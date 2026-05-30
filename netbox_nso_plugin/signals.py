@@ -813,7 +813,11 @@ def _on_route_policy_state_save(sender, instance, **kwargs):
 
 
 def _collect_redistribution_by_dest_ref(device_id: int, dest_protocol: str) -> dict[str, list[dict]]:
-    """Return redistribution entries grouped by dest_ref for the given protocol and device."""
+    """Return redistribution entries grouped by dest_ref for the given protocol and device.
+
+    When a row has its ``redistribution`` FK set (Track B), the fork object's fields
+    are used as the source of truth so operator-authored intent reaches the push payload.
+    """
     from .models import NSORedistributionState
 
     by_ref: dict[str, list[dict]] = {}
@@ -821,14 +825,23 @@ def _collect_redistribution_by_dest_ref(device_id: int, dest_protocol: str) -> d
         management__device_id=device_id,
         dest_protocol=dest_protocol,
         status__in=("accepted", "deploying", "in_sync"),
-    ):
+    ).select_related("redistribution", "redistribution__route_map"):
         entry: dict = {"source_protocol": row.source_protocol, "source_ref": row.source_ref}
-        if row.route_map:
-            entry["route_map"] = row.route_map
-        if row.metric is not None:
-            entry["metric"] = row.metric
-        if row.metric_type:
-            entry["metric_type"] = row.metric_type
+        if row.redistribution_id is not None:
+            fork = row.redistribution
+            if fork.route_map:
+                entry["route_map"] = fork.route_map.name
+            if fork.metric is not None:
+                entry["metric"] = fork.metric
+            if fork.metric_type:
+                entry["metric_type"] = fork.metric_type
+        else:
+            if row.route_map:
+                entry["route_map"] = row.route_map
+            if row.metric is not None:
+                entry["metric"] = row.metric
+            if row.metric_type:
+                entry["metric_type"] = row.metric_type
         by_ref.setdefault(row.dest_ref, []).append(entry)
     return by_ref
 
@@ -915,6 +928,47 @@ def _on_ospf_interface_state_save(sender, instance, **kwargs):
         return
 
     _push_ospf_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+
+
+def _on_redistribution_fork_save(sender, instance, **kwargs):
+    """Push protocol intent when a netbox_routing.Redistribution fork object is saved.
+
+    Finds all NSORedistributionState rows linked to this Redistribution, determines
+    their destination protocol, and triggers the appropriate intent push.
+    Deduplicates pushes so each (device, dest_protocol) pair is pushed at most once.
+    """
+    from .models import NSORedistributionState
+
+    seen: set[tuple] = set()
+    for state in NSORedistributionState.objects.filter(redistribution=instance).select_related("management"):
+        mgmt = state.management
+        if mgmt.adapter_device_id is None:
+            continue
+        key = (mgmt.device_id, state.dest_protocol)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            dest = state.dest_protocol
+            if dest == "ospf":
+                _push_ospf_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+            elif dest == "isis":
+                _push_isis_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+            elif dest == "bgp":
+                _push_bgp_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+            else:
+                logger.warning(
+                    "Redistribution fork save: unknown dest_protocol %r for device %s — no push",
+                    dest,
+                    mgmt.device_id,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Redistribution fork save: push failed for device %s protocol %s: %s",
+                mgmt.device_id,
+                state.dest_protocol,
+                exc,
+            )
 
 
 def _connect_g_activated():  # pragma: no cover
@@ -1032,3 +1086,15 @@ def _connect_g_activated():  # pragma: no cover
         sender=NSORedistributionState,
         dispatch_uid="nso_plugin_redistribution_state_post_save",
     )
+
+    # netbox_routing.Redistribution fork save → intent push (routing accept path B)
+    try:
+        from netbox_routing.models import Redistribution
+
+        post_save.connect(
+            _on_redistribution_fork_save,
+            sender=Redistribution,
+            dispatch_uid="nso_plugin_redistribution_fork_post_save",
+        )
+    except ImportError:
+        logger.debug("netbox_routing not installed — redistribution fork signal not registered")

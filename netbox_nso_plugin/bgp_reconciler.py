@@ -221,7 +221,7 @@ def _update_peer_state(
     if conflict and state.status not in _BGP_WRITE_PATH_STATUSES:
         state.status = "conflict"
     elif state.status not in _BGP_WRITE_PATH_STATUSES and state.status != "conflict":
-        state.status = "imported"
+        state.status = "in_sync" if state.bgp_peer_id else "imported"
     state.save()
     return state
 

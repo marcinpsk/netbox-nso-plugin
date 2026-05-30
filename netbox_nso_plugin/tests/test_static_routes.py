@@ -182,8 +182,8 @@ class TestReconcileStaticRoutes(TestCase):
             result = _reconcile_static_routes(self.device, payload)
         self.assertEqual(result, [])
 
-    def test_new_route_auto_create_on_creates_route_and_imported(self):
-        """auto_create=True: creates StaticRoute, adds device to M2M, status=imported."""
+    def test_new_route_auto_create_on_creates_route_and_in_sync(self):
+        """auto_create=True: creates StaticRoute, adds device to M2M, FK linked → status=in_sync."""
 
         mgmt = self._make_mgmt(self.device, nso_device_name="sr-auto-on")
         from netbox_nso_plugin.template_content import _reconcile_static_routes
@@ -194,7 +194,7 @@ class TestReconcileStaticRoutes(TestCase):
 
         self.assertEqual(len(result), 1)
         state = result[0]
-        self.assertEqual(state.status, "imported")
+        self.assertEqual(state.status, "in_sync")
         self.assertEqual(state.nso_prefix, "203.0.113.0/24")
         self.assertEqual(state.management, mgmt)
         self.assertTrue(state.static_route.devices.filter(pk=self.device.pk).exists())

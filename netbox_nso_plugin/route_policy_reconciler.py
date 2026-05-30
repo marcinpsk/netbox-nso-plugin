@@ -85,7 +85,7 @@ def _reconcile_prefix_lists(mgmt, device, pl_list: list, PrefixList, ContentType
             if state.content_hash and state.content_hash != entries_hash:
                 state.status = "conflict"
             else:
-                state.status = "imported"
+                state.status = "in_sync"  # GFK always set; hash matches → in_sync
                 state.content_hash = entries_hash
             state.last_sync_at = now
             state.content_type = ct
@@ -121,7 +121,7 @@ def _reconcile_community_lists(mgmt, device, cl_list: list, CommunityList, Conte
             if state.content_hash and state.content_hash != entries_hash:
                 state.status = "conflict"
             else:
-                state.status = "imported"
+                state.status = "in_sync"  # GFK always set; hash matches → in_sync
                 state.content_hash = entries_hash
             state.last_sync_at = now
             state.content_type = ct
@@ -157,7 +157,7 @@ def _reconcile_as_paths(mgmt, device, ap_list: list, ASPathAccessList, ContentTy
             if state.content_hash and state.content_hash != entries_hash:
                 state.status = "conflict"
             else:
-                state.status = "imported"
+                state.status = "in_sync"  # GFK always set; hash matches → in_sync
                 state.content_hash = entries_hash
             state.last_sync_at = now
             state.content_type = ct
@@ -193,7 +193,7 @@ def _reconcile_route_maps(mgmt, device, rm_list: list, RouteMap, ContentType, no
             if state.content_hash and state.content_hash != entries_hash:
                 state.status = "conflict"
             else:
-                state.status = "imported"
+                state.status = "in_sync"  # GFK always set; hash matches → in_sync
                 state.content_hash = entries_hash
             state.last_sync_at = now
             state.content_type = ct

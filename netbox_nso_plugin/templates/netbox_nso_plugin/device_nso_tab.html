@@ -305,7 +305,15 @@
   {# ── Static Routes ──────────────────────────────────────────────────── #}
   {% if static_routes %}
   <div class="card mt-3">
-    <div class="card-header"><strong>Static Routes (NSO)</strong></div>
+    <div class="card-header d-flex justify-content-between align-items-center">
+      <strong>Static Routes (NSO)</strong>
+      <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_static_routes' device_pk=object.pk %}">
+        {% csrf_token %}
+        <button type="submit" class="btn btn-sm btn-outline-success">
+          <span class="mdi mdi-check-all"></span> Accept All
+        </button>
+      </form>
+    </div>
     <div class="table-responsive">
       <table class="table table-sm table-hover">
         <thead>
@@ -316,6 +324,7 @@
             <th>Metric</th>
             <th>Status</th>
             <th>Last Synced</th>
+            <th></th>
           </tr>
         </thead>
         <tbody>
@@ -326,21 +335,33 @@
             <td>{{ sr.nso_next_hop|default:"—" }}</td>
             <td>{{ sr.static_route.metric }}</td>
             <td>
-              {% if sr.status == "in_sync" or sr.status == "imported" %}
-                <span class="badge bg-success">{{ sr.status }}</span>
+              {% if sr.status == "in_sync" %}
+                <span class="badge bg-success">in_sync</span>
+              {% elif sr.status == "imported" %}
+                <span class="badge bg-success">imported</span>
               {% elif sr.status == "changed" or sr.status == "conflict" %}
                 <span class="badge bg-warning text-dark">{{ sr.status }}</span>
               {% elif sr.status == "accepted" %}
-                <span class="badge bg-info">{{ sr.status }}</span>
+                <span class="badge bg-info text-dark">accepted</span>
               {% elif sr.status == "deploying" %}
-                <span class="badge bg-primary">{{ sr.status }}</span>
+                <span class="badge bg-primary">deploying</span>
               {% elif sr.status == "apply_failed" or sr.status == "error" %}
                 <span class="badge bg-danger">{{ sr.status }}</span>
               {% else %}
-                <span class="badge bg-info">{{ sr.status }}</span>
+                <span class="badge bg-info text-dark">{{ sr.status }}</span>
               {% endif %}
             </td>
             <td>{{ sr.last_sync_at|default:"—" }}</td>
+            <td>
+              {% if sr.status == "imported" or sr.status == "in_sync" %}
+              <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_accept_static_route' pk=sr.pk %}">
+                {% csrf_token %}
+                <button type="submit" class="btn btn-xs btn-outline-success" title="Accept">
+                  <span class="mdi mdi-check"></span>
+                </button>
+              </form>
+              {% endif %}
+            </td>
           </tr>
           {% endfor %}
         </tbody>
@@ -352,7 +373,15 @@
   {# ── IS-IS Interfaces ────────────────────────────────────────────────── #}
   {% if isis_interfaces %}
   <div class="card mt-3">
-    <div class="card-header"><strong>IS-IS Interfaces (NSO)</strong></div>
+    <div class="card-header d-flex justify-content-between align-items-center">
+      <strong>IS-IS Interfaces (NSO)</strong>
+      <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_isis_interfaces' device_pk=object.pk %}">
+        {% csrf_token %}
+        <button type="submit" class="btn btn-sm btn-outline-success">
+          <span class="mdi mdi-check-all"></span> Accept All
+        </button>
+      </form>
+    </div>
     <div class="table-responsive">
       <table class="table table-sm table-hover">
         <thead>
@@ -366,6 +395,7 @@
             <th>Passive</th>
             <th>Status</th>
             <th>Last Synced</th>
+            <th></th>
           </tr>
         </thead>
         <tbody>
@@ -390,9 +420,9 @@
               {% elif ii.status == "changed" or ii.status == "conflict" %}
                 <span class="badge bg-warning text-dark">{{ ii.status }}</span>
               {% elif ii.status == "accepted" %}
-                <span class="badge bg-info text-dark">{{ ii.status }}</span>
+                <span class="badge bg-info text-dark">accepted</span>
               {% elif ii.status == "deploying" %}
-                <span class="badge bg-primary">{{ ii.status }}</span>
+                <span class="badge bg-primary">deploying</span>
               {% elif ii.status == "apply_failed" or ii.status == "error" %}
                 <span class="badge bg-danger">{{ ii.status }}</span>
               {% else %}
@@ -400,6 +430,435 @@
               {% endif %}
             </td>
             <td>{{ ii.last_sync_at|default:"—" }}</td>
+            <td>
+              {% if ii.status == "imported" or ii.status == "in_sync" %}
+              <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_accept_isis_interface' pk=ii.pk %}">
+                {% csrf_token %}
+                <button type="submit" class="btn btn-xs btn-outline-success" title="Accept">
+                  <span class="mdi mdi-check"></span>
+                </button>
+              </form>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% endif %}
+
+  {# ── IS-IS Instances ─────────────────────────────────────────────────── #}
+  {% if isis_processes %}
+  <div class="card mt-3">
+    <div class="card-header d-flex justify-content-between align-items-center">
+      <strong>IS-IS Instances (NSO)</strong>
+      <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_isis_instances' device_pk=object.pk %}">
+        {% csrf_token %}
+        <button type="submit" class="btn btn-sm btn-outline-success">
+          <span class="mdi mdi-check-all"></span> Accept All
+        </button>
+      </form>
+    </div>
+    <div class="table-responsive">
+      <table class="table table-sm table-hover">
+        <thead>
+          <tr>
+            <th>Process Tag</th>
+            <th>IS-IS Instance</th>
+            <th>Area Auth</th>
+            <th>Domain Auth</th>
+            <th>Status</th>
+            <th>Last Synced</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for ip in isis_processes %}
+          <tr>
+            <td>{{ ip.process_tag|default:"default" }}</td>
+            <td>
+              {% if ip.isis_instance %}
+                <a href="{{ ip.isis_instance.get_absolute_url }}">{{ ip.isis_instance }}</a>
+              {% else %}—{% endif %}
+            </td>
+            <td>{{ ip.area_auth_type|default:"—" }}{% if ip.area_auth_present %} ✓{% endif %}</td>
+            <td>{{ ip.domain_auth_type|default:"—" }}{% if ip.domain_auth_present %} ✓{% endif %}</td>
+            <td>
+              {% if ip.status == "in_sync" or ip.status == "imported" %}
+                <span class="badge bg-success">{{ ip.status }}</span>
+              {% elif ip.status == "changed" or ip.status == "conflict" %}
+                <span class="badge bg-warning text-dark">{{ ip.status }}</span>
+              {% elif ip.status == "accepted" %}
+                <span class="badge bg-info text-dark">accepted</span>
+              {% elif ip.status == "deploying" %}
+                <span class="badge bg-primary">deploying</span>
+              {% elif ip.status == "apply_failed" or ip.status == "error" %}
+                <span class="badge bg-danger">{{ ip.status }}</span>
+              {% else %}
+                <span class="badge bg-info text-dark">{{ ip.status }}</span>
+              {% endif %}
+            </td>
+            <td>{{ ip.last_sync_at|default:"—" }}</td>
+            <td>
+              {% if ip.status == "imported" or ip.status == "in_sync" %}
+              <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_accept_isis_instance' pk=ip.pk %}">
+                {% csrf_token %}
+                <button type="submit" class="btn btn-xs btn-outline-success" title="Accept">
+                  <span class="mdi mdi-check"></span>
+                </button>
+              </form>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% endif %}
+
+  {# ── OSPF ────────────────────────────────────────────────────────────── #}
+  {% if ospf_data.instances or ospf_data.interfaces %}
+  <div class="card mt-3">
+    <div class="card-header d-flex justify-content-between align-items-center">
+      <strong>OSPF (NSO)</strong>
+      <div>
+        <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_ospf_instances' device_pk=object.pk %}" class="d-inline">
+          {% csrf_token %}
+          <button type="submit" class="btn btn-sm btn-outline-success me-1">
+            <span class="mdi mdi-check-all"></span> Accept All Instances
+          </button>
+        </form>
+        <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_ospf_interfaces' device_pk=object.pk %}" class="d-inline">
+          {% csrf_token %}
+          <button type="submit" class="btn btn-sm btn-outline-success">
+            <span class="mdi mdi-check-all"></span> Accept All Interfaces
+          </button>
+        </form>
+      </div>
+    </div>
+    {% if ospf_data.instances %}
+    <div class="table-responsive">
+      <table class="table table-sm table-hover mb-0">
+        <thead>
+          <tr>
+            <th>Process ID</th>
+            <th>VRF</th>
+            <th>Router ID</th>
+            <th>OSPF Instance</th>
+            <th>Status</th>
+            <th>Last Synced</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for oi in ospf_data.instances %}
+          <tr>
+            <td>{{ oi.process_id }}</td>
+            <td>{{ oi.vrf|default:"global" }}</td>
+            <td>{{ oi.router_id|default:"—" }}</td>
+            <td>
+              {% if oi.ospf_instance %}
+                <a href="{{ oi.ospf_instance.get_absolute_url }}">{{ oi.ospf_instance }}</a>
+              {% else %}—{% endif %}
+            </td>
+            <td>
+              {% if oi.status == "in_sync" or oi.status == "imported" %}
+                <span class="badge bg-success">{{ oi.status }}</span>
+              {% elif oi.status == "changed" or oi.status == "conflict" %}
+                <span class="badge bg-warning text-dark">{{ oi.status }}</span>
+              {% elif oi.status == "accepted" %}
+                <span class="badge bg-info text-dark">accepted</span>
+              {% elif oi.status == "deploying" %}
+                <span class="badge bg-primary">deploying</span>
+              {% elif oi.status == "apply_failed" %}
+                <span class="badge bg-danger">apply_failed</span>
+              {% else %}
+                <span class="badge bg-info text-dark">{{ oi.status }}</span>
+              {% endif %}
+            </td>
+            <td>{{ oi.last_sync_at|default:"—" }}</td>
+            <td>
+              {% if oi.status == "imported" or oi.status == "in_sync" %}
+              <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_accept_ospf_instance' pk=oi.pk %}">
+                {% csrf_token %}
+                <button type="submit" class="btn btn-xs btn-outline-success" title="Accept">
+                  <span class="mdi mdi-check"></span>
+                </button>
+              </form>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+    {% if ospf_data.interfaces %}
+    <div class="table-responsive">
+      <table class="table table-sm table-hover mb-0">
+        <thead>
+          <tr>
+            <th>Interface</th>
+            <th>Process ID</th>
+            <th>Area</th>
+            <th>Passive</th>
+            <th>Status</th>
+            <th>Last Synced</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for oif in ospf_data.interfaces %}
+          <tr>
+            <td><a href="{{ oif.interface.get_absolute_url }}">{{ oif.interface.name }}</a></td>
+            <td>{{ oif.process_id|default:"—" }}</td>
+            <td>{{ oif.area_id|default:"—" }}</td>
+            <td>
+              {% if oif.passive %}
+                <span class="badge bg-warning text-dark">passive</span>
+              {% else %}
+                <span class="badge bg-success">active</span>
+              {% endif %}
+            </td>
+            <td>
+              {% if oif.status == "in_sync" or oif.status == "imported" %}
+                <span class="badge bg-success">{{ oif.status }}</span>
+              {% elif oif.status == "changed" or oif.status == "conflict" %}
+                <span class="badge bg-warning text-dark">{{ oif.status }}</span>
+              {% elif oif.status == "accepted" %}
+                <span class="badge bg-info text-dark">accepted</span>
+              {% elif oif.status == "deploying" %}
+                <span class="badge bg-primary">deploying</span>
+              {% elif oif.status == "apply_failed" %}
+                <span class="badge bg-danger">apply_failed</span>
+              {% else %}
+                <span class="badge bg-info text-dark">{{ oif.status }}</span>
+              {% endif %}
+            </td>
+            <td>{{ oif.last_sync_at|default:"—" }}</td>
+            <td>
+              {% if oif.status == "imported" or oif.status == "in_sync" %}
+              <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_accept_ospf_interface' pk=oif.pk %}">
+                {% csrf_token %}
+                <button type="submit" class="btn btn-xs btn-outline-success" title="Accept">
+                  <span class="mdi mdi-check"></span>
+                </button>
+              </form>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  {# ── BGP Peers ────────────────────────────────────────────────────────── #}
+  {% if bgp_peers %}
+  <div class="card mt-3">
+    <div class="card-header d-flex justify-content-between align-items-center">
+      <strong>BGP Peers (NSO)</strong>
+      <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_bgp_peers' device_pk=object.pk %}">
+        {% csrf_token %}
+        <button type="submit" class="btn btn-sm btn-outline-success">
+          <span class="mdi mdi-check-all"></span> Accept All
+        </button>
+      </form>
+    </div>
+    <div class="table-responsive">
+      <table class="table table-sm table-hover">
+        <thead>
+          <tr>
+            <th>ASN</th>
+            <th>VRF</th>
+            <th>Peer Address</th>
+            <th>Remote AS</th>
+            <th>BGP Peer</th>
+            <th>Status</th>
+            <th>Last Synced</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for bp in bgp_peers %}
+          <tr>
+            <td>{{ bp.asn_str }}</td>
+            <td>{{ bp.vrf_name|default:"global" }}</td>
+            <td>{{ bp.peer_address_str }}</td>
+            <td>{{ bp.remote_as_str|default:"—" }}</td>
+            <td>
+              {% if bp.bgp_peer %}
+                <a href="{{ bp.bgp_peer.get_absolute_url }}">{{ bp.bgp_peer }}</a>
+              {% else %}—{% endif %}
+            </td>
+            <td>
+              {% if bp.status == "in_sync" or bp.status == "imported" %}
+                <span class="badge bg-success">{{ bp.status }}</span>
+              {% elif bp.status == "changed" or bp.status == "conflict" %}
+                <span class="badge bg-warning text-dark">{{ bp.status }}</span>
+              {% elif bp.status == "accepted" %}
+                <span class="badge bg-info text-dark">accepted</span>
+              {% elif bp.status == "deploying" %}
+                <span class="badge bg-primary">deploying</span>
+              {% elif bp.status == "apply_failed" %}
+                <span class="badge bg-danger">apply_failed</span>
+              {% else %}
+                <span class="badge bg-info text-dark">{{ bp.status }}</span>
+              {% endif %}
+            </td>
+            <td>{{ bp.last_sync_at|default:"—" }}</td>
+            <td>
+              {% if bp.status == "imported" or bp.status == "in_sync" %}
+              <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_accept_bgp_peer' pk=bp.pk %}">
+                {% csrf_token %}
+                <button type="submit" class="btn btn-xs btn-outline-success" title="Accept">
+                  <span class="mdi mdi-check"></span>
+                </button>
+              </form>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% endif %}
+
+  {# ── Route Policy ─────────────────────────────────────────────────────── #}
+  {% if route_policy_states %}
+  <div class="card mt-3">
+    <div class="card-header d-flex justify-content-between align-items-center">
+      <strong>Route Policy (NSO)</strong>
+      <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_route_policy' device_pk=object.pk %}">
+        {% csrf_token %}
+        <button type="submit" class="btn btn-sm btn-outline-success">
+          <span class="mdi mdi-check-all"></span> Accept All
+        </button>
+      </form>
+    </div>
+    <div class="table-responsive">
+      <table class="table table-sm table-hover">
+        <thead>
+          <tr>
+            <th>Family</th>
+            <th>Name</th>
+            <th>NetBox Object</th>
+            <th>Status</th>
+            <th>Last Synced</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for rp in route_policy_states %}
+          <tr>
+            <td>{{ rp.family }}</td>
+            <td>{{ rp.object_name }}</td>
+            <td>
+              {% if rp.content_object %}
+                <a href="{{ rp.content_object.get_absolute_url }}">{{ rp.content_object }}</a>
+              {% else %}—{% endif %}
+            </td>
+            <td>
+              {% if rp.status == "in_sync" or rp.status == "imported" %}
+                <span class="badge bg-success">{{ rp.status }}</span>
+              {% elif rp.status == "changed" or rp.status == "conflict" %}
+                <span class="badge bg-warning text-dark">{{ rp.status }}</span>
+              {% elif rp.status == "accepted" %}
+                <span class="badge bg-info text-dark">accepted</span>
+              {% elif rp.status == "deploying" %}
+                <span class="badge bg-primary">deploying</span>
+              {% elif rp.status == "apply_failed" %}
+                <span class="badge bg-danger">apply_failed</span>
+              {% else %}
+                <span class="badge bg-info text-dark">{{ rp.status }}</span>
+              {% endif %}
+            </td>
+            <td>{{ rp.last_sync_at|default:"—" }}</td>
+            <td>
+              {% if rp.status == "imported" or rp.status == "in_sync" %}
+              <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_accept_route_policy' pk=rp.pk %}">
+                {% csrf_token %}
+                <button type="submit" class="btn btn-xs btn-outline-success" title="Accept">
+                  <span class="mdi mdi-check"></span>
+                </button>
+              </form>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% endif %}
+
+  {# ── Redistribution ───────────────────────────────────────────────────── #}
+  {% if redistribution_states %}
+  <div class="card mt-3">
+    <div class="card-header d-flex justify-content-between align-items-center">
+      <strong>Redistribution (NSO)</strong>
+      <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_redistribution' device_pk=object.pk %}">
+        {% csrf_token %}
+        <button type="submit" class="btn btn-sm btn-outline-success">
+          <span class="mdi mdi-check-all"></span> Accept All
+        </button>
+      </form>
+    </div>
+    <div class="table-responsive">
+      <table class="table table-sm table-hover">
+        <thead>
+          <tr>
+            <th>Dest Protocol</th>
+            <th>Dest Ref</th>
+            <th>Source Protocol</th>
+            <th>Source Ref</th>
+            <th>Route Map</th>
+            <th>Metric</th>
+            <th>Status</th>
+            <th>Last Synced</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for rs in redistribution_states %}
+          <tr>
+            <td>{{ rs.dest_protocol }}</td>
+            <td>{{ rs.dest_ref|default:"—" }}</td>
+            <td>{{ rs.source_protocol }}</td>
+            <td>{{ rs.source_ref|default:"—" }}</td>
+            <td>{{ rs.route_map|default:"—" }}</td>
+            <td>{{ rs.metric|default:"—" }}</td>
+            <td>
+              {% if rs.status == "in_sync" or rs.status == "imported" %}
+                <span class="badge bg-success">{{ rs.status }}</span>
+              {% elif rs.status == "changed" or rs.status == "conflict" %}
+                <span class="badge bg-warning text-dark">{{ rs.status }}</span>
+              {% elif rs.status == "accepted" %}
+                <span class="badge bg-info text-dark">accepted</span>
+              {% elif rs.status == "deploying" %}
+                <span class="badge bg-primary">deploying</span>
+              {% elif rs.status == "apply_failed" %}
+                <span class="badge bg-danger">apply_failed</span>
+              {% else %}
+                <span class="badge bg-info text-dark">{{ rs.status }}</span>
+              {% endif %}
+            </td>
+            <td>{{ rs.last_sync_at|default:"—" }}</td>
+            <td>
+              {% if rs.status == "imported" or rs.status == "in_sync" %}
+              <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_accept_redistribution' pk=rs.pk %}">
+                {% csrf_token %}
+                <button type="submit" class="btn btn-xs btn-outline-success" title="Accept">
+                  <span class="mdi mdi-check"></span>
+                </button>
+              </form>
+              {% endif %}
+            </td>
           </tr>
           {% endfor %}
         </tbody>

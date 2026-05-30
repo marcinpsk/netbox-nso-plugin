@@ -16,7 +16,20 @@ from utilities.views import ViewTab, register_model_view
 from .adapter_client import AdapterError
 from .filters import NSODeviceManagementFilterSet, NSOInstanceFilterSet, NSOInterfaceStateFilterSet
 from .forms import AdapterConnectionForm, NSODeviceManagementForm, NSOInstanceForm
-from .models import AdapterConnection, NSODeviceManagement, NSOInstance, NSOInterfaceState
+from .models import (
+    AdapterConnection,
+    NSOBGPPeerState,
+    NSODeviceManagement,
+    NSOInstance,
+    NSOInterfaceState,
+    NSOISISInstanceState,
+    NSOISISInterfaceState,
+    NSOOSPFInstanceState,
+    NSOOSPFInterfaceState,
+    NSORedistributionState,
+    NSORoutePolicyState,
+    NSOStaticRouteState,
+)
 from .tables import NSODeviceManagementTable, NSOInstanceTable, NSOInterfaceStateTable
 
 logger = logging.getLogger(__name__)
@@ -63,6 +76,7 @@ class DeviceNSOTabView(generic.ObjectView):
         route_policy_states: list = []
         ospf_data: dict = {"instances": [], "interfaces": []}
         redistribution_states: list = []
+        bgp_peers: list = []
 
         if mgmt is not None and mgmt.adapter_device_id is not None:
             from . import adapter_client as client
@@ -73,12 +87,13 @@ class DeviceNSOTabView(generic.ObjectView):
                 compliance = client.get_compliance(mgmt.adapter_device_id)
                 interface_states = _upsert_interface_states(device, interfaces)
 
+                from .bgp_reconciler import _reconcile_bgp_config
+                from .redistribution_reconciler import reconcile_redistribution
                 from .route_policy_reconciler import reconcile_route_policy
                 from .template_content import (
                     _reconcile_isis_interfaces,
                     _reconcile_isis_process,
                     _reconcile_ospf,
-                    _reconcile_redistribution,
                     _reconcile_snmp_config,
                     _reconcile_static_routes,
                 )
@@ -100,7 +115,10 @@ class DeviceNSOTabView(generic.ObjectView):
                 ospf_data = _reconcile_ospf(device, ospf_payload)
 
                 redistribution_payload = client.get_redistribution(mgmt.adapter_device_id)
-                redistribution_states = _reconcile_redistribution(device, redistribution_payload)
+                redistribution_states = reconcile_redistribution(device, redistribution_payload)
+
+                bgp_payload = client.get_bgp_config(mgmt.adapter_device_id)
+                bgp_peers = _reconcile_bgp_config(device, bgp_payload)
 
                 update_fields = []
                 raw_ts = adapter_device.get("last_sync_at")
@@ -140,6 +158,7 @@ class DeviceNSOTabView(generic.ObjectView):
             "route_policy_states": route_policy_states,
             "ospf_data": ospf_data,
             "redistribution_states": redistribution_states,
+            "bgp_peers": bgp_peers,
         }
 
 
@@ -288,13 +307,19 @@ class NSODeviceActionView(LoginRequiredMixin, View):
 
         mgmt = get_object_or_404(NSODeviceManagement, pk=pk)
         label = _ACTION_LABELS.get(action, action)
+        is_ajax = request.headers.get("X-Requested-With") == "XMLHttpRequest"
 
         if action not in _ACTION_LABELS:
+            if is_ajax:
+                return JsonResponse({"status": "error", "message": f"Unknown action: {action}"}, status=400)
             messages.error(request, f"Unknown action: {action}")
             return redirect(mgmt.device.get_absolute_url())
 
         if mgmt.adapter_device_id is None:
-            messages.warning(request, "Device is not yet onboarded to the adapter.")
+            msg = "Device is not yet onboarded to the adapter."
+            if is_ajax:
+                return JsonResponse({"status": "error", "message": msg}, status=409)
+            messages.warning(request, msg)
             return redirect(_device_nso_tab_url(mgmt.device.pk))
 
         action_fn = {
@@ -303,8 +328,6 @@ class NSODeviceActionView(LoginRequiredMixin, View):
             "connect": client.trigger_connect,
             "apply": client.trigger_apply,
         }[action]
-
-        is_ajax = request.headers.get("X-Requested-With") == "XMLHttpRequest"
 
         try:
             result = action_fn(mgmt.adapter_device_id)
@@ -531,3 +554,163 @@ class NSOAutoAssignIPView(LoginRequiredMixin, View):
             messages.info(request, f"No IPs allocated ({skipped_total} interface(s) already have managed IPs).")
 
         return redirect(_device_nso_tab_url(device.pk))
+
+
+# ── Routing state accept views (Track A) ──────────────────────────────────────
+
+
+class RoutingStateAcceptMixin(LoginRequiredMixin, View):
+    """Per-row accept for a routing state model — sets status to 'accepted' and fires push signal."""
+
+    model_class = None
+
+    def post(self, request, pk):  # noqa: D102
+        state = get_object_or_404(self.model_class, pk=pk)
+        state.status = "accepted"
+        state.save(update_fields=["status"])
+        messages.success(request, f"Accepted routing state {state.pk}.")
+        return redirect(_device_nso_tab_url(state.management.device_id))
+
+
+class NSOStaticRouteStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
+    model_class = NSOStaticRouteState
+
+
+class NSOISISInterfaceStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
+    model_class = NSOISISInterfaceState
+
+
+class NSOISISInstanceStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
+    model_class = NSOISISInstanceState
+
+
+class NSOBGPPeerStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
+    model_class = NSOBGPPeerState
+
+
+class NSORoutePolicyStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
+    model_class = NSORoutePolicyState
+
+
+class NSOOSPFInstanceStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
+    model_class = NSOOSPFInstanceState
+
+
+class NSOOSPFInterfaceStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
+    model_class = NSOOSPFInterfaceState
+
+
+class NSORedistributionStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
+    model_class = NSORedistributionState
+
+
+# ── Routing bulk accept views (Track A) ───────────────────────────────────────
+
+
+class RoutingBulkAcceptMixin(LoginRequiredMixin, View):
+    """Bulk-accept all 'imported'/'in_sync' routing state rows for a device and push intent."""
+
+    model_class = None
+
+    def _push(self, mgmt):
+        """Trigger the appropriate intent push; override in subclasses."""
+
+    def post(self, request, device_pk):  # noqa: D102
+        try:
+            mgmt = NSODeviceManagement.objects.get(device_id=device_pk)
+        except NSODeviceManagement.DoesNotExist:
+            messages.warning(request, "Device is not NSO-managed.")
+            return redirect(_device_nso_tab_url(device_pk))
+
+        qs = self.model_class.objects.filter(
+            management=mgmt,
+            status__in=["imported", "in_sync"],
+        )
+        count = qs.count()
+        qs.update(status="accepted")
+
+        if count and mgmt.adapter_device_id is not None:
+            try:
+                self._push(mgmt)
+            except Exception as exc:
+                logger.warning("Bulk accept push failed for device %s: %s", device_pk, exc)
+
+        if count:
+            messages.success(request, f"Accepted {count} routing state(s).")
+        else:
+            messages.info(request, "No states to accept.")
+        return redirect(_device_nso_tab_url(device_pk))
+
+
+class NSOStaticRouteBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
+    model_class = NSOStaticRouteState
+
+    def _push(self, mgmt):
+        from .signals import _push_static_route_intent_for_device
+
+        _push_static_route_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+
+
+class NSOISISInterfaceBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
+    model_class = NSOISISInterfaceState
+
+    def _push(self, mgmt):
+        from .signals import _push_isis_intent_for_device
+
+        _push_isis_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+
+
+class NSOISISInstanceBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
+    model_class = NSOISISInstanceState
+
+    def _push(self, mgmt):
+        from .signals import _push_isis_intent_for_device
+
+        _push_isis_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+
+
+class NSOBGPPeerBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
+    model_class = NSOBGPPeerState
+
+    def _push(self, mgmt):
+        from .signals import _push_bgp_intent_for_device
+
+        _push_bgp_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+
+
+class NSORoutePolicyBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
+    model_class = NSORoutePolicyState
+
+    def _push(self, mgmt):
+        from .signals import _push_route_policy_intent_for_device
+
+        _push_route_policy_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+
+
+class NSOOSPFInstanceBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
+    model_class = NSOOSPFInstanceState
+
+    def _push(self, mgmt):
+        from .signals import _push_ospf_intent_for_device
+
+        _push_ospf_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+
+
+class NSOOSPFInterfaceBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
+    model_class = NSOOSPFInterfaceState
+
+    def _push(self, mgmt):
+        from .signals import _push_ospf_intent_for_device
+
+        _push_ospf_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+
+
+class NSORedistributionBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
+    model_class = NSORedistributionState
+
+    def _push(self, mgmt):
+        from .signals import _push_bgp_intent_for_device, _push_isis_intent_for_device, _push_ospf_intent_for_device
+
+        # Redistribution is distributed across destination protocols; push all three.
+        for fn in (_push_ospf_intent_for_device, _push_isis_intent_for_device, _push_bgp_intent_for_device):
+            fn(mgmt.device_id, mgmt.adapter_device_id)
