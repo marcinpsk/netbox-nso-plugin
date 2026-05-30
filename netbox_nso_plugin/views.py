@@ -68,6 +68,7 @@ class DeviceNSOTabView(generic.ObjectView):
         interfaces = None
         compliance = None
         adapter_error = None
+        adapter_error_code = None
         interface_states: dict = {}
         snmp_data: dict = {}
         static_routes: list = []
@@ -139,6 +140,7 @@ class DeviceNSOTabView(generic.ObjectView):
                     )
             except AdapterError as exc:
                 adapter_error = str(exc)
+                adapter_error_code = exc.code
                 logger.debug("Adapter unavailable for device %s: %s", device.pk, exc)
                 snapshot = mgmt.compliance_snapshot or {}
                 interfaces = snapshot.get("interfaces")
@@ -149,6 +151,7 @@ class DeviceNSOTabView(generic.ObjectView):
             "interfaces": interfaces,
             "compliance": compliance,
             "adapter_error": adapter_error,
+            "adapter_error_code": adapter_error_code,
             "interface_states": interface_states,
             "status_badge": _STATUS_BADGE,
             "snmp_data": snmp_data,
@@ -255,6 +258,7 @@ class NSODeviceManagementView(generic.ObjectView):
         interfaces = None
         compliance = None
         adapter_error = None
+        adapter_error_code = None
 
         if instance.adapter_device_id is not None:
             try:
@@ -262,6 +266,7 @@ class NSODeviceManagementView(generic.ObjectView):
                 compliance = client.get_compliance(instance.adapter_device_id)
             except AdapterError as exc:
                 adapter_error = str(exc)
+                adapter_error_code = exc.code
                 # Fall back to snapshot so the page remains useful
                 snapshot = instance.compliance_snapshot or {}
                 interfaces = snapshot.get("interfaces")
@@ -271,6 +276,7 @@ class NSODeviceManagementView(generic.ObjectView):
             "interfaces": interfaces,
             "compliance": compliance,
             "adapter_error": adapter_error,
+            "adapter_error_code": adapter_error_code,
         }
 
 
