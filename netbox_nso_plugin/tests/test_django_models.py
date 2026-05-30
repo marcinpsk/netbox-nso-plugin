@@ -1,0 +1,166 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
+"""Django-stack tests for model methods: __str__, get_absolute_url, save(), properties.
+
+These tests require the full NetBox/Django stack (run in devcontainer).
+"""
+
+from django.test import TestCase
+from django.urls import reverse
+
+
+class TestAdapterConnectionModelMethods(TestCase):
+    """Tests for AdapterConnection model methods using the real Django model."""
+
+    @classmethod
+    def setUpTestData(cls):
+        from netbox_nso_plugin.models import AdapterConnection
+
+        cls.Model = AdapterConnection
+
+    def test_str_with_url(self):
+        """__str__ returns the URL when set."""
+        obj = object.__new__(self.Model)
+        obj.url = "http://adapter:8000"
+        self.assertEqual(str(obj), "http://adapter:8000")
+
+    def test_str_without_url(self):
+        """__str__ returns fallback when URL is blank."""
+        obj = object.__new__(self.Model)
+        obj.url = ""
+        self.assertEqual(str(obj), "nso-adapter (not configured)")
+
+    def test_get_absolute_url(self):
+        """get_absolute_url returns the singleton edit URL."""
+        obj = object.__new__(self.Model)
+        url = obj.get_absolute_url()
+        self.assertEqual(url, reverse("plugins:netbox_nso_plugin:adapterconnection"))
+
+    def test_save_singleton_reuses_pk(self):
+        """Second save() reuses the existing row's PK (singleton pattern)."""
+        from netbox_nso_plugin.models import AdapterConnection
+
+        first = AdapterConnection(url="http://first:8000")
+        first.save()
+        first_pk = first.pk
+        self.assertIsNotNone(first_pk)
+
+        second = AdapterConnection(url="http://second:8000")
+        second.save()
+        self.assertEqual(second.pk, first_pk)
+        self.assertEqual(AdapterConnection.objects.count(), 1)
+
+    def test_save_first_instance_gets_pk(self):
+        """First save() works normally when no instance exists."""
+        from netbox_nso_plugin.models import AdapterConnection
+
+        obj = AdapterConnection(url="http://adapter:9000")
+        obj.save()
+        self.assertIsNotNone(obj.pk)
+        self.assertEqual(AdapterConnection.objects.count(), 1)
+
+
+class TestNSOInstanceModelMethods(TestCase):
+    """Tests for NSOInstance model methods."""
+
+    @classmethod
+    def setUpTestData(cls):
+        from netbox_nso_plugin.models import NSOInstance
+
+        cls.instance = NSOInstance.objects.create(name="prod-nso", adapter_instance_id="prod-nso-01")
+
+    def test_str(self):
+        """__str__ returns the instance name."""
+        self.assertEqual(str(self.instance), "prod-nso")
+
+    def test_get_absolute_url(self):
+        """get_absolute_url returns the correct detail URL."""
+        expected = reverse("plugins:netbox_nso_plugin:nsoinstance", args=[self.instance.pk])
+        self.assertEqual(self.instance.get_absolute_url(), expected)
+
+
+class TestNSODeviceManagementModelMethods(TestCase):
+    """Tests for NSODeviceManagement model methods using real DB fixtures."""
+
+    @classmethod
+    def setUpTestData(cls):
+        from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
+
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+        manufacturer = Manufacturer.objects.create(name="ModelMfg", slug="modelmfg")
+        device_type = DeviceType.objects.create(manufacturer=manufacturer, model="ModelDev", slug="modeldev")
+        role = DeviceRole.objects.create(name="ModelRole", slug="modelrole")
+        site = Site.objects.create(name="ModelSite", slug="modelsite")
+        cls.device = Device.objects.create(name="core-router-01", device_type=device_type, role=role, site=site)
+        cls.nso_instance = NSOInstance.objects.create(name="prod-nso", adapter_instance_id="model-nso-id")
+        cls.mgmt = NSODeviceManagement.objects.create(
+            device=cls.device,
+            nso_instance=cls.nso_instance,
+            nso_device_name="core-router-01",
+        )
+
+    def test_str(self):
+        """__str__ formats device, instance, and nso_device_name."""
+        result = str(self.mgmt)
+        self.assertIn("prod-nso", result)
+        self.assertIn("core-router-01", result)
+
+    def test_get_absolute_url(self):
+        """get_absolute_url returns correct URL for the management record."""
+        expected = reverse("plugins:netbox_nso_plugin:nsodevicemanagement", args=[self.mgmt.pk])
+        self.assertEqual(self.mgmt.get_absolute_url(), expected)
+
+    def test_managed_attributes_none(self):
+        """managed_attributes returns empty list when both flags are False."""
+        self.mgmt.manage_description = False
+        self.mgmt.manage_enabled = False
+        self.assertEqual(self.mgmt.managed_attributes, [])
+
+    def test_managed_attributes_description_only(self):
+        """managed_attributes returns ['description'] when manage_description=True."""
+        self.mgmt.manage_description = True
+        self.mgmt.manage_enabled = False
+        self.assertEqual(self.mgmt.managed_attributes, ["description"])
+
+    def test_managed_attributes_enabled_only(self):
+        """managed_attributes returns ['enabled'] when manage_enabled=True."""
+        self.mgmt.manage_description = False
+        self.mgmt.manage_enabled = True
+        self.assertEqual(self.mgmt.managed_attributes, ["enabled"])
+
+    def test_managed_attributes_both(self):
+        """managed_attributes returns both when both flags are True."""
+        self.mgmt.manage_description = True
+        self.mgmt.manage_enabled = True
+        self.assertEqual(self.mgmt.managed_attributes, ["description", "enabled"])
+
+
+class TestNSOInterfaceStateModelMethods(TestCase):
+    """Tests for NSOInterfaceState model methods using real DB fixtures."""
+
+    @classmethod
+    def setUpTestData(cls):
+        from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
+
+        from netbox_nso_plugin.models import NSOInterfaceState
+
+        manufacturer = Manufacturer.objects.create(name="StateMfg", slug="statemfg")
+        device_type = DeviceType.objects.create(manufacturer=manufacturer, model="StateDev", slug="statedev")
+        role = DeviceRole.objects.create(name="StateRole", slug="staterole")
+        site = Site.objects.create(name="StateSite", slug="statesite")
+        device = Device.objects.create(name="state-router-01", device_type=device_type, role=role, site=site)
+        cls.interface = Interface.objects.create(device=device, name="GigabitEthernet0/0", type="1000base-t")
+        cls.state = NSOInterfaceState.objects.create(interface=cls.interface, attribute="description", status="changed")
+
+    def test_str(self):
+        """__str__ includes interface, attribute, and status."""
+        result = str(self.state)
+        self.assertIn("GigabitEthernet0/0", result)
+        self.assertIn("description", result)
+        self.assertIn("changed", result)
+
+    def test_get_absolute_url(self):
+        """get_absolute_url returns correct URL."""
+        expected = reverse("plugins:netbox_nso_plugin:nsointerfacestate", args=[self.state.pk])
+        self.assertEqual(self.state.get_absolute_url(), expected)

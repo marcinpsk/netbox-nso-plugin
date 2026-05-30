@@ -1,0 +1,40 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{% extends 'generic/object_edit.html' %}
+
+{% block content %}
+{{ block.super }}
+
+<div class="card mb-3">
+  <div class="card-header">
+    <strong><span class="mdi mdi-auto-fix me-1"></span>Derived Intent Templates</strong>
+  </div>
+  <div class="card-body">
+    {% if derived_intent_templates %}
+      <table class="table table-sm mb-0">
+        <thead>
+          <tr>
+            <th>Sentinel</th>
+            <th>Pattern</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for tpl in derived_intent_templates %}
+            <tr>
+              <td><code>{{ tpl.sentinel }}</code></td>
+              <td><code>{{ tpl.pattern }}</code></td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="text-muted mb-0">
+        No derived intent templates configured.
+        Add <code>DERIVED_INTENT_TEMPLATES</code> to
+        <code>PLUGINS_CONFIG["netbox_nso_plugin"]</code> to enable automatic
+        interface description management.
+      </p>
+    {% endif %}
+  </div>
+</div>
+{% endblock content %}

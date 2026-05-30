@@ -63,3 +63,6 @@ site/
 
 # Brainstorming / design specs (local only, not for version control)
 docs/superpowers/
+
+# Internal working docs (milestone plans/designs) — kept local, never tracked.
+docs/

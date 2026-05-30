@@ -1,0 +1,944 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
+from django.contrib.contenttypes.fields import GenericForeignKey
+from django.contrib.contenttypes.models import ContentType
+from django.db import models
+from django.urls import reverse
+from netbox.models import NetBoxModel
+
+
+class AdapterConnection(NetBoxModel):
+    """Singleton — URL and non-secret connection settings for the nso-adapter.
+
+    The bearer token is intentionally absent; it is always read from
+    PLUGINS_CONFIG / env and never stored in the database.
+    When this record exists and ``enabled=True`` its values override
+    PLUGINS_CONFIG for the URL and non-secret settings.
+    """
+
+    # CharField, not URLField: Django's URLValidator rejects single-label hosts
+    # (e.g. http://nso-adapter:8000, a Docker service name), which is a valid and
+    # preferred way to reach the adapter. Reachability is exercised at request time.
+    url = models.CharField(
+        max_length=200,
+        blank=True,
+        help_text=(
+            "nso-adapter base URL, e.g. http://nso-adapter:8000 (a Docker service "
+            "name is fine). Overrides the env bootstrap when set; leave blank to use "
+            "PLUGINS_CONFIG / env."
+        ),
+    )
+    verify_tls = models.BooleanField(
+        default=True,
+        help_text="Verify TLS certificates when calling the adapter.",
+    )
+    ca_cert_path = models.CharField(
+        max_length=500,
+        blank=True,
+        help_text="Path to a CA bundle file on the NetBox host. Leave blank to use the system trust store.",
+    )
+    timeout_seconds = models.PositiveIntegerField(
+        default=30,
+        help_text="Request timeout in seconds.",
+    )
+    enabled = models.BooleanField(
+        default=True,
+        help_text="When disabled the plugin falls back to PLUGINS_CONFIG / env for all settings.",
+    )
+
+    class Meta:
+        verbose_name = "Adapter Connection"
+        verbose_name_plural = "Adapter Connection"
+
+    def __str__(self):
+        return self.url or "nso-adapter (not configured)"
+
+    def get_absolute_url(self):
+        """Return the URL for the singleton edit view."""
+        return reverse("plugins:netbox_nso_plugin:adapterconnection")
+
+    def save(self, *args, **kwargs):
+        """Enforce singleton: reuse the existing row's PK when creating a second instance."""
+        if not self.pk:
+            existing = AdapterConnection.objects.first()
+            if existing:
+                self.pk = existing.pk
+        super().save(*args, **kwargs)
+
+
+class NSOInstance(NetBoxModel):
+    """Represents a Cisco NSO instance registered in the adapter."""
+
+    name = models.CharField(max_length=100, unique=True)
+    adapter_instance_id = models.CharField(
+        max_length=100,
+        unique=True,
+        help_text="The instance ID used by the nso-adapter (matches adapter config).",
+    )
+
+    class Meta:
+        ordering = ["name"]
+        verbose_name = "NSO Instance"
+        verbose_name_plural = "NSO Instances"
+
+    def __str__(self):
+        return self.name
+
+    def get_absolute_url(self):
+        """Return the detail URL for this instance."""
+        return reverse("plugins:netbox_nso_plugin:nsoinstance", args=[self.pk])
+
+
+class NSODeviceManagement(NetBoxModel):
+    """Scope record — one per NSO-managed NetBox device."""
+
+    device = models.OneToOneField(
+        to="dcim.Device",
+        on_delete=models.CASCADE,
+        related_name="nso_management",
+    )
+    nso_instance = models.ForeignKey(
+        to=NSOInstance,
+        on_delete=models.PROTECT,
+        related_name="managed_devices",
+    )
+    nso_device_name = models.CharField(
+        max_length=255,
+        help_text="Device name in NSO. Defaults to the NetBox device name.",
+    )
+    manage_description = models.BooleanField(
+        default=False,
+        help_text="Sync interface description attribute from NSO.",
+    )
+    manage_enabled = models.BooleanField(
+        default=False,
+        help_text="Sync interface enabled/shutdown attribute from NSO.",
+    )
+    auto_apply = models.BooleanField(
+        default=False,
+        help_text=(
+            "When True, every accept of a value on this device enqueues an apply job "
+            "on the adapter. Disabled by default so brownfield devices are brought into "
+            "management one cautious push at a time."
+        ),
+    )
+    adapter_device_id = models.IntegerField(
+        null=True,
+        blank=True,
+        help_text="The device ID assigned by the nso-adapter after onboarding.",
+    )
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+    last_sync_status = models.CharField(max_length=50, blank=True, default="")
+    compliance_snapshot = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="Cached compliance counts and per-interface statuses from the last sync.",
+    )
+
+    class Meta:
+        ordering = ["device"]
+        verbose_name = "NSO Device Management"
+        verbose_name_plural = "NSO Device Management"
+
+    def __str__(self):
+        return f"{self.device} → {self.nso_instance.name}/{self.nso_device_name}"
+
+    def get_absolute_url(self):
+        """Return the detail URL for this management record."""
+        return reverse("plugins:netbox_nso_plugin:nsodevicemanagement", args=[self.pk])
+
+    @property
+    def managed_attributes(self):
+        """Return list of managed attribute names."""
+        attrs = []
+        if self.manage_description:
+            attrs.append("description")
+        if self.manage_enabled:
+            attrs.append("enabled")
+        return attrs
+
+
+class NSOInterfaceState(NetBoxModel):
+    """Per-interface, per-attribute intent status overlay (Phase 2, M6).
+
+    Intent value lives on ``dcim.Interface`` (description/enabled fields).
+    This model holds the *status overlay*: what the adapter last reported,
+    what has been accepted, and when it was last applied.
+
+    Unique constraint: one row per (interface, attribute).
+    """
+
+    ATTRIBUTE_CHOICES = [
+        ("description", "Description"),
+        ("enabled", "Enabled"),
+    ]
+
+    STATUS_CHOICES = [
+        ("unknown", "Unknown"),
+        ("imported", "Imported"),
+        ("changed", "Changed"),
+        ("accepted", "Accepted"),
+        ("deploying", "Deploying"),
+        ("in_sync", "In Sync"),
+        ("apply_failed", "Apply Failed"),
+        ("drifted", "Drifted"),
+        ("error", "Error"),
+    ]
+
+    interface = models.ForeignKey(
+        to="dcim.Interface",
+        on_delete=models.CASCADE,
+        related_name="nso_states",
+    )
+    attribute = models.CharField(max_length=64, choices=ATTRIBUTE_CHOICES)
+    status = models.CharField(
+        max_length=32,
+        choices=STATUS_CHOICES,
+        default="unknown",
+    )
+    nso_value = models.TextField(
+        blank=True,
+        null=True,
+        help_text="Last value reported by NSO (cached for display).",
+    )
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    last_apply_at = models.DateTimeField(null=True, blank=True)
+    last_apply_error = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="Populated when status=apply_failed. Contains code/message/detail.",
+    )
+
+    class Meta:
+        ordering = ["interface", "attribute"]
+        unique_together = [("interface", "attribute")]
+        verbose_name = "NSO Interface State"
+        verbose_name_plural = "NSO Interface States"
+
+    def __str__(self):
+        return f"{self.interface} / {self.attribute} [{self.status}]"
+
+    def get_absolute_url(self):
+        """Return the absolute URL for this object."""
+        return reverse("plugins:netbox_nso_plugin:nsointerfacestate", args=[self.pk])
+
+
+class NSOInterfaceIPState(NetBoxModel):
+    """Per-interface, per-address IP address status overlay (Phase 3, M12).
+
+    Tracks the synchronisation state for each IP address reported by NSO for a
+    managed interface.  Intent is driven by NetBox IPAM (``ipam.IPAddress``);
+    this model holds the *status overlay*.
+
+    Unique constraint: one row per (interface, address, vrf).
+    Empty-string ``vrf`` means the global/default routing table.
+    """
+
+    STATUS_CHOICES = [
+        ("unknown", "Unknown"),
+        ("reserved", "Reserved"),  # M13: held for P2P atomicity; never pushed until accepted
+        ("imported", "Imported"),
+        ("changed", "Changed"),
+        ("accepted", "Accepted"),
+        ("deploying", "Deploying"),
+        ("in_sync", "In Sync"),
+        ("apply_failed", "Apply Failed"),
+        ("drifted", "Drifted"),
+        ("error", "Error"),
+        ("conflict", "Conflict"),  # address already assigned elsewhere in NetBox
+    ]
+
+    interface = models.ForeignKey(
+        to="dcim.Interface",
+        on_delete=models.CASCADE,
+        related_name="nso_ip_states",
+    )
+    address = models.CharField(
+        max_length=64,
+        help_text="IP address in 'ip/prefix-length' notation (e.g. 10.0.0.1/24).",
+    )
+    vrf = models.CharField(
+        max_length=256,
+        blank=True,
+        default="",
+        help_text="VRF name; empty string means the global routing table.",
+    )
+    family = models.CharField(
+        max_length=8,
+        default="ipv4",
+        help_text="Address family: ipv4 or ipv6 (derived, informational).",
+    )
+    secondary = models.BooleanField(
+        default=False,
+        help_text="True if this is a secondary IP address on the interface.",
+    )
+    status = models.CharField(
+        max_length=32,
+        choices=STATUS_CHOICES,
+        default="unknown",
+    )
+    nso_value = models.TextField(
+        blank=True,
+        null=True,
+        help_text="Last address string reported by NSO (cached for display).",
+    )
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    last_apply_at = models.DateTimeField(null=True, blank=True)
+    last_apply_error = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="Populated when status=apply_failed.",
+    )
+    # M13: auto-assignment fields
+    auto_assigned = models.BooleanField(
+        default=False,
+        help_text="True when this address was minted by the M13 IP auto-assignment engine.",
+    )
+    source_pool = models.ForeignKey(
+        to="ipam.Prefix",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="nso_ip_states_from_pool",
+        help_text="The Prefix pool this address was drawn from (M13 audit trail).",
+    )
+    peer_state = models.ForeignKey(
+        to="self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="peer_back",
+        help_text="The other end of a P2P pair (M13 Phase B reserve-then-activate).",
+    )
+
+    class Meta:
+        ordering = ["interface", "address", "vrf"]
+        unique_together = [("interface", "address", "vrf")]
+        verbose_name = "NSO Interface IP State"
+        verbose_name_plural = "NSO Interface IP States"
+
+    def __str__(self):
+        vrf_label = f" [{self.vrf}]" if self.vrf else ""
+        return f"{self.interface} / {self.address}{vrf_label} [{self.status}]"
+
+
+# ─── M11: SNMP state overlays ─────────────────────────────────────────────────
+
+_SNMP_STATUS_CHOICES = [
+    ("unknown", "Unknown"),
+    ("imported", "Imported"),
+    ("accepted", "Accepted"),
+    ("deploying", "Deploying"),
+    ("in_sync", "In Sync"),
+    ("apply_failed", "Apply Failed"),
+    ("conflict", "Conflict"),
+    ("error", "Error"),
+]
+
+
+class NSOSnmpCommunityState(NetBoxModel):
+    """Per-device SNMP community status overlay (M11 read path).
+
+    The community string itself is never stored — only its opaque SHA-256 hash
+    (``community_hash``) as published by the NSO package.  A Vault reference
+    (``vault_ref``) links to the secret needed for the write path (Phase B).
+    """
+
+    management = models.ForeignKey(
+        to="NSODeviceManagement",
+        on_delete=models.CASCADE,
+        related_name="snmp_community_states",
+    )
+    community_hash = models.CharField(
+        max_length=64,
+        help_text="Opaque SHA-256 prefix of the community string (16 hex chars).",
+    )
+    access = models.CharField(
+        max_length=8,
+        default="RO",
+        help_text="Access mode: RO or RW.",
+    )
+    acl = models.CharField(
+        max_length=128,
+        blank=True,
+        default="",
+        help_text="ACL name bound to this community entry, if any.",
+    )
+    has_secret = models.BooleanField(
+        default=True,
+        help_text="Always True for community entries — community name IS the secret.",
+    )
+    vault_ref = models.CharField(
+        max_length=512,
+        blank=True,
+        default="",
+        help_text="Vault KV path#key for the community string (required for the write path).",
+    )
+    status = models.CharField(max_length=32, choices=_SNMP_STATUS_CHOICES, default="unknown")
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["management", "community_hash"]
+        unique_together = [("management", "community_hash")]
+        verbose_name = "NSO SNMP Community State"
+        verbose_name_plural = "NSO SNMP Community States"
+
+    def __str__(self):
+        return f"{self.management} / community:{self.community_hash} [{self.status}]"
+
+
+class NSOSnmpV3UserState(NetBoxModel):
+    """Per-device SNMP v3 user status overlay (M11 read path).
+
+    Passwords are never stored — ``has_auth_secret`` / ``has_priv_secret``
+    indicate whether the NSO device has secrets set.  ``vault_ref`` carries the
+    Vault path for the write path (Phase B).
+    """
+
+    management = models.ForeignKey(
+        to="NSODeviceManagement",
+        on_delete=models.CASCADE,
+        related_name="snmp_v3_user_states",
+    )
+    username = models.CharField(max_length=128)
+    has_auth_secret = models.BooleanField(default=False)
+    has_priv_secret = models.BooleanField(default=False)
+    vault_ref = models.CharField(
+        max_length=512,
+        blank=True,
+        default="",
+        help_text="Vault KV path#key for the v3 auth/priv secrets (required for the write path).",
+    )
+    status = models.CharField(max_length=32, choices=_SNMP_STATUS_CHOICES, default="unknown")
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["management", "username"]
+        unique_together = [("management", "username")]
+        verbose_name = "NSO SNMP V3 User State"
+        verbose_name_plural = "NSO SNMP V3 User States"
+
+    def __str__(self):
+        return f"{self.management} / v3:{self.username} [{self.status}]"
+
+
+class NSOSnmpHostState(NetBoxModel):
+    """Per-device SNMP trap/inform host status overlay (M11 read path)."""
+
+    management = models.ForeignKey(
+        to="NSODeviceManagement",
+        on_delete=models.CASCADE,
+        related_name="snmp_host_states",
+    )
+    address = models.CharField(max_length=256, help_text="Trap/inform target address.")
+    version = models.CharField(max_length=8, default="v2c", help_text="SNMP version: v1, v2c, v3.")
+    notify_type = models.CharField(
+        max_length=16,
+        default="trap",
+        help_text="Notification type: trap or inform.",
+    )
+    port = models.PositiveIntegerField(null=True, blank=True, help_text="UDP port (null = default 162).")
+    community_hash = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text="Hash of the community string used for this host (v1/v2c only).",
+    )
+    status = models.CharField(max_length=32, choices=_SNMP_STATUS_CHOICES, default="unknown")
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["management", "address"]
+        unique_together = [("management", "address")]
+        verbose_name = "NSO SNMP Host State"
+        verbose_name_plural = "NSO SNMP Host States"
+
+    def __str__(self):
+        return f"{self.management} / host:{self.address} [{self.status}]"
+
+
+class NSOSnmpSystemInfoState(NetBoxModel):
+    """Per-device SNMP system location/contact status overlay (M11 read path).
+
+    At most one row per device management object (enforced by OneToOneField).
+    """
+
+    management = models.OneToOneField(
+        to="NSODeviceManagement",
+        on_delete=models.CASCADE,
+        related_name="snmp_system_info_state",
+    )
+    location = models.CharField(max_length=256, blank=True, default="")
+    contact = models.CharField(max_length=256, blank=True, default="")
+    status = models.CharField(max_length=32, choices=_SNMP_STATUS_CHOICES, default="unknown")
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        verbose_name = "NSO SNMP System Info State"
+        verbose_name_plural = "NSO SNMP System Info States"
+
+    def __str__(self):
+        return f"{self.management} / system-info [{self.status}]"
+
+
+_STATIC_ROUTE_STATUS_CHOICES = [
+    ("unknown", "Unknown"),
+    ("imported", "Imported"),
+    ("accepted", "Accepted"),
+    ("deploying", "Deploying"),
+    ("in_sync", "In Sync"),
+    ("apply_failed", "Apply Failed"),
+    ("conflict", "Conflict"),
+    ("changed", "Changed"),
+    ("error", "Error"),
+]
+
+
+class NSOStaticRouteState(NetBoxModel):
+    """Per-(device, static_route) compliance overlay for static routing (M10).
+
+    One row exists per (NSODeviceManagement, StaticRoute) pair.  The StaticRoute
+    object itself is shared across devices via M2M — this row tracks the
+    compliance status for each individual (device, route) pairing.
+
+    The ``conflict`` status is set when the device reports a route matching an
+    existing StaticRoute that is *not* associated with this device — requiring an
+    explicit operator decision before the plugin will add the device to the M2M.
+    """
+
+    management = models.ForeignKey(
+        to="NSODeviceManagement",
+        on_delete=models.CASCADE,
+        related_name="static_route_states",
+    )
+    static_route = models.ForeignKey(
+        to="netbox_routing.StaticRoute",
+        on_delete=models.CASCADE,
+        related_name="nso_states",
+    )
+    status = models.CharField(max_length=32, choices=_STATIC_ROUTE_STATUS_CHOICES, default="unknown")
+    nso_vrf = models.CharField(max_length=128, blank=True, default="")
+    nso_prefix = models.CharField(max_length=64, blank=True, default="")
+    nso_next_hop = models.CharField(max_length=64, blank=True, default="")
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    last_apply_at = models.DateTimeField(null=True, blank=True)
+    last_apply_error = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["management", "static_route"]
+        unique_together = [("management", "static_route")]
+        verbose_name = "NSO Static Route State"
+        verbose_name_plural = "NSO Static Route States"
+
+    def __str__(self):
+        return f"{self.management} / {self.nso_prefix} [{self.status}]"
+
+
+_ISIS_STATUS_CHOICES = [
+    ("unknown", "Unknown"),
+    ("imported", "Imported"),
+    ("accepted", "Accepted"),
+    ("deploying", "Deploying"),
+    ("in_sync", "In Sync"),
+    ("apply_failed", "Apply Failed"),
+    ("conflict", "Conflict"),
+    ("changed", "Changed"),
+    ("error", "Error"),
+]
+
+
+class NSOISISInterfaceState(NetBoxModel):
+    """Per-(device, interface, af) IS-IS enablement compliance overlay (M14).
+
+    Tracks the status of IS-IS interface enablement for each (NSODeviceManagement,
+    dcim.Interface, address-family) triple.  The ``status`` lifecycle mirrors the
+    other intent models: unknown → imported → accepted → deploying → in_sync /
+    apply_failed.
+
+    When netbox-routing ISISInterface objects exist for this device they will
+    be linked via ``isis_interface`` (nullable FK added in a later migration).
+    """
+
+    management = models.ForeignKey(
+        to="NSODeviceManagement",
+        on_delete=models.CASCADE,
+        related_name="isis_interface_states",
+    )
+    interface = models.ForeignKey(
+        to="dcim.Interface",
+        on_delete=models.CASCADE,
+        related_name="nso_isis_states",
+    )
+    af = models.CharField(max_length=8)  # "ipv4" or "ipv6"
+    process_tag = models.CharField(max_length=128, blank=True, default="")
+    circuit_type = models.CharField(max_length=32, blank=True, default="")
+    network_type = models.CharField(max_length=32, blank=True, default="")
+    metric = models.PositiveIntegerField(null=True, blank=True)
+    passive = models.BooleanField(default=False)
+    status = models.CharField(max_length=32, choices=_ISIS_STATUS_CHOICES, default="unknown")
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    last_apply_at = models.DateTimeField(null=True, blank=True)
+    last_apply_error = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["management", "interface", "af"]
+        unique_together = [("management", "interface", "af")]
+        verbose_name = "NSO IS-IS Interface State"
+        verbose_name_plural = "NSO IS-IS Interface States"
+
+    def __str__(self):
+        return f"{self.management} / {self.interface} ({self.af}) [{self.status}]"
+
+
+class NSOISISInstanceState(NetBoxModel):
+    """Per-(device, isis_process_tag) IS-IS process compliance overlay (M18).
+
+    Tracks the status of IS-IS process-level config (net, is-type, metric-style,
+    overload-bit, area/domain auth) for each (NSODeviceManagement, process_tag)
+    pair.  Status lifecycle mirrors NSOISISInterfaceState.
+
+    ``isis_instance`` links to the netbox-routing ISISInstance once resolved.
+    """
+
+    management = models.ForeignKey(
+        to="NSODeviceManagement",
+        on_delete=models.CASCADE,
+        related_name="isis_instance_states",
+    )
+    process_tag = models.CharField(max_length=128)
+    # Denormalised read-path fields (what NSO reports)
+    net = models.CharField(max_length=100, blank=True, default="")
+    is_type = models.CharField(max_length=50, blank=True, default="")
+    metric_style = models.CharField(max_length=20, blank=True, default="")
+    overload_bit = models.BooleanField(null=True, blank=True)
+    area_auth_type = models.CharField(max_length=10, blank=True, default="")
+    area_auth_present = models.BooleanField(default=False)
+    domain_auth_type = models.CharField(max_length=10, blank=True, default="")
+    domain_auth_present = models.BooleanField(default=False)
+    # Linked netbox-routing object (nullable — may not exist yet)
+    isis_instance = models.ForeignKey(
+        to="netbox_routing.ISISInstance",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="nso_instance_states",
+    )
+    status = models.CharField(max_length=32, choices=_ISIS_STATUS_CHOICES, default="unknown")
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    last_apply_at = models.DateTimeField(null=True, blank=True)
+    last_apply_error = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["management", "process_tag"]
+        unique_together = [("management", "process_tag")]
+        verbose_name = "NSO IS-IS Instance State"
+        verbose_name_plural = "NSO IS-IS Instance States"
+
+    def __str__(self):
+        return f"{self.management} / isis {self.process_tag} [{self.status}]"
+
+
+_BGP_STATUS_CHOICES = [
+    ("unknown", "Unknown"),
+    ("imported", "Imported"),
+    ("accepted", "Accepted"),
+    ("deploying", "Deploying"),
+    ("in_sync", "In Sync"),
+    ("apply_failed", "Apply Failed"),
+    ("conflict", "Conflict"),
+    ("changed", "Changed"),
+    ("error", "Error"),
+]
+
+_BGP_WRITE_PATH_STATUSES = {"accepted", "deploying", "in_sync", "apply_failed"}
+
+
+class NSOBGPPeerState(NetBoxModel):
+    """Per-(device, asn, vrf, peer_address) BGP peer compliance overlay (M15).
+
+    Tracks the reconcile status of each BGP peer discovered from NSO.
+    The identity key is (management, asn_str, vrf_name, peer_address_str) — all
+    denormalised strings so that unlinked/unresolved peers can still be recorded.
+
+    ``bgp_peer`` links to the netbox-routing BGPPeer object once successfully
+    resolved.  It is nullable: a peer that cannot be linked is still tracked
+    (status='conflict' or 'error') so the operator can see what NSO reported.
+
+    Status lifecycle: unknown → imported → accepted → deploying → in_sync /
+    apply_failed.  ``conflict`` is set when a matching BGPPeer exists but was
+    NOT created by this plugin.  ``changed`` is set when NSO no longer reports
+    this peer.
+    """
+
+    management = models.ForeignKey(
+        to="NSODeviceManagement",
+        on_delete=models.CASCADE,
+        related_name="bgp_peer_states",
+    )
+    asn_str = models.CharField(max_length=10)
+    vrf_name = models.CharField(max_length=128, blank=True, default="")
+    peer_address_str = models.CharField(max_length=64)
+    bgp_peer = models.ForeignKey(
+        to="netbox_routing.BGPPeer",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="nso_bgp_states",
+    )
+    remote_as_str = models.CharField(max_length=10, blank=True, default="")
+    enabled = models.BooleanField(null=True, blank=True)
+    status = models.CharField(max_length=32, choices=_BGP_STATUS_CHOICES, default="unknown")
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    last_apply_at = models.DateTimeField(null=True, blank=True)
+    last_apply_error = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["management", "asn_str", "vrf_name", "peer_address_str"]
+        unique_together = [("management", "asn_str", "vrf_name", "peer_address_str")]
+        verbose_name = "NSO BGP Peer State"
+        verbose_name_plural = "NSO BGP Peer States"
+
+    def __str__(self):
+        vrf_part = f" vrf:{self.vrf_name}" if self.vrf_name else ""
+        return f"{self.management} / ASN:{self.asn_str}{vrf_part} peer:{self.peer_address_str} [{self.status}]"
+
+
+_ROUTE_POLICY_STATUS_CHOICES = [
+    ("unknown", "Unknown"),
+    ("imported", "Imported"),
+    ("accepted", "Accepted"),
+    ("deploying", "Deploying"),
+    ("in_sync", "In Sync"),
+    ("apply_failed", "Apply Failed"),
+    ("conflict", "Conflict"),
+    ("changed", "Changed"),
+    ("error", "Error"),
+]
+
+
+class NSORoutePolicyState(NetBoxModel):
+    """Per-(device, policy-object) compliance overlay for route policy (M17).
+
+    A single generic model covers all four object families (prefix-list,
+    community-list, as-path, route-map).  ``content_type`` + ``object_id``
+    point to the netbox-routing model instance; ``object_name`` is a
+    denormalised copy so the row remains readable even if the FK target is
+    deleted before cleanup.
+
+    Status lifecycle mirrors the other intent overlays: unknown → imported →
+    accepted → deploying → in_sync / apply_failed.  ``conflict`` is set when
+    the on-device config diverges from the NetBox object (content_hash differs).
+    """
+
+    management = models.ForeignKey(
+        to="NSODeviceManagement",
+        on_delete=models.CASCADE,
+        related_name="route_policy_states",
+    )
+    content_type = models.ForeignKey(
+        to=ContentType,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    object_id = models.PositiveBigIntegerField(null=True, blank=True)
+    assigned_object = GenericForeignKey("content_type", "object_id")
+    # Family tag for filtering without joining content_type.
+    family = models.CharField(
+        max_length=32,
+        help_text="One of: prefix_list, community_list, as_path, route_map",
+    )
+    object_name = models.CharField(max_length=256)
+    content_hash = models.CharField(max_length=64, blank=True, default="")
+    status = models.CharField(max_length=32, choices=_ROUTE_POLICY_STATUS_CHOICES, default="unknown")
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    last_apply_at = models.DateTimeField(null=True, blank=True)
+    last_apply_error = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["management", "family", "object_name"]
+        unique_together = [("management", "family", "object_name")]
+        verbose_name = "NSO Route Policy State"
+        verbose_name_plural = "NSO Route Policy States"
+
+    def __str__(self):
+        return f"{self.management} / {self.family}:{self.object_name} [{self.status}]"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# M19 OSPF plugin state models
+# ──────────────────────────────────────────────────────────────────────────────
+
+_OSPF_STATUS_CHOICES = [
+    ("unknown", "Unknown"),
+    ("imported", "Imported"),
+    ("accepted", "Accepted"),
+    ("deploying", "Deploying"),
+    ("in_sync", "In Sync"),
+    ("apply_failed", "Apply Failed"),
+    ("conflict", "Conflict"),
+    ("changed", "Changed"),
+    ("error", "Error"),
+]
+
+_OSPF_WRITE_PATH_STATUSES = {"accepted", "deploying", "in_sync", "apply_failed"}
+
+
+class NSOOSPFInstanceState(NetBoxModel):
+    """Per-(device, process_id) OSPF process compliance overlay (M19).
+
+    Tracks the status of OSPF process-level config (router-id, vrf, areas)
+    for each (NSODeviceManagement, process_id) pair.
+
+    ``ospf_instance`` links to the netbox-routing OSPFInstance once resolved.
+    """
+
+    management = models.ForeignKey(
+        to="NSODeviceManagement",
+        on_delete=models.CASCADE,
+        related_name="ospf_instance_states",
+    )
+    process_id = models.PositiveIntegerField()
+    router_id = models.CharField(max_length=64, blank=True, default="")
+    vrf = models.CharField(max_length=64, blank=True, default="")
+    # areas stored as JSON: [{area_id, area_type}]
+    areas = models.JSONField(default=list, blank=True)
+    # Linked netbox-routing object (nullable — may not exist yet)
+    ospf_instance = models.ForeignKey(
+        to="netbox_routing.OSPFInstance",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="nso_ospf_instance_states",
+    )
+    status = models.CharField(max_length=32, choices=_OSPF_STATUS_CHOICES, default="unknown")
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    last_apply_at = models.DateTimeField(null=True, blank=True)
+    last_apply_error = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["management", "process_id"]
+        unique_together = [("management", "process_id")]
+        verbose_name = "NSO OSPF Instance State"
+        verbose_name_plural = "NSO OSPF Instance States"
+
+    def __str__(self):
+        return f"{self.management} / ospf {self.process_id} [{self.status}]"
+
+
+class NSOOSPFInterfaceState(NetBoxModel):
+    """Per-(device, interface) OSPF interface compliance overlay (M19).
+
+    Tracks the status of OSPF interface config (area, passive, cost, network-type, auth)
+    for each (NSODeviceManagement, dcim.Interface) pair.
+    """
+
+    management = models.ForeignKey(
+        to="NSODeviceManagement",
+        on_delete=models.CASCADE,
+        related_name="ospf_interface_states",
+    )
+    interface = models.ForeignKey(
+        to="dcim.Interface",
+        on_delete=models.CASCADE,
+        related_name="nso_ospf_states",
+    )
+    process_id = models.PositiveIntegerField(null=True, blank=True)
+    area_id = models.CharField(max_length=64, blank=True, default="")
+    passive = models.BooleanField(default=False)
+    priority = models.PositiveSmallIntegerField(null=True, blank=True)
+    cost = models.PositiveIntegerField(null=True, blank=True)
+    network_type = models.CharField(max_length=32, blank=True, default="")
+    auth_type = models.CharField(max_length=32, blank=True, default="")
+    auth_present = models.BooleanField(default=False)
+    status = models.CharField(max_length=32, choices=_OSPF_STATUS_CHOICES, default="unknown")
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    last_apply_at = models.DateTimeField(null=True, blank=True)
+    last_apply_error = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["management", "interface"]
+        unique_together = [("management", "interface")]
+        verbose_name = "NSO OSPF Interface State"
+        verbose_name_plural = "NSO OSPF Interface States"
+
+    def __str__(self):
+        return f"{self.management} / {self.interface} ospf [{self.status}]"
+
+
+_REDISTRIBUTION_STATUS_CHOICES = [
+    ("unknown", "Unknown"),
+    ("imported", "Imported"),
+    ("accepted", "Accepted"),
+    ("deploying", "Deploying"),
+    ("in_sync", "In Sync"),
+    ("apply_failed", "Apply Failed"),
+    ("conflict", "Conflict"),
+    ("changed", "Changed"),
+    ("error", "Error"),
+]
+
+_REDISTRIBUTION_WRITE_PATH_STATUSES = {"accepted", "deploying", "in_sync", "apply_failed"}
+
+
+class NSORedistributionState(NetBoxModel):
+    """Per-(device, destination, source) redistribution statement compliance overlay (M20).
+
+    Tracks the observed + intended state of each `redistribute <source>` statement
+    under an OSPF/ISIS/BGP destination protocol scope for a managed device.
+
+    ``redistribution`` links to netbox-routing.Redistribution once resolved.
+    ``dest_protocol`` + ``dest_ref`` + ``source_protocol`` + ``source_ref`` mirror
+    the adapter's DeviceRedistribution key and are used for matching before the
+    netbox-routing row exists.
+    """
+
+    management = models.ForeignKey(
+        to="NSODeviceManagement",
+        on_delete=models.CASCADE,
+        related_name="redistribution_states",
+    )
+    # Natural key from the adapter (for matching before/without netbox-routing rows)
+    dest_protocol = models.CharField(max_length=16, blank=False)
+    dest_ref = models.CharField(max_length=128, blank=True, default="")
+    source_protocol = models.CharField(max_length=16, blank=False)
+    source_ref = models.CharField(max_length=64, blank=True, default="")
+    # Optional resolved fields
+    route_map = models.CharField(max_length=128, blank=True, default="")
+    metric = models.PositiveIntegerField(null=True, blank=True)
+    metric_type = models.CharField(max_length=16, blank=True, default="")
+    # Linked netbox-routing object (nullable — may not exist yet)
+    redistribution = models.ForeignKey(
+        to="netbox_routing.Redistribution",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="nso_redistribution_states",
+    )
+    status = models.CharField(max_length=32, choices=_REDISTRIBUTION_STATUS_CHOICES, default="unknown")
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    last_apply_at = models.DateTimeField(null=True, blank=True)
+    last_apply_error = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["management", "dest_protocol", "dest_ref", "source_protocol"]
+        unique_together = [("management", "dest_protocol", "dest_ref", "source_protocol", "source_ref")]
+        verbose_name = "NSO Redistribution State"
+        verbose_name_plural = "NSO Redistribution States"
+
+    def __str__(self):
+        src = self.source_protocol
+        if self.source_ref:
+            src += f" {self.source_ref}"
+        return f"{self.management} / {self.dest_protocol} ← {src} [{self.status}]"

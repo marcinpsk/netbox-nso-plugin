@@ -1,0 +1,420 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{% extends 'generic/object.html' %}
+{% load helpers %}
+
+{% block content %}
+{% if mgmt %}
+
+  {# ── Adapter error banner ──────────────────────────────────────────────── #}
+  {% if adapter_error %}
+    <div class="alert alert-warning d-flex align-items-center mb-3" role="alert">
+      <span class="mdi mdi-alert-outline me-2"></span>
+      <div>Adapter unreachable — showing cached data. <em>{{ adapter_error }}</em></div>
+    </div>
+  {% endif %}
+
+  {# ── Management summary ────────────────────────────────────────────────── #}
+  <div class="card mb-3">
+    <h5 class="card-header d-flex justify-content-between align-items-center">
+      NSO Management
+      <a href="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_edit' mgmt.pk %}"
+         class="btn btn-sm btn-outline-secondary">
+        <span class="mdi mdi-pencil"></span> Edit
+      </a>
+    </h5>
+    <div class="card-body">
+      <table class="table table-hover attr-table">
+        <tr><th>NSO Instance</th><td>{{ mgmt.nso_instance }}</td></tr>
+        <tr><th>NSO Device Name</th><td>{{ mgmt.nso_device_name }}</td></tr>
+        <tr><th>Managed Attributes</th><td>{{ mgmt.managed_attributes|join:", "|default:"None" }}</td></tr>
+        <tr>
+          <th>Auto Apply</th>
+          <td>
+            {% if mgmt.auto_apply %}<span class="badge bg-success">Enabled</span>
+            {% else %}<span class="badge bg-warning text-dark">Disabled</span>{% endif %}
+          </td>
+        </tr>
+        <tr><th>Last Sync</th><td>{{ mgmt.last_sync_at|date:"Y-m-d H:i"|default:"Never" }}</td></tr>
+        <tr>
+          <th>Last Sync Status</th>
+          <td>
+            {% if mgmt.last_sync_status == "succeeded" %}<span class="badge bg-success">{{ mgmt.last_sync_status }}</span>
+            {% elif mgmt.last_sync_status == "failed" %}<span class="badge bg-danger">{{ mgmt.last_sync_status }}</span>
+            {% elif mgmt.last_sync_status %}<span class="badge bg-info">{{ mgmt.last_sync_status }}</span>
+            {% else %}—{% endif %}
+          </td>
+        </tr>
+      </table>
+    </div>
+  </div>
+
+  {# ── Action buttons ────────────────────────────────────────────────────── #}
+  <div class="card mb-3">
+    <h5 class="card-header">Actions</h5>
+    <div class="card-body d-flex flex-wrap gap-2">
+      <form method="post" class="nso-action-form" data-label="Sync"
+            action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_action' mgmt.pk 'sync' %}">
+        {% csrf_token %}
+        <button type="submit" class="btn btn-primary nso-action-btn">
+          <span class="mdi mdi-sync"></span> Sync Now
+        </button>
+      </form>
+      <form method="post" class="nso-action-form" data-label="Check Compliance"
+            action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_action' mgmt.pk 'check-compliance' %}">
+        {% csrf_token %}
+        <button type="submit" class="btn btn-outline-primary nso-action-btn">
+          <span class="mdi mdi-check-circle-outline"></span> Check Compliance
+        </button>
+      </form>
+      <form method="post" class="nso-action-form" data-label="Test Connection"
+            action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_action' mgmt.pk 'connect' %}">
+        {% csrf_token %}
+        <button type="submit" class="btn btn-outline-secondary nso-action-btn">
+          <span class="mdi mdi-lan-connect"></span> Test Connection
+        </button>
+      </form>
+      <form method="post" class="nso-action-form" data-label="Apply Intent"
+            action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_action' mgmt.pk 'apply' %}">
+        {% csrf_token %}
+        <button type="submit" class="btn btn-success nso-action-btn">
+          <span class="mdi mdi-upload-network"></span> Apply Intent
+        </button>
+      </form>
+      <form method="post"
+            action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_refresh' mgmt.pk %}">
+        {% csrf_token %}
+        <button type="submit" class="btn btn-outline-info">
+          <span class="mdi mdi-refresh"></span> Refresh Compliance
+        </button>
+      </form>
+      {# Bulk Accept — rendered via JS below once we know there are changed states #}
+      <div id="nso-bulk-accept-placeholder"></div>
+    </div>
+  </div>
+
+  {# ── Job status (populated by JS polling; hidden until an action fires) ── #}
+  <div id="nso-job-status" class="mb-3 d-none"
+       data-job-status-url="{% url 'plugins:netbox_nso_plugin:nsojob_status' job_id=0 %}">
+    <div class="alert alert-info d-flex align-items-center mb-0" role="alert">
+      <span class="spinner-border spinner-border-sm me-2" id="nso-job-spinner" role="status"
+            aria-hidden="true"></span>
+      <span id="nso-job-message"></span>
+    </div>
+  </div>
+
+  <script>
+  (function () {
+    "use strict";
+    var csrfToken = (document.cookie.match(/csrftoken=([^;]+)/) || [])[1] || '';
+    var statusArea = document.getElementById('nso-job-status');
+    var jobUrlTemplate = statusArea.dataset.jobStatusUrl;
+    var spinner = document.getElementById('nso-job-spinner');
+    var messageEl = document.getElementById('nso-job-message');
+
+    function jobStatusUrl(jobId) { return jobUrlTemplate.replace('/0/', '/' + jobId + '/'); }
+
+    function setStatus(msg, type, busy) {
+      var alertEl = statusArea.querySelector('.alert');
+      alertEl.className = 'alert alert-' + type + ' d-flex align-items-center mb-0';
+      messageEl.textContent = msg;
+      spinner.classList.toggle('d-none', !busy);
+      statusArea.classList.remove('d-none');
+    }
+
+    function setButtons(disabled) {
+      document.querySelectorAll('.nso-action-btn').forEach(function (b) { b.disabled = disabled; });
+    }
+
+    function pollJob(jobId, label) {
+      var interval = setInterval(async function () {
+        try {
+          var r = await fetch(jobStatusUrl(jobId));
+          if (!r.ok) { clearInterval(interval); setStatus('Could not retrieve job status.', 'danger', false); setButtons(false); return; }
+          var job = await r.json();
+          if (job.error) { clearInterval(interval); setStatus(label + ' error: ' + job.error, 'danger', false); setButtons(false); return; }
+          if (job.status === 'succeeded') {
+            clearInterval(interval); setStatus(label + ' completed (Job #' + jobId + ').', 'success', false); setButtons(false);
+          } else if (job.status === 'failed') {
+            clearInterval(interval);
+            var errMsg = (job.error && job.error.message) ? job.error.message : 'check adapter logs';
+            setStatus(label + ' failed: ' + errMsg + ' (Job #' + jobId + ').', 'danger', false); setButtons(false);
+          } else {
+            setStatus(label + ' running\u2026 (Job #' + jobId + ', status: ' + job.status + ')', 'info', true);
+          }
+        } catch (e) { clearInterval(interval); setStatus('Polling error: ' + e.message, 'warning', false); setButtons(false); }
+      }, 2000);
+    }
+
+    document.querySelectorAll('.nso-action-form').forEach(function (form) {
+      form.addEventListener('submit', async function (e) {
+        e.preventDefault();
+        var label = form.dataset.label;
+        setButtons(true); setStatus(label + ' triggered\u2026', 'info', true);
+        try {
+          var r = await fetch(form.action, {
+            method: 'POST',
+            headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-CSRFToken': csrfToken, 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams(new FormData(form)),
+          });
+          var data = await r.json();
+          if (data.status === 'error') { setStatus('Error: ' + data.message, 'danger', false); setButtons(false); }
+          else if (data.job_id) { setStatus(label + ' running\u2026 (Job #' + data.job_id + ')', 'info', true); pollJob(data.job_id, label); }
+          else { setStatus(label + ' triggered (no job to track).', 'success', false); setButtons(false); }
+        } catch (err) { setStatus('Request failed: ' + err.message, 'danger', false); setButtons(false); }
+      });
+    });
+  })();
+  </script>
+
+  {# ── Compliance summary ────────────────────────────────────────────────── #}
+  {% if compliance %}
+    <div class="card mb-3">
+      <h5 class="card-header">Compliance Summary</h5>
+      <div class="card-body">
+        <table class="table table-hover attr-table">
+          <tr><th>Managed Interfaces</th><td>{{ compliance.managed_interfaces }}</td></tr>
+          {% with s=compliance.by_status %}
+            {% if s.in_sync    %}<tr><th>In Sync</th>    <td><span class="badge bg-success">{{ s.in_sync }}</span></td></tr>{% endif %}
+            {% if s.imported   %}<tr><th>Imported</th>   <td><span class="badge bg-success">{{ s.imported }}</span></td></tr>{% endif %}
+            {% if s.changed    %}<tr><th>Changed</th>    <td><span class="badge bg-warning text-dark">{{ s.changed }}</span></td></tr>{% endif %}
+            {% if s.drifted    %}<tr><th>Drifted</th>    <td><span class="badge bg-warning text-dark">{{ s.drifted }}</span></td></tr>{% endif %}
+            {% if s.accepted   %}<tr><th>Accepted</th>   <td><span class="badge bg-info">{{ s.accepted }}</span></td></tr>{% endif %}
+            {% if s.deploying  %}<tr><th>Deploying</th>  <td><span class="badge bg-primary">{{ s.deploying }}</span></td></tr>{% endif %}
+            {% if s.apply_failed %}<tr><th>Apply Failed</th><td><span class="badge bg-danger">{{ s.apply_failed }}</span></td></tr>{% endif %}
+            {% if s.error      %}<tr><th>Error</th>      <td><span class="badge bg-danger">{{ s.error }}</span></td></tr>{% endif %}
+            {% if s.unknown    %}<tr><th>Unknown</th>    <td><span class="badge bg-info">{{ s.unknown }}</span></td></tr>{% endif %}
+          {% endwith %}
+          {% if compliance.last_checked_at %}
+            <tr><th>Last Checked</th><td>{{ compliance.last_checked_at }}</td></tr>
+          {% endif %}
+        </table>
+      </div>
+    </div>
+  {% endif %}
+
+  {# ── Per-interface table ───────────────────────────────────────────────── #}
+  {% if interfaces %}
+    <div class="card mb-3">
+      <h5 class="card-header">Interfaces</h5>
+      <div class="card-body p-0">
+        <table class="table table-hover table-headings mb-0">
+          <thead>
+            <tr>
+              <th>Interface</th>
+              <th>Description</th>
+              <th>Enabled</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for iface in interfaces %}
+              <tr>
+                <td>{{ iface.name }}</td>
+                {# Description #}
+                <td>
+                  {% with a=iface.attrs.description %}
+                    {% if a %}
+                      {% if a.status == "in_sync" or a.status == "imported" %}<span class="badge bg-success">{{ a.status }}</span>
+                      {% elif a.status == "changed" or a.status == "drifted" %}<span class="badge bg-warning text-dark">{{ a.status }}</span>
+                      {% elif a.status == "error" or a.status == "apply_failed" %}<span class="badge bg-danger">{{ a.status }}</span>
+                      {% elif a.status == "accepted" %}<span class="badge bg-info">{{ a.status }}</span>
+                      {% elif a.status == "deploying" %}<span class="badge bg-primary">{{ a.status }}</span>
+                      {% else %}<span class="badge bg-info">{{ a.status }}</span>{% endif %}
+                      <small class="text-muted ms-1">{{ a.netbox_value|default:"—" }}</small>
+                      {% if a.status == "imported" or a.status == "changed" %}
+                        <span class="nso-accept-placeholder" data-iface="{{ iface.name }}" data-attr="description"></span>
+                      {% endif %}
+                    {% else %}—{% endif %}
+                  {% endwith %}
+                </td>
+                {# Enabled #}
+                <td>
+                  {% with a=iface.attrs.enabled %}
+                    {% if a %}
+                      {% if a.status == "in_sync" or a.status == "imported" %}<span class="badge bg-success">{{ a.status }}</span>
+                      {% elif a.status == "changed" or a.status == "drifted" %}<span class="badge bg-warning text-dark">{{ a.status }}</span>
+                      {% elif a.status == "error" or a.status == "apply_failed" %}<span class="badge bg-danger">{{ a.status }}</span>
+                      {% elif a.status == "accepted" %}<span class="badge bg-info">{{ a.status }}</span>
+                      {% elif a.status == "deploying" %}<span class="badge bg-primary">{{ a.status }}</span>
+                      {% else %}<span class="badge bg-info">{{ a.status }}</span>{% endif %}
+                      <small class="text-muted ms-1">{{ a.netbox_value }}</small>
+                      {% if a.status == "imported" or a.status == "changed" %}
+                        <span class="nso-accept-placeholder" data-iface="{{ iface.name }}" data-attr="enabled"></span>
+                      {% endif %}
+                    {% else %}—{% endif %}
+                  {% endwith %}
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    {# Accept buttons injected by JS using the state map below #}
+    <script>
+    (function () {
+      "use strict";
+      /* Prefer the already-rendered {% csrf_token %} hidden input (reliable).
+         Cookie fallback in case the DOM form appears after this script. */
+      var csrfToken = (document.querySelector('[name=csrfmiddlewaretoken]') || {}).value ||
+                      (document.cookie.match(/csrftoken=([^;]+)/) || [])[1] || '';
+      var stateMap = {
+        {% for key, state in interface_states.items %}"{{ key.0 }}__{{ key.1 }}": {"pk": {{ state.pk }}, "status": "{{ state.status }}"}{% if not forloop.last %},{% endif %}
+        {% endfor %}
+      };
+
+      var hasChanged = Object.values(stateMap).some(function (s) { return s.status === 'changed' || s.status === 'imported'; });
+      if (hasChanged) {
+        var bulkForm = document.createElement('form');
+        bulkForm.method = 'post';
+        bulkForm.action = '{% url "plugins:netbox_nso_plugin:device_bulk_accept" object.pk %}';
+        var csrf2 = document.createElement('input');
+        csrf2.type = 'hidden'; csrf2.name = 'csrfmiddlewaretoken'; csrf2.value = csrfToken;
+        var bulkBtn = document.createElement('button');
+        bulkBtn.type = 'submit'; bulkBtn.className = 'btn btn-warning';
+        bulkBtn.innerHTML = '<span class="mdi mdi-check-all"></span> Accept All';
+        bulkForm.appendChild(csrf2); bulkForm.appendChild(bulkBtn);
+        document.getElementById('nso-bulk-accept-placeholder').appendChild(bulkForm);
+      }
+
+      document.querySelectorAll('.nso-accept-placeholder').forEach(function (el) {
+        var key = el.dataset.iface + '__' + el.dataset.attr;
+        var entry = stateMap[key];
+        if (!entry || (entry.status !== 'changed' && entry.status !== 'imported')) return;
+        var form = document.createElement('form');
+        form.method = 'post';
+        form.action = '/plugins/nso/interface-state/' + entry.pk + '/accept/';
+        form.style.display = 'inline';
+        var csrf = document.createElement('input');
+        csrf.type = 'hidden'; csrf.name = 'csrfmiddlewaretoken'; csrf.value = csrfToken;
+        var btn = document.createElement('button');
+        btn.type = 'submit'; btn.className = 'btn btn-sm btn-outline-warning ms-1';
+        btn.title = 'Accept this change and push intent to adapter';
+        btn.innerHTML = '<span class="mdi mdi-check"></span> Accept';
+        form.appendChild(csrf); form.appendChild(btn);
+        el.appendChild(form);
+      });
+    })();
+    </script>
+
+  {% elif not adapter_error and mgmt.adapter_device_id %}
+    <div class="alert alert-secondary">No interface data available.</div>
+  {% endif %}
+
+  {# ── Static Routes ──────────────────────────────────────────────────── #}
+  {% if static_routes %}
+  <div class="card mt-3">
+    <div class="card-header"><strong>Static Routes (NSO)</strong></div>
+    <div class="table-responsive">
+      <table class="table table-sm table-hover">
+        <thead>
+          <tr>
+            <th>VRF</th>
+            <th>Prefix</th>
+            <th>Next Hop</th>
+            <th>Metric</th>
+            <th>Status</th>
+            <th>Last Synced</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for sr in static_routes %}
+          <tr>
+            <td>{{ sr.nso_vrf|default:"global" }}</td>
+            <td><a href="{{ sr.static_route.get_absolute_url }}">{{ sr.nso_prefix }}</a></td>
+            <td>{{ sr.nso_next_hop|default:"—" }}</td>
+            <td>{{ sr.static_route.metric }}</td>
+            <td>
+              {% if sr.status == "in_sync" or sr.status == "imported" %}
+                <span class="badge bg-success">{{ sr.status }}</span>
+              {% elif sr.status == "changed" or sr.status == "conflict" %}
+                <span class="badge bg-warning text-dark">{{ sr.status }}</span>
+              {% elif sr.status == "accepted" %}
+                <span class="badge bg-info">{{ sr.status }}</span>
+              {% elif sr.status == "deploying" %}
+                <span class="badge bg-primary">{{ sr.status }}</span>
+              {% elif sr.status == "apply_failed" or sr.status == "error" %}
+                <span class="badge bg-danger">{{ sr.status }}</span>
+              {% else %}
+                <span class="badge bg-info">{{ sr.status }}</span>
+              {% endif %}
+            </td>
+            <td>{{ sr.last_sync_at|default:"—" }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% endif %}
+
+  {# ── IS-IS Interfaces ────────────────────────────────────────────────── #}
+  {% if isis_interfaces %}
+  <div class="card mt-3">
+    <div class="card-header"><strong>IS-IS Interfaces (NSO)</strong></div>
+    <div class="table-responsive">
+      <table class="table table-sm table-hover">
+        <thead>
+          <tr>
+            <th>Interface</th>
+            <th>AF</th>
+            <th>Process Tag</th>
+            <th>Circuit Type</th>
+            <th>Network Type</th>
+            <th>Metric</th>
+            <th>Passive</th>
+            <th>Status</th>
+            <th>Last Synced</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for ii in isis_interfaces %}
+          <tr>
+            <td><a href="{{ ii.interface.get_absolute_url }}">{{ ii.interface.name }}</a></td>
+            <td>{{ ii.af }}</td>
+            <td>{{ ii.process_tag|default:"default" }}</td>
+            <td>{{ ii.circuit_type|default:"—" }}</td>
+            <td>{{ ii.network_type|default:"—" }}</td>
+            <td>{{ ii.metric|default:"—" }}</td>
+            <td>
+              {% if ii.passive %}
+                <span class="badge bg-warning text-dark">passive</span>
+              {% else %}
+                <span class="badge bg-success">active</span>
+              {% endif %}
+            </td>
+            <td>
+              {% if ii.status == "in_sync" or ii.status == "imported" %}
+                <span class="badge bg-success">{{ ii.status }}</span>
+              {% elif ii.status == "changed" or ii.status == "conflict" %}
+                <span class="badge bg-warning text-dark">{{ ii.status }}</span>
+              {% elif ii.status == "accepted" %}
+                <span class="badge bg-info text-dark">{{ ii.status }}</span>
+              {% elif ii.status == "deploying" %}
+                <span class="badge bg-primary">{{ ii.status }}</span>
+              {% elif ii.status == "apply_failed" or ii.status == "error" %}
+                <span class="badge bg-danger">{{ ii.status }}</span>
+              {% else %}
+                <span class="badge bg-info text-dark">{{ ii.status }}</span>
+              {% endif %}
+            </td>
+            <td>{{ ii.last_sync_at|default:"—" }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% endif %}
+
+{% else %}
+  <div class="alert alert-info" role="alert">
+    <span class="mdi mdi-information-outline me-1"></span>
+    This device is not NSO-managed.
+    <a href="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_add' %}?device={{ object.pk }}">
+      Enable NSO management
+    </a>
+  </div>
+{% endif %}
+{% endblock content %}

@@ -1,0 +1,79 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{% extends 'generic/object.html' %}
+{% load helpers %}
+
+{% block breadcrumbs %}
+  <li class="breadcrumb-item"><a href="{% url 'plugins:netbox_nso_plugin:nsointerfacestate_list' %}">Interface States</a></li>
+  <li class="breadcrumb-item">{{ object }}</li>
+{% endblock %}
+
+{% block content %}
+  <div class="row">
+    <div class="col-12 col-md-6">
+      <div class="card">
+        <h5 class="card-header">Interface State</h5>
+        <div class="card-body">
+          <table class="table table-hover attr-table">
+            <tr>
+              <th scope="row">Interface</th>
+              <td>{{ object.interface|linkify }}</td>
+            </tr>
+            <tr>
+              <th scope="row">Attribute</th>
+              <td><code>{{ object.attribute }}</code></td>
+            </tr>
+            <tr>
+              <th scope="row">Status</th>
+              <td>
+                {% if object.status == "in_sync" or object.status == "imported" %}
+                  <span class="badge bg-success">{{ object.status }}</span>
+                {% elif object.status == "changed" or object.status == "drifted" %}
+                  <span class="badge bg-warning text-dark">{{ object.status }}</span>
+                {% elif object.status == "error" or object.status == "apply_failed" %}
+                  <span class="badge bg-danger">{{ object.status }}</span>
+                {% elif object.status == "accepted" %}
+                  <span class="badge bg-info">{{ object.status }}</span>
+                {% elif object.status == "deploying" %}
+                  <span class="badge bg-primary">{{ object.status }}</span>
+                {% else %}
+                  <span class="badge bg-info">{{ object.status }}</span>
+                {% endif %}
+              </td>
+            </tr>
+            <tr>
+              <th scope="row">NSO Value</th>
+              <td>{{ object.nso_value|default:"—" }}</td>
+            </tr>
+            <tr>
+              <th scope="row">Accepted At</th>
+              <td>{{ object.accepted_at|date:"Y-m-d H:i"|default:"—" }}</td>
+            </tr>
+            <tr>
+              <th scope="row">Last Apply At</th>
+              <td>{{ object.last_apply_at|date:"Y-m-d H:i"|default:"—" }}</td>
+            </tr>
+            <tr>
+              <th scope="row">Last Apply Error</th>
+              <td>{{ object.last_apply_error|default:"—" }}</td>
+            </tr>
+            <tr>
+              <th scope="row">Last Sync At</th>
+              <td>{{ object.last_sync_at|date:"Y-m-d H:i"|default:"—" }}</td>
+            </tr>
+          </table>
+        </div>
+        {% if object.status == "imported" or object.status == "changed" %}
+          <div class="card-footer">
+            <form method="post" action="{% url 'plugins:netbox_nso_plugin:nsointerfacestate_accept' object.pk %}">
+              {% csrf_token %}
+              <button type="submit" class="btn btn-warning">
+                <span class="mdi mdi-check"></span> Accept
+              </button>
+            </form>
+          </div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+{% endblock content %}

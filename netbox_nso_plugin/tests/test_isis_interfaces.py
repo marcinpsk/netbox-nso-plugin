@@ -1,0 +1,294 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
+"""Tests for M14 A4: adapter_client.get_isis_interfaces and _reconcile_isis_interfaces."""
+
+import unittest
+from unittest.mock import MagicMock, patch
+
+from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
+from django.test import TestCase
+
+_BASE_CFG = {
+    "url": "http://adapter.local",
+    "token": "test-token",
+    "verify_tls": True,
+    "ca_cert_path": None,
+    "timeout": 30,
+}
+
+
+# ---------------------------------------------------------------------------
+# adapter_client.get_isis_interfaces — unit tests (no Django DB)
+# ---------------------------------------------------------------------------
+
+
+class TestGetIsisInterfaces(unittest.TestCase):
+    """Tests for adapter_client.get_isis_interfaces()."""
+
+    def _make_session(self, status=200, json_data=None):
+        response = MagicMock()
+        response.ok = status < 400
+        response.status_code = status
+        response.content = b"{}"
+        response.text = ""
+        response.json.return_value = json_data or {}
+        session = MagicMock()
+        session.request.return_value = response
+        return session
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_calls_expected_endpoint(self, mock_session_cls, _mock_cfg):
+        from netbox_nso_plugin.adapter_client import get_isis_interfaces
+
+        session = self._make_session(json_data={"interfaces": []})
+        mock_session_cls.return_value = session
+
+        get_isis_interfaces(99)
+
+        args, _ = session.request.call_args
+        self.assertEqual(args[0], "GET")
+        self.assertEqual(args[1], "http://adapter.local/api/v1/devices/99/isis-interfaces")
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_returns_interfaces_list(self, mock_session_cls, _mock_cfg):
+        from netbox_nso_plugin.adapter_client import get_isis_interfaces
+
+        ifaces = [
+            {
+                "interface_name": "GigabitEthernet0/0",
+                "af": "ipv4",
+                "process_tag": "",
+                "circuit_type": "level-1-2",
+                "network_type": "point-to-point",
+                "metric": 10,
+                "passive": False,
+            }
+        ]
+        session = self._make_session(json_data={"interfaces": ifaces, "processes": []})
+        mock_session_cls.return_value = session
+
+        result = get_isis_interfaces(99)
+        self.assertEqual(result, {"processes": [], "interfaces": ifaces})
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_404_returns_empty_list(self, mock_session_cls, _mock_cfg):
+        from netbox_nso_plugin.adapter_client import get_isis_interfaces
+
+        session = self._make_session(status=404, json_data={})
+        mock_session_cls.return_value = session
+
+        result = get_isis_interfaces(99)
+        self.assertEqual(result, {"processes": [], "interfaces": []})
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_500_raises_adapter_error(self, mock_session_cls, _mock_cfg):
+        from netbox_nso_plugin.adapter_client import AdapterError, get_isis_interfaces
+
+        session = self._make_session(
+            status=500,
+            json_data={"error": {"code": "internal_error", "message": "boom"}},
+        )
+        mock_session_cls.return_value = session
+
+        with self.assertRaises(AdapterError):
+            get_isis_interfaces(99)
+
+
+# ---------------------------------------------------------------------------
+# _reconcile_isis_interfaces — integration tests (real Django DB)
+# ---------------------------------------------------------------------------
+
+
+class TestReconcileIsisInterfaces(TestCase):
+    """Integration tests for _reconcile_isis_interfaces()."""
+
+    @classmethod
+    def setUpTestData(cls):
+        manufacturer = Manufacturer.objects.create(name="IsisMfg", slug="isissmfg")
+        device_type = DeviceType.objects.create(manufacturer=manufacturer, model="IsisDevice", slug="isisdevice")
+        role = DeviceRole.objects.create(name="IsisRole", slug="isisrole")
+        site = Site.objects.create(name="IsisSite", slug="isissite")
+        cls.device = Device.objects.create(name="isis-router", device_type=device_type, role=role, site=site)
+        cls.iface_ge0 = Interface.objects.create(device=cls.device, name="GigabitEthernet0/0", type="1000base-t")
+        cls.iface_ge1 = Interface.objects.create(device=cls.device, name="GigabitEthernet0/1", type="1000base-t")
+
+    def _make_mgmt(self, device=None):
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+        device = device or self.device
+        inst, _ = NSOInstance.objects.get_or_create(
+            name="isis-test-inst",
+            defaults={"adapter_instance_id": "isis-test-inst"},
+        )
+        return NSODeviceManagement.objects.get_or_create(
+            device=device,
+            defaults={
+                "nso_instance": inst,
+                "nso_device_name": "isis-dev",
+                "adapter_device_id": device.pk,
+            },
+        )[0]
+
+    def _entry(self, iface_name="GigabitEthernet0/0", af="ipv4", **kwargs):
+        base = {
+            "interface_name": iface_name,
+            "af": af,
+            "process_tag": "",
+            "circuit_type": "level-1-2",
+            "network_type": "",
+            "metric": None,
+            "passive": False,
+        }
+        base.update(kwargs)
+        return base
+
+    def _payload(self, *entries):
+        """Return entries as a flat list (matches get_isis_interfaces() return shape)."""
+        return list(entries)
+
+    # ── Basic cases ────────────────────────────────────────────────────────────
+
+    def test_no_mgmt_returns_empty(self):
+        """Device without NSODeviceManagement → empty list, no crash."""
+        mfg = Manufacturer.objects.get_or_create(name="NoIsisMfg", slug="noisissfg")[0]
+        dt = DeviceType.objects.get_or_create(manufacturer=mfg, model="NoIsisDevice", slug="noisisdevice")[0]
+        role = DeviceRole.objects.get_or_create(name="NoIsisRole", slug="noisisrole")[0]
+        site = Site.objects.get_or_create(name="NoIsisSite", slug="noisissite")[0]
+        orphan = Device.objects.create(name="orphan-isis", device_type=dt, role=role, site=site)
+
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        result = _reconcile_isis_interfaces(orphan, self._payload())
+        self.assertEqual(result, [])
+
+    def test_empty_payload_returns_empty(self):
+        """Empty payload → no state rows created."""
+        self._make_mgmt()
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        result = _reconcile_isis_interfaces(self.device, self._payload())
+        self.assertEqual(result, [])
+
+    def test_single_entry_creates_state_row_imported(self):
+        """New IS-IS entry → NSOISISInterfaceState created with status=imported."""
+        mgmt = self._make_mgmt()
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        result = _reconcile_isis_interfaces(self.device, self._payload(self._entry()))
+
+        self.assertEqual(len(result), 1)
+        state = result[0]
+        self.assertEqual(state.status, "imported")
+        self.assertEqual(state.af, "ipv4")
+        self.assertEqual(state.interface, self.iface_ge0)
+        self.assertEqual(state.management, mgmt)
+        self.assertEqual(state.circuit_type, "level-1-2")
+        self.assertFalse(state.passive)
+
+    def test_idempotent_second_call(self):
+        """Calling reconcile twice with same payload produces same single row."""
+        self._make_mgmt()
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        _reconcile_isis_interfaces(self.device, self._payload(self._entry()))
+        result = _reconcile_isis_interfaces(self.device, self._payload(self._entry()))
+        self.assertEqual(len(result), 1)
+
+    def test_unknown_interface_skipped(self):
+        """Interface name not in NetBox → silently skipped."""
+        self._make_mgmt()
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        result = _reconcile_isis_interfaces(self.device, self._payload(self._entry(iface_name="Ethernet99/99")))
+        self.assertEqual(result, [])
+
+    def test_dual_stack_creates_two_rows(self):
+        """IPv4 and IPv6 on same interface → two state rows with same interface FK."""
+        self._make_mgmt()
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        result = _reconcile_isis_interfaces(
+            self.device,
+            self._payload(self._entry(af="ipv4"), self._entry(af="ipv6")),
+        )
+        self.assertEqual(len(result), 2)
+        afs = {r.af for r in result}
+        self.assertEqual(afs, {"ipv4", "ipv6"})
+        # Both point to the same dcim.Interface
+        ifaces = {r.interface_id for r in result}
+        self.assertEqual(len(ifaces), 1)
+
+    def test_stale_row_set_to_changed(self):
+        """Row present in DB but absent from payload → status=changed."""
+        self._make_mgmt()
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        # First call: populate two interfaces
+        _reconcile_isis_interfaces(
+            self.device,
+            self._payload(self._entry("GigabitEthernet0/0"), self._entry("GigabitEthernet0/1")),
+        )
+
+        # Second call: only one interface in payload
+        result = _reconcile_isis_interfaces(self.device, self._payload(self._entry("GigabitEthernet0/0")))
+
+        self.assertEqual(len(result), 2)
+        statuses = {r.interface.name: r.status for r in result}
+        self.assertEqual(statuses["GigabitEthernet0/0"], "imported")
+        self.assertEqual(statuses["GigabitEthernet0/1"], "changed")
+
+    def test_write_path_status_preserved(self):
+        """Rows in accepted/deploying/in_sync are not overwritten back to imported."""
+        mgmt = self._make_mgmt()
+        from netbox_nso_plugin.models import NSOISISInterfaceState
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        # Pre-create a state row in 'accepted' status
+        NSOISISInterfaceState.objects.create(
+            management=mgmt,
+            interface=self.iface_ge0,
+            af="ipv4",
+            status="accepted",
+        )
+
+        result = _reconcile_isis_interfaces(self.device, self._payload(self._entry()))
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].status, "accepted")
+
+    def test_passive_flag_stored(self):
+        """Passive flag from payload is stored on the state row."""
+        self._make_mgmt()
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        result = _reconcile_isis_interfaces(self.device, self._payload(self._entry(passive=True)))
+        self.assertTrue(result[0].passive)
+
+    def test_metric_stored(self):
+        """Metric from payload is stored on the state row."""
+        self._make_mgmt()
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        result = _reconcile_isis_interfaces(self.device, self._payload(self._entry(metric=100)))
+        self.assertEqual(result[0].metric, 100)
+
+    def test_missing_interface_name_skipped(self):
+        """Entry with empty interface_name is silently skipped."""
+        self._make_mgmt()
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        result = _reconcile_isis_interfaces(self.device, self._payload({"interface_name": "", "af": "ipv4"}))
+        self.assertEqual(result, [])
+
+    def test_missing_af_skipped(self):
+        """Entry with empty af is silently skipped."""
+        self._make_mgmt()
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        result = _reconcile_isis_interfaces(
+            self.device, self._payload({"interface_name": "GigabitEthernet0/0", "af": ""})
+        )
+        self.assertEqual(result, [])
