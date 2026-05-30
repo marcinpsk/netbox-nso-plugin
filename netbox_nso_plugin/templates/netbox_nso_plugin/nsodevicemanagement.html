@@ -89,7 +89,11 @@
       <div class="col-12">
         <div class="alert alert-warning">
           <span class="mdi mdi-alert-outline me-1"></span>
-          Adapter unreachable — <em>{{ adapter_error }}</em>
+          {% if adapter_error_code == 'not_found' %}
+            This device is no longer in the adapter — it may need re-onboarding. <em>{{ adapter_error }}</em>
+          {% else %}
+            Adapter unreachable — <em>{{ adapter_error }}</em>
+          {% endif %}
         </div>
       </div>
     {% endif %}

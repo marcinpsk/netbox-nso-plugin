@@ -10,7 +10,11 @@
   {% if adapter_error %}
     <div class="alert alert-warning d-flex align-items-center mb-3" role="alert">
       <span class="mdi mdi-alert-outline me-2"></span>
-      <div>Adapter unreachable — showing cached data. <em>{{ adapter_error }}</em></div>
+      {% if adapter_error_code == 'not_found' %}
+        <div>This device is no longer in the adapter — it may need re-onboarding. <em>{{ adapter_error }}</em></div>
+      {% else %}
+        <div>Adapter unreachable — showing cached data. <em>{{ adapter_error }}</em></div>
+      {% endif %}
     </div>
   {% endif %}
 
