@@ -14,6 +14,13 @@
     {% render_field form.nso_device_name %}
   </div>
 
+  {# ── Manage everything (convenience) ──────────────────────────────────────── #}
+  {# Transient toggle: ticks every scope below in one click. auto_apply is not    #}
+  {# included — it stays a separate, explicit opt-in.                             #}
+  <div class="field-group mb-4">
+    {% render_field form.manage_all %}
+  </div>
+
   {# ── Interfaces group ───────────────────────────────────────────────────── #}
   {# manage_interfaces is the real master kill-switch; description/enabled are   #}
   {# indented children. Checking a child auto-checks the master (JS below).      #}
@@ -75,6 +82,28 @@
         });
       });
     });
+
+    /* "Manage everything" convenience toggle: ticks/unticks every scope flag
+       (masters + children + SNMP) in one click. auto_apply is intentionally
+       left out. The toggle also re-syncs to reflect the aggregate scope state. */
+    var manageAll = document.getElementById('id_manage_all');
+    if (manageAll) {
+      var scopeBoxes = [
+        'id_manage_interfaces', 'id_manage_description', 'id_manage_enabled',
+        'id_manage_routing', 'id_manage_static', 'id_manage_isis', 'id_manage_ospf',
+        'id_manage_bgp', 'id_manage_route_policy', 'id_manage_redistribution',
+        'id_manage_snmp'
+      ].map(function (id) { return document.getElementById(id); }).filter(Boolean);
+
+      manageAll.addEventListener('change', function () {
+        scopeBoxes.forEach(function (box) { box.checked = manageAll.checked; });
+      });
+      scopeBoxes.forEach(function (box) {
+        box.addEventListener('change', function () {
+          manageAll.checked = scopeBoxes.every(function (b) { return b.checked; });
+        });
+      });
+    }
   })();
   </script>
 {% endblock %}
