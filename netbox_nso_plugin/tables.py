@@ -11,11 +11,12 @@ class NSOInstanceTable(NetBoxTable):
 
     name = tables.Column(linkify=True)
     adapter_instance_id = tables.Column()
+    is_default = columns.BooleanColumn(verbose_name="Default")
 
     class Meta(NetBoxTable.Meta):
         model = NSOInstance
-        fields = ("pk", "id", "name", "adapter_instance_id", "actions")
-        default_columns = ("name", "adapter_instance_id")
+        fields = ("pk", "id", "name", "adapter_instance_id", "is_default", "actions")
+        default_columns = ("name", "adapter_instance_id", "is_default")
 
 
 class NSODeviceManagementTable(NetBoxTable):

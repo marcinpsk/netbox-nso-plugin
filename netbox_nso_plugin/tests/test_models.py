@@ -273,3 +273,63 @@ class TestNSODeviceManagementManagedAttributes(unittest.TestCase):
         """managed_attributes returns both attributes when both flags are set."""
         mgmt = self._make_mgmt(manage_description=True, manage_enabled=True)
         self.assertEqual(mgmt.managed_attributes, ["description", "enabled"])
+
+
+class TestNSODeviceManagementManagedScopes(unittest.TestCase):
+    """Tests for the real managed_scopes property.
+
+    Uses an unsaved NSODeviceManagement instance — the property only reads
+    boolean fields, so no database or FK targets are required.
+    """
+
+    def _make_mgmt(self, **flags):
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        return NSODeviceManagement(**flags)
+
+    def test_no_scopes(self):
+        """No flags set → empty list."""
+        self.assertEqual(self._make_mgmt().managed_scopes, [])
+
+    def test_interfaces_only(self):
+        """Only manage_interfaces → ['Interfaces']."""
+        mgmt = self._make_mgmt(manage_interfaces=True)
+        self.assertEqual(mgmt.managed_scopes, ["Interfaces"])
+
+    def test_routing_with_protocols(self):
+        """Routing master + protocols → 'Routing (...)' lists the enabled protocols in order."""
+        mgmt = self._make_mgmt(manage_routing=True, manage_isis=True, manage_bgp=True)
+        self.assertEqual(mgmt.managed_scopes, ["Routing (IS-IS, BGP)"])
+
+    def test_routing_master_without_protocols(self):
+        """Routing master on but no protocol → bare 'Routing'."""
+        mgmt = self._make_mgmt(manage_routing=True)
+        self.assertEqual(mgmt.managed_scopes, ["Routing"])
+
+    def test_routing_protocol_without_master_is_excluded(self):
+        """A protocol flag without the routing master does not surface Routing."""
+        mgmt = self._make_mgmt(manage_isis=True)
+        self.assertEqual(mgmt.managed_scopes, [])
+
+    def test_snmp_only(self):
+        """Only manage_snmp → ['SNMP']."""
+        mgmt = self._make_mgmt(manage_snmp=True)
+        self.assertEqual(mgmt.managed_scopes, ["SNMP"])
+
+    def test_all_scopes_order(self):
+        """All flags → Interfaces, Routing(all protos), SNMP in that top-level order."""
+        mgmt = self._make_mgmt(
+            manage_interfaces=True,
+            manage_routing=True,
+            manage_isis=True,
+            manage_ospf=True,
+            manage_bgp=True,
+            manage_static=True,
+            manage_route_policy=True,
+            manage_redistribution=True,
+            manage_snmp=True,
+        )
+        self.assertEqual(
+            mgmt.managed_scopes,
+            ["Interfaces", "Routing (IS-IS, OSPF, BGP, Static, Route Policy, Redistribution)", "SNMP"],
+        )

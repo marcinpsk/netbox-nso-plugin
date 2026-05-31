@@ -31,7 +31,8 @@
       <table class="table table-hover attr-table">
         <tr><th>NSO Instance</th><td>{{ mgmt.nso_instance }}</td></tr>
         <tr><th>NSO Device Name</th><td>{{ mgmt.nso_device_name }}</td></tr>
-        <tr><th>Managed Attributes</th><td>{{ mgmt.managed_attributes|join:", "|default:"None" }}</td></tr>
+        <tr><th>Managed Scopes</th><td>{{ mgmt.managed_scopes|join:", "|default:"None" }}</td></tr>
+        <tr><th>Interface Attributes</th><td>{{ mgmt.managed_attributes|join:", "|default:"None" }}</td></tr>
         <tr>
           <th>Auto Apply</th>
           <td>
@@ -171,14 +172,19 @@
   })();
   </script>
 
+  {% if mgmt.manage_interfaces %}
+  <h4 class="mt-4 mb-2"><span class="mdi mdi-ethernet"></span> Interfaces</h4>
+  {% endif %}
+
   {# ── Compliance summary ────────────────────────────────────────────────── #}
-  {% if compliance %}
+  {% if mgmt.manage_interfaces and compliance %}
     <div class="card mb-3">
       <h5 class="card-header">Compliance Summary</h5>
       <div class="card-body">
         <table class="table table-hover attr-table">
           <tr><th>Managed Interfaces</th><td>{{ compliance.managed_interfaces }}</td></tr>
           {% with s=compliance.by_status %}
+            <tr><th colspan="2" class="text-muted small fw-normal border-0 pb-0">Status by managed attribute</th></tr>
             {% if s.in_sync    %}<tr><th>In Sync</th>    <td><span class="badge bg-success">{{ s.in_sync }}</span></td></tr>{% endif %}
             {% if s.imported   %}<tr><th>Imported</th>   <td><span class="badge bg-success">{{ s.imported }}</span></td></tr>{% endif %}
             {% if s.changed    %}<tr><th>Changed</th>    <td><span class="badge bg-warning text-dark">{{ s.changed }}</span></td></tr>{% endif %}
@@ -198,7 +204,7 @@
   {% endif %}
 
   {# ── Per-interface table ───────────────────────────────────────────────── #}
-  {% if interfaces %}
+  {% if mgmt.manage_interfaces and interfaces %}
     <div class="card mb-3">
       <h5 class="card-header">Interfaces</h5>
       <div class="card-body p-0">
@@ -302,12 +308,16 @@
     })();
     </script>
 
-  {% elif not adapter_error and mgmt.adapter_device_id %}
+  {% elif mgmt.manage_interfaces and not adapter_error and mgmt.adapter_device_id %}
     <div class="alert alert-secondary">No interface data available.</div>
   {% endif %}
 
+  {% if mgmt.manage_routing %}
+  <h4 class="mt-4 mb-2"><span class="mdi mdi-router-network"></span> Routing</h4>
+  {% endif %}
+
   {# ── Static Routes ──────────────────────────────────────────────────── #}
-  {% if static_routes %}
+  {% if mgmt.manage_routing and mgmt.manage_static and static_routes %}
   <div class="card mt-3">
     <div class="card-header d-flex justify-content-between align-items-center">
       <strong>Static Routes (NSO)</strong>
@@ -375,7 +385,7 @@
   {% endif %}
 
   {# ── IS-IS Interfaces ────────────────────────────────────────────────── #}
-  {% if isis_interfaces %}
+  {% if mgmt.manage_routing and mgmt.manage_isis and isis_interfaces %}
   <div class="card mt-3">
     <div class="card-header d-flex justify-content-between align-items-center">
       <strong>IS-IS Interfaces (NSO)</strong>
@@ -453,7 +463,7 @@
   {% endif %}
 
   {# ── IS-IS Instances ─────────────────────────────────────────────────── #}
-  {% if isis_processes %}
+  {% if mgmt.manage_routing and mgmt.manage_isis and isis_processes %}
   <div class="card mt-3">
     <div class="card-header d-flex justify-content-between align-items-center">
       <strong>IS-IS Instances (NSO)</strong>
@@ -523,6 +533,7 @@
   {% endif %}
 
   {# ── OSPF ────────────────────────────────────────────────────────────── #}
+  {% if mgmt.manage_routing and mgmt.manage_ospf %}
   {% if ospf_data.instances or ospf_data.interfaces %}
   <div class="card mt-3">
     <div class="card-header d-flex justify-content-between align-items-center">
@@ -660,9 +671,10 @@
     {% endif %}
   </div>
   {% endif %}
+  {% endif %}
 
   {# ── BGP Peers ────────────────────────────────────────────────────────── #}
-  {% if bgp_peers %}
+  {% if mgmt.manage_routing and mgmt.manage_bgp and bgp_peers %}
   <div class="card mt-3">
     <div class="card-header d-flex justify-content-between align-items-center">
       <strong>BGP Peers (NSO)</strong>
@@ -734,7 +746,7 @@
   {% endif %}
 
   {# ── Route Policy ─────────────────────────────────────────────────────── #}
-  {% if route_policy_states %}
+  {% if mgmt.manage_routing and mgmt.manage_route_policy and route_policy_states %}
   <div class="card mt-3">
     <div class="card-header d-flex justify-content-between align-items-center">
       <strong>Route Policy (NSO)</strong>
@@ -802,7 +814,7 @@
   {% endif %}
 
   {# ── Redistribution ───────────────────────────────────────────────────── #}
-  {% if redistribution_states %}
+  {% if mgmt.manage_routing and mgmt.manage_redistribution and redistribution_states %}
   <div class="card mt-3">
     <div class="card-header d-flex justify-content-between align-items-center">
       <strong>Redistribution (NSO)</strong>

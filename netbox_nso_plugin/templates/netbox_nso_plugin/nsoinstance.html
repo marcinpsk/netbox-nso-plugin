@@ -24,6 +24,13 @@
               <td><code>{{ object.adapter_instance_id }}</code></td>
             </tr>
             <tr>
+              <th scope="row">Default</th>
+              <td>
+                {% if object.is_default %}<span class="badge text-bg-success">Yes</span>
+                {% else %}<span class="text-muted">No</span>{% endif %}
+              </td>
+            </tr>
+            <tr>
               <th scope="row">Managed Devices</th>
               <td>{{ object.managed_devices.count }}</td>
             </tr>

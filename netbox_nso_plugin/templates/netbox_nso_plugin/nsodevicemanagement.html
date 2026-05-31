@@ -28,7 +28,11 @@
               <td><code>{{ object.nso_device_name }}</code></td>
             </tr>
             <tr>
-              <th scope="row">Managed Attributes</th>
+              <th scope="row">Managed Scopes</th>
+              <td>{{ object.managed_scopes|join:", "|default:"—" }}</td>
+            </tr>
+            <tr>
+              <th scope="row">Interface Attributes</th>
               <td>{{ object.managed_attributes|join:", "|default:"—" }}</td>
             </tr>
             <tr>
@@ -67,6 +71,7 @@
             <table class="table table-hover attr-table">
               <tr><th>Managed Interfaces</th><td>{{ compliance.managed_interfaces }}</td></tr>
               {% with s=compliance.by_status %}
+                <tr><th colspan="2" class="text-muted small fw-normal border-0 pb-0">Status by managed attribute</th></tr>
                 {% if s.in_sync    %}<tr><th>In Sync</th>    <td><span class="badge bg-success">{{ s.in_sync }}</span></td></tr>{% endif %}
                 {% if s.imported   %}<tr><th>Imported</th>   <td><span class="badge bg-success">{{ s.imported }}</span></td></tr>{% endif %}
                 {% if s.changed    %}<tr><th>Changed</th>    <td><span class="badge bg-warning text-dark">{{ s.changed }}</span></td></tr>{% endif %}

@@ -17,6 +17,7 @@ class NSOInstanceSerializer(NetBoxModelSerializer):
             "display",
             "name",
             "adapter_instance_id",
+            "is_default",
             "tags",
             "custom_fields",
             "created",

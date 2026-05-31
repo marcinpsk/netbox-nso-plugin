@@ -75,6 +75,13 @@ class NSOInstance(NetBoxModel):
         unique=True,
         help_text="The instance ID used by the nso-adapter (matches adapter config).",
     )
+    is_default = models.BooleanField(
+        default=False,
+        help_text=(
+            "Pre-selected when onboarding a new device. The first instance created "
+            "becomes the default automatically; setting another clears the previous one."
+        ),
+    )
 
     class Meta:
         ordering = ["name"]
@@ -87,6 +94,25 @@ class NSOInstance(NetBoxModel):
     def get_absolute_url(self):
         """Return the detail URL for this instance."""
         return reverse("plugins:netbox_nso_plugin:nsoinstance", args=[self.pk])
+
+    @classmethod
+    def get_default(cls):
+        """Return the default NSO instance, or None if none exists."""
+        return cls.objects.filter(is_default=True).first()
+
+    def save(self, *args, **kwargs):
+        """Keep exactly one default instance.
+
+        The first instance created becomes the default automatically; marking
+        another as default clears the previous one.
+        """
+        # If no other default exists (e.g. this is the first instance), force this
+        # one to be the default so onboarding always has something to pre-select.
+        if not NSOInstance.objects.exclude(pk=self.pk).filter(is_default=True).exists():
+            self.is_default = True
+        super().save(*args, **kwargs)
+        if self.is_default:
+            NSOInstance.objects.exclude(pk=self.pk).filter(is_default=True).update(is_default=False)
 
 
 class NSODeviceManagement(NetBoxModel):
@@ -113,6 +139,50 @@ class NSODeviceManagement(NetBoxModel):
     manage_enabled = models.BooleanField(
         default=False,
         help_text="Sync interface enabled/shutdown attribute from NSO.",
+    )
+    # ── Management scopes (opt-in) ────────────────────────────────────────────
+    # Two-level switches that gate which sections of the NSO device tab are
+    # active. The group masters (manage_interfaces, manage_routing) are real
+    # kill-switches: a section shows only if its master AND its leaf flag are
+    # set. The edit form auto-checks a master when any child is checked, and
+    # unchecking a master disables the whole group while remembering child
+    # selections. Default False so brownfield devices are onboarded one scope at
+    # a time; existing rows are backfilled to fully-enabled in migration 0016.
+    manage_interfaces = models.BooleanField(
+        default=False,
+        help_text="Master switch for interface-attribute management (description/enabled).",
+    )
+    manage_routing = models.BooleanField(
+        default=False,
+        help_text="Master switch for routing management. Enable, then pick protocols below.",
+    )
+    manage_static = models.BooleanField(
+        default=False,
+        help_text="Manage static routes.",
+    )
+    manage_isis = models.BooleanField(
+        default=False,
+        help_text="Manage IS-IS interfaces and instances.",
+    )
+    manage_ospf = models.BooleanField(
+        default=False,
+        help_text="Manage OSPF instances and interfaces.",
+    )
+    manage_bgp = models.BooleanField(
+        default=False,
+        help_text="Manage BGP peers.",
+    )
+    manage_route_policy = models.BooleanField(
+        default=False,
+        help_text="Manage route policy objects.",
+    )
+    manage_redistribution = models.BooleanField(
+        default=False,
+        help_text="Manage redistribution statements.",
+    )
+    manage_snmp = models.BooleanField(
+        default=False,
+        help_text="Manage SNMP configuration for this device.",
     )
     auto_apply = models.BooleanField(
         default=False,
@@ -156,6 +226,46 @@ class NSODeviceManagement(NetBoxModel):
         if self.manage_enabled:
             attrs.append("enabled")
         return attrs
+
+    @property
+    def routing_protocols(self):
+        """Return the enabled routing-protocol scope labels, in display order.
+
+        Only meaningful when manage_routing (the master) is set; used for the
+        Managed Scopes display and gated everywhere by manage_routing.
+        """
+        protos = []
+        if self.manage_isis:
+            protos.append("IS-IS")
+        if self.manage_ospf:
+            protos.append("OSPF")
+        if self.manage_bgp:
+            protos.append("BGP")
+        if self.manage_static:
+            protos.append("Static")
+        if self.manage_route_policy:
+            protos.append("Route Policy")
+        if self.manage_redistribution:
+            protos.append("Redistribution")
+        return protos
+
+    @property
+    def managed_scopes(self):
+        """Return the enabled top-level management scopes for display.
+
+        Each group is gated by its master flag, so an orphaned leaf (a protocol
+        checked while its master is off) does not surface here — matching the
+        kill-switch gating used in the view and templates.
+        """
+        scopes = []
+        if self.manage_interfaces:
+            scopes.append("Interfaces")
+        if self.manage_routing:
+            protos = self.routing_protocols
+            scopes.append("Routing ({})".format(", ".join(protos)) if protos else "Routing")
+        if self.manage_snmp:
+            scopes.append("SNMP")
+        return scopes
 
 
 class NSOInterfaceState(NetBoxModel):

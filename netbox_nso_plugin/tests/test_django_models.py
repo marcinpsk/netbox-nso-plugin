@@ -79,6 +79,59 @@ class TestNSOInstanceModelMethods(TestCase):
         self.assertEqual(self.instance.get_absolute_url(), expected)
 
 
+class TestNSOInstanceDefault(TestCase):
+    """Tests for the is_default behaviour on NSOInstance."""
+
+    def _make(self, name, **kw):
+        from netbox_nso_plugin.models import NSOInstance
+
+        return NSOInstance.objects.create(name=name, adapter_instance_id=name + "-id", **kw)
+
+    def test_first_instance_becomes_default(self):
+        """The first instance created is automatically the default."""
+        inst = self._make("first")
+        inst.refresh_from_db()
+        self.assertTrue(inst.is_default)
+
+    def test_get_default_returns_default(self):
+        """get_default returns the current default instance."""
+        from netbox_nso_plugin.models import NSOInstance
+
+        first = self._make("first")
+        self.assertEqual(NSOInstance.get_default(), first)
+
+    def test_second_instance_not_default(self):
+        """A second instance does not steal default automatically."""
+        first = self._make("first")
+        second = self._make("second")
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertTrue(first.is_default)
+        self.assertFalse(second.is_default)
+
+    def test_setting_new_default_clears_previous(self):
+        """Marking another instance default clears the previous default."""
+        from netbox_nso_plugin.models import NSOInstance
+
+        first = self._make("first")
+        second = self._make("second")
+        second.is_default = True
+        second.save()
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertFalse(first.is_default)
+        self.assertTrue(second.is_default)
+        self.assertEqual(NSOInstance.get_default(), second)
+
+    def test_default_cannot_be_emptied(self):
+        """Unchecking the only default re-asserts it (always one default)."""
+        only = self._make("only")
+        only.is_default = False
+        only.save()
+        only.refresh_from_db()
+        self.assertTrue(only.is_default)
+
+
 class TestNSODeviceManagementModelMethods(TestCase):
     """Tests for NSODeviceManagement model methods using real DB fixtures."""
 

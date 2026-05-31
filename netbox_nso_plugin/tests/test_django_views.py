@@ -259,6 +259,22 @@ class TestNSODeviceManagementEditView(ViewTestBase):
         form = NSODeviceManagementForm(initial={"device": self.device.pk})
         self.assertEqual(form.initial.get("nso_device_name"), self.device.name)
 
+    def test_form_auto_selects_default_instance(self):
+        """A new NSODeviceManagementForm pre-selects the default NSO instance."""
+        from netbox_nso_plugin.forms import NSODeviceManagementForm
+
+        # self.nso_instance (from fixtures) is the first instance -> default.
+        form = NSODeviceManagementForm(initial={"device": self.device.pk})
+        self.assertEqual(form.initial.get("nso_instance"), self.nso_instance.pk)
+
+    def test_form_does_not_override_chosen_instance(self):
+        """An explicitly provided nso_instance is not overridden by the default."""
+        from netbox_nso_plugin.forms import NSODeviceManagementForm
+
+        other = NSOInstance.objects.create(name="other-nso", adapter_instance_id="other-id")
+        form = NSODeviceManagementForm(initial={"device": self.device.pk, "nso_instance": other.pk})
+        self.assertEqual(form.initial.get("nso_instance"), other.pk)
+
     def test_form_auto_fill_invalid_pk_is_ignored(self):
         """NSODeviceManagementForm silently ignores a non-existent device pk."""
         from netbox_nso_plugin.forms import NSODeviceManagementForm
@@ -787,6 +803,127 @@ class TestDeviceNSOTabView(ViewTestBase):
         response = self.client.get(url)
         self.assertIn(response.status_code, [200, 302])  # may redirect if no tab
         device2.delete()
+
+    def _patch_all_getters(self):
+        """Patch every adapter getter the tab view may call; return the patch context
+        and a dict of the mocks keyed by attribute name."""
+        from contextlib import ExitStack
+
+        names = [
+            "get_device",
+            "get_interfaces",
+            "get_compliance",
+            "get_snmp_config",
+            "get_static_routes",
+            "get_isis_interfaces",
+            "get_route_policy",
+            "get_ospf",
+            "get_redistribution",
+            "get_bgp_config",
+        ]
+        stack = ExitStack()
+        mocks = {}
+        for name in names:
+            m = stack.enter_context(patch(f"netbox_nso_plugin.adapter_client.{name}"))
+            m.return_value = {} if name in ("get_device", "get_compliance", "get_snmp_config") else []
+            mocks[name] = m
+        mocks["get_device"].return_value = {"id": 15, "last_sync_at": None, "last_sync_status": ""}
+        mocks["get_isis_interfaces"].return_value = {"interfaces": [], "processes": []}
+        # Patch the reconcilers/upsert too: this test verifies the view's *gating*
+        # decision (which adapter getter runs for a given scope), not reconciler
+        # internals, so stub them out to keep the test isolated and DB-free.
+        for target, ret in (
+            ("netbox_nso_plugin.template_content._upsert_interface_states", {}),
+            ("netbox_nso_plugin.template_content._reconcile_snmp_config", {}),
+            ("netbox_nso_plugin.template_content._reconcile_static_routes", []),
+            ("netbox_nso_plugin.template_content._reconcile_isis_interfaces", []),
+            ("netbox_nso_plugin.template_content._reconcile_isis_process", []),
+            ("netbox_nso_plugin.template_content._reconcile_ospf", {"instances": [], "interfaces": []}),
+            ("netbox_nso_plugin.route_policy_reconciler.reconcile_route_policy", []),
+            ("netbox_nso_plugin.redistribution_reconciler.reconcile_redistribution", []),
+            ("netbox_nso_plugin.bgp_reconciler._reconcile_bgp_config", []),
+        ):
+            stack.enter_context(patch(target, return_value=ret))
+        return stack, mocks
+
+    def _render_tab_with_scopes(self, **scopes):
+        """Set the given scope flags on the fixture mgmt, render the tab, return the mocks."""
+        mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+        mgmt.adapter_device_id = 15
+        for field in (
+            "manage_interfaces",
+            "manage_routing",
+            "manage_static",
+            "manage_isis",
+            "manage_ospf",
+            "manage_bgp",
+            "manage_route_policy",
+            "manage_redistribution",
+            "manage_snmp",
+        ):
+            setattr(mgmt, field, scopes.get(field, False))
+        mgmt.save()
+
+        stack, mocks = self._patch_all_getters()
+        with stack:
+            url = reverse("dcim:device_nso", kwargs={"pk": self.device.pk})
+            self.client.get(url)
+
+        mgmt.adapter_device_id = None
+        mgmt.save(update_fields=["adapter_device_id"])
+        return mocks
+
+    def test_tab_all_scopes_off_skips_all_data_fetches(self):
+        """With every scope disabled, no scoped adapter getter is called (only get_device)."""
+        mocks = self._render_tab_with_scopes()
+        mocks["get_device"].assert_called_once()
+        for name in (
+            "get_interfaces",
+            "get_compliance",
+            "get_snmp_config",
+            "get_static_routes",
+            "get_isis_interfaces",
+            "get_route_policy",
+            "get_ospf",
+            "get_redistribution",
+            "get_bgp_config",
+        ):
+            mocks[name].assert_not_called()
+
+    def test_tab_interfaces_only_fetches_interfaces_not_routing(self):
+        """manage_interfaces alone fetches interfaces/compliance but no routing or SNMP."""
+        mocks = self._render_tab_with_scopes(manage_interfaces=True)
+        mocks["get_interfaces"].assert_called_once()
+        mocks["get_compliance"].assert_called_once()
+        for name in (
+            "get_snmp_config",
+            "get_static_routes",
+            "get_isis_interfaces",
+            "get_route_policy",
+            "get_ospf",
+            "get_redistribution",
+            "get_bgp_config",
+        ):
+            mocks[name].assert_not_called()
+
+    def test_tab_routing_master_off_skips_protocols(self):
+        """A protocol flag without the routing master does not trigger its fetch."""
+        mocks = self._render_tab_with_scopes(manage_isis=True, manage_bgp=True)
+        mocks["get_isis_interfaces"].assert_not_called()
+        mocks["get_bgp_config"].assert_not_called()
+
+    def test_tab_routing_selected_protocol_only(self):
+        """Routing master + manage_bgp fetches BGP but not other routing protocols."""
+        mocks = self._render_tab_with_scopes(manage_routing=True, manage_bgp=True)
+        mocks["get_bgp_config"].assert_called_once()
+        for name in (
+            "get_static_routes",
+            "get_isis_interfaces",
+            "get_route_policy",
+            "get_ospf",
+            "get_redistribution",
+        ):
+            mocks[name].assert_not_called()
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config")
     @patch("netbox_nso_plugin.adapter_client.requests.Session")

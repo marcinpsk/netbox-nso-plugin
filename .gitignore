@@ -66,3 +66,6 @@ docs/superpowers/
 
 # Internal working docs (milestone plans/designs) — kept local, never tracked.
 docs/
+
+# Local agent workspace
+.claude/

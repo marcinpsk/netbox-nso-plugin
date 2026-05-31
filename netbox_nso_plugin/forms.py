@@ -18,7 +18,7 @@ class NSOInstanceForm(NetBoxModelForm):
 
     class Meta:
         model = NSOInstance
-        fields = ["name", "adapter_instance_id", "tags"]
+        fields = ["name", "adapter_instance_id", "is_default", "tags"]
 
 
 class NSODeviceManagementForm(NetBoxModelForm):
@@ -30,23 +30,42 @@ class NSODeviceManagementForm(NetBoxModelForm):
             "device",
             "nso_instance",
             "nso_device_name",
+            # Interfaces
+            "manage_interfaces",
             "manage_description",
             "manage_enabled",
+            # Routing
+            "manage_routing",
+            "manage_static",
+            "manage_isis",
+            "manage_ospf",
+            "manage_bgp",
+            "manage_route_policy",
+            "manage_redistribution",
+            # SNMP
+            "manage_snmp",
             "auto_apply",
             "tags",
         ]
 
     def __init__(self, *args, **kwargs):
-        """Pre-populate nso_device_name from the device name when adding via device page."""
+        """Pre-populate nso_device_name and default NSO instance when adding."""
         super().__init__(*args, **kwargs)
         # Only auto-fill on new records where no value is set yet
-        if not self.instance.pk and not self.initial.get("nso_device_name"):
-            device_pk = self.initial.get("device") or self.data.get("device")
-            if device_pk:
-                try:
-                    from dcim.models import Device
+        if not self.instance.pk:
+            # Auto-select the default NSO instance when none is chosen yet.
+            if not self.initial.get("nso_instance") and not self.data.get("nso_instance"):
+                default_instance = NSOInstance.get_default()
+                if default_instance:
+                    self.initial["nso_instance"] = default_instance.pk
 
-                    device = Device.objects.get(pk=device_pk)
-                    self.initial["nso_device_name"] = device.name
-                except Exception:
-                    pass
+            if not self.initial.get("nso_device_name"):
+                device_pk = self.initial.get("device") or self.data.get("device")
+                if device_pk:
+                    try:
+                        from dcim.models import Device
+
+                        device = Device.objects.get(pk=device_pk)
+                        self.initial["nso_device_name"] = device.name
+                    except Exception:
+                        pass

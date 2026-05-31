@@ -71,55 +71,30 @@ class DeviceNSOTabView(generic.ObjectView):
         adapter_error_code = None
         interface_states: dict = {}
         snmp_data: dict = {}
-        static_routes: list = []
-        isis_interfaces: list = []
-        isis_processes: list = []
-        route_policy_states: list = []
-        ospf_data: dict = {"instances": [], "interfaces": []}
-        redistribution_states: list = []
-        bgp_peers: list = []
+        routing = self._empty_routing_context()
 
         if mgmt is not None and mgmt.adapter_device_id is not None:
             from . import adapter_client as client
 
             try:
                 adapter_device = client.get_device(mgmt.adapter_device_id)
-                interfaces = client.get_interfaces(mgmt.adapter_device_id)
-                compliance = client.get_compliance(mgmt.adapter_device_id)
-                interface_states = _upsert_interface_states(device, interfaces)
 
-                from .bgp_reconciler import _reconcile_bgp_config
-                from .redistribution_reconciler import reconcile_redistribution
-                from .route_policy_reconciler import reconcile_route_policy
-                from .template_content import (
-                    _reconcile_isis_interfaces,
-                    _reconcile_isis_process,
-                    _reconcile_ospf,
-                    _reconcile_snmp_config,
-                    _reconcile_static_routes,
-                )
+                from .template_content import _reconcile_snmp_config
 
-                snmp_payload = client.get_snmp_config(mgmt.adapter_device_id)
-                snmp_data = _reconcile_snmp_config(device, snmp_payload)
+                # Only fetch the scopes this device opted into. Each scope is
+                # gated by its master (manage_interfaces / manage_routing) and,
+                # for routing, its per-protocol leaf flag — the kill-switch
+                # model (see NSODeviceManagement.managed_scopes).
+                if mgmt.manage_interfaces:
+                    interfaces = client.get_interfaces(mgmt.adapter_device_id)
+                    compliance = client.get_compliance(mgmt.adapter_device_id)
+                    interface_states = _upsert_interface_states(device, interfaces)
 
-                sr_payload = client.get_static_routes(mgmt.adapter_device_id)
-                static_routes = _reconcile_static_routes(device, sr_payload)
+                if mgmt.manage_snmp:
+                    snmp_payload = client.get_snmp_config(mgmt.adapter_device_id)
+                    snmp_data = _reconcile_snmp_config(device, snmp_payload)
 
-                isis_payload = client.get_isis_interfaces(mgmt.adapter_device_id)
-                isis_interfaces = _reconcile_isis_interfaces(device, isis_payload.get("interfaces", []))
-                isis_processes = _reconcile_isis_process(device, isis_payload.get("processes", []))
-
-                rp_payload = client.get_route_policy(mgmt.adapter_device_id)
-                route_policy_states = reconcile_route_policy(device, rp_payload)
-
-                ospf_payload = client.get_ospf(mgmt.adapter_device_id)
-                ospf_data = _reconcile_ospf(device, ospf_payload)
-
-                redistribution_payload = client.get_redistribution(mgmt.adapter_device_id)
-                redistribution_states = reconcile_redistribution(device, redistribution_payload)
-
-                bgp_payload = client.get_bgp_config(mgmt.adapter_device_id)
-                bgp_peers = _reconcile_bgp_config(device, bgp_payload)
+                routing = self._reconcile_routing_scopes(device, mgmt, client)
 
                 update_fields = []
                 raw_ts = adapter_device.get("last_sync_at")
@@ -155,14 +130,58 @@ class DeviceNSOTabView(generic.ObjectView):
             "interface_states": interface_states,
             "status_badge": _STATUS_BADGE,
             "snmp_data": snmp_data,
-            "static_routes": static_routes,
-            "isis_interfaces": isis_interfaces,
-            "isis_processes": isis_processes,
-            "route_policy_states": route_policy_states,
-            "ospf_data": ospf_data,
-            "redistribution_states": redistribution_states,
-            "bgp_peers": bgp_peers,
+            **routing,
         }
+
+    @staticmethod
+    def _empty_routing_context():
+        """Default (no-op) routing-scope context used before/without reconcile."""
+        return {
+            "static_routes": [],
+            "isis_interfaces": [],
+            "isis_processes": [],
+            "route_policy_states": [],
+            "ospf_data": {"instances": [], "interfaces": []},
+            "redistribution_states": [],
+            "bgp_peers": [],
+        }
+
+    def _reconcile_routing_scopes(self, device, mgmt, client):
+        """Reconcile each opted-in routing protocol for this device.
+
+        Every protocol is gated by its master (manage_routing) AND its leaf
+        flag — the kill-switch model (see NSODeviceManagement.managed_scopes).
+        """
+        from .bgp_reconciler import _reconcile_bgp_config
+        from .redistribution_reconciler import reconcile_redistribution
+        from .route_policy_reconciler import reconcile_route_policy
+        from .template_content import (
+            _reconcile_isis_interfaces,
+            _reconcile_isis_process,
+            _reconcile_ospf,
+            _reconcile_static_routes,
+        )
+
+        ctx = self._empty_routing_context()
+        if not mgmt.manage_routing:
+            return ctx
+        dev_id = mgmt.adapter_device_id
+
+        if mgmt.manage_static:
+            ctx["static_routes"] = _reconcile_static_routes(device, client.get_static_routes(dev_id))
+        if mgmt.manage_isis:
+            isis_payload = client.get_isis_interfaces(dev_id)
+            ctx["isis_interfaces"] = _reconcile_isis_interfaces(device, isis_payload.get("interfaces", []))
+            ctx["isis_processes"] = _reconcile_isis_process(device, isis_payload.get("processes", []))
+        if mgmt.manage_route_policy:
+            ctx["route_policy_states"] = reconcile_route_policy(device, client.get_route_policy(dev_id))
+        if mgmt.manage_ospf:
+            ctx["ospf_data"] = _reconcile_ospf(device, client.get_ospf(dev_id))
+        if mgmt.manage_redistribution:
+            ctx["redistribution_states"] = reconcile_redistribution(device, client.get_redistribution(dev_id))
+        if mgmt.manage_bgp:
+            ctx["bgp_peers"] = _reconcile_bgp_config(device, client.get_bgp_config(dev_id))
+        return ctx
 
 
 # ── AJAX: NSO device names for match form datalist ────────────────────────────

@@ -1,6 +1,83 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
 {% extends 'generic/object_edit.html' %}
+{% load helpers %}
+{% load form_helpers %}
+
+{% block form %}
+  <div class="field-group mb-5">
+    <div class="row mb-2">
+      <h5 class="offset-sm-3">NSO Device Management</h5>
+    </div>
+    {% render_field form.device %}
+    {% render_field form.nso_instance %}
+    {% render_field form.nso_device_name %}
+  </div>
+
+  {# ── Interfaces group ───────────────────────────────────────────────────── #}
+  {# manage_interfaces is the real master kill-switch; description/enabled are   #}
+  {# indented children. Checking a child auto-checks the master (JS below).      #}
+  <div class="field-group mb-5 nso-scope" data-master="id_manage_interfaces">
+    <div class="row mb-2">
+      <h5 class="offset-sm-3">Interfaces</h5>
+    </div>
+    {% render_field form.manage_interfaces %}
+    <div class="nso-scope-children ms-sm-4 ps-sm-3 border-start">
+      {% render_field form.manage_description %}
+      {% render_field form.manage_enabled %}
+    </div>
+  </div>
+
+  {# ── Routing group ──────────────────────────────────────────────────────── #}
+  <div class="field-group mb-5 nso-scope" data-master="id_manage_routing">
+    <div class="row mb-2">
+      <h5 class="offset-sm-3">Routing</h5>
+    </div>
+    {% render_field form.manage_routing %}
+    <div class="nso-scope-children ms-sm-4 ps-sm-3 border-start">
+      {% render_field form.manage_static %}
+      {% render_field form.manage_isis %}
+      {% render_field form.manage_ospf %}
+      {% render_field form.manage_bgp %}
+      {% render_field form.manage_route_policy %}
+      {% render_field form.manage_redistribution %}
+    </div>
+  </div>
+
+  {# ── Other ──────────────────────────────────────────────────────────────── #}
+  <div class="field-group mb-5">
+    <div class="row mb-2">
+      <h5 class="offset-sm-3">Other</h5>
+    </div>
+    {% render_field form.manage_snmp %}
+    {% render_field form.auto_apply %}
+    {% render_field form.tags %}
+  </div>
+
+  <script>
+  (function () {
+    "use strict";
+    /* Kill-switch group behaviour:
+       - checking any child auto-checks the group master (so a protocol can't be
+         "on" while its master gate is off);
+       - unchecking the master leaves children as-is (selections are remembered),
+         it just disables the whole group via the server-side gate. */
+    document.querySelectorAll('.nso-scope').forEach(function (group) {
+      var master = document.getElementById(group.dataset.master);
+      var children = Array.prototype.slice.call(
+        group.querySelectorAll('.nso-scope-children input[type="checkbox"]')
+      );
+      if (!master || !children.length) return;
+
+      children.forEach(function (child) {
+        child.addEventListener('change', function () {
+          if (child.checked) master.checked = true;
+        });
+      });
+    });
+  })();
+  </script>
+{% endblock %}
 
 {% block javascript %}
 {{ block.super }}
@@ -42,7 +119,7 @@
       if (device.address) parts.push(device.address);
       if (device.platform) parts.push('(' + device.platform + ')');
       if (parts.length > 0) {
-        opt.label = device.name + ' \u2014 ' + parts.join(' ');
+        opt.label = device.name + ' — ' + parts.join(' ');
       }
       datalist.appendChild(opt);
     });
@@ -53,7 +130,7 @@
     if (match && match.onboarded &&
         match.onboarded_netbox_device_id !== null &&
         match.onboarded_netbox_device_id !== currentNetboxDeviceId) {
-      warningEl.textContent = '\u26a0 Already mapped to NetBox device #' +
+      warningEl.textContent = '⚠ Already mapped to NetBox device #' +
                               match.onboarded_netbox_device_id;
       warningEl.hidden = false;
     } else {
