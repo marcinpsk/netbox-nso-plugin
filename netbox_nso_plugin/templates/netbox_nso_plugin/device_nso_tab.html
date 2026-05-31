@@ -137,7 +137,7 @@
           var r = await fetch(jobStatusUrl(jobId));
           if (!r.ok) { clearInterval(interval); setStatus('Could not retrieve job status.', 'danger', false); setButtons(false); return; }
           var job = await r.json();
-          if (job.error) { clearInterval(interval); setStatus(label + ' error: ' + job.error, 'danger', false); setButtons(false); return; }
+          if (job.error) { clearInterval(interval); var jobErr = (job.error && typeof job.error === 'object') ? (job.error.message || JSON.stringify(job.error)) : job.error; setStatus(label + ' error: ' + jobErr, 'danger', false); setButtons(false); return; }
           if (job.status === 'succeeded') {
             clearInterval(interval); setStatus(label + ' completed (Job #' + jobId + ').', 'success', false); setButtons(false);
           } else if (job.status === 'failed') {
