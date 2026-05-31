@@ -85,22 +85,47 @@ def _upsert_interface_states(device, interfaces: list) -> dict:
 
 
 def _reconcile_lag_topology(device, lag_data: dict) -> dict:
-    """Reconcile adapter LAG topology against NetBox interfaces."""
+    """Reconcile adapter LAG topology against NetBox interfaces.
+
+    Besides building the device-tab display structure, this writes NetBox's
+    native LAG model: each existing bundle interface is set to ``type='lag'``
+    and each existing member's ``lag`` FK is pointed at it; members no longer
+    reported in a bundle are unlinked (drift). Interfaces missing from NetBox
+    are not created here — they come from device sync — and are reported as
+    ``netbox_interface=None``.
+    """
     from dcim.models import Interface
 
     iface_map = {interface.name: interface for interface in Interface.objects.filter(device=device)}
     reconciled_lags = []
 
     for lag in lag_data.get("lags") or []:
+        bundle = iface_map.get(lag.get("name"))
+        if bundle is not None and bundle.type != "lag":
+            bundle.type = "lag"
+            bundle.save(update_fields=["type"])
+
         reconciled_members = []
+        member_names: set[str] = set()
         for member in lag.get("members") or []:
             member_name = member.get("interface")
-            reconciled_members.append({**member, "netbox_interface": iface_map.get(member_name)})
+            member_names.add(member_name)
+            member_iface = iface_map.get(member_name)
+            if bundle is not None and member_iface is not None and member_iface.lag_id != bundle.id:
+                member_iface.lag = bundle
+                member_iface.save(update_fields=["lag"])
+            reconciled_members.append({**member, "netbox_interface": member_iface})
+
+        # Drift: unlink NetBox members that NSO no longer reports in this bundle.
+        if bundle is not None:
+            for stale in Interface.objects.filter(device=device, lag=bundle).exclude(name__in=member_names):
+                stale.lag = None
+                stale.save(update_fields=["lag"])
 
         reconciled_lags.append(
             {
                 **lag,
-                "netbox_interface": iface_map.get(lag.get("name")),
+                "netbox_interface": bundle,
                 "members": reconciled_members,
             }
         )

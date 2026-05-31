@@ -168,3 +168,57 @@ class TestReconcileLagTopology(TestCase):
         )
 
         self.assertEqual(result, {"refresh_source": "never", "last_refreshed_at": None, "lags": []})
+
+    def test_reconcile_writes_native_lag_membership(self):
+        """Members get their `lag` FK set to the bundle; the bundle is type=lag."""
+        from netbox_nso_plugin.template_content import _reconcile_lag_topology
+
+        lag_data = {
+            "refresh_source": "notification",
+            "last_refreshed_at": None,
+            "lags": [
+                {
+                    "name": "Port-channel10",
+                    "id": 10,
+                    "members": [
+                        {"interface": "GigabitEthernet0/1", "mode": "active"},
+                        {"interface": "GigabitEthernet0/2", "mode": "active"},
+                    ],
+                }
+            ],
+        }
+
+        _reconcile_lag_topology(self.device, lag_data)
+
+        self.port_channel.refresh_from_db()
+        self.member_1.refresh_from_db()
+        self.member_2.refresh_from_db()
+        self.assertEqual(self.port_channel.type, "lag")
+        self.assertEqual(self.member_1.lag_id, self.port_channel.id)
+        self.assertEqual(self.member_2.lag_id, self.port_channel.id)
+
+    def test_reconcile_unlinks_members_removed_from_bundle(self):
+        """A member previously in the bundle but no longer reported by NSO is unlinked."""
+        from netbox_nso_plugin.template_content import _reconcile_lag_topology
+
+        # Pre-link both members to the bundle.
+        self.member_1.lag = self.port_channel
+        self.member_1.save(update_fields=["lag"])
+        self.member_2.lag = self.port_channel
+        self.member_2.save(update_fields=["lag"])
+
+        # NSO now reports only member_1 in the bundle.
+        lag_data = {
+            "refresh_source": "notification",
+            "last_refreshed_at": None,
+            "lags": [
+                {"name": "Port-channel10", "id": 10, "members": [{"interface": "GigabitEthernet0/1", "mode": "active"}]}
+            ],
+        }
+
+        _reconcile_lag_topology(self.device, lag_data)
+
+        self.member_1.refresh_from_db()
+        self.member_2.refresh_from_db()
+        self.assertEqual(self.member_1.lag_id, self.port_channel.id)
+        self.assertIsNone(self.member_2.lag_id)
