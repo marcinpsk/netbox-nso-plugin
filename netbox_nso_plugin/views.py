@@ -430,6 +430,27 @@ class NSORefreshComplianceView(LoginRequiredMixin, View):
         return redirect(_device_nso_tab_url(mgmt.device.pk))
 
 
+class NSODeviceReconcileView(LoginRequiredMixin, View):
+    """POST: queue a background refresh of the plugin's NSO*State display cache.
+
+    Lighter than 'Sync Now' — it does NOT run an NSO/device sync; it just re-pulls
+    the adapter's current state into the plugin cache so the tab counts update. The
+    same reconcile the adapter's sync-complete callback runs automatically.
+    """
+
+    def post(self, request, pk):
+        """Enqueue the reconcile and redirect back to the device NSO tab."""
+        from .reconcile import enqueue_device_reconcile
+
+        mgmt = get_object_or_404(NSODeviceManagement, pk=pk)
+        if mgmt.adapter_device_id is None:
+            messages.warning(request, "Device is not yet onboarded to the adapter.")
+        else:
+            enqueue_device_reconcile(mgmt.device_id)
+            messages.success(request, "Refresh from NSO queued — category counts will update shortly.")
+        return redirect(_device_nso_tab_url(mgmt.device_id))
+
+
 # ── NSO Interface State CRUD ─────────────────────────────────────────────────
 
 

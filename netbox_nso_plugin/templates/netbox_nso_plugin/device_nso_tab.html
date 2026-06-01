@@ -107,6 +107,14 @@
           <span class="mdi mdi-refresh"></span> Refresh Compliance
         </button>
       </form>
+      <form method="post"
+            action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_reconcile' mgmt.pk %}">
+        {% csrf_token %}
+        <button type="submit" class="btn btn-outline-info"
+                title="Re-pull adapter state into the tab cache (no device sync)">
+          <span class="mdi mdi-cloud-refresh"></span> Refresh from NSO
+        </button>
+      </form>
       {# Bulk Accept — rendered via JS by the interfaces fragment once loaded #}
       <div id="nso-bulk-accept-placeholder"></div>
     </div>
@@ -205,7 +213,11 @@
             {% if cat.counts.accepted %}<span class="badge bg-info ms-1">{{ cat.counts.accepted }} accepted</span>{% endif %}
             {% if cat.counts.apply_failed %}<span class="badge bg-danger ms-1">{{ cat.counts.apply_failed }} failed</span>{% endif %}
           </span>
-          <span class="mdi mdi-chevron-down nso-cat-chevron"></span>
+          <span>
+            <span class="mdi mdi-refresh nso-cat-refresh me-2" role="button"
+                  title="Refresh this category" aria-label="Refresh this category"></span>
+            <span class="mdi mdi-chevron-down nso-cat-chevron"></span>
+          </span>
         </div>
         <div class="card-body nso-cat-body d-none">
           <div class="text-muted small">
@@ -229,24 +241,36 @@
         var header = card.querySelector('.nso-cat-toggle');
         var body = card.querySelector('.nso-cat-body');
         var chevron = card.querySelector('.nso-cat-chevron');
+        var refreshIcon = card.querySelector('.nso-cat-refresh');
         var loaded = false;
+
+        function fetchRows() {
+          body.innerHTML = '<div class="text-muted small"><span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Loading…</div>';
+          fetch(card.dataset.catUrl, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+            .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); })
+            .then(function (html) { body.innerHTML = html; runScripts(body); })
+            .catch(function (e) { body.innerHTML = '<div class="text-danger small">Failed to load: ' + e.message + '</div>'; });
+        }
+
         function toggle() {
           var nowHidden = body.classList.toggle('d-none');
           header.setAttribute('aria-expanded', String(!nowHidden));
           chevron.classList.toggle('mdi-chevron-down', nowHidden);
           chevron.classList.toggle('mdi-chevron-up', !nowHidden);
-          if (!nowHidden && !loaded) {
-            loaded = true;
-            fetch(card.dataset.catUrl, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
-              .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); })
-              .then(function (html) { body.innerHTML = html; runScripts(body); })
-              .catch(function (e) { body.innerHTML = '<div class="text-danger small">Failed to load: ' + e.message + '</div>'; });
-          }
+          if (!nowHidden && !loaded) { loaded = true; fetchRows(); }
         }
+
         header.addEventListener('click', toggle);
         header.addEventListener('keydown', function (e) {
           if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
         });
+        if (refreshIcon) {
+          refreshIcon.addEventListener('click', function (e) {
+            e.stopPropagation();  // don't toggle the card
+            if (body.classList.contains('d-none')) { toggle(); return; }  // expand (which fetches)
+            loaded = true; fetchRows();  // already open → re-fetch fresh rows
+          });
+        }
       });
     })();
     </script>

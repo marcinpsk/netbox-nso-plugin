@@ -1037,6 +1037,19 @@ class TestDeviceNSOTabView(ViewTestBase):
         ):
             mocks[name].assert_not_called()
 
+    def test_refresh_from_nso_enqueues_reconcile(self):
+        """The device-level 'Refresh from NSO' button enqueues a background reconcile."""
+        mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+        mgmt.adapter_device_id = 15
+        mgmt.save(update_fields=["adapter_device_id"])
+        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_reconcile", kwargs={"pk": mgmt.pk})
+        with patch("netbox_nso_plugin.reconcile.enqueue_device_reconcile") as m:
+            resp = self.client.post(url)
+        self.assertEqual(resp.status_code, 302)
+        m.assert_called_once_with(mgmt.device_id)
+        mgmt.adapter_device_id = None
+        mgmt.save(update_fields=["adapter_device_id"])
+
     @patch("netbox_nso_plugin.adapter_client._resolve_config")
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_device_nso_tab_with_mgmt(self, mock_session_cls, mock_cfg):

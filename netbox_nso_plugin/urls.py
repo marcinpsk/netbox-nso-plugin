@@ -35,6 +35,12 @@ urlpatterns = [
         views.NSOCategoryView.as_view(),
         name="device_nso_category",
     ),
+    # Device NSO tab — background "Refresh from NSO" (reconcile cache only)
+    path(
+        "device-management/<int:pk>/reconcile/",
+        views.NSODeviceReconcileView.as_view(),
+        name="nsodevicemanagement_reconcile",
+    ),
     # Device Management CRUD
     path("device-management/", views.NSODeviceManagementListView.as_view(), name="nsodevicemanagement_list"),
     path("device-management/add/", views.NSODeviceManagementEditView.as_view(), name="nsodevicemanagement_add"),
