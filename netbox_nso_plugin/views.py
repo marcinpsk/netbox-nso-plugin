@@ -40,6 +40,31 @@ def _device_nso_tab_url(device_pk):
     return reverse("dcim:device_nso", kwargs={"pk": device_pk})
 
 
+def _refresh_sync_cache(mgmt, adapter_device):
+    """Update an NSODeviceManagement row's cached last_sync_* from an adapter device dict.
+
+    Writes only changed fields via a targeted .update() (no full save / no signals),
+    so it is cheap enough to call per-row on the list view. Returns the list of
+    fields actually changed (empty if already current).
+    """
+    update_fields = []
+    raw_ts = adapter_device.get("last_sync_at")
+    if raw_ts:
+        from dateutil.parser import parse as parse_dt
+
+        last_sync_at = parse_dt(raw_ts) if isinstance(raw_ts, str) else raw_ts
+        if mgmt.last_sync_at != last_sync_at:
+            mgmt.last_sync_at = last_sync_at
+            update_fields.append("last_sync_at")
+    last_sync_status = adapter_device.get("last_sync_status") or ""
+    if mgmt.last_sync_status != last_sync_status:
+        mgmt.last_sync_status = last_sync_status
+        update_fields.append("last_sync_status")
+    if update_fields:
+        NSODeviceManagement.objects.filter(pk=mgmt.pk).update(**{f: getattr(mgmt, f) for f in update_fields})
+    return update_fields
+
+
 # ── Device NSO Tab (registered into dcim.Device detail) ──────────────────────
 
 
@@ -96,23 +121,7 @@ class DeviceNSOTabView(generic.ObjectView):
 
                 routing = self._reconcile_routing_scopes(device, mgmt, client)
 
-                update_fields = []
-                raw_ts = adapter_device.get("last_sync_at")
-                if raw_ts:
-                    from dateutil.parser import parse as parse_dt
-
-                    last_sync_at = parse_dt(raw_ts) if isinstance(raw_ts, str) else raw_ts
-                    if mgmt.last_sync_at != last_sync_at:
-                        mgmt.last_sync_at = last_sync_at
-                        update_fields.append("last_sync_at")
-                last_sync_status = adapter_device.get("last_sync_status") or ""
-                if mgmt.last_sync_status != last_sync_status:
-                    mgmt.last_sync_status = last_sync_status
-                    update_fields.append("last_sync_status")
-                if update_fields:
-                    NSODeviceManagement.objects.filter(pk=mgmt.pk).update(
-                        **{f: getattr(mgmt, f) for f in update_fields}
-                    )
+                _refresh_sync_cache(mgmt, adapter_device)
             except AdapterError as exc:
                 adapter_error = str(exc)
                 adapter_error_code = exc.code
@@ -258,11 +267,33 @@ class NSOInstanceDeleteView(generic.ObjectDeleteView):
 
 
 class NSODeviceManagementListView(generic.ObjectListView):
-    """List view for managed NSO devices."""
+    """List view for managed NSO devices.
+
+    Refreshes the cached ``last_sync_*`` columns on each render via a cheap
+    per-row ``get_device`` call, so the list reflects current sync state without
+    the operator first having to open each device's NSO tab. Compliance and
+    per-protocol reconcile are NOT run here (those stay on the tab) — only the
+    two lightweight last-sync fields are polled. Adapter errors are swallowed
+    per row so one unreachable device never breaks the list.
+    """
 
     queryset = NSODeviceManagement.objects.select_related("device", "nso_instance")
     table = NSODeviceManagementTable
     filterset = NSODeviceManagementFilterSet
+
+    def get_queryset(self, request):
+        """Poll the adapter for last-sync state before the table is built."""
+        qs = super().get_queryset(request)
+        from . import adapter_client as client
+
+        for mgmt in qs:
+            if mgmt.adapter_device_id is None:
+                continue
+            try:
+                _refresh_sync_cache(mgmt, client.get_device(mgmt.adapter_device_id))
+            except AdapterError as exc:
+                logger.debug("List last-sync poll failed for device %s: %s", mgmt.pk, exc)
+        return qs
 
 
 class NSODeviceManagementView(generic.ObjectView):

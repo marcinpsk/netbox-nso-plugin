@@ -94,6 +94,80 @@ class TestNSODeviceManagementListView(ViewTestBase):
         response = self.client.get(url)
         self.assertEqual(response.status_code, 200)
 
+    @patch("netbox_nso_plugin.adapter_client._resolve_config")
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_list_polls_and_refreshes_last_sync(self, mock_session_cls, mock_cfg):
+        """List view refreshes cached last_sync_* via a per-row get_device poll."""
+        mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+        mgmt.adapter_device_id = 16
+        mgmt.last_sync_at = None
+        mgmt.last_sync_status = ""
+        mgmt.save(update_fields=["adapter_device_id", "last_sync_at", "last_sync_status"])
+
+        mock_cfg.return_value = {
+            "url": "http://adapter",
+            "token": "tok",
+            "verify_tls": True,
+            "ca_cert_path": None,
+            "timeout": 30,
+        }
+
+        calls = []
+
+        def make_resp(method, url, **kwargs):
+            calls.append(url)
+            resp = MagicMock(ok=True, status_code=200)
+            resp.content = b"{}"
+            resp.json.return_value = {
+                "id": 16,
+                "last_sync_at": "2025-06-01T10:00:00+00:00",
+                "last_sync_status": "succeeded",
+            }
+            return resp
+
+        mock_session_cls.return_value = MagicMock(request=make_resp)
+
+        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_list")
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+
+        # Poll hit get_device (not /interfaces or /compliance — list is lightweight).
+        self.assertTrue(any(u.endswith("/devices/16") for u in calls), calls)
+        self.assertFalse(any("/compliance" in u or "/interfaces" in u for u in calls), calls)
+
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.last_sync_status, "succeeded")
+        self.assertIsNotNone(mgmt.last_sync_at)
+
+        mgmt.adapter_device_id = None
+        mgmt.save(update_fields=["adapter_device_id"])
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config")
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_list_survives_adapter_error(self, mock_session_cls, mock_cfg):
+        """An unreachable adapter must not break the list — error is swallowed per row."""
+        mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+        mgmt.adapter_device_id = 16
+        mgmt.save(update_fields=["adapter_device_id"])
+
+        mock_cfg.return_value = {
+            "url": "http://adapter",
+            "token": "tok",
+            "verify_tls": True,
+            "ca_cert_path": None,
+            "timeout": 30,
+        }
+        resp = MagicMock(ok=False, status_code=502, content=b"{}")
+        resp.json.return_value = {}
+        mock_session_cls.return_value = MagicMock(request=MagicMock(return_value=resp))
+
+        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_list")
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+
+        mgmt.adapter_device_id = None
+        mgmt.save(update_fields=["adapter_device_id"])
+
 
 class TestNSOInterfaceStateListView(ViewTestBase):
     """Tests for NSOInterfaceStateListView."""
