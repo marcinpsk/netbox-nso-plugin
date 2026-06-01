@@ -1039,6 +1039,9 @@ class TestDeviceNSOTabView(ViewTestBase):
         self.assertIn("nso-if-filter", body1)  # filter box present
         self.assertIn("et-0/0/0", body1)
         self.assertNotIn("et-0/0/60", body1)  # second page only
+        # Guard against leaked Django comments (e.g. an illegal multi-line {# #}).
+        self.assertNotIn("{#", body1)
+        self.assertNotIn("#}", body1)
 
         # page 2 shows later interfaces
         body2 = self.client.get(url, {"page": 2}).content.decode()
@@ -1127,6 +1130,11 @@ class TestDeviceNSOTabView(ViewTestBase):
         url = reverse("dcim:device_nso", kwargs={"pk": self.device.pk})
         response = self.client.get(url)
         self.assertIn(response.status_code, [200, 302])
+        if response.status_code == 200:
+            body = response.content.decode()
+            # No leaked Django comments (illegal multi-line {# #} renders as text).
+            self.assertNotIn("{#", body)
+            self.assertNotIn("#}", body)
 
         mgmt.adapter_device_id = None
         mgmt.save(update_fields=["adapter_device_id"])
@@ -1176,6 +1184,11 @@ class TestDeviceNSOTabView(ViewTestBase):
         url = reverse("dcim:device_nso", kwargs={"pk": self.device.pk})
         response = self.client.get(url)
         self.assertIn(response.status_code, [200, 302])
+        if response.status_code == 200:
+            body = response.content.decode()
+            # No leaked Django comments (illegal multi-line {# #} renders as text).
+            self.assertNotIn("{#", body)
+            self.assertNotIn("#}", body)
 
         mgmt.adapter_device_id = None
         mgmt.save(update_fields=["adapter_device_id"])
