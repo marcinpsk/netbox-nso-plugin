@@ -26,12 +26,7 @@
           <td>{{ rs.route_map|default:"—" }}</td>
           <td>{{ rs.metric|default:"—" }}</td>
           <td>
-            {% if rs.status == "in_sync" or rs.status == "imported" %}<span class="badge bg-success">{{ rs.status }}</span>
-            {% elif rs.status == "changed" or rs.status == "conflict" %}<span class="badge bg-warning text-dark">{{ rs.status }}</span>
-            {% elif rs.status == "accepted" %}<span class="badge bg-info text-dark">accepted</span>
-            {% elif rs.status == "deploying" %}<span class="badge bg-primary">deploying</span>
-            {% elif rs.status == "apply_failed" %}<span class="badge bg-danger">apply_failed</span>
-            {% else %}<span class="badge bg-info text-dark">{{ rs.status }}</span>{% endif %}
+            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=rs.status %}
           </td>
           <td>{{ rs.last_sync_at|default:"—" }}</td>
           <td>

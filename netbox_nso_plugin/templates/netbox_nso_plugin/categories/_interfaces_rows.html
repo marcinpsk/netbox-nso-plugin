@@ -28,13 +28,30 @@
                 {% elif row.kind == 'settled' %}<span class="badge bg-success">{{ row.label }}</span>
                 {% else %}<span class="badge bg-info">{{ row.label }}</span>{% endif %}
               </td>
-              <td>
-                {% if row.state.status == 'changed' or row.state.status == 'imported' %}
+              <td class="text-nowrap">
+                {% if row.kind == 'drift' %}
+                  <form method="post" action="{% url 'plugins:netbox_nso_plugin:nsointerfacestate_accept_device' row.state.pk %}" style="display:inline">
+                    {% csrf_token %}
+                    <button type="submit" class="btn btn-sm btn-outline-success" title="Adopt the device value into NetBox (becomes in sync)">
+                      <span class="mdi mdi-download"></span> Accept device
+                    </button>
+                  </form>
                   <form method="post" action="{% url 'plugins:netbox_nso_plugin:nsointerfacestate_accept' row.state.pk %}" style="display:inline">
                     {% csrf_token %}
-                    <button type="submit" class="btn btn-sm btn-outline-warning"
-                            title="Keep the NetBox value as intent (push to the device on Apply)">
-                      <span class="mdi mdi-check"></span> {% if row.state.status == 'changed' %}Keep NetBox{% else %}Accept{% endif %}
+                    <button type="submit" class="btn btn-sm btn-outline-warning" title="Keep the NetBox value as intent (pushed to the device on Apply)">
+                      <span class="mdi mdi-content-save-check"></span> Keep NetBox
+                    </button>
+                  </form>
+                {% elif row.kind == 'pending' %}
+                  <button type="button" class="btn btn-sm btn-outline-primary nso-apply-btn" data-device="{{ object.pk }}"
+                          title="Push pending intent to the device">
+                    <span class="mdi mdi-upload-network"></span> Apply
+                  </button>
+                {% elif row.state.status == 'imported' %}
+                  <form method="post" action="{% url 'plugins:netbox_nso_plugin:nsointerfacestate_accept' row.state.pk %}" style="display:inline">
+                    {% csrf_token %}
+                    <button type="submit" class="btn btn-sm btn-outline-secondary" title="Let NetBox govern this value">
+                      <span class="mdi mdi-check"></span> Accept
                     </button>
                   </form>
                 {% endif %}

@@ -29,12 +29,7 @@
           <td>{{ ii.metric|default:"—" }}</td>
           <td>{% if ii.passive %}<span class="badge bg-warning text-dark">passive</span>{% else %}<span class="badge bg-success">active</span>{% endif %}</td>
           <td>
-            {% if ii.status == "in_sync" or ii.status == "imported" %}<span class="badge bg-success">{{ ii.status }}</span>
-            {% elif ii.status == "changed" or ii.status == "conflict" %}<span class="badge bg-warning text-dark">{{ ii.status }}</span>
-            {% elif ii.status == "accepted" %}<span class="badge bg-info text-dark">accepted</span>
-            {% elif ii.status == "deploying" %}<span class="badge bg-primary">deploying</span>
-            {% elif ii.status == "apply_failed" or ii.status == "error" %}<span class="badge bg-danger">{{ ii.status }}</span>
-            {% else %}<span class="badge bg-info text-dark">{{ ii.status }}</span>{% endif %}
+            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=ii.status %}
           </td>
           <td>{{ ii.last_sync_at|default:"—" }}</td>
           <td>
@@ -73,12 +68,7 @@
           <td>{{ ip.area_auth_type|default:"—" }}{% if ip.area_auth_present %} ✓{% endif %}</td>
           <td>{{ ip.domain_auth_type|default:"—" }}{% if ip.domain_auth_present %} ✓{% endif %}</td>
           <td>
-            {% if ip.status == "in_sync" or ip.status == "imported" %}<span class="badge bg-success">{{ ip.status }}</span>
-            {% elif ip.status == "changed" or ip.status == "conflict" %}<span class="badge bg-warning text-dark">{{ ip.status }}</span>
-            {% elif ip.status == "accepted" %}<span class="badge bg-info text-dark">accepted</span>
-            {% elif ip.status == "deploying" %}<span class="badge bg-primary">deploying</span>
-            {% elif ip.status == "apply_failed" or ip.status == "error" %}<span class="badge bg-danger">{{ ip.status }}</span>
-            {% else %}<span class="badge bg-info text-dark">{{ ip.status }}</span>{% endif %}
+            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=ip.status %}
           </td>
           <td>{{ ip.last_sync_at|default:"—" }}</td>
           <td>

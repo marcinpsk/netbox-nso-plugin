@@ -25,12 +25,7 @@
           <td>{{ bp.remote_as_str|default:"—" }}</td>
           <td>{% if bp.bgp_peer %}<a href="{{ bp.bgp_peer.get_absolute_url }}">{{ bp.bgp_peer }}</a>{% else %}—{% endif %}</td>
           <td>
-            {% if bp.status == "in_sync" or bp.status == "imported" %}<span class="badge bg-success">{{ bp.status }}</span>
-            {% elif bp.status == "changed" or bp.status == "conflict" %}<span class="badge bg-warning text-dark">{{ bp.status }}</span>
-            {% elif bp.status == "accepted" %}<span class="badge bg-info text-dark">accepted</span>
-            {% elif bp.status == "deploying" %}<span class="badge bg-primary">deploying</span>
-            {% elif bp.status == "apply_failed" %}<span class="badge bg-danger">apply_failed</span>
-            {% else %}<span class="badge bg-info text-dark">{{ bp.status }}</span>{% endif %}
+            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=bp.status %}
           </td>
           <td>{{ bp.last_sync_at|default:"—" }}</td>
           <td>

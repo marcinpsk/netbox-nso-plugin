@@ -633,6 +633,37 @@ class NSOAcceptAttributeView(LoginRequiredMixin, View):
         return redirect(_device_nso_tab_url(state.interface.device_id))
 
 
+class NSOAcceptDeviceView(LoginRequiredMixin, View):
+    """Accept the DEVICE's value into NetBox for a drifted interface attribute.
+
+    The opposite of 'Keep NetBox': when the device changed out-of-band, this pulls the
+    device (NSO) value onto the dcim.Interface so NetBox matches reality again → the
+    attribute becomes in_sync. The write is suppressed so it is NOT pushed back as
+    intent (the device already has the value — nothing to apply).
+    """
+
+    def post(self, request, pk):
+        """Copy the device value onto the interface and mark the state in_sync."""
+        from .signals import suppress_intent_push
+
+        state = get_object_or_404(NSOInterfaceState, pk=pk)
+        iface = state.interface
+        dev_val = state.nso_value
+        with suppress_intent_push():
+            if state.attribute == "description":
+                iface.description = dev_val or ""
+                iface.save(update_fields=["description"])
+            elif state.attribute == "enabled":
+                iface.enabled = str(dev_val).lower() == "true"
+                iface.save(update_fields=["enabled"])
+            state.status = "in_sync"
+            state.accepted_at = timezone.now()
+            state.save(update_fields=["status", "accepted_at"])
+
+        messages.success(request, f"Adopted device value for {state.attribute} on {iface}.")
+        return redirect(_device_nso_tab_url(iface.device_id))
+
+
 class NSOBulkAcceptView(LoginRequiredMixin, View):
     """Bulk-accept all 'changed' interface states for a device and push a single intent snapshot."""
 
@@ -657,6 +688,67 @@ class NSOBulkAcceptView(LoginRequiredMixin, View):
 
         device = get_object_or_404(Device, pk=device_pk)
         return redirect(_device_nso_tab_url(device.pk))
+
+
+class NSOApplyPreviewView(LoginRequiredMixin, View):
+    """JSON preview of what 'Apply Intent' would push to the device.
+
+    Lists the pending-apply changes (NetBox intent that differs from the device) so the
+    operator can confirm before pushing. Drives the apply-confirmation modal.
+    """
+
+    def get(self, request, device_pk):
+        """Return {auto_apply, changes:[{interface, attribute, device, netbox}], routing}."""
+        from django.http import JsonResponse
+
+        device = get_object_or_404(Device, pk=device_pk)
+        try:
+            mgmt = device.nso_management
+        except Exception:
+            mgmt = None
+        auto_apply = bool(mgmt and mgmt.auto_apply)
+
+        changes = []
+        pending = (
+            NSOInterfaceState.objects.filter(interface__device_id=device_pk, status__in=("accepted", "apply_failed"))
+            .select_related("interface")
+            .order_by("interface__name", "attribute")
+        )
+        for st in pending:
+            iface = st.interface
+            if st.attribute == "description":
+                netbox_val = iface.description or "—"
+            elif st.attribute == "enabled":
+                netbox_val = "Yes" if iface.enabled else "No"
+            else:
+                netbox_val = "—"
+            changes.append(
+                {
+                    "interface": iface.name,
+                    "attribute": st.attribute,
+                    "device": st.nso_value or "—",
+                    "netbox": netbox_val,
+                }
+            )
+
+        # Routing pending counts (overlays don't carry a simple value pair to diff).
+        routing = 0
+        for model in (
+            NSOStaticRouteState,
+            NSOISISInterfaceState,
+            NSOISISInstanceState,
+            NSOBGPPeerState,
+            NSORoutePolicyState,
+            NSOOSPFInstanceState,
+            NSOOSPFInterfaceState,
+            NSORedistributionState,
+        ):
+            if mgmt is not None:
+                routing += model.objects.filter(management=mgmt, status__in=("accepted", "apply_failed")).count()
+
+        return JsonResponse(
+            {"auto_apply": auto_apply, "changes": changes, "routing": routing, "total": len(changes) + routing}
+        )
 
 
 # ── M13: IP auto-assignment operator actions ──────────────────────────────────

@@ -23,12 +23,7 @@
           <td>{{ rp.object_name }}</td>
           <td>{% if rp.content_object %}<a href="{{ rp.content_object.get_absolute_url }}">{{ rp.content_object }}</a>{% else %}—{% endif %}</td>
           <td>
-            {% if rp.status == "in_sync" or rp.status == "imported" %}<span class="badge bg-success">{{ rp.status }}</span>
-            {% elif rp.status == "changed" or rp.status == "conflict" %}<span class="badge bg-warning text-dark">{{ rp.status }}</span>
-            {% elif rp.status == "accepted" %}<span class="badge bg-info text-dark">accepted</span>
-            {% elif rp.status == "deploying" %}<span class="badge bg-primary">deploying</span>
-            {% elif rp.status == "apply_failed" %}<span class="badge bg-danger">apply_failed</span>
-            {% else %}<span class="badge bg-info text-dark">{{ rp.status }}</span>{% endif %}
+            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=rp.status %}
           </td>
           <td>{{ rp.last_sync_at|default:"—" }}</td>
           <td>

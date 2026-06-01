@@ -847,6 +847,53 @@ class TestNSOAcceptAttributeView(ViewTestBase):
         self.assertEqual(self.iface_state.status, "in_sync")
 
 
+class TestNSOAcceptDeviceView(ViewTestBase):
+    """Tests for NSOAcceptDeviceView (adopt the device value into NetBox)."""
+
+    def test_accept_device_copies_value_and_sets_in_sync(self):
+        """Accept-device writes the device (nso) value onto the interface → in_sync."""
+        self.interface.description = "old-netbox"
+        self.interface.save(update_fields=["description"])
+        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="changed", nso_value="DEVICE-NEW")
+
+        url = reverse("plugins:netbox_nso_plugin:nsointerfacestate_accept_device", args=[self.iface_state.pk])
+        response = self.client.post(url)
+        self.assertEqual(response.status_code, 302)
+
+        self.interface.refresh_from_db()
+        self.iface_state.refresh_from_db()
+        self.assertEqual(self.interface.description, "DEVICE-NEW")  # device value adopted
+        self.assertEqual(self.iface_state.status, "in_sync")
+
+
+class TestNSOApplyPreviewView(ViewTestBase):
+    """Tests for NSOApplyPreviewView (what Apply would push)."""
+
+    def test_preview_lists_pending_changes(self):
+        import json
+
+        self.interface.description = "intended"
+        self.interface.save(update_fields=["description"])
+        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="accepted", nso_value="on-device")
+
+        url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
+        data = json.loads(self.client.get(url).content)
+        self.assertFalse(data["auto_apply"])
+        self.assertEqual(data["total"], 1)
+        chg = data["changes"][0]
+        self.assertEqual(chg["attribute"], "description")
+        self.assertEqual(chg["device"], "on-device")
+        self.assertEqual(chg["netbox"], "intended")
+
+    def test_preview_empty_when_nothing_pending(self):
+        import json
+
+        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="in_sync")
+        url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
+        data = json.loads(self.client.get(url).content)
+        self.assertEqual(data["total"], 0)
+
+
 class TestNSOBulkAcceptView(ViewTestBase):
     """Tests for NSOBulkAcceptView."""
 

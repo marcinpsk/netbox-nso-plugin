@@ -94,7 +94,8 @@
           <span class="mdi mdi-lan-connect"></span> Test Connection
         </button>
       </form>
-      <form method="post" class="nso-action-form" data-label="Apply Intent"
+      <form method="post" class="nso-action-form nso-apply-form" data-label="Apply Intent"
+            data-preview-url="{% url 'plugins:netbox_nso_plugin:device_apply_preview' mgmt.pk %}"
             action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_action' mgmt.pk 'apply' %}">
         {% csrf_token %}
         <button type="submit" class="btn btn-success nso-action-btn">
@@ -121,6 +122,25 @@
       <span class="spinner-border spinner-border-sm me-2" id="nso-job-spinner" role="status"
             aria-hidden="true"></span>
       <span id="nso-job-message"></span>
+    </div>
+  </div>
+
+  {# ── Apply confirmation modal (preview of what will be pushed) ──────────── #}
+  <div class="modal fade" id="nso-apply-modal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title"><span class="mdi mdi-upload-network me-1"></span>Apply intent to the device</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body" id="nso-apply-modal-body"></div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="button" class="btn btn-success" id="nso-apply-confirm">
+            <span class="mdi mdi-check"></span> Confirm Apply
+          </button>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -167,23 +187,68 @@
       }, 2000);
     }
 
+    async function runAction(form) {
+      var label = form.dataset.label;
+      setButtons(true); setStatus(label + ' triggered…', 'info', true);
+      try {
+        var r = await fetch(form.action, {
+          method: 'POST',
+          headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-CSRFToken': csrfToken, 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams(new FormData(form)),
+        });
+        var data = await r.json();
+        if (data.status === 'error') { setStatus('Error: ' + data.message, 'danger', false); setButtons(false); }
+        else if (data.job_id) { setStatus(label + ' running… (Job #' + data.job_id + ')', 'info', true); pollJob(data.job_id, label); }
+        else { setStatus(label + ' triggered (no job to track).', 'success', false); setButtons(false); }
+      } catch (err) { setStatus('Request failed: ' + err.message, 'danger', false); setButtons(false); }
+    }
+
+    // ── Apply Intent: preview-then-confirm ──
+    var applyForm = document.querySelector('.nso-apply-form');
+    var modalEl = document.getElementById('nso-apply-modal');
+    var modal = (window.bootstrap && modalEl) ? new window.bootstrap.Modal(modalEl) : null;
+    var modalBody = document.getElementById('nso-apply-modal-body');
+    var confirmBtn = document.getElementById('nso-apply-confirm');
+
+    function esc(s) { var d = document.createElement('div'); d.textContent = (s == null ? '' : String(s)); return d.innerHTML; }
+
+    function renderPreview(d) {
+      if (!d.total) { return '<p class="text-muted mb-0">Nothing pending — NetBox and the device are in sync.</p>'; }
+      var h = '<p>The following NetBox intent will be pushed to the device:</p>';
+      if (d.changes && d.changes.length) {
+        h += '<div class="table-responsive"><table class="table table-sm align-middle"><thead><tr><th>Interface</th><th>Attribute</th><th>Device now</th><th>→ NetBox</th></tr></thead><tbody>';
+        d.changes.forEach(function (c) {
+          h += '<tr><td>' + esc(c.interface) + '</td><td><code>' + esc(c.attribute) + '</code></td><td class="text-muted">' + esc(c.device) + '</td><td><strong>' + esc(c.netbox) + '</strong></td></tr>';
+        });
+        h += '</tbody></table></div>';
+      }
+      if (d.routing) { h += '<p class="mb-0">Plus <strong>' + d.routing + '</strong> pending routing change(s).</p>'; }
+      return h;
+    }
+
+    async function openApply() {
+      if (!applyForm) return;
+      try {
+        var r = await fetch(applyForm.dataset.previewUrl, { headers: { 'X-Requested-With': 'XMLHttpRequest' } });
+        var d = await r.json();
+        if (d.auto_apply || !d.total) { runAction(applyForm); return; }  // auto-apply or nothing pending → just go
+        if (modal) { modalBody.innerHTML = renderPreview(d); modal.show(); }
+        else if (window.confirm(d.total + ' change(s) will be pushed to the device. Continue?')) { runAction(applyForm); }
+      } catch (e) { setStatus('Could not load apply preview: ' + e.message, 'warning', false); }
+    }
+
+    if (confirmBtn) { confirmBtn.addEventListener('click', function () { if (modal) modal.hide(); runAction(applyForm); }); }
+
     document.querySelectorAll('.nso-action-form').forEach(function (form) {
-      form.addEventListener('submit', async function (e) {
+      form.addEventListener('submit', function (e) {
         e.preventDefault();
-        var label = form.dataset.label;
-        setButtons(true); setStatus(label + ' triggered…', 'info', true);
-        try {
-          var r = await fetch(form.action, {
-            method: 'POST',
-            headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-CSRFToken': csrfToken, 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: new URLSearchParams(new FormData(form)),
-          });
-          var data = await r.json();
-          if (data.status === 'error') { setStatus('Error: ' + data.message, 'danger', false); setButtons(false); }
-          else if (data.job_id) { setStatus(label + ' running… (Job #' + data.job_id + ')', 'info', true); pollJob(data.job_id, label); }
-          else { setStatus(label + ' triggered (no job to track).', 'success', false); setButtons(false); }
-        } catch (err) { setStatus('Request failed: ' + err.message, 'danger', false); setButtons(false); }
+        if (form.classList.contains('nso-apply-form')) { openApply(); return; }
+        runAction(form);
       });
+    });
+    // Per-row Apply buttons load lazily inside category fragments → delegate.
+    document.addEventListener('click', function (e) {
+      if (e.target.closest('.nso-apply-btn')) { e.preventDefault(); openApply(); }
     });
   })();
   </script>

@@ -108,9 +108,19 @@ urlpatterns = [
         name="nsointerfacestate_accept",
     ),
     path(
+        "interface-state/<int:pk>/accept-device/",
+        views.NSOAcceptDeviceView.as_view(),
+        name="nsointerfacestate_accept_device",
+    ),
+    path(
         "devices/<int:device_pk>/bulk-accept/",
         views.NSOBulkAcceptView.as_view(),
         name="device_bulk_accept",
+    ),
+    path(
+        "devices/<int:device_pk>/apply-preview/",
+        views.NSOApplyPreviewView.as_view(),
+        name="device_apply_preview",
     ),
     # M13: IP auto-assignment operator action
     path(
