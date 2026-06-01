@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
+from django.urls import path
 from netbox.api.routers import NetBoxRouter
 
 from . import views
@@ -11,4 +12,7 @@ router.register("instances", views.NSOInstanceViewSet)
 router.register("device-management", views.NSODeviceManagementViewSet)
 router.register("interface-state", views.NSOInterfaceStateViewSet)
 
-urlpatterns = router.urls
+urlpatterns = [
+    path("sync-complete/", views.SyncCompleteView.as_view(), name="sync_complete"),
+    *router.urls,
+]

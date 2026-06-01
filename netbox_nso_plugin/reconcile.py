@@ -98,3 +98,65 @@ def reconcile_device(device, mgmt=None) -> dict:
             ctx["snmp_data"] = _reconcile_snmp_config(device, client.get_snmp_config(dev_id))
         _reconcile_routing(device, mgmt, client, ctx)
     return ctx
+
+
+# ── Off-request reconcile: RQ job fired by the adapter's sync-complete callback ──
+
+_RECONCILE_QUEUE = "default"
+
+
+def run_device_reconcile(device_id: int) -> dict:
+    """RQ entrypoint: reconcile one device by NetBox device id, off the request path.
+
+    Runs in the rqworker (no HTTP request), so suppress_intent_push() — not the
+    GET-render guard — is what keeps the NSO*State writes from pushing intent back.
+    AdapterError is swallowed: a transient adapter outage must not crash the worker.
+    """
+    from dcim.models import Device
+
+    from .adapter_client import AdapterError
+
+    try:
+        device = Device.objects.get(pk=device_id)
+    except Device.DoesNotExist:
+        logger.warning("nso reconcile: device %s no longer exists; skipping", device_id)
+        return {"device_id": device_id, "skipped": "device_gone"}
+
+    try:
+        ctx = reconcile_device(device)
+    except AdapterError as exc:
+        logger.warning("nso reconcile: adapter error for device %s: %s", device_id, exc)
+        return {"device_id": device_id, "error": str(exc)}
+
+    summary = {"device_id": device_id, "interface_states": len(ctx.get("interface_states") or {})}
+    logger.info("nso reconcile complete: %s", summary)
+    return summary
+
+
+def enqueue_device_reconcile(device_id: int):
+    """Enqueue a background reconcile for *device_id*, deduped per device.
+
+    Uses a deterministic job id so 15-min adapter sync cycles across many devices
+    don't pile up: if a reconcile for this device is already queued/running, the
+    call is a no-op. Returns the (existing or new) RQ job, or None if RQ is absent.
+    """
+    try:
+        import django_rq
+        from rq.exceptions import NoSuchJobError
+        from rq.job import Job as RqJob
+    except ImportError:  # pragma: no cover - RQ ships with NetBox
+        logger.warning("django_rq unavailable; running reconcile for device %s inline", device_id)
+        run_device_reconcile(device_id)
+        return None
+
+    queue = django_rq.get_queue(_RECONCILE_QUEUE)
+    job_id = f"nso-reconcile-{device_id}"
+    try:
+        existing = RqJob.fetch(job_id, connection=queue.connection)
+    except NoSuchJobError:
+        existing = None
+    if existing is not None:
+        if existing.get_status(refresh=True) in ("queued", "started", "deferred", "scheduled"):
+            return existing  # already pending — don't pile up
+        existing.delete()  # finished/failed: clear so the id can be reused
+    return queue.enqueue(run_device_reconcile, device_id, job_id=job_id, result_ttl=300, job_timeout=600)
