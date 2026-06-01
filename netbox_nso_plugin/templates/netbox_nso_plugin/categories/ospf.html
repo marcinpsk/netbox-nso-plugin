@@ -7,14 +7,14 @@
 
 {% if ospf_data.instances or ospf_data.interfaces %}
   <div class="d-flex justify-content-end mb-2 gap-1">
-    <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_ospf_instances' device_pk=object.pk %}" class="d-inline">
+    {% if category_has_unowned %}<form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_ospf_instances' device_pk=object.pk %}" class="d-inline">
       {% csrf_token %}
       <button type="submit" class="btn btn-sm btn-outline-success"><span class="mdi mdi-check-all"></span> Accept All Instances</button>
-    </form>
-    <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_ospf_interfaces' device_pk=object.pk %}" class="d-inline">
+    </form>{% endif %}
+    {% if category_has_unowned %}<form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_ospf_interfaces' device_pk=object.pk %}" class="d-inline">
       {% csrf_token %}
       <button type="submit" class="btn btn-sm btn-outline-success"><span class="mdi mdi-check-all"></span> Accept All Interfaces</button>
-    </form>
+    </form>{% endif %}
   </div>
   {% if ospf_data.instances %}
   <div class="table-responsive mb-3">
@@ -34,10 +34,10 @@
           </td>
           <td>{{ oi.last_sync_at|default:"—" }}</td>
           <td>
-            {% if oi.status == "imported" or oi.status == "in_sync" %}
+            {% if oi.status == "imported" or oi.status == "changed" or oi.status == "conflict" or oi.status == "drifted" %}
             <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_accept_ospf_instance' pk=oi.pk %}">
               {% csrf_token %}
-              <button type="submit" class="btn btn-xs btn-outline-success" title="Accept"><span class="mdi mdi-check"></span></button>
+              <button type="submit" class="btn btn-xs btn-outline-success" title="Make NetBox the source of truth for this (re-applied to the device on Apply)"><span class="mdi mdi-check"></span> Accept</button>
             </form>
             {% endif %}
           </td>
@@ -65,10 +65,10 @@
           </td>
           <td>{{ oif.last_sync_at|default:"—" }}</td>
           <td>
-            {% if oif.status == "imported" or oif.status == "in_sync" %}
+            {% if oif.status == "imported" or oif.status == "changed" or oif.status == "conflict" or oif.status == "drifted" %}
             <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_accept_ospf_interface' pk=oif.pk %}">
               {% csrf_token %}
-              <button type="submit" class="btn btn-xs btn-outline-success" title="Accept"><span class="mdi mdi-check"></span></button>
+              <button type="submit" class="btn btn-xs btn-outline-success" title="Make NetBox the source of truth for this (re-applied to the device on Apply)"><span class="mdi mdi-check"></span> Accept</button>
             </form>
             {% endif %}
           </td>

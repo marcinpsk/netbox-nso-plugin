@@ -50,7 +50,7 @@
                 {% elif row.state.status == 'imported' %}
                   <form method="post" action="{% url 'plugins:netbox_nso_plugin:nsointerfacestate_accept' row.state.pk %}" style="display:inline">
                     {% csrf_token %}
-                    <button type="submit" class="btn btn-sm btn-outline-secondary" title="Let NetBox govern this value">
+                    <button type="submit" class="btn btn-sm btn-outline-success" title="Make NetBox the source of truth for this value">
                       <span class="mdi mdi-check"></span> Accept
                     </button>
                   </form>

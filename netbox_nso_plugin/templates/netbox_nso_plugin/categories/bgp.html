@@ -6,10 +6,10 @@
 {% endif %}
 {% if bgp_peers %}
   <div class="d-flex justify-content-end mb-2">
-    <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_bgp_peers' device_pk=object.pk %}">
+    {% if category_has_unowned %}<form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_bgp_peers' device_pk=object.pk %}">
       {% csrf_token %}
       <button type="submit" class="btn btn-sm btn-outline-success"><span class="mdi mdi-check-all"></span> Accept All</button>
-    </form>
+    </form>{% endif %}
   </div>
   <div class="table-responsive">
     <table class="table table-sm table-hover mb-0">
@@ -29,10 +29,10 @@
           </td>
           <td>{{ bp.last_sync_at|default:"—" }}</td>
           <td>
-            {% if bp.status == "imported" or bp.status == "in_sync" %}
+            {% if bp.status == "imported" or bp.status == "changed" or bp.status == "conflict" or bp.status == "drifted" %}
             <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_accept_bgp_peer' pk=bp.pk %}">
               {% csrf_token %}
-              <button type="submit" class="btn btn-xs btn-outline-success" title="Accept"><span class="mdi mdi-check"></span></button>
+              <button type="submit" class="btn btn-xs btn-outline-success" title="Make NetBox the source of truth for this (re-applied to the device on Apply)"><span class="mdi mdi-check"></span> Accept</button>
             </form>
             {% endif %}
           </td>

@@ -122,6 +122,31 @@ class DeviceNSOTabView(generic.ObjectView):
 
 # ── Lazy category load: rows for one expanded category (HTML fragment) ─────────
 
+# "Accept" makes NetBox the source of truth, so it applies to values NetBox does not
+# yet own (imported) and to drift (resolve). Already-owned states (in_sync, accepted,
+# deploying, apply_failed) offer no Accept — that was the repeatable-no-op bug.
+_UNOWNED_STATUSES = ("imported", "changed", "conflict", "drifted")
+
+
+def _ctx_has_unowned(ctx) -> bool:
+    """Return True if any reconciled routing row in *ctx* is unowned/drifted (gates 'Accept All')."""
+    lists = (
+        "static_routes",
+        "isis_interfaces",
+        "isis_processes",
+        "bgp_peers",
+        "route_policy_states",
+        "redistribution_states",
+    )
+    for key in lists:
+        if any(getattr(r, "status", "") in _UNOWNED_STATUSES for r in ctx.get(key) or []):
+            return True
+    ospf = ctx.get("ospf_data") or {}
+    for key in ("instances", "interfaces"):
+        if any(getattr(r, "status", "") in _UNOWNED_STATUSES for r in ospf.get(key) or []):
+            return True
+    return False
+
 
 class NSOCategoryView(LoginRequiredMixin, View):
     """Return one category's rows for the device NSO tab, fetched on expand.
@@ -178,6 +203,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
             except AdapterError as exc:
                 ctx["adapter_error"] = str(exc)
                 ctx["adapter_error_code"] = exc.code
+        ctx["category_has_unowned"] = _ctx_has_unowned(ctx)
         return render(request, partial, ctx)
 
     def _render_interfaces_page(self, request, device):
@@ -853,7 +879,7 @@ class NSORedistributionStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
 
 
 class RoutingBulkAcceptMixin(LoginRequiredMixin, View):
-    """Bulk-accept all 'imported'/'in_sync' routing state rows for a device and push intent."""
+    """Bulk 'Keep NetBox' for all DRIFTED routing rows of a device, then push intent."""
 
     model_class = None
 
@@ -867,14 +893,14 @@ class RoutingBulkAcceptMixin(LoginRequiredMixin, View):
             messages.warning(request, "Device is not NSO-managed.")
             return redirect(_device_nso_tab_url(device_pk))
 
-        # These rows already match the device (imported/in_sync); accepting them just
-        # records NetBox ownership — there is nothing to apply, so they stay in_sync.
-        qs = self.model_class.objects.filter(
-            management=mgmt,
-            status__in=["imported", "in_sync"],
-        )
-        count = qs.count()
-        qs.update(status="in_sync")
+        # Accept = make NetBox the source of truth for not-yet-owned rows (imported)
+        # and for drift. Already-owned rows (in_sync/accepted) are skipped (accepting
+        # them was a repeatable no-op). Matching (imported) -> in_sync (nothing to
+        # push); drift -> accepted (pending apply). _push() sends the snapshot once.
+        base = self.model_class.objects.filter(management=mgmt)
+        n_owned = base.filter(status="imported").update(status="in_sync")
+        n_drift = base.filter(status__in=["changed", "conflict", "drifted"]).update(status="accepted")
+        count = n_owned + n_drift
 
         if count and mgmt.adapter_device_id is not None:
             try:
@@ -885,7 +911,7 @@ class RoutingBulkAcceptMixin(LoginRequiredMixin, View):
         if count:
             messages.success(request, f"Accepted {count} routing state(s).")
         else:
-            messages.info(request, "No states to accept.")
+            messages.info(request, "Nothing to accept — no drift.")
         return redirect(_device_nso_tab_url(device_pk))
 
 

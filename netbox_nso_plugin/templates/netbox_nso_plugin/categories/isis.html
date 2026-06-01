@@ -8,10 +8,10 @@
 {% if isis_interfaces %}
   <div class="d-flex justify-content-between align-items-center mb-2">
     <strong>IS-IS Interfaces</strong>
-    <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_isis_interfaces' device_pk=object.pk %}">
+    {% if category_has_unowned %}<form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_isis_interfaces' device_pk=object.pk %}">
       {% csrf_token %}
       <button type="submit" class="btn btn-sm btn-outline-success"><span class="mdi mdi-check-all"></span> Accept All</button>
-    </form>
+    </form>{% endif %}
   </div>
   <div class="table-responsive mb-3">
     <table class="table table-sm table-hover mb-0">
@@ -33,10 +33,10 @@
           </td>
           <td>{{ ii.last_sync_at|default:"—" }}</td>
           <td>
-            {% if ii.status == "imported" or ii.status == "in_sync" %}
+            {% if ii.status == "imported" or ii.status == "changed" or ii.status == "conflict" or ii.status == "drifted" %}
             <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_accept_isis_interface' pk=ii.pk %}">
               {% csrf_token %}
-              <button type="submit" class="btn btn-xs btn-outline-success" title="Accept"><span class="mdi mdi-check"></span></button>
+              <button type="submit" class="btn btn-xs btn-outline-success" title="Make NetBox the source of truth for this (re-applied to the device on Apply)"><span class="mdi mdi-check"></span> Accept</button>
             </form>
             {% endif %}
           </td>
@@ -50,10 +50,10 @@
 {% if isis_processes %}
   <div class="d-flex justify-content-between align-items-center mb-2">
     <strong>IS-IS Instances</strong>
-    <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_isis_instances' device_pk=object.pk %}">
+    {% if category_has_unowned %}<form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_isis_instances' device_pk=object.pk %}">
       {% csrf_token %}
       <button type="submit" class="btn btn-sm btn-outline-success"><span class="mdi mdi-check-all"></span> Accept All</button>
-    </form>
+    </form>{% endif %}
   </div>
   <div class="table-responsive">
     <table class="table table-sm table-hover mb-0">
@@ -72,10 +72,10 @@
           </td>
           <td>{{ ip.last_sync_at|default:"—" }}</td>
           <td>
-            {% if ip.status == "imported" or ip.status == "in_sync" %}
+            {% if ip.status == "imported" or ip.status == "changed" or ip.status == "conflict" or ip.status == "drifted" %}
             <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_accept_isis_instance' pk=ip.pk %}">
               {% csrf_token %}
-              <button type="submit" class="btn btn-xs btn-outline-success" title="Accept"><span class="mdi mdi-check"></span></button>
+              <button type="submit" class="btn btn-xs btn-outline-success" title="Make NetBox the source of truth for this (re-applied to the device on Apply)"><span class="mdi mdi-check"></span> Accept</button>
             </form>
             {% endif %}
           </td>
