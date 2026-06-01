@@ -1016,19 +1016,23 @@ class TestDeviceNSOTabView(ViewTestBase):
         mocks["get_interfaces"].assert_not_called()
         mocks["get_compliance"].assert_not_called()
 
-    def test_interfaces_page_paginates_and_filters(self):
-        """The interfaces fragment paginates persisted state and filters by name."""
+    def test_interfaces_page_paginates_filters_and_states(self):
+        """The per-attribute interfaces view paginates, name-filters, and state-filters."""
         from dcim.models import Interface
 
         from netbox_nso_plugin.models import NSOInterfaceState
 
-        # 120 interfaces (> one 50-row page); one carries an acceptable state.
+        # 120 interfaces, each with a description state; #0 is drift (changed).
         for n in range(120):
-            iface = Interface.objects.create(device=self.device, name=f"et-0/0/{n}", type="other")
-            if n == 0:
-                NSOInterfaceState.objects.create(
-                    interface=iface, attribute="description", status="imported", nso_value="uplink"
-                )
+            iface = Interface.objects.create(
+                device=self.device, name=f"et-0/0/{n}", type="other", description=f"nb-{n}"
+            )
+            NSOInterfaceState.objects.create(
+                interface=iface,
+                attribute="description",
+                status="changed" if n == 0 else "imported",
+                nso_value=f"dev-{n}",
+            )
         url = reverse(
             "plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device.pk, "key": "interfaces"}
         )
@@ -1036,21 +1040,28 @@ class TestDeviceNSOTabView(ViewTestBase):
         r1 = self.client.get(url)
         self.assertEqual(r1.status_code, 200)
         body1 = r1.content.decode()
-        self.assertIn("nso-if-filter", body1)  # filter box present
+        self.assertIn("nso-if-filter", body1)  # filter box
+        self.assertIn("nso-if-state", body1)  # state chips
         self.assertIn("et-0/0/0", body1)
-        self.assertNotIn("et-0/0/60", body1)  # second page only
-        # Guard against leaked Django comments (e.g. an illegal multi-line {# #}).
+        self.assertIn("dev-0", body1)  # device (NSO) value column
+        self.assertIn("nb-0", body1)  # NetBox value column
+        self.assertNotIn("et-0/0/60", body1)  # 50/page → page 1 only
+        # No leaked Django comments (illegal multi-line {# #} renders as text).
         self.assertNotIn("{#", body1)
         self.assertNotIn("#}", body1)
 
         # page 2 shows later interfaces
-        body2 = self.client.get(url, {"page": 2}).content.decode()
-        self.assertIn("et-0/0/60", body2)
+        self.assertIn("et-0/0/60", self.client.get(url, {"page": 2}).content.decode())
 
-        # filter narrows the set
+        # name filter narrows
         bodyf = self.client.get(url, {"q": "et-0/0/119"}).content.decode()
         self.assertIn("et-0/0/119", bodyf)
         self.assertNotIn("et-0/0/0<", bodyf)
+
+        # state=drift shows only the one drifted attribute
+        bodyd = self.client.get(url, {"state": "drift"}).content.decode()
+        self.assertIn("et-0/0/0", bodyd)
+        self.assertNotIn("et-0/0/1<", bodyd)
 
         Interface.objects.filter(device=self.device, name__startswith="et-0/0/").delete()
 

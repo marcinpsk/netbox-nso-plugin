@@ -14,6 +14,43 @@ from __future__ import annotations
 
 from django.db.models import Count
 
+# Operator-facing grouping of the raw per-attribute statuses.
+#   drift   — the device changed vs NetBox (out-of-band, or after a deploy)
+#   pending — NetBox holds intent not yet on the device ("what Apply would push")
+#   settled — device and NetBox agree
+DRIFT_STATUSES = ("changed", "drifted")
+PENDING_STATUSES = ("accepted", "apply_failed", "deploying")
+SETTLED_STATUSES = ("imported", "in_sync")
+
+_STATE_FILTERS = {
+    "drift": DRIFT_STATUSES,
+    "pending": PENDING_STATUSES,
+    "in_sync": SETTLED_STATUSES,
+}
+
+
+def state_label(status: str) -> str:
+    """Human label for a raw status: drift / pending apply / in sync."""
+    if status in DRIFT_STATUSES:
+        return "drift"
+    if status in PENDING_STATUSES:
+        return "pending apply"
+    if status in SETTLED_STATUSES:
+        return "in sync"
+    return status or "unknown"
+
+
+def state_kind(status: str) -> str:
+    """Coarse bucket for badge colour: drift / pending / settled / other."""
+    if status in DRIFT_STATUSES:
+        return "drift"
+    if status in PENDING_STATUSES:
+        return "pending"
+    if status in SETTLED_STATUSES:
+        return "settled"
+    return "other"
+
+
 # Each category: key -> (label, mdi-icon, scope-flag on NSODeviceManagement).
 # Order here is the display order on the tab.
 # NOTE: SNMP is intentionally absent — the device tab has never rendered an SNMP
@@ -34,6 +71,15 @@ def _status_breakdown(qs) -> dict:
     rows = qs.values_list("status").annotate(n=Count("id"))
     by_status = {s: n for s, n in rows}
     by_status["total"] = sum(by_status.values())
+    # Operator-facing buckets (see also DRIFT_STATUSES / PENDING_STATUSES):
+    #   drift   = the device changed vs NetBox (out-of-band or post-deploy)
+    #   pending = NetBox holds intent not yet on the device ("what Apply would push")
+    #   settled = device and NetBox agree
+    by_status["drift"] = by_status.get("changed", 0) + by_status.get("drifted", 0)
+    by_status["pending"] = (
+        by_status.get("accepted", 0) + by_status.get("apply_failed", 0) + by_status.get("deploying", 0)
+    )
+    by_status["settled"] = by_status.get("imported", 0) + by_status.get("in_sync", 0)
     return by_status
 
 

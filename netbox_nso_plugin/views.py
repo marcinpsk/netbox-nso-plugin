@@ -181,46 +181,69 @@ class NSOCategoryView(LoginRequiredMixin, View):
         return render(request, partial, ctx)
 
     def _render_interfaces_page(self, request, device):
-        """Paginated, name-filterable, read-only interfaces table from persisted state."""
-        from dcim.models import Interface
+        """Per-(interface, attribute) drift/pending view — paginated, filterable, read-only.
+
+        One row per managed attribute showing NetBox value vs Device (NSO) value and the
+        state (drift / pending apply / in sync). Filter by interface name (?q=) and by
+        state (?state=drift|pending|in_sync|all). Read straight from persisted
+        NSOInterfaceState — no reconcile; the cache is refreshed off-render.
+        """
         from django.core.paginator import Paginator
 
         from .models import NSOInterfaceState
+        from .summary import _STATE_FILTERS, DRIFT_STATUSES, PENDING_STATUSES, state_kind, state_label
 
         q = (request.GET.get("q") or "").strip()
-        ifaces = Interface.objects.filter(device=device).order_by("name")
-        if q:
-            ifaces = ifaces.filter(name__icontains=q)
+        state = request.GET.get("state") or "all"
 
-        paginator = Paginator(ifaces, self._INTERFACES_PER_PAGE)
+        qs = (
+            NSOInterfaceState.objects.filter(interface__device=device)
+            .select_related("interface")
+            .order_by("interface__name", "attribute")
+        )
+        if q:
+            qs = qs.filter(interface__name__icontains=q)
+        if state in _STATE_FILTERS:
+            qs = qs.filter(status__in=_STATE_FILTERS[state])
+
+        paginator = Paginator(qs, self._INTERFACES_PER_PAGE)
         page = paginator.get_page(request.GET.get("page") or 1)
 
-        # One query for the states of just this page's interfaces.
-        states = NSOInterfaceState.objects.filter(interface__in=list(page.object_list))
-        by_iface: dict = {}
-        for s in states:
-            by_iface.setdefault(s.interface_id, {})[s.attribute] = s
+        rows = []
+        for st in page.object_list:
+            iface = st.interface
+            if st.attribute == "description":
+                netbox_value = iface.description or "—"
+            elif st.attribute == "enabled":
+                netbox_value = "Yes" if iface.enabled else "No"
+            else:
+                netbox_value = "—"
+            rows.append(
+                {
+                    "state": st,
+                    "iface_name": iface.name,
+                    "attribute": st.attribute,
+                    "netbox_value": netbox_value,
+                    "device_value": st.nso_value or "—",
+                    "label": state_label(st.status),
+                    "kind": state_kind(st.status),
+                }
+            )
 
-        rows = [
-            {
-                "iface": iface,
-                "description": by_iface.get(iface.id, {}).get("description"),
-                "description_value": iface.description or "—",
-                "enabled": by_iface.get(iface.id, {}).get("enabled"),
-                "enabled_value": "Yes" if iface.enabled else "No",
-            }
-            for iface in page.object_list
-        ]
-
-        # Show "Accept All" only when something on the device is actually acceptable.
-        accept_all = NSOInterfaceState.objects.filter(
-            interface__device=device, status__in=("imported", "changed")
-        ).exists()
+        # Per-state totals for the filter chips (whole device, honouring the name filter).
+        base = NSOInterfaceState.objects.filter(interface__device=device)
+        if q:
+            base = base.filter(interface__name__icontains=q)
+        counts = {
+            "all": base.count(),
+            "drift": base.filter(status__in=DRIFT_STATUSES).count(),
+            "pending": base.filter(status__in=PENDING_STATUSES).count(),
+        }
 
         return render(
             request,
             "netbox_nso_plugin/categories/interfaces_page.html",
-            {"object": device, "rows": rows, "page": page, "paginator": paginator, "q": q, "accept_all": accept_all},
+            {"object": device, "rows": rows, "page": page, "q": q, "state": state, "counts": counts},
         )
 
 

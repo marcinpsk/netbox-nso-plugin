@@ -1,21 +1,13 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
-{# Lazy fragment: Interfaces — paginated + name-filterable, read-only from persisted state. #}
+{# Lazy fragment: Interfaces drift/pending view — per-attribute, paginated + filterable, read-only. #}
 <div class="nso-if-pager"
      data-url="{% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='interfaces' %}"
-     data-q="{{ q }}">
-  <div class="d-flex justify-content-between align-items-center mb-2 gap-2 flex-wrap">
+     data-q="{{ q }}" data-state="{{ state }}">
+  <div class="mb-2">
     <input type="search" class="form-control form-control-sm nso-if-filter"
-           placeholder="Filter interfaces by name…" value="{{ q }}" autocomplete="off"
+           placeholder="Filter by interface name…" value="{{ q }}" autocomplete="off"
            style="max-width: 280px;">
-    {% if accept_all %}
-      <form method="post" action="{% url 'plugins:netbox_nso_plugin:device_bulk_accept' object.pk %}">
-        {% csrf_token %}
-        <button type="submit" class="btn btn-sm btn-warning">
-          <span class="mdi mdi-check-all"></span> Accept All Interfaces
-        </button>
-      </form>
-    {% endif %}
   </div>
 
   {% include "netbox_nso_plugin/categories/_interfaces_rows.html" %}
@@ -30,24 +22,16 @@
     var results = pager.querySelector('.nso-if-results');
     var debounce = null;
 
-    function wirePages() {
-      results.querySelectorAll('.nso-if-page').forEach(function (a) {
-        a.addEventListener('click', function (e) {
-          e.preventDefault();
-          load(pager.dataset.q || '', a.dataset.page);
-        });
-      });
-    }
-
-    function load(q, page) {
-      pager.dataset.q = q;
+    function load(q, state, page) {
+      pager.dataset.q = q; pager.dataset.state = state;
       results.innerHTML = '<div class="text-muted small py-2"><span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Loading…</div>';
-      fetch(url + '?q=' + encodeURIComponent(q) + '&page=' + page, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+      fetch(url + '?q=' + encodeURIComponent(q) + '&state=' + encodeURIComponent(state) + '&page=' + page,
+            { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
         .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); })
         .then(function (html) {
           var tmp = document.createElement('div'); tmp.innerHTML = html;
           var fresh = tmp.querySelector('.nso-if-results');
-          if (fresh) { results.replaceWith(fresh); results = fresh; wirePages(); }
+          if (fresh) { results.replaceWith(fresh); results = fresh; }
         })
         .catch(function (e) { results.innerHTML = '<div class="text-danger small">Failed to load: ' + e.message + '</div>'; });
     }
@@ -55,10 +39,16 @@
     if (filter) {
       filter.addEventListener('input', function () {
         clearTimeout(debounce);
-        debounce = setTimeout(function () { load(filter.value.trim(), 1); }, 350);
+        debounce = setTimeout(function () { load(filter.value.trim(), pager.dataset.state || 'all', 1); }, 350);
       });
     }
-    wirePages();
+    // Delegated so it survives results being swapped out.
+    pager.addEventListener('click', function (e) {
+      var chip = e.target.closest('.nso-if-state');
+      if (chip) { e.preventDefault(); load(pager.dataset.q || '', chip.dataset.state, 1); return; }
+      var pg = e.target.closest('.nso-if-page');
+      if (pg) { e.preventDefault(); load(pager.dataset.q || '', pager.dataset.state || 'all', pg.dataset.page); }
+    });
   })();
   </script>
 </div>

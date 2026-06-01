@@ -79,11 +79,12 @@
           <span class="mdi mdi-sync"></span> Sync Now
         </button>
       </form>
-      <form method="post" class="nso-action-form" data-label="Check Compliance"
+      <form method="post" class="nso-action-form" data-label="Detect Drift"
             action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_action' mgmt.pk 'check-compliance' %}">
         {% csrf_token %}
-        <button type="submit" class="btn btn-outline-primary nso-action-btn">
-          <span class="mdi mdi-check-circle-outline"></span> Check Compliance
+        <button type="submit" class="btn btn-outline-primary nso-action-btn"
+                title="Re-read the live device via NSO and flag where it differs from NetBox">
+          <span class="mdi mdi-compare-horizontal"></span> Detect Drift
         </button>
       </form>
       <form method="post" class="nso-action-form" data-label="Test Connection"
@@ -98,13 +99,6 @@
         {% csrf_token %}
         <button type="submit" class="btn btn-success nso-action-btn">
           <span class="mdi mdi-upload-network"></span> Apply Intent
-        </button>
-      </form>
-      <form method="post"
-            action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_refresh' mgmt.pk %}">
-        {% csrf_token %}
-        <button type="submit" class="btn btn-outline-info">
-          <span class="mdi mdi-refresh"></span> Refresh Compliance
         </button>
       </form>
       <form method="post"
@@ -208,10 +202,9 @@
           <span>
             <span class="mdi mdi-{{ cat.icon }} me-1"></span><strong>{{ cat.label }}</strong>
             <span class="text-muted ms-1">({{ cat.counts.total|default:0 }})</span>
-            {% if cat.counts.changed %}<span class="badge bg-warning text-dark ms-2">{{ cat.counts.changed }} changed</span>{% endif %}
-            {% if cat.counts.drifted %}<span class="badge bg-warning text-dark ms-1">{{ cat.counts.drifted }} drifted</span>{% endif %}
-            {% if cat.counts.accepted %}<span class="badge bg-info ms-1">{{ cat.counts.accepted }} accepted</span>{% endif %}
-            {% if cat.counts.apply_failed %}<span class="badge bg-danger ms-1">{{ cat.counts.apply_failed }} failed</span>{% endif %}
+            {% if cat.counts.drift %}<span class="badge bg-warning text-dark ms-2">{{ cat.counts.drift }} drift</span>{% endif %}
+            {% if cat.counts.pending %}<span class="badge bg-info ms-1">{{ cat.counts.pending }} pending apply</span>{% endif %}
+            {% if cat.counts.total and not cat.counts.drift and not cat.counts.pending %}<span class="badge bg-success ms-2">in sync</span>{% endif %}
           </span>
           <span>
             <span class="mdi mdi-refresh nso-cat-refresh me-2" role="button"

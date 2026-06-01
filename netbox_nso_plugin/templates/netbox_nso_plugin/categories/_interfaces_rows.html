@@ -1,45 +1,74 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
-{# Swappable interfaces results: table + pagination. Re-fetched on filter/page change. #}
+{# Swappable interfaces results: state chips + per-attribute table + pagination. #}
 <div class="nso-if-results">
-{% if rows %}
-  <div class="table-responsive">
-    <table class="table table-hover table-sm mb-2">
-      <thead><tr><th>Interface</th><th>Description</th><th>Enabled</th></tr></thead>
-      <tbody>
-        {% for row in rows %}
-          <tr>
-            <td>{{ row.iface.name }}</td>
-            <td>{% include "netbox_nso_plugin/categories/_iface_attr.html" with state=row.description value=row.description_value %}</td>
-            <td>{% include "netbox_nso_plugin/categories/_iface_attr.html" with state=row.enabled value=row.enabled_value %}</td>
-          </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+  <div class="btn-group btn-group-sm mb-2" role="group" aria-label="State filter">
+    <button type="button" class="btn btn-outline-secondary nso-if-state{% if state == 'all' %} active{% endif %}" data-state="all">All ({{ counts.all }})</button>
+    <button type="button" class="btn btn-outline-warning nso-if-state{% if state == 'drift' %} active{% endif %}" data-state="drift">Drift ({{ counts.drift }})</button>
+    <button type="button" class="btn btn-outline-info nso-if-state{% if state == 'pending' %} active{% endif %}" data-state="pending">Pending apply ({{ counts.pending }})</button>
+    <button type="button" class="btn btn-outline-success nso-if-state{% if state == 'in_sync' %} active{% endif %}" data-state="in_sync">In sync</button>
   </div>
-  <div class="d-flex justify-content-between align-items-center">
-    <small class="text-muted">
-      {{ page.paginator.count }} interface{{ page.paginator.count|pluralize }}{% if q %} matching “{{ q }}”{% endif %}
-      · page {{ page.number }} of {{ page.paginator.num_pages }}
-    </small>
-    <nav>
-      <ul class="pagination pagination-sm mb-0">
-        {% if page.has_previous %}
-          <li class="page-item"><a href="#" class="page-link nso-if-page" data-page="{{ page.previous_page_number }}">‹ Prev</a></li>
-        {% else %}
-          <li class="page-item disabled"><span class="page-link">‹ Prev</span></li>
-        {% endif %}
-        {% if page.has_next %}
-          <li class="page-item"><a href="#" class="page-link nso-if-page" data-page="{{ page.next_page_number }}">Next ›</a></li>
-        {% else %}
-          <li class="page-item disabled"><span class="page-link">Next ›</span></li>
-        {% endif %}
-      </ul>
-    </nav>
-  </div>
-{% else %}
-  <p class="text-muted mb-0">
-    {% if q %}No interfaces matching “{{ q }}”.{% else %}No interface state yet — click <strong>Refresh from NSO</strong> or wait for the next sync.{% endif %}
-  </p>
-{% endif %}
+
+  {% if rows %}
+    <div class="table-responsive">
+      <table class="table table-hover table-sm mb-2">
+        <thead>
+          <tr><th>Interface</th><th>Attribute</th><th>NetBox</th><th>Device (NSO)</th><th>State</th><th></th></tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+            <tr{% if row.kind == 'drift' %} class="table-warning"{% endif %}>
+              <td>{{ row.iface_name }}</td>
+              <td><code>{{ row.attribute }}</code></td>
+              <td>{{ row.netbox_value }}</td>
+              <td>{{ row.device_value }}</td>
+              <td>
+                {% if row.kind == 'drift' %}<span class="badge bg-warning text-dark">{{ row.label }}</span>
+                {% elif row.kind == 'pending' %}<span class="badge bg-info">{{ row.label }}</span>
+                {% elif row.kind == 'settled' %}<span class="badge bg-success">{{ row.label }}</span>
+                {% else %}<span class="badge bg-info">{{ row.label }}</span>{% endif %}
+              </td>
+              <td>
+                {% if row.state.status == 'changed' or row.state.status == 'imported' %}
+                  <form method="post" action="{% url 'plugins:netbox_nso_plugin:nsointerfacestate_accept' row.state.pk %}" style="display:inline">
+                    {% csrf_token %}
+                    <button type="submit" class="btn btn-sm btn-outline-warning"
+                            title="Keep the NetBox value as intent (push to the device on Apply)">
+                      <span class="mdi mdi-check"></span> {% if row.state.status == 'changed' %}Keep NetBox{% else %}Accept{% endif %}
+                    </button>
+                  </form>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="d-flex justify-content-between align-items-center">
+      <small class="text-muted">
+        {{ page.paginator.count }} row{{ page.paginator.count|pluralize }} · page {{ page.number }} of {{ page.paginator.num_pages }}
+      </small>
+      <nav>
+        <ul class="pagination pagination-sm mb-0">
+          {% if page.has_previous %}
+            <li class="page-item"><a href="#" class="page-link nso-if-page" data-page="{{ page.previous_page_number }}">‹ Prev</a></li>
+          {% else %}
+            <li class="page-item disabled"><span class="page-link">‹ Prev</span></li>
+          {% endif %}
+          {% if page.has_next %}
+            <li class="page-item"><a href="#" class="page-link nso-if-page" data-page="{{ page.next_page_number }}">Next ›</a></li>
+          {% else %}
+            <li class="page-item disabled"><span class="page-link">Next ›</span></li>
+          {% endif %}
+        </ul>
+      </nav>
+    </div>
+  {% else %}
+    <p class="text-muted mb-0">
+      {% if state == 'drift' %}No drift — the device matches NetBox.
+      {% elif state == 'pending' %}Nothing pending apply.
+      {% elif q %}No interfaces matching “{{ q }}”.
+      {% else %}No interface state yet — click <strong>Refresh from NSO</strong> or wait for the next sync.{% endif %}
+    </p>
+  {% endif %}
 </div>
