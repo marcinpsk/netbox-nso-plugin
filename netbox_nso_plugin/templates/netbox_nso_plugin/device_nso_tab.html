@@ -18,6 +18,20 @@
     </div>
   {% endif %}
 
+  {# ── What "Accept" means (read this before clicking) ───────────────────── #}
+  <div class="alert alert-info d-flex align-items-start mb-3" role="alert">
+    <span class="mdi mdi-information-outline me-2 mt-1"></span>
+    <div>
+      <strong>What does “Accept” do?</strong>
+      The values below are <strong>imported</strong> — a read-only mirror of what the
+      device currently has, as seen through NSO. Clicking <strong>Accept</strong> (or
+      <em>Accept All</em>) promotes a value to <strong>intent</strong>: NetBox becomes
+      the source of truth for it, and the adapter will keep the device matching NetBox
+      from then on. Simply viewing this page changes nothing — only an explicit Accept
+      makes NetBox govern a value.
+    </div>
+  </div>
+
   {# ── Management summary ────────────────────────────────────────────────── #}
   <div class="card mb-3">
     <h5 class="card-header d-flex justify-content-between align-items-center">

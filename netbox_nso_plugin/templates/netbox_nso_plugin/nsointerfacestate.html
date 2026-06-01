@@ -65,6 +65,12 @@
         </div>
         {% if object.status == "imported" or object.status == "changed" %}
           <div class="card-footer">
+            <p class="text-muted small mb-2">
+              <span class="mdi mdi-information-outline"></span>
+              This value is currently <strong>imported</strong> from the device.
+              <strong>Accept</strong> promotes it to <strong>intent</strong> — NetBox
+              becomes the source of truth and the adapter will keep the device matching it.
+            </p>
             <form method="post" action="{% url 'plugins:netbox_nso_plugin:nsointerfacestate_accept' object.pk %}">
               {% csrf_token %}
               <button type="submit" class="btn btn-warning">

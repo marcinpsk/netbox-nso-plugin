@@ -2,6 +2,7 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Signal handlers for NSODeviceManagement scope propagation and intent push."""
 
+import functools
 import logging
 import threading
 
@@ -39,6 +40,43 @@ def _is_adapter_origin_write() -> bool:
     if request is None:
         return False
     return request.headers.get(_ADAPTER_IMPORT_HEADER) is not None
+
+
+def _is_render_request() -> bool:
+    """Return True when the active HTTP request is a GET (a page render).
+
+    Intent pushes are mutations and must never fire as a side effect of *rendering*
+    a page. The device NSO tab's render reconcilers re-save NSO*State rows on every
+    view (to refresh display fields / ``last_sync_at``); each such save of an
+    ``accepted`` row would otherwise push the full intent snapshot to the adapter —
+    O(N) pushes per render, each O(N) — which hung the device-27 tab and re-minted
+    'accepted' rows the operator never clicked. Genuine accepts and interface edits
+    arrive as POSTs, so they still push. Returns False when there is no request
+    (programmatic / CLI / test contexts) so those keep pushing normally.
+    """
+    try:
+        from netbox.context import current_request
+
+        request = current_request.get()
+    except Exception:
+        return False
+    return request is not None and request.method == "GET"
+
+
+def _skip_on_render(handler):
+    """Drop an intent-push signal handler's effect when it fires during a GET render.
+
+    Decorator applied to every push-on-save handler so that merely viewing the NSO
+    tab never pushes intent to the adapter. See :func:`_is_render_request`.
+    """
+
+    @functools.wraps(handler)
+    def _wrapped(*args, **kwargs):
+        if _is_render_request():
+            return None
+        return handler(*args, **kwargs)
+
+    return _wrapped
 
 
 @receiver(post_save, sender="netbox_nso_plugin.NSODeviceManagement")
@@ -93,6 +131,7 @@ def offboard_device_from_adapter(sender, instance, **kwargs):
 
 
 @receiver(post_save, sender="netbox_nso_plugin.NSOInterfaceState")
+@_skip_on_render
 def push_intent_on_accept(sender, instance, **kwargs):
     """Push full intent snapshot to adapter when an interface state is accepted."""
     if instance.status != "accepted":
@@ -223,6 +262,7 @@ def _recompute_on_interface_save(sender, instance, created, **kwargs):
     _recompute_one(instance, templates)
 
 
+@_skip_on_render
 def _push_intent_on_interface_edit(sender, instance, created, **kwargs):
     """Treat direct edits to description/enabled on managed interfaces as intent.
 
@@ -407,6 +447,7 @@ def _push_snmp_intent_for_device(device_id, adapter_device_id):
         logger.warning("Failed to push SNMP intent for device %s: %s", device_id, exc)
 
 
+@_skip_on_render
 def _on_snmp_state_save(sender, instance, **kwargs):
     """Push SNMP intent whenever an SNMP state row is saved (accept triggers push)."""
     from .models import NSODeviceManagement
@@ -537,6 +578,7 @@ def _push_static_route_intent_for_device(device_id, adapter_device_id):
         logger.warning("Failed to push static route intent for device %s: %s", device_id, exc)
 
 
+@_skip_on_render
 def _on_static_route_state_save(sender, instance, **kwargs):
     """Push static route intent whenever an NSOStaticRouteState row is saved."""
     from .models import NSODeviceManagement
@@ -603,6 +645,7 @@ def _push_isis_intent_for_device(device_id, adapter_device_id):
         logger.warning("Failed to push IS-IS intent for device %s: %s", device_id, exc)
 
 
+@_skip_on_render
 def _on_isis_interface_state_save(sender, instance, **kwargs):
     """Push IS-IS interface intent whenever an NSOISISInterfaceState row is saved."""
     from .models import NSODeviceManagement
@@ -618,6 +661,7 @@ def _on_isis_interface_state_save(sender, instance, **kwargs):
     _push_isis_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
 
 
+@_skip_on_render
 def _on_isis_instance_state_save(sender, instance, **kwargs):
     """Push IS-IS intent (interfaces + processes) whenever an NSOISISInstanceState row is saved."""
     from .models import NSODeviceManagement
@@ -717,6 +761,7 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
         logger.warning("Failed to push BGP intent for device %s: %s", device_id, exc)
 
 
+@_skip_on_render
 def _on_bgp_peer_state_save(sender, instance, **kwargs):
     """Push BGP intent whenever an NSOBGPPeerState row is saved."""
     from .models import NSODeviceManagement
@@ -732,6 +777,7 @@ def _on_bgp_peer_state_save(sender, instance, **kwargs):
     _push_bgp_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
 
 
+@_skip_on_render
 def _on_redistribution_state_save(sender, instance, **kwargs):
     """Push the relevant routing protocol intent when an NSORedistributionState row is saved."""
     from .models import NSODeviceManagement
@@ -832,6 +878,7 @@ def _build_route_policy_entries(family, obj):
     return []
 
 
+@_skip_on_render
 def _on_route_policy_state_save(sender, instance, **kwargs):
     """Push route-policy intent whenever an NSORoutePolicyState row is saved."""
     from .models import NSODeviceManagement
@@ -935,6 +982,7 @@ def _push_ospf_intent_for_device(device_id, adapter_device_id):
         logger.warning("Failed to push OSPF intent for device %s: %s", device_id, exc)
 
 
+@_skip_on_render
 def _on_ospf_instance_state_save(sender, instance, **kwargs):
     """Push OSPF intent whenever an NSOOSPFInstanceState row is saved."""
     from .models import NSODeviceManagement
@@ -950,6 +998,7 @@ def _on_ospf_instance_state_save(sender, instance, **kwargs):
     _push_ospf_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
 
 
+@_skip_on_render
 def _on_ospf_interface_state_save(sender, instance, **kwargs):
     """Push OSPF intent whenever an NSOOSPFInterfaceState row is saved."""
     from .models import NSODeviceManagement
@@ -965,6 +1014,7 @@ def _on_ospf_interface_state_save(sender, instance, **kwargs):
     _push_ospf_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
 
 
+@_skip_on_render
 def _on_redistribution_fork_save(sender, instance, **kwargs):
     """Push protocol intent when a netbox_routing.Redistribution fork object is saved.
 

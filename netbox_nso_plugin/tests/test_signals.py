@@ -419,6 +419,69 @@ class TestPushIntentOnAccept(unittest.TestCase):
         mock_put.assert_not_called()
 
 
+class TestSkipOnRenderGuard(unittest.TestCase):
+    """An intent push must never fire during a GET render.
+
+    Regression for the device-27 NSO-tab loop: rendering the tab re-saves every
+    NSOInterfaceState row, and each save of an 'accepted' row pushed the full intent
+    snapshot — O(N) pushes per render, each O(N) — hanging the page and re-minting
+    accepts. The @_skip_on_render guard drops the push when current_request is a GET.
+    """
+
+    def _fire_with_method(self, method):
+        from netbox.context import current_request
+
+        from netbox_nso_plugin.signals import push_intent_on_accept
+
+        iface = MagicMock()
+        iface.device_id = 42
+        iface.name = "GigabitEthernet0/0"
+        iface.description = "uplink"
+        iface.enabled = True
+
+        state = MagicMock()
+        state.status = "accepted"
+        state.interface = iface
+        state.attribute = "description"
+        state.accepted_at = None
+
+        mgmt = MagicMock()
+        mgmt.adapter_device_id = 7
+        mock_mgmt_cls = MagicMock()
+        mock_mgmt_cls.objects.get.return_value = mgmt
+        mock_mgmt_cls.DoesNotExist = Exception
+        mock_istate_cls = MagicMock()
+        mock_istate_cls.objects.filter.return_value.select_related.return_value = [state]
+        fake_models = _fake_models_module(mock_mgmt_cls, mock_istate_cls)
+
+        req = None
+        if method is not None:
+            req = MagicMock()
+            req.method = method
+        token = current_request.set(req)
+        try:
+            with (
+                patch.dict(sys.modules, {"netbox_nso_plugin.models": fake_models}),
+                patch(f"{_MOD}.put_intent") as mock_put,
+            ):
+                push_intent_on_accept(sender=MagicMock(), instance=state)
+                return mock_put
+        finally:
+            current_request.reset(token)
+
+    def test_get_render_does_not_push(self):
+        """A GET (page render) is suppressed even for an accepted state."""
+        self._fire_with_method("GET").assert_not_called()
+
+    def test_post_accept_pushes(self):
+        """An operator accept arrives as a POST — push proceeds."""
+        self._fire_with_method("POST").assert_called_once()
+
+    def test_no_request_pushes(self):
+        """Programmatic / CLI context (no request) still pushes."""
+        self._fire_with_method(None).assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # TestIPAddressSignals — Django DB integration tests for the IP signal path
 # ---------------------------------------------------------------------------
