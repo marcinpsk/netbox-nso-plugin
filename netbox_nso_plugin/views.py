@@ -599,17 +599,33 @@ def _push_intent_for_device(device_id: int) -> None:
         logger.warning("Failed to push intent for device %s: %s", device_id, exc)
 
 
+# Statuses where the NetBox value already matches the device — accepting them
+# leaves nothing to apply.
+_MATCHING_SOURCE_STATUSES = ("imported", "in_sync")
+
+
+def _status_after_accept(source_status: str) -> str:
+    """Status a row should take when the operator accepts it.
+
+    Accepting a value that already matches the device (imported / in_sync) means
+    NetBox simply owns what's already there — nothing to push, so it stays
+    ``in_sync``. Accepting a *differing* value (changed / drifted / conflict) creates
+    real intent that the device doesn't have yet → ``accepted`` ("pending apply").
+    """
+    return "in_sync" if source_status in _MATCHING_SOURCE_STATUSES else "accepted"
+
+
 class NSOAcceptAttributeView(LoginRequiredMixin, View):
-    """Accept a single interface attribute — sets status to 'accepted' and pushes intent."""
+    """Accept a single interface attribute as NetBox intent."""
 
     def post(self, request, pk):
-        """Accept the interface state and push the updated intent snapshot to the adapter.
+        """Accept the interface state.
 
-        Note: the post_save signal on NSOInterfaceState (push_intent_on_accept) handles
-        the adapter PUT /intent call, so we do not call _push_intent_for_device here.
+        Accepting a value that matches the device → in_sync (nothing to apply);
+        a differing value → accepted, and the post_save signal pushes intent.
         """
         state = get_object_or_404(NSOInterfaceState, pk=pk)
-        state.status = "accepted"
+        state.status = _status_after_accept(state.status)
         state.accepted_at = timezone.now()
         state.save(update_fields=["status", "accepted_at"])
 
@@ -621,18 +637,23 @@ class NSOBulkAcceptView(LoginRequiredMixin, View):
     """Bulk-accept all 'changed' interface states for a device and push a single intent snapshot."""
 
     def post(self, request, device_pk):
-        """Accept all changed states for the given device."""
-        now = timezone.now()
-        updated = NSOInterfaceState.objects.filter(
-            interface__device_id=device_pk,
-            status__in=["changed", "imported"],
-        ).update(status="accepted", accepted_at=now)
+        """Accept all acceptable states for the given device.
 
-        if updated:
+        Matching (imported) values become in_sync (nothing to apply); differing
+        (changed) values become accepted and trigger a single intent push.
+        """
+        now = timezone.now()
+        base = NSOInterfaceState.objects.filter(interface__device_id=device_pk)
+        settled = base.filter(status="imported").update(status="in_sync", accepted_at=now)
+        pending = base.filter(status="changed").update(status="accepted", accepted_at=now)
+        updated = settled + pending
+
+        if pending:
             _push_intent_for_device(device_pk)
+        if updated:
             messages.success(request, f"Accepted {updated} interface attribute(s).")
         else:
-            messages.info(request, "No changed attributes to accept.")
+            messages.info(request, "No attributes to accept.")
 
         device = get_object_or_404(Device, pk=device_pk)
         return redirect(_device_nso_tab_url(device.pk))
@@ -697,7 +718,8 @@ class RoutingStateAcceptMixin(LoginRequiredMixin, View):
 
     def post(self, request, pk):  # noqa: D102
         state = get_object_or_404(self.model_class, pk=pk)
-        state.status = "accepted"
+        # Matching (imported/in_sync) → nothing to apply → in_sync; differing → accepted.
+        state.status = _status_after_accept(state.status)
         state.save(update_fields=["status"])
         messages.success(request, f"Accepted routing state {state.pk}.")
         return redirect(_device_nso_tab_url(state.management.device_id))
@@ -753,12 +775,14 @@ class RoutingBulkAcceptMixin(LoginRequiredMixin, View):
             messages.warning(request, "Device is not NSO-managed.")
             return redirect(_device_nso_tab_url(device_pk))
 
+        # These rows already match the device (imported/in_sync); accepting them just
+        # records NetBox ownership — there is nothing to apply, so they stay in_sync.
         qs = self.model_class.objects.filter(
             management=mgmt,
             status__in=["imported", "in_sync"],
         )
         count = qs.count()
-        qs.update(status="accepted")
+        qs.update(status="in_sync")
 
         if count and mgmt.adapter_device_id is not None:
             try:

@@ -825,14 +825,26 @@ class TestNSORefreshStateView(ViewTestBase):
 class TestNSOAcceptAttributeView(ViewTestBase):
     """Tests for NSOAcceptAttributeView."""
 
-    def test_post_accept_redirects(self):
-        """POST accept changes status to 'accepted' and redirects."""
+    def test_accept_changed_value_becomes_pending_apply(self):
+        """Accepting a DIFFERING value (changed) → accepted (real intent to push)."""
+        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="changed")
         url = reverse("plugins:netbox_nso_plugin:nsointerfacestate_accept", args=[self.iface_state.pk])
         with patch("netbox_nso_plugin.signals.push_intent_on_accept"):
             response = self.client.post(url)
         self.assertEqual(response.status_code, 302)
         self.iface_state.refresh_from_db()
         self.assertEqual(self.iface_state.status, "accepted")
+
+    def test_accept_matching_value_becomes_in_sync(self):
+        """Accepting a value that already matches the device (imported) → in_sync,
+        NOT pending apply — there is nothing to push (the ae2.0 fix)."""
+        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="imported")
+        url = reverse("plugins:netbox_nso_plugin:nsointerfacestate_accept", args=[self.iface_state.pk])
+        with patch("netbox_nso_plugin.signals.push_intent_on_accept"):
+            response = self.client.post(url)
+        self.assertEqual(response.status_code, 302)
+        self.iface_state.refresh_from_db()
+        self.assertEqual(self.iface_state.status, "in_sync")
 
 
 class TestNSOBulkAcceptView(ViewTestBase):
