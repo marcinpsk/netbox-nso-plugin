@@ -1,7 +1,6 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
-{# Lazy-loaded fragment: Interfaces category — paginated + name-filterable, read-only
-   from persisted NSOInterfaceState (no reconcile on expand). #}
+{# Lazy fragment: Interfaces — paginated + name-filterable, read-only from persisted state. #}
 <div class="nso-if-pager"
      data-url="{% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='interfaces' %}"
      data-q="{{ q }}">
