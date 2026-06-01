@@ -1,0 +1,93 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Lazy-loaded fragment: OSPF category (instances + interfaces). #}
+{% if adapter_error %}
+  <div class="alert alert-warning mb-2"><span class="mdi mdi-alert-outline me-1"></span>{{ adapter_error }}</div>
+{% endif %}
+
+{% if ospf_data.instances or ospf_data.interfaces %}
+  <div class="d-flex justify-content-end mb-2 gap-1">
+    <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_ospf_instances' device_pk=object.pk %}" class="d-inline">
+      {% csrf_token %}
+      <button type="submit" class="btn btn-sm btn-outline-success"><span class="mdi mdi-check-all"></span> Accept All Instances</button>
+    </form>
+    <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_ospf_interfaces' device_pk=object.pk %}" class="d-inline">
+      {% csrf_token %}
+      <button type="submit" class="btn btn-sm btn-outline-success"><span class="mdi mdi-check-all"></span> Accept All Interfaces</button>
+    </form>
+  </div>
+  {% if ospf_data.instances %}
+  <div class="table-responsive mb-3">
+    <table class="table table-sm table-hover mb-0">
+      <thead>
+        <tr><th>Process ID</th><th>VRF</th><th>Router ID</th><th>OSPF Instance</th><th>Status</th><th>Last Synced</th><th></th></tr>
+      </thead>
+      <tbody>
+        {% for oi in ospf_data.instances %}
+        <tr>
+          <td>{{ oi.process_id }}</td>
+          <td>{{ oi.vrf|default:"global" }}</td>
+          <td>{{ oi.router_id|default:"—" }}</td>
+          <td>{% if oi.ospf_instance %}<a href="{{ oi.ospf_instance.get_absolute_url }}">{{ oi.ospf_instance }}</a>{% else %}—{% endif %}</td>
+          <td>
+            {% if oi.status == "in_sync" or oi.status == "imported" %}<span class="badge bg-success">{{ oi.status }}</span>
+            {% elif oi.status == "changed" or oi.status == "conflict" %}<span class="badge bg-warning text-dark">{{ oi.status }}</span>
+            {% elif oi.status == "accepted" %}<span class="badge bg-info text-dark">accepted</span>
+            {% elif oi.status == "deploying" %}<span class="badge bg-primary">deploying</span>
+            {% elif oi.status == "apply_failed" %}<span class="badge bg-danger">apply_failed</span>
+            {% else %}<span class="badge bg-info text-dark">{{ oi.status }}</span>{% endif %}
+          </td>
+          <td>{{ oi.last_sync_at|default:"—" }}</td>
+          <td>
+            {% if oi.status == "imported" or oi.status == "in_sync" %}
+            <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_accept_ospf_instance' pk=oi.pk %}">
+              {% csrf_token %}
+              <button type="submit" class="btn btn-xs btn-outline-success" title="Accept"><span class="mdi mdi-check"></span></button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+  {% if ospf_data.interfaces %}
+  <div class="table-responsive">
+    <table class="table table-sm table-hover mb-0">
+      <thead>
+        <tr><th>Interface</th><th>Process ID</th><th>Area</th><th>Passive</th><th>Status</th><th>Last Synced</th><th></th></tr>
+      </thead>
+      <tbody>
+        {% for oif in ospf_data.interfaces %}
+        <tr>
+          <td><a href="{{ oif.interface.get_absolute_url }}">{{ oif.interface.name }}</a></td>
+          <td>{{ oif.process_id|default:"—" }}</td>
+          <td>{{ oif.area_id|default:"—" }}</td>
+          <td>{% if oif.passive %}<span class="badge bg-warning text-dark">passive</span>{% else %}<span class="badge bg-success">active</span>{% endif %}</td>
+          <td>
+            {% if oif.status == "in_sync" or oif.status == "imported" %}<span class="badge bg-success">{{ oif.status }}</span>
+            {% elif oif.status == "changed" or oif.status == "conflict" %}<span class="badge bg-warning text-dark">{{ oif.status }}</span>
+            {% elif oif.status == "accepted" %}<span class="badge bg-info text-dark">accepted</span>
+            {% elif oif.status == "deploying" %}<span class="badge bg-primary">deploying</span>
+            {% elif oif.status == "apply_failed" %}<span class="badge bg-danger">apply_failed</span>
+            {% else %}<span class="badge bg-info text-dark">{{ oif.status }}</span>{% endif %}
+          </td>
+          <td>{{ oif.last_sync_at|default:"—" }}</td>
+          <td>
+            {% if oif.status == "imported" or oif.status == "in_sync" %}
+            <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_accept_ospf_interface' pk=oif.pk %}">
+              {% csrf_token %}
+              <button type="submit" class="btn btn-xs btn-outline-success" title="Accept"><span class="mdi mdi-check"></span></button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+{% else %}
+  <p class="text-muted mb-0">No OSPF configuration.</p>
+{% endif %}

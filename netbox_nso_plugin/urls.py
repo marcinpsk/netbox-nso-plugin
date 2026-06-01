@@ -29,6 +29,12 @@ urlpatterns = [
         name="nsoinstance_journal",
         kwargs={"model": NSOInstance},
     ),
+    # Device NSO tab — lazy per-category row load (HTML fragment)
+    path(
+        "devices/<int:pk>/category/<str:key>/",
+        views.NSOCategoryView.as_view(),
+        name="device_nso_category",
+    ),
     # Device Management CRUD
     path("device-management/", views.NSODeviceManagementListView.as_view(), name="nsodevicemanagement_list"),
     path("device-management/add/", views.NSODeviceManagementEditView.as_view(), name="nsodevicemanagement_add"),

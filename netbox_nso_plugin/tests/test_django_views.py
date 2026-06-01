@@ -964,12 +964,15 @@ class TestDeviceNSOTabView(ViewTestBase):
         ):
             mocks[name].assert_not_called()
 
-    def test_tab_interfaces_only_fetches_interfaces_not_routing(self):
-        """manage_interfaces alone fetches interfaces/compliance but no routing or SNMP."""
-        mocks = self._render_tab_with_scopes(manage_interfaces=True)
-        mocks["get_interfaces"].assert_called_once()
-        mocks["get_compliance"].assert_called_once()
+    def test_tab_render_is_counts_only_no_scoped_fetches(self):
+        """The tab RENDER fetches no per-scope adapter data — only get_device for the
+        banner. Counts come from persisted NSO*State; rows (and their adapter fetches)
+        are deferred to the lazy category endpoint."""
+        mocks = self._render_tab_with_scopes(manage_interfaces=True, manage_routing=True, manage_bgp=True)
+        mocks["get_device"].assert_called_once()
         for name in (
+            "get_interfaces",
+            "get_compliance",
             "get_snmp_config",
             "get_static_routes",
             "get_isis_interfaces",
@@ -980,17 +983,52 @@ class TestDeviceNSOTabView(ViewTestBase):
         ):
             mocks[name].assert_not_called()
 
+    def _load_category(self, key, **scopes):
+        """Set scopes, GET the lazy category endpoint for *key*, return the getter mocks."""
+        mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+        mgmt.adapter_device_id = 15
+        for field in (
+            "manage_interfaces",
+            "manage_routing",
+            "manage_static",
+            "manage_isis",
+            "manage_ospf",
+            "manage_bgp",
+            "manage_route_policy",
+            "manage_redistribution",
+            "manage_snmp",
+        ):
+            setattr(mgmt, field, scopes.get(field, False))
+        mgmt.save()
+
+        stack, mocks = self._patch_all_getters()
+        with stack:
+            url = reverse("plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device.pk, "key": key})
+            self.client.get(url)
+
+        mgmt.adapter_device_id = None
+        mgmt.save(update_fields=["adapter_device_id"])
+        return mocks
+
+    def test_lazy_category_interfaces_fetches_interfaces(self):
+        """Expanding the interfaces category fetches interfaces + compliance, nothing else."""
+        mocks = self._load_category("interfaces", manage_interfaces=True)
+        mocks["get_interfaces"].assert_called_once()
+        mocks["get_compliance"].assert_called_once()
+        mocks["get_bgp_config"].assert_not_called()
+
     def test_tab_routing_master_off_skips_protocols(self):
         """A protocol flag without the routing master does not trigger its fetch."""
         mocks = self._render_tab_with_scopes(manage_isis=True, manage_bgp=True)
         mocks["get_isis_interfaces"].assert_not_called()
         mocks["get_bgp_config"].assert_not_called()
 
-    def test_tab_routing_selected_protocol_only(self):
-        """Routing master + manage_bgp fetches BGP but not other routing protocols."""
-        mocks = self._render_tab_with_scopes(manage_routing=True, manage_bgp=True)
+    def test_lazy_category_bgp_fetches_bgp_only(self):
+        """Expanding the BGP category fetches BGP but no other routing protocol."""
+        mocks = self._load_category("bgp", manage_routing=True, manage_bgp=True)
         mocks["get_bgp_config"].assert_called_once()
         for name in (
+            "get_interfaces",
             "get_static_routes",
             "get_isis_interfaces",
             "get_route_policy",

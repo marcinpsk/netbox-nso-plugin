@@ -1,0 +1,50 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Lazy-loaded fragment: Static Routes category. #}
+{% if adapter_error %}
+  <div class="alert alert-warning mb-2"><span class="mdi mdi-alert-outline me-1"></span>{{ adapter_error }}</div>
+{% endif %}
+{% if static_routes %}
+  <div class="d-flex justify-content-end mb-2">
+    <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_static_routes' device_pk=object.pk %}">
+      {% csrf_token %}
+      <button type="submit" class="btn btn-sm btn-outline-success"><span class="mdi mdi-check-all"></span> Accept All</button>
+    </form>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-sm table-hover mb-0">
+      <thead>
+        <tr><th>VRF</th><th>Prefix</th><th>Next Hop</th><th>Metric</th><th>Status</th><th>Last Synced</th><th></th></tr>
+      </thead>
+      <tbody>
+        {% for sr in static_routes %}
+        <tr>
+          <td>{{ sr.nso_vrf|default:"global" }}</td>
+          <td><a href="{{ sr.static_route.get_absolute_url }}">{{ sr.nso_prefix }}</a></td>
+          <td>{{ sr.nso_next_hop|default:"—" }}</td>
+          <td>{{ sr.static_route.metric }}</td>
+          <td>
+            {% if sr.status == "in_sync" or sr.status == "imported" %}<span class="badge bg-success">{{ sr.status }}</span>
+            {% elif sr.status == "changed" or sr.status == "conflict" %}<span class="badge bg-warning text-dark">{{ sr.status }}</span>
+            {% elif sr.status == "accepted" %}<span class="badge bg-info text-dark">accepted</span>
+            {% elif sr.status == "deploying" %}<span class="badge bg-primary">deploying</span>
+            {% elif sr.status == "apply_failed" or sr.status == "error" %}<span class="badge bg-danger">{{ sr.status }}</span>
+            {% else %}<span class="badge bg-info text-dark">{{ sr.status }}</span>{% endif %}
+          </td>
+          <td>{{ sr.last_sync_at|default:"—" }}</td>
+          <td>
+            {% if sr.status == "imported" or sr.status == "in_sync" %}
+            <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_accept_static_route' pk=sr.pk %}">
+              {% csrf_token %}
+              <button type="submit" class="btn btn-xs btn-outline-success" title="Accept"><span class="mdi mdi-check"></span></button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% else %}
+  <p class="text-muted mb-0">No static routes.</p>
+{% endif %}

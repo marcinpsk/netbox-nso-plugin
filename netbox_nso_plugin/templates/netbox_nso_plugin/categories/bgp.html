@@ -1,0 +1,51 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Lazy-loaded fragment: BGP Peers category. #}
+{% if adapter_error %}
+  <div class="alert alert-warning mb-2"><span class="mdi mdi-alert-outline me-1"></span>{{ adapter_error }}</div>
+{% endif %}
+{% if bgp_peers %}
+  <div class="d-flex justify-content-end mb-2">
+    <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_bgp_peers' device_pk=object.pk %}">
+      {% csrf_token %}
+      <button type="submit" class="btn btn-sm btn-outline-success"><span class="mdi mdi-check-all"></span> Accept All</button>
+    </form>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-sm table-hover mb-0">
+      <thead>
+        <tr><th>ASN</th><th>VRF</th><th>Peer Address</th><th>Remote AS</th><th>BGP Peer</th><th>Status</th><th>Last Synced</th><th></th></tr>
+      </thead>
+      <tbody>
+        {% for bp in bgp_peers %}
+        <tr>
+          <td>{{ bp.asn_str }}</td>
+          <td>{{ bp.vrf_name|default:"global" }}</td>
+          <td>{{ bp.peer_address_str }}</td>
+          <td>{{ bp.remote_as_str|default:"—" }}</td>
+          <td>{% if bp.bgp_peer %}<a href="{{ bp.bgp_peer.get_absolute_url }}">{{ bp.bgp_peer }}</a>{% else %}—{% endif %}</td>
+          <td>
+            {% if bp.status == "in_sync" or bp.status == "imported" %}<span class="badge bg-success">{{ bp.status }}</span>
+            {% elif bp.status == "changed" or bp.status == "conflict" %}<span class="badge bg-warning text-dark">{{ bp.status }}</span>
+            {% elif bp.status == "accepted" %}<span class="badge bg-info text-dark">accepted</span>
+            {% elif bp.status == "deploying" %}<span class="badge bg-primary">deploying</span>
+            {% elif bp.status == "apply_failed" %}<span class="badge bg-danger">apply_failed</span>
+            {% else %}<span class="badge bg-info text-dark">{{ bp.status }}</span>{% endif %}
+          </td>
+          <td>{{ bp.last_sync_at|default:"—" }}</td>
+          <td>
+            {% if bp.status == "imported" or bp.status == "in_sync" %}
+            <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_accept_bgp_peer' pk=bp.pk %}">
+              {% csrf_token %}
+              <button type="submit" class="btn btn-xs btn-outline-success" title="Accept"><span class="mdi mdi-check"></span></button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% else %}
+  <p class="text-muted mb-0">No BGP peers.</p>
+{% endif %}

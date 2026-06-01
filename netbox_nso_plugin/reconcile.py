@@ -100,6 +100,57 @@ def reconcile_device(device, mgmt=None) -> dict:
     return ctx
 
 
+def reconcile_category(device, mgmt, key: str) -> dict:
+    """Reconcile a SINGLE category and return its display context (for lazy expand).
+
+    Runs only the requested category's reconciler(s), suppress-wrapped (no intent
+    push). Used by the lazy-load endpoint when an operator expands one category on
+    the tab, so the page render itself stays counts-only. Raises AdapterError on
+    adapter failure — the caller renders a per-category error.
+    """
+    from . import adapter_client as client
+    from .bgp_reconciler import _reconcile_bgp_config
+    from .redistribution_reconciler import reconcile_redistribution
+    from .route_policy_reconciler import reconcile_route_policy
+    from .signals import suppress_intent_push
+    from .template_content import (
+        _reconcile_isis_interfaces,
+        _reconcile_isis_process,
+        _reconcile_ospf,
+        _reconcile_snmp_config,
+        _reconcile_static_routes,
+        _upsert_interface_states,
+    )
+
+    ctx = _empty_context()
+    if mgmt is None or mgmt.adapter_device_id is None:
+        return ctx
+    dev_id = mgmt.adapter_device_id
+
+    with suppress_intent_push():
+        if key == "interfaces":
+            ctx["interfaces"] = client.get_interfaces(dev_id)
+            ctx["compliance"] = client.get_compliance(dev_id)
+            ctx["interface_states"] = _upsert_interface_states(device, ctx["interfaces"])
+        elif key == "snmp":
+            ctx["snmp_data"] = _reconcile_snmp_config(device, client.get_snmp_config(dev_id))
+        elif key == "static":
+            ctx["static_routes"] = _reconcile_static_routes(device, client.get_static_routes(dev_id))
+        elif key == "isis":
+            isis_payload = client.get_isis_interfaces(dev_id)
+            ctx["isis_interfaces"] = _reconcile_isis_interfaces(device, isis_payload.get("interfaces", []))
+            ctx["isis_processes"] = _reconcile_isis_process(device, isis_payload.get("processes", []))
+        elif key == "ospf":
+            ctx["ospf_data"] = _reconcile_ospf(device, client.get_ospf(dev_id))
+        elif key == "bgp":
+            ctx["bgp_peers"] = _reconcile_bgp_config(device, client.get_bgp_config(dev_id))
+        elif key == "route_policy":
+            ctx["route_policy_states"] = reconcile_route_policy(device, client.get_route_policy(dev_id))
+        elif key == "redistribution":
+            ctx["redistribution_states"] = reconcile_redistribution(device, client.get_redistribution(dev_id))
+    return ctx
+
+
 # ── Off-request reconcile: RQ job fired by the adapter's sync-complete callback ──
 
 _RECONCILE_QUEUE = "default"

@@ -1,0 +1,52 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Lazy-loaded fragment: Redistribution category. #}
+{% if adapter_error %}
+  <div class="alert alert-warning mb-2"><span class="mdi mdi-alert-outline me-1"></span>{{ adapter_error }}</div>
+{% endif %}
+{% if redistribution_states %}
+  <div class="d-flex justify-content-end mb-2">
+    <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_redistribution' device_pk=object.pk %}">
+      {% csrf_token %}
+      <button type="submit" class="btn btn-sm btn-outline-success"><span class="mdi mdi-check-all"></span> Accept All</button>
+    </form>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-sm table-hover mb-0">
+      <thead>
+        <tr><th>Dest Protocol</th><th>Dest Ref</th><th>Source Protocol</th><th>Source Ref</th><th>Route Map</th><th>Metric</th><th>Status</th><th>Last Synced</th><th></th></tr>
+      </thead>
+      <tbody>
+        {% for rs in redistribution_states %}
+        <tr>
+          <td>{{ rs.dest_protocol }}</td>
+          <td>{{ rs.dest_ref|default:"—" }}</td>
+          <td>{{ rs.source_protocol }}</td>
+          <td>{{ rs.source_ref|default:"—" }}</td>
+          <td>{{ rs.route_map|default:"—" }}</td>
+          <td>{{ rs.metric|default:"—" }}</td>
+          <td>
+            {% if rs.status == "in_sync" or rs.status == "imported" %}<span class="badge bg-success">{{ rs.status }}</span>
+            {% elif rs.status == "changed" or rs.status == "conflict" %}<span class="badge bg-warning text-dark">{{ rs.status }}</span>
+            {% elif rs.status == "accepted" %}<span class="badge bg-info text-dark">accepted</span>
+            {% elif rs.status == "deploying" %}<span class="badge bg-primary">deploying</span>
+            {% elif rs.status == "apply_failed" %}<span class="badge bg-danger">apply_failed</span>
+            {% else %}<span class="badge bg-info text-dark">{{ rs.status }}</span>{% endif %}
+          </td>
+          <td>{{ rs.last_sync_at|default:"—" }}</td>
+          <td>
+            {% if rs.status == "imported" or rs.status == "in_sync" %}
+            <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_accept_redistribution' pk=rs.pk %}">
+              {% csrf_token %}
+              <button type="submit" class="btn btn-xs btn-outline-success" title="Accept"><span class="mdi mdi-check"></span></button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% else %}
+  <p class="text-muted mb-0">No redistribution.</p>
+{% endif %}

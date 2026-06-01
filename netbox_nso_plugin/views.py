@@ -5,8 +5,8 @@ import logging
 from dcim.models import Device
 from django.contrib import messages
 from django.contrib.auth.mixins import LoginRequiredMixin
-from django.http import JsonResponse
-from django.shortcuts import get_object_or_404, redirect
+from django.http import HttpResponseBadRequest, JsonResponse
+from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils import timezone
 from django.views import View
@@ -80,15 +80,17 @@ class DeviceNSOTabView(generic.ObjectView):
     )
 
     def get_extra_context(self, request, instance):
-        """Build the device NSO tab context: reconcile adapter state, then render.
+        """Counts-first, read-only tab render.
 
-        The reconcile (adapter → NSO*State writes) is delegated to
-        :func:`reconcile.reconcile_device`, which is suppress-wrapped so it never
-        pushes intent — the same callable the background sync-complete job and the
-        manual Refresh actions use.
+        Per-category counts come from persisted NSO*State (cheap aggregates — NO
+        adapter calls, NO reconcile writes), so opening the tab is instant even for a
+        2000+ interface device. Rows load lazily when a category is expanded
+        (:class:`NSOCategoryView`). The persisted cache is refreshed off-render by the
+        sync-complete background job. A single cheap ``get_device()`` drives the
+        connection / last-sync banner and is the only adapter touch here.
         """
         from .adapter_client import AdapterError
-        from .reconcile import _empty_context, reconcile_device
+        from .summary import category_summaries
         from .template_content import _STATUS_BADGE
 
         device = instance
@@ -97,32 +99,73 @@ class DeviceNSOTabView(generic.ObjectView):
         except Exception:
             mgmt = None
 
-        ctx = _empty_context()
         adapter_error = None
         adapter_error_code = None
-
         if mgmt is not None and mgmt.adapter_device_id is not None:
             from . import adapter_client as client
 
             try:
-                adapter_device = client.get_device(mgmt.adapter_device_id)
-                ctx = reconcile_device(device, mgmt)
-                _refresh_sync_cache(mgmt, adapter_device)
+                _refresh_sync_cache(mgmt, client.get_device(mgmt.adapter_device_id))
             except AdapterError as exc:
                 adapter_error = str(exc)
                 adapter_error_code = exc.code
                 logger.debug("Adapter unavailable for device %s: %s", device.pk, exc)
-                snapshot = mgmt.compliance_snapshot or {}
-                ctx["interfaces"] = snapshot.get("interfaces")
-                ctx["compliance"] = snapshot.get("compliance")
 
         return {
             "mgmt": mgmt,
+            "nso_categories": category_summaries(device, mgmt),
             "adapter_error": adapter_error,
             "adapter_error_code": adapter_error_code,
             "status_badge": _STATUS_BADGE,
-            **ctx,
         }
+
+
+# ── Lazy category load: rows for one expanded category (HTML fragment) ─────────
+
+
+class NSOCategoryView(LoginRequiredMixin, View):
+    """Return one category's rows for the device NSO tab, fetched on expand.
+
+    The tab renders counts-first; when an operator expands a category, the browser
+    GETs this view, which does a push-suppressed scoped reconcile of just that
+    category and renders its partial. Keeps the page render itself counts-only.
+
+    URL: /plugins/nso/devices/<pk>/category/<key>/
+    """
+
+    _PARTIALS = {
+        "interfaces": "netbox_nso_plugin/categories/interfaces.html",
+        "static": "netbox_nso_plugin/categories/static.html",
+        "isis": "netbox_nso_plugin/categories/isis.html",
+        "ospf": "netbox_nso_plugin/categories/ospf.html",
+        "bgp": "netbox_nso_plugin/categories/bgp.html",
+        "route_policy": "netbox_nso_plugin/categories/route_policy.html",
+        "redistribution": "netbox_nso_plugin/categories/redistribution.html",
+    }
+
+    def get(self, request, pk, key):
+        """Reconcile the requested category (suppressed) and render its partial."""
+        from .reconcile import reconcile_category
+        from .template_content import _STATUS_BADGE
+
+        partial = self._PARTIALS.get(key)
+        if partial is None:
+            return HttpResponseBadRequest(f"unknown category: {key}")
+
+        device = get_object_or_404(Device, pk=pk)
+        try:
+            mgmt = device.nso_management
+        except Exception:
+            mgmt = None
+
+        ctx = {"object": device, "mgmt": mgmt, "status_badge": _STATUS_BADGE}
+        if mgmt is not None and mgmt.adapter_device_id is not None:
+            try:
+                ctx.update(reconcile_category(device, mgmt, key))
+            except AdapterError as exc:
+                ctx["adapter_error"] = str(exc)
+                ctx["adapter_error_code"] = exc.code
+        return render(request, partial, ctx)
 
 
 # ── AJAX: NSO device names for match form datalist ────────────────────────────

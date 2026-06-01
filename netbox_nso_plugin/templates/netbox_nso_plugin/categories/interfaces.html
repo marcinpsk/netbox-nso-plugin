@@ -1,0 +1,120 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Lazy-loaded fragment: Interfaces category (compliance summary + per-interface table). #}
+{% if adapter_error %}
+  <div class="alert alert-warning mb-2"><span class="mdi mdi-alert-outline me-1"></span>{{ adapter_error }}</div>
+{% endif %}
+
+{% if compliance %}
+  <table class="table table-hover attr-table mb-3">
+    <tr><th>Managed Interfaces</th><td>{{ compliance.managed_interfaces }}</td></tr>
+    {% with s=compliance.by_status %}
+      <tr><th colspan="2" class="text-muted small fw-normal border-0 pb-0">Status by managed attribute</th></tr>
+      {% if s.in_sync    %}<tr><th>In Sync</th>    <td><span class="badge bg-success">{{ s.in_sync }}</span></td></tr>{% endif %}
+      {% if s.imported   %}<tr><th>Imported</th>   <td><span class="badge bg-success">{{ s.imported }}</span></td></tr>{% endif %}
+      {% if s.changed    %}<tr><th>Changed</th>    <td><span class="badge bg-warning text-dark">{{ s.changed }}</span></td></tr>{% endif %}
+      {% if s.drifted    %}<tr><th>Drifted</th>    <td><span class="badge bg-warning text-dark">{{ s.drifted }}</span></td></tr>{% endif %}
+      {% if s.accepted   %}<tr><th>Accepted</th>   <td><span class="badge bg-info">{{ s.accepted }}</span></td></tr>{% endif %}
+      {% if s.deploying  %}<tr><th>Deploying</th>  <td><span class="badge bg-primary">{{ s.deploying }}</span></td></tr>{% endif %}
+      {% if s.apply_failed %}<tr><th>Apply Failed</th><td><span class="badge bg-danger">{{ s.apply_failed }}</span></td></tr>{% endif %}
+      {% if s.error      %}<tr><th>Error</th>      <td><span class="badge bg-danger">{{ s.error }}</span></td></tr>{% endif %}
+      {% if s.unknown    %}<tr><th>Unknown</th>    <td><span class="badge bg-info">{{ s.unknown }}</span></td></tr>{% endif %}
+    {% endwith %}
+    {% if compliance.last_checked_at %}<tr><th>Last Checked</th><td>{{ compliance.last_checked_at }}</td></tr>{% endif %}
+  </table>
+{% endif %}
+
+{% if interfaces %}
+  <div class="table-responsive">
+    <table class="table table-hover table-headings mb-0">
+      <thead>
+        <tr><th>Interface</th><th>Description</th><th>Enabled</th></tr>
+      </thead>
+      <tbody>
+        {% for iface in interfaces %}
+          <tr>
+            <td>{{ iface.name }}</td>
+            <td>
+              {% with a=iface.attrs.description %}
+                {% if a %}
+                  {% if a.status == "in_sync" or a.status == "imported" %}<span class="badge bg-success">{{ a.status }}</span>
+                  {% elif a.status == "changed" or a.status == "drifted" %}<span class="badge bg-warning text-dark">{{ a.status }}</span>
+                  {% elif a.status == "error" or a.status == "apply_failed" %}<span class="badge bg-danger">{{ a.status }}</span>
+                  {% elif a.status == "accepted" %}<span class="badge bg-info">{{ a.status }}</span>
+                  {% elif a.status == "deploying" %}<span class="badge bg-primary">{{ a.status }}</span>
+                  {% else %}<span class="badge bg-info">{{ a.status }}</span>{% endif %}
+                  <small class="text-muted ms-1">{{ a.netbox_value|default:"—" }}</small>
+                  {% if a.status == "imported" or a.status == "changed" %}
+                    <span class="nso-accept-placeholder" data-iface="{{ iface.name }}" data-attr="description"></span>
+                  {% endif %}
+                {% else %}—{% endif %}
+              {% endwith %}
+            </td>
+            <td>
+              {% with a=iface.attrs.enabled %}
+                {% if a %}
+                  {% if a.status == "in_sync" or a.status == "imported" %}<span class="badge bg-success">{{ a.status }}</span>
+                  {% elif a.status == "changed" or a.status == "drifted" %}<span class="badge bg-warning text-dark">{{ a.status }}</span>
+                  {% elif a.status == "error" or a.status == "apply_failed" %}<span class="badge bg-danger">{{ a.status }}</span>
+                  {% elif a.status == "accepted" %}<span class="badge bg-info">{{ a.status }}</span>
+                  {% elif a.status == "deploying" %}<span class="badge bg-primary">{{ a.status }}</span>
+                  {% else %}<span class="badge bg-info">{{ a.status }}</span>{% endif %}
+                  <small class="text-muted ms-1">{{ a.netbox_value }}</small>
+                  {% if a.status == "imported" or a.status == "changed" %}
+                    <span class="nso-accept-placeholder" data-iface="{{ iface.name }}" data-attr="enabled"></span>
+                  {% endif %}
+                {% else %}—{% endif %}
+              {% endwith %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <script>
+  (function () {
+    "use strict";
+    var csrfToken = (document.querySelector('[name=csrfmiddlewaretoken]') || {}).value ||
+                    (document.cookie.match(/csrftoken=([^;]+)/) || [])[1] || '';
+    var stateMap = {
+      {% for key, state in interface_states.items %}"{{ key.0 }}__{{ key.1 }}": {"pk": {{ state.pk }}, "status": "{{ state.status }}"}{% if not forloop.last %},{% endif %}
+      {% endfor %}
+    };
+    var hasChanged = Object.values(stateMap).some(function (s) { return s.status === 'changed' || s.status === 'imported'; });
+    var placeholder = document.getElementById('nso-bulk-accept-placeholder');
+    if (hasChanged && placeholder && !placeholder.querySelector('form')) {
+      var bulkForm = document.createElement('form');
+      bulkForm.method = 'post';
+      bulkForm.action = '{% url "plugins:netbox_nso_plugin:device_bulk_accept" object.pk %}';
+      var csrf2 = document.createElement('input');
+      csrf2.type = 'hidden'; csrf2.name = 'csrfmiddlewaretoken'; csrf2.value = csrfToken;
+      var bulkBtn = document.createElement('button');
+      bulkBtn.type = 'submit'; bulkBtn.className = 'btn btn-warning';
+      bulkBtn.innerHTML = '<span class="mdi mdi-check-all"></span> Accept All Interfaces';
+      bulkForm.appendChild(csrf2); bulkForm.appendChild(bulkBtn);
+      placeholder.appendChild(bulkForm);
+    }
+    document.querySelectorAll('.nso-accept-placeholder').forEach(function (el) {
+      if (el.querySelector('form')) return;
+      var key = el.dataset.iface + '__' + el.dataset.attr;
+      var entry = stateMap[key];
+      if (!entry || (entry.status !== 'changed' && entry.status !== 'imported')) return;
+      var form = document.createElement('form');
+      form.method = 'post';
+      form.action = '/plugins/nso/interface-state/' + entry.pk + '/accept/';
+      form.style.display = 'inline';
+      var csrf = document.createElement('input');
+      csrf.type = 'hidden'; csrf.name = 'csrfmiddlewaretoken'; csrf.value = csrfToken;
+      var btn = document.createElement('button');
+      btn.type = 'submit'; btn.className = 'btn btn-sm btn-outline-warning ms-1';
+      btn.title = 'Accept this change and push intent to adapter';
+      btn.innerHTML = '<span class="mdi mdi-check"></span> Accept';
+      form.appendChild(csrf); form.appendChild(btn);
+      el.appendChild(form);
+    });
+  })();
+  </script>
+{% else %}
+  <p class="text-muted mb-0">No interface data available.</p>
+{% endif %}
