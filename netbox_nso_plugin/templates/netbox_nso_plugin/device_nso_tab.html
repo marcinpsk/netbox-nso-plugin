@@ -95,7 +95,7 @@
         </button>
       </form>
       <form method="post" class="nso-action-form nso-apply-form" data-label="Apply Intent"
-            data-preview-url="{% url 'plugins:netbox_nso_plugin:device_apply_preview' mgmt.pk %}"
+            data-preview-url="{% url 'plugins:netbox_nso_plugin:device_apply_preview' object.pk %}"
             action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_action' mgmt.pk 'apply' %}">
         {% csrf_token %}
         <button type="submit" class="btn btn-success nso-action-btn">
@@ -125,21 +125,20 @@
     </div>
   </div>
 
-  {# ── Apply confirmation modal (preview of what will be pushed) ──────────── #}
-  <div class="modal fade" id="nso-apply-modal" tabindex="-1" aria-hidden="true">
-    <div class="modal-dialog modal-lg modal-dialog-scrollable">
-      <div class="modal-content">
-        <div class="modal-header">
-          <h5 class="modal-title"><span class="mdi mdi-upload-network me-1"></span>Apply intent to the device</h5>
-          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
-        </div>
-        <div class="modal-body" id="nso-apply-modal-body"></div>
-        <div class="modal-footer">
-          <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
-          <button type="button" class="btn btn-success" id="nso-apply-confirm">
-            <span class="mdi mdi-check"></span> Confirm Apply
-          </button>
-        </div>
+  {# ── Apply confirmation modal (self-contained overlay; no Bootstrap-JS dep) ── #}
+  <div id="nso-apply-modal" class="d-none"
+       style="position:fixed; inset:0; z-index:1080; background:rgba(0,0,0,.5); align-items:flex-start; justify-content:center;">
+    <div class="card shadow" style="max-width:760px; width:92%; margin-top:5rem; max-height:80vh; display:flex; flex-direction:column;">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <span><span class="mdi mdi-upload-network me-1"></span>Apply intent to the device</span>
+        <button type="button" class="btn-close nso-apply-cancel" aria-label="Close"></button>
+      </div>
+      <div class="card-body" style="overflow:auto;" id="nso-apply-modal-body"></div>
+      <div class="card-footer d-flex justify-content-end gap-2">
+        <button type="button" class="btn btn-outline-secondary nso-apply-cancel">Cancel</button>
+        <button type="button" class="btn btn-success" id="nso-apply-confirm">
+          <span class="mdi mdi-check"></span> Confirm Apply
+        </button>
       </div>
     </div>
   </div>
@@ -206,9 +205,13 @@
     // ── Apply Intent: preview-then-confirm ──
     var applyForm = document.querySelector('.nso-apply-form');
     var modalEl = document.getElementById('nso-apply-modal');
-    var modal = (window.bootstrap && modalEl) ? new window.bootstrap.Modal(modalEl) : null;
     var modalBody = document.getElementById('nso-apply-modal-body');
     var confirmBtn = document.getElementById('nso-apply-confirm');
+
+    function showModal() { if (modalEl) { modalEl.classList.remove('d-none'); modalEl.style.display = 'flex'; } }
+    function hideModal() { if (modalEl) { modalEl.classList.add('d-none'); modalEl.style.display = 'none'; } }
+    document.querySelectorAll('.nso-apply-cancel').forEach(function (b) { b.addEventListener('click', hideModal); });
+    if (modalEl) { modalEl.addEventListener('click', function (e) { if (e.target === modalEl) hideModal(); }); }
 
     function esc(s) { var d = document.createElement('div'); d.textContent = (s == null ? '' : String(s)); return d.innerHTML; }
 
@@ -232,12 +235,12 @@
         var r = await fetch(applyForm.dataset.previewUrl, { headers: { 'X-Requested-With': 'XMLHttpRequest' } });
         var d = await r.json();
         if (d.auto_apply || !d.total) { runAction(applyForm); return; }  // auto-apply or nothing pending → just go
-        if (modal) { modalBody.innerHTML = renderPreview(d); modal.show(); }
-        else if (window.confirm(d.total + ' change(s) will be pushed to the device. Continue?')) { runAction(applyForm); }
+        modalBody.innerHTML = renderPreview(d);
+        showModal();
       } catch (e) { setStatus('Could not load apply preview: ' + e.message, 'warning', false); }
     }
 
-    if (confirmBtn) { confirmBtn.addEventListener('click', function () { if (modal) modal.hide(); runAction(applyForm); }); }
+    if (confirmBtn) { confirmBtn.addEventListener('click', function () { hideModal(); runAction(applyForm); }); }
 
     document.querySelectorAll('.nso-action-form').forEach(function (form) {
       form.addEventListener('submit', function (e) {
