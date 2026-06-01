@@ -16,6 +16,35 @@ logger = logging.getLogger(__name__)
 # premature intent pushes during P2P IPAddress pair reservation.
 _p2p_allocation_active = threading.local()
 
+# Thread-local flag set by suppress_intent_push() around any reconcile/import that
+# mirrors adapter state into the plugin's NSO*State tables. Such writes are NOT
+# operator intent — they must never push intent back to the adapter. This is the
+# single authoritative guard for the reconcile path (render today, the background
+# reconcile job and the manual Refresh buttons next); see _skip_on_render.
+_intent_push_suppressed = threading.local()
+
+
+def _is_intent_push_suppressed() -> bool:
+    return getattr(_intent_push_suppressed, "active", False)
+
+
+class suppress_intent_push:  # noqa: N801 — context-manager named like a verb on purpose
+    """Context manager: silence intent-push signals for the duration of a reconcile.
+
+    Wrap any code path that writes NSO*State rows from adapter data (the reconcilers)
+    so that mirroring adapter state never fires a push back to the adapter. Reentrant.
+    """
+
+    def __enter__(self):
+        self._prev = getattr(_intent_push_suppressed, "active", False)
+        _intent_push_suppressed.active = True
+        return self
+
+    def __exit__(self, *exc):
+        _intent_push_suppressed.active = self._prev
+        return False
+
+
 # Header the nso-adapter sets on every write it makes to NetBox. Such writes are
 # imports/applies (adapter-origin), NOT operator intent edits, so the Decision-G
 # signal must not promote them to 'accepted' or push them back as intent.
@@ -72,7 +101,10 @@ def _skip_on_render(handler):
 
     @functools.wraps(handler)
     def _wrapped(*args, **kwargs):
-        if _is_render_request():
+        # suppress_intent_push() (the reconcile/import path) is the authoritative
+        # guard; the GET-render check is a belt-and-suspenders for the legacy
+        # render-time reconcile and becomes redundant once render is read-only.
+        if _is_intent_push_suppressed() or _is_render_request():
             return None
         return handler(*args, **kwargs)
 

@@ -80,9 +80,16 @@ class DeviceNSOTabView(generic.ObjectView):
     )
 
     def get_extra_context(self, request, instance):
-        """Fetch NSO management status, interfaces, compliance, and SNMP from the adapter."""
+        """Build the device NSO tab context: reconcile adapter state, then render.
+
+        The reconcile (adapter → NSO*State writes) is delegated to
+        :func:`reconcile.reconcile_device`, which is suppress-wrapped so it never
+        pushes intent — the same callable the background sync-complete job and the
+        manual Refresh actions use.
+        """
         from .adapter_client import AdapterError
-        from .template_content import _STATUS_BADGE, _upsert_interface_states
+        from .reconcile import _empty_context, reconcile_device
+        from .template_content import _STATUS_BADGE
 
         device = instance
         try:
@@ -90,107 +97,32 @@ class DeviceNSOTabView(generic.ObjectView):
         except Exception:
             mgmt = None
 
-        interfaces = None
-        compliance = None
+        ctx = _empty_context()
         adapter_error = None
         adapter_error_code = None
-        interface_states: dict = {}
-        snmp_data: dict = {}
-        routing = self._empty_routing_context()
 
         if mgmt is not None and mgmt.adapter_device_id is not None:
             from . import adapter_client as client
 
             try:
                 adapter_device = client.get_device(mgmt.adapter_device_id)
-
-                from .template_content import _reconcile_snmp_config
-
-                # Only fetch the scopes this device opted into. Each scope is
-                # gated by its master (manage_interfaces / manage_routing) and,
-                # for routing, its per-protocol leaf flag — the kill-switch
-                # model (see NSODeviceManagement.managed_scopes).
-                if mgmt.manage_interfaces:
-                    interfaces = client.get_interfaces(mgmt.adapter_device_id)
-                    compliance = client.get_compliance(mgmt.adapter_device_id)
-                    interface_states = _upsert_interface_states(device, interfaces)
-
-                if mgmt.manage_snmp:
-                    snmp_payload = client.get_snmp_config(mgmt.adapter_device_id)
-                    snmp_data = _reconcile_snmp_config(device, snmp_payload)
-
-                routing = self._reconcile_routing_scopes(device, mgmt, client)
-
+                ctx = reconcile_device(device, mgmt)
                 _refresh_sync_cache(mgmt, adapter_device)
             except AdapterError as exc:
                 adapter_error = str(exc)
                 adapter_error_code = exc.code
                 logger.debug("Adapter unavailable for device %s: %s", device.pk, exc)
                 snapshot = mgmt.compliance_snapshot or {}
-                interfaces = snapshot.get("interfaces")
-                compliance = snapshot.get("compliance")
+                ctx["interfaces"] = snapshot.get("interfaces")
+                ctx["compliance"] = snapshot.get("compliance")
 
         return {
             "mgmt": mgmt,
-            "interfaces": interfaces,
-            "compliance": compliance,
             "adapter_error": adapter_error,
             "adapter_error_code": adapter_error_code,
-            "interface_states": interface_states,
             "status_badge": _STATUS_BADGE,
-            "snmp_data": snmp_data,
-            **routing,
+            **ctx,
         }
-
-    @staticmethod
-    def _empty_routing_context():
-        """Default (no-op) routing-scope context used before/without reconcile."""
-        return {
-            "static_routes": [],
-            "isis_interfaces": [],
-            "isis_processes": [],
-            "route_policy_states": [],
-            "ospf_data": {"instances": [], "interfaces": []},
-            "redistribution_states": [],
-            "bgp_peers": [],
-        }
-
-    def _reconcile_routing_scopes(self, device, mgmt, client):
-        """Reconcile each opted-in routing protocol for this device.
-
-        Every protocol is gated by its master (manage_routing) AND its leaf
-        flag — the kill-switch model (see NSODeviceManagement.managed_scopes).
-        """
-        from .bgp_reconciler import _reconcile_bgp_config
-        from .redistribution_reconciler import reconcile_redistribution
-        from .route_policy_reconciler import reconcile_route_policy
-        from .template_content import (
-            _reconcile_isis_interfaces,
-            _reconcile_isis_process,
-            _reconcile_ospf,
-            _reconcile_static_routes,
-        )
-
-        ctx = self._empty_routing_context()
-        if not mgmt.manage_routing:
-            return ctx
-        dev_id = mgmt.adapter_device_id
-
-        if mgmt.manage_static:
-            ctx["static_routes"] = _reconcile_static_routes(device, client.get_static_routes(dev_id))
-        if mgmt.manage_isis:
-            isis_payload = client.get_isis_interfaces(dev_id)
-            ctx["isis_interfaces"] = _reconcile_isis_interfaces(device, isis_payload.get("interfaces", []))
-            ctx["isis_processes"] = _reconcile_isis_process(device, isis_payload.get("processes", []))
-        if mgmt.manage_route_policy:
-            ctx["route_policy_states"] = reconcile_route_policy(device, client.get_route_policy(dev_id))
-        if mgmt.manage_ospf:
-            ctx["ospf_data"] = _reconcile_ospf(device, client.get_ospf(dev_id))
-        if mgmt.manage_redistribution:
-            ctx["redistribution_states"] = reconcile_redistribution(device, client.get_redistribution(dev_id))
-        if mgmt.manage_bgp:
-            ctx["bgp_peers"] = _reconcile_bgp_config(device, client.get_bgp_config(dev_id))
-        return ctx
 
 
 # ── AJAX: NSO device names for match form datalist ────────────────────────────
