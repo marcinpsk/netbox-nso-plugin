@@ -620,6 +620,7 @@ def _reconcile_isis_interfaces(device, interfaces: list) -> list:
     iface_map = {i.name: i for i in Interface.objects.filter(device=device)}
     now = timezone.now()
     seen_keys: set[tuple] = set()
+    dropped: list[str] = []
 
     for entry in interfaces or []:
         iface_name = entry.get("interface_name") or ""
@@ -629,7 +630,11 @@ def _reconcile_isis_interfaces(device, interfaces: list) -> list:
 
         iface = iface_map.get(iface_name)
         if iface is None:
-            logger.debug("Interface %r not found in NetBox; skipping IS-IS entry", iface_name)
+            # The interface the adapter reports does not exist in NetBox — most
+            # often a logical unit (e.g. Junos ae98.100) that is not yet modelled
+            # as a dcim.Interface. Record it so the drop is visible rather than
+            # silent (see docs/junos-subinterface-modeling-plan.md).
+            dropped.append(iface_name)
             continue
 
         state, _ = NSOISISInterfaceState.objects.get_or_create(
@@ -654,6 +659,14 @@ def _reconcile_isis_interfaces(device, interfaces: list) -> list:
         if (stale.interface_id, stale.af) not in seen_keys:
             stale.status = "changed"
             stale.save(update_fields=["status"])
+
+    if dropped:
+        logger.warning(
+            "IS-IS reconcile for %s: %d interface(s) not found in NetBox, dropped: %s",
+            device,
+            len(dropped),
+            ", ".join(sorted(set(dropped))),
+        )
 
     return list(NSOISISInterfaceState.objects.filter(management=mgmt).select_related("interface"))
 
@@ -692,8 +705,11 @@ def _reconcile_isis_process(device, process_list: list) -> list:
         isis_instances = {}
 
     for entry in process_list or []:
-        tag = entry.get("process_tag") or ""
-        if not tag:
+        # Junos' default IS-IS instance has an empty process tag — "" is a valid
+        # key (NSOISISInstanceState.process_tag defaults to ""). Only skip an
+        # entry that genuinely omits the field.
+        tag = entry.get("process_tag")
+        if tag is None:
             continue
 
         state, _ = NSOISISInstanceState.objects.get_or_create(
@@ -747,7 +763,6 @@ def _reconcile_ospf(device, payload: dict) -> dict:
 
     Returns {"instances": [...], "interfaces": [...]}.
     """
-    from dcim.models import Interface
     from django.utils import timezone
 
     from .models import NSODeviceManagement, NSOOSPFInstanceState, NSOOSPFInterfaceState
@@ -796,9 +811,29 @@ def _reconcile_ospf(device, payload: dict) -> dict:
             stale.status = "changed"
             stale.save(update_fields=["status"])
 
-    # ── Interface reconcile ──
+    _reconcile_ospf_interfaces(device, mgmt, payload, now, _OSPF_WRITE_PATH)
+
+    return {
+        "instances": list(NSOOSPFInstanceState.objects.filter(management=mgmt).select_related("ospf_instance")),
+        "interfaces": list(NSOOSPFInterfaceState.objects.filter(management=mgmt).select_related("interface")),
+    }
+
+
+def _reconcile_ospf_interfaces(device, mgmt, payload, now, write_path_statuses) -> None:
+    """Reconcile the OSPF interface section of *payload* into NSOOSPFInterfaceState rows.
+
+    Split out of _reconcile_ospf to keep that function under the complexity gate.
+    Interfaces the adapter reports but NetBox lacks (usually unmodelled logical
+    units — see docs/junos-subinterface-modeling-plan.md) are counted and logged
+    rather than silently dropped.
+    """
+    from dcim.models import Interface
+
+    from .models import NSOOSPFInterfaceState
+
     iface_map = {i.name: i for i in Interface.objects.filter(device=device)}
     seen_iface_pks: set[int] = set()
+    dropped: list[str] = []
 
     for entry in payload.get("interfaces") or []:
         iface_name = entry.get("interface_name") or ""
@@ -806,7 +841,7 @@ def _reconcile_ospf(device, payload: dict) -> dict:
             continue
         iface = iface_map.get(iface_name)
         if iface is None:
-            logger.debug("Interface %r not found in NetBox; skipping OSPF entry", iface_name)
+            dropped.append(iface_name)
             continue
         state, _ = NSOOSPFInterfaceState.objects.get_or_create(
             management=mgmt,
@@ -822,7 +857,7 @@ def _reconcile_ospf(device, payload: dict) -> dict:
         state.auth_type = entry.get("auth_type") or ""
         state.auth_present = bool(entry.get("auth_present", False))
         state.last_sync_at = now
-        if state.status not in _OSPF_WRITE_PATH:
+        if state.status not in write_path_statuses:
             state.status = "imported"
         state.save()
         seen_iface_pks.add(iface.pk)
@@ -832,10 +867,13 @@ def _reconcile_ospf(device, payload: dict) -> dict:
             stale.status = "changed"
             stale.save(update_fields=["status"])
 
-    return {
-        "instances": list(NSOOSPFInstanceState.objects.filter(management=mgmt).select_related("ospf_instance")),
-        "interfaces": list(NSOOSPFInterfaceState.objects.filter(management=mgmt).select_related("interface")),
-    }
+    if dropped:
+        logger.warning(
+            "OSPF reconcile for %s: %d interface(s) not found in NetBox, dropped: %s",
+            device,
+            len(dropped),
+            ", ".join(sorted(set(dropped))),
+        )
 
 
 def _reconcile_redistribution(device, payload: dict) -> list:

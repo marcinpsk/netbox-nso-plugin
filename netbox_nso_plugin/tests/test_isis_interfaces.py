@@ -292,3 +292,57 @@ class TestReconcileIsisInterfaces(TestCase):
             self.device, self._payload({"interface_name": "GigabitEthernet0/0", "af": ""})
         )
         self.assertEqual(result, [])
+
+
+class TestReconcileIsisProcess(TestCase):
+    """Tests for _reconcile_isis_process() — esp. Junos' empty default process tag."""
+
+    @classmethod
+    def setUpTestData(cls):
+        manufacturer = Manufacturer.objects.create(name="IsisProcMfg", slug="isisprocmfg")
+        device_type = DeviceType.objects.create(manufacturer=manufacturer, model="IsisProcDev", slug="isisprocdev")
+        role = DeviceRole.objects.create(name="IsisProcRole", slug="isisprocrole")
+        site = Site.objects.create(name="IsisProcSite", slug="isisprocsite")
+        cls.device = Device.objects.create(name="isis-proc-router", device_type=device_type, role=role, site=site)
+
+    def _make_mgmt(self):
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+        inst, _ = NSOInstance.objects.get_or_create(
+            name="isis-proc-inst", defaults={"adapter_instance_id": "isis-proc-inst"}
+        )
+        return NSODeviceManagement.objects.get_or_create(
+            device=self.device,
+            defaults={"nso_instance": inst, "nso_device_name": "isis-proc-dev", "adapter_device_id": self.device.pk},
+        )[0]
+
+    def test_empty_process_tag_creates_row(self):
+        """Junos' default IS-IS instance has process_tag='' — it must still be stored."""
+        self._make_mgmt()
+        from netbox_nso_plugin.models import NSOISISInstanceState
+        from netbox_nso_plugin.template_content import _reconcile_isis_process
+
+        result = _reconcile_isis_process(
+            self.device,
+            [{"process_tag": "", "net": "", "is_type": "level-1-2"}],
+        )
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].process_tag, "")
+        self.assertEqual(NSOISISInstanceState.objects.filter(management__device=self.device).count(), 1)
+
+    def test_absent_process_tag_skipped(self):
+        """An entry that genuinely omits process_tag (None) is skipped."""
+        self._make_mgmt()
+        from netbox_nso_plugin.template_content import _reconcile_isis_process
+
+        result = _reconcile_isis_process(self.device, [{"net": "", "is_type": "level-2"}])
+        self.assertEqual(result, [])
+
+    def test_named_process_tag_creates_row(self):
+        """A named process tag is stored as before."""
+        self._make_mgmt()
+        from netbox_nso_plugin.template_content import _reconcile_isis_process
+
+        result = _reconcile_isis_process(self.device, [{"process_tag": "CORE", "net": "", "is_type": "level-2"}])
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].process_tag, "CORE")
