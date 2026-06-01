@@ -15,6 +15,31 @@ logger = logging.getLogger(__name__)
 # premature intent pushes during P2P IPAddress pair reservation.
 _p2p_allocation_active = threading.local()
 
+# Header the nso-adapter sets on every write it makes to NetBox. Such writes are
+# imports/applies (adapter-origin), NOT operator intent edits, so the Decision-G
+# signal must not promote them to 'accepted' or push them back as intent.
+_ADAPTER_IMPORT_HEADER = "X-NSO-Adapter-Import"
+
+
+def _is_adapter_origin_write() -> bool:
+    """Return True if the current request is an adapter-origin write (carries the import header).
+
+    Origin — not content — is the correct discriminator: an import that writes a
+    *changed* value and an operator edit to the *same* value leave identical
+    interface state; only the request origin distinguishes them. The adapter runs
+    in a separate process, so a thread-local can't reach here; the marker rides on
+    the HTTP request via NetBox's current_request contextvar.
+    """
+    try:
+        from netbox.context import current_request
+
+        request = current_request.get()
+    except Exception:
+        return False
+    if request is None:
+        return False
+    return request.headers.get(_ADAPTER_IMPORT_HEADER) is not None
+
 
 @receiver(post_save, sender="netbox_nso_plugin.NSODeviceManagement")
 def sync_scope_to_adapter(sender, instance, created, **kwargs):
@@ -190,6 +215,8 @@ def _recompute_on_cable_delete(sender, instance, **kwargs):
 
 def _recompute_on_interface_save(sender, instance, created, **kwargs):
     """Recompute description when an interface is saved (description may have changed)."""
+    if _is_adapter_origin_write():
+        return  # adapter import — not an operator edit; don't recompute derived intent
     templates = _templates()
     if not templates:
         return
@@ -206,9 +233,17 @@ def _push_intent_on_interface_edit(sender, instance, created, **kwargs):
 
     Decision G (activated in Phase 2): editing description/enabled on a managed
     interface IS an intent change — identical to an explicit Accept action.
+
+    Adapter-origin writes (imports/applies) are skipped: importing a value is not
+    an operator accept, and re-promoting + pushing it back would both corrupt the
+    imported→accepted gate and, during a bulk sync, fire one full-device intent
+    push per interface (the device-27 sync wall).
     """
     if created:
         return  # new interface — nothing to accept yet
+
+    if _is_adapter_origin_write():
+        return  # import/apply, not an operator intent edit
 
     from .models import NSODeviceManagement, NSOInterfaceState
 

@@ -563,5 +563,80 @@ try:
                 address="10.1.3.1/28", assigned_object_type=self._ct(), assigned_object_id=self.iface.pk
             )
 
+    class TestGActivatedInterfaceIntentOrigin(DjangoTestCase):
+        """Decision-G intent signal discriminates operator edits from adapter imports."""
+
+        @classmethod
+        def setUpTestData(cls):
+            from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
+
+            from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOInterfaceState
+
+            mfg = Manufacturer.objects.create(name="GsigMfg", slug="gsigmfg")
+            dt = DeviceType.objects.create(manufacturer=mfg, model="GsigDev", slug="gsigdev")
+            role = DeviceRole.objects.create(name="GsigRole", slug="gsigrole")
+            site = Site.objects.create(name="GsigSite", slug="gsigsite")
+            cls.device = Device.objects.create(name="gsig-router", device_type=dt, role=role, site=site)
+            cls.iface = Interface.objects.create(device=cls.device, name="GigabitEthernet0/0", type="1000base-t")
+            inst = NSOInstance.objects.create(name="GsigNSO", adapter_instance_id="nso-gsig")
+            NSODeviceManagement.objects.bulk_create(
+                [
+                    NSODeviceManagement(
+                        device=cls.device,
+                        nso_instance=inst,
+                        nso_device_name="gsig-router",
+                        adapter_device_id=77,
+                        manage_description=True,
+                        manage_enabled=True,
+                        custom_field_data={},
+                    )
+                ]
+            )
+            # An imported (not-yet-accepted) state the signal could promote.
+            NSOInterfaceState.objects.create(
+                interface=cls.iface, attribute="description", status="imported", nso_value="old"
+            )
+
+        def _fire(self, header=None):
+            """Invoke the G-activated handler with an optional request header set."""
+            from netbox.context import current_request
+
+            from netbox_nso_plugin.signals import _push_intent_on_interface_edit
+
+            req = None
+            if header is not None:
+                from unittest.mock import MagicMock
+
+                req = MagicMock()
+                req.headers = header
+            token = current_request.set(req)
+            try:
+                with patch("netbox_nso_plugin.adapter_client.put_intent") as mock_put:
+                    _push_intent_on_interface_edit(None, self.iface, created=False)
+                    return mock_put
+            finally:
+                current_request.reset(token)
+
+        def _state(self):
+            from netbox_nso_plugin.models import NSOInterfaceState
+
+            return NSOInterfaceState.objects.get(interface=self.iface, attribute="description")
+
+        def test_operator_edit_promotes_and_pushes(self):
+            """A normal (non-adapter) edit promotes imported→accepted and pushes intent.
+
+            (put_intent may fire more than once — the state's own post_save also
+            pushes — so assert it was called, not the exact count.)
+            """
+            mock_put = self._fire(header=None)
+            self.assertEqual(self._state().status, "accepted")
+            mock_put.assert_called()
+
+        def test_adapter_origin_edit_is_skipped(self):
+            """An adapter-origin write (import header) does NOT promote or push."""
+            mock_put = self._fire(header={"X-NSO-Adapter-Import": "1"})
+            self.assertEqual(self._state().status, "imported")  # unchanged
+            mock_put.assert_not_called()
+
 except ImportError:
     pass  # Outside devcontainer — Django not available; tests skipped
