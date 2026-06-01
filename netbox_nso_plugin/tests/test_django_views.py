@@ -131,9 +131,9 @@ class TestNSODeviceManagementListView(ViewTestBase):
         response = self.client.get(url)
         self.assertEqual(response.status_code, 200)
 
-        # Poll hit get_device (not /interfaces or /compliance — list is lightweight).
+        # Poll hit get_device (not /interfaces or /state — list is lightweight).
         self.assertTrue(any(u.endswith("/devices/16") for u in calls), calls)
-        self.assertFalse(any("/compliance" in u or "/interfaces" in u for u in calls), calls)
+        self.assertFalse(any("/state" in u or "/interfaces" in u for u in calls), calls)
 
         mgmt.refresh_from_db()
         self.assertEqual(mgmt.last_sync_status, "succeeded")
@@ -747,8 +747,8 @@ class TestNSODeviceActionView(ViewTestBase):
 # ── Refresh compliance view ──────────────────────────────────────────────────────
 
 
-class TestNSORefreshComplianceView(ViewTestBase):
-    """Tests for NSORefreshComplianceView."""
+class TestNSORefreshStateView(ViewTestBase):
+    """Tests for NSORefreshStateView."""
 
     def test_post_no_adapter_id_redirects(self):
         """POST when not onboarded redirects with warning."""
@@ -886,7 +886,7 @@ class TestDeviceNSOTabView(ViewTestBase):
         names = [
             "get_device",
             "get_interfaces",
-            "get_compliance",
+            "get_state",
             "get_snmp_config",
             "get_static_routes",
             "get_isis_interfaces",
@@ -899,7 +899,7 @@ class TestDeviceNSOTabView(ViewTestBase):
         mocks = {}
         for name in names:
             m = stack.enter_context(patch(f"netbox_nso_plugin.adapter_client.{name}"))
-            m.return_value = {} if name in ("get_device", "get_compliance", "get_snmp_config") else []
+            m.return_value = {} if name in ("get_device", "get_state", "get_snmp_config") else []
             mocks[name] = m
         mocks["get_device"].return_value = {"id": 15, "last_sync_at": None, "last_sync_status": ""}
         mocks["get_isis_interfaces"].return_value = {"interfaces": [], "processes": []}
@@ -953,7 +953,7 @@ class TestDeviceNSOTabView(ViewTestBase):
         mocks["get_device"].assert_called_once()
         for name in (
             "get_interfaces",
-            "get_compliance",
+            "get_state",
             "get_snmp_config",
             "get_static_routes",
             "get_isis_interfaces",
@@ -972,7 +972,7 @@ class TestDeviceNSOTabView(ViewTestBase):
         mocks["get_device"].assert_called_once()
         for name in (
             "get_interfaces",
-            "get_compliance",
+            "get_state",
             "get_snmp_config",
             "get_static_routes",
             "get_isis_interfaces",
@@ -1014,7 +1014,7 @@ class TestDeviceNSOTabView(ViewTestBase):
         """The interfaces category loads paginated from persisted state — NO adapter call."""
         mocks = self._load_category("interfaces", manage_interfaces=True)
         mocks["get_interfaces"].assert_not_called()
-        mocks["get_compliance"].assert_not_called()
+        mocks["get_state"].assert_not_called()
 
     def test_interfaces_page_paginates_filters_and_states(self):
         """The per-attribute interfaces view paginates, name-filters, and state-filters."""
@@ -1122,7 +1122,7 @@ class TestDeviceNSOTabView(ViewTestBase):
                 # GET /devices/{id}/interfaces → list
                 resp.content = b"[]"
                 resp.json.return_value = []
-            elif "/compliance" in url:
+            elif "/state" in url:
                 resp.content = b"{}"
                 resp.json.return_value = {
                     "device_id": 15,
@@ -1173,7 +1173,7 @@ class TestDeviceNSOTabView(ViewTestBase):
             if "/interfaces" in url:
                 resp.content = b"[]"
                 resp.json.return_value = []
-            elif "/compliance" in url:
+            elif "/state" in url:
                 resp.content = b"{}"
                 resp.json.return_value = {
                     "device_id": 16,
@@ -1207,11 +1207,11 @@ class TestDeviceNSOTabView(ViewTestBase):
     @patch("netbox_nso_plugin.adapter_client._resolve_config")
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_device_nso_tab_adapter_error_uses_snapshot(self, mock_session_cls, mock_cfg):
-        """DeviceNSOTabView falls back to compliance_snapshot on AdapterError."""
+        """DeviceNSOTabView falls back to state_snapshot on AdapterError."""
         mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
         mgmt.adapter_device_id = 17
-        mgmt.compliance_snapshot = {"interfaces": [{"name": "eth0"}], "compliance": {"compliant": False}}
-        mgmt.save(update_fields=["adapter_device_id", "compliance_snapshot"])
+        mgmt.state_snapshot = {"interfaces": [{"name": "eth0"}], "compliance": {"compliant": False}}
+        mgmt.save(update_fields=["adapter_device_id", "state_snapshot"])
 
         mock_cfg.return_value = {
             "url": "http://adapter",
@@ -1234,8 +1234,8 @@ class TestDeviceNSOTabView(ViewTestBase):
         self.assertIn(response.status_code, [200, 302])
 
         mgmt.adapter_device_id = None
-        mgmt.compliance_snapshot = None
-        mgmt.save(update_fields=["adapter_device_id", "compliance_snapshot"])
+        mgmt.state_snapshot = None
+        mgmt.save(update_fields=["adapter_device_id", "state_snapshot"])
 
 
 # ── _push_intent_for_device ────────────────────────────────────────────────────────

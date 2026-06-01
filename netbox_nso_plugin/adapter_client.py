@@ -258,9 +258,9 @@ def put_ospf_intent(adapter_device_id: int, payload: dict) -> dict:
     return _request("PUT", f"/api/v1/devices/{adapter_device_id}/ospf-intent", json=payload)
 
 
-def get_compliance(adapter_device_id):
-    """GET /api/v1/devices/{id}/compliance."""
-    return _request("GET", f"/api/v1/devices/{adapter_device_id}/compliance")
+def get_state(adapter_device_id):
+    """GET /api/v1/devices/{id}/state."""
+    return _request("GET", f"/api/v1/devices/{adapter_device_id}/state")
 
 
 def trigger_sync(adapter_device_id):
@@ -268,9 +268,9 @@ def trigger_sync(adapter_device_id):
     return _request("POST", f"/api/v1/devices/{adapter_device_id}/actions/sync")
 
 
-def trigger_check_compliance(adapter_device_id):
-    """POST /api/v1/devices/{id}/actions/check-compliance → job_id."""
-    return _request("POST", f"/api/v1/devices/{adapter_device_id}/actions/check-compliance")
+def trigger_detect_drift(adapter_device_id):
+    """POST /api/v1/devices/{id}/actions/detect-drift → job_id."""
+    return _request("POST", f"/api/v1/devices/{adapter_device_id}/actions/detect-drift")
 
 
 def trigger_connect(adapter_device_id):

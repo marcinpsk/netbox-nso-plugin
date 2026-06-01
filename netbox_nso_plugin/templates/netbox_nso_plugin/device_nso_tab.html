@@ -80,7 +80,7 @@
         </button>
       </form>
       <form method="post" class="nso-action-form" data-label="Detect Drift"
-            action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_action' mgmt.pk 'check-compliance' %}">
+            action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_action' mgmt.pk 'detect-drift' %}">
         {% csrf_token %}
         <button type="submit" class="btn btn-outline-primary nso-action-btn"
                 title="Re-read the live device via NSO and flag where it differs from NetBox">

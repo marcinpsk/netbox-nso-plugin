@@ -319,12 +319,12 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
-    def test_get_compliance(self, mock_s, _cfg):
-        from netbox_nso_plugin.adapter_client import get_compliance
+    def test_get_state(self, mock_s, _cfg):
+        from netbox_nso_plugin.adapter_client import get_state
 
         session = self._make_session(200, {"in_sync": 3, "changed": 1})
         mock_s.return_value = session
-        result = get_compliance(5)
+        result = get_state(5)
         self.assertEqual(result["in_sync"], 3)
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
@@ -341,15 +341,15 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
-    def test_trigger_check_compliance(self, mock_s, _cfg):
-        from netbox_nso_plugin.adapter_client import trigger_check_compliance
+    def test_trigger_detect_drift(self, mock_s, _cfg):
+        from netbox_nso_plugin.adapter_client import trigger_detect_drift
 
         session = self._make_session(202, {"job_id": 12})
         mock_s.return_value = session
-        result = trigger_check_compliance(5)
+        result = trigger_detect_drift(5)
         self.assertEqual(result["job_id"], 12)
         args, _ = session.request.call_args
-        self.assertIn("check-compliance", args[1])
+        self.assertIn("detect-drift", args[1])
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")

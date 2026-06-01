@@ -67,7 +67,7 @@ urlpatterns = [
         name="nsodevicemanagement_journal",
         kwargs={"model": NSODeviceManagement},
     ),
-    # Adapter actions (sync / check-compliance / connect / apply)
+    # Adapter actions (sync / detect-drift / connect / apply)
     path(
         "device-management/<int:pk>/actions/<str:action>/",
         views.NSODeviceActionView.as_view(),
@@ -76,7 +76,7 @@ urlpatterns = [
     # Compliance refresh (fetches live data and updates snapshot)
     path(
         "device-management/<int:pk>/refresh/",
-        views.NSORefreshComplianceView.as_view(),
+        views.NSORefreshStateView.as_view(),
         name="nsodevicemanagement_refresh",
     ),
     # Adapter job status (JSON, for client-side polling)

@@ -92,7 +92,7 @@ def reconcile_device(device, mgmt=None) -> dict:
     with suppress_intent_push():
         if mgmt.manage_interfaces:
             ctx["interfaces"] = client.get_interfaces(dev_id)
-            ctx["compliance"] = client.get_compliance(dev_id)
+            ctx["state"] = client.get_state(dev_id)
             ctx["interface_states"] = _upsert_interface_states(device, ctx["interfaces"])
         if mgmt.manage_snmp:
             ctx["snmp_data"] = _reconcile_snmp_config(device, client.get_snmp_config(dev_id))
@@ -130,7 +130,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:
     with suppress_intent_push():
         if key == "interfaces":
             ctx["interfaces"] = client.get_interfaces(dev_id)
-            ctx["compliance"] = client.get_compliance(dev_id)
+            ctx["state"] = client.get_state(dev_id)
             ctx["interface_states"] = _upsert_interface_states(device, ctx["interfaces"])
         elif key == "snmp":
             ctx["snmp_data"] = _reconcile_snmp_config(device, client.get_snmp_config(dev_id))

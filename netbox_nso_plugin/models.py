@@ -199,10 +199,10 @@ class NSODeviceManagement(NetBoxModel):
     )
     last_sync_at = models.DateTimeField(null=True, blank=True)
     last_sync_status = models.CharField(max_length=50, blank=True, default="")
-    compliance_snapshot = models.JSONField(
+    state_snapshot = models.JSONField(
         null=True,
         blank=True,
-        help_text="Cached compliance counts and per-interface statuses from the last sync.",
+        help_text="Cached sync-state counts and per-interface statuses from the last sync.",
     )
 
     class Meta:

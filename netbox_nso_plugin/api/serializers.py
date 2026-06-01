@@ -50,7 +50,7 @@ class NSODeviceManagementSerializer(NetBoxModelSerializer):
             "adapter_device_id",
             "last_sync_at",
             "last_sync_status",
-            "compliance_snapshot",
+            "state_snapshot",
             "tags",
             "custom_fields",
             "created",

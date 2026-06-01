@@ -367,12 +367,12 @@ class NSODeviceManagementView(generic.ObjectView):
         if instance.adapter_device_id is not None:
             try:
                 interfaces = client.get_interfaces(instance.adapter_device_id)
-                compliance = client.get_compliance(instance.adapter_device_id)
+                compliance = client.get_state(instance.adapter_device_id)
             except AdapterError as exc:
                 adapter_error = str(exc)
                 adapter_error_code = exc.code
                 # Fall back to snapshot so the page remains useful
-                snapshot = instance.compliance_snapshot or {}
+                snapshot = instance.state_snapshot or {}
                 interfaces = snapshot.get("interfaces")
                 compliance = snapshot.get("compliance")
 
@@ -402,14 +402,14 @@ class NSODeviceManagementDeleteView(generic.ObjectDeleteView):
 
 _ACTION_LABELS = {
     "sync": "Sync",
-    "check-compliance": "Check Compliance",
+    "detect-drift": "Detect Drift",
     "connect": "Test Connection",
     "apply": "Apply Intent",
 }
 
 
 class NSODeviceActionView(LoginRequiredMixin, View):
-    """Trigger an adapter action (sync / check-compliance / connect) via POST."""
+    """Trigger an adapter action (sync / detect-drift / connect) via POST."""
 
     def post(self, request, pk, action):
         """Fire the requested action against the nso-adapter and redirect back."""
@@ -434,7 +434,7 @@ class NSODeviceActionView(LoginRequiredMixin, View):
 
         action_fn = {
             "sync": client.trigger_sync,
-            "check-compliance": client.trigger_check_compliance,
+            "detect-drift": client.trigger_detect_drift,
             "connect": client.trigger_connect,
             "apply": client.trigger_apply,
         }[action]
@@ -479,11 +479,11 @@ class NSOJobStatusView(LoginRequiredMixin, View):
             return JsonResponse({"error": str(exc)}, status=502)
 
 
-class NSORefreshComplianceView(LoginRequiredMixin, View):
+class NSORefreshStateView(LoginRequiredMixin, View):
     """Fetch live compliance + interface data from the adapter and cache it."""
 
     def post(self, request, pk):
-        """Call the adapter and update compliance_snapshot on the management record."""
+        """Call the adapter and update state_snapshot on the management record."""
         from . import adapter_client as client
 
         mgmt = get_object_or_404(NSODeviceManagement, pk=pk)
@@ -493,10 +493,10 @@ class NSORefreshComplianceView(LoginRequiredMixin, View):
             return redirect(_device_nso_tab_url(mgmt.device.pk))
 
         try:
-            compliance = client.get_compliance(mgmt.adapter_device_id)
+            compliance = client.get_state(mgmt.adapter_device_id)
             interfaces = client.get_interfaces(mgmt.adapter_device_id)
             NSODeviceManagement.objects.filter(pk=mgmt.pk).update(
-                compliance_snapshot={
+                state_snapshot={
                     "compliance": compliance,
                     "interfaces": interfaces,
                     "refreshed_at": timezone.now().isoformat(),
