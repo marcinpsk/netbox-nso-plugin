@@ -133,8 +133,8 @@ class NSOCategoryView(LoginRequiredMixin, View):
     URL: /plugins/nso/devices/<pk>/category/<key>/
     """
 
+    # interfaces is handled by _render_interfaces_page (paginated); the rest reconcile-on-expand.
     _PARTIALS = {
-        "interfaces": "netbox_nso_plugin/categories/interfaces.html",
         "static": "netbox_nso_plugin/categories/static.html",
         "isis": "netbox_nso_plugin/categories/isis.html",
         "ospf": "netbox_nso_plugin/categories/ospf.html",
@@ -143,8 +143,22 @@ class NSOCategoryView(LoginRequiredMixin, View):
         "redistribution": "netbox_nso_plugin/categories/redistribution.html",
     }
 
+    # Rows-per-page for the (potentially huge) interfaces table.
+    _INTERFACES_PER_PAGE = 50
+
     def get(self, request, pk, key):
-        """Reconcile the requested category (suppressed) and render its partial."""
+        """Render one category's rows.
+
+        Interfaces (potentially thousands) are served read-only and **paginated +
+        name-filterable** straight from persisted NSOInterfaceState — no reconcile,
+        so a page loads in milliseconds. The cache is refreshed off-render by the
+        sync-complete job or the Refresh button. Routing categories are small, so
+        they keep the on-expand suppressed scoped reconcile.
+        """
+        device = get_object_or_404(Device, pk=pk)
+        if key == "interfaces":
+            return self._render_interfaces_page(request, device)
+
         from .reconcile import reconcile_category
         from .template_content import _STATUS_BADGE
 
@@ -152,7 +166,6 @@ class NSOCategoryView(LoginRequiredMixin, View):
         if partial is None:
             return HttpResponseBadRequest(f"unknown category: {key}")
 
-        device = get_object_or_404(Device, pk=pk)
         try:
             mgmt = device.nso_management
         except Exception:
@@ -166,6 +179,49 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 ctx["adapter_error"] = str(exc)
                 ctx["adapter_error_code"] = exc.code
         return render(request, partial, ctx)
+
+    def _render_interfaces_page(self, request, device):
+        """Paginated, name-filterable, read-only interfaces table from persisted state."""
+        from dcim.models import Interface
+        from django.core.paginator import Paginator
+
+        from .models import NSOInterfaceState
+
+        q = (request.GET.get("q") or "").strip()
+        ifaces = Interface.objects.filter(device=device).order_by("name")
+        if q:
+            ifaces = ifaces.filter(name__icontains=q)
+
+        paginator = Paginator(ifaces, self._INTERFACES_PER_PAGE)
+        page = paginator.get_page(request.GET.get("page") or 1)
+
+        # One query for the states of just this page's interfaces.
+        states = NSOInterfaceState.objects.filter(interface__in=list(page.object_list))
+        by_iface: dict = {}
+        for s in states:
+            by_iface.setdefault(s.interface_id, {})[s.attribute] = s
+
+        rows = [
+            {
+                "iface": iface,
+                "description": by_iface.get(iface.id, {}).get("description"),
+                "description_value": iface.description or "—",
+                "enabled": by_iface.get(iface.id, {}).get("enabled"),
+                "enabled_value": "Yes" if iface.enabled else "No",
+            }
+            for iface in page.object_list
+        ]
+
+        # Show "Accept All" only when something on the device is actually acceptable.
+        accept_all = NSOInterfaceState.objects.filter(
+            interface__device=device, status__in=("imported", "changed")
+        ).exists()
+
+        return render(
+            request,
+            "netbox_nso_plugin/categories/interfaces_page.html",
+            {"object": device, "rows": rows, "page": page, "paginator": paginator, "q": q, "accept_all": accept_all},
+        )
 
 
 # ── AJAX: NSO device names for match form datalist ────────────────────────────

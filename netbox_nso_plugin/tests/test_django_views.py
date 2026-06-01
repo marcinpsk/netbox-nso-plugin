@@ -1010,12 +1010,46 @@ class TestDeviceNSOTabView(ViewTestBase):
         mgmt.save(update_fields=["adapter_device_id"])
         return mocks
 
-    def test_lazy_category_interfaces_fetches_interfaces(self):
-        """Expanding the interfaces category fetches interfaces + compliance, nothing else."""
+    def test_lazy_category_interfaces_is_read_only_no_adapter_fetch(self):
+        """The interfaces category loads paginated from persisted state — NO adapter call."""
         mocks = self._load_category("interfaces", manage_interfaces=True)
-        mocks["get_interfaces"].assert_called_once()
-        mocks["get_compliance"].assert_called_once()
-        mocks["get_bgp_config"].assert_not_called()
+        mocks["get_interfaces"].assert_not_called()
+        mocks["get_compliance"].assert_not_called()
+
+    def test_interfaces_page_paginates_and_filters(self):
+        """The interfaces fragment paginates persisted state and filters by name."""
+        from dcim.models import Interface
+
+        from netbox_nso_plugin.models import NSOInterfaceState
+
+        # 120 interfaces (> one 50-row page); one carries an acceptable state.
+        for n in range(120):
+            iface = Interface.objects.create(device=self.device, name=f"et-0/0/{n}", type="other")
+            if n == 0:
+                NSOInterfaceState.objects.create(
+                    interface=iface, attribute="description", status="imported", nso_value="uplink"
+                )
+        url = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device.pk, "key": "interfaces"}
+        )
+
+        r1 = self.client.get(url)
+        self.assertEqual(r1.status_code, 200)
+        body1 = r1.content.decode()
+        self.assertIn("nso-if-filter", body1)  # filter box present
+        self.assertIn("et-0/0/0", body1)
+        self.assertNotIn("et-0/0/60", body1)  # second page only
+
+        # page 2 shows later interfaces
+        body2 = self.client.get(url, {"page": 2}).content.decode()
+        self.assertIn("et-0/0/60", body2)
+
+        # filter narrows the set
+        bodyf = self.client.get(url, {"q": "et-0/0/119"}).content.decode()
+        self.assertIn("et-0/0/119", bodyf)
+        self.assertNotIn("et-0/0/0<", bodyf)
+
+        Interface.objects.filter(device=self.device, name__startswith="et-0/0/").delete()
 
     def test_tab_routing_master_off_skips_protocols(self):
         """A protocol flag without the routing master does not trigger its fetch."""

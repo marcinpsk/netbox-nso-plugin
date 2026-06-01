@@ -1,0 +1,20 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# One interface attribute cell: status badge + value + accept button. Expects `state`, `value`. #}
+{% if state %}
+  {% if state.status == "in_sync" or state.status == "imported" %}<span class="badge bg-success">{{ state.status }}</span>
+  {% elif state.status == "changed" or state.status == "drifted" %}<span class="badge bg-warning text-dark">{{ state.status }}</span>
+  {% elif state.status == "error" or state.status == "apply_failed" %}<span class="badge bg-danger">{{ state.status }}</span>
+  {% elif state.status == "accepted" %}<span class="badge bg-info">{{ state.status }}</span>
+  {% elif state.status == "deploying" %}<span class="badge bg-primary">{{ state.status }}</span>
+  {% else %}<span class="badge bg-info">{{ state.status }}</span>{% endif %}
+  <small class="text-muted ms-1">{{ value|default:"—" }}</small>
+  {% if state.status == "imported" or state.status == "changed" %}
+  <form method="post" action="{% url 'plugins:netbox_nso_plugin:nsointerfacestate_accept' state.pk %}" style="display:inline">
+    {% csrf_token %}
+    <button type="submit" class="btn btn-sm btn-outline-warning ms-1" title="Accept this value as intent">
+      <span class="mdi mdi-check"></span>
+    </button>
+  </form>
+  {% endif %}
+{% else %}—{% endif %}
