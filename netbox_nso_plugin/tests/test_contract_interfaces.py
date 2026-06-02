@@ -86,6 +86,8 @@ class TestInterfacesContractConsumer(TestCase):
         self.assertEqual(desc.status, "apply_failed")
         self.assertEqual(desc.nso_value, "uplink to spine-1")
         self.assertIsNotNone(desc.last_apply_at)
+        # The "Z"-suffixed UTC timestamp is parsed tz-aware, not naive (no RuntimeWarning).
+        self.assertIsNotNone(desc.last_apply_at.tzinfo)
         self.assertEqual(desc.last_apply_error, {"code": "nso_error", "message": "boom"})
 
         enabled = result[("GE0/0", "enabled")]

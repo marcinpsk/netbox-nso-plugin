@@ -49,7 +49,9 @@ def _upsert_interface_states(device, interfaces: list) -> dict:
             last_apply_at = None
             if attr_data.get("last_apply_at"):
                 try:
-                    last_apply_at = datetime.fromisoformat(attr_data["last_apply_at"].rstrip("Z"))
+                    # The adapter sends UTC ISO-8601 with a trailing "Z"; keep the zone
+                    # (don't strip it) so we store a tz-aware datetime, not a naive one.
+                    last_apply_at = datetime.fromisoformat(attr_data["last_apply_at"].replace("Z", "+00:00"))
                 except ValueError:
                     pass
 
