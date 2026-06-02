@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
+# Squashed initial migration (collapses former 0001–0018; no live deployment).
 import django.db.models.deletion
 import netbox.models.deletion
 import taggit.managers
@@ -11,11 +12,37 @@ class Migration(migrations.Migration):
     initial = True
 
     dependencies = [
-        ("dcim", "0233_device_render_config_permission"),
+        ("contenttypes", "0002_remove_content_type_name"),
+        ("dcim", "0234_cablepath_nodes_index"),
         ("extras", "0138_customfieldchoiceset_choice_colors"),
+        ("ipam", "0089_default_ordering_indexes"),
+        ("netbox_routing", "0036_m20_redistribution"),
     ]
 
     operations = [
+        migrations.CreateModel(
+            name="AdapterConnection",
+            fields=[
+                ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False)),
+                ("created", models.DateTimeField(auto_now_add=True, null=True)),
+                ("last_updated", models.DateTimeField(auto_now=True, null=True)),
+                (
+                    "custom_field_data",
+                    models.JSONField(blank=True, default=dict, encoder=utilities.json.CustomFieldJSONEncoder),
+                ),
+                ("url", models.CharField(blank=True, max_length=200)),
+                ("verify_tls", models.BooleanField(default=True)),
+                ("ca_cert_path", models.CharField(blank=True, max_length=500)),
+                ("timeout_seconds", models.PositiveIntegerField(default=30)),
+                ("enabled", models.BooleanField(default=True)),
+                ("tags", taggit.managers.TaggableManager(through="extras.TaggedItem", to="extras.Tag")),
+            ],
+            options={
+                "verbose_name": "Adapter Connection",
+                "verbose_name_plural": "Adapter Connection",
+            },
+            bases=(netbox.models.deletion.DeleteMixin, models.Model),
+        ),
         migrations.CreateModel(
             name="NSOInstance",
             fields=[
@@ -27,18 +54,9 @@ class Migration(migrations.Migration):
                     models.JSONField(blank=True, default=dict, encoder=utilities.json.CustomFieldJSONEncoder),
                 ),
                 ("name", models.CharField(max_length=100, unique=True)),
-                (
-                    "adapter_instance_id",
-                    models.CharField(
-                        help_text="The instance ID used by the nso-adapter (matches adapter config).",
-                        max_length=100,
-                        unique=True,
-                    ),
-                ),
-                (
-                    "tags",
-                    taggit.managers.TaggableManager(through="extras.TaggedItem", to="extras.Tag", related_name="+"),
-                ),
+                ("adapter_instance_id", models.CharField(max_length=100, unique=True)),
+                ("is_default", models.BooleanField(default=False)),
+                ("tags", taggit.managers.TaggableManager(through="extras.TaggedItem", to="extras.Tag")),
             ],
             options={
                 "verbose_name": "NSO Instance",
@@ -57,53 +75,30 @@ class Migration(migrations.Migration):
                     "custom_field_data",
                     models.JSONField(blank=True, default=dict, encoder=utilities.json.CustomFieldJSONEncoder),
                 ),
-                (
-                    "nso_device_name",
-                    models.CharField(
-                        help_text="Device name in NSO. Defaults to the NetBox device name.",
-                        max_length=255,
-                    ),
-                ),
-                (
-                    "manage_description",
-                    models.BooleanField(
-                        default=False,
-                        help_text="Sync interface description attribute from NSO.",
-                    ),
-                ),
-                (
-                    "manage_enabled",
-                    models.BooleanField(
-                        default=False,
-                        help_text="Sync interface enabled/shutdown attribute from NSO.",
-                    ),
-                ),
-                (
-                    "adapter_device_id",
-                    models.IntegerField(
-                        blank=True,
-                        help_text="The device ID assigned by the nso-adapter after onboarding.",
-                        null=True,
-                    ),
-                ),
+                ("nso_device_name", models.CharField(max_length=255)),
+                ("manage_description", models.BooleanField(default=False)),
+                ("manage_enabled", models.BooleanField(default=False)),
+                ("manage_interfaces", models.BooleanField(default=False)),
+                ("manage_routing", models.BooleanField(default=False)),
+                ("manage_static", models.BooleanField(default=False)),
+                ("manage_isis", models.BooleanField(default=False)),
+                ("manage_ospf", models.BooleanField(default=False)),
+                ("manage_bgp", models.BooleanField(default=False)),
+                ("manage_route_policy", models.BooleanField(default=False)),
+                ("manage_redistribution", models.BooleanField(default=False)),
+                ("manage_snmp", models.BooleanField(default=False)),
+                ("auto_apply", models.BooleanField(default=False)),
+                ("adapter_device_id", models.IntegerField(blank=True, null=True)),
                 ("last_sync_at", models.DateTimeField(blank=True, null=True)),
                 ("last_sync_status", models.CharField(blank=True, default="", max_length=50)),
-                (
-                    "compliance_snapshot",
-                    models.JSONField(
-                        blank=True,
-                        help_text="Cached compliance counts and per-interface statuses from the last sync.",
-                        null=True,
-                    ),
-                ),
+                ("state_snapshot", models.JSONField(blank=True, null=True)),
                 (
                     "device",
                     models.OneToOneField(
-                        on_delete=django.db.models.deletion.CASCADE,
-                        related_name="nso_management",
-                        to="dcim.device",
+                        on_delete=django.db.models.deletion.CASCADE, related_name="nso_management", to="dcim.device"
                     ),
                 ),
+                ("tags", taggit.managers.TaggableManager(through="extras.TaggedItem", to="extras.Tag")),
                 (
                     "nso_instance",
                     models.ForeignKey(
@@ -112,15 +107,615 @@ class Migration(migrations.Migration):
                         to="netbox_nso_plugin.nsoinstance",
                     ),
                 ),
-                (
-                    "tags",
-                    taggit.managers.TaggableManager(through="extras.TaggedItem", to="extras.Tag", related_name="+"),
-                ),
             ],
             options={
                 "verbose_name": "NSO Device Management",
                 "verbose_name_plural": "NSO Device Management",
                 "ordering": ["device"],
+            },
+            bases=(netbox.models.deletion.DeleteMixin, models.Model),
+        ),
+        migrations.CreateModel(
+            name="NSOSnmpSystemInfoState",
+            fields=[
+                ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False)),
+                ("created", models.DateTimeField(auto_now_add=True, null=True)),
+                ("last_updated", models.DateTimeField(auto_now=True, null=True)),
+                (
+                    "custom_field_data",
+                    models.JSONField(blank=True, default=dict, encoder=utilities.json.CustomFieldJSONEncoder),
+                ),
+                ("location", models.CharField(blank=True, default="", max_length=256)),
+                ("contact", models.CharField(blank=True, default="", max_length=256)),
+                ("status", models.CharField(default="unknown", max_length=32)),
+                ("last_sync_at", models.DateTimeField(blank=True, null=True)),
+                (
+                    "management",
+                    models.OneToOneField(
+                        on_delete=django.db.models.deletion.CASCADE,
+                        related_name="snmp_system_info_state",
+                        to="netbox_nso_plugin.nsodevicemanagement",
+                    ),
+                ),
+                ("tags", taggit.managers.TaggableManager(through="extras.TaggedItem", to="extras.Tag")),
+            ],
+            options={
+                "verbose_name": "NSO SNMP System Info State",
+                "verbose_name_plural": "NSO SNMP System Info States",
+            },
+            bases=(netbox.models.deletion.DeleteMixin, models.Model),
+        ),
+        migrations.CreateModel(
+            name="NSOBGPPeerState",
+            fields=[
+                ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False)),
+                ("created", models.DateTimeField(auto_now_add=True, null=True)),
+                ("last_updated", models.DateTimeField(auto_now=True, null=True)),
+                (
+                    "custom_field_data",
+                    models.JSONField(blank=True, default=dict, encoder=utilities.json.CustomFieldJSONEncoder),
+                ),
+                ("asn_str", models.CharField(max_length=10)),
+                ("vrf_name", models.CharField(blank=True, default="", max_length=128)),
+                ("peer_address_str", models.CharField(max_length=64)),
+                ("remote_as_str", models.CharField(blank=True, default="", max_length=10)),
+                ("enabled", models.BooleanField(blank=True, null=True)),
+                ("status", models.CharField(default="unknown", max_length=32)),
+                ("last_sync_at", models.DateTimeField(blank=True, null=True)),
+                ("accepted_at", models.DateTimeField(blank=True, null=True)),
+                ("last_apply_at", models.DateTimeField(blank=True, null=True)),
+                ("last_apply_error", models.TextField(blank=True, default="")),
+                (
+                    "bgp_peer",
+                    models.ForeignKey(
+                        blank=True,
+                        null=True,
+                        on_delete=django.db.models.deletion.SET_NULL,
+                        related_name="nso_bgp_states",
+                        to="netbox_routing.bgppeer",
+                    ),
+                ),
+                ("tags", taggit.managers.TaggableManager(through="extras.TaggedItem", to="extras.Tag")),
+                (
+                    "management",
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.CASCADE,
+                        related_name="bgp_peer_states",
+                        to="netbox_nso_plugin.nsodevicemanagement",
+                    ),
+                ),
+            ],
+            options={
+                "verbose_name": "NSO BGP Peer State",
+                "verbose_name_plural": "NSO BGP Peer States",
+                "ordering": ["management", "asn_str", "vrf_name", "peer_address_str"],
+                "unique_together": {("management", "asn_str", "vrf_name", "peer_address_str")},
+            },
+            bases=(netbox.models.deletion.DeleteMixin, models.Model),
+        ),
+        migrations.CreateModel(
+            name="NSOInterfaceIPState",
+            fields=[
+                ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False)),
+                ("created", models.DateTimeField(auto_now_add=True, null=True)),
+                ("last_updated", models.DateTimeField(auto_now=True, null=True)),
+                (
+                    "custom_field_data",
+                    models.JSONField(blank=True, default=dict, encoder=utilities.json.CustomFieldJSONEncoder),
+                ),
+                ("address", models.CharField(max_length=64)),
+                ("vrf", models.CharField(blank=True, default="", max_length=256)),
+                ("family", models.CharField(default="ipv4", max_length=8)),
+                ("secondary", models.BooleanField(default=False)),
+                ("status", models.CharField(default="unknown", max_length=32)),
+                ("nso_value", models.TextField(blank=True, null=True)),
+                ("last_sync_at", models.DateTimeField(blank=True, null=True)),
+                ("accepted_at", models.DateTimeField(blank=True, null=True)),
+                ("last_apply_at", models.DateTimeField(blank=True, null=True)),
+                ("last_apply_error", models.JSONField(blank=True, null=True)),
+                ("auto_assigned", models.BooleanField(default=False)),
+                (
+                    "interface",
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.CASCADE, related_name="nso_ip_states", to="dcim.interface"
+                    ),
+                ),
+                (
+                    "peer_state",
+                    models.ForeignKey(
+                        blank=True,
+                        null=True,
+                        on_delete=django.db.models.deletion.SET_NULL,
+                        related_name="peer_back",
+                        to="netbox_nso_plugin.nsointerfaceipstate",
+                    ),
+                ),
+                (
+                    "source_pool",
+                    models.ForeignKey(
+                        blank=True,
+                        null=True,
+                        on_delete=django.db.models.deletion.SET_NULL,
+                        related_name="nso_ip_states_from_pool",
+                        to="ipam.prefix",
+                    ),
+                ),
+                ("tags", taggit.managers.TaggableManager(through="extras.TaggedItem", to="extras.Tag")),
+            ],
+            options={
+                "verbose_name": "NSO Interface IP State",
+                "verbose_name_plural": "NSO Interface IP States",
+                "ordering": ["interface", "address", "vrf"],
+                "unique_together": {("interface", "address", "vrf")},
+            },
+            bases=(netbox.models.deletion.DeleteMixin, models.Model),
+        ),
+        migrations.CreateModel(
+            name="NSOInterfaceState",
+            fields=[
+                ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False)),
+                ("created", models.DateTimeField(auto_now_add=True, null=True)),
+                ("last_updated", models.DateTimeField(auto_now=True, null=True)),
+                (
+                    "custom_field_data",
+                    models.JSONField(blank=True, default=dict, encoder=utilities.json.CustomFieldJSONEncoder),
+                ),
+                ("attribute", models.CharField(max_length=64)),
+                ("status", models.CharField(default="unknown", max_length=32)),
+                ("nso_value", models.TextField(blank=True, null=True)),
+                ("last_sync_at", models.DateTimeField(blank=True, null=True)),
+                ("accepted_at", models.DateTimeField(blank=True, null=True)),
+                ("last_apply_at", models.DateTimeField(blank=True, null=True)),
+                ("last_apply_error", models.JSONField(blank=True, null=True)),
+                (
+                    "interface",
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.CASCADE, related_name="nso_states", to="dcim.interface"
+                    ),
+                ),
+                ("tags", taggit.managers.TaggableManager(through="extras.TaggedItem", to="extras.Tag")),
+            ],
+            options={
+                "verbose_name": "NSO Interface State",
+                "verbose_name_plural": "NSO Interface States",
+                "ordering": ["interface", "attribute"],
+                "unique_together": {("interface", "attribute")},
+            },
+            bases=(netbox.models.deletion.DeleteMixin, models.Model),
+        ),
+        migrations.CreateModel(
+            name="NSOISISInstanceState",
+            fields=[
+                ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False)),
+                ("created", models.DateTimeField(auto_now_add=True, null=True)),
+                ("last_updated", models.DateTimeField(auto_now=True, null=True)),
+                (
+                    "custom_field_data",
+                    models.JSONField(blank=True, default=dict, encoder=utilities.json.CustomFieldJSONEncoder),
+                ),
+                ("process_tag", models.CharField(max_length=128)),
+                ("net", models.CharField(blank=True, default="", max_length=100)),
+                ("is_type", models.CharField(blank=True, default="", max_length=50)),
+                ("metric_style", models.CharField(blank=True, default="", max_length=20)),
+                ("overload_bit", models.BooleanField(blank=True, null=True)),
+                ("area_auth_type", models.CharField(blank=True, default="", max_length=10)),
+                ("area_auth_present", models.BooleanField(default=False)),
+                ("domain_auth_type", models.CharField(blank=True, default="", max_length=10)),
+                ("domain_auth_present", models.BooleanField(default=False)),
+                ("status", models.CharField(default="unknown", max_length=32)),
+                ("last_sync_at", models.DateTimeField(blank=True, null=True)),
+                ("accepted_at", models.DateTimeField(blank=True, null=True)),
+                ("last_apply_at", models.DateTimeField(blank=True, null=True)),
+                ("last_apply_error", models.TextField(blank=True, default="")),
+                (
+                    "isis_instance",
+                    models.ForeignKey(
+                        blank=True,
+                        null=True,
+                        on_delete=django.db.models.deletion.SET_NULL,
+                        related_name="nso_instance_states",
+                        to="netbox_routing.isisinstance",
+                    ),
+                ),
+                (
+                    "management",
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.CASCADE,
+                        related_name="isis_instance_states",
+                        to="netbox_nso_plugin.nsodevicemanagement",
+                    ),
+                ),
+                ("tags", taggit.managers.TaggableManager(through="extras.TaggedItem", to="extras.Tag")),
+            ],
+            options={
+                "verbose_name": "NSO IS-IS Instance State",
+                "verbose_name_plural": "NSO IS-IS Instance States",
+                "ordering": ["management", "process_tag"],
+                "unique_together": {("management", "process_tag")},
+            },
+            bases=(netbox.models.deletion.DeleteMixin, models.Model),
+        ),
+        migrations.CreateModel(
+            name="NSOISISInterfaceState",
+            fields=[
+                ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False)),
+                ("created", models.DateTimeField(auto_now_add=True, null=True)),
+                ("last_updated", models.DateTimeField(auto_now=True, null=True)),
+                (
+                    "custom_field_data",
+                    models.JSONField(blank=True, default=dict, encoder=utilities.json.CustomFieldJSONEncoder),
+                ),
+                ("af", models.CharField(max_length=8)),
+                ("process_tag", models.CharField(blank=True, default="", max_length=128)),
+                ("circuit_type", models.CharField(blank=True, default="", max_length=32)),
+                ("network_type", models.CharField(blank=True, default="", max_length=32)),
+                ("metric", models.PositiveIntegerField(blank=True, null=True)),
+                ("passive", models.BooleanField(default=False)),
+                ("status", models.CharField(default="unknown", max_length=32)),
+                ("last_sync_at", models.DateTimeField(blank=True, null=True)),
+                ("accepted_at", models.DateTimeField(blank=True, null=True)),
+                ("last_apply_at", models.DateTimeField(blank=True, null=True)),
+                ("last_apply_error", models.TextField(blank=True, default="")),
+                (
+                    "interface",
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.CASCADE, related_name="nso_isis_states", to="dcim.interface"
+                    ),
+                ),
+                (
+                    "management",
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.CASCADE,
+                        related_name="isis_interface_states",
+                        to="netbox_nso_plugin.nsodevicemanagement",
+                    ),
+                ),
+                ("tags", taggit.managers.TaggableManager(through="extras.TaggedItem", to="extras.Tag")),
+            ],
+            options={
+                "verbose_name": "NSO IS-IS Interface State",
+                "verbose_name_plural": "NSO IS-IS Interface States",
+                "ordering": ["management", "interface", "af"],
+                "unique_together": {("management", "interface", "af")},
+            },
+            bases=(netbox.models.deletion.DeleteMixin, models.Model),
+        ),
+        migrations.CreateModel(
+            name="NSOOSPFInstanceState",
+            fields=[
+                ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False)),
+                ("created", models.DateTimeField(auto_now_add=True, null=True)),
+                ("last_updated", models.DateTimeField(auto_now=True, null=True)),
+                (
+                    "custom_field_data",
+                    models.JSONField(blank=True, default=dict, encoder=utilities.json.CustomFieldJSONEncoder),
+                ),
+                ("process_id", models.PositiveIntegerField()),
+                ("router_id", models.CharField(blank=True, default="", max_length=64)),
+                ("vrf", models.CharField(blank=True, default="", max_length=64)),
+                ("areas", models.JSONField(blank=True, default=list)),
+                ("status", models.CharField(default="unknown", max_length=32)),
+                ("last_sync_at", models.DateTimeField(blank=True, null=True)),
+                ("accepted_at", models.DateTimeField(blank=True, null=True)),
+                ("last_apply_at", models.DateTimeField(blank=True, null=True)),
+                ("last_apply_error", models.TextField(blank=True, default="")),
+                (
+                    "management",
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.CASCADE,
+                        related_name="ospf_instance_states",
+                        to="netbox_nso_plugin.nsodevicemanagement",
+                    ),
+                ),
+                (
+                    "ospf_instance",
+                    models.ForeignKey(
+                        blank=True,
+                        null=True,
+                        on_delete=django.db.models.deletion.SET_NULL,
+                        related_name="nso_ospf_instance_states",
+                        to="netbox_routing.ospfinstance",
+                    ),
+                ),
+                ("tags", taggit.managers.TaggableManager(through="extras.TaggedItem", to="extras.Tag")),
+            ],
+            options={
+                "verbose_name": "NSO OSPF Instance State",
+                "verbose_name_plural": "NSO OSPF Instance States",
+                "ordering": ["management", "process_id"],
+                "unique_together": {("management", "process_id")},
+            },
+            bases=(netbox.models.deletion.DeleteMixin, models.Model),
+        ),
+        migrations.CreateModel(
+            name="NSOOSPFInterfaceState",
+            fields=[
+                ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False)),
+                ("created", models.DateTimeField(auto_now_add=True, null=True)),
+                ("last_updated", models.DateTimeField(auto_now=True, null=True)),
+                (
+                    "custom_field_data",
+                    models.JSONField(blank=True, default=dict, encoder=utilities.json.CustomFieldJSONEncoder),
+                ),
+                ("process_id", models.PositiveIntegerField(blank=True, null=True)),
+                ("area_id", models.CharField(blank=True, default="", max_length=64)),
+                ("passive", models.BooleanField(default=False)),
+                ("priority", models.PositiveSmallIntegerField(blank=True, null=True)),
+                ("cost", models.PositiveIntegerField(blank=True, null=True)),
+                ("network_type", models.CharField(blank=True, default="", max_length=32)),
+                ("auth_type", models.CharField(blank=True, default="", max_length=32)),
+                ("auth_present", models.BooleanField(default=False)),
+                ("status", models.CharField(default="unknown", max_length=32)),
+                ("last_sync_at", models.DateTimeField(blank=True, null=True)),
+                ("accepted_at", models.DateTimeField(blank=True, null=True)),
+                ("last_apply_at", models.DateTimeField(blank=True, null=True)),
+                ("last_apply_error", models.TextField(blank=True, default="")),
+                (
+                    "interface",
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.CASCADE, related_name="nso_ospf_states", to="dcim.interface"
+                    ),
+                ),
+                (
+                    "management",
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.CASCADE,
+                        related_name="ospf_interface_states",
+                        to="netbox_nso_plugin.nsodevicemanagement",
+                    ),
+                ),
+                ("tags", taggit.managers.TaggableManager(through="extras.TaggedItem", to="extras.Tag")),
+            ],
+            options={
+                "verbose_name": "NSO OSPF Interface State",
+                "verbose_name_plural": "NSO OSPF Interface States",
+                "ordering": ["management", "interface"],
+                "unique_together": {("management", "interface")},
+            },
+            bases=(netbox.models.deletion.DeleteMixin, models.Model),
+        ),
+        migrations.CreateModel(
+            name="NSORedistributionState",
+            fields=[
+                ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False)),
+                ("created", models.DateTimeField(auto_now_add=True, null=True)),
+                ("last_updated", models.DateTimeField(auto_now=True, null=True)),
+                (
+                    "custom_field_data",
+                    models.JSONField(blank=True, default=dict, encoder=utilities.json.CustomFieldJSONEncoder),
+                ),
+                ("dest_protocol", models.CharField(max_length=16)),
+                ("dest_ref", models.CharField(blank=True, default="", max_length=128)),
+                ("source_protocol", models.CharField(max_length=16)),
+                ("source_ref", models.CharField(blank=True, default="", max_length=64)),
+                ("route_map", models.CharField(blank=True, default="", max_length=128)),
+                ("metric", models.PositiveIntegerField(blank=True, null=True)),
+                ("metric_type", models.CharField(blank=True, default="", max_length=16)),
+                ("status", models.CharField(default="unknown", max_length=32)),
+                ("last_sync_at", models.DateTimeField(blank=True, null=True)),
+                ("accepted_at", models.DateTimeField(blank=True, null=True)),
+                ("last_apply_at", models.DateTimeField(blank=True, null=True)),
+                ("last_apply_error", models.TextField(blank=True, default="")),
+                (
+                    "management",
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.CASCADE,
+                        related_name="redistribution_states",
+                        to="netbox_nso_plugin.nsodevicemanagement",
+                    ),
+                ),
+                (
+                    "redistribution",
+                    models.ForeignKey(
+                        blank=True,
+                        null=True,
+                        on_delete=django.db.models.deletion.SET_NULL,
+                        related_name="nso_redistribution_states",
+                        to="netbox_routing.redistribution",
+                    ),
+                ),
+                ("tags", taggit.managers.TaggableManager(through="extras.TaggedItem", to="extras.Tag")),
+            ],
+            options={
+                "verbose_name": "NSO Redistribution State",
+                "verbose_name_plural": "NSO Redistribution States",
+                "ordering": ["management", "dest_protocol", "dest_ref", "source_protocol"],
+                "unique_together": {("management", "dest_protocol", "dest_ref", "source_protocol", "source_ref")},
+            },
+            bases=(netbox.models.deletion.DeleteMixin, models.Model),
+        ),
+        migrations.CreateModel(
+            name="NSORoutePolicyState",
+            fields=[
+                ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False)),
+                ("created", models.DateTimeField(auto_now_add=True, null=True)),
+                ("last_updated", models.DateTimeField(auto_now=True, null=True)),
+                (
+                    "custom_field_data",
+                    models.JSONField(blank=True, default=dict, encoder=utilities.json.CustomFieldJSONEncoder),
+                ),
+                ("object_id", models.PositiveBigIntegerField(blank=True, null=True)),
+                ("family", models.CharField(max_length=32)),
+                ("object_name", models.CharField(max_length=256)),
+                ("content_hash", models.CharField(blank=True, default="", max_length=64)),
+                ("status", models.CharField(default="unknown", max_length=32)),
+                ("last_sync_at", models.DateTimeField(blank=True, null=True)),
+                ("accepted_at", models.DateTimeField(blank=True, null=True)),
+                ("last_apply_at", models.DateTimeField(blank=True, null=True)),
+                ("last_apply_error", models.TextField(blank=True, default="")),
+                (
+                    "content_type",
+                    models.ForeignKey(
+                        blank=True,
+                        null=True,
+                        on_delete=django.db.models.deletion.CASCADE,
+                        related_name="+",
+                        to="contenttypes.contenttype",
+                    ),
+                ),
+                (
+                    "management",
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.CASCADE,
+                        related_name="route_policy_states",
+                        to="netbox_nso_plugin.nsodevicemanagement",
+                    ),
+                ),
+                ("tags", taggit.managers.TaggableManager(through="extras.TaggedItem", to="extras.Tag")),
+            ],
+            options={
+                "verbose_name": "NSO Route Policy State",
+                "verbose_name_plural": "NSO Route Policy States",
+                "ordering": ["management", "family", "object_name"],
+                "unique_together": {("management", "family", "object_name")},
+            },
+            bases=(netbox.models.deletion.DeleteMixin, models.Model),
+        ),
+        migrations.CreateModel(
+            name="NSOSnmpCommunityState",
+            fields=[
+                ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False)),
+                ("created", models.DateTimeField(auto_now_add=True, null=True)),
+                ("last_updated", models.DateTimeField(auto_now=True, null=True)),
+                (
+                    "custom_field_data",
+                    models.JSONField(blank=True, default=dict, encoder=utilities.json.CustomFieldJSONEncoder),
+                ),
+                ("community_hash", models.CharField(max_length=64)),
+                ("access", models.CharField(default="RO", max_length=8)),
+                ("acl", models.CharField(blank=True, default="", max_length=128)),
+                ("has_secret", models.BooleanField(default=True)),
+                ("vault_ref", models.CharField(blank=True, default="", max_length=512)),
+                ("status", models.CharField(default="unknown", max_length=32)),
+                ("last_sync_at", models.DateTimeField(blank=True, null=True)),
+                (
+                    "management",
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.CASCADE,
+                        related_name="snmp_community_states",
+                        to="netbox_nso_plugin.nsodevicemanagement",
+                    ),
+                ),
+                ("tags", taggit.managers.TaggableManager(through="extras.TaggedItem", to="extras.Tag")),
+            ],
+            options={
+                "verbose_name": "NSO SNMP Community State",
+                "verbose_name_plural": "NSO SNMP Community States",
+                "ordering": ["management", "community_hash"],
+                "unique_together": {("management", "community_hash")},
+            },
+            bases=(netbox.models.deletion.DeleteMixin, models.Model),
+        ),
+        migrations.CreateModel(
+            name="NSOSnmpHostState",
+            fields=[
+                ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False)),
+                ("created", models.DateTimeField(auto_now_add=True, null=True)),
+                ("last_updated", models.DateTimeField(auto_now=True, null=True)),
+                (
+                    "custom_field_data",
+                    models.JSONField(blank=True, default=dict, encoder=utilities.json.CustomFieldJSONEncoder),
+                ),
+                ("address", models.CharField(max_length=256)),
+                ("version", models.CharField(default="v2c", max_length=8)),
+                ("notify_type", models.CharField(default="trap", max_length=16)),
+                ("port", models.PositiveIntegerField(blank=True, null=True)),
+                ("community_hash", models.CharField(blank=True, default="", max_length=64)),
+                ("status", models.CharField(default="unknown", max_length=32)),
+                ("last_sync_at", models.DateTimeField(blank=True, null=True)),
+                (
+                    "management",
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.CASCADE,
+                        related_name="snmp_host_states",
+                        to="netbox_nso_plugin.nsodevicemanagement",
+                    ),
+                ),
+                ("tags", taggit.managers.TaggableManager(through="extras.TaggedItem", to="extras.Tag")),
+            ],
+            options={
+                "verbose_name": "NSO SNMP Host State",
+                "verbose_name_plural": "NSO SNMP Host States",
+                "ordering": ["management", "address"],
+                "unique_together": {("management", "address")},
+            },
+            bases=(netbox.models.deletion.DeleteMixin, models.Model),
+        ),
+        migrations.CreateModel(
+            name="NSOSnmpV3UserState",
+            fields=[
+                ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False)),
+                ("created", models.DateTimeField(auto_now_add=True, null=True)),
+                ("last_updated", models.DateTimeField(auto_now=True, null=True)),
+                (
+                    "custom_field_data",
+                    models.JSONField(blank=True, default=dict, encoder=utilities.json.CustomFieldJSONEncoder),
+                ),
+                ("username", models.CharField(max_length=128)),
+                ("has_auth_secret", models.BooleanField(default=False)),
+                ("has_priv_secret", models.BooleanField(default=False)),
+                ("vault_ref", models.CharField(blank=True, default="", max_length=512)),
+                ("status", models.CharField(default="unknown", max_length=32)),
+                ("last_sync_at", models.DateTimeField(blank=True, null=True)),
+                (
+                    "management",
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.CASCADE,
+                        related_name="snmp_v3_user_states",
+                        to="netbox_nso_plugin.nsodevicemanagement",
+                    ),
+                ),
+                ("tags", taggit.managers.TaggableManager(through="extras.TaggedItem", to="extras.Tag")),
+            ],
+            options={
+                "verbose_name": "NSO SNMP V3 User State",
+                "verbose_name_plural": "NSO SNMP V3 User States",
+                "ordering": ["management", "username"],
+                "unique_together": {("management", "username")},
+            },
+            bases=(netbox.models.deletion.DeleteMixin, models.Model),
+        ),
+        migrations.CreateModel(
+            name="NSOStaticRouteState",
+            fields=[
+                ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False)),
+                ("created", models.DateTimeField(auto_now_add=True, null=True)),
+                ("last_updated", models.DateTimeField(auto_now=True, null=True)),
+                (
+                    "custom_field_data",
+                    models.JSONField(blank=True, default=dict, encoder=utilities.json.CustomFieldJSONEncoder),
+                ),
+                ("status", models.CharField(default="unknown", max_length=32)),
+                ("nso_vrf", models.CharField(blank=True, default="", max_length=128)),
+                ("nso_prefix", models.CharField(blank=True, default="", max_length=64)),
+                ("nso_next_hop", models.CharField(blank=True, default="", max_length=64)),
+                ("last_sync_at", models.DateTimeField(blank=True, null=True)),
+                ("accepted_at", models.DateTimeField(blank=True, null=True)),
+                ("last_apply_at", models.DateTimeField(blank=True, null=True)),
+                ("last_apply_error", models.TextField(blank=True, default="")),
+                (
+                    "management",
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.CASCADE,
+                        related_name="static_route_states",
+                        to="netbox_nso_plugin.nsodevicemanagement",
+                    ),
+                ),
+                (
+                    "static_route",
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.CASCADE,
+                        related_name="nso_states",
+                        to="netbox_routing.staticroute",
+                    ),
+                ),
+                ("tags", taggit.managers.TaggableManager(through="extras.TaggedItem", to="extras.Tag")),
+            ],
+            options={
+                "verbose_name": "NSO Static Route State",
+                "verbose_name_plural": "NSO Static Route States",
+                "ordering": ["management", "static_route"],
+                "unique_together": {("management", "static_route")},
             },
             bases=(netbox.models.deletion.DeleteMixin, models.Model),
         ),
