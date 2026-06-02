@@ -25,8 +25,10 @@
               <td>
                 {% if row.kind == 'drift' %}<span class="badge bg-warning text-dark">{{ row.label }}</span>
                 {% elif row.kind == 'pending' %}<span class="badge bg-info">{{ row.label }}</span>
-                {% elif row.kind == 'settled' %}<span class="badge bg-success">{{ row.label }}</span>
+                {% elif row.kind == 'in_sync' %}<span class="badge bg-success">{{ row.label }}</span>
+                {% elif row.kind == 'deploying' %}<span class="badge bg-primary">{{ row.label }}</span>
                 {% else %}<span class="badge bg-info">{{ row.label }}</span>{% endif %}
+                {% if row.owned %}<span class="mdi mdi-shield-check text-success ms-1" title="NetBox is the source of truth (owned)"></span>{% endif %}
               </td>
               <td class="text-nowrap">
                 {% if row.kind == 'drift' %}
@@ -38,7 +40,7 @@
                   </form>
                   <form method="post" action="{% url 'plugins:netbox_nso_plugin:nsointerfacestate_accept' row.state.pk %}" style="display:inline">
                     {% csrf_token %}
-                    <button type="submit" class="btn btn-sm btn-outline-warning" title="Keep the NetBox value as intent (pushed to the device on Apply)">
+                    <button type="submit" class="btn btn-sm btn-outline-warning" title="Make NetBox the source of truth — its value is pushed to the device on Apply">
                       <span class="mdi mdi-content-save-check"></span> Keep NetBox
                     </button>
                   </form>
@@ -47,7 +49,7 @@
                           title="Push pending intent to the device">
                     <span class="mdi mdi-upload-network"></span> Apply
                   </button>
-                {% elif row.state.status == 'imported' %}
+                {% elif not row.owned %}
                   <form method="post" action="{% url 'plugins:netbox_nso_plugin:nsointerfacestate_accept' row.state.pk %}" style="display:inline">
                     {% csrf_token %}
                     <button type="submit" class="btn btn-sm btn-outline-success" title="Make NetBox the source of truth for this value">

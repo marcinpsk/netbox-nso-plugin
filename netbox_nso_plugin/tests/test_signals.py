@@ -11,7 +11,11 @@ trigger signals via normal IPAddress CRUD to verify the full IP intent push path
 
 import sys
 import unittest
+from datetime import datetime
 from unittest.mock import MagicMock, patch
+
+# A non-None accepted_at marks a state as OWNED (push_intent_on_accept triggers on it).
+_ACCEPTED_AT = datetime(2025, 1, 1, 12, 0, 0)
 
 
 def _make_mgmt_class():
@@ -217,11 +221,13 @@ class TestOffboardDeviceFromAdapter(unittest.TestCase):
 class TestPushIntentOnAccept(unittest.TestCase):
     """Tests for push_intent_on_accept signal handler."""
 
-    def test_skips_non_accepted_status(self):
+    def test_skips_when_not_owned(self):
+        """A not-owned row (accepted_at is None) does not push, whatever its sync status."""
         from netbox_nso_plugin.signals import push_intent_on_accept
 
         instance = MagicMock()
         instance.status = "imported"
+        instance.accepted_at = None
 
         with patch(f"{_MOD}.put_intent") as mock_put:
             push_intent_on_accept(sender=MagicMock(), instance=instance)
@@ -240,7 +246,7 @@ class TestPushIntentOnAccept(unittest.TestCase):
         state.status = "accepted"
         state.interface = iface
         state.attribute = "description"
-        state.accepted_at = None
+        state.accepted_at = _ACCEPTED_AT
 
         mgmt = MagicMock()
         mgmt.adapter_device_id = 7
@@ -281,7 +287,7 @@ class TestPushIntentOnAccept(unittest.TestCase):
         state.status = "accepted"
         state.interface = iface
         state.attribute = "enabled"
-        state.accepted_at = None
+        state.accepted_at = _ACCEPTED_AT
 
         mgmt = MagicMock()
         mgmt.adapter_device_id = 3
@@ -337,7 +343,7 @@ class TestPushIntentOnAccept(unittest.TestCase):
         state.status = "accepted"
         state.interface = iface
         state.attribute = "custom_field"  # unknown — should be skipped
-        state.accepted_at = None
+        state.accepted_at = _ACCEPTED_AT
 
         mgmt = MagicMock()
         mgmt.adapter_device_id = 7
@@ -375,7 +381,7 @@ class TestPushIntentOnAccept(unittest.TestCase):
         state.status = "accepted"
         state.interface = iface
         state.attribute = "description"
-        state.accepted_at = None
+        state.accepted_at = _ACCEPTED_AT
 
         mgmt = MagicMock()
         mgmt.adapter_device_id = 3
@@ -443,7 +449,7 @@ class TestSkipOnRenderGuard(unittest.TestCase):
         state.status = "accepted"
         state.interface = iface
         state.attribute = "description"
-        state.accepted_at = None
+        state.accepted_at = _ACCEPTED_AT
 
         mgmt = MagicMock()
         mgmt.adapter_device_id = 7

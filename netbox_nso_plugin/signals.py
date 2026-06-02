@@ -165,8 +165,13 @@ def offboard_device_from_adapter(sender, instance, **kwargs):
 @receiver(post_save, sender="netbox_nso_plugin.NSOInterfaceState")
 @_skip_on_render
 def push_intent_on_accept(sender, instance, **kwargs):
-    """Push full intent snapshot to adapter when an interface state is accepted."""
-    if instance.status != "accepted":
+    """Push the full intent snapshot to the adapter when an interface state is OWNED.
+
+    Owned = accepted_at set (NetBox is the source of truth), independent of the sync
+    status — so accepting a value that already matches the device (in_sync) still
+    records ownership in the adapter and survives the next sync.
+    """
+    if instance.accepted_at is None:
         return
 
     from . import adapter_client as client
@@ -183,7 +188,7 @@ def push_intent_on_accept(sender, instance, **kwargs):
 
     states = NSOInterfaceState.objects.filter(
         interface__device_id=device_id,
-        status="accepted",
+        accepted_at__isnull=False,
     ).select_related("interface")
 
     attributes = []

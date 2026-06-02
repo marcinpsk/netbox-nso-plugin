@@ -1,10 +1,13 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
-{# Consistent state badge from a raw status. Expects `status`. #}
-{% if status == "changed" or status == "drifted" or status == "conflict" %}<span class="badge bg-warning text-dark">drift</span>
-{% elif status == "accepted" %}<span class="badge bg-info">pending apply</span>
+{# State badge from a raw status. Expects `status`. Owned (NetBox is the source of
+   truth) is derived from owned statuses and shown as a shield.
+   changed/conflict = not-owned drift; drifted/accepted = owned -> pending apply. #}
+{% if status == "changed" or status == "conflict" %}<span class="badge bg-warning text-dark">drift</span>
+{% elif status == "drifted" or status == "accepted" %}<span class="badge bg-info">pending apply</span>
 {% elif status == "apply_failed" %}<span class="badge bg-danger">apply failed</span>
 {% elif status == "deploying" %}<span class="badge bg-primary">deploying</span>
 {% elif status == "in_sync" or status == "imported" %}<span class="badge bg-success">in sync</span>
 {% elif status == "error" %}<span class="badge bg-danger">error</span>
 {% else %}<span class="badge bg-info">{{ status }}</span>{% endif %}
+{% if status == "in_sync" or status == "accepted" or status == "drifted" or status == "deploying" or status == "apply_failed" %}<span class="mdi mdi-shield-check text-success ms-1" title="NetBox is the source of truth (owned)"></span>{% endif %}

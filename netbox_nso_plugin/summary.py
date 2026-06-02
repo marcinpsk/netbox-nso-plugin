@@ -14,41 +14,29 @@ from __future__ import annotations
 
 from django.db.models import Count
 
-# Operator-facing grouping of the raw per-attribute statuses.
-#   drift   — the device changed vs NetBox (out-of-band, or after a deploy)
-#   pending — NetBox holds intent not yet on the device ("what Apply would push")
-#   settled — device and NetBox agree
-DRIFT_STATUSES = ("changed", "drifted")
-PENDING_STATUSES = ("accepted", "apply_failed", "deploying")
-SETTLED_STATUSES = ("imported", "in_sync")
-
-_STATE_FILTERS = {
-    "drift": DRIFT_STATUSES,
-    "pending": PENDING_STATUSES,
-    "in_sync": SETTLED_STATUSES,
-}
+# The display state is TWO independent dimensions:
+#   sync     — does the device match NetBox?  match (imported/in_sync) vs differ
+#   owned    — is NetBox the source of truth?  owned == accepted_at is not None
+# Combined into the operator-facing buckets:
+#   in sync       = device matches NetBox (whether owned or not)
+#   drift         = device differs AND NetBox does NOT own it (device changed out-of-band)
+#   pending apply = device differs AND NetBox owns it (Apply will push NetBox's value)
+_MATCH_STATUSES = ("imported", "in_sync")
+_DIFFER_STATUSES = ("changed", "drifted", "conflict", "accepted", "apply_failed")
 
 
-def state_label(status: str) -> str:
-    """Human label for a raw status: drift / pending apply / in sync."""
-    if status in DRIFT_STATUSES:
-        return "drift"
-    if status in PENDING_STATUSES:
-        return "pending apply"
-    if status in SETTLED_STATUSES:
-        return "in sync"
-    return status or "unknown"
+def display_state(status: str, owned: bool):
+    """Return (kind, label) for a row from its sync *status* and *owned* flag.
 
-
-def state_kind(status: str) -> str:
-    """Coarse bucket for badge colour: drift / pending / settled / other."""
-    if status in DRIFT_STATUSES:
-        return "drift"
-    if status in PENDING_STATUSES:
-        return "pending"
-    if status in SETTLED_STATUSES:
-        return "settled"
-    return "other"
+    kind ∈ in_sync | drift | pending | deploying | unknown — drives badge colour.
+    """
+    if status == "deploying":
+        return ("deploying", "deploying")
+    if status in _MATCH_STATUSES:
+        return ("in_sync", "in sync")
+    if status in _DIFFER_STATUSES:
+        return ("pending", "pending apply") if owned else ("drift", "drift")
+    return ("unknown", status or "unknown")
 
 
 # Each category: key -> (label, mdi-icon, scope-flag on NSODeviceManagement).
@@ -67,20 +55,27 @@ _CATEGORIES = [
 
 
 def _status_breakdown(qs) -> dict:
-    """Return {status: count} for a queryset, plus 'total'."""
-    rows = qs.values_list("status").annotate(n=Count("id"))
-    by_status = {s: n for s, n in rows}
-    by_status["total"] = sum(by_status.values())
-    # Operator-facing buckets (see also DRIFT_STATUSES / PENDING_STATUSES):
-    #   drift   = the device changed vs NetBox (out-of-band or post-deploy)
-    #   pending = NetBox holds intent not yet on the device ("what Apply would push")
-    #   settled = device and NetBox agree
-    by_status["drift"] = by_status.get("changed", 0) + by_status.get("drifted", 0)
-    by_status["pending"] = (
-        by_status.get("accepted", 0) + by_status.get("apply_failed", 0) + by_status.get("deploying", 0)
+    """Return owned-aware {total, drift, pending} buckets for a state queryset.
+
+    Owned = accepted_at set. differ + owned → pending apply; differ + not-owned → drift;
+    match → in sync (the implicit remainder).
+    """
+    from django.db.models import Q
+
+    rows = qs.values_list("status").annotate(
+        total=Count("id"),
+        owned=Count("id", filter=Q(accepted_at__isnull=False)),
     )
-    by_status["settled"] = by_status.get("imported", 0) + by_status.get("in_sync", 0)
-    return by_status
+    out = {"total": 0, "drift": 0, "pending": 0}
+    for status, total, owned in rows:
+        out["total"] += total
+        if status == "deploying":
+            out["pending"] += total
+        elif status in _DIFFER_STATUSES:
+            out["pending"] += owned
+            out["drift"] += total - owned
+        # _MATCH_STATUSES / unknown → counted in total only (the "in sync" remainder)
+    return out
 
 
 def _category_counts(key: str, device, mgmt) -> dict:

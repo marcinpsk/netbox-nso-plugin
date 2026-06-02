@@ -215,12 +215,18 @@ class NSOCategoryView(LoginRequiredMixin, View):
         NSOInterfaceState — no reconcile; the cache is refreshed off-render.
         """
         from django.core.paginator import Paginator
+        from django.db.models import Q
 
         from .models import NSOInterfaceState
-        from .summary import _STATE_FILTERS, DRIFT_STATUSES, PENDING_STATUSES, state_kind, state_label
+        from .summary import _DIFFER_STATUSES, _MATCH_STATUSES, display_state
 
         q = (request.GET.get("q") or "").strip()
         state = request.GET.get("state") or "all"
+
+        # Owned (NetBox is source of truth) = accepted_at set.
+        owned_differ = Q(status__in=_DIFFER_STATUSES, accepted_at__isnull=False)
+        unowned_differ = Q(status__in=_DIFFER_STATUSES, accepted_at__isnull=True)
+        pending_q = owned_differ | Q(status="deploying")
 
         qs = (
             NSOInterfaceState.objects.filter(interface__device=device)
@@ -229,8 +235,12 @@ class NSOCategoryView(LoginRequiredMixin, View):
         )
         if q:
             qs = qs.filter(interface__name__icontains=q)
-        if state in _STATE_FILTERS:
-            qs = qs.filter(status__in=_STATE_FILTERS[state])
+        if state == "drift":
+            qs = qs.filter(unowned_differ)
+        elif state == "pending":
+            qs = qs.filter(pending_q)
+        elif state == "in_sync":
+            qs = qs.filter(status__in=_MATCH_STATUSES)
 
         paginator = Paginator(qs, self._INTERFACES_PER_PAGE)
         page = paginator.get_page(request.GET.get("page") or 1)
@@ -244,6 +254,8 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 netbox_value = "Yes" if iface.enabled else "No"
             else:
                 netbox_value = "—"
+            owned = st.accepted_at is not None
+            kind, label = display_state(st.status, owned)
             rows.append(
                 {
                     "state": st,
@@ -251,8 +263,9 @@ class NSOCategoryView(LoginRequiredMixin, View):
                     "attribute": st.attribute,
                     "netbox_value": netbox_value,
                     "device_value": st.nso_value or "—",
-                    "label": state_label(st.status),
-                    "kind": state_kind(st.status),
+                    "label": label,
+                    "kind": kind,
+                    "owned": owned,
                 }
             )
 
@@ -262,8 +275,8 @@ class NSOCategoryView(LoginRequiredMixin, View):
             base = base.filter(interface__name__icontains=q)
         counts = {
             "all": base.count(),
-            "drift": base.filter(status__in=DRIFT_STATUSES).count(),
-            "pending": base.filter(status__in=PENDING_STATUSES).count(),
+            "drift": base.filter(unowned_differ).count(),
+            "pending": base.filter(pending_q).count(),
         }
 
         return render(
@@ -597,7 +610,7 @@ def _push_intent_for_device(device_id: int) -> None:
 
     states = NSOInterfaceState.objects.filter(
         interface__device_id=device_id,
-        status="accepted",
+        accepted_at__isnull=False,
     ).select_related("interface")
 
     attributes = []
@@ -705,7 +718,9 @@ class NSOBulkAcceptView(LoginRequiredMixin, View):
         pending = base.filter(status="changed").update(status="accepted", accepted_at=now)
         updated = settled + pending
 
-        if pending:
+        # Push whenever anything became owned — the snapshot is by accepted_at, so even
+        # owned-but-matching rows must be recorded in the adapter to persist ownership.
+        if updated:
             _push_intent_for_device(device_pk)
         if updated:
             messages.success(request, f"Accepted {updated} interface attribute(s).")
@@ -736,7 +751,9 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
 
         changes = []
         pending = (
-            NSOInterfaceState.objects.filter(interface__device_id=device_pk, status__in=("accepted", "apply_failed"))
+            NSOInterfaceState.objects.filter(
+                interface__device_id=device_pk, status__in=("accepted", "apply_failed", "drifted")
+            )
             .select_related("interface")
             .order_by("interface__name", "attribute")
         )
@@ -770,7 +787,9 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
             NSORedistributionState,
         ):
             if mgmt is not None:
-                routing += model.objects.filter(management=mgmt, status__in=("accepted", "apply_failed")).count()
+                routing += model.objects.filter(
+                    management=mgmt, status__in=("accepted", "apply_failed", "drifted")
+                ).count()
 
         return JsonResponse(
             {"auto_apply": auto_apply, "changes": changes, "routing": routing, "total": len(changes) + routing}
