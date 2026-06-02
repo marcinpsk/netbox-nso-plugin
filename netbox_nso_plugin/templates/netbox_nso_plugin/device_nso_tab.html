@@ -75,7 +75,8 @@
       <form method="post" class="nso-action-form" data-label="Sync"
             action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_action' mgmt.pk 'sync' %}">
         {% csrf_token %}
-        <button type="submit" class="btn btn-primary nso-action-btn">
+        <button type="submit" class="btn btn-primary nso-action-btn"
+                title="Pull the live device via NSO and WRITE it into NetBox — creates missing interfaces and overwrites description/enabled with the device's values. (Detect Drift only flags differences; it never changes NetBox.)">
           <span class="mdi mdi-sync"></span> Sync Now
         </button>
       </form>
