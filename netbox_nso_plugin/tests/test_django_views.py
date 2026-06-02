@@ -926,6 +926,30 @@ class TestNSOInterfaceEditFieldView(ViewTestBase):
         self.assertFalse(self.interface.enabled)
         self.assertEqual(en_state.status, "accepted")
 
+    def test_toggle_back_to_device_value_is_in_sync_not_pending(self):
+        """Flipping enabled off then back on lands on the device value → in_sync, not pending."""
+        self._make_managed()
+        self.interface.enabled = True
+        self.interface.save(update_fields=["enabled"])
+        en_state = NSOInterfaceState.objects.create(
+            interface=self.interface, attribute="enabled", status="in_sync", nso_value="True"
+        )
+        url = reverse("plugins:netbox_nso_plugin:nsointerfacestate_edit_field", args=[en_state.pk])
+
+        with patch("netbox_nso_plugin.adapter_client.put_intent"):
+            # Flip to False — now differs from the device → pending apply (accepted).
+            with self.captureOnCommitCallbacks(execute=True):
+                self.client.post(url, {"value": "false"}, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+            en_state.refresh_from_db()
+            self.assertEqual(en_state.status, "accepted")
+            # Flip back to True — matches the device again → in_sync (nothing to apply).
+            with self.captureOnCommitCallbacks(execute=True):
+                self.client.post(url, {"value": "true"}, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+
+        en_state.refresh_from_db()
+        self.assertEqual(en_state.status, "in_sync")
+        self.assertIsNotNone(en_state.accepted_at)  # still owned by NetBox
+
     def test_unknown_attribute_rejected(self):
         """A state whose attribute is not description/enabled cannot be inline-edited."""
         odd = NSOInterfaceState.objects.create(
