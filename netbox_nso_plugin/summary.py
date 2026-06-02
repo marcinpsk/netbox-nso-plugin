@@ -39,6 +39,71 @@ def display_state(status: str, owned: bool):
     return ("unknown", status or "unknown")
 
 
+def matches_device_value(attribute, netbox_value, nso_value):
+    """Return True if a NetBox attribute value equals the device (NSO) value.
+
+    The device value is stored as a string in ``NSOInterfaceState.nso_value``
+    ("True"/"False" for enabled), so compare in the attribute's native type.
+    """
+    if attribute == "enabled":
+        return bool(netbox_value) == (str(nso_value).strip().lower() == "true")
+    return (netbox_value or "") == (nso_value or "")
+
+
+# Interface attributes whose NetBox value we can read directly and compare against
+# the device value — so the display does not have to trust the adapter's status,
+# which lags (one-sync) and is blind to a value typed straight into NetBox.
+_COMPARABLE_IFACE_ATTRS = ("description", "enabled")
+
+
+def _netbox_value_for(attribute, iface):
+    """Return the raw NetBox value for a comparable interface attribute, else None."""
+    if attribute == "description":
+        return iface.description
+    if attribute == "enabled":
+        return iface.enabled
+    return None
+
+
+def interface_row_state(st, iface):
+    """Return (kind, label, owned) for one interface-attr row — value-aware.
+
+    For description/enabled we compare the *actual* NetBox value against the device
+    value rather than trusting the adapter-reported status: the adapter only learns a
+    NetBox value once it writes it back, so a value set directly in NetBox shows as
+    ``unknown``/``imported`` and would hide in the "in sync" remainder. When the
+    values match it is in sync; when they differ it is pending apply (owned) or drift
+    (not owned). In-flight ("deploying") and non-comparable attributes fall back to
+    the status-driven :func:`display_state`.
+    """
+    owned = st.accepted_at is not None
+    if st.status == "deploying" or st.attribute not in _COMPARABLE_IFACE_ATTRS:
+        kind, label = display_state(st.status, owned)
+        return (kind, label, owned)
+    matches = matches_device_value(st.attribute, _netbox_value_for(st.attribute, iface), st.nso_value)
+    if matches:
+        return ("in_sync", "in sync", owned)
+    return ("pending", "pending apply", owned) if owned else ("drift", "drift", owned)
+
+
+def interface_status_breakdown(qs) -> dict:
+    """Value-aware {total, drift, pending} for interface-attr states.
+
+    Mirrors :func:`_status_breakdown` but classifies each row through
+    :func:`interface_row_state` (real NetBox vs device value) so a value set
+    directly in NetBox is bucketed correctly instead of vanishing into "in sync".
+    """
+    out = {"total": 0, "drift": 0, "pending": 0}
+    for st in qs.select_related("interface"):
+        out["total"] += 1
+        kind, _label, _owned = interface_row_state(st, st.interface)
+        if kind in ("pending", "deploying"):
+            out["pending"] += 1
+        elif kind == "drift":
+            out["drift"] += 1
+    return out
+
+
 # Each category: key -> (label, mdi-icon, scope-flag on NSODeviceManagement).
 # Order here is the display order on the tab.
 # NOTE: SNMP is intentionally absent — the device tab has never rendered an SNMP
@@ -94,7 +159,7 @@ def _category_counts(key: str, device, mgmt) -> dict:
 
     dev_id = device.id
     if key == "interfaces":
-        return _status_breakdown(NSOInterfaceState.objects.filter(interface__device_id=dev_id))
+        return interface_status_breakdown(NSOInterfaceState.objects.filter(interface__device_id=dev_id))
     if key == "isis":
         # interfaces + instances combined for the headline; expand shows both.
         ifaces = _status_breakdown(NSOISISInterfaceState.objects.filter(interface__device_id=dev_id))

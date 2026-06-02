@@ -1175,16 +1175,21 @@ class TestDeviceNSOTabView(ViewTestBase):
 
         from netbox_nso_plugin.models import NSOInterfaceState
 
-        # 120 interfaces, each with a description state; #0 is drift (changed).
+        # 120 interfaces, each with a description state. Classification is value-aware:
+        # all are in sync (NetBox description == device value) except #0, whose values
+        # differ and which nobody owns → drift.
         for n in range(120):
             iface = Interface.objects.create(
-                device=self.device, name=f"et-0/0/{n}", type="other", description=f"nb-{n}"
+                device=self.device,
+                name=f"et-0/0/{n}",
+                type="other",
+                description="nb-0" if n == 0 else f"v-{n}",
             )
             NSOInterfaceState.objects.create(
                 interface=iface,
                 attribute="description",
                 status="changed" if n == 0 else "imported",
-                nso_value=f"dev-{n}",
+                nso_value="dev-0" if n == 0 else f"v-{n}",
             )
         url = reverse(
             "plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device.pk, "key": "interfaces"}
@@ -1217,6 +1222,50 @@ class TestDeviceNSOTabView(ViewTestBase):
         self.assertNotIn("et-0/0/1<", bodyd)
 
         Interface.objects.filter(device=self.device, name__startswith="et-0/0/").delete()
+
+    def test_interfaces_page_classification_is_value_aware(self):
+        """Display follows NetBox-vs-device values, not the adapter's stale status.
+
+        Reproduces the device-27 ae2.0 case: an owned row whose status the adapter
+        still reports as a MATCH ("imported"/"unknown") but whose NetBox value
+        differs from the device must read "pending apply", not hide as "in sync".
+        And a value that matches must read "in sync" even if the status is a DIFFER
+        status.
+        """
+        from dcim.models import Interface
+        from django.utils import timezone
+
+        from netbox_nso_plugin.models import NSOInterfaceState
+
+        # Owned + status says in-sync, but NetBox has a description the device lacks.
+        owned_drift = Interface.objects.create(
+            device=self.device, name="ae2.0", type="virtual", description="Core Link"
+        )
+        NSOInterfaceState.objects.create(
+            interface=owned_drift,
+            attribute="description",
+            status="unknown",
+            nso_value="",
+            accepted_at=timezone.now(),
+        )
+        # Status says "changed" (DIFFER) but the values actually match → in sync.
+        matched = Interface.objects.create(device=self.device, name="ae3.0", type="virtual", description="same")
+        NSOInterfaceState.objects.create(interface=matched, attribute="description", status="changed", nso_value="same")
+        url = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device.pk, "key": "interfaces"}
+        )
+
+        # ae2.0 must surface under the pending filter; ae3.0 must not.
+        pending = self.client.get(url, {"state": "pending"}).content.decode()
+        self.assertIn("ae2.0", pending)
+        self.assertNotIn("ae3.0", pending)
+
+        # ae3.0 (values match) must surface under in_sync; ae2.0 must not.
+        in_sync = self.client.get(url, {"state": "in_sync"}).content.decode()
+        self.assertIn("ae3.0", in_sync)
+        self.assertNotIn("ae2.0", in_sync)
+
+        Interface.objects.filter(device=self.device, name__in=["ae2.0", "ae3.0"]).delete()
 
     def test_tab_routing_master_off_skips_protocols(self):
         """A protocol flag without the routing master does not trigger its fetch."""

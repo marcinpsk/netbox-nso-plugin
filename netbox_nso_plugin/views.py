@@ -215,18 +215,12 @@ class NSOCategoryView(LoginRequiredMixin, View):
         NSOInterfaceState — no reconcile; the cache is refreshed off-render.
         """
         from django.core.paginator import Paginator
-        from django.db.models import Q
 
         from .models import NSOInterfaceState
-        from .summary import _DIFFER_STATUSES, _MATCH_STATUSES, display_state
+        from .summary import interface_row_state
 
         q = (request.GET.get("q") or "").strip()
         state = request.GET.get("state") or "all"
-
-        # Owned (NetBox is source of truth) = accepted_at set.
-        owned_differ = Q(status__in=_DIFFER_STATUSES, accepted_at__isnull=False)
-        unowned_differ = Q(status__in=_DIFFER_STATUSES, accepted_at__isnull=True)
-        pending_q = owned_differ | Q(status="deploying")
 
         qs = (
             NSOInterfaceState.objects.filter(interface__device=device)
@@ -235,18 +229,37 @@ class NSOCategoryView(LoginRequiredMixin, View):
         )
         if q:
             qs = qs.filter(interface__name__icontains=q)
-        if state == "drift":
-            qs = qs.filter(unowned_differ)
-        elif state == "pending":
-            qs = qs.filter(pending_q)
-        elif state == "in_sync":
-            qs = qs.filter(status__in=_MATCH_STATUSES)
 
-        paginator = Paginator(qs, self._INTERFACES_PER_PAGE)
+        # Classify every row value-aware (NetBox value vs device value), not by the
+        # adapter's status — which lags and is blind to a value typed straight into
+        # NetBox. Filtering/counts therefore happen in Python over the classified rows
+        # so the chips, totals and badges always agree. The per-device row count is
+        # bounded (≤2 attrs × interfaces), so this is cheap on tab load.
+        classified = []
+        counts = {"all": 0, "drift": 0, "pending": 0}
+        for st in qs:
+            kind, label, owned = interface_row_state(st, st.interface)
+            counts["all"] += 1
+            if kind in ("pending", "deploying"):
+                counts["pending"] += 1
+            elif kind == "drift":
+                counts["drift"] += 1
+            classified.append((st, kind, label, owned))
+
+        if state == "drift":
+            filtered = [c for c in classified if c[1] == "drift"]
+        elif state == "pending":
+            filtered = [c for c in classified if c[1] in ("pending", "deploying")]
+        elif state == "in_sync":
+            filtered = [c for c in classified if c[1] in ("in_sync", "unknown")]
+        else:
+            filtered = classified
+
+        paginator = Paginator(filtered, self._INTERFACES_PER_PAGE)
         page = paginator.get_page(request.GET.get("page") or 1)
 
         rows = []
-        for st in page.object_list:
+        for st, kind, label, owned in page.object_list:
             iface = st.interface
             if st.attribute == "description":
                 netbox_value = iface.description or "—"
@@ -254,8 +267,6 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 netbox_value = "Yes" if iface.enabled else "No"
             else:
                 netbox_value = "—"
-            owned = st.accepted_at is not None
-            kind, label = display_state(st.status, owned)
             rows.append(
                 {
                     "state": st,
@@ -270,16 +281,6 @@ class NSOCategoryView(LoginRequiredMixin, View):
                     "owned": owned,
                 }
             )
-
-        # Per-state totals for the filter chips (whole device, honouring the name filter).
-        base = NSOInterfaceState.objects.filter(interface__device=device)
-        if q:
-            base = base.filter(interface__name__icontains=q)
-        counts = {
-            "all": base.count(),
-            "drift": base.filter(unowned_differ).count(),
-            "pending": base.filter(pending_q).count(),
-        }
 
         return render(
             request,

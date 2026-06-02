@@ -434,17 +434,6 @@ def _stash_interface_old_values(sender, instance, **kwargs):
     instance._nso_old_values = sender.objects.filter(pk=instance.pk).values("description", "enabled").first()
 
 
-def _matches_device_value(attribute, netbox_value, nso_value):
-    """Return True if a NetBox attribute value equals the device (NSO) value.
-
-    The device value is stored as a string in ``NSOInterfaceState.nso_value`` ("True"/
-    "False" for enabled), so compare in the attribute's native type.
-    """
-    if attribute == "enabled":
-        return bool(netbox_value) == (str(nso_value).strip().lower() == "true")
-    return (netbox_value or "") == (nso_value or "")
-
-
 @_skip_on_render
 def _push_intent_on_interface_edit(sender, instance, created, **kwargs):
     """Treat direct edits to description/enabled on managed interfaces as intent.
@@ -477,6 +466,7 @@ def _push_intent_on_interface_edit(sender, instance, created, **kwargs):
         return
 
     from .models import NSODeviceManagement, NSOInterfaceState
+    from .summary import matches_device_value
 
     try:
         mgmt = NSODeviceManagement.objects.get(device_id=instance.device_id)
@@ -503,7 +493,7 @@ def _push_intent_on_interface_edit(sender, instance, created, **kwargs):
         # Operator changed this attribute → NetBox owns it. Whether it is "pending
         # apply" depends on the value: editing it back to the device's value (e.g.
         # flip enabled off then on) leaves nothing to apply → in_sync, not accepted.
-        state.status = "in_sync" if _matches_device_value(attribute, new_value, state.nso_value) else "accepted"
+        state.status = "in_sync" if matches_device_value(attribute, new_value, state.nso_value) else "accepted"
         if state.accepted_at is None:
             state.accepted_at = now
         state.save(update_fields=["status", "accepted_at"])
