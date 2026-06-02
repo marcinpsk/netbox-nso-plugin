@@ -173,21 +173,35 @@ class TestReconcileIsisInterfaces(TestCase):
         result = _reconcile_isis_interfaces(self.device, self._payload())
         self.assertEqual(result, [])
 
-    def test_single_entry_creates_state_row_imported(self):
-        """New IS-IS entry → NSOISISInterfaceState created with status=imported."""
+    def test_single_entry_creates_state_and_routing_interface(self):
+        """New IS-IS entry → NSOISISInterfaceState linked to a netbox_routing.ISISInterface.
+
+        With netbox-routing installed the reconcile now creates the real ISISInterface
+        (under its ISISInstance) and links it, so the state is in_sync (linked), not the
+        old always-"imported".
+        """
         mgmt = self._make_mgmt()
+        from netbox_routing.models import ISISInterface
+
         from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
 
-        result = _reconcile_isis_interfaces(self.device, self._payload(self._entry()))
+        result = _reconcile_isis_interfaces(self.device, self._payload(self._entry(circuit_type="level-2-only")))
 
         self.assertEqual(len(result), 1)
         state = result[0]
-        self.assertEqual(state.status, "imported")
+        self.assertEqual(state.status, "in_sync")
         self.assertEqual(state.af, "ipv4")
         self.assertEqual(state.interface, self.iface_ge0)
         self.assertEqual(state.management, mgmt)
-        self.assertEqual(state.circuit_type, "level-1-2")
+        self.assertEqual(state.circuit_type, "level-2-only")
         self.assertFalse(state.passive)
+
+        # The real routing object was created, linked, and carries the value.
+        self.assertIsNotNone(state.isis_interface)
+        ri = ISISInterface.objects.get(interface=self.iface_ge0, address_family="ipv4")
+        self.assertEqual(state.isis_interface_id, ri.pk)
+        self.assertEqual(ri.circuit_type, "level-2-only")
+        self.assertEqual(ri.instance.device, self.device)
 
     def test_idempotent_second_call(self):
         """Calling reconcile twice with same payload produces same single row."""
@@ -238,7 +252,7 @@ class TestReconcileIsisInterfaces(TestCase):
 
         self.assertEqual(len(result), 2)
         statuses = {r.interface.name: r.status for r in result}
-        self.assertEqual(statuses["GigabitEthernet0/0"], "imported")
+        self.assertEqual(statuses["GigabitEthernet0/0"], "in_sync")
         self.assertEqual(statuses["GigabitEthernet0/1"], "changed")
 
     def test_write_path_status_preserved(self):

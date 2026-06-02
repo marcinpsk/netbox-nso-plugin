@@ -597,6 +597,43 @@ def _reconcile_static_routes(device, payload: dict) -> list:
 _ISIS_WRITE_PATH_STATUSES = {"accepted", "deploying", "in_sync"}
 
 
+def _link_routing_isis_interface(device, iface, af, state, instances: dict):
+    """Create/update the netbox_routing.ISISInterface for this row; return it (or None).
+
+    Returns None when netbox-routing isn't installed. ISISInterface.instance is required,
+    so the ISISInstance is ensured here too (this reconcile runs before the process one),
+    cached in *instances* keyed by process_tag. Mirrors how BGP/static reconcile into
+    netbox_routing; owner is left null (ownership lives in NSO*State.accepted_at).
+    """
+    try:
+        from netbox_routing.models import ISISInstance, ISISInterface
+    except Exception:
+        return None
+
+    tag = state.process_tag
+    if tag not in instances:
+        instances[tag], _ = ISISInstance.objects.get_or_create(device=device, process_tag=tag)
+    inst = instances[tag]
+
+    ri, _ = ISISInterface.objects.get_or_create(interface=iface, address_family=af, defaults={"instance": inst})
+    fields: list[str] = []
+    if ri.instance_id != inst.id:
+        ri.instance = inst
+        fields.append("instance")
+    for attr, val in (
+        ("circuit_type", state.circuit_type or None),
+        ("network_type", state.network_type or None),
+        ("metric", state.metric),
+        ("passive", state.passive),
+    ):
+        if getattr(ri, attr) != val:
+            setattr(ri, attr, val)
+            fields.append(attr)
+    if fields:
+        ri.save(update_fields=fields)
+    return ri
+
+
 def _reconcile_isis_interfaces(device, interfaces: list) -> list:
     """Reconcile IS-IS interface data from the adapter into NSOISISInterfaceState rows.
 
@@ -623,6 +660,7 @@ def _reconcile_isis_interfaces(device, interfaces: list) -> list:
     now = timezone.now()
     seen_keys: set[tuple] = set()
     dropped: list[str] = []
+    instances: dict[str, object] = {}  # process_tag -> netbox_routing ISISInstance (cache)
 
     for entry in interfaces or []:
         iface_name = entry.get("interface_name") or ""
@@ -651,8 +689,12 @@ def _reconcile_isis_interfaces(device, interfaces: list) -> list:
         state.metric = entry.get("metric")
         state.passive = bool(entry.get("passive", False))
         state.last_sync_at = now
+
+        state.isis_interface = _link_routing_isis_interface(device, iface, af, state, instances)
+
         if state.status not in _ISIS_WRITE_PATH_STATUSES:
-            state.status = "imported"  # NSOISISInterfaceState has no FK yet → always imported
+            # Linked to the routing object we just synced from NSO → in sync.
+            state.status = "in_sync" if state.isis_interface_id else "imported"
         state.save()
         seen_keys.add((iface.pk, af))
 
@@ -670,7 +712,7 @@ def _reconcile_isis_interfaces(device, interfaces: list) -> list:
             ", ".join(sorted(set(dropped))),
         )
 
-    return list(NSOISISInterfaceState.objects.filter(management=mgmt).select_related("interface"))
+    return list(NSOISISInterfaceState.objects.filter(management=mgmt).select_related("interface", "isis_interface"))
 
 
 def _reconcile_isis_process(device, process_list: list) -> list:
@@ -698,13 +740,15 @@ def _reconcile_isis_process(device, process_list: list) -> list:
     now = timezone.now()
     seen_tags: set[str] = set()
 
-    # Try to import ISISInstance from netbox-routing (may not be installed)
+    # netbox-routing ISISInstance (may not be installed). When present we
+    # create/update the real instance keyed by (device, process_tag) — mirroring how
+    # the BGP reconciler auto-creates its BGPRouter — and link it from the state row.
     try:
         from netbox_routing.models import ISISInstance
 
-        isis_instances = {inst.process_id: inst for inst in ISISInstance.objects.filter(device=device)}
+        routing_ok = True
     except Exception:
-        isis_instances = {}
+        routing_ok = False
 
     for entry in process_list or []:
         # Junos' default IS-IS instance has an empty process tag — "" is a valid
@@ -729,9 +773,17 @@ def _reconcile_isis_process(device, process_list: list) -> list:
         state.domain_auth_present = bool(entry.get("domain_auth_present", False))
         state.last_sync_at = now
 
-        # Try to link to netbox-routing ISISInstance by process_tag == process_id
-        if tag in isis_instances:
-            state.isis_instance = isis_instances[tag]
+        if routing_ok:
+            inst, _ = ISISInstance.objects.get_or_create(device=device, process_tag=tag)
+            # Keep the routing instance's informational fields in step with NSO.
+            inst_fields = []
+            for attr, val in (("net", state.net), ("is_type", state.is_type)):
+                if val and getattr(inst, attr) != val:
+                    setattr(inst, attr, val)
+                    inst_fields.append(attr)
+            if inst_fields:
+                inst.save(update_fields=inst_fields)
+            state.isis_instance = inst
 
         if state.status not in _ISIS_WRITE_PATH_STATUSES:
             state.status = "in_sync" if state.isis_instance_id else "imported"

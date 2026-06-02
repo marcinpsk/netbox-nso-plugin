@@ -688,6 +688,14 @@ class NSOISISInterfaceState(NetBoxModel):
     network_type = models.CharField(max_length=32, blank=True, default="")
     metric = models.PositiveIntegerField(null=True, blank=True)
     passive = models.BooleanField(default=False)
+    # Linked netbox-routing object (nullable — created/linked by the reconcile)
+    isis_interface = models.ForeignKey(
+        to="netbox_routing.ISISInterface",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="nso_interface_states",
+    )
     status = models.CharField(max_length=32, choices=_ISIS_STATUS_CHOICES, default="unknown")
     last_sync_at = models.DateTimeField(null=True, blank=True)
     accepted_at = models.DateTimeField(null=True, blank=True)
