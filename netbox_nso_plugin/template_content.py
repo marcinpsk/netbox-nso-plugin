@@ -670,6 +670,15 @@ def _reconcile_isis_interfaces(device, interfaces: list) -> list:
 
         iface = iface_map.get(iface_name)
         if iface is None:
+            # Nokia SR OS IS-IS interfaces are logical router-interfaces (e.g.
+            # "LAG99:10") whose name does not match a NetBox dcim.Interface (named
+            # by port-id). bound_port carries the physical/LAG binding ("lag-99:10")
+            # the adapter derived from the device — correlate through it. Mirrors
+            # the interface-IP reconcile's bound_port fallback.
+            bound_port = entry.get("bound_port")
+            if bound_port:
+                iface = iface_map.get(bound_port)
+        if iface is None:
             # The interface the adapter reports does not exist in NetBox — most
             # often a logical unit (e.g. Junos ae98.100) that is not yet modelled
             # as a dcim.Interface. Record it so the drop is visible rather than

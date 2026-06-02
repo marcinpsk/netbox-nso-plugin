@@ -220,6 +220,32 @@ class TestReconcileIsisInterfaces(TestCase):
         result = _reconcile_isis_interfaces(self.device, self._payload(self._entry(iface_name="Ethernet99/99")))
         self.assertEqual(result, [])
 
+    def test_nokia_bound_port_correlates_logical_interface(self):
+        """Nokia logical IS-IS name (LAG99:10) doesn't match a dcim.Interface, but its
+        bound_port (lag-99:10) does → correlate through bound_port."""
+        self._make_mgmt()
+        port = Interface.objects.create(device=self.device, name="lag-99:10", type="lag")
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        result = _reconcile_isis_interfaces(
+            self.device,
+            self._payload(self._entry(iface_name="LAG99:10", bound_port="lag-99:10")),
+        )
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].interface_id, port.pk)
+        self.assertEqual(result[0].status, "in_sync")
+
+    def test_nokia_bound_port_unmatched_is_dropped(self):
+        """A logical name with a bound_port that still matches no dcim.Interface is dropped."""
+        self._make_mgmt()
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        result = _reconcile_isis_interfaces(
+            self.device,
+            self._payload(self._entry(iface_name="LAG99:99", bound_port="lag-99:99")),
+        )
+        self.assertEqual(result, [])
+
     def test_dual_stack_creates_two_rows(self):
         """IPv4 and IPv6 on same interface → two state rows with same interface FK."""
         self._make_mgmt()
