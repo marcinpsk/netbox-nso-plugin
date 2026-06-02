@@ -596,8 +596,13 @@ class NSOInterfaceStateDeleteView(generic.ObjectDeleteView):
 
 
 def _push_intent_for_device(device_id: int) -> None:
-    """Build full intent snapshot for a device and push it to the adapter."""
-    from . import adapter_client as client
+    """Push the full OWNED interface intent snapshot for a device to the adapter.
+
+    Delegates to the single shared builder in ``signals`` so the view-level bulk
+    accept, the accept signal, and the Decision-G edit signal all push the same
+    snapshot and share the change-detection cache.
+    """
+    from .signals import _push_interface_intent_for_device
 
     try:
         mgmt = NSODeviceManagement.objects.select_related("nso_instance").get(device_id=device_id)
@@ -608,34 +613,7 @@ def _push_intent_for_device(device_id: int) -> None:
     if mgmt.adapter_device_id is None:
         return
 
-    states = NSOInterfaceState.objects.filter(
-        interface__device_id=device_id,
-        accepted_at__isnull=False,
-    ).select_related("interface")
-
-    attributes = []
-    for state in states:
-        iface = state.interface
-        if state.attribute == "description":
-            intent_value = iface.description or ""
-        elif state.attribute == "enabled":
-            intent_value = str(iface.enabled).lower()
-        else:
-            continue
-
-        attributes.append(
-            {
-                "interface": iface.name,
-                "attribute": state.attribute,
-                "intent_value": intent_value,
-                "accepted_at": state.accepted_at.isoformat() if state.accepted_at else None,
-            }
-        )
-
-    try:
-        client.put_intent(mgmt.adapter_device_id, attributes)
-    except Exception as exc:
-        logger.warning("Failed to push intent for device %s: %s", device_id, exc)
+    _push_interface_intent_for_device(device_id, mgmt.adapter_device_id)
 
 
 # Statuses where the NetBox value already matches the device — accepting them

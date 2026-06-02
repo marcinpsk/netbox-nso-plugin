@@ -7,13 +7,20 @@ Config resolution (per call, ~30 s in-process cache):
   - Bearer token: PLUGINS_CONFIG/env ONLY — never the database.
 """
 
+import logging
 import time
 
 import requests
 from django.conf import settings
 
+logger = logging.getLogger(__name__)
+
 _CACHE_TTL = 30  # seconds
 _cfg_cache: dict = {}
+# Connect phase is capped well below the (longer) read timeout so a genuinely
+# unreachable adapter fails fast, while a connected-but-slow adapter still gets
+# the full read window before we conclude it is hung.
+_CONNECT_TIMEOUT = 5  # seconds
 
 
 class AdapterError(Exception):
@@ -86,10 +93,29 @@ def _request(method, path, **kwargs):
     else:
         verify = True
 
+    read_timeout = cfg["timeout"]
+    connect_timeout = min(_CONNECT_TIMEOUT, read_timeout)
     try:
         session = requests.Session()
         session.trust_env = False  # Adapter is always internal — never route through system proxy.
-        resp = session.request(method, url, headers=headers, timeout=cfg["timeout"], verify=verify, **kwargs)
+        resp = session.request(
+            method, url, headers=headers, timeout=(connect_timeout, read_timeout), verify=verify, **kwargs
+        )
+    except requests.exceptions.ReadTimeout as exc:
+        # Connected but no response within the read window — the adapter is up but
+        # hung (e.g. blocked event loop). Surface this distinctly so it is NOT
+        # mistaken for "unreachable" and is visible in logs.
+        logger.warning(
+            "nso-adapter accepted the connection but did not respond within %ss for %s %s — it may be hung",
+            read_timeout,
+            method,
+            path,
+        )
+        raise AdapterError(
+            f"Adapter did not respond within {read_timeout}s (it may be hung).", code="nso_timeout"
+        ) from exc
+    except requests.exceptions.ConnectTimeout as exc:
+        raise AdapterError(f"Adapter connect timed out after {connect_timeout}s.", code="nso_unreachable") from exc
     except requests.RequestException as exc:
         raise AdapterError(f"Adapter unreachable: {exc}", code="nso_unreachable") from exc
 

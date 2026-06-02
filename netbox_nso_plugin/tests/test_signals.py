@@ -546,9 +546,10 @@ try:
 
             from netbox_nso_plugin.models import NSOInterfaceIPState
 
-            IPAddress.objects.create(
-                address="10.1.0.1/24", assigned_object_type=self._ct(), assigned_object_id=self.iface.pk
-            )
+            with self.captureOnCommitCallbacks(execute=True):
+                IPAddress.objects.create(
+                    address="10.1.0.1/24", assigned_object_type=self._ct(), assigned_object_id=self.iface.pk
+                )
 
             state = NSOInterfaceIPState.objects.get(interface=self.iface, address="10.1.0.1/24", vrf="")
             self.assertEqual(state.status, "accepted")
@@ -596,12 +597,14 @@ try:
             """Deleting an IPAddress fires push with that address excluded."""
             from ipam.models import IPAddress
 
-            ip = IPAddress.objects.create(
-                address="10.1.2.1/30", assigned_object_type=self._ct(), assigned_object_id=self.iface.pk
-            )
+            with self.captureOnCommitCallbacks(execute=True):
+                ip = IPAddress.objects.create(
+                    address="10.1.2.1/30", assigned_object_type=self._ct(), assigned_object_id=self.iface.pk
+                )
             mock_put.reset_mock()
 
-            ip.delete()
+            with self.captureOnCommitCallbacks(execute=True):
+                ip.delete()
 
             mock_put.assert_called_once()
             call_device_id, call_addresses = mock_put.call_args[0]
@@ -628,9 +631,10 @@ try:
 
             mock_put.side_effect = AdapterError("down", code="nso_unreachable")
 
-            IPAddress.objects.create(
-                address="10.1.3.1/28", assigned_object_type=self._ct(), assigned_object_id=self.iface.pk
-            )
+            with self.captureOnCommitCallbacks(execute=True):
+                IPAddress.objects.create(
+                    address="10.1.3.1/28", assigned_object_type=self._ct(), assigned_object_id=self.iface.pk
+                )
 
     class TestGActivatedInterfaceIntentOrigin(DjangoTestCase):
         """Decision-G intent signal discriminates operator edits from adapter imports."""
@@ -681,7 +685,8 @@ try:
             token = current_request.set(req)
             try:
                 with patch("netbox_nso_plugin.adapter_client.put_intent") as mock_put:
-                    _push_intent_on_interface_edit(None, self.iface, created=False)
+                    with self.captureOnCommitCallbacks(execute=True):
+                        _push_intent_on_interface_edit(None, self.iface, created=False)
                     return mock_put
             finally:
                 current_request.reset(token)

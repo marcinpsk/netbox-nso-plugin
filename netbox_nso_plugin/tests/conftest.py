@@ -4,6 +4,9 @@
 
 import sys
 import types
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 
 def _make_netbox_stubs():
@@ -62,3 +65,54 @@ def _make_netbox_stubs():
 
 
 _make_netbox_stubs()
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _block_real_adapter_network():
+    """Keep the whole suite hermetic: no test ever reaches the live adapter.
+
+    The devcontainer's PLUGINS_CONFIG points ``adapter_url`` at the real adapter
+    (``http://nso-adapter:8000``) with a 30s client timeout, so any *unmocked*
+    ``adapter_client`` call makes a real HTTP round-trip — and ``setUpTestData``
+    creating an ``NSODeviceManagement`` via ``.create()`` fires the
+    ``sync_scope_to_adapter`` signal, which onboards a *test* device into the live
+    adapter's DB (pollution) and, if the adapter is slow/hung, blocks for the full
+    timeout. CI avoids this with ``adapter.mock.invalid`` (a non-resolving TLD).
+
+    This session-scoped patch replaces ``adapter_client``'s ``requests.Session``
+    with one whose ``.request`` fails fast with a ``ConnectionError`` — the same
+    ``AdapterError`` outcome a real unreachable adapter would produce (which the
+    signal handlers already swallow), but instant. Session scope means it is active
+    during ``setUpTestData`` too, which a function-scoped fixture cannot cover.
+
+    Tests that exercise the client for real (``test_adapter_client_ext``) or that
+    assert specific adapter behaviour all patch ``requests.Session`` (or higher)
+    themselves; those patches nest on top of this one, so they are unaffected.
+    """
+    import requests
+
+    def _make_blocked_session(*args, **kwargs):
+        session = MagicMock()
+        session.trust_env = False
+        session.request.side_effect = requests.exceptions.ConnectionError("adapter network blocked in tests")
+        return session
+
+    with patch("netbox_nso_plugin.adapter_client.requests.Session", side_effect=_make_blocked_session):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _reset_intent_push_state():
+    """Clear the intent-push coalescing + change-detection caches between tests.
+
+    Both are module-level state in signals.py; without a reset, a hash cached by one
+    test would make a later identical push a no-op (skipped), and a coalesced push
+    left pending by a rolled-back DB test could leak into the next.
+    """
+    try:
+        from netbox_nso_plugin.signals import reset_intent_push_state
+
+        reset_intent_push_state()
+    except Exception:
+        pass
+    yield

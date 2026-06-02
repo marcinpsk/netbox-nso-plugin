@@ -185,7 +185,8 @@ class TestOnStaticRouteStateSave(TestCase):
             )
             from netbox_nso_plugin.signals import _on_static_route_state_save
 
-            _on_static_route_state_save(sender=NSOStaticRouteState, instance=state)
+            with self.captureOnCommitCallbacks(execute=True):
+                _on_static_route_state_save(sender=NSOStaticRouteState, instance=state)
             mock_push.assert_called_once()
             args = mock_push.call_args[0]
             assert args[0] == 99  # adapter_device_id

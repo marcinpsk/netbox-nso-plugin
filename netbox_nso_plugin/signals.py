@@ -3,6 +3,8 @@
 """Signal handlers for NSODeviceManagement scope propagation and intent push."""
 
 import functools
+import hashlib
+import json
 import logging
 import threading
 
@@ -111,6 +113,146 @@ def _skip_on_render(handler):
     return _wrapped
 
 
+# ── Intent-push coalescing + change-detection ──────────────────────────────────
+#
+# A bulk operation (e.g. NetBox's native bulk-edit) saves N rows in one
+# transaction; each save fires a push handler that rebuilds and PUTs the FULL
+# device snapshot. Without coalescing that is O(N^2) work and N HTTP PUTs.
+#
+# Two complementary mitigations, mirroring the adapter perf layers:
+#   * Coalescing — collect pushes during a transaction, keyed by (device, category),
+#     and flush each key once at commit (one push reflecting the final state).
+#   * Change-detection — skip the PUT when the snapshot is byte-identical to the
+#     last one pushed for that key. The adapter PUT is an idempotent full-replace,
+#     so this in-process, best-effort cache is safe (a cold-cache redundant push
+#     is harmless).
+#
+# Coalescing only engages inside a transaction; with no active transaction (a
+# lone programmatic save, or the no-DB unit tests) the push runs immediately —
+# this also avoids on_commit's autocommit path forcing a DB connection.
+
+_pending_pushes = threading.local()
+_last_pushed_hashes: dict[tuple, str] = {}
+
+
+def reset_intent_push_state() -> None:
+    """Clear coalescing + change-detection state. Intended for use in tests."""
+    _last_pushed_hashes.clear()
+    _pending_pushes.map = {}
+
+
+def _schedule_intent_push(key, fn) -> None:
+    """Coalesce *fn* under *key*, flushing once when the current transaction commits.
+
+    Deduped by key, so N saves of the same (device, category) collapse to one push.
+    Outside a transaction the push runs immediately (nothing to coalesce).
+    """
+    from django.db import connection, transaction
+
+    if not connection.in_atomic_block:
+        fn()
+        return
+
+    pending = getattr(_pending_pushes, "map", None)
+    if pending is None:
+        pending = {}
+        _pending_pushes.map = pending
+    was_empty = not pending
+    pending[key] = fn  # last fn wins — per-key builders are equivalent
+    if was_empty:
+        transaction.on_commit(_drain_intent_pushes)
+
+
+def _drain_intent_pushes() -> None:
+    """Run every coalesced push once, isolating failures so one can't abort the rest."""
+    pending = getattr(_pending_pushes, "map", None)
+    _pending_pushes.map = {}
+    if not pending:
+        return
+    for fn in pending.values():
+        try:
+            fn()
+        except Exception as exc:  # noqa: BLE001 — a failed push must not abort siblings
+            logger.warning("Coalesced intent push failed: %s", exc)
+
+
+def _push_changed(key, payload, do_push) -> None:
+    """Run *do_push* only if *payload* differs from the last push for *key*.
+
+    ``do_push`` performs the actual ``client.put_*`` call. Errors are swallowed
+    (matching the adapter-unreachable tolerance elsewhere) and the cache is left
+    unchanged on failure so the next attempt retries.
+    """
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+    if _last_pushed_hashes.get(key) == digest:
+        logger.debug("Intent push skipped (unchanged) for %s", key)
+        return
+    try:
+        do_push()
+    except Exception as exc:  # noqa: BLE001 — adapter may be down; log and retry next time
+        logger.warning("Intent push failed for %s: %s", key, exc)
+        return
+    _last_pushed_hashes[key] = digest
+
+
+def _push_interface_intent_for_device(device_id, adapter_device_id) -> None:
+    """Build the full OWNED interface intent snapshot and push it (change-detected).
+
+    Owned = ``accepted_at`` set (the 2-D model's source-of-truth marker), independent
+    of sync status. Shared by the accept signal, the Decision-G edit signal, and the
+    view-level bulk accept so all three agree on what gets pushed.
+    """
+    from . import adapter_client as client
+    from .models import NSOInterfaceState
+
+    states = NSOInterfaceState.objects.filter(
+        interface__device_id=device_id,
+        accepted_at__isnull=False,
+    ).select_related("interface")
+
+    attributes = []
+    for state in states:
+        iface = state.interface
+        if state.attribute == "description":
+            intent_value = iface.description or ""
+        elif state.attribute == "enabled":
+            intent_value = str(iface.enabled).lower()
+        else:
+            continue
+        attributes.append(
+            {
+                "interface": iface.name,
+                "attribute": state.attribute,
+                "intent_value": intent_value,
+                "accepted_at": state.accepted_at.isoformat() if state.accepted_at else None,
+            }
+        )
+
+    _push_changed((device_id, "interface"), attributes, lambda: client.put_intent(adapter_device_id, attributes))
+
+
+def _schedule_redistribution_push(device_id, adapter_device_id, dest) -> None:
+    """Schedule the destination protocol's intent push for a redistribution change.
+
+    Keyed by (device, dest_protocol) so redistribution and the protocol's own state
+    saves coalesce into a single push for that protocol.
+    """
+    if dest == "ospf":
+        fn = _push_ospf_intent_for_device
+    elif dest == "isis":
+        fn = _push_isis_intent_for_device
+    elif dest == "bgp":
+        fn = _push_bgp_intent_for_device
+    else:
+        logger.warning(
+            "Redistribution: unknown dest_protocol %r for device %s — no push triggered",
+            dest,
+            device_id,
+        )
+        return
+    _schedule_intent_push((device_id, dest), lambda: fn(device_id, adapter_device_id))
+
+
 @receiver(post_save, sender="netbox_nso_plugin.NSODeviceManagement")
 def sync_scope_to_adapter(sender, instance, created, **kwargs):
     """Push device + scope to the adapter whenever an NSODeviceManagement record is saved.
@@ -170,12 +312,13 @@ def push_intent_on_accept(sender, instance, **kwargs):
     Owned = accepted_at set (NetBox is the source of truth), independent of the sync
     status — so accepting a value that already matches the device (in_sync) still
     records ownership in the adapter and survives the next sync.
+
+    The push is coalesced + change-detected via :func:`_schedule_intent_push`.
     """
     if instance.accepted_at is None:
         return
 
-    from . import adapter_client as client
-    from .models import NSODeviceManagement, NSOInterfaceState
+    from .models import NSODeviceManagement
 
     device_id = instance.interface.device_id
     try:
@@ -186,33 +329,11 @@ def push_intent_on_accept(sender, instance, **kwargs):
     if mgmt.adapter_device_id is None:
         return
 
-    states = NSOInterfaceState.objects.filter(
-        interface__device_id=device_id,
-        accepted_at__isnull=False,
-    ).select_related("interface")
-
-    attributes = []
-    for state in states:
-        iface = state.interface
-        if state.attribute == "description":
-            intent_value = iface.description or ""
-        elif state.attribute == "enabled":
-            intent_value = str(iface.enabled).lower()
-        else:
-            continue
-        attributes.append(
-            {
-                "interface": iface.name,
-                "attribute": state.attribute,
-                "intent_value": intent_value,
-                "accepted_at": state.accepted_at.isoformat() if state.accepted_at else None,
-            }
-        )
-
-    try:
-        client.put_intent(mgmt.adapter_device_id, attributes)
-    except Exception as exc:
-        logger.warning("Failed to push intent for device %s: %s", device_id, exc)
+    adapter_device_id = mgmt.adapter_device_id
+    _schedule_intent_push(
+        (device_id, "interface"),
+        lambda: _push_interface_intent_for_device(device_id, adapter_device_id),
+    )
 
 
 def _templates():
@@ -352,39 +473,12 @@ def _push_intent_on_interface_edit(sender, instance, created, **kwargs):
     if not updated:
         return
 
-    from . import adapter_client as client
-
-    states = NSOInterfaceState.objects.filter(
-        interface__device_id=instance.device_id,
-        status="accepted",
-    ).select_related("interface")
-
-    attributes_payload = []
-    for state in states:
-        iface = state.interface
-        if state.attribute == "description":
-            intent_value = iface.description or ""
-        elif state.attribute == "enabled":
-            intent_value = str(iface.enabled).lower()
-        else:
-            continue
-        attributes_payload.append(
-            {
-                "interface": iface.name,
-                "attribute": state.attribute,
-                "intent_value": intent_value,
-                "accepted_at": state.accepted_at.isoformat() if state.accepted_at else None,
-            }
-        )
-
-    try:
-        client.put_intent(mgmt.adapter_device_id, attributes_payload)
-    except Exception as exc:
-        logger.warning(
-            "G-activated: failed to push intent for device %s: %s",
-            instance.device_id,
-            exc,
-        )
+    device_id = instance.device_id
+    adapter_device_id = mgmt.adapter_device_id
+    _schedule_intent_push(
+        (device_id, "interface"),
+        lambda: _push_interface_intent_for_device(device_id, adapter_device_id),
+    )
 
 
 def _push_ip_intent_for_device(device_id, adapter_device_id):
@@ -409,10 +503,7 @@ def _push_ip_intent_for_device(device_id, adapter_device_id):
         for ip_state in ip_states
     ]
 
-    try:
-        client.put_ip_intent(adapter_device_id, addresses)
-    except Exception as exc:
-        logger.warning("Failed to push IP intent for device %s: %s", device_id, exc)
+    _push_changed((device_id, "ip"), addresses, lambda: client.put_ip_intent(adapter_device_id, addresses))
 
 
 def _push_snmp_intent_for_device(device_id, adapter_device_id):
@@ -478,10 +569,11 @@ def _push_snmp_intent_for_device(device_id, adapter_device_id):
     except NSOSnmpSystemInfoState.DoesNotExist:
         pass
 
-    try:
-        client.put_snmp_intent(adapter_device_id, communities, v3_users, hosts, system_info)
-    except Exception as exc:
-        logger.warning("Failed to push SNMP intent for device %s: %s", device_id, exc)
+    _push_changed(
+        (device_id, "snmp"),
+        [communities, v3_users, hosts, system_info],
+        lambda: client.put_snmp_intent(adapter_device_id, communities, v3_users, hosts, system_info),
+    )
 
 
 @_skip_on_render
@@ -497,7 +589,12 @@ def _on_snmp_state_save(sender, instance, **kwargs):
     if mgmt.adapter_device_id is None:
         return
 
-    _push_snmp_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+    device_id = mgmt.device_id
+    adapter_device_id = mgmt.adapter_device_id
+    _schedule_intent_push(
+        (device_id, "snmp"),
+        lambda: _push_snmp_intent_for_device(device_id, adapter_device_id),
+    )
 
 
 def _on_ip_address_change(sender, instance, **kwargs):
@@ -550,7 +647,11 @@ def _on_ip_address_change(sender, instance, **kwargs):
             ip_state.save(update_fields=["status", "accepted_at"])
 
     if not getattr(_p2p_allocation_active, "active", False):
-        _push_ip_intent_for_device(device_id, mgmt.adapter_device_id)
+        adapter_device_id = mgmt.adapter_device_id
+        _schedule_intent_push(
+            (device_id, "ip"),
+            lambda: _push_ip_intent_for_device(device_id, adapter_device_id),
+        )
 
 
 def _on_ip_address_delete(sender, instance, **kwargs):
@@ -581,7 +682,11 @@ def _on_ip_address_delete(sender, instance, **kwargs):
         vrf=vrf_name,
     ).delete()
 
-    _push_ip_intent_for_device(device_id, mgmt.adapter_device_id)
+    adapter_device_id = mgmt.adapter_device_id
+    _schedule_intent_push(
+        (device_id, "ip"),
+        lambda: _push_ip_intent_for_device(device_id, adapter_device_id),
+    )
 
 
 def _push_static_route_intent_for_device(device_id, adapter_device_id):
@@ -609,10 +714,11 @@ def _push_static_route_intent_for_device(device_id, adapter_device_id):
             }
         )
 
-    try:
-        client.put_static_route_intent(adapter_device_id, routes)
-    except Exception as exc:
-        logger.warning("Failed to push static route intent for device %s: %s", device_id, exc)
+    _push_changed(
+        (device_id, "static_route"),
+        routes,
+        lambda: client.put_static_route_intent(adapter_device_id, routes),
+    )
 
 
 @_skip_on_render
@@ -628,7 +734,12 @@ def _on_static_route_state_save(sender, instance, **kwargs):
     if mgmt.adapter_device_id is None:
         return
 
-    _push_static_route_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+    device_id = mgmt.device_id
+    adapter_device_id = mgmt.adapter_device_id
+    _schedule_intent_push(
+        (device_id, "static_route"),
+        lambda: _push_static_route_intent_for_device(device_id, adapter_device_id),
+    )
 
 
 def _push_isis_intent_for_device(device_id, adapter_device_id):
@@ -676,10 +787,11 @@ def _push_isis_intent_for_device(device_id, adapter_device_id):
             proc_entry["redistribution"] = proc_redist
         processes.append(proc_entry)
 
-    try:
-        client.put_isis_interface_intent(adapter_device_id, interfaces, processes=processes)
-    except Exception as exc:
-        logger.warning("Failed to push IS-IS intent for device %s: %s", device_id, exc)
+    _push_changed(
+        (device_id, "isis"),
+        [interfaces, processes],
+        lambda: client.put_isis_interface_intent(adapter_device_id, interfaces, processes=processes),
+    )
 
 
 @_skip_on_render
@@ -695,7 +807,12 @@ def _on_isis_interface_state_save(sender, instance, **kwargs):
     if mgmt.adapter_device_id is None:
         return
 
-    _push_isis_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+    device_id = mgmt.device_id
+    adapter_device_id = mgmt.adapter_device_id
+    _schedule_intent_push(
+        (device_id, "isis"),
+        lambda: _push_isis_intent_for_device(device_id, adapter_device_id),
+    )
 
 
 @_skip_on_render
@@ -711,7 +828,12 @@ def _on_isis_instance_state_save(sender, instance, **kwargs):
     if mgmt.adapter_device_id is None:
         return
 
-    _push_isis_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+    device_id = mgmt.device_id
+    adapter_device_id = mgmt.adapter_device_id
+    _schedule_intent_push(
+        (device_id, "isis"),
+        lambda: _push_isis_intent_for_device(device_id, adapter_device_id),
+    )
 
 
 def _build_bgp_router_list(routers: dict, scope_afs: dict) -> list:
@@ -792,10 +914,12 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
             }
         )
 
-    try:
-        client.put_bgp_intent(adapter_device_id, _build_bgp_router_list(routers, scope_afs))
-    except Exception as exc:
-        logger.warning("Failed to push BGP intent for device %s: %s", device_id, exc)
+    router_list = _build_bgp_router_list(routers, scope_afs)
+    _push_changed(
+        (device_id, "bgp"),
+        router_list,
+        lambda: client.put_bgp_intent(adapter_device_id, router_list),
+    )
 
 
 @_skip_on_render
@@ -811,7 +935,12 @@ def _on_bgp_peer_state_save(sender, instance, **kwargs):
     if mgmt.adapter_device_id is None:
         return
 
-    _push_bgp_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+    device_id = mgmt.device_id
+    adapter_device_id = mgmt.adapter_device_id
+    _schedule_intent_push(
+        (device_id, "bgp"),
+        lambda: _push_bgp_intent_for_device(device_id, adapter_device_id),
+    )
 
 
 @_skip_on_render
@@ -827,19 +956,7 @@ def _on_redistribution_state_save(sender, instance, **kwargs):
     if mgmt.adapter_device_id is None:
         return
 
-    dest = instance.dest_protocol
-    if dest == "ospf":
-        _push_ospf_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
-    elif dest == "isis":
-        _push_isis_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
-    elif dest == "bgp":
-        _push_bgp_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
-    else:
-        logger.warning(
-            "NSORedistributionState: unknown dest_protocol %r for device %s — no push triggered",
-            dest,
-            mgmt.device_id,
-        )
+    _schedule_redistribution_push(mgmt.device_id, mgmt.adapter_device_id, instance.dest_protocol)
 
 
 def _push_route_policy_intent_for_device(device_id, adapter_device_id):
@@ -866,10 +983,11 @@ def _push_route_policy_intent_for_device(device_id, adapter_device_id):
             }
         )
 
-    try:
-        client.put_route_policy_intent(adapter_device_id, objects)
-    except Exception as exc:
-        logger.warning("Failed to push route-policy intent for device %s: %s", device_id, exc)
+    _push_changed(
+        (device_id, "route_policy"),
+        objects,
+        lambda: client.put_route_policy_intent(adapter_device_id, objects),
+    )
 
 
 def _build_route_policy_entries(family, obj):
@@ -928,7 +1046,12 @@ def _on_route_policy_state_save(sender, instance, **kwargs):
     if mgmt.adapter_device_id is None:
         return
 
-    _push_route_policy_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+    device_id = mgmt.device_id
+    adapter_device_id = mgmt.adapter_device_id
+    _schedule_intent_push(
+        (device_id, "route_policy"),
+        lambda: _push_route_policy_intent_for_device(device_id, adapter_device_id),
+    )
 
 
 def _collect_redistribution_by_dest_ref(device_id: int, dest_protocol: str) -> dict[str, list[dict]]:
@@ -1013,10 +1136,8 @@ def _push_ospf_intent_for_device(device_id, adapter_device_id):
             entry["auth_type"] = row.auth_type
         interfaces.append(entry)
 
-    try:
-        client.put_ospf_intent(adapter_device_id, {"instances": instances, "interfaces": interfaces})
-    except Exception as exc:
-        logger.warning("Failed to push OSPF intent for device %s: %s", device_id, exc)
+    payload = {"instances": instances, "interfaces": interfaces}
+    _push_changed((device_id, "ospf"), payload, lambda: client.put_ospf_intent(adapter_device_id, payload))
 
 
 @_skip_on_render
@@ -1032,7 +1153,12 @@ def _on_ospf_instance_state_save(sender, instance, **kwargs):
     if mgmt.adapter_device_id is None:
         return
 
-    _push_ospf_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+    device_id = mgmt.device_id
+    adapter_device_id = mgmt.adapter_device_id
+    _schedule_intent_push(
+        (device_id, "ospf"),
+        lambda: _push_ospf_intent_for_device(device_id, adapter_device_id),
+    )
 
 
 @_skip_on_render
@@ -1048,7 +1174,12 @@ def _on_ospf_interface_state_save(sender, instance, **kwargs):
     if mgmt.adapter_device_id is None:
         return
 
-    _push_ospf_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+    device_id = mgmt.device_id
+    adapter_device_id = mgmt.adapter_device_id
+    _schedule_intent_push(
+        (device_id, "ospf"),
+        lambda: _push_ospf_intent_for_device(device_id, adapter_device_id),
+    )
 
 
 @_skip_on_render
@@ -1070,27 +1201,7 @@ def _on_redistribution_fork_save(sender, instance, **kwargs):
         if key in seen:
             continue
         seen.add(key)
-        try:
-            dest = state.dest_protocol
-            if dest == "ospf":
-                _push_ospf_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
-            elif dest == "isis":
-                _push_isis_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
-            elif dest == "bgp":
-                _push_bgp_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
-            else:
-                logger.warning(
-                    "Redistribution fork save: unknown dest_protocol %r for device %s — no push",
-                    dest,
-                    mgmt.device_id,
-                )
-        except Exception as exc:
-            logger.warning(
-                "Redistribution fork save: push failed for device %s protocol %s: %s",
-                mgmt.device_id,
-                state.dest_protocol,
-                exc,
-            )
+        _schedule_redistribution_push(mgmt.device_id, mgmt.adapter_device_id, state.dest_protocol)
 
 
 def _connect_g_activated():  # pragma: no cover

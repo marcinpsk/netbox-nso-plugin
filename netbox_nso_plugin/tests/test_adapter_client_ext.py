@@ -248,6 +248,44 @@ class TestRequestErrorPaths(unittest.TestCase):
 
         self.assertEqual(ctx.exception.code, "503")
 
+    def test_read_timeout_surfaces_as_nso_timeout(self):
+        """A connected-but-hung adapter (ReadTimeout) → distinct nso_timeout code, not nso_unreachable."""
+        import requests
+
+        from netbox_nso_plugin.adapter_client import AdapterError, _request
+
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
+            patch("netbox_nso_plugin.adapter_client.requests.Session") as mock_s,
+        ):
+            session = MagicMock()
+            session.request.side_effect = requests.exceptions.ReadTimeout("read timed out")
+            mock_s.return_value = session
+
+            with self.assertRaises(AdapterError) as ctx:
+                _request("GET", "/test")
+
+        self.assertEqual(ctx.exception.code, "nso_timeout")
+
+    def test_connect_error_surfaces_as_nso_unreachable(self):
+        """A connection failure → nso_unreachable."""
+        import requests
+
+        from netbox_nso_plugin.adapter_client import AdapterError, _request
+
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
+            patch("netbox_nso_plugin.adapter_client.requests.Session") as mock_s,
+        ):
+            session = MagicMock()
+            session.request.side_effect = requests.exceptions.ConnectionError("refused")
+            mock_s.return_value = session
+
+            with self.assertRaises(AdapterError) as ctx:
+                _request("GET", "/test")
+
+        self.assertEqual(ctx.exception.code, "nso_unreachable")
+
 
 class TestAdapterClientRemainingFunctions(unittest.TestCase):
     """Smoke tests for API functions not covered in test_models.py."""
