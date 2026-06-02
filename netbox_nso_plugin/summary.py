@@ -46,7 +46,13 @@ def matches_device_value(attribute, netbox_value, nso_value):
     ("True"/"False" for enabled), so compare in the attribute's native type.
     """
     if attribute == "enabled":
-        return bool(netbox_value) == (str(nso_value).strip().lower() == "true")
+        nso = (str(nso_value) if nso_value is not None else "").strip().lower()
+        if nso == "":
+            # Device did not report 'enabled' (e.g. a NED that doesn't expose it). There
+            # is nothing to compare against, so don't manufacture drift — and do it
+            # symmetrically (previously False matched but True drifted).
+            return True
+        return bool(netbox_value) == (nso == "true")
     return (netbox_value or "") == (nso_value or "")
 
 
@@ -127,7 +133,10 @@ def _status_breakdown(qs) -> dict:
     """Return owned-aware {total, drift, pending} buckets for a state queryset.
 
     Owned = accepted_at set. differ + owned → pending apply; differ + not-owned → drift;
-    match → in sync (the implicit remainder).
+    match (imported/in_sync) → in sync (the implicit remainder). A row left at
+    ``unknown`` (or any unrecognized status) is an *anomaly* — reconcilers always set a
+    concrete status — so it is surfaced under drift (needs attention) rather than hidden
+    in the in-sync remainder, where it would read as a false "in sync".
     """
     from django.db.models import Q
 
@@ -143,7 +152,10 @@ def _status_breakdown(qs) -> dict:
         elif status in _DIFFER_STATUSES:
             out["pending"] += owned
             out["drift"] += total - owned
-        # _MATCH_STATUSES / unknown → counted in total only (the "in sync" remainder)
+        elif status in _MATCH_STATUSES:
+            pass  # in sync — the implicit remainder
+        else:
+            out["drift"] += total  # unknown/unrecognized → surface, don't hide
     return out
 
 

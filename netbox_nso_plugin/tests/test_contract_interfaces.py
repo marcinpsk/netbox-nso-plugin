@@ -98,12 +98,15 @@ class TestInterfacesContractConsumer(TestCase):
         self.assertTrue(NSOInterfaceState.objects.filter(interface=self.iface, attribute="description").exists())
 
     def test_missing_status_key_silently_degrades_to_unknown(self):
-        """CHARACTERIZATION of the fragility: the consumer does NOT validate the contract.
+        """The consumer does NOT validate the contract at runtime — by decision.
 
-        If the producer ever stops sending ``status`` (e.g. a rename to ``sync_state``),
-        the plugin stores ``"unknown"`` instead of failing — which then hides in the
-        in-sync remainder (see [[drift-netbox-vs-device-value]]). This pins that blind
-        spot so a future change to add validation is a visible behavior change.
+        If the producer ever stops sending ``status`` the plugin stores ``"unknown"``.
+        We deliberately keep it this way: the cross-repo contract test (this file + the
+        adapter's producer mirror) guards the seam in CI, so a rename fails a test rather
+        than slipping to prod; runtime per-row validation would be redundant overhead.
+        And ``unknown`` no longer hides anyway — it now surfaces as needs-attention in
+        the counts (see summary._status_breakdown). This test pins the documented
+        behavior so any future move to hard validation is a visible change.
         """
         payload = [
             {

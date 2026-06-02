@@ -89,9 +89,11 @@ class TestDisplayState(SimpleTestCase):
         self.assertEqual(display_state("weird", False), ("unknown", "weird"))
 
     def test_unknown_is_not_owned_aware(self):
-        # NOTE (smell): an owned row whose status is "unknown" still renders "unknown"
-        # here (not "pending apply"). This is exactly why the interfaces tab cannot rely
-        # on display_state alone for description/enabled and uses interface_row_state.
+        # DECISION (kept): an owned row whose status is "unknown" renders "unknown", not
+        # "pending apply" — owned-awareness is meaningless without a value to compare,
+        # and "unknown" honestly means "no info". This branch is also effectively
+        # unreachable for real interface data (comparable attrs go value-aware via
+        # interface_row_state); routing badges use the template, not display_state.
         self.assertEqual(display_state("unknown", True), ("unknown", "unknown"))
 
 
@@ -121,15 +123,14 @@ class TestMatchesDeviceValue(SimpleTestCase):
         self.assertFalse(matches_device_value("enabled", True, "False"))
         self.assertFalse(matches_device_value("enabled", False, "true"))
 
-    def test_enabled_empty_or_none_device_value_matches_disabled(self):
-        # NOTE (smell): when the device did not report 'enabled' (nso_value ""/None),
-        # a NetBox-disabled interface is treated as a MATCH (False == "not true"), while
-        # a NetBox-enabled one is drift. So "device said nothing" silently agrees with
-        # "disabled". Revisit whether absent-on-device should be its own state.
+    def test_enabled_empty_or_none_device_value_matches_symmetrically(self):
+        # FIXED: when the device did not report 'enabled' (nso_value ""/None) there is
+        # nothing to compare, so it's a match regardless of the NetBox value — no
+        # manufactured drift, and symmetric (previously False matched but True drifted).
         self.assertTrue(matches_device_value("enabled", False, ""))
         self.assertTrue(matches_device_value("enabled", False, None))
-        self.assertFalse(matches_device_value("enabled", True, ""))
-        self.assertFalse(matches_device_value("enabled", True, None))
+        self.assertTrue(matches_device_value("enabled", True, ""))
+        self.assertTrue(matches_device_value("enabled", True, None))
 
 
 class TestInterfaceRowState(SimpleTestCase):
@@ -271,11 +272,14 @@ class TestStatusBreakdown(TestCase):
         qs = self._qs([("deploying", False)])
         self.assertEqual(_status_breakdown(qs), {"total": 1, "drift": 0, "pending": 1})
 
-    def test_unknown_is_swallowed_into_the_in_sync_remainder(self):
-        # NOTE (smell -> the device-27 bug at the COUNTS layer): an owned row whose
-        # status is "unknown" counts only toward total, never drift/pending — so it reads
-        # as "in sync" in the headline even though NetBox may own a value the device
-        # lacks. interface_status_breakdown was introduced precisely to avoid this for
-        # description/enabled; routing categories still use this status-only aggregation.
+    def test_unknown_is_surfaced_as_needs_attention_not_in_sync(self):
+        # FIXED: a row left at "unknown" is an anomaly (reconcilers always set a concrete
+        # status), so it is surfaced under drift rather than hidden in the in-sync
+        # remainder where it would read as a false "in sync".
         qs = self._qs([("unknown", True), ("unknown", False)])
-        self.assertEqual(_status_breakdown(qs), {"total": 2, "drift": 0, "pending": 0})
+        self.assertEqual(_status_breakdown(qs), {"total": 2, "drift": 2, "pending": 0})
+
+    def test_match_and_unrecognized_status_split_correctly(self):
+        # imported/in_sync are the in-sync remainder; a bogus status is surfaced as drift.
+        qs = self._qs([("imported", False), ("in_sync", True), ("bogus", False)])
+        self.assertEqual(_status_breakdown(qs), {"total": 3, "drift": 1, "pending": 0})
