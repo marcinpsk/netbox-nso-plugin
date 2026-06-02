@@ -260,6 +260,8 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 {
                     "state": st,
                     "iface_name": iface.name,
+                    "iface_url": iface.get_absolute_url(),
+                    "iface_enabled": iface.enabled,
                     "attribute": st.attribute,
                     "netbox_value": netbox_value,
                     "device_value": st.nso_value or "—",
@@ -646,7 +648,10 @@ class NSOAcceptAttributeView(LoginRequiredMixin, View):
         state.accepted_at = timezone.now()
         state.save(update_fields=["status", "accepted_at"])
 
-        messages.success(request, f"Accepted {state.attribute} on {state.interface}.")
+        msg = f"Accepted {state.attribute} on {state.interface}."
+        if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+            return JsonResponse({"status": "ok", "message": msg})
+        messages.success(request, msg)
         return redirect(_device_nso_tab_url(state.interface.device_id))
 
 
@@ -677,8 +682,42 @@ class NSOAcceptDeviceView(LoginRequiredMixin, View):
             state.accepted_at = timezone.now()
             state.save(update_fields=["status", "accepted_at"])
 
-        messages.success(request, f"Adopted device value for {state.attribute} on {iface}.")
+        msg = f"Adopted device value for {state.attribute} on {iface}."
+        if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+            return JsonResponse({"status": "ok", "message": msg})
+        messages.success(request, msg)
         return redirect(_device_nso_tab_url(iface.device_id))
+
+
+class NSOInterfaceEditFieldView(LoginRequiredMixin, View):
+    """Inline-edit a managed interface attribute (description / enabled) from the NSO tab.
+
+    Writes the new value onto the ``dcim.Interface`` and saves it, which fires the
+    Decision-G signal chain (:func:`signals._push_intent_on_interface_edit`) exactly
+    as editing the interface through the NetBox UI would: the attribute becomes
+    NetBox-owned intent and is pushed to the adapter. AJAX-only — returns JSON so the
+    tab's inline editor can refresh just the rows without collapsing the category.
+    """
+
+    _EDITABLE = ("description", "enabled")
+    _TRUE = ("true", "1", "on", "yes")
+
+    def post(self, request, pk):
+        """Apply the new value to the interface; Decision-G handles ownership + push."""
+        state = get_object_or_404(NSOInterfaceState, pk=pk)
+        attribute = state.attribute
+        if attribute not in self._EDITABLE:
+            return JsonResponse({"status": "error", "message": f"{attribute} is not editable here."}, status=400)
+
+        iface = state.interface
+        raw = request.POST.get("value", "")
+        if attribute == "description":
+            iface.description = raw.strip()
+        else:  # enabled
+            iface.enabled = raw.strip().lower() in self._TRUE
+        iface.save(update_fields=[attribute])
+
+        return JsonResponse({"status": "ok", "message": f"Updated {attribute} on {iface.name}."})
 
 
 class NSOBulkAcceptView(LoginRequiredMixin, View):

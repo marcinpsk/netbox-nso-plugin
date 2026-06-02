@@ -3,12 +3,14 @@
 {# Lazy fragment: Interfaces drift/pending view — per-attribute, paginated + filterable, read-only. #}
 <div class="nso-if-pager"
      data-url="{% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='interfaces' %}"
-     data-q="{{ q }}" data-state="{{ state }}">
+     data-edit-url="{% url 'plugins:netbox_nso_plugin:nsointerfacestate_edit_field' pk=0 %}"
+     data-q="{{ q }}" data-state="{{ state }}" data-page="{{ page.number }}">
   <div class="mb-2">
     <input type="search" class="form-control form-control-sm nso-if-filter"
            placeholder="Filter by interface name…" value="{{ q }}" autocomplete="off"
            style="max-width: 280px;">
   </div>
+  <div class="nso-if-msg"></div>
 
   {% include "netbox_nso_plugin/categories/_interfaces_rows.html" %}
 
@@ -18,14 +20,24 @@
     var pager = document.querySelector('.nso-if-pager');
     if (!pager) return;
     var url = pager.dataset.url;
+    var editUrlTpl = pager.dataset.editUrl;
+    var csrf = (document.cookie.match(/csrftoken=([^;]+)/) || [])[1] || '';
     var filter = pager.querySelector('.nso-if-filter');
+    var msgEl = pager.querySelector('.nso-if-msg');
     var results = pager.querySelector('.nso-if-results');
     var debounce = null;
 
+    function flash(text, type) {
+      if (!msgEl) return;
+      if (!text) { msgEl.innerHTML = ''; return; }
+      msgEl.innerHTML = '<div class="alert alert-' + type + ' alert-sm py-1 px-2 small mb-2">' + text + '</div>';
+    }
+    function esc(s) { var d = document.createElement('div'); d.textContent = (s == null ? '' : String(s)); return d.innerHTML; }
+
     function load(q, state, page) {
-      pager.dataset.q = q; pager.dataset.state = state;
+      pager.dataset.q = q; pager.dataset.state = state; pager.dataset.page = page;
       results.innerHTML = '<div class="text-muted small py-2"><span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Loading…</div>';
-      fetch(url + '?q=' + encodeURIComponent(q) + '&state=' + encodeURIComponent(state) + '&page=' + page,
+      return fetch(url + '?q=' + encodeURIComponent(q) + '&state=' + encodeURIComponent(state) + '&page=' + page,
             { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
         .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); })
         .then(function (html) {
@@ -35,6 +47,29 @@
         })
         .catch(function (e) { results.innerHTML = '<div class="text-danger small">Failed to load: ' + e.message + '</div>'; });
     }
+    function reload() { return load(pager.dataset.q || '', pager.dataset.state || 'all', pager.dataset.page || 1); }
+
+    // POST helper for row actions (accept forms) and inline edits.
+    function post(action, body) {
+      return fetch(action, {
+        method: 'POST',
+        headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-CSRFToken': csrf, 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: body,
+      }).then(function (r) {
+        return r.json().catch(function () { return {}; }).then(function (d) { return { ok: r.ok, data: d }; });
+      });
+    }
+    function afterAction(res) {
+      if (!res.ok || (res.data && res.data.status === 'error')) {
+        flash('Action failed: ' + esc((res.data && res.data.message) || 'server error'), 'danger');
+      } else {
+        flash('', '');
+      }
+      return reload();
+    }
+    function editField(statePk, value) {
+      return post(editUrlTpl.replace('/0/', '/' + statePk + '/'), new URLSearchParams({ value: value })).then(afterAction);
+    }
 
     if (filter) {
       filter.addEventListener('input', function () {
@@ -42,12 +77,68 @@
         debounce = setTimeout(function () { load(filter.value.trim(), pager.dataset.state || 'all', 1); }, 350);
       });
     }
-    // Delegated so it survives results being swapped out.
+
+    // Accept / Keep NetBox / Accept device — POST via AJAX so the category stays open.
+    pager.addEventListener('submit', function (e) {
+      var form = e.target.closest('.nso-row-form');
+      if (!form) return;
+      e.preventDefault();
+      form.querySelectorAll('button').forEach(function (b) { b.disabled = true; });
+      post(form.action, new URLSearchParams(new FormData(form))).then(afterAction);
+    });
+
+    // Delegated so handlers survive results being swapped out.
     pager.addEventListener('click', function (e) {
       var chip = e.target.closest('.nso-if-state');
       if (chip) { e.preventDefault(); load(pager.dataset.q || '', chip.dataset.state, 1); return; }
       var pg = e.target.closest('.nso-if-page');
-      if (pg) { e.preventDefault(); load(pager.dataset.q || '', pager.dataset.state || 'all', pg.dataset.page); }
+      if (pg) { e.preventDefault(); load(pager.dataset.q || '', pager.dataset.state || 'all', pg.dataset.page); return; }
+
+      // Inline toggle of "enabled".
+      var toggle = e.target.closest('.nso-toggle-enabled');
+      if (toggle) {
+        e.preventDefault();
+        var tcell = toggle.closest('.nso-nb-cell');
+        var current = tcell.dataset.enabled === 'true';
+        toggle.disabled = true;
+        editField(tcell.dataset.statePk, current ? 'false' : 'true');
+        return;
+      }
+
+      // Inline edit of "description": swap value span for an input.
+      var editBtn = e.target.closest('.nso-edit-desc');
+      if (editBtn) {
+        e.preventDefault();
+        var cell = editBtn.closest('.nso-nb-cell');
+        if (cell.querySelector('.nso-desc-input')) return;  // already editing
+        var valSpan = cell.querySelector('.nso-nb-value');
+        var cur = valSpan.textContent.trim();
+        if (cur === '—') cur = '';
+        cell.innerHTML =
+          '<div class="input-group input-group-sm" style="min-width:200px">' +
+          '<input type="text" class="form-control form-control-sm nso-desc-input" value="' + esc(cur) + '">' +
+          '<button type="button" class="btn btn-outline-success nso-desc-save" title="Save (NetBox owns this value)"><span class="mdi mdi-check"></span></button>' +
+          '<button type="button" class="btn btn-outline-secondary nso-desc-cancel" title="Cancel"><span class="mdi mdi-close"></span></button>' +
+          '</div>';
+        var input = cell.querySelector('.nso-desc-input');
+        input.focus(); input.select();
+        input.addEventListener('keydown', function (ev) {
+          if (ev.key === 'Enter') { ev.preventDefault(); cell.querySelector('.nso-desc-save').click(); }
+          else if (ev.key === 'Escape') { ev.preventDefault(); reload(); }
+        });
+        return;
+      }
+
+      var saveBtn = e.target.closest('.nso-desc-save');
+      if (saveBtn) {
+        e.preventDefault();
+        var scell = saveBtn.closest('.nso-nb-cell');
+        saveBtn.disabled = true;
+        editField(scell.dataset.statePk, scell.querySelector('.nso-desc-input').value);
+        return;
+      }
+      var cancelBtn = e.target.closest('.nso-desc-cancel');
+      if (cancelBtn) { e.preventDefault(); reload(); return; }
     });
   })();
   </script>

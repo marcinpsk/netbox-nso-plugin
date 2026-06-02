@@ -18,9 +18,23 @@
         <tbody>
           {% for row in rows %}
             <tr{% if row.kind == 'drift' %} class="table-warning"{% endif %}>
-              <td>{{ row.iface_name }}</td>
+              <td><a href="{{ row.iface_url }}" title="Open interface in NetBox">{{ row.iface_name }}</a></td>
               <td><code>{{ row.attribute }}</code></td>
-              <td>{{ row.netbox_value }}</td>
+              <td class="nso-nb-cell" data-state-pk="{{ row.state.pk }}" data-attr="{{ row.attribute }}"
+                  {% if row.attribute == 'enabled' %}data-enabled="{{ row.iface_enabled|yesno:'true,false' }}"{% endif %}>
+                <span class="nso-nb-value">{{ row.netbox_value }}</span>
+                {% if row.attribute == 'description' %}
+                  <button type="button" class="btn btn-sm btn-link p-0 ms-1 nso-edit-desc"
+                          title="Edit description — NetBox will own this value (same as Accept)">
+                    <span class="mdi mdi-pencil"></span>
+                  </button>
+                {% elif row.attribute == 'enabled' %}
+                  <button type="button" class="btn btn-sm btn-link p-0 ms-1 nso-toggle-enabled"
+                          title="Flip enabled — NetBox will own this value (same as Accept)">
+                    <span class="mdi mdi-swap-horizontal"></span>
+                  </button>
+                {% endif %}
+              </td>
               <td>{{ row.device_value }}</td>
               <td>
                 {% if row.kind == 'drift' %}<span class="badge bg-warning text-dark">{{ row.label }}</span>
@@ -32,13 +46,13 @@
               </td>
               <td class="text-nowrap">
                 {% if row.kind == 'drift' %}
-                  <form method="post" action="{% url 'plugins:netbox_nso_plugin:nsointerfacestate_accept_device' row.state.pk %}" style="display:inline">
+                  <form method="post" class="nso-row-form" action="{% url 'plugins:netbox_nso_plugin:nsointerfacestate_accept_device' row.state.pk %}" style="display:inline">
                     {% csrf_token %}
                     <button type="submit" class="btn btn-sm btn-outline-success" title="Adopt the device value into NetBox (becomes in sync)">
                       <span class="mdi mdi-download"></span> Accept device
                     </button>
                   </form>
-                  <form method="post" action="{% url 'plugins:netbox_nso_plugin:nsointerfacestate_accept' row.state.pk %}" style="display:inline">
+                  <form method="post" class="nso-row-form" action="{% url 'plugins:netbox_nso_plugin:nsointerfacestate_accept' row.state.pk %}" style="display:inline">
                     {% csrf_token %}
                     <button type="submit" class="btn btn-sm btn-outline-warning" title="Make NetBox the source of truth — its value is pushed to the device on Apply">
                       <span class="mdi mdi-content-save-check"></span> Keep NetBox
@@ -50,7 +64,7 @@
                     <span class="mdi mdi-upload-network"></span> Apply
                   </button>
                 {% elif not row.owned %}
-                  <form method="post" action="{% url 'plugins:netbox_nso_plugin:nsointerfacestate_accept' row.state.pk %}" style="display:inline">
+                  <form method="post" class="nso-row-form" action="{% url 'plugins:netbox_nso_plugin:nsointerfacestate_accept' row.state.pk %}" style="display:inline">
                     {% csrf_token %}
                     <button type="submit" class="btn btn-sm btn-outline-success" title="Make NetBox the source of truth for this value">
                       <span class="mdi mdi-check"></span> Accept

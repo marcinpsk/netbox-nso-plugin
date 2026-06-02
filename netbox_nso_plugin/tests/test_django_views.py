@@ -846,6 +846,17 @@ class TestNSOAcceptAttributeView(ViewTestBase):
         self.iface_state.refresh_from_db()
         self.assertEqual(self.iface_state.status, "in_sync")
 
+    def test_accept_ajax_returns_json_no_redirect(self):
+        """An XHR accept returns JSON (200) so the tab can refresh without collapsing."""
+        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="changed")
+        url = reverse("plugins:netbox_nso_plugin:nsointerfacestate_accept", args=[self.iface_state.pk])
+        with patch("netbox_nso_plugin.signals.push_intent_on_accept"):
+            response = self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.content)["status"], "ok")
+        self.iface_state.refresh_from_db()
+        self.assertEqual(self.iface_state.status, "accepted")
+
 
 class TestNSOAcceptDeviceView(ViewTestBase):
     """Tests for NSOAcceptDeviceView (adopt the device value into NetBox)."""
@@ -864,6 +875,65 @@ class TestNSOAcceptDeviceView(ViewTestBase):
         self.iface_state.refresh_from_db()
         self.assertEqual(self.interface.description, "DEVICE-NEW")  # device value adopted
         self.assertEqual(self.iface_state.status, "in_sync")
+
+
+class TestNSOInterfaceEditFieldView(ViewTestBase):
+    """Tests for NSOInterfaceEditFieldView (inline edit of description/enabled from the tab)."""
+
+    def _make_managed(self):
+        """Put the fixture device under management for description+enabled with an adapter id."""
+        self.mgmt.adapter_device_id = 42
+        self.mgmt.manage_description = True
+        self.mgmt.manage_enabled = True
+        self.mgmt.save(update_fields=["adapter_device_id", "manage_description", "manage_enabled"])
+
+    def test_edit_description_promotes_and_pushes(self):
+        """Inline-editing description writes the interface and fires Decision-G (owns + pushes)."""
+        self._make_managed()
+        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="imported", accepted_at=None)
+        url = reverse("plugins:netbox_nso_plugin:nsointerfacestate_edit_field", args=[self.iface_state.pk])
+
+        with patch("netbox_nso_plugin.adapter_client.put_intent") as mock_put:
+            with self.captureOnCommitCallbacks(execute=True):
+                response = self.client.post(url, {"value": "operator-set"}, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.content)["status"], "ok")
+        self.interface.refresh_from_db()
+        self.iface_state.refresh_from_db()
+        self.assertEqual(self.interface.description, "operator-set")
+        self.assertEqual(self.iface_state.status, "accepted")  # Decision-G: NetBox now owns it
+        self.assertIsNotNone(self.iface_state.accepted_at)
+        mock_put.assert_called()
+
+    def test_toggle_enabled_flips_and_owns(self):
+        """Inline toggle of enabled flips the interface and owns the 'enabled' attribute."""
+        self._make_managed()
+        self.interface.enabled = True
+        self.interface.save(update_fields=["enabled"])
+        en_state = NSOInterfaceState.objects.create(
+            interface=self.interface, attribute="enabled", status="imported", nso_value="True"
+        )
+        url = reverse("plugins:netbox_nso_plugin:nsointerfacestate_edit_field", args=[en_state.pk])
+
+        with patch("netbox_nso_plugin.adapter_client.put_intent"):
+            with self.captureOnCommitCallbacks(execute=True):
+                response = self.client.post(url, {"value": "false"}, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+
+        self.assertEqual(response.status_code, 200)
+        self.interface.refresh_from_db()
+        en_state.refresh_from_db()
+        self.assertFalse(self.interface.enabled)
+        self.assertEqual(en_state.status, "accepted")
+
+    def test_unknown_attribute_rejected(self):
+        """A state whose attribute is not description/enabled cannot be inline-edited."""
+        odd = NSOInterfaceState.objects.create(
+            interface=self.interface, attribute="mtu", status="imported", nso_value="1500"
+        )
+        url = reverse("plugins:netbox_nso_plugin:nsointerfacestate_edit_field", args=[odd.pk])
+        response = self.client.post(url, {"value": "9000"}, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+        self.assertEqual(response.status_code, 400)
 
 
 class TestNSOApplyPreviewView(ViewTestBase):

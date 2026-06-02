@@ -113,6 +113,11 @@ urlpatterns = [
         name="nsointerfacestate_accept_device",
     ),
     path(
+        "interface-state/<int:pk>/edit-field/",
+        views.NSOInterfaceEditFieldView.as_view(),
+        name="nsointerfacestate_edit_field",
+    ),
+    path(
         "devices/<int:device_pk>/bulk-accept/",
         views.NSOBulkAcceptView.as_view(),
         name="device_bulk_accept",
