@@ -5,12 +5,37 @@
 These tests require the full NetBox/Django stack (run in devcontainer).
 """
 
+import pathlib
+import re
 from unittest.mock import MagicMock, patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
-from django.test import TestCase
+from django.test import SimpleTestCase, TestCase
 
 from netbox_nso_plugin.models import NSOInterfaceState
+
+
+class TestTemplateCommentSyntax(SimpleTestCase):
+    """Guard against multiline ``{# #}`` comments, which Django renders literally."""
+
+    def test_no_multiline_hash_comments(self):
+        """Django's ``{# #}`` is single-line only; multiline leaks into the page.
+
+        Use ``{% comment %}…{% endcomment %}`` for multiline instead.
+        """
+        templates_dir = pathlib.Path(__file__).resolve().parent.parent / "templates"
+        # A comment open ``{#`` with no closing ``#}`` on the same line spans lines.
+        offender = re.compile(r"\{#(?![^\n]*#\})")
+        problems = []
+        for path in templates_dir.rglob("*.html"):
+            for lineno, line in enumerate(path.read_text().splitlines(), start=1):
+                if offender.search(line):
+                    problems.append(f"{path}:{lineno}: {line.strip()}")
+        self.assertEqual(
+            problems,
+            [],
+            "Multiline {# #} comments render as visible text; use {% comment %}:\n" + "\n".join(problems),
+        )
 
 
 class TestUpsertInterfaceStates(TestCase):

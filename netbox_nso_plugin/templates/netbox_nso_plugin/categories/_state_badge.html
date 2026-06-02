@@ -1,8 +1,10 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
-{# State badge from a raw status. Expects `status`. Owned (NetBox is the source of
-   truth) is derived from owned statuses and shown as a shield.
-   changed/conflict = not-owned drift; drifted/accepted = owned -> pending apply. #}
+{% comment %}
+State badge from a raw status. Expects `status`. Owned (NetBox is the source of
+truth) is derived from owned statuses and shown as a shield.
+changed/conflict = not-owned drift; drifted/accepted = owned -> pending apply.
+{% endcomment %}
 {% if status == "changed" or status == "conflict" %}<span class="badge bg-warning text-dark">drift</span>
 {% elif status == "drifted" or status == "accepted" %}<span class="badge bg-info">pending apply</span>
 {% elif status == "apply_failed" %}<span class="badge bg-danger">apply failed</span>
