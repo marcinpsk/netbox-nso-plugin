@@ -682,6 +682,9 @@ try:
 
                 req = MagicMock()
                 req.headers = header
+            # Simulate the pre_save snapshot: operator changed the description,
+            # left enabled untouched.
+            self.iface._nso_old_values = {"description": "PREVIOUS-DESC", "enabled": self.iface.enabled}
             token = current_request.set(req)
             try:
                 with patch("netbox_nso_plugin.adapter_client.put_intent") as mock_put:
@@ -711,6 +714,36 @@ try:
             mock_put = self._fire(header={"X-NSO-Adapter-Import": "1"})
             self.assertEqual(self._state().status, "imported")  # unchanged
             mock_put.assert_not_called()
+
+        def test_edit_does_not_own_untouched_attribute(self):
+            """Editing description must NOT promote/own the untouched 'enabled' attribute.
+
+            Regression: previously any save promoted every managed attribute, so
+            editing the description silently owned enabled (a value never accepted).
+            """
+            from netbox.context import current_request
+
+            from netbox_nso_plugin.models import NSOInterfaceState
+            from netbox_nso_plugin.signals import _push_intent_on_interface_edit
+
+            enabled_state = NSOInterfaceState.objects.create(
+                interface=self.iface, attribute="enabled", status="imported", nso_value="True"
+            )
+            # description changed; enabled untouched.
+            self.iface._nso_old_values = {"description": "PREVIOUS-DESC", "enabled": self.iface.enabled}
+            token = current_request.set(None)
+            try:
+                with patch("netbox_nso_plugin.adapter_client.put_intent"):
+                    with self.captureOnCommitCallbacks(execute=True):
+                        _push_intent_on_interface_edit(None, self.iface, created=False)
+            finally:
+                current_request.reset(token)
+
+            enabled_state.refresh_from_db()
+            self.assertEqual(enabled_state.status, "imported")
+            self.assertIsNone(enabled_state.accepted_at)
+            # the changed attribute (description) IS promoted
+            self.assertEqual(self._state().status, "accepted")
 
 except ImportError:
     pass  # Outside devcontainer — Django not available; tests skipped

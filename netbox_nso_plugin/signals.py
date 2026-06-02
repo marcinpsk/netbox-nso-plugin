@@ -8,7 +8,7 @@ import json
 import logging
 import threading
 
-from django.db.models.signals import post_delete, post_save
+from django.db.models.signals import post_delete, post_save, pre_save
 from django.dispatch import receiver
 from django.utils import timezone
 
@@ -420,14 +420,29 @@ def _recompute_on_interface_save(sender, instance, created, **kwargs):
     _recompute_one(instance, templates)
 
 
+def _stash_interface_old_values(sender, instance, **kwargs):
+    """Capture pre-save description/enabled for the Decision-G edit signal.
+
+    Lets :func:`_push_intent_on_interface_edit` tell which attribute the operator
+    actually changed. Without it, every save would promote *every* managed attribute
+    — so editing the description would silently own/accept ``enabled`` too (a value
+    the operator never accepted).
+    """
+    if not instance.pk:
+        instance._nso_old_values = None
+        return
+    instance._nso_old_values = sender.objects.filter(pk=instance.pk).values("description", "enabled").first()
+
+
 @_skip_on_render
 def _push_intent_on_interface_edit(sender, instance, created, **kwargs):
     """Treat direct edits to description/enabled on managed interfaces as intent.
 
-    If the interface belongs to an NSO-managed device, promote the
-    relevant NSOInterfaceState rows to 'accepted' and push the full
-    intent snapshot to the adapter.  This is an idempotent no-op if
-    the value hasn't actually changed.
+    Only the attribute(s) the operator actually CHANGED in this save are promoted —
+    determined by comparing against the pre-save snapshot captured in
+    :func:`_stash_interface_old_values`. A changed attribute becomes owned (NetBox
+    is the source of truth) and pending apply (its value now differs from the
+    device). Untouched attributes are left exactly as they were.
 
     Decision G (activated in Phase 2): editing description/enabled on a managed
     interface IS an intent change — identical to an explicit Accept action.
@@ -442,6 +457,13 @@ def _push_intent_on_interface_edit(sender, instance, created, **kwargs):
 
     if _is_adapter_origin_write():
         return  # import/apply, not an operator intent edit
+
+    old_values = getattr(instance, "_nso_old_values", None)
+    if old_values is None:
+        # No pre-save snapshot (signal not wired / programmatic save). Be
+        # conservative and own nothing, rather than risk adopting untouched
+        # attributes — the pre_save handler supplies this for every real edit.
+        return
 
     from .models import NSODeviceManagement, NSOInterfaceState
 
@@ -458,17 +480,22 @@ def _push_intent_on_interface_edit(sender, instance, created, **kwargs):
     for attribute in ("description", "enabled"):
         if attribute not in mgmt.managed_attributes:
             continue
+        new_value = instance.description if attribute == "description" else instance.enabled
+        if new_value == old_values.get(attribute):
+            continue  # operator did not change this attribute — leave it untouched
         state = NSOInterfaceState.objects.filter(
             interface=instance,
             attribute=attribute,
         ).first()
         if state is None:
             continue
-        if state.status in ("imported", "changed") and state.accepted_at is None:
-            state.status = "accepted"
+        # Operator changed this attribute → NetBox owns it and it is pending apply
+        # (the new value differs from what the device currently has).
+        state.status = "accepted"
+        if state.accepted_at is None:
             state.accepted_at = now
-            state.save(update_fields=["status", "accepted_at"])
-            updated = True
+        state.save(update_fields=["status", "accepted_at"])
+        updated = True
 
     if not updated:
         return
@@ -1213,6 +1240,11 @@ def _connect_g_activated():  # pragma: no cover
     from dcim.models import Cable, Interface
     from ipam.models import IPAddress
 
+    pre_save.connect(
+        _stash_interface_old_values,
+        sender=Interface,
+        dispatch_uid="nso_plugin_iface_stash_old_values",
+    )
     post_save.connect(
         _push_intent_on_interface_edit,
         sender=Interface,
