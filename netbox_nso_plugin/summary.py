@@ -83,6 +83,10 @@ def interface_row_state(st, iface):
     matches = matches_device_value(st.attribute, _netbox_value_for(st.attribute, iface), st.nso_value)
     if matches:
         return ("in_sync", "in sync", owned)
+    # Values differ. Surface a failed apply distinctly so the operator knows the last
+    # push errored, instead of it hiding as an ordinary "pending apply".
+    if st.status == "apply_failed":
+        return ("apply_failed", "apply failed", owned)
     return ("pending", "pending apply", owned) if owned else ("drift", "drift", owned)
 
 
@@ -97,7 +101,7 @@ def interface_status_breakdown(qs) -> dict:
     for st in qs.select_related("interface"):
         out["total"] += 1
         kind, _label, _owned = interface_row_state(st, st.interface)
-        if kind in ("pending", "deploying"):
+        if kind in ("pending", "deploying", "apply_failed"):
             out["pending"] += 1
         elif kind == "drift":
             out["drift"] += 1

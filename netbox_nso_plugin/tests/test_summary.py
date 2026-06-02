@@ -74,11 +74,12 @@ class TestDisplayState(SimpleTestCase):
                 self.assertEqual(display_state(status, True), ("pending", "pending apply"))
                 self.assertEqual(display_state(status, False), ("drift", "drift"))
 
-    def test_apply_failed_loses_its_failure_signal_here(self):
-        # NOTE (smell): apply_failed collapses to the same badge as any other differ
-        # status — the "last apply errored" signal is gone at this layer. The badge
-        # template special-cases apply_failed; display_state does not. Revisit whether
-        # display_state should surface a distinct kind.
+    def test_apply_failed_collapses_at_this_layer(self):
+        # display_state itself still collapses apply_failed into the differ buckets; this
+        # is only ever reached for non-comparable / deploying rows (see
+        # interface_row_state), which never carry apply_failed today. The interfaces tab
+        # surfaces "apply failed" distinctly in interface_row_state instead — see
+        # TestInterfaceRowState.test_apply_failed_with_differing_values_is_surfaced.
         self.assertEqual(display_state("apply_failed", True), ("pending", "pending apply"))
 
     def test_unknown_and_blank_fall_through_to_unknown_kind(self):
@@ -176,6 +177,19 @@ class TestInterfaceRowState(SimpleTestCase):
         st = _state(status="changed", accepted_at="2026-01-01", attribute="mtu", nso_value="9000")
         self.assertEqual(interface_row_state(st, _iface()), ("pending", "pending apply", True))
 
+    def test_apply_failed_with_differing_values_is_surfaced(self):
+        # Smell #1 fix: a failed apply must not hide as plain "pending apply".
+        st = _state(status="apply_failed", accepted_at="2026-01-01", attribute="description", nso_value="")
+        self.assertEqual(
+            interface_row_state(st, _iface(description="Core Link")),
+            ("apply_failed", "apply failed", True),
+        )
+
+    def test_apply_failed_but_values_now_match_is_in_sync(self):
+        # Value-aware still wins: if the value actually landed, stale apply_failed != failure.
+        st = _state(status="apply_failed", accepted_at="2026-01-01", attribute="description", nso_value="x")
+        self.assertEqual(interface_row_state(st, _iface(description="x")), ("in_sync", "in sync", True))
+
 
 class TestInterfaceStatusBreakdown(SimpleTestCase):
     """interface_status_breakdown(qs) -> {total, drift, pending} (value-aware buckets)."""
@@ -190,8 +204,10 @@ class TestInterfaceStatusBreakdown(SimpleTestCase):
             _row(status="imported", accepted_at="t", attribute="description", nso_value="", description="Core"),
             # deploying -> pending bucket
             _row(status="deploying", attribute="description", nso_value="x", description="x"),
+            # apply_failed (differ, owned) -> pending bucket (it needs operator action)
+            _row(status="apply_failed", accepted_at="t", attribute="description", nso_value="", description="Core"),
         ]
-        self.assertEqual(interface_status_breakdown(_FakeQS(rows)), {"total": 4, "drift": 1, "pending": 2})
+        self.assertEqual(interface_status_breakdown(_FakeQS(rows)), {"total": 5, "drift": 1, "pending": 3})
 
     def test_empty_queryset(self):
         self.assertEqual(interface_status_breakdown(_FakeQS([])), {"total": 0, "drift": 0, "pending": 0})

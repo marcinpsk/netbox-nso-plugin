@@ -39,6 +39,7 @@
               <td>
                 {% if row.kind == 'drift' %}<span class="badge bg-warning text-dark">{{ row.label }}</span>
                 {% elif row.kind == 'pending' %}<span class="badge bg-info">{{ row.label }}</span>
+                {% elif row.kind == 'apply_failed' %}<span class="badge bg-danger" title="The last Apply to the device failed — retry">{{ row.label }}</span>
                 {% elif row.kind == 'in_sync' %}<span class="badge bg-success">{{ row.label }}</span>
                 {% elif row.kind == 'deploying' %}<span class="badge bg-primary">{{ row.label }}</span>
                 {% else %}<span class="badge bg-info">{{ row.label }}</span>{% endif %}
@@ -58,10 +59,10 @@
                       <span class="mdi mdi-content-save-check"></span> Keep NetBox
                     </button>
                   </form>
-                {% elif row.kind == 'pending' %}
-                  <button type="button" class="btn btn-sm btn-outline-primary nso-apply-btn" data-device="{{ object.pk }}"
-                          title="Push pending intent to the device">
-                    <span class="mdi mdi-upload-network"></span> Apply
+                {% elif row.kind == 'pending' or row.kind == 'apply_failed' %}
+                  <button type="button" class="btn btn-sm {% if row.kind == 'apply_failed' %}btn-outline-danger{% else %}btn-outline-primary{% endif %} nso-apply-btn" data-device="{{ object.pk }}"
+                          title="{% if row.kind == 'apply_failed' %}Retry: push NetBox's value to the device (last attempt failed){% else %}Push pending intent to the device{% endif %}">
+                    <span class="mdi mdi-upload-network"></span> {% if row.kind == 'apply_failed' %}Retry apply{% else %}Apply{% endif %}
                   </button>
                 {% elif not row.owned %}
                   <form method="post" class="nso-row-form" action="{% url 'plugins:netbox_nso_plugin:nsointerfacestate_accept' row.state.pk %}" style="display:inline">

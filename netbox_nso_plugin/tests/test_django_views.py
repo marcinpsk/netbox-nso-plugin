@@ -1267,6 +1267,36 @@ class TestDeviceNSOTabView(ViewTestBase):
 
         Interface.objects.filter(device=self.device, name__in=["ae2.0", "ae3.0"]).delete()
 
+    def test_interfaces_page_apply_failed_renders_distinctly(self):
+        """A failed apply shows 'apply failed' + a Retry button, not plain 'pending apply'."""
+        from dcim.models import Interface
+        from django.utils import timezone
+
+        from netbox_nso_plugin.models import NSOInterfaceState
+
+        iface = Interface.objects.create(device=self.device, name="ae9.0", type="virtual", description="Wants This")
+        NSOInterfaceState.objects.create(
+            interface=iface,
+            attribute="description",
+            status="apply_failed",
+            nso_value="",
+            accepted_at=timezone.now(),
+        )
+        url = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device.pk, "key": "interfaces"}
+        )
+        body = self.client.get(url, {"q": "ae9.0"}).content.decode()
+        self.assertIn("apply failed", body)
+        self.assertIn("Retry apply", body)
+        # And it lives under the pending filter (needs operator action), not in_sync.
+        # Key off row-only strings: the query term itself echoes into the filter box.
+        self.assertIn("Retry apply", self.client.get(url, {"q": "ae9.0", "state": "pending"}).content.decode())
+        in_sync = self.client.get(url, {"q": "ae9.0", "state": "in_sync"}).content.decode()
+        self.assertNotIn("apply failed", in_sync)
+        self.assertNotIn("Retry apply", in_sync)
+
+        Interface.objects.filter(device=self.device, name="ae9.0").delete()
+
     def test_tab_routing_master_off_skips_protocols(self):
         """A protocol flag without the routing master does not trigger its fetch."""
         mocks = self._render_tab_with_scopes(manage_isis=True, manage_bgp=True)

@@ -240,7 +240,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
         for st in qs:
             kind, label, owned = interface_row_state(st, st.interface)
             counts["all"] += 1
-            if kind in ("pending", "deploying"):
+            if kind in ("pending", "deploying", "apply_failed"):
                 counts["pending"] += 1
             elif kind == "drift":
                 counts["drift"] += 1
@@ -249,7 +249,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
         if state == "drift":
             filtered = [c for c in classified if c[1] == "drift"]
         elif state == "pending":
-            filtered = [c for c in classified if c[1] in ("pending", "deploying")]
+            filtered = [c for c in classified if c[1] in ("pending", "deploying", "apply_failed")]
         elif state == "in_sync":
             filtered = [c for c in classified if c[1] in ("in_sync", "unknown")]
         else:
