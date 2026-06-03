@@ -61,10 +61,13 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
         ctx["route_policy_states"] = reconcile_route_policy(device, client.get_route_policy(dev_id))
     if mgmt.manage_ospf:
         ctx["ospf_data"] = _reconcile_ospf(device, client.get_ospf(dev_id))
-    if mgmt.manage_redistribution:
-        ctx["redistribution_states"] = reconcile_redistribution(device, client.get_redistribution(dev_id))
     if mgmt.manage_bgp:
         ctx["bgp_peers"] = _reconcile_bgp_config(device, client.get_bgp_config(dev_id))
+    # Redistribution runs LAST: its destination is a netbox_routing OSPFInstance /
+    # ISISInstance / BGPAddressFamily created by the protocol reconciles above, so
+    # those must run first (BGP especially — BGP-dest redistribution needs its AF).
+    if mgmt.manage_redistribution:
+        ctx["redistribution_states"] = reconcile_redistribution(device, client.get_redistribution(dev_id))
 
 
 def reconcile_device(device, mgmt=None) -> dict:
