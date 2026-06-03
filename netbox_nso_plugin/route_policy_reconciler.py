@@ -232,6 +232,12 @@ def _fill_route_map_entries(rm_obj, entries: list, pl_by_name, cl_by_name, ap_by
             obj = cl_by_name.get(nm)
             if obj:
                 rme.match_community_list.add(obj)
+                # Devices match community-LISTS, never individual communities, so also
+                # link the list's member Communities into match_community — surfacing
+                # which concrete communities the route-map matches (user request).
+                member_ids = obj.communitylistentries.values_list("community_id", flat=True)
+                if member_ids:
+                    rme.match_community.add(*[cid for cid in member_ids if cid])
             else:
                 logger.debug("route-policy: route-map %s refs community-list %r not resolvable", rm_obj.name, nm)
         for nm in e.get("match_as_paths") or []:

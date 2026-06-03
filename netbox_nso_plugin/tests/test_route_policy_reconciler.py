@@ -219,3 +219,38 @@ class TestReconcileRoutePolicy(TestCase):
         st = NSORoutePolicyState.objects.get(management__device=self.device, family="prefix_list", object_name="PL-C")
         self.assertEqual(st.status, "conflict")
         self.assertEqual(PrefixListEntry.objects.filter(prefix_list=pl).count(), 1)  # not clobbered
+
+    def test_route_map_expands_matched_community_list_into_match_community(self):
+        """A route-map matching a community-list also links that list's member
+        Communities into match_community (devices never match communities directly)."""
+        self._make_mgmt(self.device)
+        from netbox_routing.models import Community, RouteMapEntry
+
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        payload = {
+            "community_lists": [
+                {
+                    "name": "CL-M",
+                    "entries": [
+                        {"action": "permit", "community": "65000:1"},
+                        {"action": "permit", "community": "65000:2"},
+                    ],
+                }
+            ],
+            "route_maps": [
+                {
+                    "name": "RM-M",
+                    "entries": [
+                        {"sequence": 10, "action": "permit", "match_community_lists": ["CL-M"]},
+                    ],
+                }
+            ],
+        }
+        reconcile_route_policy(self.device, payload)
+
+        rme = RouteMapEntry.objects.get(route_map__name="RM-M")
+        self.assertEqual([c.name for c in rme.match_community_list.all()], ["CL-M"])
+        matched = {str(c.community) for c in rme.match_community.all()}
+        self.assertEqual(matched, {"65000:1", "65000:2"})
+        self.assertEqual(Community.objects.filter(community__in=["65000:1", "65000:2"]).count(), 2)
