@@ -53,7 +53,11 @@ def matches_device_value(attribute, netbox_value, nso_value):
             # symmetrically (previously False matched but True drifted).
             return True
         return bool(netbox_value) == (nso == "true")
-    return (netbox_value or "") == (nso_value or "")
+    # String attrs (description): compare ignoring leading/trailing whitespace. Device
+    # configs frequently carry cosmetic surrounding spaces (e.g. a trailing space in a
+    # Junos `description "..."`) that NetBox stores stripped — comparing raw would
+    # manufacture drift on values that are identical to the operator.
+    return (netbox_value or "").strip() == (nso_value or "").strip()
 
 
 # Interface attributes whose NetBox value we can read directly and compare against

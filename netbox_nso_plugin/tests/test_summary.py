@@ -113,6 +113,14 @@ class TestMatchesDeviceValue(SimpleTestCase):
         self.assertFalse(matches_device_value("description", "Core Link", None))
         self.assertFalse(matches_device_value("description", "a", "b"))
 
+    def test_description_ignores_cosmetic_surrounding_whitespace(self):
+        # Device configs carry cosmetic leading/trailing spaces NetBox stores stripped;
+        # these must not manufacture drift (regression: dev prod-lab03d-rc1 et-0/0/6).
+        self.assertTrue(matches_device_value("description", "*** IXIA LG 1/8", "*** IXIA LG 1/8 "))
+        self.assertTrue(matches_device_value("description", "Core Link ***", " Core Link *** "))
+        # Internal whitespace differences are still a real difference.
+        self.assertFalse(matches_device_value("description", "Core Link", "Core  Link"))
+
     def test_enabled_string_device_value_casing(self):
         # nso_value is stored as a string; comparison is case/space tolerant.
         self.assertTrue(matches_device_value("enabled", True, "True"))
