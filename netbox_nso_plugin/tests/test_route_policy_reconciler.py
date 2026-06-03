@@ -88,3 +88,134 @@ class TestReconcileRoutePolicy(TestCase):
         reconcile_route_policy(self.device, pl)
         reconcile_route_policy(self.device2, pl)
         self.assertEqual(PrefixList.objects.filter(name="PL-SHARED").count(), 1)
+
+    def test_fills_entries_all_families(self):
+        """Entries (not just parent shells) are written into netbox_routing."""
+        self._make_mgmt(self.device)
+        from netbox_routing.models import (
+            ASPathEntry,
+            CommunityListEntry,
+            PrefixList,
+            PrefixListEntry,
+            RouteMapEntry,
+        )
+
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        payload = {
+            "prefix_lists": [
+                {
+                    "name": "PL-A",
+                    "entries": [
+                        {"sequence": 10, "action": "permit", "prefix": "10.0.0.0/8", "le": 24},
+                        {"sequence": 20, "action": "deny", "prefix": "10.0.0.0/8"},
+                    ],
+                },
+            ],
+            "community_lists": [{"name": "CL-A", "entries": [{"action": "permit", "community": "65000:1"}]}],
+            "as_paths": [{"name": "AP-A", "entries": [{"action": "permit", "pattern": ".* 65000 .*"}]}],
+            "route_maps": [
+                {
+                    "name": "RM-A",
+                    "entries": [
+                        {
+                            "sequence": 10,
+                            "action": "permit",
+                            "match_prefix_lists": ["PL-A"],
+                            "match_as_paths": ["AP-A"],
+                            "match": '{"x": 1}',
+                            "set": '{"local_preference": 200}',
+                        },
+                    ],
+                }
+            ],
+        }
+        reconcile_route_policy(self.device, payload)
+
+        pl = PrefixList.objects.get(name="PL-A")
+        ples = list(PrefixListEntry.objects.filter(prefix_list=pl).order_by("sequence"))
+        self.assertEqual(len(ples), 2)
+        self.assertEqual(ples[0].action, "permit")
+        self.assertEqual(ples[0].le, 24)
+        self.assertEqual(str(ples[0].assigned_prefix.prefix), "10.0.0.0/8")
+        self.assertEqual([e.sequence for e in ples], [1, 2])  # positional, smallint-safe
+
+        self.assertEqual(CommunityListEntry.objects.filter(community_list__name="CL-A").count(), 1)
+        self.assertEqual(ASPathEntry.objects.filter(aspath__name="AP-A").count(), 1)
+
+        rme = RouteMapEntry.objects.get(route_map__name="RM-A")
+        self.assertEqual(rme.set, {"local_preference": 200})
+        self.assertEqual([p.name for p in rme.match_prefix_list.all()], ["PL-A"])
+        self.assertEqual([a.name for a in rme.match_aspath.all()], ["AP-A"])
+
+    def test_extended_community_routed_and_wildcard_skipped(self):
+        """target:/origin: members go to ExtendedCommunity; wildcard/regex are dropped."""
+        self._make_mgmt(self.device)
+        from netbox_routing.models import (
+            CommunityListEntry,
+            ExtendedCommunity,
+            ExtendedCommunityList,
+            ExtendedCommunityListEntry,
+        )
+
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        payload = {
+            "community_lists": [
+                {
+                    "name": "CL-EXT",
+                    "entries": [
+                        {"action": "permit", "community": "target:6830:100"},
+                        {"action": "permit", "community": "no-export"},  # well-known -> numeric
+                        {"action": "permit", "community": "target:*:*"},  # wildcard -> skipped
+                    ],
+                }
+            ],
+        }
+        reconcile_route_policy(self.device, payload)
+
+        # standard (well-known normalized) lands in the CommunityList
+        self.assertEqual(CommunityListEntry.objects.filter(community_list__name="CL-EXT").count(), 1)
+        # extended lands in a parallel ExtendedCommunityList of the same name
+        ecl = ExtendedCommunityList.objects.get(name="CL-EXT")
+        self.assertEqual(ExtendedCommunityListEntry.objects.filter(extended_community_list=ecl).count(), 1)
+        ec = ExtendedCommunity.objects.get(type="route-target", value="6830:100")
+        self.assertTrue(ExtendedCommunityListEntry.objects.filter(extended_community=ec).exists())
+
+    def test_conflict_does_not_clobber_entries(self):
+        """Once filled, a divergent re-report flags conflict and leaves entries intact."""
+        self._make_mgmt(self.device)
+        from netbox_routing.models import PrefixList, PrefixListEntry
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        reconcile_route_policy(
+            self.device,
+            {
+                "prefix_lists": [
+                    {"name": "PL-C", "entries": [{"sequence": 10, "action": "permit", "prefix": "10.0.0.0/8"}]}
+                ]
+            },
+        )
+        pl = PrefixList.objects.get(name="PL-C")
+        self.assertEqual(PrefixListEntry.objects.filter(prefix_list=pl).count(), 1)
+
+        # Same device re-reports different content → conflict, entries untouched.
+        reconcile_route_policy(
+            self.device,
+            {
+                "prefix_lists": [
+                    {
+                        "name": "PL-C",
+                        "entries": [
+                            {"sequence": 10, "action": "permit", "prefix": "10.0.0.0/8"},
+                            {"sequence": 20, "action": "permit", "prefix": "192.168.0.0/16"},
+                        ],
+                    }
+                ]
+            },
+        )
+        st = NSORoutePolicyState.objects.get(management__device=self.device, family="prefix_list", object_name="PL-C")
+        self.assertEqual(st.status, "conflict")
+        self.assertEqual(PrefixListEntry.objects.filter(prefix_list=pl).count(), 1)  # not clobbered
