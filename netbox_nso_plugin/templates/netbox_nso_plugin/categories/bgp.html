@@ -11,6 +11,8 @@
       <button type="submit" class="btn btn-sm btn-outline-success"><span class="mdi mdi-check-all"></span> Accept All</button>
     </form>{% endif %}
   </div>
+  <div id="flt-bgp">
+  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-bgp" placeholder="Filter by peer / ASN / VRF…" show_status=True %}
   <div class="table-responsive">
     <table class="table table-sm table-hover mb-0">
       <thead>
@@ -18,7 +20,7 @@
       </thead>
       <tbody>
         {% for bp in bgp_peers %}
-        <tr>
+        <tr data-status="{{ bp.status }}">
           <td>{{ bp.asn_str }}</td>
           <td>{{ bp.vrf_name|default:"global" }}</td>
           <td>{{ bp.peer_address_str }}</td>
@@ -40,6 +42,7 @@
         {% endfor %}
       </tbody>
     </table>
+  </div>
   </div>
 {% else %}
   <p class="text-muted mb-0">No BGP peers.</p>

@@ -13,6 +13,8 @@
       <button type="submit" class="btn btn-sm btn-outline-success"><span class="mdi mdi-check-all"></span> Accept All</button>
     </form>{% endif %}
   </div>
+  <div id="flt-isis-interfaces">
+  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-isis-interfaces" placeholder="Filter by interface / type…" show_status=True %}
   <div class="table-responsive mb-3">
     <table class="table table-sm table-hover mb-0">
       <thead>
@@ -20,7 +22,7 @@
       </thead>
       <tbody>
         {% for ii in isis_interfaces %}
-        <tr>
+        <tr data-status="{{ ii.status }}">
           <td><a href="{{ ii.interface.get_absolute_url }}">{{ ii.interface.name }}</a></td>
           <td>{{ ii.af }}</td>
           <td>{{ ii.process_tag|default:"default" }}</td>
@@ -45,6 +47,7 @@
       </tbody>
     </table>
   </div>
+  </div>
 {% endif %}
 
 {% if isis_processes %}
@@ -55,6 +58,8 @@
       <button type="submit" class="btn btn-sm btn-outline-success"><span class="mdi mdi-check-all"></span> Accept All</button>
     </form>{% endif %}
   </div>
+  <div id="flt-isis-instances">
+  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-isis-instances" placeholder="Filter by process tag / instance…" show_status=True %}
   <div class="table-responsive">
     <table class="table table-sm table-hover mb-0">
       <thead>
@@ -62,7 +67,7 @@
       </thead>
       <tbody>
         {% for ip in isis_processes %}
-        <tr>
+        <tr data-status="{{ ip.status }}">
           <td>{{ ip.process_tag|default:"default" }}</td>
           <td>{% if ip.isis_instance %}<a href="{{ ip.isis_instance.get_absolute_url }}">{{ ip.isis_instance }}</a>{% else %}—{% endif %}</td>
           <td>{{ ip.area_auth_type|default:"—" }}{% if ip.area_auth_present %} ✓{% endif %}</td>
@@ -83,6 +88,7 @@
         {% endfor %}
       </tbody>
     </table>
+  </div>
   </div>
 {% endif %}
 

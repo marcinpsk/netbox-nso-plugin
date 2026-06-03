@@ -11,6 +11,8 @@
       <button type="submit" class="btn btn-sm btn-outline-success"><span class="mdi mdi-check-all"></span> Accept All</button>
     </form>{% endif %}
   </div>
+  <div id="flt-redistribution">
+  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-redistribution" placeholder="Filter by protocol / ref / route-map…" show_status=True %}
   <div class="table-responsive">
     <table class="table table-sm table-hover mb-0">
       <thead>
@@ -18,7 +20,7 @@
       </thead>
       <tbody>
         {% for rs in redistribution_states %}
-        <tr>
+        <tr data-status="{{ rs.status }}">
           <td>{{ rs.dest_protocol }}</td>
           <td>{{ rs.dest_ref|default:"—" }}</td>
           <td>{{ rs.source_protocol }}</td>
@@ -41,6 +43,7 @@
         {% endfor %}
       </tbody>
     </table>
+  </div>
   </div>
 {% else %}
   <p class="text-muted mb-0">No redistribution.</p>

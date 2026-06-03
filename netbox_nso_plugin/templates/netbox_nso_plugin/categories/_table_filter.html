@@ -1,0 +1,60 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Reusable client-side filter for a category table. The rows are already rendered on
+   expand, so filtering is instant and needs no server round-trip. Params:
+     fid          id of the wrapping element that contains the <table> to filter
+     placeholder  search-box placeholder (optional)
+     show_status  when truthy, render a status dropdown auto-populated from the rows'
+                  data-status attributes (each <tr> must carry data-status="..."). #}
+<div class="d-flex align-items-center gap-2 mb-2 flex-wrap">
+  <div class="input-group input-group-sm" style="max-width: 320px;">
+    <span class="input-group-text"><span class="mdi mdi-magnify"></span></span>
+    <input type="text" class="form-control" placeholder="{{ placeholder|default:'Filter…' }}"
+           data-list-filter="{{ fid }}" autocomplete="off">
+  </div>
+  {% if show_status %}
+  <select class="form-select form-select-sm" style="max-width: 170px;" data-list-filter-status="{{ fid }}">
+    <option value="">All statuses</option>
+  </select>
+  {% endif %}
+  <span class="text-muted small ms-auto" data-list-filter-count="{{ fid }}"></span>
+</div>
+<script>
+(function () {
+  var root = document.getElementById('{{ fid }}');
+  if (!root) return;
+  var input = document.querySelector('[data-list-filter="{{ fid }}"]');
+  var statusSel = document.querySelector('[data-list-filter-status="{{ fid }}"]');
+  var counter = document.querySelector('[data-list-filter-count="{{ fid }}"]');
+  var rows = Array.prototype.slice.call(root.querySelectorAll('table > tbody > tr'));
+  // Build the status dropdown from the statuses actually present in the rows.
+  if (statusSel) {
+    var seen = {};
+    rows.forEach(function (tr) {
+      var s = tr.getAttribute('data-status');
+      if (s && !seen[s]) {
+        seen[s] = 1;
+        var o = document.createElement('option');
+        o.value = s; o.textContent = s;
+        statusSel.appendChild(o);
+      }
+    });
+  }
+  function apply() {
+    var q = (input && input.value || '').trim().toLowerCase();
+    var st = (statusSel && statusSel.value) || '';
+    var shown = 0;
+    rows.forEach(function (tr) {
+      var okText = !q || tr.textContent.toLowerCase().indexOf(q) !== -1;
+      var okStatus = !st || tr.getAttribute('data-status') === st;
+      var show = okText && okStatus;
+      tr.style.display = show ? '' : 'none';
+      if (show) shown++;
+    });
+    if (counter) counter.textContent = shown + ' of ' + rows.length;
+  }
+  if (input) input.addEventListener('input', apply);
+  if (statusSel) statusSel.addEventListener('change', apply);
+  apply();
+})();
+</script>

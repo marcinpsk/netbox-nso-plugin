@@ -11,6 +11,8 @@
       <button type="submit" class="btn btn-sm btn-outline-success"><span class="mdi mdi-check-all"></span> Accept All</button>
     </form>{% endif %}
   </div>
+  <div id="flt-static">
+  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-static" placeholder="Filter by prefix / VRF / next hop…" show_status=True %}
   <div class="table-responsive">
     <table class="table table-sm table-hover mb-0">
       <thead>
@@ -18,7 +20,7 @@
       </thead>
       <tbody>
         {% for sr in static_routes %}
-        <tr>
+        <tr data-status="{{ sr.status }}">
           <td>{{ sr.nso_vrf|default:"global" }}</td>
           <td><a href="{{ sr.static_route.get_absolute_url }}">{{ sr.nso_prefix }}</a></td>
           <td>{{ sr.nso_next_hop|default:"—" }}</td>
@@ -39,6 +41,7 @@
         {% endfor %}
       </tbody>
     </table>
+  </div>
   </div>
 {% else %}
   <p class="text-muted mb-0">No static routes.</p>

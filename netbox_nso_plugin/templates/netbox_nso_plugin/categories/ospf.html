@@ -17,6 +17,8 @@
     </form>{% endif %}
   </div>
   {% if ospf_data.instances %}
+  <div id="flt-ospf-instances">
+  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-ospf-instances" placeholder="Filter by process / VRF / router-id…" show_status=True %}
   <div class="table-responsive mb-3">
     <table class="table table-sm table-hover mb-0">
       <thead>
@@ -24,7 +26,7 @@
       </thead>
       <tbody>
         {% for oi in ospf_data.instances %}
-        <tr>
+        <tr data-status="{{ oi.status }}">
           <td>{{ oi.process_id }}</td>
           <td>{{ oi.vrf|default:"global" }}</td>
           <td>{{ oi.router_id|default:"—" }}</td>
@@ -46,8 +48,11 @@
       </tbody>
     </table>
   </div>
+  </div>
   {% endif %}
   {% if ospf_data.interfaces %}
+  <div id="flt-ospf-interfaces">
+  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-ospf-interfaces" placeholder="Filter by interface / area…" show_status=True %}
   <div class="table-responsive">
     <table class="table table-sm table-hover mb-0">
       <thead>
@@ -55,7 +60,7 @@
       </thead>
       <tbody>
         {% for oif in ospf_data.interfaces %}
-        <tr>
+        <tr data-status="{{ oif.status }}">
           <td><a href="{{ oif.interface.get_absolute_url }}">{{ oif.interface.name }}</a></td>
           <td>{{ oif.process_id|default:"—" }}</td>
           <td>{{ oif.area_id|default:"—" }}</td>
@@ -76,6 +81,7 @@
         {% endfor %}
       </tbody>
     </table>
+  </div>
   </div>
   {% endif %}
 {% else %}

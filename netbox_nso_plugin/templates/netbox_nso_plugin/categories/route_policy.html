@@ -11,6 +11,8 @@
       <button type="submit" class="btn btn-sm btn-outline-success"><span class="mdi mdi-check-all"></span> Accept All</button>
     </form>{% endif %}
   </div>
+  <div id="flt-route_policy">
+  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-route_policy" placeholder="Filter by name / family…" show_status=True %}
   <div class="table-responsive">
     <table class="table table-sm table-hover mb-0">
       <thead>
@@ -18,7 +20,7 @@
       </thead>
       <tbody>
         {% for rp in route_policy_states %}
-        <tr>
+        <tr data-status="{{ rp.status }}">
           <td>{{ rp.family }}</td>
           <td>{{ rp.object_name }}</td>
           <td>{% if rp.content_object %}<a href="{{ rp.content_object.get_absolute_url }}">{{ rp.content_object }}</a>{% else %}—{% endif %}</td>
@@ -38,6 +40,7 @@
         {% endfor %}
       </tbody>
     </table>
+  </div>
   </div>
 {% else %}
   <p class="text-muted mb-0">No route policy.</p>
