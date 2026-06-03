@@ -819,23 +819,28 @@ def _reconcile_isis_process(device, process_list: list) -> list:
         state.overload_bit = entry.get("overload_bit")
         state.area_auth_type = entry.get("area_auth_type") or ""
         state.area_auth_present = bool(entry.get("area_auth_present", False))
+        state.area_auth_key = entry.get("area_auth_key") or ""
         state.domain_auth_type = entry.get("domain_auth_type") or ""
         state.domain_auth_present = bool(entry.get("domain_auth_present", False))
+        state.domain_auth_key = entry.get("domain_auth_key") or ""
         state.last_sync_at = now
 
         if routing_ok:
             inst, _ = ISISInstance.objects.get_or_create(device=device, process_tag=tag)
             # Keep the routing instance's informational fields in step with NSO.
-            # String fields sync when NSO reported a non-empty value; the auth *keys*
-            # are secrets we never import — the auth *type* alone records that area/
-            # domain authentication is configured.
+            # String fields sync when NSO reported a non-empty value. Auth keys are
+            # routing-protocol secrets (not device-access creds): synced when NSO
+            # reports them, else the auth *type*/present flags record that area/domain
+            # authentication is configured without a key in hand.
             inst_fields = []
             for attr, val in (
                 ("net", state.net),
                 ("is_type", state.is_type),
                 ("metric_style", state.metric_style),
                 ("area_auth_type", state.area_auth_type),
+                ("area_auth_key", state.area_auth_key),
                 ("domain_auth_type", state.domain_auth_type),
+                ("domain_auth_key", state.domain_auth_key),
             ):
                 if val and getattr(inst, attr) != val:
                     setattr(inst, attr, val)
@@ -862,6 +867,104 @@ def _reconcile_isis_process(device, process_list: list) -> list:
             stale.save(update_fields=["status"])
 
     return list(NSOISISInstanceState.objects.filter(management=mgmt).select_related("isis_instance"))
+
+
+def _import_ospf_models():
+    """Return (OSPFInstance, OSPFArea, OSPFInterface) or (None, None, None).
+
+    netbox-routing is an optional dependency; treat its absence as "fill disabled".
+    """
+    try:
+        from netbox_routing.models import OSPFArea, OSPFInstance, OSPFInterface
+
+        return OSPFInstance, OSPFArea, OSPFInterface
+    except Exception:
+        return None, None, None
+
+
+def _resolve_ospf_vrf(vrf_name: str):
+    """Look up an ipam.VRF by name; None for global or when not present in NetBox."""
+    if not vrf_name:
+        return None
+    try:
+        from ipam.models import VRF
+
+        return VRF.objects.filter(name=vrf_name).first()
+    except Exception:
+        return None
+
+
+def _get_or_create_ospf_instance(device, pid, entry, OSPFInstance):
+    """Create/refresh the netbox-routing OSPFInstance for one process.
+
+    Keyed on (device, process_id). ``router_id`` is required by the model
+    (IPAddressField) so an instance NSO reports without one is skipped — the
+    overlay still records it. ``name`` is only set on create so an operator
+    rename survives later syncs; router_id/vrf are kept faithful to the device.
+    """
+    if OSPFInstance is None:
+        return None
+    router_id = entry.get("router_id")
+    if not router_id:
+        return None
+    vrf_obj = _resolve_ospf_vrf(entry.get("vrf") or "")
+    obj, created = OSPFInstance.objects.get_or_create(
+        device=device,
+        process_id=pid,
+        defaults={"name": str(pid), "router_id": router_id, "vrf": vrf_obj},
+    )
+    if not created:
+        changed = False
+        if str(obj.router_id) != str(router_id):
+            obj.router_id = router_id
+            changed = True
+        if obj.vrf_id != (vrf_obj.id if vrf_obj else None):
+            obj.vrf = vrf_obj
+            changed = True
+        if changed:
+            obj.save()
+    return obj
+
+
+_OSPF_AUTH_MAP = {"message-digest": "message-digest", "null": "null"}
+_OSPF_NETWORK_TYPES = {"broadcast", "non-broadcast", "point-to-point", "point-to-multipoint"}
+
+
+def _fill_ospf_interface(entry, iface, inst_by_pid, OSPFArea, OSPFInterface):
+    """Create/refresh the netbox-routing OSPFInterface + its OSPFArea.
+
+    OSPFArea is a global object keyed by area_id. OSPFInterface is OneToOne on
+    the dcim.Interface. Auth keys are never imported — only the auth *type* (and
+    only the values netbox-routing models; plaintext has no equivalent).
+    """
+    if OSPFInterface is None or OSPFArea is None:
+        return
+    pid = entry.get("process_id")
+    inst = inst_by_pid.get(pid)
+    if inst is None:
+        return
+    area_id = entry.get("area_id") or "0.0.0.0"
+    area, _ = OSPFArea.objects.get_or_create(area_id=area_id, defaults={"area_type": "standard"})
+
+    cost = entry.get("cost")
+    cost = cost if isinstance(cost, int) and 1 <= cost <= 65535 else None
+    nt = entry.get("network_type")
+    nt = nt if nt in _OSPF_NETWORK_TYPES else None
+    auth = _OSPF_AUTH_MAP.get(entry.get("auth_type") or "")
+    fields = {
+        "instance": inst,
+        "area": area,
+        "passive": bool(entry.get("passive", False)),
+        "priority": entry.get("priority"),
+        "cost": cost,
+        "network_type": nt,
+        "authentication": auth,
+    }
+    obj, created = OSPFInterface.objects.get_or_create(interface=iface, defaults=fields)
+    if not created:
+        for key, val in fields.items():
+            setattr(obj, key, val)
+        obj.save()
 
 
 def _reconcile_ospf(device, payload: dict) -> dict:
@@ -895,13 +998,7 @@ def _reconcile_ospf(device, payload: dict) -> dict:
 
     now = timezone.now()
 
-    # Try to import OSPFInstance from netbox-routing (may not be installed)
-    try:
-        from netbox_routing.models import OSPFInstance
-
-        ospf_instances = {inst.process_id: inst for inst in OSPFInstance.objects.filter(device=device)}
-    except Exception:
-        ospf_instances = {}
+    OSPFInstance, _OSPFArea, _OSPFInterface = _import_ospf_models()
 
     # ── Instance reconcile ──
     seen_pids: set[int] = set()
@@ -918,8 +1015,9 @@ def _reconcile_ospf(device, payload: dict) -> dict:
         state.vrf = entry.get("vrf") or ""
         state.areas = entry.get("areas") or []
         state.last_sync_at = now
-        if pid in ospf_instances:
-            state.ospf_instance = ospf_instances[pid]
+        ospf_inst = _get_or_create_ospf_instance(device, pid, entry, OSPFInstance)
+        if ospf_inst is not None:
+            state.ospf_instance = ospf_inst
         if state.status not in _OSPF_WRITE_PATH:
             state.status = "in_sync" if state.ospf_instance_id else "imported"
         state.save()
@@ -950,6 +1048,9 @@ def _reconcile_ospf_interfaces(device, mgmt, payload, now, write_path_statuses) 
 
     from .models import NSOOSPFInterfaceState
 
+    OSPFInstance, OSPFArea, OSPFInterface = _import_ospf_models()
+    inst_by_pid = {i.process_id: i for i in OSPFInstance.objects.filter(device=device)} if OSPFInstance else {}
+
     iface_map = {i.name: i for i in Interface.objects.filter(device=device)}
     seen_iface_pks: set[int] = set()
     dropped: list[str] = []
@@ -979,6 +1080,7 @@ def _reconcile_ospf_interfaces(device, mgmt, payload, now, write_path_statuses) 
         if state.status not in write_path_statuses:
             state.status = "imported"
         state.save()
+        _fill_ospf_interface(entry, iface, inst_by_pid, OSPFArea, OSPFInterface)
         seen_iface_pks.add(iface.pk)
 
     for stale in NSOOSPFInterfaceState.objects.filter(management=mgmt):

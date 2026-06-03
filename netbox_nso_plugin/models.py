@@ -753,8 +753,13 @@ class NSOISISInstanceState(NetBoxModel):
     overload_bit = models.BooleanField(null=True, blank=True)
     area_auth_type = models.CharField(max_length=10, blank=True, default="")
     area_auth_present = models.BooleanField(default=False)
+    # Routing-protocol auth keys (NOT device-access credentials). Carried so the
+    # write path can push them and the read path can import them; the *present*
+    # flags stay authoritative for "is auth configured" when no key is held.
+    area_auth_key = models.CharField(max_length=128, blank=True, default="")
     domain_auth_type = models.CharField(max_length=10, blank=True, default="")
     domain_auth_present = models.BooleanField(default=False)
+    domain_auth_key = models.CharField(max_length=128, blank=True, default="")
     # Linked netbox-routing object (nullable — may not exist yet)
     isis_instance = models.ForeignKey(
         to="netbox_routing.ISISInstance",

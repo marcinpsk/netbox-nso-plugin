@@ -807,13 +807,11 @@ def _push_isis_intent_for_device(device_id, adapter_device_id):
             "metric_style": row.metric_style,
             "overload_bit": row.overload_bit,
             "area_auth_type": row.area_auth_type,
-            # Auth keys aren't on the read overlay yet (the IS-IS auth-key import is
-            # half-built: write path / adapter intent model already accept them).
-            # getattr keeps them in the pushed intent and starts populating the moment
-            # NSOISISInstanceState gains the fields — instead of crashing now.
-            "area_auth_key": getattr(row, "area_auth_key", None),
+            # Routing-protocol auth keys: pushed when held (empty string → None so the
+            # adapter intent treats "no key" as absent rather than a literal empty key).
+            "area_auth_key": row.area_auth_key or None,
             "domain_auth_type": row.domain_auth_type,
-            "domain_auth_key": getattr(row, "domain_auth_key", None),
+            "domain_auth_key": row.domain_auth_key or None,
         }
         proc_redist = redist_by_proc.get(row.process_tag or "", [])
         if proc_redist:

@@ -421,9 +421,41 @@ class TestReconcileIsisProcess(TestCase):
         self.assertTrue(inst.overload_bit)
         self.assertEqual(inst.area_auth_type, "md5")
         self.assertEqual(inst.domain_auth_type, "text")
-        # Auth keys are secrets we never import — type alone records auth is configured.
+        # No key in the payload (only the present flag) → key stays empty.
         self.assertEqual(inst.area_auth_key, "")
         self.assertEqual(inst.domain_auth_key, "")
+
+    def test_auth_keys_imported_when_reported(self):
+        """When NSO reports the actual area/domain auth keys they are filled into the
+        overlay row and the netbox_routing.ISISInstance (routing-protocol secrets,
+        not device-access credentials)."""
+        self._make_mgmt()
+        from netbox_routing.models import ISISInstance
+
+        from netbox_nso_plugin.template_content import _reconcile_isis_process
+
+        result = _reconcile_isis_process(
+            self.device,
+            [
+                {
+                    "process_tag": "CORE",
+                    "net": "49.0001.0001.0001.0001.00",
+                    "is_type": "level-2-only",
+                    "area_auth_type": "md5",
+                    "area_auth_present": True,
+                    "area_auth_key": "s3cret-area",
+                    "domain_auth_type": "text",
+                    "domain_auth_present": True,
+                    "domain_auth_key": "s3cret-domain",
+                }
+            ],
+        )
+
+        self.assertEqual(result[0].area_auth_key, "s3cret-area")
+        self.assertEqual(result[0].domain_auth_key, "s3cret-domain")
+        inst = ISISInstance.objects.get(device=self.device, process_tag="CORE")
+        self.assertEqual(inst.area_auth_key, "s3cret-area")
+        self.assertEqual(inst.domain_auth_key, "s3cret-domain")
 
     def test_routing_instance_overload_false_synced_none_left_alone(self):
         """overload_bit is tri-state: False is synced; None leaves the field untouched."""

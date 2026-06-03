@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Regression: IS-IS instance intent push must not crash on the (not-yet-imported)
-auth-key fields. The push references area_auth_key/domain_auth_key, which the read
-overlay NSOISISInstanceState does not have yet — it must degrade to None, not raise.
+"""IS-IS instance intent push carries the area/domain auth keys.
+
+The overlay NSOISISInstanceState now holds area_auth_key/domain_auth_key, so the
+push sends a held key and maps an empty (unset) key to None — never a literal "".
 """
 
 from __future__ import annotations
@@ -22,19 +23,22 @@ class TestIsisIntentPush(TestCase):
         site = Site.objects.create(name="IiSite", slug="iisite")
         cls.device = Device.objects.create(name="ii-router", device_type=dt, role=role, site=site)
 
-    def test_push_does_not_crash_without_auth_key_fields(self):
+    def _push_and_capture(self, **state_kwargs):
         from netbox_nso_plugin import adapter_client
         from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOISISInstanceState
         from netbox_nso_plugin.signals import _push_isis_intent_for_device, suppress_intent_push
 
         inst, _ = NSOInstance.objects.get_or_create(name="ii-inst", defaults={"adapter_instance_id": "ii-inst"})
-        mgmt = NSODeviceManagement.objects.create(
-            device=self.device, nso_instance=inst, nso_device_name="ii-dev", adapter_device_id=self.device.pk
-        )
+        mgmt = NSODeviceManagement.objects.get_or_create(
+            device=self.device,
+            defaults={"nso_instance": inst, "nso_device_name": "ii-dev", "adapter_device_id": self.device.pk},
+        )[0]
         # Create within suppression so the save() itself doesn't push.
         with suppress_intent_push():
-            NSOISISInstanceState.objects.create(
-                management=mgmt, process_tag="", net="49.0001.00", is_type="level-2-only", status="in_sync"
+            NSOISISInstanceState.objects.update_or_create(
+                management=mgmt,
+                process_tag="",
+                defaults={"net": "49.0001.00", "is_type": "level-2-only", "status": "in_sync", **state_kwargs},
             )
 
         captured = {}
@@ -45,12 +49,19 @@ class TestIsisIntentPush(TestCase):
         orig = adapter_client.put_isis_interface_intent
         adapter_client.put_isis_interface_intent = MagicMock(side_effect=_fake_put)
         try:
-            _push_isis_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)  # must not raise
+            _push_isis_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
         finally:
             adapter_client.put_isis_interface_intent = orig
-
         assert "processes" in captured and len(captured["processes"]) == 1
-        proc = captured["processes"][0]
+        return captured["processes"][0]
+
+    def test_unset_key_pushed_as_none(self):
+        proc = self._push_and_capture()
         assert proc["net"] == "49.0001.00"
-        assert proc["area_auth_key"] is None  # degraded, not crashed
+        assert proc["area_auth_key"] is None  # empty "" → None, never literal ""
         assert proc["domain_auth_key"] is None
+
+    def test_held_key_is_pushed(self):
+        proc = self._push_and_capture(area_auth_key="s3cret-area", domain_auth_key="s3cret-domain")
+        assert proc["area_auth_key"] == "s3cret-area"
+        assert proc["domain_auth_key"] == "s3cret-domain"

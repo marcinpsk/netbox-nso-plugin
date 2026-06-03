@@ -1,0 +1,181 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
+"""Tests for the OSPF read-path fill: _reconcile_ospf creating netbox-routing
+OSPFInstance / OSPFArea / OSPFInterface objects (M19) plus the overlay rows."""
+
+from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
+from django.test import TestCase
+
+
+def _make_ospf_device(suffix="ospf"):
+    mfg, _ = Manufacturer.objects.get_or_create(name=f"OspfMfg{suffix}", slug=f"ospfmfg{suffix}")
+    dt, _ = DeviceType.objects.get_or_create(manufacturer=mfg, model=f"OspfDev{suffix}", slug=f"ospfdev{suffix}")
+    role, _ = DeviceRole.objects.get_or_create(name=f"OspfRole{suffix}", slug=f"ospfrole{suffix}")
+    site, _ = Site.objects.get_or_create(name=f"OspfSite{suffix}", slug=f"ospfsite{suffix}")
+    return Device.objects.create(name=f"ospf-rtr-{suffix}", device_type=dt, role=role, site=site)
+
+
+class TestReconcileOspfFill(TestCase):
+    """Integration tests for _reconcile_ospf() → netbox-routing graph + overlay."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.device = _make_ospf_device("main")
+        cls.lo0 = Interface.objects.create(device=cls.device, name="Loopback0", type="virtual")
+        cls.tun = Interface.objects.create(device=cls.device, name="Tunnel10", type="virtual")
+
+    def _make_mgmt(self, device=None):
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+        device = device or self.device
+        inst, _ = NSOInstance.objects.get_or_create(
+            name="ospf-test-inst",
+            defaults={"adapter_instance_id": "ospf-test-inst"},
+        )
+        return NSODeviceManagement.objects.get_or_create(
+            device=device,
+            defaults={
+                "nso_instance": inst,
+                "nso_device_name": "ospf-dev",
+                "adapter_device_id": device.pk,
+                "manage_ospf": True,
+            },
+        )[0]
+
+    def _payload(self, instances=None, interfaces=None):
+        return {
+            "device_id": self.device.pk,
+            "instances": instances if instances is not None else [],
+            "interfaces": interfaces if interfaces is not None else [],
+        }
+
+    def _instance(self, process_id=10, router_id="10.0.0.1", vrf="", areas=None):
+        return {
+            "process_id": process_id,
+            "router_id": router_id,
+            "vrf": vrf,
+            "areas": areas if areas is not None else [{"area-id": "0.0.0.0", "area-type": "standard"}],
+        }
+
+    def _iface(self, name="Tunnel10", process_id=10, area_id="0.0.0.0", **kw):
+        entry = {"interface_name": name, "process_id": process_id, "area_id": area_id}
+        entry.update(kw)
+        return entry
+
+    # ── Instance fill ───────────────────────────────────────────────────────
+
+    def test_no_mgmt_returns_empty(self):
+        orphan = _make_ospf_device("orphan")
+        from netbox_nso_plugin.template_content import _reconcile_ospf
+
+        result = _reconcile_ospf(orphan, self._payload([self._instance()]))
+        self.assertEqual(result, {"instances": [], "interfaces": []})
+
+    def test_creates_ospf_instance(self):
+        self._make_mgmt()
+        from netbox_routing.models import OSPFInstance
+
+        from netbox_nso_plugin.template_content import _reconcile_ospf
+
+        _reconcile_ospf(self.device, self._payload([self._instance(process_id=10, router_id="10.0.0.1")]))
+
+        inst = OSPFInstance.objects.get(device=self.device, process_id=10)
+        self.assertEqual(str(inst.router_id), "10.0.0.1")
+        self.assertEqual(inst.name, "10")
+
+    def test_instance_overlay_in_sync_when_linked(self):
+        self._make_mgmt()
+        from netbox_nso_plugin.template_content import _reconcile_ospf
+
+        res = _reconcile_ospf(self.device, self._payload([self._instance()]))
+        self.assertEqual(len(res["instances"]), 1)
+        self.assertEqual(res["instances"][0].status, "in_sync")
+
+    def test_instance_without_router_id_skipped_but_overlay_kept(self):
+        """router_id is required by the model → no OSPFInstance, but overlay still imported."""
+        self._make_mgmt()
+        from netbox_routing.models import OSPFInstance
+
+        from netbox_nso_plugin.template_content import _reconcile_ospf
+
+        res = _reconcile_ospf(self.device, self._payload([self._instance(router_id="")]))
+        self.assertFalse(OSPFInstance.objects.filter(device=self.device).exists())
+        self.assertEqual(res["instances"][0].status, "imported")
+
+    def test_idempotent(self):
+        self._make_mgmt()
+        from netbox_routing.models import OSPFInstance
+
+        from netbox_nso_plugin.template_content import _reconcile_ospf
+
+        p = self._payload([self._instance()])
+        _reconcile_ospf(self.device, p)
+        _reconcile_ospf(self.device, p)
+        self.assertEqual(OSPFInstance.objects.filter(device=self.device, process_id=10).count(), 1)
+
+    # ── Interface fill ──────────────────────────────────────────────────────
+
+    def test_creates_ospf_interface_with_knobs(self):
+        self._make_mgmt()
+        from netbox_routing.models import OSPFInterface
+
+        from netbox_nso_plugin.template_content import _reconcile_ospf
+
+        _reconcile_ospf(
+            self.device,
+            self._payload(
+                [self._instance()],
+                [self._iface(name="Tunnel10", cost=750, network_type="point-to-point")],
+            ),
+        )
+        x = OSPFInterface.objects.get(interface=self.tun)
+        self.assertEqual(x.instance.process_id, 10)
+        self.assertEqual(x.area.area_id, "0.0.0.0")
+        self.assertEqual(x.cost, 750)
+        self.assertEqual(x.network_type, "point-to-point")
+
+    def test_invalid_network_type_and_cost_dropped(self):
+        """Out-of-range cost and unknown network-type must not be written verbatim."""
+        self._make_mgmt()
+        from netbox_routing.models import OSPFInterface
+
+        from netbox_nso_plugin.template_content import _reconcile_ospf
+
+        _reconcile_ospf(
+            self.device,
+            self._payload(
+                [self._instance()],
+                [self._iface(name="Tunnel10", cost=0, network_type="bogus")],
+            ),
+        )
+        x = OSPFInterface.objects.get(interface=self.tun)
+        self.assertIsNone(x.cost)
+        self.assertIsNone(x.network_type)
+
+    def test_interface_not_in_netbox_dropped(self):
+        """An interface NSO reports but NetBox lacks is skipped, not crashed."""
+        self._make_mgmt()
+        from netbox_routing.models import OSPFInterface
+
+        from netbox_nso_plugin.template_content import _reconcile_ospf
+
+        _reconcile_ospf(
+            self.device,
+            self._payload([self._instance()], [self._iface(name="Port-channel9.999")]),
+        )
+        self.assertFalse(OSPFInterface.objects.filter(instance__device=self.device).exists())
+
+    def test_auth_type_mapped(self):
+        self._make_mgmt()
+        from netbox_routing.models import OSPFInterface
+
+        from netbox_nso_plugin.template_content import _reconcile_ospf
+
+        _reconcile_ospf(
+            self.device,
+            self._payload(
+                [self._instance()],
+                [self._iface(name="Tunnel10", auth_type="message-digest", auth_present=True)],
+            ),
+        )
+        self.assertEqual(OSPFInterface.objects.get(interface=self.tun).authentication, "message-digest")
