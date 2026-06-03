@@ -359,6 +359,64 @@ class TestReconcileBgpConfig(TestCase):
         self.assertIsNotNone(peer.remote_as)
         self.assertEqual(peer.remote_as.asn, 64999)
 
+    def test_local_as_linked(self):
+        """local_as in peer entry → ipam.ASN created and linked to BGPPeer.local_as."""
+        self._make_mgmt()
+
+        from netbox_routing.models import BGPPeer
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        _reconcile_bgp_config(
+            self.device,
+            self._payload(self._router_payload(peers=[self._peer_entry("10.0.4.1", local_as="65001")])),
+        )
+
+        peer = BGPPeer.objects.filter(peer__address__net_host="10.0.4.1").first()
+        self.assertIsNotNone(peer)
+        self.assertIsNotNone(peer.local_as)
+        self.assertEqual(peer.local_as.asn, 65001)
+
+    def test_peer_group_created_and_linked(self):
+        """peer_group name in peer entry → BGPPeerTemplate created and linked."""
+        self._make_mgmt()
+
+        from netbox_routing.models import BGPPeer, BGPPeerTemplate
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        _reconcile_bgp_config(
+            self.device,
+            self._payload(self._router_payload(peers=[self._peer_entry("10.0.5.1", peer_group="EBGP-UPSTREAM")])),
+        )
+
+        peer = BGPPeer.objects.filter(peer__address__net_host="10.0.5.1").first()
+        self.assertIsNotNone(peer.peer_group)
+        self.assertEqual(peer.peer_group.name, "EBGP-UPSTREAM")
+        self.assertEqual(BGPPeerTemplate.objects.filter(name="EBGP-UPSTREAM").count(), 1)
+
+    def test_peer_group_shared_across_peers(self):
+        """Two peers with the same peer-group name share one BGPPeerTemplate."""
+        self._make_mgmt()
+
+        from netbox_routing.models import BGPPeerTemplate
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        _reconcile_bgp_config(
+            self.device,
+            self._payload(
+                self._router_payload(
+                    peers=[
+                        self._peer_entry("10.0.6.1", peer_group="IBGP"),
+                        self._peer_entry("10.0.6.2", peer_group="IBGP"),
+                    ]
+                )
+            ),
+        )
+
+        self.assertEqual(BGPPeerTemplate.objects.filter(name="IBGP").count(), 1)
+
     def test_scope_address_family_created(self):
         """Scope-level address families → BGPAddressFamily created."""
         self._make_mgmt()

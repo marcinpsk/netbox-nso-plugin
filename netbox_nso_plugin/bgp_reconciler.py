@@ -125,38 +125,54 @@ def _resolve_peer_ip(peer_address_str: str, IPAddress):
         return None
 
 
-def _get_or_create_peer(scope_obj, ip_obj, peer_data: dict, remote_asn_obj, BGPPeer):
+def _get_or_create_peer_group(name: str, BGPPeerTemplate):
+    """Find or create a BGPPeerTemplate (netbox-routing's peer-group) by name.
+
+    remote_as is left null: a peer-group is shared across peers with differing
+    remote-AS, and the model's unique key is (name, remote_as).
+    """
+    if not name:
+        return None
+    obj, created = BGPPeerTemplate.objects.get_or_create(name=name, remote_as=None)
+    if created:
+        logger.debug("BGP: auto-created BGPPeerTemplate %r", name)
+    return obj
+
+
+def _get_or_create_peer(scope_obj, ip_obj, peer_data: dict, remote_asn_obj, local_asn_obj, peer_group_obj, BGPPeer):
     """Find or create a BGPPeer for (scope, peer_ip).
 
-    Updates mutable fields (enabled, remote_as, local_as, ttl, password)
-    only if the peer was newly created or the fields differ.
+    Updates mutable fields (enabled, remote_as, local_as, peer_group, ttl,
+    password) only if the peer was newly created or the fields differ.
     Returns (bgp_peer, conflict) where conflict=True when an existing peer
     exists that was not created by this plugin (detected heuristically by
     the absence of a linked NSOBGPPeerState row — checked by caller).
     """
+    _FK_FIELDS = {"remote_as", "local_as", "peer_group"}
+    desired = {
+        "enabled": peer_data.get("enabled"),
+        "remote_as": remote_asn_obj,
+        "local_as": local_asn_obj,
+        "peer_group": peer_group_obj,
+        "ttl": peer_data.get("ttl"),
+        "password": peer_data.get("password"),
+    }
     obj, created = BGPPeer.objects.get_or_create(
         scope=scope_obj,
         peer=ip_obj,
         name=None,
-        defaults={
-            "enabled": peer_data.get("enabled"),
-            "remote_as": remote_asn_obj,
-            "ttl": peer_data.get("ttl"),
-            "password": peer_data.get("password"),
-        },
+        defaults=desired,
     )
     if not created:
-        # Update mutable fields on existing peer
         changed = False
-        for field, value in [
-            ("enabled", peer_data.get("enabled")),
-            ("remote_as", remote_asn_obj),
-            ("ttl", peer_data.get("ttl")),
-            ("password", peer_data.get("password")),
-        ]:
-            if getattr(obj, field if field != "remote_as" else "remote_as_id") != (
-                value.pk if value is not None and field == "remote_as" else value
-            ):
+        for field, value in desired.items():
+            if field in _FK_FIELDS:
+                current = getattr(obj, f"{field}_id")
+                new = value.pk if value is not None else None
+            else:
+                current = getattr(obj, field)
+                new = value
+            if current != new:
                 setattr(obj, field, value)
                 changed = True
         if changed:
@@ -238,6 +254,7 @@ def _reconcile_scope(
     BGPAddressFamily,
     BGPPeer,
     BGPPeerAddressFamily,
+    BGPPeerTemplate,
     IPAddress,
     VRF,
 ):
@@ -261,8 +278,13 @@ def _reconcile_scope(
 
         remote_as_str = str(peer_entry.get("remote_as") or "")
         remote_asn_obj = _get_or_create_asn(remote_as_str, ASN) if remote_as_str else None
+        local_as_str = str(peer_entry.get("local_as") or "")
+        local_asn_obj = _get_or_create_asn(local_as_str, ASN) if local_as_str else None
+        peer_group_obj = _get_or_create_peer_group(peer_entry.get("peer_group") or "", BGPPeerTemplate)
 
-        bgp_peer, was_existing = _get_or_create_peer(scope_obj, ip_obj, peer_entry, remote_asn_obj, BGPPeer)
+        bgp_peer, was_existing = _get_or_create_peer(
+            scope_obj, ip_obj, peer_entry, remote_asn_obj, local_asn_obj, peer_group_obj, BGPPeer
+        )
         _update_peer_state(
             mgmt, asn_str, vrf_name, peer_address_str, bgp_peer, remote_as_str, peer_entry, was_existing, now
         )
@@ -287,7 +309,14 @@ def _reconcile_bgp_config(device, payload: dict) -> list:
     from django.utils import timezone
 
     try:
-        from netbox_routing.models import BGPAddressFamily, BGPPeer, BGPPeerAddressFamily, BGPRouter, BGPScope
+        from netbox_routing.models import (
+            BGPAddressFamily,
+            BGPPeer,
+            BGPPeerAddressFamily,
+            BGPPeerTemplate,
+            BGPRouter,
+            BGPScope,
+        )
     except ImportError:
         logger.warning("netbox_routing not installed; skipping BGP reconcile")
         return []
@@ -336,6 +365,7 @@ def _reconcile_bgp_config(device, payload: dict) -> list:
                 BGPAddressFamily,
                 BGPPeer,
                 BGPPeerAddressFamily,
+                BGPPeerTemplate,
                 IPAddress,
                 VRF,
             )
