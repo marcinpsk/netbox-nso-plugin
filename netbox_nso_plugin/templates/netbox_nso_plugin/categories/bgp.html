@@ -23,7 +23,7 @@
         <tr data-status="{{ bp.status }}" data-owned="{{ bp.accepted_at|yesno:'true,false' }}">
           <td>{{ bp.asn_str }}</td>
           <td>{{ bp.vrf_name|default:"global" }}</td>
-          <td>{{ bp.peer_address_str }}</td>
+          <td>{{ bp.peer_address_str }}{% if bp.enabled is False %} <span class="badge bg-secondary ms-1" title="Deactivated on the device (Junos deactivate / admin down)">disabled</span>{% endif %}</td>
           <td>{{ bp.remote_as_str|default:"—" }}</td>
           <td>{% if bp.bgp_peer %}<a href="{{ bp.bgp_peer.get_absolute_url }}">{{ bp.bgp_peer }}</a>{% else %}—{% endif %}</td>
           <td>
