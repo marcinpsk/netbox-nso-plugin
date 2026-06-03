@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 _FAMILY_MODELS = {
     "prefix_list": "netbox_routing.PrefixList",
     "community_list": "netbox_routing.CommunityList",
-    "as_path": "netbox_routing.ASPathAccessList",
+    "as_path": "netbox_routing.ASPath",
     "route_map": "netbox_routing.RouteMap",
 }
 
@@ -39,13 +39,13 @@ def _get_routing_models():
     """Import and return netbox-routing models, or None if not installed."""
     try:
         from netbox_routing.models import (
-            ASPathAccessList,
+            ASPath,
             CommunityList,
             PrefixList,
             RouteMap,
         )
 
-        return PrefixList, CommunityList, ASPathAccessList, RouteMap
+        return PrefixList, CommunityList, ASPath, RouteMap
     except ImportError:
         logger.warning("netbox_routing not installed; skipping route-policy reconcile")
         return None
@@ -130,16 +130,16 @@ def _reconcile_community_lists(mgmt, device, cl_list: list, CommunityList, Conte
         seen_keys.add(("community_list", name))
 
 
-def _reconcile_as_paths(mgmt, device, ap_list: list, ASPathAccessList, ContentType, now, seen_keys: set):
+def _reconcile_as_paths(mgmt, device, ap_list: list, ASPath, ContentType, now, seen_keys: set):
     from .models import NSORoutePolicyState
 
-    ct = ContentType.objects.get_for_model(ASPathAccessList)
+    ct = ContentType.objects.get_for_model(ASPath)
     for ap_data in ap_list:
         name = ap_data.get("name", "")
         if not name:
             continue
         entries_hash = _hash(ap_data.get("entries", []))
-        ap_obj, created = ASPathAccessList.objects.get_or_create(name=name)
+        ap_obj, created = ASPath.objects.get_or_create(name=name)
 
         state, new_row = NSORoutePolicyState.objects.get_or_create(
             management=mgmt,
@@ -226,7 +226,7 @@ def reconcile_route_policy(device, payload: dict) -> list:
     result = _get_routing_models()
     if result is None:
         return []
-    PrefixList, CommunityList, ASPathAccessList, RouteMap = result
+    PrefixList, CommunityList, ASPath, RouteMap = result
 
     try:
         mgmt = NSODeviceManagement.objects.get(device=device)
@@ -240,7 +240,7 @@ def reconcile_route_policy(device, payload: dict) -> list:
     _reconcile_community_lists(
         mgmt, device, payload.get("community_lists", []), CommunityList, ContentType, now, seen_keys
     )
-    _reconcile_as_paths(mgmt, device, payload.get("as_paths", []), ASPathAccessList, ContentType, now, seen_keys)
+    _reconcile_as_paths(mgmt, device, payload.get("as_paths", []), ASPath, ContentType, now, seen_keys)
     _reconcile_route_maps(mgmt, device, payload.get("route_maps", []), RouteMap, ContentType, now, seen_keys)
 
     # Mark stale rows as 'changed'.
