@@ -1003,7 +1003,7 @@ def _push_route_policy_intent_for_device(device_id, adapter_device_id):
         status__in=("accepted", "deploying", "in_sync"),
     ).select_related("management"):
         # Build the entries payload from the associated NetBox object via the GFK.
-        obj = row.content_object
+        obj = row.assigned_object
         if obj is None:
             continue
         entries = _build_route_policy_entries(row.family, obj)
