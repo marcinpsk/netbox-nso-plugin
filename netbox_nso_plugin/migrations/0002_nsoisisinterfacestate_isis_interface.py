@@ -7,7 +7,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
     dependencies = [
         ("netbox_nso_plugin", "0001_initial"),
-        ("netbox_routing", "0036_m20_redistribution"),
+        ("netbox_routing", "0033_isis"),
     ]
 
     operations = [

@@ -16,7 +16,7 @@ class Migration(migrations.Migration):
         ("dcim", "0234_cablepath_nodes_index"),
         ("extras", "0138_customfieldchoiceset_choice_colors"),
         ("ipam", "0089_default_ordering_indexes"),
-        ("netbox_routing", "0036_m20_redistribution"),
+        ("netbox_routing", "0033_isis"),
     ]
 
     operations = [
