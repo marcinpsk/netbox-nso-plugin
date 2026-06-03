@@ -211,6 +211,30 @@ class TestReconcileRoutePolicy(TestCase):
         ec = ExtendedCommunity.objects.get(type="route-target", value="6830:100")
         self.assertTrue(ExtendedCommunityListEntry.objects.filter(extended_community=ec).exists())
 
+    def test_route_map_links_extended_community_list(self):
+        """A route-map matching a community-list whose members are extended links the
+        parallel ExtendedCommunityList via match_extended_community_list."""
+        self._make_mgmt(self.device)
+        from netbox_routing.models import RouteMapEntry
+
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        payload = {
+            "community_lists": [{"name": "CL-RT", "entries": [{"action": "permit", "community": "target:6830:100"}]}],
+            "route_maps": [
+                {
+                    "name": "RM-RT",
+                    "entries": [
+                        {"sequence": 10, "action": "permit", "match_community_lists": ["CL-RT"]},
+                    ],
+                }
+            ],
+        }
+        reconcile_route_policy(self.device, payload)
+
+        rme = RouteMapEntry.objects.get(route_map__name="RM-RT")
+        self.assertEqual([e.name for e in rme.match_extended_community_list.all()], ["CL-RT"])
+
     def test_conflict_does_not_clobber_entries(self):
         """Once filled, a divergent re-report flags conflict and leaves entries intact."""
         self._make_mgmt(self.device)

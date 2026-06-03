@@ -210,7 +210,7 @@ def _fill_community_list_entries(cl_obj, entries: list) -> None:
         CommunityListEntry.objects.bulk_create(std_rows)
 
 
-def _fill_route_map_entries(rm_obj, entries: list, pl_by_name, cl_by_name, ap_by_name) -> None:
+def _fill_route_map_entries(rm_obj, entries: list, pl_by_name, cl_by_name, ap_by_name, ext_cl_by_name) -> None:
     from netbox_routing.models import RouteMapEntry
 
     RouteMapEntry.objects.filter(route_map=rm_obj).delete()
@@ -243,7 +243,13 @@ def _fill_route_map_entries(rm_obj, entries: list, pl_by_name, cl_by_name, ap_by
                 member_ids = obj.communitylistentries.values_list("community_id", flat=True)
                 if member_ids:
                     rme.match_community.add(*[cid for cid in member_ids if cid])
-            else:
+            # A community-list whose members are extended/typed lives in a parallel
+            # ExtendedCommunityList of the same name — link that too (its CommunityList
+            # shell may be empty).
+            ext = ext_cl_by_name.get(nm)
+            if ext is not None:
+                rme.match_extended_community_list.add(ext)
+            if obj is None and ext is None:
                 logger.debug("route-policy: route-map %s refs community-list %r not resolvable", rm_obj.name, nm)
         for nm in e.get("match_as_paths") or []:
             obj = ap_by_name.get(nm)
@@ -366,7 +372,9 @@ def _reconcile_as_paths(mgmt, device, ap_list, ASPath, ContentType, now, seen_ke
         seen_keys.add(("as_path", name))
 
 
-def _reconcile_route_maps(mgmt, device, rm_list, RouteMap, ContentType, now, seen_keys, pl_map, cl_map, ap_map):
+def _reconcile_route_maps(
+    mgmt, device, rm_list, RouteMap, ContentType, now, seen_keys, pl_map, cl_map, ap_map, ext_cl_map
+):
     from netbox_routing.models import RouteMapEntry
 
     ct = ContentType.objects.get_for_model(RouteMap)
@@ -378,7 +386,7 @@ def _reconcile_route_maps(mgmt, device, rm_list, RouteMap, ContentType, now, see
         rm_obj, created = RouteMap.objects.get_or_create(name=name)
         state, should_fill = _upsert_state(mgmt, "route_map", name, rm_obj, ct, _hash(entries), now)
         if _needs_fill(RouteMapEntry, created, should_fill, route_map=rm_obj):
-            _fill_route_map_entries(rm_obj, entries, pl_map, cl_map, ap_map)
+            _fill_route_map_entries(rm_obj, entries, pl_map, cl_map, ap_map, ext_cl_map)
         seen_keys.add(("route_map", name))
 
 
@@ -421,9 +429,29 @@ def reconcile_route_policy(device, payload: dict) -> list:
         mgmt, device, payload.get("community_lists", []), CommunityList, ContentType, now, seen_keys, cl_map
     )
     _reconcile_as_paths(mgmt, device, payload.get("as_paths", []), ASPath, ContentType, now, seen_keys, ap_map)
+    # Extended community-lists parallel the community-lists by name (created by the
+    # community-list reconcile above for target:/typed members); map them for route-map
+    # match linking. Empty if the fork lacks the ExtendedCommunityList model.
+    ext_cl_map: dict[str, object] = {}
+    try:
+        from netbox_routing.models import ExtendedCommunityList
+
+        ext_cl_map = {ecl.name: ecl for ecl in ExtendedCommunityList.objects.filter(name__in=cl_map.keys())}
+    except ImportError:
+        pass
     # Route-maps last: their match M2Ms reference the objects created above.
     _reconcile_route_maps(
-        mgmt, device, payload.get("route_maps", []), RouteMap, ContentType, now, seen_keys, pl_map, cl_map, ap_map
+        mgmt,
+        device,
+        payload.get("route_maps", []),
+        RouteMap,
+        ContentType,
+        now,
+        seen_keys,
+        pl_map,
+        cl_map,
+        ap_map,
+        ext_cl_map,
     )
 
     # Mark stale rows as 'changed'.
