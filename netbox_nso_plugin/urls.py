@@ -81,6 +81,8 @@ urlpatterns = [
     ),
     # Adapter job status (JSON, for client-side polling)
     path("jobs/<int:job_id>/status/", views.NSOJobStatusView.as_view(), name="nsojob_status"),
+    # Device job-activity summary (JSON: running + last finished) for the tab status strip
+    path("devices/<int:pk>/jobs/", views.NSODeviceJobsView.as_view(), name="device_nso_jobs"),
     # Interface State CRUD (read-only list + detail; delete allowed for cleanup)
     path("interface-state/", views.NSOInterfaceStateListView.as_view(), name="nsointerfacestate_list"),
     path("interface-state/<int:pk>/", views.NSOInterfaceStateView.as_view(), name="nsointerfacestate"),

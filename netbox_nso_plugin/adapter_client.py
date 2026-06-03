@@ -324,6 +324,11 @@ def get_job(job_id):
     return _request("GET", f"/api/v1/jobs/{job_id}")
 
 
+def list_jobs(adapter_device_id):
+    """GET /api/v1/jobs?device_id={id} — the device's jobs, most-recent-first."""
+    return _request("GET", f"/api/v1/jobs?device_id={adapter_device_id}")
+
+
 def put_intent(adapter_device_id, attributes):
     """PUT /api/v1/devices/{id}/intent — push full intent snapshot.
 

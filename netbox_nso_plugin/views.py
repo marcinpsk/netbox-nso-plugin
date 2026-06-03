@@ -521,6 +521,41 @@ class NSOJobStatusView(LoginRequiredMixin, View):
             return JsonResponse({"error": str(exc)}, status=502)
 
 
+class NSODeviceJobsView(LoginRequiredMixin, View):
+    """JSON summary of a device's adapter jobs for the tab's status strip.
+
+    Returns the currently-active job (queued/running) if any, and the most recent
+    finished job (succeeded/failed) so an operator returning to the tab can see at a
+    glance whether work is in flight and how the last run went. Polled client-side
+    while a job is active.
+    """
+
+    _ACTIVE = ("queued", "running")
+    _TERMINAL = ("succeeded", "failed")
+
+    def get(self, request, pk):
+        """Return {onboarded, running, last} for the device's adapter jobs."""
+        device = get_object_or_404(Device, pk=pk)
+        try:
+            mgmt = device.nso_management
+        except Exception:
+            mgmt = None
+        if mgmt is None or mgmt.adapter_device_id is None:
+            return JsonResponse({"onboarded": False, "running": None, "last": None})
+
+        from . import adapter_client as client
+
+        try:
+            jobs = client.list_jobs(mgmt.adapter_device_id)
+        except AdapterError as exc:
+            return JsonResponse({"error": str(exc)}, status=502)
+
+        # list_jobs is most-recent-first, so the first match in each bucket is newest.
+        running = next((j for j in jobs if j.get("status") in self._ACTIVE), None)
+        last = next((j for j in jobs if j.get("status") in self._TERMINAL), None)
+        return JsonResponse({"onboarded": True, "running": running, "last": last})
+
+
 class NSORefreshStateView(LoginRequiredMixin, View):
     """Fetch live compliance + interface data from the adapter and cache it."""
 

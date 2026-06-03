@@ -118,6 +118,71 @@
     </div>
   </div>
 
+  {# ── Job activity (loaded on tab open; shows any running job + last finished) ── #}
+  <div id="nso-job-activity" class="mb-3"
+       data-jobs-url="{% url 'plugins:netbox_nso_plugin:device_nso_jobs' pk=object.pk %}"></div>
+  <script>
+  (function () {
+    "use strict";
+    var box = document.getElementById('nso-job-activity');
+    if (!box) return;
+    var url = box.dataset.jobsUrl;
+    var timer = null;
+    function rel(iso) {
+      if (!iso) return '';
+      var t = new Date(iso).getTime();
+      if (isNaN(t)) return '';
+      var s = Math.max(0, Math.round((Date.now() - t) / 1000));
+      if (s < 60) return s + 's ago';
+      if (s < 3600) return Math.round(s / 60) + 'm ago';
+      if (s < 86400) return Math.round(s / 3600) + 'h ago';
+      return Math.round(s / 86400) + 'd ago';
+    }
+    function esc(x) { var d = document.createElement('div'); d.textContent = (x == null ? '' : String(x)); return d.innerHTML; }
+    function errText(e) {
+      if (!e) return '';
+      if (typeof e === 'string') return e;
+      return e.message || e.code || JSON.stringify(e);
+    }
+    function render(d) {
+      if (d.error) {
+        box.innerHTML = '<div class="alert alert-warning mb-0 py-2"><span class="mdi mdi-alert-outline me-1"></span>Adapter unreachable: ' + esc(d.error) + '</div>';
+        return;
+      }
+      if (!d.onboarded) { box.innerHTML = ''; return; }
+      var r = d.running, l = d.last;
+      if (r) {
+        box.innerHTML = '<div class="alert alert-info mb-0 py-2 d-flex align-items-center">'
+          + '<span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>'
+          + '<strong class="me-1">' + esc(r.type) + '</strong> running'
+          + (r.started_at ? ' · started ' + esc(rel(r.started_at)) : ' · queued ' + esc(rel(r.created_at)))
+          + '</div>';
+      } else if (l) {
+        var ok = l.status === 'succeeded';
+        var html = '<div class="alert ' + (ok ? 'alert-success' : 'alert-danger') + ' mb-0 py-2">'
+          + '<span class="mdi mdi-' + (ok ? 'check-circle-outline' : 'alert-circle-outline') + ' me-1"></span>'
+          + 'Last ' + esc(l.type) + ': <strong>' + esc(l.status) + '</strong> · ' + esc(rel(l.updated_at));
+        if (!ok && l.error) html += '<div class="small mt-1">' + esc(errText(l.error)) + '</div>';
+        box.innerHTML = html + '</div>';
+      } else {
+        box.innerHTML = '';
+      }
+    }
+    function poll() {
+      fetch(url, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          render(d);
+          var running = !!(d && d.running);
+          if (running && !timer) { timer = setInterval(poll, 4000); }
+          else if (!running && timer) { clearInterval(timer); timer = null; }
+        })
+        .catch(function () { /* keep last render */ });
+    }
+    poll();
+  })();
+  </script>
+
   {# ── Job status (populated by JS polling; hidden until an action fires) ── #}
   <div id="nso-job-status" class="mb-3 d-none"
        data-job-status-url="{% url 'plugins:netbox_nso_plugin:nsojob_status' job_id=0 %}">
