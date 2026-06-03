@@ -785,11 +785,26 @@ def _reconcile_isis_process(device, process_list: list) -> list:
         if routing_ok:
             inst, _ = ISISInstance.objects.get_or_create(device=device, process_tag=tag)
             # Keep the routing instance's informational fields in step with NSO.
+            # String fields sync when NSO reported a non-empty value; the auth *keys*
+            # are secrets we never import — the auth *type* alone records that area/
+            # domain authentication is configured.
             inst_fields = []
-            for attr, val in (("net", state.net), ("is_type", state.is_type)):
+            for attr, val in (
+                ("net", state.net),
+                ("is_type", state.is_type),
+                ("metric_style", state.metric_style),
+                ("area_auth_type", state.area_auth_type),
+                ("domain_auth_type", state.domain_auth_type),
+            ):
                 if val and getattr(inst, attr) != val:
                     setattr(inst, attr, val)
                     inst_fields.append(attr)
+            # overload_bit is a tri-state boolean — sync True/False, but leave None
+            # (NSO didn't report it) untouched so we never clobber a manually-set
+            # value with a guess.
+            if state.overload_bit is not None and inst.overload_bit != state.overload_bit:
+                inst.overload_bit = state.overload_bit
+                inst_fields.append("overload_bit")
             if inst_fields:
                 inst.save(update_fields=inst_fields)
             state.isis_instance = inst

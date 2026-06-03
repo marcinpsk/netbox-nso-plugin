@@ -386,3 +386,59 @@ class TestReconcileIsisProcess(TestCase):
         result = _reconcile_isis_process(self.device, [{"process_tag": "CORE", "net": "", "is_type": "level-2"}])
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0].process_tag, "CORE")
+
+    def test_routing_instance_filled_with_all_fields(self):
+        """The netbox_routing.ISISInstance is filled with every informational field
+        NSO reports — not just net + is_type."""
+        self._make_mgmt()
+        from netbox_routing.models import ISISInstance
+
+        from netbox_nso_plugin.template_content import _reconcile_isis_process
+
+        result = _reconcile_isis_process(
+            self.device,
+            [
+                {
+                    "process_tag": "CORE",
+                    "net": "49.0001.0001.0001.0001.00",
+                    "is_type": "level-2-only",
+                    "metric_style": "wide",
+                    "overload_bit": True,
+                    "area_auth_type": "md5",
+                    "area_auth_present": True,
+                    "domain_auth_type": "text",
+                    "domain_auth_present": True,
+                }
+            ],
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertIsNotNone(result[0].isis_instance)
+        inst = ISISInstance.objects.get(device=self.device, process_tag="CORE")
+        self.assertEqual(inst.net, "49.0001.0001.0001.0001.00")
+        self.assertEqual(inst.is_type, "level-2-only")
+        self.assertEqual(inst.metric_style, "wide")
+        self.assertTrue(inst.overload_bit)
+        self.assertEqual(inst.area_auth_type, "md5")
+        self.assertEqual(inst.domain_auth_type, "text")
+        # Auth keys are secrets we never import — type alone records auth is configured.
+        self.assertEqual(inst.area_auth_key, "")
+        self.assertEqual(inst.domain_auth_key, "")
+
+    def test_routing_instance_overload_false_synced_none_left_alone(self):
+        """overload_bit is tri-state: False is synced; None leaves the field untouched."""
+        self._make_mgmt()
+        from netbox_routing.models import ISISInstance
+
+        from netbox_nso_plugin.template_content import _reconcile_isis_process
+
+        _reconcile_isis_process(self.device, [{"process_tag": "OL", "overload_bit": False}])
+        inst = ISISInstance.objects.get(device=self.device, process_tag="OL")
+        self.assertEqual(inst.overload_bit, False)
+
+        # A later report that omits overload_bit (None) must not clobber the stored value.
+        inst.overload_bit = True
+        inst.save(update_fields=["overload_bit"])
+        _reconcile_isis_process(self.device, [{"process_tag": "OL"}])
+        inst.refresh_from_db()
+        self.assertTrue(inst.overload_bit)
