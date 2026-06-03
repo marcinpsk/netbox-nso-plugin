@@ -45,6 +45,24 @@ class AdapterConnection(NetBoxModel):
         default=True,
         help_text="When disabled the plugin falls back to PLUGINS_CONFIG / env for all settings.",
     )
+    static_route_auto_create = models.BooleanField(
+        default=False,
+        help_text=(
+            "Auto-create netbox_routing.StaticRoute objects from NSO during reconcile. "
+            "When off, NSO static routes only correlate to manually-created routes."
+        ),
+    )
+    interface_ip_auto_create = models.BooleanField(
+        default=False,
+        help_text="Auto-create interface IP addresses from NSO during reconcile.",
+    )
+    vrf_auto_create = models.BooleanField(
+        default=False,
+        help_text=(
+            "Auto-create ipam.VRF objects referenced by NSO routes when missing. "
+            "When off, routes in an unknown VRF are skipped (logged)."
+        ),
+    )
 
     class Meta:
         verbose_name = "Adapter Connection"

@@ -25,6 +25,26 @@ _STATUS_BADGE = {
 }
 
 
+def _adapter_setting(name: str, default: bool = False) -> bool:
+    """Resolve a boolean plugin setting.
+
+    The ``AdapterConnection`` singleton (when ``enabled``) is authoritative — this
+    is the UI-editable settings surface. When there is no enabled connection row we
+    fall back to the PLUGINS_CONFIG bootstrap (exposed on the app config as
+    ``_<name>``), then to *default*.
+    """
+    try:
+        from .models import AdapterConnection
+
+        conn = AdapterConnection.objects.filter(enabled=True).first()
+        if conn is not None:
+            return bool(getattr(conn, name))
+    except Exception:
+        pass
+    cfg = apps.get_app_config("netbox_nso_plugin")
+    return bool(getattr(cfg, f"_{name}", default))
+
+
 def _upsert_interface_states(device, interfaces: list) -> dict:
     """Sync NSOInterfaceState rows from adapter interface data.
 
@@ -277,7 +297,6 @@ def _reconcile_interface_ips(device, payload: dict) -> list:
     import logging
 
     from dcim.models import Interface
-    from django.apps import apps
     from django.core.exceptions import ValidationError
     from django.db import transaction
     from django.utils import timezone
@@ -291,8 +310,7 @@ def _reconcile_interface_ips(device, payload: dict) -> list:
     from .models import NSOInterfaceIPState
 
     logger = logging.getLogger(__name__)
-    cfg = apps.get_app_config("netbox_nso_plugin")
-    auto_create = getattr(cfg, "_interface_ip_auto_create", False)
+    auto_create = _adapter_setting("interface_ip_auto_create")
 
     iface_map = {i.name: i for i in Interface.objects.filter(device=device)}
     payload_set, attr_map, bound_port_map = _build_payload_index(payload)
@@ -465,8 +483,23 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
 _STATIC_ROUTE_WRITE_PATH_STATUSES = {"accepted", "deploying", "in_sync"}
 
 
-def _resolve_static_route(entry: dict, StaticRoute, VRF, auto_create: bool, device, logger):
-    """Find/create a StaticRoute for one adapter entry. Returns (route, created) or (None, False)."""
+def _static_route_metric(entry: dict) -> int:
+    """Clamp the NSO metric to StaticRoute's 0..255 PositiveSmallInt constraint.
+
+    Junos route metric/preference can exceed 255; an out-of-range value would fail
+    full_clean() and drop the route, so fall back to the model default (1).
+    """
+    m = entry.get("metric")
+    return m if isinstance(m, int) and 0 <= m <= 255 else 1
+
+
+def _resolve_static_route(entry, StaticRoute, VRF, auto_create, vrf_auto_create, device, logger):
+    """Find/create a StaticRoute for one adapter entry. Returns (route, created) or (None, False).
+
+    ``interface_next_hop`` carries interface-, discard/reject- and next-table-style
+    next hops (routes with no IP next hop); a route needs at least one of next_hop
+    or interface_next_hop or it is skipped.
+    """
     vrf_name = entry.get("vrf") or ""
     prefix = entry.get("prefix") or ""
     next_hop = entry.get("next_hop") or None
@@ -477,16 +510,24 @@ def _resolve_static_route(entry: dict, StaticRoute, VRF, auto_create: bool, devi
 
     vrf_obj = None
     if vrf_name and VRF is not None:
-        try:
-            vrf_obj = VRF.objects.get(name=vrf_name)
-        except VRF.DoesNotExist:
-            logger.warning("VRF %r not found in NetBox; skipping route %s", vrf_name, prefix)
-            return None, False
+        vrf_obj = VRF.objects.filter(name=vrf_name).first()
+        if vrf_obj is None:
+            if vrf_auto_create:
+                vrf_obj = VRF.objects.create(name=vrf_name)
+                logger.info("Auto-created VRF %r for static route %s", vrf_name, prefix)
+            else:
+                logger.warning("VRF %r not found in NetBox; skipping route %s", vrf_name, prefix)
+                return None, False
 
-    try:
-        return StaticRoute.objects.get(vrf=vrf_obj, prefix=prefix, next_hop=next_hop), False
-    except StaticRoute.DoesNotExist:
-        pass
+    # Idempotent lookup. IP next-hop routes key on next_hop; interface/pseudo
+    # next-hop routes (discard, reject, next-table) have a null next_hop, so key
+    # on interface_next_hop too to avoid duplicating them.
+    lookup = {"vrf": vrf_obj, "prefix": prefix, "next_hop": next_hop}
+    if next_hop is None:
+        lookup["interface_next_hop"] = iface_nh
+    existing = StaticRoute.objects.filter(**lookup).first()
+    if existing is not None:
+        return existing, False
 
     if not auto_create:
         logger.debug("StaticRoute %s not found and auto_create=False; skipping device %s", prefix, device)
@@ -498,7 +539,7 @@ def _resolve_static_route(entry: dict, StaticRoute, VRF, auto_create: bool, devi
             prefix=prefix,
             next_hop=next_hop,
             interface_next_hop=iface_nh,
-            metric=entry.get("metric") or 1,
+            metric=_static_route_metric(entry),
             permanent=bool(entry.get("permanent", False)),
             tag=entry.get("tag"),
             name=entry.get("name") or "",
@@ -546,13 +587,13 @@ def _reconcile_static_routes(device, payload: dict) -> list:
     except NSODeviceManagement.DoesNotExist:
         return []
 
-    cfg = apps.get_app_config("netbox_nso_plugin")
-    auto_create = getattr(cfg, "_static_route_auto_create", False)
+    auto_create = _adapter_setting("static_route_auto_create")
+    vrf_auto_create = _adapter_setting("vrf_auto_create")
     now = timezone.now()
     seen_route_ids: set[int] = set()
 
     for entry in payload.get("routes") or []:
-        route, created = _resolve_static_route(entry, StaticRoute, VRF, auto_create, device, logger)
+        route, created = _resolve_static_route(entry, StaticRoute, VRF, auto_create, vrf_auto_create, device, logger)
         if route is None:
             continue
 

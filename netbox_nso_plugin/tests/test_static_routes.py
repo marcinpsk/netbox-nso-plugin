@@ -363,3 +363,116 @@ class TestReconcileStaticRoutes(TestCase):
         with self._auto_create_ctx(True):
             result = _reconcile_static_routes(self.device, payload)
         self.assertEqual(result, [])
+
+
+class TestStaticRouteEnrichment(TestCase):
+    """discard/pseudo next-hops, VRF auto-create toggle, AdapterConnection settings."""
+
+    @classmethod
+    def setUpTestData(cls):
+        mfg = Manufacturer.objects.create(name="SrEnrMfg", slug="srenrmfg")
+        dt = DeviceType.objects.create(manufacturer=mfg, model="SrEnrDev", slug="srenrdev")
+        role = DeviceRole.objects.create(name="SrEnrRole", slug="srenrrole")
+        site = Site.objects.create(name="SrEnrSite", slug="srenrsite")
+        cls.device = Device.objects.create(name="sr-enr-router", device_type=dt, role=role, site=site)
+
+    def _make_mgmt(self):
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+        inst, _ = NSOInstance.objects.get_or_create(name="enr-inst", defaults={"adapter_instance_id": "enr-inst"})
+        return NSODeviceManagement.objects.get_or_create(
+            device=self.device,
+            defaults={"nso_instance": inst, "nso_device_name": "sr-enr-dev", "adapter_device_id": self.device.pk},
+        )[0]
+
+    def _conn(self, **flags):
+        from netbox_nso_plugin.models import AdapterConnection
+
+        return AdapterConnection.objects.create(url="http://adapter.local", enabled=True, **flags)
+
+    def _payload(self, *routes):
+        return {"routes": list(routes)}
+
+    def test_discard_route_fills_with_interface_next_hop(self):
+        """A blackhole route (no IP next-hop, interface_next_hop='discard') is created."""
+        self._make_mgmt()
+        self._conn(static_route_auto_create=True)
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.template_content import _reconcile_static_routes
+
+        entry = {"vrf": "", "prefix": "8.8.8.0/24", "next_hop": None, "interface_next_hop": "discard"}
+        result = _reconcile_static_routes(self.device, self._payload(entry))
+
+        self.assertEqual(len(result), 1)
+        route = StaticRoute.objects.get(prefix="8.8.8.0/24")
+        self.assertEqual(route.interface_next_hop, "discard")
+        self.assertIsNone(route.next_hop)
+        self.assertEqual(result[0].status, "in_sync")
+
+    def test_next_table_pseudo_hop_fills(self):
+        """A next-table route leak is represented via interface_next_hop."""
+        self._make_mgmt()
+        self._conn(static_route_auto_create=True, vrf_auto_create=True)
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.template_content import _reconcile_static_routes
+
+        entry = {"vrf": "ONRAMP_2", "prefix": "0.0.0.0/0", "next_hop": None, "interface_next_hop": "next-table:inet.0"}
+        _reconcile_static_routes(self.device, self._payload(entry))
+        self.assertTrue(StaticRoute.objects.filter(prefix="0.0.0.0/0", interface_next_hop="next-table:inet.0").exists())
+
+    def test_vrf_auto_create_on_creates_vrf(self):
+        """vrf_auto_create=True → missing VRF is created and the route fills."""
+        self._make_mgmt()
+        self._conn(static_route_auto_create=True, vrf_auto_create=True)
+        from ipam.models import VRF
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.template_content import _reconcile_static_routes
+
+        entry = {"vrf": "NEWVRF", "prefix": "10.9.0.0/16", "next_hop": "10.0.0.1"}
+        _reconcile_static_routes(self.device, self._payload(entry))
+
+        self.assertTrue(VRF.objects.filter(name="NEWVRF").exists())
+        self.assertTrue(StaticRoute.objects.filter(prefix="10.9.0.0/16").exists())
+
+    def test_vrf_missing_skipped_when_auto_create_off(self):
+        """vrf_auto_create=False → unknown-VRF route skipped, no VRF created."""
+        self._make_mgmt()
+        self._conn(static_route_auto_create=True, vrf_auto_create=False)
+        from ipam.models import VRF
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.template_content import _reconcile_static_routes
+
+        entry = {"vrf": "GHOSTVRF", "prefix": "10.8.0.0/16", "next_hop": "10.0.0.1"}
+        result = _reconcile_static_routes(self.device, self._payload(entry))
+
+        self.assertEqual(result, [])
+        self.assertFalse(VRF.objects.filter(name="GHOSTVRF").exists())
+        self.assertFalse(StaticRoute.objects.filter(prefix="10.8.0.0/16").exists())
+
+    def test_adapter_connection_setting_authoritative(self):
+        """With an enabled AdapterConnection, its flag drives auto_create (no app config)."""
+        self._make_mgmt()
+        self._conn(static_route_auto_create=True)
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.template_content import _reconcile_static_routes
+
+        entry = {"vrf": "", "prefix": "10.7.0.0/16", "next_hop": "10.0.0.1"}
+        _reconcile_static_routes(self.device, self._payload(entry))
+        self.assertTrue(StaticRoute.objects.filter(prefix="10.7.0.0/16").exists())
+
+    def test_metric_clamped_to_model_constraint(self):
+        """An out-of-range NSO metric falls back to 1 (model constraint 0..255)."""
+        self._make_mgmt()
+        self._conn(static_route_auto_create=True)
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.template_content import _reconcile_static_routes
+
+        entry = {"vrf": "", "prefix": "10.6.0.0/16", "next_hop": "10.0.0.1", "metric": 9999}
+        _reconcile_static_routes(self.device, self._payload(entry))
+        self.assertEqual(StaticRoute.objects.get(prefix="10.6.0.0/16").metric, 1)

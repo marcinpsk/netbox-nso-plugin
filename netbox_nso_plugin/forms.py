@@ -11,7 +11,17 @@ class AdapterConnectionForm(NetBoxModelForm):
 
     class Meta:
         model = AdapterConnection
-        fields = ["url", "verify_tls", "ca_cert_path", "timeout_seconds", "enabled", "tags"]
+        fields = [
+            "url",
+            "verify_tls",
+            "ca_cert_path",
+            "timeout_seconds",
+            "enabled",
+            "static_route_auto_create",
+            "interface_ip_auto_create",
+            "vrf_auto_create",
+            "tags",
+        ]
 
 
 class NSOInstanceForm(NetBoxModelForm):
