@@ -26,7 +26,7 @@
       </thead>
       <tbody>
         {% for oi in ospf_data.instances %}
-        <tr data-status="{{ oi.status }}">
+        <tr data-status="{{ oi.status }}" data-owned="{{ oi.accepted_at|yesno:'true,false' }}">
           <td>{{ oi.process_id }}</td>
           <td>{{ oi.vrf|default:"global" }}</td>
           <td>{{ oi.router_id|default:"—" }}</td>
@@ -60,7 +60,7 @@
       </thead>
       <tbody>
         {% for oif in ospf_data.interfaces %}
-        <tr data-status="{{ oif.status }}">
+        <tr data-status="{{ oif.status }}" data-owned="{{ oif.accepted_at|yesno:'true,false' }}">
           <td><a href="{{ oif.interface.get_absolute_url }}">{{ oif.interface.name }}</a></td>
           <td>{{ oif.process_id|default:"—" }}</td>
           <td>{{ oif.area_id|default:"—" }}</td>

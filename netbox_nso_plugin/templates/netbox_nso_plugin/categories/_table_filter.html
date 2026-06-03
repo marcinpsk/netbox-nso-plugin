@@ -1,60 +1,77 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
-{# Reusable client-side filter for a category table. The rows are already rendered on
-   expand, so filtering is instant and needs no server round-trip. Params:
-     fid          id of the wrapping element that contains the <table> to filter
-     placeholder  search-box placeholder (optional)
-     show_status  when truthy, render a status dropdown auto-populated from the rows'
-                  data-status attributes (each <tr> must carry data-status="..."). #}
+{# Reusable state-pill + name filter for a category table, mirroring the Interfaces tab. #}
+{# Rows are already rendered, so filtering is client-side and instant. Each <tr> must #}
+{# carry data-status and data-owned; the kind (drift / pending / in_sync) is derived #}
+{# here exactly like summary.display_state. Params: fid = id of the wrapper holding the #}
+{# <table>; placeholder = search-box placeholder (optional). #}
 <div class="d-flex align-items-center gap-2 mb-2 flex-wrap">
-  <div class="input-group input-group-sm" style="max-width: 320px;">
-    <span class="input-group-text"><span class="mdi mdi-magnify"></span></span>
-    <input type="text" class="form-control" placeholder="{{ placeholder|default:'Filter…' }}"
-           data-list-filter="{{ fid }}" autocomplete="off">
+  <div class="btn-group btn-group-sm" role="group" aria-label="State filter">
+    <button type="button" class="btn btn-outline-secondary active" data-kind-filter="{{ fid }}" data-kind="all">All <span class="badge bg-secondary ms-1" data-kind-count>0</span></button>
+    <button type="button" class="btn btn-outline-warning" data-kind-filter="{{ fid }}" data-kind="drift">Drift <span class="badge bg-warning text-dark ms-1" data-kind-count>0</span></button>
+    <button type="button" class="btn btn-outline-info" data-kind-filter="{{ fid }}" data-kind="pending">Pending apply <span class="badge bg-info ms-1" data-kind-count>0</span></button>
+    <button type="button" class="btn btn-outline-success" data-kind-filter="{{ fid }}" data-kind="in_sync">In sync <span class="badge bg-success ms-1" data-kind-count>0</span></button>
   </div>
-  {% if show_status %}
-  <select class="form-select form-select-sm" style="max-width: 170px;" data-list-filter-status="{{ fid }}">
-    <option value="">All statuses</option>
-  </select>
-  {% endif %}
+  <div class="input-group input-group-sm" style="max-width: 280px;">
+    <span class="input-group-text"><span class="mdi mdi-magnify"></span></span>
+    <input type="text" class="form-control" placeholder="{{ placeholder|default:'Filter…' }}" data-text-filter="{{ fid }}" autocomplete="off">
+  </div>
   <span class="text-muted small ms-auto" data-list-filter-count="{{ fid }}"></span>
 </div>
 <script>
 (function () {
   var root = document.getElementById('{{ fid }}');
   if (!root) return;
-  var input = document.querySelector('[data-list-filter="{{ fid }}"]');
-  var statusSel = document.querySelector('[data-list-filter-status="{{ fid }}"]');
-  var counter = document.querySelector('[data-list-filter-count="{{ fid }}"]');
   var rows = Array.prototype.slice.call(root.querySelectorAll('table > tbody > tr'));
-  // Build the status dropdown from the statuses actually present in the rows.
-  if (statusSel) {
-    var seen = {};
-    rows.forEach(function (tr) {
-      var s = tr.getAttribute('data-status');
-      if (s && !seen[s]) {
-        seen[s] = 1;
-        var o = document.createElement('option');
-        o.value = s; o.textContent = s;
-        statusSel.appendChild(o);
-      }
-    });
+  var pills = Array.prototype.slice.call(document.querySelectorAll('[data-kind-filter="{{ fid }}"]'));
+  var search = document.querySelector('[data-text-filter="{{ fid }}"]');
+  var counter = document.querySelector('[data-list-filter-count="{{ fid }}"]');
+  var activeKind = 'all';
+  // Mirror summary.display_state(status, owned) -> kind.
+  function kindOf(tr) {
+    var s = tr.getAttribute('data-status') || '';
+    var owned = tr.getAttribute('data-owned') === 'true';
+    if (s === 'deploying') return 'deploying';
+    if (s === 'imported' || s === 'in_sync') return 'in_sync';
+    if (s === 'apply_failed') return 'apply_failed';
+    return owned ? 'pending' : 'drift';  // changed / drifted / conflict / accepted
+  }
+  var counts = { all: rows.length, drift: 0, pending: 0, in_sync: 0 };
+  rows.forEach(function (tr) {
+    var k = kindOf(tr);
+    tr.setAttribute('data-kind', k);
+    if (k === 'drift') counts.drift++;
+    else if (k === 'pending' || k === 'apply_failed') counts.pending++;
+    else counts.in_sync++;  // in_sync + deploying
+  });
+  pills.forEach(function (p) {
+    var badge = p.querySelector('[data-kind-count]');
+    if (badge) badge.textContent = counts[p.getAttribute('data-kind')] != null ? counts[p.getAttribute('data-kind')] : 0;
+  });
+  function inBucket(k) {
+    if (activeKind === 'all') return true;
+    if (activeKind === 'pending') return k === 'pending' || k === 'apply_failed';
+    if (activeKind === 'in_sync') return k === 'in_sync' || k === 'deploying';
+    return k === activeKind;
   }
   function apply() {
-    var q = (input && input.value || '').trim().toLowerCase();
-    var st = (statusSel && statusSel.value) || '';
+    var q = (search && search.value || '').trim().toLowerCase();
     var shown = 0;
     rows.forEach(function (tr) {
-      var okText = !q || tr.textContent.toLowerCase().indexOf(q) !== -1;
-      var okStatus = !st || tr.getAttribute('data-status') === st;
-      var show = okText && okStatus;
-      tr.style.display = show ? '' : 'none';
-      if (show) shown++;
+      var ok = inBucket(tr.getAttribute('data-kind')) && (!q || tr.textContent.toLowerCase().indexOf(q) !== -1);
+      tr.style.display = ok ? '' : 'none';
+      if (ok) shown++;
     });
     if (counter) counter.textContent = shown + ' of ' + rows.length;
   }
-  if (input) input.addEventListener('input', apply);
-  if (statusSel) statusSel.addEventListener('change', apply);
+  pills.forEach(function (p) {
+    p.addEventListener('click', function () {
+      activeKind = p.getAttribute('data-kind');
+      pills.forEach(function (x) { x.classList.toggle('active', x === p); });
+      apply();
+    });
+  });
+  if (search) search.addEventListener('input', apply);
   apply();
 })();
 </script>

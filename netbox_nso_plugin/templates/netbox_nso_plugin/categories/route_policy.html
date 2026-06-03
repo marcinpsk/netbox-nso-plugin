@@ -20,7 +20,7 @@
       </thead>
       <tbody>
         {% for rp in route_policy_states %}
-        <tr data-status="{{ rp.status }}">
+        <tr data-status="{{ rp.status }}" data-owned="{{ rp.accepted_at|yesno:'true,false' }}">
           <td>{{ rp.family }}</td>
           <td>{{ rp.object_name }}</td>
           <td>{% if rp.content_object %}<a href="{{ rp.content_object.get_absolute_url }}">{{ rp.content_object }}</a>{% else %}—{% endif %}</td>

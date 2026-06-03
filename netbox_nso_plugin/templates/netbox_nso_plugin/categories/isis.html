@@ -22,7 +22,7 @@
       </thead>
       <tbody>
         {% for ii in isis_interfaces %}
-        <tr data-status="{{ ii.status }}">
+        <tr data-status="{{ ii.status }}" data-owned="{{ ii.accepted_at|yesno:'true,false' }}">
           <td><a href="{{ ii.interface.get_absolute_url }}">{{ ii.interface.name }}</a></td>
           <td>{{ ii.af }}</td>
           <td>{{ ii.process_tag|default:"default" }}</td>
@@ -67,7 +67,7 @@
       </thead>
       <tbody>
         {% for ip in isis_processes %}
-        <tr data-status="{{ ip.status }}">
+        <tr data-status="{{ ip.status }}" data-owned="{{ ip.accepted_at|yesno:'true,false' }}">
           <td>{{ ip.process_tag|default:"default" }}</td>
           <td>{% if ip.isis_instance %}<a href="{{ ip.isis_instance.get_absolute_url }}">{{ ip.isis_instance }}</a>{% else %}—{% endif %}</td>
           <td>{{ ip.area_auth_type|default:"—" }}{% if ip.area_auth_present %} ✓{% endif %}</td>

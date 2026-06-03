@@ -20,7 +20,7 @@
       </thead>
       <tbody>
         {% for bp in bgp_peers %}
-        <tr data-status="{{ bp.status }}">
+        <tr data-status="{{ bp.status }}" data-owned="{{ bp.accepted_at|yesno:'true,false' }}">
           <td>{{ bp.asn_str }}</td>
           <td>{{ bp.vrf_name|default:"global" }}</td>
           <td>{{ bp.peer_address_str }}</td>

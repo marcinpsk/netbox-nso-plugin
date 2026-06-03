@@ -20,7 +20,7 @@
       </thead>
       <tbody>
         {% for sr in static_routes %}
-        <tr data-status="{{ sr.status }}">
+        <tr data-status="{{ sr.status }}" data-owned="{{ sr.accepted_at|yesno:'true,false' }}">
           <td>{{ sr.nso_vrf|default:"global" }}</td>
           <td><a href="{{ sr.static_route.get_absolute_url }}">{{ sr.nso_prefix }}</a></td>
           <td>{{ sr.nso_next_hop|default:"—" }}</td>

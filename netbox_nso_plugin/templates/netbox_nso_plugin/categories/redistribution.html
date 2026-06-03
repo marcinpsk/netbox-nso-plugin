@@ -20,7 +20,7 @@
       </thead>
       <tbody>
         {% for rs in redistribution_states %}
-        <tr data-status="{{ rs.status }}">
+        <tr data-status="{{ rs.status }}" data-owned="{{ rs.accepted_at|yesno:'true,false' }}">
           <td>{{ rs.dest_protocol }}</td>
           <td>{{ rs.dest_ref|default:"—" }}</td>
           <td>{{ rs.source_protocol }}</td>
