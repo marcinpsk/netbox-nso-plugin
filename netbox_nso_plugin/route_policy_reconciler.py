@@ -217,12 +217,17 @@ def _fill_route_map_entries(rm_obj, entries: list, pl_by_name, cl_by_name, ap_by
     # Positional sequence — unique per route-map and smallint-safe (the device sequence
     # can exceed the field's range; see _fill_prefix_list_entries).
     for i, e in enumerate(entries, start=1):
+        # flow_control (IOS route-map `continue`) rides inside set-json (no dedicated
+        # adapter leaf) — lift it into the model field and keep it out of the set blob.
+        set_data = _load_json(e.get("set"))
+        flow_control = set_data.pop("flow_control", None)
         rme = RouteMapEntry.objects.create(
             route_map=rm_obj,
             sequence=i,
             action=_norm_action(e.get("action")),
+            flow_control=flow_control,
             match=_load_json(e.get("match")),
-            set=_load_json(e.get("set")),
+            set=set_data,
         )
         for nm in e.get("match_prefix_lists") or []:
             obj = pl_by_name.get(nm)

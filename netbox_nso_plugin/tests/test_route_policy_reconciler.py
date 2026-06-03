@@ -148,6 +148,35 @@ class TestReconcileRoutePolicy(TestCase):
         self.assertEqual([p.name for p in rme.match_prefix_list.all()], ["PL-A"])
         self.assertEqual([a.name for a in rme.match_aspath.all()], ["AP-A"])
 
+    def test_flow_control_lifted_from_set_json(self):
+        """flow_control (IOS continue) rides in set-json → lifted into the field and
+        removed from the stored set blob."""
+        self._make_mgmt(self.device)
+        from netbox_routing.models import RouteMapEntry
+
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        reconcile_route_policy(
+            self.device,
+            {
+                "route_maps": [
+                    {
+                        "name": "RM-FC",
+                        "entries": [
+                            {
+                                "sequence": 10,
+                                "action": "permit",
+                                "set": '{"flow_control": 30, "local_preference": 100}',
+                            },
+                        ],
+                    }
+                ]
+            },
+        )
+        rme = RouteMapEntry.objects.get(route_map__name="RM-FC")
+        self.assertEqual(rme.flow_control, 30)
+        self.assertEqual(rme.set, {"local_preference": 100})  # flow_control popped out
+
     def test_extended_community_routed_and_wildcard_skipped(self):
         """target:/origin: members go to ExtendedCommunity; wildcard/regex are dropped."""
         self._make_mgmt(self.device)
