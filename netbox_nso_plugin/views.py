@@ -14,8 +14,13 @@ from netbox.views import generic
 from utilities.views import ViewTab, register_model_view
 
 from .adapter_client import AdapterError
-from .filters import NSODeviceManagementFilterSet, NSOInstanceFilterSet, NSOInterfaceStateFilterSet
-from .forms import AdapterConnectionForm, NSODeviceManagementForm, NSOInstanceForm
+from .filters import (
+    NSODeviceManagementFilterSet,
+    NSOInstanceFilterSet,
+    NSOInterfaceStateFilterSet,
+    NSOPlatformNedMappingFilterSet,
+)
+from .forms import AdapterConnectionForm, NSODeviceManagementForm, NSOInstanceForm, NSOPlatformNedMappingForm
 from .models import (
     AdapterConnection,
     NSOBGPPeerState,
@@ -26,11 +31,17 @@ from .models import (
     NSOISISInterfaceState,
     NSOOSPFInstanceState,
     NSOOSPFInterfaceState,
+    NSOPlatformNedMapping,
     NSORedistributionState,
     NSORoutePolicyState,
     NSOStaticRouteState,
 )
-from .tables import NSODeviceManagementTable, NSOInstanceTable, NSOInterfaceStateTable
+from .tables import (
+    NSODeviceManagementTable,
+    NSOInstanceTable,
+    NSOInterfaceStateTable,
+    NSOPlatformNedMappingTable,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -358,6 +369,77 @@ class NSOInstanceDeleteView(generic.ObjectDeleteView):
     """Delete view for an NSO instance."""
 
     queryset = NSOInstance.objects.all()
+
+
+class NSOOnboardingDashboardView(LoginRequiredMixin, View):
+    """Three-tile onboarding dashboard: onboarded / onboardable candidates / NSO orphans.
+
+    Reads the NSO device inventory for the selected instance (default unless
+    ``?instance=<adapter_instance_id>``) and compares it to NetBox. Read-only.
+    URL: /plugins/nso/onboarding/
+    """
+
+    template_name = "netbox_nso_plugin/onboarding_dashboard.html"
+
+    def get(self, request):
+        """Render the dashboard for the selected (or default) NSO instance."""
+        from .onboarding import build_onboarding_dashboard
+
+        instances = list(NSOInstance.objects.all())
+        selected = request.GET.get("instance")
+        instance = None
+        if selected:
+            instance = next((i for i in instances if i.adapter_instance_id == selected), None)
+        if instance is None:
+            instance = NSOInstance.get_default() or (instances[0] if instances else None)
+
+        if instance is None:
+            data = {
+                "instance": "—",
+                "error": "No NSO instance configured.",
+                "onboarded": [],
+                "candidates": [],
+                "orphans": [],
+            }
+        else:
+            data = build_onboarding_dashboard(instance)
+
+        return render(
+            request,
+            self.template_name,
+            {
+                "data": data,
+                "instances": instances,
+                "selected": instance.adapter_instance_id if instance else None,
+            },
+        )
+
+
+class NSOPlatformNedMappingListView(generic.ObjectListView):
+    """List view for Platform→NED mappings."""
+
+    queryset = NSOPlatformNedMapping.objects.all()
+    table = NSOPlatformNedMappingTable
+    filterset = NSOPlatformNedMappingFilterSet
+
+
+class NSOPlatformNedMappingView(generic.ObjectView):
+    """Detail view for a Platform→NED mapping."""
+
+    queryset = NSOPlatformNedMapping.objects.all()
+
+
+class NSOPlatformNedMappingEditView(generic.ObjectEditView):
+    """Create/edit view for a Platform→NED mapping."""
+
+    queryset = NSOPlatformNedMapping.objects.all()
+    form = NSOPlatformNedMappingForm
+
+
+class NSOPlatformNedMappingDeleteView(generic.ObjectDeleteView):
+    """Delete view for a Platform→NED mapping."""
+
+    queryset = NSOPlatformNedMapping.objects.all()
 
 
 # ── NSO Device Management CRUD ───────────────────────────────────────────────

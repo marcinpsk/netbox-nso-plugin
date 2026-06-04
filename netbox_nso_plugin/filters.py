@@ -3,7 +3,15 @@
 import django_filters
 from netbox.filtersets import NetBoxModelFilterSet
 
-from .models import NSODeviceManagement, NSOInstance, NSOInterfaceState
+from .models import NSODeviceManagement, NSOInstance, NSOInterfaceState, NSOPlatformNedMapping
+
+
+class NSOPlatformNedMappingFilterSet(NetBoxModelFilterSet):
+    """FilterSet for NSOPlatformNedMapping."""
+
+    class Meta:
+        model = NSOPlatformNedMapping
+        fields = ["id", "platform", "ned_id"]
 
 
 class NSOInstanceFilterSet(NetBoxModelFilterSet):

@@ -6,9 +6,22 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from ..filters import NSODeviceManagementFilterSet, NSOInstanceFilterSet
-from ..models import NSODeviceManagement, NSOInstance, NSOInterfaceState
-from .serializers import NSODeviceManagementSerializer, NSOInstanceSerializer, NSOInterfaceStateSerializer
+from ..filters import NSODeviceManagementFilterSet, NSOInstanceFilterSet, NSOPlatformNedMappingFilterSet
+from ..models import NSODeviceManagement, NSOInstance, NSOInterfaceState, NSOPlatformNedMapping
+from .serializers import (
+    NSODeviceManagementSerializer,
+    NSOInstanceSerializer,
+    NSOInterfaceStateSerializer,
+    NSOPlatformNedMappingSerializer,
+)
+
+
+class NSOPlatformNedMappingViewSet(NetBoxModelViewSet):
+    """REST API for NSOPlatformNedMapping — CICD-editable platform→NED map."""
+
+    queryset = NSOPlatformNedMapping.objects.select_related("platform")
+    serializer_class = NSOPlatformNedMappingSerializer
+    filterset_class = NSOPlatformNedMappingFilterSet
 
 
 class NSOInstanceViewSet(NetBoxModelViewSet):
@@ -36,6 +49,64 @@ class NSOInterfaceStateViewSet(NetBoxModelViewSet):
 
     queryset = NSOInterfaceState.objects.select_related("interface")
     serializer_class = NSOInterfaceStateSerializer
+
+
+class OnboardingCandidatesView(APIView):
+    """CICD-facing read of onboarding state for an NSO instance.
+
+    ``GET /api/plugins/netbox-nso-plugin/onboarding-candidates/?instance=<id>``
+    returns the same three buckets as the dashboard (onboarded / candidates /
+    orphans) as JSON, so a pipeline can discover which staged devices are ready to
+    onboard. ``instance`` defaults to the default NSO instance.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        """Return {instance, error, onboarded, candidates, orphans} for the instance."""
+        from ..onboarding import build_onboarding_dashboard
+
+        selected = request.query_params.get("instance")
+        instance = None
+        if selected:
+            instance = NSOInstance.objects.filter(adapter_instance_id=selected).first()
+            if instance is None:
+                return Response({"detail": f"unknown instance '{selected}'"}, status=status.HTTP_404_NOT_FOUND)
+        else:
+            instance = NSOInstance.get_default()
+        if instance is None:
+            return Response({"detail": "no NSO instance configured"}, status=status.HTTP_404_NOT_FOUND)
+
+        data = build_onboarding_dashboard(instance)
+        return Response(
+            {
+                "instance": data["instance"],
+                "error": data["error"],
+                "onboarded": [
+                    {
+                        "nso_name": o["nso_name"],
+                        "ned_id": o["ned_id"],
+                        "admin_state": o["admin_state"],
+                        "netbox_device_id": o["netbox_device"].id if o["netbox_device"] else None,
+                        "plugin_managed": o["plugin_managed"],
+                    }
+                    for o in data["onboarded"]
+                ],
+                "candidates": [
+                    {
+                        "netbox_device_id": c["device"].id,
+                        "name": c["device"].name,
+                        "platform": str(c["platform"]) if c["platform"] else None,
+                        "primary_ip": c["primary_ip"],
+                        "ned_id": c["ned_id"],
+                    }
+                    for c in data["candidates"]
+                ],
+                "orphans": [
+                    {"nso_name": r["nso_name"], "ned_id": r["ned_id"], "address": r["address"]} for r in data["orphans"]
+                ],
+            }
+        )
 
 
 class SyncCompleteView(APIView):

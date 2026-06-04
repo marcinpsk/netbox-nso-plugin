@@ -1,0 +1,101 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{% extends 'base/layout.html' %}
+{% load helpers %}
+
+{% block title %}NSO Onboarding{% endblock %}
+
+{% block content %}
+<div class="row mb-3">
+  <div class="col">
+    <p class="text-muted mb-1">
+      Instance: <strong>{{ data.instance }}</strong>
+      {% if instances|length > 1 %}
+      <span class="ms-2">
+        {% for inst in instances %}
+          <a href="?instance={{ inst.adapter_instance_id }}" class="badge {% if inst.adapter_instance_id == selected %}bg-primary{% else %}bg-secondary{% endif %}">{{ inst.name }}</a>
+        {% endfor %}
+      </span>
+      {% endif %}
+    </p>
+    {% if data.error %}
+      <div class="alert alert-warning"><span class="mdi mdi-alert-outline me-1"></span>Adapter error: {{ data.error }}</div>
+    {% endif %}
+  </div>
+</div>
+
+<div class="row">
+  {# ── Tile 1: Onboarded ───────────────────────────────────────────────── #}
+  <div class="col col-md-4">
+    <div class="card">
+      <h5 class="card-header"><span class="mdi mdi-check-network me-1 text-success"></span>Onboarded <span class="badge bg-success">{{ data.onboarded|length }}</span></h5>
+      <div class="card-body p-0">
+        <table class="table table-sm table-hover mb-0">
+          <thead><tr><th>NSO device</th><th>NetBox</th><th>NED</th><th>State</th></tr></thead>
+          <tbody>
+            {% for o in data.onboarded %}
+            <tr>
+              <td>{{ o.nso_name }}{% if not o.plugin_managed %} <span class="badge bg-secondary" title="In NSO but not managed via this plugin (matched by {{ o.matched_by }})">ext</span>{% endif %}</td>
+              <td>{% if o.netbox_device %}<a href="{{ o.netbox_device.get_absolute_url }}">{{ o.netbox_device }}</a>{% else %}—{% endif %}</td>
+              <td><code>{{ o.ned_id|default:"—" }}</code></td>
+              <td>{{ o.admin_state|default:"—" }}</td>
+            </tr>
+            {% empty %}
+            <tr><td colspan="4" class="text-muted">None.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  {# ── Tile 2: Onboardable candidates ──────────────────────────────────── #}
+  <div class="col col-md-4">
+    <div class="card">
+      <h5 class="card-header"><span class="mdi mdi-plus-network me-1 text-primary"></span>Onboardable <span class="badge bg-primary">{{ data.candidates|length }}</span></h5>
+      <div class="card-body p-0">
+        <p class="text-muted small px-2 pt-2 mb-1">NetBox devices (active, with a primary IP) whose platform maps to a NED, not yet in NSO.</p>
+        <table class="table table-sm table-hover mb-0">
+          <thead><tr><th>Device</th><th>Platform</th><th>Address</th><th>NED</th></tr></thead>
+          <tbody>
+            {% for c in data.candidates %}
+            <tr>
+              <td><a href="{{ c.device.get_absolute_url }}">{{ c.device }}</a></td>
+              <td>{{ c.platform }}</td>
+              <td>{{ c.primary_ip }}</td>
+              <td><code>{{ c.ned_id }}</code></td>
+            </tr>
+            {% empty %}
+            <tr><td colspan="4" class="text-muted">None. {% if not data.error %}Add <a href="{% url 'plugins:netbox_nso_plugin:nsoplatformnedmapping_list' %}">Platform → NED mappings</a> so devices appear here.{% endif %}</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  {# ── Tile 3: NSO orphans ─────────────────────────────────────────────── #}
+  <div class="col col-md-4">
+    <div class="card">
+      <h5 class="card-header"><span class="mdi mdi-help-network me-1 text-warning"></span>Unmatched in NetBox <span class="badge bg-warning text-dark">{{ data.orphans|length }}</span></h5>
+      <div class="card-body p-0">
+        <p class="text-muted small px-2 pt-2 mb-1">Devices in NSO with no matching NetBox device (by name or primary IP).</p>
+        <table class="table table-sm table-hover mb-0">
+          <thead><tr><th>NSO device</th><th>Address</th><th>NED</th></tr></thead>
+          <tbody>
+            {% for r in data.orphans %}
+            <tr>
+              <td>{{ r.nso_name }}</td>
+              <td>{{ r.address|default:"—" }}</td>
+              <td><code>{{ r.ned_id|default:"—" }}</code></td>
+            </tr>
+            {% empty %}
+            <tr><td colspan="3" class="text-muted">None.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

@@ -133,6 +133,39 @@ class NSOInstance(NetBoxModel):
             NSOInstance.objects.exclude(pk=self.pk).filter(is_default=True).update(is_default=False)
 
 
+class NSOPlatformNedMapping(NetBoxModel):
+    """Maps a NetBox Platform to an NSO NED ID, for device onboarding.
+
+    The onboarding flow is hybrid: it suggests a NED from the NED's vendor/OS
+    metadata, the operator confirms, and the confirmed Platform→ned_id lands here
+    and is reused as the default. This is the editable, user-visible source of
+    truth for "what NED does a device of this platform onboard with" — it drives
+    the onboardable-candidates tile and pre-selects the NED on onboard.
+    """
+
+    platform = models.OneToOneField(
+        to="dcim.Platform",
+        on_delete=models.CASCADE,
+        related_name="nso_ned_mapping",
+    )
+    ned_id = models.CharField(
+        max_length=128,
+        help_text="NSO NED ID, e.g. cisco-ios-cli-6.114:cisco-ios-cli-6.114 (see NSO instance NEDs).",
+    )
+
+    class Meta:
+        ordering = ["platform"]
+        verbose_name = "NSO Platform-NED Mapping"
+        verbose_name_plural = "NSO Platform-NED Mappings"
+
+    def __str__(self):
+        return f"{self.platform} → {self.ned_id}"
+
+    def get_absolute_url(self):
+        """Return the detail URL for this mapping."""
+        return reverse("plugins:netbox_nso_plugin:nsoplatformnedmapping", args=[self.pk])
+
+
 class NSODeviceManagement(NetBoxModel):
     """Scope record — one per NSO-managed NetBox device."""
 

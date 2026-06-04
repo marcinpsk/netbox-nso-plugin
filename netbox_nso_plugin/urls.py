@@ -4,7 +4,7 @@ from django.urls import path
 from netbox.views.generic.feature_views import ObjectChangeLogView, ObjectJournalView
 
 from . import views
-from .models import NSODeviceManagement, NSOInstance, NSOInterfaceState
+from .models import NSODeviceManagement, NSOInstance, NSOInterfaceState, NSOPlatformNedMapping
 
 app_name = "netbox_nso_plugin"
 
@@ -28,6 +28,28 @@ urlpatterns = [
         ObjectJournalView.as_view(),
         name="nsoinstance_journal",
         kwargs={"model": NSOInstance},
+    ),
+    # Onboarding dashboard (3 tiles)
+    path("onboarding/", views.NSOOnboardingDashboardView.as_view(), name="onboarding_dashboard"),
+    # Platform → NED mappings (onboarding)
+    path("ned-mappings/", views.NSOPlatformNedMappingListView.as_view(), name="nsoplatformnedmapping_list"),
+    path("ned-mappings/add/", views.NSOPlatformNedMappingEditView.as_view(), name="nsoplatformnedmapping_add"),
+    path("ned-mappings/<int:pk>/", views.NSOPlatformNedMappingView.as_view(), name="nsoplatformnedmapping"),
+    path(
+        "ned-mappings/<int:pk>/edit/",
+        views.NSOPlatformNedMappingEditView.as_view(),
+        name="nsoplatformnedmapping_edit",
+    ),
+    path(
+        "ned-mappings/<int:pk>/delete/",
+        views.NSOPlatformNedMappingDeleteView.as_view(),
+        name="nsoplatformnedmapping_delete",
+    ),
+    path(
+        "ned-mappings/<int:pk>/changelog/",
+        ObjectChangeLogView.as_view(),
+        name="nsoplatformnedmapping_changelog",
+        kwargs={"model": NSOPlatformNedMapping},
     ),
     # Device NSO tab — lazy per-category row load (HTML fragment)
     path(

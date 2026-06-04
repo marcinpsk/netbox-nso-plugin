@@ -3,7 +3,25 @@
 from netbox.api.serializers import NetBoxModelSerializer
 from rest_framework import serializers
 
-from ..models import NSODeviceManagement, NSOInstance, NSOInterfaceState
+from ..models import NSODeviceManagement, NSOInstance, NSOInterfaceState, NSOPlatformNedMapping
+
+
+class NSOPlatformNedMappingSerializer(NetBoxModelSerializer):
+    """Serializer for NSOPlatformNedMapping (CICD reads/writes the platform→NED map)."""
+
+    class Meta:
+        model = NSOPlatformNedMapping
+        fields = [
+            "id",
+            "url",
+            "display",
+            "platform",
+            "ned_id",
+            "tags",
+            "custom_fields",
+            "created",
+            "last_updated",
+        ]
 
 
 class NSOInstanceSerializer(NetBoxModelSerializer):

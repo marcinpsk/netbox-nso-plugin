@@ -3,7 +3,19 @@
 import django_tables2 as tables
 from netbox.tables import NetBoxTable, columns
 
-from .models import NSODeviceManagement, NSOInstance, NSOInterfaceState
+from .models import NSODeviceManagement, NSOInstance, NSOInterfaceState, NSOPlatformNedMapping
+
+
+class NSOPlatformNedMappingTable(NetBoxTable):
+    """Table for listing Platform→NED mappings."""
+
+    platform = tables.Column(linkify=True)
+    ned_id = tables.Column(verbose_name="NED ID")
+
+    class Meta(NetBoxTable.Meta):
+        model = NSOPlatformNedMapping
+        fields = ("pk", "id", "platform", "ned_id", "actions")
+        default_columns = ("platform", "ned_id")
 
 
 class NSOInstanceTable(NetBoxTable):

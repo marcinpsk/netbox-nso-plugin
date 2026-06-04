@@ -3,7 +3,50 @@
 from django import forms
 from netbox.forms import NetBoxModelForm
 
-from .models import AdapterConnection, NSODeviceManagement, NSOInstance
+from .models import AdapterConnection, NSODeviceManagement, NSOInstance, NSOPlatformNedMapping
+
+
+class NSOPlatformNedMappingForm(NetBoxModelForm):
+    """Form for Platform→NED mappings.
+
+    ``ned_id`` is rendered as a dropdown of the NEDs actually installed on the
+    default NSO instance when the adapter is reachable (the hybrid suggestion),
+    falling back to a free-text field when it is not — so the mapping stays
+    editable even if the adapter is down.
+    """
+
+    class Meta:
+        model = NSOPlatformNedMapping
+        fields = ["platform", "ned_id", "tags"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        choices = self._available_ned_choices()
+        if choices:
+            current = self.initial.get("ned_id") or getattr(self.instance, "ned_id", "")
+            if current and current not in {c[0] for c in choices}:
+                choices = [(current, current), *choices]
+            self.fields["ned_id"] = forms.ChoiceField(
+                choices=[("", "---------"), *choices],
+                required=True,
+                label="NED ID",
+                help_text="NEDs installed on the default NSO instance.",
+            )
+
+    @staticmethod
+    def _available_ned_choices():
+        """Return [(ned_id, label)] from the adapter, or [] if unavailable."""
+        try:
+            from . import adapter_client as client
+            from .models import NSOInstance
+
+            inst = NSOInstance.get_default()
+            if inst is None:
+                return []
+            neds = client.get_neds(inst.adapter_instance_id)
+            return [(n["ned_id"], f"{n['ned_id']} ({n.get('vendor') or '?'})") for n in neds if n.get("ned_id")]
+        except Exception:
+            return []
 
 
 class AdapterConnectionForm(NetBoxModelForm):

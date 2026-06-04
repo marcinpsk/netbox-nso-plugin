@@ -9,10 +9,12 @@ app_name = "netbox_nso_plugin"
 
 router = NetBoxRouter()
 router.register("instances", views.NSOInstanceViewSet)
+router.register("ned-mappings", views.NSOPlatformNedMappingViewSet)
 router.register("device-management", views.NSODeviceManagementViewSet)
 router.register("interface-state", views.NSOInterfaceStateViewSet)
 
 urlpatterns = [
     path("sync-complete/", views.SyncCompleteView.as_view(), name="sync_complete"),
+    path("onboarding-candidates/", views.OnboardingCandidatesView.as_view(), name="onboarding_candidates"),
     *router.urls,
 ]

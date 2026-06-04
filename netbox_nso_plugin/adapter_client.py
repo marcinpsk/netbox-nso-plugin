@@ -194,6 +194,16 @@ def get_snmp_config(adapter_device_id: int) -> dict:
     return _request("GET", f"/api/v1/devices/{adapter_device_id}/snmp-config")
 
 
+def get_neds(adapter_instance_id: str) -> list:
+    """GET /api/v1/nso-instances/{id}/neds — available NED packages on the instance."""
+    return _request("GET", f"/api/v1/nso-instances/{adapter_instance_id}/neds")
+
+
+def list_instance_devices(adapter_instance_id: str) -> list:
+    """GET /api/v1/nso-instances/{id}/devices — NSO device inventory (onboarded x-ref)."""
+    return _request("GET", f"/api/v1/nso-instances/{adapter_instance_id}/devices")
+
+
 def get_static_routes(adapter_device_id: int) -> dict:
     """GET /api/v1/devices/{id}/static-routes."""
     return _request("GET", f"/api/v1/devices/{adapter_device_id}/static-routes")

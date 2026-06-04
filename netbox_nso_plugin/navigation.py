@@ -35,6 +35,21 @@ menu = PluginMenu(
                     link_text="Interface States",
                 ),
                 PluginMenuItem(
+                    link="plugins:netbox_nso_plugin:onboarding_dashboard",
+                    link_text="Onboarding",
+                ),
+                PluginMenuItem(
+                    link="plugins:netbox_nso_plugin:nsoplatformnedmapping_list",
+                    link_text="Platform → NED Mappings",
+                    buttons=(
+                        PluginMenuButton(
+                            link="plugins:netbox_nso_plugin:nsoplatformnedmapping_add",
+                            title="Add",
+                            icon_class="mdi mdi-plus-thick",
+                        ),
+                    ),
+                ),
+                PluginMenuItem(
                     link="plugins:netbox_nso_plugin:adapterconnection",
                     link_text="Adapter Connection",
                 ),

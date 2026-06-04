@@ -67,6 +67,24 @@ def _make_netbox_stubs():
 _make_netbox_stubs()
 
 
+@pytest.fixture(scope="session")
+def django_db_modify_db_settings(django_db_modify_db_settings):
+    """Give the plugin suite its OWN test database name.
+
+    The dev Postgres is shared, and Django's test runner derives the test DB name
+    from the configured DB (``test_netbox``). Other Django test suites on the same
+    box (e.g. the netbox_routing fork's) default to the SAME name, so concurrent
+    runs collide ("database already exists / being accessed by other users") and
+    every test aborts at DB setup. Pin the plugin's test DB to a distinct name so
+    the two never contend.
+    """
+    from django.conf import settings
+
+    test_cfg = dict(settings.DATABASES["default"].get("TEST") or {})
+    test_cfg["NAME"] = "test_netbox_nso_plugin"
+    settings.DATABASES["default"]["TEST"] = test_cfg
+
+
 @pytest.fixture(autouse=True, scope="session")
 def _block_real_adapter_network():
     """Keep the whole suite hermetic: no test ever reaches the live adapter.
