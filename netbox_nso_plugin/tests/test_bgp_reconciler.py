@@ -260,6 +260,41 @@ class TestReconcileBgpConfig(TestCase):
         paf = BGPPeerAddressFamily.objects.first()
         self.assertEqual(paf.address_family.address_family, "ipv4-unicast")
 
+    def test_peer_af_routemap_linked(self):
+        """Per-AF routemap_in/out names resolve to RouteMap objects on the peer-AF."""
+        self._make_mgmt()
+
+        from netbox_routing.models import BGPPeerAddressFamily, RouteMap
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        rm_in = RouteMap.objects.create(name="RM-IN")
+        rm_out = RouteMap.objects.create(name="RM-OUT")
+        peer = self._peer_entry()
+        peer["address_families"] = [
+            {"af": "ipv4-unicast", "enabled": True, "routemap_in": "RM-IN", "routemap_out": "RM-OUT"}
+        ]
+        _reconcile_bgp_config(self.device, self._payload(self._router_payload(peers=[peer])))
+
+        paf = BGPPeerAddressFamily.objects.get(address_family__address_family="ipv4-unicast")
+        self.assertEqual(paf.routemap_in, rm_in)
+        self.assertEqual(paf.routemap_out, rm_out)
+
+    def test_peer_af_unknown_routemap_left_null(self):
+        """An unresolved routemap name is left null, not guessed."""
+        self._make_mgmt()
+
+        from netbox_routing.models import BGPPeerAddressFamily
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        peer = self._peer_entry()
+        peer["address_families"] = [{"af": "ipv4-unicast", "enabled": True, "routemap_in": "NOPE"}]
+        _reconcile_bgp_config(self.device, self._payload(self._router_payload(peers=[peer])))
+
+        paf = BGPPeerAddressFamily.objects.get(address_family__address_family="ipv4-unicast")
+        self.assertIsNone(paf.routemap_in_id)
+
     def test_stale_state_row_set_to_changed(self):
         """Peer disappears from NSO payload → status set to 'changed'."""
         self._make_mgmt()

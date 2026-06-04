@@ -180,8 +180,37 @@ def _get_or_create_peer(scope_obj, ip_obj, peer_data: dict, remote_asn_obj, loca
     return obj, not created
 
 
+def _resolve_routemap(name):
+    """Resolve a netbox_routing.RouteMap by name (created by the route-policy reconciler)."""
+    if not name:
+        return None
+    try:
+        from netbox_routing.models import RouteMap
+
+        return RouteMap.objects.filter(name=name).first()
+    except Exception:
+        return None
+
+
+def _resolve_prefixlist(name):
+    """Resolve a netbox_routing.PrefixList by name."""
+    if not name:
+        return None
+    try:
+        from netbox_routing.models import PrefixList
+
+        return PrefixList.objects.filter(name=name).first()
+    except Exception:
+        return None
+
+
 def _reconcile_peer_address_families(peer_obj, peer_af_list: list, scope_obj, BGPAddressFamily, BGPPeerAddressFamily):
-    """Ensure BGPPeerAddressFamily rows exist for each (peer, af) in peer_af_list."""
+    """Ensure BGPPeerAddressFamily rows exist for each (peer, af), with per-AF policies.
+
+    Links inbound/outbound route-map + prefix-list references (resolved by name to
+    the netbox_routing objects the route-policy reconciler created). Unresolved names
+    are left null rather than guessed.
+    """
     from django.contrib.contenttypes.models import ContentType
 
     ct = ContentType.objects.get_for_model(peer_obj.__class__)
@@ -190,12 +219,32 @@ def _reconcile_peer_address_families(peer_obj, peer_af_list: list, scope_obj, BG
         if not af_str:
             continue
         af_obj = _get_or_create_address_family(scope_obj, af_str, BGPAddressFamily)
-        BGPPeerAddressFamily.objects.get_or_create(
+        policy = {
+            "enabled": paf_entry.get("enabled", True),
+            "routemap_in": _resolve_routemap(paf_entry.get("routemap_in")),
+            "routemap_out": _resolve_routemap(paf_entry.get("routemap_out")),
+            "prefixlist_in": _resolve_prefixlist(paf_entry.get("prefixlist_in")),
+            "prefixlist_out": _resolve_prefixlist(paf_entry.get("prefixlist_out")),
+        }
+        obj, created = BGPPeerAddressFamily.objects.get_or_create(
             assigned_object_type=ct,
             assigned_object_id=peer_obj.pk,
             address_family=af_obj,
-            defaults={"enabled": paf_entry.get("enabled", True)},
+            defaults=policy,
         )
+        if not created:
+            changed = False
+            for field, value in policy.items():
+                if field == "enabled":
+                    if obj.enabled != value:
+                        obj.enabled = value
+                        changed = True
+                else:
+                    if getattr(obj, f"{field}_id") != (value.pk if value else None):
+                        setattr(obj, field, value)
+                        changed = True
+            if changed:
+                obj.save()
 
 
 def _resolve_vrf(vrf_name: str, VRF):
