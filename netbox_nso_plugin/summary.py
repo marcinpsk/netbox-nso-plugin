@@ -120,8 +120,8 @@ def interface_status_breakdown(qs) -> dict:
 
 # Each category: key -> (label, mdi-icon, scope-flag on NSODeviceManagement).
 # Order here is the display order on the tab.
-# NOTE: SNMP is intentionally absent — the device tab has never rendered an SNMP
-# section, so there is no partial for it.
+# manage_interfaces and manage_snmp are standalone scopes — not gated by the
+# manage_routing master switch (see category_summaries).
 _CATEGORIES = [
     ("interfaces", "Interfaces", "ethernet", "manage_interfaces"),
     ("static", "Static Routes", "sign-direction", "manage_static"),
@@ -130,7 +130,11 @@ _CATEGORIES = [
     ("bgp", "BGP", "router-network", "manage_bgp"),
     ("route_policy", "Route Policy", "script-text", "manage_route_policy"),
     ("redistribution", "Redistribution", "swap-horizontal", "manage_redistribution"),
+    ("snmp", "SNMP", "console-network", "manage_snmp"),
 ]
+
+# Scopes that stand alone (not under the manage_routing master kill-switch).
+_NON_ROUTING_FLAGS = {"manage_interfaces", "manage_snmp"}
 
 
 def _status_breakdown(qs) -> dict:
@@ -201,7 +205,42 @@ def _category_counts(key: str, device, mgmt) -> dict:
         return _status_breakdown(NSORoutePolicyState.objects.filter(management=mgmt))
     if key == "redistribution":
         return _status_breakdown(NSORedistributionState.objects.filter(management=mgmt))
+    if key == "snmp":
+        from .models import (
+            NSOSnmpCommunityState,
+            NSOSnmpHostState,
+            NSOSnmpSystemInfoState,
+            NSOSnmpV3UserState,
+        )
+
+        return _snmp_breakdown(
+            (
+                NSOSnmpCommunityState.objects.filter(management=mgmt),
+                NSOSnmpV3UserState.objects.filter(management=mgmt),
+                NSOSnmpHostState.objects.filter(management=mgmt),
+                NSOSnmpSystemInfoState.objects.filter(management=mgmt),
+            )
+        )
     return {"total": 0}
+
+
+def _snmp_breakdown(querysets) -> dict:
+    """Status breakdown for SNMP overlays (no owned/accepted_at dimension).
+
+    Like _status_breakdown, but the SNMP state models have no accepted_at field so
+    rows are classified by status alone.
+    """
+    out = {"total": 0, "drift": 0, "pending": 0}
+    for qs in querysets:
+        for status, total in qs.values_list("status").annotate(total=Count("id")):
+            out["total"] += total
+            if status in ("deploying", "accepted"):
+                out["pending"] += total
+            elif status in _MATCH_STATUSES:
+                pass  # in sync — the implicit remainder
+            else:
+                out["drift"] += total  # changed/conflict/apply_failed/error/unknown
+    return out
 
 
 def category_summaries(device, mgmt) -> list[dict]:
@@ -214,8 +253,9 @@ def category_summaries(device, mgmt) -> list[dict]:
         return []
     summaries = []
     for key, label, icon, flag in _CATEGORIES:
-        # Routing leaves are also gated by the manage_routing master kill-switch.
-        if flag != "manage_interfaces" and not mgmt.manage_routing:
+        # Routing leaves are also gated by the manage_routing master kill-switch;
+        # standalone scopes (interfaces, SNMP) are not.
+        if flag not in _NON_ROUTING_FLAGS and not mgmt.manage_routing:
             continue
         if not getattr(mgmt, flag, False):
             continue

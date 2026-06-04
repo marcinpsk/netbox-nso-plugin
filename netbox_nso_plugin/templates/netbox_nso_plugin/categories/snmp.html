@@ -1,0 +1,97 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Lazy-loaded fragment: SNMP category (communities + v3 users + hosts + system info). #}
+{# Secret-safe: community strings and v3 passwords are never shown — only hashes/flags. #}
+{% if adapter_error %}
+  <div class="alert alert-warning mb-2"><span class="mdi mdi-alert-outline me-1"></span>{{ adapter_error }}</div>
+{% endif %}
+
+{% if snmp_data.communities or snmp_data.v3_users or snmp_data.hosts or snmp_data.system_info %}
+
+  {% if snmp_data.system_info %}
+  <table class="table table-sm mb-3">
+    <tr><th style="width:160px;">Location</th><td>{{ snmp_data.system_info.location|default:"—" }}</td></tr>
+    <tr><th>Contact</th><td>{{ snmp_data.system_info.contact|default:"—" }}</td></tr>
+    <tr><th>Status</th><td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=snmp_data.system_info.status %}</td></tr>
+  </table>
+  {% endif %}
+
+  {% if snmp_data.communities %}
+  <h6 class="mb-1">Communities</h6>
+  <div id="flt-snmp-communities">
+  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-snmp-communities" placeholder="Filter by hash / access…" show_status=True %}
+  <div class="table-responsive mb-3">
+    <table class="table table-sm table-hover mb-0">
+      <thead>
+        <tr><th>Community (hash)</th><th>Access</th><th>ACL</th><th>Status</th><th>Last Synced</th></tr>
+      </thead>
+      <tbody>
+        {% for c in snmp_data.communities %}
+        <tr data-status="{{ c.status }}" data-owned="false">
+          <td><code>{{ c.community_hash }}</code></td>
+          <td>{{ c.access }}</td>
+          <td>{{ c.acl|default:"—" }}</td>
+          <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=c.status %}</td>
+          <td>{{ c.last_sync_at|default:"—" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  </div>
+  {% endif %}
+
+  {% if snmp_data.v3_users %}
+  <h6 class="mb-1">v3 Users</h6>
+  <div id="flt-snmp-v3">
+  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-snmp-v3" placeholder="Filter by username…" show_status=True %}
+  <div class="table-responsive mb-3">
+    <table class="table table-sm table-hover mb-0">
+      <thead>
+        <tr><th>Username</th><th>Auth</th><th>Priv</th><th>Status</th><th>Last Synced</th></tr>
+      </thead>
+      <tbody>
+        {% for u in snmp_data.v3_users %}
+        <tr data-status="{{ u.status }}" data-owned="false">
+          <td>{{ u.username }}</td>
+          <td>{% if u.has_auth_secret %}<span class="badge bg-success">set</span>{% else %}<span class="badge bg-secondary">none</span>{% endif %}</td>
+          <td>{% if u.has_priv_secret %}<span class="badge bg-success">set</span>{% else %}<span class="badge bg-secondary">none</span>{% endif %}</td>
+          <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=u.status %}</td>
+          <td>{{ u.last_sync_at|default:"—" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  </div>
+  {% endif %}
+
+  {% if snmp_data.hosts %}
+  <h6 class="mb-1">Trap / Inform Hosts</h6>
+  <div id="flt-snmp-hosts">
+  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-snmp-hosts" placeholder="Filter by address…" show_status=True %}
+  <div class="table-responsive">
+    <table class="table table-sm table-hover mb-0">
+      <thead>
+        <tr><th>Address</th><th>Type</th><th>Version</th><th>Port</th><th>Status</th><th>Last Synced</th></tr>
+      </thead>
+      <tbody>
+        {% for h in snmp_data.hosts %}
+        <tr data-status="{{ h.status }}" data-owned="false">
+          <td>{{ h.address }}</td>
+          <td>{{ h.notify_type }}</td>
+          <td>{{ h.version }}</td>
+          <td>{{ h.port|default:"162" }}</td>
+          <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=h.status %}</td>
+          <td>{{ h.last_sync_at|default:"—" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  </div>
+  {% endif %}
+
+{% else %}
+  <p class="text-muted mb-0">No SNMP configuration.</p>
+{% endif %}
