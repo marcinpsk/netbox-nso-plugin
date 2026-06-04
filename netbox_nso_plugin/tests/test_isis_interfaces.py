@@ -217,6 +217,12 @@ class TestReconcileIsisInterfaces(TestCase):
         state = result[0]
         self.assertEqual(state.hello_auth_type, "md5")
         self.assertTrue(state.hello_auth_present)
+        # When the netbox-routing field exists (isis branch integrated), the
+        # reconcile writes it through to the ISISInterface too.
+        ri = state.isis_interface
+        if ri is not None and hasattr(ri, "hello_auth_type"):
+            ri.refresh_from_db()
+            self.assertEqual(ri.hello_auth_type, "md5")
 
     def test_no_hello_auth_defaults_blank(self):
         """An entry without hello-auth leaves the state blank/false."""

@@ -713,8 +713,10 @@ def _link_routing_isis_interface(device, iface, af, state, instances: dict):
     ]
     # hello_auth_type only exists on ISISInterface once the netbox-routing isis
     # branch lands — guard so the reconcile is a no-op for it until then.
+    # ISISInterface.hello_auth_type is a non-null CharField (default "") — write
+    # "" (not None) when there is no hello auth.
     if hasattr(ri, "hello_auth_type"):
-        routing_fields.append(("hello_auth_type", state.hello_auth_type or None))
+        routing_fields.append(("hello_auth_type", state.hello_auth_type or ""))
     for attr, val in routing_fields:
         if getattr(ri, attr) != val:
             setattr(ri, attr, val)
