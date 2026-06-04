@@ -326,6 +326,24 @@ class TestReconcileBgpConfig(TestCase):
 
         self.assertIsNone(BGPPeer.objects.get(peer__address__net_host="10.0.0.2").source_id)
 
+    def test_peer_group_template_gets_remote_as(self):
+        """The peer-group's BGPPeerTemplate is enriched with the (inherited) remote_as."""
+        self._make_mgmt()
+
+        from ipam.models import ASN
+        from netbox_routing.models import BGPPeerTemplate
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        peer = self._peer_entry(remote_as="65100")
+        peer["peer_group"] = "Arbor-IBGP"
+        _reconcile_bgp_config(self.device, self._payload(self._router_payload(peers=[peer])))
+
+        tmpl = BGPPeerTemplate.objects.get(name="Arbor-IBGP")
+        self.assertIsNotNone(tmpl.remote_as)
+        self.assertEqual(str(tmpl.remote_as.asn), "65100")
+        self.assertTrue(ASN.objects.filter(asn=65100).exists())
+
     def test_stale_state_row_set_to_changed(self):
         """Peer disappears from NSO payload → status set to 'changed'."""
         self._make_mgmt()

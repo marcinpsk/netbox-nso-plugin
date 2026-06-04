@@ -125,17 +125,22 @@ def _resolve_peer_ip(peer_address_str: str, IPAddress):
         return None
 
 
-def _get_or_create_peer_group(name: str, BGPPeerTemplate):
+def _get_or_create_peer_group(name: str, BGPPeerTemplate, remote_asn_obj=None):
     """Find or create a BGPPeerTemplate (netbox-routing's peer-group) by name.
 
-    remote_as is left null: a peer-group is shared across peers with differing
-    remote-AS, and the model's unique key is (name, remote_as).
+    Enriches the template's remote_as from the group's (inherited) value when
+    known — peer-group members share the group's remote-AS. Keyed by name (the
+    natural peer-group key); remote_as is set/updated, not part of the lookup.
     """
     if not name:
         return None
-    obj, created = BGPPeerTemplate.objects.get_or_create(name=name, remote_as=None)
-    if created:
+    obj = BGPPeerTemplate.objects.filter(name=name).first()
+    if obj is None:
+        obj = BGPPeerTemplate.objects.create(name=name, remote_as=remote_asn_obj)
         logger.debug("BGP: auto-created BGPPeerTemplate %r", name)
+    elif remote_asn_obj is not None and obj.remote_as_id != remote_asn_obj.pk:
+        obj.remote_as = remote_asn_obj
+        obj.save(update_fields=["remote_as"])
     return obj
 
 
@@ -360,7 +365,7 @@ def _reconcile_scope(
         remote_asn_obj = _get_or_create_asn(remote_as_str, ASN) if remote_as_str else None
         local_as_str = str(peer_entry.get("local_as") or "")
         local_asn_obj = _get_or_create_asn(local_as_str, ASN) if local_as_str else None
-        peer_group_obj = _get_or_create_peer_group(peer_entry.get("peer_group") or "", BGPPeerTemplate)
+        peer_group_obj = _get_or_create_peer_group(peer_entry.get("peer_group") or "", BGPPeerTemplate, remote_asn_obj)
         source_obj = _resolve_bgp_source(mgmt.device, peer_entry.get("source"), IPAddress)
 
         bgp_peer, was_existing = _get_or_create_peer(
