@@ -1,0 +1,34 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{% extends 'generic/object.html' %}
+{% load helpers %}
+
+{% block breadcrumbs %}
+  <li class="breadcrumb-item"><a href="{% url 'plugins:netbox_nso_plugin:nsoplatformnedmapping_list' %}">NSO Platform-NED Mappings</a></li>
+  <li class="breadcrumb-item">{{ object }}</li>
+{% endblock %}
+
+{% block content %}
+  <div class="row">
+    <div class="col-12 col-md-6">
+      <div class="card">
+        <h5 class="card-header">Platform → NED Mapping</h5>
+        <div class="card-body">
+          <table class="table table-hover attr-table">
+            <tr>
+              <th scope="row">Platform</th>
+              <td>
+                {% if object.platform %}<a href="{{ object.platform.get_absolute_url }}">{{ object.platform }}</a>
+                {% else %}<span class="text-muted">&mdash;</span>{% endif %}
+              </td>
+            </tr>
+            <tr>
+              <th scope="row">NED ID</th>
+              <td><code>{{ object.ned_id }}</code></td>
+            </tr>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+{% endblock content %}

@@ -192,6 +192,25 @@ class TestNSOInstanceDetailView(ViewTestBase):
         self.assertEqual(response.status_code, 200)
 
 
+class TestNSOPlatformNedMappingDetailView(ViewTestBase):
+    """Tests for NSOPlatformNedMappingView detail view (regression: detail template existed)."""
+
+    def test_detail_200(self):
+        """Detail view returns 200 — guards against a missing detail template,
+        which previously crashed the post-create redirect (TemplateDoesNotExist)."""
+        from dcim.models import Platform
+
+        from netbox_nso_plugin.models import NSOPlatformNedMapping
+
+        platform = Platform.objects.create(name="NedMapPlatform", slug="nedmapplatform")
+        mapping = NSOPlatformNedMapping.objects.create(
+            platform=platform, ned_id="cisco-ios-cli-6.114:cisco-ios-cli-6.114"
+        )
+        url = reverse("plugins:netbox_nso_plugin:nsoplatformnedmapping", args=[mapping.pk])
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+
+
 class TestNSODeviceManagementDetailView(ViewTestBase):
     """Tests for NSODeviceManagementView — adapter_device_id is None (no adapter calls)."""
 
