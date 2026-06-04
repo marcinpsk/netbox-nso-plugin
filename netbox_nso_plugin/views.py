@@ -406,6 +406,11 @@ class NSOOnboardingDashboardView(LoginRequiredMixin, View):
         else:
             data = build_onboarding_dashboard(instance)
             managed = list(NSODeviceManagement.objects.filter(nso_instance=instance).select_related("device"))
+            # Annotate each managed row with the NED it actually runs on (live NSO
+            # inventory), so the Managed tab shows it without a second page.
+            ned_by_name = data.get("ned_by_nso_name") or {}
+            for m in managed:
+                m.ned_in_use = ned_by_name.get(m.nso_device_name)
 
         return render(
             request,
@@ -441,8 +446,9 @@ class NSOOnboardView(LoginRequiredMixin, View):
             messages.error(request, "No NSO instance configured.")
             return redirect(redirect_url)
 
+        ned_id = (request.POST.get("ned_id") or "").strip() or None
         try:
-            result = onboard_candidate(device, instance)
+            result = onboard_candidate(device, instance, ned_id=ned_id)
         except Exception as exc:  # never 500 the action
             messages.error(request, f"Onboarding {device} failed: {exc}")
             return redirect(f"{redirect_url}?instance={instance.adapter_instance_id}")
@@ -451,6 +457,46 @@ class NSOOnboardView(LoginRequiredMixin, View):
             messages.success(request, f"Onboarded {device} into NSO ({instance.name}).")
         else:
             messages.error(request, f"Could not onboard {device}: {result['error']}")
+        return redirect(f"{redirect_url}?instance={instance.adapter_instance_id}")
+
+
+class NSOQuickManageView(LoginRequiredMixin, View):
+    """POST action: bring an already-in-NSO ('external') device under plugin management.
+
+    The device exists in both NSO and NetBox but has no NSODeviceManagement record.
+    Creates that record (no re-provisioning) and redirects to the dashboard.
+
+    URL: POST /plugins/nso/manage/  body: device=<pk>, instance=<adapter_instance_id>,
+    nso_name=<NSO device name>
+    """
+
+    def post(self, request):
+        """Create the management record for the posted external device."""
+        from .onboarding import manage_existing
+
+        device = get_object_or_404(Device, pk=request.POST.get("device"))
+        selected = request.POST.get("instance")
+        instance = None
+        if selected:
+            instance = NSOInstance.objects.filter(adapter_instance_id=selected).first()
+        instance = instance or NSOInstance.get_default()
+
+        redirect_url = reverse("plugins:netbox_nso_plugin:onboarding_dashboard")
+        if instance is None:
+            messages.error(request, "No NSO instance configured.")
+            return redirect(redirect_url)
+
+        nso_name = request.POST.get("nso_name") or device.name
+        try:
+            result = manage_existing(device, instance, nso_name)
+        except Exception as exc:  # never 500 the action
+            messages.error(request, f"Managing {device} failed: {exc}")
+            return redirect(f"{redirect_url}?instance={instance.adapter_instance_id}")
+
+        if result["ok"]:
+            messages.success(request, f"{device} is now managed by NSO ({instance.name}).")
+        else:
+            messages.error(request, f"Could not manage {device}: {result['error']}")
         return redirect(f"{redirect_url}?instance={instance.adapter_instance_id}")
 
 

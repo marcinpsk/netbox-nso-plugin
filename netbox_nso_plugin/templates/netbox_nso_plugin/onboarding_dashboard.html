@@ -36,22 +36,36 @@
 <div class="tab-content">
   {# ── Managed: plugin-managed devices (NSODeviceManagement) ───────────────── #}
   <div class="tab-pane fade show active" id="tab-managed" role="tabpanel">
+    <div class="d-flex mb-2">
+      <a href="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_add' %}" class="btn btn-sm btn-primary ms-auto">
+        <span class="mdi mdi-plus-thick"></span> Add managed device
+      </a>
+    </div>
     <div class="card">
       <div class="card-body p-0">
         <table class="table table-hover mb-0">
-          <thead><tr><th>Device</th><th>NSO name</th><th>Onboarded</th><th>Last sync</th><th>Status</th><th></th></tr></thead>
+          <thead><tr><th>Device</th><th>NSO name</th><th>NED</th><th>Scopes</th><th>Last sync</th><th>Status</th><th></th></tr></thead>
           <tbody>
             {% for m in managed %}
             <tr>
               <td><a href="{{ m.device.get_absolute_url }}">{{ m.device }}</a></td>
               <td>{{ m.nso_device_name }}</td>
-              <td>{{ m.onboarded_at|placeholder }}</td>
+              <td><code>{{ m.ned_in_use|placeholder }}</code></td>
+              <td>
+                {% if m.manage_description %}<span class="badge text-bg-light border" title="Sync interface description">desc</span>{% endif %}
+                {% if m.manage_enabled %}<span class="badge text-bg-light border" title="Sync interface enabled/shutdown">enabled</span>{% endif %}
+                {% if m.auto_apply %}<span class="badge text-bg-info" title="Auto-apply accepted intent">auto-apply</span>{% endif %}
+              </td>
               <td>{{ m.last_sync_at|placeholder }}</td>
               <td>{% if m.last_sync_status %}<span class="badge bg-info text-dark">{{ m.last_sync_status }}</span>{% else %}{{ ''|placeholder }}{% endif %}</td>
-              <td class="text-end"><a href="{% url 'dcim:device_nso' pk=m.device.pk %}" class="btn btn-sm btn-outline-primary">NSO tab</a></td>
+              <td class="text-end text-nowrap">
+                <a href="{% url 'dcim:device_nso' pk=m.device.pk %}" class="btn btn-sm btn-outline-primary">NSO tab</a>
+                <a href="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_edit' pk=m.pk %}" class="btn btn-sm btn-outline-secondary" title="Edit"><span class="mdi mdi-pencil"></span></a>
+                <a href="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_delete' pk=m.pk %}" class="btn btn-sm btn-outline-danger" title="Delete"><span class="mdi mdi-trash-can-outline"></span></a>
+              </td>
             </tr>
             {% empty %}
-            <tr><td colspan="6" class="text-muted">No managed devices on this instance.</td></tr>
+            <tr><td colspan="7" class="text-muted">No managed devices on this instance.</td></tr>
             {% endfor %}
           </tbody>
         </table>
@@ -64,7 +78,7 @@
     <div class="card">
       <div class="card-body p-0">
         <table class="table table-hover mb-0">
-          <thead><tr><th>NSO device</th><th>NetBox</th><th>NED</th><th>Admin state</th><th>Matched by</th></tr></thead>
+          <thead><tr><th>NSO device</th><th>NetBox</th><th>NED</th><th>Admin state</th><th>Matched by</th><th></th></tr></thead>
           <tbody>
             {% for o in data.onboarded %}
             <tr>
@@ -73,9 +87,20 @@
               <td><code>{{ o.ned_id|placeholder }}</code></td>
               <td>{{ o.admin_state|placeholder }}</td>
               <td><span class="badge text-bg-light border">{{ o.matched_by|default:"—" }}</span></td>
+              <td class="text-end">
+                {% if not o.plugin_managed and o.netbox_device %}
+                <form method="post" action="{% url 'plugins:netbox_nso_plugin:quick_manage' %}" class="d-inline">
+                  {% csrf_token %}
+                  <input type="hidden" name="device" value="{{ o.netbox_device.pk }}">
+                  <input type="hidden" name="instance" value="{{ selected }}">
+                  <input type="hidden" name="nso_name" value="{{ o.nso_name }}">
+                  <button type="submit" class="btn btn-sm btn-success" title="Bring under NSO management in NetBox"><span class="mdi mdi-plus-network"></span> Manage</button>
+                </form>
+                {% endif %}
+              </td>
             </tr>
             {% empty %}
-            <tr><td colspan="5" class="text-muted">None.</td></tr>
+            <tr><td colspan="6" class="text-muted">None.</td></tr>
             {% endfor %}
           </tbody>
         </table>
@@ -85,7 +110,7 @@
 
   {# ── Onboardable candidates ──────────────────────────────────────────────── #}
   <div class="tab-pane fade" id="tab-candidates" role="tabpanel">
-    <p class="text-muted small mb-2">NetBox devices that are active, have a primary IP, and whose platform maps to a NED — not yet in NSO.</p>
+    <p class="text-muted small mb-2">NetBox devices that are active and have a primary IP, not yet in NSO. The platform&rsquo;s NED mapping is the default &mdash; pick a different NED to override (software version / testing).</p>
     <div class="card">
       <div class="card-body p-0">
         <table class="table table-hover mb-0">
@@ -94,20 +119,30 @@
             {% for c in data.candidates %}
             <tr>
               <td><a href="{{ c.device.get_absolute_url }}">{{ c.device }}</a></td>
-              <td>{{ c.platform }}</td>
+              <td>{{ c.platform|placeholder }}</td>
               <td>{{ c.primary_ip }}</td>
-              <td><code>{{ c.ned_id }}</code></td>
-              <td class="text-end">
-                <form method="post" action="{% url 'plugins:netbox_nso_plugin:onboard' %}" class="d-inline">
+              <td>
+                <form method="post" action="{% url 'plugins:netbox_nso_plugin:onboard' %}" class="d-flex gap-2 align-items-center">
                   {% csrf_token %}
                   <input type="hidden" name="device" value="{{ c.device.pk }}">
                   <input type="hidden" name="instance" value="{{ selected }}">
-                  <button type="submit" class="btn btn-sm btn-success"><span class="mdi mdi-plus-network"></span> Onboard</button>
+                  {% if data.neds %}
+                    <select name="ned_id" class="form-select form-select-sm" style="max-width: 22rem;" required>
+                      <option value="">— select NED —</option>
+                      {% for ned in data.neds %}
+                        <option value="{{ ned }}" {% if ned == c.ned_id %}selected{% endif %}>{{ ned }}</option>
+                      {% endfor %}
+                    </select>
+                  {% else %}
+                    <input type="text" name="ned_id" class="form-control form-control-sm" style="max-width: 22rem;" value="{{ c.ned_id }}" placeholder="ned-id:ned-id" required>
+                  {% endif %}
+                  <button type="submit" class="btn btn-sm btn-success text-nowrap"><span class="mdi mdi-plus-network"></span> Onboard</button>
                 </form>
               </td>
+              <td></td>
             </tr>
             {% empty %}
-            <tr><td colspan="5" class="text-muted">None. {% if not data.error %}Add <a href="{% url 'plugins:netbox_nso_plugin:nsoplatformnedmapping_list' %}">Platform → NED mappings</a> so devices appear here.{% endif %}</td></tr>
+            <tr><td colspan="5" class="text-muted">None &mdash; no active devices with a primary IP that aren&rsquo;t already in NSO.</td></tr>
             {% endfor %}
           </tbody>
         </table>

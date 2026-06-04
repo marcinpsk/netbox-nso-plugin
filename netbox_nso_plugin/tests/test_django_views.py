@@ -65,6 +65,56 @@ class ViewTestBase(TestCase):
         self.client.force_login(self.superuser)
 
 
+# ── Onboarding dashboard (NSO Devices) ────────────────────────────────────────────
+
+
+class TestOnboardingDashboardView(ViewTestBase):
+    """Tests for the NSO Devices dashboard render + quick-manage action."""
+
+    @patch("netbox_nso_plugin.adapter_client.get_neds", return_value=[{"ned_id": "cisco-ios-cli-6.114"}])
+    @patch("netbox_nso_plugin.adapter_client.list_instance_devices")
+    def test_dashboard_renders_all_tabs(self, mock_list, _mock_neds):
+        """Dashboard renders 200 with managed + external rows — guards the {% url %}
+        wiring for the per-row edit/delete and quick-manage buttons."""
+        # The managed device (self.mgmt.device) appears in NSO as a managed device,
+        # plus an 'external' device matched by name only.
+        ext = Device.objects.create(
+            name="ext-router-01", device_type=self.device.device_type, role=self.device.role, site=self.device.site
+        )
+        mock_list.return_value = [
+            {
+                "name": self.mgmt.nso_device_name,
+                "ned_id": "cisco-ios-cli-6.114",
+                "admin_state": "unlocked",
+                "onboarded_netbox_device_id": self.device.id,
+            },
+            {"name": "ext-router-01", "ned_id": "juniper-junos-nc-4.19", "admin_state": "unlocked"},
+        ]
+        url = reverse("plugins:netbox_nso_plugin:onboarding_dashboard")
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        # external device (matched, not plugin-managed) is offered a quick-manage button
+        self.assertContains(response, "Manage")
+        self.assertEqual(ext.name, "ext-router-01")
+
+    def test_quick_manage_creates_management(self):
+        """POST to quick_manage creates the management record for an external device.
+
+        The NSODeviceManagement post_save signal fires and attempts an adapter call,
+        which it swallows on error — so no adapter mock is needed here.
+        """
+        ext = Device.objects.create(
+            name="ext-router-02", device_type=self.device.device_type, role=self.device.role, site=self.device.site
+        )
+        url = reverse("plugins:netbox_nso_plugin:quick_manage")
+        response = self.client.post(
+            url,
+            {"device": ext.pk, "instance": self.nso_instance.adapter_instance_id, "nso_name": "ext-router-02"},
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(NSODeviceManagement.objects.filter(device=ext).exists())
+
+
 # ── List views ──────────────────────────────────────────────────────────────────
 
 

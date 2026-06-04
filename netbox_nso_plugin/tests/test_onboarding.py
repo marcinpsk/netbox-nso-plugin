@@ -83,10 +83,13 @@ class TestOnboardingDashboard(TestCase):
         self.assertEqual(c["ned_id"], "cisco-ios-cli-6.114")
         self.assertEqual(c["primary_ip"], "10.1.1.1")
 
-    def test_not_candidate_when_no_mapping(self):
+    def test_candidate_without_mapping_still_listed(self):
+        """A device with no platform-NED mapping is still a candidate (ned_id="")
+        — the mapping is only the default suggestion; the operator picks the NED."""
         _device("nomap", platform=self.ios, ip="10.1.1.2/24")
         data = self._build([])
-        self.assertEqual(len(data["candidates"]), 0)
+        self.assertEqual(len(data["candidates"]), 1)
+        self.assertEqual(data["candidates"][0]["ned_id"], "")
 
     def test_not_candidate_when_inactive(self):
         from netbox_nso_plugin.models import NSOPlatformNedMapping
@@ -143,25 +146,43 @@ class TestOnboardCandidate(TestCase):
         NSOPlatformNedMapping.objects.get_or_create(platform=self.ios, defaults={"ned_id": "cisco-ios-cli-6.114"})
         return d
 
-    def test_no_platform_errors(self):
+    def test_no_ned_and_no_mapping_errors(self):
+        """No explicit NED and no platform mapping → asks the operator to pick a NED."""
         from netbox_nso_plugin.onboarding import onboard_candidate
 
         d = _device("noplat", ip="10.5.5.1/24")
         res = onboard_candidate(d, self.instance)
         self.assertFalse(res["ok"])
-        self.assertIn("platform", res["error"].lower())
+        self.assertIn("No NED selected", res["error"])
 
-    def test_no_mapping_errors(self):
+    def test_no_mapping_but_explicit_ned_onboards(self):
+        """No mapping is fine when an explicit ned_id is given (override / no mapping)."""
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOPlatformNedMapping
         from netbox_nso_plugin.onboarding import onboard_candidate
 
         d = _device("nomap2", platform=self.ios, ip="10.5.5.2/24")
-        # ensure no mapping exists
-        from netbox_nso_plugin.models import NSOPlatformNedMapping
-
         NSOPlatformNedMapping.objects.filter(platform=self.ios).delete()
-        res = onboard_candidate(d, self.instance)
-        self.assertFalse(res["ok"])
-        self.assertIn("NED mapping", res["error"])
+        with patch(
+            "netbox_nso_plugin.adapter_client.provision_device",
+            return_value={"ok": True, "steps": [], "device_id": 7},
+        ) as prov:
+            res = onboard_candidate(d, self.instance, ned_id="cisco-iosxr-cli-7.55:cisco-iosxr-cli-7.55")
+        self.assertTrue(res["ok"])
+        self.assertTrue(NSODeviceManagement.objects.filter(device=d).exists())
+        self.assertEqual(prov.call_args.kwargs["ned_id"], "cisco-iosxr-cli-7.55:cisco-iosxr-cli-7.55")
+
+    def test_explicit_ned_overrides_mapping(self):
+        """An explicit ned_id wins over the platform mapping default."""
+        from netbox_nso_plugin.onboarding import onboard_candidate
+
+        d = self._mapped_device("override-rtr")
+        with patch(
+            "netbox_nso_plugin.adapter_client.provision_device",
+            return_value={"ok": True, "steps": [], "device_id": 8},
+        ) as prov:
+            res = onboard_candidate(d, self.instance, ned_id="test-ned:test-ned")
+        self.assertTrue(res["ok"])
+        self.assertEqual(prov.call_args.kwargs["ned_id"], "test-ned:test-ned")
 
     def test_no_primary_ip_errors(self):
         from netbox_nso_plugin.models import NSOPlatformNedMapping
@@ -213,6 +234,46 @@ class TestOnboardCandidate(TestCase):
         res = onboard_candidate(d, self.instance)
         self.assertFalse(res["ok"])
         self.assertIn("already managed", res["error"].lower())
+
+
+class TestManageExisting(TestCase):
+    """Tests for onboarding.manage_existing (quick-manage of an external device)."""
+
+    @classmethod
+    def setUpTestData(cls):
+        from netbox_nso_plugin.models import NSOInstance
+
+        cls.instance = NSOInstance.objects.create(name="mgX", adapter_instance_id="mgX")
+
+    def test_creates_management_no_provision(self):
+        """Creating a management row for an already-in-NSO device does not provision."""
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.onboarding import manage_existing
+
+        d = _device("ext-rtr", ip="10.7.7.7/24")
+        with patch("netbox_nso_plugin.adapter_client.provision_device") as prov:
+            res = manage_existing(d, self.instance, "ext-rtr-nso")
+        self.assertTrue(res["ok"])
+        prov.assert_not_called()
+        mgmt = NSODeviceManagement.objects.get(device=d)
+        self.assertEqual(mgmt.nso_device_name, "ext-rtr-nso")
+
+    def test_already_managed_errors(self):
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.onboarding import manage_existing
+
+        d = _device("ext-dup", ip="10.7.7.8/24")
+        NSODeviceManagement.objects.create(device=d, nso_instance=self.instance, nso_device_name="x")
+        res = manage_existing(d, self.instance, "x")
+        self.assertFalse(res["ok"])
+        self.assertIn("already managed", res["error"].lower())
+
+    def test_missing_name_errors(self):
+        from netbox_nso_plugin.onboarding import manage_existing
+
+        d = _device("ext-noname", ip="10.7.7.9/24")
+        res = manage_existing(d, self.instance, "")
+        self.assertFalse(res["ok"])
 
 
 class TestNormalizeNsoName(TestCase):

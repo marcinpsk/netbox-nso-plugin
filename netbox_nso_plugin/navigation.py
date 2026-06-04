@@ -9,12 +9,12 @@ menu = PluginMenu(
             "Management",
             (
                 PluginMenuItem(
-                    link="plugins:netbox_nso_plugin:nsodevicemanagement_list",
-                    link_text="Managed Devices",
+                    link="plugins:netbox_nso_plugin:onboarding_dashboard",
+                    link_text="NSO Devices",
                     buttons=(
                         PluginMenuButton(
                             link="plugins:netbox_nso_plugin:nsodevicemanagement_add",
-                            title="Add",
+                            title="Add managed device",
                             icon_class="mdi mdi-plus-thick",
                         ),
                     ),
@@ -33,10 +33,6 @@ menu = PluginMenu(
                 PluginMenuItem(
                     link="plugins:netbox_nso_plugin:nsointerfacestate_list",
                     link_text="Interface States",
-                ),
-                PluginMenuItem(
-                    link="plugins:netbox_nso_plugin:onboarding_dashboard",
-                    link_text="NSO Devices",
                 ),
                 PluginMenuItem(
                     link="plugins:netbox_nso_plugin:nsoplatformnedmapping_list",

@@ -5,8 +5,9 @@
 Compares the NSO device inventory (from the adapter) against NetBox to produce:
 
 - **onboarded**  — NSO devices matched to a NetBox device (+ which NED they use).
-- **candidates** — NetBox devices NOT in NSO that are onboardable now: status=active,
-  a primary IP (NSO needs an address), and a platform with a configured NED mapping.
+- **candidates** — NetBox devices NOT in NSO that are onboardable now: status=active
+  and a primary IP (NSO needs an address). A platform→NED mapping is only the default
+  NED suggestion, not a requirement — the operator picks the NED on onboard.
 - **orphans**    — NSO devices that cannot be matched to any NetBox device.
 
 Device identity NSO↔NetBox is resolved **plugin-link → name → primary IP** so a
@@ -63,7 +64,15 @@ def build_onboarding_dashboard(instance) -> dict:
     from .adapter_client import AdapterError
     from .models import NSOPlatformNedMapping
 
-    out: dict = {"instance": instance.name, "error": None, "onboarded": [], "candidates": [], "orphans": []}
+    out: dict = {
+        "instance": instance.name,
+        "error": None,
+        "onboarded": [],
+        "candidates": [],
+        "orphans": [],
+        "neds": [],
+        "ned_by_nso_name": {},
+    }
 
     try:
         nso_devices = client.list_instance_devices(instance.adapter_instance_id)
@@ -76,6 +85,19 @@ def build_onboarding_dashboard(instance) -> dict:
 
     _devices, by_id, by_name, by_ip = _index_netbox_devices()
     mappings = {m.platform_id: m.ned_id for m in NSOPlatformNedMapping.objects.all()}
+
+    # Available NEDs on this instance — drives the onboard NED picker. Best-effort:
+    # the dashboard still works (free-text/mapping default) if the lookup fails.
+    try:
+        out["neds"] = [n.get("ned_id") for n in client.get_neds(instance.adapter_instance_id) if n.get("ned_id")]
+    except Exception:
+        out["neds"] = []
+
+    # NED-in-use per NSO device name — lets the Managed tab show which NED a
+    # managed device actually runs on (from the live NSO inventory).
+    out["ned_by_nso_name"] = {
+        nd.get("name"): nd.get("ned_id") for nd in nso_devices if isinstance(nd, dict) and nd.get("name")
+    }
 
     matched_ids: set[int] = set()
     for nd in nso_devices:
@@ -133,30 +155,34 @@ def _default_authgroup() -> str:
     return "network"
 
 
-def onboard_candidate(device, instance, *, admin_state="unlocked", sync=True) -> dict:
+def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", sync=True) -> dict:
     """Onboard one NetBox device into NSO (the write action).
 
-    Resolves the NED from the device's platform mapping and the address from its
-    primary IP, calls the adapter's ``/devices/provision`` (create node →
-    fetch-host-keys → unlock → sync-from), and — on success — creates the
-    NSODeviceManagement row, whose post_save signal performs the adapter mapping +
-    scope push + sync-notify (so we never double-onboard).
+    Resolves the NED from the explicit *ned_id* if given, else the device's platform
+    mapping; resolves the address from the device's primary IP; calls the adapter's
+    ``/devices/provision`` (create node → fetch-host-keys → unlock → sync-from), and
+    — on success — creates the NSODeviceManagement row, whose post_save signal
+    performs the adapter mapping + scope push + sync-notify.
+
+    The platform→NED mapping is only a *default*: passing ``ned_id`` overrides it,
+    so an operator can onboard with a different NED (software version / testing) or
+    onboard a device whose platform has no mapping at all.
 
     Returns ``{"ok", "error", "steps", "managed"}``. ``ok=False`` with a populated
-    ``error`` for the pre-flight failures (no mapping / no primary IP / already
-    managed) the operator must fix first.
+    ``error`` for the pre-flight failures (no NED / no primary IP / already managed).
     """
     from . import adapter_client as client
     from .models import NSODeviceManagement, NSOPlatformNedMapping
 
     result = {"ok": False, "error": None, "steps": [], "managed": False}
 
-    if device.platform_id is None:
-        result["error"] = "Device has no platform — set a platform and add a Platform → NED mapping."
-        return result
-    mapping = NSOPlatformNedMapping.objects.filter(platform_id=device.platform_id).first()
-    if mapping is None:
-        result["error"] = f"No NED mapping for platform '{device.platform}'. Add one under Platform → NED Mappings."
+    chosen_ned = (ned_id or "").strip()
+    if not chosen_ned and device.platform_id is not None:
+        mapping = NSOPlatformNedMapping.objects.filter(platform_id=device.platform_id).first()
+        if mapping is not None:
+            chosen_ned = mapping.ned_id
+    if not chosen_ned:
+        result["error"] = "No NED selected — pick a NED (or add a Platform → NED mapping for a default)."
         return result
     ip = device.primary_ip
     if ip is None:
@@ -187,7 +213,7 @@ def onboard_candidate(device, instance, *, admin_state="unlocked", sync=True) ->
             nso_instance=instance.adapter_instance_id,
             device_name=nso_name,
             address=address,
-            ned_id=mapping.ned_id,
+            ned_id=chosen_ned,
             authgroup=_default_authgroup(),
             admin_state=admin_state,
             sync=sync,
@@ -216,8 +242,56 @@ def onboard_candidate(device, instance, *, admin_state="unlocked", sync=True) ->
     return result
 
 
+def manage_existing(device, instance, nso_device_name) -> dict:
+    """Bring an already-in-NSO device under plugin management (no provisioning).
+
+    For a device that exists in BOTH NSO and NetBox but has no NSODeviceManagement
+    record ("external"): just create the management row. Its post_save signal
+    registers the device with the adapter + pushes scope + sync-notify — there is
+    nothing to provision because the NSO node already exists.
+
+    Returns ``{"ok", "error", "managed"}``.
+    """
+    from .models import NSODeviceManagement
+
+    result = {"ok": False, "error": None, "managed": False}
+
+    name = (nso_device_name or "").strip()
+    if not name:
+        result["error"] = "Missing NSO device name."
+        return result
+    if NSODeviceManagement.objects.filter(device=device).exists():
+        result["error"] = "Device is already managed by NSO."
+        return result
+    clash = (
+        NSODeviceManagement.objects.filter(nso_instance=instance, nso_device_name=name).exclude(device=device).first()
+    )
+    if clash is not None:
+        result["error"] = f"NSO device name '{name}' is already managed for {clash.device} on this instance."
+        return result
+
+    try:
+        NSODeviceManagement.objects.create(
+            device=device,
+            nso_instance=instance,
+            nso_device_name=name,
+        )
+    except Exception as exc:
+        result["error"] = repr(exc)
+        return result
+
+    result["ok"] = True
+    result["managed"] = True
+    return result
+
+
 def _candidates(by_id, matched_ids, mappings) -> list[dict]:
-    """NetBox devices onboardable now: active + primary IP + mapped platform + not in NSO."""
+    """NetBox devices onboardable now: active + primary IP + not in NSO.
+
+    A platform→NED mapping is a *suggestion* (the default in the NED picker), not a
+    requirement — the operator can pick any NED on onboard (e.g. a different NED for
+    a software version, or to test). ``ned_id`` is the mapped default or "".
+    """
     candidates = []
     for d in by_id.values():
         if d.id in matched_ids:
@@ -227,13 +301,11 @@ def _candidates(by_id, matched_ids, mappings) -> list[dict]:
         ip = d.primary_ip
         if ip is None:
             continue
-        if d.platform_id is None or d.platform_id not in mappings:
-            continue
         candidates.append(
             {
                 "device": d,
                 "platform": d.platform,
-                "ned_id": mappings[d.platform_id],
+                "ned_id": mappings.get(d.platform_id, "") if d.platform_id is not None else "",
                 "primary_ip": str(ip.address.ip),
             }
         )
