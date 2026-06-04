@@ -213,3 +213,60 @@ class TestOnboardCandidate(TestCase):
         res = onboard_candidate(d, self.instance)
         self.assertFalse(res["ok"])
         self.assertIn("already managed", res["error"].lower())
+
+
+class TestNormalizeNsoName(TestCase):
+    def test_keeps_valid_names(self):
+        from netbox_nso_plugin.onboarding import normalize_nso_device_name
+
+        assert normalize_nso_device_name("core-rtr-01") == "core-rtr-01"
+        assert normalize_nso_device_name("rtr01.lab.example.net") == "rtr01.lab.example.net"
+
+    def test_replaces_invalid_runs(self):
+        from netbox_nso_plugin.onboarding import normalize_nso_device_name
+
+        assert normalize_nso_device_name("core rtr 01") == "core-rtr-01"
+        assert normalize_nso_device_name("a/b c:d") == "a-b-c-d"
+
+    def test_trims_separators_and_empty_fallback(self):
+        from netbox_nso_plugin.onboarding import normalize_nso_device_name
+
+        assert normalize_nso_device_name("  .rtr.  ") == "rtr"
+        assert normalize_nso_device_name("  ///  ") == "device"
+
+
+class TestOnboardNameNormalization(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        from netbox_nso_plugin.models import NSOInstance, NSOPlatformNedMapping
+
+        cls.instance = NSOInstance.objects.create(name="onbN", adapter_instance_id="onbN")
+        cls.plat = Platform.objects.create(name="IOS-N", slug="ios-n-onb")
+        NSOPlatformNedMapping.objects.create(platform=cls.plat, ned_id="cisco-ios-cli-6.114")
+
+    def test_onboard_normalizes_device_name(self):
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.onboarding import onboard_candidate
+
+        d = _device("edge rtr 5", platform=self.plat, ip="10.6.6.6/24")
+        with patch(
+            "netbox_nso_plugin.adapter_client.provision_device",
+            return_value={"ok": True, "steps": [], "device_id": 1},
+        ) as prov:
+            res = onboard_candidate(d, self.instance)
+        assert res["ok"]
+        _, kw = prov.call_args
+        assert kw["device_name"] == "edge-rtr-5"  # spaces normalized
+        mgmt = NSODeviceManagement.objects.get(device=d)
+        assert mgmt.nso_device_name == "edge-rtr-5"
+
+    def test_onboard_name_collision_blocked(self):
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.onboarding import onboard_candidate
+
+        other = _device("taken", platform=self.plat, ip="10.6.6.1/24")
+        NSODeviceManagement.objects.create(device=other, nso_instance=self.instance, nso_device_name="edge-1")
+        d = _device("edge 1", platform=self.plat, ip="10.6.6.2/24")  # normalizes to edge-1
+        res = onboard_candidate(d, self.instance)
+        assert res["ok"] is False
+        assert "already used" in res["error"]

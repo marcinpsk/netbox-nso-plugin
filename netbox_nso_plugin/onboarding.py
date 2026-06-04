@@ -19,6 +19,7 @@ dashboard view and the CICD-facing candidates API.
 from __future__ import annotations
 
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +104,22 @@ def build_onboarding_dashboard(instance) -> dict:
     return out
 
 
+_NSO_NAME_INVALID = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def normalize_nso_device_name(name: str) -> str:
+    """Normalize a NetBox device name into a valid NSO device name.
+
+    NSO device names are a single token — keep ``[A-Za-z0-9._-]``, replace any run
+    of other characters (spaces, slashes, etc.) with a single ``-``, and trim
+    leading/trailing separators (a leading/trailing ``.``/``-`` is invalid). Falls
+    back to ``device`` if nothing usable remains.
+    """
+    cleaned = _NSO_NAME_INVALID.sub("-", (name or "").strip())
+    cleaned = cleaned.strip("-.")
+    return cleaned or "device"
+
+
 def _default_authgroup() -> str:
     """Resolve the onboarding authgroup from the AdapterConnection setting."""
     try:
@@ -149,6 +166,17 @@ def onboard_candidate(device, instance, *, admin_state="unlocked", sync=True) ->
         result["error"] = "Device is already managed by NSO."
         return result
 
+    # NSO device name = normalized NetBox name (NSO names can't hold spaces/slashes/etc.).
+    nso_name = normalize_nso_device_name(device.name)
+    clash = (
+        NSODeviceManagement.objects.filter(nso_instance=instance, nso_device_name=nso_name)
+        .exclude(device=device)
+        .first()
+    )
+    if clash is not None:
+        result["error"] = f"NSO device name '{nso_name}' is already used by {clash.device} on this instance."
+        return result
+
     # ip.address is a netaddr IPNetwork when DB-loaded (.ip = host), but can be the
     # raw "x.x.x.x/yy" string on an unsaved/in-memory instance — handle both.
     addr = ip.address
@@ -157,7 +185,7 @@ def onboard_candidate(device, instance, *, admin_state="unlocked", sync=True) ->
     try:
         prov = client.provision_device(
             nso_instance=instance.adapter_instance_id,
-            device_name=device.name,
+            device_name=nso_name,
             address=address,
             ned_id=mapping.ned_id,
             authgroup=_default_authgroup(),
@@ -174,7 +202,15 @@ def onboard_candidate(device, instance, *, admin_state="unlocked", sync=True) ->
         return result
 
     # NSO node is up; create the management row (its signal does adapter mapping + scope + sync).
-    NSODeviceManagement.objects.create(device=device, nso_instance=instance, nso_device_name=device.name)
+    from django.utils import timezone
+
+    NSODeviceManagement.objects.create(
+        device=device,
+        nso_instance=instance,
+        nso_device_name=nso_name,
+        onboarded_at=timezone.now(),
+        onboard_steps=result["steps"],
+    )
     result["ok"] = True
     result["managed"] = True
     return result

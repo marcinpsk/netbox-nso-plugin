@@ -260,6 +260,16 @@ class NSODeviceManagement(NetBoxModel):
         blank=True,
         help_text="Cached sync-state counts and per-interface statuses from the last sync.",
     )
+    onboarded_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When this device was provisioned into NSO via the plugin onboarding action.",
+    )
+    onboard_steps = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="Step-by-step result of the last plugin onboarding (create / fetch-host-keys / unlock / sync-from).",
+    )
 
     class Meta:
         ordering = ["device"]
