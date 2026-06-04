@@ -36,7 +36,7 @@ menu = PluginMenu(
                 ),
                 PluginMenuItem(
                     link="plugins:netbox_nso_plugin:onboarding_dashboard",
-                    link_text="Onboarding",
+                    link_text="NSO Devices",
                 ),
                 PluginMenuItem(
                     link="plugins:netbox_nso_plugin:nsoplatformnedmapping_list",

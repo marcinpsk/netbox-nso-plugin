@@ -372,7 +372,7 @@ class NSOInstanceDeleteView(generic.ObjectDeleteView):
 
 
 class NSOOnboardingDashboardView(LoginRequiredMixin, View):
-    """Three-tile onboarding dashboard: onboarded / onboardable candidates / NSO orphans.
+    """Combined NSO devices view (tabbed): Managed / Onboarded / Onboardable / Unmatched.
 
     Reads the NSO device inventory for the selected instance (default unless
     ``?instance=<adapter_instance_id>``) and compares it to NetBox. Read-only.
@@ -382,7 +382,7 @@ class NSOOnboardingDashboardView(LoginRequiredMixin, View):
     template_name = "netbox_nso_plugin/onboarding_dashboard.html"
 
     def get(self, request):
-        """Render the dashboard for the selected (or default) NSO instance."""
+        """Render the tabbed view for the selected (or default) NSO instance."""
         from .onboarding import build_onboarding_dashboard
 
         instances = list(NSOInstance.objects.all())
@@ -401,14 +401,17 @@ class NSOOnboardingDashboardView(LoginRequiredMixin, View):
                 "candidates": [],
                 "orphans": [],
             }
+            managed = []
         else:
             data = build_onboarding_dashboard(instance)
+            managed = list(NSODeviceManagement.objects.filter(nso_instance=instance).select_related("device"))
 
         return render(
             request,
             self.template_name,
             {
                 "data": data,
+                "managed": managed,
                 "instances": instances,
                 "selected": instance.adapter_instance_id if instance else None,
             },
