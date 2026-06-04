@@ -139,7 +139,37 @@ def _get_or_create_peer_group(name: str, BGPPeerTemplate):
     return obj
 
 
-def _get_or_create_peer(scope_obj, ip_obj, peer_data: dict, remote_asn_obj, local_asn_obj, peer_group_obj, BGPPeer):
+def _resolve_bgp_source(device, source: str, IPAddress):
+    """Resolve a BGP session source to an ipam.IPAddress.
+
+    ``source`` is either an IP (Junos/Nokia local-address) or an interface name
+    (IOS update-source, e.g. ``Loopback4``). For an IP, match an existing
+    IPAddress; for an interface, take an IP assigned to that device interface.
+    Returns None when nothing matches (we don't fabricate IPs).
+    """
+    if not source:
+        return None
+    import netaddr
+
+    try:
+        netaddr.IPAddress(source)
+        return IPAddress.objects.filter(address__net_host=source).first()
+    except (netaddr.AddrFormatError, ValueError):
+        pass
+    try:
+        from dcim.models import Interface
+
+        iface = Interface.objects.filter(device=device, name=source).first()
+        if iface is not None:
+            return iface.ip_addresses.first()
+    except Exception:
+        pass
+    return None
+
+
+def _get_or_create_peer(
+    scope_obj, ip_obj, peer_data: dict, remote_asn_obj, local_asn_obj, peer_group_obj, BGPPeer, source_obj=None
+):
     """Find or create a BGPPeer for (scope, peer_ip).
 
     Updates mutable fields (enabled, remote_as, local_as, peer_group, ttl,
@@ -148,12 +178,13 @@ def _get_or_create_peer(scope_obj, ip_obj, peer_data: dict, remote_asn_obj, loca
     exists that was not created by this plugin (detected heuristically by
     the absence of a linked NSOBGPPeerState row — checked by caller).
     """
-    _FK_FIELDS = {"remote_as", "local_as", "peer_group"}
+    _FK_FIELDS = {"remote_as", "local_as", "peer_group", "source"}
     desired = {
         "enabled": peer_data.get("enabled"),
         "remote_as": remote_asn_obj,
         "local_as": local_asn_obj,
         "peer_group": peer_group_obj,
+        "source": source_obj,
         "ttl": peer_data.get("ttl"),
         "password": peer_data.get("password"),
     }
@@ -330,9 +361,10 @@ def _reconcile_scope(
         local_as_str = str(peer_entry.get("local_as") or "")
         local_asn_obj = _get_or_create_asn(local_as_str, ASN) if local_as_str else None
         peer_group_obj = _get_or_create_peer_group(peer_entry.get("peer_group") or "", BGPPeerTemplate)
+        source_obj = _resolve_bgp_source(mgmt.device, peer_entry.get("source"), IPAddress)
 
         bgp_peer, was_existing = _get_or_create_peer(
-            scope_obj, ip_obj, peer_entry, remote_asn_obj, local_asn_obj, peer_group_obj, BGPPeer
+            scope_obj, ip_obj, peer_entry, remote_asn_obj, local_asn_obj, peer_group_obj, BGPPeer, source_obj
         )
         _update_peer_state(
             mgmt, asn_str, vrf_name, peer_address_str, bgp_peer, remote_as_str, peer_entry, was_existing, now

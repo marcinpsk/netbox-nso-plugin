@@ -295,6 +295,37 @@ class TestReconcileBgpConfig(TestCase):
         paf = BGPPeerAddressFamily.objects.get(address_family__address_family="ipv4-unicast")
         self.assertIsNone(paf.routemap_in_id)
 
+    def test_peer_source_ip_linked(self):
+        """source given as an IP resolves to an existing ipam.IPAddress on the peer."""
+        self._make_mgmt()
+
+        from ipam.models import IPAddress
+        from netbox_routing.models import BGPPeer
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        src = IPAddress.objects.create(address="84.116.255.1/32")
+        peer = self._peer_entry()
+        peer["source"] = "84.116.255.1"
+        _reconcile_bgp_config(self.device, self._payload(self._router_payload(peers=[peer])))
+
+        bp = BGPPeer.objects.get(peer__address__net_host="10.0.0.2")
+        self.assertEqual(bp.source, src)
+
+    def test_peer_source_unknown_ip_left_null(self):
+        """source IP not present in IPAM → BGPPeer.source stays null (not fabricated)."""
+        self._make_mgmt()
+
+        from netbox_routing.models import BGPPeer
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        peer = self._peer_entry()
+        peer["source"] = "203.0.113.250"
+        _reconcile_bgp_config(self.device, self._payload(self._router_payload(peers=[peer])))
+
+        self.assertIsNone(BGPPeer.objects.get(peer__address__net_host="10.0.0.2").source_id)
+
     def test_stale_state_row_set_to_changed(self):
         """Peer disappears from NSO payload → status set to 'changed'."""
         self._make_mgmt()
