@@ -380,6 +380,25 @@ def _reconcile_scope(
             bgp_peer, peer_entry.get("address_families") or [], scope_obj, BGPAddressFamily, BGPPeerAddressFamily
         )
 
+    # Peer-group / template OBJECTS: model each as a BGPPeerTemplate carrying its
+    # own per-AF route-map / prefix-list policies (not just inlined onto members).
+    for pg_entry in scope_entry.get("peer_groups") or []:
+        pg_name = pg_entry.get("name") or ""
+        if not pg_name:
+            continue
+        pg_remote_as = str(pg_entry.get("remote_as") or "")
+        pg_remote_asn_obj = _get_or_create_asn(pg_remote_as, ASN) if pg_remote_as else None
+        template_obj = _get_or_create_peer_group(pg_name, BGPPeerTemplate, pg_remote_asn_obj)
+        if template_obj is None:
+            continue
+        _reconcile_peer_address_families(
+            template_obj,
+            pg_entry.get("address_families") or [],
+            scope_obj,
+            BGPAddressFamily,
+            BGPPeerAddressFamily,
+        )
+
 
 def _reconcile_bgp_config(device, payload: dict) -> list:
     """Reconcile BGP config from adapter payload into NetBox netbox-routing BGP models.

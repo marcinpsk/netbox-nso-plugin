@@ -344,6 +344,128 @@ class TestReconcileBgpConfig(TestCase):
         self.assertEqual(str(tmpl.remote_as.asn), "65100")
         self.assertTrue(ASN.objects.filter(asn=65100).exists())
 
+    def _scope_with_peer_groups(self, peer_groups, asn="65100", address_families=None):
+        """Build a payload whose scope carries peer_groups (full-B objects)."""
+        return {
+            "device_id": self.device.pk,
+            "routers": [
+                {
+                    "asn": asn,
+                    "scopes": [
+                        {
+                            "vrf": "",
+                            "address_families": address_families if address_families is not None else ["ipv4-unicast"],
+                            "peers": [],
+                            "peer_groups": peer_groups,
+                        }
+                    ],
+                }
+            ],
+        }
+
+    def test_peer_group_object_af_policies_attached_to_template(self):
+        """A peer_groups entry → BGPPeerTemplate with its OWN per-AF route-maps."""
+        self._make_mgmt()
+
+        from netbox_routing.models import BGPPeerAddressFamily, BGPPeerTemplate, RouteMap
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        RouteMap.objects.create(name="Arbor-IBGP-in")
+        RouteMap.objects.create(name="Arbor-IBGP-out")
+        pg = {
+            "name": "Arbor-IBGP",
+            "remote_as": "65100",
+            "address_families": [
+                {
+                    "af": "ipv4-unicast",
+                    "routemap_in": "Arbor-IBGP-in",
+                    "routemap_out": "Arbor-IBGP-out",
+                }
+            ],
+        }
+        _reconcile_bgp_config(self.device, self._scope_with_peer_groups([pg]))
+
+        tmpl = BGPPeerTemplate.objects.get(name="Arbor-IBGP")
+        paf = BGPPeerAddressFamily.objects.get(
+            assigned_object_type__model="bgppeertemplate", assigned_object_id=tmpl.pk
+        )
+        self.assertEqual(paf.address_family.address_family, "ipv4-unicast")
+        self.assertEqual(paf.routemap_in.name, "Arbor-IBGP-in")
+        self.assertEqual(paf.routemap_out.name, "Arbor-IBGP-out")
+
+    def test_peer_group_object_idempotent(self):
+        """Reconciling peer_groups twice → one template, one AF row (no dupes)."""
+        self._make_mgmt()
+
+        from netbox_routing.models import BGPPeerAddressFamily, BGPPeerTemplate, RouteMap
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        RouteMap.objects.create(name="PG-in")
+        pg = {
+            "name": "ENC-RR",
+            "address_families": [{"af": "ipv4-unicast", "routemap_in": "PG-in"}],
+        }
+        payload = self._scope_with_peer_groups([pg])
+        _reconcile_bgp_config(self.device, payload)
+        _reconcile_bgp_config(self.device, payload)
+
+        self.assertEqual(BGPPeerTemplate.objects.filter(name="ENC-RR").count(), 1)
+        tmpl = BGPPeerTemplate.objects.get(name="ENC-RR")
+        self.assertEqual(
+            BGPPeerAddressFamily.objects.filter(
+                assigned_object_type__model="bgppeertemplate", assigned_object_id=tmpl.pk
+            ).count(),
+            1,
+        )
+
+    def test_peer_group_object_template_separate_from_member_af(self):
+        """A peer-group object's AF row is distinct from a member peer's AF row."""
+        self._make_mgmt()
+
+        from netbox_routing.models import BGPPeerAddressFamily, BGPPeerTemplate, RouteMap
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        RouteMap.objects.create(name="Shared-in")
+        member = self._peer_entry("10.9.9.9", remote_as="65100")
+        member["peer_group"] = "Arbor-IBGP"
+        member["address_families"] = [{"af": "ipv4-unicast", "enabled": True, "routemap_in": "Shared-in"}]
+        payload = {
+            "device_id": self.device.pk,
+            "routers": [
+                {
+                    "asn": "65100",
+                    "scopes": [
+                        {
+                            "vrf": "",
+                            "address_families": ["ipv4-unicast"],
+                            "peers": [member],
+                            "peer_groups": [
+                                {
+                                    "name": "Arbor-IBGP",
+                                    "remote_as": "65100",
+                                    "address_families": [{"af": "ipv4-unicast", "routemap_in": "Shared-in"}],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+        _reconcile_bgp_config(self.device, payload)
+
+        tmpl = BGPPeerTemplate.objects.get(name="Arbor-IBGP")
+        # One AF row on the template, one on the member peer = 2 total.
+        self.assertEqual(BGPPeerAddressFamily.objects.count(), 2)
+        self.assertEqual(
+            BGPPeerAddressFamily.objects.filter(
+                assigned_object_type__model="bgppeertemplate", assigned_object_id=tmpl.pk
+            ).count(),
+            1,
+        )
+
     def test_stale_state_row_set_to_changed(self):
         """Peer disappears from NSO payload → status set to 'changed'."""
         self._make_mgmt()
