@@ -788,6 +788,10 @@ class NSOISISInterfaceState(NetBoxModel):
     network_type = models.CharField(max_length=32, blank=True, default="")
     metric = models.PositiveIntegerField(null=True, blank=True)
     passive = models.BooleanField(default=False)
+    # Per-interface IIH (hello) authentication, secret-safe (type + present flag;
+    # the key is never imported — Junos exports it $9$-encrypted, Nokia hides it).
+    hello_auth_type = models.CharField(max_length=32, blank=True, default="")
+    hello_auth_present = models.BooleanField(default=False)
     # Linked netbox-routing object (nullable — created/linked by the reconcile)
     isis_interface = models.ForeignKey(
         to="netbox_routing.ISISInterface",

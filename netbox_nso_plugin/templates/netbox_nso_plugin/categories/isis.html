@@ -18,7 +18,7 @@
   <div class="table-responsive mb-3">
     <table class="table table-sm table-hover mb-0">
       <thead>
-        <tr><th>Interface</th><th>AF</th><th>Process Tag</th><th>Circuit Type</th><th>Network Type</th><th>Metric</th><th>Passive</th><th>Status</th><th>Last Synced</th><th></th></tr>
+        <tr><th>Interface</th><th>AF</th><th>Process Tag</th><th>Circuit Type</th><th>Network Type</th><th>Metric</th><th>Passive</th><th>Hello Auth</th><th>Status</th><th>Last Synced</th><th></th></tr>
       </thead>
       <tbody>
         {% for ii in isis_interfaces %}
@@ -30,6 +30,7 @@
           <td>{{ ii.network_type|default:"—" }}</td>
           <td>{{ ii.metric|default:"—" }}</td>
           <td>{% if ii.passive %}<span class="badge bg-warning text-dark">passive</span>{% else %}<span class="badge bg-success">active</span>{% endif %}</td>
+          <td>{% if ii.hello_auth_present or ii.hello_auth_type %}<span class="badge bg-info text-dark" title="Per-interface IIH authentication">{{ ii.hello_auth_type|default:"on" }}</span>{% else %}<span class="text-muted">—</span>{% endif %}</td>
           <td>
             {% include "netbox_nso_plugin/categories/_state_badge.html" with status=ii.status %}
           </td>

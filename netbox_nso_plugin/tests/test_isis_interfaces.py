@@ -203,6 +203,30 @@ class TestReconcileIsisInterfaces(TestCase):
         self.assertEqual(ri.circuit_type, "level-2-only")
         self.assertEqual(ri.instance.device, self.device)
 
+    def test_hello_auth_recorded_on_state(self):
+        """hello_auth_type / hello_auth_present flow from the adapter payload onto the
+        NSOISISInterfaceState overlay (the netbox_routing write is guarded separately)."""
+        self._make_mgmt()
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        result = _reconcile_isis_interfaces(
+            self.device,
+            self._payload(self._entry(hello_auth_type="md5", hello_auth_present=True)),
+        )
+        self.assertEqual(len(result), 1)
+        state = result[0]
+        self.assertEqual(state.hello_auth_type, "md5")
+        self.assertTrue(state.hello_auth_present)
+
+    def test_no_hello_auth_defaults_blank(self):
+        """An entry without hello-auth leaves the state blank/false."""
+        self._make_mgmt()
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        state = _reconcile_isis_interfaces(self.device, self._payload(self._entry()))[0]
+        self.assertEqual(state.hello_auth_type, "")
+        self.assertFalse(state.hello_auth_present)
+
     def test_idempotent_second_call(self):
         """Calling reconcile twice with same payload produces same single row."""
         self._make_mgmt()

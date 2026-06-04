@@ -705,12 +705,17 @@ def _link_routing_isis_interface(device, iface, af, state, instances: dict):
     if ri.instance_id != inst.id:
         ri.instance = inst
         fields.append("instance")
-    for attr, val in (
+    routing_fields = [
         ("circuit_type", state.circuit_type or None),
         ("network_type", state.network_type or None),
         ("metric", state.metric),
         ("passive", state.passive),
-    ):
+    ]
+    # hello_auth_type only exists on ISISInterface once the netbox-routing isis
+    # branch lands — guard so the reconcile is a no-op for it until then.
+    if hasattr(ri, "hello_auth_type"):
+        routing_fields.append(("hello_auth_type", state.hello_auth_type or None))
+    for attr, val in routing_fields:
         if getattr(ri, attr) != val:
             setattr(ri, attr, val)
             fields.append(attr)
@@ -782,6 +787,8 @@ def _reconcile_isis_interfaces(device, interfaces: list) -> list:
         state.network_type = entry.get("network_type") or ""
         state.metric = entry.get("metric")
         state.passive = bool(entry.get("passive", False))
+        state.hello_auth_type = entry.get("hello_auth_type") or ""
+        state.hello_auth_present = bool(entry.get("hello_auth_present", False))
         state.last_sync_at = now
 
         state.isis_interface = _link_routing_isis_interface(device, iface, af, state, instances)
