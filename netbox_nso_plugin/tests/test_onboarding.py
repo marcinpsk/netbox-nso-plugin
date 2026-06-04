@@ -124,3 +124,92 @@ class TestOnboardingDashboard(TestCase):
             data = build_onboarding_dashboard(self.instance)
         self.assertIsNotNone(data["error"])
         self.assertEqual(data["onboarded"], [])
+
+
+class TestOnboardCandidate(TestCase):
+    """Tests for onboarding.onboard_candidate (the write action)."""
+
+    @classmethod
+    def setUpTestData(cls):
+        from netbox_nso_plugin.models import NSOInstance
+
+        cls.instance = NSOInstance.objects.create(name="onbX", adapter_instance_id="onbX")
+        cls.ios = Platform.objects.create(name="IOS-X", slug="ios-x-onb")
+
+    def _mapped_device(self, name, ip="10.5.5.5/24"):
+        from netbox_nso_plugin.models import NSOPlatformNedMapping
+
+        d = _device(name, platform=self.ios, ip=ip)
+        NSOPlatformNedMapping.objects.get_or_create(platform=self.ios, defaults={"ned_id": "cisco-ios-cli-6.114"})
+        return d
+
+    def test_no_platform_errors(self):
+        from netbox_nso_plugin.onboarding import onboard_candidate
+
+        d = _device("noplat", ip="10.5.5.1/24")
+        res = onboard_candidate(d, self.instance)
+        self.assertFalse(res["ok"])
+        self.assertIn("platform", res["error"].lower())
+
+    def test_no_mapping_errors(self):
+        from netbox_nso_plugin.onboarding import onboard_candidate
+
+        d = _device("nomap2", platform=self.ios, ip="10.5.5.2/24")
+        # ensure no mapping exists
+        from netbox_nso_plugin.models import NSOPlatformNedMapping
+
+        NSOPlatformNedMapping.objects.filter(platform=self.ios).delete()
+        res = onboard_candidate(d, self.instance)
+        self.assertFalse(res["ok"])
+        self.assertIn("NED mapping", res["error"])
+
+    def test_no_primary_ip_errors(self):
+        from netbox_nso_plugin.models import NSOPlatformNedMapping
+        from netbox_nso_plugin.onboarding import onboard_candidate
+
+        d = _device("noip2", platform=self.ios)
+        NSOPlatformNedMapping.objects.get_or_create(platform=self.ios, defaults={"ned_id": "x"})
+        res = onboard_candidate(d, self.instance)
+        self.assertFalse(res["ok"])
+        self.assertIn("primary IP", res["error"])
+
+    def test_success_creates_management(self):
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.onboarding import onboard_candidate
+
+        d = self._mapped_device("good-rtr")
+        with patch(
+            "netbox_nso_plugin.adapter_client.provision_device",
+            return_value={"ok": True, "steps": [{"step": "create", "status": "ok"}], "device_id": 1},
+        ) as prov:
+            res = onboard_candidate(d, self.instance)
+        self.assertTrue(res["ok"])
+        self.assertTrue(NSODeviceManagement.objects.filter(device=d).exists())
+        prov.assert_called_once()
+        # ned_id + authgroup passed through
+        _, kw = prov.call_args
+        self.assertEqual(kw["ned_id"], "cisco-ios-cli-6.114")
+        self.assertEqual(kw["authgroup"], "network")
+
+    def test_provision_failure_no_management(self):
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.onboarding import onboard_candidate
+
+        d = self._mapped_device("bad-rtr")
+        with patch(
+            "netbox_nso_plugin.adapter_client.provision_device",
+            return_value={"ok": False, "steps": [{"step": "fetch_host_keys", "status": "failed"}]},
+        ):
+            res = onboard_candidate(d, self.instance)
+        self.assertFalse(res["ok"])
+        self.assertFalse(NSODeviceManagement.objects.filter(device=d).exists())
+
+    def test_already_managed_errors(self):
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.onboarding import onboard_candidate
+
+        d = self._mapped_device("dup-rtr")
+        NSODeviceManagement.objects.create(device=d, nso_instance=self.instance, nso_device_name=d.name)
+        res = onboard_candidate(d, self.instance)
+        self.assertFalse(res["ok"])
+        self.assertIn("already managed", res["error"].lower())

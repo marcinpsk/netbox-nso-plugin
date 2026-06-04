@@ -418,6 +418,41 @@ class NSOOnboardingDashboardView(LoginRequiredMixin, View):
         )
 
 
+class NSOOnboardView(LoginRequiredMixin, View):
+    """POST action: onboard one candidate device into NSO, then redirect to the dashboard.
+
+    URL: POST /plugins/nso/onboard/  body: device=<pk>, instance=<adapter_instance_id>
+    """
+
+    def post(self, request):
+        """Onboard the posted device into the selected (or default) NSO instance."""
+        from .onboarding import onboard_candidate
+
+        device = get_object_or_404(Device, pk=request.POST.get("device"))
+        selected = request.POST.get("instance")
+        instance = None
+        if selected:
+            instance = NSOInstance.objects.filter(adapter_instance_id=selected).first()
+        instance = instance or NSOInstance.get_default()
+
+        redirect_url = reverse("plugins:netbox_nso_plugin:onboarding_dashboard")
+        if instance is None:
+            messages.error(request, "No NSO instance configured.")
+            return redirect(redirect_url)
+
+        try:
+            result = onboard_candidate(device, instance)
+        except Exception as exc:  # never 500 the action
+            messages.error(request, f"Onboarding {device} failed: {exc}")
+            return redirect(f"{redirect_url}?instance={instance.adapter_instance_id}")
+
+        if result["ok"]:
+            messages.success(request, f"Onboarded {device} into NSO ({instance.name}).")
+        else:
+            messages.error(request, f"Could not onboard {device}: {result['error']}")
+        return redirect(f"{redirect_url}?instance={instance.adapter_instance_id}")
+
+
 class NSOPlatformNedMappingListView(generic.ObjectListView):
     """List view for Platform→NED mappings."""
 

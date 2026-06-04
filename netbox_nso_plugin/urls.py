@@ -29,8 +29,9 @@ urlpatterns = [
         name="nsoinstance_journal",
         kwargs={"model": NSOInstance},
     ),
-    # Onboarding dashboard (3 tiles)
+    # Onboarding dashboard (tabs) + onboard action
     path("onboarding/", views.NSOOnboardingDashboardView.as_view(), name="onboarding_dashboard"),
+    path("onboard/", views.NSOOnboardView.as_view(), name="onboard"),
     # Platform → NED mappings (onboarding)
     path("ned-mappings/", views.NSOPlatformNedMappingListView.as_view(), name="nsoplatformnedmapping_list"),
     path("ned-mappings/add/", views.NSOPlatformNedMappingEditView.as_view(), name="nsoplatformnedmapping_add"),

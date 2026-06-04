@@ -63,6 +63,7 @@ class AdapterConnectionForm(NetBoxModelForm):
             "static_route_auto_create",
             "interface_ip_auto_create",
             "vrf_auto_create",
+            "onboard_authgroup",
             "tags",
         ]
 

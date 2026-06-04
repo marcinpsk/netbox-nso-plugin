@@ -16,5 +16,6 @@ router.register("interface-state", views.NSOInterfaceStateViewSet)
 urlpatterns = [
     path("sync-complete/", views.SyncCompleteView.as_view(), name="sync_complete"),
     path("onboarding-candidates/", views.OnboardingCandidatesView.as_view(), name="onboarding_candidates"),
+    path("onboard/", views.OnboardView.as_view(), name="onboard"),
     *router.urls,
 ]

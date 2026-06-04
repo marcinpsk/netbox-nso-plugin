@@ -63,6 +63,11 @@ class AdapterConnection(NetBoxModel):
             "When off, routes in an unknown VRF are skipped (logged)."
         ),
     )
+    onboard_authgroup = models.CharField(
+        max_length=128,
+        default="network",
+        help_text="NSO authgroup applied when onboarding a device from NetBox (the default auth group).",
+    )
 
     class Meta:
         verbose_name = "Adapter Connection"

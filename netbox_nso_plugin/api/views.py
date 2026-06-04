@@ -109,6 +109,47 @@ class OnboardingCandidatesView(APIView):
         )
 
 
+class OnboardView(APIView):
+    """CICD-facing onboard action.
+
+    ``POST /api/plugins/netbox-nso-plugin/onboard/`` body:
+    ``{"netbox_device_id": <int>, "instance": "<adapter_instance_id>"?}``.
+    Provisions the device into NSO (create node → fetch-host-keys → unlock →
+    sync-from) and creates the management row. Returns the step-by-step result;
+    400 on pre-flight failure (no NED mapping / no primary IP / already managed).
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        """Onboard the posted NetBox device into the selected (or default) NSO instance."""
+        from dcim.models import Device
+
+        from ..onboarding import onboard_candidate
+
+        device_id = request.data.get("netbox_device_id")
+        if device_id is None:
+            return Response({"detail": "netbox_device_id is required"}, status=status.HTTP_400_BAD_REQUEST)
+        device = Device.objects.filter(pk=device_id).first()
+        if device is None:
+            return Response({"detail": f"device {device_id} not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        selected = request.data.get("instance")
+        instance = None
+        if selected:
+            instance = NSOInstance.objects.filter(adapter_instance_id=selected).first()
+            if instance is None:
+                return Response({"detail": f"unknown instance '{selected}'"}, status=status.HTTP_404_NOT_FOUND)
+        else:
+            instance = NSOInstance.get_default()
+        if instance is None:
+            return Response({"detail": "no NSO instance configured"}, status=status.HTTP_404_NOT_FOUND)
+
+        result = onboard_candidate(device, instance)
+        code = status.HTTP_200_OK if result["ok"] else status.HTTP_400_BAD_REQUEST
+        return Response(result, status=code)
+
+
 class SyncCompleteView(APIView):
     """Adapter → plugin callback: a device sync finished, refresh its NSO*State cache.
 

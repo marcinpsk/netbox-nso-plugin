@@ -145,6 +145,28 @@ def onboard_device(nso_instance, nso_device_name, netbox_device_id):
     )
 
 
+def provision_device(nso_instance, device_name, address, ned_id, authgroup, *, admin_state="unlocked", sync=True):
+    """POST /api/v1/devices/provision — create the device in NSO and bring it up.
+
+    Returns {"ok", "steps", "device_id"}. ``netbox_device_id`` is intentionally
+    omitted: the plugin creates the NSODeviceManagement row afterwards, whose
+    post_save signal does the adapter mapping + scope + sync-notify.
+    """
+    return _request(
+        "POST",
+        "/api/v1/devices/provision",
+        json={
+            "nso_instance": nso_instance,
+            "device_name": device_name,
+            "address": address,
+            "ned_id": ned_id,
+            "authgroup": authgroup,
+            "admin_state": admin_state,
+            "sync": sync,
+        },
+    )
+
+
 def set_scope(adapter_device_id, attributes, auto_apply=False):
     """PUT /api/v1/devices/{id}/scope — update managed attributes and settings."""
     return _request(

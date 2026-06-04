@@ -88,7 +88,7 @@
     <div class="card">
       <div class="card-body p-0">
         <table class="table table-hover mb-0">
-          <thead><tr><th>Device</th><th>Platform</th><th>Address</th><th>NED</th></tr></thead>
+          <thead><tr><th>Device</th><th>Platform</th><th>Address</th><th>NED</th><th></th></tr></thead>
           <tbody>
             {% for c in data.candidates %}
             <tr>
@@ -96,9 +96,17 @@
               <td>{{ c.platform }}</td>
               <td>{{ c.primary_ip }}</td>
               <td><code>{{ c.ned_id }}</code></td>
+              <td class="text-end">
+                <form method="post" action="{% url 'plugins:netbox_nso_plugin:onboard' %}" class="d-inline">
+                  {% csrf_token %}
+                  <input type="hidden" name="device" value="{{ c.device.pk }}">
+                  <input type="hidden" name="instance" value="{{ selected }}">
+                  <button type="submit" class="btn btn-sm btn-success"><span class="mdi mdi-plus-network"></span> Onboard</button>
+                </form>
+              </td>
             </tr>
             {% empty %}
-            <tr><td colspan="4" class="text-muted">None. {% if not data.error %}Add <a href="{% url 'plugins:netbox_nso_plugin:nsoplatformnedmapping_list' %}">Platform → NED mappings</a> so devices appear here.{% endif %}</td></tr>
+            <tr><td colspan="5" class="text-muted">None. {% if not data.error %}Add <a href="{% url 'plugins:netbox_nso_plugin:nsoplatformnedmapping_list' %}">Platform → NED mappings</a> so devices appear here.{% endif %}</td></tr>
             {% endfor %}
           </tbody>
         </table>

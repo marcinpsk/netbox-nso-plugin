@@ -103,6 +103,83 @@ def build_onboarding_dashboard(instance) -> dict:
     return out
 
 
+def _default_authgroup() -> str:
+    """Resolve the onboarding authgroup from the AdapterConnection setting."""
+    try:
+        from .models import AdapterConnection
+
+        conn = AdapterConnection.objects.filter(enabled=True).first()
+        if conn and conn.onboard_authgroup:
+            return conn.onboard_authgroup
+    except Exception:
+        pass
+    return "network"
+
+
+def onboard_candidate(device, instance, *, admin_state="unlocked", sync=True) -> dict:
+    """Onboard one NetBox device into NSO (the write action).
+
+    Resolves the NED from the device's platform mapping and the address from its
+    primary IP, calls the adapter's ``/devices/provision`` (create node →
+    fetch-host-keys → unlock → sync-from), and — on success — creates the
+    NSODeviceManagement row, whose post_save signal performs the adapter mapping +
+    scope push + sync-notify (so we never double-onboard).
+
+    Returns ``{"ok", "error", "steps", "managed"}``. ``ok=False`` with a populated
+    ``error`` for the pre-flight failures (no mapping / no primary IP / already
+    managed) the operator must fix first.
+    """
+    from . import adapter_client as client
+    from .models import NSODeviceManagement, NSOPlatformNedMapping
+
+    result = {"ok": False, "error": None, "steps": [], "managed": False}
+
+    if device.platform_id is None:
+        result["error"] = "Device has no platform — set a platform and add a Platform → NED mapping."
+        return result
+    mapping = NSOPlatformNedMapping.objects.filter(platform_id=device.platform_id).first()
+    if mapping is None:
+        result["error"] = f"No NED mapping for platform '{device.platform}'. Add one under Platform → NED Mappings."
+        return result
+    ip = device.primary_ip
+    if ip is None:
+        result["error"] = "Device has no primary IP — NSO needs an address to reach it."
+        return result
+    if NSODeviceManagement.objects.filter(device=device).exists():
+        result["error"] = "Device is already managed by NSO."
+        return result
+
+    # ip.address is a netaddr IPNetwork when DB-loaded (.ip = host), but can be the
+    # raw "x.x.x.x/yy" string on an unsaved/in-memory instance — handle both.
+    addr = ip.address
+    address = str(getattr(addr, "ip", None) or str(addr).split("/")[0])
+
+    try:
+        prov = client.provision_device(
+            nso_instance=instance.adapter_instance_id,
+            device_name=device.name,
+            address=address,
+            ned_id=mapping.ned_id,
+            authgroup=_default_authgroup(),
+            admin_state=admin_state,
+            sync=sync,
+        )
+    except Exception as exc:
+        result["error"] = repr(exc)
+        return result
+
+    result["steps"] = prov.get("steps", [])
+    if not prov.get("ok"):
+        result["error"] = "NSO provisioning failed — see steps."
+        return result
+
+    # NSO node is up; create the management row (its signal does adapter mapping + scope + sync).
+    NSODeviceManagement.objects.create(device=device, nso_instance=instance, nso_device_name=device.name)
+    result["ok"] = True
+    result["managed"] = True
+    return result
+
+
 def _candidates(by_id, matched_ids, mappings) -> list[dict]:
     """NetBox devices onboardable now: active + primary IP + mapped platform + not in NSO."""
     candidates = []
