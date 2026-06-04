@@ -883,13 +883,21 @@ def _import_ospf_models():
 
 
 def _resolve_ospf_vrf(vrf_name: str):
-    """Look up an ipam.VRF by name; None for global or when not present in NetBox."""
+    """Resolve an ipam.VRF by name for an OSPF instance.
+
+    Returns None for the global table or an unknown VRF, unless the
+    ``vrf_auto_create`` setting is on — then the VRF is created (mirrors the
+    static-route fill so all surfaces share one toggle).
+    """
     if not vrf_name:
         return None
     try:
         from ipam.models import VRF
 
-        return VRF.objects.filter(name=vrf_name).first()
+        vrf_obj = VRF.objects.filter(name=vrf_name).first()
+        if vrf_obj is None and _adapter_setting("vrf_auto_create"):
+            vrf_obj = VRF.objects.create(name=vrf_name)
+        return vrf_obj
     except Exception:
         return None
 

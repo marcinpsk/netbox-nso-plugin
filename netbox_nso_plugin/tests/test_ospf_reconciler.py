@@ -102,6 +102,45 @@ class TestReconcileOspfFill(TestCase):
         self.assertFalse(OSPFInstance.objects.filter(device=self.device).exists())
         self.assertEqual(res["instances"][0].status, "imported")
 
+    def test_vrf_linked_when_present(self):
+        self._make_mgmt()
+        from ipam.models import VRF
+        from netbox_routing.models import OSPFInstance
+
+        from netbox_nso_plugin.template_content import _reconcile_ospf
+
+        vrf = VRF.objects.create(name="ASPAN")
+        _reconcile_ospf(self.device, self._payload([self._instance(process_id=100, vrf="ASPAN")]))
+        self.assertEqual(OSPFInstance.objects.get(device=self.device, process_id=100).vrf, vrf)
+
+    def test_vrf_not_created_when_toggle_off(self):
+        """Unknown VRF + vrf_auto_create off → instance is global (vrf=None)."""
+        self._make_mgmt()
+        from ipam.models import VRF
+        from netbox_routing.models import OSPFInstance
+
+        from netbox_nso_plugin.models import AdapterConnection
+        from netbox_nso_plugin.template_content import _reconcile_ospf
+
+        AdapterConnection.objects.create(url="http://a:8000", enabled=True, vrf_auto_create=False)
+        _reconcile_ospf(self.device, self._payload([self._instance(process_id=100, vrf="MTI")]))
+        self.assertIsNone(OSPFInstance.objects.get(device=self.device, process_id=100).vrf)
+        self.assertFalse(VRF.objects.filter(name="MTI").exists())
+
+    def test_vrf_auto_created_when_toggle_on(self):
+        """Unknown VRF + vrf_auto_create on → VRF created and linked."""
+        self._make_mgmt()
+        from ipam.models import VRF
+        from netbox_routing.models import OSPFInstance
+
+        from netbox_nso_plugin.models import AdapterConnection
+        from netbox_nso_plugin.template_content import _reconcile_ospf
+
+        AdapterConnection.objects.create(url="http://a:8000", enabled=True, vrf_auto_create=True)
+        _reconcile_ospf(self.device, self._payload([self._instance(process_id=100, vrf="MTI")]))
+        self.assertTrue(VRF.objects.filter(name="MTI").exists())
+        self.assertEqual(OSPFInstance.objects.get(device=self.device, process_id=100).vrf.name, "MTI")
+
     def test_idempotent(self):
         self._make_mgmt()
         from netbox_routing.models import OSPFInstance
