@@ -101,6 +101,7 @@ class NSODeviceManagementForm(NetBoxModelForm):
         "manage_route_policy",
         "manage_redistribution",
         "manage_snmp",
+        "manage_logging",
     )
 
     class Meta:
@@ -121,8 +122,9 @@ class NSODeviceManagementForm(NetBoxModelForm):
             "manage_bgp",
             "manage_route_policy",
             "manage_redistribution",
-            # SNMP
+            # SNMP / Logging
             "manage_snmp",
+            "manage_logging",
             "auto_apply",
             "tags",
         ]

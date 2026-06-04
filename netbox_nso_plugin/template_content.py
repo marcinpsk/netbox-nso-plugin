@@ -480,6 +480,50 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
     }
 
 
+def _reconcile_logging_config(device, payload: dict) -> dict:
+    """Full-replace import of logging/syslog hosts into NSOLoggingHostState.
+
+    Rows whose address matches the payload are updated; rows absent from the
+    payload are deleted; new rows are created with status='imported'. Read-only
+    overlay (no write path yet) so status stays imported. Returns {"hosts": [...]}.
+    """
+    from django.utils import timezone
+
+    from .models import NSODeviceManagement, NSOLoggingHostState
+
+    try:
+        mgmt = device.nso_management
+    except NSODeviceManagement.DoesNotExist:
+        return {"hosts": [], "last_refreshed_at": None, "refresh_source": "never"}
+
+    now = timezone.now()
+    payload_hosts = {h.get("address"): h for h in (payload.get("hosts") or []) if h.get("address")}
+
+    # Delete rows no longer reported.
+    NSOLoggingHostState.objects.filter(management=mgmt).exclude(address__in=payload_hosts.keys()).delete()
+
+    for addr, h in payload_hosts.items():
+        state, _ = NSOLoggingHostState.objects.get_or_create(
+            management=mgmt, address=addr, defaults={"status": "unknown"}
+        )
+        state.port = h.get("port")
+        state.severity = h.get("severity") or ""
+        state.facility = h.get("facility") or ""
+        state.transport = h.get("transport") or ""
+        state.vrf = h.get("vrf") or ""
+        state.source = h.get("source") or ""
+        if state.status not in ("accepted", "deploying", "in_sync"):
+            state.status = "imported"
+        state.last_sync_at = now
+        state.save()
+
+    return {
+        "hosts": list(NSOLoggingHostState.objects.filter(management=mgmt)),
+        "last_refreshed_at": payload.get("last_refreshed_at"),
+        "refresh_source": payload.get("refresh_source", "never"),
+    }
+
+
 _STATIC_ROUTE_WRITE_PATH_STATUSES = {"accepted", "deploying", "in_sync"}
 
 

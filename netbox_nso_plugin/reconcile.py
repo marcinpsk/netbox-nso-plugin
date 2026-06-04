@@ -25,6 +25,7 @@ def _empty_context() -> dict:
         "compliance": None,
         "interface_states": {},
         "snmp_data": {},
+        "logging_data": {},
         "static_routes": [],
         "isis_interfaces": [],
         "isis_processes": [],
@@ -80,7 +81,7 @@ def reconcile_device(device, mgmt=None) -> dict:
     """
     from . import adapter_client as client
     from .signals import suppress_intent_push
-    from .template_content import _reconcile_snmp_config, _upsert_interface_states
+    from .template_content import _reconcile_logging_config, _reconcile_snmp_config, _upsert_interface_states
 
     ctx = _empty_context()
     if mgmt is None:
@@ -99,6 +100,8 @@ def reconcile_device(device, mgmt=None) -> dict:
             ctx["interface_states"] = _upsert_interface_states(device, ctx["interfaces"])
         if mgmt.manage_snmp:
             ctx["snmp_data"] = _reconcile_snmp_config(device, client.get_snmp_config(dev_id))
+        if mgmt.manage_logging:
+            ctx["logging_data"] = _reconcile_logging_config(device, client.get_logging_config(dev_id))
         _reconcile_routing(device, mgmt, client, ctx)
     return ctx
 
@@ -119,6 +122,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:
     from .template_content import (
         _reconcile_isis_interfaces,
         _reconcile_isis_process,
+        _reconcile_logging_config,
         _reconcile_ospf,
         _reconcile_snmp_config,
         _reconcile_static_routes,
@@ -137,6 +141,8 @@ def reconcile_category(device, mgmt, key: str) -> dict:
             ctx["interface_states"] = _upsert_interface_states(device, ctx["interfaces"])
         elif key == "snmp":
             ctx["snmp_data"] = _reconcile_snmp_config(device, client.get_snmp_config(dev_id))
+        elif key == "logging":
+            ctx["logging_data"] = _reconcile_logging_config(device, client.get_logging_config(dev_id))
         elif key == "static":
             ctx["static_routes"] = _reconcile_static_routes(device, client.get_static_routes(dev_id))
         elif key == "isis":

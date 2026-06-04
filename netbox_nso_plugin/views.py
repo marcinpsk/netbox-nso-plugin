@@ -178,6 +178,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
         "route_policy": "netbox_nso_plugin/categories/route_policy.html",
         "redistribution": "netbox_nso_plugin/categories/redistribution.html",
         "snmp": "netbox_nso_plugin/categories/snmp.html",
+        "logging": "netbox_nso_plugin/categories/logging.html",
     }
 
     # Rows-per-page for the (potentially huge) interfaces table.

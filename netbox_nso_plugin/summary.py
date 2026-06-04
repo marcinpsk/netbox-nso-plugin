@@ -131,10 +131,11 @@ _CATEGORIES = [
     ("route_policy", "Route Policy", "script-text", "manage_route_policy"),
     ("redistribution", "Redistribution", "swap-horizontal", "manage_redistribution"),
     ("snmp", "SNMP", "console-network", "manage_snmp"),
+    ("logging", "Logging", "file-document-outline", "manage_logging"),
 ]
 
 # Scopes that stand alone (not under the manage_routing master kill-switch).
-_NON_ROUTING_FLAGS = {"manage_interfaces", "manage_snmp"}
+_NON_ROUTING_FLAGS = {"manage_interfaces", "manage_snmp", "manage_logging"}
 
 
 def _status_breakdown(qs) -> dict:
@@ -221,6 +222,10 @@ def _category_counts(key: str, device, mgmt) -> dict:
                 NSOSnmpSystemInfoState.objects.filter(management=mgmt),
             )
         )
+    if key == "logging":
+        from .models import NSOLoggingHostState
+
+        return _snmp_breakdown((NSOLoggingHostState.objects.filter(management=mgmt),))
     return {"total": 0}
 
 

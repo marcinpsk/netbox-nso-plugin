@@ -240,6 +240,10 @@ class NSODeviceManagement(NetBoxModel):
         default=False,
         help_text="Manage SNMP configuration for this device.",
     )
+    manage_logging = models.BooleanField(
+        default=False,
+        help_text="Manage logging/syslog configuration for this device.",
+    )
     auto_apply = models.BooleanField(
         default=False,
         help_text=(
@@ -331,6 +335,8 @@ class NSODeviceManagement(NetBoxModel):
             scopes.append("Routing ({})".format(", ".join(protos)) if protos else "Routing")
         if self.manage_snmp:
             scopes.append("SNMP")
+        if self.manage_logging:
+            scopes.append("Logging")
         return scopes
 
 
@@ -657,6 +663,34 @@ class NSOSnmpSystemInfoState(NetBoxModel):
 
     def __str__(self):
         return f"{self.management} / system-info [{self.status}]"
+
+
+class NSOLoggingHostState(NetBoxModel):
+    """Per-device remote syslog server (logging host) status overlay (read path)."""
+
+    management = models.ForeignKey(
+        to="NSODeviceManagement",
+        on_delete=models.CASCADE,
+        related_name="logging_host_states",
+    )
+    address = models.CharField(max_length=256, help_text="Remote syslog server address.")
+    port = models.PositiveIntegerField(null=True, blank=True, help_text="Destination port (null = NED default 514).")
+    severity = models.CharField(max_length=32, blank=True, default="", help_text="Minimum severity sent.")
+    facility = models.CharField(max_length=32, blank=True, default="", help_text="Syslog facility, when set.")
+    transport = models.CharField(max_length=16, blank=True, default="", help_text="Transport (udp/tcp), when set.")
+    vrf = models.CharField(max_length=128, blank=True, default="", help_text="VRF/routing-instance, when set.")
+    source = models.CharField(max_length=256, blank=True, default="", help_text="Source interface/address, when set.")
+    status = models.CharField(max_length=32, choices=_SNMP_STATUS_CHOICES, default="unknown")
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["management", "address"]
+        unique_together = [("management", "address")]
+        verbose_name = "NSO Logging Host State"
+        verbose_name_plural = "NSO Logging Host States"
+
+    def __str__(self):
+        return f"{self.management} / syslog:{self.address} [{self.status}]"
 
 
 _STATIC_ROUTE_STATUS_CHOICES = [

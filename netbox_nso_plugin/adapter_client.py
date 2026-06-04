@@ -216,6 +216,11 @@ def get_snmp_config(adapter_device_id: int) -> dict:
     return _request("GET", f"/api/v1/devices/{adapter_device_id}/snmp-config")
 
 
+def get_logging_config(adapter_device_id: int) -> dict:
+    """GET /api/v1/devices/{id}/logging-config."""
+    return _request("GET", f"/api/v1/devices/{adapter_device_id}/logging-config")
+
+
 def get_neds(adapter_instance_id: str) -> list:
     """GET /api/v1/nso-instances/{id}/neds — available NED packages on the instance."""
     return _request("GET", f"/api/v1/nso-instances/{adapter_instance_id}/neds")
