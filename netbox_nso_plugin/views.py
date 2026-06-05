@@ -10,6 +10,7 @@ from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils import timezone
 from django.views import View
+from netbox.object_actions import AddObject, BulkDelete, BulkExport
 from netbox.views import generic
 from utilities.views import ViewTab, register_model_view
 
@@ -382,6 +383,18 @@ class NSOInstanceListView(generic.ObjectListView):
     queryset = NSOInstance.objects.all()
     table = NSOInstanceTable
     filterset = NSOInstanceFilterSet
+    # Only advertise the bulk/single actions we actually wire up — the NetBox
+    # default tuple includes Import / Bulk-Edit / Bulk-Rename, whose buttons would
+    # render with formaction="None" (NoReverseMatch → None) and POST to a 404.
+    actions = (AddObject, BulkExport, BulkDelete)
+
+
+class NSOInstanceBulkDeleteView(generic.BulkDeleteView):
+    """Bulk-delete view for NSO instances."""
+
+    queryset = NSOInstance.objects.all()
+    table = NSOInstanceTable
+    filterset = NSOInstanceFilterSet
 
 
 class NSOInstanceView(generic.ObjectView):
@@ -537,6 +550,15 @@ class NSOPlatformNedMappingListView(generic.ObjectListView):
     queryset = NSOPlatformNedMapping.objects.all()
     table = NSOPlatformNedMappingTable
     filterset = NSOPlatformNedMappingFilterSet
+    actions = (AddObject, BulkExport, BulkDelete)
+
+
+class NSOPlatformNedMappingBulkDeleteView(generic.BulkDeleteView):
+    """Bulk-delete view for Platform→NED mappings."""
+
+    queryset = NSOPlatformNedMapping.objects.all()
+    table = NSOPlatformNedMappingTable
+    filterset = NSOPlatformNedMappingFilterSet
 
 
 class NSOPlatformNedMappingView(generic.ObjectView):
@@ -575,6 +597,7 @@ class NSODeviceManagementListView(generic.ObjectListView):
     queryset = NSODeviceManagement.objects.select_related("device", "nso_instance")
     table = NSODeviceManagementTable
     filterset = NSODeviceManagementFilterSet
+    actions = (AddObject, BulkExport, BulkDelete)
 
     def get_queryset(self, request):
         """Poll the adapter for last-sync state before the table is built."""
@@ -589,6 +612,14 @@ class NSODeviceManagementListView(generic.ObjectListView):
             except AdapterError as exc:
                 logger.debug("List last-sync poll failed for device %s: %s", mgmt.pk, exc)
         return qs
+
+
+class NSODeviceManagementBulkDeleteView(generic.BulkDeleteView):
+    """Bulk-delete view for managed NSO devices."""
+
+    queryset = NSODeviceManagement.objects.select_related("device", "nso_instance")
+    table = NSODeviceManagementTable
+    filterset = NSODeviceManagementFilterSet
 
 
 class NSODeviceManagementView(generic.ObjectView):
@@ -823,6 +854,16 @@ class NSOInterfaceStateListView(generic.ObjectListView):
     queryset = NSOInterfaceState.objects.exclude(status__in=("imported", "in_sync")).select_related(
         "interface", "interface__device"
     )
+    table = NSOInterfaceStateTable
+    filterset = NSOInterfaceStateFilterSet
+    # Sync-managed: no add/import/edit — just export + bulk-delete (cleanup).
+    actions = (BulkExport, BulkDelete)
+
+
+class NSOInterfaceStateBulkDeleteView(generic.BulkDeleteView):
+    """Bulk-delete view for NSOInterfaceState rows (cleanup)."""
+
+    queryset = NSOInterfaceState.objects.all()
     table = NSOInterfaceStateTable
     filterset = NSOInterfaceStateFilterSet
 

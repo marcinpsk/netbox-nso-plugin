@@ -120,6 +120,26 @@ class TestNavigationLinksResolve(SimpleTestCase):
         )
         self.assertIn("/nso-device-names/", url)
 
+    def test_bulk_delete_urls_resolve(self):
+        """Every ObjectListView model must register a bulk_delete URL.
+
+        Regression: NetBox's list view shows a 'Delete Selected' button by
+        default; if the model has no <model>_bulk_delete view, ObjectAction
+        resolves the URL to None and the button POSTs to '<list>/None' → 404.
+        """
+        for name in (
+            "nsoinstance_bulk_delete",
+            "nsoplatformnedmapping_bulk_delete",
+            "nsodevicemanagement_bulk_delete",
+            "nsointerfacestate_bulk_delete",
+        ):
+            with self.subTest(name=name):
+                try:
+                    url = reverse(f"plugins:netbox_nso_plugin:{name}")
+                except NoReverseMatch as exc:
+                    self.fail(f"{name} did not resolve: {exc}")
+                self.assertTrue(url.endswith("/delete/"))
+
 
 class TestNoBadgeColorRegression(SimpleTestCase):
     """Guard against gray-on-gray badges in plugin templates.

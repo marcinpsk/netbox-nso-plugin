@@ -14,6 +14,7 @@ urlpatterns = [
     # NSO Instances
     path("instances/", views.NSOInstanceListView.as_view(), name="nsoinstance_list"),
     path("instances/add/", views.NSOInstanceEditView.as_view(), name="nsoinstance_add"),
+    path("instances/delete/", views.NSOInstanceBulkDeleteView.as_view(), name="nsoinstance_bulk_delete"),
     path("instances/<int:pk>/", views.NSOInstanceView.as_view(), name="nsoinstance"),
     path("instances/<int:pk>/edit/", views.NSOInstanceEditView.as_view(), name="nsoinstance_edit"),
     path("instances/<int:pk>/delete/", views.NSOInstanceDeleteView.as_view(), name="nsoinstance_delete"),
@@ -36,6 +37,11 @@ urlpatterns = [
     # Platform → NED mappings (onboarding)
     path("ned-mappings/", views.NSOPlatformNedMappingListView.as_view(), name="nsoplatformnedmapping_list"),
     path("ned-mappings/add/", views.NSOPlatformNedMappingEditView.as_view(), name="nsoplatformnedmapping_add"),
+    path(
+        "ned-mappings/delete/",
+        views.NSOPlatformNedMappingBulkDeleteView.as_view(),
+        name="nsoplatformnedmapping_bulk_delete",
+    ),
     path("ned-mappings/<int:pk>/", views.NSOPlatformNedMappingView.as_view(), name="nsoplatformnedmapping"),
     path(
         "ned-mappings/<int:pk>/edit/",
@@ -68,6 +74,11 @@ urlpatterns = [
     # Device Management CRUD
     path("device-management/", views.NSODeviceManagementListView.as_view(), name="nsodevicemanagement_list"),
     path("device-management/add/", views.NSODeviceManagementEditView.as_view(), name="nsodevicemanagement_add"),
+    path(
+        "device-management/delete/",
+        views.NSODeviceManagementBulkDeleteView.as_view(),
+        name="nsodevicemanagement_bulk_delete",
+    ),
     path("device-management/<int:pk>/", views.NSODeviceManagementView.as_view(), name="nsodevicemanagement"),
     path(
         "device-management/<int:pk>/edit/",
@@ -109,6 +120,11 @@ urlpatterns = [
     path("devices/<int:pk>/jobs/", views.NSODeviceJobsView.as_view(), name="device_nso_jobs"),
     # Interface State CRUD (read-only list + detail; delete allowed for cleanup)
     path("interface-state/", views.NSOInterfaceStateListView.as_view(), name="nsointerfacestate_list"),
+    path(
+        "interface-state/delete/",
+        views.NSOInterfaceStateBulkDeleteView.as_view(),
+        name="nsointerfacestate_bulk_delete",
+    ),
     path("interface-state/<int:pk>/", views.NSOInterfaceStateView.as_view(), name="nsointerfacestate"),
     path(
         "interface-state/<int:pk>/delete/",
