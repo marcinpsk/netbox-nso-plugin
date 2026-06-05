@@ -717,6 +717,77 @@ def _reconcile_isis_settings(obj, settings: dict | None) -> None:
             row.delete()
 
 
+def _reconcile_child_levels(model, parent_field, parent, cols, levels) -> None:
+    """Full-replace per-level child rows (ISISLevel/ISISInterfaceLevel) for *parent*.
+
+    *levels* is the adapter's list of {level, <snake_case cols>} dicts. Each col
+    is set only when present (and the model carries it); levels NSO no longer
+    reports are deleted. No-op when *parent* is None.
+    """
+    if parent is None:
+        return
+    incoming = {}
+    for lvl in levels or []:
+        try:
+            incoming[int(lvl["level"])] = lvl
+        except (KeyError, TypeError, ValueError):
+            continue
+    existing = {row.level: row for row in model.objects.filter(**{parent_field: parent})}
+    for lvl, data in incoming.items():
+        row = existing.get(lvl) or model(**{parent_field: parent, "level": lvl})
+        changed = row.pk is None
+        for col in cols:
+            val = data.get(col)
+            if val is not None and getattr(row, col, None) != val:
+                setattr(row, col, val)
+                changed = True
+        if changed:
+            row.save()
+    for lvl, row in existing.items():
+        if lvl not in incoming:
+            row.delete()
+
+
+def _reconcile_isis_segment_routing(inst, sr: dict | None) -> None:
+    """Upsert the netbox_routing ISISSegmentRouting (1:1) for *inst* from *sr*.
+
+    Deletes the SR row when NSO reports no segment-routing. No-op when the fork
+    lacks ISISSegmentRouting or *inst* is None.
+    """
+    if inst is None:
+        return
+    try:
+        from netbox_routing.models import ISISSegmentRouting
+    except Exception:
+        return
+    if not sr:
+        ISISSegmentRouting.objects.filter(instance=inst).delete()
+        return
+    cols = (
+        "enabled",
+        "prefix_sid_range",
+        "srgb_start",
+        "srgb_range",
+        "node_sid_index",
+        "node_sid_label",
+        "maximum_sid_depth",
+        "tunnel_table_pref",
+    )
+    row, _ = ISISSegmentRouting.objects.get_or_create(instance=inst)
+    fields = []
+    for col in cols:
+        val = sr.get(col)
+        if val is not None and getattr(row, col, None) != val:
+            setattr(row, col, val)
+            fields.append(col)
+    if fields:
+        row.save(update_fields=fields)
+
+
+_ISIS_LEVEL_COLS = ("default_metric", "wide_metrics_only", "preference", "auth_type")
+_ISIS_IFACE_LEVEL_COLS = ("metric", "hello_interval", "hello_multiplier", "priority", "passive")
+
+
 def _link_routing_isis_interface(device, iface, af, state, instances: dict, bfd_enabled=None, entry=None):
     """Create/update the netbox_routing.ISISInterface for this row; return it (or None).
 
@@ -772,6 +843,13 @@ def _link_routing_isis_interface(device, iface, af, state, instances: dict, bfd_
     if fields:
         ri.save(update_fields=fields)
     _reconcile_isis_settings(ri, entry.get("settings"))
+    # M33 P2 per-level interface child rows.
+    try:
+        from netbox_routing.models import ISISInterfaceLevel
+
+        _reconcile_child_levels(ISISInterfaceLevel, "interface", ri, _ISIS_IFACE_LEVEL_COLS, entry.get("levels"))
+    except Exception:
+        pass
     return ri
 
 
@@ -934,6 +1012,14 @@ def _sync_routing_isis_instance(device, tag, state, entry):
     if inst_fields:
         inst.save(update_fields=inst_fields)
     _reconcile_isis_settings(inst, entry.get("settings"))
+    # M33 P2 child tables — guarded import inside the helpers.
+    try:
+        from netbox_routing.models import ISISLevel
+
+        _reconcile_child_levels(ISISLevel, "instance", inst, _ISIS_LEVEL_COLS, entry.get("levels"))
+    except Exception:
+        pass
+    _reconcile_isis_segment_routing(inst, entry.get("segment_routing"))
     return inst
 
 

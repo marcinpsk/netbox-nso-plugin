@@ -588,3 +588,86 @@ class TestReconcileIsisProcess(TestCase):
         self.assertEqual(ri.lsp_interval, 100)
         self.assertEqual(ri.mesh_group, "blocked")
         self.assertEqual({s.key: s.value for s in ri.settings.all()}, {"hello_padding": "true"})
+
+    def test_routing_instance_p2_levels_and_sr(self):
+        """M33 P2: instance per-level rows + segment-routing (1:1) are reconciled."""
+        self._make_mgmt()
+        from netbox_routing.models import ISISInstance, ISISLevel, ISISSegmentRouting
+
+        from netbox_nso_plugin.template_content import _reconcile_isis_process
+
+        _reconcile_isis_process(
+            self.device,
+            [
+                {
+                    "process_tag": "0",
+                    "levels": [
+                        {"level": 1, "default_metric": 10},
+                        {"level": 2, "default_metric": 10, "wide_metrics_only": True},
+                    ],
+                    "segment_routing": {"enabled": True, "prefix_sid_range": "global"},
+                }
+            ],
+        )
+        inst = ISISInstance.objects.get(device=self.device, process_tag="0")
+        levels = {lvl.level: lvl for lvl in ISISLevel.objects.filter(instance=inst)}
+        self.assertEqual(set(levels), {1, 2})
+        self.assertEqual(levels[2].default_metric, 10)
+        self.assertTrue(levels[2].wide_metrics_only)
+        sr = ISISSegmentRouting.objects.get(instance=inst)
+        self.assertTrue(sr.enabled)
+        self.assertEqual(sr.prefix_sid_range, "global")
+
+        # Full-replace: dropping level 1 deletes its row.
+        _reconcile_isis_process(
+            self.device,
+            [{"process_tag": "0", "levels": [{"level": 2, "default_metric": 20}]}],
+        )
+        self.assertEqual(set(ISISLevel.objects.filter(instance=inst).values_list("level", flat=True)), {2})
+        self.assertEqual(ISISLevel.objects.get(instance=inst, level=2).default_metric, 20)
+
+
+class TestReconcileIsisInterfaceLevels(TestCase):
+    """M33 P2: per-level interface child rows."""
+
+    @classmethod
+    def setUpTestData(cls):
+        mfg = Manufacturer.objects.create(name="IL2Mfg", slug="il2mfg")
+        dt = DeviceType.objects.create(manufacturer=mfg, model="IL2Dev", slug="il2dev")
+        role = DeviceRole.objects.create(name="IL2Role", slug="il2role")
+        site = Site.objects.create(name="IL2Site", slug="il2site")
+        cls.device = Device.objects.create(name="il2-router", device_type=dt, role=role, site=site)
+
+    def _make_mgmt(self):
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+        inst, _ = NSOInstance.objects.get_or_create(name="il2-inst", defaults={"adapter_instance_id": "il2-inst"})
+        return NSODeviceManagement.objects.get_or_create(
+            device=self.device,
+            defaults={"nso_instance": inst, "nso_device_name": "il2-dev", "adapter_device_id": self.device.pk},
+        )[0]
+
+    def test_interface_levels_reconciled(self):
+        self._make_mgmt()
+        from netbox_routing.models import ISISInterface, ISISInterfaceLevel
+
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        iface = Interface.objects.create(device=self.device, name="GigabitEthernet0/0", type="1000base-t")
+        _reconcile_isis_interfaces(
+            self.device,
+            [
+                {
+                    "interface_name": iface.name,
+                    "af": "ipv4",
+                    "process_tag": "",
+                    "passive": False,
+                    "levels": [{"level": 2, "metric": 10, "hello_interval": 3}],
+                }
+            ],
+        )
+        ri = ISISInterface.objects.get(interface=iface, address_family="ipv4")
+        rows = {lvl.level: lvl for lvl in ISISInterfaceLevel.objects.filter(interface=ri)}
+        self.assertEqual(set(rows), {2})
+        self.assertEqual(rows[2].metric, 10)
+        self.assertEqual(rows[2].hello_interval, 3)
