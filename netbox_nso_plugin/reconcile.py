@@ -34,6 +34,7 @@ def _empty_context() -> dict:
         "redistribution_states": [],
         "bgp_peers": [],
         "bfd_interfaces": [],
+        "interface_ips": [],
     }
 
 
@@ -87,7 +88,12 @@ def reconcile_device(device, mgmt=None) -> dict:
     """
     from . import adapter_client as client
     from .signals import suppress_intent_push
-    from .template_content import _reconcile_logging_config, _reconcile_snmp_config, _upsert_interface_states
+    from .template_content import (
+        _reconcile_interface_ips,
+        _reconcile_logging_config,
+        _reconcile_snmp_config,
+        _upsert_interface_states,
+    )
 
     ctx = _empty_context()
     if mgmt is None:
@@ -104,6 +110,10 @@ def reconcile_device(device, mgmt=None) -> dict:
             ctx["interfaces"] = client.get_interfaces(dev_id)
             ctx["state"] = client.get_state(dev_id)
             ctx["interface_states"] = _upsert_interface_states(device, ctx["interfaces"])
+            # Import interface IP addresses onto their (now first-class, logical-named)
+            # NetBox interfaces. Runs AFTER the adapter sync created the interfaces;
+            # gated internally by interface_ip_auto_create (off → lands as pending).
+            ctx["interface_ips"] = _reconcile_interface_ips(device, client.get_interface_ips(dev_id))
         if mgmt.manage_snmp:
             ctx["snmp_data"] = _reconcile_snmp_config(device, client.get_snmp_config(dev_id))
         if mgmt.manage_logging:
@@ -126,6 +136,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:
     from .route_policy_reconciler import reconcile_route_policy
     from .signals import suppress_intent_push
     from .template_content import (
+        _reconcile_interface_ips,
         _reconcile_isis_interfaces,
         _reconcile_isis_process,
         _reconcile_logging_config,
@@ -145,6 +156,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:
             ctx["interfaces"] = client.get_interfaces(dev_id)
             ctx["state"] = client.get_state(dev_id)
             ctx["interface_states"] = _upsert_interface_states(device, ctx["interfaces"])
+            ctx["interface_ips"] = _reconcile_interface_ips(device, client.get_interface_ips(dev_id))
         elif key == "snmp":
             ctx["snmp_data"] = _reconcile_snmp_config(device, client.get_snmp_config(dev_id))
         elif key == "logging":
