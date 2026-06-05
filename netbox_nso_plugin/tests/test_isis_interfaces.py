@@ -515,3 +515,76 @@ class TestReconcileIsisProcess(TestCase):
         _reconcile_isis_process(self.device, [{"process_tag": "OL"}])
         inst.refresh_from_db()
         self.assertTrue(inst.overload_bit)
+
+    def test_routing_instance_p1_scalars_and_settings(self):
+        """M33 P1: instance scalar columns + ISISSetting EAV are reconciled from NSO."""
+        self._make_mgmt()
+        from netbox_routing.models import ISISInstance, ISISSetting
+
+        from netbox_nso_plugin.template_content import _reconcile_isis_process
+
+        _reconcile_isis_process(
+            self.device,
+            [
+                {
+                    "process_tag": "0",
+                    "lsp_lifetime": 65535,
+                    "lsp_refresh_interval": 32767,
+                    "te_enabled": True,
+                    "sr_enabled": True,
+                    "spf_initial_wait": 1000,
+                    "settings": {"spf_second_wait": "1000", "graceful_restart": "true"},
+                }
+            ],
+        )
+        inst = ISISInstance.objects.get(device=self.device, process_tag="0")
+        self.assertEqual(inst.lsp_lifetime, 65535)
+        self.assertEqual(inst.lsp_refresh_interval, 32767)
+        self.assertEqual(inst.spf_initial_wait, 1000)
+        self.assertTrue(inst.te_enabled)
+        self.assertTrue(inst.sr_enabled)
+
+        settings = {s.key: s.value for s in inst.settings.all()}
+        self.assertEqual(settings, {"spf_second_wait": "1000", "graceful_restart": "true"})
+
+        # A later report dropping a setting deletes its row (full-replace semantics).
+        _reconcile_isis_process(
+            self.device,
+            [{"process_tag": "0", "settings": {"spf_second_wait": "2000"}}],
+        )
+        settings = {s.key: s.value for s in ISISSetting.objects.all()}
+        self.assertEqual(settings, {"spf_second_wait": "2000"})
+
+    def test_routing_interface_p1_scalars_and_settings(self):
+        """M33 P1: per-interface scalar columns + ISISSetting EAV are reconciled."""
+        self._make_mgmt()
+        from netbox_routing.models import ISISInterface
+
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        iface = Interface.objects.create(device=self.device, name="GigabitEthernet0/0", type="1000base-t")
+        _reconcile_isis_interfaces(
+            self.device,
+            [
+                {
+                    "interface_name": iface.name,
+                    "af": "ipv4",
+                    "process_tag": "",
+                    "circuit_type": "level-1-2",
+                    "passive": False,
+                    "network_type": "point-to-point",
+                    "csnp_interval": 10,
+                    "retransmit_interval": 5,
+                    "lsp_interval": 100,
+                    "mesh_group": "blocked",
+                    "settings": {"hello_padding": "true"},
+                }
+            ],
+        )
+        ri = ISISInterface.objects.get(interface=iface, address_family="ipv4")
+        self.assertEqual(ri.network_type, "point-to-point")
+        self.assertEqual(ri.csnp_interval, 10)
+        self.assertEqual(ri.retransmit_interval, 5)
+        self.assertEqual(ri.lsp_interval, 100)
+        self.assertEqual(ri.mesh_group, "blocked")
+        self.assertEqual({s.key: s.value for s in ri.settings.all()}, {"hello_padding": "true"})

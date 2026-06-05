@@ -682,7 +682,42 @@ def _reconcile_static_routes(device, payload: dict) -> list:
 _ISIS_WRITE_PATH_STATUSES = {"accepted", "deploying", "in_sync"}
 
 
-def _link_routing_isis_interface(device, iface, af, state, instances: dict, bfd_enabled=None):
+def _reconcile_isis_settings(obj, settings: dict | None) -> None:
+    """Reconcile a netbox_routing ISISSetting EAV bag for *obj* (instance/interface).
+
+    *settings* is the {key: value} dict the adapter mirrored from the device.
+    Creates/updates rows for present keys and deletes rows no longer reported,
+    constrained to the keys netbox_routing recognises (ISISSettingChoices) so an
+    unknown key never raises. No-op when netbox-routing lacks ISISSetting (older
+    fork) or *obj* is None.
+    """
+    if obj is None:
+        return
+    try:
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.choices import ISISSettingChoices
+        from netbox_routing.models import ISISSetting
+    except Exception:
+        return
+
+    valid = {k for k, _ in ISISSettingChoices.CHOICES}
+    wanted = {k: str(v) for k, v in (settings or {}).items() if k in valid and v is not None}
+
+    ct = ContentType.objects.get_for_model(type(obj))
+    existing = {s.key: s for s in ISISSetting.objects.filter(assigned_object_type=ct, assigned_object_id=obj.pk)}
+    for key, value in wanted.items():
+        row = existing.get(key)
+        if row is None:
+            ISISSetting.objects.create(assigned_object=obj, key=key, value=value)
+        elif row.value != value:
+            row.value = value
+            row.save(update_fields=["value"])
+    for key, row in existing.items():
+        if key not in wanted:
+            row.delete()
+
+
+def _link_routing_isis_interface(device, iface, af, state, instances: dict, bfd_enabled=None, entry=None):
     """Create/update the netbox_routing.ISISInterface for this row; return it (or None).
 
     Returns None when netbox-routing isn't installed. ISISInterface.instance is required,
@@ -695,6 +730,7 @@ def _link_routing_isis_interface(device, iface, af, state, instances: dict, bfd_
     except Exception:
         return None
 
+    entry = entry or {}
     tag = state.process_tag
     if tag not in instances:
         instances[tag], _ = ISISInstance.objects.get_or_create(device=device, process_tag=tag)
@@ -720,12 +756,22 @@ def _link_routing_isis_interface(device, iface, af, state, instances: dict, bfd_
     # bfd_enabled (nullable bool) — guard until the netbox-routing field is present.
     if hasattr(ri, "bfd_enabled"):
         routing_fields.append(("bfd_enabled", bfd_enabled))
+    # M33 P1 per-interface scalars — guard each until the fork carries the column.
+    if hasattr(ri, "csnp_interval"):
+        routing_fields.append(("csnp_interval", entry.get("csnp_interval")))
+    if hasattr(ri, "retransmit_interval"):
+        routing_fields.append(("retransmit_interval", entry.get("retransmit_interval")))
+    if hasattr(ri, "lsp_interval"):
+        routing_fields.append(("lsp_interval", entry.get("lsp_interval")))
+    if hasattr(ri, "mesh_group"):
+        routing_fields.append(("mesh_group", entry.get("mesh_group") or ""))
     for attr, val in routing_fields:
         if getattr(ri, attr) != val:
             setattr(ri, attr, val)
             fields.append(attr)
     if fields:
         ri.save(update_fields=fields)
+    _reconcile_isis_settings(ri, entry.get("settings"))
     return ri
 
 
@@ -797,7 +843,7 @@ def _reconcile_isis_interfaces(device, interfaces: list) -> list:
         state.last_sync_at = now
 
         state.isis_interface = _link_routing_isis_interface(
-            device, iface, af, state, instances, bfd_enabled=entry.get("bfd_enabled")
+            device, iface, af, state, instances, bfd_enabled=entry.get("bfd_enabled"), entry=entry
         )
 
         if state.status not in _ISIS_WRITE_PATH_STATUSES:
@@ -821,6 +867,74 @@ def _reconcile_isis_interfaces(device, interfaces: list) -> list:
         )
 
     return list(NSOISISInterfaceState.objects.filter(management=mgmt).select_related("interface", "isis_interface"))
+
+
+# netbox_routing ISISInstance scalar columns synced from NSO (M33 P1). Each is
+# guarded by hasattr so the reconcile no-ops on a fork without the column.
+_ISIS_INSTANCE_SCALAR_ATTRS = (
+    "spf_initial_wait",
+    "spf_max_wait",
+    "lsp_initial_wait",
+    "lsp_max_wait",
+    "lsp_lifetime",
+    "lsp_refresh_interval",
+    "lsp_mtu",
+    "overload_on_startup",
+    "overload_timeout",
+    "te_enabled",
+    "sr_enabled",
+    "sr_node_msd",
+    "distance",
+    "maximum_paths",
+    "reference_bandwidth",
+)
+
+
+def _sync_routing_isis_instance(device, tag, state, entry):
+    """Create/update the netbox_routing.ISISInstance for *tag*; return it (or None).
+
+    Returns None when netbox-routing isn't installed. Informational/auth string
+    fields sync from *state* when NSO reported a non-empty value; overload_bit is
+    tri-state (None left alone); the M33 P1 scalar columns sync from *entry* when
+    present (guarded per-column). The ISISSetting EAV bag is full-replaced.
+    """
+    try:
+        from netbox_routing.models import ISISInstance
+    except Exception:
+        return None
+
+    inst, _ = ISISInstance.objects.get_or_create(device=device, process_tag=tag)
+    inst_fields: list[str] = []
+    for attr, val in (
+        ("net", state.net),
+        ("is_type", state.is_type),
+        ("metric_style", state.metric_style),
+        ("area_auth_type", state.area_auth_type),
+        ("area_auth_key", state.area_auth_key),
+        ("domain_auth_type", state.domain_auth_type),
+        ("domain_auth_key", state.domain_auth_key),
+    ):
+        if val and getattr(inst, attr) != val:
+            setattr(inst, attr, val)
+            inst_fields.append(attr)
+    # overload_bit is a tri-state boolean — sync True/False, but leave None
+    # (NSO didn't report it) untouched so we never clobber a manually-set value.
+    if state.overload_bit is not None and inst.overload_bit != state.overload_bit:
+        inst.overload_bit = state.overload_bit
+        inst_fields.append("overload_bit")
+    # M33 P1 cross-vendor scalars — only sync columns the fork carries and only
+    # when NSO actually reported a value (never clobber an operator value with None).
+    for attr in _ISIS_INSTANCE_SCALAR_ATTRS:
+        if not hasattr(inst, attr):
+            continue
+        val = entry.get(attr)
+        if val is not None and getattr(inst, attr) != val:
+            setattr(inst, attr, val)
+            inst_fields.append(attr)
+    if inst_fields:
+        inst.save(update_fields=inst_fields)
+    _reconcile_isis_settings(inst, entry.get("settings"))
+    return inst
 
 
 def _reconcile_isis_process(device, process_list: list) -> list:
@@ -848,16 +962,6 @@ def _reconcile_isis_process(device, process_list: list) -> list:
     now = timezone.now()
     seen_tags: set[str] = set()
 
-    # netbox-routing ISISInstance (may not be installed). When present we
-    # create/update the real instance keyed by (device, process_tag) — mirroring how
-    # the BGP reconciler auto-creates its BGPRouter — and link it from the state row.
-    try:
-        from netbox_routing.models import ISISInstance
-
-        routing_ok = True
-    except Exception:
-        routing_ok = False
-
     for entry in process_list or []:
         # Junos' default IS-IS instance has an empty process tag — "" is a valid
         # key (NSOISISInstanceState.process_tag defaults to ""). Only skip an
@@ -883,35 +987,9 @@ def _reconcile_isis_process(device, process_list: list) -> list:
         state.domain_auth_key = entry.get("domain_auth_key") or ""
         state.last_sync_at = now
 
-        if routing_ok:
-            inst, _ = ISISInstance.objects.get_or_create(device=device, process_tag=tag)
-            # Keep the routing instance's informational fields in step with NSO.
-            # String fields sync when NSO reported a non-empty value. Auth keys are
-            # routing-protocol secrets (not device-access creds): synced when NSO
-            # reports them, else the auth *type*/present flags record that area/domain
-            # authentication is configured without a key in hand.
-            inst_fields = []
-            for attr, val in (
-                ("net", state.net),
-                ("is_type", state.is_type),
-                ("metric_style", state.metric_style),
-                ("area_auth_type", state.area_auth_type),
-                ("area_auth_key", state.area_auth_key),
-                ("domain_auth_type", state.domain_auth_type),
-                ("domain_auth_key", state.domain_auth_key),
-            ):
-                if val and getattr(inst, attr) != val:
-                    setattr(inst, attr, val)
-                    inst_fields.append(attr)
-            # overload_bit is a tri-state boolean — sync True/False, but leave None
-            # (NSO didn't report it) untouched so we never clobber a manually-set
-            # value with a guess.
-            if state.overload_bit is not None and inst.overload_bit != state.overload_bit:
-                inst.overload_bit = state.overload_bit
-                inst_fields.append("overload_bit")
-            if inst_fields:
-                inst.save(update_fields=inst_fields)
-            state.isis_instance = inst
+        # netbox-routing ISISInstance (optional dep): create/update the real
+        # instance keyed by (device, process_tag) and link it from the state row.
+        state.isis_instance = _sync_routing_isis_instance(device, tag, state, entry)
 
         if state.status not in _ISIS_WRITE_PATH_STATUSES:
             state.status = "in_sync" if state.isis_instance_id else "imported"
