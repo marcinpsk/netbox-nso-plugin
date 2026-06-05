@@ -229,6 +229,47 @@ class TestNSOInterfaceStateListView(ViewTestBase):
         self.assertEqual(response.status_code, 200)
 
 
+class TestInterfacesPageNoAttrsHint(ViewTestBase):
+    """The interfaces page must explain an empty tab caused by no attrs in scope.
+
+    manage_interfaces (master) on but neither manage_description nor manage_enabled
+    (leaves) → empty adapter scope → a sync can never produce rows. The empty state
+    must say that, not the misleading "wait for the next sync".
+    """
+
+    def _render(self, device):
+        from django.test import RequestFactory
+
+        from netbox_nso_plugin.views import NSOCategoryView
+
+        req = RequestFactory().get("/x?key=interfaces")
+        req.user = self.superuser
+        return NSOCategoryView()._render_interfaces_page(req, device).content.decode()
+
+    def test_hint_shown_when_master_on_no_leaves(self):
+        """Master on, no leaf attrs, no rows → actionable hint, not the sync message."""
+        self.mgmt.manage_interfaces = True
+        self.mgmt.manage_description = False
+        self.mgmt.manage_enabled = False
+        self.mgmt.save()
+        NSOInterfaceState.objects.filter(interface__device=self.device).delete()
+
+        html = self._render(self.device)
+        self.assertIn("no interface attributes are selected", html)
+        self.assertNotIn("wait for the next sync", html)
+
+    def test_no_hint_when_a_leaf_is_selected(self):
+        """With an attribute in scope, the no-attrs hint must not appear."""
+        self.mgmt.manage_interfaces = True
+        self.mgmt.manage_description = True
+        self.mgmt.manage_enabled = False
+        self.mgmt.save()
+        NSOInterfaceState.objects.filter(interface__device=self.device).delete()
+
+        html = self._render(self.device)
+        self.assertNotIn("no interface attributes are selected", html)
+
+
 # ── Detail views ─────────────────────────────────────────────────────────────────
 
 

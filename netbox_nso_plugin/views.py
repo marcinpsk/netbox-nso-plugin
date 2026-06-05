@@ -296,10 +296,25 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 }
             )
 
+        # If interface management is on but neither attribute leaf (description/enabled)
+        # is selected, the adapter scope is empty and a sync can never produce rows.
+        # Flag it so the empty state tells the operator that — instead of the misleading
+        # "wait for the next sync".
+        mgmt = getattr(device, "nso_management", None)
+        no_attrs_in_scope = bool(mgmt and mgmt.manage_interfaces and not mgmt.managed_attributes)
+
         return render(
             request,
             "netbox_nso_plugin/categories/interfaces_page.html",
-            {"object": device, "rows": rows, "page": page, "q": q, "state": state, "counts": counts},
+            {
+                "object": device,
+                "rows": rows,
+                "page": page,
+                "q": q,
+                "state": state,
+                "counts": counts,
+                "no_attrs_in_scope": no_attrs_in_scope,
+            },
         )
 
 
