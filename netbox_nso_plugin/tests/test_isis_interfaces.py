@@ -602,8 +602,14 @@ class TestReconcileIsisProcess(TestCase):
                 {
                     "process_tag": "0",
                     "levels": [
-                        {"level": 1, "default_metric": 10},
-                        {"level": 2, "default_metric": 10, "wide_metrics_only": True},
+                        # Mirrors Junos rc1: L1 disabled, L2 wide-metrics-only + labeled-preference.
+                        {"level": 1, "disabled": True},
+                        {
+                            "level": 2,
+                            "default_metric": 10,
+                            "wide_metrics_only": True,
+                            "labeled_preference": 7,
+                        },
                     ],
                     "segment_routing": {"enabled": True, "prefix_sid_range": "global"},
                 }
@@ -612,8 +618,10 @@ class TestReconcileIsisProcess(TestCase):
         inst = ISISInstance.objects.get(device=self.device, process_tag="0")
         levels = {lvl.level: lvl for lvl in ISISLevel.objects.filter(instance=inst)}
         self.assertEqual(set(levels), {1, 2})
+        self.assertTrue(levels[1].disabled)
         self.assertEqual(levels[2].default_metric, 10)
         self.assertTrue(levels[2].wide_metrics_only)
+        self.assertEqual(levels[2].labeled_preference, 7)
         sr = ISISSegmentRouting.objects.get(instance=inst)
         self.assertTrue(sr.enabled)
         self.assertEqual(sr.prefix_sid_range, "global")

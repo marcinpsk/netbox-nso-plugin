@@ -826,7 +826,7 @@ def _reconcile_isis_flex_algos(inst, flex_algos) -> None:
             row.delete()
 
 
-_ISIS_LEVEL_COLS = ("default_metric", "wide_metrics_only", "preference", "auth_type")
+_ISIS_LEVEL_COLS = ("default_metric", "wide_metrics_only", "preference", "labeled_preference", "disabled", "auth_type")
 _ISIS_IFACE_LEVEL_COLS = ("metric", "hello_interval", "hello_multiplier", "priority", "passive")
 
 
