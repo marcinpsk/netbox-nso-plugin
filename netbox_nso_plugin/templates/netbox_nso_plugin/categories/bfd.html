@@ -24,7 +24,7 @@
           <td>{{ b.bfd_profile.min_tx_int|default:"—" }}</td>
           <td>{{ b.bfd_profile.min_rx_int|default:"—" }}</td>
           <td>{{ b.bfd_profile.multiplier|default:"—" }}</td>
-          <td>{% if b.enabled %}<span class="badge text-bg-success">yes</span>{% else %}<span class="badge text-bg-warning">no</span>{% endif %}</td>
+          <td>{% if b.enabled %}<span class="badge text-bg-success">yes</span>{% else %}<span class="badge text-bg-warning text-dark">no</span>{% endif %}</td>
         </tr>
         {% endfor %}
       </tbody>

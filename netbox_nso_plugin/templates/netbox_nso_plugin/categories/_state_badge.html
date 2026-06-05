@@ -5,7 +5,7 @@ State badge from a raw status. Expects `status`. Owned (NetBox is the source of
 truth) is derived from owned statuses and shown as a shield.
 changed/conflict = not-owned drift; drifted/accepted = owned -> pending apply.
 {% endcomment %}
-{% if status == "changed" or status == "conflict" %}<span class="badge text-bg-warning">drift</span>
+{% if status == "changed" or status == "conflict" %}<span class="badge text-bg-warning text-dark">drift</span>
 {% elif status == "drifted" or status == "accepted" %}<span class="badge text-bg-info">pending apply</span>
 {% elif status == "apply_failed" %}<span class="badge text-bg-danger">apply failed</span>
 {% elif status == "deploying" %}<span class="badge text-bg-primary">deploying</span>

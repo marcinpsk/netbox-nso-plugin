@@ -34,7 +34,7 @@
                     {% elif state.status == "imported" %}
                       <span class="badge text-bg-success">{{ state.status }}</span>
                     {% elif state.status == "changed" or state.status == "drifted" %}
-                      <span class="badge text-bg-warning">{{ state.status }}</span>
+                      <span class="badge text-bg-warning text-dark">{{ state.status }}</span>
                     {% elif state.status == "apply_failed" %}
                       <span class="badge text-bg-danger">{{ state.status }}</span>
                       {% if state.last_apply_error %}

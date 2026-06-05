@@ -39,7 +39,7 @@
               <th scope="row">Auto Apply</th>
               <td>
                 {% if object.auto_apply %}<span class="badge text-bg-success">Enabled</span>
-                {% else %}<span class="badge text-bg-warning">Disabled</span>{% endif %}
+                {% else %}<span class="badge text-bg-warning text-dark">Disabled</span>{% endif %}
               </td>
             </tr>
             <tr>
@@ -74,8 +74,8 @@
                 <tr><th colspan="2" class="text-muted small fw-normal border-0 pb-0">Status by managed attribute</th></tr>
                 {% if s.in_sync    %}<tr><th>In Sync</th>    <td><span class="badge text-bg-success">{{ s.in_sync }}</span></td></tr>{% endif %}
                 {% if s.imported   %}<tr><th>Imported</th>   <td><span class="badge text-bg-success">{{ s.imported }}</span></td></tr>{% endif %}
-                {% if s.changed    %}<tr><th>Changed</th>    <td><span class="badge text-bg-warning">{{ s.changed }}</span></td></tr>{% endif %}
-                {% if s.drifted    %}<tr><th>Drifted</th>    <td><span class="badge text-bg-warning">{{ s.drifted }}</span></td></tr>{% endif %}
+                {% if s.changed    %}<tr><th>Changed</th>    <td><span class="badge text-bg-warning text-dark">{{ s.changed }}</span></td></tr>{% endif %}
+                {% if s.drifted    %}<tr><th>Drifted</th>    <td><span class="badge text-bg-warning text-dark">{{ s.drifted }}</span></td></tr>{% endif %}
                 {% if s.accepted   %}<tr><th>Accepted</th>   <td><span class="badge text-bg-info">{{ s.accepted }}</span></td></tr>{% endif %}
                 {% if s.deploying  %}<tr><th>Deploying</th>  <td><span class="badge text-bg-primary">{{ s.deploying }}</span></td></tr>{% endif %}
                 {% if s.apply_failed %}<tr><th>Apply Failed</th><td><span class="badge text-bg-danger">{{ s.apply_failed }}</span></td></tr>{% endif %}

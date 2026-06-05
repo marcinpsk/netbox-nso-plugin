@@ -53,7 +53,7 @@
           <th>Auto Apply</th>
           <td>
             {% if mgmt.auto_apply %}<span class="badge text-bg-success">Enabled</span>
-            {% else %}<span class="badge text-bg-warning">Disabled</span>{% endif %}
+            {% else %}<span class="badge text-bg-warning text-dark">Disabled</span>{% endif %}
           </td>
         </tr>
         <tr><th>Last Sync</th><td>{{ mgmt.last_sync_at|date:"Y-m-d H:i"|default:"Never" }}</td></tr>
@@ -338,7 +338,7 @@
           <span>
             <span class="mdi mdi-{{ cat.icon }} me-1"></span><strong>{{ cat.label }}</strong>
             <span class="text-muted ms-1">({{ cat.counts.total|default:0 }})</span>
-            {% if cat.counts.drift %}<span class="badge text-bg-warning ms-2">{{ cat.counts.drift }} drift</span>{% endif %}
+            {% if cat.counts.drift %}<span class="badge text-bg-warning text-dark ms-2">{{ cat.counts.drift }} drift</span>{% endif %}
             {% if cat.counts.pending %}<span class="badge text-bg-info ms-1">{{ cat.counts.pending }} pending apply</span>{% endif %}
             {% if cat.counts.total and not cat.counts.drift and not cat.counts.pending %}<span class="badge text-bg-success ms-2">in sync</span>{% endif %}
           </span>

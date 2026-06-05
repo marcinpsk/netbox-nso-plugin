@@ -37,7 +37,7 @@
               </td>
               <td>{{ row.device_value }}</td>
               <td>
-                {% if row.kind == 'drift' %}<span class="badge text-bg-warning">{{ row.label }}</span>
+                {% if row.kind == 'drift' %}<span class="badge text-bg-warning text-dark">{{ row.label }}</span>
                 {% elif row.kind == 'pending' %}<span class="badge text-bg-info">{{ row.label }}</span>
                 {% elif row.kind == 'apply_failed' %}<span class="badge text-bg-danger" title="The last Apply to the device failed — retry">{{ row.label }}</span>
                 {% elif row.kind == 'in_sync' %}<span class="badge text-bg-success">{{ row.label }}</span>
