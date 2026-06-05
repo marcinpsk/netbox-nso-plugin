@@ -32,7 +32,7 @@ menu = PluginMenu(
                 ),
                 PluginMenuItem(
                     link="plugins:netbox_nso_plugin:nsointerfacestate_list",
-                    link_text="Interface States",
+                    link_text="Interface Drift",
                 ),
                 PluginMenuItem(
                     link="plugins:netbox_nso_plugin:nsoplatformnedmapping_list",

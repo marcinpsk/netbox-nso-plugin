@@ -70,6 +70,7 @@ class NSOInterfaceStateTable(NetBoxTable):
     NSOInterfaceState is sync-managed (no edit view); actions limited to delete + changelog.
     """
 
+    device = tables.Column(accessor="interface__device", linkify=True, verbose_name="Device")
     interface = tables.Column(linkify=True)
     attribute = tables.Column()
     status = tables.Column()
@@ -84,6 +85,7 @@ class NSOInterfaceStateTable(NetBoxTable):
         fields = (
             "pk",
             "id",
+            "device",
             "interface",
             "attribute",
             "status",
@@ -94,6 +96,7 @@ class NSOInterfaceStateTable(NetBoxTable):
             "actions",
         )
         default_columns = (
+            "device",
             "interface",
             "attribute",
             "status",

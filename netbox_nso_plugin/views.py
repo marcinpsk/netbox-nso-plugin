@@ -352,11 +352,25 @@ class AdapterConnectionEditView(generic.ObjectEditView):
         return AdapterConnection.objects.first() or AdapterConnection()
 
     def get_extra_context(self, request, instance):
-        """Return derived intent templates for display in the settings page."""
+        """Surface derived-intent templates + the env-sourced bearer token status.
+
+        Everything except the token is the editable DB row; the bearer token is read
+        ONLY from PLUGINS_CONFIG / env (never the DB), so show its source + whether
+        it is configured — otherwise the page is misleading about the effective config.
+        """
         from django.apps import apps
 
-        cfg = apps.get_app_config("netbox_nso_plugin")
-        return {"derived_intent_templates": getattr(cfg, "_derived_intent_templates", [])}
+        from . import adapter_client
+
+        app_cfg = apps.get_app_config("netbox_nso_plugin")
+        resolved = adapter_client._resolve_config()
+        db_url = (getattr(instance, "url", "") or "") if getattr(instance, "enabled", False) else ""
+        return {
+            "derived_intent_templates": getattr(app_cfg, "_derived_intent_templates", []),
+            "token_configured": bool(resolved.get("token")),
+            "effective_url": resolved.get("url") or "",
+            "url_source": "Adapter Connection (DB)" if db_url else "PLUGINS_CONFIG / env",
+        }
 
 
 # ── NSO Instance CRUD ────────────────────────────────────────────────────────
@@ -796,9 +810,19 @@ class NSODeviceReconcileView(LoginRequiredMixin, View):
 
 
 class NSOInterfaceStateListView(generic.ObjectListView):
-    """List view for NSOInterfaceState records."""
+    """Cross-device interface-attribute *drift dashboard*.
 
-    queryset = NSOInterfaceState.objects.select_related("interface")
+    Not a dump of every overlay row — it shows only attributes that need attention
+    (drift / pending apply / apply-failed) across all devices, with the device
+    column, so an operator can triage from one place. In-sync/imported rows are
+    excluded (the per-device NSO tab is the full value-aware surface). Status-based
+    filter: the adapter status lags a value typed straight into NetBox, so click
+    through to the device tab for the value-aware truth.
+    """
+
+    queryset = NSOInterfaceState.objects.exclude(status__in=("imported", "in_sync")).select_related(
+        "interface", "interface__device"
+    )
     table = NSOInterfaceStateTable
     filterset = NSOInterfaceStateFilterSet
 

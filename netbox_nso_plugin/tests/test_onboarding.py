@@ -83,13 +83,23 @@ class TestOnboardingDashboard(TestCase):
         self.assertEqual(c["ned_id"], "cisco-ios-cli-6.114")
         self.assertEqual(c["primary_ip"], "10.1.1.1")
 
-    def test_candidate_without_mapping_still_listed(self):
-        """A device with no platform-NED mapping is still a candidate (ned_id="")
-        — the mapping is only the default suggestion; the operator picks the NED."""
+    def test_candidate_requires_platform_mapping(self):
+        """A device whose platform has NO NED mapping is NOT a candidate.
+
+        The mapping filters to platforms we plausibly have a NED for (excludes
+        servers etc.); the operator can still override the NED in the picker, and
+        the mapped value is the pre-selected default.
+        """
+        from netbox_nso_plugin.models import NSOPlatformNedMapping
+
         _device("nomap", platform=self.ios, ip="10.1.1.2/24")
+        # No mapping yet → not listed.
+        self.assertEqual(len(self._build([])["candidates"]), 0)
+        # Add the mapping → now listed with the mapped NED as the default.
+        NSOPlatformNedMapping.objects.create(platform=self.ios, ned_id="cisco-ios-cli-6.114")
         data = self._build([])
         self.assertEqual(len(data["candidates"]), 1)
-        self.assertEqual(data["candidates"][0]["ned_id"], "")
+        self.assertEqual(data["candidates"][0]["ned_id"], "cisco-ios-cli-6.114")
 
     def test_not_candidate_when_inactive(self):
         from netbox_nso_plugin.models import NSOPlatformNedMapping
@@ -170,6 +180,27 @@ class TestOnboardCandidate(TestCase):
         self.assertTrue(res["ok"])
         self.assertTrue(NSODeviceManagement.objects.filter(device=d).exists())
         self.assertEqual(prov.call_args.kwargs["ned_id"], "cisco-iosxr-cli-7.55:cisco-iosxr-cli-7.55")
+        # Onboarding learns the platform→NED mapping (so future same-platform
+        # devices become candidates); the chosen NED is recorded.
+        self.assertTrue(res.get("mapping_created"))
+        m = NSOPlatformNedMapping.objects.get(platform=self.ios)
+        self.assertEqual(m.ned_id, "cisco-iosxr-cli-7.55:cisco-iosxr-cli-7.55")
+
+    def test_onboard_does_not_override_existing_mapping(self):
+        """If a platform mapping already exists, onboarding leaves it (no-op)."""
+        from netbox_nso_plugin.models import NSOPlatformNedMapping
+        from netbox_nso_plugin.onboarding import onboard_candidate
+
+        d = self._mapped_device("keepmap-rtr")
+        existing = NSOPlatformNedMapping.objects.get(platform=self.ios).ned_id
+        with patch(
+            "netbox_nso_plugin.adapter_client.provision_device",
+            return_value={"ok": True, "steps": [], "device_id": 9},
+        ):
+            res = onboard_candidate(d, self.instance, ned_id="cisco-iosxr-cli-7.55:cisco-iosxr-cli-7.55")
+        self.assertTrue(res["ok"])
+        self.assertFalse(res.get("mapping_created"))
+        self.assertEqual(NSOPlatformNedMapping.objects.get(platform=self.ios).ned_id, existing)
 
     def test_explicit_ned_overrides_mapping(self):
         """An explicit ned_id wins over the platform mapping default."""

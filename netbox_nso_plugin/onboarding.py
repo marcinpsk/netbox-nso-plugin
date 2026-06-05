@@ -237,6 +237,14 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
         onboarded_at=timezone.now(),
         onboard_steps=result["steps"],
     )
+    # Learn the platform→NED mapping from this onboard: the first device of a
+    # platform is onboarded with an explicit NED; record it so future devices of
+    # the same platform appear as onboardable candidates (no-op if one exists).
+    if device.platform_id is not None:
+        _, created = NSOPlatformNedMapping.objects.get_or_create(
+            platform_id=device.platform_id, defaults={"ned_id": chosen_ned}
+        )
+        result["mapping_created"] = created
     result["ok"] = True
     result["managed"] = True
     return result
@@ -286,11 +294,13 @@ def manage_existing(device, instance, nso_device_name) -> dict:
 
 
 def _candidates(by_id, matched_ids, mappings) -> list[dict]:
-    """NetBox devices onboardable now: active + primary IP + not in NSO.
+    """NetBox devices onboardable now: active + primary IP + not in NSO + mappable.
 
-    A platform→NED mapping is a *suggestion* (the default in the NED picker), not a
-    requirement — the operator can pick any NED on onboard (e.g. a different NED for
-    a software version, or to test). ``ned_id`` is the mapped default or "".
+    The device's platform must have a platform→NED mapping. The mapping is used to
+    filter to devices we plausibly have a NED for (so servers / unmanageable
+    platforms are excluded) — it is NOT a hard NED choice: the operator can still
+    pick any NED in the picker (e.g. a different NED for a software version, or to
+    test). ``ned_id`` is the mapped default shown pre-selected in that picker.
     """
     candidates = []
     for d in by_id.values():
@@ -300,6 +310,10 @@ def _candidates(by_id, matched_ids, mappings) -> list[dict]:
             continue
         ip = d.primary_ip
         if ip is None:
+            continue
+        # Require a platform→NED mapping — filters out platforms we have no NED for
+        # (servers, etc.). The picker still lets the operator override the NED.
+        if d.platform_id is None or d.platform_id not in mappings:
             continue
         candidates.append(
             {
