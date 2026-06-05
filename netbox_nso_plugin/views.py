@@ -175,6 +175,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
         "isis": "netbox_nso_plugin/categories/isis.html",
         "ospf": "netbox_nso_plugin/categories/ospf.html",
         "bgp": "netbox_nso_plugin/categories/bgp.html",
+        "bfd": "netbox_nso_plugin/categories/bfd.html",
         "route_policy": "netbox_nso_plugin/categories/route_policy.html",
         "redistribution": "netbox_nso_plugin/categories/redistribution.html",
         "snmp": "netbox_nso_plugin/categories/snmp.html",

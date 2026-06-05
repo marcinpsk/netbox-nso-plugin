@@ -33,6 +33,7 @@ def _empty_context() -> dict:
         "ospf_data": {"instances": [], "interfaces": []},
         "redistribution_states": [],
         "bgp_peers": [],
+        "bfd_interfaces": [],
     }
 
 
@@ -158,6 +159,10 @@ def reconcile_category(device, mgmt, key: str) -> dict:
             ctx["ospf_data"] = _reconcile_ospf(device, client.get_ospf(dev_id))
         elif key == "bgp":
             ctx["bgp_peers"] = _reconcile_bgp_config(device, client.get_bgp_config(dev_id))
+        elif key == "bfd":
+            from .bfd_reconciler import reconcile_bfd
+
+            ctx["bfd_interfaces"] = reconcile_bfd(device, client.get_bfd(dev_id).get("interfaces", []))
         elif key == "route_policy":
             ctx["route_policy_states"] = reconcile_route_policy(device, client.get_route_policy(dev_id))
         elif key == "redistribution":

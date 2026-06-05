@@ -1,0 +1,35 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Lazy-loaded fragment: BFD category (read-only — per-interface BFD sessions). #}
+{% if adapter_error %}
+  <div class="alert alert-warning mb-2"><span class="mdi mdi-alert-outline me-1"></span>{{ adapter_error }}</div>
+{% endif %}
+
+{% if bfd_interfaces %}
+  <p class="text-muted small mb-2">BFD is an interface property; protocols (BGP/IS-IS/OSPF) just enable it. Timers come from a shared profile reused network-wide.</p>
+  <div class="table-responsive mb-3">
+    <table class="table table-sm table-hover mb-0">
+      <thead>
+        <tr><th>Interface</th><th>Mode</th><th>Profile</th><th>Min TX</th><th>Min RX</th><th>Multiplier</th><th>Enabled</th></tr>
+      </thead>
+      <tbody>
+        {% for b in bfd_interfaces %}
+        <tr>
+          <td><a href="{{ b.interface.get_absolute_url }}">{{ b.interface.name }}</a></td>
+          <td>
+            {% if b.micro_bfd %}<span class="badge bg-info text-dark" title="Per-LAG-member, RFC 7130">micro-BFD</span>
+            {% else %}<span class="badge text-bg-light border">normal</span>{% endif %}
+          </td>
+          <td>{% if b.bfd_profile %}<a href="{{ b.bfd_profile.get_absolute_url }}">{{ b.bfd_profile.name }}</a>{% else %}<span class="text-muted">—</span>{% endif %}</td>
+          <td>{{ b.bfd_profile.min_tx_int|default:"—" }}</td>
+          <td>{{ b.bfd_profile.min_rx_int|default:"—" }}</td>
+          <td>{{ b.bfd_profile.multiplier|default:"—" }}</td>
+          <td>{% if b.enabled %}<span class="badge bg-success">yes</span>{% else %}<span class="badge bg-warning text-dark">no</span>{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% else %}
+  <p class="text-muted mb-0">No BFD-configured interfaces found on this device.</p>
+{% endif %}

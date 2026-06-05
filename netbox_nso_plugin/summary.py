@@ -128,6 +128,7 @@ _CATEGORIES = [
     ("isis", "IS-IS", "lan", "manage_isis"),
     ("ospf", "OSPF", "lan", "manage_ospf"),
     ("bgp", "BGP", "router-network", "manage_bgp"),
+    ("bfd", "BFD", "pulse", "manage_isis"),
     ("route_policy", "Route Policy", "script-text", "manage_route_policy"),
     ("redistribution", "Redistribution", "swap-horizontal", "manage_redistribution"),
     ("snmp", "SNMP", "console-network", "manage_snmp"),
@@ -185,6 +186,15 @@ def _category_counts(key: str, device, mgmt) -> dict:
     dev_id = device.id
     if key == "interfaces":
         return interface_status_breakdown(NSOInterfaceState.objects.filter(interface__device_id=dev_id))
+    if key == "bfd":
+        # Read-only (no NSO*State overlay): just the count of BFD-configured interfaces.
+        try:
+            from netbox_routing.models import BFDInterface
+
+            n = BFDInterface.objects.filter(interface__device_id=dev_id).count()
+        except Exception:
+            n = 0
+        return {"total": n, "drift": 0, "pending": 0}
     if key == "isis":
         # interfaces + instances combined for the headline; expand shows both.
         ifaces = _status_breakdown(NSOISISInterfaceState.objects.filter(interface__device_id=dev_id))
