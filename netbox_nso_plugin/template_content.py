@@ -682,7 +682,7 @@ def _reconcile_static_routes(device, payload: dict) -> list:
 _ISIS_WRITE_PATH_STATUSES = {"accepted", "deploying", "in_sync"}
 
 
-def _link_routing_isis_interface(device, iface, af, state, instances: dict):
+def _link_routing_isis_interface(device, iface, af, state, instances: dict, bfd_enabled=None):
     """Create/update the netbox_routing.ISISInterface for this row; return it (or None).
 
     Returns None when netbox-routing isn't installed. ISISInterface.instance is required,
@@ -717,6 +717,9 @@ def _link_routing_isis_interface(device, iface, af, state, instances: dict):
     # "" (not None) when there is no hello auth.
     if hasattr(ri, "hello_auth_type"):
         routing_fields.append(("hello_auth_type", state.hello_auth_type or ""))
+    # bfd_enabled (nullable bool) — guard until the netbox-routing field is present.
+    if hasattr(ri, "bfd_enabled"):
+        routing_fields.append(("bfd_enabled", bfd_enabled))
     for attr, val in routing_fields:
         if getattr(ri, attr) != val:
             setattr(ri, attr, val)
@@ -793,7 +796,9 @@ def _reconcile_isis_interfaces(device, interfaces: list) -> list:
         state.hello_auth_present = bool(entry.get("hello_auth_present", False))
         state.last_sync_at = now
 
-        state.isis_interface = _link_routing_isis_interface(device, iface, af, state, instances)
+        state.isis_interface = _link_routing_isis_interface(
+            device, iface, af, state, instances, bfd_enabled=entry.get("bfd_enabled")
+        )
 
         if state.status not in _ISIS_WRITE_PATH_STATUSES:
             # Linked to the routing object we just synced from NSO → in sync.

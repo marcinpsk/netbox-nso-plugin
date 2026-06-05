@@ -224,6 +224,17 @@ class TestReconcileIsisInterfaces(TestCase):
             ri.refresh_from_db()
             self.assertEqual(ri.hello_auth_type, "md5")
 
+    def test_bfd_enabled_written_to_routing(self):
+        """entry bfd_enabled flows onto netbox_routing ISISInterface.bfd_enabled."""
+        self._make_mgmt()
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        state = _reconcile_isis_interfaces(self.device, self._payload(self._entry(bfd_enabled=True)))[0]
+        ri = state.isis_interface
+        if ri is not None and hasattr(ri, "bfd_enabled"):
+            ri.refresh_from_db()
+            self.assertTrue(ri.bfd_enabled)
+
     def test_no_hello_auth_defaults_blank(self):
         """An entry without hello-auth leaves the state blank/false."""
         self._make_mgmt()
