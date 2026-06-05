@@ -37,12 +37,12 @@
               </td>
               <td>{{ row.device_value }}</td>
               <td>
-                {% if row.kind == 'drift' %}<span class="badge bg-warning text-dark">{{ row.label }}</span>
-                {% elif row.kind == 'pending' %}<span class="badge bg-info">{{ row.label }}</span>
-                {% elif row.kind == 'apply_failed' %}<span class="badge bg-danger" title="The last Apply to the device failed — retry">{{ row.label }}</span>
-                {% elif row.kind == 'in_sync' %}<span class="badge bg-success">{{ row.label }}</span>
-                {% elif row.kind == 'deploying' %}<span class="badge bg-primary">{{ row.label }}</span>
-                {% else %}<span class="badge bg-info">{{ row.label }}</span>{% endif %}
+                {% if row.kind == 'drift' %}<span class="badge text-bg-warning">{{ row.label }}</span>
+                {% elif row.kind == 'pending' %}<span class="badge text-bg-info">{{ row.label }}</span>
+                {% elif row.kind == 'apply_failed' %}<span class="badge text-bg-danger" title="The last Apply to the device failed — retry">{{ row.label }}</span>
+                {% elif row.kind == 'in_sync' %}<span class="badge text-bg-success">{{ row.label }}</span>
+                {% elif row.kind == 'deploying' %}<span class="badge text-bg-primary">{{ row.label }}</span>
+                {% else %}<span class="badge text-bg-info">{{ row.label }}</span>{% endif %}
                 {% if row.owned %}<span class="mdi mdi-shield-check text-success ms-1" title="NetBox is the source of truth (owned)"></span>{% endif %}
               </td>
               <td class="text-nowrap">

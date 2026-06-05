@@ -6,6 +6,7 @@ These tests require the full NetBox/Django stack (run in devcontainer).
 """
 
 import pathlib
+import re
 from unittest.mock import MagicMock, patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
@@ -45,6 +46,41 @@ class TestTemplateCommentSyntax(SimpleTestCase):
             [],
             "Multiline Django tokens render as visible text / break parsing "
             "(use {% comment %} for multiline prose):\n" + "\n".join(problems),
+        )
+
+
+class TestBadgeContrast(SimpleTestCase):
+    """Guard against low-contrast (grey-on-grey) badges.
+
+    Bootstrap 5.3 dropped the implicit ``.badge { color: #fff }`` rule, so a bare
+    ``class="badge bg-secondary"`` inherits the surrounding (dark) body text colour
+    and renders dark-on-grey — illegible. The fix is the combined ``text-bg-*``
+    utility, which sets a contrasting foreground for the chosen background. This
+    test forbids a bare ``bg-<colour>`` on any badge so the regression can't recur.
+    """
+
+    _CLASS_ATTR_RE = re.compile(r'class="([^"]*)"')
+    # A standalone colour-background utility NOT prefixed by ``text-`` (so
+    # ``text-bg-success`` is fine but ``bg-success`` is not).
+    _BARE_BG_RE = re.compile(r"(?<!text-)\bbg-(primary|secondary|success|danger|warning|info|light|dark)\b")
+
+    def test_badges_use_text_bg_for_contrast(self):
+        """Every ``badge`` must use ``text-bg-*`` (never a bare ``bg-*``)."""
+        templates_dir = pathlib.Path(__file__).resolve().parent.parent / "templates"
+        problems = []
+        for path in templates_dir.rglob("*.html"):
+            for lineno, line in enumerate(path.read_text().splitlines(), start=1):
+                for class_value in self._CLASS_ATTR_RE.findall(line):
+                    if "badge" not in class_value.split():
+                        continue
+                    bad = self._BARE_BG_RE.findall(class_value)
+                    if bad:
+                        problems.append(f"{path}:{lineno}: bare bg-{bad} on badge -> use text-bg-*: {line.strip()}")
+        self.assertEqual(
+            problems,
+            [],
+            "Bare bg-* on a badge renders low-contrast (Bootstrap 5.3 dropped the "
+            "default badge text colour); use the combined text-bg-* utility:\n" + "\n".join(problems),
         )
 
 

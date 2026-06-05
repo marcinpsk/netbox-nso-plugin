@@ -54,8 +54,8 @@
         {% for u in snmp_data.v3_users %}
         <tr data-status="{{ u.status }}" data-owned="false">
           <td>{{ u.username }}</td>
-          <td>{% if u.has_auth_secret %}<span class="badge bg-success">set</span>{% else %}<span class="badge bg-secondary">none</span>{% endif %}</td>
-          <td>{% if u.has_priv_secret %}<span class="badge bg-success">set</span>{% else %}<span class="badge bg-secondary">none</span>{% endif %}</td>
+          <td>{% if u.has_auth_secret %}<span class="badge text-bg-success">set</span>{% else %}<span class="badge text-bg-secondary">none</span>{% endif %}</td>
+          <td>{% if u.has_priv_secret %}<span class="badge text-bg-success">set</span>{% else %}<span class="badge text-bg-secondary">none</span>{% endif %}</td>
           <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=u.status %}</td>
           <td>{{ u.last_sync_at|default:"—" }}</td>
         </tr>

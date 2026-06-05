@@ -29,8 +29,8 @@
           <td>{{ ii.circuit_type|default:"—" }}</td>
           <td>{{ ii.network_type|default:"—" }}</td>
           <td>{{ ii.metric|default:"—" }}</td>
-          <td>{% if ii.passive %}<span class="badge bg-warning text-dark">passive</span>{% else %}<span class="badge bg-success">active</span>{% endif %}</td>
-          <td>{% if ii.hello_auth_present or ii.hello_auth_type %}<span class="badge bg-info text-dark" title="Per-interface IIH authentication">{{ ii.hello_auth_type|default:"on" }}</span>{% else %}<span class="text-muted">—</span>{% endif %}</td>
+          <td>{% if ii.passive %}<span class="badge text-bg-warning">passive</span>{% else %}<span class="badge text-bg-success">active</span>{% endif %}</td>
+          <td>{% if ii.hello_auth_present or ii.hello_auth_type %}<span class="badge text-bg-info" title="Per-interface IIH authentication">{{ ii.hello_auth_type|default:"on" }}</span>{% else %}<span class="text-muted">—</span>{% endif %}</td>
           <td>
             {% include "netbox_nso_plugin/categories/_state_badge.html" with status=ii.status %}
           </td>

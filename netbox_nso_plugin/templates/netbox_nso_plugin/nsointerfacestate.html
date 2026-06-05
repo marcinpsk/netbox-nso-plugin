@@ -27,17 +27,17 @@
               <th scope="row">Status</th>
               <td>
                 {% if object.status == "in_sync" or object.status == "imported" %}
-                  <span class="badge bg-success">{{ object.status }}</span>
+                  <span class="badge text-bg-success">{{ object.status }}</span>
                 {% elif object.status == "changed" or object.status == "drifted" %}
-                  <span class="badge bg-warning text-dark">{{ object.status }}</span>
+                  <span class="badge text-bg-warning">{{ object.status }}</span>
                 {% elif object.status == "error" or object.status == "apply_failed" %}
-                  <span class="badge bg-danger">{{ object.status }}</span>
+                  <span class="badge text-bg-danger">{{ object.status }}</span>
                 {% elif object.status == "accepted" %}
-                  <span class="badge bg-info">{{ object.status }}</span>
+                  <span class="badge text-bg-info">{{ object.status }}</span>
                 {% elif object.status == "deploying" %}
-                  <span class="badge bg-primary">{{ object.status }}</span>
+                  <span class="badge text-bg-primary">{{ object.status }}</span>
                 {% else %}
-                  <span class="badge bg-info">{{ object.status }}</span>
+                  <span class="badge text-bg-info">{{ object.status }}</span>
                 {% endif %}
               </td>
             </tr>

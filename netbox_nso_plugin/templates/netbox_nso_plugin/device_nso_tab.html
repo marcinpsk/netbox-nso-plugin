@@ -52,17 +52,17 @@
         <tr>
           <th>Auto Apply</th>
           <td>
-            {% if mgmt.auto_apply %}<span class="badge bg-success">Enabled</span>
-            {% else %}<span class="badge bg-warning text-dark">Disabled</span>{% endif %}
+            {% if mgmt.auto_apply %}<span class="badge text-bg-success">Enabled</span>
+            {% else %}<span class="badge text-bg-warning">Disabled</span>{% endif %}
           </td>
         </tr>
         <tr><th>Last Sync</th><td>{{ mgmt.last_sync_at|date:"Y-m-d H:i"|default:"Never" }}</td></tr>
         <tr>
           <th>Last Sync Status</th>
           <td>
-            {% if mgmt.last_sync_status == "succeeded" %}<span class="badge bg-success">{{ mgmt.last_sync_status }}</span>
-            {% elif mgmt.last_sync_status == "failed" %}<span class="badge bg-danger">{{ mgmt.last_sync_status }}</span>
-            {% elif mgmt.last_sync_status %}<span class="badge bg-info">{{ mgmt.last_sync_status }}</span>
+            {% if mgmt.last_sync_status == "succeeded" %}<span class="badge text-bg-success">{{ mgmt.last_sync_status }}</span>
+            {% elif mgmt.last_sync_status == "failed" %}<span class="badge text-bg-danger">{{ mgmt.last_sync_status }}</span>
+            {% elif mgmt.last_sync_status %}<span class="badge text-bg-info">{{ mgmt.last_sync_status }}</span>
             {% else %}—{% endif %}
           </td>
         </tr>
@@ -338,9 +338,9 @@
           <span>
             <span class="mdi mdi-{{ cat.icon }} me-1"></span><strong>{{ cat.label }}</strong>
             <span class="text-muted ms-1">({{ cat.counts.total|default:0 }})</span>
-            {% if cat.counts.drift %}<span class="badge bg-warning text-dark ms-2">{{ cat.counts.drift }} drift</span>{% endif %}
-            {% if cat.counts.pending %}<span class="badge bg-info ms-1">{{ cat.counts.pending }} pending apply</span>{% endif %}
-            {% if cat.counts.total and not cat.counts.drift and not cat.counts.pending %}<span class="badge bg-success ms-2">in sync</span>{% endif %}
+            {% if cat.counts.drift %}<span class="badge text-bg-warning ms-2">{{ cat.counts.drift }} drift</span>{% endif %}
+            {% if cat.counts.pending %}<span class="badge text-bg-info ms-1">{{ cat.counts.pending }} pending apply</span>{% endif %}
+            {% if cat.counts.total and not cat.counts.drift and not cat.counts.pending %}<span class="badge text-bg-success ms-2">in sync</span>{% endif %}
           </span>
           <span>
             <span class="mdi mdi-refresh nso-cat-refresh me-2" role="button"

@@ -64,7 +64,7 @@
           <td><a href="{{ oif.interface.get_absolute_url }}">{{ oif.interface.name }}</a></td>
           <td>{{ oif.process_id|default:"—" }}</td>
           <td>{{ oif.area_id|default:"—" }}</td>
-          <td>{% if oif.passive %}<span class="badge bg-warning text-dark">passive</span>{% else %}<span class="badge bg-success">active</span>{% endif %}</td>
+          <td>{% if oif.passive %}<span class="badge text-bg-warning">passive</span>{% else %}<span class="badge text-bg-success">active</span>{% endif %}</td>
           <td>
             {% include "netbox_nso_plugin/categories/_state_badge.html" with status=oif.status %}
           </td>
