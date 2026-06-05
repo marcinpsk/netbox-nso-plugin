@@ -157,6 +157,8 @@ def reconcile_category(device, mgmt, key: str) -> dict:
             ctx["state"] = client.get_state(dev_id)
             ctx["interface_states"] = _upsert_interface_states(device, ctx["interfaces"])
             ctx["interface_ips"] = _reconcile_interface_ips(device, client.get_interface_ips(dev_id))
+        elif key == "interface_ips":
+            ctx["interface_ips"] = _reconcile_interface_ips(device, client.get_interface_ips(dev_id))
         elif key == "snmp":
             ctx["snmp_data"] = _reconcile_snmp_config(device, client.get_snmp_config(dev_id))
         elif key == "logging":

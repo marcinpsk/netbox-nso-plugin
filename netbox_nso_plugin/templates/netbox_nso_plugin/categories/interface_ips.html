@@ -1,0 +1,31 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Lazy-loaded fragment: Interface IPs (read-only — IPs imported from NSO per interface). #}
+{% if adapter_error %}
+  <div class="alert alert-warning mb-2"><span class="mdi mdi-alert-outline me-1"></span>{{ adapter_error }}</div>
+{% endif %}
+
+{% if interface_ips %}
+  <p class="text-muted small mb-2">IP addresses reported by the device, correlated to their NetBox interface. Until accepted (or interface-IP auto-create is enabled) these are <strong>imported</strong> — recorded here but not yet written to NetBox IPAM.</p>
+  <div class="table-responsive mb-3">
+    <table class="table table-sm table-hover mb-0">
+      <thead>
+        <tr><th>Interface</th><th>Address</th><th>Family</th><th>VRF</th><th>Secondary</th><th>Status</th></tr>
+      </thead>
+      <tbody>
+        {% for ip in interface_ips %}
+        <tr>
+          <td><a href="{{ ip.interface.get_absolute_url }}">{{ ip.interface.name }}</a></td>
+          <td><code>{{ ip.address }}</code></td>
+          <td>{{ ip.family }}</td>
+          <td>{% if ip.vrf %}{{ ip.vrf }}{% else %}<span class="text-muted">global</span>{% endif %}</td>
+          <td>{% if ip.secondary %}<span class="badge text-bg-secondary">secondary</span>{% else %}<span class="text-muted">—</span>{% endif %}</td>
+          <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=ip.status %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% else %}
+  <p class="text-muted mb-0">No interface IP addresses reported for this device.</p>
+{% endif %}

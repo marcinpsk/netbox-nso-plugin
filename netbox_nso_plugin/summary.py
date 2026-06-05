@@ -124,6 +124,7 @@ def interface_status_breakdown(qs) -> dict:
 # manage_routing master switch (see category_summaries).
 _CATEGORIES = [
     ("interfaces", "Interfaces", "ethernet", "manage_interfaces"),
+    ("interface_ips", "Interface IPs", "ip-network", "manage_interfaces"),
     ("static", "Static Routes", "sign-direction", "manage_static"),
     ("isis", "IS-IS", "lan", "manage_isis"),
     ("ospf", "OSPF", "lan", "manage_ospf"),
@@ -186,6 +187,10 @@ def _category_counts(key: str, device, mgmt) -> dict:
     dev_id = device.id
     if key == "interfaces":
         return interface_status_breakdown(NSOInterfaceState.objects.filter(interface__device_id=dev_id))
+    if key == "interface_ips":
+        from .models import NSOInterfaceIPState
+
+        return _status_breakdown(NSOInterfaceIPState.objects.filter(interface__device_id=dev_id))
     if key == "bfd":
         # Read-only (no NSO*State overlay): just the count of BFD-configured interfaces.
         try:
