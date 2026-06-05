@@ -251,6 +251,20 @@ def get_isis_interfaces(adapter_device_id: int) -> dict:
     return {"processes": data.get("processes", []), "interfaces": data.get("interfaces", [])}
 
 
+def get_bfd(adapter_device_id: int) -> dict:
+    """GET /api/v1/devices/{id}/bfd → dict with 'interfaces' (per-interface BFD).
+
+    Returns an empty dict when the device has no BFD state (404).
+    """
+    try:
+        data = _request("GET", f"/api/v1/devices/{adapter_device_id}/bfd")
+    except AdapterError as exc:
+        if exc.code in ("not_found", "404"):
+            return {"interfaces": []}
+        raise
+    return {"interfaces": data.get("interfaces", [])}
+
+
 def get_bgp_config(adapter_device_id: int) -> dict:
     """GET /api/v1/devices/{id}/bgp-config → BGP router hierarchy dict.
 

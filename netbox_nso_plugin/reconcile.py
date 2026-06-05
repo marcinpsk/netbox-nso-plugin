@@ -38,6 +38,7 @@ def _empty_context() -> dict:
 
 def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
     """Reconcile each opted-in routing protocol into *ctx* (gated by kill-switches)."""
+    from .bfd_reconciler import reconcile_bfd
     from .bgp_reconciler import _reconcile_bgp_config
     from .redistribution_reconciler import reconcile_redistribution
     from .route_policy_reconciler import reconcile_route_policy
@@ -64,6 +65,10 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
         ctx["ospf_data"] = _reconcile_ospf(device, client.get_ospf(dev_id))
     if mgmt.manage_bgp:
         ctx["bgp_peers"] = _reconcile_bgp_config(device, client.get_bgp_config(dev_id))
+    # BFD is interface-level + protocol-agnostic; reconcile it whenever any of the
+    # protocols that ride it (BGP/IS-IS/OSPF) are managed.
+    if mgmt.manage_bgp or mgmt.manage_isis or mgmt.manage_ospf:
+        ctx["bfd_interfaces"] = reconcile_bfd(device, client.get_bfd(dev_id).get("interfaces", []))
     # Redistribution runs LAST: its destination is a netbox_routing OSPFInstance /
     # ISISInstance / BGPAddressFamily created by the protocol reconciles above, so
     # those must run first (BGP especially — BGP-dest redistribution needs its AF).

@@ -192,6 +192,7 @@ def _get_or_create_peer(
         "source": source_obj,
         "ttl": peer_data.get("ttl"),
         "password": peer_data.get("password"),
+        "bfd_enabled": peer_data.get("bfd_enabled"),
     }
     obj, created = BGPPeer.objects.get_or_create(
         scope=scope_obj,

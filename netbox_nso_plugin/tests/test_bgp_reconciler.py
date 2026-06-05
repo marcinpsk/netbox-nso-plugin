@@ -326,6 +326,20 @@ class TestReconcileBgpConfig(TestCase):
 
         self.assertIsNone(BGPPeer.objects.get(peer__address__net_host="10.0.0.2").source_id)
 
+    def test_peer_bfd_enabled_linked(self):
+        """peer bfd_enabled flows onto the BGPPeer."""
+        self._make_mgmt()
+
+        from netbox_routing.models import BGPPeer
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        _reconcile_bgp_config(
+            self.device,
+            self._payload(self._router_payload(peers=[self._peer_entry("10.7.0.1", bfd_enabled=True)])),
+        )
+        self.assertTrue(BGPPeer.objects.get(peer__address__net_host="10.7.0.1").bfd_enabled)
+
     def test_peer_group_template_gets_remote_as(self):
         """The peer-group's BGPPeerTemplate is enriched with the (inherited) remote_as."""
         self._make_mgmt()
