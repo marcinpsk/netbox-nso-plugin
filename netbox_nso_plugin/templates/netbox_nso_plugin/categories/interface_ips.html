@@ -7,6 +7,8 @@
 
 {% if interface_ips %}
   <p class="text-muted small mb-2">IP addresses reported by the device, correlated to their NetBox interface. Until accepted (or interface-IP auto-create is enabled) these are <strong>imported</strong> — recorded here but not yet written to NetBox IPAM.</p>
+  <div id="flt-interface-ips">
+  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-interface-ips" placeholder="Filter by interface / address / VRF…" show_status=True %}
   <div class="table-responsive mb-3">
     <table class="table table-sm table-hover mb-0">
       <thead>
@@ -14,7 +16,7 @@
       </thead>
       <tbody>
         {% for ip in interface_ips %}
-        <tr>
+        <tr data-status="{{ ip.status }}" data-owned="{{ ip.accepted_at|yesno:'true,false' }}">
           <td><a href="{{ ip.interface.get_absolute_url }}">{{ ip.interface.name }}</a></td>
           <td><code>{{ ip.address }}</code></td>
           <td>{{ ip.family }}</td>
@@ -25,6 +27,7 @@
         {% endfor %}
       </tbody>
     </table>
+  </div>
   </div>
 {% else %}
   <p class="text-muted mb-0">No interface IP addresses reported for this device.</p>

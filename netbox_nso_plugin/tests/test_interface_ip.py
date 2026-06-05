@@ -310,6 +310,41 @@ class TestReconcileInterfaceIps(TestCase):
         states = {s.address: s for s in result}
         self.assertTrue(states["10.1.1.2/24"].secondary)
 
+    def test_bound_port_rerun_stays_in_sync_no_spurious_drift(self):
+        """Nokia logical→physical: an IP bound via bound_port must not be retired as 'changed'.
+
+        Regression: the state row is created against the physical port, but the
+        payload key uses the logical router-interface name.  The retire pass must
+        compare on interface_id (not name), or every rerun marks the IP 'changed'.
+        """
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+        from netbox_nso_plugin.template_content import _reconcile_interface_ips
+
+        # Physical port exists in NetBox; the logical name does NOT.
+        physical = Interface.objects.create(device=self.device, name="1/1/c11/1", type="other")
+        payload = {
+            "device_id": self.device.pk,
+            "interfaces": [
+                {
+                    "interface": "router-interface-to-core",  # logical, absent from dcim
+                    "bound_port": "1/1/c11/1",
+                    "addresses": [
+                        {"address": "10.20.0.1/31", "vrf": "", "family": "ipv4", "secondary": False},
+                    ],
+                }
+            ],
+        }
+
+        with self._auto_create_ctx(True):
+            _reconcile_interface_ips(self.device, payload)
+            result = _reconcile_interface_ips(self.device, payload)  # second sync
+
+        states = {s.address: s for s in result}
+        self.assertEqual(states["10.20.0.1/31"].status, "in_sync")
+        self.assertEqual(states["10.20.0.1/31"].interface_id, physical.pk)
+        # Exactly one row, and it is NOT 'changed'.
+        self.assertEqual(NSOInterfaceIPState.objects.filter(interface=physical, address="10.20.0.1/31").count(), 1)
+
     def test_unknown_interface_name_skipped(self):
         """Addresses for an interface name that doesn't exist in NetBox are silently skipped."""
         from netbox_nso_plugin.models import NSOInterfaceIPState

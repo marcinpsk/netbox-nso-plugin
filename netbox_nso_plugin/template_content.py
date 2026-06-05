@@ -221,12 +221,19 @@ def _create_and_link_ip(address, vrf_obj, iface, Prefix, logger, transaction, Va
         return "error"
 
 
-def _retire_stale_ip_states(device, payload_set, VRF, IPAddress, now, transaction, NSOInterfaceIPState) -> None:
-    """Mark state rows no longer in *payload_set* as 'changed' and unassign their IPs."""
+def _retire_stale_ip_states(device, resolved_keys, VRF, IPAddress, now, transaction, NSOInterfaceIPState) -> None:
+    """Mark state rows no longer reported by NSO as 'changed' and unassign their IPs.
+
+    *resolved_keys* is a set of ``(interface_id, address, vrf)`` built during the
+    reconcile loop using the same logical→physical interface resolution applied
+    when the state rows were created.  Keying on ``interface_id`` (not the name
+    string) avoids spurious 'changed' drift on Nokia, where the payload carries a
+    logical router-interface name but the state row is bound to the physical port.
+    """
     existing_states = NSOInterfaceIPState.objects.filter(interface__device=device).select_related("interface")
     for state in existing_states:
-        key = (state.interface.name, state.address, state.vrf)
-        if key not in payload_set and state.status not in ("changed",):
+        key = (state.interface_id, state.address, state.vrf)
+        if key not in resolved_keys and state.status not in ("changed",):
             vrf_obj = None
             if state.vrf and VRF is not None:
                 try:
@@ -315,6 +322,9 @@ def _reconcile_interface_ips(device, payload: dict) -> list:
     iface_map = {i.name: i for i in Interface.objects.filter(device=device)}
     payload_set, attr_map, bound_port_map = _build_payload_index(payload)
     now = timezone.now()
+    # (interface_id, address, vrf) for every payload entry that resolved to a real
+    # interface — the retire pass compares against this, not the logical name set.
+    resolved_keys: set[tuple[int, str, str]] = set()
 
     for iface_name, address, vrf_name in payload_set:
         # For Nokia devices: logical router-interface → physical port lookup.
@@ -327,6 +337,7 @@ def _reconcile_interface_ips(device, payload: dict) -> list:
             iface = iface_map.get(bound_port)
         if iface is None:
             continue
+        resolved_keys.add((iface.pk, address, vrf_name))
 
         vrf_obj = None
         if vrf_name and VRF is not None:
@@ -372,7 +383,7 @@ def _reconcile_interface_ips(device, payload: dict) -> list:
 
         state.save()
 
-    _retire_stale_ip_states(device, payload_set, VRF, IPAddress, now, transaction, NSOInterfaceIPState)
+    _retire_stale_ip_states(device, resolved_keys, VRF, IPAddress, now, transaction, NSOInterfaceIPState)
 
     return list(NSOInterfaceIPState.objects.filter(interface__device=device).select_related("interface"))
 
