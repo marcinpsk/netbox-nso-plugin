@@ -784,6 +784,48 @@ def _reconcile_isis_segment_routing(inst, sr: dict | None) -> None:
         row.save(update_fields=fields)
 
 
+def _reconcile_isis_flex_algos(inst, flex_algos) -> None:
+    """Full-replace ISISFlexAlgo rows for *inst* from the adapter's flex-algo list.
+
+    Each entry is {algo_id, metric_type, priority, admin_group_*}; algos NSO no
+    longer reports are deleted. No-op when the fork lacks ISISFlexAlgo or *inst*
+    is None.
+    """
+    if inst is None:
+        return
+    try:
+        from netbox_routing.models import ISISFlexAlgo
+    except Exception:
+        return
+    cols = (
+        "metric_type",
+        "priority",
+        "admin_group_exclude",
+        "admin_group_include_any",
+        "admin_group_include_all",
+    )
+    incoming = {}
+    for fa in flex_algos or []:
+        try:
+            incoming[int(fa["algo_id"])] = fa
+        except (KeyError, TypeError, ValueError):
+            continue
+    existing = {row.algo_id: row for row in ISISFlexAlgo.objects.filter(instance=inst)}
+    for aid, data in incoming.items():
+        row = existing.get(aid) or ISISFlexAlgo(instance=inst, algo_id=aid)
+        changed = row.pk is None
+        for col in cols:
+            val = data.get(col)
+            if val is not None and getattr(row, col, None) != val:
+                setattr(row, col, val)
+                changed = True
+        if changed:
+            row.save()
+    for aid, row in existing.items():
+        if aid not in incoming:
+            row.delete()
+
+
 _ISIS_LEVEL_COLS = ("default_metric", "wide_metrics_only", "preference", "auth_type")
 _ISIS_IFACE_LEVEL_COLS = ("metric", "hello_interval", "hello_multiplier", "priority", "passive")
 
@@ -1020,6 +1062,7 @@ def _sync_routing_isis_instance(device, tag, state, entry):
     except Exception:
         pass
     _reconcile_isis_segment_routing(inst, entry.get("segment_routing"))
+    _reconcile_isis_flex_algos(inst, entry.get("flex_algos"))
     return inst
 
 

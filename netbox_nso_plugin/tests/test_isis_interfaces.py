@@ -671,3 +671,37 @@ class TestReconcileIsisInterfaceLevels(TestCase):
         self.assertEqual(set(rows), {2})
         self.assertEqual(rows[2].metric, 10)
         self.assertEqual(rows[2].hello_interval, 3)
+
+    def test_routing_instance_flex_algos(self):
+        """M33 P2b: ISISFlexAlgo rows are reconciled (full-replace by algo_id)."""
+        self._make_mgmt()
+        from netbox_routing.models import ISISFlexAlgo, ISISInstance
+
+        from netbox_nso_plugin.template_content import _reconcile_isis_process
+
+        _reconcile_isis_process(
+            self.device,
+            [
+                {
+                    "process_tag": "0",
+                    "flex_algos": [
+                        {"algo_id": 128, "metric_type": "igp-metric", "priority": 100, "admin_group_exclude": "BLUE"},
+                        {"algo_id": 129, "metric_type": "igp-metric", "priority": 100, "admin_group_exclude": "RED"},
+                    ],
+                }
+            ],
+        )
+        inst = ISISInstance.objects.get(device=self.device, process_tag="0")
+        fas = {fa.algo_id: fa for fa in ISISFlexAlgo.objects.filter(instance=inst)}
+        self.assertEqual(set(fas), {128, 129})
+        self.assertEqual(fas[128].metric_type, "igp-metric")
+        self.assertEqual(fas[128].admin_group_exclude, "BLUE")
+
+        # Full-replace: dropping 129 deletes its row.
+        _reconcile_isis_process(
+            self.device,
+            [{"process_tag": "0", "flex_algos": [{"algo_id": 128, "metric_type": "delay-metric"}]}],
+        )
+        fas = {fa.algo_id: fa for fa in ISISFlexAlgo.objects.filter(instance=inst)}
+        self.assertEqual(set(fas), {128})
+        self.assertEqual(fas[128].metric_type, "delay-metric")
