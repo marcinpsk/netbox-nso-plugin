@@ -263,11 +263,32 @@ def _snmp_breakdown(querysets) -> dict:
     return out
 
 
+def _l2_service_count(mgmt) -> dict:
+    """Count Nokia L2 SAPs for the tile via a defensive adapter call (M37 P1).
+
+    L2 services are display-only (no NSO*State overlay, no manage_* flag), so the
+    count can't come from the DB like other categories — it's fetched live from the
+    adapter and degrades to 0 on any error so the tab never breaks. Mirrors how BFD
+    counts from outside NSO*State.
+    """
+    if mgmt is None or mgmt.adapter_device_id is None:
+        return {"total": 0, "drift": 0, "pending": 0}
+    try:
+        from . import adapter_client as client
+
+        services = client.get_l2_services(mgmt.adapter_device_id).get("services", [])
+    except Exception:
+        return {"total": 0, "drift": 0, "pending": 0}
+    total = sum(len(s.get("saps", [])) for s in services)
+    return {"total": total, "drift": 0, "pending": 0}
+
+
 def category_summaries(device, mgmt) -> list[dict]:
     """Return the collapsed-view summary for every scope this device opted into.
 
-    Read-only: cheap aggregate queries over persisted NSO*State, no adapter calls.
-    Each entry: {key, label, icon, counts:{status:n,'total':N,...}}.
+    Read-only: cheap aggregate queries over persisted NSO*State. The one exception is
+    the L2-services tile (M37 P1, display-only) whose count is a guarded live adapter
+    call — see _l2_service_count. Each entry: {key, label, icon, counts:{...,'total':N}}.
     """
     if mgmt is None:
         return []
@@ -280,4 +301,9 @@ def category_summaries(device, mgmt) -> list[dict]:
         if not getattr(mgmt, flag, False):
             continue
         summaries.append({"key": key, "label": label, "icon": icon, "counts": _category_counts(key, device, mgmt)})
+    # L2 services (Nokia epipe/vpls) — no overlay/flag; show the tile only when the
+    # adapter actually reports SAPs, so non-Nokia / un-synced devices get no empty tile.
+    l2 = _l2_service_count(mgmt)
+    if l2["total"]:
+        summaries.append({"key": "l2_services", "label": "L2 Services", "icon": "lan-connect", "counts": l2})
     return summaries

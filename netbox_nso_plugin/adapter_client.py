@@ -251,6 +251,21 @@ def get_isis_interfaces(adapter_device_id: int) -> dict:
     return {"processes": data.get("processes", []), "interfaces": data.get("interfaces", [])}
 
 
+def get_l2_services(adapter_device_id: int) -> dict:
+    """GET /api/v1/devices/{id}/l2-services → dict with 'services' (Nokia epipe/vpls + SAPs).
+
+    Returns an empty shape when the device has no L2 services (404).
+    Raises AdapterError on transport or server errors.
+    """
+    try:
+        data = _request("GET", f"/api/v1/devices/{adapter_device_id}/l2-services")
+    except AdapterError as exc:
+        if exc.code in ("not_found", "404"):
+            return {"services": []}
+        raise
+    return {"services": data.get("services", [])}
+
+
 def get_bfd(adapter_device_id: int) -> dict:
     """GET /api/v1/devices/{id}/bfd → dict with 'interfaces' (per-interface BFD).
 
