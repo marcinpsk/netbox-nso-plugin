@@ -125,6 +125,7 @@ def interface_status_breakdown(qs) -> dict:
 _CATEGORIES = [
     ("interfaces", "Interfaces", "ethernet", "manage_interfaces"),
     ("interface_ips", "Interface IPs", "ip-network", "manage_interfaces"),
+    ("lacp", "LACP", "link-variant", "manage_interfaces"),
     ("static", "Static Routes", "sign-direction", "manage_static"),
     ("isis", "IS-IS", "lan", "manage_isis"),
     ("ospf", "OSPF", "lan", "manage_ospf"),
@@ -246,6 +247,17 @@ def _category_counts(key: str, device, mgmt) -> dict:
         from .models import NSOL2SapState
 
         return _status_breakdown(NSOL2SapState.objects.filter(management=mgmt))
+    if key == "lacp":
+        from .models import NSOLACPBundleState, NSOLACPMemberState
+
+        # bundles + members combined for the headline; expand shows both.
+        out = _status_breakdown(NSOLACPBundleState.objects.filter(management=mgmt))
+        members = _status_breakdown(NSOLACPMemberState.objects.filter(management=mgmt))
+        out["total"] = out.get("total", 0) + members.get("total", 0)
+        out["drift"] = out.get("drift", 0) + members.get("drift", 0)
+        out["pending"] = out.get("pending", 0) + members.get("pending", 0)
+        out["members"] = members.get("total", 0)
+        return out
     return {"total": 0}
 
 

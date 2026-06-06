@@ -174,6 +174,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
     # interfaces is handled by _render_interfaces_page (paginated); the rest reconcile-on-expand.
     _PARTIALS = {
         "interface_ips": "netbox_nso_plugin/categories/interface_ips.html",
+        "lacp": "netbox_nso_plugin/categories/lacp.html",
         "static": "netbox_nso_plugin/categories/static.html",
         "isis": "netbox_nso_plugin/categories/isis.html",
         "ospf": "netbox_nso_plugin/categories/ospf.html",

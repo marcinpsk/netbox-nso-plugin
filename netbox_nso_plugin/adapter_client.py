@@ -206,6 +206,11 @@ def get_lag_topology(adapter_device_id: int) -> dict:
     return _request("GET", f"/api/v1/devices/{adapter_device_id}/lag-topology")
 
 
+def get_lag_config(adapter_device_id: int) -> dict:
+    """GET /api/v1/devices/{id}/lag-config."""
+    return _request("GET", f"/api/v1/devices/{adapter_device_id}/lag-config")
+
+
 def get_interface_ips(adapter_device_id: int) -> dict:
     """GET /api/v1/devices/{id}/interface-ips."""
     return _request("GET", f"/api/v1/devices/{adapter_device_id}/interface-ips")

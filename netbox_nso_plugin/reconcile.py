@@ -36,6 +36,7 @@ def _empty_context() -> dict:
         "bfd_interfaces": [],
         "interface_ips": [],
         "l2_sap_states": [],
+        "lacp_bundle_states": [],
     }
 
 
@@ -115,6 +116,10 @@ def reconcile_device(device, mgmt=None) -> dict:
             # NetBox interfaces. Runs AFTER the adapter sync created the interfaces;
             # gated internally by interface_ip_auto_create (off → lands as pending).
             ctx["interface_ips"] = _reconcile_interface_ips(device, client.get_interface_ips(dev_id))
+            # M33: LACP/LAG bundle + member overlay states (interface-level).
+            from .lacp_reconciler import reconcile_lag_config
+
+            ctx["lacp_bundle_states"] = reconcile_lag_config(device, client.get_lag_config(dev_id))
         if mgmt.manage_snmp:
             ctx["snmp_data"] = _reconcile_snmp_config(device, client.get_snmp_config(dev_id))
         if mgmt.manage_logging:
@@ -160,6 +165,10 @@ def reconcile_category(device, mgmt, key: str) -> dict:
             ctx["interface_ips"] = _reconcile_interface_ips(device, client.get_interface_ips(dev_id))
         elif key == "interface_ips":
             ctx["interface_ips"] = _reconcile_interface_ips(device, client.get_interface_ips(dev_id))
+        elif key == "lacp":
+            from .lacp_reconciler import reconcile_lag_config
+
+            ctx["lacp_bundle_states"] = reconcile_lag_config(device, client.get_lag_config(dev_id))
         elif key == "snmp":
             ctx["snmp_data"] = _reconcile_snmp_config(device, client.get_snmp_config(dev_id))
         elif key == "logging":
