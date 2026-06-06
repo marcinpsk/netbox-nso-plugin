@@ -134,10 +134,11 @@ _CATEGORIES = [
     ("redistribution", "Redistribution", "swap-horizontal", "manage_redistribution"),
     ("snmp", "SNMP", "console-network", "manage_snmp"),
     ("logging", "Logging", "file-document-outline", "manage_logging"),
+    ("l2_services", "L2 Services", "lan-connect", "manage_l2"),
 ]
 
 # Scopes that stand alone (not under the manage_routing master kill-switch).
-_NON_ROUTING_FLAGS = {"manage_interfaces", "manage_snmp", "manage_logging"}
+_NON_ROUTING_FLAGS = {"manage_interfaces", "manage_snmp", "manage_logging", "manage_l2"}
 
 
 def _status_breakdown(qs) -> dict:
@@ -241,6 +242,10 @@ def _category_counts(key: str, device, mgmt) -> dict:
         from .models import NSOLoggingHostState
 
         return _snmp_breakdown((NSOLoggingHostState.objects.filter(management=mgmt),))
+    if key == "l2_services":
+        from .models import NSOL2SapState
+
+        return _status_breakdown(NSOL2SapState.objects.filter(management=mgmt))
     return {"total": 0}
 
 
@@ -263,47 +268,21 @@ def _snmp_breakdown(querysets) -> dict:
     return out
 
 
-def _l2_service_count(mgmt) -> dict:
-    """Count Nokia L2 SAPs for the tile via a defensive adapter call (M37 P1).
-
-    L2 services are display-only (no NSO*State overlay, no manage_* flag), so the
-    count can't come from the DB like other categories — it's fetched live from the
-    adapter and degrades to 0 on any error so the tab never breaks. Mirrors how BFD
-    counts from outside NSO*State.
-    """
-    if mgmt is None or mgmt.adapter_device_id is None:
-        return {"total": 0, "drift": 0, "pending": 0}
-    try:
-        from . import adapter_client as client
-
-        services = client.get_l2_services(mgmt.adapter_device_id).get("services", [])
-    except Exception:
-        return {"total": 0, "drift": 0, "pending": 0}
-    total = sum(len(s.get("saps", [])) for s in services)
-    return {"total": total, "drift": 0, "pending": 0}
-
-
 def category_summaries(device, mgmt) -> list[dict]:
     """Return the collapsed-view summary for every scope this device opted into.
 
-    Read-only: cheap aggregate queries over persisted NSO*State. The one exception is
-    the L2-services tile (M37 P1, display-only) whose count is a guarded live adapter
-    call — see _l2_service_count. Each entry: {key, label, icon, counts:{...,'total':N}}.
+    Read-only: cheap aggregate queries over persisted NSO*State.
+    Each entry: {key, label, icon, counts:{status:n,'total':N,...}}.
     """
     if mgmt is None:
         return []
     summaries = []
     for key, label, icon, flag in _CATEGORIES:
         # Routing leaves are also gated by the manage_routing master kill-switch;
-        # standalone scopes (interfaces, SNMP) are not.
+        # standalone scopes (interfaces, SNMP, L2) are not.
         if flag not in _NON_ROUTING_FLAGS and not mgmt.manage_routing:
             continue
         if not getattr(mgmt, flag, False):
             continue
         summaries.append({"key": key, "label": label, "icon": icon, "counts": _category_counts(key, device, mgmt)})
-    # L2 services (Nokia epipe/vpls) — no overlay/flag; show the tile only when the
-    # adapter actually reports SAPs, so non-Nokia / un-synced devices get no empty tile.
-    l2 = _l2_service_count(mgmt)
-    if l2["total"]:
-        summaries.append({"key": "l2_services", "label": "L2 Services", "icon": "lan-connect", "counts": l2})
     return summaries

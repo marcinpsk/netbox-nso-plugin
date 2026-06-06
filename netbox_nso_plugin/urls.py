@@ -187,6 +187,12 @@ urlpatterns = [
         views.NSOStaticRouteStateAcceptView.as_view(),
         name="routing_accept_static_route",
     ),
+    # L2 (Nokia SAP) state accept — M37 P2a
+    path(
+        "l2/sap-state/<int:pk>/accept/",
+        views.NSOL2SapStateAcceptView.as_view(),
+        name="l2_accept_sap",
+    ),
     path(
         "routing/isis-interface-state/<int:pk>/accept/",
         views.NSOISISInterfaceStateAcceptView.as_view(),

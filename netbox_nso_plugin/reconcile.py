@@ -35,7 +35,7 @@ def _empty_context() -> dict:
         "bgp_peers": [],
         "bfd_interfaces": [],
         "interface_ips": [],
-        "l2_services": [],
+        "l2_sap_states": [],
     }
 
 
@@ -183,9 +183,11 @@ def reconcile_category(device, mgmt, key: str) -> dict:
         elif key == "redistribution":
             ctx["redistribution_states"] = reconcile_redistribution(device, client.get_redistribution(dev_id))
         elif key == "l2_services":
-            # Read-only (M37 P1): display the adapter's L2 service/SAP payload; no overlay,
-            # no NetBox object creation. The dot1q tag is per-SAP interface-local encap.
-            ctx["l2_services"] = client.get_l2_services(dev_id).get("services", [])
+            # M37 P2a: reconcile into native vpn.L2VPN + L2VPNTermination + NSOL2SapState
+            # (value-aware drift/accept). The dot1q tag stays per-SAP interface-local encap.
+            from .l2_service_reconciler import reconcile_l2_services
+
+            ctx["l2_sap_states"] = reconcile_l2_services(device, client.get_l2_services(dev_id))
     return ctx
 
 

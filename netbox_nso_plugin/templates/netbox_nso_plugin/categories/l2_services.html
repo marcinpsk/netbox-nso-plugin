@@ -1,51 +1,44 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
-{# Lazy-loaded fragment: Nokia L2 services (read-only — epipe/vpls + SAPs from NSO, M37 P1). #}
+{# Lazy-loaded fragment: Nokia L2 services (M37 P2a — value-aware: epipe/vpls reconciled #}
+{# into vpn.L2VPN + L2VPNTermination; this overlay tracks drift + accept). #}
 {% if adapter_error %}
   <div class="alert alert-warning text-dark mb-2"><span class="mdi mdi-alert-outline me-1"></span>{{ adapter_error }}</div>
 {% endif %}
 
-{% if l2_services %}
-  <p class="text-muted small mb-2">L2 services (epipe = point-to-point, vpls = multipoint) and their SAPs reported by the device. The dot1q tag is per-SAP <strong>interface-local encap</strong> (not a VLAN). Read-only.</p>
-  <div class="input-group input-group-sm mb-2" style="max-width: 320px;">
-    <span class="input-group-text"><span class="mdi mdi-magnify"></span></span>
-    <input type="text" class="form-control" placeholder="Filter by service / port / tag…" data-l2-filter autocomplete="off">
-  </div>
+{% if l2_sap_states %}
+  <p class="text-muted small mb-2">L2 services (epipe = point-to-point, vpls = multipoint) reconciled into NetBox <strong>L2VPN</strong> + terminations. The dot1q tag is per-SAP <strong>interface-local encap</strong> (not a VLAN). Accept makes NetBox the source of truth; the SAP write-back is a later phase.</p>
+  <div id="flt-l2-services">
+  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-l2-services" placeholder="Filter by service / port / tag…" show_status=True %}
   <div class="table-responsive mb-3">
-    <table class="table table-sm table-hover mb-0" id="l2-services-table">
+    <table class="table table-sm table-hover mb-0">
       <thead>
-        <tr><th>Service</th><th>Type</th><th>Service ID</th><th>SAP</th><th>Port</th><th>Encap (dot1q)</th></tr>
+        <tr><th>Service</th><th>Type</th><th>SAP</th><th>Port</th><th>Encap</th><th>L2VPN</th><th>Status</th><th></th></tr>
       </thead>
       <tbody>
-        {% for svc in l2_services %}
-          {% for sap in svc.saps %}
-          <tr>
-            <td>{{ svc.service_name }}</td>
-            <td>{% if svc.service_type == "vpls" %}<span class="badge text-bg-primary">vpls</span>{% else %}<span class="badge text-bg-info">{{ svc.service_type|default:"epipe" }}</span>{% endif %}</td>
-            <td>{% if svc.service_id %}{{ svc.service_id }}{% else %}<span class="text-muted">—</span>{% endif %}</td>
-            <td><code>{{ sap.sap_id }}</code></td>
-            <td>{{ sap.port }}</td>
-            <td>{% if sap.outer_tag is not None %}{{ sap.outer_tag }}{% if sap.inner_tag is not None %}.{{ sap.inner_tag }}{% endif %}{% else %}<span class="text-muted">—</span>{% endif %}</td>
-          </tr>
-          {% endfor %}
+        {% for sap in l2_sap_states %}
+        <tr data-status="{{ sap.status }}" data-owned="{{ sap.accepted_at|yesno:'true,false' }}">
+          <td>{{ sap.service_name }}</td>
+          <td>{% if sap.service_type == "vpls" %}<span class="badge text-bg-primary">vpls</span>{% else %}<span class="badge text-bg-info">{{ sap.service_type|default:"epipe" }}</span>{% endif %}</td>
+          <td><code>{{ sap.sap_id }}</code></td>
+          <td>{{ sap.port }}</td>
+          <td>{% if sap.outer_tag is not None %}{{ sap.outer_tag }}{% if sap.inner_tag is not None %}.{{ sap.inner_tag }}{% endif %}{% else %}<span class="text-muted">—</span>{% endif %}</td>
+          <td>{% if sap.l2vpn %}<a href="{{ sap.l2vpn.get_absolute_url }}">{{ sap.l2vpn.name }}</a>{% else %}<span class="text-muted">—</span>{% endif %}</td>
+          <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=sap.status %}</td>
+          <td>
+            {% if sap.status == "imported" or sap.status == "changed" or sap.status == "conflict" %}
+            <form method="post" action="{% url 'plugins:netbox_nso_plugin:l2_accept_sap' pk=sap.pk %}">
+              {% csrf_token %}
+              <button type="submit" class="btn btn-xs btn-outline-success" title="Make NetBox the source of truth for this SAP (written to the device on Apply, later phase)"><span class="mdi mdi-check"></span> Accept</button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
-  <script>
-  (function () {
-    var input = document.querySelector('[data-l2-filter]');
-    var table = document.getElementById('l2-services-table');
-    if (!input || !table) return;
-    var rows = Array.prototype.slice.call(table.querySelectorAll('tbody > tr'));
-    input.addEventListener('input', function () {
-      var q = input.value.trim().toLowerCase();
-      rows.forEach(function (tr) {
-        tr.style.display = (!q || tr.textContent.toLowerCase().indexOf(q) !== -1) ? '' : 'none';
-      });
-    });
-  })();
-  </script>
+  </div>
 {% else %}
   <p class="text-muted mb-0">No L2 services reported for this device.</p>
 {% endif %}

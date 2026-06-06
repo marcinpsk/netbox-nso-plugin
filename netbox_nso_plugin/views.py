@@ -30,6 +30,7 @@ from .models import (
     NSOInterfaceState,
     NSOISISInstanceState,
     NSOISISInterfaceState,
+    NSOL2SapState,
     NSOOSPFInstanceState,
     NSOOSPFInterfaceState,
     NSOPlatformNedMapping,
@@ -1163,6 +1164,22 @@ class RoutingStateAcceptMixin(LoginRequiredMixin, View):
         state.status = _status_after_accept(state.status)
         state.save(update_fields=["status"])
         messages.success(request, f"Accepted routing state {state.pk}.")
+        return redirect(_device_nso_tab_url(state.management.device_id))
+
+
+class NSOL2SapStateAcceptView(LoginRequiredMixin, View):
+    """Accept one Nokia L2 SAP — mark owned (accepted_at) so NetBox is the source of truth.
+
+    P2a is read→model only; this records ownership/intent. The SAP write-back happens in
+    P2b. No intent push fires here (the write path doesn't exist yet).
+    """
+
+    def post(self, request, pk):  # noqa: D102
+        state = get_object_or_404(NSOL2SapState, pk=pk)
+        state.status = _status_after_accept(state.status)
+        state.accepted_at = timezone.now()
+        state.save(update_fields=["status", "accepted_at"])
+        messages.success(request, f"Accepted L2 SAP {state.service_name}:{state.sap_id}.")
         return redirect(_device_nso_tab_url(state.management.device_id))
 
 
