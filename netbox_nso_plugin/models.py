@@ -244,6 +244,14 @@ class NSODeviceManagement(NetBoxModel):
         default=False,
         help_text="Manage logging/syslog configuration for this device.",
     )
+    manage_l2 = models.BooleanField(
+        default=False,
+        help_text=(
+            "Manage L2 for this device — the master switch for the whole L2 domain "
+            "(L2VPN/VPLS/epipe, EVPN, and VLAN-database/switchport), the L2 analogue of "
+            "manage_routing."
+        ),
+    )
     auto_apply = models.BooleanField(
         default=False,
         help_text=(
@@ -745,6 +753,71 @@ class NSOStaticRouteState(NetBoxModel):
 
     def __str__(self):
         return f"{self.management} / {self.nso_prefix} [{self.status}]"
+
+
+_L2_SAP_STATUS_CHOICES = [
+    ("unknown", "Unknown"),
+    ("imported", "Imported"),
+    ("accepted", "Accepted"),
+    ("deploying", "Deploying"),
+    ("in_sync", "In Sync"),
+    ("apply_failed", "Apply Failed"),
+    ("conflict", "Conflict"),
+    ("changed", "Changed"),
+    ("error", "Error"),
+]
+
+
+class NSOL2SapState(NetBoxModel):
+    """Per-SAP compliance overlay for Nokia L2 services (M37 Phase 2).
+
+    One row per (device, service, SAP). The service is reconciled into a native
+    ``vpn.L2VPN`` (epipe→E-Line, vpls→VPLS) and each SAP into a ``vpn.L2VPNTermination``
+    on its port interface; this overlay carries the status/drift, the operator-accept
+    marker, and the per-SAP **dot1q encap** (outer/inner) — which has no home on the
+    native L2VPNTermination (the tag is interface-local encap, not an ipam.VLAN).
+    """
+
+    management = models.ForeignKey(
+        to="NSODeviceManagement",
+        on_delete=models.CASCADE,
+        related_name="l2_sap_states",
+    )
+    service_name = models.CharField(max_length=64)
+    service_type = models.CharField(max_length=16, blank=True, default="")  # epipe | vpls
+    service_id = models.PositiveIntegerField(null=True, blank=True)
+    sap_id = models.CharField(max_length=64)
+    port = models.CharField(max_length=64, blank=True, default="")
+    outer_tag = models.PositiveIntegerField(null=True, blank=True)
+    inner_tag = models.PositiveIntegerField(null=True, blank=True)
+    status = models.CharField(max_length=32, choices=_L2_SAP_STATUS_CHOICES, default="unknown")
+    l2vpn = models.ForeignKey(
+        to="vpn.L2VPN",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="nso_l2_sap_states",
+    )
+    termination = models.ForeignKey(
+        to="vpn.L2VPNTermination",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="nso_l2_sap_states",
+    )
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    last_apply_at = models.DateTimeField(null=True, blank=True)
+    last_apply_error = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["management", "service_name", "sap_id"]
+        unique_together = [("management", "service_name", "sap_id")]
+        verbose_name = "NSO L2 SAP State"
+        verbose_name_plural = "NSO L2 SAP States"
+
+    def __str__(self):
+        return f"{self.management} / {self.service_name}:{self.sap_id} [{self.status}]"
 
 
 _ISIS_STATUS_CHOICES = [
