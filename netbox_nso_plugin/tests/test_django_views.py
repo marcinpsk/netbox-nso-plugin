@@ -16,6 +16,8 @@ from django.urls import reverse
 
 from netbox_nso_plugin.models import AdapterConnection, NSODeviceManagement, NSOInstance, NSOInterfaceState
 
+from .mixins import IntentPushResetMixin
+
 User = get_user_model()
 TEST_PASSWORD = "testpass789"  # noqa: S105
 
@@ -44,7 +46,7 @@ def _make_fixtures():
     }
 
 
-class ViewTestBase(TestCase):
+class ViewTestBase(IntentPushResetMixin, TestCase):
     """Base class: creates superuser and logs in, creates fixtures."""
 
     @classmethod
@@ -62,6 +64,7 @@ class ViewTestBase(TestCase):
         cls.iface_state = fixtures["iface_state"]
 
     def setUp(self):
+        super().setUp()
         self.client.force_login(self.superuser)
 
 

@@ -7,8 +7,10 @@ from unittest.mock import patch
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.test import TestCase
 
+from .mixins import IntentPushResetMixin
 
-class TestPushStaticRouteIntentForDevice(TestCase):
+
+class TestPushStaticRouteIntentForDevice(IntentPushResetMixin, TestCase):
     """Unit tests for _push_static_route_intent_for_device."""
 
     @classmethod
@@ -129,7 +131,7 @@ class TestPushStaticRouteIntentForDevice(TestCase):
             _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
 
 
-class TestOnStaticRouteStateSave(TestCase):
+class TestOnStaticRouteStateSave(IntentPushResetMixin, TestCase):
     """Tests for _on_static_route_state_save signal handler."""
 
     @classmethod

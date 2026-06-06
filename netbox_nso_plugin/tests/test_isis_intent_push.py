@@ -13,8 +13,10 @@ from unittest.mock import MagicMock
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.test import TestCase
 
+from .mixins import IntentPushResetMixin
 
-class TestIsisIntentPush(TestCase):
+
+class TestIsisIntentPush(IntentPushResetMixin, TestCase):
     @classmethod
     def setUpTestData(cls):
         mfg = Manufacturer.objects.create(name="IiMfg", slug="iimfg")

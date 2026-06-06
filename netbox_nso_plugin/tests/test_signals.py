@@ -14,6 +14,8 @@ import unittest
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
+from .mixins import IntentPushResetMixin
+
 # A non-None accepted_at marks a state as OWNED (push_intent_on_accept triggers on it).
 _ACCEPTED_AT = datetime(2025, 1, 1, 12, 0, 0)
 
@@ -218,7 +220,7 @@ class TestOffboardDeviceFromAdapter(unittest.TestCase):
             offboard_device_from_adapter(sender=MagicMock(), instance=instance)
 
 
-class TestPushIntentOnAccept(unittest.TestCase):
+class TestPushIntentOnAccept(IntentPushResetMixin, unittest.TestCase):
     """Tests for push_intent_on_accept signal handler."""
 
     def test_skips_when_not_owned(self):
@@ -425,7 +427,7 @@ class TestPushIntentOnAccept(unittest.TestCase):
         mock_put.assert_not_called()
 
 
-class TestSkipOnRenderGuard(unittest.TestCase):
+class TestSkipOnRenderGuard(IntentPushResetMixin, unittest.TestCase):
     """An intent push must never fire during a GET render.
 
     Regression for the device-27 NSO-tab loop: rendering the tab re-saves every
@@ -495,7 +497,7 @@ class TestSkipOnRenderGuard(unittest.TestCase):
 try:
     from django.test import TestCase as DjangoTestCase
 
-    class TestIPAddressSignals(DjangoTestCase):
+    class TestIPAddressSignals(IntentPushResetMixin, DjangoTestCase):
         """Django-DB integration tests for the IPAddress signal → put_ip_intent path."""
 
         @classmethod
@@ -636,7 +638,7 @@ try:
                     address="10.1.3.1/28", assigned_object_type=self._ct(), assigned_object_id=self.iface.pk
                 )
 
-    class TestGActivatedInterfaceIntentOrigin(DjangoTestCase):
+    class TestGActivatedInterfaceIntentOrigin(IntentPushResetMixin, DjangoTestCase):
         """Decision-G intent signal discriminates operator edits from adapter imports."""
 
         @classmethod
