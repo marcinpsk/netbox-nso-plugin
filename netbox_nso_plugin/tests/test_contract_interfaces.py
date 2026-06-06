@@ -24,7 +24,17 @@ from netbox_nso_plugin.models import NSOInterfaceState
 from netbox_nso_plugin.template_content import _upsert_interface_states
 
 # Must match nso-adapter/tests/api/test_contract_interfaces.py exactly.
-EXPECTED_IFACE_KEYS = {"name", "netbox_interface_id", "attrs"}
+# M27R added the logical-interface modeling keys (NULL for physical ports / Cisco / Junos).
+EXPECTED_IFACE_KEYS = {
+    "name",
+    "netbox_interface_id",
+    "attrs",
+    "parent_binding",
+    "kind",
+    "encap_tag",
+    "vrf",
+    "service",
+}
 EXPECTED_ATTR_KEYS = {
     "nso_value",
     "netbox_value",
@@ -39,6 +49,12 @@ CONTRACT_PAYLOAD = [
     {
         "name": "GE0/0",
         "netbox_interface_id": 1000,
+        # M27R logical-interface modeling — NULL for a physical port like this one.
+        "parent_binding": None,
+        "kind": None,
+        "encap_tag": None,
+        "vrf": None,
+        "service": None,
         "attrs": {
             "description": {
                 "nso_value": "uplink to spine-1",
