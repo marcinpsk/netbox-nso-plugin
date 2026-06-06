@@ -771,6 +771,55 @@ def _on_static_route_state_save(sender, instance, **kwargs):
     )
 
 
+def _push_l2_sap_intent_for_device(device_id, adapter_device_id):
+    """Build and push the full Nokia L2 SAP intent snapshot for a device (M37 P2b)."""
+    from . import adapter_client as client
+    from .models import NSOL2SapState
+
+    saps = []
+    for row in NSOL2SapState.objects.filter(
+        management__device_id=device_id,
+        status__in=("accepted", "deploying", "in_sync"),
+    ):
+        saps.append(
+            {
+                "service_name": row.service_name,
+                "service_type": row.service_type,
+                "sap_id": row.sap_id,
+                "port": row.port,
+                "outer_tag": row.outer_tag,
+                "inner_tag": row.inner_tag,
+            }
+        )
+
+    _push_changed(
+        (device_id, "l2_sap"),
+        saps,
+        lambda: client.put_l2_sap_intent(adapter_device_id, saps),
+    )
+
+
+@_skip_on_render
+def _on_l2_sap_state_save(sender, instance, **kwargs):
+    """Push L2 SAP intent whenever an NSOL2SapState row is saved."""
+    from .models import NSODeviceManagement
+
+    try:
+        mgmt = instance.management
+    except NSODeviceManagement.DoesNotExist:
+        return
+
+    if mgmt.adapter_device_id is None:
+        return
+
+    device_id = mgmt.device_id
+    adapter_device_id = mgmt.adapter_device_id
+    _schedule_intent_push(
+        (device_id, "l2_sap"),
+        lambda: _push_l2_sap_intent_for_device(device_id, adapter_device_id),
+    )
+
+
 def _push_isis_intent_for_device(device_id, adapter_device_id):
     """Build and push the full IS-IS intent snapshot (interfaces + processes) for a device."""
     from . import adapter_client as client
@@ -1297,6 +1346,15 @@ def _connect_g_activated():  # pragma: no cover
         _on_static_route_state_save,
         sender=NSOStaticRouteState,
         dispatch_uid="nso_plugin_static_route_state_post_save",
+    )
+
+    # L2 SAP state → intent push (M37 P2b)
+    from .models import NSOL2SapState
+
+    post_save.connect(
+        _on_l2_sap_state_save,
+        sender=NSOL2SapState,
+        dispatch_uid="nso_plugin_l2_sap_state_post_save",
     )
 
     # IS-IS interface state → intent push (M14 B3)

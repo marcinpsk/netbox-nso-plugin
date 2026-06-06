@@ -1170,8 +1170,8 @@ class RoutingStateAcceptMixin(LoginRequiredMixin, View):
 class NSOL2SapStateAcceptView(LoginRequiredMixin, View):
     """Accept one Nokia L2 SAP — mark owned (accepted_at) so NetBox is the source of truth.
 
-    P2a is read→model only; this records ownership/intent. The SAP write-back happens in
-    P2b. No intent push fires here (the write path doesn't exist yet).
+    Saving the accepted row fires the post_save signal which pushes the device's full
+    L2 SAP intent snapshot to the adapter (M37 P2b write path), mirroring static routes.
     """
 
     def post(self, request, pk):  # noqa: D102

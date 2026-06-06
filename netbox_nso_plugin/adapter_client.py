@@ -466,6 +466,23 @@ def put_static_route_intent(adapter_device_id, routes):
     )
 
 
+def put_l2_sap_intent(adapter_device_id, saps):
+    """PUT /api/v1/devices/{id}/l2-sap-intent — push full Nokia L2 SAP intent (M37 P2b).
+
+    ``saps`` is a list of dicts:
+      [{"service_name": "TL", "service_type": "epipe", "sap_id": "lag-60:3999",
+        "port": "lag-60", "outer_tag": 3999, "inner_tag": None,
+        "accepted_at": "...Z"}, ...]
+    Empty list clears all L2 SAP intent for the device.
+    Returns {"device_id": ..., "count": N}.
+    """
+    return _request(
+        "PUT",
+        f"/api/v1/devices/{adapter_device_id}/l2-sap-intent",
+        json={"saps": saps},
+    )
+
+
 def put_isis_interface_intent(adapter_device_id, interfaces, processes=None):
     """PUT /api/v1/devices/{id}/isis-interface-intent — push full IS-IS intent.
 
