@@ -1242,3 +1242,102 @@ class NSORedistributionState(NetBoxModel):
         if self.source_ref:
             src += f" {self.source_ref}"
         return f"{self.management} / {self.dest_protocol} ← {src} [{self.status}]"
+
+
+_LACP_STATUS_CHOICES = [
+    ("unknown", "Unknown"),
+    ("imported", "Imported"),
+    ("accepted", "Accepted"),
+    ("deploying", "Deploying"),
+    ("in_sync", "In Sync"),
+    ("apply_failed", "Apply Failed"),
+    ("conflict", "Conflict"),
+    ("changed", "Changed"),
+    ("error", "Error"),
+]
+
+_LACP_WRITE_PATH_STATUSES = {"accepted", "deploying", "in_sync"}
+
+
+class NSOLACPBundleState(NetBoxModel):
+    """Per-(device, LAG interface) LACP bundle compliance overlay (M33).
+
+    Carries the LACP parameters NetBox has no native column for — min-links,
+    system-priority, system-id, timer, admin-key — plus the standard NSO overlay
+    status lifecycle (unknown → imported → accepted → deploying → in_sync /
+    apply_failed; drift → changed). One row per (management, LAG interface).
+    """
+
+    management = models.ForeignKey(
+        to="NSODeviceManagement",
+        on_delete=models.CASCADE,
+        related_name="lacp_bundle_states",
+    )
+    interface = models.ForeignKey(
+        to="dcim.Interface",
+        on_delete=models.CASCADE,
+        related_name="nso_lacp_bundle_states",
+    )
+    lag_id = models.PositiveIntegerField(null=True, blank=True)
+    min_links = models.PositiveSmallIntegerField(null=True, blank=True)
+    system_priority = models.PositiveIntegerField(null=True, blank=True)
+    system_id = models.CharField(max_length=17, blank=True, default="")
+    timer = models.CharField(max_length=8, blank=True, default="")
+    admin_key = models.PositiveIntegerField(null=True, blank=True)
+    status = models.CharField(max_length=32, choices=_LACP_STATUS_CHOICES, default="unknown")
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    last_apply_at = models.DateTimeField(null=True, blank=True)
+    last_apply_error = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["management", "interface"]
+        unique_together = [("management", "interface")]
+        verbose_name = "NSO LACP Bundle State"
+        verbose_name_plural = "NSO LACP Bundle States"
+
+    def __str__(self):
+        return f"{self.management} / {self.interface} [{self.status}]"
+
+
+class NSOLACPMemberState(NetBoxModel):
+    """Per-(device, member interface) LACP member compliance overlay (M33).
+
+    Carries the per-member LACP mode + port-priority and links to the parent LAG
+    interface. One row per (management, member interface). Status lifecycle
+    mirrors NSOLACPBundleState.
+    """
+
+    management = models.ForeignKey(
+        to="NSODeviceManagement",
+        on_delete=models.CASCADE,
+        related_name="lacp_member_states",
+    )
+    interface = models.ForeignKey(
+        to="dcim.Interface",
+        on_delete=models.CASCADE,
+        related_name="nso_lacp_member_states",
+    )
+    lag_bundle = models.ForeignKey(
+        to="dcim.Interface",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="nso_lacp_member_bundles",
+    )
+    mode = models.CharField(max_length=8, blank=True, default="")
+    port_priority = models.PositiveIntegerField(null=True, blank=True)
+    status = models.CharField(max_length=32, choices=_LACP_STATUS_CHOICES, default="unknown")
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    last_apply_at = models.DateTimeField(null=True, blank=True)
+    last_apply_error = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["management", "interface"]
+        unique_together = [("management", "interface")]
+        verbose_name = "NSO LACP Member State"
+        verbose_name_plural = "NSO LACP Member States"
+
+    def __str__(self):
+        return f"{self.management} / {self.interface} [{self.status}]"
