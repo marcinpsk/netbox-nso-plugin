@@ -1184,6 +1184,30 @@ class NSOL2SapStateAcceptView(LoginRequiredMixin, View):
         return redirect(_device_nso_tab_url(state.management.device_id))
 
 
+class NSOLACPBundleStateAcceptView(LoginRequiredMixin, View):
+    """Accept one LACP bundle (and its member rows) — mark owned so NetBox is the source of truth.
+
+    Saving the accepted rows fires the post_save signal which pushes + applies the device's
+    full LACP bundle snapshot to the adapter's lag-reconciler (M33 write path).
+    """
+
+    def post(self, request, pk):  # noqa: D102
+        from .models import NSOLACPBundleState, NSOLACPMemberState
+
+        state = get_object_or_404(NSOLACPBundleState, pk=pk)
+        now = timezone.now()
+        # Accept the member rows first; the bundle save fires the snapshot push last.
+        for m in NSOLACPMemberState.objects.filter(management=state.management, lag_bundle=state.interface):
+            m.status = _status_after_accept(m.status)
+            m.accepted_at = now
+            m.save(update_fields=["status", "accepted_at"])
+        state.status = _status_after_accept(state.status)
+        state.accepted_at = now
+        state.save(update_fields=["status", "accepted_at"])
+        messages.success(request, f"Accepted LACP bundle {state.interface.name}.")
+        return redirect(_device_nso_tab_url(state.management.device_id))
+
+
 class NSOStaticRouteStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
     model_class = NSOStaticRouteState
 

@@ -193,6 +193,12 @@ urlpatterns = [
         views.NSOL2SapStateAcceptView.as_view(),
         name="l2_accept_sap",
     ),
+    # LACP bundle state accept → apply — M33
+    path(
+        "lacp/bundle-state/<int:pk>/accept/",
+        views.NSOLACPBundleStateAcceptView.as_view(),
+        name="lacp_accept_bundle",
+    ),
     path(
         "routing/isis-interface-state/<int:pk>/accept/",
         views.NSOISISInterfaceStateAcceptView.as_view(),

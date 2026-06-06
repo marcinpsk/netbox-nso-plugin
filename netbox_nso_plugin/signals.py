@@ -820,6 +820,62 @@ def _on_l2_sap_state_save(sender, instance, **kwargs):
     )
 
 
+def _push_lacp_intent_for_device(device_id, adapter_device_id):
+    """Build and push (apply) the full LACP bundle intent snapshot for a device (M33)."""
+    from . import adapter_client as client
+    from .models import NSOLACPBundleState, NSOLACPMemberState
+
+    _owned = ("accepted", "deploying", "in_sync")
+    bundles = []
+    for b in NSOLACPBundleState.objects.filter(management__device_id=device_id, status__in=_owned).select_related(
+        "interface"
+    ):
+        members = []
+        for m in NSOLACPMemberState.objects.filter(
+            management__device_id=device_id, lag_bundle=b.interface, status__in=_owned
+        ).select_related("interface"):
+            members.append({"interface_name": m.interface.name, "mode": m.mode, "port_priority": m.port_priority})
+        bundles.append(
+            {
+                "name": b.interface.name,
+                "lag_id": b.lag_id,
+                "min_links": b.min_links,
+                "system_priority": b.system_priority,
+                "system_id": b.system_id,
+                "timer": b.timer,
+                "admin_key": b.admin_key,
+                "members": members,
+            }
+        )
+
+    _push_changed(
+        (device_id, "lacp"),
+        bundles,
+        lambda: client.apply_lag_config(adapter_device_id, bundles),
+    )
+
+
+@_skip_on_render
+def _on_lacp_state_save(sender, instance, **kwargs):
+    """Push LACP intent whenever an NSOLACPBundleState/NSOLACPMemberState row is saved."""
+    from .models import NSODeviceManagement
+
+    try:
+        mgmt = instance.management
+    except NSODeviceManagement.DoesNotExist:
+        return
+
+    if mgmt.adapter_device_id is None:
+        return
+
+    device_id = mgmt.device_id
+    adapter_device_id = mgmt.adapter_device_id
+    _schedule_intent_push(
+        (device_id, "lacp"),
+        lambda: _push_lacp_intent_for_device(device_id, adapter_device_id),
+    )
+
+
 def _push_isis_intent_for_device(device_id, adapter_device_id):
     """Build and push the full IS-IS intent snapshot (interfaces + processes) for a device."""
     from . import adapter_client as client
@@ -1355,6 +1411,20 @@ def _connect_g_activated():  # pragma: no cover
         _on_l2_sap_state_save,
         sender=NSOL2SapState,
         dispatch_uid="nso_plugin_l2_sap_state_post_save",
+    )
+
+    # LACP bundle/member state → intent push + apply (M33)
+    from .models import NSOLACPBundleState, NSOLACPMemberState
+
+    post_save.connect(
+        _on_lacp_state_save,
+        sender=NSOLACPBundleState,
+        dispatch_uid="nso_plugin_lacp_bundle_state_post_save",
+    )
+    post_save.connect(
+        _on_lacp_state_save,
+        sender=NSOLACPMemberState,
+        dispatch_uid="nso_plugin_lacp_member_state_post_save",
     )
 
     # IS-IS interface state → intent push (M14 B3)

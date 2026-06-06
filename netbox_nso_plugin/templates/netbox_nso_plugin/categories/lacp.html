@@ -14,7 +14,7 @@
   <div class="table-responsive mb-3">
     <table class="table table-sm table-hover mb-0">
       <thead>
-        <tr><th>Bundle</th><th>LAG&nbsp;ID</th><th>Min&nbsp;links</th><th>Sys&nbsp;priority</th><th>Timer</th><th>Admin&nbsp;key</th><th>Members</th><th>Status</th></tr>
+        <tr><th>Bundle</th><th>LAG&nbsp;ID</th><th>Min&nbsp;links</th><th>Sys&nbsp;priority</th><th>Timer</th><th>Admin&nbsp;key</th><th>Members</th><th>Status</th><th></th></tr>
       </thead>
       <tbody>
         {% for b in lacp_bundle_states %}
@@ -33,6 +33,14 @@
             {% endwith %}
           </td>
           <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=b.status %}</td>
+          <td>
+            {% if b.status == "imported" or b.status == "changed" or b.status == "conflict" %}
+            <form method="post" action="{% url 'plugins:netbox_nso_plugin:lacp_accept_bundle' pk=b.pk %}">
+              {% csrf_token %}
+              <button type="submit" class="btn btn-xs btn-outline-success" title="Make NetBox the source of truth for this LACP bundle and apply it to the device via NSO"><span class="mdi mdi-check"></span> Accept &amp; Apply</button>
+            </form>
+            {% endif %}
+          </td>
         </tr>
         {% endfor %}
       </tbody>

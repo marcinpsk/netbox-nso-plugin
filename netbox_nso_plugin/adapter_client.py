@@ -488,6 +488,23 @@ def put_l2_sap_intent(adapter_device_id, saps):
     )
 
 
+def apply_lag_config(adapter_device_id, bundles):
+    """POST /api/v1/devices/{id}/lag-config/apply — push + apply full LACP bundle intent (M33).
+
+    ``bundles`` is a list of dicts:
+      [{"name": "Port-channel1", "lag_id": 1, "min_links": 2, "system_priority": 100,
+        "system_id": "...", "timer": "fast", "admin_key": 33,
+        "members": [{"interface_name": "Gi0/1", "mode": "active", "port_priority": 128}]}, ...]
+    Empty list clears all LACP bundles owned by the device's lag-reconciler service.
+    Returns the adapter apply envelope ({"status": "deployed", ...} or an error envelope).
+    """
+    return _request(
+        "POST",
+        f"/api/v1/devices/{adapter_device_id}/lag-config/apply",
+        json={"bundles": bundles},
+    )
+
+
 def put_isis_interface_intent(adapter_device_id, interfaces, processes=None):
     """PUT /api/v1/devices/{id}/isis-interface-intent — push full IS-IS intent.
 
