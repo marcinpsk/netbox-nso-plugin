@@ -1,0 +1,31 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Lazy-loaded fragment: L2 switchport state (M34). Drift vs the native NetBox interface. #}
+{% if adapter_error %}
+  <div class="alert alert-warning text-dark mb-2"><span class="mdi mdi-alert-outline me-1"></span>{{ adapter_error }}</div>
+{% endif %}
+
+{% if switchport_states %}
+  <p class="text-muted small mb-2">Switchport mode/VLAN observed by NSO, compared against the native NetBox interface (<code>mode</code>/<code>untagged_vlan</code>/<code>tagged_vlans</code>).</p>
+  <div id="flt-switchport">
+  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-switchport" placeholder="Filter by interface / mode…" show_status=True %}
+  <div class="table-responsive mb-3">
+    <table class="table table-sm table-hover mb-0">
+      <thead><tr><th>Interface</th><th>Mode</th><th>Untagged</th><th>Tagged</th><th>Status</th></tr></thead>
+      <tbody>
+        {% for s in switchport_states %}
+        <tr data-status="{{ s.status }}" data-owned="{{ s.accepted_at|yesno:'true,false' }}">
+          <td><a href="{{ s.interface.get_absolute_url }}">{{ s.interface.name }}</a></td>
+          <td>{% if s.mode %}<span class="badge text-bg-secondary">{{ s.mode }}</span>{% else %}<span class="text-muted">—</span>{% endif %}</td>
+          <td>{% if s.untagged_vlan %}{{ s.untagged_vlan.vid }}{% else %}<span class="text-muted">—</span>{% endif %}</td>
+          <td>{% with tagged=s.tagged_vlans.all %}{% if tagged %}{% for v in tagged %}{{ v.vid }}{% if not forloop.last %}, {% endif %}{% endfor %}{% else %}<span class="text-muted">—</span>{% endif %}{% endwith %}</td>
+          <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=s.status %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  </div>
+{% else %}
+  <p class="text-muted mb-0">No switchports reported for this device.</p>
+{% endif %}

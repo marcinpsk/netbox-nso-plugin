@@ -37,6 +37,8 @@ def _empty_context() -> dict:
         "interface_ips": [],
         "l2_sap_states": [],
         "lacp_bundle_states": [],
+        "vlan_states": [],
+        "switchport_states": [],
     }
 
 
@@ -120,6 +122,11 @@ def reconcile_device(device, mgmt=None) -> dict:
             from .lacp_reconciler import reconcile_lag_config
 
             ctx["lacp_bundle_states"] = reconcile_lag_config(device, client.get_lag_config(dev_id))
+            # M34: VLAN database + L2 switchport (VLAN DB first — switchport links to it).
+            from .vlan_reconciler import reconcile_switchport, reconcile_vlan_database
+
+            ctx["vlan_states"] = reconcile_vlan_database(device, client.get_vlan_database(dev_id))
+            ctx["switchport_states"] = reconcile_switchport(device, client.get_switchport(dev_id))
         if mgmt.manage_snmp:
             ctx["snmp_data"] = _reconcile_snmp_config(device, client.get_snmp_config(dev_id))
         if mgmt.manage_logging:
@@ -128,7 +135,7 @@ def reconcile_device(device, mgmt=None) -> dict:
     return ctx
 
 
-def reconcile_category(device, mgmt, key: str) -> dict:
+def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
     """Reconcile a SINGLE category and return its display context (for lazy expand).
 
     Runs only the requested category's reconciler(s), suppress-wrapped (no intent
@@ -169,6 +176,16 @@ def reconcile_category(device, mgmt, key: str) -> dict:
             from .lacp_reconciler import reconcile_lag_config
 
             ctx["lacp_bundle_states"] = reconcile_lag_config(device, client.get_lag_config(dev_id))
+        elif key == "vlan":
+            from .vlan_reconciler import reconcile_vlan_database
+
+            ctx["vlan_states"] = reconcile_vlan_database(device, client.get_vlan_database(dev_id))
+        elif key == "switchport":
+            from .vlan_reconciler import reconcile_switchport, reconcile_vlan_database
+
+            # VLAN DB first so switchport vid lookups resolve in the per-device group.
+            reconcile_vlan_database(device, client.get_vlan_database(dev_id))
+            ctx["switchport_states"] = reconcile_switchport(device, client.get_switchport(dev_id))
         elif key == "snmp":
             ctx["snmp_data"] = _reconcile_snmp_config(device, client.get_snmp_config(dev_id))
         elif key == "logging":

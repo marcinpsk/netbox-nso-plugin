@@ -211,6 +211,16 @@ def get_lag_config(adapter_device_id: int) -> dict:
     return _request("GET", f"/api/v1/devices/{adapter_device_id}/lag-config")
 
 
+def get_vlan_database(adapter_device_id: int) -> dict:
+    """GET /api/v1/devices/{id}/vlan-database (M34)."""
+    return _request("GET", f"/api/v1/devices/{adapter_device_id}/vlan-database")
+
+
+def get_switchport(adapter_device_id: int) -> dict:
+    """GET /api/v1/devices/{id}/switchport (M34)."""
+    return _request("GET", f"/api/v1/devices/{adapter_device_id}/switchport")
+
+
 def get_interface_ips(adapter_device_id: int) -> dict:
     """GET /api/v1/devices/{id}/interface-ips."""
     return _request("GET", f"/api/v1/devices/{adapter_device_id}/interface-ips")

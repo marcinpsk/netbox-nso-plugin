@@ -1341,3 +1341,97 @@ class NSOLACPMemberState(NetBoxModel):
 
     def __str__(self):
         return f"{self.management} / {self.interface} [{self.status}]"
+
+
+_VLAN_STATUS_CHOICES = [
+    ("unknown", "Unknown"),
+    ("imported", "Imported"),
+    ("accepted", "Accepted"),
+    ("deploying", "Deploying"),
+    ("in_sync", "In Sync"),
+    ("apply_failed", "Apply Failed"),
+    ("conflict", "Conflict"),
+    ("changed", "Changed"),
+    ("error", "Error"),
+]
+
+_VLAN_WRITE_PATH_STATUSES = {"accepted", "deploying", "in_sync"}
+
+
+class NSOVLANState(NetBoxModel):
+    """Per-(device, ipam.VLAN) VLAN-database compliance overlay (M34).
+
+    The VLAN itself is reconciled into a per-device ``ipam.VLANGroup`` (slug
+    ``nso-{device.pk}``); this overlay carries the status/drift + accept marker.
+    """
+
+    management = models.ForeignKey(
+        to="NSODeviceManagement",
+        on_delete=models.CASCADE,
+        related_name="vlan_states",
+    )
+    vlan = models.ForeignKey(
+        to="ipam.VLAN",
+        on_delete=models.CASCADE,
+        related_name="nso_vlan_states",
+    )
+    status = models.CharField(max_length=32, choices=_VLAN_STATUS_CHOICES, default="unknown")
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    last_apply_at = models.DateTimeField(null=True, blank=True)
+    last_apply_error = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["management", "vlan"]
+        unique_together = [("management", "vlan")]
+        verbose_name = "NSO VLAN State"
+        verbose_name_plural = "NSO VLAN States"
+
+    def __str__(self):
+        return f"{self.management} / VLAN {self.vlan} [{self.status}]"
+
+
+class NSOSwitchportState(NetBoxModel):
+    """Per-(device, interface) L2 switchport compliance overlay (M34).
+
+    Reconciles into the native ``Interface.mode``/``untagged_vlan``/``tagged_vlans``;
+    this overlay mirrors the NSO-observed mode/untagged/tagged for drift + accept.
+    """
+
+    management = models.ForeignKey(
+        to="NSODeviceManagement",
+        on_delete=models.CASCADE,
+        related_name="switchport_states",
+    )
+    interface = models.ForeignKey(
+        to="dcim.Interface",
+        on_delete=models.CASCADE,
+        related_name="nso_switchport_states",
+    )
+    mode = models.CharField(max_length=16, blank=True, default="")
+    untagged_vlan = models.ForeignKey(
+        to="ipam.VLAN",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="nso_switchport_untagged_states",
+    )
+    tagged_vlans = models.ManyToManyField(
+        to="ipam.VLAN",
+        blank=True,
+        related_name="nso_switchport_tagged_states",
+    )
+    status = models.CharField(max_length=32, choices=_VLAN_STATUS_CHOICES, default="unknown")
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    last_apply_at = models.DateTimeField(null=True, blank=True)
+    last_apply_error = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["management", "interface"]
+        unique_together = [("management", "interface")]
+        verbose_name = "NSO Switchport State"
+        verbose_name_plural = "NSO Switchport States"
+
+    def __str__(self):
+        return f"{self.management} / {self.interface} [{self.status}]"

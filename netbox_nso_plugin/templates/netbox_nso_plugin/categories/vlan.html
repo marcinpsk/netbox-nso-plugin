@@ -1,0 +1,30 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Lazy-loaded fragment: VLAN database (M34). Reconciled into a per-device ipam.VLANGroup. #}
+{% if adapter_error %}
+  <div class="alert alert-warning text-dark mb-2"><span class="mdi mdi-alert-outline me-1"></span>{{ adapter_error }}</div>
+{% endif %}
+
+{% if vlan_states %}
+  <p class="text-muted small mb-2">VLANs imported from NSO into a per-device VLAN group (<code>nso-{{ object.pk }}</code>) so vids are scoped to this device.</p>
+  <div id="flt-vlan">
+  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-vlan" placeholder="Filter by vid / name…" show_status=True %}
+  <div class="table-responsive mb-3">
+    <table class="table table-sm table-hover mb-0">
+      <thead><tr><th>VID</th><th>Name</th><th>VLAN</th><th>Status</th></tr></thead>
+      <tbody>
+        {% for s in vlan_states %}
+        <tr data-status="{{ s.status }}" data-owned="{{ s.accepted_at|yesno:'true,false' }}">
+          <td>{{ s.vlan.vid }}</td>
+          <td>{{ s.vlan.name|default:"—" }}</td>
+          <td><a href="{{ s.vlan.get_absolute_url }}">{{ s.vlan }}</a></td>
+          <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=s.status %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  </div>
+{% else %}
+  <p class="text-muted mb-0">No VLAN database reported for this device.</p>
+{% endif %}

@@ -126,6 +126,8 @@ _CATEGORIES = [
     ("interfaces", "Interfaces", "ethernet", "manage_interfaces"),
     ("interface_ips", "Interface IPs", "ip-network", "manage_interfaces"),
     ("lacp", "LACP", "link-variant", "manage_interfaces"),
+    ("vlan", "VLANs", "format-list-numbered", "manage_interfaces"),
+    ("switchport", "Switchports", "ethernet-cable", "manage_interfaces"),
     ("static", "Static Routes", "sign-direction", "manage_static"),
     ("isis", "IS-IS", "lan", "manage_isis"),
     ("ospf", "OSPF", "lan", "manage_ospf"),
@@ -172,7 +174,7 @@ def _status_breakdown(qs) -> dict:
     return out
 
 
-def _category_counts(key: str, device, mgmt) -> dict:
+def _category_counts(key: str, device, mgmt) -> dict:  # noqa: C901
     """Compute the count breakdown for one category from persisted NSO*State."""
     from .models import (
         NSOBGPPeerState,
@@ -258,6 +260,14 @@ def _category_counts(key: str, device, mgmt) -> dict:
         out["pending"] = out.get("pending", 0) + members.get("pending", 0)
         out["members"] = members.get("total", 0)
         return out
+    if key == "vlan":
+        from .models import NSOVLANState
+
+        return _status_breakdown(NSOVLANState.objects.filter(management=mgmt))
+    if key == "switchport":
+        from .models import NSOSwitchportState
+
+        return _status_breakdown(NSOSwitchportState.objects.filter(management=mgmt))
     return {"total": 0}
 
 

@@ -175,6 +175,8 @@ class NSOCategoryView(LoginRequiredMixin, View):
     _PARTIALS = {
         "interface_ips": "netbox_nso_plugin/categories/interface_ips.html",
         "lacp": "netbox_nso_plugin/categories/lacp.html",
+        "vlan": "netbox_nso_plugin/categories/vlan.html",
+        "switchport": "netbox_nso_plugin/categories/switchport.html",
         "static": "netbox_nso_plugin/categories/static.html",
         "isis": "netbox_nso_plugin/categories/isis.html",
         "ospf": "netbox_nso_plugin/categories/ospf.html",
