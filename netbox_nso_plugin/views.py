@@ -1192,18 +1192,25 @@ class NSOLACPBundleStateAcceptView(LoginRequiredMixin, View):
     """
 
     def post(self, request, pk):  # noqa: D102
+        from django.db import transaction
+
         from .models import NSOLACPBundleState, NSOLACPMemberState
 
         state = get_object_or_404(NSOLACPBundleState, pk=pk)
         now = timezone.now()
-        # Accept the member rows first; the bundle save fires the snapshot push last.
-        for m in NSOLACPMemberState.objects.filter(management=state.management, lag_bundle=state.interface):
-            m.status = _status_after_accept(m.status)
-            m.accepted_at = now
-            m.save(update_fields=["status", "accepted_at"])
-        state.status = _status_after_accept(state.status)
-        state.accepted_at = now
-        state.save(update_fields=["status", "accepted_at"])
+        # Accept the bundle + all its members in ONE transaction so the per-save intent
+        # pushes coalesce (via _schedule_intent_push) into a single snapshot push at commit —
+        # otherwise each non-atomic save fires its own push and the member-before-bundle order
+        # emits a spurious bundle_count=0 push (FASTMAP briefly clears the bundle) before the
+        # real bundle_count=1 one.
+        with transaction.atomic():
+            for m in NSOLACPMemberState.objects.filter(management=state.management, lag_bundle=state.interface):
+                m.status = _status_after_accept(m.status)
+                m.accepted_at = now
+                m.save(update_fields=["status", "accepted_at"])
+            state.status = _status_after_accept(state.status)
+            state.accepted_at = now
+            state.save(update_fields=["status", "accepted_at"])
         messages.success(request, f"Accepted LACP bundle {state.interface.name}.")
         return redirect(_device_nso_tab_url(state.management.device_id))
 
