@@ -1,9 +1,7 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
 {# Lazy-loaded fragment: VLAN database (M34). Reconciled into a per-device ipam.VLANGroup. #}
-{% if adapter_error %}
-  <div class="alert alert-warning text-dark mb-2"><span class="mdi mdi-alert-outline me-1"></span>{{ adapter_error }}</div>
-{% endif %}
+{% include "netbox_nso_plugin/categories/_adapter_error.html" %}
 
 {% if vlan_states %}
   <p class="text-muted small mb-2">VLANs imported from NSO into a per-device VLAN group (<code>nso-{{ object.pk }}</code>) so vids are scoped to this device.</p>

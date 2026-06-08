@@ -1,15 +1,10 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
 {# Lazy-loaded fragment: BGP Peers category. #}
-{% if adapter_error %}
-  <div class="alert alert-warning mb-2"><span class="mdi mdi-alert-outline me-1"></span>{{ adapter_error }}</div>
-{% endif %}
+{% include "netbox_nso_plugin/categories/_adapter_error.html" %}
 {% if bgp_peers %}
   <div class="d-flex justify-content-end mb-2">
-    {% if category_has_unowned %}<form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_bgp_peers' device_pk=object.pk %}">
-      {% csrf_token %}
-      <button type="submit" class="btn btn-sm btn-outline-success"><span class="mdi mdi-check-all"></span> Accept All</button>
-    </form>{% endif %}
+    {% url 'plugins:netbox_nso_plugin:routing_bulk_accept_bgp_peers' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned %}
   </div>
   <div id="flt-bgp">
   {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-bgp" placeholder="Filter by peer / ASN / VRF…" show_status=True %}
@@ -31,12 +26,7 @@
           </td>
           <td>{{ bp.last_sync_at|default:"—" }}</td>
           <td>
-            {% if bp.status == "imported" or bp.status == "changed" or bp.status == "conflict" or bp.status == "drifted" %}
-            <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_accept_bgp_peer' pk=bp.pk %}">
-              {% csrf_token %}
-              <button type="submit" class="btn btn-xs btn-outline-success" title="Make NetBox the source of truth for this (re-applied to the device on Apply)"><span class="mdi mdi-check"></span> Accept</button>
-            </form>
-            {% endif %}
+            {% url 'plugins:netbox_nso_plugin:routing_accept_bgp_peer' pk=bp.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=bp.status %}
           </td>
         </tr>
         {% endfor %}

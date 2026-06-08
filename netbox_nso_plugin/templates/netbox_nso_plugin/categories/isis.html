@@ -1,17 +1,12 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
 {# Lazy-loaded fragment: IS-IS category (interfaces + instances). #}
-{% if adapter_error %}
-  <div class="alert alert-warning mb-2"><span class="mdi mdi-alert-outline me-1"></span>{{ adapter_error }}</div>
-{% endif %}
+{% include "netbox_nso_plugin/categories/_adapter_error.html" %}
 
 {% if isis_interfaces %}
   <div class="d-flex justify-content-between align-items-center mb-2">
     <strong>IS-IS Interfaces</strong>
-    {% if category_has_unowned %}<form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_isis_interfaces' device_pk=object.pk %}">
-      {% csrf_token %}
-      <button type="submit" class="btn btn-sm btn-outline-success"><span class="mdi mdi-check-all"></span> Accept All</button>
-    </form>{% endif %}
+    {% url 'plugins:netbox_nso_plugin:routing_bulk_accept_isis_interfaces' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned %}
   </div>
   <div id="flt-isis-interfaces">
   {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-isis-interfaces" placeholder="Filter by interface / type…" show_status=True %}
@@ -36,12 +31,7 @@
           </td>
           <td>{{ ii.last_sync_at|default:"—" }}</td>
           <td>
-            {% if ii.status == "imported" or ii.status == "changed" or ii.status == "conflict" or ii.status == "drifted" %}
-            <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_accept_isis_interface' pk=ii.pk %}">
-              {% csrf_token %}
-              <button type="submit" class="btn btn-xs btn-outline-success" title="Make NetBox the source of truth for this (re-applied to the device on Apply)"><span class="mdi mdi-check"></span> Accept</button>
-            </form>
-            {% endif %}
+            {% url 'plugins:netbox_nso_plugin:routing_accept_isis_interface' pk=ii.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=ii.status %}
           </td>
         </tr>
         {% endfor %}
@@ -54,10 +44,7 @@
 {% if isis_processes %}
   <div class="d-flex justify-content-between align-items-center mb-2">
     <strong>IS-IS Instances</strong>
-    {% if category_has_unowned %}<form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_isis_instances' device_pk=object.pk %}">
-      {% csrf_token %}
-      <button type="submit" class="btn btn-sm btn-outline-success"><span class="mdi mdi-check-all"></span> Accept All</button>
-    </form>{% endif %}
+    {% url 'plugins:netbox_nso_plugin:routing_bulk_accept_isis_instances' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned %}
   </div>
   <div id="flt-isis-instances">
   {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-isis-instances" placeholder="Filter by process tag / instance…" show_status=True %}
@@ -78,12 +65,7 @@
           </td>
           <td>{{ ip.last_sync_at|default:"—" }}</td>
           <td>
-            {% if ip.status == "imported" or ip.status == "changed" or ip.status == "conflict" or ip.status == "drifted" %}
-            <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_accept_isis_instance' pk=ip.pk %}">
-              {% csrf_token %}
-              <button type="submit" class="btn btn-xs btn-outline-success" title="Make NetBox the source of truth for this (re-applied to the device on Apply)"><span class="mdi mdi-check"></span> Accept</button>
-            </form>
-            {% endif %}
+            {% url 'plugins:netbox_nso_plugin:routing_accept_isis_instance' pk=ip.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=ip.status %}
           </td>
         </tr>
         {% endfor %}

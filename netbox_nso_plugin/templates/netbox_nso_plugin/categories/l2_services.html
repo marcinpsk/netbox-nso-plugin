@@ -2,9 +2,7 @@
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
 {# Lazy-loaded fragment: Nokia L2 services (M37 P2a — value-aware: epipe/vpls reconciled #}
 {# into vpn.L2VPN + L2VPNTermination; this overlay tracks drift + accept). #}
-{% if adapter_error %}
-  <div class="alert alert-warning text-dark mb-2"><span class="mdi mdi-alert-outline me-1"></span>{{ adapter_error }}</div>
-{% endif %}
+{% include "netbox_nso_plugin/categories/_adapter_error.html" %}
 
 {% if l2_sap_states %}
   <p class="text-muted small mb-2">L2 services (epipe = point-to-point, vpls = multipoint) reconciled into NetBox <strong>L2VPN</strong> + terminations. The dot1q tag is per-SAP <strong>interface-local encap</strong> (not a VLAN). Accept makes NetBox the source of truth; the SAP write-back is a later phase.</p>
@@ -26,12 +24,7 @@
           <td>{% if sap.l2vpn %}<a href="{{ sap.l2vpn.get_absolute_url }}">{{ sap.l2vpn.name }}</a>{% else %}<span class="text-muted">—</span>{% endif %}</td>
           <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=sap.status %}</td>
           <td>
-            {% if sap.status == "imported" or sap.status == "changed" or sap.status == "conflict" %}
-            <form method="post" action="{% url 'plugins:netbox_nso_plugin:l2_accept_sap' pk=sap.pk %}">
-              {% csrf_token %}
-              <button type="submit" class="btn btn-xs btn-outline-success" title="Make NetBox the source of truth for this SAP (written to the device on Apply, later phase)"><span class="mdi mdi-check"></span> Accept</button>
-            </form>
-            {% endif %}
+            {% url 'plugins:netbox_nso_plugin:l2_accept_sap' pk=sap.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=sap.status title="Make NetBox the source of truth for this SAP (written to the device on Apply, later phase)" %}
           </td>
         </tr>
         {% endfor %}

@@ -1,9 +1,7 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
 {# Lazy-loaded fragment: L2 switchport state (M34). Drift vs the native NetBox interface. #}
-{% if adapter_error %}
-  <div class="alert alert-warning text-dark mb-2"><span class="mdi mdi-alert-outline me-1"></span>{{ adapter_error }}</div>
-{% endif %}
+{% include "netbox_nso_plugin/categories/_adapter_error.html" %}
 
 {% if switchport_states %}
   <p class="text-muted small mb-2">Switchport mode/VLAN observed by NSO, compared against the native NetBox interface (<code>mode</code>/<code>untagged_vlan</code>/<code>tagged_vlans</code>).</p>
@@ -21,12 +19,7 @@
           <td>{% with tagged=s.tagged_vlans.all %}{% if tagged %}{% for v in tagged %}{{ v.vid }}{% if not forloop.last %}, {% endif %}{% endfor %}{% else %}<span class="text-muted">—</span>{% endif %}{% endwith %}</td>
           <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=s.status %}</td>
           <td>
-            {% if s.status == "imported" or s.status == "changed" or s.status == "conflict" %}
-            <form method="post" action="{% url 'plugins:netbox_nso_plugin:switchport_accept' pk=s.pk %}">
-              {% csrf_token %}
-              <button type="submit" class="btn btn-xs btn-outline-success" title="Make NetBox the source of truth for this switchport and apply it to the device via NSO"><span class="mdi mdi-check"></span> Accept &amp; Apply</button>
-            </form>
-            {% endif %}
+            {% url 'plugins:netbox_nso_plugin:switchport_accept' pk=s.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=s.status label="Accept & Apply" title="Make NetBox the source of truth for this switchport and apply it to the device via NSO" %}
           </td>
         </tr>
         {% endfor %}

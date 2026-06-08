@@ -3,9 +3,7 @@
 {# Lazy-loaded fragment: LACP/LAG bundle + member parameters (M33). Read-mirror of #}
 {# the device LACP config; this overlay tracks the params NetBox has no native column #}
 {# for (min-links, system-priority, system-id, timer, admin-key, per-member priority). #}
-{% if adapter_error %}
-  <div class="alert alert-warning text-dark mb-2"><span class="mdi mdi-alert-outline me-1"></span>{{ adapter_error }}</div>
-{% endif %}
+{% include "netbox_nso_plugin/categories/_adapter_error.html" %}
 
 {% if lacp_bundle_states %}
   <p class="text-muted small mb-2">LACP bundle parameters reported by NSO. The LAG membership itself lives on the native NetBox interfaces; this overlay carries the LACP knobs (min-links, system-priority, timer, admin-key) and per-member port-priority.</p>
@@ -34,12 +32,7 @@
           </td>
           <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=b.status %}</td>
           <td>
-            {% if b.status == "imported" or b.status == "changed" or b.status == "conflict" %}
-            <form method="post" action="{% url 'plugins:netbox_nso_plugin:lacp_accept_bundle' pk=b.pk %}">
-              {% csrf_token %}
-              <button type="submit" class="btn btn-xs btn-outline-success" title="Make NetBox the source of truth for this LACP bundle and apply it to the device via NSO"><span class="mdi mdi-check"></span> Accept &amp; Apply</button>
-            </form>
-            {% endif %}
+            {% url 'plugins:netbox_nso_plugin:lacp_accept_bundle' pk=b.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=b.status label="Accept & Apply" title="Make NetBox the source of truth for this LACP bundle and apply it to the device via NSO" %}
           </td>
         </tr>
         {% endfor %}

@@ -1,20 +1,12 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
 {# Lazy-loaded fragment: OSPF category (instances + interfaces). #}
-{% if adapter_error %}
-  <div class="alert alert-warning mb-2"><span class="mdi mdi-alert-outline me-1"></span>{{ adapter_error }}</div>
-{% endif %}
+{% include "netbox_nso_plugin/categories/_adapter_error.html" %}
 
 {% if ospf_data.instances or ospf_data.interfaces %}
   <div class="d-flex justify-content-end mb-2 gap-1">
-    {% if category_has_unowned %}<form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_ospf_instances' device_pk=object.pk %}" class="d-inline">
-      {% csrf_token %}
-      <button type="submit" class="btn btn-sm btn-outline-success"><span class="mdi mdi-check-all"></span> Accept All Instances</button>
-    </form>{% endif %}
-    {% if category_has_unowned %}<form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_ospf_interfaces' device_pk=object.pk %}" class="d-inline">
-      {% csrf_token %}
-      <button type="submit" class="btn btn-sm btn-outline-success"><span class="mdi mdi-check-all"></span> Accept All Interfaces</button>
-    </form>{% endif %}
+    {% url 'plugins:netbox_nso_plugin:routing_bulk_accept_ospf_instances' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned label="Accept All Instances" %}
+    {% url 'plugins:netbox_nso_plugin:routing_bulk_accept_ospf_interfaces' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned label="Accept All Interfaces" %}
   </div>
   {% if ospf_data.instances %}
   <div id="flt-ospf-instances">
@@ -36,12 +28,7 @@
           </td>
           <td>{{ oi.last_sync_at|default:"—" }}</td>
           <td>
-            {% if oi.status == "imported" or oi.status == "changed" or oi.status == "conflict" or oi.status == "drifted" %}
-            <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_accept_ospf_instance' pk=oi.pk %}">
-              {% csrf_token %}
-              <button type="submit" class="btn btn-xs btn-outline-success" title="Make NetBox the source of truth for this (re-applied to the device on Apply)"><span class="mdi mdi-check"></span> Accept</button>
-            </form>
-            {% endif %}
+            {% url 'plugins:netbox_nso_plugin:routing_accept_ospf_instance' pk=oi.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=oi.status %}
           </td>
         </tr>
         {% endfor %}
@@ -70,12 +57,7 @@
           </td>
           <td>{{ oif.last_sync_at|default:"—" }}</td>
           <td>
-            {% if oif.status == "imported" or oif.status == "changed" or oif.status == "conflict" or oif.status == "drifted" %}
-            <form method="post" action="{% url 'plugins:netbox_nso_plugin:routing_accept_ospf_interface' pk=oif.pk %}">
-              {% csrf_token %}
-              <button type="submit" class="btn btn-xs btn-outline-success" title="Make NetBox the source of truth for this (re-applied to the device on Apply)"><span class="mdi mdi-check"></span> Accept</button>
-            </form>
-            {% endif %}
+            {% url 'plugins:netbox_nso_plugin:routing_accept_ospf_interface' pk=oif.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=oif.status %}
           </td>
         </tr>
         {% endfor %}
