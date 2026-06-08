@@ -21,13 +21,13 @@ class _LacpBase(IntentPushResetMixin, TestCase):
         cls.lag = Interface.objects.create(device=cls.device, name="Port-channel1", type="lag")
         cls.m1 = Interface.objects.create(device=cls.device, name="GigabitEthernet0/1", type="1000base-t")
 
-    def _make_mgmt(self, adapter_device_id=42):
+    def _make_mgmt(self, adapter_device_id=42, auto_apply=False):
         from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
 
         inst, _ = NSOInstance.objects.get_or_create(
             name="lacp-sig-inst", defaults={"adapter_instance_id": "lacp-sig-inst"}
         )
-        return NSODeviceManagement.objects.get_or_create(
+        mgmt = NSODeviceManagement.objects.get_or_create(
             device=self.device,
             defaults={
                 "nso_instance": inst,
@@ -36,6 +36,10 @@ class _LacpBase(IntentPushResetMixin, TestCase):
                 "manage_interfaces": True,
             },
         )[0]
+        if mgmt.auto_apply != auto_apply:
+            mgmt.auto_apply = auto_apply
+            mgmt.save(update_fields=["auto_apply"])
+        return mgmt
 
     def _bundle(self, mgmt, status="accepted"):
         from netbox_nso_plugin.models import NSOLACPBundleState
@@ -109,11 +113,12 @@ class TestPushLacpIntentForDevice(_LacpBase):
 
 
 class TestOnLacpStateSave(_LacpBase):
-    def test_save_triggers_intent_push(self):
+    def test_save_triggers_intent_push_in_auto_apply(self):
+        """In auto-apply mode, accept commits to the device immediately."""
         from netbox_nso_plugin.models import NSOLACPBundleState
         from netbox_nso_plugin.signals import _on_lacp_state_save
 
-        mgmt = self._make_mgmt()
+        mgmt = self._make_mgmt(auto_apply=True)
         # Unsaved instance (mirrors the L2 SAP signal test) so the real post_save
         # doesn't schedule a push outside the captured on-commit block.
         bundle = NSOLACPBundleState(management=mgmt, interface=self.lag, lag_id=1, status="accepted")
@@ -123,6 +128,20 @@ class TestOnLacpStateSave(_LacpBase):
                 _on_lacp_state_save(sender=NSOLACPBundleState, instance=bundle)
             mock_apply.assert_called_once()
             assert mock_apply.call_args[0][0] == mgmt.adapter_device_id
+
+    def test_save_no_push_without_auto_apply(self):
+        """Default (deferred) flow: accept marks owned but does NOT commit — the
+        single device Apply commits later."""
+        from netbox_nso_plugin.models import NSOLACPBundleState
+        from netbox_nso_plugin.signals import _on_lacp_state_save
+
+        mgmt = self._make_mgmt(auto_apply=False)
+        bundle = NSOLACPBundleState(management=mgmt, interface=self.lag, lag_id=1, status="accepted")
+
+        with patch("netbox_nso_plugin.adapter_client.apply_lag_config") as mock_apply:
+            with self.captureOnCommitCallbacks(execute=True):
+                _on_lacp_state_save(sender=NSOLACPBundleState, instance=bundle)
+            mock_apply.assert_not_called()
 
     def test_no_push_without_adapter_device_id(self):
         from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOLACPBundleState

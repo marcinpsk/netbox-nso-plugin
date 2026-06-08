@@ -716,6 +716,19 @@ class NSODeviceActionView(LoginRequiredMixin, View):
             "apply": client.trigger_apply,
         }[action]
 
+        # One Apply commits everything: the adapter worker applies the intent-stored
+        # scopes (attrs/IP/SNMP/routing/L2), and here we force-commit the LACP +
+        # switchport snapshots, which are owned in NetBox rather than mirrored in the
+        # adapter. Accept itself only marks rows owned (no immediate device write).
+        if action == "apply":
+            from .signals import _push_lacp_intent_for_device, _push_switchport_intent_for_device
+
+            for push in (_push_lacp_intent_for_device, _push_switchport_intent_for_device):
+                try:
+                    push(mgmt.device_id, mgmt.adapter_device_id, force=True)
+                except Exception as exc:  # noqa: BLE001 — one scope's failure must not block the rest
+                    logger.warning("Apply push failed for device %s: %s", mgmt.device_id, exc)
+
         try:
             result = action_fn(mgmt.adapter_device_id)
             job_id = result.get("job_id") if result else None
@@ -1082,7 +1095,10 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
                 }
             )
 
-        # Routing pending counts (overlays don't carry a simple value pair to diff).
+        # Routing + L2 pending counts (overlays don't carry a simple value pair to diff).
+        # LACP/switchport are owned-in-NetBox and committed by this same Apply.
+        from .models import NSOLACPBundleState, NSOSwitchportState
+
         routing = 0
         for model in (
             NSOStaticRouteState,
@@ -1093,6 +1109,9 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
             NSOOSPFInstanceState,
             NSOOSPFInterfaceState,
             NSORedistributionState,
+            NSOL2SapState,
+            NSOLACPBundleState,
+            NSOSwitchportState,
         ):
             if mgmt is not None:
                 routing += model.objects.filter(
@@ -1189,8 +1208,9 @@ class NSOL2SapStateAcceptView(LoginRequiredMixin, View):
 class NSOLACPBundleStateAcceptView(LoginRequiredMixin, View):
     """Accept one LACP bundle (and its member rows) — mark owned so NetBox is the source of truth.
 
-    Saving the accepted rows fires the post_save signal which pushes + applies the device's
-    full LACP bundle snapshot to the adapter's lag-reconciler (M33 write path).
+    Accept only marks the rows owned; the device commit is deferred to the single
+    device Apply (one flow, like every other scope). In auto-apply mode the
+    post_save signal still commits immediately (M33 lag-reconciler write path).
     """
 
     def post(self, request, pk):  # noqa: D102
@@ -1218,10 +1238,12 @@ class NSOLACPBundleStateAcceptView(LoginRequiredMixin, View):
 
 
 class NSOSwitchportStateAcceptView(LoginRequiredMixin, View):
-    """Accept one L2 switchport: native-write + push to the switchport-reconciler (M34).
+    """Accept one L2 switchport: native-write the observed mode/VLANs + mark owned.
 
-    Writes the NSO-observed mode/VLANs onto the native NetBox interface (NetBox becomes
-    the source of truth); the post_save push then applies the device's switchport snapshot.
+    Writes the NSO-observed mode/VLANs onto the native NetBox interface (NetBox
+    becomes the source of truth). The device commit is deferred to the single
+    device Apply (one flow); in auto-apply mode the post_save signal commits
+    immediately (M34 switchport-reconciler).
     """
 
     def post(self, request, pk):  # noqa: D102

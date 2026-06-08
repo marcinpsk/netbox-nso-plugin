@@ -176,15 +176,16 @@ def _drain_intent_pushes() -> None:
             logger.warning("Coalesced intent push failed: %s", exc)
 
 
-def _push_changed(key, payload, do_push) -> None:
+def _push_changed(key, payload, do_push, force=False) -> None:
     """Run *do_push* only if *payload* differs from the last push for *key*.
 
     ``do_push`` performs the actual ``client.put_*`` call. Errors are swallowed
     (matching the adapter-unreachable tolerance elsewhere) and the cache is left
-    unchanged on failure so the next attempt retries.
+    unchanged on failure so the next attempt retries. ``force`` bypasses the
+    unchanged-skip (used by the explicit device Apply, which must always commit).
     """
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
-    if _last_pushed_hashes.get(key) == digest:
+    if not force and _last_pushed_hashes.get(key) == digest:
         logger.debug("Intent push skipped (unchanged) for %s", key)
         return
     try:
@@ -820,8 +821,13 @@ def _on_l2_sap_state_save(sender, instance, **kwargs):
     )
 
 
-def _push_lacp_intent_for_device(device_id, adapter_device_id):
-    """Build and push (apply) the full LACP bundle intent snapshot for a device (M33)."""
+def _push_lacp_intent_for_device(device_id, adapter_device_id, force=False):
+    """Build and push (apply) the full LACP bundle intent snapshot for a device (M33).
+
+    Committing LACP is a device write, so on accept it only fires when the device
+    is in auto-apply mode (see _on_lacp_state_save); the manual device Apply calls
+    this with ``force=True`` to commit the owned snapshot as part of the one Apply.
+    """
     from . import adapter_client as client
     from .models import NSOLACPBundleState, NSOLACPMemberState
 
@@ -852,12 +858,17 @@ def _push_lacp_intent_for_device(device_id, adapter_device_id):
         (device_id, "lacp"),
         bundles,
         lambda: client.apply_lag_config(adapter_device_id, bundles),
+        force=force,
     )
 
 
 @_skip_on_render
 def _on_lacp_state_save(sender, instance, **kwargs):
-    """Push LACP intent whenever an NSOLACPBundleState/NSOLACPMemberState row is saved."""
+    """On accept, commit LACP to the device only in auto-apply mode.
+
+    Without auto-apply this is deferred: accept just marks the rows owned and the
+    single device Apply commits them (one flow, matching every other scope).
+    """
     from .models import NSODeviceManagement
 
     try:
@@ -865,7 +876,7 @@ def _on_lacp_state_save(sender, instance, **kwargs):
     except NSODeviceManagement.DoesNotExist:
         return
 
-    if mgmt.adapter_device_id is None:
+    if mgmt.adapter_device_id is None or not mgmt.auto_apply:
         return
 
     device_id = mgmt.device_id
@@ -880,8 +891,12 @@ def _on_lacp_state_save(sender, instance, **kwargs):
 _NETBOX_TO_NSO_MODE = {"access": "access", "tagged": "trunk", "tagged-all": "trunk-all"}
 
 
-def _push_switchport_intent_for_device(device_id, adapter_device_id):
-    """Build and push (apply) the device's owned L2 switchport snapshot (M34)."""
+def _push_switchport_intent_for_device(device_id, adapter_device_id, force=False):
+    """Build and push (apply) the device's owned L2 switchport snapshot (M34).
+
+    A device write, so on accept it only fires in auto-apply mode; the manual
+    device Apply calls this with ``force=True`` as part of the single Apply.
+    """
     from . import adapter_client as client
     from .models import NSOSwitchportState
 
@@ -902,19 +917,24 @@ def _push_switchport_intent_for_device(device_id, adapter_device_id):
         (device_id, "switchport"),
         interfaces,
         lambda: client.apply_switchport_config(adapter_device_id, interfaces),
+        force=force,
     )
 
 
 @_skip_on_render
 def _on_switchport_state_save(sender, instance, **kwargs):
-    """Push switchport intent whenever an NSOSwitchportState row is saved."""
+    """On accept, commit switchport to the device only in auto-apply mode.
+
+    Without auto-apply this is deferred: accept marks the row owned and the single
+    device Apply commits it (one flow, matching every other scope).
+    """
     from .models import NSODeviceManagement
 
     try:
         mgmt = instance.management
     except NSODeviceManagement.DoesNotExist:
         return
-    if mgmt.adapter_device_id is None:
+    if mgmt.adapter_device_id is None or not mgmt.auto_apply:
         return
     device_id = mgmt.device_id
     adapter_device_id = mgmt.adapter_device_id

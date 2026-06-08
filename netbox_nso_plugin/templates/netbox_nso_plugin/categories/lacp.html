@@ -32,7 +32,7 @@
           </td>
           <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=b.status %}</td>
           <td>
-            {% url 'plugins:netbox_nso_plugin:lacp_accept_bundle' pk=b.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=b.status label="Accept & Apply" title="Make NetBox the source of truth for this LACP bundle and apply it to the device via NSO" %}
+            {% url 'plugins:netbox_nso_plugin:lacp_accept_bundle' pk=b.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=b.status title="Make NetBox the source of truth for this LACP bundle (committed to the device on Apply)" %}
           </td>
         </tr>
         {% endfor %}

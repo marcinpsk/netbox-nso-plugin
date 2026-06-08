@@ -23,11 +23,11 @@ class _SwBase(IntentPushResetMixin, TestCase):
         cls.group = VLANGroup.objects.create(name="g", slug=f"nso-{cls.device.pk}")
         cls.v10 = VLAN.objects.create(group=cls.group, vid=10, name="MGMT")
 
-    def _make_mgmt(self, adapter_device_id=42):
+    def _make_mgmt(self, adapter_device_id=42, auto_apply=False):
         from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
 
         inst, _ = NSOInstance.objects.get_or_create(name="sw-sig-inst", defaults={"adapter_instance_id": "sw-sig-inst"})
-        return NSODeviceManagement.objects.get_or_create(
+        mgmt = NSODeviceManagement.objects.get_or_create(
             device=self.device,
             defaults={
                 "nso_instance": inst,
@@ -36,6 +36,10 @@ class _SwBase(IntentPushResetMixin, TestCase):
                 "manage_interfaces": True,
             },
         )[0]
+        if mgmt.auto_apply != auto_apply:
+            mgmt.auto_apply = auto_apply
+            mgmt.save(update_fields=["auto_apply"])
+        return mgmt
 
     def _state(self, mgmt, mode="access", status="changed"):
         from netbox_nso_plugin.models import NSOSwitchportState
@@ -72,6 +76,19 @@ class TestPushSwitchportIntent(_SwBase):
         with patch("netbox_nso_plugin.adapter_client.apply_switchport_config") as mock_apply:
             _push_switchport_intent_for_device(self.device.pk, mgmt.adapter_device_id)
         assert mock_apply.call_args[0][1] == []
+
+    def test_save_no_push_without_auto_apply(self):
+        """Deferred flow: a switchport save does not commit to the device unless
+        auto-apply is on — the single device Apply commits it."""
+        from netbox_nso_plugin.models import NSOSwitchportState
+        from netbox_nso_plugin.signals import _on_switchport_state_save
+
+        mgmt = self._make_mgmt(auto_apply=False)
+        st = NSOSwitchportState(management=mgmt, interface=self.iface, mode="access", status="accepted")
+        with patch("netbox_nso_plugin.adapter_client.apply_switchport_config") as mock_apply:
+            with self.captureOnCommitCallbacks(execute=True):
+                _on_switchport_state_save(sender=NSOSwitchportState, instance=st)
+            mock_apply.assert_not_called()
 
 
 class TestSwitchportAcceptView(_SwBase):
