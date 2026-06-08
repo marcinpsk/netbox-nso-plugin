@@ -627,6 +627,60 @@ def _on_snmp_state_save(sender, instance, **kwargs):
     )
 
 
+def _push_logging_intent_for_device(device_id, adapter_device_id):
+    """Build and push the full remote-syslog (logging) intent snapshot for a device.
+
+    Store-only (deferred): the device commit happens on the single device Apply via
+    the adapter's logging-reconciler. Only owned rows are included.
+    """
+    from . import adapter_client as client
+    from .models import NSOLoggingHostState
+
+    hosts = []
+    for row in NSOLoggingHostState.objects.filter(
+        management__device_id=device_id,
+        status__in=("accepted", "deploying", "in_sync"),
+    ):
+        hosts.append(
+            {
+                "address": row.address,
+                "port": row.port,
+                "severity": row.severity or "",
+                "facility": row.facility or "",
+                "transport": row.transport or "",
+                "vrf": row.vrf or "",
+                "source": row.source or "",
+            }
+        )
+
+    _push_changed(
+        (device_id, "logging"),
+        hosts,
+        lambda: client.put_logging_intent(adapter_device_id, hosts),
+    )
+
+
+@_skip_on_render
+def _on_logging_state_save(sender, instance, **kwargs):
+    """Push logging intent whenever an NSOLoggingHostState row is saved (accept → push)."""
+    from .models import NSODeviceManagement
+
+    try:
+        mgmt = instance.management
+    except NSODeviceManagement.DoesNotExist:
+        return
+
+    if mgmt.adapter_device_id is None:
+        return
+
+    device_id = mgmt.device_id
+    adapter_device_id = mgmt.adapter_device_id
+    _schedule_intent_push(
+        (device_id, "logging"),
+        lambda: _push_logging_intent_for_device(device_id, adapter_device_id),
+    )
+
+
 def _on_ip_address_change(sender, instance, **kwargs):
     """Push IP intent when an IPAddress assigned to a managed interface changes."""
     from dcim.models import Interface as _Interface
@@ -1462,6 +1516,15 @@ def _connect_g_activated():  # pragma: no cover
             sender=snmp_model,
             dispatch_uid=f"nso_plugin_snmp_{snmp_model.__name__}_post_save",
         )
+
+    # Logging (remote syslog) state → intent push
+    from .models import NSOLoggingHostState
+
+    post_save.connect(
+        _on_logging_state_save,
+        sender=NSOLoggingHostState,
+        dispatch_uid="nso_plugin_logging_host_state_post_save",
+    )
 
     # Static route state → intent push (M10 B3)
     from .models import NSOStaticRouteState

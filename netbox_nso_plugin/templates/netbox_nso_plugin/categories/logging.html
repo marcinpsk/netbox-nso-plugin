@@ -2,6 +2,7 @@
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
 {# Lazy-loaded fragment: Logging category (remote syslog servers). Read-only. #}
 {% include "netbox_nso_plugin/categories/_adapter_error.html" %}
+{% url 'dcim:device_nso' pk=object.pk as return_url %}
 
 {% if logging_data.hosts %}
   <div id="flt-logging-hosts">
@@ -9,11 +10,11 @@
   <div class="table-responsive">
     <table class="table table-sm table-hover mb-0">
       <thead>
-        <tr><th>Syslog server</th><th>Port</th><th>Severity</th><th>Facility</th><th>Source</th><th>VRF</th><th>Status</th><th>Last Synced</th></tr>
+        <tr><th>Syslog server</th><th>Port</th><th>Severity</th><th>Facility</th><th>Source</th><th>VRF</th><th>Status</th><th>Last Synced</th><th></th></tr>
       </thead>
       <tbody>
         {% for h in logging_data.hosts %}
-        <tr data-status="{{ h.status }}" data-owned="false">
+        <tr data-status="{{ h.status }}" data-owned="{{ h.accepted_at|yesno:'true,false' }}">
           <td>{{ h.address }}</td>
           <td>{{ h.port|default:"514" }}</td>
           <td>{{ h.severity|default:"—" }}</td>
@@ -22,6 +23,12 @@
           <td>{{ h.vrf|default:"—" }}</td>
           <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=h.status %}</td>
           <td>{{ h.last_sync_at|default:"—" }}</td>
+          <td>
+            <div class="d-flex gap-1 align-items-center">
+              {% url 'plugins:netbox_nso_plugin:nsologginghoststate_edit' pk=h.pk as edit_url %}{% include "netbox_nso_plugin/categories/_edit_link.html" with edit_url=edit_url return_url=return_url %}
+              {% url 'plugins:netbox_nso_plugin:logging_accept_host' pk=h.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=h.status %}
+            </div>
+          </td>
         </tr>
         {% endfor %}
       </tbody>

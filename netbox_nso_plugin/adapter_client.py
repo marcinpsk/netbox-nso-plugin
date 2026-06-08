@@ -512,6 +512,23 @@ def put_l2_sap_intent(adapter_device_id, saps):
     )
 
 
+def put_logging_intent(adapter_device_id, hosts):
+    """PUT /api/v1/devices/{id}/logging-intent — push full remote-syslog intent.
+
+    ``hosts`` is a list of dicts:
+      [{"address": "10.0.0.1", "port": None, "severity": "informational",
+        "facility": "", "transport": "", "vrf": "", "source": "",
+        "accepted_at": "...Z"}, ...]
+    Empty list clears all logging intent for the device.
+    Returns {"device_id": ..., "count": N}.
+    """
+    return _request(
+        "PUT",
+        f"/api/v1/devices/{adapter_device_id}/logging-intent",
+        json={"hosts": hosts},
+    )
+
+
 def apply_lag_config(adapter_device_id, bundles):
     """POST /api/v1/devices/{id}/lag-config/apply — push + apply full LACP bundle intent (M33).
 

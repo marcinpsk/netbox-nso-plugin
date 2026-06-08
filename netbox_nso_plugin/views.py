@@ -21,7 +21,17 @@ from .filters import (
     NSOInterfaceStateFilterSet,
     NSOPlatformNedMappingFilterSet,
 )
-from .forms import AdapterConnectionForm, NSODeviceManagementForm, NSOInstanceForm, NSOPlatformNedMappingForm
+from .forms import (
+    AdapterConnectionForm,
+    NSODeviceManagementForm,
+    NSOInstanceForm,
+    NSOLoggingHostStateForm,
+    NSOPlatformNedMappingForm,
+    NSOSnmpCommunityStateForm,
+    NSOSnmpHostStateForm,
+    NSOSnmpSystemInfoStateForm,
+    NSOSnmpV3UserStateForm,
+)
 from .models import (
     AdapterConnection,
     NSOBGPPeerState,
@@ -31,11 +41,16 @@ from .models import (
     NSOISISInstanceState,
     NSOISISInterfaceState,
     NSOL2SapState,
+    NSOLoggingHostState,
     NSOOSPFInstanceState,
     NSOOSPFInterfaceState,
     NSOPlatformNedMapping,
     NSORedistributionState,
     NSORoutePolicyState,
+    NSOSnmpCommunityState,
+    NSOSnmpHostState,
+    NSOSnmpSystemInfoState,
+    NSOSnmpV3UserState,
     NSOStaticRouteState,
 )
 from .tables import (
@@ -1095,8 +1110,9 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
                 }
             )
 
-        # Routing + L2 pending counts (overlays don't carry a simple value pair to diff).
-        # LACP/switchport are owned-in-NetBox and committed by this same Apply.
+        # Routing + L2 + SNMP/logging pending counts (overlays don't carry a simple
+        # value pair to diff). LACP/switchport/SNMP/logging are all committed by this
+        # same single Apply.
         from .models import NSOLACPBundleState, NSOSwitchportState
 
         routing = 0
@@ -1109,6 +1125,11 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
             NSOOSPFInstanceState,
             NSOOSPFInterfaceState,
             NSORedistributionState,
+            NSOSnmpCommunityState,
+            NSOSnmpV3UserState,
+            NSOSnmpHostState,
+            NSOSnmpSystemInfoState,
+            NSOLoggingHostState,
             NSOL2SapState,
             NSOLACPBundleState,
             NSOSwitchportState,
@@ -1410,3 +1431,68 @@ class NSORedistributionBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
         # Redistribution is distributed across destination protocols; push all three.
         for fn in (_push_ospf_intent_for_device, _push_isis_intent_for_device, _push_bgp_intent_for_device):
             fn(mgmt.device_id, mgmt.adapter_device_id)
+
+
+# ── SNMP / Logging overlay accept + edit (operator modify → accept → push) ─────
+# Accept marks the row owned (accepted_at + status); the device commit is deferred
+# to the single device Apply — one flow, like every other scope. SNMP secrets are
+# never stored; the push resolves them from Vault via each row's vault_ref.
+
+
+class OverlayStateAcceptMixin(LoginRequiredMixin, View):
+    """Per-row accept for an SNMP/logging overlay — mark owned (accepted_at + status)."""
+
+    model_class = None
+
+    def post(self, request, pk):  # noqa: D102
+        state = get_object_or_404(self.model_class, pk=pk)
+        state.status = _status_after_accept(state.status)
+        state.accepted_at = timezone.now()
+        state.save(update_fields=["status", "accepted_at"])
+        messages.success(request, f"Accepted {state}.")
+        return redirect(_device_nso_tab_url(state.management.device_id))
+
+
+class NSOSnmpCommunityStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
+    model_class = NSOSnmpCommunityState
+
+
+class NSOSnmpV3UserStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
+    model_class = NSOSnmpV3UserState
+
+
+class NSOSnmpHostStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
+    model_class = NSOSnmpHostState
+
+
+class NSOSnmpSystemInfoStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
+    model_class = NSOSnmpSystemInfoState
+
+
+class NSOLoggingHostStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
+    model_class = NSOLoggingHostState
+
+
+class NSOSnmpCommunityStateEditView(generic.ObjectEditView):  # noqa: D101
+    queryset = NSOSnmpCommunityState.objects.all()
+    form = NSOSnmpCommunityStateForm
+
+
+class NSOSnmpV3UserStateEditView(generic.ObjectEditView):  # noqa: D101
+    queryset = NSOSnmpV3UserState.objects.all()
+    form = NSOSnmpV3UserStateForm
+
+
+class NSOSnmpHostStateEditView(generic.ObjectEditView):  # noqa: D101
+    queryset = NSOSnmpHostState.objects.all()
+    form = NSOSnmpHostStateForm
+
+
+class NSOSnmpSystemInfoStateEditView(generic.ObjectEditView):  # noqa: D101
+    queryset = NSOSnmpSystemInfoState.objects.all()
+    form = NSOSnmpSystemInfoStateForm
+
+
+class NSOLoggingHostStateEditView(generic.ObjectEditView):  # noqa: D101
+    queryset = NSOLoggingHostState.objects.all()
+    form = NSOLoggingHostStateForm

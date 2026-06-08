@@ -568,6 +568,9 @@ class NSOSnmpCommunityState(NetBoxModel):
     )
     status = models.CharField(max_length=32, choices=_SNMP_STATUS_CHOICES, default="unknown")
     last_sync_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(
+        null=True, blank=True, help_text="When an operator accepted this row (NetBox becomes source of truth)."
+    )
 
     class Meta:
         ordering = ["management", "community_hash"]
@@ -577,6 +580,12 @@ class NSOSnmpCommunityState(NetBoxModel):
 
     def __str__(self):
         return f"{self.management} / community:{self.community_hash} [{self.status}]"
+
+    def get_absolute_url(self):
+        """Return the device NSO tab URL (the overlay's detail; used by edit redirects)."""
+        from django.urls import reverse
+
+        return reverse("dcim:device_nso", kwargs={"pk": self.management.device_id})
 
 
 class NSOSnmpV3UserState(NetBoxModel):
@@ -603,6 +612,9 @@ class NSOSnmpV3UserState(NetBoxModel):
     )
     status = models.CharField(max_length=32, choices=_SNMP_STATUS_CHOICES, default="unknown")
     last_sync_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(
+        null=True, blank=True, help_text="When an operator accepted this row (NetBox becomes source of truth)."
+    )
 
     class Meta:
         ordering = ["management", "username"]
@@ -612,6 +624,12 @@ class NSOSnmpV3UserState(NetBoxModel):
 
     def __str__(self):
         return f"{self.management} / v3:{self.username} [{self.status}]"
+
+    def get_absolute_url(self):
+        """Return the device NSO tab URL (the overlay's detail; used by edit redirects)."""
+        from django.urls import reverse
+
+        return reverse("dcim:device_nso", kwargs={"pk": self.management.device_id})
 
 
 class NSOSnmpHostState(NetBoxModel):
@@ -638,6 +656,9 @@ class NSOSnmpHostState(NetBoxModel):
     )
     status = models.CharField(max_length=32, choices=_SNMP_STATUS_CHOICES, default="unknown")
     last_sync_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(
+        null=True, blank=True, help_text="When an operator accepted this row (NetBox becomes source of truth)."
+    )
 
     class Meta:
         ordering = ["management", "address"]
@@ -647,6 +668,12 @@ class NSOSnmpHostState(NetBoxModel):
 
     def __str__(self):
         return f"{self.management} / host:{self.address} [{self.status}]"
+
+    def get_absolute_url(self):
+        """Return the device NSO tab URL (the overlay's detail; used by edit redirects)."""
+        from django.urls import reverse
+
+        return reverse("dcim:device_nso", kwargs={"pk": self.management.device_id})
 
 
 class NSOSnmpSystemInfoState(NetBoxModel):
@@ -664,6 +691,9 @@ class NSOSnmpSystemInfoState(NetBoxModel):
     contact = models.CharField(max_length=256, blank=True, default="")
     status = models.CharField(max_length=32, choices=_SNMP_STATUS_CHOICES, default="unknown")
     last_sync_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(
+        null=True, blank=True, help_text="When an operator accepted this row (NetBox becomes source of truth)."
+    )
 
     class Meta:
         verbose_name = "NSO SNMP System Info State"
@@ -671,6 +701,12 @@ class NSOSnmpSystemInfoState(NetBoxModel):
 
     def __str__(self):
         return f"{self.management} / system-info [{self.status}]"
+
+    def get_absolute_url(self):
+        """Return the device NSO tab URL (the overlay's detail; used by edit redirects)."""
+        from django.urls import reverse
+
+        return reverse("dcim:device_nso", kwargs={"pk": self.management.device_id})
 
 
 class NSOLoggingHostState(NetBoxModel):
@@ -690,6 +726,9 @@ class NSOLoggingHostState(NetBoxModel):
     source = models.CharField(max_length=256, blank=True, default="", help_text="Source interface/address, when set.")
     status = models.CharField(max_length=32, choices=_SNMP_STATUS_CHOICES, default="unknown")
     last_sync_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(
+        null=True, blank=True, help_text="When an operator accepted this row (NetBox becomes source of truth)."
+    )
 
     class Meta:
         ordering = ["management", "address"]
@@ -699,6 +738,12 @@ class NSOLoggingHostState(NetBoxModel):
 
     def __str__(self):
         return f"{self.management} / syslog:{self.address} [{self.status}]"
+
+    def get_absolute_url(self):
+        """Return the device NSO tab URL (the overlay's detail; used by edit redirects)."""
+        from django.urls import reverse
+
+        return reverse("dcim:device_nso", kwargs={"pk": self.management.device_id})
 
 
 _STATIC_ROUTE_STATUS_CHOICES = [

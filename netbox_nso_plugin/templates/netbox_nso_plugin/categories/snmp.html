@@ -2,7 +2,10 @@
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
 {# Lazy-loaded fragment: SNMP category (communities + v3 users + hosts + system info). #}
 {# Secret-safe: community strings and v3 passwords are never shown — only hashes/flags. #}
+{# Operators may Modify (edit) + Accept a row; the secret is supplied via the row's #}
+{# Vault ref and resolved at Apply time (the single device Apply pushes it). #}
 {% include "netbox_nso_plugin/categories/_adapter_error.html" %}
+{% url 'dcim:device_nso' pk=object.pk as return_url %}
 
 {% if snmp_data.communities or snmp_data.v3_users or snmp_data.hosts or snmp_data.system_info %}
 
@@ -11,6 +14,12 @@
     <tr><th style="width:160px;">Location</th><td>{{ snmp_data.system_info.location|default:"—" }}</td></tr>
     <tr><th>Contact</th><td>{{ snmp_data.system_info.contact|default:"—" }}</td></tr>
     <tr><th>Status</th><td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=snmp_data.system_info.status %}</td></tr>
+    <tr><th>Actions</th><td>
+      <div class="d-flex gap-1 align-items-center">
+        {% url 'plugins:netbox_nso_plugin:nsosnmpsysteminfostate_edit' pk=snmp_data.system_info.pk as edit_url %}{% include "netbox_nso_plugin/categories/_edit_link.html" with edit_url=edit_url return_url=return_url %}
+        {% url 'plugins:netbox_nso_plugin:snmp_accept_system_info' pk=snmp_data.system_info.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=snmp_data.system_info.status %}
+      </div>
+    </td></tr>
   </table>
   {% endif %}
 
@@ -21,16 +30,23 @@
   <div class="table-responsive mb-3">
     <table class="table table-sm table-hover mb-0">
       <thead>
-        <tr><th>Community (hash)</th><th>Access</th><th>ACL</th><th>Status</th><th>Last Synced</th></tr>
+        <tr><th>Community (hash)</th><th>Access</th><th>ACL</th><th>Vault ref</th><th>Status</th><th>Last Synced</th><th></th></tr>
       </thead>
       <tbody>
         {% for c in snmp_data.communities %}
-        <tr data-status="{{ c.status }}" data-owned="false">
+        <tr data-status="{{ c.status }}" data-owned="{{ c.accepted_at|yesno:'true,false' }}">
           <td><code>{{ c.community_hash }}</code></td>
           <td>{{ c.access }}</td>
           <td>{{ c.acl|default:"—" }}</td>
+          <td>{% if c.vault_ref %}<code>{{ c.vault_ref }}</code>{% else %}<span class="text-warning" title="Set a Vault ref so the secret can be pushed">missing</span>{% endif %}</td>
           <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=c.status %}</td>
           <td>{{ c.last_sync_at|default:"—" }}</td>
+          <td>
+            <div class="d-flex gap-1 align-items-center">
+              {% url 'plugins:netbox_nso_plugin:nsosnmpcommunitystate_edit' pk=c.pk as edit_url %}{% include "netbox_nso_plugin/categories/_edit_link.html" with edit_url=edit_url return_url=return_url %}
+              {% url 'plugins:netbox_nso_plugin:snmp_accept_community' pk=c.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=c.status %}
+            </div>
+          </td>
         </tr>
         {% endfor %}
       </tbody>
@@ -46,16 +62,23 @@
   <div class="table-responsive mb-3">
     <table class="table table-sm table-hover mb-0">
       <thead>
-        <tr><th>Username</th><th>Auth</th><th>Priv</th><th>Status</th><th>Last Synced</th></tr>
+        <tr><th>Username</th><th>Auth</th><th>Priv</th><th>Vault ref</th><th>Status</th><th>Last Synced</th><th></th></tr>
       </thead>
       <tbody>
         {% for u in snmp_data.v3_users %}
-        <tr data-status="{{ u.status }}" data-owned="false">
+        <tr data-status="{{ u.status }}" data-owned="{{ u.accepted_at|yesno:'true,false' }}">
           <td>{{ u.username }}</td>
           <td>{% if u.has_auth_secret %}<span class="badge text-bg-success">set</span>{% else %}<span class="badge text-bg-secondary">none</span>{% endif %}</td>
           <td>{% if u.has_priv_secret %}<span class="badge text-bg-success">set</span>{% else %}<span class="badge text-bg-secondary">none</span>{% endif %}</td>
+          <td>{% if u.vault_ref %}<code>{{ u.vault_ref }}</code>{% else %}<span class="text-warning" title="Set a Vault ref so the secret can be pushed">missing</span>{% endif %}</td>
           <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=u.status %}</td>
           <td>{{ u.last_sync_at|default:"—" }}</td>
+          <td>
+            <div class="d-flex gap-1 align-items-center">
+              {% url 'plugins:netbox_nso_plugin:nsosnmpv3userstate_edit' pk=u.pk as edit_url %}{% include "netbox_nso_plugin/categories/_edit_link.html" with edit_url=edit_url return_url=return_url %}
+              {% url 'plugins:netbox_nso_plugin:snmp_accept_v3_user' pk=u.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=u.status %}
+            </div>
+          </td>
         </tr>
         {% endfor %}
       </tbody>
@@ -71,17 +94,23 @@
   <div class="table-responsive">
     <table class="table table-sm table-hover mb-0">
       <thead>
-        <tr><th>Address</th><th>Type</th><th>Version</th><th>Port</th><th>Status</th><th>Last Synced</th></tr>
+        <tr><th>Address</th><th>Type</th><th>Version</th><th>Port</th><th>Status</th><th>Last Synced</th><th></th></tr>
       </thead>
       <tbody>
         {% for h in snmp_data.hosts %}
-        <tr data-status="{{ h.status }}" data-owned="false">
+        <tr data-status="{{ h.status }}" data-owned="{{ h.accepted_at|yesno:'true,false' }}">
           <td>{{ h.address }}</td>
           <td>{{ h.notify_type }}</td>
           <td>{{ h.version }}</td>
           <td>{{ h.port|default:"162" }}</td>
           <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=h.status %}</td>
           <td>{{ h.last_sync_at|default:"—" }}</td>
+          <td>
+            <div class="d-flex gap-1 align-items-center">
+              {% url 'plugins:netbox_nso_plugin:nsosnmphoststate_edit' pk=h.pk as edit_url %}{% include "netbox_nso_plugin/categories/_edit_link.html" with edit_url=edit_url return_url=return_url %}
+              {% url 'plugins:netbox_nso_plugin:snmp_accept_host' pk=h.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=h.status %}
+            </div>
+          </td>
         </tr>
         {% endfor %}
       </tbody>

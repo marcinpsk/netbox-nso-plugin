@@ -3,7 +3,17 @@
 from django import forms
 from netbox.forms import NetBoxModelForm
 
-from .models import AdapterConnection, NSODeviceManagement, NSOInstance, NSOPlatformNedMapping
+from .models import (
+    AdapterConnection,
+    NSODeviceManagement,
+    NSOInstance,
+    NSOLoggingHostState,
+    NSOPlatformNedMapping,
+    NSOSnmpCommunityState,
+    NSOSnmpHostState,
+    NSOSnmpSystemInfoState,
+    NSOSnmpV3UserState,
+)
 
 
 class NSOPlatformNedMappingForm(NetBoxModelForm):
@@ -161,3 +171,48 @@ class NSODeviceManagementForm(NetBoxModelForm):
             for name in self.SCOPE_FIELDS:
                 self.cleaned_data[name] = True
         return self.cleaned_data
+
+
+# ── SNMP / Logging overlay edit forms (operator modify → accept → push) ────────
+# These mirror what NSO observed; the operator may edit the non-secret fields and
+# (for SNMP secrets) set a vault_ref. Identity/status/sync fields are not editable.
+
+
+class NSOSnmpCommunityStateForm(NetBoxModelForm):
+    """Edit an SNMP community overlay — access/ACL + the Vault ref for the secret."""
+
+    class Meta:
+        model = NSOSnmpCommunityState
+        fields = ["access", "acl", "vault_ref", "tags"]
+
+
+class NSOSnmpV3UserStateForm(NetBoxModelForm):
+    """Edit an SNMP v3 user overlay — the Vault ref for the auth/priv secrets."""
+
+    class Meta:
+        model = NSOSnmpV3UserState
+        fields = ["vault_ref", "tags"]
+
+
+class NSOSnmpHostStateForm(NetBoxModelForm):
+    """Edit an SNMP trap/inform host overlay."""
+
+    class Meta:
+        model = NSOSnmpHostState
+        fields = ["address", "version", "notify_type", "port", "tags"]
+
+
+class NSOSnmpSystemInfoStateForm(NetBoxModelForm):
+    """Edit the SNMP system location/contact overlay."""
+
+    class Meta:
+        model = NSOSnmpSystemInfoState
+        fields = ["location", "contact", "tags"]
+
+
+class NSOLoggingHostStateForm(NetBoxModelForm):
+    """Edit a remote syslog server overlay."""
+
+    class Meta:
+        model = NSOLoggingHostState
+        fields = ["address", "port", "severity", "facility", "transport", "vrf", "source", "tags"]

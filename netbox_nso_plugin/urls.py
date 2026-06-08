@@ -281,4 +281,55 @@ urlpatterns = [
         views.NSORedistributionBulkAcceptView.as_view(),
         name="routing_bulk_accept_redistribution",
     ),
+    # ── SNMP / Logging overlay edit + accept (operator modify → accept → push) ──
+    path(
+        "snmp/community-state/<int:pk>/edit/",
+        views.NSOSnmpCommunityStateEditView.as_view(),
+        name="nsosnmpcommunitystate_edit",
+    ),
+    path(
+        "snmp/community-state/<int:pk>/accept/",
+        views.NSOSnmpCommunityStateAcceptView.as_view(),
+        name="snmp_accept_community",
+    ),
+    path(
+        "snmp/v3-user-state/<int:pk>/edit/",
+        views.NSOSnmpV3UserStateEditView.as_view(),
+        name="nsosnmpv3userstate_edit",
+    ),
+    path(
+        "snmp/v3-user-state/<int:pk>/accept/",
+        views.NSOSnmpV3UserStateAcceptView.as_view(),
+        name="snmp_accept_v3_user",
+    ),
+    path(
+        "snmp/host-state/<int:pk>/edit/",
+        views.NSOSnmpHostStateEditView.as_view(),
+        name="nsosnmphoststate_edit",
+    ),
+    path(
+        "snmp/host-state/<int:pk>/accept/",
+        views.NSOSnmpHostStateAcceptView.as_view(),
+        name="snmp_accept_host",
+    ),
+    path(
+        "snmp/system-info-state/<int:pk>/edit/",
+        views.NSOSnmpSystemInfoStateEditView.as_view(),
+        name="nsosnmpsysteminfostate_edit",
+    ),
+    path(
+        "snmp/system-info-state/<int:pk>/accept/",
+        views.NSOSnmpSystemInfoStateAcceptView.as_view(),
+        name="snmp_accept_system_info",
+    ),
+    path(
+        "logging/host-state/<int:pk>/edit/",
+        views.NSOLoggingHostStateEditView.as_view(),
+        name="nsologginghoststate_edit",
+    ),
+    path(
+        "logging/host-state/<int:pk>/accept/",
+        views.NSOLoggingHostStateAcceptView.as_view(),
+        name="logging_accept_host",
+    ),
 ]
