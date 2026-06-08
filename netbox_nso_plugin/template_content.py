@@ -1287,11 +1287,14 @@ def _reconcile_ospf(device, payload: dict) -> dict:
     OSPFInstance, _OSPFArea, _OSPFInterface = _import_ospf_models()
 
     # ── Instance reconcile ──
-    seen_pids: set[int] = set()
+    seen_pids: set[str] = set()
     for entry in payload.get("instances") or []:
         pid = entry.get("process_id")
         if pid is None:
             continue
+        # process_id is a string column (IOS-XR/Junos allow named processes);
+        # coerce so int payloads and the string DB value compare consistently.
+        pid = str(pid)
         state, _ = NSOOSPFInstanceState.objects.get_or_create(
             management=mgmt,
             process_id=pid,
@@ -1354,7 +1357,11 @@ def _reconcile_ospf_interfaces(device, mgmt, payload, now, write_path_statuses) 
             interface=iface,
             defaults={"status": "unknown"},
         )
-        state.process_id = entry.get("process_id")
+        # Normalise process_id to a string (named processes on IOS-XR/Junos) so the
+        # value stored, the inst_by_pid lookup, and the DB column all agree.
+        pid_raw = entry.get("process_id")
+        entry["process_id"] = str(pid_raw) if pid_raw is not None else None
+        state.process_id = entry["process_id"]
         state.area_id = entry.get("area_id") or ""
         state.passive = bool(entry.get("passive", False))
         state.priority = entry.get("priority")

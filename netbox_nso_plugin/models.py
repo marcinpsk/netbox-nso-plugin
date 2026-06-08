@@ -1106,7 +1106,7 @@ class NSOOSPFInstanceState(NetBoxModel):
         on_delete=models.CASCADE,
         related_name="ospf_instance_states",
     )
-    process_id = models.PositiveIntegerField()
+    process_id = models.CharField(max_length=64)
     router_id = models.CharField(max_length=64, blank=True, default="")
     vrf = models.CharField(max_length=64, blank=True, default="")
     # areas stored as JSON: [{area_id, area_type}]
@@ -1152,7 +1152,7 @@ class NSOOSPFInterfaceState(NetBoxModel):
         on_delete=models.CASCADE,
         related_name="nso_ospf_states",
     )
-    process_id = models.PositiveIntegerField(null=True, blank=True)
+    process_id = models.CharField(max_length=64, null=True, blank=True)
     area_id = models.CharField(max_length=64, blank=True, default="")
     passive = models.BooleanField(default=False)
     priority = models.PositiveSmallIntegerField(null=True, blank=True)

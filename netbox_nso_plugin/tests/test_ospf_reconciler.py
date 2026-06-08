@@ -168,7 +168,7 @@ class TestReconcileOspfFill(TestCase):
             ),
         )
         x = OSPFInterface.objects.get(interface=self.tun)
-        self.assertEqual(x.instance.process_id, 10)
+        self.assertEqual(x.instance.process_id, "10")
         self.assertEqual(x.area.area_id, "0.0.0.0")
         self.assertEqual(x.cost, 750)
         self.assertEqual(x.network_type, "point-to-point")
