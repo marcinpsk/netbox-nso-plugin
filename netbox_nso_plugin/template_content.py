@@ -781,6 +781,8 @@ def _reconcile_isis_segment_routing(inst, sr: dict | None) -> None:
         "srgb_range",
         "node_sid_index",
         "node_sid_label",
+        "node_sid_v6_index",
+        "node_sid_v6_label",
         "maximum_sid_depth",
         "tunnel_table_pref",
     )
