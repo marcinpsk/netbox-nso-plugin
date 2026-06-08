@@ -876,6 +876,54 @@ def _on_lacp_state_save(sender, instance, **kwargs):
     )
 
 
+# NetBox interface mode -> NSO switchport vocabulary (M34).
+_NETBOX_TO_NSO_MODE = {"access": "access", "tagged": "trunk", "tagged-all": "trunk-all"}
+
+
+def _push_switchport_intent_for_device(device_id, adapter_device_id):
+    """Build and push (apply) the device's owned L2 switchport snapshot (M34)."""
+    from . import adapter_client as client
+    from .models import NSOSwitchportState
+
+    interfaces = []
+    for st in NSOSwitchportState.objects.filter(
+        management__device_id=device_id, status__in=("accepted", "deploying", "in_sync")
+    ).select_related("interface", "untagged_vlan"):
+        interfaces.append(
+            {
+                "interface_name": st.interface.name,
+                "mode": _NETBOX_TO_NSO_MODE.get(st.mode or "", st.mode or ""),
+                "untagged_vlan": st.untagged_vlan.vid if st.untagged_vlan else None,
+                "tagged_vlans": sorted(v.vid for v in st.tagged_vlans.all()),
+            }
+        )
+
+    _push_changed(
+        (device_id, "switchport"),
+        interfaces,
+        lambda: client.apply_switchport_config(adapter_device_id, interfaces),
+    )
+
+
+@_skip_on_render
+def _on_switchport_state_save(sender, instance, **kwargs):
+    """Push switchport intent whenever an NSOSwitchportState row is saved."""
+    from .models import NSODeviceManagement
+
+    try:
+        mgmt = instance.management
+    except NSODeviceManagement.DoesNotExist:
+        return
+    if mgmt.adapter_device_id is None:
+        return
+    device_id = mgmt.device_id
+    adapter_device_id = mgmt.adapter_device_id
+    _schedule_intent_push(
+        (device_id, "switchport"),
+        lambda: _push_switchport_intent_for_device(device_id, adapter_device_id),
+    )
+
+
 def _push_isis_intent_for_device(device_id, adapter_device_id):
     """Build and push the full IS-IS intent snapshot (interfaces + processes) for a device."""
     from . import adapter_client as client
@@ -1425,6 +1473,15 @@ def _connect_g_activated():  # pragma: no cover
         _on_lacp_state_save,
         sender=NSOLACPMemberState,
         dispatch_uid="nso_plugin_lacp_member_state_post_save",
+    )
+
+    # Switchport state -> intent push + apply (M34)
+    from .models import NSOSwitchportState
+
+    post_save.connect(
+        _on_switchport_state_save,
+        sender=NSOSwitchportState,
+        dispatch_uid="nso_plugin_switchport_state_post_save",
     )
 
     # IS-IS interface state → intent push (M14 B3)

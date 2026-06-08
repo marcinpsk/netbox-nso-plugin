@@ -199,6 +199,12 @@ urlpatterns = [
         views.NSOLACPBundleStateAcceptView.as_view(),
         name="lacp_accept_bundle",
     ),
+    # Switchport state accept → apply — M34
+    path(
+        "switchport/state/<int:pk>/accept/",
+        views.NSOSwitchportStateAcceptView.as_view(),
+        name="switchport_accept",
+    ),
     path(
         "routing/isis-interface-state/<int:pk>/accept/",
         views.NSOISISInterfaceStateAcceptView.as_view(),

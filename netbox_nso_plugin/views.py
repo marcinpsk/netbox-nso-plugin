@@ -1217,6 +1217,33 @@ class NSOLACPBundleStateAcceptView(LoginRequiredMixin, View):
         return redirect(_device_nso_tab_url(state.management.device_id))
 
 
+class NSOSwitchportStateAcceptView(LoginRequiredMixin, View):
+    """Accept one L2 switchport: native-write + push to the switchport-reconciler (M34).
+
+    Writes the NSO-observed mode/VLANs onto the native NetBox interface (NetBox becomes
+    the source of truth); the post_save push then applies the device's switchport snapshot.
+    """
+
+    def post(self, request, pk):  # noqa: D102
+        from django.db import transaction
+
+        from .models import NSOSwitchportState
+
+        state = get_object_or_404(NSOSwitchportState, pk=pk)
+        with transaction.atomic():
+            # native-write-on-accept: make the NetBox interface match what NSO observed.
+            iface = state.interface
+            iface.mode = state.mode or ""
+            iface.untagged_vlan = state.untagged_vlan
+            iface.save()
+            iface.tagged_vlans.set(state.tagged_vlans.all())
+            state.status = _status_after_accept(state.status)
+            state.accepted_at = timezone.now()
+            state.save(update_fields=["status", "accepted_at"])
+        messages.success(request, f"Accepted switchport {state.interface.name}.")
+        return redirect(_device_nso_tab_url(state.management.device_id))
+
+
 class NSOStaticRouteStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
     model_class = NSOStaticRouteState
 

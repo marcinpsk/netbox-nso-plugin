@@ -221,6 +221,20 @@ def get_switchport(adapter_device_id: int) -> dict:
     return _request("GET", f"/api/v1/devices/{adapter_device_id}/switchport")
 
 
+def apply_switchport_config(adapter_device_id, interfaces):
+    """POST /api/v1/devices/{id}/switchport/apply — push + apply L2 switchport intent (M34).
+
+    ``interfaces`` is a list of dicts:
+      [{"interface_name": "Gi0/1", "mode": "access", "untagged_vlan": 10, "tagged_vlans": []}, ...]
+    Empty list clears the device's switchport-reconciler service. Returns the apply envelope.
+    """
+    return _request(
+        "POST",
+        f"/api/v1/devices/{adapter_device_id}/switchport/apply",
+        json={"interfaces": interfaces},
+    )
+
+
 def get_interface_ips(adapter_device_id: int) -> dict:
     """GET /api/v1/devices/{id}/interface-ips."""
     return _request("GET", f"/api/v1/devices/{adapter_device_id}/interface-ips")
