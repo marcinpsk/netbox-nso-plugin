@@ -233,16 +233,32 @@ class TestOnReconcile(SimpleTestCase):
         self.assertEqual(sm.on_reconcile(sm.ACCEPTED, matches=None), sm.ACCEPTED)
         self.assertEqual(sm.on_reconcile(sm.IN_SYNC, matches=None), sm.IN_SYNC)
 
-    def test_absent_is_drift(self):
+    def test_absent_is_drift_for_confirmed_and_unowned(self):
         self.assertEqual(sm.on_reconcile(sm.IMPORTED, present=False), sm.CHANGED)
         self.assertEqual(sm.on_reconcile(sm.IN_SYNC, present=False), sm.CHANGED)
         self.assertEqual(sm.on_reconcile(sm.CHANGED, present=False), sm.CHANGED)
+
+    def test_absent_preserves_pending_intent(self):
+        # accepted/deploying = operator intent not yet confirmed on device; the
+        # device legitimately not reporting it is expected, so it is NOT drift.
+        self.assertEqual(sm.on_reconcile(sm.ACCEPTED, present=False), sm.ACCEPTED)
+        self.assertEqual(sm.on_reconcile(sm.DEPLOYING, present=False), sm.DEPLOYING)
 
     def test_on_reconcile_never_clobbers_owned_to_imported(self):
         # The whole point: no owned status can land on 'imported' via reconcile.
         for owned in sm.OWNED_STATES:
             for matches in (True, False, None):
                 self.assertNotEqual(sm.on_reconcile(owned, matches=matches), sm.IMPORTED)
+
+    def test_settles_owned_false_does_not_settle_by_materialization(self):
+        # FK/content overlays: 'matches'=materialized-at-import, NOT device confirmation.
+        # An owned row must NOT settle to in_sync via reconcile — only Apply (deploying)
+        # may settle it. Unowned rows still rest at imported/changed by 'matches'.
+        self.assertEqual(sm.on_reconcile(sm.ACCEPTED, matches=True, settles_owned=False), sm.ACCEPTED)
+        self.assertEqual(sm.on_reconcile(sm.IN_SYNC, matches=True, settles_owned=False), sm.IN_SYNC)
+        self.assertEqual(sm.on_reconcile(sm.DEPLOYING, matches=True, settles_owned=False), sm.IN_SYNC)
+        self.assertEqual(sm.on_reconcile(sm.IMPORTED, matches=True, settles_owned=False), sm.IMPORTED)
+        self.assertEqual(sm.on_reconcile(sm.IMPORTED, matches=False, settles_owned=False), sm.CHANGED)
 
     def test_is_owned(self):
         self.assertTrue(all(sm.is_owned(s) for s in sm.OWNED_STATES))

@@ -81,6 +81,17 @@ LEGACY_VOCAB_BY_MODEL: dict[str, frozenset[str]] = {
     "NSOInterfaceIPState": frozenset({"drifted", "reserved"}),
 }
 
+#: Overlays NOT yet routed through this machine (their reconcilers still set status
+#: directly), with the reason:
+#:   ``NSOInterfaceState``   — interface-attribute status is *adapter-driven*: the
+#:       plugin copies the status string the adapter computes, verbatim. Unifying it
+#:       requires the adapter (nso-adapter) to adopt this same machine — a cross-repo
+#:       change, tracked separately.
+#:   ``NSOInterfaceIPState`` — uses the legacy ``drifted``/``reserved`` vocabulary
+#:       plus bespoke IP auto-assign / reservation logic; folding it in needs the
+#:       ``drifted → changed`` vocabulary decision first (see LEGACY_VOCAB_BY_MODEL).
+NOT_YET_UNIFIED: frozenset[str] = frozenset({"NSOInterfaceState", "NSOInterfaceIPState"})
+
 #: Overlays that deliberately omit the ``changed`` (value-diff drift) state: the
 #: EAV / secret-style mirrors (SNMP, logging) signal divergence via ``conflict``
 #: instead of a value diff. Pinned so a *new* overlay forgetting ``changed`` fails.
@@ -312,30 +323,47 @@ def is_owned(status: str) -> bool:
     return status in OWNED_STATES
 
 
-def on_reconcile(current: str, *, present: bool = True, matches: bool | None = None, conflict: bool = False) -> str:
+def on_reconcile(
+    current: str,
+    *,
+    present: bool = True,
+    matches: bool | None = None,
+    conflict: bool = False,
+    settles_owned: bool = True,
+) -> str:
     """Apply the single reconcile transition shared by EVERY overlay (no read/write split).
 
     Call this from a reconciler each time it observes (or fails to observe) a row;
     it returns the next status, validated through :func:`advance`.
 
-    - ``present``  — the device still reports this row. ``False`` → ``changed`` (drift).
-    - ``matches``  — for overlays with an operator-editable value (e.g. a VLAN name),
-      whether the device value equals the NetBox value. ``None`` for overlays with no
-      separate editable value (the resting unowned state is simply ``imported``).
+    - ``present``  — the device still reports this row. ``False`` → ``changed`` (drift),
+      except ``accepted``/``deploying`` (intent not yet confirmed on device) are kept.
+    - ``matches``  — whether the row's tracked value is satisfied. For a true value
+      overlay (VLAN name, switchport L2) this is "device value == NetBox value"; for an
+      FK/content overlay it is "materialized in NetBox". ``None`` for pure mirrors with
+      no value at all (resting unowned state is simply ``imported``).
     - ``conflict`` — a native NetBox object exists that we did not create (adoption
       ambiguity); only meaningful for an unowned row.
+    - ``settles_owned`` — whether ``matches`` reflects genuine device confirmation and
+      may therefore settle an owned row (``accepted → in_sync``). Pass ``False`` for
+      FK/content overlays, where ``matches`` means "materialized at import" (NOT applied
+      to the device): an owned row must then settle only via Apply (``deploying →
+      in_sync``), never by reconcile.
 
-    Ownership is preserved: an owned row only settles ``deploying → in_sync`` (apply
-    landed) or, for value overlays, re-pends ``in_sync/accepted`` by value — it is
-    never pulled back to ``imported``.
+    Ownership is preserved: an owned row is never pulled back to ``imported``.
     """
     if not present:
-        return current if current == CHANGED else advance(current, DRIFT, to=CHANGED)
+        # accepted/deploying are operator intent not yet confirmed on the device, so
+        # the device legitimately not reporting the row is expected — don't flag drift.
+        # in_sync (was confirmed) and unowned rows that vanish are real drift.
+        if current in (ACCEPTED, DEPLOYING) or current == CHANGED:
+            return current
+        return advance(current, DRIFT, to=CHANGED)
     if is_owned(current):
         if current == DEPLOYING:
             return advance(current, RECONCILE, to=IN_SYNC)
-        if matches is None:
-            return current  # owned, nothing to compare → preserve accepted/in_sync
+        if matches is None or not settles_owned:
+            return current  # owned + no device-confirmed value → preserve accepted/in_sync
         return advance(current, RECONCILE, to=IN_SYNC if matches else ACCEPTED)
     if conflict:
         return advance(current, CONFLICT_DETECTED, to=CONFLICT)
