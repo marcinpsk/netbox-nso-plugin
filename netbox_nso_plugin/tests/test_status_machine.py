@@ -199,3 +199,53 @@ class TestAdvanceEngine(SimpleTestCase):
             result = sm.advance(t.src, t.event, to=t.dst)
             self.assertIn(result, sm.STATES)
             self.assertEqual(result, t.dst)
+
+
+class TestOnReconcile(SimpleTestCase):
+    """The single reconcile rule shared by every overlay."""
+
+    def test_unowned_value_overlay(self):
+        # imported when the device matches NetBox, changed when it diverges.
+        self.assertEqual(sm.on_reconcile(sm.IMPORTED, matches=True), sm.IMPORTED)
+        self.assertEqual(sm.on_reconcile(sm.IMPORTED, matches=False), sm.CHANGED)
+        self.assertEqual(sm.on_reconcile(sm.UNKNOWN, matches=True), sm.IMPORTED)
+        self.assertEqual(sm.on_reconcile(sm.CHANGED, matches=True), sm.IMPORTED)
+
+    def test_unowned_mirror_overlay_rests_at_imported(self):
+        # No editable value (matches=None): a present, unowned row is 'imported',
+        # never 'in_sync'. This is the correction that unifies the read overlays.
+        self.assertEqual(sm.on_reconcile(sm.IMPORTED, matches=None), sm.IMPORTED)
+        self.assertEqual(sm.on_reconcile(sm.UNKNOWN, matches=None), sm.IMPORTED)
+        self.assertEqual(sm.on_reconcile(sm.CHANGED, matches=None), sm.IMPORTED)
+
+    def test_unowned_conflict(self):
+        self.assertEqual(sm.on_reconcile(sm.IMPORTED, matches=None, conflict=True), sm.CONFLICT)
+
+    def test_owned_settles_and_repends_by_value(self):
+        self.assertEqual(sm.on_reconcile(sm.ACCEPTED, matches=True), sm.IN_SYNC)
+        self.assertEqual(sm.on_reconcile(sm.ACCEPTED, matches=False), sm.ACCEPTED)
+        self.assertEqual(sm.on_reconcile(sm.IN_SYNC, matches=False), sm.ACCEPTED)
+        self.assertEqual(sm.on_reconcile(sm.DEPLOYING, matches=True), sm.IN_SYNC)
+        self.assertEqual(sm.on_reconcile(sm.DEPLOYING, matches=None), sm.IN_SYNC)
+
+    def test_owned_mirror_is_preserved(self):
+        # Owned, no value to compare: accepted/in_sync stay put (deploying settles).
+        self.assertEqual(sm.on_reconcile(sm.ACCEPTED, matches=None), sm.ACCEPTED)
+        self.assertEqual(sm.on_reconcile(sm.IN_SYNC, matches=None), sm.IN_SYNC)
+
+    def test_absent_is_drift(self):
+        self.assertEqual(sm.on_reconcile(sm.IMPORTED, present=False), sm.CHANGED)
+        self.assertEqual(sm.on_reconcile(sm.IN_SYNC, present=False), sm.CHANGED)
+        self.assertEqual(sm.on_reconcile(sm.CHANGED, present=False), sm.CHANGED)
+
+    def test_on_reconcile_never_clobbers_owned_to_imported(self):
+        # The whole point: no owned status can land on 'imported' via reconcile.
+        for owned in sm.OWNED_STATES:
+            for matches in (True, False, None):
+                self.assertNotEqual(sm.on_reconcile(owned, matches=matches), sm.IMPORTED)
+
+    def test_is_owned(self):
+        self.assertTrue(all(sm.is_owned(s) for s in sm.OWNED_STATES))
+        self.assertFalse(sm.is_owned(sm.IMPORTED))
+        self.assertFalse(sm.is_owned(sm.CHANGED))
+        self.assertFalse(sm.is_owned(sm.CONFLICT))

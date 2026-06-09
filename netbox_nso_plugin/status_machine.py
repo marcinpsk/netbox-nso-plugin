@@ -131,23 +131,42 @@ class Transition(NamedTuple):
     note: str
 
 
-#: The intended machine. Edges with ``implemented=False`` are the tracked gaps.
+#: The one machine that governs EVERY overlay. There is no separate "read" vs
+#: "write" path: a read-only overlay simply never fires accept/apply, so it lives
+#: between ``imported`` and ``changed``; an ownable overlay additionally walks
+#: ``accepted → deploying → in_sync``. ``in_sync`` means exactly one thing —
+#: *owned, applied, and confirmed on the device* — so it never reverts to
+#: ``imported`` (the older overlays that used ``in_sync`` to mean "materialized /
+#: matches device" were mislabeled; that is now ``imported``).
+#: Edges with ``implemented=False`` are the tracked gaps.
 TRANSITIONS: tuple[Transition, ...] = (
-    # -- automatic: device reconcile -----------------------------------------
-    Transition(RECONCILE, UNKNOWN, IMPORTED, True, "first observation"),
+    # -- automatic: device observed the row (present) ------------------------
+    Transition(RECONCILE, UNKNOWN, IMPORTED, True, "first import, matches device"),
+    Transition(RECONCILE, UNKNOWN, CHANGED, True, "first import but already diverged"),
     Transition(RECONCILE, IMPORTED, IMPORTED, True, "still matches device"),
+    Transition(RECONCILE, IMPORTED, CHANGED, True, "device diverged from NetBox (drift)"),
     Transition(RECONCILE, CHANGED, IMPORTED, True, "drift resolved"),
-    Transition(RECONCILE, IN_SYNC, IN_SYNC, True, "owned, device still matches"),
-    Transition(RECONCILE, ACCEPTED, ACCEPTED, True, "owned, not clobbered (no-clobber guard)"),
-    Transition(RECONCILE, ACCEPTED, IN_SYNC, True, "value-aware (VLAN): device now matches NetBox"),
+    Transition(RECONCILE, CHANGED, CHANGED, True, "still drifted"),
+    Transition(RECONCILE, CONFLICT, IMPORTED, True, "adoption ambiguity resolved"),
+    Transition(RECONCILE, CONFLICT, CHANGED, True, "still conflicting / diverged"),
     Transition(RECONCILE, DEPLOYING, IN_SYNC, True, "apply landed: device re-reports applied config"),
-    # -- automatic: drift -----------------------------------------------------
-    Transition(DRIFT, IMPORTED, CHANGED, True, "device diverged / row dropped from payload"),
-    Transition(DRIFT, IN_SYNC, CHANGED, True, "drift after sync"),
+    Transition(RECONCILE, ACCEPTED, IN_SYNC, True, "owned & device now matches NetBox"),
+    Transition(RECONCILE, ACCEPTED, ACCEPTED, True, "owned, apply not yet reflected (still pending)"),
+    Transition(RECONCILE, IN_SYNC, IN_SYNC, True, "owned, device still matches"),
+    Transition(RECONCILE, IN_SYNC, ACCEPTED, True, "owned, device drifted → re-pend for apply"),
+    # -- automatic: row dropped from the payload -----------------------------
+    Transition(DRIFT, UNKNOWN, CHANGED, True, "dropped before first sync"),
+    Transition(DRIFT, IMPORTED, CHANGED, True, "no longer reported by device"),
+    Transition(DRIFT, CHANGED, CHANGED, True, "still gone"),
+    Transition(DRIFT, CONFLICT, CHANGED, True, "no longer reported"),
     Transition(DRIFT, ACCEPTED, CHANGED, True, "owned value no longer on device"),
-    # -- automatic: adoption ambiguity ---------------------------------------
+    Transition(DRIFT, DEPLOYING, CHANGED, True, "vanished mid-apply"),
+    Transition(DRIFT, IN_SYNC, CHANGED, True, "synced value disappeared"),
+    # -- automatic: adoption ambiguity (native object exists, not ours) ------
     Transition(CONFLICT_DETECTED, UNKNOWN, CONFLICT, True, "native object exists, not created by us"),
     Transition(CONFLICT_DETECTED, IMPORTED, CONFLICT, True, "native object diverged from ours"),
+    Transition(CONFLICT_DETECTED, CHANGED, CONFLICT, True, "drift is an adoption conflict"),
+    Transition(CONFLICT_DETECTED, CONFLICT, CONFLICT, True, "still conflicting"),
     # -- operator: accept / revert -------------------------------------------
     Transition(ACCEPT, IMPORTED, ACCEPTED, True, "operator takes ownership"),
     Transition(ACCEPT, CHANGED, ACCEPTED, True, "accept the drifted value"),
@@ -156,7 +175,7 @@ TRANSITIONS: tuple[Transition, ...] = (
     Transition(REVERT, ACCEPTED, IMPORTED, True, "edit back to device value clears pending (c160039)"),
     # -- operator: apply ------------------------------------------------------
     Transition(APPLY, ACCEPTED, DEPLOYING, True, "_prepare_apply marks owned accepted→deploying"),
-    Transition(APPLY_OK, DEPLOYING, IN_SYNC, True, "settled by the next reconcile (deploying→in_sync)"),
+    Transition(APPLY_OK, DEPLOYING, IN_SYNC, True, "apply worker reported success"),
     # -- GAPS: declared states with no entry path ----------------------------
     Transition(
         APPLY_ERR,
@@ -281,3 +300,45 @@ def advance(current: str, event: str, *, to: str | None = None) -> str:
     if to not in dests:
         raise IllegalTransition(current, event, to)
     return to
+
+
+def is_owned(status: str) -> bool:
+    """Return True if the operator has claimed the row (accepted/deploying/in_sync).
+
+    Single definition of "owned" — replaces the per-reconciler
+    ``_VLAN_WRITE_PATH_STATUSES`` copies. A reconcile must never clobber an owned
+    row back to an unowned state.
+    """
+    return status in OWNED_STATES
+
+
+def on_reconcile(current: str, *, present: bool = True, matches: bool | None = None, conflict: bool = False) -> str:
+    """Apply the single reconcile transition shared by EVERY overlay (no read/write split).
+
+    Call this from a reconciler each time it observes (or fails to observe) a row;
+    it returns the next status, validated through :func:`advance`.
+
+    - ``present``  — the device still reports this row. ``False`` → ``changed`` (drift).
+    - ``matches``  — for overlays with an operator-editable value (e.g. a VLAN name),
+      whether the device value equals the NetBox value. ``None`` for overlays with no
+      separate editable value (the resting unowned state is simply ``imported``).
+    - ``conflict`` — a native NetBox object exists that we did not create (adoption
+      ambiguity); only meaningful for an unowned row.
+
+    Ownership is preserved: an owned row only settles ``deploying → in_sync`` (apply
+    landed) or, for value overlays, re-pends ``in_sync/accepted`` by value — it is
+    never pulled back to ``imported``.
+    """
+    if not present:
+        return current if current == CHANGED else advance(current, DRIFT, to=CHANGED)
+    if is_owned(current):
+        if current == DEPLOYING:
+            return advance(current, RECONCILE, to=IN_SYNC)
+        if matches is None:
+            return current  # owned, nothing to compare → preserve accepted/in_sync
+        return advance(current, RECONCILE, to=IN_SYNC if matches else ACCEPTED)
+    if conflict:
+        return advance(current, CONFLICT_DETECTED, to=CONFLICT)
+    if matches is None:
+        return advance(current, RECONCILE, to=IMPORTED)
+    return advance(current, RECONCILE, to=IMPORTED if matches else CHANGED)
