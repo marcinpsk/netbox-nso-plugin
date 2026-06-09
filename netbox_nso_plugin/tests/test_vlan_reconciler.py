@@ -68,7 +68,9 @@ class TestVlanReconciler(TestCase):
         self.assertEqual(rows[0].status, "changed")  # drift surfaced
         self.assertEqual(rows[0].device_name, "OLD_NAME")  # device value mirrored for display
 
-    def test_switchport_in_sync_when_netbox_matches_nso(self):
+    def test_switchport_imported_when_netbox_matches_nso(self):
+        # Unified machine: an unowned row that matches the device rests at 'imported'
+        # (in_sync is reserved for owned+applied), not 'in_sync' as the old code set.
         from netbox_nso_plugin.vlan_reconciler import reconcile_switchport, reconcile_vlan_database
 
         reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 10, "name": "MGMT"}]})
@@ -86,7 +88,7 @@ class TestVlanReconciler(TestCase):
                 ]
             },
         )
-        self.assertEqual(rows[0].status, "in_sync")
+        self.assertEqual(rows[0].status, "imported")
 
     def test_switchport_changed_when_netbox_differs(self):
         from netbox_nso_plugin.vlan_reconciler import reconcile_switchport, reconcile_vlan_database

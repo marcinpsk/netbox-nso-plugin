@@ -32,7 +32,8 @@ def reconcile_vlan_database(device, payload: dict) -> list:
     from django.utils import timezone
     from ipam.models import VLAN
 
-    from .models import _VLAN_WRITE_PATH_STATUSES, NSODeviceManagement, NSOVLANState
+    from . import status_machine as sm
+    from .models import NSODeviceManagement, NSOVLANState
 
     try:
         management = NSODeviceManagement.objects.get(device=device)
@@ -54,24 +55,22 @@ def reconcile_vlan_database(device, payload: dict) -> list:
         state, _ = NSOVLANState.objects.get_or_create(management=management, vlan=vlan)
         state.last_sync_at = now
         state.device_name = name  # mirror the device value for drift display
-        # Value-aware lifecycle (NetBox name vs device name):
-        #  - owned (accepted/deploying/in_sync): in_sync once the device reflects the
-        #    NetBox name (apply succeeded); else 'accepted' = still pending apply.
-        #  - unowned: 'changed' when the device differs (operator/device rename),
-        #    else 'imported'. Import seeds the two equal, so a mismatch is real drift.
-        matches = bool(name) and vlan.name == name
-        if state.status in _VLAN_WRITE_PATH_STATUSES:
-            state.status = "in_sync" if matches else "accepted"
-        else:
-            state.status = "imported" if matches or not name else "changed"
+        # Value overlay: the editable value is the VLAN name. A device with no name
+        # has nothing to drift against, so treat that as a match. The unified machine
+        # then settles owned→in_sync (or re-pends to accepted) and rests unowned at
+        # imported (or changed on a real rename divergence).
+        matches = (not name) or vlan.name == name
+        state.status = sm.on_reconcile(state.status, matches=matches)
         state.save()
         rows.append(state)
 
     # rows the payload no longer reports → drift
     for stale in NSOVLANState.objects.filter(management=management, vlan__group=group):
-        if stale.vlan.vid not in seen_vids and stale.status != "changed":
-            stale.status = "changed"
-            stale.save(update_fields=["status"])
+        if stale.vlan.vid not in seen_vids:
+            new_status = sm.on_reconcile(stale.status, present=False)
+            if new_status != stale.status:
+                stale.status = new_status
+                stale.save(update_fields=["status"])
     return rows
 
 
@@ -80,7 +79,8 @@ def reconcile_switchport(device, payload: dict) -> list:
     from django.utils import timezone
     from ipam.models import VLAN
 
-    from .models import _VLAN_WRITE_PATH_STATUSES, NSODeviceManagement, NSOSwitchportState
+    from . import status_machine as sm
+    from .models import NSODeviceManagement, NSOSwitchportState
 
     try:
         management = NSODeviceManagement.objects.get(device=device)
@@ -112,15 +112,18 @@ def reconcile_switchport(device, payload: dict) -> list:
 
         nb_untagged = interface.untagged_vlan.vid if interface.untagged_vlan else None
         nb_tagged = sorted(interface.tagged_vlans.values_list("vid", flat=True))
-        in_sync = (interface.mode or "") == nso_mode and nb_untagged == nso_untagged and nb_tagged == nso_tagged
-        if state.status not in _VLAN_WRITE_PATH_STATUSES:
-            state.status = "in_sync" if in_sync else "changed"
+        # Value overlay: the editable value is the live NetBox L2 config (mode +
+        # untagged + tagged) compared against the device-observed config.
+        matches = (interface.mode or "") == nso_mode and nb_untagged == nso_untagged and nb_tagged == nso_tagged
+        state.status = sm.on_reconcile(state.status, matches=matches)
         state.save()
         rows.append(state)
         seen.add(interface.pk)
 
     for stale in NSOSwitchportState.objects.filter(management=management):
-        if stale.interface_id not in seen and stale.status != "changed":
-            stale.status = "changed"
-            stale.save(update_fields=["status"])
+        if stale.interface_id not in seen:
+            new_status = sm.on_reconcile(stale.status, present=False)
+            if new_status != stale.status:
+                stale.status = new_status
+                stale.save(update_fields=["status"])
     return rows
