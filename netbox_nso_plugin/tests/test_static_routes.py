@@ -194,7 +194,7 @@ class TestReconcileStaticRoutes(TestCase):
 
         self.assertEqual(len(result), 1)
         state = result[0]
-        self.assertEqual(state.status, "in_sync")
+        self.assertEqual(state.status, "imported")  # unowned, materialized → imported (unified)
         self.assertEqual(state.nso_prefix, "203.0.113.0/24")
         self.assertEqual(state.management, mgmt)
         self.assertTrue(state.static_route.devices.filter(pk=self.device.pk).exists())
@@ -408,7 +408,7 @@ class TestStaticRouteEnrichment(TestCase):
         route = StaticRoute.objects.get(prefix="8.8.8.0/24")
         self.assertEqual(route.interface_next_hop, "discard")
         self.assertIsNone(route.next_hop)
-        self.assertEqual(result[0].status, "in_sync")
+        self.assertEqual(result[0].status, "imported")  # unowned, materialized → imported (unified)
 
     def test_next_table_pseudo_hop_fills(self):
         """A next-table route leak is represented via interface_next_hop."""

@@ -9,6 +9,8 @@ from django.apps import apps
 from django.utils import timezone
 from netbox.plugins import PluginTemplateExtension
 
+from . import status_machine as sm
+
 logger = logging.getLogger(__name__)
 
 # Status → Bootstrap badge colour
@@ -431,7 +433,6 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
         NSOSnmpV3UserState,
     )
 
-    _WRITE_PATH_STATUSES = {"accepted", "deploying", "in_sync"}
     now = timezone.now()
 
     try:
@@ -451,8 +452,7 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
         state.acl = entry.get("acl") or ""
         state.has_secret = bool(entry.get("has_secret", True))
         state.last_sync_at = now
-        if state.status not in _WRITE_PATH_STATUSES:
-            state.status = "imported"
+        state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
         state.save()
     NSOSnmpCommunityState.objects.filter(management=mgmt).exclude(community_hash__in=incoming_community_hashes).delete()
 
@@ -467,8 +467,7 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
         state.has_auth_secret = bool(entry.get("has_auth_secret", False))
         state.has_priv_secret = bool(entry.get("has_priv_secret", False))
         state.last_sync_at = now
-        if state.status not in _WRITE_PATH_STATUSES:
-            state.status = "imported"
+        state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
         state.save()
     NSOSnmpV3UserState.objects.filter(management=mgmt).exclude(username__in=incoming_usernames).delete()
 
@@ -485,8 +484,7 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
         state.port = entry.get("port")
         state.community_hash = entry.get("community_hash") or ""
         state.last_sync_at = now
-        if state.status not in _WRITE_PATH_STATUSES:
-            state.status = "imported"
+        state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
         state.save()
     NSOSnmpHostState.objects.filter(management=mgmt).exclude(address__in=incoming_addresses).delete()
 
@@ -498,8 +496,7 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
         system_info_state.location = sys_data.get("location") or ""
         system_info_state.contact = sys_data.get("contact") or ""
         system_info_state.last_sync_at = now
-        if system_info_state.status not in _WRITE_PATH_STATUSES:
-            system_info_state.status = "imported"
+        system_info_state.status = sm.on_reconcile(system_info_state.status, matches=None)
         system_info_state.save()
 
     return {
@@ -544,8 +541,7 @@ def _reconcile_logging_config(device, payload: dict) -> dict:
         state.transport = h.get("transport") or ""
         state.vrf = h.get("vrf") or ""
         state.source = h.get("source") or ""
-        if state.status not in ("accepted", "deploying", "in_sync"):
-            state.status = "imported"
+        state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
         state.last_sync_at = now
         state.save()
 
@@ -554,9 +550,6 @@ def _reconcile_logging_config(device, payload: dict) -> dict:
         "last_refreshed_at": payload.get("last_refreshed_at"),
         "refresh_source": payload.get("refresh_source", "never"),
     }
-
-
-_STATIC_ROUTE_WRITE_PATH_STATUSES = {"accepted", "deploying", "in_sync"}
 
 
 def _static_route_metric(entry: dict) -> int:
@@ -688,30 +681,23 @@ def _reconcile_static_routes(device, payload: dict) -> list:
         state.last_sync_at = now
         seen_route_ids.add(route.pk)
 
-        if created:
-            state.status = "in_sync"  # static_route FK always set → in_sync
-        elif route.devices.filter(pk=device.pk).exists():
-            if state.status not in _STATIC_ROUTE_WRITE_PATH_STATUSES:
-                state.status = "in_sync"
-        elif auto_create:
+        # FK overlay: materialized = the StaticRoute is linked to this device.
+        on_device = created or route.devices.filter(pk=device.pk).exists()
+        if not on_device and auto_create:
             route.devices.add(device)
-            if state.status not in _STATIC_ROUTE_WRITE_PATH_STATUSES:
-                state.status = "in_sync"
-        else:
-            state.status = "conflict"
-
+            on_device = True
+        state.status = sm.on_reconcile(state.status, matches=on_device, conflict=not on_device, settles_owned=False)
         state.save()
 
     stale_qs = NSOStaticRouteState.objects.filter(management=mgmt).exclude(static_route_id__in=seen_route_ids)
     for stale in stale_qs:
         stale.static_route.devices.remove(device)
-        stale.status = "changed"
-        stale.save()
+        new_status = sm.on_reconcile(stale.status, present=False)
+        if new_status != stale.status:
+            stale.status = new_status
+            stale.save()
 
     return list(NSOStaticRouteState.objects.filter(management=mgmt).select_related("static_route"))
-
-
-_ISIS_WRITE_PATH_STATUSES = {"accepted", "deploying", "in_sync"}
 
 
 def _reconcile_isis_settings(obj, settings: dict | None) -> None:
@@ -1000,17 +986,19 @@ def _reconcile_isis_interfaces(device, interfaces: list) -> list:
             device, iface, af, state, instances, bfd_enabled=entry.get("bfd_enabled"), entry=entry
         )
 
-        if state.status not in _ISIS_WRITE_PATH_STATUSES:
-            # Linked to the routing object we just synced from NSO → in sync.
-            state.status = "in_sync" if state.isis_interface_id else "imported"
+        # Mirror overlay: linking the netbox-routing ISIS interface is best-effort
+        # (an unmodelled link is benign), so an unowned row rests at imported.
+        state.status = sm.on_reconcile(state.status, matches=None)
         state.save()
         seen_keys.add((iface.pk, af))
 
     stale_qs = NSOISISInterfaceState.objects.filter(management=mgmt)
     for stale in stale_qs:
         if (stale.interface_id, stale.af) not in seen_keys:
-            stale.status = "changed"
-            stale.save(update_fields=["status"])
+            new_status = sm.on_reconcile(stale.status, present=False)
+            if new_status != stale.status:
+                stale.status = new_status
+                stale.save(update_fields=["status"])
 
     if dropped:
         logger.warning(
@@ -1154,16 +1142,18 @@ def _reconcile_isis_process(device, process_list: list) -> list:
         # instance keyed by (device, process_tag) and link it from the state row.
         state.isis_instance = _sync_routing_isis_instance(device, tag, state, entry)
 
-        if state.status not in _ISIS_WRITE_PATH_STATUSES:
-            state.status = "in_sync" if state.isis_instance_id else "imported"
+        # Mirror overlay: linking the netbox-routing ISIS instance is best-effort.
+        state.status = sm.on_reconcile(state.status, matches=None)
         state.save()
         seen_tags.add(tag)
 
     stale_qs = NSOISISInstanceState.objects.filter(management=mgmt)
     for stale in stale_qs:
         if stale.process_tag not in seen_tags:
-            stale.status = "changed"
-            stale.save(update_fields=["status"])
+            new_status = sm.on_reconcile(stale.status, present=False)
+            if new_status != stale.status:
+                stale.status = new_status
+                stale.save(update_fields=["status"])
 
     return list(NSOISISInstanceState.objects.filter(management=mgmt).select_related("isis_instance"))
 
@@ -1296,8 +1286,6 @@ def _reconcile_ospf(device, payload: dict) -> dict:
 
     from .models import NSODeviceManagement, NSOOSPFInstanceState, NSOOSPFInterfaceState
 
-    _OSPF_WRITE_PATH = {"accepted", "deploying", "in_sync", "apply_failed"}
-
     try:
         mgmt = NSODeviceManagement.objects.get(device=device)
     except NSODeviceManagement.DoesNotExist:
@@ -1328,17 +1316,19 @@ def _reconcile_ospf(device, payload: dict) -> dict:
         ospf_inst = _get_or_create_ospf_instance(device, pid, entry, OSPFInstance)
         if ospf_inst is not None:
             state.ospf_instance = ospf_inst
-        if state.status not in _OSPF_WRITE_PATH:
-            state.status = "in_sync" if state.ospf_instance_id else "imported"
+        # Mirror overlay: linking the netbox-routing OSPF instance is best-effort.
+        state.status = sm.on_reconcile(state.status, matches=None)
         state.save()
         seen_pids.add(pid)
 
     for stale in NSOOSPFInstanceState.objects.filter(management=mgmt):
         if stale.process_id not in seen_pids:
-            stale.status = "changed"
-            stale.save(update_fields=["status"])
+            new_status = sm.on_reconcile(stale.status, present=False)
+            if new_status != stale.status:
+                stale.status = new_status
+                stale.save(update_fields=["status"])
 
-    _reconcile_ospf_interfaces(device, mgmt, payload, now, _OSPF_WRITE_PATH)
+    _reconcile_ospf_interfaces(device, mgmt, payload, now)
 
     return {
         "instances": list(NSOOSPFInstanceState.objects.filter(management=mgmt).select_related("ospf_instance")),
@@ -1346,7 +1336,7 @@ def _reconcile_ospf(device, payload: dict) -> dict:
     }
 
 
-def _reconcile_ospf_interfaces(device, mgmt, payload, now, write_path_statuses) -> None:
+def _reconcile_ospf_interfaces(device, mgmt, payload, now) -> None:
     """Reconcile the OSPF interface section of *payload* into NSOOSPFInterfaceState rows.
 
     Split out of _reconcile_ospf to keep that function under the complexity gate.
@@ -1391,16 +1381,17 @@ def _reconcile_ospf_interfaces(device, mgmt, payload, now, write_path_statuses) 
         state.auth_type = entry.get("auth_type") or ""
         state.auth_present = bool(entry.get("auth_present", False))
         state.last_sync_at = now
-        if state.status not in write_path_statuses:
-            state.status = "imported"
+        state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
         state.save()
         _fill_ospf_interface(entry, iface, inst_by_pid, OSPFArea, OSPFInterface)
         seen_iface_pks.add(iface.pk)
 
     for stale in NSOOSPFInterfaceState.objects.filter(management=mgmt):
         if stale.interface_id not in seen_iface_pks:
-            stale.status = "changed"
-            stale.save(update_fields=["status"])
+            new_status = sm.on_reconcile(stale.status, present=False)
+            if new_status != stale.status:
+                stale.status = new_status
+                stale.save(update_fields=["status"])
 
     if dropped:
         logger.warning(

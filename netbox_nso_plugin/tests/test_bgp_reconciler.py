@@ -186,7 +186,7 @@ class TestReconcileBgpConfig(TestCase):
 
         self.assertEqual(len(result), 1)
         state = result[0]
-        self.assertEqual(state.status, "in_sync")
+        self.assertEqual(state.status, "imported")  # unowned, materialized → imported (unified)
         self.assertEqual(state.asn_str, "65100")
         self.assertEqual(state.peer_address_str, "10.0.0.2")
         self.assertEqual(state.management, mgmt)
@@ -202,7 +202,7 @@ class TestReconcileBgpConfig(TestCase):
         _reconcile_bgp_config(self.device, self._payload(self._router_payload(peers=[self._peer_entry()])))
         result = _reconcile_bgp_config(self.device, self._payload(self._router_payload(peers=[self._peer_entry()])))
         self.assertEqual(len(result), 1)
-        self.assertEqual(result[0].status, "in_sync")
+        self.assertEqual(result[0].status, "imported")  # unowned, materialized
 
     def test_creates_bgp_router_and_scope(self):
         """Reconciler creates BGPRouter and BGPScope in netbox-routing."""
@@ -507,7 +507,7 @@ class TestReconcileBgpConfig(TestCase):
 
         self.assertEqual(len(result), 2)
         statuses = {r.peer_address_str: r.status for r in result}
-        self.assertEqual(statuses["10.0.1.1"], "in_sync")
+        self.assertEqual(statuses["10.0.1.1"], "imported")  # present, unowned → imported
         self.assertEqual(statuses["10.0.1.2"], "changed")
 
     def test_write_path_status_preserved(self):

@@ -89,7 +89,7 @@ class TestReconcileOspfFill(TestCase):
 
         res = _reconcile_ospf(self.device, self._payload([self._instance()]))
         self.assertEqual(len(res["instances"]), 1)
-        self.assertEqual(res["instances"][0].status, "in_sync")
+        self.assertEqual(res["instances"][0].status, "imported")  # unowned, materialized → imported (unified)
 
     def test_instance_without_router_id_skipped_but_overlay_kept(self):
         """router_id is required by the model → no OSPFInstance, but overlay still imported."""

@@ -61,7 +61,7 @@ class TestReconcileRedistribution(TestCase):
         self.assertEqual(len(states), 1)
         s = states[0]
         self.assertTrue(s.redistribution_id is not None)
-        self.assertEqual(s.status, "in_sync")
+        self.assertEqual(s.status, "imported")  # unowned, materialized → imported (unified)
 
         r = Redistribution.objects.get(source_protocol="static")
         self.assertEqual(r.destination, inst)

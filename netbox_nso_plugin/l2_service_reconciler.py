@@ -41,6 +41,8 @@ def _upsert_l2vpn(L2VPN, device, service_name: str, service_type: str, service_i
 
 def _reconcile_sap(NSOL2SapState, L2VPNTermination, mgmt, l2vpn, svc, sap, iface_map, iface_ct, now):
     """Upsert one SAP's NSOL2SapState + its L2VPNTermination; set status."""
+    from . import status_machine as sm
+
     state, _ = NSOL2SapState.objects.get_or_create(
         management=mgmt,
         service_name=svc["service_name"],
@@ -56,23 +58,25 @@ def _reconcile_sap(NSOL2SapState, L2VPNTermination, mgmt, l2vpn, svc, sap, iface
     state.last_sync_at = now
 
     iface = iface_map.get(state.port)
+    conflict = False
     if iface is None:
-        # Port not present in NetBox — can't terminate; surface as drift for review.
-        state.status = "conflict"
+        # Port not present in NetBox — can't terminate; adoption ambiguity.
+        conflict = True
         state.termination = None
     else:
         term = L2VPNTermination.objects.filter(assigned_object_type=iface_ct, assigned_object_id=iface.pk).first()
         if term is not None and term.l2vpn_id != l2vpn.pk:
             # The port already terminates on a different L2VPN (NetBox enforces one).
-            state.status = "conflict"
+            conflict = True
             state.termination = None
         else:
             if term is None:
                 term = L2VPNTermination(l2vpn=l2vpn, assigned_object=iface)
                 term.save()
             state.termination = term
-            if state.status not in ("accepted", "deploying"):
-                state.status = "in_sync"
+    # FK overlay: 'matches'=termination materialized (not device confirmation) →
+    # settles_owned=False. Unowned: conflict→conflict, else imported. Owned preserved.
+    state.status = sm.on_reconcile(state.status, matches=not conflict, conflict=conflict, settles_owned=False)
     state.save()
 
 
@@ -82,9 +86,14 @@ def _retire_stale_l2_saps(NSOL2SapState, mgmt, seen: set, now) -> None:
     Native L2VPN/termination objects are left intact — clobber-safe; the operator reviews
     and P2b's write path handles removal.
     """
+    from . import status_machine as sm
+
     for state in NSOL2SapState.objects.filter(management=mgmt):
-        if (state.service_name, state.sap_id) not in seen and state.status != "changed":
-            state.status = "changed"
+        if (state.service_name, state.sap_id) in seen:
+            continue
+        new_status = sm.on_reconcile(state.status, present=False)
+        if new_status != state.status:
+            state.status = new_status
             state.last_sync_at = now
             state.save(update_fields=["status", "last_sync_at"])
 

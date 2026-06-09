@@ -17,8 +17,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-_BGP_WRITE_PATH_STATUSES = {"accepted", "deploying", "in_sync", "apply_failed"}
-
 
 def _get_or_create_asn(asn_str: str, ASN):
     """Find or create an ipam.ASN for the given ASN number string.
@@ -299,6 +297,7 @@ def _update_peer_state(
     mgmt, asn_str, vrf_name, peer_address_str, bgp_peer, remote_as_str, peer_entry, was_existing, now
 ):
     """Create or update an NSOBGPPeerState overlay row for a single peer."""
+    from . import status_machine as sm
     from .models import NSOBGPPeerState
 
     has_state = NSOBGPPeerState.objects.filter(
@@ -320,10 +319,9 @@ def _update_peer_state(
     state.remote_as_str = remote_as_str
     state.enabled = peer_entry.get("enabled")
     state.last_sync_at = now
-    if conflict and state.status not in _BGP_WRITE_PATH_STATUSES:
-        state.status = "conflict"
-    elif state.status not in _BGP_WRITE_PATH_STATUSES and state.status != "conflict":
-        state.status = "in_sync" if state.bgp_peer_id else "imported"
+    # Mirror overlay: an unowned peer rests at imported (linking the netbox-routing
+    # BGPPeer is best-effort, not a status determinant); conflict = adoption ambiguity.
+    state.status = sm.on_reconcile(state.status, matches=None, conflict=conflict)
     state.save()
     return state
 
@@ -476,11 +474,15 @@ def _reconcile_bgp_config(device, payload: dict) -> list:
                 VRF,
             )
 
-    # Mark stale state rows (no longer reported by NSO)
+    # Mark stale state rows (accepted/deploying intent preserved by on_reconcile)
+    from . import status_machine as sm
+
     for stale in NSOBGPPeerState.objects.filter(management=mgmt):
         key = (mgmt.pk, stale.asn_str, stale.vrf_name, stale.peer_address_str)
         if key not in seen_keys:
-            stale.status = "changed"
-            stale.save(update_fields=["status"])
+            new_status = sm.on_reconcile(stale.status, present=False)
+            if new_status != stale.status:
+                stale.status = new_status
+                stale.save(update_fields=["status"])
 
     return list(NSOBGPPeerState.objects.filter(management=mgmt).select_related("bgp_peer"))

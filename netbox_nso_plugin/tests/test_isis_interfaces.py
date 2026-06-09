@@ -189,7 +189,7 @@ class TestReconcileIsisInterfaces(TestCase):
 
         self.assertEqual(len(result), 1)
         state = result[0]
-        self.assertEqual(state.status, "in_sync")
+        self.assertEqual(state.status, "imported")  # unowned, materialized → imported (unified)
         self.assertEqual(state.af, "ipv4")
         self.assertEqual(state.interface, self.iface_ge0)
         self.assertEqual(state.management, mgmt)
@@ -274,7 +274,7 @@ class TestReconcileIsisInterfaces(TestCase):
         )
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0].interface_id, port.pk)
-        self.assertEqual(result[0].status, "in_sync")
+        self.assertEqual(result[0].status, "imported")  # unowned, materialized → imported (unified)
 
     def test_nokia_bound_port_unmatched_is_dropped(self):
         """A logical name with a bound_port that still matches no dcim.Interface is dropped."""
@@ -319,7 +319,7 @@ class TestReconcileIsisInterfaces(TestCase):
 
         self.assertEqual(len(result), 2)
         statuses = {r.interface.name: r.status for r in result}
-        self.assertEqual(statuses["GigabitEthernet0/0"], "in_sync")
+        self.assertEqual(statuses["GigabitEthernet0/0"], "imported")  # unowned, materialized → imported (unified)
         self.assertEqual(statuses["GigabitEthernet0/1"], "changed")
 
     def test_write_path_status_preserved(self):

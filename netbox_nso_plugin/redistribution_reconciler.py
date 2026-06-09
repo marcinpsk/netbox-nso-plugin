@@ -126,7 +126,8 @@ def reconcile_redistribution(device, payload: dict) -> list:
     """
     from django.utils import timezone
 
-    from .models import _REDISTRIBUTION_WRITE_PATH_STATUSES, NSODeviceManagement, NSORedistributionState
+    from . import status_machine as sm
+    from .models import NSODeviceManagement, NSORedistributionState
 
     try:
         mgmt = NSODeviceManagement.objects.get(device=device)
@@ -156,19 +157,24 @@ def reconcile_redistribution(device, payload: dict) -> list:
         state.metric = entry.get("metric")
         state.metric_type = entry.get("metric_type") or ""
         state.last_sync_at = now
-        if state.status not in _REDISTRIBUTION_WRITE_PATH_STATUSES and state.status != "conflict":
+        if not sm.is_owned(state.status) and state.status != "conflict":
             state.save()
             _create_or_link_redistribution(state, device, entry)
             state.refresh_from_db(fields=["redistribution"])
-            state.status = "in_sync" if state.redistribution_id is not None else "imported"
+            # Mirror overlay: an unowned row rests at imported. Linking the
+            # netbox-routing Redistribution is best-effort (an unmodelled destination
+            # is benign, not drift), so it does not change the status.
+            state.status = sm.on_reconcile(state.status, matches=None)
         state.save()
         seen_keys.add(key)
 
-    # Mark stale rows
+    # Mark stale rows (accepted/deploying intent preserved by on_reconcile).
     for stale in NSORedistributionState.objects.filter(management=mgmt):
         k = (stale.dest_protocol, stale.dest_ref, stale.source_protocol, stale.source_ref)
         if k not in seen_keys:
-            stale.status = "changed"
-            stale.save(update_fields=["status"])
+            new_status = sm.on_reconcile(stale.status, present=False)
+            if new_status != stale.status:
+                stale.status = new_status
+                stale.save(update_fields=["status"])
 
     return list(NSORedistributionState.objects.filter(management=mgmt))

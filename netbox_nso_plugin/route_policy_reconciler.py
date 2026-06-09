@@ -288,14 +288,16 @@ def _upsert_state(mgmt, family, name, obj, ct, entries_hash, now):
     if new_row:
         return state, True
 
+    from . import status_machine as sm
+
+    # FK/content overlay: 'matches' = materialized (content_hash recorded & unchanged),
+    # not device confirmation, so it must not settle an owned row (settles_owned=False).
+    # Divergence is an adoption conflict for an unowned row.
     diverged = bool(state.content_hash) and state.content_hash != entries_hash
-    if diverged and state.status not in ("accepted",):
-        state.status = "conflict"
-        should_fill = False
-    else:
-        state.status = "in_sync"
+    state.status = sm.on_reconcile(state.status, matches=not diverged, conflict=diverged, settles_owned=False)
+    should_fill = state.status != sm.CONFLICT
+    if should_fill:
         state.content_hash = entries_hash
-        should_fill = True
     state.last_sync_at = now
     state.content_type = ct
     state.object_id = obj.pk
@@ -454,10 +456,15 @@ def reconcile_route_policy(device, payload: dict) -> list:
         ext_cl_map,
     )
 
-    # Mark stale rows as 'changed'.
+    # Mark stale rows as drift (accepted/deploying intent is preserved by on_reconcile).
+    from . import status_machine as sm
+
     for state in NSORoutePolicyState.objects.filter(management=mgmt):
-        if (state.family, state.object_name) not in seen_keys and state.status not in ("changed", "accepted"):
-            state.status = "changed"
+        if (state.family, state.object_name) in seen_keys:
+            continue
+        new_status = sm.on_reconcile(state.status, present=False)
+        if new_status != state.status:
+            state.status = new_status
             state.save(update_fields=["status"])
 
     return list(NSORoutePolicyState.objects.filter(management=mgmt).order_by("family", "object_name"))

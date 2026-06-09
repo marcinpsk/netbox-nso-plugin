@@ -60,7 +60,7 @@ class TestReconcileL2Services(TestCase):
         term = L2VPNTermination.objects.get(l2vpn=vpls)
         assert term.assigned_object == self.port
         st = NSOL2SapState.objects.get(management=self.mgmt, service_name="701")
-        assert (st.status, st.outer_tag, st.termination_id) == ("in_sync", 701, term.pk)
+        assert (st.status, st.outer_tag, st.termination_id) == ("imported", 701, term.pk)
 
     def test_missing_port_is_conflict(self):
         rows = reconcile_l2_services(
