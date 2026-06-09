@@ -742,19 +742,21 @@ def _push_subinterface_intent_for_device(device_id, adapter_device_id):
     subinterface-reconciler. Only owned rows (accepted/deploying/in_sync) included.
     """
     from . import adapter_client as client
-    from .models import NSOSubinterfaceState
+    from .models import _VLAN_WRITE_PATH_STATUSES, NSOSubinterfaceState
 
     interfaces = []
     for row in NSOSubinterfaceState.objects.filter(
         management__device_id=device_id,
-        status__in=("accepted", "deploying", "in_sync"),
+        status__in=_VLAN_WRITE_PATH_STATUSES,
     ).select_related("interface", "parent_interface"):
-        if row.dot1q_vlan is None:
-            continue  # the subinterface-reconciler keys on the dot1q tag
+        # The subinterface-reconciler keys on the dot1q tag and (for Junos) the
+        # parent interface — skip rows missing either rather than emit a bad payload.
+        if row.dot1q_vlan is None or row.parent_interface is None:
+            continue
         interfaces.append(
             {
                 "interface_name": row.interface.name,
-                "parent_interface": row.parent_interface.name if row.parent_interface else "",
+                "parent_interface": row.parent_interface.name,
                 "dot1q_vlan": row.dot1q_vlan,
                 "type": "subinterface",
                 "vrf": row.vrf or "",

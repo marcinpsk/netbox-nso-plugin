@@ -86,6 +86,28 @@ class TestSubinterfaceReconciler(TestCase):
         self.assertIsNone(sub.parent_id)
         self.assertEqual(rows[0].status, "changed")  # missing parent flagged for review
 
+    def test_missing_parent_self_heals_when_parent_appears(self):
+        from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
+
+        payload = {
+            "interfaces": [
+                {
+                    "interface_name": "GigabitEthernet5/5.100",
+                    "parent_interface": "GigabitEthernet5/5",
+                    "dot1q_vlan": 100,
+                    "type": "subinterface",
+                }
+            ]
+        }
+        rows = reconcile_subinterface(self.device, payload)
+        self.assertEqual(rows[0].status, "changed")  # parent absent
+
+        # Parent shows up (e.g. via a later device sync) → next reconcile self-heals.
+        Interface.objects.create(device=self.device, name="GigabitEthernet5/5", type="1000base-t")
+        rows = reconcile_subinterface(self.device, payload)
+        self.assertEqual(rows[0].status, "imported")
+        self.assertIsNotNone(rows[0].parent_interface_id)
+
     def test_existing_interface_is_reused_not_duplicated(self):
         from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
 
@@ -194,6 +216,20 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
         assert ifaces[0]["dot1q_vlan"] == 100
         assert ifaces[0]["parent_interface"] == "ge-0/0/0"
         assert ifaces[0]["vrf"] == "MTI"
+
+    def test_push_skips_rows_without_dot1q(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin.signals import _push_subinterface_intent_for_device, reset_intent_push_state
+
+        self._state(name="ge-0/0/0.100", dot1q=100, status="accepted")
+        # Owned but no dot1q tag → the reconciler can't key it; must be excluded.
+        self._state(name="ge-0/0/0.110", dot1q=None, status="accepted")
+        reset_intent_push_state()
+        with patch("netbox_nso_plugin.adapter_client.put_subinterface_intent") as mock_put:
+            _push_subinterface_intent_for_device(self.device.pk, 42)
+        ifaces = mock_put.call_args[0][1]
+        assert [i["interface_name"] for i in ifaces] == ["ge-0/0/0.100"]
 
     def test_accept_marks_owned(self):
         from unittest.mock import patch

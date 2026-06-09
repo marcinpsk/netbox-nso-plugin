@@ -24,12 +24,17 @@ def reconcile_subinterface(device, payload: dict) -> list:
     from dcim.models import Interface
     from django.utils import timezone
 
-    from .models import NSODeviceManagement, NSOSubinterfaceState
+    from .models import _VLAN_WRITE_PATH_STATUSES, NSODeviceManagement, NSOSubinterfaceState
 
     try:
         management = NSODeviceManagement.objects.get(device=device)
     except NSODeviceManagement.DoesNotExist:
         return []
+
+    # One query for the device's interfaces; resolve both the subinterface and its
+    # parent from this map. Devices can carry thousands of subinterfaces (dev27 has
+    # ~2160), so a per-row parent lookup would be thousands of extra queries.
+    iface_map = {i.name: i for i in Interface.objects.filter(device=device)}
 
     now = timezone.now()
     rows: list = []
@@ -37,11 +42,13 @@ def reconcile_subinterface(device, payload: dict) -> list:
         name = item.get("interface_name")
         if not name:
             continue
-        iface, _ = Interface.objects.get_or_create(device=device, name=name, defaults={"type": "virtual"})
+        iface = iface_map.get(name)
+        if iface is None:
+            iface = Interface.objects.create(device=device, name=name, type="virtual")
+            iface_map[name] = iface
 
-        # Look up the physical parent by name; never create it (device sync owns it).
-        parent_name = item.get("parent_interface")
-        parent = Interface.objects.filter(device=device, name=parent_name).first() if parent_name else None
+        # Resolve the physical parent from the map; never create it (device sync owns it).
+        parent = iface_map.get(item.get("parent_interface"))
         if parent and iface.parent_id != parent.id:
             iface.parent = parent
             iface.save(update_fields=["parent"])
@@ -52,7 +59,7 @@ def reconcile_subinterface(device, payload: dict) -> list:
         state.vrf = item.get("vrf") or ""
         # Never clobber operator-owned statuses (the write-path lifecycle). A fresh
         # import lands as 'imported'; a missing parent is flagged 'changed' for review.
-        if state.status not in ("accepted", "deploying", "in_sync"):
+        if state.status not in _VLAN_WRITE_PATH_STATUSES:
             state.status = "imported" if parent is not None else "changed"
         state.last_sync_at = now
         state.save()
