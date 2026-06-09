@@ -64,7 +64,7 @@ class TestL2ServicesReconcileAndCount(TestCase):
             ctx = reconcile_category(self.device, self.mgmt, "l2_services")
         rows = {r.service_name: r for r in ctx["l2_sap_states"]}
         assert set(rows) == {"TL", "701"}
-        assert rows["701"].status == "in_sync"  # port exists → terminated
+        assert rows["701"].status == "imported"  # port exists → terminated, unowned → imported
 
     def test_category_counts_from_overlay(self):
         from netbox_nso_plugin.reconcile import reconcile_category

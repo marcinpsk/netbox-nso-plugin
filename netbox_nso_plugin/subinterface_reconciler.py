@@ -58,10 +58,10 @@ def reconcile_subinterface(device, payload: dict) -> list:
         state.parent_interface = parent
         state.dot1q_vlan = item.get("dot1q_vlan")
         state.vrf = item.get("vrf") or ""
-        # The subinterface is only well-formed once its physical parent is modelled,
-        # so 'parent present' is the value the machine reconciles against: unowned →
-        # imported (ok) / changed (no parent); owned settles deploying→in_sync.
-        state.status = sm.on_reconcile(state.status, matches=parent is not None)
+        # 'parent present' is structural materialization, not device confirmation, so
+        # it must not settle an owned row (settles_owned=False): unowned → imported
+        # (ok) / changed (no parent); owned preserved, settling only via Apply.
+        state.status = sm.on_reconcile(state.status, matches=parent is not None, settles_owned=False)
         state.last_sync_at = now
         state.save()
         rows.append(state)
