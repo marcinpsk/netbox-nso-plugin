@@ -221,6 +221,11 @@ def get_switchport(adapter_device_id: int) -> dict:
     return _request("GET", f"/api/v1/devices/{adapter_device_id}/switchport")
 
 
+def get_svi(adapter_device_id: int) -> dict:
+    """GET /api/v1/devices/{id}/svi — L3 VLAN interfaces (SVIs/IRBs) (M35)."""
+    return _request("GET", f"/api/v1/devices/{adapter_device_id}/svi")
+
+
 def apply_switchport_config(adapter_device_id, interfaces):
     """POST /api/v1/devices/{id}/switchport/apply — push + apply L2 switchport intent (M34).
 

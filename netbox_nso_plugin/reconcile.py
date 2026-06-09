@@ -114,6 +114,12 @@ def reconcile_device(device, mgmt=None) -> dict:
             ctx["interfaces"] = client.get_interfaces(dev_id)
             ctx["state"] = client.get_state(dev_id)
             ctx["interface_states"] = _upsert_interface_states(device, ctx["interfaces"])
+            # M35: materialise SVIs/IRBs (virtual interfaces + VLAN link) BEFORE the IP
+            # reconcile, which only attaches IPs to interfaces that already exist —
+            # otherwise an SVI's IPs are dropped until the next refresh.
+            from .svi_reconciler import reconcile_svi
+
+            ctx["svi_states"] = reconcile_svi(device, client.get_svi(dev_id))
             # Import interface IP addresses onto their (now first-class, logical-named)
             # NetBox interfaces. Runs AFTER the adapter sync created the interfaces;
             # gated internally by interface_ip_auto_create (off → lands as pending).
@@ -169,8 +175,14 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
             ctx["interfaces"] = client.get_interfaces(dev_id)
             ctx["state"] = client.get_state(dev_id)
             ctx["interface_states"] = _upsert_interface_states(device, ctx["interfaces"])
+            from .svi_reconciler import reconcile_svi
+
+            ctx["svi_states"] = reconcile_svi(device, client.get_svi(dev_id))  # M35: before IPs
             ctx["interface_ips"] = _reconcile_interface_ips(device, client.get_interface_ips(dev_id))
         elif key == "interface_ips":
+            from .svi_reconciler import reconcile_svi
+
+            ctx["svi_states"] = reconcile_svi(device, client.get_svi(dev_id))  # M35: SVIs exist before IPs
             ctx["interface_ips"] = _reconcile_interface_ips(device, client.get_interface_ips(dev_id))
         elif key == "lacp":
             from .lacp_reconciler import reconcile_lag_config

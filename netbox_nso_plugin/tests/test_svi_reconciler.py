@@ -1,0 +1,84 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
+"""M35: plugin SVI/IRB reconciler — materialise virtual interface + VLAN link + overlay."""
+
+from __future__ import annotations
+
+from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
+from django.test import TestCase
+
+from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOSVIState
+
+
+def _make_device(tag="m35"):
+    mfg, _ = Manufacturer.objects.get_or_create(name=f"SMfg{tag}", slug=f"smfg{tag}")
+    dt, _ = DeviceType.objects.get_or_create(manufacturer=mfg, model=f"SDev{tag}", slug=f"sdev{tag}")
+    role, _ = DeviceRole.objects.get_or_create(name=f"SRole{tag}", slug=f"srole{tag}")
+    site, _ = Site.objects.get_or_create(name=f"SSite{tag}", slug=f"ssite{tag}")
+    return Device.objects.create(name=f"svi-sw-{tag}", device_type=dt, role=role, site=site)
+
+
+class TestSviReconciler(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.device = _make_device()
+        cls.instance = NSOInstance.objects.create(name="nso-dev", adapter_instance_id="nso-dev")
+        cls.management = NSODeviceManagement.objects.create(
+            device=cls.device, nso_instance=cls.instance, nso_device_name="svi-sw-m35"
+        )
+
+    def test_no_mgmt_returns_empty(self):
+        from netbox_nso_plugin.svi_reconciler import reconcile_svi
+
+        orphan = _make_device("orphan")
+        assert reconcile_svi(orphan, {"interfaces": [{"interface_name": "Vlan100", "vlan_id": 100}]}) == []
+
+    def test_creates_virtual_interface_and_state(self):
+        from netbox_nso_plugin.svi_reconciler import reconcile_svi
+
+        rows = reconcile_svi(
+            self.device, {"interfaces": [{"interface_name": "Vlan100", "vlan_id": 100, "type": "svi", "vrf": "MGMT"}]}
+        )
+        self.assertEqual(len(rows), 1)
+        iface = Interface.objects.get(device=self.device, name="Vlan100")
+        self.assertEqual(iface.type, "virtual")
+        self.assertTrue(NSOSVIState.objects.filter(management=self.management, interface=iface).exists())
+        self.assertEqual(rows[0].status, "in_sync")
+
+    def test_vlan_linked_when_present(self):
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin.svi_reconciler import reconcile_svi
+        from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
+
+        group = _device_vlan_group(self.device)
+        VLAN.objects.create(group=group, vid=150, name="DATA")
+        rows = reconcile_svi(
+            self.device, {"interfaces": [{"interface_name": "Vlan150", "vlan_id": 150, "type": "svi"}]}
+        )
+        self.assertEqual(rows[0].vlan.vid, 150)
+
+    def test_existing_interface_is_reused_not_duplicated(self):
+        from netbox_nso_plugin.svi_reconciler import reconcile_svi
+
+        Interface.objects.create(device=self.device, name="Vlan200", type="virtual")
+        reconcile_svi(self.device, {"interfaces": [{"interface_name": "Vlan200", "vlan_id": 200, "type": "svi"}]})
+        self.assertEqual(Interface.objects.filter(device=self.device, name="Vlan200").count(), 1)
+
+    def test_irb_type_preserved(self):
+        from netbox_nso_plugin.svi_reconciler import reconcile_svi
+
+        rows = reconcile_svi(
+            self.device, {"interfaces": [{"interface_name": "irb.100", "vlan_id": 100, "type": "irb"}]}
+        )
+        self.assertEqual(rows[0].svi_type, "irb")
+        self.assertTrue(Interface.objects.filter(device=self.device, name="irb.100").exists())
+
+    def test_stale_state_pruned(self):
+        from netbox_nso_plugin.svi_reconciler import reconcile_svi
+
+        reconcile_svi(self.device, {"interfaces": [{"interface_name": "Vlan300", "vlan_id": 300, "type": "svi"}]})
+        # Next refresh no longer reports Vlan300 → its overlay row is pruned.
+        reconcile_svi(self.device, {"interfaces": [{"interface_name": "Vlan301", "vlan_id": 301, "type": "svi"}]})
+        names = set(NSOSVIState.objects.filter(management=self.management).values_list("interface__name", flat=True))
+        self.assertEqual(names, {"Vlan301"})

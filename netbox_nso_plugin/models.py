@@ -1480,3 +1480,36 @@ class NSOSwitchportState(NetBoxModel):
 
     def __str__(self):
         return f"{self.management} / {self.interface} [{self.status}]"
+
+
+class NSOSVIState(NetBoxModel):
+    """Per-SVI/IRB compliance overlay (M35).
+
+    Tracks an L3 VLAN interface (IOS interface VlanN / Junos irb.N) materialised
+    into NetBox as a virtual dcim.Interface, linked to its VLAN. IP addresses are
+    NOT tracked here — they ride the M12 interface-IP path on the same interface.
+    """
+
+    management = models.ForeignKey(to="NSODeviceManagement", on_delete=models.CASCADE, related_name="svi_states")
+    interface = models.ForeignKey(to="dcim.Interface", on_delete=models.CASCADE, related_name="nso_svi_states")
+    vlan = models.ForeignKey(
+        to="ipam.VLAN", null=True, blank=True, on_delete=models.SET_NULL, related_name="nso_svi_states"
+    )
+    svi_type = models.CharField(max_length=8, default="svi", help_text="svi (IOS) or irb (Junos).")
+    status = models.CharField(max_length=32, choices=_VLAN_STATUS_CHOICES, default="unknown")
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["management", "interface"]
+        unique_together = [("management", "interface")]
+        verbose_name = "NSO SVI State"
+        verbose_name_plural = "NSO SVI States"
+
+    def __str__(self):
+        return f"{self.management} / svi:{self.interface} [{self.status}]"
+
+    def get_absolute_url(self):
+        """Return the device NSO tab URL (the overlay's detail; used by edit redirects)."""
+        from django.urls import reverse
+
+        return reverse("dcim:device_nso", kwargs={"pk": self.management.device_id})
