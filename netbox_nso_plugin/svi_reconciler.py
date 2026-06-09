@@ -22,6 +22,7 @@ def reconcile_svi(device, payload: dict) -> list:
     from django.utils import timezone
     from ipam.models import VLAN
 
+    from . import status_machine as sm
     from .models import NSODeviceManagement, NSOSVIState
     from .vlan_reconciler import _device_vlan_group
 
@@ -44,13 +45,10 @@ def reconcile_svi(device, payload: dict) -> list:
         state.vlan = vlan
         state.svi_type = item.get("type") or "svi"
         state.vrf = item.get("vrf") or ""
-        # Lifecycle: a fresh import lands 'imported'; owned statuses are preserved,
-        # except 'deploying' (Apply in flight) → 'in_sync' once the device reports the
-        # SVI again (the apply landed). accepted/in_sync are not clobbered.
-        if state.status == "deploying":
-            state.status = "in_sync"
-        elif state.status not in ("accepted", "deploying", "in_sync"):
-            state.status = "imported"
+        # Mirror overlay (no separate editable value): a fresh import lands
+        # 'imported'; owned statuses are preserved, except 'deploying' (Apply in
+        # flight) → 'in_sync' once the device reports the SVI again (apply landed).
+        state.status = sm.on_reconcile(state.status, matches=None)
         state.last_sync_at = now
         state.save()
         rows.append(state)

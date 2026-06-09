@@ -24,7 +24,8 @@ def reconcile_subinterface(device, payload: dict) -> list:
     from dcim.models import Interface
     from django.utils import timezone
 
-    from .models import _VLAN_WRITE_PATH_STATUSES, NSODeviceManagement, NSOSubinterfaceState
+    from . import status_machine as sm
+    from .models import NSODeviceManagement, NSOSubinterfaceState
 
     try:
         management = NSODeviceManagement.objects.get(device=device)
@@ -57,13 +58,10 @@ def reconcile_subinterface(device, payload: dict) -> list:
         state.parent_interface = parent
         state.dot1q_vlan = item.get("dot1q_vlan")
         state.vrf = item.get("vrf") or ""
-        # Lifecycle: a fresh import lands 'imported' ('changed' if the parent is
-        # missing); owned statuses are preserved, except 'deploying' (Apply in flight)
-        # → 'in_sync' once the device reports the subinterface again (apply landed).
-        if state.status == "deploying":
-            state.status = "in_sync"
-        elif state.status not in _VLAN_WRITE_PATH_STATUSES:
-            state.status = "imported" if parent is not None else "changed"
+        # The subinterface is only well-formed once its physical parent is modelled,
+        # so 'parent present' is the value the machine reconciles against: unowned →
+        # imported (ok) / changed (no parent); owned settles deploying→in_sync.
+        state.status = sm.on_reconcile(state.status, matches=parent is not None)
         state.last_sync_at = now
         state.save()
         rows.append(state)

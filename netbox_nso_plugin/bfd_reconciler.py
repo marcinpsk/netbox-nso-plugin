@@ -44,17 +44,16 @@ def _upsert_bfd_state(mgmt, iface, entry: dict, now) -> None:
     Fresh import lands 'imported'; owned statuses are preserved, except 'deploying'
     (Apply in flight) → 'in_sync' once the device re-reports BFD here (apply landed).
     """
-    from .models import _VLAN_WRITE_PATH_STATUSES, NSOBFDInterfaceState
+    from . import status_machine as sm
+    from .models import NSOBFDInterfaceState
 
     state, _ = NSOBFDInterfaceState.objects.get_or_create(management=mgmt, interface=iface)
     state.min_tx = entry.get("min_tx")
     state.min_rx = entry.get("min_rx")
     state.multiplier = entry.get("multiplier")
     state.micro_bfd = bool(entry.get("micro_bfd", False))
-    if state.status == "deploying":
-        state.status = "in_sync"
-    elif state.status not in _VLAN_WRITE_PATH_STATUSES:
-        state.status = "imported"
+    # Mirror overlay: imported on import; owned preserved; deploying→in_sync on apply.
+    state.status = sm.on_reconcile(state.status, matches=None)
     state.last_sync_at = now
     state.save()
 

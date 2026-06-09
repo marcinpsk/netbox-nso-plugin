@@ -33,8 +33,8 @@ def reconcile_lag_config(device, payload: dict) -> list:
     from dcim.models import Interface
     from django.utils import timezone
 
+    from . import status_machine as sm
     from .models import (
-        _LACP_WRITE_PATH_STATUSES,
         NSODeviceManagement,
         NSOLACPBundleState,
         NSOLACPMemberState,
@@ -73,8 +73,7 @@ def reconcile_lag_config(device, payload: dict) -> list:
         state.timer = bundle_data.get("timer") or ""
         state.admin_key = bundle_data.get("admin_key")
         state.last_sync_at = now
-        if state.status not in _LACP_WRITE_PATH_STATUSES:
-            state.status = "imported"
+        state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
         state.save()
         seen_bundles.add(lag_iface.pk)
 
@@ -96,20 +95,21 @@ def reconcile_lag_config(device, payload: dict) -> list:
             m_state.mode = member_data.get("mode") or ""
             m_state.port_priority = member_data.get("port_priority")
             m_state.last_sync_at = now
-            if m_state.status not in _LACP_WRITE_PATH_STATUSES:
-                m_state.status = "imported"
+            m_state.status = sm.on_reconcile(m_state.status, matches=None)  # mirror overlay
             m_state.save()
             seen_members.add(member_iface.pk)
 
     # Rows the payload no longer reports → drift (clobber-safe; native interfaces untouched).
     for stale in NSOLACPBundleState.objects.filter(management=mgmt):
-        if stale.interface_id not in seen_bundles and stale.status != "changed":
-            stale.status = "changed"
+        new_status = sm.on_reconcile(stale.status, present=False)
+        if stale.interface_id not in seen_bundles and new_status != stale.status:
+            stale.status = new_status
             stale.last_sync_at = now
             stale.save(update_fields=["status", "last_sync_at"])
     for stale in NSOLACPMemberState.objects.filter(management=mgmt):
-        if stale.interface_id not in seen_members and stale.status != "changed":
-            stale.status = "changed"
+        new_status = sm.on_reconcile(stale.status, present=False)
+        if stale.interface_id not in seen_members and new_status != stale.status:
+            stale.status = new_status
             stale.last_sync_at = now
             stale.save(update_fields=["status", "last_sync_at"])
 
