@@ -47,14 +47,18 @@ def reconcile_vlan_database(device, payload: dict) -> list:
         vid = int(item["vlan_id"])
         seen_vids.add(vid)
         name = item.get("name") or ""
-        vlan, created = VLAN.objects.get_or_create(group=group, vid=vid, defaults={"name": name})
-        if not created and name and vlan.name != name:
-            vlan.name = name
-            vlan.save()
+        # Seed the name on first import only. NEVER clobber it afterwards: the
+        # NetBox VLAN name is operator-editable, and overwriting it back to the
+        # device value would silently revert (and hide) an operator rename.
+        vlan, _ = VLAN.objects.get_or_create(group=group, vid=vid, defaults={"name": name})
         state, _ = NSOVLANState.objects.get_or_create(management=management, vlan=vlan)
         state.last_sync_at = now
+        state.device_name = name  # mirror the device value for drift display
+        # Clobber-safe drift: compare the LIVE NetBox name against the device value.
+        # Import seeds them equal, so a later mismatch is an operator rename (or a
+        # device-side rename) → surface it as drift instead of reverting it.
         if state.status not in _VLAN_WRITE_PATH_STATUSES:
-            state.status = "imported"
+            state.status = "changed" if (name and vlan.name != name) else "imported"
         state.save()
         rows.append(state)
 

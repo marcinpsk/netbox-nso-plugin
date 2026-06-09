@@ -46,6 +46,25 @@ class TestVlanReconciler(TestCase):
             NSOVLANState.objects.filter(management=self.management, vlan__group=group, vlan__vid=10).exists()
         )
 
+    def test_operator_rename_is_drift_not_clobbered(self):
+        """Renaming a VLAN in NetBox must surface as drift, not be reverted to the device name."""
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 2213, "name": "OLD_NAME"}]})
+        group = VLANGroup.objects.get(slug=f"nso-{self.device.pk}")
+        vlan = VLAN.objects.get(group=group, vid=2213)
+
+        # Operator renames the VLAN in NetBox.
+        vlan.name = "NEW_NAME"
+        vlan.save()
+
+        # Next reconcile (e.g. opening the NSO tab) must NOT revert the rename.
+        rows = reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 2213, "name": "OLD_NAME"}]})
+        vlan.refresh_from_db()
+        self.assertEqual(vlan.name, "NEW_NAME")  # not clobbered back to OLD_NAME
+        self.assertEqual(rows[0].status, "changed")  # drift surfaced
+        self.assertEqual(rows[0].device_name, "OLD_NAME")  # device value mirrored for display
+
     def test_switchport_in_sync_when_netbox_matches_nso(self):
         from netbox_nso_plugin.vlan_reconciler import reconcile_switchport, reconcile_vlan_database
 

@@ -1420,6 +1420,9 @@ class NSOVLANState(NetBoxModel):
         on_delete=models.CASCADE,
         related_name="nso_vlan_states",
     )
+    device_name = models.CharField(
+        max_length=64, blank=True, default="", help_text="VLAN name observed on the device (for drift display)."
+    )
     status = models.CharField(max_length=32, choices=_VLAN_STATUS_CHOICES, default="unknown")
     last_sync_at = models.DateTimeField(null=True, blank=True)
     accepted_at = models.DateTimeField(null=True, blank=True)

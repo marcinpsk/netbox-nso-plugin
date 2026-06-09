@@ -9,12 +9,13 @@
   {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-vlan" placeholder="Filter by vid / name…" show_status=True %}
   <div class="table-responsive mb-3">
     <table class="table table-sm table-hover mb-0">
-      <thead><tr><th>VID</th><th>Name</th><th>VLAN</th><th>Status</th></tr></thead>
+      <thead><tr><th>VID</th><th>Name (NetBox)</th><th>Device</th><th>VLAN</th><th>Status</th></tr></thead>
       <tbody>
         {% for s in vlan_states %}
         <tr data-status="{{ s.status }}" data-owned="{{ s.accepted_at|yesno:'true,false' }}">
           <td>{{ s.vlan.vid }}</td>
           <td>{{ s.vlan.name|default:"—" }}</td>
+          <td>{% if s.device_name and s.device_name != s.vlan.name %}<span class="text-warning" title="Name on the device differs from NetBox">{{ s.device_name }}</span>{% else %}<span class="text-muted">—</span>{% endif %}</td>
           <td><a href="{{ s.vlan.get_absolute_url }}">{{ s.vlan }}</a></td>
           <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=s.status %}</td>
         </tr>
