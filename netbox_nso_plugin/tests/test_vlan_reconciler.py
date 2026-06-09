@@ -13,6 +13,9 @@ from netbox_nso_plugin.models import (
     NSOInstance,
     NSOVLANState,
 )
+from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
+
+from .mixins import IntentPushResetMixin
 
 
 def _make_device(tag="m34"):
@@ -98,3 +101,50 @@ class TestVlanReconciler(TestCase):
             },
         )
         self.assertEqual(rows[0].status, "changed")
+
+
+class TestVlanWritePath(IntentPushResetMixin, TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.device = _make_device("vwp")
+        cls.instance = NSOInstance.objects.create(name="nso-vwp", adapter_instance_id="nso-vwp")
+        cls.management = NSODeviceManagement.objects.create(
+            device=cls.device, nso_instance=cls.instance, nso_device_name="vlan-router-vwp", adapter_device_id=77
+        )
+
+    def _state(self, vid=2213, name="OLD", status="imported", device_name="OLD"):
+        group = _device_vlan_group(self.device)
+        vlan = VLAN.objects.create(group=group, vid=vid, name=name)
+        return NSOVLANState.objects.create(
+            management=self.management, vlan=vlan, device_name=device_name, status=status
+        )
+
+    def test_push_builds_owned_snapshot_with_live_name(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin.signals import _push_vlan_intent_for_device, reset_intent_push_state
+
+        owned = self._state(vid=2213, name="RENAMED", status="accepted", device_name="OLD")
+        self._state(vid=10, name="MGMT", status="imported")  # not owned → excluded
+        reset_intent_push_state()
+        with patch("netbox_nso_plugin.adapter_client.put_vlan_intent") as mock_put:
+            _push_vlan_intent_for_device(self.device.pk, 77)
+        mock_put.assert_called_once()
+        vlans = mock_put.call_args[0][1]
+        assert vlans == [{"vlan_id": 2213, "name": "RENAMED"}]  # live NetBox name, owned only
+        del owned
+
+    def test_accept_marks_owned(self):
+        from unittest.mock import patch
+
+        from django.contrib.auth import get_user_model
+
+        state = self._state(vid=2213, name="RENAMED", status="conflict")
+        User = get_user_model()
+        admin = User.objects.create_superuser(username="vlan-admin", password="pw", email="v@x.y")  # noqa: S106
+        self.client.force_login(admin)
+        with patch("netbox_nso_plugin.adapter_client.put_vlan_intent"):
+            resp = self.client.post(f"/plugins/nso/vlan/state/{state.pk}/accept/")
+        assert resp.status_code == 302
+        state.refresh_from_db()
+        assert state.status == "accepted" and state.accepted_at is not None

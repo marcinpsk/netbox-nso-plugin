@@ -231,6 +231,19 @@ def get_subinterface(adapter_device_id: int) -> dict:
     return _request("GET", f"/api/v1/devices/{adapter_device_id}/subinterface")
 
 
+def put_vlan_intent(adapter_device_id, vlans):
+    """PUT /api/v1/devices/{id}/vlan-intent — push full VLAN-database intent (M34 write).
+
+    ``vlans`` is a list of dicts: [{"vlan_id": 2213, "name": "X", "accepted_at": "...Z"}, ...].
+    Empty list clears all VLAN intent for the device. Returns {"device_id": ..., "count": N}.
+    """
+    return _request(
+        "PUT",
+        f"/api/v1/devices/{adapter_device_id}/vlan-intent",
+        json={"vlans": vlans},
+    )
+
+
 def apply_switchport_config(adapter_device_id, interfaces):
     """POST /api/v1/devices/{id}/switchport/apply — push + apply L2 switchport intent (M34).
 

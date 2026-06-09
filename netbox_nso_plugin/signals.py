@@ -791,6 +791,53 @@ def _on_subinterface_state_save(sender, instance, **kwargs):
     )
 
 
+def _push_vlan_intent_for_device(device_id, adapter_device_id):
+    """Build and push the full owned VLAN-database intent snapshot for a device (M34 write).
+
+    Store-only (deferred): the single device Apply commits via the vlan-reconciler.
+    Only owned rows (accepted/deploying/in_sync) are included; the VLAN name pushed
+    is the LIVE NetBox name (operator is the source of truth for it).
+    """
+    from . import adapter_client as client
+    from .models import _VLAN_WRITE_PATH_STATUSES, NSOVLANState
+
+    vlans = []
+    for row in NSOVLANState.objects.filter(
+        management__device_id=device_id,
+        status__in=_VLAN_WRITE_PATH_STATUSES,
+    ).select_related("vlan"):
+        if row.vlan is None:
+            continue
+        vlans.append({"vlan_id": row.vlan.vid, "name": row.vlan.name or ""})
+
+    _push_changed(
+        (device_id, "vlan"),
+        vlans,
+        lambda: client.put_vlan_intent(adapter_device_id, vlans),
+    )
+
+
+@_skip_on_render
+def _on_vlan_state_save(sender, instance, **kwargs):
+    """Push VLAN intent whenever an NSOVLANState row is saved (accept triggers push)."""
+    from .models import NSODeviceManagement
+
+    try:
+        mgmt = instance.management
+    except NSODeviceManagement.DoesNotExist:
+        return
+
+    if mgmt.adapter_device_id is None:
+        return
+
+    device_id = mgmt.device_id
+    adapter_device_id = mgmt.adapter_device_id
+    _schedule_intent_push(
+        (device_id, "vlan"),
+        lambda: _push_vlan_intent_for_device(device_id, adapter_device_id),
+    )
+
+
 def _on_ip_address_change(sender, instance, **kwargs):
     """Push IP intent when an IPAddress assigned to a managed interface changes."""
     from dcim.models import Interface as _Interface
@@ -1652,6 +1699,15 @@ def _connect_g_activated():  # pragma: no cover
         _on_subinterface_state_save,
         sender=NSOSubinterfaceState,
         dispatch_uid="nso_plugin_subinterface_state_post_save",
+    )
+
+    # VLAN-database state → intent push (M34 write path)
+    from .models import NSOVLANState
+
+    post_save.connect(
+        _on_vlan_state_save,
+        sender=NSOVLANState,
+        dispatch_uid="nso_plugin_vlan_state_post_save",
     )
 
     # Static route state → intent push (M10 B3)

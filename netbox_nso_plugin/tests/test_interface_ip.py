@@ -274,6 +274,36 @@ class TestReconcileInterfaceIps(TestCase):
         ip.refresh_from_db()
         self.assertIsNone(ip.assigned_object)
 
+    def test_vrf_rekey_replaces_row_not_phantom_drift(self):
+        """Same IP later reported under a different VRF → re-key (one row), not duplicate drift.
+
+        Regression: an IP imported/accepted with no VRF (VRF not captured yet) must
+        not be left as a phantom 'changed' row when the VRF capture is later
+        corrected (e.g. "" → mgmtVrf); the corrected row is the single source.
+        """
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+        from netbox_nso_plugin.template_content import _reconcile_interface_ips
+
+        empty_vrf = self._make_payload(
+            "GigabitEthernet0/0", [{"address": "172.30.150.202/24", "vrf": "", "family": "ipv4", "secondary": False}]
+        )
+        mgmt_vrf = self._make_payload(
+            "GigabitEthernet0/0",
+            [{"address": "172.30.150.202/24", "vrf": "mgmtVrf", "family": "ipv4", "secondary": False}],
+        )
+
+        with self._auto_create_ctx(False):
+            _reconcile_interface_ips(self.device, empty_vrf)
+            # Operator had accepted the (no-VRF) row before the VRF was captured.
+            NSOInterfaceIPState.objects.filter(interface=self.iface, address="172.30.150.202/24", vrf="").update(
+                status="accepted"
+            )
+            _reconcile_interface_ips(self.device, mgmt_vrf)
+
+        rows = NSOInterfaceIPState.objects.filter(interface=self.iface, address="172.30.150.202/24")
+        self.assertEqual(rows.count(), 1)  # the stale "" row is gone, not a phantom 'changed'
+        self.assertEqual(rows.first().vrf, "mgmtVrf")
+
     def test_idempotent_rerun_does_not_duplicate(self):
         """Running reconcile twice with the same payload produces exactly one state row."""
         from netbox_nso_plugin.models import NSOInterfaceIPState

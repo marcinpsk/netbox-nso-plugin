@@ -342,4 +342,9 @@ urlpatterns = [
         views.NSOSubinterfaceStateAcceptView.as_view(),
         name="subinterface_accept",
     ),
+    path(
+        "vlan/state/<int:pk>/accept/",
+        views.NSOVLANStateAcceptView.as_view(),
+        name="vlan_accept",
+    ),
 ]

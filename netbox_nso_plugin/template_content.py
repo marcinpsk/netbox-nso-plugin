@@ -221,35 +221,56 @@ def _create_and_link_ip(address, vrf_obj, iface, Prefix, logger, transaction, Va
         return "error"
 
 
+def _unassign_state_ip(state, VRF, IPAddress, transaction) -> None:
+    """Unassign the NetBox IPAddress backing *state* (if any) from its interface."""
+    vrf_obj = None
+    if state.vrf and VRF is not None:
+        try:
+            vrf_obj = VRF.objects.get(name=state.vrf)
+        except VRF.DoesNotExist:
+            pass
+    ip_obj = IPAddress.objects.filter(address=state.address, vrf=vrf_obj, assigned_object_id=state.interface_id).first()
+    if ip_obj is not None:
+        ip_obj.assigned_object = None
+        with transaction.atomic():
+            ip_obj.save(update_fields=["assigned_object_type", "assigned_object_id"])
+
+
 def _retire_stale_ip_states(device, resolved_keys, VRF, IPAddress, now, transaction, NSOInterfaceIPState) -> None:
-    """Mark state rows no longer reported by NSO as 'changed' and unassign their IPs.
+    """Reconcile state rows the payload no longer reports under their (iface, addr, vrf) key.
 
     *resolved_keys* is a set of ``(interface_id, address, vrf)`` built during the
     reconcile loop using the same logical→physical interface resolution applied
     when the state rows were created.  Keying on ``interface_id`` (not the name
     string) avoids spurious 'changed' drift on Nokia, where the payload carries a
     logical router-interface name but the state row is bound to the physical port.
+
+    Two cases for a row whose full key is no longer reported:
+    - **VRF re-key** — the same ``(interface, address)`` IS still reported, just
+      under a different VRF (the VRF capture was corrected, e.g. ``"" → mgmtVrf``).
+      This is the *same* IP, not a removal, so the stale row is **deleted** (and its
+      orphaned NetBox IP unassigned) rather than left as a phantom 'changed'
+      duplicate alongside the correctly-keyed row.
+    - **Genuine removal** — the address is gone entirely → unassign + mark 'changed'.
     """
     existing_states = NSOInterfaceIPState.objects.filter(interface__device=device).select_related("interface")
+    # (interface_id, address) reported under *any* VRF this run.
+    reported_addr = {(iface_id, addr) for (iface_id, addr, _vrf) in resolved_keys}
     for state in existing_states:
         key = (state.interface_id, state.address, state.vrf)
-        if key not in resolved_keys and state.status not in ("changed",):
-            vrf_obj = None
-            if state.vrf and VRF is not None:
-                try:
-                    vrf_obj = VRF.objects.get(name=state.vrf)
-                except VRF.DoesNotExist:
-                    pass
-            ip_obj = IPAddress.objects.filter(
-                address=state.address, vrf=vrf_obj, assigned_object_id=state.interface_id
-            ).first()
-            if ip_obj is not None:
-                ip_obj.assigned_object = None
-                with transaction.atomic():
-                    ip_obj.save(update_fields=["assigned_object_type", "assigned_object_id"])
-            state.status = "changed"
-            state.last_sync_at = now
-            state.save(update_fields=["status", "last_sync_at"])
+        if key in resolved_keys:
+            continue
+        if (state.interface_id, state.address) in reported_addr:
+            # VRF re-key: same IP, corrected VRF → drop the stale variant.
+            _unassign_state_ip(state, VRF, IPAddress, transaction)
+            state.delete()
+            continue
+        if state.status == "changed":
+            continue
+        _unassign_state_ip(state, VRF, IPAddress, transaction)
+        state.status = "changed"
+        state.last_sync_at = now
+        state.save(update_fields=["status", "last_sync_at"])
 
 
 def _activate_auto_assigned_ip(state, existing_ip, address, iface, IPAddress, logger):

@@ -54,6 +54,7 @@ from .models import (
     NSOStaticRouteState,
     NSOSubinterfaceState,
     NSOSVIState,
+    NSOVLANState,
 )
 from .tables import (
     NSODeviceManagementTable,
@@ -1136,6 +1137,7 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
             NSOLoggingHostState,
             NSOSVIState,
             NSOSubinterfaceState,
+            NSOVLANState,
             NSOL2SapState,
             NSOLACPBundleState,
             NSOSwitchportState,
@@ -1485,6 +1487,10 @@ class NSOSVIStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
 
 class NSOSubinterfaceStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOSubinterfaceState
+
+
+class NSOVLANStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
+    model_class = NSOVLANState
 
 
 class NSOSnmpCommunityStateEditView(generic.ObjectEditView):  # noqa: D101
