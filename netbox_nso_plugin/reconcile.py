@@ -120,6 +120,11 @@ def reconcile_device(device, mgmt=None) -> dict:
             from .svi_reconciler import reconcile_svi
 
             ctx["svi_states"] = reconcile_svi(device, client.get_svi(dev_id))
+            # M36: materialise dot1q subinterfaces (virtual interface + Interface.parent
+            # link) BEFORE the IP reconcile, for the same ordering reason as SVIs.
+            from .subinterface_reconciler import reconcile_subinterface
+
+            ctx["subinterface_states"] = reconcile_subinterface(device, client.get_subinterface(dev_id))
             # Import interface IP addresses onto their (now first-class, logical-named)
             # NetBox interfaces. Runs AFTER the adapter sync created the interfaces;
             # gated internally by interface_ip_auto_create (off → lands as pending).
@@ -178,11 +183,16 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
             from .svi_reconciler import reconcile_svi
 
             ctx["svi_states"] = reconcile_svi(device, client.get_svi(dev_id))  # M35: before IPs
+            from .subinterface_reconciler import reconcile_subinterface
+
+            ctx["subinterface_states"] = reconcile_subinterface(device, client.get_subinterface(dev_id))  # M36
             ctx["interface_ips"] = _reconcile_interface_ips(device, client.get_interface_ips(dev_id))
         elif key == "interface_ips":
+            from .subinterface_reconciler import reconcile_subinterface
             from .svi_reconciler import reconcile_svi
 
             ctx["svi_states"] = reconcile_svi(device, client.get_svi(dev_id))  # M35: SVIs exist before IPs
+            ctx["subinterface_states"] = reconcile_subinterface(device, client.get_subinterface(dev_id))  # M36
             ctx["interface_ips"] = _reconcile_interface_ips(device, client.get_interface_ips(dev_id))
         elif key == "lacp":
             from .lacp_reconciler import reconcile_lag_config
@@ -202,6 +212,10 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
             from .svi_reconciler import reconcile_svi
 
             ctx["svi_states"] = reconcile_svi(device, client.get_svi(dev_id))
+        elif key == "subinterface":
+            from .subinterface_reconciler import reconcile_subinterface
+
+            ctx["subinterface_states"] = reconcile_subinterface(device, client.get_subinterface(dev_id))
         elif key == "snmp":
             ctx["snmp_data"] = _reconcile_snmp_config(device, client.get_snmp_config(dev_id))
         elif key == "logging":

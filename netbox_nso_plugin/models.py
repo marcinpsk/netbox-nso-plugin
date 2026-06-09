@@ -1519,3 +1519,54 @@ class NSOSVIState(NetBoxModel):
         from django.urls import reverse
 
         return reverse("dcim:device_nso", kwargs={"pk": self.management.device_id})
+
+
+class NSOSubinterfaceState(NetBoxModel):
+    """Per-subinterface compliance overlay (M36 — dot1q L3 subinterfaces).
+
+    Tracks a dot1q subinterface (IOS Gi0/1.100 / Junos ge-0/0/0.100) materialised
+    into NetBox as a virtual ``dcim.Interface`` linked to its physical parent via
+    ``Interface.parent``. The dot1q encapsulation tag is interface-local and is
+    recorded as a plain integer (``dot1q_vlan``) — deliberately NOT an ``ipam.VLAN``
+    FK (a routed subinterface tag is not a device VLAN-database entry). IP addresses
+    are NOT tracked here — they ride the M12 interface-IP path on the same interface.
+    """
+
+    management = models.ForeignKey(
+        to="NSODeviceManagement", on_delete=models.CASCADE, related_name="subinterface_states"
+    )
+    interface = models.ForeignKey(to="dcim.Interface", on_delete=models.CASCADE, related_name="nso_subinterface_states")
+    parent_interface = models.ForeignKey(
+        to="dcim.Interface",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="nso_child_subinterface_states",
+        help_text="Physical parent interface (Interface.parent); null if not yet present in NetBox.",
+    )
+    dot1q_vlan = models.PositiveIntegerField(
+        null=True, blank=True, help_text="Interface-local 802.1q encapsulation tag (NOT a VLAN FK)."
+    )
+    vrf = models.CharField(max_length=128, blank=True, default="", help_text="VRF/routing-instance; empty for global.")
+    status = models.CharField(max_length=32, choices=_VLAN_STATUS_CHOICES, default="unknown")
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(
+        null=True, blank=True, help_text="When an operator accepted this subinterface (NetBox owns it)."
+    )
+    last_apply_at = models.DateTimeField(null=True, blank=True)
+    last_apply_error = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["management", "interface"]
+        unique_together = [("management", "interface")]
+        verbose_name = "NSO Subinterface State"
+        verbose_name_plural = "NSO Subinterface States"
+
+    def __str__(self):
+        return f"{self.management} / subif:{self.interface} [{self.status}]"
+
+    def get_absolute_url(self):
+        """Return the device NSO tab URL (the overlay's detail; used by edit redirects)."""
+        from django.urls import reverse
+
+        return reverse("dcim:device_nso", kwargs={"pk": self.management.device_id})

@@ -226,6 +226,11 @@ def get_svi(adapter_device_id: int) -> dict:
     return _request("GET", f"/api/v1/devices/{adapter_device_id}/svi")
 
 
+def get_subinterface(adapter_device_id: int) -> dict:
+    """GET /api/v1/devices/{id}/subinterface — dot1q L3 subinterfaces (M36)."""
+    return _request("GET", f"/api/v1/devices/{adapter_device_id}/subinterface")
+
+
 def apply_switchport_config(adapter_device_id, interfaces):
     """POST /api/v1/devices/{id}/switchport/apply — push + apply L2 switchport intent (M34).
 
@@ -546,6 +551,22 @@ def put_svi_intent(adapter_device_id, interfaces):
     return _request(
         "PUT",
         f"/api/v1/devices/{adapter_device_id}/svi-intent",
+        json={"interfaces": interfaces},
+    )
+
+
+def put_subinterface_intent(adapter_device_id, interfaces):
+    """PUT /api/v1/devices/{id}/subinterface-intent — push full subinterface intent (M36).
+
+    ``interfaces`` is a list of dicts:
+      [{"interface_name": "GigabitEthernet0/1.100", "parent_interface": "GigabitEthernet0/1",
+        "dot1q_vlan": 100, "type": "subinterface", "vrf": "", "accepted_at": "...Z"}, ...]
+    Empty list clears all subinterface intent for the device.
+    Returns {"device_id": ..., "count": N}.
+    """
+    return _request(
+        "PUT",
+        f"/api/v1/devices/{adapter_device_id}/subinterface-intent",
         json={"interfaces": interfaces},
     )
 

@@ -735,6 +735,60 @@ def _on_svi_state_save(sender, instance, **kwargs):
     )
 
 
+def _push_subinterface_intent_for_device(device_id, adapter_device_id):
+    """Build and push the full owned dot1q subinterface intent snapshot (M36).
+
+    Store-only (deferred): the single device Apply commits via the
+    subinterface-reconciler. Only owned rows (accepted/deploying/in_sync) included.
+    """
+    from . import adapter_client as client
+    from .models import NSOSubinterfaceState
+
+    interfaces = []
+    for row in NSOSubinterfaceState.objects.filter(
+        management__device_id=device_id,
+        status__in=("accepted", "deploying", "in_sync"),
+    ).select_related("interface", "parent_interface"):
+        if row.dot1q_vlan is None:
+            continue  # the subinterface-reconciler keys on the dot1q tag
+        interfaces.append(
+            {
+                "interface_name": row.interface.name,
+                "parent_interface": row.parent_interface.name if row.parent_interface else "",
+                "dot1q_vlan": row.dot1q_vlan,
+                "type": "subinterface",
+                "vrf": row.vrf or "",
+            }
+        )
+
+    _push_changed(
+        (device_id, "subinterface"),
+        interfaces,
+        lambda: client.put_subinterface_intent(adapter_device_id, interfaces),
+    )
+
+
+@_skip_on_render
+def _on_subinterface_state_save(sender, instance, **kwargs):
+    """Push subinterface intent whenever an NSOSubinterfaceState row is saved."""
+    from .models import NSODeviceManagement
+
+    try:
+        mgmt = instance.management
+    except NSODeviceManagement.DoesNotExist:
+        return
+
+    if mgmt.adapter_device_id is None:
+        return
+
+    device_id = mgmt.device_id
+    adapter_device_id = mgmt.adapter_device_id
+    _schedule_intent_push(
+        (device_id, "subinterface"),
+        lambda: _push_subinterface_intent_for_device(device_id, adapter_device_id),
+    )
+
+
 def _on_ip_address_change(sender, instance, **kwargs):
     """Push IP intent when an IPAddress assigned to a managed interface changes."""
     from dcim.models import Interface as _Interface
@@ -1587,6 +1641,15 @@ def _connect_g_activated():  # pragma: no cover
         _on_svi_state_save,
         sender=NSOSVIState,
         dispatch_uid="nso_plugin_svi_state_post_save",
+    )
+
+    # dot1q subinterface state → intent push (M36 write path)
+    from .models import NSOSubinterfaceState
+
+    post_save.connect(
+        _on_subinterface_state_save,
+        sender=NSOSubinterfaceState,
+        dispatch_uid="nso_plugin_subinterface_state_post_save",
     )
 
     # Static route state → intent push (M10 B3)

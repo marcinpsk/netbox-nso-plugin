@@ -337,4 +337,9 @@ urlpatterns = [
         views.NSOSVIStateAcceptView.as_view(),
         name="svi_accept",
     ),
+    path(
+        "subinterface/state/<int:pk>/accept/",
+        views.NSOSubinterfaceStateAcceptView.as_view(),
+        name="subinterface_accept",
+    ),
 ]
