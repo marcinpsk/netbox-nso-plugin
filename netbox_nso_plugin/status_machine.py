@@ -209,3 +209,75 @@ def allowed(event: str, src: str, *, implemented_only: bool = False) -> frozense
     isn't in this set is a bug, not a silent string overwrite.
     """
     return frozenset(t.dst for t in transitions(implemented_only=implemented_only) if t.event == event and t.src == src)
+
+
+# --- Engine -----------------------------------------------------------------
+#
+# ``advance`` is the runtime form of the spec: the single chokepoint the
+# reconcilers / views / signals will route through (step 2, the centralize work).
+# It operates over the *intended* machine (all edges, implemented or not) so that
+# wiring a gap edge later — e.g. ``deploying -> apply_failed`` — needs only its
+# caller plus flipping ``implemented=True``; ``advance`` already permits it.
+#
+# Today every call site does a raw ``state.status = "..."`` with no check, so an
+# illegal jump (a reconcile clobbering an owned row, an apply from an un-accepted
+# row) corrupts state silently. Routing through ``advance`` turns each of those
+# into a raised error at the source.
+
+
+class IllegalTransition(ValueError):
+    """Raised when ``(event, current[, to])`` is not an edge of the machine."""
+
+    def __init__(self, current: str, event: str, to: str | None = None):
+        self.current, self.event, self.to = current, event, to
+        if to is None:
+            super().__init__(f"no {event!r} transition from {current!r}")
+        else:
+            super().__init__(f"{event!r} cannot move {current!r} -> {to!r}")
+
+
+class AmbiguousTransition(ValueError):
+    """Raised when ``(event, current)`` has several targets and ``to`` was omitted.
+
+    These are the guarded/value-aware edges (e.g. a reconcile of an ``accepted``
+    row may settle to ``in_sync`` or stay ``accepted`` depending on whether the
+    device matches). The caller owns that decision and must pass ``to=``.
+    """
+
+    def __init__(self, current: str, event: str, options: frozenset[str]):
+        self.current, self.event, self.options = current, event, options
+        super().__init__(f"{event!r} from {current!r} is ambiguous; pass to= one of {sorted(options)}")
+
+
+def can(event: str, src: str, to: str | None = None) -> bool:
+    """Return True if ``(event, src[, to])`` is a legal transition (no exceptions)."""
+    dests = allowed(event, src)
+    return bool(dests) if to is None else to in dests
+
+
+def advance(current: str, event: str, *, to: str | None = None) -> str:
+    """Return the next status for ``current`` under ``event``, or raise.
+
+    - Deterministic edge (one legal target): ``to`` is optional and inferred.
+    - Guarded edge (several legal targets): ``to`` is required; the caller decides
+      based on its own context (does the device match? is the parent present?), and
+      ``advance`` validates the choice is legal.
+    - No legal target, or a ``to`` outside the legal set: raises :class:`IllegalTransition`.
+
+    Operates over the intended machine, so unimplemented gap edges (``apply_err``,
+    ``reconcile_error``) are already accepted — wiring them later is caller-only.
+    """
+    if current not in STATES:
+        raise IllegalTransition(current, event, to)
+    if event not in EVENTS:
+        raise ValueError(f"unknown event {event!r}")
+    dests = allowed(event, current)
+    if not dests:
+        raise IllegalTransition(current, event, to)
+    if to is None:
+        if len(dests) == 1:
+            return next(iter(dests))
+        raise AmbiguousTransition(current, event, dests)
+    if to not in dests:
+        raise IllegalTransition(current, event, to)
+    return to

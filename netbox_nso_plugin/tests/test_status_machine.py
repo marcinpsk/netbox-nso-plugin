@@ -136,3 +136,66 @@ class TestStateMachineSpec(SimpleTestCase):
         # Apply only proceeds from accepted.
         self.assertEqual(sm.allowed(sm.APPLY, sm.ACCEPTED), {sm.DEPLOYING})
         self.assertEqual(sm.allowed(sm.APPLY, sm.IMPORTED), frozenset())
+
+
+class TestAdvanceEngine(SimpleTestCase):
+    """The runtime guard. Pure functions — no DB."""
+
+    def test_deterministic_edges_infer_target(self):
+        self.assertEqual(sm.advance(sm.IMPORTED, sm.ACCEPT), sm.ACCEPTED)
+        self.assertEqual(sm.advance(sm.CHANGED, sm.ACCEPT), sm.ACCEPTED)
+        self.assertEqual(sm.advance(sm.CONFLICT, sm.ACCEPT), sm.ACCEPTED)
+        self.assertEqual(sm.advance(sm.ACCEPTED, sm.APPLY), sm.DEPLOYING)
+        self.assertEqual(sm.advance(sm.ACCEPTED, sm.REVERT), sm.IMPORTED)
+        self.assertEqual(sm.advance(sm.DEPLOYING, sm.APPLY_OK), sm.IN_SYNC)
+
+    def test_apply_failed_is_retryable_via_accept(self):
+        self.assertEqual(sm.advance(sm.APPLY_FAILED, sm.ACCEPT), sm.ACCEPTED)
+
+    def test_guarded_edge_requires_explicit_target(self):
+        # reconcile of an owned 'accepted' row is value-aware → caller must choose.
+        with self.assertRaises(sm.AmbiguousTransition):
+            sm.advance(sm.ACCEPTED, sm.RECONCILE)
+        self.assertEqual(sm.advance(sm.ACCEPTED, sm.RECONCILE, to=sm.IN_SYNC), sm.IN_SYNC)
+        self.assertEqual(sm.advance(sm.ACCEPTED, sm.RECONCILE, to=sm.ACCEPTED), sm.ACCEPTED)
+
+    def test_no_clobber_of_owned_rows_is_enforced(self):
+        # The bug the duplicated `if status not in WRITE_PATH` idiom guards against:
+        # a reconcile must not pull an owned row back to 'imported'.
+        with self.assertRaises(sm.IllegalTransition):
+            sm.advance(sm.ACCEPTED, sm.RECONCILE, to=sm.IMPORTED)
+        with self.assertRaises(sm.IllegalTransition):
+            sm.advance(sm.IN_SYNC, sm.RECONCILE, to=sm.IMPORTED)
+
+    def test_apply_only_from_accepted(self):
+        with self.assertRaises(sm.IllegalTransition):
+            sm.advance(sm.IMPORTED, sm.APPLY)
+        with self.assertRaises(sm.IllegalTransition):
+            sm.advance(sm.IN_SYNC, sm.APPLY)
+
+    def test_unknown_event_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            sm.advance(sm.IMPORTED, "frobnicate")
+
+    def test_unknown_state_raises(self):
+        with self.assertRaises(sm.IllegalTransition):
+            sm.advance("bogus", sm.ACCEPT)
+
+    def test_engine_accepts_unimplemented_gap_edges(self):
+        # advance works over the INTENDED machine, so step 4 only has to start
+        # *calling* these — no engine change.
+        self.assertEqual(sm.advance(sm.DEPLOYING, sm.APPLY_ERR), sm.APPLY_FAILED)
+        self.assertEqual(sm.advance(sm.IMPORTED, sm.RECONCILE_ERROR), sm.ERROR)
+
+    def test_can_mirrors_advance_legality(self):
+        self.assertTrue(sm.can(sm.APPLY, sm.ACCEPTED))
+        self.assertTrue(sm.can(sm.APPLY, sm.ACCEPTED, to=sm.DEPLOYING))
+        self.assertFalse(sm.can(sm.APPLY, sm.IMPORTED))
+        self.assertFalse(sm.can(sm.RECONCILE, sm.ACCEPTED, to=sm.IMPORTED))
+
+    def test_advance_only_ever_returns_declared_states(self):
+        # Property: every legal (event, src[, to]) result is a canonical state.
+        for t in sm.TRANSITIONS:
+            result = sm.advance(t.src, t.event, to=t.dst)
+            self.assertIn(result, sm.STATES)
+            self.assertEqual(result, t.dst)
