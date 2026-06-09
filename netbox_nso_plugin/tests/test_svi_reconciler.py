@@ -117,6 +117,15 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
 
         self.assertEqual(NSOSVIState.objects.get(interface__name="Vlan100").status, "accepted")
 
+    def test_deploying_settles_in_sync_on_reconcile(self):
+        """A 'deploying' SVI (Apply in flight) settles to in_sync once re-reported by the device."""
+        from netbox_nso_plugin.models import NSOSVIState
+        from netbox_nso_plugin.svi_reconciler import reconcile_svi
+
+        self._state(name="Vlan100", vid=100, status="deploying")
+        reconcile_svi(self.device, {"interfaces": [{"interface_name": "Vlan100", "vlan_id": 100, "type": "svi"}]})
+        self.assertEqual(NSOSVIState.objects.get(interface__name="Vlan100").status, "in_sync")
+
     def test_push_builds_owned_snapshot(self):
         from unittest.mock import patch
 

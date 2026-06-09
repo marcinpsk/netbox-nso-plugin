@@ -148,3 +148,19 @@ class TestVlanWritePath(IntentPushResetMixin, TestCase):
         assert resp.status_code == 302
         state.refresh_from_db()
         assert state.status == "accepted" and state.accepted_at is not None
+
+    def test_owned_settles_in_sync_when_device_matches(self):
+        """An accepted VLAN whose device name now matches NetBox → in_sync (apply landed)."""
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+
+        self._state(vid=2213, name="FW-01", status="accepted")
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 2213, "name": "FW-01"}]})
+        assert NSOVLANState.objects.get(vlan__vid=2213).status == "in_sync"
+
+    def test_owned_stays_accepted_when_device_differs(self):
+        """An accepted VLAN whose device name still differs stays pending (accepted)."""
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+
+        self._state(vid=2300, name="NEW", status="accepted")
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 2300, "name": "OLD"}]})
+        assert NSOVLANState.objects.get(vlan__vid=2300).status == "accepted"

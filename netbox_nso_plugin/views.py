@@ -706,6 +706,30 @@ _ACTION_LABELS = {
 }
 
 
+def _prepare_apply(mgmt):
+    """Pre-Apply bookkeeping for one device's single Apply.
+
+    LACP + switchport are owned in NetBox (not mirrored as adapter intent), so
+    force-push their snapshots now. Then move owned 'accepted' overlays →
+    'deploying' so they read as "applying" and settle to 'in_sync' on the next
+    reconcile once the device reflects them (VLAN value-aware; SVI/subif/BFD when
+    re-reported). ``.update()`` avoids firing the per-row push signal.
+    """
+    from .signals import _push_lacp_intent_for_device, _push_switchport_intent_for_device
+
+    for push in (_push_lacp_intent_for_device, _push_switchport_intent_for_device):
+        try:
+            push(mgmt.device_id, mgmt.adapter_device_id, force=True)
+        except Exception as exc:  # noqa: BLE001 — one scope's failure must not block the rest
+            logger.warning("Apply push failed for device %s: %s", mgmt.device_id, exc)
+
+    for model in (NSOVLANState, NSOSVIState, NSOSubinterfaceState, NSOBFDInterfaceState):
+        try:
+            model.objects.filter(management=mgmt, status="accepted").update(status="deploying")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Apply deploying-mark failed for device %s: %s", mgmt.device_id, exc)
+
+
 class NSODeviceActionView(LoginRequiredMixin, View):
     """Trigger an adapter action (sync / detect-drift / connect) via POST."""
 
@@ -742,13 +766,7 @@ class NSODeviceActionView(LoginRequiredMixin, View):
         # switchport snapshots, which are owned in NetBox rather than mirrored in the
         # adapter. Accept itself only marks rows owned (no immediate device write).
         if action == "apply":
-            from .signals import _push_lacp_intent_for_device, _push_switchport_intent_for_device
-
-            for push in (_push_lacp_intent_for_device, _push_switchport_intent_for_device):
-                try:
-                    push(mgmt.device_id, mgmt.adapter_device_id, force=True)
-                except Exception as exc:  # noqa: BLE001 — one scope's failure must not block the rest
-                    logger.warning("Apply push failed for device %s: %s", mgmt.device_id, exc)
+            _prepare_apply(mgmt)
 
         try:
             result = action_fn(mgmt.adapter_device_id)

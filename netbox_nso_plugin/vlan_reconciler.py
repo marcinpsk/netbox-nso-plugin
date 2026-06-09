@@ -54,11 +54,16 @@ def reconcile_vlan_database(device, payload: dict) -> list:
         state, _ = NSOVLANState.objects.get_or_create(management=management, vlan=vlan)
         state.last_sync_at = now
         state.device_name = name  # mirror the device value for drift display
-        # Clobber-safe drift: compare the LIVE NetBox name against the device value.
-        # Import seeds them equal, so a later mismatch is an operator rename (or a
-        # device-side rename) → surface it as drift instead of reverting it.
-        if state.status not in _VLAN_WRITE_PATH_STATUSES:
-            state.status = "changed" if (name and vlan.name != name) else "imported"
+        # Value-aware lifecycle (NetBox name vs device name):
+        #  - owned (accepted/deploying/in_sync): in_sync once the device reflects the
+        #    NetBox name (apply succeeded); else 'accepted' = still pending apply.
+        #  - unowned: 'changed' when the device differs (operator/device rename),
+        #    else 'imported'. Import seeds the two equal, so a mismatch is real drift.
+        matches = bool(name) and vlan.name == name
+        if state.status in _VLAN_WRITE_PATH_STATUSES:
+            state.status = "in_sync" if matches else "accepted"
+        else:
+            state.status = "imported" if matches or not name else "changed"
         state.save()
         rows.append(state)
 
