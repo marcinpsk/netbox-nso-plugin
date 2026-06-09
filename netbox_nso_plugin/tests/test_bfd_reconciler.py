@@ -5,6 +5,8 @@
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
 from django.test import TestCase
 
+from .mixins import IntentPushResetMixin
+
 
 def _make_device(suffix="bfd"):
     mfg, _ = Manufacturer.objects.get_or_create(name=f"BfdMfg{suffix}", slug=f"bfdmfg{suffix}")
@@ -90,3 +92,99 @@ class TestReconcileBfd(TestCase):
 
         reconcile_bfd(self.device, [self._entry("ae99")])  # not a NetBox interface
         self.assertEqual(BFDInterface.objects.filter(interface__device=self.device).count(), 0)
+
+
+class TestBfdWritePath(IntentPushResetMixin, TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+        cls.device = _make_device("wp")
+        cls.iface = Interface.objects.create(device=cls.device, name="Port-channel1", type="lag")
+        cls.instance = NSOInstance.objects.create(name="nso-bwp", adapter_instance_id="nso-bwp")
+        cls.management = NSODeviceManagement.objects.create(
+            device=cls.device, nso_instance=cls.instance, nso_device_name="bfd-router-wp", adapter_device_id=88
+        )
+
+    def test_reconcile_creates_overlay_imported(self):
+        from netbox_nso_plugin.bfd_reconciler import reconcile_bfd
+        from netbox_nso_plugin.models import NSOBFDInterfaceState
+
+        reconcile_bfd(
+            self.device,
+            [
+                {
+                    "interface_name": "Port-channel1",
+                    "micro_bfd": True,
+                    "enabled": True,
+                    "min_tx": 300,
+                    "min_rx": 300,
+                    "multiplier": 3,
+                },
+            ],
+        )
+        st = NSOBFDInterfaceState.objects.get(management=self.management, interface=self.iface)
+        assert st.status == "imported" and st.min_tx == 300 and st.multiplier == 3 and st.micro_bfd is True
+
+    def test_reconcile_preserves_owned_status(self):
+        from netbox_nso_plugin.bfd_reconciler import reconcile_bfd
+        from netbox_nso_plugin.models import NSOBFDInterfaceState
+
+        NSOBFDInterfaceState.objects.create(
+            management=self.management, interface=self.iface, min_tx=300, min_rx=300, multiplier=3, status="accepted"
+        )
+        reconcile_bfd(
+            self.device,
+            [
+                {"interface_name": "Port-channel1", "micro_bfd": True, "min_tx": 300, "min_rx": 300, "multiplier": 3},
+            ],
+        )
+        assert NSOBFDInterfaceState.objects.get(interface=self.iface).status == "accepted"
+
+    def test_push_builds_owned_snapshot(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin.models import NSOBFDInterfaceState
+        from netbox_nso_plugin.signals import _push_bfd_intent_for_device, reset_intent_push_state
+
+        NSOBFDInterfaceState.objects.create(
+            management=self.management,
+            interface=self.iface,
+            min_tx=300,
+            min_rx=300,
+            multiplier=3,
+            micro_bfd=True,
+            status="accepted",
+        )
+        ge = Interface.objects.create(device=self.device, name="Gi9/9", type="1000base-t")
+        NSOBFDInterfaceState.objects.create(
+            management=self.management,
+            interface=ge,
+            min_tx=100,
+            status="imported",  # not owned → excluded
+        )
+        reset_intent_push_state()
+        with patch("netbox_nso_plugin.adapter_client.put_bfd_intent") as mock_put:
+            _push_bfd_intent_for_device(self.device.pk, 88)
+        ifaces = mock_put.call_args[0][1]
+        assert [i["interface_name"] for i in ifaces] == ["Port-channel1"]
+        assert ifaces[0]["min_tx"] == 300 and ifaces[0]["multiplier"] == 3 and ifaces[0]["micro_bfd"] is True
+
+    def test_accept_marks_owned(self):
+        from unittest.mock import patch
+
+        from django.contrib.auth import get_user_model
+
+        from netbox_nso_plugin.models import NSOBFDInterfaceState
+
+        state = NSOBFDInterfaceState.objects.create(
+            management=self.management, interface=self.iface, min_tx=300, min_rx=300, multiplier=3, status="conflict"
+        )
+        User = get_user_model()
+        admin = User.objects.create_superuser(username="bfd-admin", password="pw", email="b@x.y")  # noqa: S106
+        self.client.force_login(admin)
+        with patch("netbox_nso_plugin.adapter_client.put_bfd_intent"):
+            resp = self.client.post(f"/plugins/nso/bfd/state/{state.pk}/accept/")
+        assert resp.status_code == 302
+        state.refresh_from_db()
+        assert state.status == "accepted" and state.accepted_at is not None

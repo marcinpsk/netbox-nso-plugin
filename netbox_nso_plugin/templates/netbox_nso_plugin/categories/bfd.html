@@ -1,30 +1,33 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
-{# Lazy-loaded fragment: BFD category (read-only — per-interface BFD sessions). #}
+{# Lazy-loaded fragment: per-interface BFD. Accept = NetBox owns the BFD timers; #}
+{# pushed to the device on Apply via the bfd-reconciler. #}
 {% include "netbox_nso_plugin/categories/_adapter_error.html" %}
 
-{% if bfd_interfaces %}
-  <p class="text-muted small mb-2">BFD is an interface property; protocols (BGP/IS-IS/OSPF) just enable it. Timers come from a shared profile reused network-wide.</p>
+{% if bfd_states %}
+  <p class="text-muted small mb-2">BFD is an interface property; protocols (BGP/IS-IS/OSPF) just enable it. Accept to make NetBox the source of truth for the timers; Apply writes them to the device.</p>
   <div id="flt-bfd">
-  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-bfd" placeholder="Filter by interface / profile…" text_only=True %}
+  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-bfd" placeholder="Filter by interface…" show_status=True %}
   <div class="table-responsive mb-3">
     <table class="table table-sm table-hover mb-0">
       <thead>
-        <tr><th>Interface</th><th>Mode</th><th>Profile</th><th>Min TX</th><th>Min RX</th><th>Multiplier</th><th>Enabled</th></tr>
+        <tr><th>Interface</th><th>Mode</th><th>Min TX</th><th>Min RX</th><th>Multiplier</th><th>Status</th><th></th></tr>
       </thead>
       <tbody>
-        {% for b in bfd_interfaces %}
-        <tr>
+        {% for b in bfd_states %}
+        <tr data-status="{{ b.status }}" data-owned="{{ b.accepted_at|yesno:'true,false' }}">
           <td><a href="{{ b.interface.get_absolute_url }}">{{ b.interface.name }}</a></td>
           <td>
             {% if b.micro_bfd %}<span class="badge text-bg-info" title="Per-LAG-member, RFC 7130">micro-BFD</span>
             {% else %}<span class="badge text-bg-light border">normal</span>{% endif %}
           </td>
-          <td>{% if b.bfd_profile %}<a href="{{ b.bfd_profile.get_absolute_url }}">{{ b.bfd_profile.name }}</a>{% else %}<span class="text-muted">—</span>{% endif %}</td>
-          <td>{{ b.bfd_profile.min_tx_int|default:"—" }}</td>
-          <td>{{ b.bfd_profile.min_rx_int|default:"—" }}</td>
-          <td>{{ b.bfd_profile.multiplier|default:"—" }}</td>
-          <td>{% if b.enabled %}<span class="badge text-bg-success">yes</span>{% else %}<span class="badge text-bg-warning text-dark">no</span>{% endif %}</td>
+          <td>{{ b.min_tx|default:"—" }}</td>
+          <td>{{ b.min_rx|default:"—" }}</td>
+          <td>{{ b.multiplier|default:"—" }}</td>
+          <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=b.status %}</td>
+          <td>
+            {% url 'plugins:netbox_nso_plugin:bfd_accept' pk=b.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=b.status title="Make NetBox the source of truth for this interface's BFD timers (written to the device on Apply)" %}
+          </td>
         </tr>
         {% endfor %}
       </tbody>

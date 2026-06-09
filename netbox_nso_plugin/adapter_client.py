@@ -231,6 +231,21 @@ def get_subinterface(adapter_device_id: int) -> dict:
     return _request("GET", f"/api/v1/devices/{adapter_device_id}/subinterface")
 
 
+def put_bfd_intent(adapter_device_id, interfaces):
+    """PUT /api/v1/devices/{id}/bfd-intent — push full per-interface BFD intent.
+
+    ``interfaces`` is a list of dicts:
+      [{"interface_name": "X", "min_tx": 300, "min_rx": 300, "multiplier": 3,
+        "micro_bfd": false, "accepted_at": "...Z"}, ...]
+    Empty list clears all BFD intent for the device. Returns {"device_id": ..., "count": N}.
+    """
+    return _request(
+        "PUT",
+        f"/api/v1/devices/{adapter_device_id}/bfd-intent",
+        json={"interfaces": interfaces},
+    )
+
+
 def put_vlan_intent(adapter_device_id, vlans):
     """PUT /api/v1/devices/{id}/vlan-intent — push full VLAN-database intent (M34 write).
 

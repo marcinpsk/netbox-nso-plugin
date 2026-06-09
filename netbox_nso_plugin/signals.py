@@ -838,6 +838,58 @@ def _on_vlan_state_save(sender, instance, **kwargs):
     )
 
 
+def _push_bfd_intent_for_device(device_id, adapter_device_id):
+    """Build and push the full owned per-interface BFD intent snapshot for a device.
+
+    Store-only (deferred): the single device Apply commits via the bfd-reconciler.
+    Only owned rows (accepted/deploying/in_sync) are included.
+    """
+    from . import adapter_client as client
+    from .models import _VLAN_WRITE_PATH_STATUSES, NSOBFDInterfaceState
+
+    interfaces = []
+    for row in NSOBFDInterfaceState.objects.filter(
+        management__device_id=device_id,
+        status__in=_VLAN_WRITE_PATH_STATUSES,
+    ).select_related("interface"):
+        interfaces.append(
+            {
+                "interface_name": row.interface.name,
+                "min_tx": row.min_tx,
+                "min_rx": row.min_rx,
+                "multiplier": row.multiplier,
+                "micro_bfd": bool(row.micro_bfd),
+            }
+        )
+
+    _push_changed(
+        (device_id, "bfd"),
+        interfaces,
+        lambda: client.put_bfd_intent(adapter_device_id, interfaces),
+    )
+
+
+@_skip_on_render
+def _on_bfd_state_save(sender, instance, **kwargs):
+    """Push BFD intent whenever an NSOBFDInterfaceState row is saved (accept triggers push)."""
+    from .models import NSODeviceManagement
+
+    try:
+        mgmt = instance.management
+    except NSODeviceManagement.DoesNotExist:
+        return
+
+    if mgmt.adapter_device_id is None:
+        return
+
+    device_id = mgmt.device_id
+    adapter_device_id = mgmt.adapter_device_id
+    _schedule_intent_push(
+        (device_id, "bfd"),
+        lambda: _push_bfd_intent_for_device(device_id, adapter_device_id),
+    )
+
+
 def _on_ip_address_change(sender, instance, **kwargs):
     """Push IP intent when an IPAddress assigned to a managed interface changes."""
     from dcim.models import Interface as _Interface
@@ -1708,6 +1760,15 @@ def _connect_g_activated():  # pragma: no cover
         _on_vlan_state_save,
         sender=NSOVLANState,
         dispatch_uid="nso_plugin_vlan_state_post_save",
+    )
+
+    # BFD state → intent push (BFD write path)
+    from .models import NSOBFDInterfaceState
+
+    post_save.connect(
+        _on_bfd_state_save,
+        sender=NSOBFDInterfaceState,
+        dispatch_uid="nso_plugin_bfd_state_post_save",
     )
 
     # Static route state → intent push (M10 B3)

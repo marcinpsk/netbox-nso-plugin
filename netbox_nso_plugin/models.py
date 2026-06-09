@@ -1573,3 +1573,42 @@ class NSOSubinterfaceState(NetBoxModel):
         from django.urls import reverse
 
         return reverse("dcim:device_nso", kwargs={"pk": self.management.device_id})
+
+
+class NSOBFDInterfaceState(NetBoxModel):
+    """Per-interface BFD compliance overlay (write path).
+
+    BFD timers themselves are modelled in netbox_routing (BFDInterface/BFDProfile);
+    this overlay carries the NSO-observed timers + status/accept marker so an
+    operator can adopt and push BFD back to the device (bfd-reconciler). One row
+    per (management, interface).
+    """
+
+    management = models.ForeignKey(to="NSODeviceManagement", on_delete=models.CASCADE, related_name="bfd_states")
+    interface = models.ForeignKey(to="dcim.Interface", on_delete=models.CASCADE, related_name="nso_bfd_states")
+    min_tx = models.PositiveIntegerField(null=True, blank=True, help_text="Desired min TX interval (ms).")
+    min_rx = models.PositiveIntegerField(null=True, blank=True, help_text="Required min RX interval (ms).")
+    multiplier = models.PositiveIntegerField(null=True, blank=True, help_text="Detection multiplier.")
+    micro_bfd = models.BooleanField(default=False, help_text="RFC 7130 per-LAG-member BFD.")
+    status = models.CharField(max_length=32, choices=_VLAN_STATUS_CHOICES, default="unknown")
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(
+        null=True, blank=True, help_text="When an operator accepted this BFD config (NetBox owns it)."
+    )
+    last_apply_at = models.DateTimeField(null=True, blank=True)
+    last_apply_error = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["management", "interface"]
+        unique_together = [("management", "interface")]
+        verbose_name = "NSO BFD State"
+        verbose_name_plural = "NSO BFD States"
+
+    def __str__(self):
+        return f"{self.management} / bfd:{self.interface} [{self.status}]"
+
+    def get_absolute_url(self):
+        """Return the device NSO tab URL (the overlay's detail; used by edit redirects)."""
+        from django.urls import reverse
+
+        return reverse("dcim:device_nso", kwargs={"pk": self.management.device_id})

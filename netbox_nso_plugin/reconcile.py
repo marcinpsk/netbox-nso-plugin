@@ -75,6 +75,11 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
     # protocols that ride it (BGP/IS-IS/OSPF) are managed.
     if mgmt.manage_bgp or mgmt.manage_isis or mgmt.manage_ospf:
         ctx["bfd_interfaces"] = reconcile_bfd(device, client.get_bfd(dev_id).get("interfaces", []))
+        from .models import NSOBFDInterfaceState
+
+        ctx["bfd_states"] = list(
+            NSOBFDInterfaceState.objects.filter(management__device=device).select_related("interface")
+        )
     # Redistribution runs LAST: its destination is a netbox_routing OSPFInstance /
     # ISISInstance / BGPAddressFamily created by the protocol reconciles above, so
     # those must run first (BGP especially — BGP-dest redistribution needs its AF).
@@ -232,8 +237,12 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
             ctx["bgp_peers"] = _reconcile_bgp_config(device, client.get_bgp_config(dev_id))
         elif key == "bfd":
             from .bfd_reconciler import reconcile_bfd
+            from .models import NSOBFDInterfaceState
 
             ctx["bfd_interfaces"] = reconcile_bfd(device, client.get_bfd(dev_id).get("interfaces", []))
+            ctx["bfd_states"] = list(
+                NSOBFDInterfaceState.objects.filter(management__device=device).select_related("interface")
+            )
         elif key == "route_policy":
             ctx["route_policy_states"] = reconcile_route_policy(device, client.get_route_policy(dev_id))
         elif key == "redistribution":

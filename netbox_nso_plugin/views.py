@@ -34,6 +34,7 @@ from .forms import (
 )
 from .models import (
     AdapterConnection,
+    NSOBFDInterfaceState,
     NSOBGPPeerState,
     NSODeviceManagement,
     NSOInstance,
@@ -1138,6 +1139,7 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
             NSOSVIState,
             NSOSubinterfaceState,
             NSOVLANState,
+            NSOBFDInterfaceState,
             NSOL2SapState,
             NSOLACPBundleState,
             NSOSwitchportState,
@@ -1491,6 +1493,10 @@ class NSOSubinterfaceStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
 
 class NSOVLANStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOVLANState
+
+
+class NSOBFDInterfaceStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
+    model_class = NSOBFDInterfaceState
 
 
 class NSOSnmpCommunityStateEditView(generic.ObjectEditView):  # noqa: D101

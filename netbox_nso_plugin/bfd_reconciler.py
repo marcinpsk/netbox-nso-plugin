@@ -52,10 +52,16 @@ def reconcile_bfd(device, interfaces: list) -> list:
         return []
 
     from dcim.models import Interface
+    from django.utils import timezone
+
+    from .models import _VLAN_WRITE_PATH_STATUSES, NSOBFDInterfaceState, NSODeviceManagement
 
     iface_map = {i.name: i for i in Interface.objects.filter(device=device)}
     profiles: dict = {}
     seen_iface_ids: set = set()
+    mgmt = NSODeviceManagement.objects.filter(device=device).first()
+    now = timezone.now()
+    seen_state_iface_ids: set = set()
 
     for entry in interfaces or []:
         name = entry.get("interface_name") or ""
@@ -89,7 +95,23 @@ def reconcile_bfd(device, interfaces: list) -> list:
                 obj.save()
         seen_iface_ids.add(iface.pk)
 
+        # Write-path overlay: mirror the device-observed timers + status so an
+        # operator can accept/own and push BFD back (preserve owned statuses).
+        if mgmt is not None:
+            state, _ = NSOBFDInterfaceState.objects.get_or_create(management=mgmt, interface=iface)
+            state.min_tx = entry.get("min_tx")
+            state.min_rx = entry.get("min_rx")
+            state.multiplier = entry.get("multiplier")
+            state.micro_bfd = bool(entry.get("micro_bfd", False))
+            if state.status not in _VLAN_WRITE_PATH_STATUSES:
+                state.status = "imported"
+            state.last_sync_at = now
+            state.save()
+            seen_state_iface_ids.add(iface.pk)
+
     # Prune BFDInterface rows for this device's interfaces no longer reporting BFD.
     BFDInterface.objects.filter(interface__device=device).exclude(interface_id__in=seen_iface_ids).delete()
+    if mgmt is not None:
+        NSOBFDInterfaceState.objects.filter(management=mgmt).exclude(interface_id__in=seen_state_iface_ids).delete()
 
     return list(BFDInterface.objects.filter(interface__device=device).select_related("interface", "bfd_profile"))
