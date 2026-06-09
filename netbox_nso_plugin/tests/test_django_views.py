@@ -1100,6 +1100,28 @@ class TestNSOApplyPreviewView(ViewTestBase):
         data = json.loads(self.client.get(url).content)
         self.assertEqual(data["total"], 0)
 
+    def test_preview_itemises_non_interface_changes(self):
+        """A pending overlay (e.g. VLAN) is listed with category+item+detail, not just counted."""
+        import json
+
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
+
+        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="in_sync")  # no interface changes
+        vlan = VLAN.objects.create(group=_device_vlan_group(self.device), vid=2213, name="FW_uplink_cpms-01")
+        NSOVLANState.objects.create(management=self.mgmt, vlan=vlan, device_name="OLD", status="accepted")
+
+        url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
+        data = json.loads(self.client.get(url).content)
+        self.assertEqual(data["total"], 1)
+        self.assertEqual(len(data["routing_changes"]), 1)
+        rc = data["routing_changes"][0]
+        self.assertEqual(rc["category"], "VLAN")
+        self.assertEqual(rc["item"], "VLAN 2213")
+        self.assertEqual(rc["detail"], "name FW_uplink_cpms-01")
+
 
 class TestNSOBulkAcceptView(ViewTestBase):
     """Tests for NSOBulkAcceptView."""

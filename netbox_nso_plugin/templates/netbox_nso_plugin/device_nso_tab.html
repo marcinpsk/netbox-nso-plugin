@@ -293,7 +293,13 @@
         });
         h += '</tbody></table></div>';
       }
-      if (d.routing) { h += '<p class="mb-0">Plus <strong>' + d.routing + '</strong> pending routing change(s).</p>'; }
+      if (d.routing_changes && d.routing_changes.length) {
+        h += '<div class="table-responsive"><table class="table table-sm align-middle"><thead><tr><th>Category</th><th>Item</th><th>Change</th><th>State</th></tr></thead><tbody>';
+        d.routing_changes.forEach(function (c) {
+          h += '<tr><td>' + esc(c.category) + '</td><td>' + esc(c.item) + '</td><td><strong>' + esc(c.detail) + '</strong></td><td><span class="text-muted small">' + esc(c.status) + '</span></td></tr>';
+        });
+        h += '</tbody></table></div>';
+      }
       return h;
     }
 

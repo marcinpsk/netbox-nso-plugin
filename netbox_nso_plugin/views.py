@@ -1116,41 +1116,92 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
                 }
             )
 
-        # Routing + L2 + SNMP/logging pending counts (overlays don't carry a simple
-        # value pair to diff). LACP/switchport/SNMP/logging are all committed by this
-        # same single Apply.
+        # Every other category is an NSO*State overlay committed by this same single
+        # Apply. Itemise each pending row (category + item + detail) so the operator
+        # sees exactly what will be pushed — not just a count.
         from .models import NSOLACPBundleState, NSOSwitchportState
 
-        routing = 0
-        for model in (
-            NSOStaticRouteState,
-            NSOISISInterfaceState,
-            NSOISISInstanceState,
-            NSOBGPPeerState,
-            NSORoutePolicyState,
-            NSOOSPFInstanceState,
-            NSOOSPFInterfaceState,
-            NSORedistributionState,
-            NSOSnmpCommunityState,
-            NSOSnmpV3UserState,
-            NSOSnmpHostState,
-            NSOSnmpSystemInfoState,
-            NSOLoggingHostState,
-            NSOSVIState,
-            NSOSubinterfaceState,
-            NSOVLANState,
-            NSOBFDInterfaceState,
-            NSOL2SapState,
-            NSOLACPBundleState,
-            NSOSwitchportState,
-        ):
-            if mgmt is not None:
-                routing += model.objects.filter(
-                    management=mgmt, status__in=("accepted", "apply_failed", "drifted")
-                ).count()
+        def _iface(r):
+            try:
+                return r.interface.name
+            except Exception:
+                return "—"
+
+        def _vlan_item(r):
+            return f"VLAN {r.vlan.vid}" if getattr(r, "vlan", None) else "VLAN"
+
+        # (Model, category label, item fn, detail fn) — all read defensively.
+        preview_specs = [
+            (NSOVLANState, "VLAN", _vlan_item, lambda r: f"name {r.vlan.name}" if r.vlan else ""),
+            (NSOSwitchportState, "Switchport", _iface, lambda r: r.mode or ""),
+            (
+                NSOSVIState,
+                "SVI / IRB",
+                _iface,
+                lambda r: f"VLAN {r.vlan.vid}" if getattr(r, "vlan", None) else (r.vrf or ""),
+            ),
+            (NSOSubinterfaceState, "Subinterface", _iface, lambda r: f"dot1q {r.dot1q_vlan}" if r.dot1q_vlan else ""),
+            (
+                NSOBFDInterfaceState,
+                "BFD",
+                _iface,
+                lambda r: f"tx {r.min_tx or '?'} / rx {r.min_rx or '?'} x{r.multiplier or '?'}",
+            ),
+            (NSOLACPBundleState, "LACP", _iface, lambda r: f"lag {r.lag_id}" if r.lag_id else ""),
+            (
+                NSOStaticRouteState,
+                "Static route",
+                lambda r: r.nso_prefix or "",
+                lambda r: f"→ {r.nso_next_hop}" if r.nso_next_hop else "",
+            ),
+            (NSOISISInterfaceState, "IS-IS interface", _iface, lambda r: ""),
+            (NSOISISInstanceState, "IS-IS", lambda r: r.process_tag or "instance", lambda r: r.net or ""),
+            (NSOOSPFInterfaceState, "OSPF interface", _iface, lambda r: ""),
+            (NSOOSPFInstanceState, "OSPF", lambda r: f"process {r.process_id}", lambda r: r.router_id or ""),
+            (
+                NSOBGPPeerState,
+                "BGP peer",
+                lambda r: r.peer_address_str or "",
+                lambda r: f"AS {r.remote_as_str}" if r.remote_as_str else "",
+            ),
+            (NSORoutePolicyState, "Route policy", lambda r: r.object_name or "", lambda r: r.family or ""),
+            (
+                NSORedistributionState,
+                "Redistribution",
+                lambda r: f"{r.source_protocol} → {r.dest_protocol}",
+                lambda r: r.route_map or "",
+            ),
+            (NSOSnmpCommunityState, "SNMP community", lambda r: "community", lambda r: r.access or ""),
+            (NSOSnmpV3UserState, "SNMP v3 user", lambda r: r.username or "user", lambda r: ""),
+            (NSOSnmpHostState, "SNMP host", lambda r: r.address or "", lambda r: f"v{r.version}" if r.version else ""),
+            (NSOSnmpSystemInfoState, "SNMP system", lambda r: "system-info", lambda r: ""),
+            (NSOLoggingHostState, "Logging host", lambda r: r.address or "", lambda r: r.severity or ""),
+            (NSOL2SapState, "L2 SAP", lambda r: r.sap_id or "", lambda r: r.service_name or ""),
+        ]
+
+        routing_changes = []
+        if mgmt is not None:
+            for model, label, item_fn, detail_fn in preview_specs:
+                rows = model.objects.filter(management=mgmt, status__in=("accepted", "apply_failed", "drifted"))
+                for r in rows:
+                    try:
+                        item = item_fn(r)
+                    except Exception:
+                        item = "—"
+                    try:
+                        detail = detail_fn(r)
+                    except Exception:
+                        detail = ""
+                    routing_changes.append({"category": label, "item": item, "detail": detail, "status": r.status})
 
         return JsonResponse(
-            {"auto_apply": auto_apply, "changes": changes, "routing": routing, "total": len(changes) + routing}
+            {
+                "auto_apply": auto_apply,
+                "changes": changes,
+                "routing_changes": routing_changes,
+                "routing": len(routing_changes),
+                "total": len(changes) + len(routing_changes),
+            }
         )
 
 
