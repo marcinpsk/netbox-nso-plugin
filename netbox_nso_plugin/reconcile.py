@@ -198,6 +198,10 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
             # VLAN DB first so switchport vid lookups resolve in the per-device group.
             reconcile_vlan_database(device, client.get_vlan_database(dev_id))
             ctx["switchport_states"] = reconcile_switchport(device, client.get_switchport(dev_id))
+        elif key == "svi":
+            from .svi_reconciler import reconcile_svi
+
+            ctx["svi_states"] = reconcile_svi(device, client.get_svi(dev_id))
         elif key == "snmp":
             ctx["snmp_data"] = _reconcile_snmp_config(device, client.get_snmp_config(dev_id))
         elif key == "logging":

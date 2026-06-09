@@ -128,6 +128,7 @@ _CATEGORIES = [
     ("lacp", "LACP", "link-variant", "manage_interfaces"),
     ("vlan", "VLANs", "format-list-numbered", "manage_interfaces"),
     ("switchport", "Switchports", "ethernet-cable", "manage_interfaces"),
+    ("svi", "SVIs / IRBs", "ip-network", "manage_interfaces"),
     ("static", "Static Routes", "sign-direction", "manage_static"),
     ("isis", "IS-IS", "lan", "manage_isis"),
     ("ospf", "OSPF", "lan", "manage_ospf"),
@@ -268,6 +269,10 @@ def _category_counts(key: str, device, mgmt) -> dict:  # noqa: C901
         from .models import NSOSwitchportState
 
         return _status_breakdown(NSOSwitchportState.objects.filter(management=mgmt))
+    if key == "svi":
+        from .models import NSOSVIState
+
+        return _status_breakdown(NSOSVIState.objects.filter(management=mgmt))
     return {"total": 0}
 
 

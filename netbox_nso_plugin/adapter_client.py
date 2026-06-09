@@ -534,6 +534,22 @@ def put_logging_intent(adapter_device_id, hosts):
     )
 
 
+def put_svi_intent(adapter_device_id, interfaces):
+    """PUT /api/v1/devices/{id}/svi-intent — push full SVI/IRB intent snapshot (M35).
+
+    ``interfaces`` is a list of dicts:
+      [{"interface_name": "Vlan100", "vlan_id": 100, "type": "svi", "vrf": "",
+        "accepted_at": "...Z"}, ...]
+    Empty list clears all SVI intent for the device.
+    Returns {"device_id": ..., "count": N}.
+    """
+    return _request(
+        "PUT",
+        f"/api/v1/devices/{adapter_device_id}/svi-intent",
+        json={"interfaces": interfaces},
+    )
+
+
 def apply_lag_config(adapter_device_id, bundles):
     """POST /api/v1/devices/{id}/lag-config/apply — push + apply full LACP bundle intent (M33).
 

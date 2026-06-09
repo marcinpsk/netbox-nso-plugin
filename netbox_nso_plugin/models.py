@@ -1496,8 +1496,14 @@ class NSOSVIState(NetBoxModel):
         to="ipam.VLAN", null=True, blank=True, on_delete=models.SET_NULL, related_name="nso_svi_states"
     )
     svi_type = models.CharField(max_length=8, default="svi", help_text="svi (IOS) or irb (Junos).")
+    vrf = models.CharField(max_length=128, blank=True, default="", help_text="VRF/routing-instance; empty for global.")
     status = models.CharField(max_length=32, choices=_VLAN_STATUS_CHOICES, default="unknown")
     last_sync_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(
+        null=True, blank=True, help_text="When an operator accepted this SVI (NetBox owns it)."
+    )
+    last_apply_at = models.DateTimeField(null=True, blank=True)
+    last_apply_error = models.TextField(blank=True, default="")
 
     class Meta:
         ordering = ["management", "interface"]

@@ -332,4 +332,9 @@ urlpatterns = [
         views.NSOLoggingHostStateAcceptView.as_view(),
         name="logging_accept_host",
     ),
+    path(
+        "svi/state/<int:pk>/accept/",
+        views.NSOSVIStateAcceptView.as_view(),
+        name="svi_accept",
+    ),
 ]

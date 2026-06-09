@@ -52,6 +52,7 @@ from .models import (
     NSOSnmpSystemInfoState,
     NSOSnmpV3UserState,
     NSOStaticRouteState,
+    NSOSVIState,
 )
 from .tables import (
     NSODeviceManagementTable,
@@ -192,6 +193,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
         "lacp": "netbox_nso_plugin/categories/lacp.html",
         "vlan": "netbox_nso_plugin/categories/vlan.html",
         "switchport": "netbox_nso_plugin/categories/switchport.html",
+        "svi": "netbox_nso_plugin/categories/svi.html",
         "static": "netbox_nso_plugin/categories/static.html",
         "isis": "netbox_nso_plugin/categories/isis.html",
         "ospf": "netbox_nso_plugin/categories/ospf.html",
@@ -1130,6 +1132,7 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
             NSOSnmpHostState,
             NSOSnmpSystemInfoState,
             NSOLoggingHostState,
+            NSOSVIState,
             NSOL2SapState,
             NSOLACPBundleState,
             NSOSwitchportState,
@@ -1471,6 +1474,10 @@ class NSOSnmpSystemInfoStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
 
 class NSOLoggingHostStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOLoggingHostState
+
+
+class NSOSVIStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
+    model_class = NSOSVIState
 
 
 class NSOSnmpCommunityStateEditView(generic.ObjectEditView):  # noqa: D101

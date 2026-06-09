@@ -43,7 +43,11 @@ def reconcile_svi(device, payload: dict) -> list:
         state, _ = NSOSVIState.objects.get_or_create(management=management, interface=iface)
         state.vlan = vlan
         state.svi_type = item.get("type") or "svi"
-        state.status = "in_sync"
+        state.vrf = item.get("vrf") or ""
+        # Never clobber operator-owned statuses (the write-path lifecycle); a fresh
+        # import lands as 'imported' (observed, not yet owned).
+        if state.status not in ("accepted", "deploying", "in_sync"):
+            state.status = "imported"
         state.last_sync_at = now
         state.save()
         rows.append(state)

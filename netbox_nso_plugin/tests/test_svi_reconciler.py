@@ -9,6 +9,8 @@ from django.test import TestCase
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOSVIState
 
+from .mixins import IntentPushResetMixin
+
 
 def _make_device(tag="m35"):
     mfg, _ = Manufacturer.objects.get_or_create(name=f"SMfg{tag}", slug=f"smfg{tag}")
@@ -43,7 +45,7 @@ class TestSviReconciler(TestCase):
         iface = Interface.objects.get(device=self.device, name="Vlan100")
         self.assertEqual(iface.type, "virtual")
         self.assertTrue(NSOSVIState.objects.filter(management=self.management, interface=iface).exists())
-        self.assertEqual(rows[0].status, "in_sync")
+        self.assertEqual(rows[0].status, "imported")
 
     def test_vlan_linked_when_present(self):
         from ipam.models import VLAN
@@ -82,3 +84,65 @@ class TestSviReconciler(TestCase):
         reconcile_svi(self.device, {"interfaces": [{"interface_name": "Vlan301", "vlan_id": 301, "type": "svi"}]})
         names = set(NSOSVIState.objects.filter(management=self.management).values_list("interface__name", flat=True))
         self.assertEqual(names, {"Vlan301"})
+
+
+class TestSviWritePath(IntentPushResetMixin, TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.device = _make_device("wp")
+        cls.instance = NSOInstance.objects.create(name="nso-wp", adapter_instance_id="nso-wp")
+        cls.management = NSODeviceManagement.objects.create(
+            device=cls.device, nso_instance=cls.instance, nso_device_name="svi-sw-wp", adapter_device_id=42
+        )
+
+    def _state(self, name="Vlan100", vid=100, status="imported"):
+        from dcim.models import Interface
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin.models import NSOSVIState
+        from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
+
+        iface = Interface.objects.create(device=self.device, name=name, type="virtual")
+        vlan = VLAN.objects.create(group=_device_vlan_group(self.device), vid=vid, name=f"V{vid}")
+        return NSOSVIState.objects.create(
+            management=self.management, interface=iface, vlan=vlan, svi_type="svi", vrf="MGMT", status=status
+        )
+
+    def test_reconcile_preserves_owned_status(self):
+        from netbox_nso_plugin.svi_reconciler import reconcile_svi
+
+        self._state(name="Vlan100", vid=100, status="accepted")
+        reconcile_svi(self.device, {"interfaces": [{"interface_name": "Vlan100", "vlan_id": 100, "type": "svi"}]})
+        from netbox_nso_plugin.models import NSOSVIState
+
+        self.assertEqual(NSOSVIState.objects.get(interface__name="Vlan100").status, "accepted")
+
+    def test_push_builds_owned_snapshot(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin.signals import _push_svi_intent_for_device, reset_intent_push_state
+
+        self._state(name="Vlan100", vid=100, status="accepted")
+        self._state(name="Vlan200", vid=200, status="imported")  # not owned → excluded
+        reset_intent_push_state()
+        with patch("netbox_nso_plugin.adapter_client.put_svi_intent") as mock_put:
+            _push_svi_intent_for_device(self.device.pk, 42)
+        mock_put.assert_called_once()
+        ifaces = mock_put.call_args[0][1]
+        assert [i["interface_name"] for i in ifaces] == ["Vlan100"]
+        assert ifaces[0]["vlan_id"] == 100 and ifaces[0]["vrf"] == "MGMT"
+
+    def test_accept_marks_owned(self):
+        from unittest.mock import patch
+
+        from django.contrib.auth import get_user_model
+
+        state = self._state(name="Vlan300", vid=300, status="conflict")
+        User = get_user_model()
+        admin = User.objects.create_superuser(username="svi-admin", password="pw", email="s@x.y")  # noqa: S106
+        self.client.force_login(admin)
+        with patch("netbox_nso_plugin.adapter_client.put_svi_intent"):
+            resp = self.client.post(f"/plugins/nso/svi/state/{state.pk}/accept/")
+        assert resp.status_code == 302
+        state.refresh_from_db()
+        assert state.status == "accepted" and state.accepted_at is not None

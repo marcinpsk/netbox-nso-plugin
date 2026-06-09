@@ -681,6 +681,60 @@ def _on_logging_state_save(sender, instance, **kwargs):
     )
 
 
+def _push_svi_intent_for_device(device_id, adapter_device_id):
+    """Build and push the full owned SVI/IRB intent snapshot for a device (M35).
+
+    Store-only (deferred): the single device Apply commits via the svi-reconciler.
+    Only owned rows (accepted/deploying/in_sync) are included.
+    """
+    from . import adapter_client as client
+    from .models import NSOSVIState
+
+    interfaces = []
+    for row in NSOSVIState.objects.filter(
+        management__device_id=device_id,
+        status__in=("accepted", "deploying", "in_sync"),
+    ).select_related("interface", "vlan"):
+        vid = row.vlan.vid if row.vlan else None
+        if vid is None:
+            continue  # the svi-reconciler keys on a VLAN id
+        interfaces.append(
+            {
+                "interface_name": row.interface.name,
+                "vlan_id": vid,
+                "type": row.svi_type or "svi",
+                "vrf": row.vrf or "",
+            }
+        )
+
+    _push_changed(
+        (device_id, "svi"),
+        interfaces,
+        lambda: client.put_svi_intent(adapter_device_id, interfaces),
+    )
+
+
+@_skip_on_render
+def _on_svi_state_save(sender, instance, **kwargs):
+    """Push SVI intent whenever an NSOSVIState row is saved (accept triggers push)."""
+    from .models import NSODeviceManagement
+
+    try:
+        mgmt = instance.management
+    except NSODeviceManagement.DoesNotExist:
+        return
+
+    if mgmt.adapter_device_id is None:
+        return
+
+    device_id = mgmt.device_id
+    adapter_device_id = mgmt.adapter_device_id
+    _schedule_intent_push(
+        (device_id, "svi"),
+        lambda: _push_svi_intent_for_device(device_id, adapter_device_id),
+    )
+
+
 def _on_ip_address_change(sender, instance, **kwargs):
     """Push IP intent when an IPAddress assigned to a managed interface changes."""
     from dcim.models import Interface as _Interface
@@ -1524,6 +1578,15 @@ def _connect_g_activated():  # pragma: no cover
         _on_logging_state_save,
         sender=NSOLoggingHostState,
         dispatch_uid="nso_plugin_logging_host_state_post_save",
+    )
+
+    # SVI/IRB state → intent push (M35 write path)
+    from .models import NSOSVIState
+
+    post_save.connect(
+        _on_svi_state_save,
+        sender=NSOSVIState,
+        dispatch_uid="nso_plugin_svi_state_post_save",
     )
 
     # Static route state → intent push (M10 B3)
