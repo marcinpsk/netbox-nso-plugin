@@ -408,13 +408,19 @@ class TestReconcileBgpConfig(TestCase):
         self.assertEqual(paf.routemap_in.name, "Arbor-IBGP-in")
         self.assertEqual(paf.routemap_out.name, "Arbor-IBGP-out")
 
-    def test_peer_group_template_af_edit_survives_resync(self):
-        """Clobber-safe templates: an operator edit to a peer-group AF policy is preserved."""
+    def test_peer_group_template_af_edit_surfaces_changed_and_survives(self):
+        """3-way templates: an operator edit to a peer-group AF policy drifts + is preserved.
+
+        Edit -> apply contract for the template overlay: the edit must (a) surface as
+        'changed' on NSOBGPPeerTemplateState, and (b) survive the next device sync
+        (device unchanged) instead of being reverted to the device value.
+        """
         self._make_mgmt()
 
         from netbox_routing.models import BGPPeerAddressFamily, BGPPeerTemplate, RouteMap
 
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.models import NSOBGPPeerTemplateState
 
         RouteMap.objects.create(name="Arbor-IBGP-in")
         operator_rm = RouteMap.objects.create(name="Operator-RM")
@@ -435,7 +441,79 @@ class TestReconcileBgpConfig(TestCase):
         # Re-sync with the original device data → the edit must NOT be clobbered.
         _reconcile_bgp_config(self.device, self._scope_with_peer_groups([pg]))
         paf.refresh_from_db()
-        self.assertEqual(paf.routemap_in_id, operator_rm.pk)
+        self.assertEqual(paf.routemap_in_id, operator_rm.pk)  # (b) edit preserved
+        state = NSOBGPPeerTemplateState.objects.get(management__device=self.device, template_name="Arbor-IBGP")
+        self.assertEqual(state.status, "changed")  # (a) surfaced as drift
+
+    def test_peer_group_template_device_change_auto_mirrors(self):
+        """3-way templates: device-side AF change with NetBox untouched → object auto-updated."""
+        self._make_mgmt()
+
+        from netbox_routing.models import BGPPeerAddressFamily, BGPPeerTemplate, RouteMap
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.models import NSOBGPPeerTemplateState
+
+        rm_a = RouteMap.objects.create(name="RM-A")
+        RouteMap.objects.create(name="RM-B")
+        pg_a = {"name": "PG", "remote_as": "65100", "address_families": [{"af": "ipv4-unicast", "routemap_in": "RM-A"}]}
+        _reconcile_bgp_config(self.device, self._scope_with_peer_groups([pg_a]))
+        tmpl = BGPPeerTemplate.objects.get(name="PG")
+        paf = BGPPeerAddressFamily.objects.get(
+            assigned_object_type__model="bgppeertemplate", assigned_object_id=tmpl.pk
+        )
+        self.assertEqual(paf.routemap_in_id, rm_a.pk)
+
+        # Device moves RM-A -> RM-B; NetBox never touched → auto-mirror.
+        pg_b = {"name": "PG", "remote_as": "65100", "address_families": [{"af": "ipv4-unicast", "routemap_in": "RM-B"}]}
+        _reconcile_bgp_config(self.device, self._scope_with_peer_groups([pg_b]))
+        paf.refresh_from_db()
+        self.assertEqual(paf.routemap_in.name, "RM-B")  # mirrored to new device value
+        state = NSOBGPPeerTemplateState.objects.get(management__device=self.device, template_name="PG")
+        self.assertEqual(state.status, "imported")  # unowned + matches → no drift
+
+    def test_peer_group_template_both_moved_is_conflict(self):
+        """3-way templates: NetBox edited AND device changed since base → conflict, edit kept."""
+        self._make_mgmt()
+
+        from netbox_routing.models import BGPPeerAddressFamily, BGPPeerTemplate, RouteMap
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.models import NSOBGPPeerTemplateState
+
+        RouteMap.objects.create(name="RM-A")
+        RouteMap.objects.create(name="RM-B")
+        operator_rm = RouteMap.objects.create(name="RM-OP")
+        pg_a = {"name": "PG", "remote_as": "65100", "address_families": [{"af": "ipv4-unicast", "routemap_in": "RM-A"}]}
+        _reconcile_bgp_config(self.device, self._scope_with_peer_groups([pg_a]))
+        tmpl = BGPPeerTemplate.objects.get(name="PG")
+        paf = BGPPeerAddressFamily.objects.get(
+            assigned_object_type__model="bgppeertemplate", assigned_object_id=tmpl.pk
+        )
+        paf.routemap_in = operator_rm  # operator edit
+        paf.save()
+
+        # Device ALSO moved RM-A -> RM-B: both sides diverged from base → conflict.
+        pg_b = {"name": "PG", "remote_as": "65100", "address_families": [{"af": "ipv4-unicast", "routemap_in": "RM-B"}]}
+        _reconcile_bgp_config(self.device, self._scope_with_peer_groups([pg_b]))
+        state = NSOBGPPeerTemplateState.objects.get(management__device=self.device, template_name="PG")
+        self.assertEqual(state.status, "conflict")
+        paf.refresh_from_db()
+        self.assertEqual(paf.routemap_in_id, operator_rm.pk)  # operator edit preserved
+
+    def test_peer_group_template_state_row_created(self):
+        """A peer-group template reconcile creates an NSOBGPPeerTemplateState overlay row."""
+        self._make_mgmt()
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.models import NSOBGPPeerTemplateState
+
+        pg = {"name": "RR", "remote_as": "65100", "address_families": [{"af": "ipv4-unicast"}]}
+        _reconcile_bgp_config(self.device, self._scope_with_peer_groups([pg]))
+        state = NSOBGPPeerTemplateState.objects.get(management__device=self.device, template_name="RR")
+        self.assertEqual(state.status, "imported")
+        self.assertEqual(state.remote_as_str, "65100")
+        self.assertTrue(state.device_base_hash)
 
     def test_peer_group_object_idempotent(self):
         """Reconciling peer_groups twice → one template, one AF row (no dupes)."""

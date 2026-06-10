@@ -1057,6 +1057,56 @@ class NSOBGPPeerState(NetBoxModel):
         return f"{self.management} / ASN:{self.asn_str}{vrf_part} peer:{self.peer_address_str} [{self.status}]"
 
 
+class NSOBGPPeerTemplateState(NetBoxModel):
+    """Per-(device, peer-group name) BGP peer-group TEMPLATE compliance overlay.
+
+    Tracks the reconcile status of each BGP peer-group template (netbox-routing's
+    ``BGPPeerTemplate``) discovered from NSO, with a 3-way merge base so an operator
+    edit to the template's per-AF policies is distinguished from a device-side change
+    (object moved, device == base → freeze/drift; device moved, object == base →
+    auto-mirror; both moved → conflict) — the same clobber-safe contract the BGP peer
+    overlay uses, instead of the older seed-once-never-touch behaviour.
+
+    The template is keyed globally by ``name`` in netbox-routing, but each device tracks
+    its own ``device_base_hash`` against the policies that device reports for that group.
+    ``template`` links to the resolved BGPPeerTemplate; ``template_name`` is the natural
+    key so the row survives the FK target being deleted. There is no apply path for
+    templates, so the lifecycle rests at imported/changed/conflict (or in_sync once an
+    accepted edit re-matches the device).
+    """
+
+    management = models.ForeignKey(
+        to="NSODeviceManagement",
+        on_delete=models.CASCADE,
+        related_name="bgp_peer_template_states",
+    )
+    template_name = models.CharField(max_length=128)
+    template = models.ForeignKey(
+        to="netbox_routing.BGPPeerTemplate",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="nso_bgp_template_states",
+    )
+    remote_as_str = models.CharField(max_length=10, blank=True, default="")
+    status = models.CharField(max_length=32, choices=_BGP_STATUS_CHOICES, default="unknown")
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    last_apply_at = models.DateTimeField(null=True, blank=True)
+    last_apply_error = models.TextField(blank=True, default="")
+    # 3-way merge base: hash of the device-reported template content at last agreed sync.
+    device_base_hash = models.CharField(max_length=64, blank=True, default="")
+
+    class Meta:
+        ordering = ["management", "template_name"]
+        unique_together = [("management", "template_name")]
+        verbose_name = "NSO BGP Peer Template State"
+        verbose_name_plural = "NSO BGP Peer Template States"
+
+    def __str__(self):
+        return f"{self.management} / peer-group:{self.template_name} [{self.status}]"
+
+
 _ROUTE_POLICY_STATUS_CHOICES = [
     ("unknown", "Unknown"),
     ("imported", "Imported"),

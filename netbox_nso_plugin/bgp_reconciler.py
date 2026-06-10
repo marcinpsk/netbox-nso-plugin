@@ -200,8 +200,12 @@ def _peer_desired(peer_data, remote_asn_obj, local_asn_obj, peer_group_obj, sour
     }
 
 
-def _peer_device_content(desired: dict, af_list: list) -> dict:
-    """Build canonical device-desired content (peer fields + AF policies), FKs as pks."""
+def _af_device_content(af_list: list) -> list:
+    """Canonical per-AF policy content from the device payload (FKs resolved to pks).
+
+    Shared by the BGP peer and the peer-group TEMPLATE 3-way merges — both carry the
+    same per-AF route-map / prefix-list policy shape.
+    """
     afs = []
     for paf in af_list or []:
         af_str = paf.get("af") or ""
@@ -217,20 +221,18 @@ def _peer_device_content(desired: dict, af_list: list) -> dict:
                 "prefixlist_out": _pk(_resolve_prefixlist(paf.get("prefixlist_out"))),
             }
         )
-    content = {f: (_pk(desired[f]) if f in _PEER_FK_FIELDS else desired[f]) for f in _PEER_FIELDS}
-    content["afs"] = sorted(afs, key=lambda a: a["af"])
-    return content
+    return sorted(afs, key=lambda a: a["af"])
 
 
-def _peer_object_content(bgp_peer) -> dict:
-    """Build canonical content read back from the netbox-routing BGPPeer object + its AFs."""
+def _af_object_content(owner_obj) -> list:
+    """Canonical per-AF policy content read back from a BGPPeer / BGPPeerTemplate object."""
     from django.contrib.contenttypes.models import ContentType
     from netbox_routing.models import BGPPeerAddressFamily
 
-    ct = ContentType.objects.get_for_model(bgp_peer.__class__)
+    ct = ContentType.objects.get_for_model(owner_obj.__class__)
     afs = []
     for paf in BGPPeerAddressFamily.objects.filter(
-        assigned_object_type=ct, assigned_object_id=bgp_peer.pk
+        assigned_object_type=ct, assigned_object_id=owner_obj.pk
     ).select_related("address_family"):
         afs.append(
             {
@@ -242,11 +244,40 @@ def _peer_object_content(bgp_peer) -> dict:
                 "prefixlist_out": paf.prefixlist_out_id,
             }
         )
+    return sorted(afs, key=lambda a: a["af"])
+
+
+def _peer_device_content(desired: dict, af_list: list) -> dict:
+    """Build canonical device-desired content (peer fields + AF policies), FKs as pks."""
+    content = {f: (_pk(desired[f]) if f in _PEER_FK_FIELDS else desired[f]) for f in _PEER_FIELDS}
+    content["afs"] = _af_device_content(af_list)
+    return content
+
+
+def _peer_object_content(bgp_peer) -> dict:
+    """Build canonical content read back from the netbox-routing BGPPeer object + its AFs."""
     content = {
         f: (getattr(bgp_peer, f"{f}_id") if f in _PEER_FK_FIELDS else getattr(bgp_peer, f)) for f in _PEER_FIELDS
     }
-    content["afs"] = sorted(afs, key=lambda a: a["af"])
+    content["afs"] = _af_object_content(bgp_peer)
     return content
+
+
+def _template_device_content(remote_asn_obj, af_list: list) -> dict:
+    """Canonical device-desired content for a peer-group template (remote-AS + AF policies)."""
+    return {"remote_as": _pk(remote_asn_obj), "afs": _af_device_content(af_list)}
+
+
+def _template_object_content(template_obj) -> dict:
+    """Canonical content read back from a netbox-routing BGPPeerTemplate object + its AFs."""
+    return {"remote_as": template_obj.remote_as_id, "afs": _af_object_content(template_obj)}
+
+
+def _write_template_fields(template_obj, remote_asn_obj) -> None:
+    """Force the device-desired remote-AS onto the peer-group template (seed/auto-mirror)."""
+    if template_obj.remote_as_id != _pk(remote_asn_obj):
+        template_obj.remote_as = remote_asn_obj
+        template_obj.save(update_fields=["remote_as"])
 
 
 def _write_peer_fields(bgp_peer, desired: dict) -> None:
@@ -280,17 +311,14 @@ def _resolve_prefixlist(name):
         return None
 
 
-def _write_peer_afs(
-    peer_obj, peer_af_list: list, scope_obj, BGPAddressFamily, BGPPeerAddressFamily, *, clobber_safe: bool = False
-) -> None:
-    """Write the peer's/template's BGPPeerAddressFamily rows from the device.
+def _write_peer_afs(peer_obj, peer_af_list: list, scope_obj, BGPAddressFamily, BGPPeerAddressFamily) -> None:
+    """Force-mirror a peer's/template's BGPPeerAddressFamily rows from the device.
 
-    Default (``clobber_safe=False``, peers): force-mirror — create/update each device AF
-    and prune AF rows the device dropped. Used only on the 3-way seed / auto-mirror paths.
-
-    ``clobber_safe=True`` (peer-group TEMPLATEs, which have no overlay/base to drive a
-    3-way and no apply path): seed missing AF rows on first import only, NEVER overwrite
-    or prune an existing one, so an operator edit to a peer-group's policy survives.
+    Create/update each device AF and prune AF rows the device dropped (mirror = match
+    the device exactly). Called only on the 3-way *seed* / *auto-mirror* paths — both
+    the BGP peer and the peer-group TEMPLATE merge gate this behind a base comparison,
+    so an operator edit (object moved, device unchanged) is frozen and never reaches
+    here, while a device-side change is mirrored in.
     """
     from django.contrib.contenttypes.models import ContentType
 
@@ -314,16 +342,15 @@ def _write_peer_afs(
             address_family=af_obj,
             defaults=policy,
         )
-        if not created and not clobber_safe:
+        if not created:
             for field, value in policy.items():
                 setattr(obj, field, value)
             obj.save()
         seen_af_ids.add(af_obj.pk)
-    if not clobber_safe:
-        # Prune AF rows the device dropped (mirror = match device exactly).
-        BGPPeerAddressFamily.objects.filter(assigned_object_type=ct, assigned_object_id=peer_obj.pk).exclude(
-            address_family_id__in=seen_af_ids
-        ).delete()
+    # Prune AF rows the device dropped (mirror = match device exactly).
+    BGPPeerAddressFamily.objects.filter(assigned_object_type=ct, assigned_object_id=peer_obj.pk).exclude(
+        address_family_id__in=seen_af_ids
+    ).delete()
 
 
 def _resolve_vrf(vrf_name: str, VRF):
@@ -403,6 +430,58 @@ def _reconcile_one_peer(
     return state
 
 
+def _reconcile_one_template(mgmt, scope_obj, template_obj, pg_entry, remote_asn_obj, now, models):
+    """3-way reconcile of one BGP peer-group template: NetBox object vs device vs base.
+
+    Same clobber-safe contract as :func:`_reconcile_one_peer` (operator edit frozen +
+    flagged 'changed'; device-side change auto-mirrored; both-moved → 'conflict') applied
+    to the template's remote-AS + per-AF policies, replacing the old seed-once behaviour.
+    Templates have no apply path, so an accepted edit rests at ``accepted`` until the
+    device adopts the same value (then the next reconcile settles it to ``in_sync``).
+    """
+    from . import status_machine as sm
+    from .models import NSOBGPPeerTemplateState
+
+    af_list = pg_entry.get("address_families") or []
+
+    state, state_created = NSOBGPPeerTemplateState.objects.get_or_create(
+        management=mgmt, template_name=template_obj.name, defaults={"status": "unknown"}
+    )
+    state.template = template_obj
+    state.remote_as_str = str(pg_entry.get("remote_as") or "")
+    state.last_sync_at = now
+
+    dev_hash = _content_hash(_template_device_content(remote_asn_obj, af_list))
+    obj_hash = _content_hash(_template_object_content(template_obj))
+    base = state.device_base_hash
+
+    def _mirror():
+        _write_template_fields(template_obj, remote_asn_obj)
+        _write_peer_afs(template_obj, af_list, scope_obj, models["BGPAddressFamily"], models["BGPPeerAddressFamily"])
+
+    matches, conflict = True, False
+    if state_created:
+        _mirror()  # first time tracked: seed the template's AF policies from the device
+        state.device_base_hash = dev_hash
+    elif not base:
+        # Bootstrap the base without clobbering (rows pre-dating the overlay/migration).
+        state.device_base_hash = dev_hash
+        matches = obj_hash == dev_hash
+    elif obj_hash == dev_hash:
+        state.device_base_hash = dev_hash  # in sync; advance base
+    elif obj_hash == base and dev_hash != base:
+        _mirror()  # device moved, NetBox untouched → auto-mirror
+        state.device_base_hash = dev_hash
+    elif dev_hash == base and obj_hash != base:
+        matches = False  # operator edited the template, device unchanged → freeze + drift
+    else:
+        conflict = True  # both moved since base → conflict
+
+    state.status = sm.on_reconcile(state.status, matches=matches, conflict=conflict)
+    state.save()
+    return state
+
+
 def _reconcile_scope(
     mgmt,
     router_obj,
@@ -410,6 +489,7 @@ def _reconcile_scope(
     asn_str,
     now,
     seen_keys,
+    seen_template_names,
     ASN,
     BGPScope,
     BGPAddressFamily,
@@ -474,17 +554,19 @@ def _reconcile_scope(
         template_obj = _get_or_create_peer_group(pg_name, BGPPeerTemplate, pg_remote_asn_obj)
         if template_obj is None:
             continue
-        # Peer-group TEMPLATE AF policies: clobber-safe seed (templates have no overlay
-        # row / base for a full 3-way and no apply path) — seed on first import, never
-        # overwrite, so an operator edit to a peer-group's policy survives the sync.
-        _write_peer_afs(
-            template_obj,
-            pg_entry.get("address_families") or [],
+        # Peer-group TEMPLATE: full 3-way merge of its remote-AS + per-AF policies via a
+        # NSOBGPPeerTemplateState overlay (operator edits frozen, device changes mirrored,
+        # both-moved → conflict) — replaces the old seed-once-never-touch behaviour.
+        _reconcile_one_template(
+            mgmt,
             scope_obj,
-            BGPAddressFamily,
-            BGPPeerAddressFamily,
-            clobber_safe=True,
+            template_obj,
+            pg_entry,
+            pg_remote_asn_obj,
+            now,
+            {"BGPAddressFamily": BGPAddressFamily, "BGPPeerAddressFamily": BGPPeerAddressFamily},
         )
+        seen_template_names.add((mgmt.pk, pg_name))
 
 
 def _reconcile_bgp_config(device, payload: dict) -> list:
@@ -535,6 +617,7 @@ def _reconcile_bgp_config(device, payload: dict) -> list:
 
     now = timezone.now()
     seen_keys: set[tuple] = set()
+    seen_template_names: set[tuple] = set()
 
     for router_entry in payload.get("routers") or []:
         asn_str = str(router_entry.get("asn") or "")
@@ -552,6 +635,7 @@ def _reconcile_bgp_config(device, payload: dict) -> list:
                 asn_str,
                 now,
                 seen_keys,
+                seen_template_names,
                 ASN,
                 BGPScope,
                 BGPAddressFamily,
@@ -564,6 +648,7 @@ def _reconcile_bgp_config(device, payload: dict) -> list:
 
     # Mark stale state rows (accepted/deploying intent preserved by on_reconcile)
     from . import status_machine as sm
+    from .models import NSOBGPPeerTemplateState
 
     for stale in NSOBGPPeerState.objects.filter(management=mgmt):
         key = (mgmt.pk, stale.asn_str, stale.vrf_name, stale.peer_address_str)
@@ -572,5 +657,12 @@ def _reconcile_bgp_config(device, payload: dict) -> list:
             if new_status != stale.status:
                 stale.status = new_status
                 stale.save(update_fields=["status"])
+
+    for stale_t in NSOBGPPeerTemplateState.objects.filter(management=mgmt):
+        if (mgmt.pk, stale_t.template_name) not in seen_template_names:
+            new_status = sm.on_reconcile(stale_t.status, present=False)
+            if new_status != stale_t.status:
+                stale_t.status = new_status
+                stale_t.save(update_fields=["status"])
 
     return list(NSOBGPPeerState.objects.filter(management=mgmt).select_related("bgp_peer"))
