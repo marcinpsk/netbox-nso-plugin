@@ -172,7 +172,7 @@ class TestReconcileInterfaceIps(TestCase):
 
         states = {s.address: s for s in result}
         self.assertIn("10.10.0.1/30", states)
-        self.assertEqual(states["10.10.0.1/30"].status, "in_sync")
+        self.assertEqual(states["10.10.0.1/30"].status, "imported")  # unowned materialized → imported (unified)
         ip_exists = IPAddress.objects.filter(address="10.10.0.1/30").exists()
         self.assertTrue(ip_exists)
 
@@ -201,7 +201,7 @@ class TestReconcileInterfaceIps(TestCase):
             result = _reconcile_interface_ips(self.device, payload)
 
         states = {s.address: s for s in result}
-        self.assertEqual(states["172.16.0.1/24"].status, "in_sync")
+        self.assertEqual(states["172.16.0.1/24"].status, "imported")  # unowned materialized → imported (unified)
 
     def test_existing_ip_on_different_interface_is_conflict(self):
         """Address in IPAM assigned to a DIFFERENT interface → conflict, no reassignment."""
@@ -370,7 +370,7 @@ class TestReconcileInterfaceIps(TestCase):
             result = _reconcile_interface_ips(self.device, payload)  # second sync
 
         states = {s.address: s for s in result}
-        self.assertEqual(states["10.20.0.1/31"].status, "in_sync")
+        self.assertEqual(states["10.20.0.1/31"].status, "imported")  # unowned materialized → imported (unified)
         self.assertEqual(states["10.20.0.1/31"].interface_id, physical.pk)
         # Exactly one row, and it is NOT 'changed'.
         self.assertEqual(NSOInterfaceIPState.objects.filter(interface=physical, address="10.20.0.1/31").count(), 1)

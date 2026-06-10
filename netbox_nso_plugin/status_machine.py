@@ -64,33 +64,24 @@ STATES: frozenset[str] = frozenset(
 
 INITIAL = UNKNOWN
 
-#: Non-canonical states still declared by the older M12 interface / interface-IP
-#: overlays, tracked here so the parity guard tolerates them *explicitly* (a brand
-#: new stray state still fails) while flagging them for migration:
-#:   ``drifted``  — pre-unification synonym for ``changed`` (``NSOInterfaceState``,
-#:                  ``NSOInterfaceIPState``); ``views.py`` filters it alongside
-#:                  ``changed`` to this day. Should fold into ``changed``.
-#:   ``reserved`` — IP-reservation status specific to ``NSOInterfaceIPState``;
-#:                  arguably a legitimate IP-domain state, kept separate for now.
-LEGACY_STATES: frozenset[str] = frozenset({"drifted", "reserved"})
+#: Historically the M12 interface / interface-IP overlays declared non-canonical
+#: states (``drifted`` = synonym for ``changed``; ``reserved`` = a dead overlay choice,
+#: the real reservation lives on ipam.IPAddress). Both are now folded: the adapter's
+#: ``drifted`` is normalised to ``changed`` at ingest, the dead choices were dropped.
+#: Empty = fully folded; a re-introduced legacy state fails the parity test.
+LEGACY_STATES: frozenset[str] = frozenset()
 
 #: Maps each overlay that diverges from the canonical vocabulary to the legacy
-#: states it declares. The parity test pins this so closing a gap is a visible diff.
-LEGACY_VOCAB_BY_MODEL: dict[str, frozenset[str]] = {
-    "NSOInterfaceState": frozenset({"drifted"}),
-    "NSOInterfaceIPState": frozenset({"drifted", "reserved"}),
-}
+#: states it declares. Empty now (folded); the parity test pins it so a regression
+#: re-introducing a legacy state is a visible diff.
+LEGACY_VOCAB_BY_MODEL: dict[str, frozenset[str]] = {}
 
-#: Overlays NOT yet routed through this machine (their reconcilers still set status
-#: directly), with the reason:
-#:   ``NSOInterfaceState``   — interface-attribute status is *adapter-driven*: the
-#:       plugin copies the status string the adapter computes, verbatim. Unifying it
-#:       requires the adapter (nso-adapter) to adopt this same machine — a cross-repo
-#:       change, tracked separately.
-#:   ``NSOInterfaceIPState`` — uses the legacy ``drifted``/``reserved`` vocabulary
-#:       plus bespoke IP auto-assign / reservation logic; folding it in needs the
-#:       ``drifted → changed`` vocabulary decision first (see LEGACY_VOCAB_BY_MODEL).
-NOT_YET_UNIFIED: frozenset[str] = frozenset({"NSOInterfaceState", "NSOInterfaceIPState"})
+#: Overlays whose status the plugin does NOT compute via on_reconcile. Only
+#: ``NSOInterfaceState`` remains: interface-attribute status is *adapter-driven* (the
+#: plugin copies the string the adapter computes; ``drifted`` is normalised to
+#: ``changed`` at ingest so the vocabulary is aligned). Fully routing it through this
+#: machine requires the adapter (nso-adapter) to adopt it — a cross-repo change.
+NOT_YET_UNIFIED: frozenset[str] = frozenset({"NSOInterfaceState"})
 
 #: Overlays that deliberately omit the ``changed`` (value-diff drift) state: the
 #: EAV / secret-style mirrors (SNMP, logging) signal divergence via ``conflict``

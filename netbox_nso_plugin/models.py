@@ -371,7 +371,6 @@ class NSOInterfaceState(NetBoxModel):
         ("deploying", "Deploying"),
         ("in_sync", "In Sync"),
         ("apply_failed", "Apply Failed"),
-        ("drifted", "Drifted"),
         ("error", "Error"),
     ]
 
@@ -427,14 +426,12 @@ class NSOInterfaceIPState(NetBoxModel):
 
     STATUS_CHOICES = [
         ("unknown", "Unknown"),
-        ("reserved", "Reserved"),  # M13: held for P2P atomicity; never pushed until accepted
         ("imported", "Imported"),
         ("changed", "Changed"),
         ("accepted", "Accepted"),
         ("deploying", "Deploying"),
         ("in_sync", "In Sync"),
         ("apply_failed", "Apply Failed"),
-        ("drifted", "Drifted"),
         ("error", "Error"),
         ("conflict", "Conflict"),  # address already assigned elsewhere in NetBox
     ]

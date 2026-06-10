@@ -272,8 +272,8 @@ class TestStatusBreakdown(TestCase):
         self.assertEqual(_status_breakdown(qs), {"total": 2, "drift": 0, "pending": 0})
 
     def test_differ_splits_on_ownership(self):
-        qs = self._qs([("changed", False), ("changed", True), ("drifted", True), ("conflict", False)])
-        # owned differ -> pending (changed+True, drifted+True = 2); not-owned differ -> drift (2)
+        qs = self._qs([("changed", False), ("changed", True), ("apply_failed", True), ("conflict", False)])
+        # owned differ -> pending (changed+True, apply_failed+True = 2); not-owned differ -> drift (2)
         self.assertEqual(_status_breakdown(qs), {"total": 4, "drift": 2, "pending": 2})
 
     def test_deploying_counts_as_pending(self):

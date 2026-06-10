@@ -22,7 +22,6 @@ _STATUS_BADGE = {
     "deploying": "primary",
     "in_sync": "success",
     "apply_failed": "danger",
-    "drifted": "warning",
     "error": "danger",
 }
 
@@ -68,6 +67,8 @@ def _upsert_interface_states(device, interfaces: list) -> dict:
         for attr_name, attr_data in (iface_data.get("attrs") or {}).items():
             nso_value = attr_data.get("nso_value") or ""
             status = attr_data.get("status") or "unknown"
+            if status == "drifted":  # legacy adapter vocab → unified machine
+                status = "changed"
             last_apply_at = None
             if attr_data.get("last_apply_at"):
                 try:
@@ -195,7 +196,7 @@ def _build_payload_index(payload: dict) -> tuple[set, dict, dict]:
 def _create_and_link_ip(address, vrf_obj, iface, Prefix, logger, transaction, ValidationError) -> str:
     """Create an IPAddress in IPAM, assign it to *iface*, and link a containing Prefix.
 
-    Returns the new status string: 'in_sync', 'conflict', or 'error'.
+    Returns the new status string: 'imported' (materialized), 'conflict', or 'error'.
     """
     from ipam.models import IPAddress
 
@@ -215,7 +216,7 @@ def _create_and_link_ip(address, vrf_obj, iface, Prefix, logger, transaction, Va
                     Prefix(prefix=address, vrf=vrf_obj).save()
         except Exception as prefix_exc:  # pragma: no cover
             logger.warning("nso_ip.prefix_link_failed addr=%s: %s", address, repr(prefix_exc))
-        return "in_sync"
+        return "imported"
     except ValidationError:
         return "conflict"
     except Exception as exc:  # pragma: no cover
@@ -267,10 +268,13 @@ def _retire_stale_ip_states(device, resolved_keys, VRF, IPAddress, now, transact
             _unassign_state_ip(state, VRF, IPAddress, transaction)
             state.delete()
             continue
-        if state.status == "changed":
+        # Drift on genuine removal — but accepted/deploying (pending push, device
+        # legitimately doesn't have it yet) is preserved by on_reconcile.
+        new_status = sm.on_reconcile(state.status, present=False)
+        if new_status == state.status:
             continue
         _unassign_state_ip(state, VRF, IPAddress, transaction)
-        state.status = "changed"
+        state.status = new_status
         state.last_sync_at = now
         state.save(update_fields=["status", "last_sync_at"])
 
@@ -388,8 +392,9 @@ def _reconcile_interface_ips(device, payload: dict) -> list:
         existing_ip = IPAddress.objects.filter(address=address, vrf=vrf_obj).first()
         if existing_ip is not None:
             if existing_ip.assigned_object == iface:
-                if state.status not in ("deploying",):
-                    state.status = "in_sync"
+                # Device reports the IP and it's correctly assigned (materialized):
+                # owned settles to in_sync (device confirms intent), unowned rests imported.
+                state.status = sm.on_reconcile(state.status, matches=True)
                 if (
                     state.auto_assigned
                     and state.status == "in_sync"
@@ -398,10 +403,13 @@ def _reconcile_interface_ips(device, payload: dict) -> list:
                 ):
                     _activate_auto_assigned_ip(state, existing_ip, address, iface, IPAddress, logger)
             else:
-                state.status = "conflict"
-        elif auto_create and state.status not in ("conflict",):
-            state.status = _create_and_link_ip(address, vrf_obj, iface, Prefix, logger, transaction, ValidationError)
-        elif state.status not in ("accepted", "deploying", "in_sync", "conflict"):
+                # Address already assigned to a different interface → adoption conflict.
+                state.status = sm.on_reconcile(state.status, matches=False, conflict=True)
+        elif auto_create and state.status != "conflict":
+            result = _create_and_link_ip(address, vrf_obj, iface, Prefix, logger, transaction, ValidationError)
+            if not sm.is_owned(state.status):
+                state.status = result
+        elif not sm.is_owned(state.status) and state.status != "conflict":
             state.status = "imported"
 
         state.save()

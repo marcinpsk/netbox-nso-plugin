@@ -22,7 +22,7 @@ from django.db.models import Count
 #   drift         = device differs AND NetBox does NOT own it (device changed out-of-band)
 #   pending apply = device differs AND NetBox owns it (Apply will push NetBox's value)
 _MATCH_STATUSES = ("imported", "in_sync")
-_DIFFER_STATUSES = ("changed", "drifted", "conflict", "accepted", "apply_failed")
+_DIFFER_STATUSES = ("changed", "conflict", "accepted", "apply_failed")
 
 
 def display_state(status: str, owned: bool):

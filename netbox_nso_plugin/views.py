@@ -157,7 +157,7 @@ class DeviceNSOTabView(generic.ObjectView):
 # "Accept" makes NetBox the source of truth, so it applies to values NetBox does not
 # yet own (imported) and to drift (resolve). Already-owned states (in_sync, accepted,
 # deploying, apply_failed) offer no Accept — that was the repeatable-no-op bug.
-_UNOWNED_STATUSES = ("imported", "changed", "conflict", "drifted")
+_UNOWNED_STATUSES = ("imported", "changed", "conflict")
 
 
 def _ctx_has_unowned(ctx) -> bool:
@@ -1111,9 +1111,7 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
 
         changes = []
         pending = (
-            NSOInterfaceState.objects.filter(
-                interface__device_id=device_pk, status__in=("accepted", "apply_failed", "drifted")
-            )
+            NSOInterfaceState.objects.filter(interface__device_id=device_pk, status__in=("accepted", "apply_failed"))
             .select_related("interface")
             .order_by("interface__name", "attribute")
         )
@@ -1200,7 +1198,7 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
         routing_changes = []
         if mgmt is not None:
             for model, label, item_fn, detail_fn in preview_specs:
-                rows = model.objects.filter(management=mgmt, status__in=("accepted", "apply_failed", "drifted"))
+                rows = model.objects.filter(management=mgmt, status__in=("accepted", "apply_failed"))
                 for r in rows:
                     try:
                         item = item_fn(r)
@@ -1422,7 +1420,7 @@ class RoutingBulkAcceptMixin(LoginRequiredMixin, View):
         # push); drift -> accepted (pending apply). _push() sends the snapshot once.
         base = self.model_class.objects.filter(management=mgmt)
         n_owned = base.filter(status="imported").update(status="in_sync")
-        n_drift = base.filter(status__in=["changed", "conflict", "drifted"]).update(status="accepted")
+        n_drift = base.filter(status__in=["changed", "conflict"]).update(status="accepted")
         count = n_owned + n_drift
 
         if count and mgmt.adapter_device_id is not None:
