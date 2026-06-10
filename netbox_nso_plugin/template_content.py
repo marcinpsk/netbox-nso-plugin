@@ -623,7 +623,12 @@ def _resolve_static_route(entry, StaticRoute, VRF, auto_create, vrf_auto_create,
         )
         route.full_clean()
         route.save()
-        route.devices.add(device)
+        # Brownfield adoption (reconcile-created route) — not operator intent; suppress
+        # so the greenfield static-route signal doesn't auto-Accept it.
+        from .signals import suppress_intent_push
+
+        with suppress_intent_push():
+            route.devices.add(device)
         return route, True
     except Exception as exc:
         logger.warning("Could not create StaticRoute %s: %s", prefix, exc)
@@ -645,6 +650,8 @@ def _reconcile_static_routes(device, payload: dict) -> list:
     Returns a list of NSOStaticRouteState instances for this device.
     """
     from django.utils import timezone
+
+    from .signals import suppress_intent_push
 
     try:
         from netbox_routing.models import StaticRoute
@@ -692,14 +699,18 @@ def _reconcile_static_routes(device, payload: dict) -> list:
         # FK overlay: materialized = the StaticRoute is linked to this device.
         on_device = created or route.devices.filter(pk=device.pk).exists()
         if not on_device and auto_create:
-            route.devices.add(device)
+            # Brownfield adoption: this M2M change is not operator intent — suppress so the
+            # greenfield static-route signal doesn't mistake it for an Accept.
+            with suppress_intent_push():
+                route.devices.add(device)
             on_device = True
         state.status = sm.on_reconcile(state.status, matches=on_device, conflict=not on_device, settles_owned=False)
         state.save()
 
     stale_qs = NSOStaticRouteState.objects.filter(management=mgmt).exclude(static_route_id__in=seen_route_ids)
     for stale in stale_qs:
-        stale.static_route.devices.remove(device)
+        with suppress_intent_push():
+            stale.static_route.devices.remove(device)
         new_status = sm.on_reconcile(stale.status, present=False)
         if new_status != stale.status:
             stale.status = new_status

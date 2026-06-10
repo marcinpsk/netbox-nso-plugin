@@ -41,6 +41,7 @@ class TestPushStaticRouteIntentForDevice(IntentPushResetMixin, TestCase):
         from netbox_routing.models import StaticRoute
 
         from netbox_nso_plugin.models import NSOStaticRouteState
+        from netbox_nso_plugin.signals import suppress_intent_push
 
         sr, _ = StaticRoute.objects.get_or_create(
             prefix=prefix,
@@ -48,7 +49,10 @@ class TestPushStaticRouteIntentForDevice(IntentPushResetMixin, TestCase):
             vrf=vrf,
             defaults={"metric": 1},
         )
-        sr.devices.add(self.device)
+        # Brownfield setup mirrors reconcile (under suppress) so the greenfield
+        # assign-signal doesn't auto-own the route before we set the desired status.
+        with suppress_intent_push():
+            sr.devices.add(self.device)
         return NSOStaticRouteState.objects.create(
             management=mgmt,
             static_route=sr,
@@ -161,13 +165,16 @@ class TestOnStaticRouteStateSave(IntentPushResetMixin, TestCase):
     def _make_route(self, prefix="10.20.0.0/16", next_hop="10.0.0.1"):
         from netbox_routing.models import StaticRoute
 
+        from netbox_nso_plugin.signals import suppress_intent_push
+
         sr, _ = StaticRoute.objects.get_or_create(
             prefix=prefix,
             next_hop=next_hop,
             vrf=None,
             defaults={"metric": 1},
         )
-        sr.devices.add(self.device)
+        with suppress_intent_push():
+            sr.devices.add(self.device)
         return sr
 
     def test_save_triggers_intent_push(self):
@@ -219,3 +226,79 @@ class TestOnStaticRouteStateSave(IntentPushResetMixin, TestCase):
 
             _on_static_route_state_save(sender=NSOStaticRouteState, instance=state)
             mock_push.assert_not_called()
+
+
+class TestGreenfieldStaticRoute(IntentPushResetMixin, TestCase):
+    """Greenfield write path: an operator-created route assigned to a managed device
+    becomes accepted intent + pushes; removing/deleting it pushes the removal."""
+
+    @classmethod
+    def setUpTestData(cls):
+        mfg = Manufacturer.objects.create(name="GfMfg", slug="gfmfg")
+        dt = DeviceType.objects.create(manufacturer=mfg, model="GfDev", slug="gfdev")
+        role = DeviceRole.objects.create(name="GfRole", slug="gfrole")
+        site = Site.objects.create(name="GfSite", slug="gfsite")
+        cls.device = Device.objects.create(name="gf-router", device_type=dt, role=role, site=site)
+
+    def _mgmt(self):
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+        inst, _ = NSOInstance.objects.get_or_create(name="gf-inst", defaults={"adapter_instance_id": "gf-inst"})
+        return NSODeviceManagement.objects.get_or_create(
+            device=self.device,
+            defaults={"nso_instance": inst, "nso_device_name": "nso-gf", "adapter_device_id": 77},
+        )[0]
+
+    def test_assign_device_owns_and_pushes(self):
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.models import NSOStaticRouteState
+
+        mgmt = self._mgmt()
+        sr = StaticRoute.objects.create(prefix="10.9.9.0/24", next_hop="10.0.0.9", metric=1)
+
+        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent") as mock_push:
+            with self.captureOnCommitCallbacks(execute=True):
+                sr.devices.add(self.device)  # operator assignment (not suppressed)
+            state = NSOStaticRouteState.objects.get(management=mgmt, static_route=sr)
+            self.assertEqual(state.status, "accepted")
+            mock_push.assert_called()
+            routes = mock_push.call_args[0][1]
+            self.assertTrue(any(r["prefix"] == "10.9.9.0/24" and r["next_hop"] == "10.0.0.9" for r in routes))
+
+    def test_unassign_device_drops_overlay_and_pushes_removal(self):
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.models import NSOStaticRouteState
+
+        mgmt = self._mgmt()
+        sr = StaticRoute.objects.create(prefix="10.9.10.0/24", next_hop="10.0.0.10", metric=1)
+        with self.captureOnCommitCallbacks(execute=True):
+            sr.devices.add(self.device)
+        self.assertTrue(NSOStaticRouteState.objects.filter(management=mgmt, static_route=sr).exists())
+
+        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent") as mock_push:
+            with self.captureOnCommitCallbacks(execute=True):
+                sr.devices.remove(self.device)
+            self.assertFalse(NSOStaticRouteState.objects.filter(management=mgmt, static_route=sr).exists())
+            mock_push.assert_called()
+            routes = mock_push.call_args[0][1]
+            self.assertFalse(any(r["prefix"] == "10.9.10.0/24" for r in routes))
+
+    def test_delete_route_pushes_removal(self):
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.models import NSOStaticRouteState
+
+        mgmt = self._mgmt()
+        sr = StaticRoute.objects.create(prefix="10.9.11.0/24", next_hop="10.0.0.11", metric=1)
+        with self.captureOnCommitCallbacks(execute=True):
+            sr.devices.add(self.device)
+
+        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent") as mock_push:
+            with self.captureOnCommitCallbacks(execute=True):
+                sr.delete()
+            self.assertFalse(NSOStaticRouteState.objects.filter(management=mgmt, static_route__isnull=False).exists())
+            mock_push.assert_called()
+            routes = mock_push.call_args[0][1]
+            self.assertFalse(any(r["prefix"] == "10.9.11.0/24" for r in routes))

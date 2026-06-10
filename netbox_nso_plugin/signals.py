@@ -8,7 +8,7 @@ import json
 import logging
 import threading
 
-from django.db.models.signals import post_delete, post_save, pre_save
+from django.db.models.signals import m2m_changed, post_delete, post_save, pre_delete, pre_save
 from django.dispatch import receiver
 from django.utils import timezone
 
@@ -1066,6 +1066,108 @@ def _on_static_route_state_save(sender, instance, **kwargs):
     )
 
 
+# ── Greenfield static routes (operator-created in NetBox, not yet on the device) ──
+#
+# The reconcile path only ever creates an NSOStaticRouteState overlay for a route the
+# device already reports (brownfield adoption). These handlers add the missing direction:
+# a netbox_routing.StaticRoute the operator assigns to a managed device becomes an
+# *accepted* overlay (owned intent) and pushes; removing/deleting it pushes the removal
+# (full-replace). All wired from the plugin against the netbox_routing model — no fork edit.
+
+
+def _accept_static_route_for_device(static_route, device) -> None:
+    """Own a greenfield route for *device* (accepted overlay) → its save pushes intent."""
+    from .models import NSODeviceManagement, NSOStaticRouteState
+
+    if static_route.next_hop is None:
+        return  # interface-only next-hop not supported by static-route-reconciler v1
+    try:
+        mgmt = NSODeviceManagement.objects.get(device=device)
+    except NSODeviceManagement.DoesNotExist:
+        return
+    if mgmt.adapter_device_id is None:
+        return
+    state, created = NSOStaticRouteState.objects.get_or_create(
+        management=mgmt,
+        static_route=static_route,
+        defaults={"status": "accepted", "accepted_at": timezone.now()},
+    )
+    if not created and state.status not in ("accepted", "deploying", "in_sync", "apply_failed"):
+        state.status = "accepted"
+        state.accepted_at = timezone.now()
+    state.nso_prefix = str(static_route.prefix or "")
+    state.nso_next_hop = str(static_route.next_hop or "")
+    state.last_sync_at = timezone.now()
+    state.save()  # → _on_static_route_state_save schedules the push
+
+
+def _remove_static_route_for_device(static_route, device) -> None:
+    """Drop the overlay for (device, route) and push the removal (full-replace)."""
+    from .models import NSODeviceManagement, NSOStaticRouteState
+
+    try:
+        mgmt = NSODeviceManagement.objects.get(device=device)
+    except NSODeviceManagement.DoesNotExist:
+        return
+    if mgmt.adapter_device_id is None:
+        return
+    NSOStaticRouteState.objects.filter(management=mgmt, static_route=static_route).delete()
+    device_id, adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
+    _schedule_intent_push(
+        (device_id, "static_route"),
+        lambda: _push_static_route_intent_for_device(device_id, adapter_device_id),
+    )
+
+
+@_skip_on_render
+def _on_routing_static_route_save(sender, instance, **kwargs):
+    """Re-push when an owned greenfield route's fields (prefix/next-hop/…) are edited."""
+    from .models import NSODeviceManagement, NSOStaticRouteState
+
+    for device in instance.devices.all():
+        try:
+            mgmt = NSODeviceManagement.objects.get(device=device)
+        except NSODeviceManagement.DoesNotExist:
+            continue
+        if mgmt.adapter_device_id is None:
+            continue
+        owned = NSOStaticRouteState.objects.filter(
+            management=mgmt, static_route=instance, status__in=("accepted", "deploying", "in_sync", "apply_failed")
+        ).exists()
+        if owned:
+            device_id, adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
+            _schedule_intent_push(
+                (device_id, "static_route"),
+                lambda d=device_id, a=adapter_device_id: _push_static_route_intent_for_device(d, a),
+            )
+
+
+@_skip_on_render
+def _on_routing_static_route_devices_changed(sender, instance, action, pk_set, reverse, **kwargs):
+    """Device assigned to / removed from a route → own / remove + push (greenfield)."""
+    from dcim.models import Device
+
+    try:
+        from netbox_routing.models import StaticRoute
+    except ImportError:
+        return
+    if reverse or not isinstance(instance, StaticRoute):
+        return  # only the StaticRoute.devices side
+    if action == "post_add":
+        for device in Device.objects.filter(pk__in=pk_set or []):
+            _accept_static_route_for_device(instance, device)
+    elif action in ("post_remove", "post_clear"):
+        for device in Device.objects.filter(pk__in=pk_set or []):
+            _remove_static_route_for_device(instance, device)
+
+
+@_skip_on_render
+def _on_routing_static_route_pre_delete(sender, instance, **kwargs):
+    """Route deleted in NetBox → drop overlays + push removal before the cascade lands."""
+    for device in instance.devices.all():
+        _remove_static_route_for_device(instance, device)
+
+
 def _push_l2_sap_intent_for_device(device_id, adapter_device_id):
     """Build and push the full Nokia L2 SAP intent snapshot for a device (M37 P2b)."""
     from . import adapter_client as client
@@ -1920,3 +2022,25 @@ def _connect_g_activated():  # pragma: no cover
         )
     except ImportError:
         logger.debug("netbox_routing not installed — redistribution fork signal not registered")
+
+    # netbox_routing.StaticRoute greenfield write path (operator-created routes → push)
+    try:
+        from netbox_routing.models import StaticRoute
+
+        post_save.connect(
+            _on_routing_static_route_save,
+            sender=StaticRoute,
+            dispatch_uid="nso_plugin_routing_static_route_post_save",
+        )
+        m2m_changed.connect(
+            _on_routing_static_route_devices_changed,
+            sender=StaticRoute.devices.through,
+            dispatch_uid="nso_plugin_routing_static_route_devices_changed",
+        )
+        pre_delete.connect(
+            _on_routing_static_route_pre_delete,
+            sender=StaticRoute,
+            dispatch_uid="nso_plugin_routing_static_route_pre_delete",
+        )
+    except ImportError:
+        logger.debug("netbox_routing not installed — static-route greenfield signals not registered")
