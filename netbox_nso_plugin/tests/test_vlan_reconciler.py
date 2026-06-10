@@ -68,9 +68,31 @@ class TestVlanReconciler(TestCase):
         self.assertEqual(rows[0].status, "changed")  # drift surfaced
         self.assertEqual(rows[0].device_name, "OLD_NAME")  # device value mirrored for display
 
+    def test_switchport_seeded_when_pristine(self):
+        """A pristine NetBox interface is SEEDED from the device (read mirror) → imported, no drift.
+
+        This is the fix for false drift on freshly-imported switchports: an interface with
+        no L2 config gets the device's mode/native/tagged written onto it (like VLAN seeds
+        its name), instead of being flagged as 'changed'.
+        """
+        from netbox_nso_plugin.vlan_reconciler import reconcile_switchport, reconcile_vlan_database
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 10, "name": "MGMT"}]})
+        rows = reconcile_switchport(
+            self.device,
+            {
+                "interfaces": [
+                    {"interface_name": "GigabitEthernet0/1", "mode": "access", "untagged_vlan": 10, "tagged_vlans": []}
+                ]
+            },
+        )
+        self.assertEqual(rows[0].status, "imported")  # seeded, not false drift
+        self.interface.refresh_from_db()
+        self.assertEqual(self.interface.mode, "access")  # device L2 materialised onto NetBox
+        self.assertEqual(self.interface.untagged_vlan.vid, 10)
+
     def test_switchport_imported_when_netbox_matches_nso(self):
-        # Unified machine: an unowned row that matches the device rests at 'imported'
-        # (in_sync is reserved for owned+applied), not 'in_sync' as the old code set.
+        # Non-pristine interface already matching the device → imported (no drift), no clobber.
         from netbox_nso_plugin.vlan_reconciler import reconcile_switchport, reconcile_vlan_database
 
         reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 10, "name": "MGMT"}]})
@@ -90,10 +112,19 @@ class TestVlanReconciler(TestCase):
         )
         self.assertEqual(rows[0].status, "imported")
 
-    def test_switchport_changed_when_netbox_differs(self):
+    def test_switchport_changed_when_netbox_has_divergent_value(self):
+        """A non-pristine interface whose L2 differs from the device → changed, NOT clobbered."""
         from netbox_nso_plugin.vlan_reconciler import reconcile_switchport, reconcile_vlan_database
 
-        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 10, "name": "MGMT"}]})
+        reconcile_vlan_database(
+            self.device, {"vlans": [{"vlan_id": 10, "name": "MGMT"}, {"vlan_id": 20, "name": "DATA"}]}
+        )
+        group = VLANGroup.objects.get(slug=f"nso-{self.device.pk}")
+        # NetBox already carries access vlan 20; the device says access vlan 10 → divergence.
+        self.interface.mode = "access"
+        self.interface.untagged_vlan = VLAN.objects.get(group=group, vid=20)
+        self.interface.save()
+
         rows = reconcile_switchport(
             self.device,
             {
@@ -103,6 +134,30 @@ class TestVlanReconciler(TestCase):
             },
         )
         self.assertEqual(rows[0].status, "changed")
+        self.interface.refresh_from_db()
+        self.assertEqual(self.interface.untagged_vlan.vid, 20)  # operator value NOT clobbered
+
+    def test_switchport_native_vlan_1_normalized(self):
+        """IOS implicit default native VLAN 1 is treated as 'no native' (no false drift)."""
+        from netbox_nso_plugin.vlan_reconciler import reconcile_switchport
+
+        rows = reconcile_switchport(
+            self.device,
+            {
+                "interfaces": [
+                    {
+                        "interface_name": "GigabitEthernet0/1",
+                        "mode": "trunk-all",
+                        "untagged_vlan": 1,
+                        "tagged_vlans": [],
+                    }
+                ]
+            },
+        )
+        self.assertEqual(rows[0].status, "imported")  # pristine → seeded, in sync
+        self.interface.refresh_from_db()
+        self.assertEqual(self.interface.mode, "tagged-all")
+        self.assertIsNone(self.interface.untagged_vlan)  # native VLAN 1 normalised away
 
 
 class TestVlanWritePath(IntentPushResetMixin, TestCase):

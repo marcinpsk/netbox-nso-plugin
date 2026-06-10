@@ -1530,6 +1530,10 @@ class NSOSwitchportState(NetBoxModel):
     accepted_at = models.DateTimeField(null=True, blank=True)
     last_apply_at = models.DateTimeField(null=True, blank=True)
     last_apply_error = models.TextField(blank=True, default="")
+    # 3-way merge base: hash of the device L2 content at the last agreed sync. Lets the
+    # reconciler seed a pristine NetBox interface from the device (read mirror) and then
+    # tell an operator edit (freeze) apart from a device-side change (auto-mirror).
+    device_base_hash = models.CharField(max_length=64, blank=True, default="")
 
     class Meta:
         ordering = ["management", "interface"]

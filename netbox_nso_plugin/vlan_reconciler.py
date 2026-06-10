@@ -74,11 +74,57 @@ def reconcile_vlan_database(device, payload: dict) -> list:
     return rows
 
 
+def _switchport_content(mode: str, untagged, tagged: list) -> dict:
+    """Canonical L2 content (mode + native + tagged vids) for hashing/compare."""
+    return {"mode": mode or "", "untagged": untagged, "tagged": sorted(tagged or [])}
+
+
+def _switchport_object_content(interface) -> dict:
+    """Return the live NetBox interface's L2 content."""
+    nb_untagged = interface.untagged_vlan.vid if interface.untagged_vlan else None
+    nb_tagged = sorted(interface.tagged_vlans.values_list("vid", flat=True))
+    return _switchport_content(interface.mode or "", nb_untagged, nb_tagged)
+
+
+def _switchport_is_pristine(interface) -> bool:
+    """Return True if the NetBox interface carries NO operator L2 config (never materialised)."""
+    return not (interface.mode or "") and interface.untagged_vlan_id is None and not interface.tagged_vlans.exists()
+
+
+def _write_switchport(interface, group, mode: str, untagged, tagged: list) -> None:
+    """Seed/mirror the device's L2 config onto the native NetBox interface.
+
+    Missing VLANs are created in the per-device group so the seed is faithful (the
+    tagged set may reference vids not in the device's VLAN database export).
+    """
+    from ipam.models import VLAN
+
+    interface.mode = mode
+    if untagged is not None:
+        interface.untagged_vlan, _ = VLAN.objects.get_or_create(group=group, vid=untagged)
+    else:
+        interface.untagged_vlan = None
+    interface.save()
+    tagged_objs = [VLAN.objects.get_or_create(group=group, vid=v)[0] for v in (tagged or [])]
+    interface.tagged_vlans.set(tagged_objs)
+
+
 def reconcile_switchport(device, payload: dict) -> list:
-    """Upsert NSOSwitchportState; status = in_sync iff the live NetBox interface matches NSO."""
+    """Reconcile L2 switchports: seed a pristine NetBox interface from the device, else 3-way.
+
+    Brings switchport in line with every other overlay: when the NetBox interface has no
+    L2 config (pristine), the device's mode/native/tagged is *seeded* onto it (read
+    mirror) → ``imported``/``in_sync``, so a freshly-imported switchport no longer shows
+    as false drift. When NetBox already carries a value, a stored ``device_base_hash``
+    drives a 3-way merge: device-side change auto-mirrors when the operator hasn't
+    touched it, an operator edit is frozen (``changed``) and survives, both-moved →
+    ``conflict``. Owned (accepted) rows keep the value-aware settle and are never
+    auto-clobbered. IOS's implicit default native VLAN 1 is normalised to "no native".
+    """
     from django.utils import timezone
     from ipam.models import VLAN
 
+    from . import merge_util
     from . import status_machine as sm
     from .models import NSODeviceManagement, NSOSwitchportState
 
@@ -99,6 +145,8 @@ def reconcile_switchport(device, payload: dict) -> list:
 
         nso_mode = _NSO_TO_NETBOX_MODE.get(item.get("mode") or "", "")
         nso_untagged = item.get("untagged_vlan")
+        if nso_untagged == 1:
+            nso_untagged = None  # IOS default native VLAN 1 is not operator intent
         nso_tagged = sorted(item.get("tagged_vlans") or [])
 
         state, _ = NSOSwitchportState.objects.get_or_create(management=management, interface=interface)
@@ -110,12 +158,38 @@ def reconcile_switchport(device, payload: dict) -> list:
         state.save()
         state.tagged_vlans.set(VLAN.objects.filter(group=group, vid__in=nso_tagged))
 
-        nb_untagged = interface.untagged_vlan.vid if interface.untagged_vlan else None
-        nb_tagged = sorted(interface.tagged_vlans.values_list("vid", flat=True))
-        # Value overlay: the editable value is the live NetBox L2 config (mode +
-        # untagged + tagged) compared against the device-observed config.
-        matches = (interface.mode or "") == nso_mode and nb_untagged == nso_untagged and nb_tagged == nso_tagged
-        state.status = sm.on_reconcile(state.status, matches=matches)
+        dev_hash = merge_util.content_hash(_switchport_content(nso_mode, nso_untagged, nso_tagged))
+        obj_hash = merge_util.content_hash(_switchport_object_content(interface))
+
+        if sm.is_owned(state.status):
+            # Owned (accepted/applied): value-aware settle; never auto-clobber the operator.
+            state.status = sm.on_reconcile(state.status, matches=obj_hash == dev_hash)
+        elif _switchport_is_pristine(interface):
+            # No NetBox value → seed the device's L2 config (read mirror) → imported/in_sync.
+            _write_switchport(interface, group, nso_mode, nso_untagged, nso_tagged)
+            state.device_base_hash = dev_hash
+            state.status = sm.on_reconcile(state.status, matches=True)
+        elif not state.device_base_hash:
+            # NetBox already has a value, first time we 3-way-track it: adopt the base
+            # without clobbering; drift if it already differs from the device.
+            state.device_base_hash = dev_hash
+            state.status = sm.on_reconcile(state.status, matches=obj_hash == dev_hash)
+        else:
+            action = merge_util.three_way(
+                created=False, base=state.device_base_hash, obj_hash=obj_hash, dev_hash=dev_hash
+            )
+            matches, conflict = True, False
+            if action == "mirror":
+                _write_switchport(interface, group, nso_mode, nso_untagged, nso_tagged)
+                state.device_base_hash = dev_hash
+            elif action == "insync":
+                state.device_base_hash = dev_hash
+            elif action == "freeze":
+                matches = False
+            elif action == "conflict":
+                matches, conflict = False, True
+            state.status = sm.on_reconcile(state.status, matches=matches, conflict=conflict)
+
         state.save()
         rows.append(state)
         seen.add(interface.pk)
