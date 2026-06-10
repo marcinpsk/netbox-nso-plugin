@@ -280,12 +280,17 @@ def _resolve_prefixlist(name):
         return None
 
 
-def _write_peer_afs(peer_obj, peer_af_list: list, scope_obj, BGPAddressFamily, BGPPeerAddressFamily) -> None:
-    """Force the peer's BGPPeerAddressFamily rows to mirror the device (seed/auto-mirror).
+def _write_peer_afs(
+    peer_obj, peer_af_list: list, scope_obj, BGPAddressFamily, BGPPeerAddressFamily, *, clobber_safe: bool = False
+) -> None:
+    """Write the peer's/template's BGPPeerAddressFamily rows from the device.
 
-    Creates/updates a per-AF row for each device AF (route-map + prefix-list refs
-    resolved by name to the netbox_routing objects), and deletes AF rows the device no
-    longer reports. Only called on the seed / auto-mirror paths (never freezes edits).
+    Default (``clobber_safe=False``, peers): force-mirror — create/update each device AF
+    and prune AF rows the device dropped. Used only on the 3-way seed / auto-mirror paths.
+
+    ``clobber_safe=True`` (peer-group TEMPLATEs, which have no overlay/base to drive a
+    3-way and no apply path): seed missing AF rows on first import only, NEVER overwrite
+    or prune an existing one, so an operator edit to a peer-group's policy survives.
     """
     from django.contrib.contenttypes.models import ContentType
 
@@ -309,15 +314,16 @@ def _write_peer_afs(peer_obj, peer_af_list: list, scope_obj, BGPAddressFamily, B
             address_family=af_obj,
             defaults=policy,
         )
-        if not created:
+        if not created and not clobber_safe:
             for field, value in policy.items():
                 setattr(obj, field, value)
             obj.save()
         seen_af_ids.add(af_obj.pk)
-    # Prune AF rows the device dropped (mirror = match device exactly).
-    BGPPeerAddressFamily.objects.filter(assigned_object_type=ct, assigned_object_id=peer_obj.pk).exclude(
-        address_family_id__in=seen_af_ids
-    ).delete()
+    if not clobber_safe:
+        # Prune AF rows the device dropped (mirror = match device exactly).
+        BGPPeerAddressFamily.objects.filter(assigned_object_type=ct, assigned_object_id=peer_obj.pk).exclude(
+            address_family_id__in=seen_af_ids
+        ).delete()
 
 
 def _resolve_vrf(vrf_name: str, VRF):
@@ -468,14 +474,16 @@ def _reconcile_scope(
         template_obj = _get_or_create_peer_group(pg_name, BGPPeerTemplate, pg_remote_asn_obj)
         if template_obj is None:
             continue
-        # Peer-group TEMPLATE AF policies mirror the device (not yet edit-safe —
-        # template-level 3-way is a follow-up; the per-peer path above is the reference).
+        # Peer-group TEMPLATE AF policies: clobber-safe seed (templates have no overlay
+        # row / base for a full 3-way and no apply path) — seed on first import, never
+        # overwrite, so an operator edit to a peer-group's policy survives the sync.
         _write_peer_afs(
             template_obj,
             pg_entry.get("address_families") or [],
             scope_obj,
             BGPAddressFamily,
             BGPPeerAddressFamily,
+            clobber_safe=True,
         )
 
 

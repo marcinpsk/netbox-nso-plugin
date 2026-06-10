@@ -408,6 +408,35 @@ class TestReconcileBgpConfig(TestCase):
         self.assertEqual(paf.routemap_in.name, "Arbor-IBGP-in")
         self.assertEqual(paf.routemap_out.name, "Arbor-IBGP-out")
 
+    def test_peer_group_template_af_edit_survives_resync(self):
+        """Clobber-safe templates: an operator edit to a peer-group AF policy is preserved."""
+        self._make_mgmt()
+
+        from netbox_routing.models import BGPPeerAddressFamily, BGPPeerTemplate, RouteMap
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        RouteMap.objects.create(name="Arbor-IBGP-in")
+        operator_rm = RouteMap.objects.create(name="Operator-RM")
+        pg = {
+            "name": "Arbor-IBGP",
+            "remote_as": "65100",
+            "address_families": [{"af": "ipv4-unicast", "routemap_in": "Arbor-IBGP-in"}],
+        }
+        _reconcile_bgp_config(self.device, self._scope_with_peer_groups([pg]))
+
+        tmpl = BGPPeerTemplate.objects.get(name="Arbor-IBGP")
+        paf = BGPPeerAddressFamily.objects.get(
+            assigned_object_type__model="bgppeertemplate", assigned_object_id=tmpl.pk
+        )
+        paf.routemap_in = operator_rm  # operator edits the peer-group's inbound policy
+        paf.save()
+
+        # Re-sync with the original device data → the edit must NOT be clobbered.
+        _reconcile_bgp_config(self.device, self._scope_with_peer_groups([pg]))
+        paf.refresh_from_db()
+        self.assertEqual(paf.routemap_in_id, operator_rm.pk)
+
     def test_peer_group_object_idempotent(self):
         """Reconciling peer_groups twice → one template, one AF row (no dupes)."""
         self._make_mgmt()
