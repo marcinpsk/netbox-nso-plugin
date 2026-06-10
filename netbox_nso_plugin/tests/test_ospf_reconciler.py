@@ -91,6 +91,34 @@ class TestReconcileOspfFill(TestCase):
         self.assertEqual(len(res["instances"]), 1)
         self.assertEqual(res["instances"][0].status, "imported")  # unowned, materialized → imported (unified)
 
+    def test_instance_device_change_auto_mirrors_when_untouched(self):
+        """3-way: device router_id change with object untouched → auto-mirror, in sync."""
+        self._make_mgmt()
+        from netbox_routing.models import OSPFInstance
+
+        from netbox_nso_plugin.template_content import _reconcile_ospf
+
+        _reconcile_ospf(self.device, self._payload([self._instance(router_id="10.0.0.1")]))
+        res = _reconcile_ospf(self.device, self._payload([self._instance(router_id="10.0.0.2")]))
+        self.assertEqual(str(OSPFInstance.objects.get(device=self.device, process_id="10").router_id), "10.0.0.2")
+        self.assertEqual(res["instances"][0].status, "imported")
+
+    def test_instance_both_moved_is_conflict(self):
+        """3-way: object edited AND device changed since base → conflict, edit preserved."""
+        self._make_mgmt()
+        from netbox_routing.models import OSPFInstance
+
+        from netbox_nso_plugin.template_content import _reconcile_ospf
+
+        _reconcile_ospf(self.device, self._payload([self._instance(router_id="10.0.0.1")]))
+        inst = OSPFInstance.objects.get(device=self.device, process_id="10")
+        inst.router_id = "10.9.9.9"  # operator edit
+        inst.save()
+        res = _reconcile_ospf(self.device, self._payload([self._instance(router_id="10.0.0.2")]))  # device also moved
+        self.assertEqual(res["instances"][0].status, "conflict")
+        inst.refresh_from_db()
+        self.assertEqual(str(inst.router_id), "10.9.9.9")  # edit preserved
+
     def test_instance_without_router_id_skipped_but_overlay_kept(self):
         """router_id is required by the model → no OSPFInstance, but overlay still imported."""
         self._make_mgmt()

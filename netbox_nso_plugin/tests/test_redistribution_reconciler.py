@@ -110,3 +110,35 @@ class TestReconcileRedistribution(TestCase):
         self.assertEqual(states[0].status, "changed")  # edit surfaced as drift
         redist.refresh_from_db()
         self.assertEqual(redist.metric, 99)  # edit preserved, not reverted
+
+    def test_device_change_auto_mirrors_when_untouched(self):
+        """3-way: device metric change with object untouched → auto-mirror, in sync."""
+        self._make_mgmt()
+        from netbox_routing.models import ISISInstance, Redistribution
+
+        ISISInstance.objects.create(device=self.device, process_tag="")
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+
+        reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
+        # Device changes metric 10→20; object never edited → auto-mirror.
+        states = reconcile_redistribution(self.device, {"entries": [self._entry(metric=20)]})
+        Redistribution.objects.get(source_protocol="static").refresh_from_db()
+        self.assertEqual(Redistribution.objects.get(source_protocol="static").metric, 20)
+        self.assertEqual(states[0].status, "imported")
+
+    def test_both_moved_is_conflict(self):
+        """3-way: object edited AND device changed since base → conflict, edit preserved."""
+        self._make_mgmt()
+        from netbox_routing.models import ISISInstance, Redistribution
+
+        ISISInstance.objects.create(device=self.device, process_tag="")
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+
+        reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
+        redist = Redistribution.objects.get(source_protocol="static")
+        redist.metric = 99  # operator edit
+        redist.save()
+        states = reconcile_redistribution(self.device, {"entries": [self._entry(metric=20)]})  # device also moved
+        self.assertEqual(states[0].status, "conflict")
+        redist.refresh_from_db()
+        self.assertEqual(redist.metric, 99)  # edit preserved

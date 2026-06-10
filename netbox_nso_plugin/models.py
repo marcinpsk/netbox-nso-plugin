@@ -1170,6 +1170,7 @@ class NSOOSPFInstanceState(NetBoxModel):
     accepted_at = models.DateTimeField(null=True, blank=True)
     last_apply_at = models.DateTimeField(null=True, blank=True)
     last_apply_error = models.TextField(blank=True, default="")
+    device_base_hash = models.CharField(max_length=64, blank=True, default="")
 
     class Meta:
         ordering = ["management", "process_id"]
@@ -1211,6 +1212,7 @@ class NSOOSPFInterfaceState(NetBoxModel):
     accepted_at = models.DateTimeField(null=True, blank=True)
     last_apply_at = models.DateTimeField(null=True, blank=True)
     last_apply_error = models.TextField(blank=True, default="")
+    device_base_hash = models.CharField(max_length=64, blank=True, default="")
 
     class Meta:
         ordering = ["management", "interface"]
@@ -1276,6 +1278,7 @@ class NSORedistributionState(NetBoxModel):
     accepted_at = models.DateTimeField(null=True, blank=True)
     last_apply_at = models.DateTimeField(null=True, blank=True)
     last_apply_error = models.TextField(blank=True, default="")
+    device_base_hash = models.CharField(max_length=64, blank=True, default="")
 
     class Meta:
         ordering = ["management", "dest_protocol", "dest_ref", "source_protocol"]

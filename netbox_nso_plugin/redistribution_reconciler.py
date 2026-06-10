@@ -66,45 +66,58 @@ def _resolve_redist_destination(device, dest_protocol: str, dest_ref: str):
     return None
 
 
-def _redist_matches(redist, entry: dict) -> bool:
-    """Return True if the netbox-routing Redistribution content equals the device entry."""
-    rm = redist.route_map.name if redist.route_map_id else ""
-    if rm != (entry.get("route_map") or ""):
-        return False
-    if redist.metric != entry.get("metric"):
-        return False
-    return (redist.metric_type or "") == (entry.get("metric_type") or "")
+def _redist_device_content(entry: dict, route_map) -> dict:
+    """Canonical device-desired Redistribution content (route_map as pk)."""
+    from . import merge_util
+
+    return {
+        "route_map": merge_util.pk(route_map),
+        "metric": entry.get("metric"),
+        "metric_type": entry.get("metric_type") or "",
+    }
 
 
-def _create_or_link_redistribution(state, device, entry: dict) -> bool:
-    """Create (or link to) the netbox_routing.Redistribution for this state row.
+def _redist_object_content(redist) -> dict:
+    """Canonical content read back from the netbox-routing Redistribution object."""
+    return {
+        "route_map": redist.route_map_id,
+        "metric": redist.metric,
+        "metric_type": redist.metric_type or "",
+    }
 
-    Clobber-safe: seeds the Redistribution from the device on first create only; an
-    existing object is never overwritten, so operator edits survive. Returns
-    ``matches`` = (object content == device) for value-aware drift detection (an edit
-    → False → 'changed'); True when nothing is linkable yet (benign → imported).
+
+def _write_redist(redist, route_map, entry: dict) -> None:
+    """Write the device-desired values onto the Redistribution (seed / auto-mirror)."""
+    redist.route_map = route_map
+    redist.metric = entry.get("metric")
+    redist.metric_type = entry.get("metric_type") or ""
+    redist.save(update_fields=["route_map", "metric", "metric_type"])
+
+
+def _create_or_link_redistribution(state, device, entry: dict) -> tuple[bool, bool]:
+    """3-way reconcile the netbox_routing.Redistribution for this state row.
+
+    Returns ``(matches, conflict)``. Device-side changes auto-mirror when the object is
+    untouched; operator edits survive and surface as 'changed'; both-moved → conflict.
     """
+    from . import merge_util
+
     try:
         from django.contrib.contenttypes.models import ContentType
         from netbox_routing.models import Redistribution, RouteMap
     except ImportError:
-        return True
+        return True, False
 
     try:
-        if state.redistribution_id is not None:
-            return _redist_matches(state.redistribution, entry)  # already linked → drift check
-
         dest = _resolve_redist_destination(device, state.dest_protocol, state.dest_ref)
         if dest is None:
-            return True  # destination scope not modelled (yet) — leave status=imported
+            return True, False  # destination scope not modelled (yet) — leave imported
 
-        route_map = None
-        rm_name = entry.get("route_map") or ""
-        if rm_name:
-            route_map = RouteMap.objects.filter(name=rm_name).first()
-
+        route_map = (
+            RouteMap.objects.filter(name=entry.get("route_map") or "").first() if entry.get("route_map") else None
+        )
         dct = ContentType.objects.get_for_model(dest.__class__)
-        redist, _ = Redistribution.objects.get_or_create(
+        redist, created = Redistribution.objects.get_or_create(
             destination_type=dct,
             destination_id=dest.pk,
             source_protocol=state.source_protocol,
@@ -117,10 +130,26 @@ def _create_or_link_redistribution(state, device, entry: dict) -> bool:
         )
         state.redistribution = redist
         state.save(update_fields=["redistribution"])
-        return _redist_matches(redist, entry)
+
+        dev_hash = merge_util.content_hash(_redist_device_content(entry, route_map))
+        obj_hash = merge_util.content_hash(_redist_object_content(redist))
+        action = merge_util.three_way(
+            created=created, base=state.device_base_hash, obj_hash=obj_hash, dev_hash=dev_hash
+        )
+        if action in ("seed", "mirror"):
+            if action == "mirror":
+                _write_redist(redist, route_map, entry)
+            state.device_base_hash = dev_hash
+            return True, False
+        if action == "insync":
+            state.device_base_hash = dev_hash
+            return True, False
+        if action == "freeze":
+            return False, False
+        return False, True  # conflict
     except Exception as exc:
         logger.debug("_create_or_link_redistribution: error for state %s: %s", state.pk, exc)
-        return True
+        return True, False
 
 
 def reconcile_redistribution(device, payload: dict) -> list:
@@ -170,13 +199,12 @@ def reconcile_redistribution(device, payload: dict) -> list:
         state.metric = entry.get("metric")
         state.metric_type = entry.get("metric_type") or ""
         state.last_sync_at = now
-        if state.status != "conflict":
-            state.save()
-            # Clobber-safe link + value-aware drift: matches=(object content==device).
-            # An edit → changed → accept → apply → in_sync (owned settles by value).
-            matches = _create_or_link_redistribution(state, device, entry)
-            state.refresh_from_db(fields=["redistribution"])
-            state.status = sm.on_reconcile(state.status, matches=matches)
+        state.save()
+        # 3-way merge: device change auto-mirrors when untouched; operator edit →
+        # changed (and survives); both moved → conflict. The helper mutates this same
+        # state object (redistribution FK + device_base_hash); the final save persists.
+        matches, conflict = _create_or_link_redistribution(state, device, entry)
+        state.status = sm.on_reconcile(state.status, matches=matches, conflict=conflict)
         state.save()
         seen_keys.add(key)
 

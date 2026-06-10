@@ -1248,52 +1248,64 @@ def _resolve_ospf_vrf(vrf_name: str):
         return None
 
 
-def _get_or_create_ospf_instance(device, pid, entry, OSPFInstance):
-    """Create the netbox-routing OSPFInstance for one process; report device match.
+def _get_or_create_ospf_instance(device, pid, entry, OSPFInstance, base):
+    """3-way reconcile the netbox-routing OSPFInstance for one process.
 
-    Keyed on (device, process_id). ``router_id`` is required by the model
-    (IPAddressField) so an instance NSO reports without one is skipped. Clobber-safe
-    (write-path): device values seed the object on create only; an existing instance
-    is NEVER overwritten so operator edits survive. Returns ``(obj, matches)`` where
-    matches = (object content == device) for value-aware drift detection.
+    Keyed on (device, process_id). ``router_id`` is required by the model so an
+    instance NSO reports without one is skipped. 3-way merge against *base*: device
+    changes auto-mirror when the object is untouched; operator edits survive and
+    surface as drift; both-moved → conflict. Returns ``(obj, matches, conflict, base)``
+    where the returned base is the new device hash (advanced on seed/mirror/insync).
     """
+    from . import merge_util
+
     if OSPFInstance is None:
-        return None, True
+        return None, True, False, base
     router_id = entry.get("router_id")
     if not router_id:
-        return None, True
+        return None, True, False, base
     vrf_obj = _resolve_ospf_vrf(entry.get("vrf") or "")
     obj, created = OSPFInstance.objects.get_or_create(
         device=device,
         process_id=pid,
         defaults={"name": str(pid), "router_id": router_id, "vrf": vrf_obj},
     )
-    matches = True
-    if not created:
-        if str(obj.router_id) != str(router_id):
-            matches = False
-        elif obj.vrf_id != (vrf_obj.id if vrf_obj else None):
-            matches = False
-    return obj, matches
+    dev = {"router_id": str(router_id), "vrf": merge_util.pk(vrf_obj)}
+    objc = {"router_id": str(obj.router_id), "vrf": obj.vrf_id}
+    dev_hash = merge_util.content_hash(dev)
+    action = merge_util.three_way(created=created, base=base, obj_hash=merge_util.content_hash(objc), dev_hash=dev_hash)
+    if action in ("seed", "mirror", "insync"):
+        if action == "mirror":
+            obj.router_id = router_id
+            obj.vrf = vrf_obj
+            obj.save(update_fields=["router_id", "vrf"])
+        return obj, True, False, dev_hash
+    if action == "freeze":
+        return obj, False, False, base
+    return obj, False, True, base  # conflict
 
 
 _OSPF_AUTH_MAP = {"message-digest": "message-digest", "null": "null"}
 _OSPF_NETWORK_TYPES = {"broadcast", "non-broadcast", "point-to-point", "point-to-multipoint"}
 
 
-def _fill_ospf_interface(entry, iface, inst_by_pid, OSPFArea, OSPFInterface):
-    """Create/refresh the netbox-routing OSPFInterface + its OSPFArea.
+def _fill_ospf_interface(entry, iface, inst_by_pid, OSPFArea, OSPFInterface, base):
+    """3-way reconcile the netbox-routing OSPFInterface + its OSPFArea.
 
-    OSPFArea is a global object keyed by area_id. OSPFInterface is OneToOne on
-    the dcim.Interface. Auth keys are never imported — only the auth *type* (and
-    only the values netbox-routing models; plaintext has no equivalent).
+    OSPFArea is a global object keyed by area_id. OSPFInterface is OneToOne on the
+    dcim.Interface. Auth keys are never imported — only the auth *type*. 3-way merge
+    against *base*: device changes auto-mirror when the object is untouched; operator
+    edits survive and surface as drift; both-moved → conflict. Returns
+    ``(matches, conflict, base)`` (returned base advanced on seed/mirror/insync).
     """
+    from . import merge_util
+
     if OSPFInterface is None or OSPFArea is None:
-        return True
+        return True, False, base
     pid = entry.get("process_id")
     inst = inst_by_pid.get(pid)
     if inst is None:
-        return True
+        return True, False, base
     area_id = entry.get("area_id") or "0.0.0.0"
     area, _ = OSPFArea.objects.get_or_create(area_id=area_id, defaults={"area_type": "standard"})
 
@@ -1312,19 +1324,29 @@ def _fill_ospf_interface(entry, iface, inst_by_pid, OSPFArea, OSPFInterface):
         "authentication": auth,
     }
     obj, created = OSPFInterface.objects.get_or_create(interface=iface, defaults=fields)
-    # Clobber-safe: seed on create only; never overwrite an existing interface so
-    # operator edits survive. Return matches = (object content == device) for drift.
-    matches = True
-    if not created:
+
+    def _content(src_is_obj):
+        out = {}
         for key, val in fields.items():
             if key in ("instance", "area"):
-                if getattr(obj, f"{key}_id") != (val.pk if val is not None else None):
-                    matches = False
-                    break
-            elif getattr(obj, key) != val:
-                matches = False
-                break
-    return matches
+                out[key] = getattr(obj, f"{key}_id") if src_is_obj else merge_util.pk(val)
+            else:
+                out[key] = getattr(obj, key) if src_is_obj else val
+        return out
+
+    dev_hash = merge_util.content_hash(_content(False))
+    action = merge_util.three_way(
+        created=created, base=base, obj_hash=merge_util.content_hash(_content(True)), dev_hash=dev_hash
+    )
+    if action in ("seed", "mirror", "insync"):
+        if action == "mirror":
+            for key, val in fields.items():
+                setattr(obj, key, val)
+            obj.save()
+        return True, False, dev_hash
+    if action == "freeze":
+        return False, False, base
+    return False, True, base  # conflict
 
 
 def _reconcile_ospf(device, payload: dict) -> dict:
@@ -1376,12 +1398,15 @@ def _reconcile_ospf(device, payload: dict) -> dict:
         state.vrf = entry.get("vrf") or ""
         state.areas = entry.get("areas") or []
         state.last_sync_at = now
-        ospf_inst, inst_matches = _get_or_create_ospf_instance(device, pid, entry, OSPFInstance)
+        # 3-way merge: device router_id/vrf change auto-mirrors when the object is
+        # untouched; an operator edit surfaces as 'changed' and survives; both → conflict.
+        ospf_inst, inst_matches, inst_conflict, new_base = _get_or_create_ospf_instance(
+            device, pid, entry, OSPFInstance, state.device_base_hash
+        )
         if ospf_inst is not None:
             state.ospf_instance = ospf_inst
-        # Value overlay: an edit to the OSPFInstance (router_id/vrf) surfaces as
-        # 'changed' and survives sync; accept -> apply -> in_sync.
-        state.status = sm.on_reconcile(state.status, matches=inst_matches)
+        state.device_base_hash = new_base
+        state.status = sm.on_reconcile(state.status, matches=inst_matches, conflict=inst_conflict)
         state.save()
         seen_pids.add(pid)
 
@@ -1445,10 +1470,13 @@ def _reconcile_ospf_interfaces(device, mgmt, payload, now) -> None:
         state.auth_type = entry.get("auth_type") or ""
         state.auth_present = bool(entry.get("auth_present", False))
         state.last_sync_at = now
-        # Fill first so its drift folds into status: value overlay — an edit to the
-        # OSPFInterface surfaces as 'changed' and survives sync; accept -> apply.
-        iface_matches = _fill_ospf_interface(entry, iface, inst_by_pid, OSPFArea, OSPFInterface)
-        state.status = sm.on_reconcile(state.status, matches=iface_matches)
+        # 3-way merge: device change auto-mirrors when the OSPFInterface is untouched;
+        # an operator edit surfaces as 'changed' and survives; both moved → conflict.
+        iface_matches, iface_conflict, new_base = _fill_ospf_interface(
+            entry, iface, inst_by_pid, OSPFArea, OSPFInterface, state.device_base_hash
+        )
+        state.device_base_hash = new_base
+        state.status = sm.on_reconcile(state.status, matches=iface_matches, conflict=iface_conflict)
         state.save()
         seen_iface_pks.add(iface.pk)
 
