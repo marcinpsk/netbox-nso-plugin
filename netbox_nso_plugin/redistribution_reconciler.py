@@ -66,26 +66,37 @@ def _resolve_redist_destination(device, dest_protocol: str, dest_ref: str):
     return None
 
 
-def _create_or_link_redistribution(state, device, entry: dict):
+def _redist_matches(redist, entry: dict) -> bool:
+    """Return True if the netbox-routing Redistribution content equals the device entry."""
+    rm = redist.route_map.name if redist.route_map_id else ""
+    if rm != (entry.get("route_map") or ""):
+        return False
+    if redist.metric != entry.get("metric"):
+        return False
+    return (redist.metric_type or "") == (entry.get("metric_type") or "")
+
+
+def _create_or_link_redistribution(state, device, entry: dict) -> bool:
     """Create (or link to) the netbox_routing.Redistribution for this state row.
 
-    Resolves the destination scope + route-map, then get_or_creates the
-    Redistribution keyed by (destination, source_protocol, source_ref) and links it.
-    No-ops if netbox_routing is absent or the destination scope doesn't exist yet.
+    Clobber-safe: seeds the Redistribution from the device on first create only; an
+    existing object is never overwritten, so operator edits survive. Returns
+    ``matches`` = (object content == device) for value-aware drift detection (an edit
+    → False → 'changed'); True when nothing is linkable yet (benign → imported).
     """
-    if state.redistribution_id is not None:
-        return  # already linked
-
     try:
         from django.contrib.contenttypes.models import ContentType
         from netbox_routing.models import Redistribution, RouteMap
     except ImportError:
-        return
+        return True
 
     try:
+        if state.redistribution_id is not None:
+            return _redist_matches(state.redistribution, entry)  # already linked → drift check
+
         dest = _resolve_redist_destination(device, state.dest_protocol, state.dest_ref)
         if dest is None:
-            return  # destination scope not modelled (yet) — leave status=imported
+            return True  # destination scope not modelled (yet) — leave status=imported
 
         route_map = None
         rm_name = entry.get("route_map") or ""
@@ -106,8 +117,10 @@ def _create_or_link_redistribution(state, device, entry: dict):
         )
         state.redistribution = redist
         state.save(update_fields=["redistribution"])
+        return _redist_matches(redist, entry)
     except Exception as exc:
         logger.debug("_create_or_link_redistribution: error for state %s: %s", state.pk, exc)
+        return True
 
 
 def reconcile_redistribution(device, payload: dict) -> list:
@@ -157,14 +170,13 @@ def reconcile_redistribution(device, payload: dict) -> list:
         state.metric = entry.get("metric")
         state.metric_type = entry.get("metric_type") or ""
         state.last_sync_at = now
-        if not sm.is_owned(state.status) and state.status != "conflict":
+        if state.status != "conflict":
             state.save()
-            _create_or_link_redistribution(state, device, entry)
+            # Clobber-safe link + value-aware drift: matches=(object content==device).
+            # An edit → changed → accept → apply → in_sync (owned settles by value).
+            matches = _create_or_link_redistribution(state, device, entry)
             state.refresh_from_db(fields=["redistribution"])
-            # Mirror overlay: an unowned row rests at imported. Linking the
-            # netbox-routing Redistribution is best-effort (an unmodelled destination
-            # is benign, not drift), so it does not change the status.
-            state.status = sm.on_reconcile(state.status, matches=None)
+            state.status = sm.on_reconcile(state.status, matches=matches)
         state.save()
         seen_keys.add(key)
 

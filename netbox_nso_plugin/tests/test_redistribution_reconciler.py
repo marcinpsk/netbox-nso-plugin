@@ -92,3 +92,21 @@ class TestReconcileRedistribution(TestCase):
         reconcile_redistribution(self.device, {"entries": [self._entry()]})
         reconcile_redistribution(self.device, {"entries": [self._entry()]})
         self.assertEqual(Redistribution.objects.filter(source_protocol="static").count(), 1)
+
+    def test_edit_surfaces_as_changed_and_survives(self):
+        """Editing the Redistribution object → drift, and the edit is not clobbered."""
+        self._make_mgmt()
+        from netbox_routing.models import ISISInstance, Redistribution
+
+        ISISInstance.objects.create(device=self.device, process_tag="")
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+
+        reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
+        redist = Redistribution.objects.get(source_protocol="static")
+        redist.metric = 99  # operator edit; device still reports 10
+        redist.save()
+
+        states = reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
+        self.assertEqual(states[0].status, "changed")  # edit surfaced as drift
+        redist.refresh_from_db()
+        self.assertEqual(redist.metric, 99)  # edit preserved, not reverted

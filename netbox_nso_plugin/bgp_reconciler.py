@@ -245,10 +245,16 @@ def _reconcile_peer_address_families(peer_obj, peer_af_list: list, scope_obj, BG
     Links inbound/outbound route-map + prefix-list references (resolved by name to
     the netbox_routing objects the route-policy reconciler created). Unresolved names
     are left null rather than guessed.
+
+    Clobber-safe (write-path): the device policy seeds a per-AF row on first import
+    only; an existing row is NEVER overwritten, so an operator edit to a peer's AF
+    policy survives to be applied. Returns ``matches`` — False when any existing AF
+    row diverges from the device (the caller turns that into 'changed').
     """
     from django.contrib.contenttypes.models import ContentType
 
     ct = ContentType.objects.get_for_model(peer_obj.__class__)
+    matches = True
     for paf_entry in peer_af_list:
         af_str = paf_entry.get("af") or ""
         if not af_str:
@@ -268,18 +274,13 @@ def _reconcile_peer_address_families(peer_obj, peer_af_list: list, scope_obj, BG
             defaults=policy,
         )
         if not created:
-            changed = False
             for field, value in policy.items():
-                if field == "enabled":
-                    if obj.enabled != value:
-                        obj.enabled = value
-                        changed = True
-                else:
-                    if getattr(obj, f"{field}_id") != (value.pk if value else None):
-                        setattr(obj, field, value)
-                        changed = True
-            if changed:
-                obj.save()
+                current = obj.enabled if field == "enabled" else getattr(obj, f"{field}_id")
+                new = value if field == "enabled" else (value.pk if value else None)
+                if current != new:
+                    matches = False  # AF policy diverges → drift (do NOT clobber)
+                    break
+    return matches
 
 
 def _resolve_vrf(vrf_name: str, VRF):
@@ -371,6 +372,11 @@ def _reconcile_scope(
         bgp_peer, was_existing, peer_matches = _get_or_create_peer(
             scope_obj, ip_obj, peer_entry, remote_asn_obj, local_asn_obj, peer_group_obj, BGPPeer, source_obj
         )
+        # Reconcile per-AF policies first so their drift folds into the peer's status:
+        # the peer matches the device only if both its fields AND every AF policy do.
+        af_matches = _reconcile_peer_address_families(
+            bgp_peer, peer_entry.get("address_families") or [], scope_obj, BGPAddressFamily, BGPPeerAddressFamily
+        )
         _update_peer_state(
             mgmt,
             asn_str,
@@ -381,13 +387,9 @@ def _reconcile_scope(
             peer_entry,
             was_existing,
             now,
-            peer_matches,
+            peer_matches and af_matches,
         )
         seen_keys.add((mgmt.pk, asn_str, vrf_name, peer_address_str))
-
-        _reconcile_peer_address_families(
-            bgp_peer, peer_entry.get("address_families") or [], scope_obj, BGPAddressFamily, BGPPeerAddressFamily
-        )
 
     # Peer-group / template OBJECTS: model each as a BGPPeerTemplate carrying its
     # own per-AF route-map / prefix-list policies (not just inlined onto members).
