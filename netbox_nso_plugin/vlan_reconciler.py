@@ -2,11 +2,18 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """M34: reconcile the adapter VLAN-database + switchport payloads into NetBox.
 
-VLANs are reconciled into a per-device ``ipam.VLANGroup`` (slug ``nso-{device.pk}``)
-so imported vids are scoped per device (NetBox enforces UNIQUE(group, vid) — two
-switches can both have VLAN 10 without colliding). Switchports compare the NSO-
-observed mode/untagged/tagged against the LIVE NetBox interface to compute drift;
-the overlay carries status, native L2 fields stay the source of truth.
+VLANs are *seeded* into a per-device ``ipam.VLANGroup`` (slug ``nso-{device.pk}``)
+on first import so imported vids are scoped per device (NetBox enforces
+UNIQUE(group, vid) — two switches can both have VLAN 10 without colliding). After
+that the device↔VLAN link is anchored on the ``NSOVLANState`` row, NOT on the
+group: an operator may move a VLAN into a broader/shared group (site-wide,
+shared across switches) and it stays synced with the device — reconcile follows
+the overlay FK instead of recreating a duplicate in the per-device group. The
+per-device group is only the default landing spot for never-before-seen vids.
+
+Switchports compare the NSO-observed mode/untagged/tagged against the LIVE NetBox
+interface to compute drift; the overlay carries status, native L2 fields stay the
+source of truth.
 """
 
 from __future__ import annotations
@@ -20,17 +27,39 @@ _NSO_TO_NETBOX_MODE = {"access": "access", "trunk": "tagged", "trunk-all": "tagg
 
 
 def _device_vlan_group(device):
-    """Per-device VLAN group so imported vids are scoped to the device."""
+    """Per-device VLAN group — the default landing spot for newly-imported vids."""
     from ipam.models import VLANGroup
 
     group, _ = VLANGroup.objects.get_or_create(slug=f"nso-{device.pk}", defaults={"name": f"NSO {device.name}"})
     return group
 
 
+def _resolve_synced_vlan(management, group, vid, *, name=None, create=True):
+    """Return the ipam.VLAN this device's *vid* is synced to.
+
+    Anchor on an existing ``NSOVLANState`` for (management, vid) so a VLAN the
+    operator moved to a broader/shared group stays synced and is never duplicated
+    in the per-device group. Only fall back to the per-device *group* when this vid
+    has never been imported for this device.
+
+    ``create=True`` creates the per-device VLAN on that fallback (seed/write path);
+    ``create=False`` returns an existing per-device VLAN or ``None`` (read mirror).
+    """
+    from ipam.models import VLAN
+
+    from .models import NSOVLANState
+
+    state = NSOVLANState.objects.filter(management=management, vlan__vid=vid).select_related("vlan").first()
+    if state is not None:
+        return state.vlan
+    if create:
+        return VLAN.objects.get_or_create(group=group, vid=vid, defaults={"name": name} if name else {})[0]
+    return VLAN.objects.filter(group=group, vid=vid).first()
+
+
 def reconcile_vlan_database(device, payload: dict) -> list:
     """Upsert ipam.VLAN (per-device group) + NSOVLANState from the adapter payload."""
     from django.utils import timezone
-    from ipam.models import VLAN
 
     from . import status_machine as sm
     from .models import NSODeviceManagement, NSOVLANState
@@ -51,7 +80,8 @@ def reconcile_vlan_database(device, payload: dict) -> list:
         # Seed the name on first import only. NEVER clobber it afterwards: the
         # NetBox VLAN name is operator-editable, and overwriting it back to the
         # device value would silently revert (and hide) an operator rename.
-        vlan, _ = VLAN.objects.get_or_create(group=group, vid=vid, defaults={"name": name})
+        # Anchor on the overlay FK so a VLAN moved to a broader group stays synced.
+        vlan = _resolve_synced_vlan(management, group, vid, name=name)
         state, _ = NSOVLANState.objects.get_or_create(management=management, vlan=vlan)
         state.last_sync_at = now
         state.device_name = name  # mirror the device value for drift display
@@ -64,8 +94,9 @@ def reconcile_vlan_database(device, payload: dict) -> list:
         state.save()
         rows.append(state)
 
-    # rows the payload no longer reports → drift
-    for stale in NSOVLANState.objects.filter(management=management, vlan__group=group):
+    # rows the payload no longer reports → drift (anchor on the management, not the
+    # group, so a VLAN moved out of the per-device group is still tracked).
+    for stale in NSOVLANState.objects.filter(management=management).select_related("vlan"):
         if stale.vlan.vid not in seen_vids:
             new_status = sm.on_reconcile(stale.status, present=False)
             if new_status != stale.status:
@@ -91,21 +122,21 @@ def _switchport_is_pristine(interface) -> bool:
     return not (interface.mode or "") and interface.untagged_vlan_id is None and not interface.tagged_vlans.exists()
 
 
-def _write_switchport(interface, group, mode: str, untagged, tagged: list) -> None:
+def _write_switchport(management, interface, group, mode: str, untagged, tagged: list) -> None:
     """Seed/mirror the device's L2 config onto the native NetBox interface.
 
-    Missing VLANs are created in the per-device group so the seed is faithful (the
-    tagged set may reference vids not in the device's VLAN database export).
+    VLANs are resolved through the device's synced overlay first (so a moved/shared
+    VLAN is referenced, not duplicated); a vid never seen on this device falls back
+    to a per-device-group VLAN so the seed is faithful (the tagged set may reference
+    vids not in the device's VLAN database export).
     """
-    from ipam.models import VLAN
-
     interface.mode = mode
     if untagged is not None:
-        interface.untagged_vlan, _ = VLAN.objects.get_or_create(group=group, vid=untagged)
+        interface.untagged_vlan = _resolve_synced_vlan(management, group, untagged)
     else:
         interface.untagged_vlan = None
     interface.save()
-    tagged_objs = [VLAN.objects.get_or_create(group=group, vid=v)[0] for v in (tagged or [])]
+    tagged_objs = [_resolve_synced_vlan(management, group, v) for v in (tagged or [])]
     interface.tagged_vlans.set(tagged_objs)
 
 
@@ -122,7 +153,6 @@ def reconcile_switchport(device, payload: dict) -> list:
     auto-clobbered. IOS's implicit default native VLAN 1 is normalised to "no native".
     """
     from django.utils import timezone
-    from ipam.models import VLAN
 
     from . import merge_util
     from . import status_machine as sm
@@ -152,11 +182,13 @@ def reconcile_switchport(device, payload: dict) -> list:
         state, _ = NSOSwitchportState.objects.get_or_create(management=management, interface=interface)
         state.mode = nso_mode
         state.untagged_vlan = (
-            VLAN.objects.filter(group=group, vid=nso_untagged).first() if nso_untagged is not None else None
+            _resolve_synced_vlan(management, group, nso_untagged, create=False) if nso_untagged is not None else None
         )
         state.last_sync_at = now
         state.save()
-        state.tagged_vlans.set(VLAN.objects.filter(group=group, vid__in=nso_tagged))
+        state.tagged_vlans.set(
+            v for v in (_resolve_synced_vlan(management, group, vid, create=False) for vid in nso_tagged) if v
+        )
 
         dev_hash = merge_util.content_hash(_switchport_content(nso_mode, nso_untagged, nso_tagged))
         obj_hash = merge_util.content_hash(_switchport_object_content(interface))
@@ -166,7 +198,7 @@ def reconcile_switchport(device, payload: dict) -> list:
             state.status = sm.on_reconcile(state.status, matches=obj_hash == dev_hash)
         elif _switchport_is_pristine(interface):
             # No NetBox value → seed the device's L2 config (read mirror) → imported/in_sync.
-            _write_switchport(interface, group, nso_mode, nso_untagged, nso_tagged)
+            _write_switchport(management, interface, group, nso_mode, nso_untagged, nso_tagged)
             state.device_base_hash = dev_hash
             state.status = sm.on_reconcile(state.status, matches=True)
         elif not state.device_base_hash:
@@ -180,7 +212,7 @@ def reconcile_switchport(device, payload: dict) -> list:
             )
             matches, conflict = True, False
             if action == "mirror":
-                _write_switchport(interface, group, nso_mode, nso_untagged, nso_tagged)
+                _write_switchport(management, interface, group, nso_mode, nso_untagged, nso_tagged)
                 state.device_base_hash = dev_hash
             elif action == "insync":
                 state.device_base_hash = dev_hash

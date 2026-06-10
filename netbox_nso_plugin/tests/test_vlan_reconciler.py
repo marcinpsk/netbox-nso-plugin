@@ -68,6 +68,63 @@ class TestVlanReconciler(TestCase):
         self.assertEqual(rows[0].status, "changed")  # drift surfaced
         self.assertEqual(rows[0].device_name, "OLD_NAME")  # device value mirrored for display
 
+    def test_moved_vlan_stays_synced_not_duplicated(self):
+        """A VLAN re-scoped to a broader group is followed via the overlay FK, not duplicated."""
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 10, "name": "MGMT"}]})
+        per_device = VLANGroup.objects.get(slug=f"nso-{self.device.pk}")
+        vlan = VLAN.objects.get(group=per_device, vid=10)
+
+        # Operator re-scopes the VLAN into a shared, site-wide group.
+        site = VLANGroup.objects.create(name="Site Wide", slug="site-wide")
+        vlan.group = site
+        vlan.save()
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 10, "name": "MGMT"}]})
+
+        # No duplicate created back in the per-device group; the moved VLAN is reused.
+        self.assertEqual(VLAN.objects.filter(vid=10).count(), 1)
+        self.assertFalse(VLAN.objects.filter(group=per_device, vid=10).exists())
+        state = NSOVLANState.objects.get(management=self.management, vlan__vid=10)
+        self.assertEqual(state.vlan_id, vlan.pk)
+        self.assertEqual(state.vlan.group_id, site.pk)
+
+    def test_moved_vlan_still_drifts_when_device_drops_it(self):
+        """Stale detection follows the overlay FK even after a re-scope out of the per-device group."""
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+
+        reconcile_vlan_database(
+            self.device, {"vlans": [{"vlan_id": 10, "name": "MGMT"}, {"vlan_id": 20, "name": "DATA"}]}
+        )
+        vlan10 = NSOVLANState.objects.get(management=self.management, vlan__vid=10).vlan
+        site = VLANGroup.objects.create(name="Site Wide", slug="site-wide")
+        vlan10.group = site
+        vlan10.save()
+
+        # Device now reports only VLAN 20 → the moved VLAN 10 must still surface as drift.
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 20, "name": "DATA"}]})
+        state10 = NSOVLANState.objects.get(management=self.management, vlan__vid=10)
+        self.assertEqual(state10.status, "changed")
+
+    def test_switchport_anchors_to_moved_vlan(self):
+        """A trunk's tagged VLAN resolves to the re-scoped VLAN, not a per-device duplicate."""
+        from netbox_nso_plugin.vlan_reconciler import reconcile_switchport, reconcile_vlan_database
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 10, "name": "MGMT"}]})
+        vlan10 = NSOVLANState.objects.get(management=self.management, vlan__vid=10).vlan
+        site = VLANGroup.objects.create(name="Site Wide", slug="site-wide")
+        vlan10.group = site
+        vlan10.save()
+
+        reconcile_switchport(
+            self.device,
+            {"interfaces": [{"interface_name": "GigabitEthernet0/1", "mode": "trunk", "tagged_vlans": [10]}]},
+        )
+        self.interface.refresh_from_db()
+        self.assertEqual(VLAN.objects.filter(vid=10).count(), 1)
+        self.assertEqual(list(self.interface.tagged_vlans.values_list("pk", flat=True)), [vlan10.pk])
+
     def test_switchport_seeded_when_pristine(self):
         """A pristine NetBox interface is SEEDED from the device (read mirror) → imported, no drift.
 
