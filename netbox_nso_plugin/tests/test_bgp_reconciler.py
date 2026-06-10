@@ -510,25 +510,55 @@ class TestReconcileBgpConfig(TestCase):
         self.assertEqual(statuses["10.0.1.1"], "imported")  # present, unowned → imported
         self.assertEqual(statuses["10.0.1.2"], "changed")
 
-    def test_write_path_status_preserved(self):
-        """Rows in accepted/deploying/in_sync are not overwritten to imported."""
+    def test_accepted_peer_matching_device_settles_in_sync(self):
+        """Value overlay: an accepted peer whose device already matches → in_sync.
+
+        (Never reverts to 'imported' — the owned no-clobber guarantee — but, like VLAN,
+        an accepted row that the device already confirms is in sync, nothing to apply.)
+        """
         mgmt = self._make_mgmt()
 
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
         from netbox_nso_plugin.models import NSOBGPPeerState
 
-        # First call to create the row
         _reconcile_bgp_config(self.device, self._payload(self._router_payload(peers=[self._peer_entry()])))
-
-        # Force status to 'accepted'
         NSOBGPPeerState.objects.filter(management=mgmt).update(status="accepted")
 
-        # Second call — should NOT revert to 'imported'
         result = _reconcile_bgp_config(
             self.device,
             self._payload(self._router_payload(peers=[self._peer_entry()])),
         )
-        self.assertEqual(result[0].status, "accepted")
+        self.assertEqual(result[0].status, "in_sync")
+
+    def test_edit_to_bgp_peer_surfaces_as_changed_and_survives(self):
+        """Editing the netbox-routing BGPPeer shows as drift and is NOT clobbered.
+
+        This is the edit->apply contract: the operator's edit must (a) surface as
+        'changed' so it can be accepted/applied, and (b) survive the next device sync
+        instead of being reverted to the device value.
+        """
+        self._make_mgmt()
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        try:
+            from netbox_routing.models import BGPPeer
+        except ImportError:
+            self.skipTest("netbox_routing not installed")
+
+        _reconcile_bgp_config(self.device, self._payload(self._router_payload(peers=[self._peer_entry()])))
+        peer = BGPPeer.objects.get()
+        # Operator edits in NetBox; the device still reports enabled=True.
+        peer.enabled = False
+        peer.save()
+
+        result = _reconcile_bgp_config(
+            self.device,
+            self._payload(self._router_payload(peers=[self._peer_entry()])),
+        )
+        self.assertEqual(result[0].status, "changed")  # (a) edit surfaced as drift
+        peer.refresh_from_db()
+        self.assertFalse(peer.enabled)  # (b) edit preserved, not reverted to device
 
     def test_invalid_asn_skipped(self):
         """Router with invalid ASN string → silently skipped."""

@@ -175,11 +175,13 @@ def _get_or_create_peer(
 ):
     """Find or create a BGPPeer for (scope, peer_ip).
 
-    Updates mutable fields (enabled, remote_as, local_as, peer_group, ttl,
-    password) only if the peer was newly created or the fields differ.
-    Returns (bgp_peer, conflict) where conflict=True when an existing peer
-    exists that was not created by this plugin (detected heuristically by
-    the absence of a linked NSOBGPPeerState row — checked by caller).
+    Clobber-safe (write-path overlay): the device values seed the BGPPeer on first
+    import only; an existing peer is NEVER overwritten, so an operator edit survives
+    to be applied. Instead we compute whether the object still matches the device
+    (drift detection): the caller turns a mismatch into 'changed'.
+
+    Returns ``(bgp_peer, was_existing, matches)`` — ``was_existing`` feeds adoption
+    conflict detection (checked by caller), ``matches`` drives value-aware status.
     """
     _FK_FIELDS = {"remote_as", "local_as", "peer_group", "source"}
     desired = {
@@ -198,8 +200,8 @@ def _get_or_create_peer(
         name=None,
         defaults=desired,
     )
+    matches = True
     if not created:
-        changed = False
         for field, value in desired.items():
             if field in _FK_FIELDS:
                 current = getattr(obj, f"{field}_id")
@@ -208,11 +210,9 @@ def _get_or_create_peer(
                 current = getattr(obj, field)
                 new = value
             if current != new:
-                setattr(obj, field, value)
-                changed = True
-        if changed:
-            obj.save()
-    return obj, not created
+                matches = False  # device differs from NetBox → drift (do NOT clobber)
+                break
+    return obj, not created, matches
 
 
 def _resolve_routemap(name):
@@ -294,7 +294,7 @@ def _resolve_vrf(vrf_name: str, VRF):
 
 
 def _update_peer_state(
-    mgmt, asn_str, vrf_name, peer_address_str, bgp_peer, remote_as_str, peer_entry, was_existing, now
+    mgmt, asn_str, vrf_name, peer_address_str, bgp_peer, remote_as_str, peer_entry, was_existing, now, matches=True
 ):
     """Create or update an NSOBGPPeerState overlay row for a single peer."""
     from . import status_machine as sm
@@ -319,9 +319,10 @@ def _update_peer_state(
     state.remote_as_str = remote_as_str
     state.enabled = peer_entry.get("enabled")
     state.last_sync_at = now
-    # Mirror overlay: an unowned peer rests at imported (linking the netbox-routing
-    # BGPPeer is best-effort, not a status determinant); conflict = adoption ambiguity.
-    state.status = sm.on_reconcile(state.status, matches=None, conflict=conflict)
+    # Value overlay: 'matches' = the netbox-routing BGPPeer content equals the device.
+    # An operator edit (or device drift) makes them differ → changed → accept → apply;
+    # an owned peer settles to in_sync once the device confirms it. conflict = adoption.
+    state.status = sm.on_reconcile(state.status, matches=matches, conflict=conflict)
     state.save()
     return state
 
@@ -367,11 +368,20 @@ def _reconcile_scope(
         peer_group_obj = _get_or_create_peer_group(peer_entry.get("peer_group") or "", BGPPeerTemplate, remote_asn_obj)
         source_obj = _resolve_bgp_source(mgmt.device, peer_entry.get("source"), IPAddress)
 
-        bgp_peer, was_existing = _get_or_create_peer(
+        bgp_peer, was_existing, peer_matches = _get_or_create_peer(
             scope_obj, ip_obj, peer_entry, remote_asn_obj, local_asn_obj, peer_group_obj, BGPPeer, source_obj
         )
         _update_peer_state(
-            mgmt, asn_str, vrf_name, peer_address_str, bgp_peer, remote_as_str, peer_entry, was_existing, now
+            mgmt,
+            asn_str,
+            vrf_name,
+            peer_address_str,
+            bgp_peer,
+            remote_as_str,
+            peer_entry,
+            was_existing,
+            now,
+            peer_matches,
         )
         seen_keys.add((mgmt.pk, asn_str, vrf_name, peer_address_str))
 
