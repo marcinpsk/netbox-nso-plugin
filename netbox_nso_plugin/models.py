@@ -1039,6 +1039,10 @@ class NSOBGPPeerState(NetBoxModel):
     accepted_at = models.DateTimeField(null=True, blank=True)
     last_apply_at = models.DateTimeField(null=True, blank=True)
     last_apply_error = models.TextField(blank=True, default="")
+    # 3-way merge base: hash of the device content at the last agreed sync. Lets the
+    # reconciler tell an operator edit (object moved, device == base → freeze/drift)
+    # apart from a device-side change (device moved, object == base → auto-mirror).
+    device_base_hash = models.CharField(max_length=64, blank=True, default="")
 
     class Meta:
         ordering = ["management", "asn_str", "vrf_name", "peer_address_str"]

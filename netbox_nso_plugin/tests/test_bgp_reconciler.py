@@ -560,6 +560,55 @@ class TestReconcileBgpConfig(TestCase):
         peer.refresh_from_db()
         self.assertFalse(peer.enabled)  # (b) edit preserved, not reverted to device
 
+    def test_device_change_auto_mirrors_when_netbox_untouched(self):
+        """3-way: device-side change with NetBox untouched → object auto-updated, in sync.
+
+        This is what the 3-way base restores over plain freeze: a row the operator
+        never edited keeps tracking the device automatically.
+        """
+        self._make_mgmt()
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        try:
+            from netbox_routing.models import BGPPeer
+        except ImportError:
+            self.skipTest("netbox_routing not installed")
+
+        _reconcile_bgp_config(self.device, self._payload(self._router_payload(peers=[self._peer_entry(ttl=1)])))
+        peer = BGPPeer.objects.get()
+        self.assertEqual(peer.ttl, 1)
+
+        # Device changes ttl 1→2; NetBox was never touched → auto-mirror.
+        result = _reconcile_bgp_config(
+            self.device, self._payload(self._router_payload(peers=[self._peer_entry(ttl=2)]))
+        )
+        peer.refresh_from_db()
+        self.assertEqual(peer.ttl, 2)  # auto-mirrored to the new device value
+        self.assertEqual(result[0].status, "imported")  # unowned + matches → in sync, no drift
+
+    def test_both_moved_is_conflict(self):
+        """3-way: NetBox edited AND device changed since base → conflict, edit preserved."""
+        self._make_mgmt()
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        try:
+            from netbox_routing.models import BGPPeer
+        except ImportError:
+            self.skipTest("netbox_routing not installed")
+
+        _reconcile_bgp_config(self.device, self._payload(self._router_payload(peers=[self._peer_entry(ttl=1)])))
+        peer = BGPPeer.objects.get()
+        peer.ttl = 99  # operator edit
+        peer.save()
+
+        # Device ALSO moved ttl 1→2: both sides diverged from base → conflict.
+        result = _reconcile_bgp_config(
+            self.device, self._payload(self._router_payload(peers=[self._peer_entry(ttl=2)]))
+        )
+        self.assertEqual(result[0].status, "conflict")
+        peer.refresh_from_db()
+        self.assertEqual(peer.ttl, 99)  # operator edit preserved (never clobbered)
+
     def test_invalid_asn_skipped(self):
         """Router with invalid ASN string → silently skipped."""
         self._make_mgmt()
