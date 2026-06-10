@@ -122,3 +122,176 @@ class NSOInterfaceStateSerializer(NetBoxModelSerializer):
             "created",
             "last_updated",
         ]
+
+
+# ── Internal NSO*State overlay serializers ────────────────────────────────────────
+# These overlays are internal status rows (surfaced via the device NSO tab), NOT a
+# REST/relational API surface — so they have no viewsets/routes. They exist solely so
+# get_serializer_for_model() resolves a class for NetBox's event serialization when a
+# parent object with a cascading overlay is deleted (otherwise the delete 500s). Plain
+# ModelSerializers (FKs/M2Ms as PKs, no hyperlink url field) so no API route is needed.
+from rest_framework.serializers import ModelSerializer  # noqa: E402
+
+from ..models import (  # noqa: E402
+    NSOBFDInterfaceState,
+    NSOBGPPeerState,
+    NSOBGPPeerTemplateState,
+    NSOInterfaceIPState,
+    NSOISISInstanceState,
+    NSOISISInterfaceState,
+    NSOL2SapState,
+    NSOLACPBundleState,
+    NSOLACPMemberState,
+    NSOLoggingHostState,
+    NSOOSPFInstanceState,
+    NSOOSPFInterfaceState,
+    NSORedistributionState,
+    NSORoutePolicyState,
+    NSOSnmpCommunityState,
+    NSOSnmpHostState,
+    NSOSnmpSystemInfoState,
+    NSOSnmpV3UserState,
+    NSOStaticRouteState,
+    NSOSubinterfaceState,
+    NSOSVIState,
+    NSOSwitchportState,
+    NSOVLANState,
+)
+
+
+class NSOInterfaceIPStateSerializer(ModelSerializer):  # noqa: D101
+    class Meta:
+        model = NSOInterfaceIPState
+        fields = "__all__"
+
+
+class NSOSnmpCommunityStateSerializer(ModelSerializer):  # noqa: D101
+    class Meta:
+        model = NSOSnmpCommunityState
+        fields = "__all__"
+
+
+class NSOSnmpV3UserStateSerializer(ModelSerializer):  # noqa: D101
+    class Meta:
+        model = NSOSnmpV3UserState
+        fields = "__all__"
+
+
+class NSOSnmpHostStateSerializer(ModelSerializer):  # noqa: D101
+    class Meta:
+        model = NSOSnmpHostState
+        fields = "__all__"
+
+
+class NSOSnmpSystemInfoStateSerializer(ModelSerializer):  # noqa: D101
+    class Meta:
+        model = NSOSnmpSystemInfoState
+        fields = "__all__"
+
+
+class NSOLoggingHostStateSerializer(ModelSerializer):  # noqa: D101
+    class Meta:
+        model = NSOLoggingHostState
+        fields = "__all__"
+
+
+class NSOStaticRouteStateSerializer(ModelSerializer):  # noqa: D101
+    class Meta:
+        model = NSOStaticRouteState
+        fields = "__all__"
+
+
+class NSOL2SapStateSerializer(ModelSerializer):  # noqa: D101
+    class Meta:
+        model = NSOL2SapState
+        fields = "__all__"
+
+
+class NSOISISInterfaceStateSerializer(ModelSerializer):  # noqa: D101
+    class Meta:
+        model = NSOISISInterfaceState
+        fields = "__all__"
+
+
+class NSOISISInstanceStateSerializer(ModelSerializer):  # noqa: D101
+    class Meta:
+        model = NSOISISInstanceState
+        fields = "__all__"
+
+
+class NSOBGPPeerStateSerializer(ModelSerializer):  # noqa: D101
+    class Meta:
+        model = NSOBGPPeerState
+        fields = "__all__"
+
+
+class NSOBGPPeerTemplateStateSerializer(ModelSerializer):  # noqa: D101
+    class Meta:
+        model = NSOBGPPeerTemplateState
+        fields = "__all__"
+
+
+class NSORoutePolicyStateSerializer(ModelSerializer):  # noqa: D101
+    class Meta:
+        model = NSORoutePolicyState
+        fields = "__all__"
+
+
+class NSOOSPFInstanceStateSerializer(ModelSerializer):  # noqa: D101
+    class Meta:
+        model = NSOOSPFInstanceState
+        fields = "__all__"
+
+
+class NSOOSPFInterfaceStateSerializer(ModelSerializer):  # noqa: D101
+    class Meta:
+        model = NSOOSPFInterfaceState
+        fields = "__all__"
+
+
+class NSORedistributionStateSerializer(ModelSerializer):  # noqa: D101
+    class Meta:
+        model = NSORedistributionState
+        fields = "__all__"
+
+
+class NSOLACPBundleStateSerializer(ModelSerializer):  # noqa: D101
+    class Meta:
+        model = NSOLACPBundleState
+        fields = "__all__"
+
+
+class NSOLACPMemberStateSerializer(ModelSerializer):  # noqa: D101
+    class Meta:
+        model = NSOLACPMemberState
+        fields = "__all__"
+
+
+class NSOVLANStateSerializer(ModelSerializer):  # noqa: D101
+    class Meta:
+        model = NSOVLANState
+        fields = "__all__"
+
+
+class NSOSwitchportStateSerializer(ModelSerializer):  # noqa: D101
+    class Meta:
+        model = NSOSwitchportState
+        fields = "__all__"
+
+
+class NSOSVIStateSerializer(ModelSerializer):  # noqa: D101
+    class Meta:
+        model = NSOSVIState
+        fields = "__all__"
+
+
+class NSOSubinterfaceStateSerializer(ModelSerializer):  # noqa: D101
+    class Meta:
+        model = NSOSubinterfaceState
+        fields = "__all__"
+
+
+class NSOBFDInterfaceStateSerializer(ModelSerializer):  # noqa: D101
+    class Meta:
+        model = NSOBFDInterfaceState
+        fields = "__all__"

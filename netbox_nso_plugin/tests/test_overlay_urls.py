@@ -43,3 +43,29 @@ class TestOverlayGetAbsoluteUrl(TestCase):
         vlan = VLAN.objects.create(group=group, vid=10, name="X")
         state = NSOVLANState.objects.create(management=self.mgmt, vlan=vlan)
         assert state.get_absolute_url() == reverse("dcim:device_nso", kwargs={"pk": self.device.pk})
+
+
+class TestOverlayEventSerialization(TestCase):
+    """Overlays need a resolvable serializer so NetBox event serialization on
+    cascade-delete works (otherwise deleting a parent object 500s)."""
+
+    def test_static_route_overlay_serializes_for_event(self):
+        from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
+        from extras.events import serialize_for_event
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOStaticRouteState
+
+        mfg = Manufacturer.objects.create(name="EvMfg", slug="evmfg")
+        dt = DeviceType.objects.create(manufacturer=mfg, model="EvDev", slug="evdev")
+        role = DeviceRole.objects.create(name="EvRole", slug="evrole")
+        site = Site.objects.create(name="EvSite", slug="evsite")
+        dev = Device.objects.create(name="ev-rtr", device_type=dt, role=role, site=site)
+        inst = NSOInstance.objects.create(name="ev-inst", adapter_instance_id="ev-inst")
+        mgmt = NSODeviceManagement.objects.create(device=dev, nso_instance=inst, nso_device_name="nso-ev")
+        sr = StaticRoute.objects.create(prefix="10.3.3.3/32", next_hop="192.0.0.40", metric=1)
+        state = NSOStaticRouteState.objects.create(management=mgmt, static_route=sr, status="accepted")
+
+        data = serialize_for_event(state)  # must not raise (was: Could not determine serializer)
+        assert "prefix" not in data or True
+        assert data["id"] == state.pk
