@@ -234,19 +234,37 @@
       document.querySelectorAll('.nso-action-btn').forEach(function (b) { b.disabled = disabled; });
     }
 
+    // Build a specific failure message: WHICH scopes failed + why, and what DID apply.
+    // The per-device Apply commits every accepted scope, so one failing scope (e.g. a
+    // stale static route) fails the whole job even when the change you made (e.g. a VLAN
+    // rename) succeeded — say so, instead of a cryptic "1 item(s) failed to apply".
+    function formatApplyError(job) {
+      var err = job.error || {};
+      var items = (err.detail && err.detail.items) || [];
+      var failed = items.map(function (it) { return (it.type || 'item') + ' — ' + (it.error || 'failed'); });
+      var msg = failed.length ? failed.join('; ') : (err.message || 'check adapter logs');
+      var ok = [];
+      var res = job.result || {};
+      Object.keys(res).forEach(function (k) {
+        var m = k.match(/^(.+)_count_by_outcome$/);
+        if (m && res[k] && res[k].in_sync) { ok.push(m[1] + ' ×' + res[k].in_sync); }
+      });
+      if (ok.length) { msg += '  (applied OK: ' + ok.join(', ') + ')'; }
+      return msg;
+    }
+
     function pollJob(jobId, label) {
       var interval = setInterval(async function () {
         try {
           var r = await fetch(jobStatusUrl(jobId));
           if (!r.ok) { clearInterval(interval); setStatus('Could not retrieve job status.', 'danger', false); setButtons(false); return; }
           var job = await r.json();
-          if (job.error) { clearInterval(interval); var jobErr = (job.error && typeof job.error === 'object') ? (job.error.message || JSON.stringify(job.error)) : job.error; setStatus(label + ' error: ' + jobErr, 'danger', false); setButtons(false); return; }
+          if (job.error && job.status !== 'failed') { clearInterval(interval); var jobErr = (job.error && typeof job.error === 'object') ? (job.error.message || JSON.stringify(job.error)) : job.error; setStatus(label + ' error: ' + jobErr, 'danger', false); setButtons(false); return; }
           if (job.status === 'succeeded') {
             clearInterval(interval); setStatus(label + ' completed (Job #' + jobId + ').', 'success', false); setButtons(false);
           } else if (job.status === 'failed') {
             clearInterval(interval);
-            var errMsg = (job.error && job.error.message) ? job.error.message : 'check adapter logs';
-            setStatus(label + ' failed: ' + errMsg + ' (Job #' + jobId + ').', 'danger', false); setButtons(false);
+            setStatus(label + ' failed — ' + formatApplyError(job) + ' (Job #' + jobId + ').', 'danger', false); setButtons(false);
           } else {
             setStatus(label + ' running… (Job #' + jobId + ', status: ' + job.status + ')', 'info', true);
           }
