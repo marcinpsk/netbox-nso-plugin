@@ -125,6 +125,40 @@ class TestVlanReconciler(TestCase):
         self.assertEqual(VLAN.objects.filter(vid=10).count(), 1)
         self.assertEqual(list(self.interface.tagged_vlans.values_list("pk", flat=True)), [vlan10.pk])
 
+    def test_vlan_rename_surfaces_drift_immediately(self):
+        """Renaming an ipam.VLAN flips the overlay to changed without a full reconcile."""
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 30, "name": "MGMT"}]})
+        state = NSOVLANState.objects.get(management=self.management, vlan__vid=30)
+        self.assertNotEqual(state.status, "changed")
+        vlan = state.vlan
+
+        # Operator renames the VLAN in NetBox — fires ipam.VLAN post_save only.
+        vlan.name = "RENAMED"
+        vlan.save()
+
+        state.refresh_from_db()
+        self.assertEqual(state.status, "changed")
+
+    def test_vlan_rename_back_clears_drift(self):
+        """Renaming back to the device value clears the overlay drift immediately."""
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 31, "name": "MGMT"}]})
+        state = NSOVLANState.objects.get(management=self.management, vlan__vid=31)
+        vlan = state.vlan
+
+        vlan.name = "RENAMED"
+        vlan.save()
+        state.refresh_from_db()
+        self.assertEqual(state.status, "changed")
+
+        vlan.name = "MGMT"
+        vlan.save()
+        state.refresh_from_db()
+        self.assertNotEqual(state.status, "changed")
+
     def test_switchport_seeded_when_pristine(self):
         """A pristine NetBox interface is SEEDED from the device (read mirror) → imported, no drift.
 

@@ -843,6 +843,32 @@ def _on_vlan_state_save(sender, instance, **kwargs):
     )
 
 
+@_skip_on_render
+def _on_vlan_change(sender, instance, **kwargs):
+    """Surface a NetBox VLAN rename as overlay drift immediately (visibility only).
+
+    Renaming an ``ipam.VLAN`` fires no NSOVLANState signal, so the overlay would
+    otherwise sit at a stale ``in_sync``/``imported`` until the next full reconcile.
+    Re-evaluate each linked overlay's drift here (the editable value is the VLAN
+    name, compared against the device-observed name) so a rename shows as ``changed``
+    (unowned) / re-pends to ``accepted`` (owned) right away — and renaming back to the
+    device value clears the drift. The device push still happens on Apply (force-push),
+    so this stays side-effect free under suppress_intent_push().
+    """
+    from . import status_machine as sm
+
+    states = list(instance.nso_vlan_states.all())
+    if not states:
+        return
+    with suppress_intent_push():
+        for state in states:
+            matches = (not state.device_name) or instance.name == state.device_name
+            new_status = sm.on_reconcile(state.status, matches=matches)
+            if new_status != state.status:
+                state.status = new_status
+                state.save(update_fields=["status"])
+
+
 def _push_bfd_intent_for_device(device_id, adapter_device_id):
     """Build and push the full owned per-interface BFD intent snapshot for a device.
 
@@ -1765,6 +1791,15 @@ def _connect_g_activated():  # pragma: no cover
         _on_vlan_state_save,
         sender=NSOVLANState,
         dispatch_uid="nso_plugin_vlan_state_post_save",
+    )
+
+    # ipam.VLAN rename → overlay drift visibility (no NSOVLANState signal otherwise)
+    from ipam.models import VLAN
+
+    post_save.connect(
+        _on_vlan_change,
+        sender=VLAN,
+        dispatch_uid="nso_plugin_ipam_vlan_post_save",
     )
 
     # BFD state → intent push (BFD write path)
