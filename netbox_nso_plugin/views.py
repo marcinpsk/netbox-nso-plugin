@@ -715,9 +715,19 @@ def _prepare_apply(mgmt):
     reconcile once the device reflects them (VLAN value-aware; SVI/subif/BFD when
     re-reported). ``.update()`` avoids firing the per-row push signal.
     """
-    from .signals import _push_lacp_intent_for_device, _push_switchport_intent_for_device
+    from .signals import (
+        _push_lacp_intent_for_device,
+        _push_switchport_intent_for_device,
+        _push_vlan_intent_for_device,
+    )
 
-    for push in (_push_lacp_intent_for_device, _push_switchport_intent_for_device):
+    # Force-push the overlays whose editable value lives on a native NetBox object the
+    # plugin does NOT have a save-signal on, so an edit made AFTER accept still ships:
+    #   - LACP / switchport: owned in NetBox, never mirrored as adapter intent.
+    #   - VLAN: the name lives on ipam.VLAN; renaming it fires no plugin signal, so a
+    #     post-accept rename would otherwise be stranded in NetBox (the row stays
+    #     'in_sync' and the stale old name is what gets applied).
+    for push in (_push_lacp_intent_for_device, _push_switchport_intent_for_device, _push_vlan_intent_for_device):
         try:
             push(mgmt.device_id, mgmt.adapter_device_id, force=True)
         except Exception as exc:  # noqa: BLE001 — one scope's failure must not block the rest

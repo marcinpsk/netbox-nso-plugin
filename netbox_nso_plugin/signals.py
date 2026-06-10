@@ -791,12 +791,16 @@ def _on_subinterface_state_save(sender, instance, **kwargs):
     )
 
 
-def _push_vlan_intent_for_device(device_id, adapter_device_id):
+def _push_vlan_intent_for_device(device_id, adapter_device_id, force=False):
     """Build and push the full owned VLAN-database intent snapshot for a device (M34 write).
 
     Store-only (deferred): the single device Apply commits via the vlan-reconciler.
     Only owned rows (accepted/deploying/in_sync) are included; the VLAN name pushed
     is the LIVE NetBox name (operator is the source of truth for it).
+
+    ``force`` re-pushes even if the snapshot looks unchanged — the single Apply calls
+    this with ``force=True`` so a VLAN renamed in NetBox *after* it was accepted (the
+    rename touches ipam.VLAN, which fires no plugin signal) still reaches the device.
     """
     from . import adapter_client as client
     from .models import _VLAN_WRITE_PATH_STATUSES, NSOVLANState
@@ -814,6 +818,7 @@ def _push_vlan_intent_for_device(device_id, adapter_device_id):
         (device_id, "vlan"),
         vlans,
         lambda: client.put_vlan_intent(adapter_device_id, vlans),
+        force=force,
     )
 
 
