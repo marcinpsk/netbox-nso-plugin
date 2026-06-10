@@ -88,3 +88,47 @@ class TestSyncCompleteEndpoint(APITestCase):
             response = self.client.post(self._url(), {"adapter_device_id": 4242}, format="json", **self.header)
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
         m.assert_called_once_with(device.pk)
+
+
+class TestSettleApplyFailures(APITestCase):
+    """Step 4: a stuck 'deploying' row in a scope whose apply failed → apply_failed."""
+
+    def _setup(self):
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
+
+        device = _make_device("settle")
+        inst, _ = NSOInstance.objects.get_or_create(name="settle-inst", defaults={"adapter_instance_id": "settle-inst"})
+        mgmt = NSODeviceManagement.objects.create(
+            device=device, nso_instance=inst, nso_device_name="settle", adapter_device_id=77
+        )
+        vlan = VLAN.objects.create(group=_device_vlan_group(device), vid=100, name="V100")
+        row = NSOVLANState.objects.create(management=mgmt, vlan=vlan, device_name="V100", status="deploying")
+        return mgmt, row
+
+    def test_failed_scope_marks_deploying_apply_failed(self):
+        from netbox_nso_plugin.reconcile import _settle_apply_failures
+
+        mgmt, row = self._setup()
+        _settle_apply_failures(mgmt, {"vlan_count_by_outcome": {"in_sync": 0, "apply_failed": 1}})
+        row.refresh_from_db()
+        self.assertEqual(row.status, "apply_failed")
+        self.assertTrue(row.last_apply_error)
+
+    def test_no_failure_leaves_deploying(self):
+        from netbox_nso_plugin.reconcile import _settle_apply_failures
+
+        mgmt, row = self._setup()
+        _settle_apply_failures(mgmt, {"vlan_count_by_outcome": {"in_sync": 1, "apply_failed": 0}})
+        row.refresh_from_db()
+        self.assertEqual(row.status, "deploying")  # apply succeeded → reconcile settles it, not us
+
+    def test_no_result_is_noop(self):
+        from netbox_nso_plugin.reconcile import _settle_apply_failures
+
+        mgmt, row = self._setup()
+        _settle_apply_failures(mgmt, None)
+        row.refresh_from_db()
+        self.assertEqual(row.status, "deploying")

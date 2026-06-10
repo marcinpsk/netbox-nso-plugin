@@ -112,20 +112,18 @@ class TestStateMachineSpec(SimpleTestCase):
         """
         self.assertEqual(sm.reachable_states(implemented_only=False), sm.STATES)
 
-    def test_gaps_are_exactly_apply_failed_and_error(self):
-        """Pin the *current* implementation gaps so closing one is a visible diff.
+    def test_only_remaining_gap_is_error(self):
+        """apply_failed is now wired (step 4); only ``error`` remains unreachable.
 
-        These two states are declared (and rendered) but unreachable because the
-        only edges into them are implemented=False. When a gap is wired, this test
-        fails and must be updated alongside the transition flag.
+        ``error`` needs reconcile-exception handling (reconcile_error→error) — when
+        that lands, this test fails and must be updated alongside the transition flag.
         """
-        self.assertEqual(sm.unreachable_states(implemented_only=True), {sm.APPLY_FAILED, sm.ERROR})
+        self.assertEqual(sm.unreachable_states(implemented_only=True), {sm.ERROR})
 
-    # apply_failed/error are not yet wired (deploying→apply_failed needs the adapter
-    # to expose per-intent errors; reconcile_error→error needs reconcile exception
-    # handling). Under the unittest runner an expectedFailure that *passes* is an
-    # unexpected success → the suite goes red, forcing this marker to be removed once
-    # the edges are implemented. That is the intended "flips green when fixed" guard.
+    # ``error`` is the last gap: reconcile_error→error is still implemented=False
+    # (exceptions during reconcile are logged, never set status=error). Under the
+    # unittest runner an expectedFailure that *passes* is an unexpected success → the
+    # suite goes red, forcing this marker's removal once that edge is implemented.
     @unittest.expectedFailure
     def test_implemented_graph_reaches_every_state(self):
         self.assertEqual(sm.reachable_states(implemented_only=True), sm.STATES)
@@ -265,3 +263,29 @@ class TestOnReconcile(SimpleTestCase):
         self.assertFalse(sm.is_owned(sm.IMPORTED))
         self.assertFalse(sm.is_owned(sm.CHANGED))
         self.assertFalse(sm.is_owned(sm.CONFLICT))
+        self.assertTrue(sm.is_owned(sm.APPLY_FAILED))  # owned row whose apply errored
+
+
+class TestOnApplyResult(SimpleTestCase):
+    """Step 4: the apply outcome settles a deploying row."""
+
+    def test_apply_ok_settles_in_sync(self):
+        self.assertEqual(sm.on_apply_result(sm.DEPLOYING, ok=True), sm.IN_SYNC)
+
+    def test_apply_fail_marks_apply_failed(self):
+        self.assertEqual(sm.on_apply_result(sm.DEPLOYING, ok=False), sm.APPLY_FAILED)
+
+    def test_only_acts_on_deploying(self):
+        # The apply outcome only concerns in-flight rows; others are untouched.
+        for s in (sm.ACCEPTED, sm.IN_SYNC, sm.IMPORTED, sm.CHANGED):
+            self.assertEqual(sm.on_apply_result(s, ok=False), s)
+
+    def test_apply_failed_recovers_on_reconcile(self):
+        # Not stuck: the device catching up → in_sync; still differing → re-pend accepted.
+        self.assertEqual(sm.on_reconcile(sm.APPLY_FAILED, matches=True), sm.IN_SYNC)
+        self.assertEqual(sm.on_reconcile(sm.APPLY_FAILED, matches=False), sm.ACCEPTED)
+        # Absent from payload (pending retry) → preserved, not drifted.
+        self.assertEqual(sm.on_reconcile(sm.APPLY_FAILED, present=False), sm.APPLY_FAILED)
+
+    def test_apply_failed_retryable_via_accept(self):
+        self.assertEqual(sm.advance(sm.APPLY_FAILED, sm.ACCEPT), sm.ACCEPTED)

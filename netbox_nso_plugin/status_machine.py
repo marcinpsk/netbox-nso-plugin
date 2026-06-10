@@ -99,7 +99,7 @@ OVERLAYS_WITHOUT_DRIFT_STATE: frozenset[str] = frozenset(
 #: Owned (operator-claimed) statuses a reconcile must never clobber back to
 #: ``imported``. Mirrors ``models._VLAN_WRITE_PATH_STATUSES`` — kept here as the
 #: canonical definition the reconcilers should converge on.
-OWNED_STATES: frozenset[str] = frozenset({ACCEPTED, DEPLOYING, IN_SYNC})
+OWNED_STATES: frozenset[str] = frozenset({ACCEPTED, DEPLOYING, IN_SYNC, APPLY_FAILED})
 
 # --- Events -----------------------------------------------------------------
 
@@ -164,6 +164,9 @@ TRANSITIONS: tuple[Transition, ...] = (
     Transition(DRIFT, ACCEPTED, CHANGED, True, "owned value no longer on device"),
     Transition(DRIFT, DEPLOYING, CHANGED, True, "vanished mid-apply"),
     Transition(DRIFT, IN_SYNC, CHANGED, True, "synced value disappeared"),
+    # -- automatic: recovery of an apply-failed (owned) row on the next reconcile --
+    Transition(RECONCILE, APPLY_FAILED, IN_SYNC, True, "failed apply: device now matches → recovered"),
+    Transition(RECONCILE, APPLY_FAILED, ACCEPTED, True, "failed apply: still differs → re-pend for retry"),
     # -- automatic: adoption ambiguity (native object exists, not ours) ------
     Transition(CONFLICT_DETECTED, UNKNOWN, CONFLICT, True, "native object exists, not created by us"),
     Transition(CONFLICT_DETECTED, IMPORTED, CONFLICT, True, "native object diverged from ours"),
@@ -178,15 +181,8 @@ TRANSITIONS: tuple[Transition, ...] = (
     # -- operator: apply ------------------------------------------------------
     Transition(APPLY, ACCEPTED, DEPLOYING, True, "_prepare_apply marks owned accepted→deploying"),
     Transition(APPLY_OK, DEPLOYING, IN_SYNC, True, "apply worker reported success"),
-    # -- GAPS: declared states with no entry path ----------------------------
-    Transition(
-        APPLY_ERR,
-        DEPLOYING,
-        APPLY_FAILED,
-        False,
-        "GAP: adapter does not expose per-intent apply error; the plugin never sets "
-        "apply_failed, so a failed apply leaves the row stuck in 'deploying'.",
-    ),
+    Transition(APPLY_ERR, DEPLOYING, APPLY_FAILED, True, "apply worker reported a per-intent failure"),
+    # -- GAP: declared state with no entry path ------------------------------
     Transition(
         RECONCILE_ERROR,
         IMPORTED,
@@ -347,7 +343,8 @@ def on_reconcile(
         # accepted/deploying are operator intent not yet confirmed on the device, so
         # the device legitimately not reporting the row is expected — don't flag drift.
         # in_sync (was confirmed) and unowned rows that vanish are real drift.
-        if current in (ACCEPTED, DEPLOYING) or current == CHANGED:
+        # apply_failed is pending re-apply → also keep (device absence is expected).
+        if current in (ACCEPTED, DEPLOYING, APPLY_FAILED) or current == CHANGED:
             return current
         return advance(current, DRIFT, to=CHANGED)
     if is_owned(current):
@@ -361,3 +358,17 @@ def on_reconcile(
     if matches is None:
         return advance(current, RECONCILE, to=IMPORTED)
     return advance(current, RECONCILE, to=IMPORTED if matches else CHANGED)
+
+
+def on_apply_result(current: str, *, ok: bool) -> str:
+    """Settle a ``deploying`` row from the adapter apply outcome.
+
+    ``ok`` → ``deploying → in_sync`` (the apply committed); not ok → ``deploying →
+    apply_failed`` (the apply errored — the row is no longer stuck in 'deploying';
+    ``last_apply_error`` carries the detail, and the next reconcile recovers it to
+    in_sync once the device catches up, or re-pends to accepted to retry). Rows not in
+    ``deploying`` are returned unchanged (the apply outcome only concerns in-flight rows).
+    """
+    if current != DEPLOYING:
+        return current
+    return advance(current, APPLY_OK if ok else APPLY_ERR, to=IN_SYNC if ok else APPLY_FAILED)

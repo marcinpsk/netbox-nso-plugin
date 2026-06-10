@@ -260,6 +260,56 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
 
 _RECONCILE_QUEUE = "default"
 
+# Scopes that move owned rows accepted→deploying on Apply (views._prepare_apply), so a
+# stuck 'deploying' is the failure signal. scope key → NSO*State model attribute name.
+_APPLY_DEPLOYING_SCOPES = {
+    "vlan": "NSOVLANState",
+    "svi": "NSOSVIState",
+    "subinterface": "NSOSubinterfaceState",
+    "bfd": "NSOBFDInterfaceState",
+}
+
+
+def _settle_apply_failures(mgmt, apply_result: dict | None) -> None:
+    """Mark rows still 'deploying' in a scope whose apply reported failures → apply_failed.
+
+    Called AFTER the post-sync reconcile, so rows whose apply succeeded have already
+    settled deploying→in_sync (the device reflects them). Any row still 'deploying' in a
+    scope the apply job counted as failed is therefore a genuine failure — convert it via
+    on_apply_result so it's no longer stuck, with last_apply_error for the operator. The
+    next reconcile recovers it to in_sync (device caught up) or re-pends to accepted.
+    """
+    if not apply_result:
+        return
+    from . import models
+    from . import status_machine as sm
+
+    for scope, model_name in _APPLY_DEPLOYING_SCOPES.items():
+        counts = apply_result.get(f"{scope}_count_by_outcome") or {}
+        if (counts.get("apply_failed") or 0) <= 0:
+            continue
+        model = getattr(models, model_name)
+        for row in model.objects.filter(management=mgmt, status="deploying"):
+            new_status = sm.on_apply_result(row.status, ok=False)
+            if new_status != row.status:
+                row.status = new_status
+                row.last_apply_error = "Apply reported a failure for this scope (see the adapter apply job)."
+                row.save(update_fields=["status", "last_apply_error"])
+
+
+def _last_apply_result(adapter_device_id) -> dict | None:
+    """Best-effort: the result of the device's most recent terminal apply job."""
+    from . import adapter_client as client
+
+    try:
+        jobs = client.list_jobs(adapter_device_id)  # most-recent-first
+    except Exception:  # noqa: BLE001 — adapter transient; settling is best-effort
+        return None
+    for job in jobs or []:
+        if job.get("type") == "apply" and job.get("status") in ("succeeded", "failed"):
+            return job.get("result")
+    return None
+
 
 def run_device_reconcile(device_id: int) -> dict:
     """RQ entrypoint: reconcile one device by NetBox device id, off the request path.
@@ -283,6 +333,15 @@ def run_device_reconcile(device_id: int) -> dict:
     except AdapterError as exc:
         logger.warning("nso reconcile: adapter error for device %s: %s", device_id, exc)
         return {"device_id": device_id, "error": str(exc)}
+
+    # Step 4: after the post-sync reconcile, settle any rows left 'deploying' whose
+    # scope's last apply reported a failure → apply_failed (no longer stuck).
+    try:
+        mgmt = device.nso_management
+        if mgmt is not None and mgmt.adapter_device_id is not None:
+            _settle_apply_failures(mgmt, _last_apply_result(mgmt.adapter_device_id))
+    except Exception as exc:  # noqa: BLE001 — settling is best-effort, never crash the worker
+        logger.warning("nso reconcile: apply-failure settle skipped for device %s: %s", device_id, exc)
 
     summary = {"device_id": device_id, "interface_states": len(ctx.get("interface_states") or {})}
     logger.info("nso reconcile complete: %s", summary)
