@@ -1452,6 +1452,34 @@ class TestDeviceNSOTabView(ViewTestBase):
         ):
             mocks[name].assert_not_called()
 
+    def test_accept_bgp_peer_template_marks_owned(self):
+        """POST to the peer-group template accept URL takes ownership (status + accepted_at)."""
+        from netbox_nso_plugin.models import NSOBGPPeerTemplateState
+
+        state = NSOBGPPeerTemplateState.objects.create(
+            management=self.mgmt, template_name="RR-CLIENTS", remote_as_str="65000", status="changed"
+        )
+        url = reverse("plugins:netbox_nso_plugin:routing_accept_bgp_peer_template", kwargs={"pk": state.pk})
+        resp = self.client.post(url)
+        self.assertEqual(resp.status_code, 302)
+        state.refresh_from_db()
+        self.assertEqual(state.status, "accepted")  # differing value → pending (no apply path)
+        self.assertIsNotNone(state.accepted_at)
+
+    def test_bgp_count_folds_in_peer_templates(self):
+        """The BGP headline count includes peer-group templates (with a 'templates' sub-count)."""
+        from netbox_nso_plugin.models import NSOBGPPeerState, NSOBGPPeerTemplateState
+        from netbox_nso_plugin.summary import _category_counts
+
+        NSOBGPPeerState.objects.create(
+            management=self.mgmt, asn_str="65000", peer_address_str="10.0.0.2", status="imported"
+        )
+        NSOBGPPeerTemplateState.objects.create(management=self.mgmt, template_name="RR", status="changed")
+        counts = _category_counts("bgp", self.device, self.mgmt)
+        self.assertEqual(counts["total"], 2)  # 1 peer + 1 template
+        self.assertEqual(counts["templates"], 1)
+        self.assertEqual(counts["drift"], 1)  # the un-owned 'changed' template
+
     def test_refresh_from_nso_enqueues_reconcile(self):
         """The device-level 'Refresh from NSO' button enqueues a background reconcile."""
         mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)

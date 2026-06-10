@@ -1380,6 +1380,25 @@ class NSOBGPPeerStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
     model_class = NSOBGPPeerState
 
 
+class NSOBGPPeerTemplateStateAcceptView(LoginRequiredMixin, View):
+    """Accept one BGP peer-group template — take ownership (no device apply path).
+
+    Peer-group templates have no apply path, so accepting just marks the row owned
+    (status + accepted_at). The 3-way reconcile already preserves the operator edit;
+    accepting acknowledges the drift so it stops showing as un-owned.
+    """
+
+    def post(self, request, pk):  # noqa: D102
+        from .models import NSOBGPPeerTemplateState
+
+        state = get_object_or_404(NSOBGPPeerTemplateState, pk=pk)
+        state.status = _status_after_accept(state.status)
+        state.accepted_at = timezone.now()
+        state.save(update_fields=["status", "accepted_at"])
+        messages.success(request, f"Accepted BGP peer-group template {state.template_name}.")
+        return redirect(_device_nso_tab_url(state.management.device_id))
+
+
 class NSORoutePolicyStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
     model_class = NSORoutePolicyState
 

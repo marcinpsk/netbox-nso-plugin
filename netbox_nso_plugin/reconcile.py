@@ -402,7 +402,12 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
         elif key == "ospf":
             ctx["ospf_data"] = _reconcile_ospf(device, client.get_ospf(dev_id))
         elif key == "bgp":
+            from .models import NSOBGPPeerTemplateState
+
             ctx["bgp_peers"] = _reconcile_bgp_config(device, client.get_bgp_config(dev_id))
+            ctx["bgp_peer_templates"] = list(
+                NSOBGPPeerTemplateState.objects.filter(management=mgmt).select_related("template")
+            )
         elif key == "bfd":
             from .bfd_reconciler import reconcile_bfd
             from .models import NSOBFDInterfaceState

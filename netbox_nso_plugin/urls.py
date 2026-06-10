@@ -221,6 +221,11 @@ urlpatterns = [
         name="routing_accept_bgp_peer",
     ),
     path(
+        "routing/bgp-peer-template-state/<int:pk>/accept/",
+        views.NSOBGPPeerTemplateStateAcceptView.as_view(),
+        name="routing_accept_bgp_peer_template",
+    ),
+    path(
         "routing/route-policy-state/<int:pk>/accept/",
         views.NSORoutePolicyStateAcceptView.as_view(),
         name="routing_accept_route_policy",

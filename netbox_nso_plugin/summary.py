@@ -180,6 +180,7 @@ def _category_counts(key: str, device, mgmt) -> dict:  # noqa: C901
     """Compute the count breakdown for one category from persisted NSO*State."""
     from .models import (
         NSOBGPPeerState,
+        NSOBGPPeerTemplateState,
         NSOInterfaceState,
         NSOISISInstanceState,
         NSOISISInterfaceState,
@@ -222,7 +223,13 @@ def _category_counts(key: str, device, mgmt) -> dict:  # noqa: C901
     if key == "static":
         return _status_breakdown(NSOStaticRouteState.objects.filter(management=mgmt))
     if key == "bgp":
-        return _status_breakdown(NSOBGPPeerState.objects.filter(management=mgmt))
+        # Peers + peer-group templates share the BGP headline; expand shows both tables.
+        out = _status_breakdown(NSOBGPPeerState.objects.filter(management=mgmt))
+        tmpl = _status_breakdown(NSOBGPPeerTemplateState.objects.filter(management=mgmt))
+        for bucket in ("total", "drift", "pending"):
+            out[bucket] = out.get(bucket, 0) + tmpl.get(bucket, 0)
+        out["templates"] = tmpl["total"]
+        return out
     if key == "route_policy":
         return _status_breakdown(NSORoutePolicyState.objects.filter(management=mgmt))
     if key == "redistribution":
