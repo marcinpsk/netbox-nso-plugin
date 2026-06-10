@@ -2,25 +2,21 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Canonical status state machine for the ``NSO*State`` write-path overlays.
 
-This module is the **single source of truth** for the overlay lifecycle. Today the
+This module is the **single source of truth** for the overlay lifecycle. The
 reconcilers (``vlan_reconciler``, ``svi_reconciler``, ``subinterface_reconciler``,
-``bfd_reconciler``, ``lacp_reconciler`` …), the accept/apply views and the signals
-each set ``state.status = "..."`` by hand. This module does NOT yet drive them — it
-*documents* the intended machine and lets ``tests/test_status_machine.py`` assert
-two invariants:
+``bfd_reconciler``, ``lacp_reconciler`` …) now route their status decisions through
+the helpers here (:func:`on_reconcile`, :func:`on_apply_result`,
+:func:`on_reconcile_error`) instead of assigning ``state.status = "..."`` by hand,
+and ``tests/test_status_machine.py`` asserts two invariants:
 
   1. every overlay's ``status`` choices stay within :data:`STATES`, and
-  2. every declared state is *reachable* through real transitions.
+  2. every declared state is *reachable* through real (``implemented=True``) transitions.
 
-Invariant (2) is what surfaces the known gaps: ``apply_failed`` and ``error`` are in
-every overlay's choices (``apply_failed`` even renders a red badge and gates Accept
-eligibility) but **no code path sets them** — so the edges that would reach them are
-marked ``implemented=False`` below. That makes "a failed apply leaves the row stuck
-in ``deploying`` forever" a tracked, testable fact instead of folklore.
-
-When the centralize step lands (route reconcilers through :func:`advance`) and the
-adapter exposes per-intent apply errors, flip the affected edges to
-``implemented=True`` and the reachability guard turns green on its own.
+Both ``apply_failed`` (a failed apply, wired in step 4 via :func:`on_apply_result` +
+``reconcile._settle_apply_failures``) and ``error`` (an unexpected exception during a
+reconcile, wired via :func:`on_reconcile_error` + ``reconcile._safe_reconcile``) are
+now reachable through real code — there are no ``implemented=False`` gaps left, so the
+reachability guard is fully green.
 
 State semantics
 ---------------
@@ -36,8 +32,8 @@ Write side (operator-driven):
   ``accepted``     operator owns the row; intent pushed to the adapter; pending Apply.
   ``deploying``    Apply in flight (marker set by the Apply action / ``_prepare_apply``).
   ``in_sync``      applied and the device re-reports the matching value.
-  ``apply_failed`` the apply errored; retryable via Accept.  (GAP: not yet reachable.)
-  ``error``        unexpected failure during reconcile.       (GAP: not yet reachable.)
+  ``apply_failed`` the apply errored; retryable via Accept.
+  ``error``        unexpected exception during reconcile; recovers on the next good read.
 """
 
 from __future__ import annotations
@@ -182,14 +178,20 @@ TRANSITIONS: tuple[Transition, ...] = (
     Transition(APPLY, ACCEPTED, DEPLOYING, True, "_prepare_apply marks owned accepted→deploying"),
     Transition(APPLY_OK, DEPLOYING, IN_SYNC, True, "apply worker reported success"),
     Transition(APPLY_ERR, DEPLOYING, APPLY_FAILED, True, "apply worker reported a per-intent failure"),
-    # -- GAP: declared state with no entry path ------------------------------
-    Transition(
-        RECONCILE_ERROR,
-        IMPORTED,
-        ERROR,
-        False,
-        "GAP: exceptions during reconcile are logged but never set status=error.",
-    ),
+    # -- automatic: an unexpected exception while reconciling a row ----------
+    # Only the unowned/observable states flip to error; an operator-owned row is
+    # preserved by ``on_reconcile_error`` (a crash in the read path must never
+    # silently drop ownership), so there is deliberately no edge from accepted/
+    # deploying/in_sync/apply_failed.
+    Transition(RECONCILE_ERROR, UNKNOWN, ERROR, True, "reconcile raised before first import"),
+    Transition(RECONCILE_ERROR, IMPORTED, ERROR, True, "reconcile of an imported row raised"),
+    Transition(RECONCILE_ERROR, CHANGED, ERROR, True, "reconcile of a drifted row raised"),
+    Transition(RECONCILE_ERROR, CONFLICT, ERROR, True, "reconcile of a conflicting row raised"),
+    Transition(RECONCILE_ERROR, ERROR, ERROR, True, "still failing"),
+    # -- automatic: recovery once a later reconcile succeeds -----------------
+    Transition(RECONCILE, ERROR, IMPORTED, True, "reconcile recovered: matches device"),
+    Transition(RECONCILE, ERROR, CHANGED, True, "reconcile recovered: diverged"),
+    Transition(DRIFT, ERROR, CHANGED, True, "errored row no longer reported by device"),
 )
 
 
@@ -372,3 +374,16 @@ def on_apply_result(current: str, *, ok: bool) -> str:
     if current != DEPLOYING:
         return current
     return advance(current, APPLY_OK if ok else APPLY_ERR, to=IN_SYNC if ok else APPLY_FAILED)
+
+
+def on_reconcile_error(current: str) -> str:
+    """Return the status for a row whose reconcile raised an unexpected exception.
+
+    Owned rows (accepted/deploying/in_sync/apply_failed) are preserved — a crash in
+    the read path must never silently drop operator ownership. Any other state moves
+    to ``error`` (validated through :func:`advance`); the next successful reconcile
+    recovers it to ``imported``/``changed`` automatically via :func:`on_reconcile`.
+    """
+    if is_owned(current) or current == ERROR:
+        return current
+    return advance(current, RECONCILE_ERROR, to=ERROR)

@@ -42,6 +42,46 @@ def _empty_context() -> dict:
     }
 
 
+def _mark_scope_error(mgmt, model_names: tuple[str, ...]) -> None:
+    """Flip a scope's unowned overlay rows to ``error`` after a reconcile fault.
+
+    Owned rows (accepted/deploying/in_sync/apply_failed) are preserved by
+    ``status_machine.on_reconcile_error`` — a crash in the read path must never drop
+    operator ownership. The next successful reconcile recovers the errored rows.
+    """
+    from . import models
+    from . import status_machine as sm
+
+    for name in model_names:
+        model = getattr(models, name)
+        for row in model.objects.filter(management=mgmt):
+            new_status = sm.on_reconcile_error(row.status)
+            if new_status != row.status:
+                row.status = new_status
+                row.save(update_fields=["status"])
+
+
+def _safe_reconcile(ctx: dict, key: str, mgmt, model_names: tuple[str, ...], fn, *args) -> None:
+    """Run one reconciler, storing its result in ``ctx[key]``; isolate its failures.
+
+    ``AdapterError`` is never caught here — it is raised while *fetching* the payload
+    (before ``fn`` runs) and is handled by the caller as a whole-device transient. Any
+    other exception is a genuine reconcile fault: the scope's rows are flipped to
+    ``error`` (owned rows preserved) so the failure is visible, ``ctx[key]`` keeps its
+    empty default, and the remaining scopes still reconcile instead of the whole device
+    sync — and the worker — dying on one bad payload.
+    """
+    from .adapter_client import AdapterError
+
+    try:
+        ctx[key] = fn(*args)
+    except AdapterError:
+        raise
+    except Exception:  # noqa: BLE001 — isolate a faulty scope; mark it + keep going
+        logger.exception("nso reconcile: %s failed; marking %s rows error", fn.__name__, ",".join(model_names))
+        _mark_scope_error(mgmt, model_names)
+
+
 def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
     """Reconcile each opted-in routing protocol into *ctx* (gated by kill-switches)."""
     from .bfd_reconciler import reconcile_bfd
@@ -60,21 +100,77 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
     dev_id = mgmt.adapter_device_id
 
     if mgmt.manage_static:
-        ctx["static_routes"] = _reconcile_static_routes(device, client.get_static_routes(dev_id))
+        _safe_reconcile(
+            ctx,
+            "static_routes",
+            mgmt,
+            ("NSOStaticRouteState",),
+            _reconcile_static_routes,
+            device,
+            client.get_static_routes(dev_id),
+        )
     if mgmt.manage_isis:
         isis_payload = client.get_isis_interfaces(dev_id)
-        ctx["isis_interfaces"] = _reconcile_isis_interfaces(device, isis_payload.get("interfaces", []))
-        ctx["isis_processes"] = _reconcile_isis_process(device, isis_payload.get("processes", []))
+        _safe_reconcile(
+            ctx,
+            "isis_interfaces",
+            mgmt,
+            ("NSOISISInterfaceState",),
+            _reconcile_isis_interfaces,
+            device,
+            isis_payload.get("interfaces", []),
+        )
+        _safe_reconcile(
+            ctx,
+            "isis_processes",
+            mgmt,
+            ("NSOISISInstanceState",),
+            _reconcile_isis_process,
+            device,
+            isis_payload.get("processes", []),
+        )
     if mgmt.manage_route_policy:
-        ctx["route_policy_states"] = reconcile_route_policy(device, client.get_route_policy(dev_id))
+        _safe_reconcile(
+            ctx,
+            "route_policy_states",
+            mgmt,
+            ("NSORoutePolicyState",),
+            reconcile_route_policy,
+            device,
+            client.get_route_policy(dev_id),
+        )
     if mgmt.manage_ospf:
-        ctx["ospf_data"] = _reconcile_ospf(device, client.get_ospf(dev_id))
+        _safe_reconcile(
+            ctx,
+            "ospf_data",
+            mgmt,
+            ("NSOOSPFInstanceState", "NSOOSPFInterfaceState"),
+            _reconcile_ospf,
+            device,
+            client.get_ospf(dev_id),
+        )
     if mgmt.manage_bgp:
-        ctx["bgp_peers"] = _reconcile_bgp_config(device, client.get_bgp_config(dev_id))
+        _safe_reconcile(
+            ctx,
+            "bgp_peers",
+            mgmt,
+            ("NSOBGPPeerState",),
+            _reconcile_bgp_config,
+            device,
+            client.get_bgp_config(dev_id),
+        )
     # BFD is interface-level + protocol-agnostic; reconcile it whenever any of the
     # protocols that ride it (BGP/IS-IS/OSPF) are managed.
     if mgmt.manage_bgp or mgmt.manage_isis or mgmt.manage_ospf:
-        ctx["bfd_interfaces"] = reconcile_bfd(device, client.get_bfd(dev_id).get("interfaces", []))
+        _safe_reconcile(
+            ctx,
+            "bfd_interfaces",
+            mgmt,
+            ("NSOBFDInterfaceState",),
+            reconcile_bfd,
+            device,
+            client.get_bfd(dev_id).get("interfaces", []),
+        )
         from .models import NSOBFDInterfaceState
 
         ctx["bfd_states"] = list(
@@ -84,7 +180,15 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
     # ISISInstance / BGPAddressFamily created by the protocol reconciles above, so
     # those must run first (BGP especially — BGP-dest redistribution needs its AF).
     if mgmt.manage_redistribution:
-        ctx["redistribution_states"] = reconcile_redistribution(device, client.get_redistribution(dev_id))
+        _safe_reconcile(
+            ctx,
+            "redistribution_states",
+            mgmt,
+            ("NSORedistributionState",),
+            reconcile_redistribution,
+            device,
+            client.get_redistribution(dev_id),
+        )
 
 
 def reconcile_device(device, mgmt=None) -> dict:
@@ -118,35 +222,99 @@ def reconcile_device(device, mgmt=None) -> dict:
         if mgmt.manage_interfaces:
             ctx["interfaces"] = client.get_interfaces(dev_id)
             ctx["state"] = client.get_state(dev_id)
-            ctx["interface_states"] = _upsert_interface_states(device, ctx["interfaces"])
+            _safe_reconcile(
+                ctx,
+                "interface_states",
+                mgmt,
+                ("NSOInterfaceState",),
+                _upsert_interface_states,
+                device,
+                ctx["interfaces"],
+            )
             # M35: materialise SVIs/IRBs (virtual interfaces + VLAN link) BEFORE the IP
             # reconcile, which only attaches IPs to interfaces that already exist —
             # otherwise an SVI's IPs are dropped until the next refresh.
             from .svi_reconciler import reconcile_svi
 
-            ctx["svi_states"] = reconcile_svi(device, client.get_svi(dev_id))
+            _safe_reconcile(ctx, "svi_states", mgmt, ("NSOSVIState",), reconcile_svi, device, client.get_svi(dev_id))
             # M36: materialise dot1q subinterfaces (virtual interface + Interface.parent
             # link) BEFORE the IP reconcile, for the same ordering reason as SVIs.
             from .subinterface_reconciler import reconcile_subinterface
 
-            ctx["subinterface_states"] = reconcile_subinterface(device, client.get_subinterface(dev_id))
+            _safe_reconcile(
+                ctx,
+                "subinterface_states",
+                mgmt,
+                ("NSOSubinterfaceState",),
+                reconcile_subinterface,
+                device,
+                client.get_subinterface(dev_id),
+            )
             # Import interface IP addresses onto their (now first-class, logical-named)
             # NetBox interfaces. Runs AFTER the adapter sync created the interfaces;
             # gated internally by interface_ip_auto_create (off → lands as pending).
-            ctx["interface_ips"] = _reconcile_interface_ips(device, client.get_interface_ips(dev_id))
+            _safe_reconcile(
+                ctx,
+                "interface_ips",
+                mgmt,
+                ("NSOInterfaceIPState",),
+                _reconcile_interface_ips,
+                device,
+                client.get_interface_ips(dev_id),
+            )
             # M33: LACP/LAG bundle + member overlay states (interface-level).
             from .lacp_reconciler import reconcile_lag_config
 
-            ctx["lacp_bundle_states"] = reconcile_lag_config(device, client.get_lag_config(dev_id))
+            _safe_reconcile(
+                ctx,
+                "lacp_bundle_states",
+                mgmt,
+                ("NSOLACPBundleState", "NSOLACPMemberState"),
+                reconcile_lag_config,
+                device,
+                client.get_lag_config(dev_id),
+            )
             # M34: VLAN database + L2 switchport (VLAN DB first — switchport links to it).
             from .vlan_reconciler import reconcile_switchport, reconcile_vlan_database
 
-            ctx["vlan_states"] = reconcile_vlan_database(device, client.get_vlan_database(dev_id))
-            ctx["switchport_states"] = reconcile_switchport(device, client.get_switchport(dev_id))
+            _safe_reconcile(
+                ctx,
+                "vlan_states",
+                mgmt,
+                ("NSOVLANState",),
+                reconcile_vlan_database,
+                device,
+                client.get_vlan_database(dev_id),
+            )
+            _safe_reconcile(
+                ctx,
+                "switchport_states",
+                mgmt,
+                ("NSOSwitchportState",),
+                reconcile_switchport,
+                device,
+                client.get_switchport(dev_id),
+            )
         if mgmt.manage_snmp:
-            ctx["snmp_data"] = _reconcile_snmp_config(device, client.get_snmp_config(dev_id))
+            _safe_reconcile(
+                ctx,
+                "snmp_data",
+                mgmt,
+                ("NSOSnmpCommunityState", "NSOSnmpV3UserState", "NSOSnmpHostState", "NSOSnmpSystemInfoState"),
+                _reconcile_snmp_config,
+                device,
+                client.get_snmp_config(dev_id),
+            )
         if mgmt.manage_logging:
-            ctx["logging_data"] = _reconcile_logging_config(device, client.get_logging_config(dev_id))
+            _safe_reconcile(
+                ctx,
+                "logging_data",
+                mgmt,
+                ("NSOLoggingHostState",),
+                _reconcile_logging_config,
+                device,
+                client.get_logging_config(dev_id),
+            )
         _reconcile_routing(device, mgmt, client, ctx)
     return ctx
 

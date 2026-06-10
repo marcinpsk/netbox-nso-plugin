@@ -132,3 +132,61 @@ class TestSettleApplyFailures(APITestCase):
         _settle_apply_failures(mgmt, None)
         row.refresh_from_db()
         self.assertEqual(row.status, "deploying")
+
+
+class TestSafeReconcile(APITestCase):
+    """A faulty reconciler marks its scope's rows 'error' and never crashes the worker."""
+
+    def _setup(self):
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
+
+        device = _make_device("safe")
+        inst, _ = NSOInstance.objects.get_or_create(name="safe-inst", defaults={"adapter_instance_id": "safe-inst"})
+        mgmt = NSODeviceManagement.objects.create(
+            device=device, nso_instance=inst, nso_device_name="safe", adapter_device_id=88
+        )
+        vlan = VLAN.objects.create(group=_device_vlan_group(device), vid=10, name="V10")
+        imported = NSOVLANState.objects.create(management=mgmt, vlan=vlan, device_name="V10", status="imported")
+        vlan2 = VLAN.objects.create(group=_device_vlan_group(device), vid=20, name="V20")
+        owned = NSOVLANState.objects.create(management=mgmt, vlan=vlan2, device_name="V20", status="accepted")
+        return mgmt, imported, owned
+
+    def test_failure_marks_unowned_error_preserves_owned(self):
+        from netbox_nso_plugin.reconcile import _safe_reconcile
+
+        mgmt, imported, owned = self._setup()
+        ctx = {"vlan_states": []}
+
+        def boom(*_a):
+            raise RuntimeError("malformed payload")
+
+        # No exception escapes; ctx keeps its default; scope rows are reconciled.
+        _safe_reconcile(ctx, "vlan_states", mgmt, ("NSOVLANState",), boom, object())
+        self.assertEqual(ctx["vlan_states"], [])
+        imported.refresh_from_db()
+        owned.refresh_from_db()
+        self.assertEqual(imported.status, "error")  # unowned → error
+        self.assertEqual(owned.status, "accepted")  # owned ownership preserved
+
+    def test_adapter_error_propagates(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.reconcile import _safe_reconcile
+
+        mgmt, _imported, _owned = self._setup()
+
+        def down(*_a):
+            raise AdapterError("nso down", code="nso_unreachable")
+
+        with self.assertRaises(AdapterError):
+            _safe_reconcile({}, "vlan_states", mgmt, ("NSOVLANState",), down, object())
+
+    def test_success_stores_result(self):
+        from netbox_nso_plugin.reconcile import _safe_reconcile
+
+        mgmt, _imported, _owned = self._setup()
+        ctx = {"vlan_states": []}
+        _safe_reconcile(ctx, "vlan_states", mgmt, ("NSOVLANState",), lambda *_a: ["ok"], object())
+        self.assertEqual(ctx["vlan_states"], ["ok"])

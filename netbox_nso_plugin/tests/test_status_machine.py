@@ -3,14 +3,12 @@
 """Guard tests for the overlay status state machine (status_machine.py).
 
 These tests do not exercise runtime behaviour — they assert the *spec* is sound and
-that every overlay's status vocabulary tracks the canonical one. The reachability
-test deliberately documents the ``apply_failed`` / ``error`` gaps via an xfail that
-flips green only once those transitions are wired.
+that every overlay's status vocabulary tracks the canonical one. Every declared state
+is now reachable through real (``implemented=True``) transitions, so the reachability
+guard is fully green (the historical ``apply_failed`` / ``error`` gaps are wired).
 """
 
 from __future__ import annotations
-
-import unittest
 
 from django.apps import apps
 from django.core.exceptions import FieldDoesNotExist
@@ -112,19 +110,15 @@ class TestStateMachineSpec(SimpleTestCase):
         """
         self.assertEqual(sm.reachable_states(implemented_only=False), sm.STATES)
 
-    def test_only_remaining_gap_is_error(self):
-        """apply_failed is now wired (step 4); only ``error`` remains unreachable.
+    def test_no_remaining_gaps(self):
+        """All states are now reachable through real (implemented) code paths.
 
-        ``error`` needs reconcile-exception handling (reconcile_error→error) — when
-        that lands, this test fails and must be updated alongside the transition flag.
+        apply_failed was wired in step 4 (on_apply_result + _settle_apply_failures);
+        ``error`` is now wired via on_reconcile_error + reconcile._safe_reconcile. A
+        new declared-but-unwired state re-introduces an entry here and fails this test.
         """
-        self.assertEqual(sm.unreachable_states(implemented_only=True), {sm.ERROR})
+        self.assertEqual(sm.unreachable_states(implemented_only=True), frozenset())
 
-    # ``error`` is the last gap: reconcile_error→error is still implemented=False
-    # (exceptions during reconcile are logged, never set status=error). Under the
-    # unittest runner an expectedFailure that *passes* is an unexpected success → the
-    # suite goes red, forcing this marker's removal once that edge is implemented.
-    @unittest.expectedFailure
     def test_implemented_graph_reaches_every_state(self):
         self.assertEqual(sm.reachable_states(implemented_only=True), sm.STATES)
 
@@ -289,3 +283,27 @@ class TestOnApplyResult(SimpleTestCase):
 
     def test_apply_failed_retryable_via_accept(self):
         self.assertEqual(sm.advance(sm.APPLY_FAILED, sm.ACCEPT), sm.ACCEPTED)
+
+
+class TestOnReconcileError(SimpleTestCase):
+    """A reconcile that raised: unowned rows go to error, owned rows are preserved."""
+
+    def test_unowned_states_move_to_error(self):
+        for s in (sm.UNKNOWN, sm.IMPORTED, sm.CHANGED, sm.CONFLICT):
+            self.assertEqual(sm.on_reconcile_error(s), sm.ERROR)
+
+    def test_owned_rows_are_preserved(self):
+        # A crash in the read path must never silently drop operator ownership.
+        for s in (sm.ACCEPTED, sm.DEPLOYING, sm.IN_SYNC, sm.APPLY_FAILED):
+            self.assertEqual(sm.on_reconcile_error(s), s)
+
+    def test_error_is_idempotent(self):
+        self.assertEqual(sm.on_reconcile_error(sm.ERROR), sm.ERROR)
+
+    def test_error_recovers_on_next_good_reconcile(self):
+        # The next successful read pulls an errored row back to imported/changed.
+        self.assertEqual(sm.on_reconcile(sm.ERROR, matches=True), sm.IMPORTED)
+        self.assertEqual(sm.on_reconcile(sm.ERROR, matches=False), sm.CHANGED)
+        self.assertEqual(sm.on_reconcile(sm.ERROR, matches=None), sm.IMPORTED)
+        # Vanished while errored → drift.
+        self.assertEqual(sm.on_reconcile(sm.ERROR, present=False), sm.CHANGED)
