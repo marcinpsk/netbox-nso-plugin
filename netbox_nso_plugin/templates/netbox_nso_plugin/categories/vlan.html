@@ -20,6 +20,7 @@
           <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=s.status %}</td>
           <td>
             {% url 'plugins:netbox_nso_plugin:vlan_accept' pk=s.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=s.status title="Make NetBox the source of truth for this VLAN (vid + name written to the device on Apply)" %}
+            <a href="{% url 'plugins:netbox_nso_plugin:vlan_rescope' pk=s.pk %}" class="btn btn-sm btn-outline-secondary ms-1" title="Move this VLAN to another group (e.g. site-wide / shared) while keeping it synced">Re-scope…</a>
           </td>
         </tr>
         {% endfor %}

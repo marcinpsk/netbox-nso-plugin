@@ -159,6 +159,62 @@ class TestVlanReconciler(TestCase):
         state.refresh_from_db()
         self.assertNotEqual(state.status, "changed")
 
+    def test_rescope_move_to_empty_group(self):
+        """Re-scoping into a group with no collision just moves the VLAN (stays synced)."""
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database, rescope_vlan
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 40, "name": "MGMT"}]})
+        state = NSOVLANState.objects.get(management=self.management, vlan__vid=40)
+        vlan = state.vlan
+        site = VLANGroup.objects.create(name="Site Wide", slug="site-wide")
+
+        action, surviving = rescope_vlan(state, site)
+        self.assertEqual(action, "moved")
+        self.assertEqual(surviving.pk, vlan.pk)
+        vlan.refresh_from_db()
+        self.assertEqual(vlan.group_id, site.pk)
+        self.assertEqual(VLAN.objects.filter(vid=40).count(), 1)
+        # Reconcile still tracks it via the overlay FK, no duplicate.
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 40, "name": "MGMT"}]})
+        self.assertEqual(VLAN.objects.filter(vid=40).count(), 1)
+
+    def test_rescope_merge_onto_shared_vlan(self):
+        """Re-scoping into a group that already has the vid merges onto the shared VLAN."""
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database, rescope_vlan
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 41, "name": "MGMT"}]})
+        state = NSOVLANState.objects.get(management=self.management, vlan__vid=41)
+        per_device_vlan = state.vlan
+        # The device's interface carries the per-device VLAN as its access VLAN.
+        self.interface.mode = "access"
+        self.interface.untagged_vlan = per_device_vlan
+        self.interface.save()
+        self.interface.refresh_from_db()
+        self.assertEqual(self.interface.untagged_vlan_id, per_device_vlan.pk)  # sanity
+
+        # A shared, site-wide VLAN 41 already exists.
+        site = VLANGroup.objects.create(name="Site Wide", slug="site-wide")
+        shared = VLAN.objects.create(group=site, vid=41, name="SHARED_MGMT")
+
+        action, surviving = rescope_vlan(state, site)
+        self.assertEqual(action, "merged")
+        self.assertEqual(surviving.pk, shared.pk)
+        # Overlay + native interface re-pointed onto the shared VLAN; duplicate gone.
+        state.refresh_from_db()
+        self.assertEqual(state.vlan_id, shared.pk)
+        self.interface.refresh_from_db()
+        self.assertEqual(self.interface.untagged_vlan_id, shared.pk)
+        self.assertFalse(VLAN.objects.filter(pk=per_device_vlan.pk).exists())
+        self.assertEqual(VLAN.objects.filter(group=site, vid=41).count(), 1)
+
+    def test_rescope_noop_same_group(self):
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database, rescope_vlan
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 42, "name": "MGMT"}]})
+        state = NSOVLANState.objects.get(management=self.management, vlan__vid=42)
+        action, _ = rescope_vlan(state, state.vlan.group)
+        self.assertEqual(action, "noop")
+
     def test_switchport_seeded_when_pristine(self):
         """A pristine NetBox interface is SEEDED from the device (read mirror) → imported, no drift.
 

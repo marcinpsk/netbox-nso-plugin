@@ -1591,6 +1591,48 @@ class NSOVLANStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOVLANState
 
 
+class NSOVLANRescopeView(LoginRequiredMixin, View):
+    """Re-scope a synced VLAN into a different (e.g. site-wide/shared) VLAN group.
+
+    The device↔VLAN link is anchored on the overlay row, so a VLAN can leave its
+    per-device group and stay synced. GET shows the target-group picker (annotated
+    with whether each group already has this vid → a merge); POST performs the
+    move-or-merge via :func:`vlan_reconciler.rescope_vlan`.
+    """
+
+    def get(self, request, pk):  # noqa: D102
+        from ipam.models import VLAN, VLANGroup
+
+        state = get_object_or_404(NSOVLANState, pk=pk)
+        vid = state.vlan.vid
+        groups = []
+        for group in VLANGroup.objects.exclude(pk=state.vlan.group_id).order_by("name"):
+            merges = VLAN.objects.filter(group=group, vid=vid).exclude(pk=state.vlan.pk).exists()
+            groups.append({"group": group, "merges": merges})
+        return render(
+            request,
+            "netbox_nso_plugin/rescope_vlan.html",
+            {"state": state, "groups": groups, "object": state.management.device},
+        )
+
+    def post(self, request, pk):  # noqa: D102
+        from ipam.models import VLANGroup
+
+        from .vlan_reconciler import rescope_vlan
+
+        state = get_object_or_404(NSOVLANState, pk=pk)
+        group = get_object_or_404(VLANGroup, pk=request.POST.get("group"))
+        device_id = state.management.device_id
+        action, vlan = rescope_vlan(state, group)
+        if action == "noop":
+            messages.info(request, f"VLAN {vlan.vid} is already in group {group}.")
+        elif action == "moved":
+            messages.success(request, f"Moved VLAN {vlan.vid} to group {group} (still synced).")
+        else:
+            messages.success(request, f"Merged VLAN {vlan.vid} onto the shared VLAN in group {group} (still synced).")
+        return redirect(_device_nso_tab_url(device_id))
+
+
 class NSOBFDInterfaceStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOBFDInterfaceState
 

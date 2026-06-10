@@ -353,6 +353,11 @@ urlpatterns = [
         name="vlan_accept",
     ),
     path(
+        "vlan/state/<int:pk>/rescope/",
+        views.NSOVLANRescopeView.as_view(),
+        name="vlan_rescope",
+    ),
+    path(
         "bfd/state/<int:pk>/accept/",
         views.NSOBFDInterfaceStateAcceptView.as_view(),
         name="bfd_accept",

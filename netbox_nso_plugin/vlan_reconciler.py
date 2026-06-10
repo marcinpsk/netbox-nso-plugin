@@ -57,6 +57,63 @@ def _resolve_synced_vlan(management, group, vid, *, name=None, create=True):
     return VLAN.objects.filter(group=group, vid=vid).first()
 
 
+def rescope_vlan(state, target_group):
+    """Re-scope this device's VLAN into *target_group*, keeping it synced.
+
+    The device↔VLAN link is the ``NSOVLANState`` FK (see module docstring), so re-scoping
+    is safe:
+
+    * **move** — if *target_group* has no VLAN with this vid, just change the VLAN's group
+      (the overlay FK is unchanged; reconcile keeps following it).
+    * **merge** — if *target_group* already has a VLAN with this vid (a shared/site VLAN),
+      re-point every reference to the device's per-device VLAN onto that shared VLAN
+      (overlay, native ``Interface`` untagged/tagged, switchport overlay mirror), then delete
+      the now-orphaned per-device VLAN. The vid is unchanged, so drift hashes stay equal.
+
+    Returns ``(action, surviving_vlan)`` where action is ``moved`` / ``merged`` / ``noop``.
+    """
+    from dcim.models import Interface
+    from ipam.models import VLAN
+
+    from .models import NSOSwitchportState, NSOVLANState
+    from .signals import suppress_intent_push
+
+    old_vlan = state.vlan
+    vid = old_vlan.vid
+    if old_vlan.group_id == target_group.pk:
+        return "noop", old_vlan
+
+    existing = VLAN.objects.filter(group=target_group, vid=vid).exclude(pk=old_vlan.pk).first()
+
+    # Re-scoping mirrors/moves objects; it is not operator intent to push back to NSO.
+    with suppress_intent_push():
+        if existing is None:
+            old_vlan.group = target_group
+            old_vlan.save(update_fields=["group"])
+            return "moved", old_vlan
+
+        Interface.objects.filter(untagged_vlan=old_vlan).update(untagged_vlan=existing)
+        for iface in Interface.objects.filter(tagged_vlans=old_vlan):
+            iface.tagged_vlans.remove(old_vlan)
+            iface.tagged_vlans.add(existing)
+        NSOSwitchportState.objects.filter(untagged_vlan=old_vlan).update(untagged_vlan=existing)
+        for sp in NSOSwitchportState.objects.filter(tagged_vlans=old_vlan):
+            sp.tagged_vlans.remove(old_vlan)
+            sp.tagged_vlans.add(existing)
+
+        # Re-point overlays, honouring unique_together(management, vlan): if a device already
+        # tracks the shared VLAN, drop its now-duplicate per-device overlay row.
+        for vs in NSOVLANState.objects.filter(vlan=old_vlan):
+            if NSOVLANState.objects.filter(management=vs.management, vlan=existing).exclude(pk=vs.pk).exists():
+                vs.delete()
+            else:
+                vs.vlan = existing
+                vs.save(update_fields=["vlan"])
+
+        old_vlan.delete()
+    return "merged", existing
+
+
 def reconcile_vlan_database(device, payload: dict) -> list:
     """Upsert ipam.VLAN (per-device group) + NSOVLANState from the adapter payload."""
     from django.utils import timezone
