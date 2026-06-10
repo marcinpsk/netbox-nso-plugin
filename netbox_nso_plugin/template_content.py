@@ -886,22 +886,141 @@ def _reconcile_isis_flex_algos(inst, flex_algos, *, write: bool = True) -> bool:
 
 _ISIS_LEVEL_COLS = ("default_metric", "wide_metrics_only", "preference", "labeled_preference", "disabled", "auth_type")
 _ISIS_IFACE_LEVEL_COLS = ("metric", "hello_interval", "hello_multiplier", "priority", "passive")
+_ISIS_SR_COLS = (
+    "enabled",
+    "prefix_sid_range",
+    "srgb_start",
+    "srgb_range",
+    "node_sid_index",
+    "node_sid_label",
+    "node_sid_v6_index",
+    "node_sid_v6_label",
+    "maximum_sid_depth",
+    "tunnel_table_pref",
+)
+_ISIS_FLEX_COLS = (
+    "metric_type",
+    "priority",
+    "admin_group_exclude",
+    "admin_group_include_any",
+    "admin_group_include_all",
+)
+_ISIS_INSTANCE_SCALAR_COLS = (
+    "net",
+    "is_type",
+    "metric_style",
+    "area_auth_type",
+    "area_auth_key",
+    "domain_auth_type",
+    "domain_auth_key",
+    "overload_bit",
+)
 
 
-def _link_routing_isis_interface(device, iface, af, state, instances: dict, bfd_enabled=None, entry=None, *, seed=True):
-    """Create/refresh the netbox_routing.ISISInterface for this row; report device match.
+_ISIS_IFACE_SCALAR_ATTRS = (
+    "circuit_type",
+    "network_type",
+    "metric",
+    "passive",
+    "hello_auth_type",
+    "bfd_enabled",
+    "csnp_interval",
+    "retransmit_interval",
+    "lsp_interval",
+    "mesh_group",
+)
 
-    Clobber-safe value overlay: when ``seed`` (overlay row newly imported) the editable
-    fields + settings + per-level rows are populated from the device; when ``seed`` is
-    False they are FROZEN so operator edits survive, and ``matches`` reports whether the
-    object still equals the device. The structural ``instance`` FK is always kept correct
-    (not operator-editable). Returns ``(ri, matches)``; ``(None, True)`` when
+
+def _isis_interface_routing_fields(state, entry, ri, bfd_enabled):
+    """Build the (attr, device-value) list for the ISISInterface, guarded by the fork's columns."""
+    rf = [
+        ("circuit_type", state.circuit_type or None),
+        ("network_type", state.network_type or None),
+        ("metric", state.metric),
+        ("passive", state.passive),
+    ]
+    if hasattr(ri, "hello_auth_type"):
+        rf.append(("hello_auth_type", state.hello_auth_type or ""))
+    if hasattr(ri, "bfd_enabled"):
+        rf.append(("bfd_enabled", bfd_enabled))
+    if hasattr(ri, "csnp_interval"):
+        rf.append(("csnp_interval", entry.get("csnp_interval")))
+    if hasattr(ri, "retransmit_interval"):
+        rf.append(("retransmit_interval", entry.get("retransmit_interval")))
+    if hasattr(ri, "lsp_interval"):
+        rf.append(("lsp_interval", entry.get("lsp_interval")))
+    if hasattr(ri, "mesh_group"):
+        rf.append(("mesh_group", entry.get("mesh_group") or ""))
+    return rf
+
+
+def _isis_interface_pass(state, entry, ri, bfd_enabled, *, write: bool) -> bool:
+    """Compare (and, when ``write``, mirror) the device ISIS-interface graph onto *ri*."""
+    fields: list[str] = []
+    scalar_matches = True
+    for attr, val in _isis_interface_routing_fields(state, entry, ri, bfd_enabled):
+        if getattr(ri, attr) != val:
+            scalar_matches = False
+            if write:
+                setattr(ri, attr, val)
+                fields.append(attr)
+    if fields:
+        ri.save(update_fields=fields)
+    settings_matches = _reconcile_isis_settings(ri, entry.get("settings"), write=write)
+    try:
+        from netbox_routing.models import ISISInterfaceLevel
+
+        levels_matches = _reconcile_child_levels(
+            ISISInterfaceLevel, "interface", ri, _ISIS_IFACE_LEVEL_COLS, entry.get("levels"), write=write
+        )
+    except Exception:
+        levels_matches = True
+    return scalar_matches and settings_matches and levels_matches
+
+
+def _isis_interface_object_hash(ri) -> str:
+    """Hash the netbox-routing ISISInterface's content (scalars + settings + levels)."""
+    from django.contrib.contenttypes.models import ContentType
+
+    from . import merge_util
+
+    content: dict = {a: getattr(ri, a) for a in _ISIS_IFACE_SCALAR_ATTRS if hasattr(ri, a)}
+    try:
+        from netbox_routing.models import ISISSetting
+
+        ct = ContentType.objects.get_for_model(type(ri))
+        content["settings"] = {
+            s.key: s.value for s in ISISSetting.objects.filter(assigned_object_type=ct, assigned_object_id=ri.pk)
+        }
+    except Exception:
+        pass
+    try:
+        from netbox_routing.models import ISISInterfaceLevel
+
+        content["levels"] = sorted(
+            (
+                {"level": r.level, **{c: getattr(r, c, None) for c in _ISIS_IFACE_LEVEL_COLS}}
+                for r in ISISInterfaceLevel.objects.filter(interface=ri)
+            ),
+            key=lambda x: x["level"],
+        )
+    except Exception:
+        pass
+    return merge_util.content_hash(content)
+
+
+def _link_routing_isis_interface(device, iface, af, state, instances: dict, bfd_enabled=None, entry=None, base=""):
+    """3-way reconcile the netbox_routing.ISISInterface graph for this row.
+
+    Object-content-hash 3-way: device changes auto-mirror when the object is untouched;
+    operator edits survive + surface as 'changed'. The structural ``instance`` FK is
+    always kept correct. Returns ``(ri, matches, base)``; ``(None, True, base)`` when
     netbox-routing isn't installed.
     """
     try:
         from netbox_routing.models import ISISInstance, ISISInterface
     except Exception:
-        return None, True
+        return None, True, base
 
     entry = entry or {}
     tag = state.process_tag
@@ -910,55 +1029,17 @@ def _link_routing_isis_interface(device, iface, af, state, instances: dict, bfd_
     inst = instances[tag]
 
     ri, _ = ISISInterface.objects.get_or_create(interface=iface, address_family=af, defaults={"instance": inst})
-    fields: list[str] = []
     if ri.instance_id != inst.id:  # structural FK — always keep correct
         ri.instance = inst
-        fields.append("instance")
-    scalar_matches = True
-    routing_fields = [
-        ("circuit_type", state.circuit_type or None),
-        ("network_type", state.network_type or None),
-        ("metric", state.metric),
-        ("passive", state.passive),
-    ]
-    # hello_auth_type only exists on ISISInterface once the netbox-routing isis
-    # branch lands — guard so the reconcile is a no-op for it until then.
-    # ISISInterface.hello_auth_type is a non-null CharField (default "") — write
-    # "" (not None) when there is no hello auth.
-    if hasattr(ri, "hello_auth_type"):
-        routing_fields.append(("hello_auth_type", state.hello_auth_type or ""))
-    # bfd_enabled (nullable bool) — guard until the netbox-routing field is present.
-    if hasattr(ri, "bfd_enabled"):
-        routing_fields.append(("bfd_enabled", bfd_enabled))
-    # M33 P1 per-interface scalars — guard each until the fork carries the column.
-    if hasattr(ri, "csnp_interval"):
-        routing_fields.append(("csnp_interval", entry.get("csnp_interval")))
-    if hasattr(ri, "retransmit_interval"):
-        routing_fields.append(("retransmit_interval", entry.get("retransmit_interval")))
-    if hasattr(ri, "lsp_interval"):
-        routing_fields.append(("lsp_interval", entry.get("lsp_interval")))
-    if hasattr(ri, "mesh_group"):
-        routing_fields.append(("mesh_group", entry.get("mesh_group") or ""))
-    for attr, val in routing_fields:
-        if getattr(ri, attr) != val:
-            scalar_matches = False
-            if seed:
-                setattr(ri, attr, val)
-                fields.append(attr)
-    if fields:
-        ri.save(update_fields=fields)
-    settings_matches = _reconcile_isis_settings(ri, entry.get("settings"), write=seed)
-    # M33 P2 per-level interface child rows.
-    try:
-        from netbox_routing.models import ISISInterfaceLevel
+        ri.save(update_fields=["instance"])
 
-        levels_matches = _reconcile_child_levels(
-            ISISInterfaceLevel, "interface", ri, _ISIS_IFACE_LEVEL_COLS, entry.get("levels"), write=seed
-        )
-    except Exception:
-        levels_matches = True
-    # On seed the object now equals the device → matches; only compare reports drift.
-    return ri, (True if seed else (scalar_matches and settings_matches and levels_matches))
+    matches = _isis_interface_pass(state, entry, ri, bfd_enabled, write=False)
+    if matches:
+        return ri, True, _isis_interface_object_hash(ri)
+    if (not base) or _isis_interface_object_hash(ri) == base:
+        _isis_interface_pass(state, entry, ri, bfd_enabled, write=True)
+        return ri, True, _isis_interface_object_hash(ri)
+    return ri, False, base
 
 
 def _reconcile_isis_interfaces(device, interfaces: list) -> list:
@@ -1013,7 +1094,7 @@ def _reconcile_isis_interfaces(device, interfaces: list) -> list:
             dropped.append(iface_name)
             continue
 
-        state, created = NSOISISInterfaceState.objects.get_or_create(
+        state, _ = NSOISISInterfaceState.objects.get_or_create(
             management=mgmt,
             interface=iface,
             af=af,
@@ -1028,11 +1109,19 @@ def _reconcile_isis_interfaces(device, interfaces: list) -> list:
         state.hello_auth_present = bool(entry.get("hello_auth_present", False))
         state.last_sync_at = now
 
-        # Value overlay: seed the netbox-routing ISISInterface graph on first import;
-        # afterwards it's frozen so operator edits survive, and 'matches' reports drift.
-        state.isis_interface, iface_matches = _link_routing_isis_interface(
-            device, iface, af, state, instances, bfd_enabled=entry.get("bfd_enabled"), entry=entry, seed=created
+        # 3-way merge: device changes auto-mirror when the ISISInterface object is
+        # untouched (object_hash == base); operator edits survive + surface as 'changed'.
+        state.isis_interface, iface_matches, new_base = _link_routing_isis_interface(
+            device,
+            iface,
+            af,
+            state,
+            instances,
+            bfd_enabled=entry.get("bfd_enabled"),
+            entry=entry,
+            base=state.device_base_hash,
         )
+        state.device_base_hash = new_base
         state.status = sm.on_reconcile(state.status, matches=iface_matches)
         state.save()
         seen_keys.add((iface.pk, af))
@@ -1077,22 +1166,12 @@ _ISIS_INSTANCE_SCALAR_ATTRS = (
 )
 
 
-def _sync_routing_isis_instance(device, tag, state, entry, *, seed: bool = True):
-    """Create/refresh the netbox_routing.ISISInstance for *tag*; report device match.
+def _isis_instance_pass(state, entry, inst, *, write: bool) -> bool:
+    """Compare/mirror the whole device ISIS-instance graph onto *inst*.
 
-    Clobber-safe value overlay: when ``seed`` (the overlay row is newly imported) the
-    whole ISIS graph — scalar cols + M33 scalars + settings (EAV) + levels + SR +
-    flex-algos — is populated from the device. When ``seed`` is False the object is
-    FROZEN (nothing written) so an operator edit anywhere in the graph survives, and
-    we compute ``matches`` = the object still equals the device. Returns
-    ``(inst, matches)``; ``(None, True)`` when netbox-routing isn't installed.
+    When ``write`` is set, mirror device → object; always return ``matches`` (the
+    object already equals the device).
     """
-    try:
-        from netbox_routing.models import ISISInstance
-    except Exception:
-        return None, True
-
-    inst, _ = ISISInstance.objects.get_or_create(device=device, process_tag=tag)
     inst_fields: list[str] = []
     scalar_matches = True
     for attr, val in (
@@ -1106,44 +1185,120 @@ def _sync_routing_isis_instance(device, tag, state, entry, *, seed: bool = True)
     ):
         if val and getattr(inst, attr) != val:
             scalar_matches = False
-            if seed:
+            if write:
                 setattr(inst, attr, val)
                 inst_fields.append(attr)
-    # overload_bit is a tri-state boolean — sync True/False, leave None untouched.
     if state.overload_bit is not None and inst.overload_bit != state.overload_bit:
         scalar_matches = False
-        if seed:
+        if write:
             inst.overload_bit = state.overload_bit
             inst_fields.append("overload_bit")
-    # M33 P1 cross-vendor scalars — only columns the fork carries, only non-None device values.
     for attr in _ISIS_INSTANCE_SCALAR_ATTRS:
         if not hasattr(inst, attr):
             continue
         val = entry.get(attr)
         if val is not None and getattr(inst, attr) != val:
             scalar_matches = False
-            if seed:
+            if write:
                 setattr(inst, attr, val)
                 inst_fields.append(attr)
     if inst_fields:
         inst.save(update_fields=inst_fields)
 
-    settings_matches = _reconcile_isis_settings(inst, entry.get("settings"), write=seed)
+    settings_matches = _reconcile_isis_settings(inst, entry.get("settings"), write=write)
     try:
         from netbox_routing.models import ISISLevel
 
         levels_matches = _reconcile_child_levels(
-            ISISLevel, "instance", inst, _ISIS_LEVEL_COLS, entry.get("levels"), write=seed
+            ISISLevel, "instance", inst, _ISIS_LEVEL_COLS, entry.get("levels"), write=write
         )
     except Exception:
         levels_matches = True
-    sr_matches = _reconcile_isis_segment_routing(inst, entry.get("segment_routing"), write=seed)
-    flex_matches = _reconcile_isis_flex_algos(inst, entry.get("flex_algos"), write=seed)
+    sr_matches = _reconcile_isis_segment_routing(inst, entry.get("segment_routing"), write=write)
+    flex_matches = _reconcile_isis_flex_algos(inst, entry.get("flex_algos"), write=write)
+    return scalar_matches and settings_matches and levels_matches and sr_matches and flex_matches
 
-    # On seed the graph now equals the device (just written) → matches; only the
-    # compare pass (seed=False) reports real drift.
-    matches = True if seed else (scalar_matches and settings_matches and levels_matches and sr_matches and flex_matches)
-    return inst, matches
+
+def _isis_instance_object_hash(inst) -> str:
+    """Hash the netbox-routing ISISInstance's full content (cols + settings + levels + SR + flex).
+
+    Self-consistent (compared only against itself / the stored base), so it need not
+    match a separate device serializer.
+    """
+    from django.contrib.contenttypes.models import ContentType
+
+    from . import merge_util
+
+    content: dict = {a: getattr(inst, a, None) for a in _ISIS_INSTANCE_SCALAR_COLS}
+    for a in _ISIS_INSTANCE_SCALAR_ATTRS:
+        if hasattr(inst, a):
+            content[a] = getattr(inst, a)
+    try:
+        from netbox_routing.models import ISISSetting
+
+        ct = ContentType.objects.get_for_model(type(inst))
+        content["settings"] = {
+            s.key: s.value for s in ISISSetting.objects.filter(assigned_object_type=ct, assigned_object_id=inst.pk)
+        }
+    except Exception:
+        pass
+    try:
+        from netbox_routing.models import ISISLevel
+
+        content["levels"] = sorted(
+            (
+                {"level": r.level, **{c: getattr(r, c, None) for c in _ISIS_LEVEL_COLS}}
+                for r in ISISLevel.objects.filter(instance=inst)
+            ),
+            key=lambda x: x["level"],
+        )
+    except Exception:
+        pass
+    try:
+        from netbox_routing.models import ISISSegmentRouting
+
+        sr = ISISSegmentRouting.objects.filter(instance=inst).first()
+        content["sr"] = {c: getattr(sr, c, None) for c in _ISIS_SR_COLS} if sr else None
+    except Exception:
+        pass
+    try:
+        from netbox_routing.models import ISISFlexAlgo
+
+        content["flex"] = sorted(
+            (
+                {"algo_id": r.algo_id, **{c: getattr(r, c, None) for c in _ISIS_FLEX_COLS}}
+                for r in ISISFlexAlgo.objects.filter(instance=inst)
+            ),
+            key=lambda x: x["algo_id"],
+        )
+    except Exception:
+        pass
+    return merge_util.content_hash(content)
+
+
+def _sync_routing_isis_instance(device, tag, state, entry, base):
+    """3-way reconcile the netbox_routing.ISISInstance graph for *tag*.
+
+    Uses an object-content hash + the object-vs-device compare: device-side changes
+    auto-mirror when the object is untouched (object_hash == base); operator edits
+    survive and surface as 'changed'. Returns ``(inst, matches, base)`` (returned base
+    advanced on seed/mirror/insync). ``(None, True, base)`` when netbox-routing absent.
+    (ISIS folds both-moved into 'changed' — the edit is always preserved either way.)
+    """
+    try:
+        from netbox_routing.models import ISISInstance
+    except Exception:
+        return None, True, base
+
+    inst, _ = ISISInstance.objects.get_or_create(device=device, process_tag=tag)
+    matches = _isis_instance_pass(state, entry, inst, write=False)
+    if matches:
+        return inst, True, _isis_instance_object_hash(inst)
+    if (not base) or _isis_instance_object_hash(inst) == base:
+        # first import (seed) OR device moved while the object was untouched (mirror)
+        _isis_instance_pass(state, entry, inst, write=True)
+        return inst, True, _isis_instance_object_hash(inst)
+    return inst, False, base  # operator edited → changed (edit preserved)
 
 
 def _reconcile_isis_process(device, process_list: list) -> list:
@@ -1179,7 +1334,7 @@ def _reconcile_isis_process(device, process_list: list) -> list:
         if tag is None:
             continue
 
-        state, created = NSOISISInstanceState.objects.get_or_create(
+        state, _ = NSOISISInstanceState.objects.get_or_create(
             management=mgmt,
             process_tag=tag,
             defaults={"status": "unknown"},
@@ -1196,10 +1351,13 @@ def _reconcile_isis_process(device, process_list: list) -> list:
         state.domain_auth_key = entry.get("domain_auth_key") or ""
         state.last_sync_at = now
 
-        # Value overlay: seed the netbox-routing ISISInstance graph (cols + settings +
-        # levels + SR + flex) on first import; afterwards it's frozen so operator edits
-        # survive, and 'matches' reports drift across the whole graph.
-        state.isis_instance, inst_matches = _sync_routing_isis_instance(device, tag, state, entry, seed=created)
+        # 3-way merge over the whole ISIS graph: device changes auto-mirror when the
+        # object is untouched (object_hash == base); operator edits survive + surface
+        # as 'changed'. device_base_hash persists the agreed object snapshot.
+        state.isis_instance, inst_matches, new_base = _sync_routing_isis_instance(
+            device, tag, state, entry, state.device_base_hash
+        )
+        state.device_base_hash = new_base
         state.status = sm.on_reconcile(state.status, matches=inst_matches)
         state.save()
         seen_tags.add(tag)

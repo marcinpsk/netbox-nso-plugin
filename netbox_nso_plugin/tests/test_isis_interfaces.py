@@ -338,7 +338,8 @@ class TestReconcileIsisInterfaces(TestCase):
 
         result = _reconcile_isis_interfaces(self.device, self._payload(self._entry()))
         self.assertEqual(len(result), 1)
-        self.assertEqual(result[0].status, "accepted")
+        # Owned + object seeded to match device → settles in_sync (never reverts to imported).
+        self.assertEqual(result[0].status, "in_sync")
 
     def test_passive_flag_stored(self):
         """Passive flag from payload is stored on the state row."""
@@ -565,15 +566,15 @@ class TestReconcileIsisProcess(TestCase):
         settings = {s.key: s.value for s in inst.settings.all()}
         self.assertEqual(settings, {"spf_second_wait": "1000", "graceful_restart": "true"})
 
-        # Clobber-safe: a later differing device report does NOT overwrite the object
-        # (operator edits survive); the object is frozen and the overlay surfaces drift.
+        # 3-way: a later device change with the object UNTOUCHED auto-mirrors (the
+        # dropped 'graceful_restart' is removed, 'spf_second_wait' updated), stays in sync.
         states = _reconcile_isis_process(
             self.device,
             [{"process_tag": "0", "settings": {"spf_second_wait": "2000"}}],
         )
         settings = {s.key: s.value for s in ISISSetting.objects.all()}
-        self.assertEqual(settings, {"spf_second_wait": "1000", "graceful_restart": "true"})  # frozen
-        self.assertEqual(states[0].status, "changed")  # drift surfaced
+        self.assertEqual(settings, {"spf_second_wait": "2000"})  # auto-mirrored
+        self.assertEqual(states[0].status, "imported")
 
     def test_routing_interface_p1_scalars_and_settings(self):
         """M33 P1: per-interface scalar columns + ISISSetting EAV are reconciled."""
@@ -646,14 +647,17 @@ class TestReconcileIsisProcess(TestCase):
         self.assertTrue(sr.enabled)
         self.assertEqual(sr.prefix_sid_range, "global")
 
-        # Clobber-safe: a later differing device report is frozen; drift is surfaced.
+        # 3-way: a later device change with the object UNTOUCHED auto-mirrors (level 1
+        # dropped, level 2 metric updated), stays in sync.
         states = _reconcile_isis_process(
             self.device,
             [{"process_tag": "0", "levels": [{"level": 2, "default_metric": 20}]}],
         )
-        self.assertEqual(set(ISISLevel.objects.filter(instance=inst).values_list("level", flat=True)), {1, 2})  # frozen
-        self.assertEqual(ISISLevel.objects.get(instance=inst, level=2).default_metric, 10)  # frozen
-        self.assertEqual(states[0].status, "changed")  # drift surfaced
+        self.assertEqual(
+            set(ISISLevel.objects.filter(instance=inst).values_list("level", flat=True)), {2}
+        )  # auto-mirrored
+        self.assertEqual(ISISLevel.objects.get(instance=inst, level=2).default_metric, 20)  # auto-mirrored
+        self.assertEqual(states[0].status, "imported")
 
 
 class TestReconcileIsisInterfaceLevels(TestCase):
@@ -726,12 +730,13 @@ class TestReconcileIsisInterfaceLevels(TestCase):
         self.assertEqual(fas[128].metric_type, "igp-metric")
         self.assertEqual(fas[128].admin_group_exclude, "BLUE")
 
-        # Clobber-safe: a later differing device report is frozen; drift is surfaced.
+        # 3-way: a later device change with the object UNTOUCHED auto-mirrors (129
+        # dropped, 128 metric_type updated), stays in sync.
         states = _reconcile_isis_process(
             self.device,
             [{"process_tag": "0", "flex_algos": [{"algo_id": 128, "metric_type": "delay-metric"}]}],
         )
         fas = {fa.algo_id: fa for fa in ISISFlexAlgo.objects.filter(instance=inst)}
-        self.assertEqual(set(fas), {128, 129})  # frozen
-        self.assertEqual(fas[128].metric_type, "igp-metric")  # frozen
-        self.assertEqual(states[0].status, "changed")  # drift surfaced
+        self.assertEqual(set(fas), {128})  # auto-mirrored
+        self.assertEqual(fas[128].metric_type, "delay-metric")  # auto-mirrored
+        self.assertEqual(states[0].status, "imported")
