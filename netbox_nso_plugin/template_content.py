@@ -1200,35 +1200,32 @@ def _resolve_ospf_vrf(vrf_name: str):
 
 
 def _get_or_create_ospf_instance(device, pid, entry, OSPFInstance):
-    """Create/refresh the netbox-routing OSPFInstance for one process.
+    """Create the netbox-routing OSPFInstance for one process; report device match.
 
     Keyed on (device, process_id). ``router_id`` is required by the model
-    (IPAddressField) so an instance NSO reports without one is skipped — the
-    overlay still records it. ``name`` is only set on create so an operator
-    rename survives later syncs; router_id/vrf are kept faithful to the device.
+    (IPAddressField) so an instance NSO reports without one is skipped. Clobber-safe
+    (write-path): device values seed the object on create only; an existing instance
+    is NEVER overwritten so operator edits survive. Returns ``(obj, matches)`` where
+    matches = (object content == device) for value-aware drift detection.
     """
     if OSPFInstance is None:
-        return None
+        return None, True
     router_id = entry.get("router_id")
     if not router_id:
-        return None
+        return None, True
     vrf_obj = _resolve_ospf_vrf(entry.get("vrf") or "")
     obj, created = OSPFInstance.objects.get_or_create(
         device=device,
         process_id=pid,
         defaults={"name": str(pid), "router_id": router_id, "vrf": vrf_obj},
     )
+    matches = True
     if not created:
-        changed = False
         if str(obj.router_id) != str(router_id):
-            obj.router_id = router_id
-            changed = True
-        if obj.vrf_id != (vrf_obj.id if vrf_obj else None):
-            obj.vrf = vrf_obj
-            changed = True
-        if changed:
-            obj.save()
-    return obj
+            matches = False
+        elif obj.vrf_id != (vrf_obj.id if vrf_obj else None):
+            matches = False
+    return obj, matches
 
 
 _OSPF_AUTH_MAP = {"message-digest": "message-digest", "null": "null"}
@@ -1243,11 +1240,11 @@ def _fill_ospf_interface(entry, iface, inst_by_pid, OSPFArea, OSPFInterface):
     only the values netbox-routing models; plaintext has no equivalent).
     """
     if OSPFInterface is None or OSPFArea is None:
-        return
+        return True
     pid = entry.get("process_id")
     inst = inst_by_pid.get(pid)
     if inst is None:
-        return
+        return True
     area_id = entry.get("area_id") or "0.0.0.0"
     area, _ = OSPFArea.objects.get_or_create(area_id=area_id, defaults={"area_type": "standard"})
 
@@ -1266,10 +1263,19 @@ def _fill_ospf_interface(entry, iface, inst_by_pid, OSPFArea, OSPFInterface):
         "authentication": auth,
     }
     obj, created = OSPFInterface.objects.get_or_create(interface=iface, defaults=fields)
+    # Clobber-safe: seed on create only; never overwrite an existing interface so
+    # operator edits survive. Return matches = (object content == device) for drift.
+    matches = True
     if not created:
         for key, val in fields.items():
-            setattr(obj, key, val)
-        obj.save()
+            if key in ("instance", "area"):
+                if getattr(obj, f"{key}_id") != (val.pk if val is not None else None):
+                    matches = False
+                    break
+            elif getattr(obj, key) != val:
+                matches = False
+                break
+    return matches
 
 
 def _reconcile_ospf(device, payload: dict) -> dict:
@@ -1321,11 +1327,12 @@ def _reconcile_ospf(device, payload: dict) -> dict:
         state.vrf = entry.get("vrf") or ""
         state.areas = entry.get("areas") or []
         state.last_sync_at = now
-        ospf_inst = _get_or_create_ospf_instance(device, pid, entry, OSPFInstance)
+        ospf_inst, inst_matches = _get_or_create_ospf_instance(device, pid, entry, OSPFInstance)
         if ospf_inst is not None:
             state.ospf_instance = ospf_inst
-        # Mirror overlay: linking the netbox-routing OSPF instance is best-effort.
-        state.status = sm.on_reconcile(state.status, matches=None)
+        # Value overlay: an edit to the OSPFInstance (router_id/vrf) surfaces as
+        # 'changed' and survives sync; accept -> apply -> in_sync.
+        state.status = sm.on_reconcile(state.status, matches=inst_matches)
         state.save()
         seen_pids.add(pid)
 
@@ -1389,9 +1396,11 @@ def _reconcile_ospf_interfaces(device, mgmt, payload, now) -> None:
         state.auth_type = entry.get("auth_type") or ""
         state.auth_present = bool(entry.get("auth_present", False))
         state.last_sync_at = now
-        state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
+        # Fill first so its drift folds into status: value overlay — an edit to the
+        # OSPFInterface surfaces as 'changed' and survives sync; accept -> apply.
+        iface_matches = _fill_ospf_interface(entry, iface, inst_by_pid, OSPFArea, OSPFInterface)
+        state.status = sm.on_reconcile(state.status, matches=iface_matches)
         state.save()
-        _fill_ospf_interface(entry, iface, inst_by_pid, OSPFArea, OSPFInterface)
         seen_iface_pks.add(iface.pk)
 
     for stale in NSOOSPFInterfaceState.objects.filter(management=mgmt):
