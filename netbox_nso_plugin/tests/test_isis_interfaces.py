@@ -516,6 +516,24 @@ class TestReconcileIsisProcess(TestCase):
         inst.refresh_from_db()
         self.assertTrue(inst.overload_bit)
 
+    def test_edit_to_isis_instance_surfaces_as_changed_and_survives(self):
+        """Editing the netbox-routing ISISInstance → drift, and the edit is not clobbered."""
+        self._make_mgmt()
+        from netbox_routing.models import ISISInstance
+
+        from netbox_nso_plugin.template_content import _reconcile_isis_process
+
+        payload = [{"process_tag": "0", "net": "49.0001.0000.0000.0001.00", "is_type": "level-2"}]
+        _reconcile_isis_process(self.device, payload)
+        inst = ISISInstance.objects.get(device=self.device, process_tag="0")
+        inst.is_type = "level-1"  # operator edit; device still reports level-2
+        inst.save()
+
+        states = _reconcile_isis_process(self.device, payload)
+        self.assertEqual(states[0].status, "changed")  # edit surfaced as drift
+        inst.refresh_from_db()
+        self.assertEqual(inst.is_type, "level-1")  # edit preserved, not reverted
+
     def test_routing_instance_p1_scalars_and_settings(self):
         """M33 P1: instance scalar columns + ISISSetting EAV are reconciled from NSO."""
         self._make_mgmt()
@@ -547,13 +565,15 @@ class TestReconcileIsisProcess(TestCase):
         settings = {s.key: s.value for s in inst.settings.all()}
         self.assertEqual(settings, {"spf_second_wait": "1000", "graceful_restart": "true"})
 
-        # A later report dropping a setting deletes its row (full-replace semantics).
-        _reconcile_isis_process(
+        # Clobber-safe: a later differing device report does NOT overwrite the object
+        # (operator edits survive); the object is frozen and the overlay surfaces drift.
+        states = _reconcile_isis_process(
             self.device,
             [{"process_tag": "0", "settings": {"spf_second_wait": "2000"}}],
         )
         settings = {s.key: s.value for s in ISISSetting.objects.all()}
-        self.assertEqual(settings, {"spf_second_wait": "2000"})
+        self.assertEqual(settings, {"spf_second_wait": "1000", "graceful_restart": "true"})  # frozen
+        self.assertEqual(states[0].status, "changed")  # drift surfaced
 
     def test_routing_interface_p1_scalars_and_settings(self):
         """M33 P1: per-interface scalar columns + ISISSetting EAV are reconciled."""
@@ -626,13 +646,14 @@ class TestReconcileIsisProcess(TestCase):
         self.assertTrue(sr.enabled)
         self.assertEqual(sr.prefix_sid_range, "global")
 
-        # Full-replace: dropping level 1 deletes its row.
-        _reconcile_isis_process(
+        # Clobber-safe: a later differing device report is frozen; drift is surfaced.
+        states = _reconcile_isis_process(
             self.device,
             [{"process_tag": "0", "levels": [{"level": 2, "default_metric": 20}]}],
         )
-        self.assertEqual(set(ISISLevel.objects.filter(instance=inst).values_list("level", flat=True)), {2})
-        self.assertEqual(ISISLevel.objects.get(instance=inst, level=2).default_metric, 20)
+        self.assertEqual(set(ISISLevel.objects.filter(instance=inst).values_list("level", flat=True)), {1, 2})  # frozen
+        self.assertEqual(ISISLevel.objects.get(instance=inst, level=2).default_metric, 10)  # frozen
+        self.assertEqual(states[0].status, "changed")  # drift surfaced
 
 
 class TestReconcileIsisInterfaceLevels(TestCase):
@@ -705,11 +726,12 @@ class TestReconcileIsisInterfaceLevels(TestCase):
         self.assertEqual(fas[128].metric_type, "igp-metric")
         self.assertEqual(fas[128].admin_group_exclude, "BLUE")
 
-        # Full-replace: dropping 129 deletes its row.
-        _reconcile_isis_process(
+        # Clobber-safe: a later differing device report is frozen; drift is surfaced.
+        states = _reconcile_isis_process(
             self.device,
             [{"process_tag": "0", "flex_algos": [{"algo_id": 128, "metric_type": "delay-metric"}]}],
         )
         fas = {fa.algo_id: fa for fa in ISISFlexAlgo.objects.filter(instance=inst)}
-        self.assertEqual(set(fas), {128})
-        self.assertEqual(fas[128].metric_type, "delay-metric")
+        self.assertEqual(set(fas), {128, 129})  # frozen
+        self.assertEqual(fas[128].metric_type, "igp-metric")  # frozen
+        self.assertEqual(states[0].status, "changed")  # drift surfaced
