@@ -255,6 +255,38 @@ class TestReconcileOspfFill(TestCase):
         self.assertEqual(x.area.pk, area0.pk)
         self.assertEqual(OSPFArea.objects.filter(area_id__in=["0", "0.0.0.0"]).count(), 1)
 
+    def test_owned_overlay_cost_network_type_not_clobbered(self):
+        """A reconcile must not wipe an owned row's pushed cost/network-type.
+
+        Greenfield: operator set cost/network-type, but the device hasn't applied them
+        yet, so the adapter reports them as None. The owned overlay must keep the intent
+        (else the next re-push would drop it from the adapter too)."""
+        self._make_mgmt()
+        from netbox_nso_plugin.models import NSOOSPFInterfaceState
+
+        state = NSOOSPFInterfaceState.objects.create(
+            management=self._make_mgmt(),
+            interface=self.tun,
+            process_id="10",
+            area_id="0.0.0.0",
+            cost=120,
+            network_type="point-to-point",
+            status="accepted",
+        )
+
+        from netbox_nso_plugin.template_content import _reconcile_ospf
+
+        # Device reports the interface present but WITHOUT cost / network-type.
+        _reconcile_ospf(
+            self.device,
+            self._payload([self._instance()], [self._iface(name="Tunnel10", cost=None, network_type=None)]),
+        )
+
+        state.refresh_from_db()
+        self.assertEqual(state.cost, 120)
+        self.assertEqual(state.network_type, "point-to-point")
+        self.assertIn(state.status, ("accepted", "deploying", "in_sync", "apply_failed"))
+
     def test_invalid_network_type_and_cost_dropped(self):
         """Out-of-range cost and unknown network-type must not be written verbatim."""
         self._make_mgmt()

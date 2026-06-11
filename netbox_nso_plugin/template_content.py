@@ -1691,14 +1691,22 @@ def _reconcile_ospf_interfaces(device, mgmt, payload, now) -> None:
         # value stored, the inst_by_pid lookup, and the DB column all agree.
         pid_raw = entry.get("process_id")
         entry["process_id"] = str(pid_raw) if pid_raw is not None else None
-        state.process_id = entry["process_id"]
-        state.area_id = entry.get("area_id") or ""
-        state.passive = bool(entry.get("passive", False))
-        state.priority = entry.get("priority")
-        state.cost = entry.get("cost")
-        state.network_type = entry.get("network_type") or ""
-        state.auth_type = entry.get("auth_type") or ""
-        state.auth_present = bool(entry.get("auth_present", False))
+        # For owned (operator-claimed) rows the overlay columns hold the intent we
+        # push — set by _accept_ospf_interface and refreshed on every OSPFInterface
+        # edit. A reconcile must NOT clobber them with the device's current values:
+        # a greenfield owned change isn't on the device yet, so the adapter reports
+        # cost/network-type as None and would wipe the intent (then the next re-push
+        # would drop it from the adapter too). Mirror device values only into unowned
+        # (brownfield / imported) rows; owned rows keep the operator intent.
+        if not sm.is_owned(state.status):
+            state.process_id = entry["process_id"]
+            state.area_id = entry.get("area_id") or ""
+            state.passive = bool(entry.get("passive", False))
+            state.priority = entry.get("priority")
+            state.cost = entry.get("cost")
+            state.network_type = entry.get("network_type") or ""
+            state.auth_type = entry.get("auth_type") or ""
+            state.auth_present = bool(entry.get("auth_present", False))
         state.last_sync_at = now
         # 3-way merge: device change auto-mirrors when the OSPFInterface is untouched;
         # an operator edit surfaces as 'changed' and survives; both moved → conflict.
