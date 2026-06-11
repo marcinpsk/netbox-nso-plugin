@@ -283,10 +283,29 @@ def reconcile_switchport(device, payload: dict) -> list:
         rows.append(state)
         seen.add(interface.pk)
 
-    for stale in NSOSwitchportState.objects.filter(management=management):
-        if stale.interface_id not in seen:
-            new_status = sm.on_reconcile(stale.status, present=False)
-            if new_status != stale.status:
-                stale.status = new_status
-                stale.save(update_fields=["status"])
+    _finalise_stale_switchports(management, seen)
     return rows
+
+
+def _finalise_stale_switchports(management, seen: set) -> None:
+    """Prune vestigial stale switchport rows; mark genuine removals ``changed``.
+
+    A row whose interface dropped out of the device payload is vestigial when it
+    is not owned and its interface carries no L2 config (e.g. an early-days seed
+    onto a 'no switchport' L3 port) → delete it rather than show perpetual drift.
+    An owned (accepted) row, or one whose interface still holds an operator L2
+    value, is a genuine removal → keep it and mark ``changed``.
+    """
+    from . import status_machine as sm
+    from .models import NSOSwitchportState
+
+    for stale in NSOSwitchportState.objects.filter(management=management).select_related("interface"):
+        if stale.interface_id in seen:
+            continue
+        if not sm.is_owned(stale.status) and _switchport_is_pristine(stale.interface):
+            stale.delete()
+            continue
+        new_status = sm.on_reconcile(stale.status, present=False)
+        if new_status != stale.status:
+            stale.status = new_status
+            stale.save(update_fields=["status"])

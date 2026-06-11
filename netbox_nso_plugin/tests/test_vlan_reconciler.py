@@ -284,6 +284,39 @@ class TestVlanReconciler(TestCase):
         self.interface.refresh_from_db()
         self.assertEqual(self.interface.untagged_vlan.vid, 20)  # operator value NOT clobbered
 
+    def test_switchport_stale_vestigial_row_pruned(self):
+        """A stale row whose interface carries no L2 config is vestigial → pruned, not drift.
+
+        Guards the early-days bug where 'no switchport' (L3) ports got switchport
+        overlays that then lingered as perpetual false drift.
+        """
+        from netbox_nso_plugin.models import NSOSwitchportState
+        from netbox_nso_plugin.vlan_reconciler import reconcile_switchport
+
+        iface2 = Interface.objects.create(device=self.device, name="GigabitEthernet0/2", type="1000base-t")
+        NSOSwitchportState.objects.create(
+            management=self.management, interface=iface2, mode="tagged-all", status="imported"
+        )
+        # iface2 is blank (no L2) and absent from the payload → vestigial → pruned.
+        reconcile_switchport(self.device, {"interfaces": []})
+        self.assertFalse(NSOSwitchportState.objects.filter(interface=iface2).exists())
+
+    def test_switchport_stale_row_with_operator_value_marked_changed(self):
+        """A stale row whose interface still holds an L2 value is a genuine removal → changed, kept."""
+        from netbox_nso_plugin.models import NSOSwitchportState
+        from netbox_nso_plugin.vlan_reconciler import reconcile_switchport
+
+        iface2 = Interface.objects.create(
+            device=self.device, name="GigabitEthernet0/3", type="1000base-t", mode="tagged-all"
+        )
+        state = NSOSwitchportState.objects.create(
+            management=self.management, interface=iface2, mode="tagged-all", status="imported"
+        )
+        reconcile_switchport(self.device, {"interfaces": []})
+        self.assertTrue(NSOSwitchportState.objects.filter(pk=state.pk).exists())
+        state.refresh_from_db()
+        self.assertEqual(state.status, "changed")
+
     def test_switchport_native_vlan_1_normalized(self):
         """IOS implicit default native VLAN 1 is treated as 'no native' (no false drift)."""
         from netbox_nso_plugin.vlan_reconciler import reconcile_switchport
