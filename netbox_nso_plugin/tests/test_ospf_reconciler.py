@@ -224,6 +224,37 @@ class TestReconcileOspfFill(TestCase):
         self.assertEqual(x.cost, 750)
         self.assertEqual(x.network_type, "point-to-point")
 
+    def test_resolve_ospf_area_equivalence(self):
+        from netbox_routing.models import OSPFArea
+
+        from netbox_nso_plugin.template_content import _resolve_ospf_area
+
+        # Operator created the area as a bare integer; the device reports the dotted form.
+        op = OSPFArea.objects.create(area_id="0", area_type="standard")
+        resolved = _resolve_ospf_area(OSPFArea, "0.0.0.0")
+        self.assertEqual(resolved.pk, op.pk)  # matched, not duplicated
+        self.assertEqual(OSPFArea.objects.filter(area_id__in=["0", "0.0.0.0"]).count(), 1)
+        # And the reverse: bare-int device value matches an existing dotted area.
+        op2 = OSPFArea.objects.create(area_id="0.0.0.1", area_type="standard")
+        self.assertEqual(_resolve_ospf_area(OSPFArea, "1").pk, op2.pk)
+
+    def test_device_dotted_area_reuses_operator_bare_area(self):
+        # Regression for the LAG99:99 'pending apply' bug: device reports area 0.0.0.0,
+        # operator created area '0' — the reconcile must reuse it, not make a duplicate.
+        self._make_mgmt()
+        from netbox_routing.models import OSPFArea, OSPFInterface
+
+        from netbox_nso_plugin.template_content import _reconcile_ospf
+
+        area0 = OSPFArea.objects.create(area_id="0", area_type="standard")
+        _reconcile_ospf(
+            self.device,
+            self._payload([self._instance()], [self._iface(name="Tunnel10", area_id="0.0.0.0")]),
+        )
+        x = OSPFInterface.objects.get(interface=self.tun)
+        self.assertEqual(x.area.pk, area0.pk)
+        self.assertEqual(OSPFArea.objects.filter(area_id__in=["0", "0.0.0.0"]).count(), 1)
+
     def test_invalid_network_type_and_cost_dropped(self):
         """Out-of-range cost and unknown network-type must not be written verbatim."""
         self._make_mgmt()

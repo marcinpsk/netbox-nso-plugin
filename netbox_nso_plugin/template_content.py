@@ -1468,6 +1468,43 @@ _OSPF_AUTH_MAP = {"message-digest": "message-digest", "null": "null"}
 _OSPF_NETWORK_TYPES = {"broadcast", "non-broadcast", "point-to-point", "point-to-multipoint"}
 
 
+def _canonical_area_id(area_id) -> str:
+    """Canonicalise an OSPF area-id to dotted-quad (``0`` → ``0.0.0.0``).
+
+    OSPF area-ids are canonically IPv4, so a bare integer and its dotted form name the same
+    area. Already-dotted and non-numeric values pass through unchanged.
+    """
+    s = str(area_id)
+    if "." in s:
+        return s
+    try:
+        n = int(s)
+    except (TypeError, ValueError):
+        return s
+    return f"{(n >> 24) & 255}.{(n >> 16) & 255}.{(n >> 8) & 255}.{n & 255}"
+
+
+def _resolve_ospf_area(OSPFArea, area_id):
+    """Get/create the OSPFArea, matching equivalent area-id forms (``0`` ≡ ``0.0.0.0``).
+
+    The device reports the dotted form; an operator may have created the area as a bare
+    integer (or vice-versa). Match either existing form so we don't spawn a duplicate area.
+    Comparison still goes by canonical *value* (see ``_fill_ospf_interface``), so even a
+    pre-existing duplicate doesn't prevent the owned interface from settling.
+    """
+    canon = _canonical_area_id(area_id)
+    candidates = {str(area_id), canon}
+    try:  # also the bare-integer form of the canonical address
+        p = [int(x) for x in canon.split(".")]
+        candidates.add(str((p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]))
+    except Exception:
+        pass
+    existing = OSPFArea.objects.filter(area_id__in=candidates).first()
+    if existing is not None:
+        return existing
+    return OSPFArea.objects.get_or_create(area_id=canon, defaults={"area_type": "standard"})[0]
+
+
 def _fill_ospf_interface(entry, iface, inst_by_pid, OSPFArea, OSPFInterface, base):
     """3-way reconcile the netbox-routing OSPFInterface + its OSPFArea.
 
@@ -1485,8 +1522,7 @@ def _fill_ospf_interface(entry, iface, inst_by_pid, OSPFArea, OSPFInterface, bas
     inst = inst_by_pid.get(pid)
     if inst is None:
         return True, False, base
-    area_id = entry.get("area_id") or "0.0.0.0"
-    area, _ = OSPFArea.objects.get_or_create(area_id=area_id, defaults={"area_type": "standard"})
+    area = _resolve_ospf_area(OSPFArea, entry.get("area_id") or "0.0.0.0")
 
     cost = entry.get("cost")
     cost = cost if isinstance(cost, int) and 1 <= cost <= 65535 else None
@@ -1507,8 +1543,19 @@ def _fill_ospf_interface(entry, iface, inst_by_pid, OSPFArea, OSPFInterface, bas
     def _content(src_is_obj):
         out = {}
         for key, val in fields.items():
-            if key in ("instance", "area"):
-                out[key] = getattr(obj, f"{key}_id") if src_is_obj else merge_util.pk(val)
+            if key == "instance":
+                out[key] = obj.instance_id if src_is_obj else merge_util.pk(val)
+            elif key == "area":
+                # Compare areas by canonical value (0 ≡ 0.0.0.0), not pk — the device's
+                # dotted area must match an operator's bare-integer area (and survive any
+                # pre-existing duplicate area rows) so the owned interface settles in_sync.
+                a = obj.area if src_is_obj else val
+                out[key] = _canonical_area_id(a.area_id) if a is not None else None
+            elif key == "passive":
+                # passive is a nullable boolean: an operator who never set it leaves None,
+                # while the device-derived value is bool(...) → False. Treat None ≡ False so
+                # the owned interface settles instead of perpetually mismatching.
+                out[key] = bool(getattr(obj, key) if src_is_obj else val)
             else:
                 out[key] = getattr(obj, key) if src_is_obj else val
         return out
