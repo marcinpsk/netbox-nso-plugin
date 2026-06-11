@@ -1153,13 +1153,10 @@ def _reconcile_isis_interfaces(device, interfaces: list) -> list:
         state.save()
         seen_keys.add((iface.pk, af))
 
-    stale_qs = NSOISISInterfaceState.objects.filter(management=mgmt)
-    for stale in stale_qs:
+    for stale in NSOISISInterfaceState.objects.filter(management=mgmt):
         if (stale.interface_id, stale.af) not in seen_keys:
-            new_status = sm.on_reconcile(stale.status, present=False)
-            if new_status != stale.status:
-                stale.status = new_status
-                stale.save(update_fields=["status"])
+            # vestigial = status-only ghost (no linked netbox-routing ISISInterface)
+            sm.finalise_stale_overlay(stale, vestigial=stale.isis_interface_id is None)
 
     if dropped:
         logger.warning(
@@ -1389,13 +1386,10 @@ def _reconcile_isis_process(device, process_list: list) -> list:
         state.save()
         seen_tags.add(tag)
 
-    stale_qs = NSOISISInstanceState.objects.filter(management=mgmt)
-    for stale in stale_qs:
+    for stale in NSOISISInstanceState.objects.filter(management=mgmt):
         if stale.process_tag not in seen_tags:
-            new_status = sm.on_reconcile(stale.status, present=False)
-            if new_status != stale.status:
-                stale.status = new_status
-                stale.save(update_fields=["status"])
+            # vestigial = status-only ghost (no linked netbox-routing ISISInstance)
+            sm.finalise_stale_overlay(stale, vestigial=stale.isis_instance_id is None)
 
     return list(NSOISISInstanceState.objects.filter(management=mgmt).select_related("isis_instance"))
 
@@ -1597,10 +1591,8 @@ def _reconcile_ospf(device, payload: dict) -> dict:
 
     for stale in NSOOSPFInstanceState.objects.filter(management=mgmt):
         if stale.process_id not in seen_pids:
-            new_status = sm.on_reconcile(stale.status, present=False)
-            if new_status != stale.status:
-                stale.status = new_status
-                stale.save(update_fields=["status"])
+            # vestigial = status-only ghost (no linked netbox-routing OSPFInstance)
+            sm.finalise_stale_overlay(stale, vestigial=stale.ospf_instance_id is None)
 
     _reconcile_ospf_interfaces(device, mgmt, payload, now)
 
@@ -1667,10 +1659,11 @@ def _reconcile_ospf_interfaces(device, mgmt, payload, now) -> None:
 
     for stale in NSOOSPFInterfaceState.objects.filter(management=mgmt):
         if stale.interface_id not in seen_iface_pks:
-            new_status = sm.on_reconcile(stale.status, present=False)
-            if new_status != stale.status:
-                stale.status = new_status
-                stale.save(update_fields=["status"])
+            # vestigial = status-only ghost (no durable netbox-routing OSPFInterface row)
+            vestigial = (
+                OSPFInterface is None or not OSPFInterface.objects.filter(interface_id=stale.interface_id).exists()
+            )
+            sm.finalise_stale_overlay(stale, vestigial=vestigial)
 
     if dropped:
         logger.warning(

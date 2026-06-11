@@ -101,11 +101,50 @@ class TestReconcileLagConfig(TestCase):
         assert state.min_links == 5
         assert state.status == "imported"
 
-    def test_stale_bundle_marked_changed(self):
+    def test_stale_bundle_husk_pruned(self):
+        # A dropped bundle whose LAG interface has no members left is a vestigial husk
+        # → pruned (no perpetual false drift), not left as a changed ghost row.
         reconcile_lag_config(self.device, _payload([self._bundle(min_links=2)]))
-        # payload no longer reports the bundle → drift
+        reconcile_lag_config(self.device, _payload([]))
+        assert not NSOLACPBundleState.objects.filter(interface=self.lag).exists()
+
+    def test_stale_bundle_with_members_marked_changed(self):
+        # The LAG still carries real members (topology-reconciled) → genuine removal → drift.
+        reconcile_lag_config(self.device, _payload([self._bundle(min_links=2)]))
+        self.m1.lag = self.lag
+        self.m1.save(update_fields=["lag"])
         reconcile_lag_config(self.device, _payload([]))
         state = NSOLACPBundleState.objects.get(interface=self.lag)
+        assert state.status == "changed"
+
+    def test_stale_owned_bundle_husk_preserved(self):
+        # An owned (accepted) row is never pruned, even as a husk.
+        reconcile_lag_config(self.device, _payload([self._bundle(min_links=2)]))
+        state = NSOLACPBundleState.objects.get(interface=self.lag)
+        state.status = "accepted"
+        state.save(update_fields=["status"])
+        reconcile_lag_config(self.device, _payload([]))
+        state.refresh_from_db()
+        assert state.status == "accepted"
+
+    def test_stale_member_unbundled_pruned(self):
+        # A dropped member whose interface is no longer assigned to any LAG is vestigial.
+        reconcile_lag_config(
+            self.device,
+            _payload([self._bundle(members=[{"interface_name": "GigabitEthernet0/1", "mode": "active"}])]),
+        )
+        reconcile_lag_config(self.device, _payload([self._bundle(members=[])]))
+        assert not NSOLACPMemberState.objects.filter(interface=self.m1).exists()
+
+    def test_stale_member_still_bundled_marked_changed(self):
+        reconcile_lag_config(
+            self.device,
+            _payload([self._bundle(members=[{"interface_name": "GigabitEthernet0/1", "mode": "active"}])]),
+        )
+        self.m1.lag = self.lag
+        self.m1.save(update_fields=["lag"])
+        reconcile_lag_config(self.device, _payload([self._bundle(members=[])]))
+        state = NSOLACPMemberState.objects.get(interface=self.m1)
         assert state.status == "changed"
 
     def test_no_management_returns_empty(self):

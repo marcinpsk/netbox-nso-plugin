@@ -91,6 +91,29 @@ class TestReconcileOspfFill(TestCase):
         self.assertEqual(len(res["instances"]), 1)
         self.assertEqual(res["instances"][0].status, "imported")  # unowned, materialized → imported (unified)
 
+    def test_stale_instance_with_linked_object_marked_changed(self):
+        # Device drops the process but its netbox-routing OSPFInstance still exists → drift.
+        self._make_mgmt()
+        from netbox_nso_plugin.models import NSOOSPFInstanceState
+        from netbox_nso_plugin.template_content import _reconcile_ospf
+
+        _reconcile_ospf(self.device, self._payload([self._instance(process_id=10)]))
+        _reconcile_ospf(self.device, self._payload([]))
+        state = NSOOSPFInstanceState.objects.get(process_id="10")
+        self.assertEqual(state.status, "changed")
+        self.assertIsNotNone(state.ospf_instance_id)
+
+    def test_stale_instance_ghost_pruned(self):
+        # An unowned overlay with no linked netbox-routing object is a status-only ghost
+        # → pruned rather than left as perpetual false drift.
+        mgmt = self._make_mgmt()
+        from netbox_nso_plugin.models import NSOOSPFInstanceState
+        from netbox_nso_plugin.template_content import _reconcile_ospf
+
+        NSOOSPFInstanceState.objects.create(management=mgmt, process_id="999", status="imported", ospf_instance=None)
+        _reconcile_ospf(self.device, self._payload([]))
+        self.assertFalse(NSOOSPFInstanceState.objects.filter(process_id="999").exists())
+
     def test_instance_device_change_auto_mirrors_when_untouched(self):
         """3-way: device router_id change with object untouched → auto-mirror, in sync."""
         self._make_mgmt()

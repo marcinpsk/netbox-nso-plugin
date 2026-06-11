@@ -99,19 +99,16 @@ def reconcile_lag_config(device, payload: dict) -> list:
             m_state.save()
             seen_members.add(member_iface.pk)
 
-    # Rows the payload no longer reports → drift (clobber-safe; native interfaces untouched).
+    # Rows the payload no longer reports → prune vestigial husks, else drift (clobber-safe;
+    # native interfaces untouched). A stale bundle is vestigial when its LAG interface has
+    # no members left; a stale member when its interface is no longer assigned to any LAG.
     for stale in NSOLACPBundleState.objects.filter(management=mgmt):
-        new_status = sm.on_reconcile(stale.status, present=False)
-        if stale.interface_id not in seen_bundles and new_status != stale.status:
-            stale.status = new_status
-            stale.last_sync_at = now
-            stale.save(update_fields=["status", "last_sync_at"])
-    for stale in NSOLACPMemberState.objects.filter(management=mgmt):
-        new_status = sm.on_reconcile(stale.status, present=False)
-        if stale.interface_id not in seen_members and new_status != stale.status:
-            stale.status = new_status
-            stale.last_sync_at = now
-            stale.save(update_fields=["status", "last_sync_at"])
+        if stale.interface_id not in seen_bundles:
+            vestigial = not Interface.objects.filter(lag_id=stale.interface_id).exists()
+            sm.finalise_stale_overlay(stale, vestigial=vestigial, now=now)
+    for stale in NSOLACPMemberState.objects.filter(management=mgmt).select_related("interface"):
+        if stale.interface_id not in seen_members:
+            sm.finalise_stale_overlay(stale, vestigial=stale.interface.lag_id is None, now=now)
 
     if dropped:
         logger.warning(

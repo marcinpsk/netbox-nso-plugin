@@ -302,10 +302,4 @@ def _finalise_stale_switchports(management, seen: set) -> None:
     for stale in NSOSwitchportState.objects.filter(management=management).select_related("interface"):
         if stale.interface_id in seen:
             continue
-        if not sm.is_owned(stale.status) and _switchport_is_pristine(stale.interface):
-            stale.delete()
-            continue
-        new_status = sm.on_reconcile(stale.status, present=False)
-        if new_status != stale.status:
-            stale.status = new_status
-            stale.save(update_fields=["status"])
+        sm.finalise_stale_overlay(stale, vestigial=_switchport_is_pristine(stale.interface))

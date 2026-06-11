@@ -307,3 +307,63 @@ class TestOnReconcileError(SimpleTestCase):
         self.assertEqual(sm.on_reconcile(sm.ERROR, matches=None), sm.IMPORTED)
         # Vanished while errored → drift.
         self.assertEqual(sm.on_reconcile(sm.ERROR, present=False), sm.CHANGED)
+
+
+class _FakeRow:
+    """Minimal stand-in for a stale overlay row (no DB) to exercise finalise_stale_overlay."""
+
+    def __init__(self, status):
+        self.status = status
+        self.last_sync_at = None
+        self.deleted = False
+        self.saved_fields = None
+
+    def delete(self):
+        self.deleted = True
+
+    def save(self, update_fields=None):
+        self.saved_fields = list(update_fields) if update_fields else None
+
+
+class TestFinaliseStaleOverlay(SimpleTestCase):
+    """Shared stale-loop tail: prune vestigial unowned ghosts, mark genuine removals changed."""
+
+    def test_vestigial_unowned_is_pruned(self):
+        for s in (sm.UNKNOWN, sm.IMPORTED, sm.CHANGED, sm.CONFLICT, sm.ERROR):
+            row = _FakeRow(s)
+            sm.finalise_stale_overlay(row, vestigial=True)
+            self.assertTrue(row.deleted)
+            self.assertIsNone(row.saved_fields)
+
+    def test_owned_is_never_pruned(self):
+        # Owned rows are preserved even when 'vestigial' — present=False keeps accepted/deploying.
+        for s in (sm.ACCEPTED, sm.DEPLOYING, sm.IN_SYNC, sm.APPLY_FAILED):
+            row = _FakeRow(s)
+            sm.finalise_stale_overlay(row, vestigial=True)
+            self.assertFalse(row.deleted)
+
+    def test_non_vestigial_unowned_marked_changed(self):
+        row = _FakeRow(sm.IMPORTED)
+        sm.finalise_stale_overlay(row, vestigial=False)
+        self.assertFalse(row.deleted)
+        self.assertEqual(row.status, sm.CHANGED)
+        self.assertEqual(row.saved_fields, ["status"])
+
+    def test_owned_confirmed_marked_changed_not_pruned(self):
+        # in_sync was device-confirmed → its disappearance is real drift, kept as changed.
+        row = _FakeRow(sm.IN_SYNC)
+        sm.finalise_stale_overlay(row, vestigial=False)
+        self.assertFalse(row.deleted)
+        self.assertEqual(row.status, sm.CHANGED)
+
+    def test_now_bumps_last_sync_at(self):
+        row = _FakeRow(sm.IMPORTED)
+        sm.finalise_stale_overlay(row, vestigial=False, now="T")
+        self.assertEqual(row.last_sync_at, "T")
+        self.assertEqual(row.saved_fields, ["status", "last_sync_at"])
+
+    def test_no_change_no_save(self):
+        # already changed + still absent → no transition → no save.
+        row = _FakeRow(sm.CHANGED)
+        sm.finalise_stale_overlay(row, vestigial=False)
+        self.assertIsNone(row.saved_fields)

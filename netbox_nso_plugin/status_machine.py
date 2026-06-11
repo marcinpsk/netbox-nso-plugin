@@ -387,3 +387,33 @@ def on_reconcile_error(current: str) -> str:
     if is_owned(current) or current == ERROR:
         return current
     return advance(current, RECONCILE_ERROR, to=ERROR)
+
+
+def finalise_stale_overlay(stale, *, vestigial: bool, now=None) -> None:
+    """Shared tail for every reconciler's stale loop: prune vestigial rows, else mark ``changed``.
+
+    A row the device stopped reporting is *vestigial* when it is **not owned** and its
+    durable NetBox representation is already absent/empty (the per-overlay ``vestigial``
+    predicate — e.g. switchport interface carries no L2 config, or an ISIS/OSPF overlay
+    whose netbox-routing object FK is ``None``). Such a row is a status-only ghost (often
+    an early-import seed): delete it rather than show perpetual false drift.
+
+    Owned rows (accepted/deploying/in_sync/apply_failed) and genuine removals — whose
+    NetBox object still carries config — are kept and advanced through ``on_reconcile``
+    to ``changed`` (clobber-safe; we never auto-delete real config, so a transient export
+    gap / device-down surfaces as drift, not data loss).
+
+    ``now`` (optional) bumps ``last_sync_at`` alongside ``status`` when the row is kept.
+    """
+    if not is_owned(stale.status) and vestigial:
+        stale.delete()
+        return
+    new_status = on_reconcile(stale.status, present=False)
+    if new_status == stale.status:
+        return
+    stale.status = new_status
+    fields = ["status"]
+    if now is not None:
+        stale.last_sync_at = now
+        fields.append("last_sync_at")
+    stale.save(update_fields=fields)
