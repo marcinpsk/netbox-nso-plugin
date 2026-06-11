@@ -1633,6 +1633,83 @@ class NSOVLANRescopeView(LoginRequiredMixin, View):
         return redirect(_device_nso_tab_url(device_id))
 
 
+_RP_ATTACH_FAMILIES = [
+    ("prefix_list", "Prefix List", "PrefixList"),
+    ("route_map", "Route Map", "RouteMap"),
+    ("community_list", "Community List", "CommunityList"),
+    ("as_path", "AS Path", "ASPath"),
+]
+
+
+class NSORoutePolicyAttachView(LoginRequiredMixin, View):
+    """Attach an existing netbox-routing policy object to this device (greenfield write).
+
+    Handles prefix-list / route-map / community-list / as-path.
+    The device↔object link is the NSORoutePolicyState overlay (content-type GFK), so
+    one policy object can be attached to several devices. GET lists objects not yet
+    attached to this device; POST creates an *accepted* overlay (which pushes the
+    owned route-policy intent), written on the next Apply.
+    """
+
+    def get(self, request, device_pk):  # noqa: D102
+        from django.contrib.contenttypes.models import ContentType
+
+        mgmt = get_object_or_404(NSODeviceManagement, device_id=device_pk)
+        attached = set(NSORoutePolicyState.objects.filter(management=mgmt).values_list("content_type_id", "object_id"))
+        candidates = []
+        try:
+            import netbox_routing.models as rm
+        except ImportError:
+            rm = None
+        for family, label, model_name in _RP_ATTACH_FAMILIES:
+            model = getattr(rm, model_name, None) if rm else None
+            if model is None:
+                continue
+            ct = ContentType.objects.get_for_model(model)
+            for obj in model.objects.all().order_by("name"):
+                if (ct.id, obj.pk) in attached:
+                    continue
+                candidates.append({"value": f"{family}:{ct.id}:{obj.pk}", "label": label, "name": obj.name})
+        return render(
+            request,
+            "netbox_nso_plugin/attach_route_policy.html",
+            {"mgmt": mgmt, "candidates": candidates, "object": mgmt.device},
+        )
+
+    def post(self, request, device_pk):  # noqa: D102
+        from django.contrib.contenttypes.models import ContentType
+        from django.utils import timezone
+
+        mgmt = get_object_or_404(NSODeviceManagement, device_id=device_pk)
+        try:
+            family, ct_id, obj_pk = request.POST.get("policy", "").split(":")
+            ct = ContentType.objects.get_for_id(int(ct_id))
+            obj = ct.get_object_for_this_type(pk=int(obj_pk))
+        except (ValueError, ContentType.DoesNotExist, Exception):  # noqa: BLE001
+            messages.error(request, "Invalid route-policy selection.")
+            return redirect(_device_nso_tab_url(mgmt.device_id))
+        state, created = NSORoutePolicyState.objects.get_or_create(
+            management=mgmt,
+            family=family,
+            object_name=obj.name,
+            defaults={
+                "content_type": ct,
+                "object_id": obj.pk,
+                "status": "accepted",
+                "accepted_at": timezone.now(),
+            },
+        )
+        if not created and state.status not in ("accepted", "deploying", "in_sync", "apply_failed"):
+            state.status = "accepted"
+            state.accepted_at = timezone.now()
+        state.content_type = ct
+        state.object_id = obj.pk
+        state.last_sync_at = timezone.now()
+        state.save()  # → _on_route_policy_state_save schedules the push
+        messages.success(request, f"Attached {family} {obj.name} to {mgmt.device.name} — Apply to write it.")
+        return redirect(_device_nso_tab_url(mgmt.device_id))
+
+
 class NSOVLANAttachView(LoginRequiredMixin, View):
     """Attach an existing (shared) ipam.VLAN to this device — greenfield write path.
 

@@ -1,0 +1,42 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{% extends 'base/layout.html' %}
+
+{% block title %}Attach Route-Policy — {{ object }}{% endblock %}
+
+{% block content %}
+<div class="row">
+  <div class="col col-md-8 offset-md-2">
+    <div class="card">
+      <h5 class="card-header">Attach Route-Policy to {{ object }}</h5>
+      <div class="card-body">
+        <p class="text-muted">
+          Attach an existing route-policy object (prefix-list / route-map / community-list / as-path) to
+          <strong>{{ object }}</strong>. The device↔object link is the overlay, so one object can be attached to
+          several devices. It is written to the device on the next <strong>Apply</strong>. Create new objects under
+          Netbox Routing → Routing Objects first.
+        </p>
+
+        {% if candidates %}
+        <form method="post">
+          {% csrf_token %}
+          <div class="mb-3">
+            <label class="form-label" for="policy">Route-policy object</label>
+            <select class="form-select" id="policy" name="policy" required>
+              {% for c in candidates %}
+                <option value="{{ c.value }}">[{{ c.label }}] {{ c.name }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <button type="submit" class="btn btn-primary">Attach</button>
+          <a href="{% url 'dcim:device_nso' pk=object.pk %}" class="btn btn-outline-secondary">Cancel</a>
+        </form>
+        {% else %}
+          <p class="text-warning mb-0">No unattached route-policy objects available. Create one first under
+          Netbox Routing → Routing Objects.</p>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

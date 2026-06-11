@@ -1745,16 +1745,21 @@ def _push_route_policy_intent_for_device(device_id, adapter_device_id):
 def _build_route_policy_entries(family, obj):
     """Serialize a NetBox route-policy object's entries for the adapter intent payload."""
     if family == "prefix_list":
-        return [
-            {
-                "sequence": e.index,
-                "action": e.action.lower() if e.action else "permit",
-                "prefix": str(e.prefix),
-                **({"ge": e.ge} if getattr(e, "ge", None) is not None else {}),
-                **({"le": e.le} if getattr(e, "le", None) is not None else {}),
-            }
-            for e in obj.prefixes.all().order_by("index")
-        ]
+        out = []
+        for e in obj.prefix_list_entries.all().order_by("sequence"):
+            cp = e.assigned_prefix
+            if cp is None:
+                continue
+            out.append(
+                {
+                    "sequence": e.sequence,
+                    "action": e.action.lower() if e.action else "permit",
+                    "prefix": str(cp.prefix),
+                    **({"ge": e.ge} if getattr(e, "ge", None) is not None else {}),
+                    **({"le": e.le} if getattr(e, "le", None) is not None else {}),
+                }
+            )
+        return out
     if family == "community_list":
         return [
             {"sequence": i + 1, "action": "permit", "community": str(c.value)}
@@ -1804,6 +1809,36 @@ def _on_route_policy_state_save(sender, instance, **kwargs):
         (device_id, "route_policy"),
         lambda: _push_route_policy_intent_for_device(device_id, adapter_device_id),
     )
+
+
+@_skip_on_render
+def _on_routing_policy_pre_delete(sender, instance, **kwargs):
+    """Drop overlays + push the reduced snapshot when a netbox-routing policy is deleted.
+
+    Reverts the removal on each attached device.
+    The overlay links via a content-type GFK (no DB cascade), so the overlays must be
+    removed explicitly here, before the object is gone. Captures attached devices first,
+    then a deferred push (post-commit, overlays gone) sends the reduced snapshot.
+    """
+    from django.contrib.contenttypes.models import ContentType
+
+    from .models import NSORoutePolicyState
+
+    ct = ContentType.objects.get_for_model(type(instance))
+    states = list(
+        NSORoutePolicyState.objects.filter(content_type=ct, object_id=instance.pk).select_related("management")
+    )
+    targets = []
+    for state in states:
+        mgmt = state.management
+        if mgmt.adapter_device_id is not None:
+            targets.append((mgmt.device_id, mgmt.adapter_device_id))
+    NSORoutePolicyState.objects.filter(content_type=ct, object_id=instance.pk).delete()
+    for device_id, adapter_device_id in targets:
+        _schedule_intent_push(
+            (device_id, "route_policy"),
+            lambda d=device_id, a=adapter_device_id: _push_route_policy_intent_for_device(d, a),
+        )
 
 
 def _collect_redistribution_by_dest_ref(device_id: int, dest_protocol: str) -> dict[str, list[dict]]:
@@ -2153,6 +2188,19 @@ def _connect_g_activated():  # pragma: no cover
         sender=NSORoutePolicyState,
         dispatch_uid="nso_plugin_route_policy_state_post_save",
     )
+
+    # netbox_routing policy object deletion → drop overlays + push removal (full-replace)
+    try:
+        from netbox_routing.models import ASPath, CommunityList, PrefixList, RouteMap
+
+        for _model in (PrefixList, RouteMap, CommunityList, ASPath):
+            pre_delete.connect(
+                _on_routing_policy_pre_delete,
+                sender=_model,
+                dispatch_uid=f"nso_plugin_routing_policy_pre_delete_{_model.__name__.lower()}",
+            )
+    except ImportError:
+        logger.debug("netbox_routing not installed — route-policy delete signals not registered")
 
     # OSPF state → intent push (M19 B3)
     from .models import NSOOSPFInstanceState, NSOOSPFInterfaceState

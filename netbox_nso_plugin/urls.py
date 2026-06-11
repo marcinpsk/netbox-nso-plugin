@@ -363,6 +363,11 @@ urlpatterns = [
         name="vlan_attach",
     ),
     path(
+        "device/<int:device_pk>/route-policy/attach/",
+        views.NSORoutePolicyAttachView.as_view(),
+        name="route_policy_attach",
+    ),
+    path(
         "bfd/state/<int:pk>/accept/",
         views.NSOBFDInterfaceStateAcceptView.as_view(),
         name="bfd_accept",
