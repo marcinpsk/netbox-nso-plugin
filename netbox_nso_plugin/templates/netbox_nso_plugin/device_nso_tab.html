@@ -226,7 +226,7 @@
   {# ── Apply confirmation modal (self-contained overlay; no Bootstrap-JS dep) ── #}
   <div id="nso-apply-modal" class="d-none"
        style="position:fixed; inset:0; z-index:1080; background:rgba(0,0,0,.5); align-items:flex-start; justify-content:center;">
-    <div class="card shadow" style="max-width:760px; width:92%; margin-top:5rem; max-height:80vh; display:flex; flex-direction:column;">
+    <div class="card shadow" style="max-width:1180px; width:94%; margin-top:4rem; max-height:82vh; display:flex; flex-direction:column;">
       <div class="card-header d-flex justify-content-between align-items-center">
         <span><span class="mdi mdi-upload-network me-1"></span>Apply intent to the device</span>
         <button type="button" class="btn-close nso-apply-cancel" aria-label="Close"></button>
@@ -331,24 +331,59 @@
 
     function esc(s) { var d = document.createElement('div'); d.textContent = (s == null ? '' : String(s)); return d.innerHTML; }
 
-    function renderPreview(d) {
-      if (!d.total) { return '<p class="text-muted mb-0">Nothing pending — NetBox and the device are in sync.</p>'; }
-      var h = '<p>The following NetBox intent will be pushed to the device:</p>';
+    // Strip the netconf <rpc>/<edit-config> envelope so the panel shows just the config body.
+    function trimNative(s) {
+      s = String(s || '');
+      var m = s.match(/<config[^>]*>([\s\S]*?)<\/config>/i);
+      return (m ? m[1] : s).replace(/^\s*\n/, '').replace(/\s+$/, '');
+    }
+
+    function renderIntentPanel(d) {
+      if (!d.total) { return '<p class="text-muted mb-0">Nothing pending.</p>'; }
+      var h = '';
       if (d.changes && d.changes.length) {
-        h += '<div class="table-responsive"><table class="table table-sm align-middle"><thead><tr><th>Interface</th><th>Attribute</th><th>Device now</th><th>→ NetBox</th></tr></thead><tbody>';
+        h += '<div class="table-responsive"><table class="table table-sm align-middle mb-2"><thead><tr><th>Interface</th><th>Attribute</th><th>Device now</th><th>→ NetBox</th></tr></thead><tbody>';
         d.changes.forEach(function (c) {
           h += '<tr><td>' + esc(c.interface) + '</td><td><code>' + esc(c.attribute) + '</code></td><td class="text-muted">' + esc(c.device) + '</td><td><strong>' + esc(c.netbox) + '</strong></td></tr>';
         });
         h += '</tbody></table></div>';
       }
       if (d.routing_changes && d.routing_changes.length) {
-        h += '<div class="table-responsive"><table class="table table-sm align-middle"><thead><tr><th>Category</th><th>Item</th><th>Change</th><th>State</th></tr></thead><tbody>';
+        h += '<div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Category</th><th>Item</th><th>Change</th><th>State</th></tr></thead><tbody>';
         d.routing_changes.forEach(function (c) {
           h += '<tr><td>' + esc(c.category) + '</td><td>' + esc(c.item) + '</td><td><strong>' + esc(c.detail) + '</strong></td><td><span class="text-muted small">' + esc(c.status) + '</span></td></tr>';
         });
         h += '</tbody></table></div>';
       }
       return h;
+    }
+
+    function renderDiffPanel(d) {
+      var diff = d.device_diff || {};
+      var keys = Object.keys(diff);
+      if (!keys.length) {
+        return '<p class="text-muted mb-0">No device change — the intent already matches the device (or the diff is unavailable).</p>';
+      }
+      var h = '';
+      keys.forEach(function (k) {
+        h += '<div class="mb-2"><div class="small text-uppercase text-muted">' + esc(k) + '</div>'
+           + '<pre class="border rounded bg-body-tertiary p-2 mb-0" style="font-size:.78rem; white-space:pre; overflow:auto;">'
+           + esc(trimNative(diff[k])) + '</pre></div>';
+      });
+      return h;
+    }
+
+    function renderPreview(d) {
+      if (!d.total) { return '<p class="text-muted mb-0">Nothing pending — NetBox and the device are in sync.</p>'; }
+      return ''
+        + '<div class="row g-3">'
+        + '  <div class="col-lg-6"><h6 class="border-bottom pb-1"><span class="mdi mdi-cloud-upload-outline me-1"></span>Intent — what we push</h6>'
+        +      renderIntentPanel(d)
+        + '  </div>'
+        + '  <div class="col-lg-6"><h6 class="border-bottom pb-1"><span class="mdi mdi-file-compare me-1"></span>Device diff — NSO dry-run</h6>'
+        +      renderDiffPanel(d)
+        + '  </div>'
+        + '</div>';
     }
 
     async function openApply() {

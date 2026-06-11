@@ -283,6 +283,11 @@ def get_intent_summary(adapter_device_id: int) -> dict:
     return _request("GET", f"/api/v1/devices/{adapter_device_id}/intent-summary")
 
 
+def get_apply_diff(adapter_device_id: int) -> dict:
+    """GET /api/v1/devices/{id}/actions/apply-diff → per-scope native device diff (NSO dry-run)."""
+    return _request("GET", f"/api/v1/devices/{adapter_device_id}/actions/apply-diff")
+
+
 def get_snmp_config(adapter_device_id: int) -> dict:
     """GET /api/v1/devices/{id}/snmp-config."""
     return _request("GET", f"/api/v1/devices/{adapter_device_id}/snmp-config")

@@ -1252,6 +1252,17 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
                         detail = ""
                     routing_changes.append({"category": label, "item": item, "detail": detail, "status": r.status})
 
+        # Right panel: the actual native device diff the Apply would push (NSO dry-run,
+        # no commit). Best-effort — a slow/unavailable adapter must not block the preview.
+        device_diff = {}
+        if mgmt is not None and mgmt.adapter_device_id is not None:
+            from . import adapter_client as client
+
+            try:
+                device_diff = (client.get_apply_diff(mgmt.adapter_device_id) or {}).get("diffs", {})
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("apply-diff unavailable for device %s: %s", device_pk, exc)
+
         return JsonResponse(
             {
                 "auto_apply": auto_apply,
@@ -1259,6 +1270,7 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
                 "routing_changes": routing_changes,
                 "routing": len(routing_changes),
                 "total": len(changes) + len(routing_changes),
+                "device_diff": device_diff,
             }
         )
 
