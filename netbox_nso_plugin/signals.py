@@ -519,10 +519,11 @@ def _push_ip_intent_for_device(device_id, adapter_device_id):
     ip_states = NSOInterfaceIPState.objects.filter(
         interface__device_id=device_id,
         status="accepted",
-    ).select_related("interface")
+    ).select_related("interface", "interface__parent")
 
-    addresses = [
-        {
+    addresses = []
+    for ip_state in ip_states:
+        entry = {
             "interface": ip_state.interface.name,
             "address": ip_state.address,
             "family": ip_state.family,
@@ -530,10 +531,31 @@ def _push_ip_intent_for_device(device_id, adapter_device_id):
             "vrf": ip_state.vrf,
             "accepted_at": ip_state.accepted_at.isoformat() if ip_state.accepted_at else None,
         }
-        for ip_state in ip_states
-    ]
+        entry.update(_nokia_routed_binding(ip_state.interface))
+        addresses.append(entry)
 
     _push_changed((device_id, "ip"), addresses, lambda: client.put_ip_intent(adapter_device_id, addresses))
+
+
+def _nokia_routed_binding(interface) -> dict:
+    """Derive the SR OS binding for a greenfield Nokia routed sub-interface (M27).
+
+    Nokia routed logical interfaces are modelled in NetBox by their LOGICAL name
+    (``LAG99:99``), type=virtual, ``parent`` = the bound port/LAG (``lag-99``); the dot1q
+    tag is the numeric suffix after ``:``. When both are present we emit ``parent_binding``/
+    ``encap_tag``/``routed`` so the adapter can materialise the routed interface for an
+    operator-created (never-imported) sub-interface and the apply writes
+    ``router Base interface LAG99:99 port lag-99:99``. The ``:tag`` convention is Nokia-only
+    (IOS/Junos sub-interfaces use ``.``), so this is a no-op for non-Nokia interfaces.
+    """
+    name = interface.name or ""
+    parent = interface.parent
+    if parent is None or ":" not in name:
+        return {}
+    tag = name.rsplit(":", 1)[1]
+    if not tag.isdigit():
+        return {}
+    return {"routed": True, "parent_binding": parent.name, "encap_tag": tag}
 
 
 def _push_snmp_intent_for_device(device_id, adapter_device_id):

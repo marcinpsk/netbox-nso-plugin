@@ -565,6 +565,45 @@ try:
             self.assertEqual(call_addresses[0]["interface"], "GigabitEthernet0/0")
 
         @patch("netbox_nso_plugin.adapter_client.put_ip_intent")
+        def test_greenfield_nokia_routed_binding_in_push(self, mock_put):
+            """A parented LAG99:99 sub-interface pushes routed/parent_binding/encap_tag (M27)."""
+            from dcim.models import Interface
+            from ipam.models import IPAddress
+
+            lag = Interface.objects.create(device=self.device, name="lag-99", type="lag")
+            sub = Interface.objects.create(device=self.device, name="LAG99:99", type="virtual", parent=lag)
+
+            with self.captureOnCommitCallbacks(execute=True):
+                IPAddress.objects.create(
+                    address="84.116.249.160/31", assigned_object_type=self._ct(), assigned_object_id=sub.pk
+                )
+
+            mock_put.assert_called_once()
+            _, call_addresses = mock_put.call_args[0]
+            entry = next(a for a in call_addresses if a["interface"] == "LAG99:99")
+            self.assertTrue(entry["routed"])
+            self.assertEqual(entry["parent_binding"], "lag-99")
+            self.assertEqual(entry["encap_tag"], "99")
+
+        def test_nokia_routed_binding_helper(self):
+            """_nokia_routed_binding: only emits for a parented :tag interface."""
+            from types import SimpleNamespace
+
+            from netbox_nso_plugin.signals import _nokia_routed_binding
+
+            parent = SimpleNamespace(name="lag-99")
+            self.assertEqual(
+                _nokia_routed_binding(SimpleNamespace(name="LAG99:99", parent=parent)),
+                {"routed": True, "parent_binding": "lag-99", "encap_tag": "99"},
+            )
+            # no parent → not a sub-interface
+            self.assertEqual(_nokia_routed_binding(SimpleNamespace(name="LAG99:99", parent=None)), {})
+            # IOS/Junos dotted subif (no ':') → no-op
+            self.assertEqual(_nokia_routed_binding(SimpleNamespace(name="Gi0/1.100", parent=parent)), {})
+            # non-numeric suffix (e.g. VPRN logical name) → no encap tag to derive
+            self.assertEqual(_nokia_routed_binding(SimpleNamespace(name="CRPD-VPN:LO7", parent=parent)), {})
+
+        @patch("netbox_nso_plugin.adapter_client.put_ip_intent")
         def test_conflict_state_blocks_push(self, mock_put):
             """Pre-existing conflict state blocks automatic acceptance and push."""
             from ipam.models import IPAddress
