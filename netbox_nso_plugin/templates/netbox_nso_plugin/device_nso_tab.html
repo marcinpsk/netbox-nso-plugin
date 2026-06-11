@@ -366,7 +366,7 @@
       }
       var h = '';
       keys.forEach(function (k) {
-        h += '<div class="mb-2"><div class="small text-uppercase text-muted">' + esc(k) + '</div>'
+        h += '<div class="mb-2"><div class="small text-uppercase text-muted">' + esc(k.replace(/_/g, ' ')) + '</div>'
            + '<pre class="border rounded bg-body-tertiary p-2 mb-0" style="font-size:.78rem; white-space:pre; overflow:auto;">'
            + esc(trimNative(diff[k])) + '</pre></div>';
       });
