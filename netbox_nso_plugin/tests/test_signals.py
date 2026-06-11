@@ -786,5 +786,62 @@ try:
             # the changed attribute (description) IS promoted
             self.assertEqual(self._state().status, "accepted")
 
+    class TestGreenfieldOspfSignals(IntentPushResetMixin, DjangoTestCase):
+        """Operator-created netbox_routing OSPF → accepted overlays + OSPF intent push."""
+
+        @classmethod
+        def setUpTestData(cls):
+            from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
+
+            from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+            mfg = Manufacturer.objects.create(name="OspfGfMfg", slug="ospfgfmfg")
+            dt = DeviceType.objects.create(manufacturer=mfg, model="OspfGfDev", slug="ospfgfdev")
+            role = DeviceRole.objects.create(name="OspfGfRole", slug="ospfgfrole")
+            site = Site.objects.create(name="OspfGfSite", slug="ospfgfsite")
+            cls.device = Device.objects.create(name="ospf-gf-rtr", device_type=dt, role=role, site=site)
+            cls.iface = Interface.objects.create(device=cls.device, name="LAG99:99", type="virtual")
+            nso_inst = NSOInstance.objects.create(name="OspfGfNSO", adapter_instance_id="nso-ospfgf")
+            NSODeviceManagement.objects.bulk_create(
+                [
+                    NSODeviceManagement(
+                        device=cls.device,
+                        nso_instance=nso_inst,
+                        nso_device_name="ospf-gf-rtr",
+                        adapter_device_id=77,
+                        custom_field_data={},
+                    )
+                ]
+            )
+
+        @patch("netbox_nso_plugin.adapter_client.put_ospf_intent")
+        def test_create_ospf_iface_owns_overlays_and_pushes(self, mock_put):
+            from netbox_routing.models import OSPFArea, OSPFInstance, OSPFInterface
+
+            from netbox_nso_plugin.models import NSOOSPFInstanceState, NSOOSPFInterfaceState
+
+            with self.captureOnCommitCallbacks(execute=True):
+                inst = OSPFInstance.objects.create(
+                    name="ospf-1", router_id="84.116.250.117", process_id="1", device=self.device
+                )
+                area = OSPFArea.objects.create(area_id="0", area_type="standard")
+                OSPFInterface.objects.create(instance=inst, area=area, interface=self.iface, cost=100)
+
+            inst_state = NSOOSPFInstanceState.objects.get(management__device=self.device, process_id="1")
+            self.assertEqual(inst_state.status, "accepted")
+            iface_state = NSOOSPFInterfaceState.objects.get(management__device=self.device, interface=self.iface)
+            self.assertEqual(iface_state.status, "accepted")
+            self.assertEqual(iface_state.area_id, "0")
+            self.assertEqual(iface_state.process_id, "1")
+            self.assertEqual(iface_state.cost, 100)
+
+            self.assertTrue(mock_put.called)
+            _, payload = mock_put.call_args[0]
+            iface_entry = next(i for i in payload["interfaces"] if i["interface_name"] == "LAG99:99")
+            self.assertEqual(iface_entry["area_id"], "0")
+            self.assertEqual(iface_entry["process_id"], "1")
+            self.assertEqual(iface_entry["cost"], 100)
+            self.assertTrue(any(i["process_id"] == "1" for i in payload["instances"]))
+
 except ImportError:
     pass  # Outside devcontainer — Django not available; tests skipped

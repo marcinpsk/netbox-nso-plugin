@@ -1927,7 +1927,7 @@ def _push_ospf_intent_for_device(device_id, adapter_device_id):
         status__in=("accepted", "deploying", "in_sync"),
     ).select_related("management"):
         entry = {
-            "interface_name": row.interface_name,
+            "interface_name": row.interface.name,
             "passive": row.passive if row.passive is not None else False,
             "auth_present": row.auth_present if row.auth_present is not None else False,
         }
@@ -1985,6 +1985,134 @@ def _on_ospf_interface_state_save(sender, instance, **kwargs):
 
     device_id = mgmt.device_id
     adapter_device_id = mgmt.adapter_device_id
+    _schedule_intent_push(
+        (device_id, "ospf"),
+        lambda: _push_ospf_intent_for_device(device_id, adapter_device_id),
+    )
+
+
+# ── netbox_routing OSPF greenfield write path ───────────────────────────────
+# The reconcile path only creates NSOOSPF*State overlays for OSPF the device already
+# reports (brownfield adoption). These handlers add the operator-created direction: a
+# netbox_routing OSPFInstance/OSPFInterface created on a managed device becomes an
+# *accepted* overlay (owned intent) whose save pushes the OSPF intent → ospf-reconciler.
+
+_OWNED_OSPF = ("accepted", "deploying", "in_sync", "apply_failed")
+
+
+def _accept_ospf_instance(ospf_instance) -> None:
+    """Own a greenfield OSPF process for its device (accepted overlay → push)."""
+    from .models import NSODeviceManagement, NSOOSPFInstanceState
+
+    try:
+        mgmt = NSODeviceManagement.objects.get(device=ospf_instance.device)
+    except NSODeviceManagement.DoesNotExist:
+        return
+    if mgmt.adapter_device_id is None:
+        return
+    state, created = NSOOSPFInstanceState.objects.get_or_create(
+        management=mgmt,
+        process_id=str(ospf_instance.process_id),
+        defaults={"status": "accepted", "accepted_at": timezone.now()},
+    )
+    # Only own a GREENFIELD process (overlay newly created here) or one already owned.
+    # A pre-existing unowned overlay is brownfield-adopted: editing the netbox-routing
+    # object must surface via the 3-way reconcile (changed/conflict), not be force-owned.
+    if not created and state.status not in _OWNED_OSPF:
+        return
+    state.router_id = str(ospf_instance.router_id or "")
+    state.vrf = ospf_instance.vrf.name if ospf_instance.vrf else ""
+    state.ospf_instance = ospf_instance
+    # Instance-level area list (the timos apply binds areas per-interface, but other
+    # NEDs surface the area set here) — collect distinct areas from bound interfaces.
+    areas, seen = [], set()
+    for oi in ospf_instance.interfaces.all():
+        if oi.area and oi.area.area_id not in seen:
+            seen.add(oi.area.area_id)
+            areas.append({"area_id": oi.area.area_id, "area_type": oi.area.area_type or "standard"})
+    state.areas = areas
+    state.last_sync_at = timezone.now()
+    state.save()  # → _on_ospf_instance_state_save schedules the push
+
+
+def _accept_ospf_interface(ospf_iface) -> None:
+    """Own a greenfield OSPF interface (accepted overlay → push)."""
+    from .models import NSODeviceManagement, NSOOSPFInterfaceState
+
+    iface = ospf_iface.interface
+    try:
+        mgmt = NSODeviceManagement.objects.get(device=iface.device)
+    except NSODeviceManagement.DoesNotExist:
+        return
+    if mgmt.adapter_device_id is None:
+        return
+    state, created = NSOOSPFInterfaceState.objects.get_or_create(
+        management=mgmt,
+        interface=iface,
+        defaults={"status": "accepted", "accepted_at": timezone.now()},
+    )
+    # Greenfield-only ownership (see _accept_ospf_instance): don't force-own a
+    # pre-existing unowned (brownfield) overlay — leave it to the 3-way reconcile.
+    if not created and state.status not in _OWNED_OSPF:
+        return
+    state.process_id = str(ospf_iface.instance.process_id) if ospf_iface.instance else None
+    state.area_id = ospf_iface.area.area_id if ospf_iface.area else ""
+    state.passive = bool(ospf_iface.passive)
+    state.priority = ospf_iface.priority
+    state.cost = ospf_iface.cost
+    state.network_type = ospf_iface.network_type or ""
+    state.last_sync_at = timezone.now()
+    state.save()  # → _on_ospf_interface_state_save schedules the push
+    # Refresh the instance overlay so its area list reflects the new binding.
+    if ospf_iface.instance is not None:
+        _accept_ospf_instance(ospf_iface.instance)
+
+
+@_skip_on_render
+def _on_routing_ospf_instance_save(sender, instance, **kwargs):
+    """netbox_routing OSPFInstance created/edited on a managed device → own + push."""
+    _accept_ospf_instance(instance)
+
+
+@_skip_on_render
+def _on_routing_ospf_interface_save(sender, instance, **kwargs):
+    """netbox_routing OSPFInterface created/edited → own + push."""
+    _accept_ospf_interface(instance)
+
+
+@_skip_on_render
+def _on_routing_ospf_instance_pre_delete(sender, instance, **kwargs):
+    """Operator deletes an OSPF process → drop its overlay + push the removal."""
+    from .models import NSODeviceManagement, NSOOSPFInstanceState
+
+    try:
+        mgmt = NSODeviceManagement.objects.get(device=instance.device)
+    except NSODeviceManagement.DoesNotExist:
+        return
+    if mgmt.adapter_device_id is None:
+        return
+    NSOOSPFInstanceState.objects.filter(management=mgmt, process_id=str(instance.process_id)).delete()
+    device_id, adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
+    _schedule_intent_push(
+        (device_id, "ospf"),
+        lambda: _push_ospf_intent_for_device(device_id, adapter_device_id),
+    )
+
+
+@_skip_on_render
+def _on_routing_ospf_interface_pre_delete(sender, instance, **kwargs):
+    """Operator deletes an OSPF interface → drop its overlay + push the removal."""
+    from .models import NSODeviceManagement, NSOOSPFInterfaceState
+
+    iface = instance.interface
+    try:
+        mgmt = NSODeviceManagement.objects.get(device=iface.device)
+    except NSODeviceManagement.DoesNotExist:
+        return
+    if mgmt.adapter_device_id is None:
+        return
+    NSOOSPFInterfaceState.objects.filter(management=mgmt, interface=iface).delete()
+    device_id, adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
     _schedule_intent_push(
         (device_id, "ospf"),
         lambda: _push_ospf_intent_for_device(device_id, adapter_device_id),
@@ -2280,6 +2408,33 @@ def _connect_g_activated():  # pragma: no cover
         )
     except ImportError:
         logger.debug("netbox_routing not installed — static-route greenfield signals not registered")
+
+    # netbox_routing OSPF greenfield write path (operator-created OSPF → accepted overlay → push)
+    try:
+        from netbox_routing.models import OSPFInstance, OSPFInterface
+
+        post_save.connect(
+            _on_routing_ospf_instance_save,
+            sender=OSPFInstance,
+            dispatch_uid="nso_plugin_routing_ospf_instance_post_save",
+        )
+        post_save.connect(
+            _on_routing_ospf_interface_save,
+            sender=OSPFInterface,
+            dispatch_uid="nso_plugin_routing_ospf_interface_post_save",
+        )
+        pre_delete.connect(
+            _on_routing_ospf_instance_pre_delete,
+            sender=OSPFInstance,
+            dispatch_uid="nso_plugin_routing_ospf_instance_pre_delete",
+        )
+        pre_delete.connect(
+            _on_routing_ospf_interface_pre_delete,
+            sender=OSPFInterface,
+            dispatch_uid="nso_plugin_routing_ospf_interface_pre_delete",
+        )
+    except ImportError:
+        logger.debug("netbox_routing not installed — OSPF greenfield signals not registered")
 
     # netbox_routing.ISISFlexAlgo greenfield write path (operator-created flex-algos → push)
     try:
