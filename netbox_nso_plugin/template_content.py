@@ -1539,6 +1539,12 @@ def _fill_ospf_interface(entry, iface, inst_by_pid, OSPFArea, OSPFInterface, bas
         "authentication": auth,
     }
     obj, created = OSPFInterface.objects.get_or_create(interface=iface, defaults=fields)
+    if not created and obj.passive is None:
+        # An operator-created OSPF interface leaves passive unset (None) → the routing UI
+        # renders "—". The device value is a concrete bool, so normalise None → that value
+        # (benign: None and False already compare equal in the 3-way below).
+        obj.passive = fields["passive"]
+        obj.save(update_fields=["passive"])
 
     def _content(src_is_obj):
         out = {}

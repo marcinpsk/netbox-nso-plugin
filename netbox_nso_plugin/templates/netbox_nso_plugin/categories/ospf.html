@@ -43,7 +43,7 @@
   <div class="table-responsive">
     <table class="table table-sm table-hover mb-0">
       <thead>
-        <tr><th>Interface</th><th>Process ID</th><th>Area</th><th>Passive</th><th>Status</th><th>Last Synced</th><th></th></tr>
+        <tr><th>Interface</th><th>Process ID</th><th>Area</th><th>Network Type</th><th>Cost</th><th>Passive</th><th>Status</th><th>Last Synced</th><th></th></tr>
       </thead>
       <tbody>
         {% for oif in ospf_data.interfaces %}
@@ -51,6 +51,8 @@
           <td><a href="{{ oif.interface.get_absolute_url }}">{{ oif.interface.name }}</a></td>
           <td>{{ oif.process_id|default:"—" }}</td>
           <td>{{ oif.area_id|default:"—" }}</td>
+          <td>{{ oif.network_type|default:"—" }}</td>
+          <td>{{ oif.cost|default:"—" }}</td>
           <td>{% if oif.passive %}<span class="badge text-bg-warning text-dark">passive</span>{% else %}<span class="badge text-bg-success">active</span>{% endif %}</td>
           <td>
             {% include "netbox_nso_plugin/categories/_state_badge.html" with status=oif.status %}
