@@ -358,6 +358,11 @@ urlpatterns = [
         name="vlan_rescope",
     ),
     path(
+        "device/<int:device_pk>/vlan/attach/",
+        views.NSOVLANAttachView.as_view(),
+        name="vlan_attach",
+    ),
+    path(
         "bfd/state/<int:pk>/accept/",
         views.NSOBFDInterfaceStateAcceptView.as_view(),
         name="bfd_accept",

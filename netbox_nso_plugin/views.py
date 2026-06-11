@@ -1633,6 +1633,50 @@ class NSOVLANRescopeView(LoginRequiredMixin, View):
         return redirect(_device_nso_tab_url(device_id))
 
 
+class NSOVLANAttachView(LoginRequiredMixin, View):
+    """Attach an existing (shared) ipam.VLAN to this device — greenfield write path.
+
+    The device↔VLAN link is the NSOVLANState overlay, *not* the VLAN group, so the
+    same shared VLAN can be attached to several devices; renaming the VLAN then
+    propagates to all of them (one ipam.VLAN, N overlays). GET shows a picker of
+    VLANs not yet attached to this device; POST creates an *accepted* overlay (which
+    pushes the owned VLAN intent), so the vid+name is written on the next Apply.
+    """
+
+    def get(self, request, device_pk):  # noqa: D102
+        from ipam.models import VLAN
+
+        mgmt = get_object_or_404(NSODeviceManagement, device_id=device_pk)
+        attached = NSOVLANState.objects.filter(management=mgmt).values_list("vlan_id", flat=True)
+        vlans = VLAN.objects.exclude(pk__in=list(attached)).select_related("group").order_by("vid")
+        return render(
+            request,
+            "netbox_nso_plugin/attach_vlan.html",
+            {"mgmt": mgmt, "vlans": vlans, "object": mgmt.device},
+        )
+
+    def post(self, request, device_pk):  # noqa: D102
+        from django.utils import timezone
+        from ipam.models import VLAN
+
+        mgmt = get_object_or_404(NSODeviceManagement, device_id=device_pk)
+        vlan = get_object_or_404(VLAN, pk=request.POST.get("vlan"))
+        state, created = NSOVLANState.objects.get_or_create(
+            management=mgmt,
+            vlan=vlan,
+            defaults={"status": "accepted", "accepted_at": timezone.now()},
+        )
+        if not created and state.status not in ("accepted", "deploying", "in_sync", "apply_failed"):
+            state.status = "accepted"
+            state.accepted_at = timezone.now()
+        state.last_sync_at = timezone.now()
+        state.save()  # → _on_vlan_state_save schedules the owned-VLAN intent push
+        messages.success(
+            request, f"Attached VLAN {vlan.vid} ({vlan.name or '—'}) to {mgmt.device.name} — Apply to write it."
+        )
+        return redirect(_device_nso_tab_url(mgmt.device_id))
+
+
 class NSOBFDInterfaceStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOBFDInterfaceState
 

@@ -869,6 +869,28 @@ def _on_vlan_change(sender, instance, **kwargs):
                 state.save(update_fields=["status"])
 
 
+@_skip_on_render
+def _on_ipam_vlan_pre_delete(sender, instance, **kwargs):
+    """VLAN deleted in NetBox → push the reduced VLAN intent to each attached device.
+
+    Deleting an ipam.VLAN cascade-deletes its NSOVLANState overlays but fires no
+    per-overlay signal, so without this the device keeps the (now-orphaned) VLAN.
+    Capture the attached devices *before* the cascade, then schedule a deferred push;
+    by the time it runs (post-commit) the overlays are gone, so the snapshot omits this
+    vid and the adapter PUT-replaces the vlan-reconciler instance → FASTMAP reverts it.
+    """
+    targets = []
+    for state in instance.nso_vlan_states.select_related("management").all():
+        mgmt = state.management
+        if mgmt.adapter_device_id is not None:
+            targets.append((mgmt.device_id, mgmt.adapter_device_id))
+    for device_id, adapter_device_id in targets:
+        _schedule_intent_push(
+            (device_id, "vlan"),
+            lambda d=device_id, a=adapter_device_id: _push_vlan_intent_for_device(d, a),
+        )
+
+
 def _push_bfd_intent_for_device(device_id, adapter_device_id):
     """Build and push the full owned per-interface BFD intent snapshot for a device.
 
@@ -2032,6 +2054,11 @@ def _connect_g_activated():  # pragma: no cover
         _on_vlan_change,
         sender=VLAN,
         dispatch_uid="nso_plugin_ipam_vlan_post_save",
+    )
+    pre_delete.connect(
+        _on_ipam_vlan_pre_delete,
+        sender=VLAN,
+        dispatch_uid="nso_plugin_ipam_vlan_pre_delete",
     )
 
     # BFD state → intent push (BFD write path)
