@@ -18,6 +18,36 @@
     </div>
   {% endif %}
 
+  {# ── Adapter intent drift (split-brain) — renders ONLY when there is orphaned intent ── #}
+  {% if intent_drift %}
+    <div class="alert alert-warning d-flex align-items-start mb-3" role="alert">
+      <span class="mdi mdi-sync-alert me-2 mt-1"></span>
+      <div class="flex-grow-1">
+        <strong>Adapter holds intent NetBox no longer owns.</strong>
+        The adapter would push this on a device-wide apply, but NetBox shows nothing pending
+        for it (an adapter↔NetBox split-brain). Re-sync drops the orphaned intent; it does
+        <em>not</em> touch the device.
+        <ul class="mb-2 mt-1">
+          {% for d in intent_drift %}
+            <li>
+              <strong>{{ d.label }}</strong> — {{ d.count }} intent row{{ d.count|pluralize }}
+              {% if d.failed %}<span class="badge bg-danger ms-1">{{ d.failed }} apply-failed</span>
+              {% elif d.applied %}<span class="badge bg-secondary ms-1">{{ d.applied }} applied</span>
+              {% else %}<span class="badge bg-warning text-dark ms-1">never applied</span>{% endif %}
+            </li>
+          {% endfor %}
+        </ul>
+        <form method="post"
+              action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_intent_resync' mgmt.pk %}">
+          {% csrf_token %}
+          <button type="submit" class="btn btn-sm btn-warning">
+            <span class="mdi mdi-sync"></span> Re-sync adapter intent
+          </button>
+        </form>
+      </div>
+    </div>
+  {% endif %}
+
   {# ── What "Accept" means (read this before clicking) ───────────────────── #}
   <div class="alert alert-info d-flex align-items-start mb-3" role="alert">
     <span class="mdi mdi-information-outline me-2 mt-1"></span>

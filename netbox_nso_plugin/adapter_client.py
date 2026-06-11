@@ -278,6 +278,11 @@ def get_interface_ips(adapter_device_id: int) -> dict:
     return _request("GET", f"/api/v1/devices/{adapter_device_id}/interface-ips")
 
 
+def get_intent_summary(adapter_device_id: int) -> dict:
+    """GET /api/v1/devices/{id}/intent-summary → per-scope adapter intent counts."""
+    return _request("GET", f"/api/v1/devices/{adapter_device_id}/intent-summary")
+
+
 def get_snmp_config(adapter_device_id: int) -> dict:
     """GET /api/v1/devices/{id}/snmp-config."""
     return _request("GET", f"/api/v1/devices/{adapter_device_id}/snmp-config")

@@ -114,6 +114,12 @@ urlpatterns = [
         views.NSORefreshStateView.as_view(),
         name="nsodevicemanagement_refresh",
     ),
+    # Re-sync orphaned adapter intent (clears adapter↔NetBox split-brain)
+    path(
+        "device-management/<int:pk>/intent-resync/",
+        views.NSOIntentResyncView.as_view(),
+        name="nsodevicemanagement_intent_resync",
+    ),
     # Adapter job status (JSON, for client-side polling)
     path("jobs/<int:job_id>/status/", views.NSOJobStatusView.as_view(), name="nsojob_status"),
     # Device job-activity summary (JSON: running + last finished) for the tab status strip

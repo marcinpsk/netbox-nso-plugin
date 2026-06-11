@@ -133,11 +133,15 @@ class DeviceNSOTabView(generic.ObjectView):
 
         adapter_error = None
         adapter_error_code = None
+        intent_drift = []
         if mgmt is not None and mgmt.adapter_device_id is not None:
             from . import adapter_client as client
+            from .intent_drift import compute_intent_drift
 
             try:
                 _refresh_sync_cache(mgmt, client.get_device(mgmt.adapter_device_id))
+                # Surface adapter↔NetBox split-brain (orphaned intent) — only renders if any.
+                intent_drift = compute_intent_drift(device, mgmt)
             except AdapterError as exc:
                 adapter_error = str(exc)
                 adapter_error_code = exc.code
@@ -148,6 +152,7 @@ class DeviceNSOTabView(generic.ObjectView):
             "nso_categories": category_summaries(device, mgmt),
             "adapter_error": adapter_error,
             "adapter_error_code": adapter_error_code,
+            "intent_drift": intent_drift,
             "status_badge": _STATUS_BADGE,
         }
 
@@ -801,6 +806,33 @@ class NSODeviceActionView(LoginRequiredMixin, View):
                 return JsonResponse({"status": "error", "message": str(exc)}, status=502)
             messages.error(request, f"Adapter error triggering {label}: {exc}")
 
+        return redirect(_device_nso_tab_url(mgmt.device.pk))
+
+
+class NSOIntentResyncView(LoginRequiredMixin, View):
+    """POST: re-sync orphaned adapter intent to NetBox ownership (clears split-brain).
+
+    Re-pushes the device's current owned intent for every orphaned scope; the adapter's
+    full-replace then drops the rows NetBox no longer owns. Never writes to the device.
+    """
+
+    def post(self, request, pk):
+        """Re-sync orphaned adapter intent for the device, then redirect to the NSO tab."""
+        from .intent_drift import resync_intent
+
+        mgmt = get_object_or_404(NSODeviceManagement, pk=pk)
+        if mgmt.adapter_device_id is None:
+            messages.warning(request, "Device is not yet onboarded to the adapter.")
+            return redirect(_device_nso_tab_url(mgmt.device.pk))
+        try:
+            done = resync_intent(mgmt.device, mgmt)
+            if done:
+                messages.success(request, f"Re-synced adapter intent — cleared orphaned: {', '.join(done)}.")
+            else:
+                messages.info(request, "No orphaned adapter intent to clear.")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Intent re-sync failed for device %s: %s", mgmt.device_id, exc)
+            messages.error(request, f"Intent re-sync failed: {exc}")
         return redirect(_device_nso_tab_url(mgmt.device.pk))
 
 
