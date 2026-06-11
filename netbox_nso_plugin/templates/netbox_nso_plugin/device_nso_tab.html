@@ -349,7 +349,7 @@
         h += '</tbody></table></div>';
       }
       if (d.routing_changes && d.routing_changes.length) {
-        h += '<div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Category</th><th>Item</th><th>Change</th><th>State</th></tr></thead><tbody>';
+        h += '<div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Category</th><th>Item</th><th>Properties pushed</th><th>State</th></tr></thead><tbody>';
         d.routing_changes.forEach(function (c) {
           h += '<tr><td>' + esc(c.category) + '</td><td>' + esc(c.item) + '</td><td><strong>' + esc(c.detail) + '</strong></td><td><span class="text-muted small">' + esc(c.status) + '</span></td></tr>';
         });

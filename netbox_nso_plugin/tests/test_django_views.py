@@ -1100,6 +1100,31 @@ class TestNSOApplyPreviewView(ViewTestBase):
         data = json.loads(self.client.get(url).content)
         self.assertEqual(data["total"], 0)
 
+    def test_preview_ospf_interface_lists_pushed_properties(self):
+        """An accepted OSPF interface overlay shows its pushed properties (area/cost/network-type)."""
+        import json
+
+        from netbox_nso_plugin.models import NSOOSPFInterfaceState
+
+        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="in_sync")  # no interface changes
+        NSOOSPFInterfaceState.objects.create(
+            management=self.mgmt,
+            interface=self.interface,
+            process_id="1",
+            area_id="0.0.0.0",
+            cost=120,
+            network_type="point-to-point",
+            status="accepted",
+        )
+
+        url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
+        data = json.loads(self.client.get(url).content)
+        rc = next(r for r in data["routing_changes"] if r["category"] == "OSPF interface")
+        # Overlay holds the values directly (no netbox-routing object in this fixture).
+        self.assertIn("area 0.0.0.0", rc["detail"])
+        self.assertIn("cost 120", rc["detail"])
+        self.assertIn("point-to-point", rc["detail"])
+
     def test_preview_itemises_non_interface_changes(self):
         """A pending overlay (e.g. VLAN) is listed with category+item+detail, not just counted."""
         import json

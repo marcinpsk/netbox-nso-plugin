@@ -1133,6 +1133,66 @@ class NSOBulkAcceptView(LoginRequiredMixin, View):
         return redirect(_device_nso_tab_url(device.pk))
 
 
+def _join_props(parts):
+    """Render the non-empty property fragments as a single ' · '-joined string."""
+    return " · ".join(p for p in parts if p)
+
+
+def _ospf_iface_detail(r):
+    """Pushed OSPF-interface properties for the Apply preview.
+
+    Prefer the live netbox-routing OSPFInterface (the actual values we push) — the
+    overlay's value columns are refreshed from the device on reconcile and can read
+    stale (None) before an owned change has been applied. Fall back to the overlay.
+    """
+    src = None
+    try:
+        from netbox_routing.models import OSPFInterface
+
+        src = OSPFInterface.objects.filter(interface=r.interface).first()
+    except Exception:
+        src = None
+    area = (getattr(getattr(src, "area", None), "area_id", "") or r.area_id) if src else r.area_id
+    cost = src.cost if (src and src.cost is not None) else r.cost
+    net = (src.network_type if src else "") or r.network_type
+    prio = src.priority if (src and src.priority is not None) else r.priority
+    passive = src.passive if src else r.passive
+    return _join_props(
+        [
+            f"area {area}" if area else "",
+            f"cost {cost}" if cost is not None else "",
+            net,
+            f"prio {prio}" if prio is not None else "",
+            "passive" if passive else "",
+            f"auth {r.auth_type}".strip() if r.auth_present else "",
+        ]
+    )
+
+
+def _isis_iface_detail(r):
+    """Pushed IS-IS-interface properties for the Apply preview.
+
+    Prefer the linked netbox-routing ISISInterface (the values we push); fall back to
+    the overlay's cached fields when it is not linked yet.
+    """
+    src = getattr(r, "isis_interface", None)
+    metric = getattr(src, "metric", None) if src else None
+    metric = metric if metric is not None else r.metric
+    net = (getattr(src, "network_type", "") if src else "") or r.network_type
+    ctype = (getattr(src, "circuit_type", "") if src else "") or r.circuit_type
+    return _join_props(
+        [
+            r.process_tag,
+            r.af,
+            ctype,
+            net,
+            f"metric {metric}" if metric is not None else "",
+            "passive" if r.passive else "",
+            "hello-auth" if r.hello_auth_present else "",
+        ]
+    )
+
+
 class NSOApplyPreviewView(LoginRequiredMixin, View):
     """JSON preview of what 'Apply Intent' would push to the device.
 
@@ -1212,9 +1272,9 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
                 lambda r: r.nso_prefix or "",
                 lambda r: f"→ {r.nso_next_hop}" if r.nso_next_hop else "",
             ),
-            (NSOISISInterfaceState, "IS-IS interface", _iface, lambda r: ""),
+            (NSOISISInterfaceState, "IS-IS interface", _iface, _isis_iface_detail),
             (NSOISISInstanceState, "IS-IS", lambda r: r.process_tag or "instance", lambda r: r.net or ""),
-            (NSOOSPFInterfaceState, "OSPF interface", _iface, lambda r: ""),
+            (NSOOSPFInterfaceState, "OSPF interface", _iface, _ospf_iface_detail),
             (NSOOSPFInstanceState, "OSPF", lambda r: f"process {r.process_id}", lambda r: r.router_id or ""),
             (
                 NSOBGPPeerState,
