@@ -1168,6 +1168,136 @@ def _on_routing_static_route_pre_delete(sender, instance, **kwargs):
         _remove_static_route_for_device(instance, device)
 
 
+# ── IS-IS Flex-Algorithm intent (process-tag scoped) ────────────────────────
+
+
+def _push_isis_flex_algo_intent_for_device(device_id, adapter_device_id):
+    """Build and push the full IS-IS Flex-Algo intent snapshot for a device."""
+    from . import adapter_client as client
+    from .models import NSOISISFlexAlgoState
+
+    flex_algos = []
+    for row in NSOISISFlexAlgoState.objects.filter(
+        management__device_id=device_id,
+        status__in=("accepted", "deploying", "in_sync"),
+    ):
+        flex_algos.append(
+            {
+                "process_tag": row.process_tag or "",
+                "algo_id": int(row.algo_id),
+                "metric_type": row.metric_type or None,
+                "priority": row.priority,
+                "admin_group_exclude": row.admin_group_exclude or None,
+                "admin_group_include_any": row.admin_group_include_any or None,
+                "admin_group_include_all": row.admin_group_include_all or None,
+            }
+        )
+
+    _push_changed(
+        (device_id, "isis_flex_algo"),
+        flex_algos,
+        lambda: client.put_isis_flex_algo_intent(adapter_device_id, flex_algos),
+    )
+
+
+@_skip_on_render
+def _on_isis_flex_algo_state_save(sender, instance, **kwargs):
+    """Push Flex-Algo intent whenever an NSOISISFlexAlgoState row is saved."""
+    from .models import NSODeviceManagement
+
+    try:
+        mgmt = instance.management
+    except NSODeviceManagement.DoesNotExist:
+        return
+    if mgmt.adapter_device_id is None:
+        return
+    device_id, adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
+    _schedule_intent_push(
+        (device_id, "isis_flex_algo"),
+        lambda: _push_isis_flex_algo_intent_for_device(device_id, adapter_device_id),
+    )
+
+
+# ── Greenfield Flex-Algo (operator-created in NetBox, not yet on the device) ──
+#
+# ISISFlexAlgo belongs to an ISISInstance which carries the device + process-tag,
+# so a flex-algo the operator creates becomes an *accepted* overlay (owned intent)
+# and pushes; editing re-pushes; deleting pushes the removal (full-replace).
+
+
+def _accept_isis_flex_algo(flex_algo) -> None:
+    """Own a greenfield flex-algo (accepted overlay) → its save pushes intent."""
+    from .models import NSODeviceManagement, NSOISISFlexAlgoState
+
+    inst = flex_algo.instance
+    device = getattr(inst, "device", None)
+    if device is None:
+        return
+    try:
+        mgmt = NSODeviceManagement.objects.get(device=device)
+    except NSODeviceManagement.DoesNotExist:
+        return
+    if mgmt.adapter_device_id is None:
+        return
+    state, created = NSOISISFlexAlgoState.objects.get_or_create(
+        management=mgmt,
+        process_tag=inst.process_tag or "",
+        algo_id=int(flex_algo.algo_id),
+        defaults={
+            "isis_flex_algo": flex_algo,
+            "status": "accepted",
+            "accepted_at": timezone.now(),
+        },
+    )
+    if not created and state.status not in ("accepted", "deploying", "in_sync", "apply_failed"):
+        state.status = "accepted"
+        state.accepted_at = timezone.now()
+    state.isis_flex_algo = flex_algo
+    state.metric_type = flex_algo.metric_type or ""
+    state.priority = flex_algo.priority
+    state.admin_group_exclude = flex_algo.admin_group_exclude or ""
+    state.admin_group_include_any = flex_algo.admin_group_include_any or ""
+    state.admin_group_include_all = flex_algo.admin_group_include_all or ""
+    state.last_sync_at = timezone.now()
+    state.save()  # → _on_isis_flex_algo_state_save schedules the push
+
+
+def _remove_isis_flex_algo(flex_algo) -> None:
+    """Drop the overlay for this flex-algo and push the removal (full-replace)."""
+    from .models import NSODeviceManagement, NSOISISFlexAlgoState
+
+    inst = flex_algo.instance
+    device = getattr(inst, "device", None)
+    if device is None:
+        return
+    try:
+        mgmt = NSODeviceManagement.objects.get(device=device)
+    except NSODeviceManagement.DoesNotExist:
+        return
+    if mgmt.adapter_device_id is None:
+        return
+    NSOISISFlexAlgoState.objects.filter(
+        management=mgmt, process_tag=inst.process_tag or "", algo_id=int(flex_algo.algo_id)
+    ).delete()
+    device_id, adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
+    _schedule_intent_push(
+        (device_id, "isis_flex_algo"),
+        lambda: _push_isis_flex_algo_intent_for_device(device_id, adapter_device_id),
+    )
+
+
+@_skip_on_render
+def _on_routing_isis_flex_algo_save(sender, instance, **kwargs):
+    """Flex-algo created/edited in NetBox → own it (accepted overlay) + push."""
+    _accept_isis_flex_algo(instance)
+
+
+@_skip_on_render
+def _on_routing_isis_flex_algo_pre_delete(sender, instance, **kwargs):
+    """Flex-algo deleted in NetBox → drop overlay + push removal before the cascade."""
+    _remove_isis_flex_algo(instance)
+
+
 def _push_l2_sap_intent_for_device(device_id, adapter_device_id):
     """Build and push the full Nokia L2 SAP intent snapshot for a device (M37 P2b)."""
     from . import adapter_client as client
@@ -1970,6 +2100,15 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_isis_instance_state_post_save",
     )
 
+    # IS-IS Flex-Algo state → intent push
+    from .models import NSOISISFlexAlgoState
+
+    post_save.connect(
+        _on_isis_flex_algo_state_save,
+        sender=NSOISISFlexAlgoState,
+        dispatch_uid="nso_plugin_isis_flex_algo_state_post_save",
+    )
+
     # BGP peer state → intent push (M16 B3)
     from .models import NSOBGPPeerState
 
@@ -2044,3 +2183,20 @@ def _connect_g_activated():  # pragma: no cover
         )
     except ImportError:
         logger.debug("netbox_routing not installed — static-route greenfield signals not registered")
+
+    # netbox_routing.ISISFlexAlgo greenfield write path (operator-created flex-algos → push)
+    try:
+        from netbox_routing.models import ISISFlexAlgo
+
+        post_save.connect(
+            _on_routing_isis_flex_algo_save,
+            sender=ISISFlexAlgo,
+            dispatch_uid="nso_plugin_routing_isis_flex_algo_post_save",
+        )
+        pre_delete.connect(
+            _on_routing_isis_flex_algo_pre_delete,
+            sender=ISISFlexAlgo,
+            dispatch_uid="nso_plugin_routing_isis_flex_algo_pre_delete",
+        )
+    except ImportError:
+        logger.debug("netbox_routing not installed — flex-algo greenfield signals not registered")

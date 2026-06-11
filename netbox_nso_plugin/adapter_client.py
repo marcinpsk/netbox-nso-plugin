@@ -637,6 +637,22 @@ def put_isis_interface_intent(adapter_device_id, interfaces, processes=None):
     )
 
 
+def put_isis_flex_algo_intent(adapter_device_id, flex_algos):
+    """PUT /api/v1/devices/{id}/isis-flex-algo-intent — push full Flex-Algo intent.
+
+    ``flex_algos`` is a list of dicts:
+      [{"process_tag": "CORE", "algo_id": 130, "metric_type": "delay-metric",
+        "priority": 200, "admin_group_exclude": "RED", ...}, ...]
+    Empty list clears all Flex-Algo intent for the device.
+    Returns {"device_id": ..., "flex_algo_count": N}.
+    """
+    return _request(
+        "PUT",
+        f"/api/v1/devices/{adapter_device_id}/isis-flex-algo-intent",
+        json={"flex_algos": flex_algos},
+    )
+
+
 def put_bgp_intent(adapter_device_id, routers):
     """PUT /api/v1/devices/{id}/bgp-intent — push full BGP intent snapshot (M16 B3).
 

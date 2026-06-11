@@ -875,23 +875,28 @@ def _reconcile_isis_flex_algos(inst, flex_algos, *, write: bool = True) -> bool:
             continue
     existing = {row.algo_id: row for row in ISISFlexAlgo.objects.filter(instance=inst)}
     matches = True
-    for aid, data in incoming.items():
-        row = existing.get(aid) or ISISFlexAlgo(instance=inst, algo_id=aid)
-        changed = row.pk is None
-        for col in cols:
-            val = data.get(col)
-            if val is not None and getattr(row, col, None) != val:
-                setattr(row, col, val)
-                changed = True
-        if changed:
-            matches = False
-            if write:
-                row.save()
-    for aid, row in existing.items():
-        if aid not in incoming:
-            matches = False
-            if write:
-                row.delete()
+    # Brownfield mirror: writing ISISFlexAlgo must not trip the greenfield
+    # accept→push signal (that handler is _skip_on_render-gated → suppressed here).
+    from .signals import suppress_intent_push
+
+    with suppress_intent_push():
+        for aid, data in incoming.items():
+            row = existing.get(aid) or ISISFlexAlgo(instance=inst, algo_id=aid)
+            changed = row.pk is None
+            for col in cols:
+                val = data.get(col)
+                if val is not None and getattr(row, col, None) != val:
+                    setattr(row, col, val)
+                    changed = True
+            if changed:
+                matches = False
+                if write:
+                    row.save()
+        for aid, row in existing.items():
+            if aid not in incoming:
+                matches = False
+                if write:
+                    row.delete()
     return matches
 
 

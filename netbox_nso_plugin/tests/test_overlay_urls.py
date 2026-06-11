@@ -44,6 +44,20 @@ class TestOverlayGetAbsoluteUrl(TestCase):
         state = NSOVLANState.objects.create(management=self.mgmt, vlan=vlan)
         assert state.get_absolute_url() == reverse("dcim:device_nso", kwargs={"pk": self.device.pk})
 
+    def test_flex_algo_overlay_url_and_event_serialization(self):
+        """Overlay needs both get_absolute_url and a resolvable serializer, else deleting
+        a parent ISISFlexAlgo 500s (NoReverseMatch / SerializerNotFound)."""
+        from extras.events import serialize_for_event
+
+        from netbox_nso_plugin.models import NSOISISFlexAlgoState
+
+        state = NSOISISFlexAlgoState.objects.create(
+            management=self.mgmt, process_tag="CORE", algo_id=130, status="accepted"
+        )
+        assert state.get_absolute_url() == reverse("dcim:device_nso", kwargs={"pk": self.device.pk})
+        data = serialize_for_event(state)  # must not raise (was: Could not determine serializer)
+        assert data["id"] == state.pk
+
 
 class TestOverlayEventSerialization(TestCase):
     """Overlays need a resolvable serializer so NetBox event serialization on

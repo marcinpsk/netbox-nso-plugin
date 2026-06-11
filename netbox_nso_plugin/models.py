@@ -1005,6 +1005,52 @@ class NSOISISInstanceState(_NSODeviceTabURLMixin, NetBoxModel):
         return f"{self.management} / isis {self.process_tag} [{self.status}]"
 
 
+class NSOISISFlexAlgoState(_NSODeviceTabURLMixin, NetBoxModel):
+    """Per-(device, process_tag, algo_id) IS-IS Flex-Algorithm compliance overlay.
+
+    Tracks the status of one Flex-Algo definition the operator manages via NSO.
+    Status lifecycle mirrors NSOISISInstanceState.  ``isis_flex_algo`` links to
+    the netbox-routing ISISFlexAlgo object once resolved.
+    """
+
+    management = models.ForeignKey(
+        to="NSODeviceManagement",
+        on_delete=models.CASCADE,
+        related_name="isis_flex_algo_states",
+    )
+    process_tag = models.CharField(max_length=128, blank=True, default="")
+    algo_id = models.PositiveSmallIntegerField()
+    # Denormalised definition fields (what NSO reports / what we write)
+    metric_type = models.CharField(max_length=40, blank=True, default="")
+    priority = models.PositiveSmallIntegerField(null=True, blank=True)
+    admin_group_exclude = models.CharField(max_length=200, blank=True, default="")
+    admin_group_include_any = models.CharField(max_length=200, blank=True, default="")
+    admin_group_include_all = models.CharField(max_length=200, blank=True, default="")
+    # Linked netbox-routing object (nullable — may not exist yet)
+    isis_flex_algo = models.ForeignKey(
+        to="netbox_routing.ISISFlexAlgo",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="nso_flex_algo_states",
+    )
+    status = models.CharField(max_length=32, choices=_ISIS_STATUS_CHOICES, default="unknown")
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    last_apply_at = models.DateTimeField(null=True, blank=True)
+    last_apply_error = models.TextField(blank=True, default="")
+    device_base_hash = models.CharField(max_length=64, blank=True, default="")
+
+    class Meta:
+        ordering = ["management", "process_tag", "algo_id"]
+        unique_together = [("management", "process_tag", "algo_id")]
+        verbose_name = "NSO IS-IS Flex-Algo State"
+        verbose_name_plural = "NSO IS-IS Flex-Algo States"
+
+    def __str__(self):
+        return f"{self.management} / flex-algo {self.algo_id} [{self.status}]"
+
+
 _BGP_STATUS_CHOICES = [
     ("unknown", "Unknown"),
     ("imported", "Imported"),

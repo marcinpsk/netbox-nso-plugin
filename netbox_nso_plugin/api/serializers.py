@@ -137,6 +137,7 @@ from ..models import (  # noqa: E402
     NSOBGPPeerState,
     NSOBGPPeerTemplateState,
     NSOInterfaceIPState,
+    NSOISISFlexAlgoState,
     NSOISISInstanceState,
     NSOISISInterfaceState,
     NSOL2SapState,
@@ -216,6 +217,12 @@ class NSOISISInterfaceStateSerializer(ModelSerializer):  # noqa: D101
 class NSOISISInstanceStateSerializer(ModelSerializer):  # noqa: D101
     class Meta:
         model = NSOISISInstanceState
+        fields = "__all__"
+
+
+class NSOISISFlexAlgoStateSerializer(ModelSerializer):  # noqa: D101
+    class Meta:
+        model = NSOISISFlexAlgoState
         fields = "__all__"
 
 
