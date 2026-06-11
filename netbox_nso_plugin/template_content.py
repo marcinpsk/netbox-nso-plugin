@@ -709,12 +709,23 @@ def _reconcile_static_routes(device, payload: dict) -> list:
 
     stale_qs = NSOStaticRouteState.objects.filter(management=mgmt).exclude(static_route_id__in=seen_route_ids)
     for stale in stale_qs:
-        with suppress_intent_push():
-            stale.static_route.devices.remove(device)
-        new_status = sm.on_reconcile(stale.status, present=False)
-        if new_status != stale.status:
-            stale.status = new_status
-            stale.save()
+        if sm.is_owned(stale.status):
+            # Operator-owned (greenfield) route the device stopped reporting → genuine
+            # removal drift. KEEP the device↔route association + overlay so the operator
+            # can resolve it; removing it from the M2M would silently discard their intent.
+            new_status = sm.on_reconcile(stale.status, present=False)
+            if new_status != stale.status:
+                stale.status = new_status
+                stale.save()
+        else:
+            # Brownfield mirror: the route is gone from the device → un-materialise it.
+            # Drop the device↔route association AND the overlay. (The old code removed the
+            # M2M but then re-saved the overlay as 'changed', resurrecting a dangling
+            # overlay orphaned from the M2M — a route shown as drift on a device its
+            # devices-list no longer includes.)
+            with suppress_intent_push():
+                stale.static_route.devices.remove(device)
+            stale.delete()
 
     return list(NSOStaticRouteState.objects.filter(management=mgmt).select_related("static_route"))
 

@@ -256,8 +256,10 @@ class TestReconcileStaticRoutes(TestCase):
 
     # ── Removal (stale routes) ─────────────────────────────────────────────────
 
-    def test_stale_route_removed_from_m2m_and_status_changed(self):
-        """Route that disappears from NSO payload → device removed from M2M, status='changed'."""
+    def test_stale_brownfield_route_pruned_from_m2m_and_overlay(self):
+        """A brownfield (non-owned) route that disappears from the payload → device removed
+        from the M2M AND the overlay pruned (no dangling drift on a device the route's
+        devices-list no longer includes)."""
         from netbox_routing.models import StaticRoute
 
         self._make_mgmt(self.device, nso_device_name="sr-stale")
@@ -274,9 +276,33 @@ class TestReconcileStaticRoutes(TestCase):
         sr = StaticRoute.objects.filter(prefix="10.99.0.0/16").first()
         self.assertIsNotNone(sr)
         self.assertFalse(sr.devices.filter(pk=self.device.pk).exists())
+        # Vestigial overlay pruned — not left dangling as 'changed'.
+        self.assertFalse(NSOStaticRouteState.objects.filter(management__device=self.device, static_route=sr).exists())
 
+    def test_stale_owned_route_kept_as_changed(self):
+        """An owned (greenfield/accepted) route the device stops reporting → overlay kept as
+        'changed' and the device↔route association preserved (operator intent not discarded)."""
+        from netbox_routing.models import StaticRoute
+
+        self._make_mgmt(self.device, nso_device_name="sr-owned-stale")
+        from netbox_nso_plugin.models import NSOStaticRouteState
+        from netbox_nso_plugin.template_content import _reconcile_static_routes
+
+        payload_with = self._route_payload(self._route_entry("10.77.0.0/16", "10.0.0.3"))
+        with self._auto_create_ctx(True):
+            _reconcile_static_routes(self.device, payload_with)
+
+        sr = StaticRoute.objects.get(prefix="10.77.0.0/16")
         state = NSOStaticRouteState.objects.get(management__device=self.device, static_route=sr)
+        state.status = "in_sync"  # operator owns it
+        state.save()
+
+        with self._auto_create_ctx(True):
+            _reconcile_static_routes(self.device, self._route_payload())  # route gone
+
+        state.refresh_from_db()
         self.assertEqual(state.status, "changed")
+        self.assertTrue(sr.devices.filter(pk=self.device.pk).exists())  # association kept
 
     def test_stale_removal_leaves_static_route_object(self):
         """Removing device from M2M never deletes the StaticRoute object."""
