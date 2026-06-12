@@ -9,6 +9,8 @@ from django.test import TestCase
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOInterfaceMtuState
 
+from .mixins import IntentPushResetMixin
+
 
 def _make_device(tag="mtu"):
     mfg, _ = Manufacturer.objects.get_or_create(name=f"MtuMfg{tag}", slug=f"mtumfg{tag}")
@@ -94,3 +96,96 @@ class TestInterfaceMtuReconciler(TestCase):
         reconcile_interface_mtu(self.device, {"interfaces": [{"interface_name": "Port-channel1", "mtu": 9216}]})
         reconcile_interface_mtu(self.device, {"interfaces": [{"interface_name": "Port-channel1", "mtu": 1500}]})
         self.assertEqual(NSOInterfaceMtuState.objects.get(interface=self.po1).l2_mtu, 1500)
+
+
+class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.device = _make_device("wp")
+        cls.instance = NSOInstance.objects.create(name="nso-mtuwp", adapter_instance_id="nso-mtuwp")
+        cls.management = NSODeviceManagement.objects.create(
+            device=cls.device, nso_instance=cls.instance, nso_device_name="rtr-mtuwp", adapter_device_id=77
+        )
+        cls.po1 = Interface.objects.create(device=cls.device, name="Port-channel1", type="lag")
+
+    def _state(self, l2_mtu=9216, status="accepted"):
+        return NSOInterfaceMtuState.objects.create(
+            management=self.management, interface=self.po1, l2_mtu=l2_mtu, status=status
+        )
+
+    def test_owned_values_not_clobbered_by_device_read(self):
+        from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
+
+        self._state(l2_mtu=9216, status="accepted")
+        # Device still reports the OLD mtu (operator's change not applied yet).
+        reconcile_interface_mtu(self.device, {"interfaces": [{"interface_name": "Port-channel1", "mtu": 1500}]})
+        state = NSOInterfaceMtuState.objects.get(interface=self.po1)
+        self.assertEqual(state.l2_mtu, 9216)  # operator intent preserved, not overwritten
+        self.assertEqual(state.status, "accepted")  # device mismatch → holds accepted
+
+    def test_deploying_settles_in_sync_when_device_matches(self):
+        from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
+
+        self._state(l2_mtu=9000, status="deploying")
+        reconcile_interface_mtu(self.device, {"interfaces": [{"interface_name": "Port-channel1", "mtu": 9000}]})
+        self.assertEqual(NSOInterfaceMtuState.objects.get(interface=self.po1).status, "in_sync")
+
+    def test_owned_row_unreported_not_pruned(self):
+        from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
+
+        self._state(l2_mtu=9216, status="accepted")
+        # Device stops reporting MTU for this interface — owned intent must survive.
+        reconcile_interface_mtu(self.device, {"interfaces": []})
+        self.assertTrue(NSOInterfaceMtuState.objects.filter(interface=self.po1).exists())
+
+    def test_push_builds_owned_snapshot(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin.signals import _push_interface_mtu_intent_for_device, reset_intent_push_state
+
+        self._state(l2_mtu=9216, status="accepted")
+        # An unowned mirror row must be excluded from the pushed intent.
+        other = Interface.objects.create(device=self.device, name="TenGig0/0/0", type="10gbase-t")
+        NSOInterfaceMtuState.objects.create(management=self.management, interface=other, l2_mtu=1500, status="imported")
+        reset_intent_push_state()
+        with patch("netbox_nso_plugin.adapter_client.put_interface_mtu_intent") as mock_put:
+            _push_interface_mtu_intent_for_device(self.device.pk, 77)
+        mock_put.assert_called_once()
+        ifaces = mock_put.call_args[0][1]
+        self.assertEqual([i["interface_name"] for i in ifaces], ["Port-channel1"])
+        self.assertEqual(ifaces[0]["mtu"], 9216)
+
+    def test_accept_marks_owned_and_writes_native_mtu(self):
+        from unittest.mock import patch
+
+        from django.contrib.auth import get_user_model
+
+        state = self._state(l2_mtu=9216, status="imported")
+        User = get_user_model()
+        admin = User.objects.create_superuser(username="mtu-admin", password="pw", email="m@x.y")  # noqa: S106
+        self.client.force_login(admin)
+        with patch("netbox_nso_plugin.adapter_client.put_interface_mtu_intent"):
+            resp = self.client.post(f"/plugins/nso/interface-mtu/state/{state.pk}/accept/")
+        self.assertEqual(resp.status_code, 302)
+        state.refresh_from_db()
+        self.po1.refresh_from_db()
+        # Accepting an already-matching (imported) value → NetBox owns what's there → in_sync.
+        self.assertEqual(state.status, "in_sync")
+        self.assertIsNotNone(state.accepted_at)
+        self.assertEqual(self.po1.mtu, 9216)  # native L2 mtu written onto dcim.Interface
+
+    def test_accept_differing_value_marks_accepted_pending_apply(self):
+        from unittest.mock import patch
+
+        from django.contrib.auth import get_user_model
+
+        state = self._state(l2_mtu=9216, status="changed")
+        User = get_user_model()
+        admin = User.objects.create_superuser(username="mtu-admin2", password="pw", email="m2@x.y")  # noqa: S106
+        self.client.force_login(admin)
+        with patch("netbox_nso_plugin.adapter_client.put_interface_mtu_intent"):
+            resp = self.client.post(f"/plugins/nso/interface-mtu/state/{state.pk}/accept/")
+        self.assertEqual(resp.status_code, 302)
+        state.refresh_from_db()
+        self.assertEqual(state.status, "accepted")  # differing value → pending apply
+        self.assertIsNotNone(state.accepted_at)

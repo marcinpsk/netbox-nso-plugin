@@ -38,6 +38,7 @@ from .models import (
     NSOBGPPeerState,
     NSODeviceManagement,
     NSOInstance,
+    NSOInterfaceMtuState,
     NSOInterfaceState,
     NSOISISInstanceState,
     NSOISISInterfaceState,
@@ -767,7 +768,7 @@ def _prepare_apply(mgmt):
         except Exception as exc:  # noqa: BLE001 — one scope's failure must not block the rest
             logger.warning("Apply push failed for device %s: %s", mgmt.device_id, exc)
 
-    for model in (NSOVLANState, NSOSVIState, NSOSubinterfaceState, NSOBFDInterfaceState):
+    for model in (NSOVLANState, NSOSVIState, NSOSubinterfaceState, NSOBFDInterfaceState, NSOInterfaceMtuState):
         try:
             model.objects.filter(management=mgmt, status="accepted").update(status="deploying")
         except Exception as exc:  # noqa: BLE001
@@ -1718,6 +1719,34 @@ class NSOSVIStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
 
 class NSOSubinterfaceStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOSubinterfaceState
+
+
+class NSOInterfaceMtuStateAcceptView(OverlayStateAcceptMixin):
+    """Accept a per-interface MTU overlay (Phase 2b).
+
+    Marks the row owned AND adopts the native L2 MTU onto the dcim.Interface
+    (clamped for NetBox), so NetBox's native field reflects the managed value.
+    ip-mtu/mpls-mtu ride the overlay only.
+    """
+
+    model_class = NSOInterfaceMtuState
+
+    # NetBox dcim.Interface.mtu max (and the read-side clamp ceiling).
+    _NETBOX_MTU_MAX = 65536
+
+    def post(self, request, pk):  # noqa: D102
+        state = get_object_or_404(self.model_class, pk=pk)
+        if state.l2_mtu is not None:
+            iface = state.interface
+            clamped = min(int(state.l2_mtu), self._NETBOX_MTU_MAX)
+            if iface.mtu != clamped:
+                iface.mtu = clamped
+                iface.save(update_fields=["mtu"])
+        state.status = _status_after_accept(state.status)
+        state.accepted_at = timezone.now()
+        state.save(update_fields=["status", "accepted_at"])
+        messages.success(request, f"Accepted {state}.")
+        return redirect(_device_nso_tab_url(state.management.device_id))
 
 
 class NSOVLANStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101

@@ -813,6 +813,60 @@ def _on_subinterface_state_save(sender, instance, **kwargs):
     )
 
 
+def _push_interface_mtu_intent_for_device(device_id, adapter_device_id):
+    """Build and push the full owned per-interface MTU intent snapshot (Phase 2b).
+
+    Store-only (deferred): the single device Apply commits via the mtu-reconciler.
+    Only owned rows (accepted/deploying/in_sync) are included.
+    """
+    from . import adapter_client as client
+    from .models import _VLAN_WRITE_PATH_STATUSES, NSOInterfaceMtuState
+
+    interfaces = []
+    for row in NSOInterfaceMtuState.objects.filter(
+        management__device_id=device_id,
+        status__in=_VLAN_WRITE_PATH_STATUSES,
+    ).select_related("interface"):
+        # At least one MTU value must be set or the reconciler has nothing to write.
+        if row.l2_mtu is None and row.ip_mtu is None and row.mpls_mtu is None:
+            continue
+        interfaces.append(
+            {
+                "interface_name": row.interface.name,
+                "mtu": row.l2_mtu,
+                "ip_mtu": row.ip_mtu,
+                "mpls_mtu": row.mpls_mtu,
+            }
+        )
+
+    _push_changed(
+        (device_id, "interface_mtu"),
+        interfaces,
+        lambda: client.put_interface_mtu_intent(adapter_device_id, interfaces),
+    )
+
+
+@_skip_on_render
+def _on_mtu_state_save(sender, instance, **kwargs):
+    """Push MTU intent whenever an NSOInterfaceMtuState row is saved."""
+    from .models import NSODeviceManagement
+
+    try:
+        mgmt = instance.management
+    except NSODeviceManagement.DoesNotExist:
+        return
+
+    if mgmt.adapter_device_id is None:
+        return
+
+    device_id = mgmt.device_id
+    adapter_device_id = mgmt.adapter_device_id
+    _schedule_intent_push(
+        (device_id, "interface_mtu"),
+        lambda: _push_interface_mtu_intent_for_device(device_id, adapter_device_id),
+    )
+
+
 def _push_vlan_intent_for_device(device_id, adapter_device_id, force=False):
     """Build and push the full owned VLAN-database intent snapshot for a device (M34 write).
 
@@ -2276,6 +2330,15 @@ def _connect_g_activated():  # pragma: no cover
         _on_subinterface_state_save,
         sender=NSOSubinterfaceState,
         dispatch_uid="nso_plugin_subinterface_state_post_save",
+    )
+
+    # per-interface MTU state → intent push (Phase 2b write path)
+    from .models import NSOInterfaceMtuState
+
+    post_save.connect(
+        _on_mtu_state_save,
+        sender=NSOInterfaceMtuState,
+        dispatch_uid="nso_plugin_interface_mtu_state_post_save",
     )
 
     # VLAN-database state → intent push (M34 write path)

@@ -236,6 +236,21 @@ def get_interface_mtu(adapter_device_id: int) -> dict:
     return _request("GET", f"/api/v1/devices/{adapter_device_id}/interface-mtu")
 
 
+def put_interface_mtu_intent(adapter_device_id, interfaces):
+    """PUT /api/v1/devices/{id}/interface-mtu-intent — push full MTU intent (Phase 2b).
+
+    ``interfaces`` is a list of dicts:
+      [{"interface_name": "X", "mtu": 9216, "ip_mtu": 9000, "mpls_mtu": None,
+        "accepted_at": "...Z"}, ...]
+    Empty list clears all MTU intent for the device. Returns {"device_id": ..., "count": N}.
+    """
+    return _request(
+        "PUT",
+        f"/api/v1/devices/{adapter_device_id}/interface-mtu-intent",
+        json={"interfaces": interfaces},
+    )
+
+
 def put_bfd_intent(adapter_device_id, interfaces):
     """PUT /api/v1/devices/{id}/bfd-intent — push full per-interface BFD intent.
 
