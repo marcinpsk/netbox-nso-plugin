@@ -142,3 +142,58 @@ class TestReconcileRedistribution(TestCase):
         self.assertEqual(states[0].status, "conflict")
         redist.refresh_from_db()
         self.assertEqual(redist.metric, 99)  # edit preserved
+
+
+class TestBuildBgpRouterList(TestCase):
+    """_build_bgp_router_list must materialize redistribution-only scopes.
+
+    An accepted BGP redistribution whose (asn, vrf) has no owned peer previously
+    produced an empty router list — the dest_ref join at apply time then found no
+    AF and the redistribution silently never reached the device.
+    """
+
+    def test_redistribution_only_scope_materializes_router(self):
+        from netbox_nso_plugin.signals import _build_bgp_router_list
+
+        redist = [{"source_protocol": "static", "source_ref": "", "route_map": "PCE-BGP-EXPORT"}]
+        out = _build_bgp_router_list({}, {("6730", ""): {"ipv4-unicast": redist}})
+        self.assertEqual(
+            out,
+            [
+                {
+                    "asn": "6730",
+                    "scopes": [
+                        {
+                            "vrf": "",
+                            "peers": [],
+                            "address_families": [{"af": "ipv4-unicast", "redistribution": redist}],
+                        }
+                    ],
+                }
+            ],
+        )
+
+    def test_peer_scope_keeps_redistribution_and_no_duplicate(self):
+        from netbox_nso_plugin.signals import _build_bgp_router_list
+
+        redist = [{"source_protocol": "static", "source_ref": ""}]
+        routers = {
+            "6730": {
+                "asn": "6730",
+                "scopes": {
+                    "": {
+                        "vrf": "",
+                        "address_families": [],
+                        "peers": [
+                            {"peer_address": "192.0.2.1", "enabled": True, "remote_as": "1", "address_families": []}
+                        ],
+                    }
+                },
+            }
+        }
+        out = _build_bgp_router_list(routers, {("6730", ""): {"ipv4-unicast": redist}})
+        self.assertEqual(len(out), 1)
+        self.assertEqual(len(out[0]["scopes"]), 1)
+        scope = out[0]["scopes"][0]
+        self.assertEqual(scope["address_families"], [{"af": "ipv4-unicast", "redistribution": redist}])
+        self.assertEqual(len(scope["peers"]), 1)

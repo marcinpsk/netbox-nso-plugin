@@ -1676,15 +1676,39 @@ def _on_isis_instance_state_save(sender, instance, **kwargs):
 def _build_bgp_router_list(routers: dict, scope_afs: dict) -> list:
     """Convert the routers dict + scope_afs into the adapter router_list format."""
     router_list = []
+    covered: set[tuple[str, str]] = set()
     for asn_str, router_data in routers.items():
         scopes_out = []
         for vrf_str, scope_data in router_data["scopes"].items():
             af_map = scope_afs.get((asn_str, vrf_str), {})
+            covered.add((asn_str, vrf_str))
             afs_out = [{"af": af_str, "redistribution": redist_entries} for af_str, redist_entries in af_map.items()]
             scope_out = dict(scope_data)
             scope_out["address_families"] = afs_out
             scopes_out.append(scope_out)
         router_list.append({"asn": asn_str, "scopes": scopes_out})
+
+    # Redistribution-only scopes: an accepted redistribution row whose (asn, vrf)
+    # has no owned peer still needs its router/scope/AF in the payload — without
+    # it the dest_ref join at apply time finds no AF and the entry is dropped.
+    by_asn = {r["asn"]: r for r in router_list}
+    for (asn_str, vrf_str), af_map in scope_afs.items():
+        if (asn_str, vrf_str) in covered:
+            continue
+        router = by_asn.get(asn_str)
+        if router is None:
+            router = {"asn": asn_str, "scopes": []}
+            by_asn[asn_str] = router
+            router_list.append(router)
+        router["scopes"].append(
+            {
+                "vrf": vrf_str,
+                "peers": [],
+                "address_families": [
+                    {"af": af_str, "redistribution": redist_entries} for af_str, redist_entries in af_map.items()
+                ],
+            }
+        )
     return router_list
 
 
@@ -1696,10 +1720,14 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
     # BGP redistribution: dest_ref = f"{asn}:{vrf}:{af}"
     redist_by_af = _collect_redistribution_by_dest_ref(device_id, "bgp")
 
-    # Build scope-level address_families from redistribution dest_refs
+    # Build scope-level address_families from redistribution dest_refs.
+    # Greenfield rows use "asn:vrf:af"; rows imported off the adapter mirror
+    # carry its "asn/vrf/af" form — accept both.
     scope_afs: dict[tuple[str, str], dict[str, list[dict]]] = {}
     for dest_ref, redist_entries in redist_by_af.items():
         parts = dest_ref.split(":", 2)
+        if len(parts) != 3:
+            parts = dest_ref.split("/", 2)
         if len(parts) != 3:
             continue
         asn_str, vrf_str, af_str = parts
