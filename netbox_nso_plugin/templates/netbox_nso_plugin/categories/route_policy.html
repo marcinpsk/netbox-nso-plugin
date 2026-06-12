@@ -27,7 +27,7 @@
           <tr data-status="{{ rp.status }}" data-owned="{{ rp.accepted_at|yesno:'true,false' }}">
             <td>{{ rp.family }}</td>
             <td>{{ rp.object_name }}</td>
-            <td>{% if rp.content_object %}<a href="{{ rp.content_object.get_absolute_url }}">{{ rp.content_object }}</a>{% else %}—{% endif %}</td>
+            <td>{% if rp.assigned_object %}<a href="{{ rp.assigned_object.get_absolute_url }}">{{ rp.assigned_object }}</a>{% else %}—{% endif %}</td>
             <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=rp.status %}</td>
             <td>{{ rp.last_sync_at|default:"—" }}</td>
             <td>

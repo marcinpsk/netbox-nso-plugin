@@ -1837,24 +1837,31 @@ def _build_route_policy_entries(family, obj):
             )
         return out
     if family == "community_list":
-        return [
-            {"sequence": i + 1, "action": "permit", "community": str(c.value)}
-            for i, c in enumerate(obj.communities.all())
-        ]
-    if family == "as_path":
+        # netbox-routing: CommunityList → communitylistentries (CommunityListEntry),
+        # each with an `action` and a FK to Community whose value is `.community`.
         return [
             {
                 "sequence": i + 1,
                 "action": e.action.lower() if e.action else "permit",
-                "pattern": e.regex or "",
+                "community": str(e.community.community),
             }
-            for i, e in enumerate(
-                getattr(obj, "entries", obj.access_list_entries.all()) if hasattr(obj, "access_list_entries") else []
-            )
+            for i, e in enumerate(e for e in obj.communitylistentries.all() if e.community_id)
+        ]
+    if family == "as_path":
+        # netbox-routing: ASPath → aspath_entries (ASPathEntry: sequence/action/pattern).
+        return [
+            {
+                "sequence": e.sequence,
+                "action": e.action.lower() if e.action else "permit",
+                "pattern": e.pattern or "",
+            }
+            for e in obj.aspath_entries.all().order_by("sequence")
         ]
     if family == "route_map":
+        # netbox-routing: RouteMap → route_map_entries (RouteMapEntry: sequence/action +
+        # match/set JSON blobs).
         entries = []
-        for e in obj.entries.all().order_by("sequence"):
+        for e in obj.route_map_entries.all().order_by("sequence"):
             entry: dict = {
                 "sequence": e.sequence,
                 "action": e.action.lower() if e.action else "permit",

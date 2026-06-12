@@ -56,6 +56,40 @@ class TestRoutePolicyEntrySerialization(_RPBase):
         entries = _build_route_policy_entries("prefix_list", pl)
         assert entries == [{"sequence": 10, "action": "permit", "prefix": "10.99.0.0/16"}]
 
+    def test_community_list_entries_serialize_from_fork_model(self):
+        """community_list reads CommunityList.communitylistentries (not .communities)."""
+        from netbox_routing.models import Community, CommunityList, CommunityListEntry
+
+        from netbox_nso_plugin.signals import _build_route_policy_entries
+
+        cl = CommunityList.objects.create(name="TESTNSO-CL")
+        comm = Community.objects.create(community="65000:1")
+        CommunityListEntry.objects.create(community_list=cl, action="permit", community=comm)
+        entries = _build_route_policy_entries("community_list", cl)
+        assert entries == [{"sequence": 1, "action": "permit", "community": "65000:1"}]
+
+    def test_as_path_entries_serialize_from_fork_model(self):
+        """as_path reads ASPath.aspath_entries (sequence/action/pattern)."""
+        from netbox_routing.models import ASPath, ASPathEntry
+
+        from netbox_nso_plugin.signals import _build_route_policy_entries
+
+        ap = ASPath.objects.create(name="TESTNSO-AP")
+        ASPathEntry.objects.create(aspath=ap, sequence=5, action="permit", pattern="^65000_")
+        entries = _build_route_policy_entries("as_path", ap)
+        assert entries == [{"sequence": 5, "action": "permit", "pattern": "^65000_"}]
+
+    def test_route_map_entries_serialize_from_fork_model(self):
+        """route_map reads RouteMap.route_map_entries (not .entries)."""
+        from netbox_routing.models import RouteMap, RouteMapEntry
+
+        from netbox_nso_plugin.signals import _build_route_policy_entries
+
+        rm = RouteMap.objects.create(name="TESTNSO-RM")
+        RouteMapEntry.objects.create(route_map=rm, sequence=10, action="permit", match={"x": 1}, set={"y": 2})
+        entries = _build_route_policy_entries("route_map", rm)
+        assert entries == [{"sequence": 10, "action": "permit", "match": {"x": 1}, "set": {"y": 2}}]
+
 
 class TestRoutePolicyDeletePropagation(_RPBase):
     def test_delete_prefix_list_pushes_removal_to_attached_device(self):
