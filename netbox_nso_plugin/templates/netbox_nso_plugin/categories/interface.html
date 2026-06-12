@@ -1,0 +1,210 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Lazy fragment: consolidated per-interface view — one row per interface, a #}
+{# column per attribute (enabled / description / MTU / IPs / switchport) with a #}
+{# client-side column-select. Each cell reuses that overlay's own status badge + #}
+{# Accept endpoint, so per-attribute Accept/Apply keeps working. Paginated + name- #}
+{# filterable, fetched via AJAX so actions keep the card open. #}
+{% include "netbox_nso_plugin/categories/_adapter_error.html" %}
+{% url 'dcim:device_nso' pk=object.pk as return_url %}
+
+<div class="nso-ifm-pager"
+     data-url="{% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='interface' %}"
+     data-q="{{ q }}" data-page="{{ page.number }}">
+
+  <div class="nso-ifm-results">
+  <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
+    <input type="search" class="form-control form-control-sm nso-ifm-filter"
+           placeholder="Filter by interface name…" value="{{ q }}" autocomplete="off"
+           style="max-width: 260px;">
+    <span class="text-muted small ms-1">Show:</span>
+    <div class="btn-group btn-group-sm nso-ifm-cols" role="group" aria-label="Columns">
+      <button type="button" class="btn btn-outline-secondary active" data-col="enabled">Enabled</button>
+      <button type="button" class="btn btn-outline-secondary active" data-col="desc">Description</button>
+      <button type="button" class="btn btn-outline-secondary active" data-col="mtu">MTU</button>
+      <button type="button" class="btn btn-outline-secondary active" data-col="ip">IPs</button>
+      <button type="button" class="btn btn-outline-secondary active" data-col="sw">Switchport</button>
+    </div>
+  </div>
+  <div class="nso-ifm-msg"></div>
+
+  {% if rows %}
+  <div class="table-responsive mb-2">
+    <table class="table table-sm table-hover mb-0 nso-ifm-table">
+      <thead>
+        <tr>
+          <th>Interface</th>
+          <th class="c-enabled">Enabled</th>
+          <th class="c-desc">Description</th>
+          <th class="c-mtu">MTU (L2 / IP / MPLS)</th>
+          <th class="c-ip">IPs</th>
+          <th class="c-sw">Switchport</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in rows %}
+        <tr>
+          <td><a href="{{ r.iface.get_absolute_url }}">{{ r.iface.name }}</a></td>
+
+          {# ── Enabled ─────────────────────────────────────────────── #}
+          <td class="c-enabled">
+            {% if r.enabled %}
+              {{ r.enabled.nso_value|default:"—" }}
+              {% include "netbox_nso_plugin/categories/_state_badge.html" with status=r.enabled.status %}
+              {% url 'plugins:netbox_nso_plugin:nsointerfacestate_accept' pk=r.enabled.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=r.enabled.status form_class="nso-row-form d-inline" only %}
+            {% else %}<span class="text-muted">—</span>{% endif %}
+          </td>
+
+          {# ── Description ─────────────────────────────────────────── #}
+          <td class="c-desc">
+            {% if r.description %}
+              {{ r.description.nso_value|default:"—" }}
+              {% include "netbox_nso_plugin/categories/_state_badge.html" with status=r.description.status %}
+              {% url 'plugins:netbox_nso_plugin:nsointerfacestate_accept' pk=r.description.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=r.description.status form_class="nso-row-form d-inline" only %}
+            {% else %}<span class="text-muted">—</span>{% endif %}
+          </td>
+
+          {# ── MTU (L2 / IP / MPLS) ────────────────────────────────── #}
+          <td class="c-mtu">
+            {% if r.mtu %}
+              {{ r.mtu.l2_mtu|default:"—" }} / {{ r.mtu.ip_mtu|default:"—" }} / {{ r.mtu.mpls_mtu|default:"—" }}
+              {% include "netbox_nso_plugin/categories/_state_badge.html" with status=r.mtu.status %}
+              {% url 'plugins:netbox_nso_plugin:interface_mtu_accept' pk=r.mtu.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=r.mtu.status form_class="nso-row-form d-inline" only %}
+              {% if r.mtu.bound_port %}<span class="text-muted small d-block">port {{ r.mtu.bound_port }}</span>{% endif %}
+            {% else %}<span class="text-muted">—</span>{% endif %}
+          </td>
+
+          {# ── IPs (read-only) ─────────────────────────────────────── #}
+          <td class="c-ip">
+            {% for ip in r.ips %}
+              <div><code>{{ ip.address }}</code>{% if ip.secondary %} <span class="badge text-bg-secondary">sec</span>{% endif %}
+                {% include "netbox_nso_plugin/categories/_state_badge.html" with status=ip.status %}</div>
+            {% empty %}<span class="text-muted">—</span>{% endfor %}
+          </td>
+
+          {# ── Switchport ──────────────────────────────────────────── #}
+          <td class="c-sw">
+            {% if r.switchport %}
+              {% if r.switchport.mode %}<span class="badge text-bg-secondary">{{ r.switchport.mode }}</span>{% endif %}
+              {% if r.switchport.untagged_vlan %}u:{{ r.switchport.untagged_vlan.vid }}{% endif %}
+              {% with tagged=r.switchport.tagged_vlans.all %}{% if tagged %}t:{% for v in tagged %}{{ v.vid }}{% if not forloop.last %},{% endif %}{% endfor %}{% endif %}{% endwith %}
+              {% include "netbox_nso_plugin/categories/_state_badge.html" with status=r.switchport.status %}
+              {% url 'plugins:netbox_nso_plugin:switchport_accept' pk=r.switchport.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=r.switchport.status form_class="nso-row-form d-inline" only %}
+            {% else %}<span class="text-muted">—</span>{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  {% if page.paginator.num_pages > 1 %}
+  <nav class="d-flex align-items-center gap-2">
+    <span class="text-muted small">Page {{ page.number }} of {{ page.paginator.num_pages }} ({{ page.paginator.count }} interfaces)</span>
+    {% if page.has_previous %}<button type="button" class="btn btn-xs btn-outline-secondary nso-ifm-page" data-page="{{ page.previous_page_number }}">&laquo; Prev</button>{% endif %}
+    {% if page.has_next %}<button type="button" class="btn btn-xs btn-outline-secondary nso-ifm-page" data-page="{{ page.next_page_number }}">Next &raquo;</button>{% endif %}
+  </nav>
+  {% endif %}
+  {% else %}
+    <p class="text-muted mb-0">No interface attributes reported for this device{% if q %} matching “{{ q }}”{% endif %}.</p>
+  {% endif %}
+  </div>
+
+  <script>
+  (function () {
+    "use strict";
+    var pager = document.querySelector('.nso-ifm-pager');
+    if (!pager) return;
+    var url = pager.dataset.url;
+    function csrfToken() {
+      var el = document.querySelector('input[name=csrfmiddlewaretoken]');
+      if (el && el.value) return el.value;
+      return (document.cookie.match(/csrftoken=([^;]+)/) || [])[1] || '';
+    }
+    function esc(s) { var d = document.createElement('div'); d.textContent = (s == null ? '' : String(s)); return d.innerHTML; }
+
+    // Column show/hide preference, remembered across re-fetches within the page.
+    var hidden = (window.__nsoIfmHidden = window.__nsoIfmHidden || {});
+    function applyCols(scope) {
+      Object.keys(hidden).forEach(function (col) {
+        if (!hidden[col]) return;
+        scope.querySelectorAll('.c-' + col).forEach(function (el) { el.style.display = 'none'; });
+      });
+      var grp = scope.querySelector('.nso-ifm-cols');
+      if (grp) grp.querySelectorAll('[data-col]').forEach(function (b) {
+        b.classList.toggle('active', !hidden[b.dataset.col]);
+      });
+    }
+
+    var results = pager.querySelector('.nso-ifm-results');
+    var debounce = null;
+
+    function flash(text, type) {
+      var m = pager.querySelector('.nso-ifm-msg');
+      if (!m) return;
+      m.innerHTML = text ? '<div class="alert alert-' + type + ' py-1 px-2 small mb-2">' + text + '</div>' : '';
+    }
+
+    function load(q, page) {
+      pager.dataset.q = q; pager.dataset.page = page;
+      results.innerHTML = '<div class="text-muted small py-2"><span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Loading…</div>';
+      return fetch(url + '?q=' + encodeURIComponent(q) + '&page=' + page, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+        .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); })
+        .then(function (html) {
+          var tmp = document.createElement('div'); tmp.innerHTML = html;
+          var fresh = tmp.querySelector('.nso-ifm-results');
+          if (fresh) { results.replaceWith(fresh); results = pager.querySelector('.nso-ifm-results'); applyCols(results); }
+        })
+        .catch(function (e) { results.innerHTML = '<div class="text-danger small">Failed to load: ' + e.message + '</div>'; });
+    }
+    function reload() { return load(pager.dataset.q || '', pager.dataset.page || 1); }
+
+    function post(action, body) {
+      return fetch(action, {
+        method: 'POST',
+        headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-CSRFToken': csrfToken(), 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: body,
+      }).then(function (r) { return r.json().catch(function () { return {}; }).then(function (d) { return { ok: r.ok, data: d }; }); });
+    }
+
+    pager.addEventListener('input', function (e) {
+      if (!e.target.classList.contains('nso-ifm-filter')) return;
+      clearTimeout(debounce);
+      var v = e.target.value.trim();
+      debounce = setTimeout(function () { load(v, 1); }, 350);
+    });
+
+    pager.addEventListener('submit', function (e) {
+      var form = e.target.closest('.nso-row-form');
+      if (!form) return;
+      e.preventDefault();
+      form.querySelectorAll('button').forEach(function (b) { b.disabled = true; });
+      post(form.action, new URLSearchParams(new FormData(form))).then(function (res) {
+        if (!res.ok || (res.data && res.data.status === 'error')) {
+          flash('Action failed: ' + esc((res.data && res.data.message) || 'server error'), 'danger');
+        } else {
+          flash('', '');
+          document.dispatchEvent(new CustomEvent('nso:refresh-categories'));
+        }
+        return reload();
+      });
+    });
+
+    pager.addEventListener('click', function (e) {
+      var col = e.target.closest('.nso-ifm-cols [data-col]');
+      if (col) {
+        e.preventDefault();
+        var key = col.dataset.col;
+        hidden[key] = !hidden[key];
+        col.classList.toggle('active', !hidden[key]);
+        pager.querySelectorAll('.c-' + key).forEach(function (el) { el.style.display = hidden[key] ? 'none' : ''; });
+        return;
+      }
+      var pg = e.target.closest('.nso-ifm-page');
+      if (pg) { e.preventDefault(); load(pager.dataset.q || '', pg.dataset.page); return; }
+    });
+
+    applyCols(pager);
+  })();
+  </script>
+</div>

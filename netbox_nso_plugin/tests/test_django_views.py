@@ -1383,6 +1383,48 @@ class TestDeviceNSOTabView(ViewTestBase):
 
         Interface.objects.filter(device=self.device, name__startswith="et-0/0/").delete()
 
+    def test_merged_interface_category_pivots_overlays_into_one_row(self):
+        """The consolidated 'interface' card renders one row per interface with every
+        per-interface scalar overlay (enabled/description/MTU/IP/switchport) as a column,
+        plus the column-select chips. adapter_device_id=None → renders from persisted
+        state with no adapter fetch."""
+        from dcim.models import Interface
+
+        from netbox_nso_plugin.models import (
+            NSOInterfaceIPState,
+            NSOInterfaceMtuState,
+            NSOInterfaceState,
+            NSOSwitchportState,
+        )
+
+        iface = Interface.objects.create(device=self.device, name="Gi0/1", type="other", description="nb")
+        NSOInterfaceState.objects.create(interface=iface, attribute="enabled", status="imported", nso_value="true")
+        NSOInterfaceState.objects.create(
+            interface=iface, attribute="description", status="changed", nso_value="uplink to core"
+        )
+        NSOInterfaceMtuState.objects.create(
+            management=self.mgmt, interface=iface, l2_mtu=9216, ip_mtu=9000, status="imported"
+        )
+        NSOInterfaceIPState.objects.create(interface=iface, address="10.0.0.1/31", family="ipv4", status="imported")
+        NSOSwitchportState.objects.create(management=self.mgmt, interface=iface, mode="access", status="imported")
+
+        url = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device.pk, "key": "interface"}
+        )
+        r = self.client.get(url)
+        self.assertEqual(r.status_code, 200)
+        body = r.content.decode()
+        self.assertIn("nso-ifm-cols", body)  # column-select chips
+        self.assertIn("Gi0/1", body)
+        self.assertIn("uplink to core", body)  # description device value
+        self.assertIn("9216", body)  # L2 MTU
+        self.assertIn("10.0.0.1/31", body)  # IP address
+        # No leaked Django comments (illegal multi-line {# #} would render as text).
+        self.assertNotIn("{#", body)
+        self.assertNotIn("#}", body)
+
+        iface.delete()
+
     def test_interfaces_page_classification_is_value_aware(self):
         """Display follows NetBox-vs-device values, not the adapter's stale status.
 
@@ -1525,8 +1567,9 @@ class TestDeviceNSOTabView(ViewTestBase):
         )
         url = reverse("plugins:netbox_nso_plugin:device_nso_category_counts", kwargs={"device_pk": self.device.pk})
         data = json.loads(self.client.get(url).content)
-        self.assertIn("interfaces", data["categories"])
-        self.assertEqual(data["categories"]["interfaces"]["pending"], 1)
+        # The per-interface scalar overlays render as one merged "interface" card.
+        self.assertIn("interface", data["categories"])
+        self.assertEqual(data["categories"]["interface"]["pending"], 1)
 
     def test_refresh_from_nso_enqueues_reconcile(self):
         """The device-level 'Refresh from NSO' button enqueues a background reconcile."""

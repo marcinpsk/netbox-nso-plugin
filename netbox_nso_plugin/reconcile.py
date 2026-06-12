@@ -361,7 +361,26 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
     dev_id = mgmt.adapter_device_id
 
     with suppress_intent_push():
-        if key == "interfaces":
+        if key == "interface":
+            # Merged "Interfaces" card: refresh all four per-interface scalar
+            # overlays (enabled/description, IPs, MTU, switchport) so the
+            # consolidated row-per-interface table reflects the latest device read.
+            from .interface_mtu_reconciler import reconcile_interface_mtu
+            from .subinterface_reconciler import reconcile_subinterface
+            from .svi_reconciler import reconcile_svi
+            from .vlan_reconciler import reconcile_switchport, reconcile_vlan_database
+
+            ctx["interfaces"] = client.get_interfaces(dev_id)
+            ctx["state"] = client.get_state(dev_id)
+            ctx["interface_states"] = _upsert_interface_states(device, ctx["interfaces"])
+            ctx["svi_states"] = reconcile_svi(device, client.get_svi(dev_id))  # M35: before IPs
+            ctx["subinterface_states"] = reconcile_subinterface(device, client.get_subinterface(dev_id))
+            ctx["interface_ips"] = _reconcile_interface_ips(device, client.get_interface_ips(dev_id))
+            ctx["interface_mtu_states"] = reconcile_interface_mtu(device, client.get_interface_mtu(dev_id))
+            # VLAN DB first so switchport vid lookups resolve in the per-device group.
+            reconcile_vlan_database(device, client.get_vlan_database(dev_id))
+            ctx["switchport_states"] = reconcile_switchport(device, client.get_switchport(dev_id))
+        elif key == "interfaces":
             ctx["interfaces"] = client.get_interfaces(dev_id)
             ctx["state"] = client.get_state(dev_id)
             ctx["interface_states"] = _upsert_interface_states(device, ctx["interfaces"])

@@ -122,15 +122,17 @@ def interface_status_breakdown(qs) -> dict:
 # Order here is the display order on the tab.
 # manage_interfaces and manage_snmp are standalone scopes — not gated by the
 # manage_routing master switch (see category_summaries).
+# The per-interface scalar attributes (enabled/description, IPs, MTU, switchport)
+# render as ONE consolidated "Interfaces" card — a row per interface with a
+# column per attribute and a column-select filter — instead of four scattered
+# cards. The individual keys still exist (partials/accept/reconcile) for direct
+# fetch and per-cell reuse; they're just no longer separate cards on the tab.
 _CATEGORIES = [
-    ("interfaces", "Interfaces", "ethernet", "manage_interfaces"),
-    ("interface_ips", "Interface IPs", "ip-network", "manage_interfaces"),
+    ("interface", "Interfaces", "ethernet", "manage_interfaces"),
     ("lacp", "LACP", "link-variant", "manage_interfaces"),
     ("vlan", "VLANs", "format-list-numbered", "manage_interfaces"),
-    ("switchport", "Switchports", "ethernet-cable", "manage_interfaces"),
     ("svi", "SVIs / IRBs", "ip-network", "manage_interfaces"),
     ("subinterface", "Subinterfaces", "vector-difference", "manage_interfaces"),
-    ("interface_mtu", "Interface MTU", "ruler", "manage_interfaces"),
     ("static", "Static Routes", "sign-direction", "manage_static"),
     ("isis", "IS-IS", "lan", "manage_isis"),
     ("ospf", "OSPF", "lan", "manage_ospf"),
@@ -193,6 +195,22 @@ def _category_counts(key: str, device, mgmt) -> dict:  # noqa: C901
     )
 
     dev_id = device.id
+    if key == "interface":
+        # Merged card: aggregate the four per-interface scalar overlays so the
+        # headline count/badges cover everything shown in the consolidated table.
+        from .models import NSOInterfaceIPState, NSOInterfaceMtuState, NSOSwitchportState
+
+        out = {"total": 0, "drift": 0, "pending": 0}
+        parts = [
+            interface_status_breakdown(NSOInterfaceState.objects.filter(interface__device_id=dev_id)),
+            _status_breakdown(NSOInterfaceIPState.objects.filter(interface__device_id=dev_id)),
+            _status_breakdown(NSOInterfaceMtuState.objects.filter(interface__device_id=dev_id)),
+            _status_breakdown(NSOSwitchportState.objects.filter(interface__device_id=dev_id)),
+        ]
+        for part in parts:
+            for bucket in ("total", "drift", "pending"):
+                out[bucket] += part.get(bucket, 0)
+        return out
     if key == "interfaces":
         return interface_status_breakdown(NSOInterfaceState.objects.filter(interface__device_id=dev_id))
     if key == "interface_ips":

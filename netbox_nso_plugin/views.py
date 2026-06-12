@@ -259,6 +259,8 @@ class NSOCategoryView(LoginRequiredMixin, View):
         they keep the on-expand suppressed scoped reconcile.
         """
         device = get_object_or_404(Device, pk=pk)
+        if key == "interface":
+            return self._render_interface_merged(request, device)
         if key == "interfaces":
             return self._render_interfaces_page(request, device)
 
@@ -283,6 +285,97 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 ctx["adapter_error_code"] = exc.code
         ctx["category_has_unowned"] = _ctx_has_unowned(ctx)
         return render(request, partial, ctx)
+
+    def _render_interface_merged(self, request, device):
+        """Consolidated per-interface view: one row per interface, a column per attribute.
+
+        Folds the four scattered per-interface scalar overlays (enabled/description,
+        IPs, MTU, switchport) into a single table with a client-side column-select.
+        Reconciles all four on expand (suppress-wrapped), then pivots the persisted
+        NSO*State rows by interface. Each attribute cell reuses that overlay's own
+        status badge + Accept endpoint, so per-attribute Accept/Apply still works.
+        Filter by interface name (?q=), paginated like the interfaces page.
+        """
+        from django.core.paginator import Paginator
+
+        from .models import (
+            NSOInterfaceIPState,
+            NSOInterfaceMtuState,
+            NSOSwitchportState,
+        )
+        from .reconcile import reconcile_category
+
+        try:
+            mgmt = device.nso_management
+        except Exception:
+            mgmt = None
+
+        adapter_error = None
+        if mgmt is not None and mgmt.adapter_device_id is not None:
+            try:
+                reconcile_category(device, mgmt, "interface")
+            except AdapterError as exc:
+                adapter_error = str(exc)
+
+        dev_filter = {"interface__device": device}
+        # Index every overlay by interface id (enabled/description keyed by attribute).
+        attr_states: dict[tuple[int, str], NSOInterfaceState] = {}
+        for st in NSOInterfaceState.objects.filter(**dev_filter).select_related("interface"):
+            attr_states[(st.interface_id, st.attribute)] = st
+        mtu_states = {
+            st.interface_id: st for st in NSOInterfaceMtuState.objects.filter(**dev_filter).select_related("interface")
+        }
+        sw_states = {
+            st.interface_id: st
+            for st in NSOSwitchportState.objects.filter(**dev_filter)
+            .select_related("interface", "untagged_vlan")
+            .prefetch_related("tagged_vlans")
+        }
+        ip_states: dict[int, list] = {}
+        ifaces: dict[int, object] = {}
+        for st in NSOInterfaceIPState.objects.filter(**dev_filter).select_related("interface").order_by("address"):
+            ip_states.setdefault(st.interface_id, []).append(st)
+            ifaces[st.interface_id] = st.interface
+        for (iface_id, _attr), st in attr_states.items():
+            ifaces[iface_id] = st.interface
+        for iface_id, st in mtu_states.items():
+            ifaces[iface_id] = st.interface
+        for iface_id, st in sw_states.items():
+            ifaces[iface_id] = st.interface
+
+        q = (request.GET.get("q") or "").strip()
+        ordered = sorted(ifaces.values(), key=lambda i: i.name)
+        if q:
+            ql = q.lower()
+            ordered = [i for i in ordered if ql in i.name.lower()]
+
+        paginator = Paginator(ordered, self._INTERFACES_PER_PAGE)
+        page = paginator.get_page(request.GET.get("page") or 1)
+
+        rows = []
+        for iface in page.object_list:
+            rows.append(
+                {
+                    "iface": iface,
+                    "enabled": attr_states.get((iface.id, "enabled")),
+                    "description": attr_states.get((iface.id, "description")),
+                    "mtu": mtu_states.get(iface.id),
+                    "ips": ip_states.get(iface.id, []),
+                    "switchport": sw_states.get(iface.id),
+                }
+            )
+
+        return render(
+            request,
+            "netbox_nso_plugin/categories/interface.html",
+            {
+                "object": device,
+                "rows": rows,
+                "page": page,
+                "q": q,
+                "adapter_error": adapter_error,
+            },
+        )
 
     def _render_interfaces_page(self, request, device):
         """Per-(interface, attribute) drift/pending view — paginated, filterable, read-only.
