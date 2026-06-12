@@ -70,3 +70,4 @@ docs/
 # Local agent workspace
 .claude/
 .playwright-mcp/
+milestone-status.db
