@@ -7,6 +7,7 @@ from .models import (
     AdapterConnection,
     NSODeviceManagement,
     NSOInstance,
+    NSOInterfaceMtuState,
     NSOLoggingHostState,
     NSOPlatformNedMapping,
     NSOSnmpCommunityState,
@@ -216,3 +217,29 @@ class NSOLoggingHostStateForm(NetBoxModelForm):
     class Meta:
         model = NSOLoggingHostState
         fields = ["address", "port", "severity", "facility", "transport", "vrf", "source", "tags"]
+
+
+class NSOInterfaceMtuStateForm(NetBoxModelForm):
+    """Operator-edit the per-interface MTU overlay (Phase 2b write path).
+
+    Changing a value declares intent that diverges from the device; an unowned row
+    is flagged ``changed`` so it surfaces for Accept (which marks it owned, writes
+    the native L2 MTU onto the interface, and pushes). An already-owned row keeps
+    its ownership and re-pushes the new value via the save signal.
+    """
+
+    class Meta:
+        model = NSOInterfaceMtuState
+        fields = ["l2_mtu", "ip_mtu", "mpls_mtu", "tags"]
+
+    def save(self, commit=True):
+        """Flag an edited unowned row as ``changed`` (diverged → needs Accept)."""
+        from . import status_machine as sm
+
+        obj = super().save(commit=False)
+        if not sm.is_owned(obj.status):
+            obj.status = "changed"
+        if commit:
+            obj.save()
+            self.save_m2m()
+        return obj

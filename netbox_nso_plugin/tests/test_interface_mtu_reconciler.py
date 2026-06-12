@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
 from django.test import TestCase
+from django.utils import timezone
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOInterfaceMtuState
 
@@ -189,3 +190,46 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
         state.refresh_from_db()
         self.assertEqual(state.status, "accepted")  # differing value → pending apply
         self.assertIsNotNone(state.accepted_at)
+
+    def test_edit_form_flags_unowned_changed(self):
+        from netbox_nso_plugin.forms import NSOInterfaceMtuStateForm
+
+        state = self._state(l2_mtu=9216, status="imported")
+        form = NSOInterfaceMtuStateForm(data={"l2_mtu": 9000, "ip_mtu": "", "mpls_mtu": ""}, instance=state)
+        self.assertTrue(form.is_valid(), form.errors)
+        obj = form.save()
+        self.assertEqual(obj.l2_mtu, 9000)
+        self.assertEqual(obj.status, "changed")  # diverged from device → needs accept
+
+    def test_edit_form_preserves_owned_status(self):
+        from netbox_nso_plugin.forms import NSOInterfaceMtuStateForm
+
+        state = self._state(l2_mtu=9216, status="in_sync")
+        state.accepted_at = timezone.now()
+        state.save(update_fields=["accepted_at"])
+        form = NSOInterfaceMtuStateForm(data={"l2_mtu": 9100, "ip_mtu": "", "mpls_mtu": ""}, instance=state)
+        self.assertTrue(form.is_valid(), form.errors)
+        obj = form.save()
+        self.assertEqual(obj.l2_mtu, 9100)
+        self.assertEqual(obj.status, "in_sync")  # owned → ownership preserved, value re-pushed
+
+    def test_edit_then_accept_owns_and_writes_native(self):
+        from unittest.mock import patch
+
+        from django.contrib.auth import get_user_model
+
+        from netbox_nso_plugin.forms import NSOInterfaceMtuStateForm
+
+        state = self._state(l2_mtu=9216, status="imported")
+        form = NSOInterfaceMtuStateForm(data={"l2_mtu": 9000, "ip_mtu": "", "mpls_mtu": ""}, instance=state)
+        self.assertTrue(form.is_valid(), form.errors)
+        form.save()
+        User = get_user_model()
+        admin = User.objects.create_superuser(username="mtu-edit", password="pw", email="e@x.y")  # noqa: S106
+        self.client.force_login(admin)
+        with patch("netbox_nso_plugin.adapter_client.put_interface_mtu_intent"):
+            self.client.post(f"/plugins/nso/interface-mtu/state/{state.pk}/accept/")
+        state.refresh_from_db()
+        self.po1.refresh_from_db()
+        self.assertEqual(state.status, "accepted")  # edited (changed) → accept → pending apply
+        self.assertEqual(self.po1.mtu, 9000)  # native L2 mtu = the edited value

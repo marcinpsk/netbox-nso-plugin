@@ -365,6 +365,11 @@ urlpatterns = [
         name="interface_mtu_accept",
     ),
     path(
+        "interface-mtu/state/<int:pk>/edit/",
+        views.NSOInterfaceMtuStateEditView.as_view(),
+        name="nsointerfacemtustate_edit",
+    ),
+    path(
         "vlan/state/<int:pk>/accept/",
         views.NSOVLANStateAcceptView.as_view(),
         name="vlan_accept",

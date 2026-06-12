@@ -2,6 +2,7 @@
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
 {# Lazy-loaded fragment: per-interface MTU (Phase 2b, read-only mirror). #}
 {% include "netbox_nso_plugin/categories/_adapter_error.html" %}
+{% url 'dcim:device_nso' pk=object.pk as return_url %}
 
 {% if interface_mtu_states %}
   <p class="text-muted small mb-2">Per-interface MTU read from the device (only explicitly-configured values are shown). Accept adopts the interface's MTU as NetBox-managed intent (the native L2 MTU is also written onto the NetBox interface) and re-asserts it on the device on Apply. Nokia router interfaces show the bound port that carries the L2 MTU.</p>
@@ -22,7 +23,8 @@
           <td>{{ s.bound_port|default:"—" }}</td>
           <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=s.status %}</td>
           <td>{{ s.last_sync_at|default:"—" }}</td>
-          <td>
+          <td class="text-nowrap">
+            {% url 'plugins:netbox_nso_plugin:nsointerfacemtustate_edit' pk=s.pk as edit_url %}{% include "netbox_nso_plugin/categories/_edit_link.html" with edit_url=edit_url return_url=return_url %}
             {% url 'plugins:netbox_nso_plugin:interface_mtu_accept' pk=s.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=s.status title="Make NetBox the source of truth for this interface's MTU (re-asserted on the device on Apply)" %}
           </td>
         </tr>

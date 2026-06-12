@@ -25,6 +25,7 @@ from .forms import (
     AdapterConnectionForm,
     NSODeviceManagementForm,
     NSOInstanceForm,
+    NSOInterfaceMtuStateForm,
     NSOLoggingHostStateForm,
     NSOPlatformNedMappingForm,
     NSOSnmpCommunityStateForm,
@@ -1943,3 +1944,8 @@ class NSOSnmpSystemInfoStateEditView(generic.ObjectEditView):  # noqa: D101
 class NSOLoggingHostStateEditView(generic.ObjectEditView):  # noqa: D101
     queryset = NSOLoggingHostState.objects.all()
     form = NSOLoggingHostStateForm
+
+
+class NSOInterfaceMtuStateEditView(generic.ObjectEditView):  # noqa: D101
+    queryset = NSOInterfaceMtuState.objects.all()
+    form = NSOInterfaceMtuStateForm
