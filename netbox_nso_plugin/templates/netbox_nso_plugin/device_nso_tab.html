@@ -31,9 +31,9 @@
           {% for d in intent_drift %}
             <li>
               <strong>{{ d.label }}</strong> — {{ d.count }} intent row{{ d.count|pluralize }}
-              {% if d.failed %}<span class="badge bg-danger ms-1">{{ d.failed }} apply-failed</span>
-              {% elif d.applied %}<span class="badge bg-secondary ms-1">{{ d.applied }} applied</span>
-              {% else %}<span class="badge bg-warning text-dark ms-1">never applied</span>{% endif %}
+              {% if d.failed %}<span class="badge text-bg-danger ms-1">{{ d.failed }} apply-failed</span>
+              {% elif d.applied %}<span class="badge text-bg-info ms-1">{{ d.applied }} applied</span>
+              {% else %}<span class="badge text-bg-warning text-dark ms-1">never applied</span>{% endif %}
             </li>
           {% endfor %}
         </ul>
