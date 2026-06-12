@@ -292,9 +292,11 @@
           if (job.error && job.status !== 'failed') { clearInterval(interval); var jobErr = (job.error && typeof job.error === 'object') ? (job.error.message || JSON.stringify(job.error)) : job.error; setStatus(label + ' error: ' + jobErr, 'danger', false); setButtons(false); return; }
           if (job.status === 'succeeded') {
             clearInterval(interval); setStatus(label + ' completed (Job #' + jobId + ').', 'success', false); setButtons(false);
+            document.dispatchEvent(new CustomEvent('nso:refresh-categories'));  // clear stale header badges
           } else if (job.status === 'failed') {
             clearInterval(interval);
             setStatus(label + ' failed — ' + formatApplyError(job) + ' (Job #' + jobId + ').', 'danger', false); setButtons(false);
+            document.dispatchEvent(new CustomEvent('nso:refresh-categories'));  // reflect any partial state change
           } else {
             setStatus(label + ' running… (Job #' + jobId + ', status: ' + job.status + ')', 'info', true);
           }
@@ -416,20 +418,27 @@
   {# ── NSO configuration: counts-first, rows loaded lazily on expand ──────── #}
   {% if nso_categories %}
     <h4 class="mt-4 mb-2"><span class="mdi mdi-format-list-bulleted"></span> NSO Configuration</h4>
-    <p class="text-muted small mb-2">
+    <p class="text-muted small mb-2"
+       data-cat-counts-url="{% url 'plugins:netbox_nso_plugin:device_nso_category_counts' device_pk=object.pk %}">
       Counts reflect the last sync. Click a category to load its rows.
     </p>
     {% for cat in nso_categories %}
       <div class="card mb-2 nso-category"
+           data-cat-key="{{ cat.key }}"
            data-cat-url="{% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key=cat.key %}">
         <div class="card-header d-flex justify-content-between align-items-center nso-cat-toggle"
              role="button" tabindex="0" aria-expanded="false" style="cursor: pointer;">
           <span>
             <span class="mdi mdi-{{ cat.icon }} me-1"></span><strong>{{ cat.label }}</strong>
-            <span class="text-muted ms-1">({{ cat.counts.total|default:0 }})</span>
-            {% if cat.counts.drift %}<span class="badge text-bg-warning text-dark ms-2">{{ cat.counts.drift }} drift</span>{% endif %}
-            {% if cat.counts.pending %}<span class="badge text-bg-info ms-1">{{ cat.counts.pending }} pending apply</span>{% endif %}
-            {% if cat.counts.total and not cat.counts.drift and not cat.counts.pending %}<span class="badge text-bg-success ms-2">in sync</span>{% endif %}
+            <span class="nso-cat-badges"
+                  data-total="{{ cat.counts.total|default:0 }}"
+                  data-drift="{{ cat.counts.drift|default:0 }}"
+                  data-pending="{{ cat.counts.pending|default:0 }}">
+              <span class="text-muted ms-1">({{ cat.counts.total|default:0 }})</span>
+              {% if cat.counts.drift %}<span class="badge text-bg-warning text-dark ms-2">{{ cat.counts.drift }} drift</span>{% endif %}
+              {% if cat.counts.pending %}<span class="badge text-bg-info ms-1">{{ cat.counts.pending }} pending apply</span>{% endif %}
+              {% if cat.counts.total and not cat.counts.drift and not cat.counts.pending %}<span class="badge text-bg-success ms-2">in sync</span>{% endif %}
+            </span>
           </span>
           <span>
             <span class="mdi mdi-refresh nso-cat-refresh me-2" role="button"
@@ -455,6 +464,52 @@
           old.parentNode.replaceChild(s, old);
         });
       }
+
+      function esc(s) { var d = document.createElement('div'); d.textContent = (s == null ? '' : String(s)); return d.innerHTML; }
+
+      // Rebuild a category header's badge block from fresh counts (mirrors the
+      // server-side render) so a Sync/Apply that clears rows also clears the header,
+      // instead of leaving a stale "pending apply" until a full page reload.
+      function renderBadges(total, drift, pending) {
+        var h = '<span class="text-muted ms-1">(' + esc(total) + ')</span>';
+        if (drift) { h += '<span class="badge text-bg-warning text-dark ms-2">' + esc(drift) + ' drift</span>'; }
+        if (pending) { h += '<span class="badge text-bg-info ms-1">' + esc(pending) + ' pending apply</span>'; }
+        if (total && !drift && !pending) { h += '<span class="badge text-bg-success ms-2">in sync</span>'; }
+        return h;
+      }
+
+      var countsEl = document.querySelector('[data-cat-counts-url]');
+      var countsUrl = countsEl ? countsEl.dataset.catCountsUrl : null;
+
+      function refreshHeaders() {
+        if (!countsUrl) { return Promise.resolve(); }
+        return fetch(countsUrl, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (d) {
+            if (!d || !d.categories) { return; }
+            document.querySelectorAll('.nso-category').forEach(function (card) {
+              var c = d.categories[card.dataset.catKey];
+              var badges = card.querySelector('.nso-cat-badges');
+              if (!c || !badges) { return; }
+              badges.dataset.total = c.total; badges.dataset.drift = c.drift; badges.dataset.pending = c.pending;
+              badges.innerHTML = renderBadges(c.total, c.drift, c.pending);
+            });
+          })
+          .catch(function () { /* best-effort: leave headers as-is on failure */ });
+      }
+
+      // A state-changing action (Sync / Detect Drift / Apply) finished → refresh the
+      // headers and re-pull any already-expanded category bodies.
+      document.addEventListener('nso:refresh-categories', function () {
+        refreshHeaders();
+        document.querySelectorAll('.nso-category').forEach(function (card) {
+          var body = card.querySelector('.nso-cat-body');
+          if (body && !body.classList.contains('d-none')) {
+            card.dispatchEvent(new CustomEvent('nso:refetch-rows'));
+          }
+        });
+      });
+
       document.querySelectorAll('.nso-category').forEach(function (card) {
         var header = card.querySelector('.nso-cat-toggle');
         var body = card.querySelector('.nso-cat-body');
@@ -482,9 +537,12 @@
         header.addEventListener('keydown', function (e) {
           if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
         });
+        // Programmatic re-pull (fired after a Sync/Apply for already-open categories).
+        card.addEventListener('nso:refetch-rows', function () { loaded = true; fetchRows(); });
         if (refreshIcon) {
           refreshIcon.addEventListener('click', function (e) {
             e.stopPropagation();  // don't toggle the card
+            refreshHeaders();  // a manual refresh must also clear a stale header badge
             if (body.classList.contains('d-none')) { toggle(); return; }  // expand (which fetches)
             loaded = true; fetchRows();  // already open → re-fetch fresh rows
           });

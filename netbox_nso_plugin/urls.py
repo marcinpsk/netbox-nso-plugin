@@ -65,6 +65,12 @@ urlpatterns = [
         views.NSOCategoryView.as_view(),
         name="device_nso_category",
     ),
+    # Device NSO tab — live category header counts (JSON; refreshes stale badges post-Sync)
+    path(
+        "devices/<int:device_pk>/category-counts/",
+        views.NSOCategoryCountsView.as_view(),
+        name="device_nso_category_counts",
+    ),
     # Device NSO tab — background "Refresh from NSO" (reconcile cache only)
     path(
         "device-management/<int:pk>/reconcile/",

@@ -185,6 +185,34 @@ def _ctx_has_unowned(ctx) -> bool:
     return False
 
 
+class NSOCategoryCountsView(LoginRequiredMixin, View):
+    """JSON of every category's live counts for the device NSO tab.
+
+    The tab renders the category header badges (total / drift / pending apply / in sync)
+    server-side at page load. After a Sync/Detect-Drift/Apply, the rows can clear but the
+    headers stay stale until a full reload — so the JS re-fetches these counts and rewrites
+    the badges in place. Read-only aggregate over NSO*State (same source as the tab render).
+
+    URL: /plugins/nso/devices/<pk>/category-counts/
+    """
+
+    def get(self, request, device_pk):
+        """Return {categories: {key: {total, drift, pending}}} for the device."""
+        from .summary import category_summaries
+
+        device = get_object_or_404(Device, pk=device_pk)
+        mgmt = getattr(device, "nso_management", None)
+        out = {
+            c["key"]: {
+                "total": c["counts"].get("total", 0),
+                "drift": c["counts"].get("drift", 0),
+                "pending": c["counts"].get("pending", 0),
+            }
+            for c in category_summaries(device, mgmt)
+        }
+        return JsonResponse({"categories": out})
+
+
 class NSOCategoryView(LoginRequiredMixin, View):
     """Return one category's rows for the device NSO tab, fetched on expand.
 

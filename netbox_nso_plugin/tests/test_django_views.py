@@ -1505,6 +1505,29 @@ class TestDeviceNSOTabView(ViewTestBase):
         self.assertEqual(counts["templates"], 1)
         self.assertEqual(counts["drift"], 1)  # the un-owned 'changed' template
 
+    def test_category_counts_endpoint_returns_live_counts(self):
+        """The category-counts JSON endpoint feeds the post-Sync header-badge refresh."""
+        import json
+
+        from django.utils import timezone
+
+        self.mgmt.manage_interfaces = True
+        self.mgmt.manage_description = True
+        self.mgmt.save(update_fields=["manage_interfaces", "manage_description"])
+        # A pending (owned) interface attr → counts.interfaces.pending == 1.
+        iface = Interface.objects.create(device=self.device, name="et-9/9/9", type="other", description="nb")
+        NSOInterfaceState.objects.create(
+            interface=iface,
+            attribute="description",
+            status="accepted",
+            nso_value="dev",
+            accepted_at=timezone.now(),
+        )
+        url = reverse("plugins:netbox_nso_plugin:device_nso_category_counts", kwargs={"device_pk": self.device.pk})
+        data = json.loads(self.client.get(url).content)
+        self.assertIn("interfaces", data["categories"])
+        self.assertEqual(data["categories"]["interfaces"]["pending"], 1)
+
     def test_refresh_from_nso_enqueues_reconcile(self):
         """The device-level 'Refresh from NSO' button enqueues a background reconcile."""
         mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
