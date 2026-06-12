@@ -12,6 +12,15 @@ from django.db.models.signals import m2m_changed, post_delete, post_save, pre_de
 from django.dispatch import receiver
 from django.utils import timezone
 
+from .status_machine import OWNED_STATES as _OWNED_PUSH_STATUSES
+
+# Every intent-mirror push filters its overlay rows by _OWNED_PUSH_STATUSES (the canonical
+# OWNED_STATES, *including* apply_failed): intent stays accepted underneath a failed apply,
+# and the adapter PUTs are full-replace — a push that skipped apply_failed rows would drop
+# their intent from the mirror and a retry-apply could no longer see them. Direct-apply
+# pushes (switchport, LACP) keep narrower filters on purpose: including apply_failed there
+# would re-attempt the failed device write on every save.
+
 logger = logging.getLogger(__name__)
 
 # Thread-local flag set by ip_autoassign._suppress_ip_intent_push() to prevent
@@ -518,7 +527,7 @@ def _push_ip_intent_for_device(device_id, adapter_device_id):
 
     ip_states = NSOInterfaceIPState.objects.filter(
         interface__device_id=device_id,
-        status="accepted",
+        status__in=_OWNED_PUSH_STATUSES,
     ).select_related("interface", "interface__parent")
 
     addresses = []
@@ -566,7 +575,7 @@ def _push_snmp_intent_for_device(device_id, adapter_device_id):
     communities = []
     for row in NSOSnmpCommunityState.objects.filter(
         management__device_id=device_id,
-        status__in=("accepted", "deploying", "in_sync"),
+        status__in=_OWNED_PUSH_STATUSES,
     ).select_related("management"):
         if not row.vault_ref:
             continue
@@ -582,7 +591,7 @@ def _push_snmp_intent_for_device(device_id, adapter_device_id):
     v3_users = []
     for row in NSOSnmpV3UserState.objects.filter(
         management__device_id=device_id,
-        status__in=("accepted", "deploying", "in_sync"),
+        status__in=_OWNED_PUSH_STATUSES,
     ):
         if not row.vault_ref:
             continue
@@ -597,7 +606,7 @@ def _push_snmp_intent_for_device(device_id, adapter_device_id):
     hosts = []
     for row in NSOSnmpHostState.objects.filter(
         management__device_id=device_id,
-        status__in=("accepted", "deploying", "in_sync"),
+        status__in=_OWNED_PUSH_STATUSES,
     ):
         hosts.append(
             {
@@ -613,7 +622,7 @@ def _push_snmp_intent_for_device(device_id, adapter_device_id):
         sysinfo = NSOSnmpSystemInfoState.objects.get(
             management__device_id=device_id,
         )
-        if sysinfo.status in ("accepted", "deploying", "in_sync"):
+        if sysinfo.status in _OWNED_PUSH_STATUSES:
             system_info = {
                 "location": sysinfo.location or None,
                 "contact": sysinfo.contact or None,
@@ -661,7 +670,7 @@ def _push_logging_intent_for_device(device_id, adapter_device_id):
     hosts = []
     for row in NSOLoggingHostState.objects.filter(
         management__device_id=device_id,
-        status__in=("accepted", "deploying", "in_sync"),
+        status__in=_OWNED_PUSH_STATUSES,
     ):
         hosts.append(
             {
@@ -707,7 +716,7 @@ def _push_svi_intent_for_device(device_id, adapter_device_id):
     """Build and push the full owned SVI/IRB intent snapshot for a device (M35).
 
     Store-only (deferred): the single device Apply commits via the svi-reconciler.
-    Only owned rows (accepted/deploying/in_sync) are included.
+    Only owned rows (_OWNED_PUSH_STATUSES, incl. apply_failed) are included.
     """
     from . import adapter_client as client
     from .models import NSOSVIState
@@ -715,7 +724,7 @@ def _push_svi_intent_for_device(device_id, adapter_device_id):
     interfaces = []
     for row in NSOSVIState.objects.filter(
         management__device_id=device_id,
-        status__in=("accepted", "deploying", "in_sync"),
+        status__in=_OWNED_PUSH_STATUSES,
     ).select_related("interface", "vlan"):
         vid = row.vlan.vid if row.vlan else None
         if vid is None:
@@ -761,15 +770,15 @@ def _push_subinterface_intent_for_device(device_id, adapter_device_id):
     """Build and push the full owned dot1q subinterface intent snapshot (M36).
 
     Store-only (deferred): the single device Apply commits via the
-    subinterface-reconciler. Only owned rows (accepted/deploying/in_sync) included.
+    subinterface-reconciler. Only owned rows (_OWNED_PUSH_STATUSES, incl. apply_failed) included.
     """
     from . import adapter_client as client
-    from .models import _VLAN_WRITE_PATH_STATUSES, NSOSubinterfaceState
+    from .models import NSOSubinterfaceState
 
     interfaces = []
     for row in NSOSubinterfaceState.objects.filter(
         management__device_id=device_id,
-        status__in=_VLAN_WRITE_PATH_STATUSES,
+        status__in=_OWNED_PUSH_STATUSES,
     ).select_related("interface", "parent_interface"):
         # The subinterface-reconciler keys on the dot1q tag and (for Junos) the
         # parent interface — skip rows missing either rather than emit a bad payload.
@@ -817,15 +826,15 @@ def _push_interface_mtu_intent_for_device(device_id, adapter_device_id):
     """Build and push the full owned per-interface MTU intent snapshot (Phase 2b).
 
     Store-only (deferred): the single device Apply commits via the mtu-reconciler.
-    Only owned rows (accepted/deploying/in_sync) are included.
+    Only owned rows (_OWNED_PUSH_STATUSES, incl. apply_failed) are included.
     """
     from . import adapter_client as client
-    from .models import _VLAN_WRITE_PATH_STATUSES, NSOInterfaceMtuState
+    from .models import NSOInterfaceMtuState
 
     interfaces = []
     for row in NSOInterfaceMtuState.objects.filter(
         management__device_id=device_id,
-        status__in=_VLAN_WRITE_PATH_STATUSES,
+        status__in=_OWNED_PUSH_STATUSES,
     ).select_related("interface"):
         # At least one MTU value must be set or the reconciler has nothing to write.
         if row.l2_mtu is None and row.ip_mtu is None and row.mpls_mtu is None:
@@ -871,7 +880,7 @@ def _push_vlan_intent_for_device(device_id, adapter_device_id, force=False):
     """Build and push the full owned VLAN-database intent snapshot for a device (M34 write).
 
     Store-only (deferred): the single device Apply commits via the vlan-reconciler.
-    Only owned rows (accepted/deploying/in_sync) are included; the VLAN name pushed
+    Only owned rows (_OWNED_PUSH_STATUSES, incl. apply_failed) are included; the VLAN name pushed
     is the LIVE NetBox name (operator is the source of truth for it).
 
     ``force`` re-pushes even if the snapshot looks unchanged — the single Apply calls
@@ -879,12 +888,12 @@ def _push_vlan_intent_for_device(device_id, adapter_device_id, force=False):
     rename touches ipam.VLAN, which fires no plugin signal) still reaches the device.
     """
     from . import adapter_client as client
-    from .models import _VLAN_WRITE_PATH_STATUSES, NSOVLANState
+    from .models import NSOVLANState
 
     vlans = []
     for row in NSOVLANState.objects.filter(
         management__device_id=device_id,
-        status__in=_VLAN_WRITE_PATH_STATUSES,
+        status__in=_OWNED_PUSH_STATUSES,
     ).select_related("vlan"):
         if row.vlan is None:
             continue
@@ -971,15 +980,15 @@ def _push_bfd_intent_for_device(device_id, adapter_device_id):
     """Build and push the full owned per-interface BFD intent snapshot for a device.
 
     Store-only (deferred): the single device Apply commits via the bfd-reconciler.
-    Only owned rows (accepted/deploying/in_sync) are included.
+    Only owned rows (_OWNED_PUSH_STATUSES, incl. apply_failed) are included.
     """
     from . import adapter_client as client
-    from .models import _VLAN_WRITE_PATH_STATUSES, NSOBFDInterfaceState
+    from .models import NSOBFDInterfaceState
 
     interfaces = []
     for row in NSOBFDInterfaceState.objects.filter(
         management__device_id=device_id,
-        status__in=_VLAN_WRITE_PATH_STATUSES,
+        status__in=_OWNED_PUSH_STATUSES,
     ).select_related("interface"):
         interfaces.append(
             {
@@ -1119,7 +1128,7 @@ def _push_static_route_intent_for_device(device_id, adapter_device_id):
     routes = []
     for row in NSOStaticRouteState.objects.filter(
         management__device_id=device_id,
-        status__in=("accepted", "deploying", "in_sync"),
+        status__in=_OWNED_PUSH_STATUSES,
     ).select_related("static_route", "static_route__vrf"):
         sr = row.static_route
         if sr.next_hop is None:
@@ -1277,7 +1286,7 @@ def _push_isis_flex_algo_intent_for_device(device_id, adapter_device_id):
     flex_algos = []
     for row in NSOISISFlexAlgoState.objects.filter(
         management__device_id=device_id,
-        status__in=("accepted", "deploying", "in_sync"),
+        status__in=_OWNED_PUSH_STATUSES,
     ):
         flex_algos.append(
             {
@@ -1404,7 +1413,7 @@ def _push_l2_sap_intent_for_device(device_id, adapter_device_id):
     saps = []
     for row in NSOL2SapState.objects.filter(
         management__device_id=device_id,
-        status__in=("accepted", "deploying", "in_sync"),
+        status__in=_OWNED_PUSH_STATUSES,
     ):
         saps.append(
             {
@@ -1578,7 +1587,7 @@ def _push_isis_intent_for_device(device_id, adapter_device_id):
     interfaces = []
     for row in NSOISISInterfaceState.objects.filter(
         management__device_id=device_id,
-        status__in=("accepted", "deploying", "in_sync"),
+        status__in=_OWNED_PUSH_STATUSES,
     ).select_related("interface"):
         interfaces.append(
             {
@@ -1595,7 +1604,7 @@ def _push_isis_intent_for_device(device_id, adapter_device_id):
     processes = []
     for row in NSOISISInstanceState.objects.filter(
         management__device_id=device_id,
-        status__in=("accepted", "deploying", "in_sync"),
+        status__in=_OWNED_PUSH_STATUSES,
     ):
         proc_entry = {
             "process_tag": row.process_tag or "",
@@ -1699,7 +1708,7 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
     routers: dict[str, dict] = {}
     for row in NSOBGPPeerState.objects.filter(
         management__device_id=device_id,
-        status__in=("accepted", "deploying", "in_sync"),
+        status__in=_OWNED_PUSH_STATUSES,
     ).select_related("management", "bgp_peer"):
         asn_str = row.asn_str
         vrf_name = row.vrf_name or ""
@@ -1795,7 +1804,7 @@ def _push_route_policy_intent_for_device(device_id, adapter_device_id):
     objects = []
     for row in NSORoutePolicyState.objects.filter(
         management__device_id=device_id,
-        status__in=("accepted", "deploying", "in_sync"),
+        status__in=_OWNED_PUSH_STATUSES,
     ).select_related("management"):
         # Build the entries payload from the associated NetBox object via the GFK.
         obj = row.assigned_object
@@ -1936,7 +1945,7 @@ def _collect_redistribution_by_dest_ref(device_id: int, dest_protocol: str) -> d
     for row in NSORedistributionState.objects.filter(
         management__device_id=device_id,
         dest_protocol=dest_protocol,
-        status__in=("accepted", "deploying", "in_sync"),
+        status__in=_OWNED_PUSH_STATUSES,
     ).select_related("redistribution", "redistribution__route_map"):
         entry: dict = {"source_protocol": row.source_protocol, "source_ref": row.source_ref}
         if row.redistribution_id is not None:
@@ -1968,7 +1977,7 @@ def _push_ospf_intent_for_device(device_id, adapter_device_id):
     instances = []
     for row in NSOOSPFInstanceState.objects.filter(
         management__device_id=device_id,
-        status__in=("accepted", "deploying", "in_sync"),
+        status__in=_OWNED_PUSH_STATUSES,
     ).select_related("management"):
         entry = {
             "process_id": row.process_id,
@@ -1987,7 +1996,7 @@ def _push_ospf_intent_for_device(device_id, adapter_device_id):
     interfaces = []
     for row in NSOOSPFInterfaceState.objects.filter(
         management__device_id=device_id,
-        status__in=("accepted", "deploying", "in_sync"),
+        status__in=_OWNED_PUSH_STATUSES,
     ).select_related("management"):
         entry = {
             "interface_name": row.interface.name,

@@ -1523,8 +1523,6 @@ _VLAN_STATUS_CHOICES = [
     ("error", "Error"),
 ]
 
-_VLAN_WRITE_PATH_STATUSES = {"accepted", "deploying", "in_sync"}
-
 
 class NSOVLANState(_NSODeviceTabURLMixin, NetBoxModel):
     """Per-(device, ipam.VLAN) VLAN-database compliance overlay (M34).

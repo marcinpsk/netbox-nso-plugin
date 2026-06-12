@@ -80,6 +80,22 @@ class TestPushStaticRouteIntentForDevice(IntentPushResetMixin, TestCase):
             assert routes[0]["next_hop"] == "192.168.1.1"
             assert routes[0]["vrf"] == ""
 
+    def test_pushes_apply_failed_routes(self):
+        """apply_failed rows stay in the push: intent is still owned (retry-eligible), and
+        the adapter PUT is full-replace — skipping them would drop their mirror rows."""
+        from netbox_nso_plugin.signals import _push_static_route_intent_for_device
+
+        mgmt = self._make_mgmt()
+        self._make_state(mgmt, status="apply_failed")
+
+        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent") as mock_push:
+            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+
+            mock_push.assert_called_once()
+            routes = mock_push.call_args[0][1]
+            assert len(routes) == 1
+            assert routes[0]["prefix"] == "10.0.0.0/8"
+
     def test_excludes_non_accepted_routes(self):
         """Routes with status=imported are excluded from the intent push."""
         from netbox_nso_plugin.signals import _push_static_route_intent_for_device

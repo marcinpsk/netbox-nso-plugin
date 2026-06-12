@@ -93,8 +93,9 @@ OVERLAYS_WITHOUT_DRIFT_STATE: frozenset[str] = frozenset(
 )
 
 #: Owned (operator-claimed) statuses a reconcile must never clobber back to
-#: ``imported``. Mirrors ``models._VLAN_WRITE_PATH_STATUSES`` — kept here as the
-#: canonical definition the reconcilers should converge on.
+#: ``imported``. The canonical definition: the intent-mirror pushes in ``signals``
+#: filter by it too (as ``_OWNED_PUSH_STATUSES``), so apply_failed intent survives
+#: a re-push instead of being dropped by the adapter's full-replace.
 OWNED_STATES: frozenset[str] = frozenset({ACCEPTED, DEPLOYING, IN_SYNC, APPLY_FAILED})
 
 # --- Events -----------------------------------------------------------------
@@ -305,9 +306,8 @@ def advance(current: str, event: str, *, to: str | None = None) -> str:
 def is_owned(status: str) -> bool:
     """Return True if the operator has claimed the row (accepted/deploying/in_sync).
 
-    Single definition of "owned" — replaces the per-reconciler
-    ``_VLAN_WRITE_PATH_STATUSES`` copies. A reconcile must never clobber an owned
-    row back to an unowned state.
+    Single definition of "owned" — replaces the per-reconciler status-set copies.
+    A reconcile must never clobber an owned row back to an unowned state.
     """
     return status in OWNED_STATES
 
