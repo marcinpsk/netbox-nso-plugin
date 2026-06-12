@@ -44,7 +44,7 @@ class NSOInterfaceStateViewSet(NetBoxModelViewSet):
     """REST API for NSOInterfaceState — per-interface intent status overlay.
 
     The adapter's scope reconciler also reads this to mirror intent (decision L).
-    Endpoint: /api/plugins/netbox-nso-plugin/interface-state/
+    Endpoint: /api/plugins/nso/interface-state/
     """
 
     queryset = NSOInterfaceState.objects.select_related("interface")
@@ -54,7 +54,7 @@ class NSOInterfaceStateViewSet(NetBoxModelViewSet):
 class OnboardingCandidatesView(APIView):
     """CICD-facing read of onboarding state for an NSO instance.
 
-    ``GET /api/plugins/netbox-nso-plugin/onboarding-candidates/?instance=<id>``
+    ``GET /api/plugins/nso/onboarding-candidates/?instance=<id>``
     returns the same three buckets as the dashboard (onboarded / candidates /
     orphans) as JSON, so a pipeline can discover which staged devices are ready to
     onboard. ``instance`` defaults to the default NSO instance.
@@ -112,7 +112,7 @@ class OnboardingCandidatesView(APIView):
 class OnboardView(APIView):
     """CICD-facing onboard action.
 
-    ``POST /api/plugins/netbox-nso-plugin/onboard/`` body:
+    ``POST /api/plugins/nso/onboard/`` body:
     ``{"netbox_device_id": <int>, "instance": "<adapter_instance_id>"?}``.
     Provisions the device into NSO (create node → fetch-host-keys → unlock →
     sync-from) and creates the management row. Returns the step-by-step result;
@@ -159,7 +159,7 @@ class SyncCompleteView(APIView):
     deduped background reconcile and returns 202 immediately so the adapter never
     waits on the reconcile.
 
-    Endpoint: ``POST /api/plugins/netbox-nso-plugin/sync-complete/``
+    Endpoint: ``POST /api/plugins/nso/sync-complete/``
     Body: ``{"netbox_device_id": <int>}`` (or ``{"adapter_device_id": <int>}``).
     """
 

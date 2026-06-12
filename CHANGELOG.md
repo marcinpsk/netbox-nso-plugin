@@ -7,4 +7,4 @@
 - `adapter_client.py` — thin wrapper over the nso-adapter REST API.
 - Device "NSO" tab template extension.
 - Interface NSO compliance badge.
-- REST API at `/api/plugins/netbox-nso-plugin/device-management/`.
+- REST API at `/api/plugins/nso/device-management/`.

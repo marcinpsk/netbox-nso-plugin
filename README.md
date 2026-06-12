@@ -7,7 +7,7 @@ NetBox 4.6 plugin that integrates NetBox with Cisco NSO via the **nso-adapter** 
 - Mark NetBox devices as NSO-managed and choose which attributes to sync (`description`, `enabled`).
 - Trigger adapter actions: **Sync**, **Check compliance**, **Test connection**.
 - Display per-interface compliance status in the Device detail "NSO" tab.
-- Exposes `NSODeviceManagement` at `/api/plugins/netbox-nso-plugin/device-management/` for the adapter's self-healing reconcile path.
+- Exposes `NSODeviceManagement` at `/api/plugins/nso/device-management/` for the adapter's self-healing reconcile path.
 
 ## Requirements
 
