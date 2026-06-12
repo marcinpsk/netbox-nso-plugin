@@ -88,7 +88,69 @@ class TestRoutePolicyEntrySerialization(_RPBase):
         rm = RouteMap.objects.create(name="TESTNSO-RM")
         RouteMapEntry.objects.create(route_map=rm, sequence=10, action="permit", match={"x": 1}, set={"y": 2})
         entries = _build_route_policy_entries("route_map", rm)
-        assert entries == [{"sequence": 10, "action": "permit", "match": {"x": 1}, "set": {"y": 2}}]
+        assert entries == [
+            {
+                "sequence": 10,
+                "action": "permit",
+                "match-prefix-lists": [],
+                "match-community-lists": [],
+                "match-as-paths": [],
+                "match-json": '{"x": 1}',
+                "set-json": '{"y": 2}',
+            }
+        ]
+
+    def test_route_map_entry_body_serializes_match_refs_and_json(self):
+        """The intent body must carry the M2M match refs + match/set JSON — a route-map
+        with a prefix-list match, from/to-protocol and next-hop self (PCE-BGP-EXPORT
+        shape) must not push a hollow body."""
+        import json
+
+        from netbox_routing.models import RouteMap, RouteMapEntry
+
+        from netbox_nso_plugin.signals import _build_route_policy_entries
+
+        rm = RouteMap.objects.create(name="TESTNSO-PCE-EXPORT")
+        pl = self._prefix_list(name="TESTNSO-PCE-EXPORT-PL")
+        e1 = RouteMapEntry.objects.create(
+            route_map=rm,
+            sequence=10,
+            action="permit",
+            match={"protocol": ["direct", "static", "bgp"], "to_protocol": ["bgp"]},
+            set={"next_hop_self": True},
+        )
+        e1.match_prefix_list.add(pl)
+        RouteMapEntry.objects.create(route_map=rm, sequence=20, action="deny")
+
+        entries = _build_route_policy_entries("route_map", rm)
+        assert entries[0]["match-prefix-lists"] == ["TESTNSO-PCE-EXPORT-PL"]
+        assert json.loads(entries[0]["match-json"]) == {
+            "protocol": ["direct", "static", "bgp"],
+            "to_protocol": ["bgp"],
+        }
+        assert json.loads(entries[0]["set-json"]) == {"next_hop_self": True}
+        assert entries[1] == {
+            "sequence": 20,
+            "action": "deny",
+            "match-prefix-lists": [],
+            "match-community-lists": [],
+            "match-as-paths": [],
+            "match-json": "{}",
+            "set-json": "{}",
+        }
+
+    def test_route_map_entry_flow_control_reinjected_into_set_json(self):
+        """flow_control is lifted out of set-json on read — the write path puts it back."""
+        import json
+
+        from netbox_routing.models import RouteMap, RouteMapEntry
+
+        from netbox_nso_plugin.signals import _build_route_policy_entries
+
+        rm = RouteMap.objects.create(name="TESTNSO-RM-FC")
+        RouteMapEntry.objects.create(route_map=rm, sequence=10, action="permit", flow_control=20)
+        entries = _build_route_policy_entries("route_map", rm)
+        assert json.loads(entries[0]["set-json"]) == {"flow_control": 20}
 
 
 class TestRoutePolicyDeletePropagation(_RPBase):

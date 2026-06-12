@@ -1868,18 +1868,46 @@ def _build_route_policy_entries(family, obj):
         ]
     if family == "route_map":
         # netbox-routing: RouteMap → route_map_entries (RouteMapEntry: sequence/action +
-        # match/set JSON blobs).
+        # M2M match refs + match/set JSON blobs). Entry keys are the YANG leaf names of
+        # route-policy-reconciler — the adapter passes them verbatim into the service
+        # payload (m17-route-policy-contract.md §2).
         entries = []
         for e in obj.route_map_entries.all().order_by("sequence"):
+            match_data = _as_json_dict(e.match)
+            set_data = _as_json_dict(e.set)
+            if e.flow_control is not None and "flow_control" not in set_data:
+                # the read path lifts flow_control out of set-json into the model
+                # field — put it back so the round-trip stays symmetric
+                set_data["flow_control"] = e.flow_control
+            community_names = list(e.match_community_list.values_list("name", flat=True))
+            for nm in e.match_extended_community_list.values_list("name", flat=True):
+                if nm not in community_names:
+                    community_names.append(nm)
             entry: dict = {
                 "sequence": e.sequence,
                 "action": e.action.lower() if e.action else "permit",
-                "match": e.match or "{}",
-                "set": e.set or "{}",
+                "match-prefix-lists": list(e.match_prefix_list.values_list("name", flat=True)),
+                "match-community-lists": community_names,
+                "match-as-paths": list(e.match_aspath.values_list("name", flat=True)),
+                "match-json": json.dumps(match_data, sort_keys=True),
+                "set-json": json.dumps(set_data, sort_keys=True),
             }
             entries.append(entry)
         return entries
     return []
+
+
+def _as_json_dict(value):
+    """Coerce a JSONField value (dict, JSON string, or None) into a dict."""
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str) and value:
+        try:
+            data = json.loads(value)
+        except ValueError:
+            return {}
+        return data if isinstance(data, dict) else {}
+    return {}
 
 
 @_skip_on_render
