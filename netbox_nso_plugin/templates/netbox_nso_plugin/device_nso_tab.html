@@ -24,9 +24,9 @@
       <span class="mdi mdi-sync-alert me-2 mt-1"></span>
       <div class="flex-grow-1">
         <strong>Adapter holds intent NetBox no longer owns.</strong>
-        The adapter would push this on a device-wide apply, but NetBox shows nothing pending
-        for it (an adapter↔NetBox split-brain). Re-sync drops the stale intent; it does
-        <em>not</em> touch the device.
+        The adapter would push this on a device-wide apply, but NetBox owns fewer rows than
+        the adapter holds (an adapter↔NetBox split-brain). Re-sync drops the stale intent;
+        it does <em>not</em> touch the device.
         <ul class="mb-2 mt-1">
           {% for d in intent_drift %}
             <li>

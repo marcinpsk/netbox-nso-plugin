@@ -51,6 +51,7 @@ def _scopes() -> list[dict]:
         NSOBFDInterfaceState,
         NSOBGPPeerState,
         NSOInterfaceIPState,
+        NSOInterfaceMtuState,
         NSOInterfaceState,
         NSOISISFlexAlgoState,
         NSOISISInstanceState,
@@ -133,6 +134,13 @@ def _scopes() -> list[dict]:
             "tables": ["interface_ip_intent"],
             "owned": lambda d: _owned_count(NSOInterfaceIPState, d, via="interface__device"),
             "push": signals._push_ip_intent_for_device,
+        },
+        {
+            "key": "interface_mtu",
+            "label": "Interface MTU",
+            "tables": ["interface_mtu_intent"],
+            "owned": lambda d: _owned_count(NSOInterfaceMtuState, d),
+            "push": signals._push_interface_mtu_intent_for_device,
         },
         {
             "key": "interface",

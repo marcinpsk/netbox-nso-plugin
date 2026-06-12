@@ -19,8 +19,10 @@ from netbox_nso_plugin.models import (
     NSOInterfaceState,
 )
 
+from .mixins import IntentPushResetMixin
 
-class TestIntentDrift(TestCase):
+
+class TestIntentDrift(IntentPushResetMixin, TestCase):
     @classmethod
     def setUpTestData(cls):
         mfg = Manufacturer.objects.create(name="DriftMfg", slug="driftmfg")
@@ -113,6 +115,16 @@ class TestIntentDrift(TestCase):
         state.save()
         drift = intent_drift.compute_intent_drift(self.device, self.mgmt)
         self.assertIn("interface", {d["key"] for d in drift})
+
+    @patch("netbox_nso_plugin.adapter_client.get_intent_summary")
+    def test_interface_mtu_scope_registered(self, mock_sum):
+        # interface_mtu_intent was missing from the registry — orphaned MTU intent was
+        # invisible. Pin the scope so it can't fall out again.
+        mock_sum.return_value = {"scopes": {"interface_mtu_intent": {"count": 2, "applied": 0, "failed": 0}}}
+        drift = intent_drift.compute_intent_drift(self.device, self.mgmt)
+        entry = next(d for d in drift if d["key"] == "interface_mtu")
+        self.assertEqual(entry["count"], 2)
+        self.assertFalse(entry["partial"])
 
     @patch("netbox_nso_plugin.adapter_client.get_intent_summary")
     def test_empty_summary_no_drift(self, mock_sum):
