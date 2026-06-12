@@ -2080,6 +2080,54 @@ def _on_routing_ospf_interface_save(sender, instance, **kwargs):
     _accept_ospf_interface(instance)
 
 
+_OWNED_ISIS = ("accepted", "deploying", "in_sync", "apply_failed")
+
+
+def _accept_isis_interface(isis_iface) -> None:
+    """Own a greenfield IS-IS interface (operator-edited ISISInterface → accepted overlay → push).
+
+    Mirrors _accept_ospf_interface: copies the operator's metric / network-type /
+    circuit-type / passive from the netbox_routing.ISISInterface into the
+    NSOISISInterfaceState overlay (keyed by interface + address-family) and marks it
+    owned so _on_isis_interface_state_save pushes. Greenfield-only: a pre-existing
+    unowned (brownfield) overlay is left to the 3-way reconcile.
+    """
+    from .models import NSODeviceManagement, NSOISISInterfaceState
+
+    iface = isis_iface.interface
+    af = isis_iface.address_family
+    if not af:
+        return
+    try:
+        mgmt = NSODeviceManagement.objects.get(device=iface.device)
+    except NSODeviceManagement.DoesNotExist:
+        return
+    if mgmt.adapter_device_id is None:
+        return
+    state, created = NSOISISInterfaceState.objects.get_or_create(
+        management=mgmt,
+        interface=iface,
+        af=af,
+        defaults={"status": "accepted", "accepted_at": timezone.now()},
+    )
+    if not created and state.status not in _OWNED_ISIS:
+        return
+    state.process_tag = isis_iface.instance.process_tag if isis_iface.instance else ""
+    state.circuit_type = isis_iface.circuit_type or ""
+    state.network_type = isis_iface.network_type or ""
+    state.metric = isis_iface.metric
+    state.passive = bool(isis_iface.passive)
+    state.isis_interface = isis_iface
+    state.last_sync_at = timezone.now()
+    state.save()  # → _on_isis_interface_state_save schedules the push
+
+
+@_skip_on_render
+def _on_routing_isis_interface_save(sender, instance, **kwargs):
+    """netbox_routing ISISInterface created/edited → own + push."""
+    _accept_isis_interface(instance)
+
+
 @_skip_on_render
 def _on_routing_ospf_instance_pre_delete(sender, instance, **kwargs):
     """Operator deletes an OSPF process → drop its overlay + push the removal."""
@@ -2452,3 +2500,16 @@ def _connect_g_activated():  # pragma: no cover
         )
     except ImportError:
         logger.debug("netbox_routing not installed — flex-algo greenfield signals not registered")
+
+    # netbox_routing.ISISInterface greenfield write path (operator-edited metric /
+    # network-type / circuit-type → owned overlay → push), parity with OSPF.
+    try:
+        from netbox_routing.models import ISISInterface
+
+        post_save.connect(
+            _on_routing_isis_interface_save,
+            sender=ISISInterface,
+            dispatch_uid="nso_plugin_routing_isis_interface_post_save",
+        )
+    except ImportError:
+        logger.debug("netbox_routing not installed — IS-IS interface greenfield signals not registered")

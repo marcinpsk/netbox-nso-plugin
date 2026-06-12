@@ -981,6 +981,21 @@ def _isis_interface_routing_fields(state, entry, ri, bfd_enabled):
     return rf
 
 
+def _isis_device_matches_intent(entry, state) -> bool:
+    """Return True when the device (adapter *entry*) has caught up to the owned overlay intent.
+
+    Used for owned IS-IS rows where the clobber guard keeps the overlay == netbox-routing
+    object, so the normal overlay-vs-object match can't tell whether the *device* has the
+    change yet. Mirrors the OSPF device-vs-netbox status semantics.
+    """
+    return (
+        entry.get("metric") == state.metric
+        and (entry.get("network_type") or "") == (state.network_type or "")
+        and (entry.get("circuit_type") or "") == (state.circuit_type or "")
+        and bool(entry.get("passive", False)) == bool(state.passive)
+    )
+
+
 def _isis_interface_pass(state, entry, ri, bfd_enabled, *, write: bool) -> bool:
     """Compare (and, when ``write``, mirror) the device ISIS-interface graph onto *ri*."""
     fields: list[str] = []
@@ -1127,13 +1142,19 @@ def _reconcile_isis_interfaces(device, interfaces: list) -> list:
             af=af,
             defaults={"status": "unknown"},
         )
-        state.process_tag = entry.get("process_tag") or ""
-        state.circuit_type = entry.get("circuit_type") or ""
-        state.network_type = entry.get("network_type") or ""
-        state.metric = entry.get("metric")
-        state.passive = bool(entry.get("passive", False))
-        state.hello_auth_type = entry.get("hello_auth_type") or ""
-        state.hello_auth_present = bool(entry.get("hello_auth_present", False))
+        # Owned (operator-claimed) rows hold the intent we push — set by
+        # _accept_isis_interface and refreshed on every ISISInterface edit. A reconcile
+        # must NOT clobber them with the device's current values (a greenfield owned
+        # change isn't on the device yet, so the adapter reports metric/network-type as
+        # None and would wipe the intent). Mirror device values only into unowned rows.
+        if not sm.is_owned(state.status):
+            state.process_tag = entry.get("process_tag") or ""
+            state.circuit_type = entry.get("circuit_type") or ""
+            state.network_type = entry.get("network_type") or ""
+            state.metric = entry.get("metric")
+            state.passive = bool(entry.get("passive", False))
+            state.hello_auth_type = entry.get("hello_auth_type") or ""
+            state.hello_auth_present = bool(entry.get("hello_auth_present", False))
         state.last_sync_at = now
 
         # 3-way merge: device changes auto-mirror when the ISISInterface object is
@@ -1149,6 +1170,14 @@ def _reconcile_isis_interfaces(device, interfaces: list) -> list:
             base=state.device_base_hash,
         )
         state.device_base_hash = new_base
+        if sm.is_owned(state.status):
+            # Owned rows hold the intent we push; the clobber guard keeps the overlay
+            # equal to the netbox-routing object, so _isis_interface_pass would always
+            # "match" and prematurely settle in_sync before the change reaches the
+            # device (which would also drop the row from the Apply preview). Instead,
+            # gauge whether the DEVICE (entry) has caught up to the pushed intent —
+            # mirrors the OSPF device-vs-netbox semantics.
+            iface_matches = _isis_device_matches_intent(entry, state)
         state.status = sm.on_reconcile(state.status, matches=iface_matches)
         state.save()
         seen_keys.add((iface.pk, af))

@@ -173,6 +173,78 @@ class TestReconcileIsisInterfaces(TestCase):
         result = _reconcile_isis_interfaces(self.device, self._payload())
         self.assertEqual(result, [])
 
+    def test_greenfield_isis_interface_accept_owns_overlay(self):
+        """Operator-created ISISInterface → owned overlay carries the pushed metric/network-type."""
+        mgmt = self._make_mgmt()
+        from netbox_routing.models import ISISInstance, ISISInterface
+
+        from netbox_nso_plugin.models import NSOISISInterfaceState
+
+        inst = ISISInstance.objects.create(device=self.device, process_tag="")
+        ISISInterface.objects.create(
+            interface=self.iface_ge1,
+            address_family="ipv4",
+            instance=inst,
+            metric=77,
+            network_type="point-to-point",
+            circuit_type="level-2-only",
+        )
+        state = NSOISISInterfaceState.objects.get(management=mgmt, interface=self.iface_ge1, af="ipv4")
+        self.assertEqual(state.status, "accepted")
+        self.assertEqual(state.metric, 77)
+        self.assertEqual(state.network_type, "point-to-point")
+        self.assertEqual(state.circuit_type, "level-2-only")
+
+    def test_owned_overlay_metric_network_type_not_clobbered(self):
+        """A reconcile must not wipe an owned IS-IS row's pushed metric/network-type.
+
+        Greenfield parity with OSPF: operator set metric/network-type via the
+        ISISInterface, but the device hasn't applied them yet, so the adapter reports
+        them as None/''. The owned overlay must keep the intent (else the next re-push
+        would drop it from the adapter too)."""
+        mgmt = self._make_mgmt()
+        from netbox_routing.models import ISISInstance, ISISInterface
+
+        from netbox_nso_plugin.models import NSOISISInterfaceState
+
+        # Greenfield via the real signal path: creating the ISISInterface owns the
+        # overlay (status accepted) with the operator's metric/network-type — this also
+        # links the overlay so a later reconcile doesn't synthesise an empty object.
+        inst = ISISInstance.objects.create(device=self.device, process_tag="")
+        ISISInterface.objects.create(
+            interface=self.iface_ge0,
+            address_family="ipv4",
+            instance=inst,
+            metric=50,
+            network_type="point-to-point",
+            circuit_type="level-2-only",
+        )
+        state = NSOISISInterfaceState.objects.get(management=mgmt, interface=self.iface_ge0, af="ipv4")
+        self.assertEqual(state.status, "accepted")
+
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        _reconcile_isis_interfaces(
+            self.device,
+            self._payload(self._entry(metric=None, network_type="", circuit_type="level-1-2")),
+        )
+
+        state.refresh_from_db()
+        self.assertEqual(state.metric, 50)
+        self.assertEqual(state.network_type, "point-to-point")
+        self.assertEqual(state.circuit_type, "level-2-only")
+        # Device hasn't caught up to the intent → stays owned/pending (not premature in_sync).
+        self.assertEqual(state.status, "accepted")
+
+        # Once the device reports the pushed values, the owned row settles in_sync.
+        _reconcile_isis_interfaces(
+            self.device,
+            self._payload(self._entry(metric=50, network_type="point-to-point", circuit_type="level-2-only")),
+        )
+        state.refresh_from_db()
+        self.assertEqual(state.status, "in_sync")
+        self.assertEqual(state.metric, 50)
+
     def test_single_entry_creates_state_and_routing_interface(self):
         """New IS-IS entry → NSOISISInterfaceState linked to a netbox_routing.ISISInterface.
 
