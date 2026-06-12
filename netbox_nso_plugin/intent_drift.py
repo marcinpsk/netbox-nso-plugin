@@ -9,9 +9,14 @@ e.g. a migration reset the plugin overlays to ``imported`` while the adapter kep
 invisible in the UI yet would be pushed by a device-wide apply.
 
 This module surfaces it: for each registered scope, if the adapter holds intent but NetBox
-owns nothing in that scope, it is orphaned. ``resync_intent`` fixes it by re-pushing the
-scope's *current* owned intent — the adapter's full-replace PUT then drops the orphaned rows
-(empty push → all removed). It can only ever remove intent NetBox doesn't own.
+owns nothing in that scope, it is orphaned. For scopes with count *parity* (one owned overlay
+row ↔ one adapter intent row; all scopes except BGP, where one router intent row covers N
+owned peers), an adapter count *exceeding* the owned count is flagged as **partial**
+split-brain — stale rows hiding behind legitimate ownership. ``resync_intent`` fixes both by
+re-pushing the scope's *current* owned intent — the adapter's full-replace PUT then drops the
+surplus rows (empty push → all removed). It can only ever remove intent NetBox doesn't own.
+
+Design + per-scope parity audit: nso-adapter ``docs/intent-split-brain-design.md``.
 """
 
 from __future__ import annotations
@@ -33,6 +38,13 @@ def _scopes() -> list[dict]:
     Covers the routing + interface families where the split-brain has been observed (the
     migration-reset overlays). Extend by appending an entry; the detector + re-sync pick it
     up automatically.
+
+    ``parity`` (default True) declares that one owned overlay row corresponds to exactly one
+    adapter intent row in a healthy state, enabling partial-drift detection (adapter count >
+    owned count). Set it False where that mapping is structurally not 1:1 (BGP: one
+    ``bgp_router_intent`` row covers N owned peers) — such scopes fall back to the
+    orphan-only rule. Push-time row *skips* (dangling FKs, missing vault refs) only ever make
+    the adapter hold FEWER rows than NetBox owns, which the partial rule ignores by design.
     """
     from . import signals
     from .models import (
@@ -90,6 +102,9 @@ def _scopes() -> list[dict]:
             "tables": ["bgp_router_intent"],
             "owned": lambda d: _owned_count(NSOBGPPeerState, d),
             "push": signals._push_bgp_intent_for_device,
+            # One router intent row covers N owned peer rows — counts can never be
+            # compared 1:1, so this scope only gets the orphan (owned == 0) rule.
+            "parity": False,
         },
         {
             "key": "ospf",
@@ -123,7 +138,11 @@ def _scopes() -> list[dict]:
             "key": "interface",
             "label": "Interface attributes",
             "tables": ["interface_intent"],
-            "owned": lambda d: _owned_count(NSOInterfaceState, d, via="interface__device"),
+            # 2-D model: ownership marker is accepted_at, independent of sync status (an
+            # owned attribute can sit at status "changed" while drifted). Mirror the push
+            # predicate in _push_interface_intent_for_device exactly, or owned rows in
+            # drift would read as orphaned/partial.
+            "owned": lambda d: NSOInterfaceState.objects.filter(interface__device=d, accepted_at__isnull=False).count(),
             "push": signals._push_interface_intent_for_device,
         },
         {
@@ -184,10 +203,17 @@ def _scopes() -> list[dict]:
 
 
 def compute_intent_drift(device, mgmt) -> list[dict]:
-    """Return orphaned-intent scopes for *device*: adapter holds intent, NetBox owns none.
+    """Return drifted-intent scopes for *device*.
+
+    Two flavours, distinguished by the ``partial`` flag on each entry:
+
+    - **orphaned** (``partial: False``) — adapter holds intent, NetBox owns nothing in the
+      scope;
+    - **partial** (``partial: True``) — for parity scopes only: the adapter holds *more*
+      rows than NetBox owns, so the surplus is stale even though the scope looks healthy.
 
     One cheap adapter call (GET intent-summary). Returns ``[]`` on any adapter error or when
-    nothing is orphaned, so the caller renders nothing.
+    nothing is drifted, so the caller renders nothing.
     """
     if mgmt is None or mgmt.adapter_device_id is None:
         return []
@@ -205,13 +231,16 @@ def compute_intent_drift(device, mgmt) -> list[dict]:
         count = sum(scopes_intent.get(t, {}).get("count", 0) for t in sc["tables"])
         if count == 0:
             continue
-        if sc["owned"](device) > 0:
-            continue  # NetBox owns intent in this scope → adapter rows are legit, not orphaned
+        owned = sc["owned"](device)
+        if owned > 0 and not (sc.get("parity", True) and count > owned):
+            continue  # NetBox owns enough in this scope → adapter rows are legit
         drift.append(
             {
                 "key": sc["key"],
                 "label": sc["label"],
                 "count": count,
+                "owned": owned,
+                "partial": owned > 0,
                 "applied": sum(scopes_intent.get(t, {}).get("applied", 0) for t in sc["tables"]),
                 "failed": sum(scopes_intent.get(t, {}).get("failed", 0) for t in sc["tables"]),
             }
@@ -220,7 +249,7 @@ def compute_intent_drift(device, mgmt) -> list[dict]:
 
 
 def resync_intent(device, mgmt, keys: list[str] | None = None) -> list[str]:
-    """Re-push the owned intent for *keys* (default: all orphaned scopes) → clears orphans.
+    """Re-push the owned intent for *keys* (default: all orphaned/partial scopes) → clears them.
 
     Returns the scope keys re-synced. The push is the plugin's normal full-snapshot push, so
     for a scope NetBox owns nothing in, it sends an empty snapshot and the adapter full-replace

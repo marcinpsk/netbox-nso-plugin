@@ -1277,6 +1277,38 @@ class TestDeviceNSOTabView(ViewTestBase):
         ):
             mocks[name].assert_not_called()
 
+    def test_tab_renders_partial_split_brain_banner(self):
+        """Partial drift (adapter holds more rows than NetBox owns) renders the banner
+        with both counts + the partial badge + the re-sync form."""
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+        mgmt.adapter_device_id = 15
+        mgmt.save(update_fields=["adapter_device_id"])
+        for i in (1, 2):
+            NSOInterfaceIPState.objects.create(
+                interface=self.interface, address=f"10.9.9.{i}/32", vrf="", family="ipv4", status="in_sync"
+            )
+
+        stack, _mocks = self._patch_all_getters()
+        with stack:
+            with patch(
+                "netbox_nso_plugin.adapter_client.get_intent_summary",
+                return_value={"scopes": {"interface_ip_intent": {"count": 3, "applied": 0, "failed": 0}}},
+            ):
+                url = reverse("dcim:device_nso", kwargs={"pk": self.device.pk})
+                response = self.client.get(url)
+
+        mgmt.adapter_device_id = None
+        mgmt.save(update_fields=["adapter_device_id"])
+
+        self.assertEqual(response.status_code, 200)
+        html = response.content.decode()
+        self.assertIn("Adapter holds intent NetBox no longer owns", html)
+        self.assertIn("NetBox owns 2", html)
+        self.assertIn(">partial<", html)
+        self.assertIn("Re-sync adapter intent", html)
+
     def test_tab_render_is_counts_only_no_scoped_fetches(self):
         """The tab RENDER fetches no per-scope adapter data — only get_device for the
         banner. Counts come from persisted NSO*State; rows (and their adapter fetches)

@@ -18,19 +18,25 @@
     </div>
   {% endif %}
 
-  {# ── Adapter intent drift (split-brain) — renders ONLY when there is orphaned intent ── #}
+  {# ── Adapter intent drift (split-brain) — renders ONLY when there is stale intent ── #}
   {% if intent_drift %}
     <div class="alert alert-warning d-flex align-items-start mb-3" role="alert">
       <span class="mdi mdi-sync-alert me-2 mt-1"></span>
       <div class="flex-grow-1">
         <strong>Adapter holds intent NetBox no longer owns.</strong>
         The adapter would push this on a device-wide apply, but NetBox shows nothing pending
-        for it (an adapter↔NetBox split-brain). Re-sync drops the orphaned intent; it does
+        for it (an adapter↔NetBox split-brain). Re-sync drops the stale intent; it does
         <em>not</em> touch the device.
         <ul class="mb-2 mt-1">
           {% for d in intent_drift %}
             <li>
-              <strong>{{ d.label }}</strong> — {{ d.count }} intent row{{ d.count|pluralize }}
+              <strong>{{ d.label }}</strong> —
+              {% if d.partial %}
+                {{ d.count }} intent row{{ d.count|pluralize }}, NetBox owns {{ d.owned }}
+                <span class="badge text-bg-warning text-dark ms-1">partial</span>
+              {% else %}
+                {{ d.count }} intent row{{ d.count|pluralize }}
+              {% endif %}
               {% if d.failed %}<span class="badge text-bg-danger ms-1">{{ d.failed }} apply-failed</span>
               {% elif d.applied %}<span class="badge text-bg-info ms-1">{{ d.applied }} applied</span>
               {% else %}<span class="badge text-bg-warning text-dark ms-1">never applied</span>{% endif %}
