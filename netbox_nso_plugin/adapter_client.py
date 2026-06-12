@@ -231,6 +231,11 @@ def get_subinterface(adapter_device_id: int) -> dict:
     return _request("GET", f"/api/v1/devices/{adapter_device_id}/subinterface")
 
 
+def get_interface_mtu(adapter_device_id: int) -> dict:
+    """GET /api/v1/devices/{id}/interface-mtu — per-interface MTU (Phase 2b)."""
+    return _request("GET", f"/api/v1/devices/{adapter_device_id}/interface-mtu")
+
+
 def put_bfd_intent(adapter_device_id, interfaces):
     """PUT /api/v1/devices/{id}/bfd-intent — push full per-interface BFD intent.
 

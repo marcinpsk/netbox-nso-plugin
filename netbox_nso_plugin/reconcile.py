@@ -250,6 +250,18 @@ def reconcile_device(device, mgmt=None) -> dict:
                 device,
                 client.get_subinterface(dev_id),
             )
+            # Phase 2b: per-interface MTU read mirror (read-only display).
+            from .interface_mtu_reconciler import reconcile_interface_mtu
+
+            _safe_reconcile(
+                ctx,
+                "interface_mtu_states",
+                mgmt,
+                ("NSOInterfaceMtuState",),
+                reconcile_interface_mtu,
+                device,
+                client.get_interface_mtu(dev_id),
+            )
             # Import interface IP addresses onto their (now first-class, logical-named)
             # NetBox interfaces. Runs AFTER the adapter sync created the interfaces;
             # gated internally by interface_ip_auto_create (off → lands as pending).
@@ -389,6 +401,10 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
             from .subinterface_reconciler import reconcile_subinterface
 
             ctx["subinterface_states"] = reconcile_subinterface(device, client.get_subinterface(dev_id))
+        elif key == "interface_mtu":
+            from .interface_mtu_reconciler import reconcile_interface_mtu
+
+            ctx["interface_mtu_states"] = reconcile_interface_mtu(device, client.get_interface_mtu(dev_id))
         elif key == "snmp":
             ctx["snmp_data"] = _reconcile_snmp_config(device, client.get_snmp_config(dev_id))
         elif key == "logging":

@@ -1,0 +1,33 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Lazy-loaded fragment: per-interface MTU (Phase 2b, read-only mirror). #}
+{% include "netbox_nso_plugin/categories/_adapter_error.html" %}
+
+{% if interface_mtu_states %}
+  <p class="text-muted small mb-2">Per-interface MTU read from the device (only explicitly-configured values are shown). The native L2 MTU is mirrored here for review; it is not yet written to the NetBox interface. Nokia router interfaces show the bound port that carries the L2 MTU.</p>
+  <div id="flt-ifmtu">
+  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-ifmtu" placeholder="Filter by interface / bound port…" show_status=True %}
+  <div class="table-responsive">
+    <table class="table table-sm table-hover mb-0">
+      <thead>
+        <tr><th>Interface</th><th>L2 MTU</th><th>IP MTU</th><th>MPLS MTU</th><th>Bound Port</th><th>Status</th><th>Last Synced</th></tr>
+      </thead>
+      <tbody>
+        {% for s in interface_mtu_states %}
+        <tr data-status="{{ s.status }}" data-owned="{{ s.accepted_at|yesno:'true,false' }}">
+          <td><a href="{{ s.interface.get_absolute_url }}">{{ s.interface.name }}</a></td>
+          <td>{{ s.l2_mtu|default:"—" }}</td>
+          <td>{{ s.ip_mtu|default:"—" }}</td>
+          <td>{{ s.mpls_mtu|default:"—" }}</td>
+          <td>{{ s.bound_port|default:"—" }}</td>
+          <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=s.status %}</td>
+          <td>{{ s.last_sync_at|default:"—" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  </div>
+{% else %}
+  <p class="text-muted mb-0">No interface MTU reported for this device.</p>
+{% endif %}

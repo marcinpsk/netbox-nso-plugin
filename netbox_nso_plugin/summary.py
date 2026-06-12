@@ -130,6 +130,7 @@ _CATEGORIES = [
     ("switchport", "Switchports", "ethernet-cable", "manage_interfaces"),
     ("svi", "SVIs / IRBs", "ip-network", "manage_interfaces"),
     ("subinterface", "Subinterfaces", "vector-difference", "manage_interfaces"),
+    ("interface_mtu", "Interface MTU", "ruler", "manage_interfaces"),
     ("static", "Static Routes", "sign-direction", "manage_static"),
     ("isis", "IS-IS", "lan", "manage_isis"),
     ("ospf", "OSPF", "lan", "manage_ospf"),
@@ -285,6 +286,10 @@ def _category_counts(key: str, device, mgmt) -> dict:  # noqa: C901
         from .models import NSOSubinterfaceState
 
         return _status_breakdown(NSOSubinterfaceState.objects.filter(management=mgmt))
+    if key == "interface_mtu":
+        from .models import NSOInterfaceMtuState
+
+        return _status_breakdown(NSOInterfaceMtuState.objects.filter(management=mgmt))
     return {"total": 0}
 
 

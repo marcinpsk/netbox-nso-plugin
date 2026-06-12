@@ -231,6 +231,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
         "switchport": "netbox_nso_plugin/categories/switchport.html",
         "svi": "netbox_nso_plugin/categories/svi.html",
         "subinterface": "netbox_nso_plugin/categories/subinterface.html",
+        "interface_mtu": "netbox_nso_plugin/categories/interface_mtu.html",
         "static": "netbox_nso_plugin/categories/static.html",
         "isis": "netbox_nso_plugin/categories/isis.html",
         "ospf": "netbox_nso_plugin/categories/ospf.html",

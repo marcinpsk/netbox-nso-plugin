@@ -1702,6 +1702,57 @@ class NSOSubinterfaceState(NetBoxModel):
         return reverse("dcim:device_nso", kwargs={"pk": self.management.device_id})
 
 
+class NSOInterfaceMtuState(NetBoxModel):
+    """Per-interface MTU compliance overlay (Phase 2b — read path).
+
+    Mirrors the device's MTU surface for one ``dcim.Interface``: ``l2_mtu`` (the
+    native interface MTU; Cisco/Junos ``mtu`` / Nokia ``port ethernet mtu``),
+    ``ip_mtu`` and ``mpls_mtu``. Read-only display first — the native ``l2_mtu``
+    is NOT yet written to ``dcim.Interface.mtu`` (that is the accept/write slice).
+    Only explicitly-configured MTU surfaces (the export reads NO_DEFAULTS), so a
+    row exists only for interfaces that actually set an MTU. ``bound_port`` carries
+    the Nokia port↔router-interface binding for operator context.
+    """
+
+    management = models.ForeignKey(
+        to="NSODeviceManagement", on_delete=models.CASCADE, related_name="interface_mtu_states"
+    )
+    interface = models.ForeignKey(to="dcim.Interface", on_delete=models.CASCADE, related_name="nso_mtu_states")
+    l2_mtu = models.PositiveIntegerField(
+        null=True, blank=True, help_text="Native L2/physical MTU reported by the device."
+    )
+    ip_mtu = models.PositiveIntegerField(null=True, blank=True, help_text="IP MTU reported by the device.")
+    mpls_mtu = models.PositiveIntegerField(null=True, blank=True, help_text="MPLS MTU reported by the device.")
+    bound_port = models.CharField(
+        max_length=128,
+        blank=True,
+        default="",
+        help_text="Nokia physical/LAG port backing a router interface; empty otherwise.",
+    )
+    status = models.CharField(max_length=32, choices=_VLAN_STATUS_CHOICES, default="unknown")
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(
+        null=True, blank=True, help_text="When an operator accepted this MTU (NetBox owns it)."
+    )
+    last_apply_at = models.DateTimeField(null=True, blank=True)
+    last_apply_error = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["management", "interface"]
+        unique_together = [("management", "interface")]
+        verbose_name = "NSO Interface MTU State"
+        verbose_name_plural = "NSO Interface MTU States"
+
+    def __str__(self):
+        return f"{self.management} / mtu:{self.interface} [{self.status}]"
+
+    def get_absolute_url(self):
+        """Return the device NSO tab URL (the overlay has no standalone detail view)."""
+        from django.urls import reverse
+
+        return reverse("dcim:device_nso", kwargs={"pk": self.management.device_id})
+
+
 class NSOBFDInterfaceState(NetBoxModel):
     """Per-interface BFD compliance overlay (write path).
 
