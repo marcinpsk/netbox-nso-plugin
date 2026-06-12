@@ -8,6 +8,16 @@
 {% include "netbox_nso_plugin/categories/_adapter_error.html" %}
 {% url 'dcim:device_nso' pk=object.pk as return_url %}
 
+<style>
+.nso-ifm-table .nso-cell { display: inline-flex; align-items: center; gap: .4rem; }
+.nso-ifm-table .nso-val { white-space: nowrap; }
+.nso-ifm-table td.c-desc .nso-val { white-space: normal; }
+.nso-ifm-table td.c-desc { min-width: 200px; max-width: 380px; }
+.nso-ifm-table .nso-cell form { display: inline; margin: 0; }
+.nso-ifm-table > tbody > tr > td, .nso-ifm-table > thead > tr > th { padding: .45rem .6rem; }
+.nso-ifm-cols .btn:not(.active) { opacity: .45; }
+</style>
+
 <div class="nso-ifm-pager"
      data-url="{% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='interface' %}"
      data-q="{{ q }}" data-page="{{ page.number }}">
@@ -30,13 +40,13 @@
 
   {% if rows %}
   <div class="table-responsive mb-2">
-    <table class="table table-sm table-hover mb-0 nso-ifm-table">
+    <table class="table table-sm table-hover align-middle mb-0 nso-ifm-table">
       <thead>
         <tr>
           <th>Interface</th>
           <th class="c-enabled">Enabled</th>
           <th class="c-desc">Description</th>
-          <th class="c-mtu">MTU (L2 / IP / MPLS)</th>
+          <th class="c-mtu text-nowrap">MTU <span class="text-muted fw-normal">L2 / IP / MPLS</span></th>
           <th class="c-ip">IPs</th>
           <th class="c-sw">Switchport</th>
         </tr>
@@ -44,52 +54,41 @@
       <tbody>
         {% for r in rows %}
         <tr>
-          <td><a href="{{ r.iface.get_absolute_url }}">{{ r.iface.name }}</a></td>
+          <td class="text-nowrap"><a href="{{ r.iface.get_absolute_url }}">{{ r.iface.name }}</a></td>
 
           {# ── Enabled ─────────────────────────────────────────────── #}
           <td class="c-enabled">
             {% if r.enabled %}
-              {{ r.enabled.nso_value|default:"—" }}
-              {% include "netbox_nso_plugin/categories/_state_badge.html" with status=r.enabled.status %}
-              {% url 'plugins:netbox_nso_plugin:nsointerfacestate_accept' pk=r.enabled.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=r.enabled.status form_class="nso-row-form d-inline" only %}
+              <span class="nso-cell"><span class="nso-val">{% if r.enabled.nso_value|lower == "true" %}<span class="mdi mdi-check-circle text-success"></span> Enabled{% elif r.enabled.nso_value|lower == "false" %}<span class="mdi mdi-minus-circle text-muted"></span> Disabled{% else %}{{ r.enabled.nso_value|default:"—" }}{% endif %}</span>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=r.enabled.status compact=True %}{% url 'plugins:netbox_nso_plugin:nsointerfacestate_accept' pk=r.enabled.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=r.enabled.status form_class="nso-row-form" icon_only=True only %}</span>
             {% else %}<span class="text-muted">—</span>{% endif %}
           </td>
 
           {# ── Description ─────────────────────────────────────────── #}
           <td class="c-desc">
             {% if r.description %}
-              {{ r.description.nso_value|default:"—" }}
-              {% include "netbox_nso_plugin/categories/_state_badge.html" with status=r.description.status %}
-              {% url 'plugins:netbox_nso_plugin:nsointerfacestate_accept' pk=r.description.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=r.description.status form_class="nso-row-form d-inline" only %}
+              <span class="nso-cell"><span class="nso-val">{{ r.description.nso_value|default:"—" }}</span>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=r.description.status compact=True %}{% url 'plugins:netbox_nso_plugin:nsointerfacestate_accept' pk=r.description.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=r.description.status form_class="nso-row-form" icon_only=True only %}</span>
             {% else %}<span class="text-muted">—</span>{% endif %}
           </td>
 
           {# ── MTU (L2 / IP / MPLS) ────────────────────────────────── #}
           <td class="c-mtu">
             {% if r.mtu %}
-              {{ r.mtu.l2_mtu|default:"—" }} / {{ r.mtu.ip_mtu|default:"—" }} / {{ r.mtu.mpls_mtu|default:"—" }}
-              {% include "netbox_nso_plugin/categories/_state_badge.html" with status=r.mtu.status %}
-              {% url 'plugins:netbox_nso_plugin:interface_mtu_accept' pk=r.mtu.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=r.mtu.status form_class="nso-row-form d-inline" only %}
-              {% if r.mtu.bound_port %}<span class="text-muted small d-block">port {{ r.mtu.bound_port }}</span>{% endif %}
+              <span class="nso-cell"><span class="nso-val font-monospace">{{ r.mtu.l2_mtu|default:"—" }} / {{ r.mtu.ip_mtu|default:"—" }} / {{ r.mtu.mpls_mtu|default:"—" }}</span>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=r.mtu.status compact=True %}{% url 'plugins:netbox_nso_plugin:interface_mtu_accept' pk=r.mtu.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=r.mtu.status form_class="nso-row-form" icon_only=True only %}</span>
+              {% if r.mtu.bound_port %}<div class="text-muted small">port {{ r.mtu.bound_port }}</div>{% endif %}
             {% else %}<span class="text-muted">—</span>{% endif %}
           </td>
 
           {# ── IPs (read-only) ─────────────────────────────────────── #}
           <td class="c-ip">
             {% for ip in r.ips %}
-              <div><code>{{ ip.address }}</code>{% if ip.secondary %} <span class="badge text-bg-secondary">sec</span>{% endif %}
-                {% include "netbox_nso_plugin/categories/_state_badge.html" with status=ip.status %}</div>
+              <span class="nso-cell"><code>{{ ip.address }}</code>{% if ip.secondary %}<span class="badge text-bg-secondary">sec</span>{% endif %}{% include "netbox_nso_plugin/categories/_state_badge.html" with status=ip.status compact=True %}</span>{% if not forloop.last %}<br>{% endif %}
             {% empty %}<span class="text-muted">—</span>{% endfor %}
           </td>
 
           {# ── Switchport ──────────────────────────────────────────── #}
           <td class="c-sw">
             {% if r.switchport %}
-              {% if r.switchport.mode %}<span class="badge text-bg-secondary">{{ r.switchport.mode }}</span>{% endif %}
-              {% if r.switchport.untagged_vlan %}u:{{ r.switchport.untagged_vlan.vid }}{% endif %}
-              {% with tagged=r.switchport.tagged_vlans.all %}{% if tagged %}t:{% for v in tagged %}{{ v.vid }}{% if not forloop.last %},{% endif %}{% endfor %}{% endif %}{% endwith %}
-              {% include "netbox_nso_plugin/categories/_state_badge.html" with status=r.switchport.status %}
-              {% url 'plugins:netbox_nso_plugin:switchport_accept' pk=r.switchport.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=r.switchport.status form_class="nso-row-form d-inline" only %}
+              <span class="nso-cell">{% if r.switchport.mode %}<span class="badge text-bg-secondary">{{ r.switchport.mode }}</span>{% endif %}<span class="nso-val">{% if r.switchport.untagged_vlan %}u:{{ r.switchport.untagged_vlan.vid }}{% endif %}{% with tagged=r.switchport.tagged_vlans.all %}{% if tagged %} t:{% for v in tagged %}{{ v.vid }}{% if not forloop.last %},{% endif %}{% endfor %}{% endif %}{% endwith %}</span>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=r.switchport.status compact=True %}{% url 'plugins:netbox_nso_plugin:switchport_accept' pk=r.switchport.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=r.switchport.status form_class="nso-row-form" icon_only=True only %}</span>
             {% else %}<span class="text-muted">—</span>{% endif %}
           </td>
         </tr>

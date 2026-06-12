@@ -9,7 +9,7 @@ changed/conflict = not-owned drift; drifted/accepted = owned -> pending apply.
 {% elif status == "drifted" or status == "accepted" %}<span class="badge text-bg-info">pending apply</span>
 {% elif status == "apply_failed" %}<span class="badge text-bg-danger">apply failed</span>
 {% elif status == "deploying" %}<span class="badge text-bg-primary">deploying</span>
-{% elif status == "in_sync" or status == "imported" %}<span class="badge text-bg-success">in sync</span>
+{% elif status == "in_sync" or status == "imported" %}{% if compact %}{% if status == "in_sync" %}<span class="mdi mdi-check-circle text-success" title="in sync (owned)"></span>{% endif %}{% else %}<span class="badge text-bg-success">in sync</span>{% endif %}
 {% elif status == "error" %}<span class="badge text-bg-danger">error</span>
 {% else %}<span class="badge text-bg-info">{{ status }}</span>{% endif %}
 {% if status == "in_sync" or status == "accepted" or status == "drifted" or status == "deploying" or status == "apply_failed" %}<span class="mdi mdi-shield-check text-success ms-1" title="NetBox is the source of truth (owned)"></span>{% endif %}
