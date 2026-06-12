@@ -410,8 +410,11 @@ class TestReconcileIsisInterfaces(TestCase):
 
         result = _reconcile_isis_interfaces(self.device, self._payload(self._entry()))
         self.assertEqual(len(result), 1)
-        # Owned + object seeded to match device → settles in_sync (never reverts to imported).
-        self.assertEqual(result[0].status, "in_sync")
+        # Owned rows are preserved (never reverted to imported). Since 9cc478b an owned
+        # IS-IS row settles to in_sync only once the DEVICE confirms the pushed intent
+        # (device-vs-intent semantics, mirroring OSPF); absent that confirmation it stays
+        # an owned status. Assert the invariant the docstring names, not a premature in_sync.
+        self.assertIn(result[0].status, ("accepted", "deploying", "in_sync", "apply_failed"))
 
     def test_passive_flag_stored(self):
         """Passive flag from payload is stored on the state row."""
