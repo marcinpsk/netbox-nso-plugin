@@ -1916,6 +1916,8 @@ def _push_ospf_intent_for_device(device_id, adapter_device_id):
         }
         if row.router_id:
             entry["router_id"] = row.router_id
+        if row.enabled is not None:
+            entry["enabled"] = row.enabled
         proc_redist = redist_by_proc.get(str(row.process_id), [])
         if proc_redist:
             entry["redistribution"] = proc_redist
@@ -2023,6 +2025,11 @@ def _accept_ospf_instance(ospf_instance) -> None:
     state.router_id = str(ospf_instance.router_id or "")
     state.vrf = ospf_instance.vrf.name if ospf_instance.vrf else ""
     state.ospf_instance = ospf_instance
+    # Greenfield default: an operator-created OSPF process is meant to be enabled —
+    # set the admin-state intent True (re-asserts Nokia SR OS 'admin-state enable',
+    # which a freshly-created instance lacks). Preserve an explicit prior value.
+    if state.enabled is None:
+        state.enabled = True
     # Instance-level area list (the timos apply binds areas per-interface, but other
     # NEDs surface the area set here) — collect distinct areas from bound interfaces.
     areas, seen = [], set()

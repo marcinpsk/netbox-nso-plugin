@@ -1658,6 +1658,11 @@ def _reconcile_ospf(device, payload: dict) -> dict:
         state.router_id = entry.get("router_id") or ""
         state.vrf = entry.get("vrf") or ""
         state.areas = entry.get("areas") or []
+        # Admin-state (Nokia 'admin-state enable'): mirror the device value into unowned
+        # rows; owned rows keep the operator intent (set by _accept_ospf_instance) so a
+        # reconcile before the enable reaches the device doesn't wipe it.
+        if not sm.is_owned(state.status):
+            state.enabled = entry.get("enabled")
         state.last_sync_at = now
         # 3-way merge: device router_id/vrf change auto-mirrors when the object is
         # untouched; an operator edit surfaces as 'changed' and survives; both → conflict.

@@ -83,6 +83,30 @@ class TestReconcileOspfFill(TestCase):
         self.assertEqual(str(inst.router_id), "10.0.0.1")
         self.assertEqual(inst.name, "10")
 
+    def test_instance_captures_admin_state(self):
+        """The OSPF instance overlay mirrors the device admin-state (Nokia 'enabled')."""
+        self._make_mgmt()
+        from netbox_nso_plugin.models import NSOOSPFInstanceState
+        from netbox_nso_plugin.template_content import _reconcile_ospf
+
+        inst = self._instance(process_id=1)
+        inst["enabled"] = True
+        _reconcile_ospf(self.device, self._payload([inst]))
+        state = NSOOSPFInstanceState.objects.get(process_id="1")
+        self.assertTrue(state.enabled)
+
+    def test_greenfield_ospf_instance_accept_defaults_enabled(self):
+        """An operator-created OSPFInstance owns the overlay with admin-state intent True."""
+        self._make_mgmt()
+        from netbox_routing.models import OSPFInstance
+
+        from netbox_nso_plugin.models import NSOOSPFInstanceState
+
+        OSPFInstance.objects.create(device=self.device, process_id=1, router_id="9.9.9.9", name="1")
+        state = NSOOSPFInstanceState.objects.get(management__device=self.device, process_id="1")
+        self.assertIn(state.status, ("accepted", "deploying", "in_sync", "apply_failed"))
+        self.assertTrue(state.enabled)
+
     def test_instance_overlay_in_sync_when_linked(self):
         self._make_mgmt()
         from netbox_nso_plugin.template_content import _reconcile_ospf

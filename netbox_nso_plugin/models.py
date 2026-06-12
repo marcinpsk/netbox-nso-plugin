@@ -1273,6 +1273,9 @@ class NSOOSPFInstanceState(_NSODeviceTabURLMixin, NetBoxModel):
     vrf = models.CharField(max_length=64, blank=True, default="")
     # areas stored as JSON: [{area_id, area_type}]
     areas = models.JSONField(default=list, blank=True)
+    # OSPF process admin-state (Nokia SR OS 'admin-state enable'); null when the NED
+    # has no explicit admin-state (process enabled by config presence).
+    enabled = models.BooleanField(null=True, blank=True)
     # Linked netbox-routing object (nullable — may not exist yet)
     ospf_instance = models.ForeignKey(
         to="netbox_routing.OSPFInstance",
