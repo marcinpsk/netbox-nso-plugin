@@ -104,12 +104,14 @@ class TestL2ServicesCategoryViewAndAccept(TestCase):
             "plugins:netbox_nso_plugin:device_nso_category",
             kwargs={"pk": self.device.pk, "key": "l2_services"},
         )
+        # Paged categories read last-synced state; ?refresh=1 forces a live reconcile
+        # (here driven by the mocked adapter) so the rows materialise on this request.
         with patch("netbox_nso_plugin.adapter_client.get_l2_services", return_value=_PAYLOAD):
-            resp = self.client.get(url)
+            resp = self.client.get(url, {"refresh": "1"})
         assert resp.status_code == 200
         html = resp.content.decode()
         assert "lag-60:3999" in html
-        assert "data-text-filter" in html  # shared state-pill filter present
+        assert "nso-cat-filter" in html  # server-side pager search box present
         assert "vpls" in html
 
     def test_accept_marks_owned(self):

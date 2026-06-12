@@ -1,40 +1,44 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
-{# Lazy-loaded fragment: Redistribution category. #}
-{% include "netbox_nso_plugin/categories/_adapter_error.html" %}
-{% if redistribution_states %}
-  <div class="d-flex justify-content-end mb-2">
-    {% url 'plugins:netbox_nso_plugin:routing_bulk_accept_redistribution' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned %}
+{# Lazy-loaded fragment: Redistribution category — paginated from last-synced state. #}
+<div class="nso-cat-pager"
+     data-url="{% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='redistribution' %}"
+     data-q="{{ q }}" data-page="{{ page.number }}">
+  <div class="nso-cat-results">
+    {% include "netbox_nso_plugin/categories/_adapter_error.html" %}
+    <div class="nso-cat-msg"></div>
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      {% include "netbox_nso_plugin/categories/_cat_search.html" with placeholder=placeholder q=q %}
+      {% url 'plugins:netbox_nso_plugin:routing_bulk_accept_redistribution' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned %}
+    </div>
+    {% if redistribution_states %}
+    <div class="table-responsive">
+      <table class="table table-sm table-hover mb-0">
+        <thead>
+          <tr><th>Dest Protocol</th><th>Dest Ref</th><th>Source Protocol</th><th>Source Ref</th><th>Route Map</th><th>Metric</th><th>Status</th><th>Last Synced</th><th></th></tr>
+        </thead>
+        <tbody>
+          {% for rs in redistribution_states %}
+          <tr data-status="{{ rs.status }}" data-owned="{{ rs.accepted_at|yesno:'true,false' }}">
+            <td>{{ rs.dest_protocol }}</td>
+            <td>{{ rs.dest_ref|default:"—" }}</td>
+            <td>{{ rs.source_protocol }}</td>
+            <td>{{ rs.source_ref|default:"—" }}</td>
+            <td>{{ rs.route_map|default:"—" }}</td>
+            <td>{{ rs.metric|default:"—" }}</td>
+            <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=rs.status %}</td>
+            <td>{{ rs.last_sync_at|default:"—" }}</td>
+            <td>
+              {% url 'plugins:netbox_nso_plugin:routing_accept_redistribution' pk=rs.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=rs.status form_class="nso-row-form" %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% include "netbox_nso_plugin/categories/_cat_pager.html" with page=page %}
+    {% else %}
+    <p class="text-muted mb-0">No redistribution{% if q %} matching “{{ q }}”{% endif %}.</p>
+    {% endif %}
   </div>
-  <div id="flt-redistribution">
-  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-redistribution" placeholder="Filter by protocol / ref / route-map…" show_status=True %}
-  <div class="table-responsive">
-    <table class="table table-sm table-hover mb-0">
-      <thead>
-        <tr><th>Dest Protocol</th><th>Dest Ref</th><th>Source Protocol</th><th>Source Ref</th><th>Route Map</th><th>Metric</th><th>Status</th><th>Last Synced</th><th></th></tr>
-      </thead>
-      <tbody>
-        {% for rs in redistribution_states %}
-        <tr data-status="{{ rs.status }}" data-owned="{{ rs.accepted_at|yesno:'true,false' }}">
-          <td>{{ rs.dest_protocol }}</td>
-          <td>{{ rs.dest_ref|default:"—" }}</td>
-          <td>{{ rs.source_protocol }}</td>
-          <td>{{ rs.source_ref|default:"—" }}</td>
-          <td>{{ rs.route_map|default:"—" }}</td>
-          <td>{{ rs.metric|default:"—" }}</td>
-          <td>
-            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=rs.status %}
-          </td>
-          <td>{{ rs.last_sync_at|default:"—" }}</td>
-          <td>
-            {% url 'plugins:netbox_nso_plugin:routing_accept_redistribution' pk=rs.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=rs.status %}
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-  </div>
-{% else %}
-  <p class="text-muted mb-0">No redistribution.</p>
-{% endif %}
+</div>

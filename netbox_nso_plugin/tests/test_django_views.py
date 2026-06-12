@@ -1425,6 +1425,48 @@ class TestDeviceNSOTabView(ViewTestBase):
 
         iface.delete()
 
+    def test_paged_category_reads_persisted_paginated_and_searchable(self):
+        """Single-table categories render paginated from last-synced state with NO
+        adapter call on plain expand; ?page navigates, ?q filters server-side."""
+        from django.contrib.contenttypes.models import ContentType
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+
+        ct = ContentType.objects.get_for_model(self.device.__class__)
+        for n in range(60):
+            NSORoutePolicyState.objects.create(
+                management=self.mgmt,
+                family="prefix_list",
+                object_name=("MATCHME" if n == 0 else f"PL{n:02d}"),
+                content_type=ct,
+                object_id=self.device.id,
+                status="imported",
+            )
+        url = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device.pk, "key": "route_policy"}
+        )
+
+        # Plain expand reads persisted state — no adapter round-trip — and paginates.
+        with patch("netbox_nso_plugin.adapter_client.get_route_policy") as getter:
+            r = self.client.get(url)
+        getter.assert_not_called()
+        self.assertEqual(r.status_code, 200)
+        body = r.content.decode()
+        self.assertIn("nso-cat-pager", body)
+        self.assertIn("Page 1 of 2", body)
+        self.assertIn("PL01", body)
+        self.assertNotIn("PL55", body)  # 50/page → page 2
+        self.assertNotIn("{#", body)
+        self.assertNotIn("#}", body)
+
+        # ?page navigates; ?q filters server-side.
+        self.assertIn("PL55", self.client.get(url, {"page": 2}).content.decode())
+        bodyq = self.client.get(url, {"q": "MATCHME"}).content.decode()
+        self.assertIn("MATCHME", bodyq)
+        self.assertNotIn("PL01", bodyq)
+
+        NSORoutePolicyState.objects.filter(management=self.mgmt).delete()
+
     def test_interfaces_page_classification_is_value_aware(self):
         """Display follows NetBox-vs-device values, not the adapter's stale status.
 

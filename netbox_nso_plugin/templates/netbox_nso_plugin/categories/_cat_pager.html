@@ -1,0 +1,11 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Pagination nav for a paginated category. Lives inside .nso-cat-results so it #}
+{# refreshes with the rows; clicks are handled by the delegated pager JS. Param: page. #}
+{% if page.paginator.num_pages > 1 %}
+<nav class="d-flex align-items-center gap-2 mt-2">
+  <span class="text-muted small">Page {{ page.number }} of {{ page.paginator.num_pages }} ({{ page.paginator.count }} rows)</span>
+  {% if page.has_previous %}<button type="button" class="btn btn-xs btn-outline-secondary nso-cat-page" data-page="{{ page.previous_page_number }}">&laquo; Prev</button>{% endif %}
+  {% if page.has_next %}<button type="button" class="btn btn-xs btn-outline-secondary nso-cat-page" data-page="{{ page.next_page_number }}">Next &raquo;</button>{% endif %}
+</nav>
+{% endif %}

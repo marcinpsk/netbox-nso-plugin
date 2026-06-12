@@ -264,17 +264,24 @@ class NSOCategoryView(LoginRequiredMixin, View):
         if key == "interfaces":
             return self._render_interfaces_page(request, device)
 
+        try:
+            mgmt = device.nso_management
+        except Exception:
+            mgmt = None
+
+        # Large single-table categories render paginated from last-synced state
+        # (fast); ?refresh=1 (the Refresh icon) forces a live reconcile first.
+        paged = self._render_paged_category(request, device, mgmt, key)
+        if paged is not None:
+            return paged
+
+        # Remaining (small / multi-table) categories keep the on-expand reconcile.
         from .reconcile import reconcile_category
         from .template_content import _STATUS_BADGE
 
         partial = self._PARTIALS.get(key)
         if partial is None:
             return HttpResponseBadRequest(f"unknown category: {key}")
-
-        try:
-            mgmt = device.nso_management
-        except Exception:
-            mgmt = None
 
         ctx = {"object": device, "mgmt": mgmt, "status_badge": _STATUS_BADGE}
         if mgmt is not None and mgmt.adapter_device_id is not None:
@@ -285,6 +292,144 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 ctx["adapter_error_code"] = exc.code
         ctx["category_has_unowned"] = _ctx_has_unowned(ctx)
         return render(request, partial, ctx)
+
+    # Single-table overlay categories that render paginated from last-synced state.
+    # spec: model, ctx var the partial loops, partial, search fields, order, FKs to
+    # select_related, and the filter-box placeholder. Freshness comes from the
+    # sync-complete / scheduler reconcile (reconcile_device covers every one of these).
+    def _paged_category_specs(self):
+        from .models import (
+            NSOL2SapState,
+            NSORedistributionState,
+            NSORoutePolicyState,
+            NSOStaticRouteState,
+            NSOSubinterfaceState,
+            NSOSVIState,
+            NSOVLANState,
+        )
+
+        base = "netbox_nso_plugin/categories/"
+        return {
+            "route_policy": dict(
+                model=NSORoutePolicyState,
+                ctx="route_policy_states",
+                partial=base + "route_policy.html",
+                search=["object_name", "family"],
+                order=["family", "object_name"],
+                sr=["content_type"],
+                ph="Filter by name / family…",
+            ),
+            "static": dict(
+                model=NSOStaticRouteState,
+                ctx="static_routes",
+                partial=base + "static.html",
+                search=["nso_prefix", "nso_vrf", "nso_next_hop"],
+                order=["nso_prefix"],
+                sr=["static_route"],
+                ph="Filter by prefix / VRF / next hop…",
+            ),
+            "redistribution": dict(
+                model=NSORedistributionState,
+                ctx="redistribution_states",
+                partial=base + "redistribution.html",
+                search=["dest_protocol", "dest_ref", "source_protocol", "route_map"],
+                order=["dest_protocol", "source_protocol"],
+                sr=[],
+                ph="Filter by protocol / ref / route-map…",
+            ),
+            "vlan": dict(
+                model=NSOVLANState,
+                ctx="vlan_states",
+                partial=base + "vlan.html",
+                search=["vlan__name", "device_name"],
+                order=["vlan__vid"],
+                sr=["vlan"],
+                ph="Filter by name…",
+            ),
+            "svi": dict(
+                model=NSOSVIState,
+                ctx="svi_states",
+                partial=base + "svi.html",
+                search=["interface__name", "vrf"],
+                order=["interface__name"],
+                sr=["interface", "vlan"],
+                ph="Filter by interface / VRF…",
+            ),
+            "subinterface": dict(
+                model=NSOSubinterfaceState,
+                ctx="subinterface_states",
+                partial=base + "subinterface.html",
+                search=["interface__name", "vrf"],
+                order=["interface__name"],
+                sr=["interface", "parent_interface"],
+                ph="Filter by interface / VRF…",
+            ),
+            "l2_services": dict(
+                model=NSOL2SapState,
+                ctx="l2_sap_states",
+                partial=base + "l2_services.html",
+                search=["service_name", "port", "sap_id"],
+                order=["service_name", "sap_id"],
+                sr=["l2vpn", "termination"],
+                ph="Filter by service / port / tag…",
+            ),
+        }
+
+    def _render_paged_category(self, request, device, mgmt, key):
+        """Render a single-table category paginated from last-synced NSO*State.
+
+        Returns None if *key* isn't a paginated category (caller falls back to the
+        reconcile-on-expand path). Reads persisted rows (fast); ?refresh=1 forces a
+        live reconcile first. Server-side ?q filter + ?page, driven by the shared
+        pager JS so paging/search keep the card open.
+        """
+        from django.core.paginator import Paginator
+        from django.db.models import Q
+
+        from .template_content import _STATUS_BADGE
+
+        spec = self._paged_category_specs().get(key)
+        if spec is None:
+            return None
+
+        adapter_error = None
+        if request.GET.get("refresh") and mgmt is not None and mgmt.adapter_device_id is not None:
+            from .reconcile import reconcile_category
+
+            try:
+                reconcile_category(device, mgmt, key)
+            except AdapterError as exc:
+                adapter_error = str(exc)
+
+        qs = spec["model"].objects.filter(management=mgmt)
+        if spec["sr"]:
+            qs = qs.select_related(*spec["sr"])
+        qs = qs.order_by(*spec["order"])
+
+        q = (request.GET.get("q") or "").strip()
+        if q:
+            cond = Q()
+            for field in spec["search"]:
+                cond |= Q(**{f"{field}__icontains": q})
+            qs = qs.filter(cond)
+
+        has_unowned = qs.filter(status__in=_UNOWNED_STATUSES).exists()
+        paginator = Paginator(qs, self._INTERFACES_PER_PAGE)
+        page = paginator.get_page(request.GET.get("page") or 1)
+
+        ctx = {
+            "object": device,
+            "mgmt": mgmt,
+            "status_badge": _STATUS_BADGE,
+            spec["ctx"]: list(page.object_list),
+            "page": page,
+            "q": q,
+            "placeholder": spec["ph"],
+            "category_has_unowned": has_unowned,
+            "adapter_error": adapter_error,
+            "paged": True,
+        }
+        return render(request, spec["partial"], ctx)
 
     def _render_interface_merged(self, request, device):
         """Consolidated per-interface view: one row per interface, a column per attribute.
@@ -310,8 +455,10 @@ class NSOCategoryView(LoginRequiredMixin, View):
         except Exception:
             mgmt = None
 
+        # Read from last-synced state (fast); the Refresh icon (?refresh=1) forces a
+        # live reconcile. Freshness otherwise comes from the sync-complete reconcile.
         adapter_error = None
-        if mgmt is not None and mgmt.adapter_device_id is not None:
+        if request.GET.get("refresh") and mgmt is not None and mgmt.adapter_device_id is not None:
             try:
                 reconcile_category(device, mgmt, "interface")
             except AdapterError as exc:

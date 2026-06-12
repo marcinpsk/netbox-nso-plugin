@@ -517,9 +517,12 @@
         var refreshIcon = card.querySelector('.nso-cat-refresh');
         var loaded = false;
 
-        function fetchRows() {
+        // Paginated categories render from last-synced state (fast). Pass refresh=1
+        // to force a live reconcile (the Refresh icon) before rendering.
+        function fetchRows(refresh) {
+          var url = card.dataset.catUrl + (refresh ? '?refresh=1' : '');
           body.innerHTML = '<div class="text-muted small"><span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Loading…</div>';
-          fetch(card.dataset.catUrl, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+          fetch(url, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
             .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); })
             .then(function (html) { body.innerHTML = html; runScripts(body); })
             .catch(function (e) { body.innerHTML = '<div class="text-danger small">Failed to load: ' + e.message + '</div>'; });
@@ -543,10 +546,75 @@
           refreshIcon.addEventListener('click', function (e) {
             e.stopPropagation();  // don't toggle the card
             refreshHeaders();  // a manual refresh must also clear a stale header badge
-            if (body.classList.contains('d-none')) { toggle(); return; }  // expand (which fetches)
-            loaded = true; fetchRows();  // already open → re-fetch fresh rows
+            if (body.classList.contains('d-none')) { body.classList.remove('d-none'); header.setAttribute('aria-expanded', 'true'); chevron.classList.replace('mdi-chevron-down', 'mdi-chevron-up'); }
+            loaded = true; fetchRows(true);  // force a live reconcile, then render
           });
         }
+      });
+    })();
+
+    // ── Generic category pager (read-from-last-synced, paginated) ──────────────
+    // Delegated on document so it works for every .nso-cat-pager fragment, even
+    // several open at once. Fragments carry only markup; this drives search/page
+    // re-fetch (q + page, no reconcile) and AJAX Accept (keeps the card open).
+    (function () {
+      "use strict";
+      function csrf() {
+        var el = document.querySelector('input[name=csrfmiddlewaretoken]');
+        return (el && el.value) || (document.cookie.match(/csrftoken=([^;]+)/) || [])[1] || '';
+      }
+      function esc(s) { var d = document.createElement('div'); d.textContent = (s == null ? '' : String(s)); return d.innerHTML; }
+      function flash(pager, text, type) {
+        var m = pager.querySelector('.nso-cat-msg');
+        if (m) m.innerHTML = text ? '<div class="alert alert-' + type + ' py-1 px-2 small mb-2">' + text + '</div>' : '';
+      }
+      function load(pager, q, page) {
+        pager.dataset.q = q; pager.dataset.page = page;
+        var results = pager.querySelector('.nso-cat-results');
+        results.innerHTML = '<div class="text-muted small py-2"><span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Loading…</div>';
+        return fetch(pager.dataset.url + '?q=' + encodeURIComponent(q) + '&page=' + page, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+          .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); })
+          .then(function (html) {
+            var t = document.createElement('div'); t.innerHTML = html;
+            var fresh = t.querySelector('.nso-cat-results');
+            if (fresh) pager.querySelector('.nso-cat-results').replaceWith(fresh);
+          })
+          .catch(function (e) { pager.querySelector('.nso-cat-results').innerHTML = '<div class="text-danger small">Failed to load: ' + esc(e.message) + '</div>'; });
+      }
+      var debounce = null;
+      document.addEventListener('input', function (e) {
+        var inp = e.target.closest('.nso-cat-filter'); if (!inp) return;
+        var pager = inp.closest('.nso-cat-pager'); if (!pager) return;
+        clearTimeout(debounce);
+        var v = inp.value.trim();
+        debounce = setTimeout(function () { load(pager, v, 1); }, 350);
+      });
+      document.addEventListener('click', function (e) {
+        var pg = e.target.closest('.nso-cat-page'); if (!pg) return;
+        var pager = pg.closest('.nso-cat-pager'); if (!pager) return;
+        e.preventDefault();
+        load(pager, pager.dataset.q || '', pg.dataset.page);
+      });
+      document.addEventListener('submit', function (e) {
+        var form = e.target.closest('.nso-cat-pager .nso-row-form'); if (!form) return;
+        var pager = form.closest('.nso-cat-pager');
+        e.preventDefault();
+        form.querySelectorAll('button').forEach(function (b) { b.disabled = true; });
+        fetch(form.action, {
+          method: 'POST',
+          headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-CSRFToken': csrf(), 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams(new FormData(form)),
+        }).then(function (r) {
+          return r.json().catch(function () { return {}; }).then(function (d) { return { ok: r.ok, data: d }; });
+        }).then(function (res) {
+          if (!res.ok || (res.data && res.data.status === 'error')) {
+            flash(pager, 'Action failed: ' + esc((res.data && res.data.message) || 'server error'), 'danger');
+          } else {
+            flash(pager, '', '');
+            document.dispatchEvent(new CustomEvent('nso:refresh-categories'));
+          }
+          return load(pager, pager.dataset.q || '', pager.dataset.page || 1);
+        });
       });
     })();
     </script>

@@ -1,0 +1,9 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Server-side search box for a paginated category. Re-fetch is driven by the #}
+{# delegated pager JS in device_nso_tab.html. Params: placeholder, q. #}
+<div class="mb-2">
+  <input type="search" class="form-control form-control-sm nso-cat-filter"
+         placeholder="{{ placeholder|default:'Filter…' }}" value="{{ q }}" autocomplete="off"
+         style="max-width: 280px;">
+</div>

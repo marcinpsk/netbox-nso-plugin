@@ -1,38 +1,42 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
-{# Lazy-loaded fragment: Static Routes category. #}
-{% include "netbox_nso_plugin/categories/_adapter_error.html" %}
-{% if static_routes %}
-  <div class="d-flex justify-content-end mb-2">
-    {% url 'plugins:netbox_nso_plugin:routing_bulk_accept_static_routes' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned %}
+{# Lazy-loaded fragment: Static Routes category — paginated from last-synced state. #}
+<div class="nso-cat-pager"
+     data-url="{% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='static' %}"
+     data-q="{{ q }}" data-page="{{ page.number }}">
+  <div class="nso-cat-results">
+    {% include "netbox_nso_plugin/categories/_adapter_error.html" %}
+    <div class="nso-cat-msg"></div>
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      {% include "netbox_nso_plugin/categories/_cat_search.html" with placeholder=placeholder q=q %}
+      {% url 'plugins:netbox_nso_plugin:routing_bulk_accept_static_routes' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned %}
+    </div>
+    {% if static_routes %}
+    <div class="table-responsive">
+      <table class="table table-sm table-hover mb-0">
+        <thead>
+          <tr><th>VRF</th><th>Prefix</th><th>Next Hop</th><th>Metric</th><th>Status</th><th>Last Synced</th><th></th></tr>
+        </thead>
+        <tbody>
+          {% for sr in static_routes %}
+          <tr data-status="{{ sr.status }}" data-owned="{{ sr.accepted_at|yesno:'true,false' }}">
+            <td>{{ sr.nso_vrf|default:"global" }}</td>
+            <td><a href="{{ sr.static_route.get_absolute_url }}">{{ sr.nso_prefix }}</a></td>
+            <td>{{ sr.nso_next_hop|default:"—" }}</td>
+            <td>{{ sr.static_route.metric }}</td>
+            <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=sr.status %}</td>
+            <td>{{ sr.last_sync_at|default:"—" }}</td>
+            <td>
+              {% url 'plugins:netbox_nso_plugin:routing_accept_static_route' pk=sr.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=sr.status form_class="nso-row-form" %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% include "netbox_nso_plugin/categories/_cat_pager.html" with page=page %}
+    {% else %}
+    <p class="text-muted mb-0">No static routes{% if q %} matching “{{ q }}”{% endif %}.</p>
+    {% endif %}
   </div>
-  <div id="flt-static">
-  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-static" placeholder="Filter by prefix / VRF / next hop…" show_status=True %}
-  <div class="table-responsive">
-    <table class="table table-sm table-hover mb-0">
-      <thead>
-        <tr><th>VRF</th><th>Prefix</th><th>Next Hop</th><th>Metric</th><th>Status</th><th>Last Synced</th><th></th></tr>
-      </thead>
-      <tbody>
-        {% for sr in static_routes %}
-        <tr data-status="{{ sr.status }}" data-owned="{{ sr.accepted_at|yesno:'true,false' }}">
-          <td>{{ sr.nso_vrf|default:"global" }}</td>
-          <td><a href="{{ sr.static_route.get_absolute_url }}">{{ sr.nso_prefix }}</a></td>
-          <td>{{ sr.nso_next_hop|default:"—" }}</td>
-          <td>{{ sr.static_route.metric }}</td>
-          <td>
-            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=sr.status %}
-          </td>
-          <td>{{ sr.last_sync_at|default:"—" }}</td>
-          <td>
-            {% url 'plugins:netbox_nso_plugin:routing_accept_static_route' pk=sr.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=sr.status %}
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-  </div>
-{% else %}
-  <p class="text-muted mb-0">No static routes.</p>
-{% endif %}
+</div>

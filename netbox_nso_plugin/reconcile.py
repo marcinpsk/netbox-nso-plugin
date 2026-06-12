@@ -327,6 +327,21 @@ def reconcile_device(device, mgmt=None) -> dict:
                 device,
                 client.get_logging_config(dev_id),
             )
+        if getattr(mgmt, "manage_l2", False):
+            # M37: Nokia L2 SAP overlays. Kept in the full reconcile (not just
+            # on-expand) so the periodic sync-complete refresh keeps them current —
+            # the tab reads these persisted rows without reconciling on expand.
+            from .l2_service_reconciler import reconcile_l2_services
+
+            _safe_reconcile(
+                ctx,
+                "l2_sap_states",
+                mgmt,
+                ("NSOL2SapState",),
+                reconcile_l2_services,
+                device,
+                client.get_l2_services(dev_id),
+            )
         _reconcile_routing(device, mgmt, client, ctx)
     return ctx
 
