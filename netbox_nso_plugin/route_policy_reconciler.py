@@ -74,6 +74,19 @@ _EXT_COMMUNITY_TYPES = {
     "encapsulation": "encapsulation",
 }
 
+# Reverse of _EXT_COMMUNITY_TYPES for the WRITE path: ExtendedCommunityTypeChoices value
+# → the canonical device member prefix. The forward map is many-to-one (target/rt/
+# route-target all normalise to "route-target"), so the original keyword is lost; we emit
+# the canonical device keyword ("target:6830:100" etc.), which the NEDs accept and which
+# round-trips against what the read path captured.
+_EXT_TYPE_TO_DEVICE_PREFIX = {
+    "route-target": "target",
+    "route-origin": "origin",
+    "color": "color",
+    "bandwidth": "bandwidth",
+    "encapsulation": "encapsulation",
+}
+
 _NUMERIC_COMMUNITY_RE = re.compile(r"^\d+(?::\d+){1,2}$")
 _EXT_VALUE_RE = re.compile(r"^\d+(?::\d+){0,2}$")
 

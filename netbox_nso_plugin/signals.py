@@ -1855,6 +1855,52 @@ def _push_route_policy_intent_for_device(device_id, adapter_device_id):
     )
 
 
+def _build_community_list_entries(obj):
+    """Serialize a community-list's members for the adapter intent payload.
+
+    netbox-routing splits members across TWO parallel models: standard members in
+    CommunityList.communitylistentries (→ Community), and extended/typed members
+    (route-target/route-origin/color/…) in an ExtendedCommunityList of the SAME name —
+    the read path (_fill_community_list_entries) routes them there. A list whose members
+    are ALL extended (e.g. a route-target list like `target:6830:100`) therefore has 0
+    standard entries; emitting only the standard side pushed an empty intent and the
+    reconciler never managed the members. Emit BOTH, reconstructing each extended
+    member's device string. Regex/wildcard members fit neither model and stay skipped.
+    """
+    out = []
+    seq = 0
+    for e in obj.communitylistentries.all():
+        if not e.community_id:
+            continue
+        seq += 1
+        out.append(
+            {
+                "sequence": seq,
+                "action": e.action.lower() if e.action else "permit",
+                "community": str(e.community.community),
+            }
+        )
+    try:
+        from netbox_routing.models import ExtendedCommunityList
+
+        from .route_policy_reconciler import _EXT_TYPE_TO_DEVICE_PREFIX
+    except ImportError:
+        return out
+    ext = ExtendedCommunityList.objects.filter(name=obj.name).first()
+    if ext is None:
+        return out
+    for e in ext.extendedcommunitylistentries.all():
+        ec = e.extended_community
+        if ec is None:
+            continue
+        prefix = _EXT_TYPE_TO_DEVICE_PREFIX.get(ec.type, ec.type)
+        seq += 1
+        out.append(
+            {"sequence": seq, "action": e.action.lower() if e.action else "permit", "community": f"{prefix}:{ec.value}"}
+        )
+    return out
+
+
 def _build_route_policy_entries(family, obj):
     """Serialize a NetBox route-policy object's entries for the adapter intent payload."""
     if family == "prefix_list":
@@ -1874,16 +1920,7 @@ def _build_route_policy_entries(family, obj):
             )
         return out
     if family == "community_list":
-        # netbox-routing: CommunityList → communitylistentries (CommunityListEntry),
-        # each with an `action` and a FK to Community whose value is `.community`.
-        return [
-            {
-                "sequence": i + 1,
-                "action": e.action.lower() if e.action else "permit",
-                "community": str(e.community.community),
-            }
-            for i, e in enumerate(e for e in obj.communitylistentries.all() if e.community_id)
-        ]
+        return _build_community_list_entries(obj)
     if family == "as_path":
         # netbox-routing: ASPath → aspath_entries (ASPathEntry: sequence/action/pattern).
         return [
