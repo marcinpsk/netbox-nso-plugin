@@ -87,30 +87,42 @@ _EXT_TYPE_TO_DEVICE_PREFIX = {
     "encapsulation": "encapsulation",
 }
 
-_NUMERIC_COMMUNITY_RE = re.compile(r"^\d+(?::\d+){1,2}$")
-_EXT_VALUE_RE = re.compile(r"^\d+(?::\d+){0,2}$")
+# One colon-separated part of a community value: digits, dots and regex/wildcard
+# metacharacters. Mirrors the relaxed netbox_routing Community/ExtendedCommunity
+# validators so anything we classify as standard/extended also validates there.
+# A value is up to 3 such parts (4+ is not a valid community).
+_COMMUNITY_PART = r"[\d.*^$()\[\]|+?\\_-]+"
+_STD_OR_REGEX_RE = re.compile(rf"^{_COMMUNITY_PART}(?::{_COMMUNITY_PART}){{0,2}}$")
 
 
 def _classify_community(value: str):
     """Classify a community-list member value.
 
     Returns one of:
-      ("standard", numeric_value)        — fits netbox_routing.Community
+      ("standard", value)                — fits netbox_routing.Community (exact OR regex)
       ("extended", ext_type, ext_value)  — fits netbox_routing.ExtendedCommunity
-      ("skip", reason)                   — regex/wildcard/unparseable; logged, dropped
+      ("skip", reason)                   — unparseable / unsupported (e.g. large:); dropped
+
+    Regex / wildcard members (Cisco expanded community-lists, Nokia/Junos inline —
+    6830:*, 6830:.*, 6830:1113.) are accepted: they are match-only but must round-trip,
+    and the netbox_routing validators now permit the metacharacters.
     """
     v = (value or "").strip()
     if not v:
         return ("skip", "empty")
     if v.lower() in _WELL_KNOWN_COMMUNITIES:
         return ("standard", _WELL_KNOWN_COMMUNITIES[v.lower()])
-    if _NUMERIC_COMMUNITY_RE.match(v):
-        return ("standard", v)
+    # Extended/typed prefix (target:/origin:/...) — the remainder may be exact or regex.
+    # Checked before the standard branch because typed prefixes carry letters and never
+    # match _STD_OR_REGEX_RE.
     if ":" in v:
         prefix, _, rest = v.partition(":")
         etype = _EXT_COMMUNITY_TYPES.get(prefix.lower())
-        if etype and _EXT_VALUE_RE.match(rest):
+        if etype and _STD_OR_REGEX_RE.match(rest):
             return ("extended", etype, rest)
+    # Standard exact (6830:100) or inline regex/wildcard (6830:*, 6830:1113.).
+    if _STD_OR_REGEX_RE.match(v):
+        return ("standard", v)
     return ("skip", f"unsupported community member {v!r}")
 
 

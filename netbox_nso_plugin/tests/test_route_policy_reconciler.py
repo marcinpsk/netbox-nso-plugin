@@ -177,10 +177,13 @@ class TestReconcileRoutePolicy(TestCase):
         self.assertEqual(rme.flow_control, 30)
         self.assertEqual(rme.set, {"local_preference": 100})  # flow_control popped out
 
-    def test_extended_community_routed_and_wildcard_skipped(self):
-        """target:/origin: members go to ExtendedCommunity; wildcard/regex are dropped."""
+    def test_extended_and_regex_community_members_routed(self):
+        """target:/origin: members go to ExtendedCommunity; standard regex/wildcard
+        (6830:*, 6830:1113.) go to Community; typed regex (target:*:*) to ExtendedCommunity.
+        Regex members are match-only but must round-trip (no longer skipped)."""
         self._make_mgmt(self.device)
         from netbox_routing.models import (
+            Community,
             CommunityListEntry,
             ExtendedCommunity,
             ExtendedCommunityList,
@@ -194,22 +197,26 @@ class TestReconcileRoutePolicy(TestCase):
                 {
                     "name": "CL-EXT",
                     "entries": [
-                        {"action": "permit", "community": "target:6830:100"},
+                        {"action": "permit", "community": "target:6830:100"},  # extended exact
                         {"action": "permit", "community": "no-export"},  # well-known -> numeric
-                        {"action": "permit", "community": "target:*:*"},  # wildcard -> skipped
+                        {"action": "permit", "community": "target:*:*"},  # extended regex
+                        {"action": "permit", "community": "6830:*"},  # standard regex
+                        {"action": "permit", "community": "6830:1113."},  # standard wildcard
                     ],
                 }
             ],
         }
         reconcile_route_policy(self.device, payload)
 
-        # standard (well-known normalized) lands in the CommunityList
-        self.assertEqual(CommunityListEntry.objects.filter(community_list__name="CL-EXT").count(), 1)
-        # extended lands in a parallel ExtendedCommunityList of the same name
+        # standard exact/regex/wildcard land in the CommunityList (no-export, 6830:*, 6830:1113.)
+        self.assertEqual(CommunityListEntry.objects.filter(community_list__name="CL-EXT").count(), 3)
+        self.assertTrue(Community.objects.filter(community="6830:*").exists())
+        self.assertTrue(Community.objects.filter(community="6830:1113.").exists())
+        # extended exact + regex land in the parallel ExtendedCommunityList of the same name
         ecl = ExtendedCommunityList.objects.get(name="CL-EXT")
-        self.assertEqual(ExtendedCommunityListEntry.objects.filter(extended_community_list=ecl).count(), 1)
-        ec = ExtendedCommunity.objects.get(type="route-target", value="6830:100")
-        self.assertTrue(ExtendedCommunityListEntry.objects.filter(extended_community=ec).exists())
+        self.assertEqual(ExtendedCommunityListEntry.objects.filter(extended_community_list=ecl).count(), 2)
+        self.assertTrue(ExtendedCommunity.objects.filter(type="route-target", value="6830:100").exists())
+        self.assertTrue(ExtendedCommunity.objects.filter(type="route-target", value="*:*").exists())
 
     def test_route_map_links_extended_community_list(self):
         """A route-map matching a community-list whose members are extended links the
