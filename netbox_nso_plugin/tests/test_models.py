@@ -91,6 +91,23 @@ class TestAdapterClientScope(unittest.TestCase):
         set_scope(7, ["description"])
         _, kwargs = session.request.call_args
         self.assertEqual(kwargs["json"]["attributes"], ["description"])
+        # sync_before_apply defaults to True (sync-from before each apply).
+        self.assertTrue(kwargs["json"]["sync_before_apply"])
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_RESOLVED_CONFIG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_set_scope_sends_sync_before_apply_toggle(self, mock_session_cls, _cfg):
+        """set_scope forwards the per-device sync_before_apply toggle to the adapter."""
+        from netbox_nso_plugin.adapter_client import set_scope
+
+        session = MagicMock()
+        session.request.return_value = _mock_response(200, {"device_id": 7})
+        mock_session_cls.return_value = session
+
+        set_scope(7, ["description"], auto_apply=True, sync_before_apply=False)
+        _, kwargs = session.request.call_args
+        self.assertFalse(kwargs["json"]["sync_before_apply"])
+        self.assertTrue(kwargs["json"]["auto_apply"])
 
 
 class TestAdapterClientSyncNotify(unittest.TestCase):

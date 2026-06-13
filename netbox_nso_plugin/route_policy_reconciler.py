@@ -323,8 +323,19 @@ def _reconcile_route_maps(mgmt, device, rm_list, RouteMap, ContentType, now, see
 def reconcile_route_policy(device, payload: dict) -> list:
     """Reconcile route-policy data (objects + entries) from the adapter into NetBox.
 
-    Returns a list of NSORoutePolicyState instances for this device.
+    Runs under ``suppress_intent_push()``: this reconcile MATERIALIZES netbox-routing fork
+    objects (CommunityList/RouteMap/... + their entries) from device state, and those saves
+    would otherwise fire the operator-edit push handlers (own + push). Suppression keeps the
+    import side-effect-free; it is reentrant, so this is safe whether or not the caller
+    (reconcile_device) already suppresses. Returns NSORoutePolicyState instances for the device.
     """
+    from .signals import suppress_intent_push
+
+    with suppress_intent_push():
+        return _reconcile_route_policy(device, payload)
+
+
+def _reconcile_route_policy(device, payload: dict) -> list:
     from django.contrib.contenttypes.models import ContentType
     from django.utils import timezone
 

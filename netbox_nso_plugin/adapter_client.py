@@ -167,12 +167,16 @@ def provision_device(nso_instance, device_name, address, ned_id, authgroup, *, a
     )
 
 
-def set_scope(adapter_device_id, attributes, auto_apply=False):
+def set_scope(adapter_device_id, attributes, auto_apply=False, sync_before_apply=True):
     """PUT /api/v1/devices/{id}/scope — update managed attributes and settings."""
     return _request(
         "PUT",
         f"/api/v1/devices/{adapter_device_id}/scope",
-        json={"attributes": attributes, "auto_apply": auto_apply},
+        json={
+            "attributes": attributes,
+            "auto_apply": auto_apply,
+            "sync_before_apply": sync_before_apply,
+        },
     )
 
 

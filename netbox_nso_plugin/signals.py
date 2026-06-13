@@ -288,7 +288,12 @@ def sync_scope_to_adapter(sender, instance, created, **kwargs):
                 nso_device_name=instance.nso_device_name,
             )
 
-        client.set_scope(instance.adapter_device_id, instance.managed_attributes, auto_apply=instance.auto_apply)
+        client.set_scope(
+            instance.adapter_device_id,
+            instance.managed_attributes,
+            auto_apply=instance.auto_apply,
+            sync_before_apply=instance.sync_before_apply,
+        )
 
         notify_result = client.sync_notify(instance.adapter_device_id)
         if notify_result and notify_result.get("job_id"):
@@ -2003,6 +2008,64 @@ def _on_routing_policy_pre_delete(sender, instance, **kwargs):
         )
 
 
+# ── netbox_routing route-policy edit write path ─────────────────────────────
+# The reconcile path only creates NSORoutePolicyState overlays for policy objects the
+# device already reports (brownfield adoption); it never reacts to an operator EDIT of a
+# netbox-routing object. Without this, editing an OWNED community-list (adding/removing a
+# member) leaves the overlay in_sync, so Accept is a no-op and the edit never pushes.
+# These handlers mirror the OSPF/IS-IS greenfield path: editing an OWNED route-policy
+# object (or one of its entries) on a managed device re-asserts ownership (status →
+# accepted) and pushes the updated intent. A brownfield (un-owned/imported) overlay is
+# left to the 3-way reconcile so the edit surfaces as changed/conflict, not force-owned.
+
+
+def _accept_route_policy_object(obj) -> None:
+    """Re-own + push every OWNED overlay attached to a saved route-policy object."""
+    from django.contrib.contenttypes.models import ContentType
+
+    from .models import NSORoutePolicyState
+
+    ct = ContentType.objects.get_for_model(type(obj))
+    states = NSORoutePolicyState.objects.filter(content_type=ct, object_id=obj.pk).select_related("management")
+    for state in states:
+        mgmt = state.management
+        if mgmt.adapter_device_id is None:
+            continue
+        # Only re-own an already-owned overlay (incl. in_sync). A brownfield/un-owned
+        # (imported/unknown) overlay must surface the edit via reconcile, not be force-owned.
+        if state.status not in _OWNED_PUSH_STATUSES:
+            continue
+        if state.status != "accepted":
+            state.status = "accepted"
+        state.last_sync_at = timezone.now()
+        state.save()  # → _on_route_policy_state_save schedules the intent push
+
+
+@_skip_on_render
+def _on_routing_policy_object_save(sender, instance, **kwargs):
+    """netbox_routing CommunityList/RouteMap/PrefixList/ASPath edited → own + push."""
+    _accept_route_policy_object(instance)
+
+
+@_skip_on_render
+def _on_routing_policy_entry_save(sender, instance, **kwargs):
+    """Own + push the parent object when a route-policy ENTRY (member) is edited/added."""
+    parent = (
+        getattr(instance, "community_list", None)
+        or getattr(instance, "prefix_list", None)
+        or getattr(instance, "route_map", None)
+        or getattr(instance, "aspath", None)
+    )
+    if parent is not None:
+        _accept_route_policy_object(parent)
+
+
+@_skip_on_render
+def _on_routing_policy_entry_delete(sender, instance, **kwargs):
+    """Own + push the parent object when a route-policy ENTRY is removed (reduced member set)."""
+    _on_routing_policy_entry_save(sender, instance, **kwargs)
+
+
 def _collect_redistribution_by_dest_ref(device_id: int, dest_protocol: str) -> dict[str, list[dict]]:
     """Return redistribution entries grouped by dest_ref for the given protocol and device.
 
@@ -2545,7 +2608,16 @@ def _connect_g_activated():  # pragma: no cover
 
     # netbox_routing policy object deletion → drop overlays + push removal (full-replace)
     try:
-        from netbox_routing.models import ASPath, CommunityList, PrefixList, RouteMap
+        from netbox_routing.models import (
+            ASPath,
+            ASPathEntry,
+            CommunityList,
+            CommunityListEntry,
+            PrefixList,
+            PrefixListEntry,
+            RouteMap,
+            RouteMapEntry,
+        )
 
         for _model in (PrefixList, RouteMap, CommunityList, ASPath):
             pre_delete.connect(
@@ -2553,8 +2625,26 @@ def _connect_g_activated():  # pragma: no cover
                 sender=_model,
                 dispatch_uid=f"nso_plugin_routing_policy_pre_delete_{_model.__name__.lower()}",
             )
+            # Editing an owned policy object → re-own + push (mirror OSPF/IS-IS greenfield).
+            post_save.connect(
+                _on_routing_policy_object_save,
+                sender=_model,
+                dispatch_uid=f"nso_plugin_routing_policy_save_{_model.__name__.lower()}",
+            )
+        # Editing/adding/removing an ENTRY (member) → re-own + push its parent object.
+        for _entry in (PrefixListEntry, RouteMapEntry, CommunityListEntry, ASPathEntry):
+            post_save.connect(
+                _on_routing_policy_entry_save,
+                sender=_entry,
+                dispatch_uid=f"nso_plugin_routing_policy_entry_save_{_entry.__name__.lower()}",
+            )
+            post_delete.connect(
+                _on_routing_policy_entry_delete,
+                sender=_entry,
+                dispatch_uid=f"nso_plugin_routing_policy_entry_delete_{_entry.__name__.lower()}",
+            )
     except ImportError:
-        logger.debug("netbox_routing not installed — route-policy delete signals not registered")
+        logger.debug("netbox_routing not installed — route-policy edit/delete signals not registered")
 
     # OSPF state → intent push (M19 B3)
     from .models import NSOOSPFInstanceState, NSOOSPFInterfaceState

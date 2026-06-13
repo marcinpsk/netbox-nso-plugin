@@ -221,3 +221,69 @@ class TestRoutePolicyDeletePropagation(_RPBase):
         assert NSORoutePolicyState.objects.filter(object_name="TESTNSO-PL").count() == 0
         assert pushed and pushed[-1][0] == 196
         assert pushed[-1][1] == []  # reduced snapshot → removal propagates
+
+
+class TestRoutePolicyEditOwnsAndPushes(_RPBase):
+    """Editing an OWNED route-policy object (or its members) re-owns the overlay and pushes —
+    so an operator edit to an in_sync community-list actually reaches the device on Apply,
+    instead of Accept being a silent no-op (the gap found in the live write e2e)."""
+
+    def _community_list_with_overlay(self, status="in_sync"):
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import CommunityList
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        mgmt = self._mgmt()
+        cl = CommunityList.objects.create(name="TESTNSO-CL-EDIT")
+        with suppress_intent_push():
+            state = NSORoutePolicyState.objects.create(
+                management=mgmt,
+                family="community_list",
+                object_name=cl.name,
+                content_type=ContentType.objects.get_for_model(CommunityList),
+                object_id=cl.pk,
+                status=status,
+            )
+        return cl, state
+
+    def test_adding_member_to_owned_list_owns_and_pushes(self):
+        """Adding a member to an in_sync community-list flips its overlay to accepted and
+        pushes the updated intent (so Accept/Apply deploys the edit)."""
+        from netbox_routing.models import Community, CommunityListEntry
+
+        cl, state = self._community_list_with_overlay(status="in_sync")
+
+        pushed = []
+        with patch(
+            "netbox_nso_plugin.adapter_client.put_route_policy_intent",
+            side_effect=lambda adapter_id, objects: pushed.append((adapter_id, objects)),
+        ):
+            with self.captureOnCommitCallbacks(execute=True):
+                comm = Community.objects.create(community="65000:1")
+                CommunityListEntry.objects.create(community_list=cl, action="permit", community=comm)
+
+        state.refresh_from_db()
+        assert state.status == "accepted"  # re-owned by the edit
+        assert pushed and pushed[-1][0] == 196  # intent pushed to the adapter
+
+    def test_editing_brownfield_list_is_not_force_owned(self):
+        """An un-owned (imported / brownfield) overlay is NOT force-owned by an edit — the
+        edit must surface via the 3-way reconcile (changed/conflict), not silently push."""
+        from netbox_routing.models import Community, CommunityListEntry
+
+        cl, state = self._community_list_with_overlay(status="imported")
+
+        pushed = []
+        with patch(
+            "netbox_nso_plugin.adapter_client.put_route_policy_intent",
+            side_effect=lambda adapter_id, objects: pushed.append((adapter_id, objects)),
+        ):
+            with self.captureOnCommitCallbacks(execute=True):
+                comm = Community.objects.create(community="65000:2")
+                CommunityListEntry.objects.create(community_list=cl, action="permit", community=comm)
+
+        state.refresh_from_db()
+        assert state.status == "imported"  # left for reconcile to surface
+        assert pushed == []

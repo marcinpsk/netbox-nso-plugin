@@ -137,6 +137,7 @@ class NSODeviceManagementForm(NetBoxModelForm):
             "manage_snmp",
             "manage_logging",
             "auto_apply",
+            "sync_before_apply",
             "tags",
         ]
 

@@ -278,6 +278,15 @@ class NSODeviceManagement(NetBoxModel):
             "management one cautious push at a time."
         ),
     )
+    sync_before_apply = models.BooleanField(
+        default=True,
+        help_text=(
+            "When True, the adapter sync-froms this device before each apply, clearing the "
+            "NSO/device out-of-sync state a timed-out or partial prior commit can leave (which "
+            "would otherwise make the next apply fail). Disable for NEDs that already sync on "
+            "connect."
+        ),
+    )
     adapter_device_id = models.IntegerField(
         null=True,
         blank=True,
