@@ -105,6 +105,7 @@ omit = [
     "*/migrations/*",
     "*/tests/*",
 ]
+branch = true
 
 [tool.coverage.report]
 # Target: 90%. Plugin currently exceeds this after comprehensive unit tests.
