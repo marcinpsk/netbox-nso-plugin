@@ -68,84 +68,42 @@ class TestRoutePolicyEntrySerialization(_RPBase):
         entries = _build_route_policy_entries("community_list", cl)
         assert entries == [{"sequence": 1, "action": "permit", "community": "65000:1"}]
 
-    def test_community_list_extended_members_serialize_from_parallel_list(self):
-        """Regression: a list whose members are extended (route-target/route-origin/…)
-        has 0 standard CommunityListEntry rows — they live in a parallel
-        ExtendedCommunityList of the same name. The push must emit those too, rebuilding
-        the device member string (route-target → `target:<value>`), else the intent is
-        silently empty and the reconciler never manages the members."""
-        from netbox_routing.models import (
-            CommunityList,
-            ExtendedCommunity,
-            ExtendedCommunityList,
-            ExtendedCommunityListEntry,
-        )
+    def test_community_list_extended_members_serialize_verbatim(self):
+        """Regression (the EU_CDN_AS_EXT empty-intent bug): a list whose members are
+        extended (target:/origin:/…) now stores them VERBATIM as Community rows in the one
+        CommunityList, so the push emits them directly — no parallel list, no reconstruction,
+        no silently-empty intent."""
+        from netbox_routing.models import Community, CommunityList, CommunityListEntry
 
         from netbox_nso_plugin.signals import _build_route_policy_entries
 
         name = "100365038-EU_CDN_AS_EXT"
-        cl = CommunityList.objects.create(name=name)  # 0 standard entries
-        ext = ExtendedCommunityList.objects.create(name=name)
-        ec = ExtendedCommunity.objects.create(type="route-target", value="6830:100365038")
-        ExtendedCommunityListEntry.objects.create(extended_community_list=ext, action="permit", extended_community=ec)
-
-        entries = _build_route_policy_entries("community_list", cl)
-        assert entries == [{"sequence": 1, "action": "permit", "community": "target:6830:100365038"}]
-
-    def test_community_list_mixed_standard_and_extended_members(self):
-        """Standard + extended members merge into one sequentially-numbered entry list."""
-        from netbox_routing.models import (
-            Community,
-            CommunityList,
-            CommunityListEntry,
-            ExtendedCommunity,
-            ExtendedCommunityList,
-            ExtendedCommunityListEntry,
-        )
-
-        from netbox_nso_plugin.signals import _build_route_policy_entries
-
-        name = "TESTNSO-CL-MIX"
         cl = CommunityList.objects.create(name=name)
-        CommunityListEntry.objects.create(
-            community_list=cl, action="permit", community=Community.objects.create(community="65000:7")
-        )
-        ext = ExtendedCommunityList.objects.create(name=name)
-        ExtendedCommunityListEntry.objects.create(
-            extended_community_list=ext,
-            action="permit",
-            extended_community=ExtendedCommunity.objects.create(type="route-origin", value="64500:9"),
-        )
+        comm = Community.objects.create(community="target:1111:100365038")
+        CommunityListEntry.objects.create(community_list=cl, action="permit", community=comm)
 
         entries = _build_route_policy_entries("community_list", cl)
-        assert entries == [
-            {"sequence": 1, "action": "permit", "community": "65000:7"},
-            {"sequence": 2, "action": "permit", "community": "origin:64500:9"},
-        ]
+        assert entries == [{"sequence": 1, "action": "permit", "community": "target:1111:100365038"}]
 
-    def test_community_list_large_members_serialize(self):
-        """RFC 8092 large members (in a parallel LargeCommunityList of the same name) are
-        emitted as `large:<value>` so they round-trip back to the device."""
-        from netbox_routing.models import (
-            CommunityList,
-            LargeCommunity,
-            LargeCommunityList,
-            LargeCommunityListEntry,
-        )
+    def test_community_list_mixed_member_kinds_serialize_verbatim(self):
+        """Standard, extended, and large members all live in the one CommunityList and are
+        emitted verbatim in a single entry list with contiguous sequence numbers (order is
+        the model's, an implementation detail — assert the member set, not a fixed order)."""
+        from netbox_routing.models import Community, CommunityList, CommunityListEntry
 
         from netbox_nso_plugin.signals import _build_route_policy_entries
 
-        name = "TESTNSO-CL-LARGE"
-        cl = CommunityList.objects.create(name=name)  # 0 standard entries
-        lcl = LargeCommunityList.objects.create(name=name)
-        LargeCommunityListEntry.objects.create(
-            large_community_list=lcl,
-            action="permit",
-            large_community=LargeCommunity.objects.create(value="65000:1:2"),
-        )
+        cl = CommunityList.objects.create(name="TESTNSO-CL-MIX")
+        values = {"65000:7", "origin:64500:9", "large:65000:1:2"}
+        for value in values:
+            CommunityListEntry.objects.create(
+                community_list=cl, action="permit", community=Community.objects.create(community=value)
+            )
 
         entries = _build_route_policy_entries("community_list", cl)
-        assert entries == [{"sequence": 1, "action": "permit", "community": "large:65000:1:2"}]
+        assert {e["community"] for e in entries} == values
+        assert all(e["action"] == "permit" for e in entries)
+        assert sorted(e["sequence"] for e in entries) == [1, 2, 3]
 
     def test_as_path_entries_serialize_from_fork_model(self):
         """as_path reads ASPath.aspath_entries (sequence/action/pattern)."""

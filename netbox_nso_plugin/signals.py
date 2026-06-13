@@ -1858,14 +1858,10 @@ def _push_route_policy_intent_for_device(device_id, adapter_device_id):
 def _build_community_list_entries(obj):
     """Serialize a community-list's members for the adapter intent payload.
 
-    netbox-routing splits members across TWO parallel models: standard members in
-    CommunityList.communitylistentries (→ Community), and extended/typed members
-    (route-target/route-origin/color/…) in an ExtendedCommunityList of the SAME name —
-    the read path (_fill_community_list_entries) routes them there. A list whose members
-    are ALL extended (e.g. a route-target list like `target:6830:100`) therefore has 0
-    standard entries; emitting only the standard side pushed an empty intent and the
-    reconciler never managed the members. Emit BOTH, reconstructing each extended
-    member's device string. Regex/wildcard members fit neither model and stay skipped.
+    The universal Community model stores every member VERBATIM (numeric, well-known
+    keyword, typed extended `target:…`/`color:…`, RFC 8092 `large:…`, and regex/wildcards),
+    so the whole list is the single CommunityList — no parallel typed lists to merge. Emit
+    each member's text exactly as stored; the NED-specific split by kind happens reconciler-side.
     """
     out = []
     seq = 0
@@ -1879,40 +1875,6 @@ def _build_community_list_entries(obj):
                 "action": e.action.lower() if e.action else "permit",
                 "community": str(e.community.community),
             }
-        )
-    try:
-        from netbox_routing.models import ExtendedCommunityList
-
-        from .route_policy_reconciler import _EXT_TYPE_TO_DEVICE_PREFIX
-
-        ext = ExtendedCommunityList.objects.filter(name=obj.name).first()
-    except ImportError:
-        ext = None
-    for e in ext.extendedcommunitylistentries.all() if ext is not None else []:
-        ec = e.extended_community
-        if ec is None:
-            continue
-        prefix = _EXT_TYPE_TO_DEVICE_PREFIX.get(ec.type, ec.type)
-        seq += 1
-        out.append(
-            {"sequence": seq, "action": e.action.lower() if e.action else "permit", "community": f"{prefix}:{ec.value}"}
-        )
-
-    # RFC 8092 large communities live in a parallel LargeCommunityList of the same name;
-    # emit them as `large:<value>` (the device keyword the read path captured).
-    try:
-        from netbox_routing.models import LargeCommunityList
-
-        large = LargeCommunityList.objects.filter(name=obj.name).first()
-    except ImportError:
-        large = None
-    for e in large.largecommunitylistentries.all() if large is not None else []:
-        lc = e.large_community
-        if lc is None:
-            continue
-        seq += 1
-        out.append(
-            {"sequence": seq, "action": e.action.lower() if e.action else "permit", "community": f"large:{lc.value}"}
         )
     return out
 
@@ -1960,10 +1922,9 @@ def _build_route_policy_entries(family, obj):
                 # the read path lifts flow_control out of set-json into the model
                 # field — put it back so the round-trip stays symmetric
                 set_data["flow_control"] = e.flow_control
+            # The universal Community model means a community-list of any kind is just the
+            # one CommunityList — match_community_list carries every referenced list.
             community_names = list(e.match_community_list.values_list("name", flat=True))
-            for nm in e.match_extended_community_list.values_list("name", flat=True):
-                if nm not in community_names:
-                    community_names.append(nm)
             entry: dict = {
                 "sequence": e.sequence,
                 "action": e.action.lower() if e.action else "permit",

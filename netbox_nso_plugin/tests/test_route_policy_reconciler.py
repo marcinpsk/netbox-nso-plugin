@@ -177,82 +177,51 @@ class TestReconcileRoutePolicy(TestCase):
         self.assertEqual(rme.flow_control, 30)
         self.assertEqual(rme.set, {"local_preference": 100})  # flow_control popped out
 
-    def test_extended_and_regex_community_members_routed(self):
-        """target:/origin: members go to ExtendedCommunity; standard regex/wildcard
-        (6830:*, 6830:1113.) go to Community; typed regex (target:*:*) to ExtendedCommunity.
-        Regex members are match-only but must round-trip (no longer skipped)."""
+    def test_all_member_kinds_land_verbatim_in_one_list(self):
+        """The universal Community model stores EVERY member verbatim in the single
+        CommunityList — standard, well-known keyword, typed extended (exact + regex),
+        RFC 8092 large (exact + regex), and inline regex/wildcard. No parallel typed lists;
+        the kind is derived by parsing. Well-known keywords are stored as text (no numeric
+        normalization), so they round-trip."""
         self._make_mgmt(self.device)
-        from netbox_routing.models import (
-            Community,
-            CommunityListEntry,
-            ExtendedCommunity,
-            ExtendedCommunityList,
-            ExtendedCommunityListEntry,
-        )
+        from netbox_routing.models import Community, CommunityListEntry
 
         from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
 
+        members = [
+            ("1111:100", "standard"),
+            ("no-export", "standard"),  # well-known keyword, stored verbatim (not numeric)
+            ("target:1111:100", "extended"),  # extended exact
+            ("target:*:*", "extended"),  # extended regex
+            ("large:65000:1:2", "large"),  # large exact
+            ("large:1111:.*:[0-4]", "large"),  # large regex
+            ("1111:*", "standard"),  # inline regex
+            ("1111:1113.", "standard"),  # wildcard
+        ]
         payload = {
             "community_lists": [
-                {
-                    "name": "CL-EXT",
-                    "entries": [
-                        {"action": "permit", "community": "target:6830:100"},  # extended exact
-                        {"action": "permit", "community": "no-export"},  # well-known -> numeric
-                        {"action": "permit", "community": "target:*:*"},  # extended regex
-                        {"action": "permit", "community": "6830:*"},  # standard regex
-                        {"action": "permit", "community": "6830:1113."},  # standard wildcard
-                    ],
-                }
+                {"name": "CL-MIX", "entries": [{"action": "permit", "community": v} for v, _ in members]}
             ],
         }
         reconcile_route_policy(self.device, payload)
 
-        # standard exact/regex/wildcard land in the CommunityList (no-export, 6830:*, 6830:1113.)
-        self.assertEqual(CommunityListEntry.objects.filter(community_list__name="CL-EXT").count(), 3)
-        self.assertTrue(Community.objects.filter(community="6830:*").exists())
-        self.assertTrue(Community.objects.filter(community="6830:1113.").exists())
-        # extended exact + regex land in the parallel ExtendedCommunityList of the same name
-        ecl = ExtendedCommunityList.objects.get(name="CL-EXT")
-        self.assertEqual(ExtendedCommunityListEntry.objects.filter(extended_community_list=ecl).count(), 2)
-        self.assertTrue(ExtendedCommunity.objects.filter(type="route-target", value="6830:100").exists())
-        self.assertTrue(ExtendedCommunity.objects.filter(type="route-target", value="*:*").exists())
+        # ALL members land in the one CommunityList, stored verbatim.
+        self.assertEqual(CommunityListEntry.objects.filter(community_list__name="CL-MIX").count(), len(members))
+        for value, expected_kind in members:
+            comm = Community.objects.filter(community=value).first()
+            self.assertIsNotNone(comm, f"{value!r} not stored verbatim")
+            self.assertEqual(comm.kind, expected_kind, f"{value!r} kind")
 
-    def test_large_community_members_routed(self):
-        """RFC 8092 large: members (exact + regex) go to a parallel LargeCommunityList."""
-        self._make_mgmt(self.device)
-        from netbox_routing.models import LargeCommunity, LargeCommunityList, LargeCommunityListEntry
-
-        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
-
-        payload = {
-            "community_lists": [
-                {
-                    "name": "CL-LARGE",
-                    "entries": [
-                        {"action": "permit", "community": "large:65000:1:2"},
-                        {"action": "permit", "community": "large:6830:.*:[0-4]"},
-                    ],
-                }
-            ],
-        }
-        reconcile_route_policy(self.device, payload)
-
-        lcl = LargeCommunityList.objects.get(name="CL-LARGE")
-        self.assertEqual(LargeCommunityListEntry.objects.filter(large_community_list=lcl).count(), 2)
-        self.assertTrue(LargeCommunity.objects.filter(value="65000:1:2").exists())
-        self.assertTrue(LargeCommunity.objects.filter(value="6830:.*:[0-4]").exists())
-
-    def test_route_map_links_extended_community_list(self):
-        """A route-map matching a community-list whose members are extended links the
-        parallel ExtendedCommunityList via match_extended_community_list."""
+    def test_route_map_links_single_community_list(self):
+        """A route-map matching a community-list of ANY kind links the one CommunityList
+        via match_community_list (there is no parallel extended/large list anymore)."""
         self._make_mgmt(self.device)
         from netbox_routing.models import RouteMapEntry
 
         from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
 
         payload = {
-            "community_lists": [{"name": "CL-RT", "entries": [{"action": "permit", "community": "target:6830:100"}]}],
+            "community_lists": [{"name": "CL-RT", "entries": [{"action": "permit", "community": "target:1111:100"}]}],
             "route_maps": [
                 {
                     "name": "RM-RT",
@@ -265,7 +234,7 @@ class TestReconcileRoutePolicy(TestCase):
         reconcile_route_policy(self.device, payload)
 
         rme = RouteMapEntry.objects.get(route_map__name="RM-RT")
-        self.assertEqual([e.name for e in rme.match_extended_community_list.all()], ["CL-RT"])
+        self.assertEqual([e.name for e in rme.match_community_list.all()], ["CL-RT"])
 
     def test_conflict_does_not_clobber_entries(self):
         """Once filled, a divergent re-report flags conflict and leaves entries intact."""

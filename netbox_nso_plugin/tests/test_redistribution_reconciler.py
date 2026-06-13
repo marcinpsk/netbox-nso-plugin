@@ -156,12 +156,12 @@ class TestBuildBgpRouterList(TestCase):
         from netbox_nso_plugin.signals import _build_bgp_router_list
 
         redist = [{"source_protocol": "static", "source_ref": "", "route_map": "PCE-BGP-EXPORT"}]
-        out = _build_bgp_router_list({}, {("6730", ""): {"ipv4-unicast": redist}})
+        out = _build_bgp_router_list({}, {("2222", ""): {"ipv4-unicast": redist}})
         self.assertEqual(
             out,
             [
                 {
-                    "asn": "6730",
+                    "asn": "2222",
                     "scopes": [
                         {
                             "vrf": "",
@@ -178,8 +178,8 @@ class TestBuildBgpRouterList(TestCase):
 
         redist = [{"source_protocol": "static", "source_ref": ""}]
         routers = {
-            "6730": {
-                "asn": "6730",
+            "2222": {
+                "asn": "2222",
                 "scopes": {
                     "": {
                         "vrf": "",
@@ -191,7 +191,7 @@ class TestBuildBgpRouterList(TestCase):
                 },
             }
         }
-        out = _build_bgp_router_list(routers, {("6730", ""): {"ipv4-unicast": redist}})
+        out = _build_bgp_router_list(routers, {("2222", ""): {"ipv4-unicast": redist}})
         self.assertEqual(len(out), 1)
         self.assertEqual(len(out[0]["scopes"]), 1)
         scope = out[0]["scopes"][0]

@@ -19,7 +19,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import re
 
 logger = logging.getLogger(__name__)
 
@@ -49,86 +48,6 @@ def _load_json(value) -> dict:
         return out if isinstance(out, dict) else {}
     except (ValueError, TypeError):
         return {}
-
-
-# RFC 1997 + common well-known community keywords → numeric form (so they dedup
-# with the numeric members and fit the numeric-only Community model).
-_WELL_KNOWN_COMMUNITIES = {
-    "no-export": "65535:65281",
-    "no-advertise": "65535:65282",
-    "no-export-subconfed": "65535:65283",
-    "local-as": "65535:65283",
-    "internet": "0:0",
-}
-
-# Extended/typed community prefixes → ExtendedCommunityTypeChoices value.
-_EXT_COMMUNITY_TYPES = {
-    "target": "route-target",
-    "route-target": "route-target",
-    "rt": "route-target",
-    "origin": "route-origin",
-    "route-origin": "route-origin",
-    "soo": "route-origin",
-    "color": "color",
-    "bandwidth": "bandwidth",
-    "encapsulation": "encapsulation",
-}
-
-# Reverse of _EXT_COMMUNITY_TYPES for the WRITE path: ExtendedCommunityTypeChoices value
-# → the canonical device member prefix. The forward map is many-to-one (target/rt/
-# route-target all normalise to "route-target"), so the original keyword is lost; we emit
-# the canonical device keyword ("target:6830:100" etc.), which the NEDs accept and which
-# round-trips against what the read path captured.
-_EXT_TYPE_TO_DEVICE_PREFIX = {
-    "route-target": "target",
-    "route-origin": "origin",
-    "color": "color",
-    "bandwidth": "bandwidth",
-    "encapsulation": "encapsulation",
-}
-
-# One colon-separated part of a community value: digits, dots and regex/wildcard
-# metacharacters. Mirrors the relaxed netbox_routing Community/ExtendedCommunity
-# validators so anything we classify as standard/extended also validates there.
-# A value is up to 3 such parts (4+ is not a valid community).
-_COMMUNITY_PART = r"[\d.*^$()\[\]|+?\\_-]+"
-_STD_OR_REGEX_RE = re.compile(rf"^{_COMMUNITY_PART}(?::{_COMMUNITY_PART}){{0,2}}$")
-
-
-def _classify_community(value: str):
-    """Classify a community-list member value.
-
-    Returns one of:
-      ("standard", value)                — fits netbox_routing.Community (exact OR regex)
-      ("extended", ext_type, ext_value)  — fits netbox_routing.ExtendedCommunity
-      ("large", value)                   — RFC 8092, fits netbox_routing.LargeCommunity
-      ("skip", reason)                   — unparseable / unsupported; dropped
-
-    Regex / wildcard members (Cisco expanded community-lists, Nokia/Junos inline —
-    6830:*, 6830:.*, 6830:1113.) are accepted: they are match-only but must round-trip,
-    and the netbox_routing validators now permit the metacharacters.
-    """
-    v = (value or "").strip()
-    if not v:
-        return ("skip", "empty")
-    if v.lower() in _WELL_KNOWN_COMMUNITIES:
-        return ("standard", _WELL_KNOWN_COMMUNITIES[v.lower()])
-    # Extended/typed prefix (target:/origin:/...) — the remainder may be exact or regex.
-    # Checked before the standard branch because typed prefixes carry letters and never
-    # match _STD_OR_REGEX_RE.
-    if ":" in v:
-        prefix, _, rest = v.partition(":")
-        etype = _EXT_COMMUNITY_TYPES.get(prefix.lower())
-        if etype and _STD_OR_REGEX_RE.match(rest):
-            return ("extended", etype, rest)
-        # RFC 8092 large community (large:GlobalAdmin:Local1:Local2) — fits
-        # netbox_routing.LargeCommunity; value may be exact or regex.
-        if prefix.lower() == "large" and _STD_OR_REGEX_RE.match(rest):
-            return ("large", rest)
-    # Standard exact (6830:100) or inline regex/wildcard (6830:*, 6830:1113.).
-    if _STD_OR_REGEX_RE.match(v):
-        return ("standard", v)
-    return ("skip", f"unsupported community member {v!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -199,66 +118,30 @@ def _fill_as_path_entries(ap_obj, entries: list) -> None:
 def _fill_community_list_entries(cl_obj, entries: list) -> None:
     """Fill a CommunityList's members.
 
-    Standard members (incl. inline regex/wildcard) go to Community; extended/typed members
-    to a parallel ExtendedCommunityList; RFC 8092 large communities to a parallel
-    LargeCommunityList — all of the same name. Truly unsupported members are logged + dropped.
+    The universal Community model stores every member string VERBATIM, exactly as the
+    device reports it — numeric (1111:100), well-known keywords (no-export), typed extended
+    (target:1111:100, color:0:128), RFC 8092 large (large:GA:L1:L2), and match-only
+    regex/wildcards (1111:*, 1111:1113.). The kind is derived by parsing the text on the
+    netbox_routing side; the plugin no longer routes members to parallel typed lists.
+    Empty members are skipped.
     """
     from netbox_routing.models import Community, CommunityListEntry
 
-    try:
-        from netbox_routing.models import (
-            ExtendedCommunity,
-            ExtendedCommunityList,
-            ExtendedCommunityListEntry,
-        )
-
-        have_ext = True
-    except ImportError:
-        have_ext = False
-
-    try:
-        from netbox_routing.models import (
-            LargeCommunity,
-            LargeCommunityList,
-            LargeCommunityListEntry,
-        )
-
-        have_large = True
-    except ImportError:
-        have_large = False
-
     CommunityListEntry.objects.filter(community_list=cl_obj).delete()
-    ext_parent = None
-    large_parent = None
-    std_rows = []
+    rows = []
     for e in entries:
-        kind = _classify_community(e.get("community", ""))
+        value = (e.get("community") or "").strip()
+        if not value:
+            logger.info("route-policy: skipping empty community member in %s", cl_obj.name)
+            continue
         action = _norm_action(e.get("action"))
-        if kind[0] == "standard":
-            comm, _ = Community.objects.get_or_create(community=kind[1])
-            std_rows.append(CommunityListEntry(community_list=cl_obj, action=action, community=comm))
-        elif kind[0] == "extended" and have_ext:
-            if ext_parent is None:
-                ext_parent, _ = ExtendedCommunityList.objects.get_or_create(name=cl_obj.name)
-                ExtendedCommunityListEntry.objects.filter(extended_community_list=ext_parent).delete()
-            ec, _ = ExtendedCommunity.objects.get_or_create(type=kind[1], value=kind[2])
-            ExtendedCommunityListEntry.objects.create(
-                extended_community_list=ext_parent, action=action, extended_community=ec
-            )
-        elif kind[0] == "large" and have_large:
-            if large_parent is None:
-                large_parent, _ = LargeCommunityList.objects.get_or_create(name=cl_obj.name)
-                LargeCommunityListEntry.objects.filter(large_community_list=large_parent).delete()
-            lc, _ = LargeCommunity.objects.get_or_create(value=kind[1])
-            LargeCommunityListEntry.objects.create(large_community_list=large_parent, action=action, large_community=lc)
-        else:
-            reason = kind[1] if kind[0] == "skip" else f"no model for {kind[0]} community"
-            logger.info("route-policy: skipping community member in %s (%s)", cl_obj.name, reason)
-    if std_rows:
-        CommunityListEntry.objects.bulk_create(std_rows)
+        comm, _ = Community.objects.get_or_create(community=value)
+        rows.append(CommunityListEntry(community_list=cl_obj, action=action, community=comm))
+    if rows:
+        CommunityListEntry.objects.bulk_create(rows)
 
 
-def _fill_route_map_entries(rm_obj, entries: list, pl_by_name, cl_by_name, ap_by_name, ext_cl_by_name) -> None:
+def _fill_route_map_entries(rm_obj, entries: list, pl_by_name, cl_by_name, ap_by_name) -> None:
     from netbox_routing.models import RouteMapEntry
 
     RouteMapEntry.objects.filter(route_map=rm_obj).delete()
@@ -291,13 +174,7 @@ def _fill_route_map_entries(rm_obj, entries: list, pl_by_name, cl_by_name, ap_by
                 member_ids = obj.communitylistentries.values_list("community_id", flat=True)
                 if member_ids:
                     rme.match_community.add(*[cid for cid in member_ids if cid])
-            # A community-list whose members are extended/typed lives in a parallel
-            # ExtendedCommunityList of the same name — link that too (its CommunityList
-            # shell may be empty).
-            ext = ext_cl_by_name.get(nm)
-            if ext is not None:
-                rme.match_extended_community_list.add(ext)
-            if obj is None and ext is None:
+            else:
                 logger.debug("route-policy: route-map %s refs community-list %r not resolvable", rm_obj.name, nm)
         for nm in e.get("match_as_paths") or []:
             obj = ap_by_name.get(nm)
@@ -422,9 +299,7 @@ def _reconcile_as_paths(mgmt, device, ap_list, ASPath, ContentType, now, seen_ke
         seen_keys.add(("as_path", name))
 
 
-def _reconcile_route_maps(
-    mgmt, device, rm_list, RouteMap, ContentType, now, seen_keys, pl_map, cl_map, ap_map, ext_cl_map
-):
+def _reconcile_route_maps(mgmt, device, rm_list, RouteMap, ContentType, now, seen_keys, pl_map, cl_map, ap_map):
     from netbox_routing.models import RouteMapEntry
 
     ct = ContentType.objects.get_for_model(RouteMap)
@@ -436,7 +311,7 @@ def _reconcile_route_maps(
         rm_obj, created = RouteMap.objects.get_or_create(name=name)
         state, should_fill = _upsert_state(mgmt, "route_map", name, rm_obj, ct, _hash(entries), now)
         if _needs_fill(RouteMapEntry, created, should_fill, route_map=rm_obj):
-            _fill_route_map_entries(rm_obj, entries, pl_map, cl_map, ap_map, ext_cl_map)
+            _fill_route_map_entries(rm_obj, entries, pl_map, cl_map, ap_map)
         seen_keys.add(("route_map", name))
 
 
@@ -479,16 +354,6 @@ def reconcile_route_policy(device, payload: dict) -> list:
         mgmt, device, payload.get("community_lists", []), CommunityList, ContentType, now, seen_keys, cl_map
     )
     _reconcile_as_paths(mgmt, device, payload.get("as_paths", []), ASPath, ContentType, now, seen_keys, ap_map)
-    # Extended community-lists parallel the community-lists by name (created by the
-    # community-list reconcile above for target:/typed members); map them for route-map
-    # match linking. Empty if the fork lacks the ExtendedCommunityList model.
-    ext_cl_map: dict[str, object] = {}
-    try:
-        from netbox_routing.models import ExtendedCommunityList
-
-        ext_cl_map = {ecl.name: ecl for ecl in ExtendedCommunityList.objects.filter(name__in=cl_map.keys())}
-    except ImportError:
-        pass
     # Route-maps last: their match M2Ms reference the objects created above.
     _reconcile_route_maps(
         mgmt,
@@ -501,7 +366,6 @@ def reconcile_route_policy(device, payload: dict) -> list:
         pl_map,
         cl_map,
         ap_map,
-        ext_cl_map,
     )
 
     # Mark stale rows as drift (accepted/deploying intent is preserved by on_reconcile).
