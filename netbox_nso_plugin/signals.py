@@ -1884,12 +1884,11 @@ def _build_community_list_entries(obj):
         from netbox_routing.models import ExtendedCommunityList
 
         from .route_policy_reconciler import _EXT_TYPE_TO_DEVICE_PREFIX
+
+        ext = ExtendedCommunityList.objects.filter(name=obj.name).first()
     except ImportError:
-        return out
-    ext = ExtendedCommunityList.objects.filter(name=obj.name).first()
-    if ext is None:
-        return out
-    for e in ext.extendedcommunitylistentries.all():
+        ext = None
+    for e in ext.extendedcommunitylistentries.all() if ext is not None else []:
         ec = e.extended_community
         if ec is None:
             continue
@@ -1897,6 +1896,23 @@ def _build_community_list_entries(obj):
         seq += 1
         out.append(
             {"sequence": seq, "action": e.action.lower() if e.action else "permit", "community": f"{prefix}:{ec.value}"}
+        )
+
+    # RFC 8092 large communities live in a parallel LargeCommunityList of the same name;
+    # emit them as `large:<value>` (the device keyword the read path captured).
+    try:
+        from netbox_routing.models import LargeCommunityList
+
+        large = LargeCommunityList.objects.filter(name=obj.name).first()
+    except ImportError:
+        large = None
+    for e in large.largecommunitylistentries.all() if large is not None else []:
+        lc = e.large_community
+        if lc is None:
+            continue
+        seq += 1
+        out.append(
+            {"sequence": seq, "action": e.action.lower() if e.action else "permit", "community": f"large:{lc.value}"}
         )
     return out
 

@@ -123,6 +123,30 @@ class TestRoutePolicyEntrySerialization(_RPBase):
             {"sequence": 2, "action": "permit", "community": "origin:64500:9"},
         ]
 
+    def test_community_list_large_members_serialize(self):
+        """RFC 8092 large members (in a parallel LargeCommunityList of the same name) are
+        emitted as `large:<value>` so they round-trip back to the device."""
+        from netbox_routing.models import (
+            CommunityList,
+            LargeCommunity,
+            LargeCommunityList,
+            LargeCommunityListEntry,
+        )
+
+        from netbox_nso_plugin.signals import _build_route_policy_entries
+
+        name = "TESTNSO-CL-LARGE"
+        cl = CommunityList.objects.create(name=name)  # 0 standard entries
+        lcl = LargeCommunityList.objects.create(name=name)
+        LargeCommunityListEntry.objects.create(
+            large_community_list=lcl,
+            action="permit",
+            large_community=LargeCommunity.objects.create(value="65000:1:2"),
+        )
+
+        entries = _build_route_policy_entries("community_list", cl)
+        assert entries == [{"sequence": 1, "action": "permit", "community": "large:65000:1:2"}]
+
     def test_as_path_entries_serialize_from_fork_model(self):
         """as_path reads ASPath.aspath_entries (sequence/action/pattern)."""
         from netbox_routing.models import ASPath, ASPathEntry

@@ -218,6 +218,31 @@ class TestReconcileRoutePolicy(TestCase):
         self.assertTrue(ExtendedCommunity.objects.filter(type="route-target", value="6830:100").exists())
         self.assertTrue(ExtendedCommunity.objects.filter(type="route-target", value="*:*").exists())
 
+    def test_large_community_members_routed(self):
+        """RFC 8092 large: members (exact + regex) go to a parallel LargeCommunityList."""
+        self._make_mgmt(self.device)
+        from netbox_routing.models import LargeCommunity, LargeCommunityList, LargeCommunityListEntry
+
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        payload = {
+            "community_lists": [
+                {
+                    "name": "CL-LARGE",
+                    "entries": [
+                        {"action": "permit", "community": "large:65000:1:2"},
+                        {"action": "permit", "community": "large:6830:.*:[0-4]"},
+                    ],
+                }
+            ],
+        }
+        reconcile_route_policy(self.device, payload)
+
+        lcl = LargeCommunityList.objects.get(name="CL-LARGE")
+        self.assertEqual(LargeCommunityListEntry.objects.filter(large_community_list=lcl).count(), 2)
+        self.assertTrue(LargeCommunity.objects.filter(value="65000:1:2").exists())
+        self.assertTrue(LargeCommunity.objects.filter(value="6830:.*:[0-4]").exists())
+
     def test_route_map_links_extended_community_list(self):
         """A route-map matching a community-list whose members are extended links the
         parallel ExtendedCommunityList via match_extended_community_list."""

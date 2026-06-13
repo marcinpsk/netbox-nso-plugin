@@ -101,7 +101,8 @@ def _classify_community(value: str):
     Returns one of:
       ("standard", value)                — fits netbox_routing.Community (exact OR regex)
       ("extended", ext_type, ext_value)  — fits netbox_routing.ExtendedCommunity
-      ("skip", reason)                   — unparseable / unsupported (e.g. large:); dropped
+      ("large", value)                   — RFC 8092, fits netbox_routing.LargeCommunity
+      ("skip", reason)                   — unparseable / unsupported; dropped
 
     Regex / wildcard members (Cisco expanded community-lists, Nokia/Junos inline —
     6830:*, 6830:.*, 6830:1113.) are accepted: they are match-only but must round-trip,
@@ -120,6 +121,10 @@ def _classify_community(value: str):
         etype = _EXT_COMMUNITY_TYPES.get(prefix.lower())
         if etype and _STD_OR_REGEX_RE.match(rest):
             return ("extended", etype, rest)
+        # RFC 8092 large community (large:GlobalAdmin:Local1:Local2) — fits
+        # netbox_routing.LargeCommunity; value may be exact or regex.
+        if prefix.lower() == "large" and _STD_OR_REGEX_RE.match(rest):
+            return ("large", rest)
     # Standard exact (6830:100) or inline regex/wildcard (6830:*, 6830:1113.).
     if _STD_OR_REGEX_RE.match(v):
         return ("standard", v)
@@ -194,9 +199,9 @@ def _fill_as_path_entries(ap_obj, entries: list) -> None:
 def _fill_community_list_entries(cl_obj, entries: list) -> None:
     """Fill a CommunityList's members.
 
-    Standard members go to Community; extended/typed members are routed into a parallel
-    ExtendedCommunityList of the same name. Regex/wildcard members are logged and dropped
-    (they don't fit either model).
+    Standard members (incl. inline regex/wildcard) go to Community; extended/typed members
+    to a parallel ExtendedCommunityList; RFC 8092 large communities to a parallel
+    LargeCommunityList — all of the same name. Truly unsupported members are logged + dropped.
     """
     from netbox_routing.models import Community, CommunityListEntry
 
@@ -211,8 +216,20 @@ def _fill_community_list_entries(cl_obj, entries: list) -> None:
     except ImportError:
         have_ext = False
 
+    try:
+        from netbox_routing.models import (
+            LargeCommunity,
+            LargeCommunityList,
+            LargeCommunityListEntry,
+        )
+
+        have_large = True
+    except ImportError:
+        have_large = False
+
     CommunityListEntry.objects.filter(community_list=cl_obj).delete()
     ext_parent = None
+    large_parent = None
     std_rows = []
     for e in entries:
         kind = _classify_community(e.get("community", ""))
@@ -228,8 +245,14 @@ def _fill_community_list_entries(cl_obj, entries: list) -> None:
             ExtendedCommunityListEntry.objects.create(
                 extended_community_list=ext_parent, action=action, extended_community=ec
             )
+        elif kind[0] == "large" and have_large:
+            if large_parent is None:
+                large_parent, _ = LargeCommunityList.objects.get_or_create(name=cl_obj.name)
+                LargeCommunityListEntry.objects.filter(large_community_list=large_parent).delete()
+            lc, _ = LargeCommunity.objects.get_or_create(value=kind[1])
+            LargeCommunityListEntry.objects.create(large_community_list=large_parent, action=action, large_community=lc)
         else:
-            reason = kind[1] if kind[0] == "skip" else "no ExtendedCommunity model"
+            reason = kind[1] if kind[0] == "skip" else f"no model for {kind[0]} community"
             logger.info("route-policy: skipping community member in %s (%s)", cl_obj.name, reason)
     if std_rows:
         CommunityListEntry.objects.bulk_create(std_rows)
