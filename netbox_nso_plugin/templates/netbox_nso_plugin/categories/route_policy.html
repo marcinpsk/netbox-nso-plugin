@@ -10,6 +10,9 @@
       <a href="{% url 'plugins:netbox_nso_plugin:route_policy_attach' device_pk=object.pk %}" class="btn btn-sm btn-primary" title="Attach an existing route-policy object to this device — written on Apply">
         <i class="mdi mdi-plus-thick"></i> Add Route-Policy…
       </a>
+      <a href="{% url 'plugins:netbox_nso_plugin:route_policy_capabilities' device_pk=object.pk %}" class="btn btn-sm btn-outline-primary" title="What this device can apply for route-maps and communities (by NED + software)">
+        <i class="mdi mdi-shield-check-outline"></i> Capabilities
+      </a>
     </div>
     <div class="nso-cat-msg"></div>
     <div class="d-flex justify-content-between align-items-center mb-2">

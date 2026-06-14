@@ -74,6 +74,11 @@ def _device_nso_tab_url(device_pk):
     return reverse("dcim:device_nso", kwargs={"pk": device_pk})
 
 
+def _device_capabilities_url(device_pk):
+    """Return the URL for a device's route-policy capabilities page."""
+    return reverse("plugins:netbox_nso_plugin:route_policy_capabilities", kwargs={"device_pk": device_pk})
+
+
 def _refresh_sync_cache(mgmt, adapter_device):
     """Update an NSODeviceManagement row's cached last_sync_* from an adapter device dict.
 
@@ -2163,6 +2168,54 @@ class NSORoutePolicyAttachView(LoginRequiredMixin, View):
         return client.preflight_route_policy(
             mgmt.adapter_device_id, community_members, set_keys, match_keys, refresh=True
         )
+
+
+class NSORoutePolicyCapabilityView(LoginRequiredMixin, View):
+    """Operator-facing capability matrix for one device's route-policy support.
+
+    Lists, per ``(ned_id, sw_version)``, which route-map / community constructs this device
+    supports — native / translated / skipped / unsupported, with the source (probe vs a real
+    device rejection). Read is cache-only (no live probe); ``?refresh=1`` (or the "Check now"
+    POST) forces a fresh probe. This is the browsable companion to the attach-time block and
+    the per-object panel badge.
+    """
+
+    def get(self, request, device_pk):  # noqa: D102
+        mgmt = get_object_or_404(NSODeviceManagement, device_id=device_pk)
+        refresh = request.GET.get("refresh") == "1"
+        return render(request, "netbox_nso_plugin/route_policy_capabilities.html", self._context(mgmt, refresh))
+
+    def post(self, request, device_pk):  # noqa: D102
+        mgmt = get_object_or_404(NSODeviceManagement, device_id=device_pk)
+        ctx = self._context(mgmt, refresh=True)
+        if ctx["known"]:
+            messages.success(request, f"Refreshed capabilities for {mgmt.device.name}.")
+        else:
+            messages.warning(request, "Could not determine capabilities (adapter unreachable or device not probed).")
+        return redirect(_device_capabilities_url(mgmt.device_id))
+
+    @staticmethod
+    def _context(mgmt, refresh):
+        from . import adapter_client as client
+
+        result: dict = {"known": False, "ned_id": "", "sw_version": "", "elements": []}
+        if mgmt.adapter_device_id:
+            result = client.get_device_capability(mgmt.adapter_device_id, refresh=refresh)
+        # Group rows by scope for the template; keep a stable order.
+        scopes: dict[str, list] = {"community": [], "rm-set": [], "rm-match": []}
+        for el in result.get("elements", []):
+            scopes.setdefault(el.get("scope", "other"), []).append(el)
+        flagged = sum(1 for el in result.get("elements", []) if el.get("status") in ("skipped", "unsupported"))
+        return {
+            "mgmt": mgmt,
+            "object": mgmt.device,
+            "known": result.get("known", False),
+            "ned_id": result.get("ned_id", ""),
+            "sw_version": result.get("sw_version", ""),
+            "scopes": scopes,
+            "total": len(result.get("elements", [])),
+            "flagged": flagged,
+        }
 
 
 class NSOVLANAttachView(LoginRequiredMixin, View):

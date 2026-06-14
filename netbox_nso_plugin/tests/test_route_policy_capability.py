@@ -283,3 +283,91 @@ class TestPanelCapabilityBadge(_CapBase):
             states = self._annotated_states(pl)
 
         assert states[0].capability["state"] == "supported"
+
+
+# ── operator capabilities page ────────────────────────────────────────────────
+
+
+class TestCapabilitiesPage(_CapBase):
+    def setUp(self):
+        super().setUp()
+        self.superuser = get_user_model().objects.create_superuser(
+            username="capadmin2", password=TEST_PASSWORD, email="capadmin2@test.example"
+        )
+        self.client.force_login(self.superuser)
+
+    def _url(self):
+        return reverse("plugins:netbox_nso_plugin:route_policy_capabilities", args=[self.device.pk])
+
+    def test_page_lists_grouped_capability_rows(self):
+        self._mgmt()
+        capability_payload = {
+            "known": True,
+            "ned_id": "cisco-ios-cli-6.114",
+            "sw_version": "15.2(4)E10",
+            "elements": [
+                {
+                    "scope": "community",
+                    "name": "color:0:128",
+                    "status": "skipped",
+                    "detail": "no IOS home",
+                    "source": "probe",
+                },
+                {
+                    "scope": "rm-set",
+                    "name": "set extcommunity color",
+                    "status": "unsupported",
+                    "detail": "% Invalid input",
+                    "source": "apply",
+                },
+                {"scope": "rm-set", "name": "set metric-type", "status": "native", "detail": "", "source": "probe"},
+            ],
+        }
+        with patch("netbox_nso_plugin.adapter_client._request", return_value=capability_payload):
+            resp = self.client.get(self._url())
+
+        assert resp.status_code == 200
+        self.assertContains(resp, "15.2(4)E10")
+        self.assertContains(resp, "set extcommunity color")
+        self.assertContains(resp, "unsupported")
+        self.assertContains(resp, "<strong>2</strong>")  # flagged count (skipped + unsupported)
+        self.assertContains(resp, "of 3 construct")  # summary line rendered
+
+    def test_page_get_is_cache_only(self):
+        """The browsable GET must read cache-only (refresh=false → no ?refresh=true on the call)."""
+        self._mgmt()
+        seen = {}
+
+        def _capture(method, path, **kwargs):
+            seen["path"] = path
+            return {"known": True, "ned_id": "n", "sw_version": "s", "elements": []}
+
+        with patch("netbox_nso_plugin.adapter_client._request", side_effect=_capture):
+            self.client.get(self._url())
+
+        assert "refresh=true" not in seen["path"]
+
+    def test_check_now_post_forces_refresh_then_redirects(self):
+        self._mgmt()
+        seen = {}
+
+        def _capture(method, path, **kwargs):
+            seen["path"] = path
+            return {"known": True, "ned_id": "n", "sw_version": "s", "elements": []}
+
+        with patch("netbox_nso_plugin.adapter_client._request", side_effect=_capture):
+            resp = self.client.post(self._url())
+
+        assert resp.status_code == 302
+        assert "refresh=true" in seen["path"]  # POST = authoritative probe
+
+    def test_unknown_device_renders_check_now_prompt(self):
+        self._mgmt()
+        with patch(
+            "netbox_nso_plugin.adapter_client._request",
+            return_value={"known": False, "ned_id": "", "sw_version": "", "elements": []},
+        ):
+            resp = self.client.get(self._url())
+
+        assert resp.status_code == 200
+        self.assertContains(resp, "never been probed")
