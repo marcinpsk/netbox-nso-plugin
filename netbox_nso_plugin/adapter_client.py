@@ -716,6 +716,48 @@ def put_route_policy_intent(adapter_device_id, objects):
     )
 
 
+def get_device_capability(adapter_device_id, refresh=False):
+    """GET /api/v1/devices/{id}/capability — the route-policy capability verdict for this device.
+
+    ``refresh=False`` (default) is the cheap cache-only read used to render the panel badge;
+    ``refresh=True`` forces a fresh NSO probe ("check now"). Returns the adapter dict
+    ``{known, ned_id, sw_version, elements:[{scope,name,status,detail,source}]}``. Fails open:
+    on any adapter error returns ``{known: False, elements: []}`` so the UI degrades to
+    "unknown" rather than erroring.
+    """
+    suffix = "?refresh=true" if refresh else ""
+    try:
+        return _request("GET", f"/api/v1/devices/{adapter_device_id}/capability{suffix}")
+    except AdapterError as exc:
+        logger.warning("capability read failed for device %s: %s", adapter_device_id, exc)
+        return {"known": False, "ned_id": "", "sw_version": "", "elements": []}
+
+
+def preflight_route_policy(adapter_device_id, community_members=(), set_keys=(), match_keys=(), refresh=True):
+    """POST /api/v1/devices/{id}/route-policy/preflight — check an attach against the matrix.
+
+    ``refresh=True`` (default — the authoritative attach-time check) probes the device once;
+    ``refresh=False`` reads the last-learned verdict. Returns
+    ``{known, fully_supported, unsupported:[{scope,element,status,detail}], ned_id, sw_version}``.
+    Fails open: any adapter error → ``{known: False, fully_supported: True, unsupported: []}`` so
+    an unreachable adapter never blocks an attach (we block only on a KNOWN-negative verdict).
+    """
+    suffix = "?refresh=false" if not refresh else ""
+    try:
+        return _request(
+            "POST",
+            f"/api/v1/devices/{adapter_device_id}/route-policy/preflight{suffix}",
+            json={
+                "community_members": list(community_members),
+                "set_keys": list(set_keys),
+                "match_keys": list(match_keys),
+            },
+        )
+    except AdapterError as exc:
+        logger.warning("route-policy preflight failed for device %s: %s", adapter_device_id, exc)
+        return {"known": False, "fully_supported": True, "unsupported": []}
+
+
 def trigger_apply(adapter_device_id, force=True):
     """POST /api/v1/devices/{id}/actions/apply → job_id.
 

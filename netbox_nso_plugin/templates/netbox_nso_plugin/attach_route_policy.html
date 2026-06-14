@@ -7,6 +7,58 @@
 {% block content %}
 <div class="row">
   <div class="col col-md-8 offset-md-2">
+    {% if preflight %}
+    {# Block-with-override: this device's (NED, software) is known not to support some #}
+    {# parts of the selected object. Show exactly what won't apply before letting the #}
+    {# operator attach anyway. #}
+    <div class="card border-warning">
+      <h5 class="card-header text-bg-warning text-dark">
+        <span class="mdi mdi-alert me-1"></span>Some parts won't apply on {{ object }}
+      </h5>
+      <div class="card-body">
+        <p>
+          Attaching <strong>{{ selected_label }}</strong> to <strong>{{ object }}</strong>
+          {% if preflight.sw_version %}(software <code>{{ preflight.sw_version }}</code>){% endif %}.
+          Based on this device's capability check, the following would be
+          <strong>silently dropped</strong> when written to the device:
+        </p>
+        <table class="table table-sm">
+          <thead>
+            <tr><th>Scope</th><th>Element</th><th>Verdict</th><th>Detail</th></tr>
+          </thead>
+          <tbody>
+            {% for u in preflight.unsupported %}
+              <tr>
+                <td><span class="text-muted">{{ u.scope }}</span></td>
+                <td><code>{{ u.element }}</code></td>
+                <td>
+                  {% if u.status == "unsupported" %}
+                    <span class="badge text-bg-danger">{{ u.status }}</span>
+                  {% else %}
+                    <span class="badge text-bg-warning text-dark">{{ u.status }}</span>
+                  {% endif %}
+                </td>
+                <td><small class="text-muted">{{ u.detail|default:"—" }}</small></td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        <p class="text-muted">
+          The rest of the object still applies. Attach anyway to write the supported parts now;
+          the unsupported parts above won't reach the device.
+        </p>
+        <form method="post">
+          {% csrf_token %}
+          <input type="hidden" name="policy" value="{{ selected_policy }}">
+          <input type="hidden" name="override" value="1">
+          <button type="submit" class="btn btn-warning">
+            <span class="mdi mdi-alert-outline me-1"></span>Attach anyway
+          </button>
+          <a href="{% url 'dcim:device_nso' pk=object.pk %}" class="btn btn-outline-secondary">Cancel</a>
+        </form>
+      </div>
+    </div>
+    {% else %}
     <div class="card">
       <h5 class="card-header">Attach Route-Policy to {{ object }}</h5>
       <div class="card-body">
@@ -14,7 +66,8 @@
           Attach an existing route-policy object (prefix-list / route-map / community-list / as-path) to
           <strong>{{ object }}</strong>. The device↔object link is the overlay, so one object can be attached to
           several devices. It is written to the device on the next <strong>Apply</strong>. Create new objects under
-          Netbox Routing → Routing Objects first.
+          Netbox Routing → Routing Objects first. Route-maps and community-lists are checked against this device's
+          capabilities before attaching.
         </p>
 
         {% if candidates %}
@@ -37,6 +90,7 @@
         {% endif %}
       </div>
     </div>
+    {% endif %}
   </div>
 </div>
 {% endblock %}

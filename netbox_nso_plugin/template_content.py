@@ -1820,7 +1820,12 @@ class RoutePolicyNSODevices(PluginTemplateExtension):
     ]
 
     def full_width_page(self):
-        """Render the per-device status table for the route-policy object on display."""
+        """Render the per-device status table for the route-policy object on display.
+
+        Each row also carries a *capability* verdict for that device — a cache-only
+        pre-flight (no live probe) so the operator sees, at a glance, whether the whole
+        object applies on that box or some parts are silently dropped.
+        """
         from django.contrib.contenttypes.models import ContentType
 
         from .models import NSORoutePolicyState
@@ -1832,10 +1837,40 @@ class RoutePolicyNSODevices(PluginTemplateExtension):
                 "management", "management__device"
             )
         )
+        self._annotate_capability(obj, states)
         return self.render(
             "netbox_nso_plugin/route_policy_nso_devices.html",
             extra_context={"nso_states": states},
         )
+
+    @staticmethod
+    def _annotate_capability(obj, states):
+        """Attach a ``capability`` dict to each state row (cache-only, best-effort).
+
+        ``{state: supported|partial|unknown, unsupported: [...]}``. Computed from the
+        adapter's persisted matrix without probing NSO, so the panel stays cheap; an
+        unreachable adapter or never-probed device degrades to ``unknown``.
+        """
+        from . import adapter_client as client
+        from .signals import _preflight_constructs
+
+        for state in states:
+            community_members, set_keys, match_keys = _preflight_constructs(state.family, obj)
+            if not (community_members or set_keys or match_keys):
+                # prefix-list / as-path carry nothing flaggable — universally representable.
+                state.capability = {"state": "supported", "unsupported": []}
+                continue
+            adapter_id = getattr(state.management, "adapter_device_id", None)
+            if not adapter_id:
+                state.capability = {"state": "unknown", "unsupported": []}
+                continue
+            verdict = client.preflight_route_policy(adapter_id, community_members, set_keys, match_keys, refresh=False)
+            if not verdict.get("known"):
+                state.capability = {"state": "unknown", "unsupported": []}
+            elif verdict.get("fully_supported"):
+                state.capability = {"state": "supported", "unsupported": []}
+            else:
+                state.capability = {"state": "partial", "unsupported": verdict.get("unsupported", [])}
 
 
 template_extensions = [InterfaceNSOBadge, RoutePolicyNSODevices]

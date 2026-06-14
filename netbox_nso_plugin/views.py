@@ -2098,6 +2098,26 @@ class NSORoutePolicyAttachView(LoginRequiredMixin, View):
         except (ValueError, ContentType.DoesNotExist, Exception):  # noqa: BLE001
             messages.error(request, "Invalid route-policy selection.")
             return redirect(_device_nso_tab_url(mgmt.device_id))
+
+        # Capability pre-flight (block-with-override): if this device's (ned, sw) is KNOWN
+        # not to support parts of the object, stop and show exactly what won't apply — unless
+        # the operator already chose to override. Unknown / unreachable adapter → fail open
+        # (never block on a verdict we don't have). See compatibility-matrix design.
+        override = request.POST.get("override") == "1"
+        preflight = self._preflight(mgmt, family, obj) if (mgmt.adapter_device_id and not override) else None
+        if preflight and preflight.get("known") and not preflight.get("fully_supported"):
+            return render(
+                request,
+                "netbox_nso_plugin/attach_route_policy.html",
+                {
+                    "mgmt": mgmt,
+                    "object": mgmt.device,
+                    "preflight": preflight,
+                    "selected_policy": request.POST.get("policy", ""),
+                    "selected_label": f"{family} {obj.name}",
+                },
+            )
+
         state, created = NSORoutePolicyState.objects.get_or_create(
             management=mgmt,
             family=family,
@@ -2116,8 +2136,33 @@ class NSORoutePolicyAttachView(LoginRequiredMixin, View):
         state.object_id = obj.pk
         state.last_sync_at = timezone.now()
         state.save()  # → _on_route_policy_state_save schedules the push
-        messages.success(request, f"Attached {family} {obj.name} to {mgmt.device.name} — Apply to write it.")
+        if override:
+            # Operator overrode a known-negative verdict — be explicit about what won't land.
+            messages.warning(
+                request,
+                f"Attached {family} {obj.name} to {mgmt.device.name} with override — "
+                f"some parts won't apply on this device (see its capability check).",
+            )
+        else:
+            messages.success(request, f"Attached {family} {obj.name} to {mgmt.device.name} — Apply to write it.")
         return redirect(_device_nso_tab_url(mgmt.device_id))
+
+    @staticmethod
+    def _preflight(mgmt, family, obj):
+        """Run the adapter capability pre-flight for an attach (authoritative, probes once).
+
+        Returns the adapter verdict dict, or ``None`` when there is nothing to check
+        (prefix-list / as-path carry no flaggable constructs).
+        """
+        from . import adapter_client as client
+        from .signals import _preflight_constructs
+
+        community_members, set_keys, match_keys = _preflight_constructs(family, obj)
+        if not (community_members or set_keys or match_keys):
+            return None
+        return client.preflight_route_policy(
+            mgmt.adapter_device_id, community_members, set_keys, match_keys, refresh=True
+        )
 
 
 class NSOVLANAttachView(LoginRequiredMixin, View):

@@ -1950,6 +1950,34 @@ def _build_route_policy_entries(family, obj):
     return []
 
 
+def _preflight_constructs(family, obj):
+    """Derive the capability-preflight inputs from a netbox-routing route-policy object.
+
+    Returns ``(community_members, set_keys, match_keys)`` — the same shape the adapter's
+    ``/route-policy/preflight`` endpoint checks against a device's capability matrix:
+
+      - community_list → its member strings (checked by KIND: large / color / regex / …);
+      - route_map → the union of set-json / match-json keys across entries (checked by
+        construct name, e.g. ``metric_type`` → "set metric-type");
+      - prefix_list / as_path → nothing (universally representable — always supported).
+
+    Mirrors the keys ``_build_route_policy_entries`` already serializes, so the preflight
+    sees exactly what an Apply would push.
+    """
+    community_members: list[str] = []
+    set_keys: set[str] = set()
+    match_keys: set[str] = set()
+    if family == "community_list":
+        for e in obj.communitylistentries.all():
+            if e.community_id:
+                community_members.append(str(e.community.community))
+    elif family == "route_map":
+        for e in obj.route_map_entries.all():
+            set_keys.update(_as_json_dict(e.set).keys())
+            match_keys.update(_as_json_dict(e.match).keys())
+    return sorted(set(community_members)), sorted(set_keys), sorted(match_keys)
+
+
 def _as_json_dict(value):
     """Coerce a JSONField value (dict, JSON string, or None) into a dict."""
     if isinstance(value, dict):
