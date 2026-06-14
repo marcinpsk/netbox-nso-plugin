@@ -42,6 +42,7 @@ def _make_mgmt_instance(
     manage_description=True,
     manage_enabled=False,
     auto_apply=False,
+    sync_before_apply=True,
 ):
     """Return a fake NSODeviceManagement instance with all attrs needed by signals."""
     cls = _make_mgmt_class()
@@ -51,6 +52,7 @@ def _make_mgmt_instance(
     inst.device_id = device_id
     inst.nso_device_name = "core-rtr-01"
     inst.auto_apply = auto_apply
+    inst.sync_before_apply = sync_before_apply
 
     nso_inst = MagicMock()
     nso_inst.adapter_instance_id = "nso-prod"
@@ -103,7 +105,7 @@ class TestSyncScopeToAdapter(unittest.TestCase):
                 nso_device_name="core-rtr-01",
                 netbox_device_id=42,
             )
-            mock_scope.assert_called_once_with(99, ["description"], auto_apply=False)
+            mock_scope.assert_called_once_with(99, ["description"], auto_apply=False, sync_before_apply=True)
             mock_notify.assert_called_once_with(99)
             mock_patch.assert_not_called()
 
@@ -181,7 +183,7 @@ class TestSyncScopeToAdapter(unittest.TestCase):
 
         mock_onboard.assert_called_once()
         # Both description and enabled should be in the scope call
-        mock_scope.assert_called_once_with(5, ["description", "enabled"], auto_apply=False)
+        mock_scope.assert_called_once_with(5, ["description", "enabled"], auto_apply=False, sync_before_apply=True)
 
 
 class TestOffboardDeviceFromAdapter(unittest.TestCase):
