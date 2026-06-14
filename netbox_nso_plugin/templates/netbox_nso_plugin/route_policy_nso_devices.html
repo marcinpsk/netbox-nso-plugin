@@ -1,0 +1,52 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# "NSO — applied to devices" panel for netbox-routing route-policy objects. #}
+{% load helpers %}
+{% if nso_states %}
+  <div class="row">
+    <div class="col col-md-12">
+      <div class="card">
+        <h2 class="card-header">
+          <span class="mdi mdi-cisco-webex me-1"></span>NSO — Applied to Devices
+        </h2>
+        <table class="table table-hover attr-table">
+          <thead>
+            <tr>
+              <th>Device</th>
+              <th>Status</th>
+              <th>Last apply</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for state in nso_states %}
+              <tr>
+                <td>
+                  <a href="{% url 'dcim:device_nso' pk=state.management.device_id %}">{{ state.management.device }}</a>
+                </td>
+                <td>
+                  {% if state.status == "in_sync" or state.status == "imported" %}
+                    <span class="badge text-bg-success">{{ state.get_status_display }}</span>
+                  {% elif state.status == "changed" %}
+                    <span class="badge text-bg-warning text-dark">{{ state.get_status_display }}</span>
+                  {% elif state.status == "conflict" %}
+                    <span class="badge text-bg-warning text-dark">{{ state.get_status_display }}</span>
+                  {% elif state.status == "apply_failed" or state.status == "error" %}
+                    <span class="badge text-bg-danger">{{ state.get_status_display }}</span>
+                    {% if state.last_apply_error %}
+                      <small class="text-danger ms-1">{{ state.last_apply_error }}</small>
+                    {% endif %}
+                  {% elif state.status == "deploying" %}
+                    <span class="badge text-bg-primary">{{ state.get_status_display }}</span>
+                  {% else %}
+                    <span class="badge text-bg-info">{{ state.get_status_display }}</span>
+                  {% endif %}
+                </td>
+                <td>{{ state.last_apply_at|placeholder }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+{% endif %}

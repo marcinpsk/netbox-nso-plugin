@@ -294,6 +294,16 @@ class NSODeviceManagement(NetBoxModel):
     )
     last_sync_at = models.DateTimeField(null=True, blank=True)
     last_sync_status = models.CharField(max_length=50, blank=True, default="")
+    last_journaled_apply_job = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "Adapter apply job id whose route-policy outcome was last written to object "
+            "journals. Idempotency guard so a re-run of the post-apply reconcile does not "
+            "re-post the same apply to the netbox-routing object journals."
+        ),
+    )
     state_snapshot = models.JSONField(
         null=True,
         blank=True,

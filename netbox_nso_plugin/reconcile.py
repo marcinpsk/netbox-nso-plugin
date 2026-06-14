@@ -520,8 +520,12 @@ def _settle_apply_failures(mgmt, apply_result: dict | None) -> None:
                 row.save(update_fields=["status", "last_apply_error"])
 
 
-def _last_apply_result(adapter_device_id) -> dict | None:
-    """Best-effort: the result of the device's most recent terminal apply job."""
+def _last_apply_job(adapter_device_id) -> dict | None:
+    """Best-effort: the device's most recent terminal apply job (full dict).
+
+    Returns the whole job ``{id, type, status, result}`` so callers can read both the
+    per-scope outcome (``result``) and the job id (apply-journal idempotency key).
+    """
     from . import adapter_client as client
 
     try:
@@ -530,8 +534,86 @@ def _last_apply_result(adapter_device_id) -> dict | None:
         return None
     for job in jobs or []:
         if job.get("type") == "apply" and job.get("status") in ("succeeded", "failed"):
-            return job.get("result")
+            return job
     return None
+
+
+def _last_apply_result(adapter_device_id) -> dict | None:
+    """Best-effort: the result of the device's most recent terminal apply job."""
+    job = _last_apply_job(adapter_device_id)
+    return job.get("result") if job else None
+
+
+def _journal_route_policy_apply(mgmt, job: dict | None) -> None:
+    """Write a coarse per-object JournalEntry recording this device's route-policy apply.
+
+    Route-policy is the one intent scope with no deploying→in_sync settle, so the
+    operator has no per-row apply outcome for it. To give a consolidated "what applied
+    where" view we drop a single JournalEntry onto each linked netbox-routing object
+    (community-list / route-map / prefix-list / as-path) carrying the device + the
+    route_policy scope outcome; the per-member skip/error detail stays on the device's
+    NSO tab. Idempotent per apply job via ``mgmt.last_journaled_apply_job`` so a re-run
+    of this post-apply reconcile does not re-post the same apply.
+    """
+    if not job:
+        return
+    job_id = str(job.get("id") or "")
+    if not job_id or job_id == (mgmt.last_journaled_apply_job or ""):
+        return
+    counts = (job.get("result") or {}).get("route_policy_count_by_outcome") or {}
+    applied = int(counts.get("in_sync") or 0)
+    failed = int(counts.get("apply_failed") or 0)
+    # Mark the job seen FIRST so a failure mid-write can't double-post next reconcile.
+    mgmt.last_journaled_apply_job = job_id
+    mgmt.save(update_fields=["last_journaled_apply_job"])
+    if applied == 0 and failed == 0:
+        return  # this apply committed no route-policy scope → nothing to journal
+
+    from django.urls import reverse
+    from django.utils import timezone
+    from extras.models import JournalEntry
+
+    from . import models
+    from . import status_machine as sm
+
+    # Only objects the operator owns on this device were part of the apply — an
+    # imported-only object was never pushed, so it gets no apply log here (it still
+    # shows on the "Applied to devices" panel, which lists every device).
+    rows = list(
+        models.NSORoutePolicyState.objects.filter(
+            management=mgmt,
+            content_type__isnull=False,
+            object_id__isnull=False,
+            status__in=sm.OWNED_STATES,
+        )
+    )
+    if not rows:
+        return
+
+    if failed:
+        kind, verb = "danger", f"**failed** ({applied} applied, {failed} failed)"
+    else:
+        kind, verb = "success", f"**succeeded** ({applied} applied)"
+    try:
+        tab = reverse("dcim:device_nso", kwargs={"pk": mgmt.device_id})
+        pointer = f" Member-level detail is on the device's [NSO tab]({tab})."
+    except Exception:  # noqa: BLE001 — URL reverse is best-effort decoration
+        pointer = " Member-level detail is on the device's NSO tab."
+    comment = f"NSO apply on **{mgmt.device}** — route-policy {verb}, adapter job #{job_id}.{pointer}"
+
+    now = timezone.now()
+    for row in rows:
+        obj = row.assigned_object
+        if obj is None:
+            continue
+        try:
+            JournalEntry.objects.create(assigned_object=obj, kind=kind, created_by=None, comments=comment)
+        except Exception as exc:  # noqa: BLE001 — one object's journal must not block the rest
+            logger.warning("nso journal: route-policy apply entry skipped for %s: %s", row.object_name, exc)
+            continue
+        # Stamp the apply time so the "Applied to devices" panel shows a real timestamp.
+        row.last_apply_at = now
+        row.save(update_fields=["last_apply_at"])
 
 
 def run_device_reconcile(device_id: int) -> dict:
@@ -558,11 +640,14 @@ def run_device_reconcile(device_id: int) -> dict:
         return {"device_id": device_id, "error": str(exc)}
 
     # Step 4: after the post-sync reconcile, settle any rows left 'deploying' whose
-    # scope's last apply reported a failure → apply_failed (no longer stuck).
+    # scope's last apply reported a failure → apply_failed (no longer stuck), and record
+    # the route-policy apply outcome in the netbox-routing object journals (idempotent).
     try:
         mgmt = device.nso_management
         if mgmt is not None and mgmt.adapter_device_id is not None:
-            _settle_apply_failures(mgmt, _last_apply_result(mgmt.adapter_device_id))
+            job = _last_apply_job(mgmt.adapter_device_id)
+            _settle_apply_failures(mgmt, job.get("result") if job else None)
+            _journal_route_policy_apply(mgmt, job)
     except Exception as exc:  # noqa: BLE001 — settling is best-effort, never crash the worker
         logger.warning("nso reconcile: apply-failure settle skipped for device %s: %s", device_id, exc)
 

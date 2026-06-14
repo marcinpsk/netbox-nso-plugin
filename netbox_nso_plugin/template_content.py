@@ -1801,4 +1801,41 @@ class InterfaceNSOBadge(PluginTemplateExtension):
         )
 
 
-template_extensions = [InterfaceNSOBadge]
+class RoutePolicyNSODevices(PluginTemplateExtension):
+    """Adds an "NSO — applied to devices" panel to the route-policy object pages.
+
+    Targets the netbox-routing community-list / route-map / prefix-list / as-path
+    detail pages. The relationship is a GenericForeignKey from our overlay
+    (``NSORoutePolicyState``)
+    *into* netbox-routing, so NetBox's built-in "Related Objects" card cannot surface
+    it — we render our own panel here, without modifying netbox-routing. One row per
+    managing device, with that device's per-object status and last apply time.
+    """
+
+    models = [
+        "netbox_routing.communitylist",
+        "netbox_routing.routemap",
+        "netbox_routing.prefixlist",
+        "netbox_routing.aspath",
+    ]
+
+    def full_width_page(self):
+        """Render the per-device status table for the route-policy object on display."""
+        from django.contrib.contenttypes.models import ContentType
+
+        from .models import NSORoutePolicyState
+
+        obj = self.context["object"]
+        ct = ContentType.objects.get_for_model(obj)
+        states = list(
+            NSORoutePolicyState.objects.filter(content_type=ct, object_id=obj.pk).select_related(
+                "management", "management__device"
+            )
+        )
+        return self.render(
+            "netbox_nso_plugin/route_policy_nso_devices.html",
+            extra_context={"nso_states": states},
+        )
+
+
+template_extensions = [InterfaceNSOBadge, RoutePolicyNSODevices]
