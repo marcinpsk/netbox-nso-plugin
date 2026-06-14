@@ -1855,16 +1855,18 @@ class RoutePolicyNSODevices(PluginTemplateExtension):
         from .signals import _preflight_constructs
 
         for state in states:
-            community_members, set_keys, match_keys = _preflight_constructs(state.family, obj)
-            if not (community_members or set_keys or match_keys):
-                # prefix-list / as-path carry nothing flaggable — universally representable.
+            community_members, set_keys, match_keys, aspath_names = _preflight_constructs(state.family, obj)
+            if not (community_members or set_keys or match_keys or aspath_names):
+                # prefix-list carries nothing flaggable — universally representable.
                 state.capability = {"state": "supported", "unsupported": []}
                 continue
             adapter_id = getattr(state.management, "adapter_device_id", None)
             if not adapter_id:
                 state.capability = {"state": "unknown", "unsupported": []}
                 continue
-            verdict = client.preflight_route_policy(adapter_id, community_members, set_keys, match_keys, refresh=False)
+            verdict = client.preflight_route_policy(
+                adapter_id, community_members, set_keys, match_keys, aspath_names, refresh=False
+            )
             if not verdict.get("known"):
                 state.capability = {"state": "unknown", "unsupported": []}
             elif verdict.get("coverage_unknown"):

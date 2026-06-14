@@ -90,9 +90,9 @@ class TestPreflightConstructs(_CapBase):
         from netbox_nso_plugin.signals import _preflight_constructs
 
         cl = self._community_list("CAP-CL", ["color:0:200", "65000:1"])
-        members, set_keys, match_keys = _preflight_constructs("community_list", cl)
+        members, set_keys, match_keys, aspath_names = _preflight_constructs("community_list", cl)
         assert members == ["65000:1", "color:0:200"]  # sorted
-        assert set_keys == [] and match_keys == []
+        assert set_keys == [] and match_keys == [] and aspath_names == []
 
     def test_route_map_yields_set_and_match_keys(self):
         from netbox_nso_plugin.signals import _preflight_constructs
@@ -102,10 +102,32 @@ class TestPreflightConstructs(_CapBase):
             set_={"metric_type": "internal", "extcommunity_color": "color:0:5"},
             match={"local_preference": 200},
         )
-        members, set_keys, match_keys = _preflight_constructs("route_map", rm)
+        members, set_keys, match_keys, aspath_names = _preflight_constructs("route_map", rm)
         assert members == []
         assert set_keys == ["extcommunity_color", "metric_type"]  # sorted union of set-json keys
         assert match_keys == ["local_preference"]
+        assert aspath_names == []
+
+    def test_as_path_yields_its_name(self):
+        from netbox_routing.models import ASPath
+
+        from netbox_nso_plugin.signals import _preflight_constructs
+
+        ap = ASPath.objects.create(name="AP-NAMED")
+        members, set_keys, match_keys, aspath_names = _preflight_constructs("as_path", ap)
+        assert aspath_names == ["AP-NAMED"]
+        assert members == [] and set_keys == [] and match_keys == []
+
+    def test_route_map_collects_referenced_as_path_names(self):
+        from netbox_routing.models import ASPath, RouteMapEntry
+
+        from netbox_nso_plugin.signals import _preflight_constructs
+
+        rm = self._route_map("CAP-RM-AP")
+        ap = ASPath.objects.create(name="55")
+        RouteMapEntry.objects.get(route_map=rm).match_aspath.add(ap)
+        _members, _set, _match, aspath_names = _preflight_constructs("route_map", rm)
+        assert aspath_names == ["55"]
 
     def test_prefix_list_has_nothing_flaggable(self):
         from netbox_routing.models import PrefixList
@@ -113,7 +135,27 @@ class TestPreflightConstructs(_CapBase):
         from netbox_nso_plugin.signals import _preflight_constructs
 
         pl = PrefixList.objects.create(name="CAP-PL")
-        assert _preflight_constructs("prefix_list", pl) == ([], [], [])
+        assert _preflight_constructs("prefix_list", pl) == ([], [], [], [])
+
+    def test_attach_preflight_passes_aspath_names_and_flags(self):
+        """Attaching a named as-path runs preflight with aspath_names and returns the flag."""
+        from netbox_routing.models import ASPath
+
+        from netbox_nso_plugin.views import NSORoutePolicyAttachView
+
+        mgmt = self._mgmt()
+        ap = ASPath.objects.create(name="AP-NAMED")
+        verdict = {
+            "known": True,
+            "fully_supported": False,
+            "unsupported": [{"scope": "as-path", "element": "AP-NAMED", "status": "unsupported", "detail": "x"}],
+        }
+        with patch("netbox_nso_plugin.adapter_client.preflight_route_policy", return_value=verdict) as pf:
+            result = NSORoutePolicyAttachView._preflight(mgmt, "as_path", ap)
+
+        assert result["fully_supported"] is False
+        # aspath_names (5th positional) carries the as-path's own name
+        assert pf.call_args.args[4] == ["AP-NAMED"]
 
 
 # ── attach-time block / override ──────────────────────────────────────────────

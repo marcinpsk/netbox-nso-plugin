@@ -733,7 +733,9 @@ def get_device_capability(adapter_device_id, refresh=False):
         return {"known": False, "ned_id": "", "sw_version": "", "elements": []}
 
 
-def preflight_route_policy(adapter_device_id, community_members=(), set_keys=(), match_keys=(), refresh=True):
+def preflight_route_policy(
+    adapter_device_id, community_members=(), set_keys=(), match_keys=(), aspath_names=(), refresh=True
+):
     """POST /api/v1/devices/{id}/route-policy/preflight — check an attach against the matrix.
 
     ``refresh=True`` (default — the authoritative attach-time check) probes the device once;
@@ -751,6 +753,7 @@ def preflight_route_policy(adapter_device_id, community_members=(), set_keys=(),
                 "community_members": list(community_members),
                 "set_keys": list(set_keys),
                 "match_keys": list(match_keys),
+                "aspath_names": list(aspath_names),
             },
         )
     except AdapterError as exc:

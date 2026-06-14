@@ -1953,13 +1953,15 @@ def _build_route_policy_entries(family, obj):
 def _preflight_constructs(family, obj):
     """Derive the capability-preflight inputs from a netbox-routing route-policy object.
 
-    Returns ``(community_members, set_keys, match_keys)`` — the same shape the adapter's
-    ``/route-policy/preflight`` endpoint checks against a device's capability matrix:
+    Returns ``(community_members, set_keys, match_keys, aspath_names)`` — the shape the
+    adapter's ``/route-policy/preflight`` endpoint checks against a device's capability matrix:
 
       - community_list → its member strings (checked by KIND: large / color / regex / …);
       - route_map → the union of set-json / match-json keys across entries (checked by
-        construct name, e.g. ``metric_type`` → "set metric-type");
-      - prefix_list / as_path → nothing (universally representable — always supported).
+        construct name, e.g. ``metric_type`` → "set metric-type") + its referenced as-path
+        list names (IOS needs a numeric 1-500 name);
+      - as_path → its own name (same numeric check);
+      - prefix_list → nothing (universally representable — always supported).
 
     Mirrors the keys ``_build_route_policy_entries`` already serializes, so the preflight
     sees exactly what an Apply would push.
@@ -1967,6 +1969,7 @@ def _preflight_constructs(family, obj):
     community_members: list[str] = []
     set_keys: set[str] = set()
     match_keys: set[str] = set()
+    aspath_names: set[str] = set()
     if family == "community_list":
         for e in obj.communitylistentries.all():
             if e.community_id:
@@ -1975,7 +1978,10 @@ def _preflight_constructs(family, obj):
         for e in obj.route_map_entries.all():
             set_keys.update(_as_json_dict(e.set).keys())
             match_keys.update(_as_json_dict(e.match).keys())
-    return sorted(set(community_members)), sorted(set_keys), sorted(match_keys)
+            aspath_names.update(e.match_aspath.values_list("name", flat=True))
+    elif family == "as_path":
+        aspath_names.add(obj.name)
+    return sorted(set(community_members)), sorted(set_keys), sorted(match_keys), sorted(aspath_names)
 
 
 def _as_json_dict(value):

@@ -2157,16 +2157,16 @@ class NSORoutePolicyAttachView(LoginRequiredMixin, View):
         """Run the adapter capability pre-flight for an attach (authoritative, probes once).
 
         Returns the adapter verdict dict, or ``None`` when there is nothing to check
-        (prefix-list / as-path carry no flaggable constructs).
+        (prefix-list carries no flaggable constructs).
         """
         from . import adapter_client as client
         from .signals import _preflight_constructs
 
-        community_members, set_keys, match_keys = _preflight_constructs(family, obj)
-        if not (community_members or set_keys or match_keys):
+        community_members, set_keys, match_keys, aspath_names = _preflight_constructs(family, obj)
+        if not (community_members or set_keys or match_keys or aspath_names):
             return None
         return client.preflight_route_policy(
-            mgmt.adapter_device_id, community_members, set_keys, match_keys, refresh=True
+            mgmt.adapter_device_id, community_members, set_keys, match_keys, aspath_names, refresh=True
         )
 
 
