@@ -1850,6 +1850,12 @@ def _push_route_policy_intent_for_device(device_id, adapter_device_id):
                 "name": row.object_name,
                 "entries": entries,
                 "accepted": row.status == "accepted",
+                # community-list only: Junos invert-match / Nokia expression NOT(…).
+                **(
+                    {"invert_match": bool(getattr(obj, "invert_match", False))}
+                    if row.family == "community_list"
+                    else {}
+                ),
             }
         )
 

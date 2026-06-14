@@ -274,9 +274,19 @@ def _reconcile_community_lists(mgmt, device, cl_list, CommunityList, ContentType
         if not name:
             continue
         entries = cl_data.get("entries", []) or []
-        cl_obj, created = CommunityList.objects.get_or_create(name=name)
+        invert_match = bool(cl_data.get("invert_match", False))
+        cl_obj, created = CommunityList.objects.get_or_create(name=name, defaults={"invert_match": invert_match})
         name_map[name] = cl_obj
-        state, should_fill = _upsert_state(mgmt, "community_list", name, cl_obj, ct, _hash(entries), now)
+        # Backward-compatible hash: keep the plain-entries hash for non-inverted lists
+        # (the common case) so they don't all false-drift on the first poll after this
+        # field shipped; an invert_match flip still changes the hash → drift detected.
+        hash_input = {"invert_match": True, "entries": entries} if invert_match else entries
+        state, should_fill = _upsert_state(mgmt, "community_list", name, cl_obj, ct, _hash(hash_input), now)
+        # invert_match is device-sourced config — refresh it on any non-conflicting read
+        # (a conflicting read leaves should_fill False, so an owned/diverged row is untouched).
+        if should_fill and cl_obj.invert_match != invert_match:
+            cl_obj.invert_match = invert_match
+            cl_obj.save(update_fields=["invert_match"])
         if _needs_fill(CommunityListEntry, created, should_fill, community_list=cl_obj):
             _fill_community_list_entries(cl_obj, entries)
         seen_keys.add(("community_list", name))

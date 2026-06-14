@@ -61,6 +61,58 @@ class TestReconcileRoutePolicy(TestCase):
         self.assertEqual(ASPath.objects.filter(name="AP-PRIVATE").count(), 1)
         self.assertEqual(RouteMap.objects.filter(name="RM-IMPORT").count(), 1)
 
+    def test_community_invert_match_reconciled(self):
+        """A community-list reported with invert_match=True sets the field; a plain
+        list stays False; an idempotent re-read keeps it stable."""
+        self._make_mgmt(self.device)
+        from netbox_routing.models import CommunityList
+
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        reconcile_route_policy(
+            self.device,
+            {
+                "community_lists": [
+                    {"name": "CL-INV", "invert_match": True, "entries": [{"community": "no-export"}]},
+                    {"name": "CL-PLAIN", "invert_match": False, "entries": [{"community": "65000:1"}]},
+                ]
+            },
+        )
+        self.assertTrue(CommunityList.objects.get(name="CL-INV").invert_match)
+        self.assertFalse(CommunityList.objects.get(name="CL-PLAIN").invert_match)
+
+        # Idempotent re-read (same invert_match) keeps it stable.
+        reconcile_route_policy(
+            self.device,
+            {"community_lists": [{"name": "CL-INV", "invert_match": True, "entries": [{"community": "no-export"}]}]},
+        )
+        self.assertTrue(CommunityList.objects.get(name="CL-INV").invert_match)
+
+    def test_community_invert_match_flip_is_drift_not_clobber(self):
+        """A device-side invert_match flip diverges the content hash → the overlay
+        goes to conflict and the stored value is NOT silently overwritten (brownfield
+        no-clobber), exactly like an entries divergence."""
+        self._make_mgmt(self.device)
+        from netbox_routing.models import CommunityList
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        reconcile_route_policy(
+            self.device,
+            {"community_lists": [{"name": "CL-FLIP", "invert_match": True, "entries": [{"community": "no-export"}]}]},
+        )
+        self.assertTrue(CommunityList.objects.get(name="CL-FLIP").invert_match)
+
+        reconcile_route_policy(
+            self.device,
+            {"community_lists": [{"name": "CL-FLIP", "invert_match": False, "entries": [{"community": "no-export"}]}]},
+        )
+        st = NSORoutePolicyState.objects.get(family="community_list", object_name="CL-FLIP")
+        self.assertIn(st.status, ("conflict", "changed"))
+        # No silent clobber: the imported value is preserved until the operator resolves.
+        self.assertTrue(CommunityList.objects.get(name="CL-FLIP").invert_match)
+
     def test_as_path_uses_aspath_model(self):
         """Regression guard: as_paths reconcile into netbox_routing.ASPath.
 
