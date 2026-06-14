@@ -1867,6 +1867,10 @@ class RoutePolicyNSODevices(PluginTemplateExtension):
             verdict = client.preflight_route_policy(adapter_id, community_members, set_keys, match_keys, refresh=False)
             if not verdict.get("known"):
                 state.capability = {"state": "unknown", "unsupported": []}
+            elif verdict.get("coverage_unknown"):
+                # probed, but this NED's route-policy isn't classified yet (Junos/Nokia) —
+                # honest "not assessed" instead of a green "supported".
+                state.capability = {"state": "unassessed", "unsupported": []}
             elif verdict.get("fully_supported"):
                 state.capability = {"state": "supported", "unsupported": []}
             else:

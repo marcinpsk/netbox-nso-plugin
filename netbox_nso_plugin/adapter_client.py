@@ -755,7 +755,7 @@ def preflight_route_policy(adapter_device_id, community_members=(), set_keys=(),
         )
     except AdapterError as exc:
         logger.warning("route-policy preflight failed for device %s: %s", adapter_device_id, exc)
-        return {"known": False, "fully_supported": True, "unsupported": []}
+        return {"known": False, "fully_supported": True, "unsupported": [], "coverage_unknown": False}
 
 
 def trigger_apply(adapter_device_id, force=True):

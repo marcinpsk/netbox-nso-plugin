@@ -50,8 +50,10 @@
                           title="{% for u in state.capability.unsupported %}{{ u.scope }} {{ u.element }}{% if not forloop.last %}, {% endif %}{% endfor %}">
                       {{ state.capability.unsupported|length }} part{{ state.capability.unsupported|length|pluralize }} won't apply
                     </span>
+                  {% elif state.capability.state == "unassessed" %}
+                    <span class="badge text-bg-info" title="The capability probe does not yet assess route-policy on this platform">Not assessed</span>
                   {% else %}
-                    <span class="badge text-bg-info">Unknown</span>
+                    <span class="text-muted" title="Never probed, or the adapter is unreachable">Unknown</span>
                   {% endif %}
                 </td>
                 <td>{{ state.last_apply_at|placeholder }}</td>

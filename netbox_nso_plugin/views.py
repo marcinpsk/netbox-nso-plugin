@@ -2201,19 +2201,25 @@ class NSORoutePolicyCapabilityView(LoginRequiredMixin, View):
         result: dict = {"known": False, "ned_id": "", "sw_version": "", "elements": []}
         if mgmt.adapter_device_id:
             result = client.get_device_capability(mgmt.adapter_device_id, refresh=refresh)
-        # Group rows by scope for the template; keep a stable order.
+        # The 'coverage' row is a meta marker ("not assessed"), not a flaggable construct —
+        # lift it out of the per-scope table and into a banner.
+        elements = [el for el in result.get("elements", []) if el.get("scope") != "coverage"]
+        coverage_unknown = result.get("coverage_unknown") or any(
+            el.get("scope") == "coverage" and el.get("status") == "unknown" for el in result.get("elements", [])
+        )
         scopes: dict[str, list] = {"community": [], "rm-set": [], "rm-match": []}
-        for el in result.get("elements", []):
+        for el in elements:
             scopes.setdefault(el.get("scope", "other"), []).append(el)
-        flagged = sum(1 for el in result.get("elements", []) if el.get("status") in ("skipped", "unsupported"))
+        flagged = sum(1 for el in elements if el.get("status") in ("skipped", "unsupported"))
         return {
             "mgmt": mgmt,
             "object": mgmt.device,
             "known": result.get("known", False),
+            "coverage_unknown": coverage_unknown,
             "ned_id": result.get("ned_id", ""),
             "sw_version": result.get("sw_version", ""),
             "scopes": scopes,
-            "total": len(result.get("elements", [])),
+            "total": len(elements),
             "flagged": flagged,
         }
 

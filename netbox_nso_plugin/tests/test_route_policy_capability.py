@@ -273,6 +273,17 @@ class TestPanelCapabilityBadge(_CapBase):
 
         assert states[0].capability["state"] == "unknown"
 
+    def test_uncovered_platform_marks_state_unassessed(self):
+        """A Junos/Nokia verdict (coverage_unknown) shows 'not assessed', not green 'supported'."""
+        mgmt = self._mgmt()
+        cl = self._community_list("CAP-CL-JUNOS", ["color:0:200"])
+        self._attach_overlay("community_list", cl, mgmt)
+        verdict = {"known": True, "fully_supported": True, "unsupported": [], "coverage_unknown": True}
+        with patch("netbox_nso_plugin.adapter_client._request", side_effect=_request_returning(verdict)):
+            states = self._annotated_states(cl)
+
+        assert states[0].capability["state"] == "unassessed"
+
     def test_prefix_list_panel_is_supported_without_adapter_call(self):
         from netbox_routing.models import PrefixList
 
@@ -371,3 +382,28 @@ class TestCapabilitiesPage(_CapBase):
 
         assert resp.status_code == 200
         self.assertContains(resp, "never been probed")
+
+    def test_uncovered_platform_shows_not_assessed_banner(self):
+        """A Junos/Nokia device (coverage marker) shows the 'not yet assessed' banner."""
+        self._mgmt()
+        payload = {
+            "known": True,
+            "coverage_unknown": True,
+            "ned_id": "juniper-junos-nc-4.19",
+            "sw_version": "24.4R2",
+            "elements": [
+                {
+                    "scope": "coverage",
+                    "name": "juniper-junos-nc-4.19",
+                    "status": "unknown",
+                    "detail": "not yet implemented",
+                    "source": "probe",
+                }
+            ],
+        }
+        with patch("netbox_nso_plugin.adapter_client._request", return_value=payload):
+            resp = self.client.get(self._url())
+
+        assert resp.status_code == 200
+        self.assertContains(resp, "not yet assessed")
+        self.assertContains(resp, "juniper-junos-nc-4.19")
