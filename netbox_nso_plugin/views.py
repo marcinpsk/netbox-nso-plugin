@@ -1009,7 +1009,14 @@ def _prepare_apply(mgmt):
         except Exception as exc:  # noqa: BLE001 — one scope's failure must not block the rest
             logger.warning("Apply push failed for device %s: %s", mgmt.device_id, exc)
 
-    for model in (NSOVLANState, NSOSVIState, NSOSubinterfaceState, NSOBFDInterfaceState, NSOInterfaceMtuState):
+    for model in (
+        NSOVLANState,
+        NSOSVIState,
+        NSOSubinterfaceState,
+        NSOBFDInterfaceState,
+        NSOInterfaceMtuState,
+        NSORoutePolicyState,
+    ):
         try:
             model.objects.filter(management=mgmt, status="accepted").update(status="deploying")
         except Exception as exc:  # noqa: BLE001

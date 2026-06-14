@@ -46,6 +46,24 @@ class TestReconcileRoutePolicy(TestCase):
 
         self.assertEqual(reconcile_route_policy(self.device, self._payload()), [])
 
+    def test_deploying_row_settles_in_sync_when_present(self):
+        """A route-policy row marked 'deploying' at Apply settles to in_sync once the
+        device re-reports the object — the accepted→deploying→in_sync apply lifecycle."""
+        self._make_mgmt(self.device)
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        reconcile_route_policy(self.device, self._payload())  # first read → imported rows
+        st = NSORoutePolicyState.objects.get(
+            management__device=self.device, family="community_list", object_name="CL-LOCAL"
+        )
+        st.status = "deploying"  # Apply marked it deploying
+        st.save(update_fields=["status"])
+
+        reconcile_route_policy(self.device, self._payload())  # object still present → settle
+        st.refresh_from_db()
+        self.assertEqual(st.status, "in_sync")
+
     def test_reconciles_all_families(self):
         """One object per family → created in netbox_routing + a state row each."""
         self._make_mgmt(self.device)

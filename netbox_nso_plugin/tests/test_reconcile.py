@@ -134,6 +134,48 @@ class TestSettleApplyFailures(APITestCase):
         self.assertEqual(row.status, "deploying")
 
 
+class TestRoutePolicyApplySettle(APITestCase):
+    """Route-policy joins the deploying→settle flow: Apply marks accepted→deploying,
+    a failed route_policy scope flips the stuck deploying row → apply_failed."""
+
+    def _setup(self, status_="deploying"):
+        from netbox_nso_plugin.models import NSORoutePolicyState
+
+        device = _make_device("rp-settle")
+        inst, _ = NSOInstance.objects.get_or_create(
+            name="rp-settle-inst", defaults={"adapter_instance_id": "rp-settle-inst"}
+        )
+        mgmt = NSODeviceManagement.objects.create(
+            device=device, nso_instance=inst, nso_device_name="rp-settle", adapter_device_id=88
+        )
+        row = NSORoutePolicyState.objects.create(
+            management=mgmt, family="community_list", object_name="CL-X", status=status_
+        )
+        return mgmt, row
+
+    def test_failed_route_policy_scope_marks_apply_failed(self):
+        from netbox_nso_plugin.reconcile import _settle_apply_failures
+
+        mgmt, row = self._setup()
+        _settle_apply_failures(mgmt, {"route_policy_count_by_outcome": {"in_sync": 0, "apply_failed": 1}})
+        row.refresh_from_db()
+        self.assertEqual(row.status, "apply_failed")
+        self.assertTrue(row.last_apply_error)
+
+    def test_prepare_apply_marks_accepted_route_policy_deploying(self):
+        from netbox_nso_plugin.views import _prepare_apply
+
+        mgmt, row = self._setup(status_="accepted")
+        with (
+            patch("netbox_nso_plugin.signals._push_lacp_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_switchport_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_vlan_intent_for_device"),
+        ):
+            _prepare_apply(mgmt)
+        row.refresh_from_db()
+        self.assertEqual(row.status, "deploying")
+
+
 class TestSafeReconcile(APITestCase):
     """A faulty reconciler marks its scope's rows 'error' and never crashes the worker."""
 
