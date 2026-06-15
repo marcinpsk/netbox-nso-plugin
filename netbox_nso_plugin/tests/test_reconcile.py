@@ -190,6 +190,7 @@ class TestRoutePolicyApplySettle(APITestCase):
 
         mgmt, row = self._setup(status_="accepted")
         with (
+            patch("netbox_nso_plugin.signals._push_interface_intent_for_device"),
             patch("netbox_nso_plugin.signals._push_lacp_intent_for_device"),
             patch("netbox_nso_plugin.signals._push_switchport_intent_for_device"),
             patch("netbox_nso_plugin.signals._push_vlan_intent_for_device"),
@@ -197,6 +198,68 @@ class TestRoutePolicyApplySettle(APITestCase):
             _prepare_apply(mgmt)
         row.refresh_from_db()
         self.assertEqual(row.status, "deploying")
+
+    def test_prepare_apply_force_pushes_owned_interface_intent(self):
+        """Apply force-re-pushes the owned interface snapshot, so an owned attribute that
+        drifted back to 'imported' (device differs again) is actually re-applied instead
+        of silently skipped (was shown 'pending apply' but never pushed by Apply)."""
+        from netbox_nso_plugin.views import _prepare_apply
+
+        mgmt, _row = self._setup(status_="accepted")
+        with (
+            patch("netbox_nso_plugin.signals._push_interface_intent_for_device") as push_if,
+            patch("netbox_nso_plugin.signals._push_lacp_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_switchport_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_vlan_intent_for_device"),
+        ):
+            _prepare_apply(mgmt)
+        push_if.assert_called_once_with(mgmt.device_id, mgmt.adapter_device_id, force=True)
+
+
+class TestApplyPreviewInterfaceScope(APITestCase):
+    """The Apply preview lists owned interface attributes whose NetBox value differs from
+    the device — the value-aware 'pending' the matrix shows and the force-push applies."""
+
+    def test_preview_includes_owned_interface_that_drifted_to_imported(self):
+        from dcim.models import Interface
+        from django.utils import timezone
+
+        from netbox_nso_plugin.models import NSOInterfaceState
+        from netbox_nso_plugin.views import _apply_preview_interface_changes
+
+        device = _make_device("ifprev")
+        iface = Interface.objects.create(device=device, name="ae2.0", type="virtual", description="UPLINK")
+        # Owned (accepted_at set) but the adapter status drifted back to 'imported', and the
+        # device description is empty → value differs → genuinely pending, must show + apply.
+        NSOInterfaceState.objects.create(
+            interface=iface,
+            attribute="description",
+            status="imported",
+            nso_value="",
+            accepted_at=timezone.now(),
+        )
+        changes = _apply_preview_interface_changes(device.pk)
+        self.assertEqual([(c["interface"], c["attribute"]) for c in changes], [("ae2.0", "description")])
+        self.assertEqual(changes[0]["netbox"], "UPLINK")
+
+    def test_preview_excludes_owned_interface_in_sync(self):
+        from dcim.models import Interface
+        from django.utils import timezone
+
+        from netbox_nso_plugin.models import NSOInterfaceState
+        from netbox_nso_plugin.views import _apply_preview_interface_changes
+
+        device = _make_device("ifprev2")
+        iface = Interface.objects.create(device=device, name="ae3.0", type="virtual", description="MATCH")
+        # Owned and the device already matches NetBox → not pending → not in the preview.
+        NSOInterfaceState.objects.create(
+            interface=iface,
+            attribute="description",
+            status="imported",
+            nso_value="MATCH",
+            accepted_at=timezone.now(),
+        )
+        self.assertEqual(_apply_preview_interface_changes(device.pk), [])
 
 
 class TestSafeReconcile(APITestCase):

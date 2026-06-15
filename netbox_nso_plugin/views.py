@@ -245,6 +245,19 @@ def _merged_iface_kinds(iface, attr_states, mtu_states, sw_states, ip_states) ->
     return kinds
 
 
+def _paged_row_bucket(status: str, owned: bool) -> str:
+    """Bucket one paged-overlay row into the drift / pending / in_sync quick-filter group.
+
+    Mirrors ``summary.display_state`` + the ``_table_filter.html`` ``kindOf`` JS so the
+    server-side paged filter and the client-side non-paged filter agree exactly.
+    """
+    if status in ("imported", "in_sync", "deploying"):
+        return "in_sync"
+    if status == "apply_failed":
+        return "pending"
+    return "pending" if owned else "drift"  # changed / conflict / accepted
+
+
 def _filter_ifaces_by_state(ordered, kinds_by_iface, state):
     """Filter the interface list to those matching the quick-select *state* bucket."""
     if state == "drift":
@@ -460,8 +473,22 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 cond |= Q(**{f"{field}__icontains": q})
             qs = qs.filter(cond)
 
-        has_unowned = qs.filter(status__in=_UNOWNED_STATUSES).exists()
-        paginator = Paginator(qs, self._INTERFACES_PER_PAGE)
+        # Server-side state quick-filter — applied HERE (the one renderer for every paged
+        # category) so route_policy / static / redistribution / vlan / svi / subinterface /
+        # l2_services all get the drift/pending/in-sync quick-select without per-template work.
+        rows = list(qs)
+        bucketed = [(_paged_row_bucket(r.status, r.accepted_at is not None), r) for r in rows]
+        state_counts = {"all": len(rows), "drift": 0, "pending": 0, "in_sync": 0}
+        for bucket, _row in bucketed:
+            state_counts[bucket] += 1
+        state = request.GET.get("state") or "all"
+        if state in ("drift", "pending", "in_sync"):
+            rows = [r for bucket, r in bucketed if bucket == state]
+        else:
+            state = "all"
+
+        has_unowned = any(r.status in _UNOWNED_STATUSES for _b, r in bucketed)
+        paginator = Paginator(rows, self._INTERFACES_PER_PAGE)
         page = paginator.get_page(request.GET.get("page") or 1)
 
         ctx = {
@@ -471,6 +498,8 @@ class NSOCategoryView(LoginRequiredMixin, View):
             spec["ctx"]: list(page.object_list),
             "page": page,
             "q": q,
+            "state": state,
+            "state_counts": state_counts,
             "placeholder": spec["ph"],
             "category_has_unowned": has_unowned,
             "adapter_error": adapter_error,
@@ -1052,18 +1081,27 @@ def _prepare_apply(mgmt):
     re-reported). ``.update()`` avoids firing the per-row push signal.
     """
     from .signals import (
+        _push_interface_intent_for_device,
         _push_lacp_intent_for_device,
         _push_switchport_intent_for_device,
         _push_vlan_intent_for_device,
     )
 
-    # Force-push the overlays whose editable value lives on a native NetBox object the
-    # plugin does NOT have a save-signal on, so an edit made AFTER accept still ships:
+    # Force-push (bypass change-detection) the owned snapshots so Apply re-ships the
+    # operator's intent even when the adapter's stored intent went stale:
     #   - LACP / switchport: owned in NetBox, never mirrored as adapter intent.
     #   - VLAN: the name lives on ipam.VLAN; renaming it fires no plugin signal, so a
     #     post-accept rename would otherwise be stranded in NetBox (the row stays
     #     'in_sync' and the stale old name is what gets applied).
-    for push in (_push_lacp_intent_for_device, _push_switchport_intent_for_device, _push_vlan_intent_for_device):
+    #   - interface description/enabled: an owned attribute that drifted back to
+    #     'imported' (device differs again) is shown 'pending apply' but was being
+    #     silently skipped — force-push so Apply actually re-applies it.
+    for push in (
+        _push_interface_intent_for_device,
+        _push_lacp_intent_for_device,
+        _push_switchport_intent_for_device,
+        _push_vlan_intent_for_device,
+    ):
         try:
             push(mgmt.device_id, mgmt.adapter_device_id, force=True)
         except Exception as exc:  # noqa: BLE001 — one scope's failure must not block the rest
@@ -1531,6 +1569,38 @@ def _isis_iface_detail(r):
     )
 
 
+def _apply_preview_interface_changes(device_pk):
+    """Owned interface attributes whose NetBox value differs from the device.
+
+    The value-aware 'pending' the matrix shows and the force-push applies — so the
+    preview agrees with what Apply actually pushes (filtering by status==accepted alone
+    missed an owned attribute that drifted back to 'imported').
+    """
+    from .summary import interface_row_state
+
+    changes = []
+    owned = (
+        NSOInterfaceState.objects.filter(interface__device_id=device_pk, accepted_at__isnull=False)
+        .select_related("interface")
+        .order_by("interface__name", "attribute")
+    )
+    for st in owned:
+        iface = st.interface
+        kind, _label, _owned = interface_row_state(st, iface)
+        if kind not in ("pending", "apply_failed"):
+            continue
+        if st.attribute == "description":
+            netbox_val = iface.description or "—"
+        elif st.attribute == "enabled":
+            netbox_val = "Yes" if iface.enabled else "No"
+        else:
+            netbox_val = "—"
+        changes.append(
+            {"interface": iface.name, "attribute": st.attribute, "device": st.nso_value or "—", "netbox": netbox_val}
+        )
+    return changes
+
+
 class NSOApplyPreviewView(LoginRequiredMixin, View):
     """JSON preview of what 'Apply Intent' would push to the device.
 
@@ -1549,28 +1619,7 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
             mgmt = None
         auto_apply = bool(mgmt and mgmt.auto_apply)
 
-        changes = []
-        pending = (
-            NSOInterfaceState.objects.filter(interface__device_id=device_pk, status__in=("accepted", "apply_failed"))
-            .select_related("interface")
-            .order_by("interface__name", "attribute")
-        )
-        for st in pending:
-            iface = st.interface
-            if st.attribute == "description":
-                netbox_val = iface.description or "—"
-            elif st.attribute == "enabled":
-                netbox_val = "Yes" if iface.enabled else "No"
-            else:
-                netbox_val = "—"
-            changes.append(
-                {
-                    "interface": iface.name,
-                    "attribute": st.attribute,
-                    "device": st.nso_value or "—",
-                    "netbox": netbox_val,
-                }
-            )
+        changes = _apply_preview_interface_changes(device_pk)
 
         # Every other category is an NSO*State overlay committed by this same single
         # Apply. Itemise each pending row (category + item + detail) so the operator

@@ -205,12 +205,15 @@ def _push_changed(key, payload, do_push, force=False) -> None:
     _last_pushed_hashes[key] = digest
 
 
-def _push_interface_intent_for_device(device_id, adapter_device_id) -> None:
+def _push_interface_intent_for_device(device_id, adapter_device_id, force=False) -> None:
     """Build the full OWNED interface intent snapshot and push it (change-detected).
 
     Owned = ``accepted_at`` set (the 2-D model's source-of-truth marker), independent
     of sync status. Shared by the accept signal, the Decision-G edit signal, and the
-    view-level bulk accept so all three agree on what gets pushed.
+    view-level bulk accept so all three agree on what gets pushed. ``force=True`` (the
+    device Apply) bypasses change-detection so an owned interface whose adapter intent
+    went stale — e.g. it reads as ``imported`` again but NetBox still differs from the
+    device — is re-pushed and actually applied, instead of being silently skipped.
     """
     from . import adapter_client as client
     from .models import NSOInterfaceState
@@ -238,7 +241,12 @@ def _push_interface_intent_for_device(device_id, adapter_device_id) -> None:
             }
         )
 
-    _push_changed((device_id, "interface"), attributes, lambda: client.put_intent(adapter_device_id, attributes))
+    _push_changed(
+        (device_id, "interface"),
+        attributes,
+        lambda: client.put_intent(adapter_device_id, attributes),
+        force=force,
+    )
 
 
 def _schedule_redistribution_push(device_id, adapter_device_id, dest) -> None:

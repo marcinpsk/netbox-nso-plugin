@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import SimpleTestCase, TestCase
 from django.urls import reverse
 
 from netbox_nso_plugin.models import AdapterConnection, NSODeviceManagement, NSOInstance, NSOInterfaceState
@@ -2016,3 +2016,60 @@ class TestInterfaceMatrixStateChips(ViewTestBase):
     def test_matrix_accepts_state_param(self):
         resp = self.client.get(self._url() + "?state=pending", HTTP_X_REQUESTED_WITH="XMLHttpRequest")
         self.assertEqual(resp.status_code, 200)
+
+
+class TestPagedCategoryQuickSelect(ViewTestBase):
+    """Behavioral guard: EVERY paged category in the device NSO tab renders the
+    drift/pending/in-sync quick-select. Driven by the view's own paged-category spec,
+    so adding a paged category without the filter (or removing the shared pills) fails
+    here — the 'route-policy is missing the quick-select, fix category by category'
+    regression. This would have failed before the pills were centralized in _cat_search.
+    """
+
+    def test_every_paged_category_renders_state_pills(self):
+        from netbox_nso_plugin.views import NSOCategoryView
+
+        keys = list(NSOCategoryView()._paged_category_specs().keys())
+        self.assertIn("route_policy", keys)  # guard the introspection found the specs
+        for key in keys:
+            url = reverse(
+                "plugins:netbox_nso_plugin:device_nso_category",
+                kwargs={"pk": self.device.pk, "key": key},
+            )
+            resp = self.client.get(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+            self.assertEqual(resp.status_code, 200, key)
+            # The quick-select pills (rendered by the shared _cat_search) must be present,
+            # even with zero rows (counts all=0) — so no category can ship without them.
+            self.assertContains(resp, 'data-cat-state="drift"', msg_prefix=key)
+            self.assertContains(resp, 'data-cat-state="pending"', msg_prefix=key)
+            self.assertContains(resp, 'data-cat-state="in_sync"', msg_prefix=key)
+
+
+class TestCategoryQuickSelectStructure(SimpleTestCase):
+    """Fast structural backstop (no DB): any category template that renders per-row
+    status (data-status) must also pull in a quick-select provider, so a new/edited
+    category template can't omit it.
+    """
+
+    # A category provides the quick-select via one of these (paged: _cat_search pills;
+    # non-paged: _table_filter; the bespoke interface views: nso-ifm/if-state).
+    _FILTER_MARKERS = ("_table_filter.html", "_cat_search.html", "nso-ifm-state", "nso-if-state")
+
+    def _category_dir(self):
+        from pathlib import Path
+
+        import netbox_nso_plugin
+
+        return Path(netbox_nso_plugin.__file__).parent / "templates" / "netbox_nso_plugin" / "categories"
+
+    def test_status_tables_include_a_quick_select(self):
+        offenders = []
+        for path in sorted(self._category_dir().glob("*.html")):
+            if path.name.startswith("_"):  # shared partials are not standalone categories
+                continue
+            text = path.read_text(encoding="utf-8")
+            if "data-status=" not in text:
+                continue  # no status table → nothing to filter
+            if not any(marker in text for marker in self._FILTER_MARKERS):
+                offenders.append(path.name)
+        self.assertEqual(offenders, [], f"category templates render status rows without a quick-select: {offenders}")

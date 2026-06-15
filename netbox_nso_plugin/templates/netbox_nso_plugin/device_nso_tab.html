@@ -574,11 +574,17 @@
         var m = pager.querySelector('.nso-cat-msg');
         if (m) m.innerHTML = text ? '<div class="alert alert-' + type + ' py-1 px-2 small mb-2">' + text + '</div>' : '';
       }
-      function load(pager, q, page) {
+      // Current quick-select state = the active pill (re-rendered server-side each load),
+      // so the pager div needs no per-template data-state attribute.
+      function curState(pager) {
+        var a = pager.querySelector('.nso-cat-state.active');
+        return (a && a.dataset.catState) || 'all';
+      }
+      function load(pager, q, state, page) {
         pager.dataset.q = q; pager.dataset.page = page;
         var results = pager.querySelector('.nso-cat-results');
         results.innerHTML = '<div class="text-muted small py-2"><span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Loading…</div>';
-        return fetch(pager.dataset.url + '?q=' + encodeURIComponent(q) + '&page=' + page, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+        return fetch(pager.dataset.url + '?q=' + encodeURIComponent(q) + '&state=' + encodeURIComponent(state) + '&page=' + page, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
           .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); })
           .then(function (html) {
             var t = document.createElement('div'); t.innerHTML = html;
@@ -593,13 +599,20 @@
         var pager = inp.closest('.nso-cat-pager'); if (!pager) return;
         clearTimeout(debounce);
         var v = inp.value.trim();
-        debounce = setTimeout(function () { load(pager, v, 1); }, 350);
+        debounce = setTimeout(function () { load(pager, v, curState(pager), 1); }, 350);
       });
       document.addEventListener('click', function (e) {
+        var st = e.target.closest('.nso-cat-state');
+        if (st) {
+          var sp = st.closest('.nso-cat-pager'); if (!sp) return;
+          e.preventDefault();
+          load(sp, sp.dataset.q || '', st.dataset.catState, 1);
+          return;
+        }
         var pg = e.target.closest('.nso-cat-page'); if (!pg) return;
         var pager = pg.closest('.nso-cat-pager'); if (!pager) return;
         e.preventDefault();
-        load(pager, pager.dataset.q || '', pg.dataset.page);
+        load(pager, pager.dataset.q || '', curState(pager), pg.dataset.page);
       });
       document.addEventListener('submit', function (e) {
         var form = e.target.closest('.nso-cat-pager .nso-row-form'); if (!form) return;
@@ -619,7 +632,7 @@
             flash(pager, '', '');
             document.dispatchEvent(new CustomEvent('nso:refresh-categories'));
           }
-          return load(pager, pager.dataset.q || '', pager.dataset.page || 1);
+          return load(pager, pager.dataset.q || '', curState(pager), pager.dataset.page || 1);
         });
       });
     })();
