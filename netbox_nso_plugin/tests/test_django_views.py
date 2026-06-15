@@ -1960,3 +1960,59 @@ class TestPushIntentForDevice(ViewTestBase):
         mgmt.adapter_device_id = None
         mgmt.save(update_fields=["adapter_device_id"])
         NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="changed")
+
+
+class TestMergedInterfaceStateFilter(TestCase):
+    """Unit tests for the matrix-view state quick-filter bucketing (pure function)."""
+
+    class _I:
+        def __init__(self, iface_id):
+            self.id = iface_id
+
+    def test_buckets_drift_pending_in_sync(self):
+        from netbox_nso_plugin.views import _filter_ifaces_by_state
+
+        a, b, c = self._I(1), self._I(2), self._I(3)
+        ordered = [a, b, c]
+        kinds = {1: {"drift"}, 2: {"pending"}, 3: {"in_sync"}}
+        self.assertEqual(_filter_ifaces_by_state(ordered, kinds, "drift"), [a])
+        self.assertEqual(_filter_ifaces_by_state(ordered, kinds, "pending"), [b])
+        self.assertEqual(_filter_ifaces_by_state(ordered, kinds, "in_sync"), [c])
+        self.assertEqual(_filter_ifaces_by_state(ordered, kinds, "all"), [a, b, c])
+
+    def test_apply_failed_counts_as_pending_not_in_sync(self):
+        from netbox_nso_plugin.views import _filter_ifaces_by_state
+
+        x = self._I(1)
+        self.assertEqual(_filter_ifaces_by_state([x], {1: {"apply_failed"}}, "pending"), [x])
+        self.assertEqual(_filter_ifaces_by_state([x], {1: {"apply_failed"}}, "in_sync"), [])
+
+    def test_mixed_interface_appears_in_both_drift_and_pending(self):
+        from netbox_nso_plugin.views import _filter_ifaces_by_state
+
+        x = self._I(1)
+        kinds = {1: {"drift", "pending"}}
+        self.assertEqual(_filter_ifaces_by_state([x], kinds, "drift"), [x])
+        self.assertEqual(_filter_ifaces_by_state([x], kinds, "pending"), [x])
+        self.assertEqual(_filter_ifaces_by_state([x], kinds, "in_sync"), [])  # not clean → excluded
+
+
+class TestInterfaceMatrixStateChips(ViewTestBase):
+    """The consolidated interface matrix renders the drift/pending/in-sync quick-filter."""
+
+    def _url(self):
+        return reverse(
+            "plugins:netbox_nso_plugin:device_nso_category",
+            kwargs={"pk": self.device.pk, "key": "interface"},
+        )
+
+    def test_matrix_renders_state_chips(self):
+        resp = self.client.get(self._url(), HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, "nso-ifm-state")
+        self.assertContains(resp, 'data-state="drift"')
+        self.assertContains(resp, 'data-state="pending"')
+
+    def test_matrix_accepts_state_param(self):
+        resp = self.client.get(self._url() + "?state=pending", HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+        self.assertEqual(resp.status_code, 200)

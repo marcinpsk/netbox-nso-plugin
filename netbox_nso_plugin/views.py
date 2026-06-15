@@ -220,6 +220,48 @@ class NSOCategoryCountsView(LoginRequiredMixin, View):
         return JsonResponse({"categories": out})
 
 
+_PENDING_KINDS = {"pending", "apply_failed"}
+
+
+def _merged_iface_kinds(iface, attr_states, mtu_states, sw_states, ip_states) -> set[str]:
+    """Aggregate the per-attribute state kinds for one interface (matrix view).
+
+    Each attribute cell classifies independently: enabled/description are value-aware
+    (interface_row_state), the rest go through display_state. Returns the SET of kinds
+    across all of the interface's cells so the view can bucket it as drift/pending/in_sync.
+    """
+    from .summary import display_state, interface_row_state
+
+    kinds: set[str] = set()
+    for attr in ("enabled", "description"):
+        st = attr_states.get((iface.id, attr))
+        if st is not None:
+            kinds.add(interface_row_state(st, iface)[0])
+    for st in (mtu_states.get(iface.id), sw_states.get(iface.id)):
+        if st is not None:
+            kinds.add(display_state(st.status, st.accepted_at is not None)[0])
+    for st in ip_states.get(iface.id, []):
+        kinds.add(display_state(st.status, st.accepted_at is not None)[0])
+    return kinds
+
+
+def _filter_ifaces_by_state(ordered, kinds_by_iface, state):
+    """Filter the interface list to those matching the quick-select *state* bucket."""
+    if state == "drift":
+        return [i for i in ordered if "drift" in kinds_by_iface[i.id]]
+    if state == "pending":
+        return [i for i in ordered if kinds_by_iface[i.id] & _PENDING_KINDS]
+    if state == "in_sync":
+        return [
+            i
+            for i in ordered
+            if kinds_by_iface[i.id]
+            and "drift" not in kinds_by_iface[i.id]
+            and not (kinds_by_iface[i.id] & _PENDING_KINDS)
+        ]
+    return ordered  # "all" (or unknown) → no filter
+
+
 class NSOCategoryView(LoginRequiredMixin, View):
     """Return one category's rows for the device NSO tab, fetched on expand.
 
@@ -501,6 +543,17 @@ class NSOCategoryView(LoginRequiredMixin, View):
             ql = q.lower()
             ordered = [i for i in ordered if ql in i.name.lower()]
 
+        # Per-interface aggregate state, so the matrix offers the same drift/pending
+        # quick-filter the per-attribute interfaces page has. Counts are over the
+        # name-filtered set (before the state filter); the chips then narrow the rows.
+        kinds_by_iface = {i.id: _merged_iface_kinds(i, attr_states, mtu_states, sw_states, ip_states) for i in ordered}
+        counts = {"all": len(ordered), "drift": 0, "pending": 0}
+        for ks in kinds_by_iface.values():
+            counts["drift"] += 1 if "drift" in ks else 0
+            counts["pending"] += 1 if ks & _PENDING_KINDS else 0
+        state = request.GET.get("state") or "all"
+        ordered = _filter_ifaces_by_state(ordered, kinds_by_iface, state)
+
         paginator = Paginator(ordered, self._INTERFACES_PER_PAGE)
         page = paginator.get_page(request.GET.get("page") or 1)
 
@@ -525,6 +578,8 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 "rows": rows,
                 "page": page,
                 "q": q,
+                "state": state,
+                "counts": counts,
                 "adapter_error": adapter_error,
             },
         )

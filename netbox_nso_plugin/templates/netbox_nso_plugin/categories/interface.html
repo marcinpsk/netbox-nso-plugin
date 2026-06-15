@@ -20,13 +20,19 @@
 
 <div class="nso-ifm-pager"
      data-url="{% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='interface' %}"
-     data-q="{{ q }}" data-page="{{ page.number }}">
+     data-q="{{ q }}" data-state="{{ state }}" data-page="{{ page.number }}">
 
   <div class="nso-ifm-results">
   <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
     <input type="search" class="form-control form-control-sm nso-ifm-filter"
            placeholder="Filter by interface name…" value="{{ q }}" autocomplete="off"
            style="max-width: 260px;">
+    <div class="btn-group btn-group-sm nso-ifm-state" role="group" aria-label="State filter">
+      <button type="button" class="btn btn-outline-secondary{% if state == 'all' %} active{% endif %}" data-state="all">All ({{ counts.all }})</button>
+      <button type="button" class="btn btn-outline-warning{% if state == 'drift' %} active{% endif %}" data-state="drift">Drift ({{ counts.drift }})</button>
+      <button type="button" class="btn btn-outline-info{% if state == 'pending' %} active{% endif %}" data-state="pending">Pending apply ({{ counts.pending }})</button>
+      <button type="button" class="btn btn-outline-success{% if state == 'in_sync' %} active{% endif %}" data-state="in_sync">In sync</button>
+    </div>
     <span class="text-muted small ms-1">Show:</span>
     <div class="btn-group btn-group-sm nso-ifm-cols" role="group" aria-label="Columns">
       <button type="button" class="btn btn-outline-secondary active" data-col="enabled">Enabled</button>
@@ -144,10 +150,10 @@
       m.innerHTML = text ? '<div class="alert alert-' + type + ' py-1 px-2 small mb-2">' + text + '</div>' : '';
     }
 
-    function load(q, page) {
-      pager.dataset.q = q; pager.dataset.page = page;
+    function load(q, state, page) {
+      pager.dataset.q = q; pager.dataset.state = state; pager.dataset.page = page;
       results.innerHTML = '<div class="text-muted small py-2"><span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Loading…</div>';
-      return fetch(url + '?q=' + encodeURIComponent(q) + '&page=' + page, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+      return fetch(url + '?q=' + encodeURIComponent(q) + '&state=' + encodeURIComponent(state) + '&page=' + page, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
         .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); })
         .then(function (html) {
           var tmp = document.createElement('div'); tmp.innerHTML = html;
@@ -156,7 +162,7 @@
         })
         .catch(function (e) { results.innerHTML = '<div class="text-danger small">Failed to load: ' + e.message + '</div>'; });
     }
-    function reload() { return load(pager.dataset.q || '', pager.dataset.page || 1); }
+    function reload() { return load(pager.dataset.q || '', pager.dataset.state || 'all', pager.dataset.page || 1); }
 
     function post(action, body) {
       return fetch(action, {
@@ -170,7 +176,7 @@
       if (!e.target.classList.contains('nso-ifm-filter')) return;
       clearTimeout(debounce);
       var v = e.target.value.trim();
-      debounce = setTimeout(function () { load(v, 1); }, 350);
+      debounce = setTimeout(function () { load(v, pager.dataset.state || 'all', 1); }, 350);
     });
 
     pager.addEventListener('submit', function (e) {
@@ -199,8 +205,10 @@
         pager.querySelectorAll('.c-' + key).forEach(function (el) { el.style.display = hidden[key] ? 'none' : ''; });
         return;
       }
+      var stChip = e.target.closest('.nso-ifm-state [data-state]');
+      if (stChip) { e.preventDefault(); load(pager.dataset.q || '', stChip.dataset.state, 1); return; }
       var pg = e.target.closest('.nso-ifm-page');
-      if (pg) { e.preventDefault(); load(pager.dataset.q || '', pg.dataset.page); return; }
+      if (pg) { e.preventDefault(); load(pager.dataset.q || '', pager.dataset.state || 'all', pg.dataset.page); return; }
     });
 
     applyCols(pager);
