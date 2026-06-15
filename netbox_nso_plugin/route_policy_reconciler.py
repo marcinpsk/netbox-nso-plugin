@@ -169,24 +169,97 @@ def _fill_community_list_entries(cl_obj, entries: list) -> None:
         CommunityListEntry.objects.bulk_create(rows)
 
 
+# Community literals (vs community-LIST names) when resolving a set-community by-ref:
+# anything with a ':' or a well-known keyword is an inline literal, the rest is a list name.
+_WELLKNOWN_COMMUNITIES = frozenset(
+    {
+        "no-export",
+        "no-advertise",
+        "no-export-subconfed",
+        "local-as",
+        "internet",
+        "gshut",
+        "accept-own",
+        "none",
+    }
+)
+
+
+def _looks_like_community_literal(name: str) -> bool:
+    n = name.strip().lower()
+    return ":" in n or n in _WELLKNOWN_COMMUNITIES
+
+
+def _resolve_call_policy(RouteMap, name: str | None):
+    """Resolve a Junos from-policy / IOS-XR apply policy name to an existing RouteMap (by-ref)."""
+    if not name:
+        return None
+    return RouteMap.objects.filter(name__iexact=name).first()
+
+
+def _materialise_set_communities(rme, structured, cl_by_name) -> list:
+    """Create RouteMapEntrySetCommunity rows from the structured set-actions (R3).
+
+    Each action targets a community-LIST by reference (resolved against the materialised
+    CommunityList objects), or an inline community literal (IOS-style). Anything that
+    resolves to neither — a dangling by-ref to a list the device never defined — is returned
+    so the caller can preserve it in vendor_ext rather than drop it (no silent loss).
+    """
+    from netbox_routing.models import Community, CommunityList, RouteMapEntrySetCommunity
+
+    unresolved: list = []
+    for sc in structured.set_communities:
+        cl = cl_by_name.get(sc.name) or CommunityList.objects.filter(name__iexact=sc.name).first()
+        if cl is not None:
+            RouteMapEntrySetCommunity.objects.create(route_map_entry=rme, operation=sc.operation, community_list=cl)
+        elif _looks_like_community_literal(sc.name):
+            row = RouteMapEntrySetCommunity.objects.create(route_map_entry=rme, operation=sc.operation)
+            comm, _ = Community.objects.get_or_create(community=sc.name)
+            row.communities.add(comm)
+        else:
+            unresolved.append({"operation": sc.operation, "name": sc.name})
+    return unresolved
+
+
 def _fill_route_map_entries(rm_obj, entries: list, pl_by_name, cl_by_name, ap_by_name) -> None:
-    from netbox_routing.models import RouteMapEntry
+    from netbox_routing.models import RouteMap, RouteMapEntry
+
+    from .route_policy_structure import structure_entry
 
     RouteMapEntry.objects.filter(route_map=rm_obj).delete()
     # Positional sequence — unique per route-map and smallint-safe (the device sequence
     # can exceed the field's range; see _fill_prefix_list_entries).
+    default_action = None
     for i, e in enumerate(entries, start=1):
-        # flow_control (IOS route-map `continue`) rides inside set-json (no dedicated
-        # adapter leaf) — lift it into the model field and keep it out of the set blob.
-        set_data = _load_json(e.get("set"))
+        match_blob = _load_json(e.get("match"))
+        set_blob = _load_json(e.get("set"))
+        # Derive the structured projection (M17 P1): match_afi, set-community ops, call-policy,
+        # vendor_ext. The full match/set blobs are kept AS-IS (authoritative for the write-side
+        # round-trip until the reader/contract speak structured in P3) — the structured fields
+        # are an additive, queryable/display view, not a replacement. See route_policy_structure.
+        structured = structure_entry(match_blob, set_blob)
+        # flow_control (IOS route-map `continue`) rides inside set-json (no dedicated adapter
+        # leaf) — lift it into the model field; the push re-adds it so the round-trip is symmetric.
+        set_data = dict(set_blob)
         flow_control = set_data.pop("flow_control", None)
+
+        # default-action projection (R5): mirror the device's flagged default-action entry onto
+        # RouteMap.default_action. The synthetic entry itself is KEPT so the write-side blob
+        # round-trip stays byte-symmetric (the reader still synthesises it pre-contract-v2);
+        # P2 hides it in favour of the field, P3 retires the synthesis.
+        if structured.is_default_action:
+            default_action = _norm_action(e.get("action"))
+
+        vendor_ext = dict(structured.vendor_ext)
         rme = RouteMapEntry.objects.create(
             route_map=rm_obj,
             sequence=i,
             action=_norm_action(e.get("action")),
             flow_control=flow_control,
-            match=_load_json(e.get("match")),
+            match=match_blob,
             set=set_data,
+            match_afi=structured.match_afi or None,
+            call_policy=_resolve_call_policy(RouteMap, structured.call_policy),
         )
         for nm in e.get("match_prefix_lists") or []:
             obj = pl_by_name.get(nm)
@@ -208,6 +281,17 @@ def _fill_route_map_entries(rm_obj, entries: list, pl_by_name, cl_by_name, ap_by
             obj = ap_by_name.get(nm)
             if obj:
                 rme.match_aspath.add(obj)
+        unresolved = _materialise_set_communities(rme, structured, cl_by_name)
+        if unresolved:
+            vendor_ext.setdefault("unmapped", {})["set_community"] = unresolved
+        # Persist vendor_ext last (it may have grown an "unmapped" note above); null when empty.
+        rme.vendor_ext = vendor_ext or None
+        rme.save(update_fields=["vendor_ext"])
+
+    # default_action is device-sourced config on the shared RouteMap (full-replace each fill).
+    if rm_obj.default_action != default_action:
+        rm_obj.default_action = default_action
+        rm_obj.save(update_fields=["default_action"])
 
 
 # ---------------------------------------------------------------------------

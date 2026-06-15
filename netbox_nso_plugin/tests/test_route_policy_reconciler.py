@@ -572,3 +572,293 @@ class TestSharedObjectOwnership(TestCase):
         self.assertTrue(cl.invert_match)  # d2's flag now materialized
         members = {str(e.community.community) for e in CommunityListEntry.objects.filter(community_list=cl)}
         self.assertEqual(members, {"65000:9", "65000:8"})
+
+
+class TestRouteMapStructuredMaterialisation(TestCase):
+    """M17 P1: route-map entries materialise the structured fields (match_afi,
+    set_communities, call_policy, vendor_ext, RouteMap.default_action) from the opaque
+    match/set blobs the reader packs — end-to-end through reconcile_route_policy against
+    the REAL netbox_routing models + DB. The structured fields are an ADDITIVE projection:
+    the full match/set blobs are kept verbatim (authoritative for the write-side round-trip
+    until P3), so a push reproduces them byte-for-byte. Anything not yet first-class lands in
+    vendor_ext, never dropped.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        mfg = Manufacturer.objects.create(name="StMfg", slug="stmfg")
+        dt = DeviceType.objects.create(manufacturer=mfg, model="StDev", slug="stdev")
+        role = DeviceRole.objects.create(name="StRole", slug="strole")
+        site = Site.objects.create(name="StSite", slug="stsite")
+        cls.device = Device.objects.create(name="st-router", device_type=dt, role=role, site=site)
+
+    def _mgmt(self):
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+        inst, _ = NSOInstance.objects.get_or_create(name="st-inst", defaults={"adapter_instance_id": "st-inst"})
+        return NSODeviceManagement.objects.get_or_create(
+            device=self.device,
+            defaults={"nso_instance": inst, "nso_device_name": "st-dev", "adapter_device_id": self.device.pk},
+        )[0]
+
+    def _reconcile(self, payload):
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._mgmt()
+        reconcile_route_policy(self.device, payload)
+
+    def _entry(self):
+        from netbox_routing.models import RouteMapEntry
+
+        return RouteMapEntry.objects.get(route_map__name="RM")
+
+    def test_set_community_by_ref_junos_ops(self):
+        """Junos `then community add|set|delete <list>` → one by-ref set_communities row each."""
+        self._reconcile(
+            {
+                "community_lists": [
+                    {"name": "CL-ADD", "entries": [{"community": "65000:1"}]},
+                    {"name": "CL-DEL", "entries": [{"community": "65000:2"}]},
+                ],
+                "route_maps": [
+                    {
+                        "name": "RM",
+                        "entries": [
+                            {
+                                "sequence": 10,
+                                "action": "permit",
+                                "set": '{"community": ["CL-ADD", "CL-DEL"], "_junos_community_op": ["add", "delete"]}',
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+        rme = self._entry()
+        rows = {(sc.operation, sc.community_list.name) for sc in rme.set_communities.all()}
+        self.assertEqual(rows, {("add", "CL-ADD"), ("delete", "CL-DEL")})
+        # The full set blob is kept verbatim so the write-side push round-trips byte-for-byte.
+        self.assertEqual(rme.set, {"community": ["CL-ADD", "CL-DEL"], "_junos_community_op": ["add", "delete"]})
+
+    def test_set_community_timos_by_ref_ops(self):
+        """Nokia action community add|remove|replace <list> → add | delete | set by-ref."""
+        self._reconcile(
+            {
+                "community_lists": [{"name": f"CL-{x}", "entries": [{"community": "65000:1"}]} for x in "ABC"],
+                "route_maps": [
+                    {
+                        "name": "RM",
+                        "entries": [
+                            {
+                                "sequence": 10,
+                                "action": "permit",
+                                "set": '{"community_add": ["CL-A"], "community_remove": ["CL-B"], '
+                                '"community_replace": ["CL-C"]}',
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+        rows = {(sc.operation, sc.community_list.name) for sc in self._entry().set_communities.all()}
+        self.assertEqual(rows, {("add", "CL-A"), ("delete", "CL-B"), ("set", "CL-C")})
+
+    def test_set_community_iosxr_additive(self):
+        """IOS-XR `set community <set> additive` → op add by-ref; no additive → set."""
+        self._reconcile(
+            {
+                "community_lists": [{"name": "CS-X", "entries": [{"community": "65000:1"}]}],
+                "route_maps": [
+                    {
+                        "name": "RM",
+                        "entries": [
+                            {
+                                "sequence": 10,
+                                "action": "permit",
+                                "set": '{"community": "CS-X", "community_additive": true}',
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+        sc = self._entry().set_communities.get()
+        self.assertEqual((sc.operation, sc.community_list.name), ("add", "CS-X"))
+
+    def test_set_community_inline_literal(self):
+        """A set-community target that is a community LITERAL (not a defined list) becomes an
+        inline community, not a dangling by-ref."""
+        from netbox_routing.models import Community
+
+        self._reconcile(
+            {
+                "route_maps": [
+                    {
+                        "name": "RM",
+                        "entries": [
+                            {"sequence": 10, "action": "permit", "set": '{"community_add": ["65000:7"]}'},
+                        ],
+                    }
+                ],
+            }
+        )
+        sc = self._entry().set_communities.get()
+        self.assertEqual(sc.operation, "add")
+        self.assertIsNone(sc.community_list)
+        self.assertEqual([c.community for c in sc.communities.all()], ["65000:7"])
+        self.assertTrue(Community.objects.filter(community="65000:7").exists())
+
+    def test_unresolved_set_community_preserved_in_vendor_ext(self):
+        """A by-ref set-community to a list the device never defined (and not a literal) is
+        preserved in vendor_ext.unmapped — never silently dropped, and makes no junk row."""
+        self._reconcile(
+            {
+                "route_maps": [
+                    {
+                        "name": "RM",
+                        "entries": [
+                            {"sequence": 10, "action": "permit", "set": '{"community_remove": ["GHOST-LIST"]}'},
+                        ],
+                    }
+                ],
+            }
+        )
+        rme = self._entry()
+        self.assertEqual(rme.set_communities.count(), 0)
+        self.assertEqual(rme.vendor_ext["unmapped"]["set_community"], [{"operation": "delete", "name": "GHOST-LIST"}])
+
+    def test_match_afi_lifted_and_normalised(self):
+        """match-json family (Nokia tokens) + _junos_family (inet6) → normalised match_afi;
+        unknown tokens go to vendor_ext.unmapped, not the column."""
+        self._reconcile(
+            {
+                "route_maps": [
+                    {
+                        "name": "RM",
+                        "entries": [
+                            {
+                                "sequence": 10,
+                                "action": "permit",
+                                "match": '{"family": ["ipv4", "vpn-ipv4", "mvpn-ipv4"]}',
+                            },
+                            {"sequence": 20, "action": "permit", "match": '{"_junos_family": "inet6"}'},
+                        ],
+                    }
+                ],
+            }
+        )
+        from netbox_routing.models import RouteMapEntry
+
+        e1 = RouteMapEntry.objects.get(route_map__name="RM", sequence=1)
+        e2 = RouteMapEntry.objects.get(route_map__name="RM", sequence=2)
+        self.assertEqual(e1.match_afi, ["ipv4", "vpn-ipv4"])
+        self.assertEqual(e1.vendor_ext["unmapped"]["family"], ["mvpn-ipv4"])
+        self.assertEqual(e2.match_afi, ["ipv6"])
+        self.assertIn("family", e1.match)  # full blob kept for the write-side round-trip
+
+    def test_vendor_ext_projection_with_full_blob_kept(self):
+        """All _rpl_/_junos_/_timos_ keys are projected (namespaced) into vendor_ext, while
+        the full match/set blobs are kept verbatim so the write-side push round-trips."""
+        self._reconcile(
+            {
+                "route_maps": [
+                    {
+                        "name": "RM",
+                        "entries": [
+                            {
+                                "sequence": 10,
+                                "action": "permit",
+                                "match": '{"_rpl_done": true, "protocol": ["bgp"]}',
+                                "set": '{"_junos_priority": "high", "local_preference": 200}',
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+        rme = self._entry()
+        self.assertEqual(rme.vendor_ext, {"xr": {"done": True}, "junos": {"priority": "high"}})
+        # Blobs unchanged (full) — the structured fields are additive, not a replacement.
+        self.assertEqual(rme.match, {"_rpl_done": True, "protocol": ["bgp"]})
+        self.assertEqual(rme.set, {"_junos_priority": "high", "local_preference": 200})
+
+    def test_call_policy_resolved_from_junos_from_policy(self):
+        """Junos `from policy <name>` (a match subroutine) → call_policy FK to the RouteMap."""
+        from netbox_routing.models import RouteMap
+
+        RouteMap.objects.create(name="SUB-POLICY")
+        self._reconcile(
+            {
+                "route_maps": [
+                    {
+                        "name": "RM",
+                        "entries": [
+                            {
+                                "sequence": 10,
+                                "action": "permit",
+                                "match": '{"_junos_from_policy": ["SUB-POLICY"]}',
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+        self.assertEqual(self._entry().call_policy.name, "SUB-POLICY")
+
+    def test_timos_default_action_projected_to_route_map(self):
+        """A Nokia default-action arrives as a synthetic trailing entry flagged
+        _timos_default_action → RouteMap.default_action mirrors it. The synthetic entry is
+        KEPT (not dropped) so the write-side blob round-trips byte-symmetric; P2 hides it."""
+        from netbox_routing.models import RouteMap, RouteMapEntry
+
+        self._reconcile(
+            {
+                "route_maps": [
+                    {
+                        "name": "RM",
+                        "entries": [
+                            {"sequence": 10, "action": "permit", "match": '{"protocol": ["bgp"]}'},
+                            {
+                                "sequence": 999999,
+                                "action": "deny",
+                                "match": '{"_timos_default_action": true}',
+                                "set": "{}",
+                            },
+                        ],
+                    }
+                ],
+            }
+        )
+        self.assertEqual(RouteMap.objects.get(name="RM").default_action, "deny")
+        # Both device entries are materialised (positional) — nothing dropped.
+        seqs = list(RouteMapEntry.objects.filter(route_map__name="RM").values_list("sequence", flat=True))
+        self.assertEqual(seqs, [1, 2])
+        shell = RouteMapEntry.objects.get(route_map__name="RM", sequence=2)
+        self.assertEqual(shell.vendor_ext, {"timos": {"default_action": True}})
+
+    def test_timos_default_action_with_set_keeps_full_blob(self):
+        """A default-action that also carries set knobs: default_action mirrors the action AND
+        the entry keeps its full set blob — no set knob is lost on the projection."""
+        from netbox_routing.models import RouteMap, RouteMapEntry
+
+        self._reconcile(
+            {
+                "route_maps": [
+                    {
+                        "name": "RM",
+                        "entries": [
+                            {
+                                "sequence": 999999,
+                                "action": "permit",
+                                "match": '{"_timos_default_action": true}',
+                                "set": '{"local_preference": 50}',
+                            },
+                        ],
+                    }
+                ],
+            }
+        )
+        self.assertEqual(RouteMap.objects.get(name="RM").default_action, "permit")
+        rme = RouteMapEntry.objects.get(route_map__name="RM")
+        self.assertEqual(rme.set, {"local_preference": 50})
+        self.assertEqual(rme.vendor_ext, {"timos": {"default_action": True}})
