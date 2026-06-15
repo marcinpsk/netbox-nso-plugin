@@ -162,6 +162,29 @@ class TestRoutePolicyApplySettle(APITestCase):
         self.assertEqual(row.status, "apply_failed")
         self.assertTrue(row.last_apply_error)
 
+    def test_failed_route_policy_records_real_error_detail(self):
+        """When the apply job carries the device-commit error, last_apply_error shows
+        the real reason (not the generic 'see the adapter job' placeholder)."""
+        from netbox_nso_plugin.reconcile import _settle_apply_failures
+
+        mgmt, row = self._setup()
+        job = {
+            "result": {"route_policy_count_by_outcome": {"in_sync": 0, "apply_failed": 1}},
+            "error": {
+                "detail": {
+                    "items": [
+                        {"type": "route_policy", "error": "device parser rejected: invalid community"},
+                        {"type": "vlan", "error": "unrelated"},
+                    ]
+                }
+            },
+        }
+        _settle_apply_failures(mgmt, job["result"], job)
+        row.refresh_from_db()
+        self.assertEqual(row.status, "apply_failed")
+        self.assertIn("device parser rejected: invalid community", row.last_apply_error)
+        self.assertNotIn("unrelated", row.last_apply_error)  # other scopes excluded
+
     def test_prepare_apply_marks_accepted_route_policy_deploying(self):
         from netbox_nso_plugin.views import _prepare_apply
 

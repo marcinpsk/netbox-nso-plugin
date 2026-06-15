@@ -494,7 +494,34 @@ _APPLY_DEPLOYING_SCOPES = {
 }
 
 
-def _settle_apply_failures(mgmt, apply_result: dict | None) -> None:
+_GENERIC_APPLY_ERROR = "Apply reported a failure for this scope (see the adapter apply job)."
+
+
+def _scope_failure_messages(job: dict | None, scope: str) -> str:
+    """Join the real per-item error messages for *scope* from a failed apply job.
+
+    The adapter records each failed item under ``job.error.detail.items`` as
+    ``{"type": <scope>, "error": <message>, ...}`` (jobs API exposes ``error``).
+    Returns a de-duplicated, human-readable string, or "" when none are present.
+    """
+    if not job:
+        return ""
+    items = (((job.get("error") or {}).get("detail") or {}).get("items")) or []
+    msgs: list[str] = []
+    for it in items:
+        if not isinstance(it, dict) or it.get("type") != scope:
+            continue
+        name = it.get("name") or it.get("interface") or it.get("attribute") or ""
+        err = str(it.get("error") or "").strip()
+        if not err:
+            continue
+        msg = f"{name}: {err}" if name else err
+        if msg not in msgs:
+            msgs.append(msg)
+    return "; ".join(msgs)
+
+
+def _settle_apply_failures(mgmt, apply_result: dict | None, job: dict | None = None) -> None:
     """Mark rows still 'deploying' in a scope whose apply reported failures → apply_failed.
 
     Called AFTER the post-sync reconcile, so rows whose apply succeeded have already
@@ -502,6 +529,10 @@ def _settle_apply_failures(mgmt, apply_result: dict | None) -> None:
     scope the apply job counted as failed is therefore a genuine failure — convert it via
     on_apply_result so it's no longer stuck, with last_apply_error for the operator. The
     next reconcile recovers it to in_sync (device caught up) or re-pends to accepted.
+
+    ``job`` (the full apply job, optional) carries the per-item commit errors under
+    ``job.error.detail.items``; when present, last_apply_error records the REAL device
+    rejection reason instead of a generic pointer.
     """
     if not apply_result:
         return
@@ -512,12 +543,13 @@ def _settle_apply_failures(mgmt, apply_result: dict | None) -> None:
         counts = apply_result.get(f"{scope}_count_by_outcome") or {}
         if (counts.get("apply_failed") or 0) <= 0:
             continue
+        detail = _scope_failure_messages(job, scope) or _GENERIC_APPLY_ERROR
         model = getattr(models, model_name)
         for row in model.objects.filter(management=mgmt, status="deploying"):
             new_status = sm.on_apply_result(row.status, ok=False)
             if new_status != row.status:
                 row.status = new_status
-                row.last_apply_error = "Apply reported a failure for this scope (see the adapter apply job)."
+                row.last_apply_error = detail
                 row.save(update_fields=["status", "last_apply_error"])
 
 
@@ -600,7 +632,19 @@ def _journal_route_policy_apply(mgmt, job: dict | None) -> None:
         pointer = f" Member-level detail is on the device's [NSO tab]({tab})."
     except Exception:  # noqa: BLE001 — URL reverse is best-effort decoration
         pointer = " Member-level detail is on the device's NSO tab."
-    comment = f"NSO apply on **{mgmt.device}** — route-policy {verb}, adapter job #{job_id}.{pointer}"
+    detail = _scope_failure_messages(job, "route_policy") if failed else ""
+    failure_note = f" Failures: {detail}." if detail else ""
+    comment = f"NSO apply on **{mgmt.device}** — route-policy {verb}, adapter job #{job_id}.{failure_note}{pointer}"
+
+    # Device-level journal entry: the operator is pointed at the device journal for apply
+    # outcomes, so record the apply (with the real failure reason) there too — not only on
+    # the per-object journals.
+    try:
+        device = mgmt.device
+        if device is not None:
+            JournalEntry.objects.create(assigned_object=device, kind=kind, created_by=None, comments=comment)
+    except Exception as exc:  # noqa: BLE001 — the device entry must not block per-object ones
+        logger.warning("nso journal: route-policy apply device entry skipped for %s: %s", mgmt.device_id, exc)
 
     now = timezone.now()
     for row in rows:
@@ -647,7 +691,7 @@ def run_device_reconcile(device_id: int) -> dict:
         mgmt = device.nso_management
         if mgmt is not None and mgmt.adapter_device_id is not None:
             job = _last_apply_job(mgmt.adapter_device_id)
-            _settle_apply_failures(mgmt, job.get("result") if job else None)
+            _settle_apply_failures(mgmt, job.get("result") if job else None, job)
             _journal_route_policy_apply(mgmt, job)
     except Exception as exc:  # noqa: BLE001 — settling is best-effort, never crash the worker
         logger.warning("nso reconcile: apply-failure settle skipped for device %s: %s", device_id, exc)

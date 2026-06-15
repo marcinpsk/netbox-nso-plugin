@@ -17,13 +17,21 @@ from django.test import TestCase
 from extras.models import JournalEntry
 
 
-def _job(job_id, *, in_sync=0, apply_failed=0, status="succeeded"):
-    return {
+def _job(job_id, *, in_sync=0, apply_failed=0, status="succeeded", errors=None):
+    job = {
         "id": job_id,
         "type": "apply",
         "status": status,
         "result": {"route_policy_count_by_outcome": {"in_sync": in_sync, "apply_failed": apply_failed}},
     }
+    if errors:
+        # Mirror the adapter's failed-apply job.error shape (jobs API exposes it).
+        job["error"] = {
+            "code": "nso_commit_failed",
+            "message": f"{len(errors)} item(s) failed to apply",
+            "detail": {"items": [{"type": "route_policy", "error": e} for e in errors]},
+        }
+    return job
 
 
 class _RoutePolicyFixture(TestCase):
@@ -206,3 +214,57 @@ class TestRoutePolicyApplyJournal(_RoutePolicyFixture):
         _journal_route_policy_apply(mgmt, _job(8540, in_sync=2))
 
         self.assertEqual(self._entries_for("CLJ", CommunityList).count(), 0)
+
+    def _device_entries(self):
+        dev_ct = ContentType.objects.get_for_model(self.device)
+        return JournalEntry.objects.filter(assigned_object_type=dev_ct, assigned_object_id=self.device.pk)
+
+    def test_success_writes_a_device_journal_entry(self):
+        """The DEVICE journal (where the UI points the operator) records the apply."""
+        from netbox_nso_plugin.reconcile import _journal_route_policy_apply
+
+        mgmt = self._make_mgmt()
+        self._owned_reconcile()
+
+        _journal_route_policy_apply(mgmt, _job(8550, in_sync=2))
+
+        entries = self._device_entries()
+        self.assertEqual(entries.count(), 1)
+        self.assertEqual(entries.first().kind, "success")
+        self.assertIn("job #8550", entries.first().comments)
+
+    def test_failure_writes_device_journal_with_real_error_detail(self):
+        """A failed apply lands on the device journal WITH the real device-commit reason
+        (not just a generic 'see the adapter job') — the operator's complaint."""
+        from netbox_nso_plugin.reconcile import _journal_route_policy_apply
+
+        mgmt = self._make_mgmt()
+        self._owned_reconcile()
+
+        _journal_route_policy_apply(
+            mgmt,
+            _job(
+                8551,
+                in_sync=1,
+                apply_failed=1,
+                status="failed",
+                errors=["device rejected 'set extcommunity rt' (unsupported on this NED)"],
+            ),
+        )
+
+        entry = self._device_entries().first()
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.kind, "danger")
+        self.assertIn("failed", entry.comments)
+        self.assertIn("device rejected 'set extcommunity rt'", entry.comments)
+
+    def test_device_journal_idempotent_for_same_job(self):
+        from netbox_nso_plugin.reconcile import _journal_route_policy_apply
+
+        mgmt = self._make_mgmt()
+        self._owned_reconcile()
+
+        _journal_route_policy_apply(mgmt, _job(8552, in_sync=2))
+        _journal_route_policy_apply(mgmt, _job(8552, in_sync=2))
+
+        self.assertEqual(self._device_entries().count(), 1)
