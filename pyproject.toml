@@ -76,13 +76,20 @@ ignore = [
     "E501",
     "F403",
     "F405",
+    # Docstring PRESENCE is not required — we enforce one FORMAT convention, not coverage.
     "D100",
+    "D101",
+    "D102",
+    "D103",
     "D104",
     "D105",
     "D106",
     "D107",
+    # One convention: summary on the first line (D212), no blank line before a class
+    # docstring (D211) — i.e. disable the conflicting D213/D203.
     "D203",
     "D213",
+    "UP042",
 ]
 
 [tool.ruff.lint.mccabe]
