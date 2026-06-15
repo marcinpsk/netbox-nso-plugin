@@ -1946,6 +1946,7 @@ class SharedObjectVersionsMixin(LoginRequiredMixin, View):
 
         state = get_object_or_404(self.model_class, pk=pk)
         items = ownership.version_items(self.model_class, state.family, state.object_name)
+        self.decorate_items(items, state)
         return render(
             request,
             self.template_name,
@@ -1958,6 +1959,13 @@ class SharedObjectVersionsMixin(LoginRequiredMixin, View):
                 "materialize_url_name": self.materialize_url_name,
             },
         )
+
+    def decorate_items(self, items, state):
+        """Attach per-family display detail to each version item (hook; default no-op).
+
+        The surface is family-agnostic; route-policy overrides this to attach a structured
+        route-map summary so operators compare versions without reading raw JSON.
+        """
 
 
 class SharedObjectMaterializeMixin(LoginRequiredMixin, View):
@@ -1990,6 +1998,16 @@ class SharedObjectMaterializeMixin(LoginRequiredMixin, View):
 class NSORoutePolicyVersionsView(SharedObjectVersionsMixin):  # noqa: D101
     model_class = NSORoutePolicyState
     materialize_url_name = "plugins:netbox_nso_plugin:routing_materialize_route_policy"
+
+    def decorate_items(self, items, state):
+        """Attach a structured route-map summary to each device version (route_map only)."""
+        if state.family != "route_map":
+            return
+        from .route_policy_structure import summarize_route_map
+
+        for it in items:
+            row = it.get("row")
+            it["route_map"] = summarize_route_map(getattr(row, "captured", None)) if it.get("has_capture") else None
 
 
 class NSORoutePolicyMaterializeView(SharedObjectMaterializeMixin):  # noqa: D101

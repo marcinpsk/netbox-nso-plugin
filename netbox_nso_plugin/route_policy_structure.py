@@ -202,3 +202,55 @@ def structure_entry(match_blob: dict | None, set_blob: dict | None) -> Structure
         residual_set=residual_set,
         is_default_action=match_blob.get("_timos_default_action") is True,
     )
+
+
+def _loads(value) -> dict:
+    """Parse a match/set value (the adapter ships them as JSON strings) into a dict."""
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        import json
+
+        out = json.loads(value)
+        return out if isinstance(out, dict) else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+def summarize_route_map(captured: dict | None) -> dict:
+    """Build a display summary of a device's CAPTURED route-map (for the versions UI).
+
+    Returns ``{"default_action": <permit|deny|None>, "entries": [ {…}, … ]}``. Each entry is
+    the structured projection of one device entry — action, match AFI / referenced lists /
+    residual match knobs, set-community ops, call-policy, residual set knobs, vendor_ext — so
+    operators can compare two devices' versions of the same route-map without reading raw JSON.
+    The synthetic ``_timos_default_action`` entry is folded into ``default_action`` (not shown
+    as an entry). Pure + display-only; mirrors what the reconciler materialises.
+    """
+    captured = captured or {}
+    default_action = None
+    entries: list[dict] = []
+    for e in captured.get("entries") or []:
+        s = structure_entry(_loads(e.get("match")), _loads(e.get("set")))
+        action = (e.get("action") or "").strip().lower() or None
+        if s.is_default_action:
+            default_action = action
+            continue
+        entries.append(
+            {
+                "sequence": e.get("sequence"),
+                "action": action,
+                "match_afi": s.match_afi,
+                "match_prefix_lists": e.get("match_prefix_lists") or [],
+                "match_community_lists": e.get("match_community_lists") or [],
+                "match_as_paths": e.get("match_as_paths") or [],
+                "match_knobs": s.residual_match,
+                "set_communities": [{"operation": c.operation, "name": c.name} for c in s.set_communities],
+                "call_policy": s.call_policy,
+                "set_knobs": s.residual_set,
+                "vendor_ext": s.vendor_ext,
+            }
+        )
+    return {"default_action": default_action, "entries": entries}

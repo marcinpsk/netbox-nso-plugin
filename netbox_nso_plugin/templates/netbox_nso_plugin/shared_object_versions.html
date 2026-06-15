@@ -32,7 +32,18 @@
                 {% if it.device %}<a href="{% url 'dcim:device_nso' pk=it.device.pk %}">{{ it.device }}</a>{% else %}—{% endif %}
               </td>
               <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=it.row.status %}</td>
-              <td>{% if it.has_capture %}{{ it.entry_count }}{% else %}<span class="text-muted" title="No captured content yet — populated on the next sync from this device">—</span>{% endif %}</td>
+              <td>
+                {% if it.has_capture %}
+                  {% if it.route_map %}
+                  <button class="btn btn-sm btn-link p-0 text-decoration-none" type="button"
+                          data-bs-toggle="collapse" data-bs-target="#rpv{{ it.row.pk }}"
+                          aria-expanded="false" aria-controls="rpv{{ it.row.pk }}"
+                          title="Show this device's structured route-map">
+                    {{ it.entry_count }} <span class="mdi mdi-chevron-down"></span>
+                  </button>
+                  {% else %}{{ it.entry_count }}{% endif %}
+                {% else %}<span class="text-muted" title="No captured content yet — populated on the next sync from this device">—</span>{% endif %}
+              </td>
               <td>
                 {% if it.is_owner %}
                   <span class="badge text-bg-info" title="NetBox currently mirrors this device's version">materialized</span>
@@ -56,6 +67,17 @@
                 {% endif %}
               </td>
             </tr>
+            {% if it.route_map %}
+            <tr class="nso-rp-detail">
+              <td colspan="5" class="p-0 border-0">
+                <div class="collapse" id="rpv{{ it.row.pk }}">
+                  <div class="p-3 bg-body-tertiary border-start border-4 border-info">
+                    {% include "netbox_nso_plugin/categories/_route_map_version_detail.html" with rm=it.route_map %}
+                  </div>
+                </div>
+              </td>
+            </tr>
+            {% endif %}
             {% endfor %}
           </tbody>
         </table>

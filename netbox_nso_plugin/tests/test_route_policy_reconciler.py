@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.test import TestCase
+from django.urls import reverse
 
 
 class TestReconcileRoutePolicy(TestCase):
@@ -862,3 +863,93 @@ class TestRouteMapStructuredMaterialisation(TestCase):
         rme = RouteMapEntry.objects.get(route_map__name="RM")
         self.assertEqual(rme.set, {"local_preference": 50})
         self.assertEqual(rme.vendor_ext, {"timos": {"default_action": True}})
+
+
+class TestRoutePolicyVersionsStructuredUI(TestCase):
+    """M17 P2: the 'Versions' surface renders each device's STRUCTURED route-map (via
+    summarize_route_map) so operators compare versions without reading raw JSON — end-to-end
+    through the real view + template against real models."""
+
+    @classmethod
+    def setUpTestData(cls):
+        from django.contrib.auth import get_user_model
+
+        mfg = Manufacturer.objects.create(name="UiMfg", slug="uimfg")
+        dt = DeviceType.objects.create(manufacturer=mfg, model="UiDev", slug="uidev")
+        role = DeviceRole.objects.create(name="UiRole", slug="uirole")
+        site = Site.objects.create(name="UiSite", slug="uisite")
+        cls.device = Device.objects.create(name="ui-router", device_type=dt, role=role, site=site)
+        cls.user = get_user_model().objects.create_superuser(
+            username="rpuiadmin", password="pw", email="rpui@test.example"
+        )
+
+    def _mgmt(self):
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+        inst, _ = NSOInstance.objects.get_or_create(name="ui-inst", defaults={"adapter_instance_id": "ui-inst"})
+        return NSODeviceManagement.objects.get_or_create(
+            device=self.device,
+            defaults={"nso_instance": inst, "nso_device_name": "ui-dev", "adapter_device_id": self.device.pk},
+        )[0]
+
+    def test_versions_page_renders_structured_route_map(self):
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._mgmt()
+        reconcile_route_policy(
+            self.device,
+            {
+                "community_lists": [{"name": "CL-X", "entries": [{"community": "65000:1"}]}],
+                "route_maps": [
+                    {
+                        "name": "RM-UI",
+                        "entries": [
+                            {
+                                "sequence": 10,
+                                "action": "permit",
+                                "match_prefix_lists": [],
+                                "match_community_lists": [],
+                                "match_as_paths": [],
+                                "match": '{"family": ["ipv4"]}',
+                                "set": '{"community_add": ["CL-X"], "local_preference": 200}',
+                            },
+                            {
+                                "sequence": 999999,
+                                "action": "deny",
+                                "match": '{"_timos_default_action": true}',
+                                "set": "{}",
+                            },
+                        ],
+                    }
+                ],
+            },
+        )
+        state = NSORoutePolicyState.objects.get(family="route_map", object_name="RM-UI")
+        self.client.force_login(self.user)
+        url = reverse("plugins:netbox_nso_plugin:routing_route_policy_versions", kwargs={"pk": state.pk})
+        resp = self.client.get(url)
+
+        self.assertEqual(resp.status_code, 200)
+        html = resp.content.decode()
+        self.assertIn("community add CL-X", html)  # set-community op rendered structurally
+        self.assertIn("ipv4", html)  # match AFI chip
+        self.assertIn("Default action", html)  # folded default-action surfaced, not an entry
+        self.assertIn("local_preference=200", html)  # residual set knob
+
+    def test_versions_page_non_route_map_has_no_detail(self):
+        # A community-list version page must not error and carries no route-map detail toggle.
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._mgmt()
+        reconcile_route_policy(
+            self.device,
+            {"community_lists": [{"name": "CL-Y", "entries": [{"community": "65000:2"}]}]},
+        )
+        state = NSORoutePolicyState.objects.get(family="community_list", object_name="CL-Y")
+        self.client.force_login(self.user)
+        url = reverse("plugins:netbox_nso_plugin:routing_route_policy_versions", kwargs={"pk": state.pk})
+        resp = self.client.get(url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotIn("rpv", resp.content.decode())  # no route-map collapse target
