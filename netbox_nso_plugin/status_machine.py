@@ -192,6 +192,11 @@ TRANSITIONS: tuple[Transition, ...] = (
     # -- automatic: recovery once a later reconcile succeeds -----------------
     Transition(RECONCILE, ERROR, IMPORTED, True, "reconcile recovered: matches device"),
     Transition(RECONCILE, ERROR, CHANGED, True, "reconcile recovered: diverged"),
+    # An errored, unowned row whose recovering read diverges is an adoption conflict
+    # like any other unowned divergence. Without this edge on_reconcile raised
+    # IllegalTransition (error->conflict), aborting the WHOLE reconcile and re-marking
+    # every row 'error' — a self-perpetuating wedge (e.g. route-policy after a read change).
+    Transition(CONFLICT_DETECTED, ERROR, CONFLICT, True, "errored row recovered into an adoption conflict"),
     Transition(DRIFT, ERROR, CHANGED, True, "errored row no longer reported by device"),
 )
 

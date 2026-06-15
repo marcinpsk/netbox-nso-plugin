@@ -297,6 +297,17 @@ class TestOnReconcileError(SimpleTestCase):
         for s in (sm.ACCEPTED, sm.DEPLOYING, sm.IN_SYNC, sm.APPLY_FAILED):
             self.assertEqual(sm.on_reconcile_error(s), s)
 
+    def test_errored_row_recovers_on_next_reconcile(self):
+        # 'error' is transient: the next good read re-classifies the row by what it
+        # observes — matches → imported, diverges → changed, diverges+native object
+        # → conflict, absent → drift. Regression: the diverged+conflict path tried
+        # error->conflict, which had no edge and raised IllegalTransition, aborting the
+        # WHOLE reconcile and re-marking every row 'error' (a self-perpetuating wedge).
+        self.assertEqual(sm.on_reconcile(sm.ERROR, matches=True, settles_owned=False), sm.IMPORTED)
+        self.assertEqual(sm.on_reconcile(sm.ERROR, matches=False, settles_owned=False), sm.CHANGED)
+        self.assertEqual(sm.on_reconcile(sm.ERROR, matches=False, conflict=True, settles_owned=False), sm.CONFLICT)
+        self.assertEqual(sm.on_reconcile(sm.ERROR, present=False), sm.CHANGED)
+
     def test_error_is_idempotent(self):
         self.assertEqual(sm.on_reconcile_error(sm.ERROR), sm.ERROR)
 

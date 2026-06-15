@@ -46,6 +46,39 @@ class TestReconcileRoutePolicy(TestCase):
 
         self.assertEqual(reconcile_route_policy(self.device, self._payload()), [])
 
+    def test_case_insensitive_name_adopts_existing_object(self):
+        """A device object whose name differs only in CASE from an existing netbox_routing
+        object must ADOPT it, not crash on the Lower(name) unique constraint.
+
+        Regression: get_or_create(name='ACCEPT-ALL') with an existing 'accept-all' did
+        get-miss → create → IntegrityError, which aborted the whole route-policy reconcile
+        and left EVERY row marked 'error' (self-perpetuating once the status machine also
+        couldn't move error→conflict).
+        """
+        from netbox_routing.models import RouteMap
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        existing = RouteMap.objects.create(name="accept-all")  # e.g. imported from another device
+        self._make_mgmt(self.device)
+
+        payload = {
+            "prefix_lists": [],
+            "community_lists": [],
+            "as_paths": [],
+            "route_maps": [{"name": "ACCEPT-ALL", "entries": [{"seq": 10, "action": "permit"}]}],
+        }
+        reconcile_route_policy(self.device, payload)  # must not raise
+
+        # No duplicate object created; the device's row adopts the existing (other-case) one.
+        self.assertEqual(RouteMap.objects.filter(name__iexact="accept-all").count(), 1)
+        st = NSORoutePolicyState.objects.get(
+            management__device=self.device, family="route_map", object_name="ACCEPT-ALL"
+        )
+        self.assertNotEqual(st.status, "error")
+        self.assertEqual(st.object_id, existing.pk)
+
     def test_deploying_row_settles_in_sync_when_present(self):
         """A route-policy row marked 'deploying' at Apply settles to in_sync once the
         device re-reports the object — the accepted→deploying→in_sync apply lifecycle."""

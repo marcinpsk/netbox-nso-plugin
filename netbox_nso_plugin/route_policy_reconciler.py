@@ -27,6 +27,32 @@ def _hash(obj: object) -> str:
     return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
+def _get_or_create_named(model, name, **defaults):
+    """Get-or-create a netbox_routing policy object by CASE-INSENSITIVE name.
+
+    netbox_routing enforces uniqueness on ``Lower(name)``, so a plain
+    ``get_or_create(name=...)`` raises IntegrityError when an object with the same
+    name in a different case already exists (device ``ACCEPT-ALL`` vs an existing
+    ``accept-all``). That exception aborted the ENTIRE route-policy reconcile, leaving
+    every row stuck in ``error``. The global dedup is case-insensitive, so match
+    existing objects with ``name__iexact``; create only when truly absent, re-fetching
+    on a race (the create is savepointed so an IntegrityError doesn't poison the txn).
+    """
+    from django.db import IntegrityError, transaction
+
+    obj = model.objects.filter(name__iexact=name).first()
+    if obj is not None:
+        return obj, False
+    try:
+        with transaction.atomic():
+            return model.objects.create(name=name, **defaults), True
+    except IntegrityError:
+        existing = model.objects.filter(name__iexact=name).first()
+        if existing is None:
+            raise
+        return existing, False
+
+
 def _norm_action(action: str | None) -> str:
     """Map an adapter action to netbox_routing ActionChoices (permit/deny)."""
     a = (action or "").strip().lower()
@@ -257,7 +283,7 @@ def _reconcile_prefix_lists(mgmt, device, pl_list, PrefixList, ContentType, now,
         if not name:
             continue
         entries = pl_data.get("entries", []) or []
-        pl_obj, created = PrefixList.objects.get_or_create(name=name)
+        pl_obj, created = _get_or_create_named(PrefixList, name)
         name_map[name] = pl_obj
         state, should_fill = _upsert_state(mgmt, "prefix_list", name, pl_obj, ct, _hash(entries), now)
         if _needs_fill(PrefixListEntry, created, should_fill, prefix_list=pl_obj):
@@ -275,7 +301,7 @@ def _reconcile_community_lists(mgmt, device, cl_list, CommunityList, ContentType
             continue
         entries = cl_data.get("entries", []) or []
         invert_match = bool(cl_data.get("invert_match", False))
-        cl_obj, created = CommunityList.objects.get_or_create(name=name, defaults={"invert_match": invert_match})
+        cl_obj, created = _get_or_create_named(CommunityList, name, invert_match=invert_match)
         name_map[name] = cl_obj
         # Backward-compatible hash: keep the plain-entries hash for non-inverted lists
         # (the common case) so they don't all false-drift on the first poll after this
@@ -301,7 +327,7 @@ def _reconcile_as_paths(mgmt, device, ap_list, ASPath, ContentType, now, seen_ke
         if not name:
             continue
         entries = ap_data.get("entries", []) or []
-        ap_obj, created = ASPath.objects.get_or_create(name=name)
+        ap_obj, created = _get_or_create_named(ASPath, name)
         name_map[name] = ap_obj
         state, should_fill = _upsert_state(mgmt, "as_path", name, ap_obj, ct, _hash(entries), now)
         if _needs_fill(ASPathEntry, created, should_fill, aspath=ap_obj):
@@ -318,7 +344,7 @@ def _reconcile_route_maps(mgmt, device, rm_list, RouteMap, ContentType, now, see
         if not name:
             continue
         entries = rm_data.get("entries", []) or []
-        rm_obj, created = RouteMap.objects.get_or_create(name=name)
+        rm_obj, created = _get_or_create_named(RouteMap, name)
         state, should_fill = _upsert_state(mgmt, "route_map", name, rm_obj, ct, _hash(entries), now)
         if _needs_fill(RouteMapEntry, created, should_fill, route_map=rm_obj):
             _fill_route_map_entries(rm_obj, entries, pl_map, cl_map, ap_map)
