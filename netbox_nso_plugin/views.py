@@ -1924,6 +1924,78 @@ class NSORoutePolicyStateAcceptView(RoutingStateAcceptMixin):
         return redirect(_device_nso_tab_url(state.management.device_id))
 
 
+# ── Shared-object versions + re-point (universal: route-policy now, ACL later) ──
+
+
+class SharedObjectVersionsMixin(LoginRequiredMixin, View):
+    """Show every device's captured version of one globally-deduped named object.
+
+    Globally-deduped objects (a route-map / community-list / … shared by name across
+    devices) hold ONE device's content in NetBox while every device keeps its own
+    captured version.  This lists all of them — which device is the materialized owner,
+    which match it, which diverge — so an operator can pick which version NetBox should
+    mirror.  Family-agnostic: an ACL overlay subclasses this with its own ``model_class``.
+    """
+
+    model_class = None
+    materialize_url_name = ""
+    template_name = "netbox_nso_plugin/shared_object_versions.html"
+
+    def get(self, request, pk):  # noqa: D102
+        from . import shared_object_ownership as ownership
+
+        state = get_object_or_404(self.model_class, pk=pk)
+        items = ownership.version_items(self.model_class, state.family, state.object_name)
+        return render(
+            request,
+            self.template_name,
+            {
+                "state": state,
+                "object_name": state.object_name,
+                "family": state.family.replace("_", "-"),
+                "items": items,
+                "device": getattr(state.management, "device", None),
+                "materialize_url_name": self.materialize_url_name,
+            },
+        )
+
+
+class SharedObjectMaterializeMixin(LoginRequiredMixin, View):
+    """Re-point a shared object's content to a chosen device's captured version.
+
+    Refills the NetBox object from this device's capture and flips ownership (the former
+    owner becomes the conflict).  Writes only into NetBox — pushing the new content to
+    other devices is a separate, explicit Accept.  Family-agnostic via ``model_class``.
+    """
+
+    model_class = None
+
+    def post(self, request, pk):  # noqa: D102
+        from . import shared_object_ownership as ownership
+
+        state = get_object_or_404(self.model_class, pk=pk)
+        try:
+            ownership.rematerialize(state)
+        except ValueError as exc:
+            messages.error(request, f"Could not use this version: {exc}")
+            return redirect(_device_nso_tab_url(state.management.device_id))
+        dev = getattr(state.management, "device", None)
+        messages.success(
+            request,
+            f"NetBox now mirrors {dev}'s version of {state.family.replace('_', '-')} “{state.object_name}”.",
+        )
+        return redirect(_device_nso_tab_url(state.management.device_id))
+
+
+class NSORoutePolicyVersionsView(SharedObjectVersionsMixin):  # noqa: D101
+    model_class = NSORoutePolicyState
+    materialize_url_name = "plugins:netbox_nso_plugin:routing_materialize_route_policy"
+
+
+class NSORoutePolicyMaterializeView(SharedObjectMaterializeMixin):  # noqa: D101
+    model_class = NSORoutePolicyState
+
+
 class NSOOSPFInstanceStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
     model_class = NSOOSPFInstanceState
 

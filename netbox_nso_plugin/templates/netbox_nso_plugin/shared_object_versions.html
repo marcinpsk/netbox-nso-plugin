@@ -1,0 +1,71 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Per-device versions of one globally-deduped named object + pick-which-to-own. #}
+{% extends 'base/layout.html' %}
+
+{% block title %}Versions — {{ family }} {{ object_name }}{% endblock %}
+
+{% block content %}
+<div class="row">
+  <div class="col col-md-10 offset-md-1">
+    <div class="card">
+      <h5 class="card-header">
+        <span class="mdi mdi-source-branch me-1"></span>
+        Device versions of {{ family }} <code>{{ object_name }}</code>
+      </h5>
+      <div class="card-body">
+        <p class="text-muted">
+          This object is shared by name across devices, but each device has its own
+          on-box content. NetBox mirrors <strong>one</strong> device's version (the
+          <span class="badge text-bg-info">materialized</span> owner). Pick a different
+          device's version to make NetBox mirror it instead — that writes into NetBox
+          only; pushing it to other devices is a separate Accept.
+        </p>
+        <table class="table table-sm table-hover">
+          <thead>
+            <tr><th>Device</th><th>Status</th><th>Entries</th><th>NetBox mirrors</th><th></th></tr>
+          </thead>
+          <tbody>
+            {% for it in items %}
+            <tr{% if it.is_owner %} class="table-info"{% endif %}>
+              <td>
+                {% if it.device %}<a href="{% url 'dcim:device_nso' pk=it.device.pk %}">{{ it.device }}</a>{% else %}—{% endif %}
+              </td>
+              <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=it.row.status %}</td>
+              <td>{% if it.has_capture %}{{ it.entry_count }}{% else %}<span class="text-muted" title="No captured content yet — populated on the next sync from this device">—</span>{% endif %}</td>
+              <td>
+                {% if it.is_owner %}
+                  <span class="badge text-bg-info" title="NetBox currently mirrors this device's version">materialized</span>
+                {% elif not it.comparable %}
+                  <span class="text-muted" title="Not yet compared — needs a fresh sync from this device (and the owner)">—</span>
+                {% elif it.matches_owner %}
+                  <span class="badge text-bg-success" title="Same content as the materialized version">matches</span>
+                {% else %}
+                  <span class="badge text-bg-warning text-dark" title="Differs from the materialized version">diverges</span>
+                {% endif %}
+              </td>
+              <td>
+                {% if not it.is_owner %}
+                <form method="post" action="{% url materialize_url_name pk=it.row.pk %}">
+                  {% csrf_token %}
+                  <button type="submit" class="btn btn-xs btn-outline-primary"
+                          title="Make NetBox mirror this device's version of {{ object_name }}">
+                    <span class="mdi mdi-content-copy"></span> Use this version
+                  </button>
+                </form>
+                {% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% if device %}
+        <a href="{% url 'dcim:device_nso' pk=device.pk %}" class="btn btn-sm btn-outline-secondary">
+          <span class="mdi mdi-arrow-left"></span> Back to {{ device }}
+        </a>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

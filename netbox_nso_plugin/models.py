@@ -1203,7 +1203,37 @@ _ROUTE_POLICY_STATUS_CHOICES = [
 ]
 
 
-class NSORoutePolicyState(_NSODeviceTabURLMixin, NetBoxModel):
+class SharedObjectStateMixin(models.Model):
+    """Per-device capture + materialized-owner fields for globally-deduped named objects.
+
+    Some config families (route-policy route-maps / community-lists / prefix-lists /
+    as-paths today; ACLs later) are deduplicated *by name* into a single NetBox object,
+    yet every device has its OWN content for that name.  These two fields let a row keep
+    the device's own captured content alongside the shared object, and mark which device's
+    version is currently materialized into it:
+
+    - ``captured`` — the raw per-object payload this device reported (its own version),
+      refreshed every reconcile.  Display-only; never feeds the shared object unless an
+      operator re-materializes from it.  This is what makes "show every device's version"
+      possible.
+    - ``is_materialized`` — exactly one row per (family, object_name) group holds ``True``:
+      the device whose ``captured`` currently populates the shared NetBox object.  The
+      first device to import an object owns it; an operator can re-point ownership to a
+      different device's version (see ``shared_object_ownership.rematerialize``).
+
+    Abstract so the route-policy overlay and the future ACL overlay share one contract;
+    the family-agnostic machinery in ``shared_object_ownership`` operates purely through
+    these fields plus ``family`` / ``object_name`` / ``content_hash`` / the GFK target.
+    """
+
+    captured = models.JSONField(default=dict, blank=True)
+    is_materialized = models.BooleanField(default=False)
+
+    class Meta:
+        abstract = True
+
+
+class NSORoutePolicyState(SharedObjectStateMixin, _NSODeviceTabURLMixin, NetBoxModel):
     """Per-(device, policy-object) compliance overlay for route policy (M17).
 
     A single generic model covers all four object families (prefix-list,

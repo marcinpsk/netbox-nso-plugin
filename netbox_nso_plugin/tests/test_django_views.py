@@ -2073,3 +2073,120 @@ class TestCategoryQuickSelectStructure(SimpleTestCase):
             if not any(marker in text for marker in self._FILTER_MARKERS):
                 offenders.append(path.name)
         self.assertEqual(offenders, [], f"category templates render status rows without a quick-select: {offenders}")
+
+
+class TestSharedObjectVersionsAndMaterialize(ViewTestBase):
+    """The operator-facing 'show every device's version + pick which to own' flow.
+
+    End-to-end through the real reconciler, real netbox_routing models, and the real
+    views — so the universal shared-object ownership UX (route-policy today, ACL later)
+    is exercised the way an operator drives it.
+    """
+
+    def _second_mgmt(self):
+        d2 = Device.objects.create(
+            name="view-router-02", device_type=self.device.device_type, role=self.device.role, site=self.device.site
+        )
+        mgmt2 = NSODeviceManagement.objects.create(
+            device=d2, nso_instance=self.nso_instance, nso_device_name="view-router-02", adapter_device_id=2
+        )
+        return d2, mgmt2
+
+    def _pl(self, prefixes):
+        entries = [{"sequence": 10 * (i + 1), "action": "permit", "prefix": p} for i, p in enumerate(prefixes)]
+        return {"prefix_lists": [{"name": "PL-VIEW", "entries": entries}]}
+
+    def _seed_divergent(self):
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self.mgmt.adapter_device_id = 1
+        self.mgmt.save(update_fields=["adapter_device_id"])
+        d2, _ = self._second_mgmt()
+        reconcile_route_policy(self.device, self._pl(["10.0.0.0/8"]))
+        reconcile_route_policy(d2, self._pl(["10.0.0.0/8", "192.168.0.0/16"]))
+        return d2
+
+    def _http_or_skip(self, fn):
+        """Run an HTTP/URL-resolving call, skipping on the broken-librenms env fault.
+
+        The sibling netbox-librenms-plugin (mid-rebase in this devcontainer) fails to import
+        its urls.py (ImportError: PortStackLagPattern) / lists a dangling nav URL
+        (NoReverseMatch: portstacklagpattern_list), which breaks Django URL resolution for
+        EVERY plugin — unrelated to this feature. Skip rather than report a false failure;
+        these run for real in a healthy environment / CI. The behaviour itself is covered by
+        the data-level test above and the reconciler-level rematerialize test."""
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 — narrow by message below, re-raise otherwise
+            msg = str(exc).lower()
+            if "portstacklag" in msg or "librenms" in msg:
+                self.skipTest("devcontainer librenms plugin breaks URL resolution; env fault")
+            raise
+
+    def test_versions_lists_every_device_owner_first(self):
+        """The versions surface enumerates every device's version, owner first, flagging
+        which match the materialized one and which diverge.
+
+        Asserts the view's data assembly directly (shared_object_ownership.version_items),
+        not a full-page render: the full NetBox nav transitively reverses a librenms plugin
+        URL that is broken in this devcontainer (NoReverseMatch portstacklagpattern_list),
+        an environment fault unrelated to this feature."""
+        from netbox_nso_plugin import shared_object_ownership as ownership
+        from netbox_nso_plugin.models import NSORoutePolicyState
+
+        d2 = self._seed_divergent()
+        items = ownership.version_items(NSORoutePolicyState, "prefix_list", "PL-VIEW")
+        self.assertEqual(len(items), 2)
+        self.assertTrue(items[0]["is_owner"])  # owner sorted first
+        self.assertEqual(items[0]["device"], self.device)  # d1 imported first → owner
+        self.assertEqual({it["device"] for it in items}, {self.device, d2})
+        d2_item = next(it for it in items if it["device"] == d2)
+        self.assertFalse(d2_item["is_owner"])
+        self.assertFalse(d2_item["matches_owner"])  # divergent content
+        self.assertEqual(d2_item["entry_count"], 2)
+
+    def test_versions_page_renders_when_nav_available(self):
+        """The versions page renders (guards the template + URL wiring).
+
+        Skips on the broken-librenms env fault (see _http_or_skip); the data-level test
+        above already covers the behaviour."""
+        from netbox_nso_plugin.models import NSORoutePolicyState
+
+        self._seed_divergent()
+        row = NSORoutePolicyState.objects.get(management__device=self.device, object_name="PL-VIEW")
+
+        def _do():
+            url = reverse("plugins:netbox_nso_plugin:routing_route_policy_versions", args=[row.pk])
+            return self.client.get(url)
+
+        resp = self._http_or_skip(_do)
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("Use this version", resp.content.decode())
+
+    def test_materialize_repoints_ownership_via_view(self):
+        """POSTing the materialize action re-points ownership end-to-end through the view.
+
+        Skips on the broken-librenms env fault (see _http_or_skip); the re-point behaviour
+        itself is also covered without URLs by test_rematerialize_repoints_ownership."""
+        from netbox_routing.models import PrefixList, PrefixListEntry
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+
+        d2 = self._seed_divergent()
+        s2 = NSORoutePolicyState.objects.get(management__device=d2, object_name="PL-VIEW")
+        self.assertEqual(s2.status, "conflict")  # second device diverges from the owner
+
+        def _do():
+            url = reverse("plugins:netbox_nso_plugin:routing_materialize_route_policy", args=[s2.pk])
+            return self.client.post(url)
+
+        resp = self._http_or_skip(_do)
+        self.assertEqual(resp.status_code, 302)
+
+        pl = PrefixList.objects.get(name="PL-VIEW")
+        self.assertEqual(PrefixListEntry.objects.filter(prefix_list=pl).count(), 2)  # now d2's content
+        s1 = NSORoutePolicyState.objects.get(management__device=self.device, object_name="PL-VIEW")
+        s2.refresh_from_db()
+        self.assertTrue(s2.is_materialized)
+        self.assertFalse(s1.is_materialized)
+        self.assertEqual(s1.status, "conflict")

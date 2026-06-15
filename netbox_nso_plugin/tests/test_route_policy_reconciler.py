@@ -411,3 +411,164 @@ class TestReconcileRoutePolicy(TestCase):
         matched = {str(c.community) for c in rme.match_community.all()}
         self.assertEqual(matched, {"65000:1", "65000:2"})
         self.assertEqual(Community.objects.filter(community__in=["65000:1", "65000:2"]).count(), 2)
+
+
+class TestSharedObjectOwnership(TestCase):
+    """Per-device capture + materialized-owner + operator re-point (universal core).
+
+    These exercise the shared_object_ownership machinery THROUGH the route-policy
+    reconciler against the real netbox_routing models, so the cross-device behaviour the
+    operator actually sees (show every version; pick which to own) is covered end to end.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        mfg = Manufacturer.objects.create(name="OwnMfg", slug="ownmfg")
+        dt = DeviceType.objects.create(manufacturer=mfg, model="OwnDev", slug="owndev")
+        role = DeviceRole.objects.create(name="OwnRole", slug="ownrole")
+        site = Site.objects.create(name="OwnSite", slug="ownsite")
+        cls.d1 = Device.objects.create(name="own-r1", device_type=dt, role=role, site=site)
+        cls.d2 = Device.objects.create(name="own-r2", device_type=dt, role=role, site=site)
+
+    def _mgmt(self, device):
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+        inst, _ = NSOInstance.objects.get_or_create(name="own-inst", defaults={"adapter_instance_id": "own-inst"})
+        return NSODeviceManagement.objects.get_or_create(
+            device=device,
+            defaults={"nso_instance": inst, "nso_device_name": f"own-{device.pk}", "adapter_device_id": device.pk},
+        )[0]
+
+    def _pl(self, name, prefixes):
+        entries = [{"sequence": 10 * (i + 1), "action": "permit", "prefix": p} for i, p in enumerate(prefixes)]
+        return {"prefix_lists": [{"name": name, "entries": entries}]}
+
+    def test_registry_has_all_route_policy_families(self):
+        from netbox_nso_plugin import route_policy_reconciler  # noqa: F401 — registers specs on import
+        from netbox_nso_plugin import shared_object_ownership as ownership
+
+        for family in ("prefix_list", "community_list", "as_path", "route_map"):
+            self.assertIsNotNone(ownership.get_spec(family), f"missing spec for {family}")
+
+    def test_capture_stored_per_device(self):
+        """Each device's own reported content is persisted on its row (so we can show it)."""
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._mgmt(self.d1)
+        reconcile_route_policy(self.d1, self._pl("PL-CAP", ["10.0.0.0/8"]))
+        st = NSORoutePolicyState.objects.get(management__device=self.d1, object_name="PL-CAP")
+        self.assertEqual(st.captured.get("name"), "PL-CAP")
+        self.assertEqual(st.captured["entries"][0]["prefix"], "10.0.0.0/8")
+
+    def test_first_writer_is_materialized_owner(self):
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._mgmt(self.d1)
+        reconcile_route_policy(self.d1, self._pl("PL-OWN", ["10.0.0.0/8"]))
+        st = NSORoutePolicyState.objects.get(management__device=self.d1, object_name="PL-OWN")
+        self.assertTrue(st.is_materialized)
+        self.assertEqual(st.status, "imported")
+
+    def test_divergent_second_device_conflicts_without_clobber(self):
+        """Two devices, same name, different content → ONE object holding the first
+        device's content; the second device is a NON-owner flagged conflict, its own
+        version captured, the shared object NOT clobbered."""
+        from netbox_routing.models import PrefixList, PrefixListEntry
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._mgmt(self.d1)
+        self._mgmt(self.d2)
+        reconcile_route_policy(self.d1, self._pl("PL-DIV", ["10.0.0.0/8"]))
+        reconcile_route_policy(self.d2, self._pl("PL-DIV", ["10.0.0.0/8", "192.168.0.0/16"]))
+
+        self.assertEqual(PrefixList.objects.filter(name="PL-DIV").count(), 1)
+        pl = PrefixList.objects.get(name="PL-DIV")
+        self.assertEqual(PrefixListEntry.objects.filter(prefix_list=pl).count(), 1)  # d1 content, not clobbered
+
+        s1 = NSORoutePolicyState.objects.get(management__device=self.d1, object_name="PL-DIV")
+        s2 = NSORoutePolicyState.objects.get(management__device=self.d2, object_name="PL-DIV")
+        self.assertTrue(s1.is_materialized)
+        self.assertEqual(s1.status, "imported")
+        self.assertFalse(s2.is_materialized)
+        self.assertEqual(s2.status, "conflict")
+        # d2's own divergent version is captured so the UI can show it.
+        self.assertEqual(len(s2.captured["entries"]), 2)
+
+    def test_matching_second_device_imports_not_conflict(self):
+        """Same name AND same content on the second device is NOT a conflict."""
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._mgmt(self.d1)
+        self._mgmt(self.d2)
+        reconcile_route_policy(self.d1, self._pl("PL-SAME", ["10.0.0.0/8"]))
+        reconcile_route_policy(self.d2, self._pl("PL-SAME", ["10.0.0.0/8"]))
+        s2 = NSORoutePolicyState.objects.get(management__device=self.d2, object_name="PL-SAME")
+        self.assertEqual(s2.status, "imported")
+        self.assertFalse(s2.is_materialized)
+
+    def test_rematerialize_repoints_ownership(self):
+        """Operator picks the second device's version → the shared object is refilled from
+        it, ownership flips, and the former owner becomes the conflict."""
+        from netbox_routing.models import PrefixList, PrefixListEntry
+
+        from netbox_nso_plugin import shared_object_ownership as ownership
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._mgmt(self.d1)
+        self._mgmt(self.d2)
+        reconcile_route_policy(self.d1, self._pl("PL-RE", ["10.0.0.0/8"]))
+        reconcile_route_policy(self.d2, self._pl("PL-RE", ["10.0.0.0/8", "192.168.0.0/16"]))
+
+        s2 = NSORoutePolicyState.objects.get(management__device=self.d2, object_name="PL-RE")
+        ownership.rematerialize(s2)
+
+        pl = PrefixList.objects.get(name="PL-RE")
+        self.assertEqual(PrefixListEntry.objects.filter(prefix_list=pl).count(), 2)  # now d2's content
+        s1 = NSORoutePolicyState.objects.get(management__device=self.d1, object_name="PL-RE")
+        s2.refresh_from_db()
+        s1.refresh_from_db()
+        self.assertTrue(s2.is_materialized)
+        self.assertEqual(s2.status, "imported")
+        self.assertFalse(s1.is_materialized)
+        self.assertEqual(s1.status, "conflict")
+
+    def test_rematerialize_community_invert_match(self):
+        """Re-point works for community-lists incl. the invert_match flag (universal path)."""
+        from netbox_routing.models import CommunityList, CommunityListEntry
+
+        from netbox_nso_plugin import shared_object_ownership as ownership
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._mgmt(self.d1)
+        self._mgmt(self.d2)
+        reconcile_route_policy(
+            self.d1,
+            {"community_lists": [{"name": "CL-RE", "invert_match": False, "entries": [{"community": "65000:1"}]}]},
+        )
+        reconcile_route_policy(
+            self.d2,
+            {
+                "community_lists": [
+                    {
+                        "name": "CL-RE",
+                        "invert_match": True,
+                        "entries": [{"community": "65000:9"}, {"community": "65000:8"}],
+                    }
+                ]
+            },
+        )
+        s2 = NSORoutePolicyState.objects.get(management__device=self.d2, object_name="CL-RE")
+        self.assertEqual(s2.status, "conflict")
+        ownership.rematerialize(s2)
+
+        cl = CommunityList.objects.get(name="CL-RE")
+        self.assertTrue(cl.invert_match)  # d2's flag now materialized
+        members = {str(e.community.community) for e in CommunityListEntry.objects.filter(community_list=cl)}
+        self.assertEqual(members, {"65000:9", "65000:8"})

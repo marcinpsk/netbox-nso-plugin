@@ -242,6 +242,17 @@ urlpatterns = [
         views.NSORoutePolicyStateAcceptView.as_view(),
         name="routing_accept_route_policy",
     ),
+    # Shared-object versions + re-point (pick which device's version NetBox mirrors)
+    path(
+        "routing/route-policy-state/<int:pk>/versions/",
+        views.NSORoutePolicyVersionsView.as_view(),
+        name="routing_route_policy_versions",
+    ),
+    path(
+        "routing/route-policy-state/<int:pk>/materialize/",
+        views.NSORoutePolicyMaterializeView.as_view(),
+        name="routing_materialize_route_policy",
+    ),
     path(
         "routing/ospf-instance-state/<int:pk>/accept/",
         views.NSOOSPFInstanceStateAcceptView.as_view(),

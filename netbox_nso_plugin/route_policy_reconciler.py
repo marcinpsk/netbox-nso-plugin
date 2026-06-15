@@ -20,6 +20,8 @@ import hashlib
 import json
 import logging
 
+from . import shared_object_ownership as ownership
+
 logger = logging.getLogger(__name__)
 
 
@@ -209,21 +211,122 @@ def _fill_route_map_entries(rm_obj, entries: list, pl_by_name, cl_by_name, ap_by
 
 
 # ---------------------------------------------------------------------------
+# Family materialization specs — register route-policy into the universal
+# shared_object_ownership core (route-maps/community-lists/prefix-lists/as-paths).
+# Each spec knows how to rebuild its NetBox object from a device capture and how
+# to hash a capture; ACL plugs in the same way later.
+# ---------------------------------------------------------------------------
+
+
+def _entries(captured: dict) -> list:
+    return captured.get("entries") or []
+
+
+def _cl_hash(captured: dict) -> str:
+    """Hash a community-list capture (invert_match-aware; see _reconcile_community_lists)."""
+    entries = _entries(captured)
+    if bool(captured.get("invert_match", False)):
+        return _hash({"invert_match": True, "entries": entries})
+    return _hash(entries)
+
+
+def _cl_fill(obj, captured: dict) -> None:
+    invert = bool(captured.get("invert_match", False))
+    if obj.invert_match != invert:
+        obj.invert_match = invert
+        obj.save(update_fields=["invert_match"])
+    _fill_community_list_entries(obj, _entries(captured))
+
+
+def _resolve_name_maps(entries: list):
+    """Resolve a route-map capture's referenced object names to existing NetBox objects.
+
+    Used when re-materializing a route-map from a device capture: the referenced
+    prefix-lists / community-lists / as-paths already exist (global dedup), so look them
+    up case-insensitively rather than relying on the reconcile-time in-memory maps.
+    """
+    from netbox_routing.models import ASPath, CommunityList, PrefixList
+
+    pl_names: set[str] = set()
+    cl_names: set[str] = set()
+    ap_names: set[str] = set()
+    for e in entries:
+        pl_names.update(e.get("match_prefix_lists") or [])
+        cl_names.update(e.get("match_community_lists") or [])
+        ap_names.update(e.get("match_as_paths") or [])
+
+    def _lookup(model, names):
+        out = {}
+        for nm in names:
+            obj = model.objects.filter(name__iexact=nm).first()
+            if obj is not None:
+                out[nm] = obj
+        return out
+
+    return _lookup(PrefixList, pl_names), _lookup(CommunityList, cl_names), _lookup(ASPath, ap_names)
+
+
+def _rm_fill(obj, captured: dict) -> None:
+    entries = _entries(captured)
+    pl_map, cl_map, ap_map = _resolve_name_maps(entries)
+    _fill_route_map_entries(obj, entries, pl_map, cl_map, ap_map)
+
+
+def _register_specs() -> None:
+    Spec = ownership.SharedObjectSpec
+    ownership.register(
+        "prefix_list",
+        Spec(fill=lambda o, c: _fill_prefix_list_entries(o, _entries(c)), hash_captured=lambda c: _hash(_entries(c))),
+    )
+    ownership.register("community_list", Spec(fill=_cl_fill, hash_captured=_cl_hash))
+    ownership.register(
+        "as_path",
+        Spec(fill=lambda o, c: _fill_as_path_entries(o, _entries(c)), hash_captured=lambda c: _hash(_entries(c))),
+    )
+    ownership.register("route_map", Spec(fill=_rm_fill, hash_captured=lambda c: _hash(_entries(c))))
+
+
+_register_specs()
+
+
+# ---------------------------------------------------------------------------
 # Overlay upsert (shared by every family)
 # ---------------------------------------------------------------------------
 
 _FILL_STATUSES = ("imported", "in_sync")  # safe to (re)fill entries in these states
 
 
-def _upsert_state(mgmt, family, name, obj, ct, entries_hash, now):
-    """Create/update the NSORoutePolicyState overlay row. Returns (state, should_fill).
+def _row_diverged(state, entries_hash, family, name) -> bool:
+    """Whether this reconcile's capture diverges from what's materialized in NetBox.
 
-    should_fill is True when this is a fresh import (or the row matches) — i.e. it is
-    safe to fill entries. A divergent hash on an already-imported object sets
-    status=conflict and should_fill stays False (no silent clobber).
+    The materialized owner compares against its OWN recorded content (a device-side
+    change to the canonical version is drift, never an auto-clobber).  A non-owner row
+    compares against the canonical (owner's) hash — an honest cross-device divergence —
+    so a second device reporting different content for the same name shows ``conflict``
+    instead of a misleading ``imported``.  With no owner yet, fall back to self-history.
     """
     from .models import NSORoutePolicyState
 
+    if state.is_materialized:
+        return bool(state.content_hash) and state.content_hash != entries_hash
+    canon = ownership.canonical_hash(NSORoutePolicyState, family, name)
+    if canon is None:
+        return bool(state.content_hash) and state.content_hash != entries_hash
+    return canon != entries_hash
+
+
+def _upsert_state(mgmt, family, name, obj, ct, captured, now):
+    """Create/update the NSORoutePolicyState overlay row. Returns (state, should_fill).
+
+    should_fill is True when it is safe to fill the shared object's entries from THIS
+    device — a fresh import, or a non-owner whose capture matches the canonical version.
+    A divergence (owner drift, or a non-owner differing from the canonical) sets
+    status=conflict and should_fill stays False (no silent clobber). The device's own
+    ``captured`` is always refreshed so every version stays visible.
+    """
+    from .models import NSORoutePolicyState
+
+    entries_hash = ownership.hash_captured(family, captured)
     state, new_row = NSORoutePolicyState.objects.get_or_create(
         management=mgmt,
         family=family,
@@ -232,27 +335,37 @@ def _upsert_state(mgmt, family, name, obj, ct, entries_hash, now):
             "content_type": ct,
             "object_id": obj.pk,
             "content_hash": entries_hash,
+            "captured": captured,
             "status": "imported",
             "last_sync_at": now,
         },
     )
     if new_row:
+        from . import status_machine as sm
+
+        # A brand-new row for an object another device already materialized: imported if
+        # it matches that canonical version, conflict if it diverges (and don't refill).
+        canon = ownership.canonical_hash(NSORoutePolicyState, family, name)
+        if canon is not None and canon != entries_hash:
+            state.status = sm.CONFLICT
+            state.save(update_fields=["status"])
+            return state, False
         return state, True
 
     from . import status_machine as sm
 
-    # FK/content overlay: 'matches' = materialized (content_hash recorded & unchanged),
-    # not device confirmation, so it must not settle an owned row (settles_owned=False).
-    # Divergence is an adoption conflict for an unowned row.
-    diverged = bool(state.content_hash) and state.content_hash != entries_hash
+    # FK/content overlay: 'matches' = materialized (content recorded & unchanged), not
+    # device confirmation, so it must not settle an owned row (settles_owned=False).
+    diverged = _row_diverged(state, entries_hash, family, name)
     state.status = sm.on_reconcile(state.status, matches=not diverged, conflict=diverged, settles_owned=False)
     should_fill = state.status != sm.CONFLICT
     if should_fill:
         state.content_hash = entries_hash
+    state.captured = captured  # always refresh this device's own version (display)
     state.last_sync_at = now
     state.content_type = ct
     state.object_id = obj.pk
-    state.save(update_fields=["status", "content_hash", "last_sync_at", "content_type", "object_id"])
+    state.save(update_fields=["status", "content_hash", "captured", "last_sync_at", "content_type", "object_id"])
     return state, should_fill
 
 
@@ -285,9 +398,10 @@ def _reconcile_prefix_lists(mgmt, device, pl_list, PrefixList, ContentType, now,
         entries = pl_data.get("entries", []) or []
         pl_obj, created = _get_or_create_named(PrefixList, name)
         name_map[name] = pl_obj
-        state, should_fill = _upsert_state(mgmt, "prefix_list", name, pl_obj, ct, _hash(entries), now)
+        state, should_fill = _upsert_state(mgmt, "prefix_list", name, pl_obj, ct, pl_data, now)
         if _needs_fill(PrefixListEntry, created, should_fill, prefix_list=pl_obj):
             _fill_prefix_list_entries(pl_obj, entries)
+            ownership.mark_materialized(state)
         seen_keys.add(("prefix_list", name))
 
 
@@ -303,11 +417,9 @@ def _reconcile_community_lists(mgmt, device, cl_list, CommunityList, ContentType
         invert_match = bool(cl_data.get("invert_match", False))
         cl_obj, created = _get_or_create_named(CommunityList, name, invert_match=invert_match)
         name_map[name] = cl_obj
-        # Backward-compatible hash: keep the plain-entries hash for non-inverted lists
-        # (the common case) so they don't all false-drift on the first poll after this
-        # field shipped; an invert_match flip still changes the hash → drift detected.
-        hash_input = {"invert_match": True, "entries": entries} if invert_match else entries
-        state, should_fill = _upsert_state(mgmt, "community_list", name, cl_obj, ct, _hash(hash_input), now)
+        # Hash is invert_match-aware via the registered spec (_cl_hash); a non-inverted
+        # list keeps the plain-entries hash so it doesn't false-drift, an invert flip drifts.
+        state, should_fill = _upsert_state(mgmt, "community_list", name, cl_obj, ct, cl_data, now)
         # invert_match is device-sourced config — refresh it on any non-conflicting read
         # (a conflicting read leaves should_fill False, so an owned/diverged row is untouched).
         if should_fill and cl_obj.invert_match != invert_match:
@@ -315,6 +427,7 @@ def _reconcile_community_lists(mgmt, device, cl_list, CommunityList, ContentType
             cl_obj.save(update_fields=["invert_match"])
         if _needs_fill(CommunityListEntry, created, should_fill, community_list=cl_obj):
             _fill_community_list_entries(cl_obj, entries)
+            ownership.mark_materialized(state)
         seen_keys.add(("community_list", name))
 
 
@@ -329,9 +442,10 @@ def _reconcile_as_paths(mgmt, device, ap_list, ASPath, ContentType, now, seen_ke
         entries = ap_data.get("entries", []) or []
         ap_obj, created = _get_or_create_named(ASPath, name)
         name_map[name] = ap_obj
-        state, should_fill = _upsert_state(mgmt, "as_path", name, ap_obj, ct, _hash(entries), now)
+        state, should_fill = _upsert_state(mgmt, "as_path", name, ap_obj, ct, ap_data, now)
         if _needs_fill(ASPathEntry, created, should_fill, aspath=ap_obj):
             _fill_as_path_entries(ap_obj, entries)
+            ownership.mark_materialized(state)
         seen_keys.add(("as_path", name))
 
 
@@ -345,9 +459,10 @@ def _reconcile_route_maps(mgmt, device, rm_list, RouteMap, ContentType, now, see
             continue
         entries = rm_data.get("entries", []) or []
         rm_obj, created = _get_or_create_named(RouteMap, name)
-        state, should_fill = _upsert_state(mgmt, "route_map", name, rm_obj, ct, _hash(entries), now)
+        state, should_fill = _upsert_state(mgmt, "route_map", name, rm_obj, ct, rm_data, now)
         if _needs_fill(RouteMapEntry, created, should_fill, route_map=rm_obj):
             _fill_route_map_entries(rm_obj, entries, pl_map, cl_map, ap_map)
+            ownership.mark_materialized(state)
         seen_keys.add(("route_map", name))
 
 
