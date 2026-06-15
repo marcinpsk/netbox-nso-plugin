@@ -2059,12 +2059,47 @@ def _on_routing_policy_pre_delete(sender, instance, **kwargs):
 # left to the 3-way reconcile so the edit surfaces as changed/conflict, not force-owned.
 
 
+def _own_route_map_contributors(mgmt, route_map) -> None:
+    """Own (accepted) every prefix-list / community-list / as-path a route-map references.
+
+    Owning a top-level object cascades ownership to everything it depends on: a route-map
+    references prefix-lists / community-lists / as-paths by name, and owning the route-map
+    WITHOUT owning them leaves dangling references on the device (the ``match`` line is
+    written, but the referenced list/path object is not pushed — the exact gap that left an
+    ``ip as-path access-list`` missing after a route-map apply). Already-owned contributors
+    (accepted / deploying / in_sync / apply_failed) are left untouched.
+    """
+    from django.contrib.contenttypes.models import ContentType
+
+    from .models import NSORoutePolicyState
+
+    now = timezone.now()
+    referenced = []  # (family, obj)
+    for entry in route_map.route_map_entries.all():
+        referenced += [("prefix_list", o) for o in entry.match_prefix_list.all()]
+        referenced += [("community_list", o) for o in entry.match_community_list.all()]
+        referenced += [("as_path", o) for o in entry.match_aspath.all()]
+    for family, obj in referenced:
+        ct = ContentType.objects.get_for_model(obj)
+        state, created = NSORoutePolicyState.objects.get_or_create(
+            management=mgmt,
+            family=family,
+            object_name=obj.name,
+            defaults={"content_type": ct, "object_id": obj.pk, "status": "accepted", "accepted_at": now},
+        )
+        if not created and state.status not in _OWNED_PUSH_STATUSES:
+            state.content_type, state.object_id = ct, obj.pk
+            state.status, state.accepted_at = "accepted", now
+            state.save()
+
+
 def _accept_route_policy_object(obj) -> None:
     """Re-own + push every OWNED overlay attached to a saved route-policy object."""
     from django.contrib.contenttypes.models import ContentType
 
     from .models import NSORoutePolicyState
 
+    is_route_map = hasattr(obj, "route_map_entries")
     ct = ContentType.objects.get_for_model(type(obj))
     states = NSORoutePolicyState.objects.filter(content_type=ct, object_id=obj.pk).select_related("management")
     for state in states:
@@ -2079,6 +2114,9 @@ def _accept_route_policy_object(obj) -> None:
             state.status = "accepted"
         state.last_sync_at = timezone.now()
         state.save()  # → _on_route_policy_state_save schedules the intent push
+        if is_route_map:
+            # Owning a route-map owns its contributors (else dangling device references).
+            _own_route_map_contributors(mgmt, obj)
 
 
 @_skip_on_render

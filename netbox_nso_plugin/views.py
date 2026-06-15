@@ -1796,8 +1796,28 @@ class NSOBGPPeerTemplateStateAcceptView(LoginRequiredMixin, View):
         return redirect(_device_nso_tab_url(state.management.device_id))
 
 
-class NSORoutePolicyStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
+class NSORoutePolicyStateAcceptView(RoutingStateAcceptMixin):
+    """Per-row accept for a route-policy object.
+
+    Owns it, and cascades ownership to a route-map's referenced prefix-lists /
+    community-lists / as-paths so they're pushed too.
+    """
+
     model_class = NSORoutePolicyState
+
+    def post(self, request, pk):  # noqa: D102
+        from django.db import transaction
+
+        from .signals import _own_route_map_contributors
+
+        state = get_object_or_404(NSORoutePolicyState, pk=pk)
+        with transaction.atomic():
+            state.status = _status_after_accept(state.status)
+            state.save(update_fields=["status"])
+            if state.family == "route_map" and state.assigned_object is not None:
+                _own_route_map_contributors(state.management, state.assigned_object)
+        messages.success(request, f"Accepted routing state {state.pk}.")
+        return redirect(_device_nso_tab_url(state.management.device_id))
 
 
 class NSOOSPFInstanceStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
@@ -1823,6 +1843,9 @@ class RoutingBulkAcceptMixin(LoginRequiredMixin, View):
     def _push(self, mgmt):
         """Trigger the appropriate intent push; override in subclasses."""
 
+    def _after_accept(self, mgmt):
+        """Run after the bulk ownership update, before the push (override in subclasses)."""
+
     def post(self, request, device_pk):  # noqa: D102
         try:
             mgmt = NSODeviceManagement.objects.get(device_id=device_pk)
@@ -1841,6 +1864,7 @@ class RoutingBulkAcceptMixin(LoginRequiredMixin, View):
 
         if count and mgmt.adapter_device_id is not None:
             try:
+                self._after_accept(mgmt)
                 self._push(mgmt)
             except Exception as exc:
                 logger.warning("Bulk accept push failed for device %s: %s", device_pk, exc)
@@ -1890,6 +1914,16 @@ class NSOBGPPeerBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
 
 class NSORoutePolicyBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     model_class = NSORoutePolicyState
+
+    def _after_accept(self, mgmt):
+        from .signals import _own_route_map_contributors
+
+        # Owning a route-map owns its contributors — cascade for every now-owned route-map.
+        owned = ("accepted", "deploying", "in_sync", "apply_failed")
+        for st in NSORoutePolicyState.objects.filter(management=mgmt, family="route_map", status__in=owned):
+            obj = st.assigned_object
+            if obj is not None:
+                _own_route_map_contributors(mgmt, obj)
 
     def _push(self, mgmt):
         from .signals import _push_route_policy_intent_for_device
@@ -2141,6 +2175,11 @@ class NSORoutePolicyAttachView(LoginRequiredMixin, View):
         state.object_id = obj.pk
         state.last_sync_at = timezone.now()
         state.save()  # → _on_route_policy_state_save schedules the push
+        if family == "route_map":
+            # Owning a route-map owns its contributors too (else dangling device references).
+            from .signals import _own_route_map_contributors
+
+            _own_route_map_contributors(mgmt, obj)
         if override:
             # Operator overrode a known-negative verdict — be explicit about what won't land.
             messages.warning(

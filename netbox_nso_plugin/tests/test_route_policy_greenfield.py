@@ -287,3 +287,92 @@ class TestRoutePolicyEditOwnsAndPushes(_RPBase):
         state.refresh_from_db()
         assert state.status == "imported"  # left for reconcile to surface
         assert pushed == []
+
+
+class TestOwnershipCascade(_RPBase):
+    """Owning a route-map cascades ownership to its referenced prefix-lists / community-lists /
+    as-paths — otherwise the route-map's ``match`` references dangle on the device (the gap that
+    left an ``ip as-path access-list`` missing after a route-map apply)."""
+
+    def _route_map_with_refs(self, name="RM-CASCADE"):
+        from netbox_routing.models import ASPath, CommunityList, RouteMap, RouteMapEntry
+
+        rm = RouteMap.objects.create(name=name)
+        e = RouteMapEntry.objects.create(route_map=rm, sequence=10, action="permit")
+        ap = ASPath.objects.create(name="50")
+        cl = CommunityList.objects.create(name="CL-CASCADE")
+        pl = self._prefix_list(name="PL-CASCADE")
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        with suppress_intent_push():
+            e.match_aspath.add(ap)
+            e.match_community_list.add(cl)
+            e.match_prefix_list.add(pl)
+        return rm, ap, cl, pl
+
+    def test_cascade_owns_referenced_contributors(self):
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.signals import _own_route_map_contributors
+
+        mgmt = self._mgmt()
+        rm, _ap, _cl, _pl = self._route_map_with_refs()
+        _own_route_map_contributors(mgmt, rm)
+
+        owned = {(s.family, s.object_name): s.status for s in NSORoutePolicyState.objects.filter(management=mgmt)}
+        assert owned.get(("as_path", "50")) == "accepted"
+        assert owned.get(("community_list", "CL-CASCADE")) == "accepted"
+        assert owned.get(("prefix_list", "PL-CASCADE")) == "accepted"
+
+    def test_cascade_does_not_clobber_already_owned_contributor(self):
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import ASPath
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.signals import _own_route_map_contributors, suppress_intent_push
+
+        mgmt = self._mgmt()
+        rm, ap, _cl, _pl = self._route_map_with_refs()
+        with suppress_intent_push():
+            NSORoutePolicyState.objects.create(
+                management=mgmt,
+                family="as_path",
+                object_name="50",
+                content_type=ContentType.objects.get_for_model(ASPath),
+                object_id=ap.pk,
+                status="in_sync",
+            )
+        _own_route_map_contributors(mgmt, rm)
+        st = NSORoutePolicyState.objects.get(management=mgmt, family="as_path", object_name="50")
+        assert st.status == "in_sync"  # an already-owned contributor is left untouched
+
+    def test_editing_owned_route_map_cascades_to_new_reference(self):
+        """The real fix: adding an as-path to an OWNED route-map auto-owns the as-path
+        (so the apply pushes the list, not just `match as-path`)."""
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import ASPath, RouteMap, RouteMapEntry
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        mgmt = self._mgmt()
+        rm = RouteMap.objects.create(name="RM-EDIT-CASCADE")
+        e = RouteMapEntry.objects.create(route_map=rm, sequence=10, action="permit")
+        with suppress_intent_push():
+            NSORoutePolicyState.objects.create(
+                management=mgmt,
+                family="route_map",
+                object_name="RM-EDIT-CASCADE",
+                content_type=ContentType.objects.get_for_model(RouteMap),
+                object_id=rm.pk,
+                status="in_sync",
+            )
+        ap = ASPath.objects.create(name="50")
+
+        with patch("netbox_nso_plugin.adapter_client.put_route_policy_intent", side_effect=lambda a, o: None):
+            with self.captureOnCommitCallbacks(execute=True):
+                e.match_aspath.add(ap)
+                e.save()  # → _on_routing_policy_entry_save → cascade
+
+        assert NSORoutePolicyState.objects.filter(
+            management=mgmt, family="as_path", object_name="50", status="accepted"
+        ).exists()
