@@ -961,8 +961,10 @@ _ISIS_IFACE_SCALAR_ATTRS = (
 def _isis_interface_routing_fields(state, entry, ri, bfd_enabled):
     """Build the (attr, device-value) list for the ISISInterface, guarded by the fork's columns."""
     rf = [
-        ("circuit_type", state.circuit_type or None),
-        ("network_type", state.network_type or None),
+        # circuit_type/network_type are NOT NULL (blank=True, default='') on the
+        # netbox-routing ISISInterface, so an unset value must mirror as '' not None.
+        ("circuit_type", state.circuit_type or ""),
+        ("network_type", state.network_type or ""),
         ("metric", state.metric),
         ("passive", state.passive),
     ]

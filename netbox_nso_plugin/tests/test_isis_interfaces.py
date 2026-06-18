@@ -269,6 +269,21 @@ class TestReconcileIsisInterfaces(TestCase):
         self.assertEqual(ri.circuit_type, "level-2-only")
         self.assertEqual(ri.instance.device, self.device)
 
+    def test_empty_circuit_network_type_mirror_as_empty_string(self):
+        """Unset circuit_type/network_type must mirror onto the netbox-routing
+        ISISInterface as '' — those columns are NOT NULL (default=''), so writing
+        None raised IntegrityError before the or-'' fix."""
+        self._make_mgmt()
+        from netbox_routing.models import ISISInterface
+
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        result = _reconcile_isis_interfaces(self.device, self._payload(self._entry(circuit_type="", network_type="")))
+        self.assertEqual(len(result), 1)
+        ri = ISISInterface.objects.get(interface=self.iface_ge0, address_family="ipv4")
+        self.assertEqual(ri.circuit_type, "")
+        self.assertEqual(ri.network_type, "")
+
     def test_hello_auth_recorded_on_state(self):
         """hello_auth_type / hello_auth_present flow from the adapter payload onto the
         NSOISISInterfaceState overlay (the netbox_routing write is guarded separately)."""
