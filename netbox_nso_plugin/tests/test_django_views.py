@@ -1079,9 +1079,16 @@ class TestNSOApplyPreviewView(ViewTestBase):
     def test_preview_lists_pending_changes(self):
         import json
 
+        from django.utils import timezone
+
         self.interface.description = "intended"
         self.interface.save(update_fields=["description"])
-        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="accepted", nso_value="on-device")
+        # Acceptance always stamps accepted_at alongside status (views accept-flow +
+        # signals). The preview is value-aware and keys ownership off accepted_at, so a
+        # realistic accepted row must set it — status="accepted" alone leaves it unowned.
+        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(
+            status="accepted", nso_value="on-device", accepted_at=timezone.now()
+        )
 
         url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
         data = json.loads(self.client.get(url).content)
