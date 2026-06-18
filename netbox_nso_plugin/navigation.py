@@ -49,6 +49,10 @@ menu = PluginMenu(
                     link="plugins:netbox_nso_plugin:adapterconnection",
                     link_text="Adapter Connection",
                 ),
+                PluginMenuItem(
+                    link="plugins:netbox_nso_plugin:nsofailoversettings",
+                    link_text="Failover Settings",
+                ),
             ),
         ),
     ),

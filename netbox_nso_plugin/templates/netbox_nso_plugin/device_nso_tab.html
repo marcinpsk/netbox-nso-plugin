@@ -102,6 +102,49 @@
             {% else %}—{% endif %}
           </td>
         </tr>
+        {% if failover %}
+        {# ── Mgmt-IP failover status (adapter-owned; not persisted on the mgmt row) ── #}
+        <tr>
+          <th>Failover Address</th>
+          <td>
+            {% if failover.active_address == "oob" %}
+              <span class="badge text-bg-warning text-dark">OOB (failed over)</span>
+              <span class="text-muted ms-1">{{ failover.oob_ip|default:"" }}</span>
+            {% else %}
+              <span class="badge text-bg-success">Primary</span>
+              <span class="text-muted ms-1">{{ failover.primary_ip|default:"" }}</span>
+            {% endif %}
+            {% if failover.manual_override %}
+              <span class="badge text-bg-warning text-dark ms-1"
+                    title="NSO's management address was set by hand — automatic failover is paused for this device.">
+                Manual override
+              </span>
+            {% endif %}
+          </td>
+        </tr>
+        <tr>
+          <th>Last Probe</th>
+          <td>
+            {% if failover.last_probe_result == "ok" %}<span class="badge text-bg-success">OK</span>
+            {% elif failover.last_probe_result == "fail" %}<span class="badge text-bg-danger">Failed</span>
+            {% else %}—{% endif %}
+            {% if failover.last_probe_at %}<small class="text-muted ms-1">{{ failover.last_probe_at|date:"Y-m-d H:i" }}</small>{% endif %}
+          </td>
+        </tr>
+        <tr>
+          <th>OOB Fallback Health</th>
+          <td>
+            {% if failover.oob_healthy is True %}<span class="badge text-bg-success">Healthy</span>
+            {% elif failover.oob_healthy is False %}<span class="badge text-bg-danger">Unreachable</span>
+            {% else %}<span title="Not yet checked">—</span>{% endif %}
+            {% if failover.oob_health_checked_at %}<small class="text-muted ms-1">{{ failover.oob_health_checked_at|date:"Y-m-d H:i" }}</small>{% endif %}
+          </td>
+        </tr>
+        <tr>
+          <th>Last Failover Switch</th>
+          <td>{{ failover.last_switch_at|date:"Y-m-d H:i"|default:"Never" }}</td>
+        </tr>
+        {% endif %}
       </table>
     </div>
   </div>

@@ -24,6 +24,7 @@ from .filters import (
 from .forms import (
     AdapterConnectionForm,
     NSODeviceManagementForm,
+    NSOFailoverSettingsForm,
     NSOInstanceForm,
     NSOInterfaceMtuStateForm,
     NSOLoggingHostStateForm,
@@ -38,6 +39,7 @@ from .models import (
     NSOBFDInterfaceState,
     NSOBGPPeerState,
     NSODeviceManagement,
+    NSOFailoverSettings,
     NSOInstance,
     NSOInterfaceMtuState,
     NSOInterfaceState,
@@ -141,12 +143,24 @@ class DeviceNSOTabView(generic.ObjectView):
         adapter_error = None
         adapter_error_code = None
         intent_drift = []
+        failover = None
         if mgmt is not None and mgmt.adapter_device_id is not None:
             from . import adapter_client as client
             from .intent_drift import compute_intent_drift
 
             try:
-                _refresh_sync_cache(mgmt, client.get_device(mgmt.adapter_device_id))
+                adapter_device = client.get_device(mgmt.adapter_device_id)
+                _refresh_sync_cache(mgmt, adapter_device)
+                # Mgmt-IP failover status (active address / last probe / OOB health) — None when
+                # the device has no failover row (no primary/OOB IPs pushed yet). Parse the ISO
+                # timestamps to datetimes so the template's |date filter can format them.
+                failover = adapter_device.get("failover")
+                if failover:
+                    from dateutil.parser import parse as parse_dt
+
+                    for key in ("last_probe_at", "last_switch_at", "oob_health_checked_at"):
+                        if failover.get(key):
+                            failover[key] = parse_dt(failover[key])
                 # Surface adapter↔NetBox split-brain (orphaned intent) — only renders if any.
                 intent_drift = compute_intent_drift(device, mgmt)
             except AdapterError as exc:
@@ -160,6 +174,7 @@ class DeviceNSOTabView(generic.ObjectView):
             "adapter_error": adapter_error,
             "adapter_error_code": adapter_error_code,
             "intent_drift": intent_drift,
+            "failover": failover,
             "status_badge": _STATUS_BADGE,
         }
 
@@ -763,6 +778,17 @@ class AdapterConnectionEditView(generic.ObjectEditView):
             "effective_url": resolved.get("url") or "",
             "url_source": "Adapter Connection (DB)" if db_url else "PLUGINS_CONFIG / env",
         }
+
+
+class NSOFailoverSettingsEditView(generic.ObjectEditView):
+    """Singleton edit view for NSOFailoverSettings (global mgmt-IP failover tuning)."""
+
+    queryset = NSOFailoverSettings.objects.all()
+    form = NSOFailoverSettingsForm
+
+    def get_object(self, **kwargs):
+        """Return the existing singleton or a blank instance for first-time creation."""
+        return NSOFailoverSettings.objects.first() or NSOFailoverSettings()
 
 
 # ── NSO Instance CRUD ────────────────────────────────────────────────────────

@@ -175,6 +175,17 @@ def provision_device(
     return _request("POST", "/api/v1/devices/provision", json=payload)
 
 
+def put_failover_config(payload):
+    """PUT /api/v1/config/failover — push the global mgmt-IP failover tuning singleton.
+
+    ``payload`` is a dict of the failover knobs (enabled, primary_probe_interval,
+    oob_probe_interval, failure_threshold, success_threshold, probe_timeout,
+    probe_concurrency, max_flips_per_tick, sync_from_after_switch). The adapter applies
+    them on its next base tick. Returns the adapter's effective config dict.
+    """
+    return _request("PUT", "/api/v1/config/failover", json=payload)
+
+
 def set_scope(
     adapter_device_id, attributes, auto_apply=False, sync_before_apply=True, *, primary_ip=_UNSET, oob_ip=_UNSET
 ):

@@ -322,6 +322,22 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_put_failover_config_payload(self, mock_s, _cfg):
+        """put_failover_config PUTs the tuning dict to /api/v1/config/failover."""
+        from netbox_nso_plugin.adapter_client import put_failover_config
+
+        session = self._make_session(200, {"enabled": False})
+        mock_s.return_value = session
+        put_failover_config({"enabled": False, "primary_probe_interval": 15, "probe_concurrency": 8})
+
+        args, kwargs = session.request.call_args
+        self.assertEqual(args[0], "PUT")
+        self.assertTrue(args[1].endswith("/api/v1/config/failover"))
+        self.assertEqual(kwargs["json"]["primary_probe_interval"], 15)
+        self.assertIs(kwargs["json"]["enabled"], False)
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_delete_device_no_error(self, mock_s, _cfg):
         from netbox_nso_plugin.adapter_client import delete_device
 

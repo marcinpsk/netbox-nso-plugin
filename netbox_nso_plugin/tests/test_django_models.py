@@ -5,6 +5,8 @@
 These tests require the full NetBox/Django stack (run in devcontainer).
 """
 
+from unittest.mock import patch
+
 from django.test import TestCase
 from django.urls import reverse
 
@@ -217,3 +219,44 @@ class TestNSOInterfaceStateModelMethods(TestCase):
         """get_absolute_url returns correct URL."""
         expected = reverse("plugins:netbox_nso_plugin:nsointerfacestate", args=[self.state.pk])
         self.assertEqual(self.state.get_absolute_url(), expected)
+
+
+class TestNSOFailoverSettingsModel(TestCase):
+    """NSOFailoverSettings singleton — defaults, singleton save, get_absolute_url.
+
+    Saving fires the push-to-adapter signal, so put_failover_config is patched (the
+    push itself is covered in test_signals.py).
+    """
+
+    def test_str(self):
+        from netbox_nso_plugin.models import NSOFailoverSettings
+
+        self.assertEqual(str(object.__new__(NSOFailoverSettings)), "NSO Failover Settings")
+
+    def test_get_absolute_url(self):
+        from netbox_nso_plugin.models import NSOFailoverSettings
+
+        obj = object.__new__(NSOFailoverSettings)
+        self.assertEqual(obj.get_absolute_url(), reverse("plugins:netbox_nso_plugin:nsofailoversettings"))
+
+    def test_defaults_are_spike_prod_values(self):
+        from netbox_nso_plugin.models import NSOFailoverSettings
+
+        with patch("netbox_nso_plugin.adapter_client.put_failover_config"):
+            s = NSOFailoverSettings.objects.create()
+        self.assertTrue(s.enabled)
+        self.assertEqual((s.primary_probe_interval, s.oob_probe_interval), (15, 360))
+        self.assertEqual((s.failure_threshold, s.success_threshold), (3, 5))
+        self.assertEqual(s.probe_timeout, 10)
+        self.assertEqual((s.probe_concurrency, s.max_flips_per_tick), (8, 8))
+        self.assertTrue(s.sync_from_after_switch)
+
+    def test_save_singleton_reuses_pk(self):
+        from netbox_nso_plugin.models import NSOFailoverSettings
+
+        with patch("netbox_nso_plugin.adapter_client.put_failover_config"):
+            first = NSOFailoverSettings.objects.create()
+            second = NSOFailoverSettings(primary_probe_interval=30)
+            second.save()
+        self.assertEqual(second.pk, first.pk)
+        self.assertEqual(NSOFailoverSettings.objects.count(), 1)

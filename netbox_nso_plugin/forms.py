@@ -6,6 +6,7 @@ from netbox.forms import NetBoxModelForm
 from .models import (
     AdapterConnection,
     NSODeviceManagement,
+    NSOFailoverSettings,
     NSOInstance,
     NSOInterfaceMtuState,
     NSOLoggingHostState,
@@ -77,6 +78,32 @@ class AdapterConnectionForm(NetBoxModelForm):
             "onboard_authgroup",
             "tags",
         ]
+
+
+class NSOFailoverSettingsForm(NetBoxModelForm):
+    """Form for the NSOFailoverSettings singleton (pushed to the adapter on save)."""
+
+    class Meta:
+        model = NSOFailoverSettings
+        fields = [
+            "enabled",
+            "primary_probe_interval",
+            "oob_probe_interval",
+            "failure_threshold",
+            "success_threshold",
+            "probe_timeout",
+            "probe_concurrency",
+            "max_flips_per_tick",
+            "sync_from_after_switch",
+            "tags",
+        ]
+        # Django title-cases field names ("oob" → "Oob"); spell the acronym/units properly.
+        labels = {
+            "primary_probe_interval": "Primary probe interval (min)",
+            "oob_probe_interval": "OOB probe interval (min)",
+            "probe_timeout": "Probe timeout (sec)",
+            "sync_from_after_switch": "Sync-from after switch",
+        }
 
 
 class NSOInstanceForm(NetBoxModelForm):

@@ -72,3 +72,32 @@ class TestManageEverythingToggle(TestCase):
         )
         form = NSODeviceManagementForm(instance=obj)
         self.assertFalse(form.fields["manage_all"].initial)
+
+
+class TestNSOFailoverSettingsForm(TestCase):
+    """NSOFailoverSettingsForm — validity + the MinValueValidator bounds guard."""
+
+    _VALID = {
+        "enabled": True,
+        "primary_probe_interval": 15,
+        "oob_probe_interval": 360,
+        "failure_threshold": 3,
+        "success_threshold": 5,
+        "probe_timeout": 10,
+        "probe_concurrency": 8,
+        "max_flips_per_tick": 8,
+        "sync_from_after_switch": True,
+    }
+
+    def test_valid_with_prod_defaults(self):
+        from netbox_nso_plugin.forms import NSOFailoverSettingsForm
+
+        form = NSOFailoverSettingsForm(data=dict(self._VALID))
+        self.assertTrue(form.is_valid(), form.errors)
+
+    def test_rejects_zero_interval(self):
+        from netbox_nso_plugin.forms import NSOFailoverSettingsForm
+
+        form = NSOFailoverSettingsForm(data={**self._VALID, "primary_probe_interval": 0})
+        self.assertFalse(form.is_valid())
+        self.assertIn("primary_probe_interval", form.errors)

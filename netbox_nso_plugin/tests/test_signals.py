@@ -793,3 +793,45 @@ try:
 
 except ImportError:
     pass  # Outside devcontainer — Django not available; tests skipped
+
+
+class TestPushFailoverSettings(TestCase):
+    """The NSOFailoverSettings post_save signal pushes the tuning to the adapter."""
+
+    def test_save_pushes_full_config_payload(self):
+        from netbox_nso_plugin.models import NSOFailoverSettings
+
+        with patch(f"{_MOD}.put_failover_config") as mock_put:
+            NSOFailoverSettings.objects.create(
+                primary_probe_interval=20, oob_probe_interval=720, probe_concurrency=12, enabled=False
+            )
+
+        mock_put.assert_called_once()
+        payload = mock_put.call_args.args[0]
+        self.assertEqual(payload["primary_probe_interval"], 20)
+        self.assertEqual(payload["oob_probe_interval"], 720)
+        self.assertEqual(payload["probe_concurrency"], 12)
+        self.assertIs(payload["enabled"], False)
+        # The adapter applies a complete config, so all knobs are always sent.
+        self.assertEqual(
+            set(payload),
+            {
+                "enabled",
+                "primary_probe_interval",
+                "oob_probe_interval",
+                "failure_threshold",
+                "success_threshold",
+                "probe_timeout",
+                "probe_concurrency",
+                "max_flips_per_tick",
+                "sync_from_after_switch",
+            },
+        )
+
+    def test_adapter_error_is_swallowed(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.models import NSOFailoverSettings
+
+        with patch(f"{_MOD}.put_failover_config", side_effect=AdapterError("down", code="nso_unreachable")):
+            NSOFailoverSettings.objects.create()  # must not raise
+        self.assertEqual(NSOFailoverSettings.objects.count(), 1)

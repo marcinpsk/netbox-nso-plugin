@@ -11,6 +11,8 @@ app_name = "netbox_nso_plugin"
 urlpatterns = [
     # Adapter Connection (singleton)
     path("adapter-connection/", views.AdapterConnectionEditView.as_view(), name="adapterconnection"),
+    # Failover Settings (singleton)
+    path("failover-settings/", views.NSOFailoverSettingsEditView.as_view(), name="nsofailoversettings"),
     # NSO Instances
     path("instances/", views.NSOInstanceListView.as_view(), name="nsoinstance_list"),
     path("instances/add/", views.NSOInstanceEditView.as_view(), name="nsoinstance_add"),

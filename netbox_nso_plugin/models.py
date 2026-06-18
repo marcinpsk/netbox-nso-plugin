@@ -2,6 +2,7 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
+from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.urls import reverse
 from netbox.models import NetBoxModel
@@ -84,6 +85,80 @@ class AdapterConnection(NetBoxModel):
         """Enforce singleton: reuse the existing row's PK when creating a second instance."""
         if not self.pk:
             existing = AdapterConnection.objects.first()
+            if existing:
+                self.pk = existing.pk
+        super().save(*args, **kwargs)
+
+
+class NSOFailoverSettings(NetBoxModel):
+    """Singleton — global mgmt-IP failover tuning, pushed to the adapter on save.
+
+    Mirrors the adapter's ``FailoverConfig``. A post_save signal PUTs these to
+    ``/api/v1/config/failover``; the adapter's base tick reads them live (next tick), so a
+    change applies without restarting either service. Defaults are the perf-spike prod values
+    (primary 15 min, OOB 6 h) — the dominant fleet cost is an unreachable connect, so probe
+    *concurrency* (not the timers) is the load lever. See the failover-perf-spike writeup.
+    """
+
+    enabled = models.BooleanField(
+        default=True,
+        help_text="Master switch for the adapter's failover loop (live on/off, no restart).",
+    )
+    primary_probe_interval = models.PositiveIntegerField(
+        default=15,
+        validators=[MinValueValidator(1)],
+        help_text="Minutes between probes of the primary (in-band) management IP.",
+    )
+    oob_probe_interval = models.PositiveIntegerField(
+        default=360,
+        validators=[MinValueValidator(1)],
+        help_text="Minutes between fallback-health checks of the OOB IP (6–12 h is typical).",
+    )
+    failure_threshold = models.PositiveIntegerField(
+        default=3,
+        validators=[MinValueValidator(1)],
+        help_text="Consecutive failed primary probes before failing over to OOB.",
+    )
+    success_threshold = models.PositiveIntegerField(
+        default=5,
+        validators=[MinValueValidator(1)],
+        help_text="Consecutive good primary probes before failing back from OOB (keep > failure to damp flapping).",
+    )
+    probe_timeout = models.PositiveIntegerField(
+        default=10,
+        validators=[MinValueValidator(1), MaxValueValidator(120)],
+        help_text="Seconds before an unreachable connect is given up — short, so a down device can't stall the loop.",
+    )
+    probe_concurrency = models.PositiveIntegerField(
+        default=8,
+        validators=[MinValueValidator(1), MaxValueValidator(64)],
+        help_text="How many devices the adapter probes at once — the load lever for an unreachable fleet.",
+    )
+    max_flips_per_tick = models.PositiveIntegerField(
+        default=8,
+        validators=[MinValueValidator(1), MaxValueValidator(256)],
+        help_text="Cap on disruptive address flips per tick (a safety belt against NSO churn).",
+    )
+    sync_from_after_switch = models.BooleanField(
+        default=True,
+        help_text="Run sync-from after a primary↔OOB switch so NSO's CDB matches the device.",
+    )
+
+    class Meta:
+        verbose_name = "Failover Settings"
+        verbose_name_plural = "Failover Settings"
+
+    def __str__(self):
+        return "NSO Failover Settings"
+
+    def get_absolute_url(self):
+        """Return the URL for the singleton edit view."""
+        return reverse("plugins:netbox_nso_plugin:nsofailoversettings")
+
+    def save(self, *args, **kwargs):
+        """Enforce singleton: reuse the existing row's PK when creating a second instance."""
+        if not self.pk:
+            existing = NSOFailoverSettings.objects.first()
             if existing:
                 self.pk = existing.pk
         super().save(*args, **kwargs)

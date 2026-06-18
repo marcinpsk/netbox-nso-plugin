@@ -334,6 +334,32 @@ def offboard_device_from_adapter(sender, instance, **kwargs):
         logger.warning("Failed to offboard device %s from adapter: %s", instance.adapter_device_id, exc)
 
 
+@receiver(post_save, sender="netbox_nso_plugin.NSOFailoverSettings")
+def push_failover_settings_to_adapter(sender, instance, **kwargs):
+    """Push the global failover tuning to the adapter whenever the singleton is saved.
+
+    The adapter persists it and applies it on the next base tick (no restart). Failures are
+    swallowed with a warning so a transient adapter outage never blocks saving the settings.
+    """
+    from . import adapter_client as client
+
+    payload = {
+        "enabled": instance.enabled,
+        "primary_probe_interval": instance.primary_probe_interval,
+        "oob_probe_interval": instance.oob_probe_interval,
+        "failure_threshold": instance.failure_threshold,
+        "success_threshold": instance.success_threshold,
+        "probe_timeout": instance.probe_timeout,
+        "probe_concurrency": instance.probe_concurrency,
+        "max_flips_per_tick": instance.max_flips_per_tick,
+        "sync_from_after_switch": instance.sync_from_after_switch,
+    }
+    try:
+        client.put_failover_config(payload)
+    except Exception as exc:
+        logger.warning("Failed to push failover settings to adapter: %s", exc)
+
+
 @receiver(post_save, sender="netbox_nso_plugin.NSOInterfaceState")
 @_skip_on_render
 def push_intent_on_accept(sender, instance, **kwargs):
