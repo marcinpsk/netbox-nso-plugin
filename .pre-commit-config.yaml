@@ -45,6 +45,17 @@ repos:
         language: system
         pass_filenames: false
 
+      # Test-quality guard: no new spec-less MagicMock/Mock (or object-shaped AsyncMock)
+      # in the test tree beyond the grandfathered baseline. Pure stdlib — runs on the host
+      # by file path (the plugin package can't import without NetBox). Regenerate after an
+      # intentional change: python netbox_nso_plugin/tests/mock_discipline.py --update-baseline
+      - id: mock-discipline
+        name: mock discipline (no new spec-less MagicMock/Mock)
+        entry: python3 netbox_nso_plugin/tests/mock_discipline.py
+        language: system
+        pass_filenames: false
+        files: ^netbox_nso_plugin/tests/.*\.py$
+
 # Configuration
 default_install_hook_types: [pre-commit, commit-msg]
 default_stages: [pre-commit]
