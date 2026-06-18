@@ -7,7 +7,6 @@
 # mock, or add an inline `# mock-ok: <reason>`. Regenerate after an intentional
 # change with:  python netbox_nso_plugin/tests/mock_discipline.py --update-baseline
 
-conftest.py::_block_real_adapter_network._make_blocked_session	1
 test_adapter_client_ext.py::TestAdapterClientRemainingFunctions._make_session	1
 test_adapter_client_ext.py::TestAdapterClientRemainingFunctions.test_sync_notify_non_conflict_error_propagates	1
 test_adapter_client_ext.py::TestRequestErrorPaths.test_ca_cert_path_passed_as_verify	1

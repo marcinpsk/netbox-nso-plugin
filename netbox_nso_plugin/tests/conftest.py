@@ -4,7 +4,7 @@
 
 import sys
 import types
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -109,13 +109,16 @@ def _block_real_adapter_network():
     """
     import requests
 
-    def _make_blocked_session(*args, **kwargs):
-        session = MagicMock()
-        session.trust_env = False
-        session.request.side_effect = requests.exceptions.ConnectionError("adapter network blocked in tests")
-        return session
+    class _BlockedSession(requests.Session):
+        """A REAL requests.Session whose every HTTP call fails fast. get/post/put/... all
+        delegate to request(), so overriding request() blocks the WHOLE surface — unlike a
+        bare MagicMock, which would only block the one method stubbed and fabricate the rest
+        (silently un-hermetic the moment the client used a different verb)."""
 
-    with patch("netbox_nso_plugin.adapter_client.requests.Session", side_effect=_make_blocked_session):
+        def request(self, *args, **kwargs):
+            raise requests.exceptions.ConnectionError("adapter network blocked in tests")
+
+    with patch("netbox_nso_plugin.adapter_client.requests.Session", _BlockedSession):
         yield
 
 
