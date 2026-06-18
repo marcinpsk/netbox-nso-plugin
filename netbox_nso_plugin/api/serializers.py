@@ -51,6 +51,24 @@ class NSODeviceManagementSerializer(NetBoxModelSerializer):
         read_only=True,
         help_text="Computed list of attribute names currently in scope (e.g. ['description', 'enabled']).",
     )
+    primary_ip = serializers.SerializerMethodField(
+        help_text="Host string of the device's primary management IP (no prefix), or null. Drives failover.",
+    )
+    oob_ip = serializers.SerializerMethodField(
+        help_text="Host string of the device's out-of-band IP (no prefix), or null — the failover fallback.",
+    )
+
+    def get_primary_ip(self, obj) -> str | None:
+        """Return the device's primary management IP as a bare host string (no prefix)."""
+        from ..onboarding import _ip_host
+
+        return _ip_host(getattr(obj.device, "primary_ip", None))
+
+    def get_oob_ip(self, obj) -> str | None:
+        """Return the device's out-of-band IP as a bare host string (no prefix)."""
+        from ..onboarding import _ip_host
+
+        return _ip_host(getattr(obj.device, "oob_ip", None))
 
     class Meta:
         model = NSODeviceManagement
@@ -65,6 +83,8 @@ class NSODeviceManagementSerializer(NetBoxModelSerializer):
             "manage_enabled",
             "auto_apply",
             "managed_attributes",
+            "primary_ip",
+            "oob_ip",
             "adapter_device_id",
             "last_sync_at",
             "last_sync_status",

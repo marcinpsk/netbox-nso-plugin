@@ -17,6 +17,9 @@ logger = logging.getLogger(__name__)
 
 _CACHE_TTL = 30  # seconds
 _cfg_cache: dict = {}
+# Distinguishes "caller did not supply this field" (omit → adapter preserves it) from an
+# explicit ``None`` (send null → adapter clears it). Used by set_scope's failover IPs.
+_UNSET = object()
 # Connect phase is capped well below the (longer) read timeout so a genuinely
 # unreachable adapter fails fast, while a connected-but-slow adapter still gets
 # the full read window before we conclude it is hung.
@@ -145,39 +148,52 @@ def onboard_device(nso_instance, nso_device_name, netbox_device_id):
     )
 
 
-def provision_device(nso_instance, device_name, address, ned_id, authgroup, *, admin_state="unlocked", sync=True):
+def provision_device(
+    nso_instance, device_name, address, ned_id, authgroup, *, admin_state="unlocked", sync=True, oob_ip=None
+):
     """POST /api/v1/devices/provision — create the device in NSO and bring it up.
 
     Returns {"ok", "steps", "device_id"}. ``netbox_device_id`` is intentionally
     omitted: the plugin creates the NSODeviceManagement row afterwards, whose
     post_save signal does the adapter mapping + scope + sync-notify.
+
+    ``oob_ip`` (optional) is the device's out-of-band fallback address. When set, the
+    adapter probes the primary first and, if unreachable, bootstraps NSO over OOB so a
+    fresh device (whose in-band loopback is not yet configured) is still onboardable.
     """
-    return _request(
-        "POST",
-        "/api/v1/devices/provision",
-        json={
-            "nso_instance": nso_instance,
-            "device_name": device_name,
-            "address": address,
-            "ned_id": ned_id,
-            "authgroup": authgroup,
-            "admin_state": admin_state,
-            "sync": sync,
-        },
-    )
+    payload = {
+        "nso_instance": nso_instance,
+        "device_name": device_name,
+        "address": address,
+        "ned_id": ned_id,
+        "authgroup": authgroup,
+        "admin_state": admin_state,
+        "sync": sync,
+    }
+    if oob_ip is not None:
+        payload["oob_ip"] = oob_ip
+    return _request("POST", "/api/v1/devices/provision", json=payload)
 
 
-def set_scope(adapter_device_id, attributes, auto_apply=False, sync_before_apply=True):
-    """PUT /api/v1/devices/{id}/scope — update managed attributes and settings."""
-    return _request(
-        "PUT",
-        f"/api/v1/devices/{adapter_device_id}/scope",
-        json={
-            "attributes": attributes,
-            "auto_apply": auto_apply,
-            "sync_before_apply": sync_before_apply,
-        },
-    )
+def set_scope(
+    adapter_device_id, attributes, auto_apply=False, sync_before_apply=True, *, primary_ip=_UNSET, oob_ip=_UNSET
+):
+    """PUT /api/v1/devices/{id}/scope — update managed attributes and settings.
+
+    ``primary_ip`` / ``oob_ip`` (optional) carry the device's management addresses for the
+    failover loop. They follow explicit-null semantics: pass a host string to set, ``None``
+    to clear, or omit entirely (``_UNSET``) to leave the adapter's stored value untouched.
+    """
+    payload = {
+        "attributes": attributes,
+        "auto_apply": auto_apply,
+        "sync_before_apply": sync_before_apply,
+    }
+    if primary_ip is not _UNSET:
+        payload["primary_ip"] = primary_ip
+    if oob_ip is not _UNSET:
+        payload["oob_ip"] = oob_ip
+    return _request("PUT", f"/api/v1/devices/{adapter_device_id}/scope", json=payload)
 
 
 def patch_device(adapter_device_id, nso_instance=None, nso_device_name=None):

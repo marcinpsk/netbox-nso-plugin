@@ -296,11 +296,18 @@ def sync_scope_to_adapter(sender, instance, created, **kwargs):
                 nso_device_name=instance.nso_device_name,
             )
 
+        # Carry the device's management addresses so the adapter's failover loop can probe
+        # primary and fall back to OOB. Explicit values (incl. None to clear) — the plugin
+        # is authoritative for these, so a removed OOB IP in NetBox clears it adapter-side.
+        from .onboarding import _ip_host
+
         client.set_scope(
             instance.adapter_device_id,
             instance.managed_attributes,
             auto_apply=instance.auto_apply,
             sync_before_apply=instance.sync_before_apply,
+            primary_ip=_ip_host(getattr(instance.device, "primary_ip", None)),
+            oob_ip=_ip_host(getattr(instance.device, "oob_ip", None)),
         )
 
         notify_result = client.sync_notify(instance.adapter_device_id)

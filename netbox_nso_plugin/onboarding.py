@@ -25,6 +25,19 @@ import re
 logger = logging.getLogger(__name__)
 
 
+def _ip_host(ip) -> str | None:
+    """Return the bare host string of a NetBox IPAddress (v4 or v6), or ``None``.
+
+    ``ip.address`` is a netaddr ``IPNetwork`` when DB-loaded (``.ip`` is the host) but can be
+    the raw ``"x.x.x.x/yy"`` string on an unsaved/in-memory instance — handle both. Used to
+    feed NSO/adapter a plain host string for both the primary and the OOB management address.
+    """
+    if ip is None:
+        return None
+    addr = ip.address
+    return str(getattr(addr, "ip", None) or str(addr).split("/")[0])
+
+
 def _index_netbox_devices():
     """Return (all_devices, by_id, by_name, by_primary_ip) for matching."""
     from dcim.models import Device
@@ -203,10 +216,11 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
         result["error"] = f"NSO device name '{nso_name}' is already used by {clash.device} on this instance."
         return result
 
-    # ip.address is a netaddr IPNetwork when DB-loaded (.ip = host), but can be the
-    # raw "x.x.x.x/yy" string on an unsaved/in-memory instance — handle both.
-    addr = ip.address
-    address = str(getattr(addr, "ip", None) or str(addr).split("/")[0])
+    address = _ip_host(ip)
+    # OOB is the failover fallback — a fresh device's primary (in-band) loopback is usually
+    # unreachable until NSO configures it, so the adapter onboards over OOB when primary is
+    # down. ``oob_ip`` is optional: a device without one simply has no fallback.
+    oob_address = _ip_host(getattr(device, "oob_ip", None))
 
     try:
         prov = client.provision_device(
@@ -217,6 +231,7 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
             authgroup=_default_authgroup(),
             admin_state=admin_state,
             sync=sync,
+            oob_ip=oob_address,
         )
     except Exception as exc:
         result["error"] = repr(exc)
@@ -320,7 +335,7 @@ def _candidates(by_id, matched_ids, mappings) -> list[dict]:
                 "device": d,
                 "platform": d.platform,
                 "ned_id": mappings.get(d.platform_id, "") if d.platform_id is not None else "",
-                "primary_ip": str(ip.address.ip),
+                "primary_ip": _ip_host(ip),
             }
         )
     candidates.sort(key=lambda e: e["device"].name or "")

@@ -124,7 +124,10 @@ class TestSyncScopeToAdapter(_SignalDBBase):
                 nso_device_name="core-rtr-01",
                 netbox_device_id=self.device.pk,
             )
-            mock_scope.assert_called_once_with(99, ["description"], auto_apply=False, sync_before_apply=True)
+            # The base fixture device has no primary/OOB IP → both pushed as None (clear).
+            mock_scope.assert_called_once_with(
+                99, ["description"], auto_apply=False, sync_before_apply=True, primary_ip=None, oob_ip=None
+            )
             mock_notify.assert_called_once_with(99)
             mock_patch.assert_not_called()
 
@@ -206,7 +209,34 @@ class TestSyncScopeToAdapter(_SignalDBBase):
 
         mock_onboard.assert_called_once()
         # Both description and enabled should be in the scope call.
-        mock_scope.assert_called_once_with(5, ["description", "enabled"], auto_apply=False, sync_before_apply=True)
+        mock_scope.assert_called_once_with(
+            5, ["description", "enabled"], auto_apply=False, sync_before_apply=True, primary_ip=None, oob_ip=None
+        )
+
+    def test_scope_carries_primary_and_oob_ips(self):
+        """The scope push carries the device's primary + OOB management IPs as bare host
+        strings, so the adapter's failover loop can probe primary and fall back to OOB."""
+        from ipam.models import IPAddress
+
+        from netbox_nso_plugin.signals import sync_scope_to_adapter
+
+        primary = IPAddress.objects.create(address="10.0.0.1/32", assigned_object=self.iface)
+        oob = IPAddress.objects.create(address="192.0.2.5/24", assigned_object=self.iface)
+        self.device.primary_ip4 = primary
+        self.device.oob_ip = oob
+        self.device.save()
+
+        mgmt = self._make_mgmt(adapter_device_id=7)
+        with (
+            patch(f"{_MOD}.patch_device", return_value=None),
+            patch(f"{_MOD}.set_scope", return_value={}) as mock_scope,
+            patch(f"{_MOD}.sync_notify", return_value=None),
+        ):
+            sync_scope_to_adapter(sender=type(mgmt), instance=mgmt, created=False)
+
+        _, kw = mock_scope.call_args
+        self.assertEqual(kw["primary_ip"], "10.0.0.1")  # /32 stripped → host only
+        self.assertEqual(kw["oob_ip"], "192.0.2.5")  # /24 stripped → host only
 
 
 class TestOffboardDeviceFromAdapter(unittest.TestCase):

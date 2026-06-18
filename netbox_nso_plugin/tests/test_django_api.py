@@ -99,6 +99,39 @@ class NSODeviceManagementAPITest(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["nso_device_name"], "api-mgmt-router")
 
+    def test_detail_exposes_primary_and_oob_ip(self):
+        """The device-management record serializes primary_ip + oob_ip as bare host strings.
+
+        The adapter's scope reconciler reads this endpoint to feed the failover loop both
+        management addresses — exercised here through the real DRF serializer + viewset.
+        """
+        from ipam.models import IPAddress
+
+        dev = Device.objects.create(
+            name="api-mgmt-ipd", device_type=self.device.device_type, role=self.device.role, site=self.device.site
+        )
+        iface = Interface.objects.create(device=dev, name="mgmt0", type="virtual")
+        dev.primary_ip4 = IPAddress.objects.create(address="10.0.0.1/32", assigned_object=iface)
+        dev.oob_ip = IPAddress.objects.create(address="192.0.2.5/24", assigned_object=iface)
+        dev.save()
+        mgmt = NSODeviceManagement.objects.create(
+            device=dev, nso_instance=self.nso_instance, nso_device_name="api-mgmt-ipd"
+        )
+
+        url = self._get_detail_url(mgmt)
+        response = self.client.get(url, **self.header)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["primary_ip"], "10.0.0.1")  # /32 stripped
+        self.assertEqual(response.data["oob_ip"], "192.0.2.5")  # /24 stripped
+
+    def test_detail_null_ips_when_unset(self):
+        """A device with no primary/OOB IP serializes both as null (not an error)."""
+        url = self._get_detail_url(self.mgmt)
+        response = self.client.get(url, **self.header)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsNone(response.data["primary_ip"])
+        self.assertIsNone(response.data["oob_ip"])
+
 
 class NSOInterfaceStateAPITest(APITestCase):
     """Test read operations on NSOInterfaceState via REST API."""

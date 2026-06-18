@@ -276,6 +276,52 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_set_scope_includes_failover_ips_when_passed(self, mock_s, _cfg):
+        """primary_ip/oob_ip are sent (incl. explicit None to clear) when passed."""
+        from netbox_nso_plugin.adapter_client import set_scope
+
+        session = self._make_session(200, {"device_id": 5})
+        mock_s.return_value = session
+        set_scope(5, ["description"], primary_ip="10.0.0.1", oob_ip=None)
+
+        _, kwargs = session.request.call_args
+        self.assertEqual(kwargs["json"]["primary_ip"], "10.0.0.1")
+        self.assertIn("oob_ip", kwargs["json"])  # explicit None included → clears adapter-side
+        self.assertIsNone(kwargs["json"]["oob_ip"])
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_set_scope_omits_failover_ips_when_not_passed(self, mock_s, _cfg):
+        """Omitting primary_ip/oob_ip leaves the keys out → adapter preserves stored values."""
+        from netbox_nso_plugin.adapter_client import set_scope
+
+        session = self._make_session(200, {"device_id": 5})
+        mock_s.return_value = session
+        set_scope(5, ["description"], auto_apply=True)
+
+        _, kwargs = session.request.call_args
+        self.assertNotIn("primary_ip", kwargs["json"])
+        self.assertNotIn("oob_ip", kwargs["json"])
+        self.assertTrue(kwargs["json"]["auto_apply"])
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_provision_device_includes_oob_ip(self, mock_s, _cfg):
+        """oob_ip is included in the provision payload only when set (None → omitted)."""
+        from netbox_nso_plugin.adapter_client import provision_device
+
+        session = self._make_session(200, {"ok": True, "steps": [], "device_id": 1})
+        mock_s.return_value = session
+        provision_device("prod", "rtr", "10.0.0.1", "cisco-ios-cli-6.114", "network", oob_ip="192.0.2.5")
+        _, kwargs = session.request.call_args
+        self.assertEqual(kwargs["json"]["oob_ip"], "192.0.2.5")
+
+        provision_device("prod", "rtr", "10.0.0.1", "cisco-ios-cli-6.114", "network")
+        _, kwargs = session.request.call_args
+        self.assertNotIn("oob_ip", kwargs["json"])
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_delete_device_no_error(self, mock_s, _cfg):
         from netbox_nso_plugin.adapter_client import delete_device
 

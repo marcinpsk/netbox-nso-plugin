@@ -2,11 +2,13 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for the onboarding dashboard computation (3 tiles + identity matching)."""
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Platform, Site
-from django.test import TestCase
+from django.test import SimpleTestCase, TestCase
 from ipam.models import IPAddress
+from netaddr import IPNetwork
 
 
 def _device(name, *, status="active", platform=None, ip=None):
@@ -225,6 +227,37 @@ class TestOnboardCandidate(TestCase):
         self.assertFalse(res["ok"])
         self.assertIn("primary IP", res["error"])
 
+    def test_onboard_passes_oob_ip(self):
+        """A device with an OOB IP forwards it to provision_device (the failover fallback,
+        so a fresh box only reachable on OOB is still onboardable)."""
+        from netbox_nso_plugin.onboarding import onboard_candidate
+
+        d = self._mapped_device("oob-rtr", ip="10.5.5.20/24")
+        iface = Interface.objects.filter(device=d).first()
+        oob = IPAddress.objects.create(address="192.0.2.9/24", assigned_object=iface)
+        d.oob_ip = oob
+        d.save()
+        with patch(
+            "netbox_nso_plugin.adapter_client.provision_device",
+            return_value={"ok": True, "steps": [], "device_id": 11},
+        ) as prov:
+            res = onboard_candidate(d, self.instance)
+        self.assertTrue(res["ok"])
+        self.assertEqual(prov.call_args.kwargs["oob_ip"], "192.0.2.9")  # /24 stripped → host only
+
+    def test_onboard_oob_ip_none_when_unset(self):
+        """A device with no OOB IP forwards oob_ip=None (no fallback) — never blocks onboard."""
+        from netbox_nso_plugin.onboarding import onboard_candidate
+
+        d = self._mapped_device("nooob-rtr", ip="10.5.5.21/24")
+        with patch(
+            "netbox_nso_plugin.adapter_client.provision_device",
+            return_value={"ok": True, "steps": [], "device_id": 12},
+        ) as prov:
+            res = onboard_candidate(d, self.instance)
+        self.assertTrue(res["ok"])
+        self.assertIsNone(prov.call_args.kwargs["oob_ip"])
+
     def test_success_creates_management(self):
         from netbox_nso_plugin.models import NSODeviceManagement
         from netbox_nso_plugin.onboarding import onboard_candidate
@@ -305,6 +338,32 @@ class TestManageExisting(TestCase):
         d = _device("ext-noname", ip="10.7.7.9/24")
         res = manage_existing(d, self.instance, "")
         self.assertFalse(res["ok"])
+
+
+class TestIpHost(SimpleTestCase):
+    """Pure-logic tests for onboarding._ip_host (no DB) — both NetBox IPAddress shapes."""
+
+    def test_none_returns_none(self):
+        from netbox_nso_plugin.onboarding import _ip_host
+
+        self.assertIsNone(_ip_host(None))
+
+    def test_db_loaded_ipnetwork_returns_host(self):
+        """DB-loaded IPAddress: ``.address`` is a netaddr IPNetwork → host via ``.ip``."""
+        from netbox_nso_plugin.onboarding import _ip_host
+
+        self.assertEqual(_ip_host(SimpleNamespace(address=IPNetwork("10.0.0.1/32"))), "10.0.0.1")
+
+    def test_raw_string_address_returns_host(self):
+        """In-memory/unsaved IPAddress: ``.address`` is the raw 'x/yy' string → split host."""
+        from netbox_nso_plugin.onboarding import _ip_host
+
+        self.assertEqual(_ip_host(SimpleNamespace(address="172.16.0.5/24")), "172.16.0.5")
+
+    def test_ipv6_host(self):
+        from netbox_nso_plugin.onboarding import _ip_host
+
+        self.assertEqual(_ip_host(SimpleNamespace(address=IPNetwork("2001:db8::1/64"))), "2001:db8::1")
 
 
 class TestNormalizeNsoName(TestCase):
