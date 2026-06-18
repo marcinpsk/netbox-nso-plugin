@@ -3,10 +3,12 @@
 """Tests for M10 A4: adapter_client.get_static_routes and _reconcile_static_routes."""
 
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.test import TestCase
+
+from ._adapter_http import make_session
 
 _BASE_CFG = {
     "url": "http://adapter.local",
@@ -26,15 +28,7 @@ class TestGetStaticRoutes(unittest.TestCase):
     """Tests for adapter_client.get_static_routes()."""
 
     def _make_session(self, status=200, json_data=None):
-        response = MagicMock()
-        response.ok = status < 400
-        response.status_code = status
-        response.content = b"{}"
-        response.text = ""
-        response.json.return_value = json_data or {}
-        session = MagicMock()
-        session.request.return_value = response
-        return session
+        return make_session(status_code=status, json_data=json_data)
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
@@ -121,18 +115,16 @@ class TestReconcileStaticRoutes(TestCase):
         )[0]
 
     def _auto_create_ctx(self, auto_create: bool):
-        from django.apps import apps as real_apps
+        """Flip the real AppConfig's auto-create flag (the attribute production reads).
 
-        real_get = real_apps.get_app_config
-        mock_cfg = MagicMock()
-        mock_cfg._static_route_auto_create = auto_create
+        patch.object targets the live AppConfig singleton and existence-checks the
+        attribute, so a rename of `_static_route_auto_create` fails the test loudly —
+        unlike a MagicMock config, which would silently fabricate any attribute name.
+        """
+        from django.apps import apps
 
-        def _patched(app_label):
-            if app_label == "netbox_nso_plugin":
-                return mock_cfg
-            return real_get(app_label)
-
-        return patch("django.apps.apps.get_app_config", side_effect=_patched)
+        cfg = apps.get_app_config("netbox_nso_plugin")
+        return patch.object(cfg, "_static_route_auto_create", auto_create)
 
     def _route_payload(self, *routes):
         return {

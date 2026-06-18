@@ -3,7 +3,11 @@
 """Unit tests for the adapter_client public functions and model helpers."""
 
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
+
+import requests
+
+from ._adapter_http import make_response, make_session
 
 _RESOLVED_CONFIG = {
     "url": "http://adapter",
@@ -15,12 +19,7 @@ _RESOLVED_CONFIG = {
 
 
 def _mock_response(status_code=200, json_data=None):
-    resp = MagicMock()
-    resp.ok = status_code < 400
-    resp.status_code = status_code
-    resp.content = b"{}"
-    resp.json.return_value = json_data or {}
-    return resp
+    return make_response(status_code, json_data)
 
 
 class TestAdapterClientOnboard(unittest.TestCase):
@@ -32,7 +31,7 @@ class TestAdapterClientOnboard(unittest.TestCase):
         """onboard_device returns the adapter response on 201."""
         from netbox_nso_plugin.adapter_client import onboard_device
 
-        session = MagicMock()
+        session = make_session()
         session.request.return_value = _mock_response(201, {"id": 7})
         mock_session_cls.return_value = session
 
@@ -48,7 +47,7 @@ class TestAdapterClientOnboard(unittest.TestCase):
         """onboard_device raises AdapterError on 409."""
         from netbox_nso_plugin.adapter_client import AdapterError, onboard_device
 
-        session = MagicMock()
+        session = make_session()
         session.request.return_value = _mock_response(
             409, {"error": {"code": "conflict", "message": "already onboarded", "detail": {}}}
         )
@@ -62,12 +61,10 @@ class TestAdapterClientOnboard(unittest.TestCase):
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_unreachable_raises(self, mock_session_cls, _cfg):
         """Network errors are wrapped in AdapterError with nso_unreachable code."""
-        import requests as req_lib
-
         from netbox_nso_plugin.adapter_client import AdapterError, onboard_device
 
-        session = MagicMock()
-        session.request.side_effect = req_lib.ConnectionError("refused")
+        session = make_session()
+        session.request.side_effect = requests.ConnectionError("refused")
         mock_session_cls.return_value = session
 
         with self.assertRaises(AdapterError) as ctx:
@@ -84,7 +81,7 @@ class TestAdapterClientScope(unittest.TestCase):
         """set_scope sends the attributes list in the request body."""
         from netbox_nso_plugin.adapter_client import set_scope
 
-        session = MagicMock()
+        session = make_session()
         session.request.return_value = _mock_response(200, {"device_id": 7, "attributes": ["description"]})
         mock_session_cls.return_value = session
 
@@ -100,7 +97,7 @@ class TestAdapterClientScope(unittest.TestCase):
         """set_scope forwards the per-device sync_before_apply toggle to the adapter."""
         from netbox_nso_plugin.adapter_client import set_scope
 
-        session = MagicMock()
+        session = make_session()
         session.request.return_value = _mock_response(200, {"device_id": 7})
         mock_session_cls.return_value = session
 
@@ -119,7 +116,7 @@ class TestAdapterClientSyncNotify(unittest.TestCase):
         """sync_notify returns job dict on 202."""
         from netbox_nso_plugin.adapter_client import sync_notify
 
-        session = MagicMock()
+        session = make_session()
         session.request.return_value = _mock_response(202, {"job_id": 9})
         mock_session_cls.return_value = session
 
@@ -132,7 +129,7 @@ class TestAdapterClientSyncNotify(unittest.TestCase):
         """sync_notify swallows 409 conflict and returns the existing job detail."""
         from netbox_nso_plugin.adapter_client import sync_notify
 
-        session = MagicMock()
+        session = make_session()
         session.request.return_value = _mock_response(
             409, {"error": {"code": "conflict", "message": "job running", "detail": {"job_id": 5}}}
         )
@@ -151,7 +148,7 @@ class TestAdapterClientListNSODevices(unittest.TestCase):
         """list_nso_devices returns list of dicts (not strings) after M7."""
         from netbox_nso_plugin.adapter_client import list_nso_devices
 
-        session = MagicMock()
+        session = make_session()
         session.request.return_value = _mock_response(
             200,
             [
@@ -195,7 +192,7 @@ class TestAdapterClientListNSODevices(unittest.TestCase):
         """list_nso_devices returns [] on empty adapter response."""
         from netbox_nso_plugin.adapter_client import list_nso_devices
 
-        session = MagicMock()
+        session = make_session()
         session.request.return_value = _mock_response(200, [])
         mock_session_cls.return_value = session
 
@@ -211,7 +208,7 @@ class TestAdapterClientGetDeviceByNso(unittest.TestCase):
         """get_device_by_nso returns device dict on 200."""
         from netbox_nso_plugin.adapter_client import get_device_by_nso
 
-        session = MagicMock()
+        session = make_session()
         session.request.return_value = _mock_response(200, {"id": 17, "nso_device_name": "core-rtr-01"})
         mock_session_cls.return_value = session
 
@@ -228,7 +225,7 @@ class TestAdapterClientGetDeviceByNso(unittest.TestCase):
         """get_device_by_nso returns None on 404 not_found."""
         from netbox_nso_plugin.adapter_client import AdapterError, get_device_by_nso  # noqa: F401
 
-        session = MagicMock()
+        session = make_session()
         session.request.return_value = _mock_response(
             404, {"error": {"code": "not_found", "message": "no device", "detail": {}}}
         )
@@ -243,7 +240,7 @@ class TestAdapterClientGetDeviceByNso(unittest.TestCase):
         """get_device_by_nso raises AdapterError on non-404 errors."""
         from netbox_nso_plugin.adapter_client import AdapterError, get_device_by_nso
 
-        session = MagicMock()
+        session = make_session()
         session.request.return_value = _mock_response(
             502, {"error": {"code": "nso_unreachable", "message": "timeout", "detail": {}}}
         )

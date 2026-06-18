@@ -7,7 +7,7 @@ Adapter calls are mocked so no live adapter is needed.
 """
 
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
 from django.contrib.auth import get_user_model
@@ -16,6 +16,7 @@ from django.urls import reverse
 
 from netbox_nso_plugin.models import AdapterConnection, NSODeviceManagement, NSOInstance, NSOInterfaceState
 
+from ._adapter_http import make_response, make_session
 from .mixins import IntentPushResetMixin
 
 User = get_user_model()
@@ -169,16 +170,18 @@ class TestNSODeviceManagementListView(ViewTestBase):
 
         def make_resp(method, url, **kwargs):
             calls.append(url)
-            resp = MagicMock(ok=True, status_code=200)
-            resp.content = b"{}"
-            resp.json.return_value = {
-                "id": 16,
-                "last_sync_at": "2025-06-01T10:00:00+00:00",
-                "last_sync_status": "succeeded",
-            }
-            return resp
+            return make_response(
+                200,
+                json_data={
+                    "id": 16,
+                    "last_sync_at": "2025-06-01T10:00:00+00:00",
+                    "last_sync_status": "succeeded",
+                },
+            )
 
-        mock_session_cls.return_value = MagicMock(request=make_resp)
+        session = make_session()
+        session.request = make_resp
+        mock_session_cls.return_value = session
 
         url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_list")
         response = self.client.get(url)
@@ -210,9 +213,7 @@ class TestNSODeviceManagementListView(ViewTestBase):
             "ca_cert_path": None,
             "timeout": 30,
         }
-        resp = MagicMock(ok=False, status_code=502, content=b"{}")
-        resp.json.return_value = {}
-        mock_session_cls.return_value = MagicMock(request=MagicMock(return_value=resp))
+        mock_session_cls.return_value = make_session(response=make_response(502, json_data={}))
 
         url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_list")
         response = self.client.get(url)
@@ -322,13 +323,7 @@ class TestNSODeviceManagementDetailView(ViewTestBase):
         mgmt.adapter_device_id = 99
         mgmt.save(update_fields=["adapter_device_id"])
 
-        session = MagicMock()
-        session.request.return_value = MagicMock(
-            ok=True,
-            status_code=200,
-            content=b"{}",
-            json=MagicMock(return_value={"interfaces": [], "compliant": True}),
-        )
+        session = make_session(response=make_response(200, json_data={"interfaces": [], "compliant": True}))
         mock_session_cls.return_value = session
 
         with patch("netbox_nso_plugin.adapter_client._resolve_config") as mock_cfg:
@@ -354,12 +349,10 @@ class TestNSODeviceManagementDetailView(ViewTestBase):
         mgmt.adapter_device_id = 99
         mgmt.save(update_fields=["adapter_device_id"])
 
-        session = MagicMock()
-        session.request.return_value = MagicMock(
-            ok=False,
-            status_code=502,
-            content=b"{}",
-            json=MagicMock(return_value={"error": {"code": "nso_unreachable", "message": "down", "detail": {}}}),
+        session = make_session(
+            response=make_response(
+                502, json_data={"error": {"code": "nso_unreachable", "message": "down", "detail": {}}}
+            )
         )
         mock_session_cls.return_value = session
 
@@ -513,13 +506,7 @@ class TestNSODeviceNamesView(ViewTestBase):
             "ca_cert_path": None,
             "timeout": 30,
         }
-        session = MagicMock()
-        session.request.return_value = MagicMock(
-            ok=True,
-            status_code=200,
-            content=b"[]",
-            json=MagicMock(return_value=[{"name": "router-01", "onboarded": False}]),
-        )
+        session = make_session(response=make_response(200, json_data=[{"name": "router-01", "onboarded": False}]))
         mock_session_cls.return_value = session
 
         url = reverse("plugins:netbox_nso_plugin:ajax_nso_device_names", args=[self.nso_instance.pk])
@@ -539,12 +526,10 @@ class TestNSODeviceNamesView(ViewTestBase):
             "ca_cert_path": None,
             "timeout": 30,
         }
-        session = MagicMock()
-        session.request.return_value = MagicMock(
-            ok=False,
-            status_code=502,
-            content=b"{}",
-            json=MagicMock(return_value={"error": {"code": "nso_unreachable", "message": "down", "detail": {}}}),
+        session = make_session(
+            response=make_response(
+                502, json_data={"error": {"code": "nso_unreachable", "message": "down", "detail": {}}}
+            )
         )
         mock_session_cls.return_value = session
 
@@ -570,13 +555,7 @@ class TestNSOJobStatusView(ViewTestBase):
             "ca_cert_path": None,
             "timeout": 30,
         }
-        session = MagicMock()
-        session.request.return_value = MagicMock(
-            ok=True,
-            status_code=200,
-            content=b"{}",
-            json=MagicMock(return_value={"job_id": 42, "status": "completed"}),
-        )
+        session = make_session(response=make_response(200, json_data={"job_id": 42, "status": "completed"}))
         mock_session_cls.return_value = session
 
         url = reverse("plugins:netbox_nso_plugin:nsojob_status", args=[42])
@@ -596,12 +575,8 @@ class TestNSOJobStatusView(ViewTestBase):
             "ca_cert_path": None,
             "timeout": 30,
         }
-        session = MagicMock()
-        session.request.return_value = MagicMock(
-            ok=False,
-            status_code=404,
-            content=b"{}",
-            json=MagicMock(return_value={"error": {"code": "not_found", "message": "job gone", "detail": {}}}),
+        session = make_session(
+            response=make_response(404, json_data={"error": {"code": "not_found", "message": "job gone", "detail": {}}})
         )
         mock_session_cls.return_value = session
 
@@ -652,13 +627,7 @@ class TestNSODeviceActionView(ViewTestBase):
             "ca_cert_path": None,
             "timeout": 30,
         }
-        session = MagicMock()
-        session.request.return_value = MagicMock(
-            ok=True,
-            status_code=202,
-            content=b"{}",
-            json=MagicMock(return_value={"job_id": 5}),
-        )
+        session = make_session(response=make_response(202, json_data={"job_id": 5}))
         mock_session_cls.return_value = session
 
         url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[mgmt.pk, "sync"])
@@ -683,13 +652,7 @@ class TestNSODeviceActionView(ViewTestBase):
             "ca_cert_path": None,
             "timeout": 30,
         }
-        session = MagicMock()
-        session.request.return_value = MagicMock(
-            ok=True,
-            status_code=202,
-            content=b"{}",
-            json=MagicMock(return_value={"job_id": 7}),
-        )
+        session = make_session(response=make_response(202, json_data={"job_id": 7}))
         mock_session_cls.return_value = session
 
         url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[mgmt.pk, "sync"])
@@ -716,12 +679,10 @@ class TestNSODeviceActionView(ViewTestBase):
             "ca_cert_path": None,
             "timeout": 30,
         }
-        session = MagicMock()
-        session.request.return_value = MagicMock(
-            ok=False,
-            status_code=409,
-            content=b"{}",
-            json=MagicMock(return_value={"error": {"code": "conflict", "message": "running", "detail": {"job_id": 3}}}),
+        session = make_session(
+            response=make_response(
+                409, json_data={"error": {"code": "conflict", "message": "running", "detail": {"job_id": 3}}}
+            )
         )
         mock_session_cls.return_value = session
 
@@ -749,14 +710,8 @@ class TestNSODeviceActionView(ViewTestBase):
             "ca_cert_path": None,
             "timeout": 30,
         }
-        session = MagicMock()
         # Adapter returns 202 but no job_id field
-        session.request.return_value = MagicMock(
-            ok=True,
-            status_code=202,
-            content=b"{}",
-            json=MagicMock(return_value={}),
-        )
+        session = make_session(response=make_response(202, json_data={}))
         mock_session_cls.return_value = session
 
         url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[mgmt.pk, "sync"])
@@ -781,12 +736,10 @@ class TestNSODeviceActionView(ViewTestBase):
             "ca_cert_path": None,
             "timeout": 30,
         }
-        session = MagicMock()
-        session.request.return_value = MagicMock(
-            ok=False,
-            status_code=503,
-            content=b"{}",
-            json=MagicMock(return_value={"error": {"code": "nso_unreachable", "message": "down", "detail": {}}}),
+        session = make_session(
+            response=make_response(
+                503, json_data={"error": {"code": "nso_unreachable", "message": "down", "detail": {}}}
+            )
         )
         mock_session_cls.return_value = session
 
@@ -809,12 +762,10 @@ class TestNSODeviceActionView(ViewTestBase):
             "ca_cert_path": None,
             "timeout": 30,
         }
-        session = MagicMock()
-        session.request.return_value = MagicMock(
-            ok=False,
-            status_code=409,
-            content=b"{}",
-            json=MagicMock(return_value={"error": {"code": "conflict", "message": "running", "detail": {"job_id": 3}}}),
+        session = make_session(
+            response=make_response(
+                409, json_data={"error": {"code": "conflict", "message": "running", "detail": {"job_id": 3}}}
+            )
         )
         mock_session_cls.return_value = session
 
@@ -840,12 +791,10 @@ class TestNSODeviceActionView(ViewTestBase):
             "ca_cert_path": None,
             "timeout": 30,
         }
-        session = MagicMock()
-        session.request.return_value = MagicMock(
-            ok=False,
-            status_code=503,
-            content=b"{}",
-            json=MagicMock(return_value={"error": {"code": "nso_unreachable", "message": "down", "detail": {}}}),
+        session = make_session(
+            response=make_response(
+                503, json_data={"error": {"code": "nso_unreachable", "message": "down", "detail": {}}}
+            )
         )
         mock_session_cls.return_value = session
 
@@ -884,13 +833,7 @@ class TestNSORefreshStateView(ViewTestBase):
             "ca_cert_path": None,
             "timeout": 30,
         }
-        session = MagicMock()
-        session.request.return_value = MagicMock(
-            ok=True,
-            status_code=200,
-            content=b"{}",
-            json=MagicMock(return_value={"interfaces": [], "compliant": True}),
-        )
+        session = make_session(response=make_response(200, json_data={"interfaces": [], "compliant": True}))
         mock_session_cls.return_value = session
 
         url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_refresh", args=[mgmt.pk])
@@ -915,12 +858,10 @@ class TestNSORefreshStateView(ViewTestBase):
             "ca_cert_path": None,
             "timeout": 30,
         }
-        session = MagicMock()
-        session.request.return_value = MagicMock(
-            ok=False,
-            status_code=503,
-            content=b"{}",
-            json=MagicMock(return_value={"error": {"code": "nso_unreachable", "message": "down", "detail": {}}}),
+        session = make_session(
+            response=make_response(
+                503, json_data={"error": {"code": "nso_unreachable", "message": "down", "detail": {}}}
+            )
         )
         mock_session_cls.return_value = session
 
@@ -1680,27 +1621,23 @@ class TestDeviceNSOTabView(ViewTestBase):
             "ca_cert_path": None,
             "timeout": 30,
         }
-        session = MagicMock()
+        session = make_session()
 
         def make_resp(method, url, **kwargs):
-            """Return proper shape for each adapter endpoint."""
-            resp = MagicMock(ok=True, status_code=200)
+            """Return the proper real response shape for each adapter endpoint."""
             if "/interfaces" in url:
-                # GET /devices/{id}/interfaces → list
-                resp.content = b"[]"
-                resp.json.return_value = []
-            elif "/state" in url:
-                resp.content = b"{}"
-                resp.json.return_value = {
-                    "device_id": 15,
-                    "managed_interfaces": 0,
-                    "by_status": {},
-                    "last_checked_at": None,
-                }
-            else:
-                resp.content = b"{}"
-                resp.json.return_value = {"id": 15, "last_sync_at": None, "last_sync_status": ""}
-            return resp
+                return make_response(200, json_data=[])  # GET /devices/{id}/interfaces → list
+            if "/state" in url:
+                return make_response(
+                    200,
+                    json_data={
+                        "device_id": 15,
+                        "managed_interfaces": 0,
+                        "by_status": {},
+                        "last_checked_at": None,
+                    },
+                )
+            return make_response(200, json_data={"id": 15, "last_sync_at": None, "last_sync_status": ""})
 
         session.request.side_effect = make_resp
         mock_session_cls.return_value = session
@@ -1736,28 +1673,30 @@ class TestDeviceNSOTabView(ViewTestBase):
         }
 
         def make_resp(method, url, **kwargs):
-            resp = MagicMock(ok=True, status_code=200)
             if "/interfaces" in url:
-                resp.content = b"[]"
-                resp.json.return_value = []
-            elif "/state" in url:
-                resp.content = b"{}"
-                resp.json.return_value = {
-                    "device_id": 16,
-                    "managed_interfaces": 0,
-                    "by_status": {},
-                    "last_checked_at": None,
-                }
-            else:
-                resp.content = b"{}"
-                resp.json.return_value = {
+                return make_response(200, json_data=[])
+            if "/state" in url:
+                return make_response(
+                    200,
+                    json_data={
+                        "device_id": 16,
+                        "managed_interfaces": 0,
+                        "by_status": {},
+                        "last_checked_at": None,
+                    },
+                )
+            return make_response(
+                200,
+                json_data={
                     "id": 16,
                     "last_sync_at": "2025-06-01T10:00:00+00:00",
                     "last_sync_status": "succeeded",
-                }
-            return resp
+                },
+            )
 
-        mock_session_cls.return_value = MagicMock(request=make_resp)
+        session = make_session()
+        session.request = make_resp
+        mock_session_cls.return_value = session
 
         url = reverse("dcim:device_nso", kwargs={"pk": self.device.pk})
         response = self.client.get(url)
@@ -1787,12 +1726,10 @@ class TestDeviceNSOTabView(ViewTestBase):
             "ca_cert_path": None,
             "timeout": 30,
         }
-        session = MagicMock()
-        session.request.return_value = MagicMock(
-            ok=False,
-            status_code=503,
-            content=b"{}",
-            json=MagicMock(return_value={"error": {"code": "nso_unreachable", "message": "down", "detail": {}}}),
+        session = make_session(
+            response=make_response(
+                503, json_data={"error": {"code": "nso_unreachable", "message": "down", "detail": {}}}
+            )
         )
         mock_session_cls.return_value = session
 
@@ -1851,13 +1788,7 @@ class TestPushIntentForDevice(ViewTestBase):
             "ca_cert_path": None,
             "timeout": 30,
         }
-        session = MagicMock()
-        session.request.return_value = MagicMock(
-            ok=True,
-            status_code=200,
-            content=b"{}",
-            json=MagicMock(return_value={}),
-        )
+        session = make_session(response=make_response(200, json_data={}))
         mock_session_cls.return_value = session
 
         _push_intent_for_device(self.device.pk)
@@ -1890,10 +1821,7 @@ class TestPushIntentForDevice(ViewTestBase):
             "ca_cert_path": None,
             "timeout": 30,
         }
-        session = MagicMock()
-        session.request.return_value = MagicMock(
-            ok=True, status_code=200, content=b"{}", json=MagicMock(return_value={})
-        )
+        session = make_session(response=make_response(200, json_data={}))
         mock_session_cls.return_value = session
 
         _push_intent_for_device(self.device.pk)
@@ -1926,10 +1854,7 @@ class TestPushIntentForDevice(ViewTestBase):
             "ca_cert_path": None,
             "timeout": 30,
         }
-        session = MagicMock()
-        session.request.return_value = MagicMock(
-            ok=True, status_code=200, content=b"{}", json=MagicMock(return_value={})
-        )
+        session = make_session(response=make_response(200, json_data={}))
         mock_session_cls.return_value = session
 
         _push_intent_for_device(self.device.pk)
@@ -1956,7 +1881,7 @@ class TestPushIntentForDevice(ViewTestBase):
             "ca_cert_path": None,
             "timeout": 30,
         }
-        session = MagicMock()
+        session = make_session()
         # Simulate a connection error to make put_intent raise
         session.request.side_effect = OSError("connection refused")
         mock_session_cls.return_value = session

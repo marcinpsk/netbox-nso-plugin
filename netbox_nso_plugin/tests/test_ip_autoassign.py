@@ -12,7 +12,7 @@ Covers:
 - reconciler in_sync → active IPAddress activation (single-ended and P2P both-ends)
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from dcim.models import Cable, CableTermination, Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
 from django.test import TestCase
@@ -325,20 +325,11 @@ class TestReconcileAutoAssignedActivation(TestCase):
         cls.device = Device.objects.create(name="rec-router", device_type=device_type, role=role, site=site)
 
     def _auto_create_ctx(self, auto_create: bool = False):
-        from unittest.mock import patch
+        """Flip the real AppConfig's auto-create flag (existence-checked by patch.object)."""
+        from django.apps import apps
 
-        from django.apps import apps as real_apps
-
-        real_get = real_apps.get_app_config
-        mock_cfg = MagicMock()
-        mock_cfg._interface_ip_auto_create = auto_create
-
-        def _patched(app_label):
-            if app_label == "netbox_nso_plugin":
-                return mock_cfg
-            return real_get(app_label)
-
-        return patch("django.apps.apps.get_app_config", side_effect=_patched)
+        cfg = apps.get_app_config("netbox_nso_plugin")
+        return patch.object(cfg, "_interface_ip_auto_create", auto_create)
 
     def test_auto_assigned_in_sync_activates_ip(self):
         """When reconciler sees an auto_assigned accepted→in_sync transition, flip IPAddress to active."""
@@ -441,18 +432,16 @@ class TestClassifyInterfaceP2PAutoDetect(TestCase):
         cls.device_edge = Device.objects.create(name="p2p-edge", device_type=dt, role=cls.edge_role, site=site)
 
     def _with_core_slugs(self, slugs):
-        from django.apps import apps as real_apps
+        """Set the real AppConfig's optional core-role-slugs override.
 
-        real_get = real_apps.get_app_config
-        mock_cfg = MagicMock()
-        mock_cfg._p2p_core_device_role_slugs = slugs
+        Production reads it via ``getattr(cfg, "_p2p_core_device_role_slugs", DEFAULT)``,
+        so the attribute is normally absent — create=True lets patch.object inject it
+        (and tear it back down) on the live AppConfig, matching a real config override.
+        """
+        from django.apps import apps
 
-        def _patched(app_label):
-            if app_label == "netbox_nso_plugin":
-                return mock_cfg
-            return real_get(app_label)
-
-        return patch("django.apps.apps.get_app_config", side_effect=_patched)
+        cfg = apps.get_app_config("netbox_nso_plugin")
+        return patch.object(cfg, "_p2p_core_device_role_slugs", slugs, create=True)
 
     def test_p2p_core_detected_via_role_slugs(self):
         from netbox_nso_plugin.ip_autoassign import classify_interface
@@ -758,20 +747,11 @@ class TestReconcileP2PBothInSync(TestCase):
         cls.device_b = Device.objects.create(name="recp2p-b", device_type=dt, role=role, site=site)
 
     def _auto_create_ctx(self, auto_create: bool = False):
-        from unittest.mock import patch
+        """Flip the real AppConfig's auto-create flag (existence-checked by patch.object)."""
+        from django.apps import apps
 
-        from django.apps import apps as real_apps
-
-        real_get = real_apps.get_app_config
-        mock_cfg = MagicMock()
-        mock_cfg._interface_ip_auto_create = auto_create
-
-        def _patched(app_label):
-            if app_label == "netbox_nso_plugin":
-                return mock_cfg
-            return real_get(app_label)
-
-        return patch("django.apps.apps.get_app_config", side_effect=_patched)
+        cfg = apps.get_app_config("netbox_nso_plugin")
+        return patch.object(cfg, "_interface_ip_auto_create", auto_create)
 
     def _setup_p2p_pair(self, addr_a="10.77.0.0/31", addr_b="10.77.0.1/31"):
         from netbox_nso_plugin.models import NSOInterfaceIPState

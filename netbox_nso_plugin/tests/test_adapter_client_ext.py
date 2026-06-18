@@ -6,7 +6,14 @@ and the remaining API call functions not covered by test_models.py.
 
 import sys
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
+
+import requests
+from django.test import TestCase, override_settings
+
+from netbox_nso_plugin.models import AdapterConnection
+
+from ._adapter_http import make_response, make_session
 
 _BASE_CFG = {
     "url": "http://adapter.local",
@@ -17,48 +24,36 @@ _BASE_CFG = {
 }
 
 
-def _mock_response(status_code=200, json_data=None, content=b"{}"):
-    resp = MagicMock()
-    resp.ok = status_code < 400
-    resp.status_code = status_code
-    resp.content = content
-    resp.text = content.decode() if content else ""
-    resp.json.return_value = json_data or {}
-    return resp
+def _mock_response(status_code=200, json_data=None, content=None):
+    return make_response(status_code, json_data, content)
 
 
-class TestResolveConfig(unittest.TestCase):
-    """Tests for adapter_client._resolve_config()."""
+class TestResolveConfig(TestCase):
+    """Tests for adapter_client._resolve_config() against a real AdapterConnection row.
+
+    _resolve_config reads ``settings.PLUGINS_CONFIG`` and queries
+    ``AdapterConnection.objects.filter(enabled=True).first()``. Both are exercised for
+    real here — @override_settings supplies a real PLUGINS_CONFIG dict and real model
+    rows drive the DB branch — so a field rename or query change fails loudly, unlike
+    the previous MagicMock'd ORM + settings which fabricated any attribute on demand.
+    """
 
     def setUp(self):
-        # Clear the in-process cache before each test so they are independent.
+        # Clear the in-process cache and start from an empty singleton table so each
+        # test's AdapterConnection state is explicit.
         import netbox_nso_plugin.adapter_client as ac
 
         ac._cfg_cache.clear()
+        AdapterConnection.objects.all().delete()
 
-    def _fake_models(self, conn=None):
-        mod = MagicMock()
-        mod.AdapterConnection = MagicMock()
-        mod.AdapterConnection.objects.filter.return_value.first.return_value = conn
-        return mod
-
+    @override_settings(
+        PLUGINS_CONFIG={"netbox_nso_plugin": {"adapter_token": "env-token", "adapter_url": "http://env-adapter"}}
+    )
     def test_reads_from_plugin_config_when_no_db_connection(self):
         import netbox_nso_plugin.adapter_client as ac
 
-        mock_settings = MagicMock()
-        mock_settings.PLUGINS_CONFIG = {
-            "netbox_nso_plugin": {
-                "adapter_token": "env-token",
-                "adapter_url": "http://env-adapter",
-            }
-        }
-        fake_models = self._fake_models(conn=None)
-
-        with (
-            patch.dict(sys.modules, {"netbox_nso_plugin.models": fake_models}),
-            patch("netbox_nso_plugin.adapter_client.settings", mock_settings),
-        ):
-            result = ac._resolve_config()
+        # No AdapterConnection row → URL + non-secret settings come from PLUGINS_CONFIG.
+        result = ac._resolve_config()
 
         self.assertEqual(result["token"], "env-token")
         self.assertEqual(result["url"], "http://env-adapter")
@@ -66,107 +61,74 @@ class TestResolveConfig(unittest.TestCase):
         self.assertIsNone(result["ca_cert_path"])
         self.assertEqual(result["timeout"], 30)
 
+    @override_settings(PLUGINS_CONFIG={"netbox_nso_plugin": {"adapter_token": "tok", "adapter_url": "http://fallback"}})
     def test_adapter_connection_overrides_url(self):
         import netbox_nso_plugin.adapter_client as ac
 
-        conn = MagicMock()
-        conn.url = "http://db-adapter"
-        conn.verify_tls = False
-        conn.ca_cert_path = ""
-        conn.timeout_seconds = 15
-
-        mock_settings = MagicMock()
-        mock_settings.PLUGINS_CONFIG = {"netbox_nso_plugin": {"adapter_token": "tok", "adapter_url": "http://fallback"}}
-        fake_models = self._fake_models(conn=conn)
-
-        with (
-            patch.dict(sys.modules, {"netbox_nso_plugin.models": fake_models}),
-            patch("netbox_nso_plugin.adapter_client.settings", mock_settings),
-        ):
-            result = ac._resolve_config()
+        AdapterConnection.objects.create(
+            url="http://db-adapter", verify_tls=False, ca_cert_path="", timeout_seconds=15, enabled=True
+        )
+        result = ac._resolve_config()
 
         self.assertEqual(result["url"], "http://db-adapter")
         self.assertFalse(result["verify_tls"])
         self.assertEqual(result["timeout"], 15)
 
+    @override_settings(PLUGINS_CONFIG={"netbox_nso_plugin": {"adapter_token": "tok"}})
     def test_adapter_connection_ca_cert_path(self):
         import netbox_nso_plugin.adapter_client as ac
 
-        conn = MagicMock()
-        conn.url = "https://adapter"
-        conn.verify_tls = True
-        conn.ca_cert_path = "/etc/ssl/ca.pem"
-        conn.timeout_seconds = 30
-
-        mock_settings = MagicMock()
-        mock_settings.PLUGINS_CONFIG = {"netbox_nso_plugin": {"adapter_token": "tok"}}
-        fake_models = self._fake_models(conn=conn)
-
-        with (
-            patch.dict(sys.modules, {"netbox_nso_plugin.models": fake_models}),
-            patch("netbox_nso_plugin.adapter_client.settings", mock_settings),
-        ):
-            result = ac._resolve_config()
+        AdapterConnection.objects.create(
+            url="https://adapter", verify_tls=True, ca_cert_path="/etc/ssl/ca.pem", timeout_seconds=30, enabled=True
+        )
+        result = ac._resolve_config()
 
         self.assertEqual(result["ca_cert_path"], "/etc/ssl/ca.pem")
 
+    @override_settings(PLUGINS_CONFIG={"netbox_nso_plugin": {"adapter_token": "tok", "adapter_url": "http://adapter/"}})
     def test_url_trailing_slash_stripped(self):
         import netbox_nso_plugin.adapter_client as ac
 
-        mock_settings = MagicMock()
-        mock_settings.PLUGINS_CONFIG = {"netbox_nso_plugin": {"adapter_token": "tok", "adapter_url": "http://adapter/"}}
-        fake_models = self._fake_models(conn=None)
-
-        with (
-            patch.dict(sys.modules, {"netbox_nso_plugin.models": fake_models}),
-            patch("netbox_nso_plugin.adapter_client.settings", mock_settings),
-        ):
-            result = ac._resolve_config()
+        # No AdapterConnection row → URL from PLUGINS_CONFIG, trailing slash stripped.
+        result = ac._resolve_config()
 
         self.assertEqual(result["url"], "http://adapter")
 
+    @override_settings(PLUGINS_CONFIG={"netbox_nso_plugin": {"adapter_token": "tok", "adapter_url": "http://x"}})
     def test_cache_used_on_second_call(self):
-        """Second call within TTL returns cached value without re-resolving."""
+        """Second call within the TTL returns the cached value without re-querying.
+
+        Proven behaviorally with a real row: after the first resolve caches the value we
+        mutate the AdapterConnection's URL in the DB but do NOT clear the cache. The
+        second resolve must still return the OLD url — if caching regressed it would read
+        the new url and the assert would fail. (The old test spied on a mock's filter()
+        call count; this exercises the real query + real cache instead.)
+        """
         import netbox_nso_plugin.adapter_client as ac
 
-        mock_settings = MagicMock()
-        mock_settings.PLUGINS_CONFIG = {"netbox_nso_plugin": {"adapter_token": "tok", "adapter_url": "http://x"}}
-        fake_models = self._fake_models(conn=None)
+        conn = AdapterConnection.objects.create(url="http://first", timeout_seconds=30, enabled=True)
+        r1 = ac._resolve_config()
+        self.assertEqual(r1["url"], "http://first")
 
-        call_count = [0]
-        original_filter = fake_models.AdapterConnection.objects.filter
+        conn.url = "http://second"
+        conn.save(update_fields=["url"])
 
-        def counting_filter(*a, **kw):
-            call_count[0] += 1
-            return original_filter(*a, **kw)
+        r2 = ac._resolve_config()  # within the 30s TTL → served from cache
+        self.assertEqual(r2["url"], "http://first")
 
-        fake_models.AdapterConnection.objects.filter = counting_filter
-
-        with (
-            patch.dict(sys.modules, {"netbox_nso_plugin.models": fake_models}),
-            patch("netbox_nso_plugin.adapter_client.settings", mock_settings),
-        ):
-            r1 = ac._resolve_config()
-            r2 = ac._resolve_config()  # should hit cache
-
-        self.assertEqual(r1["token"], r2["token"])
-        # AdapterConnection was only queried once
-        self.assertEqual(call_count[0], 1)
-
+    @override_settings(
+        PLUGINS_CONFIG={"netbox_nso_plugin": {"adapter_token": "fallback-tok", "adapter_url": "http://fallback"}}
+    )
     def test_models_import_failure_falls_back_to_plugin_config(self):
-        """If importing models raises, _resolve_config falls back to PLUGINS_CONFIG."""
+        """If importing models raises, _resolve_config falls back to PLUGINS_CONFIG.
+
+        ``sys.modules[...] = None`` forces ``from .models import AdapterConnection`` to
+        raise ImportError — a real import failure (the module genuinely unimportable),
+        not a mock — exercising the handler's except-and-fall-back branch.
+        """
         import netbox_nso_plugin.adapter_client as ac
 
-        mock_settings = MagicMock()
-        mock_settings.PLUGINS_CONFIG = {
-            "netbox_nso_plugin": {"adapter_token": "fallback-tok", "adapter_url": "http://fallback"}
-        }
-
-        # Simulate models import failure (e.g., outside devcontainer)
-        with (
-            patch.dict(sys.modules, {"netbox_nso_plugin.models": None}),
-            patch("netbox_nso_plugin.adapter_client.settings", mock_settings),
-        ):
+        with patch.dict(sys.modules, {"netbox_nso_plugin.models": None}):
             result = ac._resolve_config()
 
         self.assertEqual(result["token"], "fallback-tok")
@@ -202,7 +164,7 @@ class TestRequestErrorPaths(unittest.TestCase):
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=cfg),
             patch("netbox_nso_plugin.adapter_client.requests.Session") as mock_s,
         ):
-            session = MagicMock()
+            session = make_session()
             session.request.return_value = _mock_response(200, {})
             mock_s.return_value = session
             _request("GET", "/test")
@@ -218,7 +180,7 @@ class TestRequestErrorPaths(unittest.TestCase):
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=cfg),
             patch("netbox_nso_plugin.adapter_client.requests.Session") as mock_s,
         ):
-            session = MagicMock()
+            session = make_session()
             session.request.return_value = _mock_response(200, {})
             mock_s.return_value = session
             _request("GET", "/test")
@@ -233,14 +195,11 @@ class TestRequestErrorPaths(unittest.TestCase):
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
             patch("netbox_nso_plugin.adapter_client.requests.Session") as mock_s,
         ):
-            session = MagicMock()
-            resp = MagicMock()
-            resp.ok = False
-            resp.status_code = 503
-            resp.content = b"Service Unavailable"
-            resp.text = "Service Unavailable"
-            resp.json.side_effect = ValueError("not JSON")
-            session.request.return_value = resp
+            session = make_session()
+            # Real non-JSON body: resp.json() raises a real JSONDecodeError, so this
+            # genuinely exercises _request's except-fallback to status_code — a MagicMock
+            # with a hand-set json.side_effect only re-asserts our own assumption.
+            session.request.return_value = make_response(503, content=b"Service Unavailable")
             mock_s.return_value = session
 
             with self.assertRaises(AdapterError) as ctx:
@@ -250,15 +209,13 @@ class TestRequestErrorPaths(unittest.TestCase):
 
     def test_read_timeout_surfaces_as_nso_timeout(self):
         """A connected-but-hung adapter (ReadTimeout) → distinct nso_timeout code, not nso_unreachable."""
-        import requests
-
         from netbox_nso_plugin.adapter_client import AdapterError, _request
 
         with (
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
             patch("netbox_nso_plugin.adapter_client.requests.Session") as mock_s,
         ):
-            session = MagicMock()
+            session = make_session()
             session.request.side_effect = requests.exceptions.ReadTimeout("read timed out")
             mock_s.return_value = session
 
@@ -269,15 +226,13 @@ class TestRequestErrorPaths(unittest.TestCase):
 
     def test_connect_error_surfaces_as_nso_unreachable(self):
         """A connection failure → nso_unreachable."""
-        import requests
-
         from netbox_nso_plugin.adapter_client import AdapterError, _request
 
         with (
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
             patch("netbox_nso_plugin.adapter_client.requests.Session") as mock_s,
         ):
-            session = MagicMock()
+            session = make_session()
             session.request.side_effect = requests.exceptions.ConnectionError("refused")
             mock_s.return_value = session
 
@@ -291,11 +246,7 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
     """Smoke tests for API functions not covered in test_models.py."""
 
     def _make_session(self, status=200, json_data=None, content=None):
-        session = MagicMock()
-        if content is None:
-            content = b"{}" if json_data is not None else b""
-        session.request.return_value = _mock_response(status, json_data, content)
-        return session
+        return make_session(status_code=status, json_data=json_data, content=content)
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
@@ -444,7 +395,7 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
         """sync_notify re-raises AdapterError when code != conflict."""
         from netbox_nso_plugin.adapter_client import AdapterError, sync_notify
 
-        session = MagicMock()
+        session = make_session()
         session.request.return_value = _mock_response(
             503, {"error": {"code": "nso_unreachable", "message": "down", "detail": {}}}
         )

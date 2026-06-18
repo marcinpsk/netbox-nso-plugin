@@ -8,8 +8,6 @@ push sends a held key and maps an empty (unset) key to None — never a literal 
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
-
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.test import TestCase
 
@@ -49,7 +47,9 @@ class TestIsisIntentPush(IntentPushResetMixin, TestCase):
             captured["processes"] = processes
 
         orig = adapter_client.put_isis_interface_intent
-        adapter_client.put_isis_interface_intent = MagicMock(side_effect=_fake_put)
+        # _fake_put is a real function that records the pushed processes; nothing
+        # inspects a mock here, so assign it directly (no MagicMock wrapper needed).
+        adapter_client.put_isis_interface_intent = _fake_put
         try:
             _push_isis_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
         finally:

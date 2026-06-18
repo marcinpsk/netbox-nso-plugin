@@ -3,10 +3,12 @@
 """Tests for M11 A4: adapter_client.get_snmp_config and _reconcile_snmp_config."""
 
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.test import TestCase
+
+from ._adapter_http import make_session
 
 _BASE_CFG = {
     "url": "http://adapter.local",
@@ -48,15 +50,7 @@ class TestGetSnmpConfig(unittest.TestCase):
     """Tests for adapter_client.get_snmp_config()."""
 
     def _make_session(self, status=200, json_data=None):
-        response = MagicMock()
-        response.ok = status < 400
-        response.status_code = status
-        response.content = b"{}" if json_data is None else b"{}"
-        response.text = ""
-        response.json.return_value = json_data or {}
-        session = MagicMock()
-        session.request.return_value = response
-        return session
+        return make_session(status_code=status, json_data=json_data)
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")

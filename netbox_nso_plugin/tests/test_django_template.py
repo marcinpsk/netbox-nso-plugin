@@ -7,10 +7,11 @@ These tests require the full NetBox/Django stack (run in devcontainer).
 
 import pathlib
 import re
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
-from django.test import SimpleTestCase, TestCase
+from django.apps import apps
+from django.test import RequestFactory, SimpleTestCase, TestCase
 
 from netbox_nso_plugin.models import NSOInterfaceState
 
@@ -261,7 +262,7 @@ class TestInterfaceNSOBadge(TestCase):
         from netbox_nso_plugin.template_content import InterfaceNSOBadge
 
         badge = object.__new__(InterfaceNSOBadge)
-        badge.context = {"object": self.interface, "request": MagicMock()}
+        badge.context = {"object": self.interface, "request": RequestFactory().get("/")}
 
         with patch.object(InterfaceNSOBadge, "render", return_value="<div>badge</div>") as mock_render:
             result = badge.right_page()
@@ -280,7 +281,7 @@ class TestInterfaceNSOBadge(TestCase):
         )
 
         badge = object.__new__(InterfaceNSOBadge)
-        badge.context = {"object": self.interface, "request": MagicMock()}
+        badge.context = {"object": self.interface, "request": RequestFactory().get("/")}
 
         captured = {}
 
@@ -300,7 +301,7 @@ class TestInterfaceNSOBadge(TestCase):
         from netbox_nso_plugin.template_content import InterfaceNSOBadge
 
         badge = object.__new__(InterfaceNSOBadge)
-        badge.context = {"object": self.interface, "request": MagicMock()}
+        badge.context = {"object": self.interface, "request": RequestFactory().get("/")}
 
         captured = {}
 
@@ -308,12 +309,12 @@ class TestInterfaceNSOBadge(TestCase):
             captured.update(extra_context or {})
             return ""
 
-        with patch("netbox_nso_plugin.template_content.apps") as mock_apps:
-            cfg = MagicMock()
-            cfg._derived_intent_templates = []
-            mock_apps.get_app_config.return_value = cfg
-            with patch.object(InterfaceNSOBadge, "render", side_effect=fake_render):
-                badge.right_page()
+        cfg = apps.get_app_config("netbox_nso_plugin")
+        with (
+            patch.object(cfg, "_derived_intent_templates", []),
+            patch.object(InterfaceNSOBadge, "render", side_effect=fake_render),
+        ):
+            badge.right_page()
 
         self.assertIsNone(captured.get("derived_intent_match"))
 
@@ -326,7 +327,7 @@ class TestInterfaceNSOBadge(TestCase):
         self.interface.save(update_fields=["description"])
 
         badge = object.__new__(InterfaceNSOBadge)
-        badge.context = {"object": self.interface, "request": MagicMock()}
+        badge.context = {"object": self.interface, "request": RequestFactory().get("/")}
 
         captured = {}
 
@@ -335,12 +336,12 @@ class TestInterfaceNSOBadge(TestCase):
             return ""
 
         template = SentinelTemplate(sentinel="[auto]", template="[auto] {peer_device}:{peer_iface}")
-        with patch("netbox_nso_plugin.template_content.apps") as mock_apps:
-            cfg = MagicMock()
-            cfg._derived_intent_templates = [template]
-            mock_apps.get_app_config.return_value = cfg
-            with patch.object(InterfaceNSOBadge, "render", side_effect=fake_render):
-                badge.right_page()
+        cfg = apps.get_app_config("netbox_nso_plugin")
+        with (
+            patch.object(cfg, "_derived_intent_templates", [template]),
+            patch.object(InterfaceNSOBadge, "render", side_effect=fake_render),
+        ):
+            badge.right_page()
 
         match = captured.get("derived_intent_match")
         self.assertIsNotNone(match)
@@ -355,7 +356,7 @@ class TestInterfaceNSOBadge(TestCase):
         self.interface.save(update_fields=["description"])
 
         badge = object.__new__(InterfaceNSOBadge)
-        badge.context = {"object": self.interface, "request": MagicMock()}
+        badge.context = {"object": self.interface, "request": RequestFactory().get("/")}
 
         captured = {}
 
@@ -364,11 +365,11 @@ class TestInterfaceNSOBadge(TestCase):
             return ""
 
         template = SentinelTemplate(sentinel="[auto]", template="[auto] {peer_device}:{peer_iface}")
-        with patch("netbox_nso_plugin.template_content.apps") as mock_apps:
-            cfg = MagicMock()
-            cfg._derived_intent_templates = [template]
-            mock_apps.get_app_config.return_value = cfg
-            with patch.object(InterfaceNSOBadge, "render", side_effect=fake_render):
-                badge.right_page()
+        cfg = apps.get_app_config("netbox_nso_plugin")
+        with (
+            patch.object(cfg, "_derived_intent_templates", [template]),
+            patch.object(InterfaceNSOBadge, "render", side_effect=fake_render),
+        ):
+            badge.right_page()
 
         self.assertIsNone(captured.get("derived_intent_match"))
