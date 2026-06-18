@@ -6,24 +6,3 @@
 # Shrink this file over time: replace a mock with a real object or a spec=-bounded
 # mock, or add an inline `# mock-ok: <reason>`. Regenerate after an intentional
 # change with:  python netbox_nso_plugin/tests/mock_discipline.py --update-baseline
-
-test_signals.py::TestGActivatedInterfaceIntentOrigin._fire	1
-test_signals.py::TestOffboardDeviceFromAdapter.test_adapter_error_swallowed	2
-test_signals.py::TestOffboardDeviceFromAdapter.test_offboards_when_adapter_device_id_set	2
-test_signals.py::TestOffboardDeviceFromAdapter.test_skips_when_adapter_device_id_none	2
-test_signals.py::TestPushIntentOnAccept.test_pushes_enabled_attribute	6
-test_signals.py::TestPushIntentOnAccept.test_pushes_intent_on_accepted	6
-test_signals.py::TestPushIntentOnAccept.test_put_intent_error_is_swallowed	10
-test_signals.py::TestPushIntentOnAccept.test_skips_unknown_attribute	6
-test_signals.py::TestPushIntentOnAccept.test_skips_when_mgmt_does_not_exist	3
-test_signals.py::TestPushIntentOnAccept.test_skips_when_not_owned	2
-test_signals.py::TestSkipOnRenderGuard._fire_with_method	7
-test_signals.py::TestSyncScopeToAdapter.test_adapter_error_is_swallowed_with_warning	1
-test_signals.py::TestSyncScopeToAdapter.test_created_none_adapter_id_triggers_onboard	1
-test_signals.py::TestSyncScopeToAdapter.test_created_onboards_device_and_sets_scope	1
-test_signals.py::TestSyncScopeToAdapter.test_manage_enabled_included_in_scope	1
-test_signals.py::TestSyncScopeToAdapter.test_sync_notify_job_logged	1
-test_signals.py::TestSyncScopeToAdapter.test_update_patches_device_and_sets_scope	1
-test_signals.py::_fake_models_module	3
-test_signals.py::_make_mgmt_class	1
-test_signals.py::_make_mgmt_instance	1

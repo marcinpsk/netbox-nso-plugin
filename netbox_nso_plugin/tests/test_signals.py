@@ -1,96 +1,115 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Unit tests for signal handlers in signals.py.
+"""Tests for the signal handlers in signals.py.
 
-Handlers are called directly with mocked model instances so that no Django
-database is required.  adapter_client functions are patched at source.
-
-Django DB integration tests (TestIPAddressSignals) use real Django models and
-trigger signals via normal IPAddress CRUD to verify the full IP intent push path.
+Every handler is driven against real Django model rows — a real device + interface +
+NSODeviceManagement / NSOInterfaceState — so the handlers' own ORM queries and updates
+are exercised for real. Only the adapter_client HTTP functions are patched, since those
+are the genuine external boundary. (Earlier revisions called the handlers with MagicMock'd
+instances plus a sys.modules-injected fake `models` module, which bypassed exactly those
+queries — e.g. the OWNED-states filter — and so could not catch a regression in them.)
 """
 
-import sys
 import unittest
-from datetime import datetime
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from django.test import RequestFactory, TestCase
+from django.utils import timezone
 
 from .mixins import IntentPushResetMixin
-
-# A non-None accepted_at marks a state as OWNED (push_intent_on_accept triggers on it).
-_ACCEPTED_AT = datetime(2025, 1, 1, 12, 0, 0)
-
-
-def _make_mgmt_class():
-    """Return a fake NSODeviceManagement *class* whose class-level `objects` is a MagicMock.
-
-    signals.sync_scope_to_adapter does ``type(instance).objects.filter(pk=…).update(…)``.
-    When instance is a plain MagicMock, ``type(instance)`` is the real MagicMock class
-    which has no `objects` attribute, causing AttributeError.  Using a custom class avoids this.
-    """
-    return type(
-        "FakeNSODeviceManagement",
-        (),
-        {"objects": MagicMock(), "DoesNotExist": type("DoesNotExist", (Exception,), {})},
-    )
-
-
-def _make_mgmt_instance(
-    *,
-    pk=1,
-    adapter_device_id=None,
-    device_id=42,
-    manage_description=True,
-    manage_enabled=False,
-    auto_apply=False,
-    sync_before_apply=True,
-):
-    """Return a fake NSODeviceManagement instance with all attrs needed by signals."""
-    cls = _make_mgmt_class()
-    inst = object.__new__(cls)
-    inst.pk = pk
-    inst.adapter_device_id = adapter_device_id
-    inst.device_id = device_id
-    inst.nso_device_name = "core-rtr-01"
-    inst.auto_apply = auto_apply
-    inst.sync_before_apply = sync_before_apply
-
-    nso_inst = MagicMock()
-    nso_inst.adapter_instance_id = "nso-prod"
-    inst.nso_instance = nso_inst
-
-    inst.managed_attributes = []
-    if manage_description:
-        inst.managed_attributes.append("description")
-    if manage_enabled:
-        inst.managed_attributes.append("enabled")
-    return inst
-
-
-def _fake_models_module(mgmt_cls=None, istate_cls=None):
-    """Return a MagicMock to substitute for netbox_nso_plugin.models.
-
-    push_intent_on_accept does ``from .models import NSODeviceManagement, NSOInterfaceState``
-    inside the function body.  Importing the real module fails outside the devcontainer
-    because Django model registration requires INSTALLED_APPS.  Injecting a fake module
-    via patch.dict(sys.modules, …) intercepts the import at runtime.
-    """
-    mod = MagicMock()
-    mod.NSODeviceManagement = mgmt_cls or MagicMock()
-    mod.NSOInterfaceState = istate_cls or MagicMock()
-    return mod
-
 
 _MOD = "netbox_nso_plugin.adapter_client"
 
 
-class TestSyncScopeToAdapter(unittest.TestCase):
-    """Tests for sync_scope_to_adapter signal handler."""
+class _SignalDBBase(IntentPushResetMixin, TestCase):
+    """Shared real-DB fixture for the signal-handler tests.
+
+    These handlers read and update the real overlay models (NSODeviceManagement /
+    NSOInterfaceState) — ``sync_scope_to_adapter`` does
+    ``type(instance).objects.filter(pk=…).update(…)`` and ``push_intent_on_accept``
+    queries ``NSOInterfaceState.objects.filter(…).select_related(…)`` — so they are
+    driven against real rows, not a MagicMock'd ORM. Only the adapter_client HTTP
+    functions (onboard_device/set_scope/sync_notify/patch_device/put_intent) are
+    patched: those are the genuine external boundary. (A sibling TestIPAddressSignals
+    already follows this pattern.)
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
+
+        from netbox_nso_plugin.models import NSOInstance
+
+        mfg = Manufacturer.objects.create(name="SigMfg", slug="sigmfg")
+        dt = DeviceType.objects.create(manufacturer=mfg, model="SigDev", slug="sigdev")
+        role = DeviceRole.objects.create(name="SigRole", slug="sigrole")
+        site = Site.objects.create(name="SigSite", slug="sigsite")
+        cls.device = Device.objects.create(name="core-rtr-01", device_type=dt, role=role, site=site)
+        cls.iface = Interface.objects.create(
+            device=cls.device, name="GigabitEthernet0/0", type="1000base-t", description="uplink", enabled=True
+        )
+        cls.nso_instance = NSOInstance.objects.create(name="nso-prod", adapter_instance_id="nso-prod")
+
+    def _make_mgmt(
+        self,
+        *,
+        adapter_device_id=None,
+        manage_description=True,
+        manage_enabled=False,
+        auto_apply=False,
+        sync_before_apply=True,
+    ):
+        """Create a real NSODeviceManagement row WITHOUT firing its post_save sync signal.
+
+        bulk_create skips signals, so the test can drive sync_scope_to_adapter explicitly
+        rather than have the row's own save trigger it.
+        """
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        NSODeviceManagement.objects.bulk_create(
+            [
+                NSODeviceManagement(
+                    device=self.device,
+                    nso_instance=self.nso_instance,
+                    nso_device_name="core-rtr-01",
+                    adapter_device_id=adapter_device_id,
+                    manage_description=manage_description,
+                    manage_enabled=manage_enabled,
+                    auto_apply=auto_apply,
+                    sync_before_apply=sync_before_apply,
+                    custom_field_data={},
+                )
+            ]
+        )
+        return NSODeviceManagement.objects.get(device=self.device)
+
+    def _accepted_state(self, interface, attribute, *, nso_value=""):
+        """Create an OWNED (accepted_at-set) NSOInterfaceState without firing the push signal.
+
+        Created as ``imported`` then promoted via a queryset ``update`` (no post_save), so
+        the test drives push_intent_on_accept explicitly. The returned in-memory object has
+        the accepted markers set to match the row.
+        """
+        from netbox_nso_plugin.models import NSOInterfaceState
+
+        now = timezone.now()
+        state = NSOInterfaceState.objects.create(
+            interface=interface, attribute=attribute, status="imported", nso_value=nso_value
+        )
+        NSOInterfaceState.objects.filter(pk=state.pk).update(status="accepted", accepted_at=now)
+        state.status = "accepted"
+        state.accepted_at = now
+        return state
+
+
+class TestSyncScopeToAdapter(_SignalDBBase):
+    """Tests for the sync_scope_to_adapter signal handler (real NSODeviceManagement row)."""
 
     def test_created_onboards_device_and_sets_scope(self):
         from netbox_nso_plugin.signals import sync_scope_to_adapter
 
-        instance = _make_mgmt_instance()
-        # type(instance).objects.filter(...).update(...) uses MagicMock chain — works automatically
+        mgmt = self._make_mgmt(adapter_device_id=None)
 
         with (
             patch(f"{_MOD}.onboard_device", return_value={"id": 99}) as mock_onboard,
@@ -98,21 +117,25 @@ class TestSyncScopeToAdapter(unittest.TestCase):
             patch(f"{_MOD}.sync_notify", return_value={"job_id": 5}) as mock_notify,
             patch(f"{_MOD}.patch_device") as mock_patch,
         ):
-            sync_scope_to_adapter(sender=MagicMock(), instance=instance, created=True)
+            sync_scope_to_adapter(sender=type(mgmt), instance=mgmt, created=True)
 
             mock_onboard.assert_called_once_with(
                 nso_instance="nso-prod",
                 nso_device_name="core-rtr-01",
-                netbox_device_id=42,
+                netbox_device_id=self.device.pk,
             )
             mock_scope.assert_called_once_with(99, ["description"], auto_apply=False, sync_before_apply=True)
             mock_notify.assert_called_once_with(99)
             mock_patch.assert_not_called()
 
+        # The handler wrote the adapter id back to the real row via a queryset update.
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.adapter_device_id, 99)
+
     def test_update_patches_device_and_sets_scope(self):
         from netbox_nso_plugin.signals import sync_scope_to_adapter
 
-        instance = _make_mgmt_instance(adapter_device_id=7)
+        mgmt = self._make_mgmt(adapter_device_id=7)
 
         with (
             patch(f"{_MOD}.patch_device", return_value=None) as mock_patch,
@@ -120,7 +143,7 @@ class TestSyncScopeToAdapter(unittest.TestCase):
             patch(f"{_MOD}.sync_notify", return_value=None),
             patch(f"{_MOD}.onboard_device") as mock_onboard,
         ):
-            sync_scope_to_adapter(sender=MagicMock(), instance=instance, created=False)
+            sync_scope_to_adapter(sender=type(mgmt), instance=mgmt, created=False)
 
         mock_patch.assert_called_once_with(
             adapter_device_id=7,
@@ -134,16 +157,16 @@ class TestSyncScopeToAdapter(unittest.TestCase):
         from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.signals import sync_scope_to_adapter
 
-        instance = _make_mgmt_instance()
+        mgmt = self._make_mgmt(adapter_device_id=None)
 
         with patch(f"{_MOD}.onboard_device", side_effect=AdapterError("down", code="nso_unreachable")):
-            # Should not raise — warning is logged instead
-            sync_scope_to_adapter(sender=MagicMock(), instance=instance, created=True)
+            # Should not raise — a warning is logged instead.
+            sync_scope_to_adapter(sender=type(mgmt), instance=mgmt, created=True)
 
     def test_sync_notify_job_logged(self):
         from netbox_nso_plugin.signals import sync_scope_to_adapter
 
-        instance = _make_mgmt_instance()
+        mgmt = self._make_mgmt(adapter_device_id=None)
 
         with (
             patch(f"{_MOD}.onboard_device", return_value={"id": 10}),
@@ -151,20 +174,20 @@ class TestSyncScopeToAdapter(unittest.TestCase):
             patch(f"{_MOD}.sync_notify", return_value={"job_id": 7}),
         ):
             with self.assertLogs("netbox_nso_plugin.signals", level="DEBUG"):
-                sync_scope_to_adapter(sender=MagicMock(), instance=instance, created=True)
+                sync_scope_to_adapter(sender=type(mgmt), instance=mgmt, created=True)
 
     def test_created_none_adapter_id_triggers_onboard(self):
         """created=False but adapter_device_id=None should also trigger onboard."""
         from netbox_nso_plugin.signals import sync_scope_to_adapter
 
-        instance = _make_mgmt_instance(adapter_device_id=None)
+        mgmt = self._make_mgmt(adapter_device_id=None)
 
         with (
             patch(f"{_MOD}.onboard_device", return_value={"id": 3}) as mock_onboard,
             patch(f"{_MOD}.set_scope", return_value={}),
             patch(f"{_MOD}.sync_notify", return_value=None),
         ):
-            sync_scope_to_adapter(sender=MagicMock(), instance=instance, created=False)
+            sync_scope_to_adapter(sender=type(mgmt), instance=mgmt, created=False)
 
         mock_onboard.assert_called_once()
 
@@ -172,42 +195,45 @@ class TestSyncScopeToAdapter(unittest.TestCase):
         """manage_enabled=True includes 'enabled' in the managed_attributes scope call."""
         from netbox_nso_plugin.signals import sync_scope_to_adapter
 
-        instance = _make_mgmt_instance(manage_enabled=True)
+        mgmt = self._make_mgmt(adapter_device_id=None, manage_enabled=True)
 
         with (
             patch(f"{_MOD}.onboard_device", return_value={"id": 5}) as mock_onboard,
             patch(f"{_MOD}.set_scope", return_value={}) as mock_scope,
             patch(f"{_MOD}.sync_notify", return_value=None),
         ):
-            sync_scope_to_adapter(sender=MagicMock(), instance=instance, created=True)
+            sync_scope_to_adapter(sender=type(mgmt), instance=mgmt, created=True)
 
         mock_onboard.assert_called_once()
-        # Both description and enabled should be in the scope call
+        # Both description and enabled should be in the scope call.
         mock_scope.assert_called_once_with(5, ["description", "enabled"], auto_apply=False, sync_before_apply=True)
 
 
 class TestOffboardDeviceFromAdapter(unittest.TestCase):
-    """Tests for offboard_device_from_adapter signal handler."""
+    """Tests for the offboard_device_from_adapter signal handler.
+
+    The handler reads exactly one attribute (``instance.adapter_device_id``) and calls
+    the adapter ``delete_device`` boundary. A SimpleNamespace is the honest stand-in: it
+    carries that field and raises AttributeError on anything else, whereas a MagicMock
+    would silently fabricate any attribute. ``delete_device`` is the real external
+    boundary and stays patched.
+    """
 
     def test_offboards_when_adapter_device_id_set(self):
         from netbox_nso_plugin.signals import offboard_device_from_adapter
 
-        instance = MagicMock()
-        instance.adapter_device_id = 55
-
+        instance = SimpleNamespace(adapter_device_id=55)
         with patch(f"{_MOD}.delete_device") as mock_delete:
-            offboard_device_from_adapter(sender=MagicMock(), instance=instance)
+            offboard_device_from_adapter(sender=None, instance=instance)
 
         mock_delete.assert_called_once_with(55)
 
     def test_skips_when_adapter_device_id_none(self):
         from netbox_nso_plugin.signals import offboard_device_from_adapter
 
-        instance = MagicMock()
-        instance.adapter_device_id = None
-
+        instance = SimpleNamespace(adapter_device_id=None)
         with patch(f"{_MOD}.delete_device") as mock_delete:
-            offboard_device_from_adapter(sender=MagicMock(), instance=instance)
+            offboard_device_from_adapter(sender=None, instance=instance)
 
         mock_delete.assert_not_called()
 
@@ -215,221 +241,132 @@ class TestOffboardDeviceFromAdapter(unittest.TestCase):
         from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.signals import offboard_device_from_adapter
 
-        instance = MagicMock()
-        instance.adapter_device_id = 5
-
+        instance = SimpleNamespace(adapter_device_id=5)
         with patch(f"{_MOD}.delete_device", side_effect=AdapterError("gone", code="not_found")):
-            offboard_device_from_adapter(sender=MagicMock(), instance=instance)
+            # Should not raise — a warning is logged instead.
+            offboard_device_from_adapter(sender=None, instance=instance)
 
 
-class TestPushIntentOnAccept(IntentPushResetMixin, unittest.TestCase):
-    """Tests for push_intent_on_accept signal handler."""
+class TestPushIntentOnAccept(_SignalDBBase):
+    """Tests for push_intent_on_accept (real overlay rows; put_intent is the boundary).
+
+    The handler resolves the device's NSODeviceManagement, then schedules
+    _push_interface_intent_for_device, which queries every OWNED NSOInterfaceState for
+    the device and builds the put_intent payload. Driving it against real rows exercises
+    that real filter + select_related + attribute-building — the part a MagicMock'd
+    queryset (returning a hand-built [state]) entirely bypassed.
+    """
 
     def test_skips_when_not_owned(self):
-        """A not-owned row (accepted_at is None) does not push, whatever its sync status."""
+        from netbox_nso_plugin.models import NSOInterfaceState
         from netbox_nso_plugin.signals import push_intent_on_accept
 
-        instance = MagicMock()
-        instance.status = "imported"
-        instance.accepted_at = None
+        self._make_mgmt(adapter_device_id=7)
+        # accepted_at is None → not owned, whatever the sync status.
+        state = NSOInterfaceState.objects.create(
+            interface=self.iface, attribute="description", status="imported", nso_value="x"
+        )
 
         with patch(f"{_MOD}.put_intent") as mock_put:
-            push_intent_on_accept(sender=MagicMock(), instance=instance)
-            mock_put.assert_not_called()
+            push_intent_on_accept(sender=NSOInterfaceState, instance=state)
+
+        mock_put.assert_not_called()
 
     def test_pushes_intent_on_accepted(self):
+        from netbox_nso_plugin.models import NSOInterfaceState
         from netbox_nso_plugin.signals import push_intent_on_accept
 
-        iface = MagicMock()
-        iface.device_id = 42
-        iface.name = "GigabitEthernet0/0"
-        iface.description = "uplink"
-        iface.enabled = True
+        self._make_mgmt(adapter_device_id=7)
+        state = self._accepted_state(self.iface, "description", nso_value="uplink")
 
-        state = MagicMock()
-        state.status = "accepted"
-        state.interface = iface
-        state.attribute = "description"
-        state.accepted_at = _ACCEPTED_AT
-
-        mgmt = MagicMock()
-        mgmt.adapter_device_id = 7
-
-        mock_mgmt_cls = MagicMock()
-        mock_mgmt_cls.objects.get.return_value = mgmt
-        mock_mgmt_cls.DoesNotExist = Exception
-
-        mock_istate_cls = MagicMock()
-        mock_istate_cls.objects.filter.return_value.select_related.return_value = [state]
-
-        fake_models = _fake_models_module(mock_mgmt_cls, mock_istate_cls)
-
-        with (
-            patch.dict(sys.modules, {"netbox_nso_plugin.models": fake_models}),
-            patch(f"{_MOD}.put_intent") as mock_put,
-        ):
-            push_intent_on_accept(sender=MagicMock(), instance=state)
+        with patch(f"{_MOD}.put_intent") as mock_put:
+            with self.captureOnCommitCallbacks(execute=True):
+                push_intent_on_accept(sender=NSOInterfaceState, instance=state)
 
         mock_put.assert_called_once()
-        call_args = mock_put.call_args[0]
-        self.assertEqual(call_args[0], 7)
-        attrs = call_args[1]
+        adapter_id, attrs = mock_put.call_args[0]
+        self.assertEqual(adapter_id, 7)
         self.assertEqual(len(attrs), 1)
         self.assertEqual(attrs[0]["interface"], "GigabitEthernet0/0")
         self.assertEqual(attrs[0]["attribute"], "description")
-        self.assertEqual(attrs[0]["intent_value"], "uplink")
+        self.assertEqual(attrs[0]["intent_value"], "uplink")  # from the real Interface.description
 
     def test_pushes_enabled_attribute(self):
+        from dcim.models import Interface
+
+        from netbox_nso_plugin.models import NSOInterfaceState
         from netbox_nso_plugin.signals import push_intent_on_accept
 
-        iface = MagicMock()
-        iface.device_id = 42
-        iface.name = "Loopback0"
-        iface.enabled = False
+        self._make_mgmt(adapter_device_id=3)
+        iface = Interface.objects.create(device=self.device, name="Loopback0", type="virtual", enabled=False)
+        state = self._accepted_state(iface, "enabled", nso_value="true")
 
-        state = MagicMock()
-        state.status = "accepted"
-        state.interface = iface
-        state.attribute = "enabled"
-        state.accepted_at = _ACCEPTED_AT
-
-        mgmt = MagicMock()
-        mgmt.adapter_device_id = 3
-
-        mock_mgmt_cls = MagicMock()
-        mock_mgmt_cls.objects.get.return_value = mgmt
-        mock_mgmt_cls.DoesNotExist = Exception
-
-        mock_istate_cls = MagicMock()
-        mock_istate_cls.objects.filter.return_value.select_related.return_value = [state]
-
-        fake_models = _fake_models_module(mock_mgmt_cls, mock_istate_cls)
-
-        with (
-            patch.dict(sys.modules, {"netbox_nso_plugin.models": fake_models}),
-            patch(f"{_MOD}.put_intent") as mock_put,
-        ):
-            push_intent_on_accept(sender=MagicMock(), instance=state)
+        with patch(f"{_MOD}.put_intent") as mock_put:
+            with self.captureOnCommitCallbacks(execute=True):
+                push_intent_on_accept(sender=NSOInterfaceState, instance=state)
 
         attrs = mock_put.call_args[0][1]
-        self.assertEqual(attrs[0]["intent_value"], "false")
+        self.assertEqual(attrs[0]["intent_value"], "false")  # str(Interface.enabled).lower()
 
     def test_skips_when_mgmt_does_not_exist(self):
+        from netbox_nso_plugin.models import NSOInterfaceState
         from netbox_nso_plugin.signals import push_intent_on_accept
 
-        state = MagicMock()
-        state.status = "accepted"
-        state.interface.device_id = 99
+        # No NSODeviceManagement for this device → NSODeviceManagement.objects.get raises.
+        state = self._accepted_state(self.iface, "description", nso_value="uplink")
 
-        mock_mgmt_cls = MagicMock()
-        mock_mgmt_cls.DoesNotExist = type("DoesNotExist", (Exception,), {})
-        mock_mgmt_cls.objects.get.side_effect = mock_mgmt_cls.DoesNotExist("not found")
+        with patch(f"{_MOD}.put_intent") as mock_put:
+            with self.captureOnCommitCallbacks(execute=True):
+                push_intent_on_accept(sender=NSOInterfaceState, instance=state)
 
-        fake_models = _fake_models_module(mock_mgmt_cls)
+        mock_put.assert_not_called()
 
-        with (
-            patch.dict(sys.modules, {"netbox_nso_plugin.models": fake_models}),
-            patch(f"{_MOD}.put_intent") as mock_put,
-        ):
-            push_intent_on_accept(sender=MagicMock(), instance=state)
+    def test_skips_when_adapter_id_none(self):
+        """A management row without an adapter_device_id yet → nothing to push to."""
+        from netbox_nso_plugin.models import NSOInterfaceState
+        from netbox_nso_plugin.signals import push_intent_on_accept
+
+        self._make_mgmt(adapter_device_id=None)
+        state = self._accepted_state(self.iface, "description", nso_value="uplink")
+
+        with patch(f"{_MOD}.put_intent") as mock_put:
+            with self.captureOnCommitCallbacks(execute=True):
+                push_intent_on_accept(sender=NSOInterfaceState, instance=state)
 
         mock_put.assert_not_called()
 
     def test_skips_unknown_attribute(self):
-        """state.attribute not in (description, enabled) hits the 'continue' branch."""
+        """An owned state with an attribute outside (description, enabled) is dropped."""
+        from netbox_nso_plugin.models import NSOInterfaceState
         from netbox_nso_plugin.signals import push_intent_on_accept
 
-        iface = MagicMock()
-        iface.device_id = 42
-        iface.name = "GigabitEthernet0/0"
+        self._make_mgmt(adapter_device_id=7)
+        state = self._accepted_state(self.iface, "mtu", nso_value="1500")
 
-        state = MagicMock()
-        state.status = "accepted"
-        state.interface = iface
-        state.attribute = "custom_field"  # unknown — should be skipped
-        state.accepted_at = _ACCEPTED_AT
+        with patch(f"{_MOD}.put_intent") as mock_put:
+            with self.captureOnCommitCallbacks(execute=True):
+                push_intent_on_accept(sender=NSOInterfaceState, instance=state)
 
-        mgmt = MagicMock()
-        mgmt.adapter_device_id = 7
-
-        mock_mgmt_cls = MagicMock()
-        mock_mgmt_cls.objects.get.return_value = mgmt
-        mock_mgmt_cls.DoesNotExist = Exception
-
-        mock_istate_cls = MagicMock()
-        mock_istate_cls.objects.filter.return_value.select_related.return_value = [state]
-
-        fake_models = _fake_models_module(mock_mgmt_cls, mock_istate_cls)
-
-        with (
-            patch.dict(sys.modules, {"netbox_nso_plugin.models": fake_models}),
-            patch(f"{_MOD}.put_intent") as mock_put,
-        ):
-            push_intent_on_accept(sender=MagicMock(), instance=state)
-
-        # put_intent called with empty attributes list (unknown attribute was skipped)
+        # put_intent is still called, but the unknown attribute was filtered out.
         attrs = mock_put.call_args[0][1]
         self.assertEqual(attrs, [])
 
     def test_put_intent_error_is_swallowed(self):
-        """put_intent raising AdapterError is caught and logged."""
+        """put_intent raising AdapterError is caught and logged, not propagated."""
         from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.models import NSOInterfaceState
         from netbox_nso_plugin.signals import push_intent_on_accept
 
-        iface = MagicMock()
-        iface.device_id = 42
-        iface.name = "Loopback0"
-        iface.description = "test"
+        self._make_mgmt(adapter_device_id=3)
+        state = self._accepted_state(self.iface, "description", nso_value="uplink")
 
-        state = MagicMock()
-        state.status = "accepted"
-        state.interface = iface
-        state.attribute = "description"
-        state.accepted_at = _ACCEPTED_AT
-
-        mgmt = MagicMock()
-        mgmt.adapter_device_id = 3
-
-        mock_mgmt_cls = MagicMock()
-        mock_mgmt_cls.objects.get.return_value = mgmt
-        mock_mgmt_cls.DoesNotExist = Exception
-
-        mock_istate_cls = MagicMock()
-        mock_istate_cls.objects.filter.return_value.select_related.return_value = [state]
-
-        fake_models = _fake_models_module(mock_mgmt_cls, mock_istate_cls)
-
-        with (
-            patch.dict(sys.modules, {"netbox_nso_plugin.models": fake_models}),
-            patch(f"{_MOD}.put_intent", side_effect=AdapterError("down", code="nso_unreachable")),
-        ):
-            # should not raise — warning is logged instead
-            push_intent_on_accept(sender=MagicMock(), instance=state)
-        from netbox_nso_plugin.signals import push_intent_on_accept
-
-        state = MagicMock()
-        state.status = "accepted"
-        state.interface.device_id = 42
-
-        mgmt = MagicMock()
-        mgmt.adapter_device_id = None
-
-        mock_mgmt_cls = MagicMock()
-        mock_mgmt_cls.objects.get.return_value = mgmt
-        mock_mgmt_cls.DoesNotExist = Exception
-
-        fake_models = _fake_models_module(mock_mgmt_cls)
-
-        with (
-            patch.dict(sys.modules, {"netbox_nso_plugin.models": fake_models}),
-            patch(f"{_MOD}.put_intent") as mock_put,
-        ):
-            push_intent_on_accept(sender=MagicMock(), instance=state)
-
-        mock_put.assert_not_called()
+        with patch(f"{_MOD}.put_intent", side_effect=AdapterError("down", code="nso_unreachable")):
+            with self.captureOnCommitCallbacks(execute=True):
+                # Should not raise — a warning is logged instead.
+                push_intent_on_accept(sender=NSOInterfaceState, instance=state)
 
 
-class TestSkipOnRenderGuard(IntentPushResetMixin, unittest.TestCase):
+class TestSkipOnRenderGuard(_SignalDBBase):
     """An intent push must never fire during a GET render.
 
     Regression for the device-27 NSO-tab loop: rendering the tab re-saves every
@@ -439,42 +376,21 @@ class TestSkipOnRenderGuard(IntentPushResetMixin, unittest.TestCase):
     """
 
     def _fire_with_method(self, method):
+        """Drive push_intent_on_accept with current_request set to a real GET/POST/None."""
         from netbox.context import current_request
 
+        from netbox_nso_plugin.models import NSOInterfaceState
         from netbox_nso_plugin.signals import push_intent_on_accept
 
-        iface = MagicMock()
-        iface.device_id = 42
-        iface.name = "GigabitEthernet0/0"
-        iface.description = "uplink"
-        iface.enabled = True
+        self._make_mgmt(adapter_device_id=7)
+        state = self._accepted_state(self.iface, "description", nso_value="uplink")
 
-        state = MagicMock()
-        state.status = "accepted"
-        state.interface = iface
-        state.attribute = "description"
-        state.accepted_at = _ACCEPTED_AT
-
-        mgmt = MagicMock()
-        mgmt.adapter_device_id = 7
-        mock_mgmt_cls = MagicMock()
-        mock_mgmt_cls.objects.get.return_value = mgmt
-        mock_mgmt_cls.DoesNotExist = Exception
-        mock_istate_cls = MagicMock()
-        mock_istate_cls.objects.filter.return_value.select_related.return_value = [state]
-        fake_models = _fake_models_module(mock_mgmt_cls, mock_istate_cls)
-
-        req = None
-        if method is not None:
-            req = MagicMock()
-            req.method = method
+        req = None if method is None else getattr(RequestFactory(), method.lower())("/")
         token = current_request.set(req)
         try:
-            with (
-                patch.dict(sys.modules, {"netbox_nso_plugin.models": fake_models}),
-                patch(f"{_MOD}.put_intent") as mock_put,
-            ):
-                push_intent_on_accept(sender=MagicMock(), instance=state)
+            with patch(f"{_MOD}.put_intent") as mock_put:
+                with self.captureOnCommitCallbacks(execute=True):
+                    push_intent_on_accept(sender=NSOInterfaceState, instance=state)
                 return mock_put
         finally:
             current_request.reset(token)
@@ -714,17 +630,17 @@ try:
             )
 
         def _fire(self, header=None):
-            """Invoke the G-activated handler with an optional request header set."""
+            """Invoke the G-activated handler with current_request set to a real request.
+
+            A non-None *header* is the adapter-import marker; it rides on a real POST
+            (deliberately not a GET, so it is the import header — not the render guard —
+            that suppresses the push). header=None models a programmatic write (no request).
+            """
             from netbox.context import current_request
 
             from netbox_nso_plugin.signals import _push_intent_on_interface_edit
 
-            req = None
-            if header is not None:
-                from unittest.mock import MagicMock
-
-                req = MagicMock()
-                req.headers = header
+            req = RequestFactory().post("/", headers=header) if header is not None else None
             # Simulate the pre_save snapshot: operator changed the description,
             # left enabled untouched.
             self.iface._nso_old_values = {"description": "PREVIOUS-DESC", "enabled": self.iface.enabled}
