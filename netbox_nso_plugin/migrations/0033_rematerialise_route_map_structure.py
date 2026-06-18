@@ -42,7 +42,7 @@ class Migration(migrations.Migration):
     dependencies = [
         ("netbox_nso_plugin", "0032_shared_object_capture_materialized"),
         # The structured columns these fills write must already exist.
-        ("netbox_routing", "0055_routemapentry_match_condition_call_apply_policy"),
+        ("netbox_routing", "0034_integration"),
     ]
 
     operations = [

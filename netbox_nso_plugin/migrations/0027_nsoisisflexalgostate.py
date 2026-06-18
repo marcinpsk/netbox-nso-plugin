@@ -13,7 +13,7 @@ class Migration(migrations.Migration):
     dependencies = [
         ("extras", "0138_customfieldchoiceset_choice_colors"),
         ("netbox_nso_plugin", "0026_nsoswitchportstate_device_base_hash"),
-        ("netbox_routing", "0047_ospfinstance_process_id_string"),
+        ("netbox_routing", "0033_isis"),
     ]
 
     operations = [
