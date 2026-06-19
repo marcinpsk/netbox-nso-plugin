@@ -298,9 +298,9 @@ class TestReconcileBgpConfig(TestCase):
 
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
 
-        src = IPAddress.objects.create(address="84.116.255.1/32")
+        src = IPAddress.objects.create(address="192.0.2.1/32")
         peer = self._peer_entry()
-        peer["source"] = "84.116.255.1"
+        peer["source"] = "192.0.2.1"
         _reconcile_bgp_config(self.device, self._payload(self._router_payload(peers=[peer])))
 
         bp = BGPPeer.objects.get(peer__address__net_host="10.0.0.2")
