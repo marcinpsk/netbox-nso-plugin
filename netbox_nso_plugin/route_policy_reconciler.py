@@ -399,24 +399,27 @@ def _row_diverged(state, entries_hash, family, name) -> bool:
     return canon != entries_hash
 
 
-def _sole_owner_can_refresh(state, family, name) -> bool:
+def _owner_can_refresh(state) -> bool:
     """Return True if a divergence on *state* should auto-refresh NetBox, not conflict.
 
-    A materialized owner that is the ONLY device reporting this name is the sole authority
-    for it: a divergence in its OWN capture is just the device's config moving, not a
-    cross-device adoption ambiguity (there is no other version to be ambiguous with). In
-    that case NetBox should track the change (full-replace from the new capture) instead of
-    freezing the row in ``conflict`` forever — once conflicted, ``should_fill`` stays False
-    and the owner could never recover. Restricted to UNOWNED rows: an operator-owned row
-    (accepted/deploying/in_sync/apply_failed) is intent and is never auto-clobbered.
+    NetBox mirrors exactly ONE version per (family, name): the materialized owner's. When
+    that owner's OWN device changes, NetBox should track it — the row is just a device mirror
+    until an operator accepts it, so following the source it already tracks is correct, not a
+    clobber. This holds whether or not other devices share the name: only the owner ever
+    writes the shared object (non-owners never materialize), so there is no last-writer churn,
+    and a non-owner that diverges from the (now updated) version still surfaces as ``conflict``
+    on its next reconcile. Two invariants keep it safe:
+
+    - UNOWNED only — an operator-owned row (accepted/deploying/in_sync/apply_failed) is intent
+      and is never auto-clobbered;
+    - OWNER only — a non-owner divergence is a genuine cross-device conflict, left untouched.
+
+    (Without this an unowned owner whose device changed froze in ``conflict`` forever, since
+    ``should_fill`` then stays False and the owner could never recover.)
     """
     from . import status_machine as sm
-    from .models import NSORoutePolicyState
 
-    if not state.is_materialized or sm.is_owned(state.status):
-        return False
-    others = NSORoutePolicyState.objects.filter(family=family, object_name=name).exclude(pk=state.pk)
-    return not others.exists()
+    return state.is_materialized and not sm.is_owned(state.status)
 
 
 def _refresh_owner(state, family, obj, ct, captured, entries_hash, now) -> None:
@@ -458,9 +461,9 @@ def _upsert_state(mgmt, family, name, obj, ct, captured, now):
     should_fill is True when it is safe to fill the shared object's entries from THIS
     device — a fresh import, or a non-owner whose capture matches the canonical version.
     A divergence sets status=conflict and should_fill stays False (no silent clobber) —
-    EXCEPT for a sole-device materialized owner, the only authority for its name, whose own
-    device edits are tracked in place (see :func:`_sole_owner_can_refresh`). The device's
-    own ``captured`` is always refreshed so every version stays visible.
+    EXCEPT for the unowned materialized owner (the one version NetBox mirrors), whose own
+    device changes are tracked in place (see :func:`_owner_can_refresh`). The device's own
+    ``captured`` is always refreshed so every version stays visible.
     """
     from .models import NSORoutePolicyState
 
@@ -495,9 +498,10 @@ def _upsert_state(mgmt, family, name, obj, ct, captured, now):
     # FK/content overlay: 'matches' = materialized (content recorded & unchanged), not
     # device confirmation, so it must not settle an owned row (settles_owned=False).
     diverged = _row_diverged(state, entries_hash, family, name)
-    # A sole-device materialized owner is the only authority for this name: track its own
-    # device's edits (full-replace) instead of freezing it in a (non-existent) conflict.
-    if diverged and _sole_owner_can_refresh(state, family, name):
+    # The materialized owner is the one version NetBox mirrors for this name: when its own
+    # device changes and the row is unowned, track it (full-replace) instead of freezing as
+    # conflict. Non-owners that diverge are still genuine cross-device conflicts.
+    if diverged and _owner_can_refresh(state):
         _refresh_owner(state, family, obj, ct, captured, entries_hash, now)
         return state, False
     state.status = sm.on_reconcile(state.status, matches=not diverged, conflict=diverged, settles_owned=False)

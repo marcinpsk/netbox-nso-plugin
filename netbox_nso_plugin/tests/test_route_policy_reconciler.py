@@ -592,6 +592,34 @@ class TestSharedObjectOwnership(TestCase):
         self.assertEqual(s2.status, "imported")
         self.assertFalse(s2.is_materialized)
 
+    def test_owner_auto_refreshes_even_with_other_devices(self):
+        """NetBox mirrors ONE version per name (the materialized owner's). When that owner's
+        own device changes and the row is unowned, NetBox tracks it — even if other devices
+        share the name. Only the owner ever writes, so there is no last-writer churn; the
+        non-owners still surface as ``conflict`` when they diverge from the tracked version."""
+        from netbox_routing.models import PrefixList, PrefixListEntry
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._mgmt(self.d1)
+        self._mgmt(self.d2)
+        reconcile_route_policy(self.d1, self._pl("PL-MULTI", ["10.0.0.0/8"]))  # d1 owns
+        reconcile_route_policy(self.d2, self._pl("PL-MULTI", ["10.0.0.0/8"]))  # d2 matches
+
+        # The owner's device changes → NetBox follows it (not a frozen conflict).
+        reconcile_route_policy(self.d1, self._pl("PL-MULTI", ["10.0.0.0/8", "192.168.0.0/16"]))
+        s1 = NSORoutePolicyState.objects.get(management__device=self.d1, object_name="PL-MULTI")
+        self.assertEqual(s1.status, "imported")
+        self.assertTrue(s1.is_materialized)
+        pl = PrefixList.objects.get(name="PL-MULTI")
+        self.assertEqual(PrefixListEntry.objects.filter(prefix_list=pl).count(), 2)  # NetBox tracked the owner
+
+        # A non-owner that now diverges from the tracked (owner) version still conflicts.
+        reconcile_route_policy(self.d2, self._pl("PL-MULTI", ["10.0.0.0/8"]))
+        s2 = NSORoutePolicyState.objects.get(management__device=self.d2, object_name="PL-MULTI")
+        self.assertEqual(s2.status, "conflict")
+
     def test_rematerialize_repoints_ownership(self):
         """Operator picks the second device's version → the shared object is refilled from
         it, ownership flips, and the former owner becomes the conflict."""
