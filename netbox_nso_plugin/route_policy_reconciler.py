@@ -399,14 +399,66 @@ def _row_diverged(state, entries_hash, family, name) -> bool:
     return canon != entries_hash
 
 
+def _sole_owner_can_refresh(state, family, name) -> bool:
+    """Return True if a divergence on *state* should auto-refresh NetBox, not conflict.
+
+    A materialized owner that is the ONLY device reporting this name is the sole authority
+    for it: a divergence in its OWN capture is just the device's config moving, not a
+    cross-device adoption ambiguity (there is no other version to be ambiguous with). In
+    that case NetBox should track the change (full-replace from the new capture) instead of
+    freezing the row in ``conflict`` forever — once conflicted, ``should_fill`` stays False
+    and the owner could never recover. Restricted to UNOWNED rows: an operator-owned row
+    (accepted/deploying/in_sync/apply_failed) is intent and is never auto-clobbered.
+    """
+    from . import status_machine as sm
+    from .models import NSORoutePolicyState
+
+    if not state.is_materialized or sm.is_owned(state.status):
+        return False
+    others = NSORoutePolicyState.objects.filter(family=family, object_name=name).exclude(pk=state.pk)
+    return not others.exists()
+
+
+def _refresh_owner(state, family, obj, ct, captured, entries_hash, now) -> None:
+    """Re-materialize a sole owner's NetBox object from its current capture (full replace).
+
+    The reconcile already runs under ``suppress_intent_push`` so the object saves don't fire
+    the operator-edit push handlers; this just refreshes the mirror to match the device.
+    """
+    from . import status_machine as sm
+
+    spec = ownership.get_spec(family)
+    if spec is not None:
+        spec.fill(obj, captured)
+    state.status = sm.IMPORTED
+    state.content_hash = entries_hash
+    state.captured = captured
+    state.last_sync_at = now
+    state.content_type = ct
+    state.object_id = obj.pk
+    state.is_materialized = True
+    state.save(
+        update_fields=[
+            "status",
+            "content_hash",
+            "captured",
+            "last_sync_at",
+            "content_type",
+            "object_id",
+            "is_materialized",
+        ]
+    )
+
+
 def _upsert_state(mgmt, family, name, obj, ct, captured, now):
     """Create/update the NSORoutePolicyState overlay row. Returns (state, should_fill).
 
     should_fill is True when it is safe to fill the shared object's entries from THIS
     device — a fresh import, or a non-owner whose capture matches the canonical version.
-    A divergence (owner drift, or a non-owner differing from the canonical) sets
-    status=conflict and should_fill stays False (no silent clobber). The device's own
-    ``captured`` is always refreshed so every version stays visible.
+    A divergence sets status=conflict and should_fill stays False (no silent clobber) —
+    EXCEPT for a sole-device materialized owner, the only authority for its name, whose own
+    device edits are tracked in place (see :func:`_sole_owner_can_refresh`). The device's
+    own ``captured`` is always refreshed so every version stays visible.
     """
     from .models import NSORoutePolicyState
 
@@ -441,6 +493,11 @@ def _upsert_state(mgmt, family, name, obj, ct, captured, now):
     # FK/content overlay: 'matches' = materialized (content recorded & unchanged), not
     # device confirmation, so it must not settle an owned row (settles_owned=False).
     diverged = _row_diverged(state, entries_hash, family, name)
+    # A sole-device materialized owner is the only authority for this name: track its own
+    # device's edits (full-replace) instead of freezing it in a (non-existent) conflict.
+    if diverged and _sole_owner_can_refresh(state, family, name):
+        _refresh_owner(state, family, obj, ct, captured, entries_hash, now)
+        return state, False
     state.status = sm.on_reconcile(state.status, matches=not diverged, conflict=diverged, settles_owned=False)
     should_fill = state.status != sm.CONFLICT
     if should_fill:

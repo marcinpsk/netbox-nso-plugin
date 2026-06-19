@@ -140,10 +140,11 @@ class TestReconcileRoutePolicy(TestCase):
         )
         self.assertTrue(CommunityList.objects.get(name="CL-INV").invert_match)
 
-    def test_community_invert_match_flip_is_drift_not_clobber(self):
-        """A device-side invert_match flip diverges the content hash → the overlay
-        goes to conflict and the stored value is NOT silently overwritten (brownfield
-        no-clobber), exactly like an entries divergence."""
+    def test_community_invert_match_flip_tracked_for_sole_owner(self):
+        """A device-side invert_match flip diverges the content hash. For a sole-device
+        owner (the only authority for the name) NetBox tracks the flip and the row stays
+        ``imported``; a cross-device flip still conflicts (test_rematerialize_community_
+        invert_match covers that)."""
         self._make_mgmt(self.device)
         from netbox_routing.models import CommunityList
 
@@ -161,9 +162,9 @@ class TestReconcileRoutePolicy(TestCase):
             {"community_lists": [{"name": "CL-FLIP", "invert_match": False, "entries": [{"community": "no-export"}]}]},
         )
         st = NSORoutePolicyState.objects.get(family="community_list", object_name="CL-FLIP")
-        self.assertIn(st.status, ("conflict", "changed"))
-        # No silent clobber: the imported value is preserved until the operator resolves.
-        self.assertTrue(CommunityList.objects.get(name="CL-FLIP").invert_match)
+        self.assertEqual(st.status, "imported")
+        # Sole owner: NetBox mirror tracks the device flip.
+        self.assertFalse(CommunityList.objects.get(name="CL-FLIP").invert_match)
 
     def test_as_path_uses_aspath_model(self):
         """Regression guard: as_paths reconcile into netbox_routing.ASPath.
@@ -340,8 +341,14 @@ class TestReconcileRoutePolicy(TestCase):
         rme = RouteMapEntry.objects.get(route_map__name="RM-RT")
         self.assertEqual([e.name for e in rme.match_community_list.all()], ["CL-RT"])
 
-    def test_conflict_does_not_clobber_entries(self):
-        """Once filled, a divergent re-report flags conflict and leaves entries intact."""
+    def test_sole_device_owner_auto_refreshes_on_divergence(self):
+        """A sole-device materialized owner that re-reports different content is the only
+        authority for that name, so NetBox tracks the change (full-replace) and the row
+        stays ``imported`` instead of freezing in a (non-existent) cross-device conflict.
+
+        The brownfield no-clobber rule still holds where it matters — when ANOTHER device
+        shares the name — proven by test_divergent_second_device_conflicts_without_clobber.
+        """
         self._make_mgmt(self.device)
         from netbox_routing.models import PrefixList, PrefixListEntry
 
@@ -359,7 +366,7 @@ class TestReconcileRoutePolicy(TestCase):
         pl = PrefixList.objects.get(name="PL-C")
         self.assertEqual(PrefixListEntry.objects.filter(prefix_list=pl).count(), 1)
 
-        # Same device re-reports different content → conflict, entries untouched.
+        # Same (sole) device re-reports richer content → NetBox tracks it, no conflict.
         reconcile_route_policy(
             self.device,
             {
@@ -375,8 +382,53 @@ class TestReconcileRoutePolicy(TestCase):
             },
         )
         st = NSORoutePolicyState.objects.get(management__device=self.device, family="prefix_list", object_name="PL-C")
-        self.assertEqual(st.status, "conflict")
-        self.assertEqual(PrefixListEntry.objects.filter(prefix_list=pl).count(), 1)  # not clobbered
+        self.assertEqual(st.status, "imported")
+        self.assertTrue(st.is_materialized)
+        self.assertEqual(PrefixListEntry.objects.filter(prefix_list=pl).count(), 2)  # refreshed to match device
+
+    def test_owned_sole_owner_is_not_auto_refreshed(self):
+        """The sole-owner auto-refresh never touches an operator-owned row: an ``accepted``
+        owner that the device diverges from keeps its content (intent is not clobbered);
+        the divergence is preserved for the operator to resolve via Apply/Accept."""
+        from django.utils import timezone
+
+        self._make_mgmt(self.device)
+        from netbox_routing.models import PrefixList, PrefixListEntry
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        reconcile_route_policy(
+            self.device,
+            {
+                "prefix_lists": [
+                    {"name": "PL-OWN", "entries": [{"sequence": 10, "action": "permit", "prefix": "10.0.0.0/8"}]}
+                ]
+            },
+        )
+        st = NSORoutePolicyState.objects.get(family="prefix_list", object_name="PL-OWN")
+        st.status = "accepted"
+        st.accepted_at = timezone.now()
+        st.save(update_fields=["status", "accepted_at"])
+
+        reconcile_route_policy(
+            self.device,
+            {
+                "prefix_lists": [
+                    {
+                        "name": "PL-OWN",
+                        "entries": [
+                            {"sequence": 10, "action": "permit", "prefix": "10.0.0.0/8"},
+                            {"sequence": 20, "action": "permit", "prefix": "192.168.0.0/16"},
+                        ],
+                    }
+                ]
+            },
+        )
+        st.refresh_from_db()
+        self.assertIn(st.status, ("accepted", "deploying", "in_sync", "apply_failed"))
+        pl = PrefixList.objects.get(name="PL-OWN")
+        self.assertEqual(PrefixListEntry.objects.filter(prefix_list=pl).count(), 1)  # intent not clobbered
 
     def test_route_map_expands_matched_community_list_into_match_community(self):
         """A route-map matching a community-list also links that list's member
