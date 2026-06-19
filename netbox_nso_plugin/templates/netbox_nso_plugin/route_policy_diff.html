@@ -1,6 +1,6 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
-{# Device-vs-NetBox delta for one route-map overlay row. #}
+{# Device-vs-NetBox delta for one route-policy overlay row (any family). #}
 {% extends 'base/layout.html' %}
 
 {% block title %}Drift delta — {{ object_name }}{% endblock %}
@@ -11,7 +11,7 @@
     <div class="card">
       <h5 class="card-header">
         <span class="mdi mdi-not-equal-variant me-1"></span>
-        Drift delta — route-map <code>{{ object_name }}</code>
+        Drift delta — {{ family }} <code>{{ object_name }}</code>
         {% if device %}on <a href="{% url 'dcim:device_nso' pk=device.pk %}">{{ device }}</a>{% endif %}
       </h5>
       <div class="card-body">
@@ -21,7 +21,7 @@
         </p>
 
         {% if diff is None %}
-          <div class="alert alert-secondary mb-0">No materialised route-map to compare yet.</div>
+          <div class="alert alert-secondary mb-0">No materialised {{ family }} to compare yet.</div>
         {% elif not diff.any_diff %}
           <div class="alert alert-success mb-0">
             <span class="mdi mdi-check-circle-outline me-1"></span>
@@ -32,7 +32,7 @@
           {% if diff.removed_on_device %}
           <div class="alert alert-warning">
             <span class="mdi mdi-minus-circle-outline me-1"></span>
-            Removed on the device — this route-map is gone from the device but still exists in
+            Removed on the device — this {{ family }} is gone from the device but still exists in
             NetBox (every entry below reads “only in NetBox”). Accept to take ownership, or
             delete the NetBox object to match the device.
           </div>
@@ -46,6 +46,17 @@
             <span class="badge text-bg-info">netbox: {{ diff.default_action.netbox }}</span>
           </div>
           {% endif %}
+
+          {% for x in diff.extra %}
+            {% if x.differs %}
+            <div class="mb-3">
+              <span class="text-muted small me-2">{{ x.label }}</span>
+              <span class="badge text-bg-warning text-dark">device: {{ x.device }}</span>
+              <span class="mdi mdi-arrow-left-right mx-1 text-muted"></span>
+              <span class="badge text-bg-info">netbox: {{ x.netbox }}</span>
+            </div>
+            {% endif %}
+          {% endfor %}
 
           {% for e in diff.entries %}
             {% if e.differs %}

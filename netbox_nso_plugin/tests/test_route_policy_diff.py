@@ -148,14 +148,15 @@ class TestCrossDeviceStateDiff(_RPBase):
         self.assertEqual(setrow["device"], "local_preference=200")  # d2 on-box
         self.assertEqual(setrow["netbox"], "local_preference=100")  # materialised (d1) owner
 
-    def test_non_route_map_family_has_no_diff(self):
+    def test_unmaterialised_row_has_no_diff(self):
+        """A row with no linked NetBox object yet returns None (nothing to compare)."""
         from netbox_nso_plugin.models import NSORoutePolicyState
         from netbox_nso_plugin.route_policy_diff import route_policy_state_diff
-        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
 
-        self._mgmt(self.d1)
-        reconcile_route_policy(self.d1, {"prefix_lists": [{"name": "PL", "entries": []}]})
-        st = NSORoutePolicyState.objects.get(family="prefix_list", object_name="PL")
+        mgmt = self._mgmt(self.d1)
+        st = NSORoutePolicyState.objects.create(
+            management=mgmt, family="prefix_list", object_name="PL-NONE", status="imported"
+        )
         self.assertIsNone(route_policy_state_diff(st))
 
 
@@ -344,3 +345,143 @@ class TestRouteMapRemovalDiff(_RPBase):
         self.assertTrue(d["any_diff"])
         self.assertTrue(d["removed_on_device"])
         self.assertTrue(any(e["presence"] == "netbox_only" for e in d["entries"]))
+
+
+class TestSimpleFamilyDiff(_RPBase):
+    """The diff now covers prefix-list / as-path / community-list, not just route-maps."""
+
+    def test_prefix_list_matching_reconstruction_no_diff(self):
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_diff import route_policy_state_diff
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._mgmt(self.d1)
+        reconcile_route_policy(
+            self.d1,
+            {
+                "prefix_lists": [
+                    {"name": "PLD", "entries": [{"sequence": 10, "action": "permit", "prefix": "10.0.0.0/8"}]}
+                ]
+            },
+        )
+        st = NSORoutePolicyState.objects.get(family="prefix_list", object_name="PLD")
+        d = route_policy_state_diff(st)
+        self.assertFalse(d["any_diff"], d)  # device capture reconstructs to the NetBox object
+
+    def test_prefix_list_cross_device_diff(self):
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_diff import route_policy_state_diff
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._mgmt(self.d1)
+        self._mgmt(self.d2)
+        reconcile_route_policy(
+            self.d1,
+            {
+                "prefix_lists": [
+                    {"name": "PLX", "entries": [{"sequence": 10, "action": "permit", "prefix": "10.0.0.0/8"}]}
+                ]
+            },
+        )
+        reconcile_route_policy(
+            self.d2,
+            {
+                "prefix_lists": [
+                    {
+                        "name": "PLX",
+                        "entries": [
+                            {"sequence": 10, "action": "permit", "prefix": "10.0.0.0/8"},
+                            {"sequence": 20, "action": "permit", "prefix": "192.168.0.0/16"},
+                        ],
+                    }
+                ]
+            },
+        )
+        s2 = NSORoutePolicyState.objects.get(management__device=self.d2, object_name="PLX")
+        self.assertEqual(s2.status, "conflict")
+        d = route_policy_state_diff(s2)
+        self.assertTrue(d["any_diff"])
+        extra = next(e for e in d["entries"] if e["presence"] == "device_only")
+        self.assertTrue(any(f["device"] == "192.168.0.0/16" for f in extra["fields"]))
+
+    def test_community_list_invert_in_extra(self):
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_diff import route_policy_state_diff
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._mgmt(self.d1)
+        self._mgmt(self.d2)
+        reconcile_route_policy(
+            self.d1,
+            {"community_lists": [{"name": "CLX", "invert_match": False, "entries": [{"community": "65000:1"}]}]},
+        )
+        reconcile_route_policy(
+            self.d2,
+            {"community_lists": [{"name": "CLX", "invert_match": True, "entries": [{"community": "65000:1"}]}]},
+        )
+        s2 = NSORoutePolicyState.objects.get(management__device=self.d2, object_name="CLX")
+        self.assertEqual(s2.status, "conflict")
+        d = route_policy_state_diff(s2)
+        invert = next(x for x in d["extra"] if x["label"] == "Invert match")
+        self.assertTrue(invert["differs"])
+
+    def test_as_path_cross_device_diff(self):
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_diff import route_policy_state_diff
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._mgmt(self.d1)
+        self._mgmt(self.d2)
+        reconcile_route_policy(
+            self.d1, {"as_paths": [{"name": "APX", "entries": [{"action": "permit", "pattern": "^65000_"}]}]}
+        )
+        reconcile_route_policy(
+            self.d2, {"as_paths": [{"name": "APX", "entries": [{"action": "permit", "pattern": "^65001_"}]}]}
+        )
+        s2 = NSORoutePolicyState.objects.get(management__device=self.d2, object_name="APX")
+        self.assertEqual(s2.status, "conflict")
+        d = route_policy_state_diff(s2)
+        self.assertTrue(d["any_diff"])
+        row = next(f for e in d["entries"] for f in e["fields"] if f["label"] == "Pattern")
+        self.assertEqual(row["device"], "^65001_")
+        self.assertEqual(row["netbox"], "^65000_")
+
+    def test_simple_family_removal_shows_removed(self):
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_diff import route_policy_state_diff
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._mgmt(self.d1)
+        reconcile_route_policy(
+            self.d1,
+            {"as_paths": [{"name": "APR", "entries": [{"action": "permit", "pattern": "^65000_"}]}]},
+        )
+        st = NSORoutePolicyState.objects.get(family="as_path", object_name="APR")
+        st.device_present = False
+        st.save(update_fields=["device_present"])
+        d = route_policy_state_diff(st)
+        self.assertTrue(d["removed_on_device"])
+        self.assertTrue(d["any_diff"])
+
+    def test_as_path_diff_page_renders(self):
+        from django.contrib.auth import get_user_model
+        from django.urls import reverse
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        user = get_user_model().objects.create_user(username="apdiff", password="pw")  # noqa: S106
+        self.client.force_login(user)
+        self._mgmt(self.d1)
+        self._mgmt(self.d2)
+        reconcile_route_policy(
+            self.d1, {"as_paths": [{"name": "APV", "entries": [{"action": "permit", "pattern": "^65000_"}]}]}
+        )
+        reconcile_route_policy(
+            self.d2, {"as_paths": [{"name": "APV", "entries": [{"action": "permit", "pattern": "^65001_"}]}]}
+        )
+        s2 = NSORoutePolicyState.objects.get(management__device=self.d2, object_name="APV")
+        url = reverse("plugins:netbox_nso_plugin:routing_route_policy_diff", kwargs={"pk": s2.pk})
+        resp = self.client.get(url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("^65001_", resp.content.decode())

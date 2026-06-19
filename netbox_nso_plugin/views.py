@@ -2081,6 +2081,7 @@ class NSORoutePolicyDiffView(LoginRequiredMixin, View):
             {
                 "state": state,
                 "object_name": state.object_name,
+                "family": state.family.replace("_", "-"),
                 "diff": diff,
                 "device": getattr(state.management, "device", None),
             },

@@ -16,6 +16,7 @@
               <th>Status</th>
               <th>Capability</th>
               <th>Last apply</th>
+              <th></th>
             </tr>
           </thead>
           <tbody>
@@ -57,6 +58,12 @@
                   {% endif %}
                 </td>
                 <td>{{ state.last_apply_at|placeholder }}</td>
+                <td class="text-end">
+                  <a href="{% url 'plugins:netbox_nso_plugin:routing_route_policy_diff' pk=state.pk %}"
+                     class="btn btn-xs btn-outline-warning" title="See exactly what differs between this device and NetBox">
+                    <span class="mdi mdi-not-equal-variant"></span> Diff
+                  </a>
+                </td>
               </tr>
             {% endfor %}
           </tbody>

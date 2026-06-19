@@ -112,7 +112,7 @@ def route_map_diff(device_captured: dict | None, netbox_captured: dict | None) -
         "differs": dev["default_action"] != nb["default_action"],
     }
     any_diff = any_diff or default_action["differs"]
-    return {"any_diff": any_diff, "default_action": default_action, "entries": entries}
+    return {"any_diff": any_diff, "default_action": default_action, "extra": [], "entries": entries}
 
 
 def netbox_route_map_captured(rm_obj) -> dict:
@@ -143,25 +143,132 @@ def netbox_route_map_captured(rm_obj) -> dict:
     return {"entries": entries}
 
 
+# Per-entry display fields for the simple (non-route-map) families. Each captured entry / NetBox
+# entry-row is projected to the same dict so the device and NetBox sides compare apples-to-apples.
+_SIMPLE_FIELDS: dict[str, tuple[tuple[str, str], ...]] = {
+    "prefix_list": (("prefix", "Prefix"), ("action", "Action"), ("ge", "GE"), ("le", "LE")),
+    "as_path": (("action", "Action"), ("pattern", "Pattern")),
+    "community_list": (("action", "Action"), ("community", "Community")),
+}
+
+
+def _norm_action(action) -> str:
+    """Normalise a device action the same way the reconciler stores it (permit/deny)."""
+    a = (action or "").strip().lower()
+    if a in ("deny", "reject"):
+        return "deny"
+    return "permit"
+
+
+def _render_scalar(value) -> str:
+    return "" if value in (None, "") else str(value)
+
+
+def _device_simple_entries(family: str, captured: dict | None) -> list[dict]:
+    """Project a device's captured entries for a simple family into comparable dicts."""
+    out: list[dict] = []
+    for e in (captured or {}).get("entries") or []:
+        if family == "prefix_list":
+            prefix = (e.get("prefix") or "").strip()
+            if not prefix:
+                continue
+            out.append(
+                {"prefix": prefix, "action": _norm_action(e.get("action")), "ge": e.get("ge"), "le": e.get("le")}
+            )
+        elif family == "as_path":
+            out.append({"action": _norm_action(e.get("action")), "pattern": (e.get("pattern") or "").strip()})
+        elif family == "community_list":
+            community = (e.get("community") or "").strip()
+            if not community:
+                continue
+            out.append({"action": _norm_action(e.get("action")), "community": community})
+    return out
+
+
+def _netbox_simple_entries(family: str, obj) -> list[dict]:
+    """Reconstruct comparable entry dicts from a materialised prefix-list/as-path/community-list."""
+    out: list[dict] = []
+    if family == "prefix_list":
+        from netbox_routing.models import PrefixListEntry
+
+        for e in PrefixListEntry.objects.filter(prefix_list=obj).order_by("sequence"):
+            cp = e.assigned_prefix
+            out.append({"prefix": str(cp.prefix) if cp else "", "action": e.action, "ge": e.ge, "le": e.le})
+    elif family == "as_path":
+        from netbox_routing.models import ASPathEntry
+
+        for e in ASPathEntry.objects.filter(aspath=obj).order_by("sequence"):
+            out.append({"action": e.action, "pattern": e.pattern or ""})
+    elif family == "community_list":
+        from netbox_routing.models import CommunityListEntry
+
+        for e in CommunityListEntry.objects.filter(community_list=obj).select_related("community").order_by("pk"):
+            out.append({"action": e.action, "community": e.community.community if e.community_id else ""})
+    return out
+
+
+def _entry_list_diff(device_entries: list[dict], netbox_entries: list[dict], field_specs) -> dict:
+    """Positional diff of two entry lists into the shared diff shape (no default_action)."""
+    entries = []
+    any_diff = False
+    for i, (de, ne) in enumerate(zip_longest(device_entries, netbox_entries), start=1):
+        presence = "both" if de and ne else ("device_only" if de else "netbox_only")
+        fields = []
+        for key, label in field_specs:
+            dv = _render_scalar((de or {}).get(key))
+            nv = _render_scalar((ne or {}).get(key))
+            if not dv and not nv:
+                continue
+            fields.append({"label": label, "device": dv or "—", "netbox": nv or "—", "differs": dv != nv})
+        differs = presence != "both" or any(f["differs"] for f in fields)
+        any_diff = any_diff or differs
+        entries.append(
+            {"sequence": i, "netbox_sequence": None, "presence": presence, "differs": differs, "fields": fields}
+        )
+    return {"any_diff": any_diff, "default_action": None, "extra": [], "entries": entries}
+
+
+def _simple_family_diff(state, obj, removed: bool) -> dict:
+    """Diff a prefix-list / as-path / community-list row (device capture vs NetBox object)."""
+    family = state.family
+    device_entries = [] if removed else _device_simple_entries(family, state.captured)
+    diff = _entry_list_diff(device_entries, _netbox_simple_entries(family, obj), _SIMPLE_FIELDS[family])
+    if family == "community_list":
+        dev_inv = "" if removed else _render_scalar((state.captured or {}).get("invert_match"))
+        nb_inv = _render_scalar(getattr(obj, "invert_match", None))
+        if dev_inv or nb_inv:
+            differs = dev_inv != nb_inv
+            diff["extra"].append(
+                {"label": "Invert match", "device": dev_inv or "—", "netbox": nb_inv or "—", "differs": differs}
+            )
+            diff["any_diff"] = diff["any_diff"] or differs
+    return diff
+
+
 def route_policy_state_diff(state) -> dict | None:
-    """Diff a NSORoutePolicyState route-map row (device capture vs the NetBox object).
+    """Diff a NSORoutePolicyState row — device capture vs the materialised NetBox object.
 
-    Returns the :func:`route_map_diff` result (with a ``removed_on_device`` flag), or ``None``
-    when the row isn't a route-map or has no materialised object to compare against.
+    Dispatches by family: route-maps use the rich structured :func:`route_map_diff`; prefix-lists,
+    as-paths and community-lists use a positional entry-list diff. Returns the shared diff shape
+    (``any_diff``, ``default_action``, ``extra``, ``entries``, ``removed_on_device``), or ``None``
+    when there is no materialised object to compare against.
 
-    When ``device_present`` is False the device has REMOVED this route-map: its ``captured`` is
-    stale (last-seen) and would falsely match the materialised object, so the device side is
-    compared as empty — every NetBox entry reads "only in NetBox" and ``removed_on_device`` /
-    ``any_diff`` are set, so the delta agrees with the row's ``changed`` status.
+    When ``device_present`` is False the device has REMOVED the object: its ``captured`` is stale
+    (last-seen) and would falsely match the object, so the device side is compared as empty —
+    every NetBox entry reads "only in NetBox" and ``removed_on_device`` / ``any_diff`` are set, so
+    the delta agrees with the row's ``changed`` status.
     """
-    if state.family != "route_map":
-        return None
-    rm_obj = state.assigned_object
-    if rm_obj is None:
+    obj = state.assigned_object
+    if obj is None:
         return None
     removed_on_device = not getattr(state, "device_present", True)
-    device_captured = {} if removed_on_device else state.captured
-    diff = route_map_diff(device_captured, netbox_route_map_captured(rm_obj))
+    if state.family == "route_map":
+        device_captured = {} if removed_on_device else state.captured
+        diff = route_map_diff(device_captured, netbox_route_map_captured(obj))
+    elif state.family in _SIMPLE_FIELDS:
+        diff = _simple_family_diff(state, obj, removed_on_device)
+    else:
+        return None
     diff["removed_on_device"] = removed_on_device
     if removed_on_device:
         diff["any_diff"] = True
