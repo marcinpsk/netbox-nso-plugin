@@ -2056,6 +2056,57 @@ class NSORoutePolicyMaterializeView(SharedObjectMaterializeMixin):  # noqa: D101
     model_class = NSORoutePolicyState
 
 
+# ── Drift delta: what differs between the device and what NetBox holds ──────────
+
+
+class NSORoutePolicyDiffView(LoginRequiredMixin, View):
+    """Show the concrete delta between a device's captured route-map and the NetBox object.
+
+    The status badge says *that* a route-map drifted (``conflict`` / ``changed``); this shows
+    *what* — a per-entry, per-field comparison of the device's on-box capture against the
+    materialised ``RouteMap``, so the operator can see exactly which match/set construct
+    differs (e.g. a ``set as-path replace`` the device has but NetBox is missing).
+    """
+
+    template_name = "netbox_nso_plugin/route_policy_diff.html"
+
+    def get(self, request, pk):  # noqa: D102
+        from .route_policy_diff import route_policy_state_diff
+
+        state = get_object_or_404(NSORoutePolicyState, pk=pk)
+        diff = route_policy_state_diff(state)
+        return render(
+            request,
+            self.template_name,
+            {
+                "state": state,
+                "object_name": state.object_name,
+                "diff": diff,
+                "device": getattr(state.management, "device", None),
+            },
+        )
+
+
+class NSORedistributionDiffView(LoginRequiredMixin, View):
+    """Show the device-vs-NetBox delta for a redistribution overlay row (field-level)."""
+
+    template_name = "netbox_nso_plugin/redistribution_diff.html"
+
+    def get(self, request, pk):  # noqa: D102
+        from .route_policy_diff import redistribution_diff
+
+        state = get_object_or_404(NSORedistributionState.objects.select_related("redistribution"), pk=pk)
+        return render(
+            request,
+            self.template_name,
+            {
+                "state": state,
+                "diff": redistribution_diff(state),
+                "device": getattr(state.management, "device", None),
+            },
+        )
+
+
 class NSOOSPFInstanceStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
     model_class = NSOOSPFInstanceState
 

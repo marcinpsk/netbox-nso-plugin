@@ -35,6 +35,7 @@
             <td>{{ rp.last_sync_at|default:"—" }}</td>
             <td>
               <div class="d-flex gap-1">
+                {% if rp.family == 'route_map' and rp.assigned_object %}<a href="{% url 'plugins:netbox_nso_plugin:routing_route_policy_diff' pk=rp.pk %}" class="btn btn-xs btn-outline-warning" title="See exactly what differs between this device and NetBox"><span class="mdi mdi-not-equal-variant"></span> Diff</a>{% endif %}
                 {% if rp.assigned_object %}<a href="{% url 'plugins:netbox_nso_plugin:routing_route_policy_versions' pk=rp.pk %}" class="btn btn-xs btn-outline-info" title="See every device's version of this object and pick which one NetBox mirrors"><span class="mdi mdi-source-branch"></span> Versions</a>{% endif %}
                 {% url 'plugins:netbox_nso_plugin:routing_accept_route_policy' pk=rp.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=rp.status form_class="nso-row-form" %}
               </div>

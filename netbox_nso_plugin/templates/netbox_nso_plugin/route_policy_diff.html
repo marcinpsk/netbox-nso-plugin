@@ -1,0 +1,98 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Device-vs-NetBox delta for one route-map overlay row. #}
+{% extends 'base/layout.html' %}
+
+{% block title %}Drift delta — {{ object_name }}{% endblock %}
+
+{% block content %}
+<div class="row">
+  <div class="col col-md-10 offset-md-1">
+    <div class="card">
+      <h5 class="card-header">
+        <span class="mdi mdi-not-equal-variant me-1"></span>
+        Drift delta — route-map <code>{{ object_name }}</code>
+        {% if device %}on <a href="{% url 'dcim:device_nso' pk=device.pk %}">{{ device }}</a>{% endif %}
+      </h5>
+      <div class="card-body">
+        <p class="text-muted">
+          What the device reports on-box versus what NetBox currently holds (the materialised
+          object). Differing values are highlighted; identical entries are summarised.
+        </p>
+
+        {% if diff is None %}
+          <div class="alert alert-secondary mb-0">No materialised route-map to compare yet.</div>
+        {% elif not diff.any_diff %}
+          <div class="alert alert-success mb-0">
+            <span class="mdi mdi-check-circle-outline me-1"></span>
+            The device and NetBox match — no drift.
+          </div>
+        {% else %}
+
+          {% if diff.default_action.differs %}
+          <div class="mb-3">
+            <span class="text-muted small me-2">Default action</span>
+            <span class="badge text-bg-warning text-dark">device: {{ diff.default_action.device }}</span>
+            <span class="mdi mdi-arrow-left-right mx-1 text-muted"></span>
+            <span class="badge text-bg-info">netbox: {{ diff.default_action.netbox }}</span>
+          </div>
+          {% endif %}
+
+          {% for e in diff.entries %}
+            {% if e.differs %}
+            <div class="card mb-2 border-warning">
+              <div class="card-header py-1 d-flex justify-content-between align-items-center bg-body-tertiary">
+                <span>
+                  <span class="text-muted small">Seq</span> <code>{{ e.sequence }}</code>
+                  {% if e.netbox_sequence and e.netbox_sequence != e.sequence %}<span class="text-muted small">(NetBox seq {{ e.netbox_sequence }})</span>{% endif %}
+                </span>
+                {% if e.presence == 'device_only' %}
+                  <span class="badge text-bg-warning text-dark" title="This entry is on the device but not in NetBox">only on device</span>
+                {% elif e.presence == 'netbox_only' %}
+                  <span class="badge text-bg-info" title="NetBox holds this entry but the device no longer reports it">only in NetBox</span>
+                {% else %}
+                  <span class="badge text-bg-warning text-dark">changed</span>
+                {% endif %}
+              </div>
+              <div class="table-responsive">
+                <table class="table table-sm mb-0 align-middle">
+                  <thead>
+                    <tr class="small text-muted"><th style="width:14rem;">Field</th><th>Device (on-box)</th><th>NetBox</th></tr>
+                  </thead>
+                  <tbody>
+                    {% for f in e.fields %}
+                    <tr{% if f.differs %} class="table-warning"{% endif %}>
+                      <td class="text-nowrap">{{ f.label }}</td>
+                      <td><code class="text-body">{{ f.device }}</code></td>
+                      <td><code class="text-body">{{ f.netbox }}</code></td>
+                    </tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            {% endif %}
+          {% endfor %}
+
+          <p class="text-muted small mb-0">
+            Showing only entries that differ. Entries not listed match between the device and NetBox.
+          </p>
+        {% endif %}
+
+        {% if device %}
+        <div class="mt-3">
+          <a href="{% url 'dcim:device_nso' pk=device.pk %}" class="btn btn-sm btn-outline-secondary">
+            <span class="mdi mdi-arrow-left"></span> Back to {{ device }}
+          </a>
+          {% if state.assigned_object %}
+          <a href="{% url 'plugins:netbox_nso_plugin:routing_route_policy_versions' pk=state.pk %}" class="btn btn-sm btn-outline-info">
+            <span class="mdi mdi-source-branch"></span> Versions
+          </a>
+          {% endif %}
+        </div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

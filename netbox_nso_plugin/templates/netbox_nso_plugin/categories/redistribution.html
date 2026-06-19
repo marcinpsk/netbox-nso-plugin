@@ -29,7 +29,10 @@
             <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=rs.status %}</td>
             <td>{{ rs.last_sync_at|default:"—" }}</td>
             <td>
-              {% url 'plugins:netbox_nso_plugin:routing_accept_redistribution' pk=rs.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=rs.status form_class="nso-row-form" %}
+              <div class="d-flex gap-1">
+                <a href="{% url 'plugins:netbox_nso_plugin:routing_redistribution_diff' pk=rs.pk %}" class="btn btn-xs btn-outline-warning" title="See exactly what differs between this device and NetBox"><span class="mdi mdi-not-equal-variant"></span> Diff</a>
+                {% url 'plugins:netbox_nso_plugin:routing_accept_redistribution' pk=rs.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=rs.status form_class="nso-row-form" %}
+              </div>
             </td>
           </tr>
           {% endfor %}

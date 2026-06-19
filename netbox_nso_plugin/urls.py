@@ -255,6 +255,12 @@ urlpatterns = [
         views.NSORoutePolicyMaterializeView.as_view(),
         name="routing_materialize_route_policy",
     ),
+    # Drift delta: device capture vs the materialised NetBox object.
+    path(
+        "routing/route-policy-state/<int:pk>/diff/",
+        views.NSORoutePolicyDiffView.as_view(),
+        name="routing_route_policy_diff",
+    ),
     path(
         "routing/ospf-instance-state/<int:pk>/accept/",
         views.NSOOSPFInstanceStateAcceptView.as_view(),
@@ -269,6 +275,11 @@ urlpatterns = [
         "routing/redistribution-state/<int:pk>/accept/",
         views.NSORedistributionStateAcceptView.as_view(),
         name="routing_accept_redistribution",
+    ),
+    path(
+        "routing/redistribution-state/<int:pk>/diff/",
+        views.NSORedistributionDiffView.as_view(),
+        name="routing_redistribution_diff",
     ),
     # Routing state: bulk accept
     path(
