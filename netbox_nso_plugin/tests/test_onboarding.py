@@ -83,7 +83,8 @@ class TestOnboardingDashboard(TestCase):
         c = data["candidates"][0]
         self.assertEqual(c["device"].name, "cand")
         self.assertEqual(c["ned_id"], "cisco-ios-cli-6.114")
-        self.assertEqual(c["primary_ip"], "10.1.1.1")
+        self.assertEqual(c["mgmt_ip"], "10.1.1.1")
+        self.assertFalse(c["oob_only"])
 
     def test_candidate_requires_platform_mapping(self):
         """A device whose platform has NO NED mapping is NOT a candidate.
@@ -111,13 +112,30 @@ class TestOnboardingDashboard(TestCase):
         data = self._build([])
         self.assertEqual(len(data["candidates"]), 0)
 
-    def test_not_candidate_when_no_primary_ip(self):
+    def test_not_candidate_when_no_mgmt_ip(self):
+        """No primary AND no OOB → not a candidate (NSO needs some address to reach it)."""
         from netbox_nso_plugin.models import NSOPlatformNedMapping
 
         _device("noip", platform=self.ios)
         NSOPlatformNedMapping.objects.create(platform=self.ios, ned_id="x")
         data = self._build([])
         self.assertEqual(len(data["candidates"]), 0)
+
+    def test_candidate_oob_only(self):
+        """A freshly-deployed box with only an OOB IP (no primary yet) IS onboardable —
+        it onboards over OOB, the same fallback the failover loop uses."""
+        from netbox_nso_plugin.models import NSOPlatformNedMapping
+
+        d = _device("oobonly", platform=self.ios)
+        iface = Interface.objects.create(device=d, name="oob0", type="virtual")
+        d.oob_ip = IPAddress.objects.create(address="192.0.2.50/24", assigned_object=iface)
+        d.save()
+        NSOPlatformNedMapping.objects.create(platform=self.ios, ned_id="cisco-ios-cli-6.114")
+        data = self._build([])
+        self.assertEqual(len(data["candidates"]), 1)
+        c = data["candidates"][0]
+        self.assertEqual(c["mgmt_ip"], "192.0.2.50")
+        self.assertTrue(c["oob_only"])
 
     def test_onboarded_excluded_from_candidates(self):
         from netbox_nso_plugin.models import NSOPlatformNedMapping
@@ -217,7 +235,8 @@ class TestOnboardCandidate(TestCase):
         self.assertTrue(res["ok"])
         self.assertEqual(prov.call_args.kwargs["ned_id"], "test-ned:test-ned")
 
-    def test_no_primary_ip_errors(self):
+    def test_no_mgmt_ip_errors(self):
+        """No primary AND no OOB → cannot onboard (no address to reach the device)."""
         from netbox_nso_plugin.models import NSOPlatformNedMapping
         from netbox_nso_plugin.onboarding import onboard_candidate
 
@@ -225,7 +244,43 @@ class TestOnboardCandidate(TestCase):
         NSOPlatformNedMapping.objects.get_or_create(platform=self.ios, defaults={"ned_id": "x"})
         res = onboard_candidate(d, self.instance)
         self.assertFalse(res["ok"])
-        self.assertIn("primary IP", res["error"])
+        self.assertIn("OOB", res["error"])
+
+    def test_onboard_oob_only_uses_oob_as_address(self):
+        """An OOB-only box onboards over its OOB address (address=OOB) — the same fallback
+        the failover loop uses — instead of being blocked for lack of a primary."""
+        from netbox_nso_plugin.models import NSOPlatformNedMapping
+        from netbox_nso_plugin.onboarding import onboard_candidate
+
+        d = _device("oob-only-rtr", platform=self.ios)
+        NSOPlatformNedMapping.objects.get_or_create(platform=self.ios, defaults={"ned_id": "cisco-ios-cli-6.114"})
+        iface = Interface.objects.create(device=d, name="oob0", type="virtual")
+        d.oob_ip = IPAddress.objects.create(address="192.0.2.7/24", assigned_object=iface)
+        d.save()
+        with patch(
+            "netbox_nso_plugin.adapter_client.provision_device",
+            return_value={"ok": True, "steps": [], "device_id": 21},
+        ) as prov:
+            res = onboard_candidate(d, self.instance)
+        self.assertTrue(res["ok"])
+        self.assertEqual(prov.call_args.kwargs["address"], "192.0.2.7")  # onboarded over OOB
+
+    def test_onboard_prefers_primary_address_when_present(self):
+        """With both, the primary is the provision address and OOB rides as the fallback."""
+        from netbox_nso_plugin.onboarding import onboard_candidate
+
+        d = self._mapped_device("both-rtr", ip="10.5.5.30/24")
+        iface = Interface.objects.filter(device=d).first()
+        d.oob_ip = IPAddress.objects.create(address="192.0.2.8/24", assigned_object=iface)
+        d.save()
+        with patch(
+            "netbox_nso_plugin.adapter_client.provision_device",
+            return_value={"ok": True, "steps": [], "device_id": 22},
+        ) as prov:
+            res = onboard_candidate(d, self.instance)
+        self.assertTrue(res["ok"])
+        self.assertEqual(prov.call_args.kwargs["address"], "10.5.5.30")  # primary
+        self.assertEqual(prov.call_args.kwargs["oob_ip"], "192.0.2.8")  # OOB fallback
 
     def test_onboard_passes_oob_ip(self):
         """A device with an OOB IP forwards it to provision_device (the failover fallback,
@@ -421,3 +476,33 @@ class TestOnboardNameNormalization(TestCase):
         res = onboard_candidate(d, self.instance)
         assert res["ok"] is False
         assert "already used" in res["error"]
+
+
+class TestDeviceMgmtAddresses(TestCase):
+    """device_mgmt_addresses — the single resolver shared by onboarding + the failover
+    scope push (signals), so the provision address and the failover-probed addresses can
+    never diverge."""
+
+    def test_resolves_primary_and_oob_host_strings(self):
+        from netbox_nso_plugin.onboarding import device_mgmt_addresses
+
+        d = _device("res-rtr", ip="10.9.9.9/24")
+        iface = Interface.objects.filter(device=d).first()
+        d.oob_ip = IPAddress.objects.create(address="192.0.2.99/24", assigned_object=iface)
+        d.save()
+        self.assertEqual(device_mgmt_addresses(d), ("10.9.9.9", "192.0.2.99"))
+
+    def test_returns_none_when_absent(self):
+        from netbox_nso_plugin.onboarding import device_mgmt_addresses
+
+        d = _device("bare-rtr")
+        self.assertEqual(device_mgmt_addresses(d), (None, None))
+
+    def test_oob_only_resolves_primary_none(self):
+        from netbox_nso_plugin.onboarding import device_mgmt_addresses
+
+        d = _device("oob-res-rtr")
+        iface = Interface.objects.create(device=d, name="oob0", type="virtual")
+        d.oob_ip = IPAddress.objects.create(address="192.0.2.77/24", assigned_object=iface)
+        d.save()
+        self.assertEqual(device_mgmt_addresses(d), (None, "192.0.2.77"))

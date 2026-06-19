@@ -6,8 +6,9 @@ Compares the NSO device inventory (from the adapter) against NetBox to produce:
 
 - **onboarded**  — NSO devices matched to a NetBox device (+ which NED they use).
 - **candidates** — NetBox devices NOT in NSO that are onboardable now: status=active
-  and a primary IP (NSO needs an address). A platform→NED mapping is only the default
-  NED suggestion, not a requirement — the operator picks the NED on onboard.
+  and a management IP — primary, or OOB when there is no primary yet (NSO needs an
+  address). A platform→NED mapping is only the default NED suggestion, not a requirement —
+  the operator picks the NED on onboard.
 - **orphans**    — NSO devices that cannot be matched to any NetBox device.
 
 Device identity NSO↔NetBox is resolved **plugin-link → name → primary IP** so a
@@ -38,11 +39,26 @@ def _ip_host(ip) -> str | None:
     return str(getattr(addr, "ip", None) or str(addr).split("/")[0])
 
 
+def device_mgmt_addresses(device) -> tuple[str | None, str | None]:
+    """Resolve a device's ``(primary, OOB)`` management host strings.
+
+    The **single** source of management-address resolution, shared by onboarding and the
+    failover scope push (``signals.sync_scope_to_adapter`` → ``set_scope``). Keeping both on
+    this one helper guarantees the address NSO is provisioned over and the addresses the
+    failover loop probes can never diverge — there is no second selection code path. Either
+    element may be ``None`` (a freshly-deployed box with no primary yet; a device with no OOB).
+    """
+    return (
+        _ip_host(getattr(device, "primary_ip", None)),
+        _ip_host(getattr(device, "oob_ip", None)),
+    )
+
+
 def _index_netbox_devices():
     """Return (all_devices, by_id, by_name, by_primary_ip) for matching."""
     from dcim.models import Device
 
-    devices = list(Device.objects.select_related("platform", "primary_ip4", "primary_ip6", "site"))
+    devices = list(Device.objects.select_related("platform", "primary_ip4", "primary_ip6", "oob_ip", "site"))
     by_id = {d.id: d for d in devices}
     by_name = {d.name: d for d in devices if d.name}
     by_ip: dict[str, object] = {}
@@ -172,7 +188,9 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
     """Onboard one NetBox device into NSO (the write action).
 
     Resolves the NED from the explicit *ned_id* if given, else the device's platform
-    mapping; resolves the address from the device's primary IP; calls the adapter's
+    mapping; resolves the management address via :func:`device_mgmt_addresses` (primary,
+    or OOB when there is no primary yet) and passes BOTH to the adapter so its failover
+    bootstrap picks the reachable one; calls the adapter's
     ``/devices/provision`` (create node → fetch-host-keys → unlock → sync-from), and
     — on success — creates the NSODeviceManagement row, whose post_save signal
     performs the adapter mapping + scope push + sync-notify.
@@ -197,9 +215,15 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
     if not chosen_ned:
         result["error"] = "No NED selected — pick a NED (or add a Platform → NED mapping for a default)."
         return result
-    ip = device.primary_ip
-    if ip is None:
-        result["error"] = "Device has no primary IP — NSO needs an address to reach it."
+    # Default to the primary (in-band) address; fall back to OOB when a freshly-deployed box
+    # has no primary yet. Both are resolved by the shared device_mgmt_addresses helper and sent
+    # to the adapter, whose failover bootstrap probes the primary and switches to OOB if it is
+    # unreachable — the plugin never decides reachability, so onboarding can't diverge from the
+    # failover loop. Require at least one address (no way to reach the device otherwise).
+    primary_address, oob_address = device_mgmt_addresses(device)
+    address = primary_address or oob_address
+    if address is None:
+        result["error"] = "Device has no primary or OOB IP — NSO needs an address to reach it."
         return result
     if NSODeviceManagement.objects.filter(device=device).exists():
         result["error"] = "Device is already managed by NSO."
@@ -216,12 +240,9 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
         result["error"] = f"NSO device name '{nso_name}' is already used by {clash.device} on this instance."
         return result
 
-    address = _ip_host(ip)
-    # OOB is the failover fallback — a fresh device's primary (in-band) loopback is usually
-    # unreachable until NSO configures it, so the adapter onboards over OOB when primary is
-    # down. ``oob_ip`` is optional: a device without one simply has no fallback.
-    oob_address = _ip_host(getattr(device, "oob_ip", None))
-
+    # OOB rides along as the failover fallback — a fresh device's primary (in-band) loopback is
+    # usually unreachable until NSO configures it, so the adapter onboards over OOB when primary
+    # is down (and when there is no primary at all, ``address`` already IS the OOB above).
     try:
         prov = client.provision_device(
             nso_instance=instance.adapter_instance_id,
@@ -309,13 +330,15 @@ def manage_existing(device, instance, nso_device_name) -> dict:
 
 
 def _candidates(by_id, matched_ids, mappings) -> list[dict]:
-    """NetBox devices onboardable now: active + primary IP + not in NSO + mappable.
+    """NetBox devices onboardable now: active + a management IP + not in NSO + mappable.
 
-    The device's platform must have a platform→NED mapping. The mapping is used to
-    filter to devices we plausibly have a NED for (so servers / unmanageable
-    platforms are excluded) — it is NOT a hard NED choice: the operator can still
-    pick any NED in the picker (e.g. a different NED for a software version, or to
-    test). ``ned_id`` is the mapped default shown pre-selected in that picker.
+    A management IP is the primary OR the OOB address (a freshly-deployed box may only have
+    OOB yet) — resolved by the shared :func:`device_mgmt_addresses`, so candidacy uses the same
+    addresses onboarding will provision over. The device's platform must have a platform→NED
+    mapping. The mapping filters to devices we plausibly have a NED for (so servers /
+    unmanageable platforms are excluded) — it is NOT a hard NED choice: the operator can still
+    pick any NED in the picker. ``ned_id`` is the mapped default shown pre-selected there;
+    ``oob_only`` flags a device that would onboard over OOB (no primary yet).
     """
     candidates = []
     for d in by_id.values():
@@ -323,8 +346,9 @@ def _candidates(by_id, matched_ids, mappings) -> list[dict]:
             continue
         if (d.status or "") != "active":
             continue
-        ip = d.primary_ip
-        if ip is None:
+        primary, oob = device_mgmt_addresses(d)
+        mgmt_ip = primary or oob
+        if mgmt_ip is None:
             continue
         # Require a platform→NED mapping — filters out platforms we have no NED for
         # (servers, etc.). The picker still lets the operator override the NED.
@@ -335,7 +359,8 @@ def _candidates(by_id, matched_ids, mappings) -> list[dict]:
                 "device": d,
                 "platform": d.platform,
                 "ned_id": mappings.get(d.platform_id, "") if d.platform_id is not None else "",
-                "primary_ip": _ip_host(ip),
+                "mgmt_ip": mgmt_ip,
+                "oob_only": primary is None,
             }
         )
     candidates.sort(key=lambda e: e["device"].name or "")

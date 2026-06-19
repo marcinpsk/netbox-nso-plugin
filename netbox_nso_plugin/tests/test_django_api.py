@@ -165,3 +165,44 @@ class NSOInterfaceStateAPITest(APITestCase):
         response = self.client.get(url, **self.header)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["attribute"], "description")
+
+
+class OnboardingCandidatesAPITest(APITestCase):
+    """The CICD-facing candidates API exposes the management IP + oob_only, and onboardable
+    OOB-only devices now appear (with primary_ip kept null for backward compatibility)."""
+
+    @classmethod
+    def setUpTestData(cls):
+        from dcim.models import Platform
+        from ipam.models import IPAddress
+
+        from netbox_nso_plugin.models import NSOPlatformNedMapping
+
+        cls.instance = NSOInstance.objects.create(name="cand-api", adapter_instance_id="cand-api")
+        mfg = Manufacturer.objects.create(name="CandMfg", slug="candmfg")
+        dt = DeviceType.objects.create(manufacturer=mfg, model="CandDev", slug="canddev")
+        role = DeviceRole.objects.create(name="CandRole", slug="candrole")
+        site = Site.objects.create(name="CandSite", slug="candsite")
+        plat = Platform.objects.create(name="CandPlat", slug="candplat")
+        NSOPlatformNedMapping.objects.create(platform=plat, ned_id="cisco-ios-cli-6.114")
+        d = Device.objects.create(name="cand-oob", device_type=dt, role=role, site=site, status="active", platform=plat)
+        iface = Interface.objects.create(device=d, name="oob0", type="virtual")
+        d.oob_ip = IPAddress.objects.create(address="192.0.2.222/24", assigned_object=iface)
+        d.save()
+
+    def test_candidates_api_exposes_mgmt_ip_and_oob_only(self):
+        from unittest.mock import patch
+
+        from django.urls import reverse
+
+        url = reverse("plugins-api:netbox_nso_plugin-api:onboarding_candidates")
+        with (
+            patch("netbox_nso_plugin.adapter_client.list_instance_devices", return_value=[]),
+            patch("netbox_nso_plugin.adapter_client.get_neds", return_value=[]),
+        ):
+            resp = self.client.get(f"{url}?instance=cand-api", **self.header)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        c = next(x for x in resp.json()["candidates"] if x["name"] == "cand-oob")
+        self.assertEqual(c["mgmt_ip"], "192.0.2.222")
+        self.assertTrue(c["oob_only"])
+        self.assertIsNone(c["primary_ip"])  # backward compat: OOB-only keeps primary_ip null

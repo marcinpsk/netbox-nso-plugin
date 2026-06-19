@@ -110,7 +110,7 @@
 
   {# ── Onboardable candidates ──────────────────────────────────────────────── #}
   <div class="tab-pane fade" id="tab-candidates" role="tabpanel">
-    <p class="text-muted small mb-2">NetBox devices that are active and have a primary IP, not yet in NSO. The platform&rsquo;s NED mapping is the default &mdash; pick a different NED to override (software version / testing).</p>
+    <p class="text-muted small mb-2">NetBox devices that are active and have a management IP (primary, or OOB for a freshly-deployed box), not yet in NSO. The platform&rsquo;s NED mapping is the default &mdash; pick a different NED to override (software version / testing).</p>
     <div class="card">
       <div class="card-body p-0">
         <table class="table table-hover mb-0">
@@ -120,7 +120,10 @@
             <tr>
               <td><a href="{{ c.device.get_absolute_url }}">{{ c.device }}</a></td>
               <td>{{ c.platform|placeholder }}</td>
-              <td>{{ c.primary_ip }}</td>
+              <td>
+                {{ c.mgmt_ip }}
+                {% if c.oob_only %}<span class="badge text-bg-warning text-dark ms-1" title="No primary IP yet — NSO will onboard over the OOB address (the failover loop switches to primary once it comes up)">OOB</span>{% endif %}
+              </td>
               <td>
                 <form method="post" action="{% url 'plugins:netbox_nso_plugin:onboard' %}" class="d-flex gap-2 align-items-center">
                   {% csrf_token %}
@@ -142,7 +145,7 @@
               <td></td>
             </tr>
             {% empty %}
-            <tr><td colspan="5" class="text-muted">None &mdash; no active devices with a primary IP that aren&rsquo;t already in NSO.</td></tr>
+            <tr><td colspan="5" class="text-muted">None &mdash; no active devices with a management IP that aren&rsquo;t already in NSO.</td></tr>
             {% endfor %}
           </tbody>
         </table>

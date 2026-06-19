@@ -303,17 +303,20 @@ def sync_scope_to_adapter(sender, instance, created, **kwargs):
             )
 
         # Carry the device's management addresses so the adapter's failover loop can probe
-        # primary and fall back to OOB. Explicit values (incl. None to clear) — the plugin
-        # is authoritative for these, so a removed OOB IP in NetBox clears it adapter-side.
-        from .onboarding import _ip_host
+        # primary and fall back to OOB. Resolved by the SAME helper onboarding uses, so the
+        # provision address and the failover-probed addresses never diverge. Explicit values
+        # (incl. None to clear) — the plugin is authoritative, so a removed OOB IP in NetBox
+        # clears it adapter-side.
+        from .onboarding import device_mgmt_addresses
 
+        primary_ip, oob_ip = device_mgmt_addresses(instance.device)
         client.set_scope(
             instance.adapter_device_id,
             instance.managed_attributes,
             auto_apply=instance.auto_apply,
             sync_before_apply=instance.sync_before_apply,
-            primary_ip=_ip_host(getattr(instance.device, "primary_ip", None)),
-            oob_ip=_ip_host(getattr(instance.device, "oob_ip", None)),
+            primary_ip=primary_ip,
+            oob_ip=oob_ip,
         )
 
         notify_result = client.sync_notify(instance.adapter_device_id)

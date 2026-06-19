@@ -97,7 +97,11 @@ class OnboardingCandidatesView(APIView):
                         "netbox_device_id": c["device"].id,
                         "name": c["device"].name,
                         "platform": str(c["platform"]) if c["platform"] else None,
-                        "primary_ip": c["primary_ip"],
+                        # primary_ip kept for backward compat (None for an OOB-only candidate);
+                        # mgmt_ip is the address onboarding uses (primary or OOB), oob_only flags it.
+                        "primary_ip": None if c["oob_only"] else c["mgmt_ip"],
+                        "mgmt_ip": c["mgmt_ip"],
+                        "oob_only": c["oob_only"],
                         "ned_id": c["ned_id"],
                     }
                     for c in data["candidates"]
