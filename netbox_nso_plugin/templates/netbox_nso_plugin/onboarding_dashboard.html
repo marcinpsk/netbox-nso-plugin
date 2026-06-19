@@ -47,7 +47,7 @@
           <thead><tr><th>Device</th><th>NSO name</th><th>NED</th><th>Scopes</th><th>Last sync</th><th>Status</th><th></th></tr></thead>
           <tbody>
             {% for m in managed %}
-            <tr>
+            <tr{% if m.onboard_status == 'provisioning' %} data-onboard-pk="{{ m.pk }}"{% endif %}>
               <td><a href="{{ m.device.get_absolute_url }}">{{ m.device }}</a></td>
               <td>{{ m.nso_device_name }}</td>
               <td><code>{{ m.ned_in_use|placeholder }}</code></td>
@@ -57,7 +57,13 @@
                 {% if m.auto_apply %}<span class="badge text-bg-info" title="Auto-apply accepted intent">auto-apply</span>{% endif %}
               </td>
               <td>{{ m.last_sync_at|placeholder }}</td>
-              <td>{% if m.last_sync_status %}<span class="badge text-bg-info">{{ m.last_sync_status }}</span>{% else %}{{ ''|placeholder }}{% endif %}</td>
+              <td>
+                {% if m.onboard_status == 'provisioning' %}
+                  <span class="badge text-bg-warning text-dark"><span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true" style="width:.7rem;height:.7rem;"></span>Provisioning…</span>
+                {% elif m.onboard_status == 'provision_failed' %}
+                  <span class="badge text-bg-danger" title="{{ m.onboard_error }}">Provisioning failed</span>
+                {% elif m.last_sync_status %}<span class="badge text-bg-info">{{ m.last_sync_status }}</span>{% else %}{{ ''|placeholder }}{% endif %}
+              </td>
               <td class="text-end text-nowrap">
                 <a href="{% url 'dcim:device_nso' pk=m.device.pk %}" class="btn btn-sm btn-outline-primary">NSO tab</a>
                 <a href="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_edit' pk=m.pk %}" class="btn btn-sm btn-outline-secondary" title="Edit"><span class="mdi mdi-pencil"></span></a>
@@ -176,4 +182,36 @@
     </div>
   </div>
 </div>
+
+{# ── Live-poll provisioning rows: advance the async onboarding job, reload on terminal ── #}
+<script>
+(function () {
+  "use strict";
+  var rows = document.querySelectorAll('tr[data-onboard-pk]');
+  if (!rows.length) return;
+  var csrfToken = (document.cookie.match(/csrftoken=([^;]+)/) || [])[1] || '';
+  var base = "{% url 'plugins:netbox_nso_plugin:onboard_status' pk=0 %}";
+  function statusUrl(pk) { return base.replace(/0\/$/, pk + '/'); }
+  var stopped = false;
+  function poll() {
+    if (stopped) return;
+    rows.forEach(function (row) {
+      fetch(statusUrl(row.dataset.onboardPk), {
+        method: 'POST',
+        headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-CSRFToken': csrfToken },
+      })
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          if (d && d.status && d.status !== 'provisioning' && !stopped) {
+            stopped = true;            // a row finished (ready / failed) — refresh tables + badges
+            window.location.reload();
+          }
+        })
+        .catch(function () { /* transient adapter blip — retry next tick */ });
+    });
+  }
+  setInterval(poll, 4000);
+  poll();
+})();
+</script>
 {% endblock %}

@@ -35,6 +35,7 @@ urlpatterns = [
     # Onboarding dashboard (tabs) + onboard action
     path("onboarding/", views.NSOOnboardingDashboardView.as_view(), name="onboarding_dashboard"),
     path("onboard/", views.NSOOnboardView.as_view(), name="onboard"),
+    path("onboard-status/<int:pk>/", views.NSOOnboardStatusView.as_view(), name="onboard_status"),
     path("manage/", views.NSOQuickManageView.as_view(), name="quick_manage"),
     # Platform → NED mappings (onboarding)
     path("ned-mappings/", views.NSOPlatformNedMappingListView.as_view(), name="nsoplatformnedmapping_list"),

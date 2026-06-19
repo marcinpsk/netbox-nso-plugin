@@ -935,7 +935,10 @@ class NSOOnboardView(NSOActionPermissionMixin, View):
             return redirect(f"{redirect_url}?instance={instance.adapter_instance_id}")
 
         if result["ok"]:
-            messages.success(request, f"Onboarded {device} into NSO ({instance.name}).")
+            messages.success(
+                request,
+                f"Provisioning {device} into NSO ({instance.name})… this list updates automatically.",
+            )
         else:
             messages.error(request, f"Could not onboard {device}: {result['error']}")
         return redirect(f"{redirect_url}?instance={instance.adapter_instance_id}")
@@ -981,6 +984,84 @@ class NSOQuickManageView(NSOActionPermissionMixin, View):
         else:
             messages.error(request, f"Could not manage {device}: {result['error']}")
         return redirect(f"{redirect_url}?instance={instance.adapter_instance_id}")
+
+
+def _summarize_provision_failure(steps) -> str:
+    """Build a one-line summary of the first failed step in a provision result."""
+    for step in steps or []:
+        if step.get("status") == "failed":
+            detail = step.get("detail")
+            return f"{step.get('step')} failed" + (f": {detail}" if detail else "")
+    return "Provisioning failed."
+
+
+class NSOOnboardStatusView(NSOActionPermissionMixin, View):
+    """Advance + report an async onboarding job — polled by the dashboard while a row provisions.
+
+    Provisioning runs as a background adapter job; the NSODeviceManagement row sits in
+    ``provisioning`` (its adapter-push signal gated) until this view, polled client-side,
+    sees the job finish and advances the row:
+
+      * job succeeded + result.ok  → ``onboard_status=""`` (ready). Saving re-fires
+        ``sync_scope_to_adapter`` (no longer gated) → adapter mapping + scope + sync-notify.
+      * job succeeded + ``ok=False`` (a blocking step failed) or job failed/timeout →
+        ``provision_failed`` + recorded steps/error (no adapter push).
+
+    Idempotent: once the row is terminal (``""`` / ``provision_failed``) it just reports that.
+    A transient adapter error while polling keeps the row provisioning so the client retries.
+
+    URL: POST /plugins/nso/onboard-status/<pk>/  (pk = NSODeviceManagement id)
+    """
+
+    required_permission = "netbox_nso_plugin.add_nsodevicemanagement"
+
+    def post(self, request, pk):
+        """Poll the provision job and advance the row; return its onboarding status as JSON."""
+        from . import adapter_client as client
+
+        mgmt = get_object_or_404(NSODeviceManagement, pk=pk)
+        if mgmt.onboard_status != "provisioning":
+            return JsonResponse({"status": mgmt.onboard_status or "ready", "error": mgmt.onboard_error})
+
+        if not mgmt.onboard_job_id:
+            mgmt.onboard_status = "provision_failed"
+            mgmt.onboard_error = "No provision job id recorded."
+            mgmt.save(update_fields=["onboard_status", "onboard_error"])
+            return JsonResponse({"status": "provision_failed", "error": mgmt.onboard_error})
+
+        try:
+            job = client.get_job(mgmt.onboard_job_id)
+        except AdapterError as exc:
+            # Transient — keep provisioning so the client keeps polling (200, not 502).
+            return JsonResponse({"status": "provisioning", "poll_error": str(exc)})
+
+        job_status = (job or {}).get("status")
+        if job_status in ("queued", "running"):
+            return JsonResponse({"status": "provisioning"})
+
+        if job_status == "succeeded":
+            result = (job or {}).get("result") or {}
+            steps = result.get("steps") or []
+            if result.get("ok"):
+                # NSO node is up — flip to ready; the save re-fires the (now un-gated)
+                # sync_scope_to_adapter signal → adapter mapping + scope + sync-notify.
+                mgmt.onboard_status = ""
+                mgmt.onboard_steps = steps
+                mgmt.onboard_error = ""
+                mgmt.save()
+                return JsonResponse({"status": "ready"})
+            mgmt.onboard_status = "provision_failed"
+            mgmt.onboard_steps = steps
+            mgmt.onboard_error = _summarize_provision_failure(steps)
+            mgmt.save(update_fields=["onboard_status", "onboard_steps", "onboard_error"])
+            return JsonResponse({"status": "provision_failed", "error": mgmt.onboard_error})
+
+        # failed / timeout / unknown-terminal
+        err = (job or {}).get("error") or {}
+        mgmt.onboard_status = "provision_failed"
+        mgmt.onboard_error = err.get("message") or "Provision job failed."
+        mgmt.save(update_fields=["onboard_status", "onboard_error"])
+        return JsonResponse({"status": "provision_failed", "error": mgmt.onboard_error})
 
 
 class NSOPlatformNedMappingListView(generic.ObjectListView):

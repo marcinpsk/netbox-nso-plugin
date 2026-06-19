@@ -283,7 +283,15 @@ def sync_scope_to_adapter(sender, instance, created, **kwargs):
 
     After setting scope, calls sync-notify so the adapter starts an immediate sync
     rather than waiting for the next scheduled poll.
+
+    Gated during async onboarding: while a row is ``provisioning`` (the background
+    provision job hasn't finished) or ``provision_failed``, the NSO node may not exist
+    yet, so mapping/scope/sync would fail or race. The status-advance view clears the
+    status to "" on success and re-saves, which fires this handler normally.
     """
+    if getattr(instance, "onboard_status", "") in ("provisioning", "provision_failed"):
+        return
+
     from . import adapter_client as client
 
     try:

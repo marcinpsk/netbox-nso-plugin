@@ -190,22 +190,29 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
     Resolves the NED from the explicit *ned_id* if given, else the device's platform
     mapping; resolves the management address via :func:`device_mgmt_addresses` (primary,
     or OOB when there is no primary yet) and passes BOTH to the adapter so its failover
-    bootstrap picks the reachable one; calls the adapter's
-    ``/devices/provision`` (create node → fetch-host-keys → unlock → sync-from), and
-    — on success — creates the NSODeviceManagement row, whose post_save signal
-    performs the adapter mapping + scope push + sync-notify.
+    bootstrap picks the reachable one; **enqueues** the adapter's ``/devices/provision``
+    job (create node → fetch-host-keys → unlock → sync-from) and immediately creates the
+    NSODeviceManagement row in ``provisioning`` status. The row's post_save signal is
+    *gated* on that status, so the adapter mapping + scope push + sync-notify do NOT fire
+    until the background job succeeds and the status-advance view flips the row to ready.
+
+    Provisioning is async because it can take minutes (probe an unreachable primary,
+    bootstrap over OOB, then a full sync-from) — far longer than the plugin's adapter
+    read timeout, which previously aborted the onboard mid-flight while NSO kept going.
 
     The platform→NED mapping is only a *default*: passing ``ned_id`` overrides it,
     so an operator can onboard with a different NED (software version / testing) or
     onboard a device whose platform has no mapping at all.
 
-    Returns ``{"ok", "error", "steps", "managed"}``. ``ok=False`` with a populated
-    ``error`` for the pre-flight failures (no NED / no primary IP / already managed).
+    Returns ``{"ok", "error", "provisioning", "job_id", "managed"}``. ``ok=False`` with a
+    populated ``error`` for the pre-flight failures (no NED / no primary IP / already
+    managed) or an adapter enqueue failure; ``ok=True, provisioning=True`` once the job is
+    queued and the row exists (the device is not yet managed — the job is still running).
     """
     from . import adapter_client as client
     from .models import NSODeviceManagement, NSOPlatformNedMapping
 
-    result = {"ok": False, "error": None, "steps": [], "managed": False}
+    result = {"ok": False, "error": None, "provisioning": False, "job_id": None, "managed": False}
 
     chosen_ned = (ned_id or "").strip()
     if not chosen_ned and device.platform_id is not None:
@@ -258,12 +265,16 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
         result["error"] = repr(exc)
         return result
 
-    result["steps"] = prov.get("steps", [])
-    if not prov.get("ok"):
-        result["error"] = "NSO provisioning failed — see steps."
+    job_id = str((prov or {}).get("job_id") or "")
+    if not job_id:
+        result["error"] = "Adapter did not return a provision job id."
         return result
 
-    # NSO node is up; create the management row (its signal does adapter mapping + scope + sync).
+    # Create the management row in 'provisioning' — its post_save signal is GATED on this
+    # status (signals.sync_scope_to_adapter) so it does NOT map/scope/sync while the NSO
+    # node is still being built. The dashboard polls the job (NSOOnboardStatusView): on
+    # success the status flips to "" (ready), re-firing the signal to map/scope/sync; on
+    # failure it records provision_failed + the steps.
     from django.utils import timezone
 
     NSODeviceManagement.objects.create(
@@ -271,7 +282,8 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
         nso_instance=instance,
         nso_device_name=nso_name,
         onboarded_at=timezone.now(),
-        onboard_steps=result["steps"],
+        onboard_status="provisioning",
+        onboard_job_id=job_id,
     )
     # Learn the platform→NED mapping from this onboard: the first device of a
     # platform is onboarded with an explicit NED; record it so future devices of
@@ -282,7 +294,8 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
         )
         result["mapping_created"] = created
     result["ok"] = True
-    result["managed"] = True
+    result["provisioning"] = True
+    result["job_id"] = job_id
     return result
 
 

@@ -185,6 +185,11 @@ class TestOnboardCandidate(TestCase):
         self.assertFalse(res["ok"])
         self.assertIn("No NED selected", res["error"])
 
+    # Onboarding is now async: provision_device ENQUEUES a job and returns {job_id, ...};
+    # onboard_candidate creates the management row in 'provisioning' immediately (its
+    # adapter-push signal gated) and the dashboard polls the job to completion.
+    _QUEUED = {"job_id": "55", "nso_device_name": "x", "status": "queued"}
+
     def test_no_mapping_but_explicit_ned_onboards(self):
         """No mapping is fine when an explicit ned_id is given (override / no mapping)."""
         from netbox_nso_plugin.models import NSODeviceManagement, NSOPlatformNedMapping
@@ -192,13 +197,11 @@ class TestOnboardCandidate(TestCase):
 
         d = _device("nomap2", platform=self.ios, ip="10.5.5.2/24")
         NSOPlatformNedMapping.objects.filter(platform=self.ios).delete()
-        with patch(
-            "netbox_nso_plugin.adapter_client.provision_device",
-            return_value={"ok": True, "steps": [], "device_id": 7},
-        ) as prov:
+        with patch("netbox_nso_plugin.adapter_client.provision_device", return_value=self._QUEUED) as prov:
             res = onboard_candidate(d, self.instance, ned_id="cisco-iosxr-cli-7.55:cisco-iosxr-cli-7.55")
         self.assertTrue(res["ok"])
-        self.assertTrue(NSODeviceManagement.objects.filter(device=d).exists())
+        self.assertTrue(res["provisioning"])
+        self.assertTrue(NSODeviceManagement.objects.filter(device=d, onboard_status="provisioning").exists())
         self.assertEqual(prov.call_args.kwargs["ned_id"], "cisco-iosxr-cli-7.55:cisco-iosxr-cli-7.55")
         # Onboarding learns the platform→NED mapping (so future same-platform
         # devices become candidates); the chosen NED is recorded.
@@ -213,10 +216,7 @@ class TestOnboardCandidate(TestCase):
 
         d = self._mapped_device("keepmap-rtr")
         existing = NSOPlatformNedMapping.objects.get(platform=self.ios).ned_id
-        with patch(
-            "netbox_nso_plugin.adapter_client.provision_device",
-            return_value={"ok": True, "steps": [], "device_id": 9},
-        ):
+        with patch("netbox_nso_plugin.adapter_client.provision_device", return_value=self._QUEUED):
             res = onboard_candidate(d, self.instance, ned_id="cisco-iosxr-cli-7.55:cisco-iosxr-cli-7.55")
         self.assertTrue(res["ok"])
         self.assertFalse(res.get("mapping_created"))
@@ -227,10 +227,7 @@ class TestOnboardCandidate(TestCase):
         from netbox_nso_plugin.onboarding import onboard_candidate
 
         d = self._mapped_device("override-rtr")
-        with patch(
-            "netbox_nso_plugin.adapter_client.provision_device",
-            return_value={"ok": True, "steps": [], "device_id": 8},
-        ) as prov:
+        with patch("netbox_nso_plugin.adapter_client.provision_device", return_value=self._QUEUED) as prov:
             res = onboard_candidate(d, self.instance, ned_id="test-ned:test-ned")
         self.assertTrue(res["ok"])
         self.assertEqual(prov.call_args.kwargs["ned_id"], "test-ned:test-ned")
@@ -257,10 +254,7 @@ class TestOnboardCandidate(TestCase):
         iface = Interface.objects.create(device=d, name="oob0", type="virtual")
         d.oob_ip = IPAddress.objects.create(address="192.0.2.7/24", assigned_object=iface)
         d.save()
-        with patch(
-            "netbox_nso_plugin.adapter_client.provision_device",
-            return_value={"ok": True, "steps": [], "device_id": 21},
-        ) as prov:
+        with patch("netbox_nso_plugin.adapter_client.provision_device", return_value=self._QUEUED) as prov:
             res = onboard_candidate(d, self.instance)
         self.assertTrue(res["ok"])
         self.assertEqual(prov.call_args.kwargs["address"], "192.0.2.7")  # onboarded over OOB
@@ -273,10 +267,7 @@ class TestOnboardCandidate(TestCase):
         iface = Interface.objects.filter(device=d).first()
         d.oob_ip = IPAddress.objects.create(address="192.0.2.8/24", assigned_object=iface)
         d.save()
-        with patch(
-            "netbox_nso_plugin.adapter_client.provision_device",
-            return_value={"ok": True, "steps": [], "device_id": 22},
-        ) as prov:
+        with patch("netbox_nso_plugin.adapter_client.provision_device", return_value=self._QUEUED) as prov:
             res = onboard_candidate(d, self.instance)
         self.assertTrue(res["ok"])
         self.assertEqual(prov.call_args.kwargs["address"], "10.5.5.30")  # primary
@@ -292,10 +283,7 @@ class TestOnboardCandidate(TestCase):
         oob = IPAddress.objects.create(address="192.0.2.9/24", assigned_object=iface)
         d.oob_ip = oob
         d.save()
-        with patch(
-            "netbox_nso_plugin.adapter_client.provision_device",
-            return_value={"ok": True, "steps": [], "device_id": 11},
-        ) as prov:
+        with patch("netbox_nso_plugin.adapter_client.provision_device", return_value=self._QUEUED) as prov:
             res = onboard_candidate(d, self.instance)
         self.assertTrue(res["ok"])
         self.assertEqual(prov.call_args.kwargs["oob_ip"], "192.0.2.9")  # /24 stripped → host only
@@ -305,43 +293,50 @@ class TestOnboardCandidate(TestCase):
         from netbox_nso_plugin.onboarding import onboard_candidate
 
         d = self._mapped_device("nooob-rtr", ip="10.5.5.21/24")
-        with patch(
-            "netbox_nso_plugin.adapter_client.provision_device",
-            return_value={"ok": True, "steps": [], "device_id": 12},
-        ) as prov:
+        with patch("netbox_nso_plugin.adapter_client.provision_device", return_value=self._QUEUED) as prov:
             res = onboard_candidate(d, self.instance)
         self.assertTrue(res["ok"])
         self.assertIsNone(prov.call_args.kwargs["oob_ip"])
 
-    def test_success_creates_management(self):
+    def test_success_creates_provisioning_row_and_gates_signal(self):
+        """Enqueue → row created in 'provisioning' with the job id; the adapter-push signal
+        is GATED (no onboard/set_scope/sync_notify) until the job completes."""
         from netbox_nso_plugin.models import NSODeviceManagement
         from netbox_nso_plugin.onboarding import onboard_candidate
 
         d = self._mapped_device("good-rtr")
-        with patch(
-            "netbox_nso_plugin.adapter_client.provision_device",
-            return_value={"ok": True, "steps": [{"step": "create", "status": "ok"}], "device_id": 1},
-        ) as prov:
+        with (
+            patch(
+                "netbox_nso_plugin.adapter_client.provision_device",
+                return_value={"job_id": "77", "nso_device_name": "good-rtr", "status": "queued"},
+            ) as prov,
+            patch("netbox_nso_plugin.adapter_client.onboard_device") as onboard,
+            patch("netbox_nso_plugin.adapter_client.set_scope") as set_scope,
+        ):
             res = onboard_candidate(d, self.instance)
-        self.assertTrue(res["ok"])
-        self.assertTrue(NSODeviceManagement.objects.filter(device=d).exists())
+        self.assertTrue(res["ok"] and res["provisioning"])
+        self.assertEqual(res["job_id"], "77")
+        mgmt = NSODeviceManagement.objects.get(device=d)
+        self.assertEqual(mgmt.onboard_status, "provisioning")
+        self.assertEqual(mgmt.onboard_job_id, "77")
+        self.assertIsNone(mgmt.adapter_device_id)  # not mapped yet — signal was gated
+        onboard.assert_not_called()
+        set_scope.assert_not_called()
         prov.assert_called_once()
-        # ned_id + authgroup passed through
         _, kw = prov.call_args
         self.assertEqual(kw["ned_id"], "cisco-ios-cli-6.114")
         self.assertEqual(kw["authgroup"], "network")
 
-    def test_provision_failure_no_management(self):
+    def test_no_job_id_no_management(self):
+        """If the adapter returns no job id (enqueue failed) → error and no row created."""
         from netbox_nso_plugin.models import NSODeviceManagement
         from netbox_nso_plugin.onboarding import onboard_candidate
 
         d = self._mapped_device("bad-rtr")
-        with patch(
-            "netbox_nso_plugin.adapter_client.provision_device",
-            return_value={"ok": False, "steps": [{"step": "fetch_host_keys", "status": "failed"}]},
-        ):
+        with patch("netbox_nso_plugin.adapter_client.provision_device", return_value={"status": "error"}):
             res = onboard_candidate(d, self.instance)
         self.assertFalse(res["ok"])
+        self.assertIn("job id", res["error"])
         self.assertFalse(NSODeviceManagement.objects.filter(device=d).exists())
 
     def test_already_managed_errors(self):
@@ -457,7 +452,7 @@ class TestOnboardNameNormalization(TestCase):
         d = _device("edge rtr 5", platform=self.plat, ip="10.6.6.6/24")
         with patch(
             "netbox_nso_plugin.adapter_client.provision_device",
-            return_value={"ok": True, "steps": [], "device_id": 1},
+            return_value={"job_id": "5", "nso_device_name": "edge-rtr-5", "status": "queued"},
         ) as prov:
             res = onboard_candidate(d, self.instance)
         assert res["ok"]

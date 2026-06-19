@@ -394,6 +394,36 @@ class NSODeviceManagement(NetBoxModel):
         blank=True,
         help_text="Step-by-step result of the last plugin onboarding (create / fetch-host-keys / unlock / sync-from).",
     )
+    # ── Async onboarding lifecycle ────────────────────────────────────────────
+    # Provisioning a device into NSO (create node → fetch-host-keys → unlock → sync-from)
+    # runs as a background adapter job — it can take minutes when the primary mgmt IP is
+    # unreachable and the adapter must bootstrap over OOB before a full sync-from. The row
+    # is created immediately in ``provisioning`` and the dashboard polls the job; only when
+    # it succeeds does the row go ready ("") and fire the adapter map/scope/sync signal. The
+    # empty default keeps every legacy / externally-managed row at the steady "ready" state.
+    ONBOARD_STATUS_CHOICES = [
+        ("", "Ready"),
+        ("provisioning", "Provisioning"),
+        ("provision_failed", "Provisioning failed"),
+    ]
+    onboard_status = models.CharField(
+        max_length=20,
+        blank=True,
+        default="",
+        choices=ONBOARD_STATUS_CHOICES,
+        help_text="Async onboarding lifecycle: '' (ready/managed), provisioning, or provision_failed.",
+    )
+    onboard_job_id = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text="Adapter job id of the in-flight (or last) provision job for this device.",
+    )
+    onboard_error = models.TextField(
+        blank=True,
+        default="",
+        help_text="Populated when onboard_status=provision_failed — the blocking step / error summary.",
+    )
 
     class Meta:
         ordering = ["device"]
