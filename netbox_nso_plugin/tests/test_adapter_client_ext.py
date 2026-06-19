@@ -188,6 +188,45 @@ class TestRequestErrorPaths(unittest.TestCase):
         _, kwargs = session.request.call_args
         self.assertEqual(kwargs["verify"], "/etc/certs/ca.pem")
 
+    def test_session_is_pooled_across_requests(self):
+        """The session is built once and reused — connection pooling, not a handshake per call."""
+        import netbox_nso_plugin.adapter_client as ac
+
+        ac.reset_session()
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
+            patch("netbox_nso_plugin.adapter_client.requests.Session") as mock_s,
+        ):
+            session = make_session()
+            session.request.return_value = _mock_response(200, {})
+            mock_s.return_value = session
+            ac._request("GET", "/a")
+            ac._request("GET", "/b")
+            # The Session class is instantiated ONCE (pooled) yet used for BOTH requests.
+            self.assertEqual(mock_s.call_count, 1)
+            self.assertEqual(session.request.call_count, 2)
+            # Internal adapter: the pooled session never trusts the system proxy env.
+            self.assertFalse(session.trust_env)
+        ac.reset_session()
+
+    def test_reset_session_forces_rebuild(self):
+        """reset_session() drops the pool so the next call rebuilds (e.g. after a Session patch)."""
+        import netbox_nso_plugin.adapter_client as ac
+
+        ac.reset_session()
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
+            patch("netbox_nso_plugin.adapter_client.requests.Session") as mock_s,
+        ):
+            session = make_session()
+            session.request.return_value = _mock_response(200, {})
+            mock_s.return_value = session
+            ac._request("GET", "/a")
+            ac.reset_session()
+            ac._request("GET", "/b")
+            self.assertEqual(mock_s.call_count, 2)
+        ac.reset_session()
+
     def test_error_response_non_json_falls_back_to_status_code(self):
         from netbox_nso_plugin.adapter_client import AdapterError, _request
 

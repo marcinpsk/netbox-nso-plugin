@@ -5,6 +5,7 @@ import logging
 from dcim.models import Device
 from django.contrib import messages
 from django.contrib.auth.mixins import LoginRequiredMixin
+from django.core.exceptions import PermissionDenied
 from django.http import HttpResponseBadRequest, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
@@ -106,6 +107,32 @@ def _refresh_sync_cache(mgmt, adapter_device):
     return update_fields
 
 
+# ── Authorization for NSO action views ───────────────────────────────────────
+
+
+class NSOActionPermissionMixin(LoginRequiredMixin):
+    """Require a NetBox permission (not just authentication) to invoke an NSO action.
+
+    The NSO action views are RPC-style (Accept / Apply / onboard / sync / re-point)
+    rather than object CRUD, so — unlike NetBox's generic ``ObjectEditView`` etc. — they
+    carry no single restrictable queryset for ``ObjectPermissionRequiredMixin`` to filter.
+    Gating them on ``LoginRequiredMixin`` alone let *any* authenticated user push intent or
+    apply config to a device. Each view names the NetBox permission it needs in
+    ``required_permission``; it is evaluated against the user's ObjectPermissions by
+    NetBox's auth backend (a superuser and any holder of a matching ObjectPermission pass).
+    An authenticated user lacking it gets 403; an anonymous user still follows the normal
+    login redirect (so the login-required behaviour is unchanged).
+    """
+
+    required_permission = "netbox_nso_plugin.change_nsodevicemanagement"
+
+    def dispatch(self, request, *args, **kwargs):
+        """Enforce ``required_permission`` for authenticated users before the handler runs."""
+        if request.user.is_authenticated and not request.user.has_perm(self.required_permission):
+            raise PermissionDenied
+        return super().dispatch(request, *args, **kwargs)
+
+
 # ── Device NSO Tab (registered into dcim.Device detail) ──────────────────────
 
 
@@ -135,10 +162,7 @@ class DeviceNSOTabView(generic.ObjectView):
         from .template_content import _STATUS_BADGE
 
         device = instance
-        try:
-            mgmt = device.nso_management
-        except Exception:
-            mgmt = None
+        mgmt = getattr(device, "nso_management", None)
 
         adapter_error = None
         adapter_error_code = None
@@ -339,10 +363,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
         if key == "interfaces":
             return self._render_interfaces_page(request, device)
 
-        try:
-            mgmt = device.nso_management
-        except Exception:
-            mgmt = None
+        mgmt = getattr(device, "nso_management", None)
 
         # Large single-table categories render paginated from last-synced state
         # (fast); ?refresh=1 (the Refresh icon) forces a live reconcile first.
@@ -541,10 +562,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
         )
         from .reconcile import reconcile_category
 
-        try:
-            mgmt = device.nso_management
-        except Exception:
-            mgmt = None
+        mgmt = getattr(device, "nso_management", None)
 
         # Read from last-synced state (fast); the Refresh icon (?refresh=1) forces a
         # live reconcile. Freshness otherwise comes from the sync-complete reconcile.
@@ -885,11 +903,13 @@ class NSOOnboardingDashboardView(LoginRequiredMixin, View):
         )
 
 
-class NSOOnboardView(LoginRequiredMixin, View):
+class NSOOnboardView(NSOActionPermissionMixin, View):
     """POST action: onboard one candidate device into NSO, then redirect to the dashboard.
 
     URL: POST /plugins/nso/onboard/  body: device=<pk>, instance=<adapter_instance_id>
     """
+
+    required_permission = "netbox_nso_plugin.add_nsodevicemanagement"
 
     def post(self, request):
         """Onboard the posted device into the selected (or default) NSO instance."""
@@ -921,7 +941,7 @@ class NSOOnboardView(LoginRequiredMixin, View):
         return redirect(f"{redirect_url}?instance={instance.adapter_instance_id}")
 
 
-class NSOQuickManageView(LoginRequiredMixin, View):
+class NSOQuickManageView(NSOActionPermissionMixin, View):
     """POST action: bring an already-in-NSO ('external') device under plugin management.
 
     The device exists in both NSO and NetBox but has no NSODeviceManagement record.
@@ -930,6 +950,8 @@ class NSOQuickManageView(LoginRequiredMixin, View):
     URL: POST /plugins/nso/manage/  body: device=<pk>, instance=<adapter_instance_id>,
     nso_name=<NSO device name>
     """
+
+    required_permission = "netbox_nso_plugin.add_nsodevicemanagement"
 
     def post(self, request):
         """Create the management record for the posted external device."""
@@ -1147,7 +1169,7 @@ def _prepare_apply(mgmt):
             logger.warning("Apply deploying-mark failed for device %s: %s", mgmt.device_id, exc)
 
 
-class NSODeviceActionView(LoginRequiredMixin, View):
+class NSODeviceActionView(NSOActionPermissionMixin, View):
     """Trigger an adapter action (sync / detect-drift / connect) via POST."""
 
     def post(self, request, pk, action):
@@ -1211,7 +1233,7 @@ class NSODeviceActionView(LoginRequiredMixin, View):
         return redirect(_device_nso_tab_url(mgmt.device.pk))
 
 
-class NSOIntentResyncView(LoginRequiredMixin, View):
+class NSOIntentResyncView(NSOActionPermissionMixin, View):
     """POST: re-sync orphaned adapter intent to NetBox ownership (clears split-brain).
 
     Re-pushes the device's current owned intent for every orphaned scope; the adapter's
@@ -1267,10 +1289,7 @@ class NSODeviceJobsView(LoginRequiredMixin, View):
     def get(self, request, pk):
         """Return {onboarded, running, last} for the device's adapter jobs."""
         device = get_object_or_404(Device, pk=pk)
-        try:
-            mgmt = device.nso_management
-        except Exception:
-            mgmt = None
+        mgmt = getattr(device, "nso_management", None)
         if mgmt is None or mgmt.adapter_device_id is None:
             return JsonResponse({"onboarded": False, "running": None, "last": None})
 
@@ -1287,7 +1306,7 @@ class NSODeviceJobsView(LoginRequiredMixin, View):
         return JsonResponse({"onboarded": True, "running": running, "last": last})
 
 
-class NSORefreshStateView(LoginRequiredMixin, View):
+class NSORefreshStateView(NSOActionPermissionMixin, View):
     """Fetch live compliance + interface data from the adapter and cache it."""
 
     def post(self, request, pk):
@@ -1317,7 +1336,7 @@ class NSORefreshStateView(LoginRequiredMixin, View):
         return redirect(_device_nso_tab_url(mgmt.device.pk))
 
 
-class NSODeviceReconcileView(LoginRequiredMixin, View):
+class NSODeviceReconcileView(NSOActionPermissionMixin, View):
     """POST: queue a background refresh of the plugin's NSO*State display cache.
 
     Lighter than 'Sync Now' — it does NOT run an NSO/device sync; it just re-pulls
@@ -1421,7 +1440,7 @@ def _status_after_accept(source_status: str) -> str:
     return "in_sync" if source_status in _MATCHING_SOURCE_STATUSES else "accepted"
 
 
-class NSOAcceptAttributeView(LoginRequiredMixin, View):
+class NSOAcceptAttributeView(NSOActionPermissionMixin, View):
     """Accept a single interface attribute as NetBox intent."""
 
     def post(self, request, pk):
@@ -1442,7 +1461,7 @@ class NSOAcceptAttributeView(LoginRequiredMixin, View):
         return redirect(_device_nso_tab_url(state.interface.device_id))
 
 
-class NSOAcceptDeviceView(LoginRequiredMixin, View):
+class NSOAcceptDeviceView(NSOActionPermissionMixin, View):
     """Accept the DEVICE's value into NetBox for a drifted interface attribute.
 
     The opposite of 'Keep NetBox': when the device changed out-of-band, this pulls the
@@ -1476,7 +1495,7 @@ class NSOAcceptDeviceView(LoginRequiredMixin, View):
         return redirect(_device_nso_tab_url(iface.device_id))
 
 
-class NSOInterfaceEditFieldView(LoginRequiredMixin, View):
+class NSOInterfaceEditFieldView(NSOActionPermissionMixin, View):
     """Inline-edit a managed interface attribute (description / enabled) from the NSO tab.
 
     Writes the new value onto the ``dcim.Interface`` and saves it, which fires the
@@ -1507,7 +1526,7 @@ class NSOInterfaceEditFieldView(LoginRequiredMixin, View):
         return JsonResponse({"status": "ok", "message": f"Updated {attribute} on {iface.name}."})
 
 
-class NSOBulkAcceptView(LoginRequiredMixin, View):
+class NSOBulkAcceptView(NSOActionPermissionMixin, View):
     """Bulk-accept all 'changed' interface states for a device and push a single intent snapshot."""
 
     def post(self, request, device_pk):
@@ -1639,10 +1658,7 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
         from django.http import JsonResponse
 
         device = get_object_or_404(Device, pk=device_pk)
-        try:
-            mgmt = device.nso_management
-        except Exception:
-            mgmt = None
+        mgmt = getattr(device, "nso_management", None)
         auto_apply = bool(mgmt and mgmt.auto_apply)
 
         changes = _apply_preview_interface_changes(device_pk)
@@ -1751,7 +1767,7 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
 # ── M13: IP auto-assignment operator actions ──────────────────────────────────
 
 
-class NSOAutoAssignIPView(LoginRequiredMixin, View):
+class NSOAutoAssignIPView(NSOActionPermissionMixin, View):
     """Operator action: auto-assign IPs to one or more interfaces from purpose pools.
 
     POST body: ``interface_pks`` (comma-separated or repeated query param).
@@ -1800,7 +1816,7 @@ class NSOAutoAssignIPView(LoginRequiredMixin, View):
 # ── Routing state accept views (Track A) ──────────────────────────────────────
 
 
-class RoutingStateAcceptMixin(LoginRequiredMixin, View):
+class RoutingStateAcceptMixin(NSOActionPermissionMixin, View):
     """Per-row accept for a routing state model — sets status to 'accepted' and fires push signal."""
 
     model_class = None
@@ -1814,7 +1830,7 @@ class RoutingStateAcceptMixin(LoginRequiredMixin, View):
         return redirect(_device_nso_tab_url(state.management.device_id))
 
 
-class NSOL2SapStateAcceptView(LoginRequiredMixin, View):
+class NSOL2SapStateAcceptView(NSOActionPermissionMixin, View):
     """Accept one Nokia L2 SAP — mark owned (accepted_at) so NetBox is the source of truth.
 
     Saving the accepted row fires the post_save signal which pushes the device's full
@@ -1830,7 +1846,7 @@ class NSOL2SapStateAcceptView(LoginRequiredMixin, View):
         return redirect(_device_nso_tab_url(state.management.device_id))
 
 
-class NSOLACPBundleStateAcceptView(LoginRequiredMixin, View):
+class NSOLACPBundleStateAcceptView(NSOActionPermissionMixin, View):
     """Accept one LACP bundle (and its member rows) — mark owned so NetBox is the source of truth.
 
     Accept only marks the rows owned; the device commit is deferred to the single
@@ -1862,7 +1878,7 @@ class NSOLACPBundleStateAcceptView(LoginRequiredMixin, View):
         return redirect(_device_nso_tab_url(state.management.device_id))
 
 
-class NSOSwitchportStateAcceptView(LoginRequiredMixin, View):
+class NSOSwitchportStateAcceptView(NSOActionPermissionMixin, View):
     """Accept one L2 switchport: native-write the observed mode/VLANs + mark owned.
 
     Writes the NSO-observed mode/VLANs onto the native NetBox interface (NetBox
@@ -1907,7 +1923,7 @@ class NSOBGPPeerStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
     model_class = NSOBGPPeerState
 
 
-class NSOBGPPeerTemplateStateAcceptView(LoginRequiredMixin, View):
+class NSOBGPPeerTemplateStateAcceptView(NSOActionPermissionMixin, View):
     """Accept one BGP peer-group template — take ownership (no device apply path).
 
     Peer-group templates have no apply path, so accepting just marks the row owned
@@ -1994,7 +2010,7 @@ class SharedObjectVersionsMixin(LoginRequiredMixin, View):
         """
 
 
-class SharedObjectMaterializeMixin(LoginRequiredMixin, View):
+class SharedObjectMaterializeMixin(NSOActionPermissionMixin, View):
     """Re-point a shared object's content to a chosen device's captured version.
 
     Refills the NetBox object from this device's capture and flips ownership (the former
@@ -2055,7 +2071,7 @@ class NSORedistributionStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
 # ── Routing bulk accept views (Track A) ───────────────────────────────────────
 
 
-class RoutingBulkAcceptMixin(LoginRequiredMixin, View):
+class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
     """Bulk 'Keep NetBox' for all DRIFTED routing rows of a device, then push intent."""
 
     model_class = None
@@ -2186,7 +2202,7 @@ class NSORedistributionBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
 # never stored; the push resolves them from Vault via each row's vault_ref.
 
 
-class OverlayStateAcceptMixin(LoginRequiredMixin, View):
+class OverlayStateAcceptMixin(NSOActionPermissionMixin, View):
     """Per-row accept for an SNMP/logging overlay — mark owned (accepted_at + status)."""
 
     model_class = None
@@ -2260,7 +2276,7 @@ class NSOVLANStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOVLANState
 
 
-class NSOVLANRescopeView(LoginRequiredMixin, View):
+class NSOVLANRescopeView(NSOActionPermissionMixin, View):
     """Re-scope a synced VLAN into a different (e.g. site-wide/shared) VLAN group.
 
     The device↔VLAN link is anchored on the overlay row, so a VLAN can leave its
@@ -2310,7 +2326,7 @@ _RP_ATTACH_FAMILIES = [
 ]
 
 
-class NSORoutePolicyAttachView(LoginRequiredMixin, View):
+class NSORoutePolicyAttachView(NSOActionPermissionMixin, View):
     """Attach an existing netbox-routing policy object to this device (greenfield write).
 
     Handles prefix-list / route-map / community-list / as-path.
@@ -2483,7 +2499,7 @@ class NSORoutePolicyCapabilityView(LoginRequiredMixin, View):
         }
 
 
-class NSOVLANAttachView(LoginRequiredMixin, View):
+class NSOVLANAttachView(NSOActionPermissionMixin, View):
     """Attach an existing (shared) ipam.VLAN to this device — greenfield write path.
 
     The device↔VLAN link is the NSOVLANState overlay, *not* the VLAN group, so the

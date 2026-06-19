@@ -140,6 +140,12 @@ def _skip_on_render(handler):
 # lone programmatic save, or the no-DB unit tests) the push runs immediately —
 # this also avoids on_commit's autocommit path forcing a DB connection.
 
+# ``_pending_pushes`` is thread-local: coalescing is per-transaction, so it must not bleed
+# between request threads. ``_last_pushed_hashes`` is deliberately the opposite — a single
+# process-wide dict shared across threads. Two threads racing on the same key can at worst
+# cause one redundant or one un-deduped push, both harmless because the adapter PUT is an
+# idempotent full-replace (and the explicit Apply passes ``force=True``, bypassing it). A
+# per-thread cache would instead miss every cross-thread dedup, so sharing is the right call.
 _pending_pushes = threading.local()
 _last_pushed_hashes: dict[tuple, str] = {}
 

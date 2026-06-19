@@ -25,6 +25,37 @@ _UNSET = object()
 # the full read window before we conclude it is hung.
 _CONNECT_TIMEOUT = 5  # seconds
 
+# Process-wide pooled session, reused across calls so connections to the (internal)
+# adapter are kept alive instead of a fresh TCP+TLS handshake per request. Keyed by the
+# bound ``requests.Session`` class: in production that never changes (one pooled session
+# for the life of the process); the adapter test-suite patches ``requests.Session`` per
+# test, which changes the class identity, so the pool transparently rebuilds from the
+# patched class and every ``@patch`` is honoured.
+_session = None
+_session_cls = None
+
+
+def _get_session():
+    """Return the process-wide pooled requests session, (re)creating it when needed."""
+    global _session, _session_cls
+    if _session is None or _session_cls is not requests.Session:
+        _session = requests.Session()
+        _session.trust_env = False  # Adapter is always internal — never route through system proxy.
+        _session_cls = requests.Session
+    return _session
+
+
+def reset_session():
+    """Drop the pooled session (tests; or to force a re-read of proxy/env on next call)."""
+    global _session, _session_cls
+    if _session is not None:
+        try:
+            _session.close()
+        except Exception:  # noqa: BLE001 — best-effort close; a half-built/mock session may not implement it
+            pass
+    _session = None
+    _session_cls = None
+
 
 class AdapterError(Exception):
     """Raised when the nso-adapter returns an error or is unreachable."""
@@ -99,8 +130,7 @@ def _request(method, path, **kwargs):
     read_timeout = cfg["timeout"]
     connect_timeout = min(_CONNECT_TIMEOUT, read_timeout)
     try:
-        session = requests.Session()
-        session.trust_env = False  # Adapter is always internal — never route through system proxy.
+        session = _get_session()
         resp = session.request(
             method, url, headers=headers, timeout=(connect_timeout, read_timeout), verify=verify, **kwargs
         )

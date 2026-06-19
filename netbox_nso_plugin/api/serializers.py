@@ -150,6 +150,15 @@ class NSOInterfaceStateSerializer(NetBoxModelSerializer):
 # get_serializer_for_model() resolves a class for NetBox's event serialization when a
 # parent object with a cascading overlay is deleted (otherwise the delete 500s). Plain
 # ModelSerializers (FKs/M2Ms as PKs, no hyperlink url field) so no API route is needed.
+#
+# Secret-exposure convention: ``fields = "__all__"`` is acceptable here ONLY because the
+# overlay models hold no plaintext credentials — secrets live behind ``vault_ref`` +
+# ``has_*_secret`` booleans (SNMP) or presence flags (``*_auth_present``), never the raw
+# value. The one exception is NSOISISInstanceState, whose ``area_auth_key`` /
+# ``domain_auth_key`` ARE plaintext (routing-auth keys, plaintext-at-rest by policy); those
+# are excluded below so they never reach a changelog/event payload. Any future overlay field
+# that carries a secret MUST be excluded the same way — ``test_serializers`` introspects every
+# serializer and fails if a plaintext-secret-looking field is ever serialized.
 from rest_framework.serializers import ModelSerializer  # noqa: E402
 
 from ..models import (  # noqa: E402
@@ -237,7 +246,10 @@ class NSOISISInterfaceStateSerializer(ModelSerializer):  # noqa: D101
 class NSOISISInstanceStateSerializer(ModelSerializer):  # noqa: D101
     class Meta:
         model = NSOISISInstanceState
-        fields = "__all__"
+        # area_auth_key / domain_auth_key are plaintext IS-IS auth keys — never serialize
+        # them (they would land in ObjectChange/webhook payloads). Mirrors the netbox-routing
+        # GraphQL exclusion; the area/domain auth_type fields still report that auth is set.
+        exclude = ["area_auth_key", "domain_auth_key"]
 
 
 class NSOISISFlexAlgoStateSerializer(ModelSerializer):  # noqa: D101
