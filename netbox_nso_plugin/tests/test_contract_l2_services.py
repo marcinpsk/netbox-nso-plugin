@@ -6,7 +6,7 @@ Nokia epipe/vpls services + SAPs; fixed key set per level; NO top-level
 last_refreshed_at/refresh_source. Consumed by
 ``l2_service_reconciler.reconcile_l2_services``.
 
-Canonical contract: ``nso-adapter/docs/api-contract.md`` (M37 L2 services §).
+Canonical contract: ``nso-adapter/docs/api-contract.md`` (L2 services §).
 Mirror (producer side): ``nso-adapter/tests/api/test_contract_l2_services.py`` — the
 ``*_KEYS`` sets MUST stay identical across both files.
 """

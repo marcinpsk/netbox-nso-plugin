@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Contract tests — consumer side of the L2/L3-interface read-mirrors (M34–M36).
+"""Contract tests — consumer side of the L2/L3-interface read-mirrors.
 
 Mirrors the producer contract for GET /vlan-database, /switchport, /svi,
 /subinterface. These four responses have NO top-level ``last_refreshed_at``/
 ``refresh_source`` and every level emits a fixed key set.
 
-Canonical contract: ``nso-adapter/docs/api-contract.md`` (M34–M36 sections).
+Canonical contract: ``nso-adapter/docs/api-contract.md`` (sections).
 Mirror (producer side): ``nso-adapter/tests/api/test_contract_l2_read.py`` — the
 ``*_KEYS`` sets MUST stay identical across both files.
 """

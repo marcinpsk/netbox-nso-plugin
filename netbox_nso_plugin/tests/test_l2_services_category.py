@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""M37 P2a Task 3: L2 services category — reconcile wiring, counts, accept, view render."""
+"""Task 3: L2 services category — reconcile wiring, counts, accept, view render."""
 
 from __future__ import annotations
 

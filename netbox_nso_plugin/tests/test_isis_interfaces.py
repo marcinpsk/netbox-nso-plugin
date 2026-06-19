@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Tests for M14 A4: adapter_client.get_isis_interfaces and _reconcile_isis_interfaces."""
+"""Tests for A4: adapter_client.get_isis_interfaces and _reconcile_isis_interfaces."""
 
 import unittest
 from unittest.mock import patch
@@ -620,7 +620,7 @@ class TestReconcileIsisProcess(TestCase):
         self.assertEqual(inst.is_type, "level-1")  # edit preserved, not reverted
 
     def test_routing_instance_p1_scalars_and_settings(self):
-        """M33 P1: instance scalar columns + ISISSetting EAV are reconciled from NSO."""
+        """instance scalar columns + ISISSetting EAV are reconciled from NSO."""
         self._make_mgmt()
         from netbox_routing.models import ISISInstance, ISISSetting
 
@@ -661,7 +661,7 @@ class TestReconcileIsisProcess(TestCase):
         self.assertEqual(states[0].status, "imported")
 
     def test_routing_interface_p1_scalars_and_settings(self):
-        """M33 P1: per-interface scalar columns + ISISSetting EAV are reconciled."""
+        """per-interface scalar columns + ISISSetting EAV are reconciled."""
         self._make_mgmt()
         from netbox_routing.models import ISISInterface
 
@@ -695,7 +695,7 @@ class TestReconcileIsisProcess(TestCase):
         self.assertEqual({s.key: s.value for s in ri.settings.all()}, {"hello_padding": "true"})
 
     def test_routing_instance_p2_levels_and_sr(self):
-        """M33 P2: instance per-level rows + segment-routing (1:1) are reconciled."""
+        """instance per-level rows + segment-routing (1:1) are reconciled."""
         self._make_mgmt()
         from netbox_routing.models import ISISInstance, ISISLevel, ISISSegmentRouting
 
@@ -745,7 +745,7 @@ class TestReconcileIsisProcess(TestCase):
 
 
 class TestReconcileIsisInterfaceLevels(TestCase):
-    """M33 P2: per-level interface child rows."""
+    """per-level interface child rows."""
 
     @classmethod
     def setUpTestData(cls):
@@ -790,7 +790,7 @@ class TestReconcileIsisInterfaceLevels(TestCase):
         self.assertEqual(rows[2].hello_interval, 3)
 
     def test_routing_instance_flex_algos(self):
-        """M33 P2b: ISISFlexAlgo rows are reconciled (full-replace by algo_id)."""
+        """ISISFlexAlgo rows are reconciled (full-replace by algo_id)."""
         self._make_mgmt()
         from netbox_routing.models import ISISFlexAlgo, ISISInstance
 

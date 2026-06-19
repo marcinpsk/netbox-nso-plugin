@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for the OSPF read-path fill: _reconcile_ospf creating netbox-routing
-OSPFInstance / OSPFArea / OSPFInterface objects (M19) plus the overlay rows."""
+OSPFInstance / OSPFArea / OSPFInterface objects plus the overlay rows."""
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
 from django.test import TestCase

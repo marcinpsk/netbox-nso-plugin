@@ -1200,7 +1200,7 @@ def _reconcile_isis_interfaces(device, interfaces: list) -> list:
     return list(NSOISISInterfaceState.objects.filter(management=mgmt).select_related("interface", "isis_interface"))
 
 
-# netbox_routing ISISInstance scalar columns synced from NSO (M33 P1). Each is
+# netbox_routing ISISInstance scalar columns synced from NSO. Each is
 # guarded by hasattr so the reconcile no-ops on a fork without the column.
 _ISIS_INSTANCE_SCALAR_ATTRS = (
     "spf_initial_wait",

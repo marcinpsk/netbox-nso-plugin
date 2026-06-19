@@ -1764,7 +1764,7 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
         )
 
 
-# ── M13: IP auto-assignment operator actions ──────────────────────────────────
+# ── IP auto-assignment operator actions ──────────────────────────────────
 
 
 class NSOAutoAssignIPView(NSOActionPermissionMixin, View):
@@ -1834,7 +1834,7 @@ class NSOL2SapStateAcceptView(NSOActionPermissionMixin, View):
     """Accept one Nokia L2 SAP — mark owned (accepted_at) so NetBox is the source of truth.
 
     Saving the accepted row fires the post_save signal which pushes the device's full
-    L2 SAP intent snapshot to the adapter (M37 P2b write path), mirroring static routes.
+    L2 SAP intent snapshot to the adapter (write path), mirroring static routes.
     """
 
     def post(self, request, pk):  # noqa: D102
@@ -1851,7 +1851,7 @@ class NSOLACPBundleStateAcceptView(NSOActionPermissionMixin, View):
 
     Accept only marks the rows owned; the device commit is deferred to the single
     device Apply (one flow, like every other scope). In auto-apply mode the
-    post_save signal still commits immediately (M33 lag-reconciler write path).
+    post_save signal still commits immediately (lag-reconciler write path).
     """
 
     def post(self, request, pk):  # noqa: D102
@@ -1884,7 +1884,7 @@ class NSOSwitchportStateAcceptView(NSOActionPermissionMixin, View):
     Writes the NSO-observed mode/VLANs onto the native NetBox interface (NetBox
     becomes the source of truth). The device commit is deferred to the single
     device Apply (one flow); in auto-apply mode the post_save signal commits
-    immediately (M34 switchport-reconciler).
+    immediately (switchport-reconciler).
     """
 
     def post(self, request, pk):  # noqa: D102

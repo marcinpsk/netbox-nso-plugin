@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""M36: plugin dot1q subinterface reconciler — virtual interface + parent link + overlay."""
+"""plugin dot1q subinterface reconciler — virtual interface + parent link + overlay."""
 
 from __future__ import annotations
 

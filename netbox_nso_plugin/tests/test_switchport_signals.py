@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""M34: switchport intent push + accept->apply round-trip."""
+"""switchport intent push + accept->apply round-trip."""
 
 from unittest.mock import patch
 

@@ -231,13 +231,13 @@ def reconcile_device(device, mgmt=None) -> dict:
                 device,
                 ctx["interfaces"],
             )
-            # M35: materialise SVIs/IRBs (virtual interfaces + VLAN link) BEFORE the IP
+            # materialise SVIs/IRBs (virtual interfaces + VLAN link) BEFORE the IP
             # reconcile, which only attaches IPs to interfaces that already exist —
             # otherwise an SVI's IPs are dropped until the next refresh.
             from .svi_reconciler import reconcile_svi
 
             _safe_reconcile(ctx, "svi_states", mgmt, ("NSOSVIState",), reconcile_svi, device, client.get_svi(dev_id))
-            # M36: materialise dot1q subinterfaces (virtual interface + Interface.parent
+            # materialise dot1q subinterfaces (virtual interface + Interface.parent
             # link) BEFORE the IP reconcile, for the same ordering reason as SVIs.
             from .subinterface_reconciler import reconcile_subinterface
 
@@ -274,7 +274,7 @@ def reconcile_device(device, mgmt=None) -> dict:
                 device,
                 client.get_interface_ips(dev_id),
             )
-            # M33: LACP/LAG bundle + member overlay states (interface-level).
+            # LACP/LAG bundle + member overlay states (interface-level).
             from .lacp_reconciler import reconcile_lag_config
 
             _safe_reconcile(
@@ -286,7 +286,7 @@ def reconcile_device(device, mgmt=None) -> dict:
                 device,
                 client.get_lag_config(dev_id),
             )
-            # M34: VLAN database + L2 switchport (VLAN DB first — switchport links to it).
+            # VLAN database + L2 switchport (VLAN DB first — switchport links to it).
             from .vlan_reconciler import reconcile_switchport, reconcile_vlan_database
 
             _safe_reconcile(
@@ -328,7 +328,7 @@ def reconcile_device(device, mgmt=None) -> dict:
                 client.get_logging_config(dev_id),
             )
         if getattr(mgmt, "manage_l2", False):
-            # M37: Nokia L2 SAP overlays. Kept in the full reconcile (not just
+            # Nokia L2 SAP overlays. Kept in the full reconcile (not just
             # on-expand) so the periodic sync-complete refresh keeps them current —
             # the tab reads these persisted rows without reconciling on expand.
             from .l2_service_reconciler import reconcile_l2_services
@@ -388,7 +388,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
             ctx["interfaces"] = client.get_interfaces(dev_id)
             ctx["state"] = client.get_state(dev_id)
             ctx["interface_states"] = _upsert_interface_states(device, ctx["interfaces"])
-            ctx["svi_states"] = reconcile_svi(device, client.get_svi(dev_id))  # M35: before IPs
+            ctx["svi_states"] = reconcile_svi(device, client.get_svi(dev_id))  # before IPs
             ctx["subinterface_states"] = reconcile_subinterface(device, client.get_subinterface(dev_id))
             ctx["interface_ips"] = _reconcile_interface_ips(device, client.get_interface_ips(dev_id))
             ctx["interface_mtu_states"] = reconcile_interface_mtu(device, client.get_interface_mtu(dev_id))
@@ -401,17 +401,17 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
             ctx["interface_states"] = _upsert_interface_states(device, ctx["interfaces"])
             from .svi_reconciler import reconcile_svi
 
-            ctx["svi_states"] = reconcile_svi(device, client.get_svi(dev_id))  # M35: before IPs
+            ctx["svi_states"] = reconcile_svi(device, client.get_svi(dev_id))  # before IPs
             from .subinterface_reconciler import reconcile_subinterface
 
-            ctx["subinterface_states"] = reconcile_subinterface(device, client.get_subinterface(dev_id))  # M36
+            ctx["subinterface_states"] = reconcile_subinterface(device, client.get_subinterface(dev_id))
             ctx["interface_ips"] = _reconcile_interface_ips(device, client.get_interface_ips(dev_id))
         elif key == "interface_ips":
             from .subinterface_reconciler import reconcile_subinterface
             from .svi_reconciler import reconcile_svi
 
-            ctx["svi_states"] = reconcile_svi(device, client.get_svi(dev_id))  # M35: SVIs exist before IPs
-            ctx["subinterface_states"] = reconcile_subinterface(device, client.get_subinterface(dev_id))  # M36
+            ctx["svi_states"] = reconcile_svi(device, client.get_svi(dev_id))  # SVIs exist before IPs
+            ctx["subinterface_states"] = reconcile_subinterface(device, client.get_subinterface(dev_id))
             ctx["interface_ips"] = _reconcile_interface_ips(device, client.get_interface_ips(dev_id))
         elif key == "lacp":
             from .lacp_reconciler import reconcile_lag_config
@@ -471,7 +471,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
         elif key == "redistribution":
             ctx["redistribution_states"] = reconcile_redistribution(device, client.get_redistribution(dev_id))
         elif key == "l2_services":
-            # M37 P2a: reconcile into native vpn.L2VPN + L2VPNTermination + NSOL2SapState
+            # reconcile into native vpn.L2VPN + L2VPNTermination + NSOL2SapState
             # (value-aware drift/accept). The dot1q tag stays per-SAP interface-local encap.
             from .l2_service_reconciler import reconcile_l2_services
 

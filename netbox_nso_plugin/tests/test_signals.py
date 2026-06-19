@@ -514,7 +514,7 @@ try:
 
         @patch("netbox_nso_plugin.adapter_client.put_ip_intent")
         def test_greenfield_nokia_routed_binding_in_push(self, mock_put):
-            """A parented LAG99:99 sub-interface pushes routed/parent_binding/encap_tag (M27)."""
+            """A parented LAG99:99 sub-interface pushes routed/parent_binding/encap_tag."""
             from dcim.models import Interface
             from ipam.models import IPAddress
 
@@ -523,7 +523,7 @@ try:
 
             with self.captureOnCommitCallbacks(execute=True):
                 IPAddress.objects.create(
-                    address="192.0.2.160/31", assigned_object_type=self._ct(), assigned_object_id=sub.pk
+                    address="198.18.249.160/31", assigned_object_type=self._ct(), assigned_object_id=sub.pk
                 )
 
             mock_put.assert_called_once()
@@ -770,7 +770,7 @@ try:
 
             with self.captureOnCommitCallbacks(execute=True):
                 inst = OSPFInstance.objects.create(
-                    name="ospf-1", router_id="192.0.2.117", process_id="1", device=self.device
+                    name="ospf-1", router_id="198.18.250.117", process_id="1", device=self.device
                 )
                 area = OSPFArea.objects.create(area_id="0", area_type="standard")
                 OSPFInterface.objects.create(instance=inst, area=area, interface=self.iface, cost=100)

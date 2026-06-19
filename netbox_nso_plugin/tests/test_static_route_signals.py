@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Tests for M10 B3: static route intent push signals."""
+"""Tests for: static route intent push signals."""
 
 from unittest.mock import patch
 

@@ -461,7 +461,7 @@ class NSODeviceManagement(NetBoxModel):
 
 
 class NSOInterfaceState(NetBoxModel):
-    """Per-interface, per-attribute intent status overlay (Phase 2, M6).
+    """Per-interface, per-attribute intent status overlay (Phase 2).
 
     Intent value lives on ``dcim.Interface`` (description/enabled fields).
     This model holds the *status overlay*: what the adapter last reported,
@@ -526,7 +526,7 @@ class NSOInterfaceState(NetBoxModel):
 
 
 class NSOInterfaceIPState(_NSODeviceTabURLMixin, NetBoxModel):
-    """Per-interface, per-address IP address status overlay (Phase 3, M12).
+    """Per-interface, per-address IP address status overlay (Phase 3).
 
     Tracks the synchronisation state for each IP address reported by NSO for a
     managed interface.  Intent is driven by NetBox IPAM (``ipam.IPAddress``);
@@ -590,10 +590,10 @@ class NSOInterfaceIPState(_NSODeviceTabURLMixin, NetBoxModel):
         blank=True,
         help_text="Populated when status=apply_failed.",
     )
-    # M13: auto-assignment fields
+    # auto-assignment fields
     auto_assigned = models.BooleanField(
         default=False,
-        help_text="True when this address was minted by the M13 IP auto-assignment engine.",
+        help_text="True when this address was minted by the IP auto-assignment engine.",
     )
     source_pool = models.ForeignKey(
         to="ipam.Prefix",
@@ -601,7 +601,7 @@ class NSOInterfaceIPState(_NSODeviceTabURLMixin, NetBoxModel):
         null=True,
         blank=True,
         related_name="nso_ip_states_from_pool",
-        help_text="The Prefix pool this address was drawn from (M13 audit trail).",
+        help_text="The Prefix pool this address was drawn from (audit trail).",
     )
     peer_state = models.ForeignKey(
         to="self",
@@ -609,7 +609,7 @@ class NSOInterfaceIPState(_NSODeviceTabURLMixin, NetBoxModel):
         null=True,
         blank=True,
         related_name="peer_back",
-        help_text="The other end of a P2P pair (M13 Phase B reserve-then-activate).",
+        help_text="The other end of a P2P pair (reserve-then-activate).",
     )
 
     class Meta:
@@ -623,7 +623,7 @@ class NSOInterfaceIPState(_NSODeviceTabURLMixin, NetBoxModel):
         return f"{self.interface} / {self.address}{vrf_label} [{self.status}]"
 
 
-# ─── M11: SNMP state overlays ─────────────────────────────────────────────────
+# ─── SNMP state overlays ─────────────────────────────────────────────────
 
 _SNMP_STATUS_CHOICES = [
     ("unknown", "Unknown"),
@@ -638,7 +638,7 @@ _SNMP_STATUS_CHOICES = [
 
 
 class NSOSnmpCommunityState(NetBoxModel):
-    """Per-device SNMP community status overlay (M11 read path).
+    """Per-device SNMP community status overlay (read path).
 
     The community string itself is never stored — only its opaque SHA-256 hash
     (``community_hash``) as published by the NSO package.  A Vault reference
@@ -698,7 +698,7 @@ class NSOSnmpCommunityState(NetBoxModel):
 
 
 class NSOSnmpV3UserState(NetBoxModel):
-    """Per-device SNMP v3 user status overlay (M11 read path).
+    """Per-device SNMP v3 user status overlay (read path).
 
     Passwords are never stored — ``has_auth_secret`` / ``has_priv_secret``
     indicate whether the NSO device has secrets set.  ``vault_ref`` carries the
@@ -742,7 +742,7 @@ class NSOSnmpV3UserState(NetBoxModel):
 
 
 class NSOSnmpHostState(NetBoxModel):
-    """Per-device SNMP trap/inform host status overlay (M11 read path)."""
+    """Per-device SNMP trap/inform host status overlay (read path)."""
 
     management = models.ForeignKey(
         to="NSODeviceManagement",
@@ -786,7 +786,7 @@ class NSOSnmpHostState(NetBoxModel):
 
 
 class NSOSnmpSystemInfoState(NetBoxModel):
-    """Per-device SNMP system location/contact status overlay (M11 read path).
+    """Per-device SNMP system location/contact status overlay (read path).
 
     At most one row per device management object (enforced by OneToOneField).
     """
@@ -869,7 +869,7 @@ _STATIC_ROUTE_STATUS_CHOICES = [
 
 
 class NSOStaticRouteState(_NSODeviceTabURLMixin, NetBoxModel):
-    """Per-(device, static_route) compliance overlay for static routing (M10).
+    """Per-(device, static_route) compliance overlay for static routing.
 
     One row exists per (NSODeviceManagement, StaticRoute) pair.  The StaticRoute
     object itself is shared across devices via M2M — this row tracks the
@@ -923,7 +923,7 @@ _L2_SAP_STATUS_CHOICES = [
 
 
 class NSOL2SapState(_NSODeviceTabURLMixin, NetBoxModel):
-    """Per-SAP compliance overlay for Nokia L2 services (M37 Phase 2).
+    """Per-SAP compliance overlay for Nokia L2 services.
 
     One row per (device, service, SAP). The service is reconciled into a native
     ``vpn.L2VPN`` (epipe→E-Line, vpls→VPLS) and each SAP into a ``vpn.L2VPNTermination``
@@ -988,7 +988,7 @@ _ISIS_STATUS_CHOICES = [
 
 
 class NSOISISInterfaceState(_NSODeviceTabURLMixin, NetBoxModel):
-    """Per-(device, interface, af) IS-IS enablement compliance overlay (M14).
+    """Per-(device, interface, af) IS-IS enablement compliance overlay.
 
     Tracks the status of IS-IS interface enablement for each (NSODeviceManagement,
     dcim.Interface, address-family) triple.  The ``status`` lifecycle mirrors the
@@ -1045,7 +1045,7 @@ class NSOISISInterfaceState(_NSODeviceTabURLMixin, NetBoxModel):
 
 
 class NSOISISInstanceState(_NSODeviceTabURLMixin, NetBoxModel):
-    """Per-(device, isis_process_tag) IS-IS process compliance overlay (M18).
+    """Per-(device, isis_process_tag) IS-IS process compliance overlay.
 
     Tracks the status of IS-IS process-level config (net, is-type, metric-style,
     overload-bit, area/domain auth) for each (NSODeviceManagement, process_tag)
@@ -1161,7 +1161,7 @@ _BGP_WRITE_PATH_STATUSES = {"accepted", "deploying", "in_sync", "apply_failed"}
 
 
 class NSOBGPPeerState(_NSODeviceTabURLMixin, NetBoxModel):
-    """Per-(device, asn, vrf, peer_address) BGP peer compliance overlay (M15).
+    """Per-(device, asn, vrf, peer_address) BGP peer compliance overlay.
 
     Tracks the reconcile status of each BGP peer discovered from NSO.
     The identity key is (management, asn_str, vrf_name, peer_address_str) — all
@@ -1309,7 +1309,7 @@ class SharedObjectStateMixin(models.Model):
 
 
 class NSORoutePolicyState(SharedObjectStateMixin, _NSODeviceTabURLMixin, NetBoxModel):
-    """Per-(device, policy-object) compliance overlay for route policy (M17).
+    """Per-(device, policy-object) compliance overlay for route policy.
 
     A single generic model covers all four object families (prefix-list,
     community-list, as-path, route-map).  ``content_type`` + ``object_id``
@@ -1360,7 +1360,7 @@ class NSORoutePolicyState(SharedObjectStateMixin, _NSODeviceTabURLMixin, NetBoxM
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# M19 OSPF plugin state models
+# OSPF plugin state models
 # ──────────────────────────────────────────────────────────────────────────────
 
 _OSPF_STATUS_CHOICES = [
@@ -1379,7 +1379,7 @@ _OSPF_WRITE_PATH_STATUSES = {"accepted", "deploying", "in_sync", "apply_failed"}
 
 
 class NSOOSPFInstanceState(_NSODeviceTabURLMixin, NetBoxModel):
-    """Per-(device, process_id) OSPF process compliance overlay (M19).
+    """Per-(device, process_id) OSPF process compliance overlay.
 
     Tracks the status of OSPF process-level config (router-id, vrf, areas)
     for each (NSODeviceManagement, process_id) pair.
@@ -1426,7 +1426,7 @@ class NSOOSPFInstanceState(_NSODeviceTabURLMixin, NetBoxModel):
 
 
 class NSOOSPFInterfaceState(_NSODeviceTabURLMixin, NetBoxModel):
-    """Per-(device, interface) OSPF interface compliance overlay (M19).
+    """Per-(device, interface) OSPF interface compliance overlay.
 
     Tracks the status of OSPF interface config (area, passive, cost, network-type, auth)
     for each (NSODeviceManagement, dcim.Interface) pair.
@@ -1483,7 +1483,7 @@ _REDISTRIBUTION_WRITE_PATH_STATUSES = {"accepted", "deploying", "in_sync", "appl
 
 
 class NSORedistributionState(_NSODeviceTabURLMixin, NetBoxModel):
-    """Per-(device, destination, source) redistribution statement compliance overlay (M20).
+    """Per-(device, destination, source) redistribution statement compliance overlay.
 
     Tracks the observed + intended state of each `redistribute <source>` statement
     under an OSPF/ISIS/BGP destination protocol scope for a managed device.
@@ -1552,7 +1552,7 @@ _LACP_WRITE_PATH_STATUSES = {"accepted", "deploying", "in_sync"}
 
 
 class NSOLACPBundleState(_NSODeviceTabURLMixin, NetBoxModel):
-    """Per-(device, LAG interface) LACP bundle compliance overlay (M33).
+    """Per-(device, LAG interface) LACP bundle compliance overlay.
 
     Carries the LACP parameters NetBox has no native column for — min-links,
     system-priority, system-id, timer, admin-key — plus the standard NSO overlay
@@ -1593,7 +1593,7 @@ class NSOLACPBundleState(_NSODeviceTabURLMixin, NetBoxModel):
 
 
 class NSOLACPMemberState(_NSODeviceTabURLMixin, NetBoxModel):
-    """Per-(device, member interface) LACP member compliance overlay (M33).
+    """Per-(device, member interface) LACP member compliance overlay.
 
     Carries the per-member LACP mode + port-priority and links to the parent LAG
     interface. One row per (management, member interface). Status lifecycle
@@ -1649,7 +1649,7 @@ _VLAN_STATUS_CHOICES = [
 
 
 class NSOVLANState(_NSODeviceTabURLMixin, NetBoxModel):
-    """Per-(device, ipam.VLAN) VLAN-database compliance overlay (M34).
+    """Per-(device, ipam.VLAN) VLAN-database compliance overlay.
 
     The VLAN itself is reconciled into a per-device ``ipam.VLANGroup`` (slug
     ``nso-{device.pk}``); this overlay carries the status/drift + accept marker.
@@ -1685,7 +1685,7 @@ class NSOVLANState(_NSODeviceTabURLMixin, NetBoxModel):
 
 
 class NSOSwitchportState(_NSODeviceTabURLMixin, NetBoxModel):
-    """Per-(device, interface) L2 switchport compliance overlay (M34).
+    """Per-(device, interface) L2 switchport compliance overlay.
 
     Reconciles into the native ``Interface.mode``/``untagged_vlan``/``tagged_vlans``;
     this overlay mirrors the NSO-observed mode/untagged/tagged for drift + accept.
@@ -1735,11 +1735,11 @@ class NSOSwitchportState(_NSODeviceTabURLMixin, NetBoxModel):
 
 
 class NSOSVIState(NetBoxModel):
-    """Per-SVI/IRB compliance overlay (M35).
+    """Per-SVI/IRB compliance overlay.
 
     Tracks an L3 VLAN interface (IOS interface VlanN / Junos irb.N) materialised
     into NetBox as a virtual dcim.Interface, linked to its VLAN. IP addresses are
-    NOT tracked here — they ride the M12 interface-IP path on the same interface.
+    NOT tracked here — they ride the interface-IP path on the same interface.
     """
 
     management = models.ForeignKey(to="NSODeviceManagement", on_delete=models.CASCADE, related_name="svi_states")
@@ -1774,14 +1774,14 @@ class NSOSVIState(NetBoxModel):
 
 
 class NSOSubinterfaceState(NetBoxModel):
-    """Per-subinterface compliance overlay (M36 — dot1q L3 subinterfaces).
+    """Per-subinterface compliance overlay (dot1q L3 subinterfaces).
 
     Tracks a dot1q subinterface (IOS Gi0/1.100 / Junos ge-0/0/0.100) materialised
     into NetBox as a virtual ``dcim.Interface`` linked to its physical parent via
     ``Interface.parent``. The dot1q encapsulation tag is interface-local and is
     recorded as a plain integer (``dot1q_vlan``) — deliberately NOT an ``ipam.VLAN``
     FK (a routed subinterface tag is not a device VLAN-database entry). IP addresses
-    are NOT tracked here — they ride the M12 interface-IP path on the same interface.
+    are NOT tracked here — they ride the interface-IP path on the same interface.
     """
 
     management = models.ForeignKey(

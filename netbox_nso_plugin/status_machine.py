@@ -60,7 +60,7 @@ STATES: frozenset[str] = frozenset(
 
 INITIAL = UNKNOWN
 
-#: Historically the M12 interface / interface-IP overlays declared non-canonical
+# Historically the interface / interface-IP overlays declared non-canonical
 #: states (``drifted`` = synonym for ``changed``; ``reserved`` = a dead overlay choice,
 #: the real reservation lives on ipam.IPAddress). Both are now folded: the adapter's
 #: ``drifted`` is normalised to ``changed`` at ingest, the dead choices were dropped.

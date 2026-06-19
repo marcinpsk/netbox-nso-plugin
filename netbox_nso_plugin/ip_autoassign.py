@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""M13 — IP auto-assignment from purpose Prefix pools.
+"""IP auto-assignment from purpose Prefix pools.
 
 Phase A: single-ended allocation for loopback and access interfaces.
 Phase B (P2P reserve-then-activate) is a follow-on milestone.
@@ -207,7 +207,7 @@ def carve_p2p_child(pool, family: str):
         prefix=str(child_network),
         vrf=pool.vrf,
         status="reserved",
-        description="P2P link (M13 auto-assigned)",
+        description="P2P link (auto-assigned)",
     )
     child_prefix.refresh_from_db()  # ensure prefix is netaddr.IPNetwork for get_available_ips()
 
@@ -638,7 +638,7 @@ def auto_assign_ip(interface, families: tuple[str, ...] = ("ipv4", "ipv6")) -> d
             )
             continue
 
-        # Explicitly push the device's IP intent (M12 write pipe) so the new
+        # Explicitly push the device's IP intent (write pipe) so the new
         # address is sent to NSO.  Signal-driven push will fire on the next
         # IPAddress save, but we push now to be immediate.
         try:

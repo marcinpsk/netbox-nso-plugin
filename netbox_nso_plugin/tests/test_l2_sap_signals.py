@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Tests for M37 P2b: Nokia L2 SAP intent push signals."""
+"""Tests for: Nokia L2 SAP intent push signals."""
 
 from unittest.mock import patch
 

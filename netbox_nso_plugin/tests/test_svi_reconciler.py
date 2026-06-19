@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""M35: plugin SVI/IRB reconciler — materialise virtual interface + VLAN link + overlay."""
+"""plugin SVI/IRB reconciler — materialise virtual interface + VLAN link + overlay."""
 
 from __future__ import annotations
 

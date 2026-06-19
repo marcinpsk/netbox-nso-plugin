@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Route-policy reconciler for M17 A4.
+"""Route-policy reconciler for A4.
 
 Reads the adapter's GET /api/v1/devices/{id}/route-policy response and
 reconciles it into netbox-routing policy objects (PrefixList, CommunityList,
@@ -233,7 +233,7 @@ def _fill_route_map_entries(rm_obj, entries: list, pl_by_name, cl_by_name, ap_by
     for i, e in enumerate(entries, start=1):
         match_blob = _load_json(e.get("match"))
         set_blob = _load_json(e.get("set"))
-        # Derive the structured projection (M17 P1): match_afi, set-community ops, call-policy,
+        # Derive the structured projection: match_afi, set-community ops, call-policy,
         # vendor_ext. The full match/set blobs are kept AS-IS (authoritative for the write-side
         # round-trip until the reader/contract speak structured in P3) — the structured fields
         # are an additive, queryable/display view, not a replacement. See route_policy_structure.

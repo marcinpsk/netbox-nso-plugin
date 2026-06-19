@@ -183,7 +183,7 @@ urlpatterns = [
         views.NSOApplyPreviewView.as_view(),
         name="device_apply_preview",
     ),
-    # M13: IP auto-assignment operator action
+    # IP auto-assignment operator action
     path(
         "devices/<int:device_pk>/auto-assign-ip/",
         views.NSOAutoAssignIPView.as_view(),
@@ -201,19 +201,19 @@ urlpatterns = [
         views.NSOStaticRouteStateAcceptView.as_view(),
         name="routing_accept_static_route",
     ),
-    # L2 (Nokia SAP) state accept — M37 P2a
+    # L2 (Nokia SAP) state accept —
     path(
         "l2/sap-state/<int:pk>/accept/",
         views.NSOL2SapStateAcceptView.as_view(),
         name="l2_accept_sap",
     ),
-    # LACP bundle state accept → apply — M33
+    # LACP bundle state accept → apply —
     path(
         "lacp/bundle-state/<int:pk>/accept/",
         views.NSOLACPBundleStateAcceptView.as_view(),
         name="lacp_accept_bundle",
     ),
-    # Switchport state accept → apply — M34
+    # Switchport state accept → apply —
     path(
         "switchport/state/<int:pk>/accept/",
         views.NSOSwitchportStateAcceptView.as_view(),

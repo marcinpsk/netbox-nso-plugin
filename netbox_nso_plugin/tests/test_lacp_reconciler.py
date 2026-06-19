@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""M33: reconcile_lag_config → NSOLACPBundleState + NSOLACPMemberState."""
+"""reconcile_lag_config → NSOLACPBundleState + NSOLACPMemberState."""
 
 from __future__ import annotations
 

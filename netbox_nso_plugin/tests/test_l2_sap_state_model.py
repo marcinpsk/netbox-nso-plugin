@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""M37 P2a Task 1: NSOL2SapState overlay model + manage_l2 flag."""
+"""Task 1: NSOL2SapState overlay model + manage_l2 flag."""
 
 from __future__ import annotations
 

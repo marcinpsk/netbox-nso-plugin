@@ -2,7 +2,7 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Derived-intent engine for the NSO plugin.
 
-Implements M8 — Description-from-Cable-Topology.  See docs/m8-derived-intent-plan.md
+Implements — Description-from-Cable-Topology. See docs/m8-derived-intent-plan.md
 for the full design spec.  The public surface is:
 
   * ``load_sentinel_templates(raw)`` — validate and parse the config-time sentinel list.

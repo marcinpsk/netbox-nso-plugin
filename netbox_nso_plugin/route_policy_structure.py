@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Pure transform: route-map entry match/set blobs → structured model fields (M17 P1).
+"""Pure transform: route-map entry match/set blobs → structured model fields.
 
 The network-state-export reader captures every vendor construct losslessly into the
 ``match`` / ``set`` JSON blobs of a route-map entry: vendor-neutral keys (``family``,

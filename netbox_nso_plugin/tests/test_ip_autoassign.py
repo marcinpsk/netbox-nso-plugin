@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Tests for M13 IP auto-assignment: Phase A (loopback/access) and Phase B (P2P).
+"""Tests for IP auto-assignment: Phase A (loopback/access) and Phase B (P2P).
 
 Covers:
 - interface classification (loopback by name, tag override, access default, P2P auto-detect)
@@ -406,7 +406,7 @@ class TestReconcileAutoAssignedActivation(TestCase):
         self.assertEqual(ip.status, "active")  # unchanged — was already active
 
 
-# ── M13 Phase B tests ─────────────────────────────────────────────────────────
+# ── tests ─────────────────────────────────────────────────────────
 
 
 def _make_cable_pair(iface_a, iface_b):

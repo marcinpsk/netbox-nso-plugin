@@ -599,7 +599,7 @@ def _push_ip_intent_for_device(device_id, adapter_device_id):
 
 
 def _nokia_routed_binding(interface) -> dict:
-    """Derive the SR OS binding for a greenfield Nokia routed sub-interface (M27).
+    """Derive the SR OS binding for a greenfield Nokia routed sub-interface.
 
     Nokia routed logical interfaces are modelled in NetBox by their LOGICAL name
     (``LAG99:99``), type=virtual, ``parent`` = the bound port/LAG (``lag-99``); the dot1q
@@ -765,7 +765,7 @@ def _on_logging_state_save(sender, instance, **kwargs):
 
 
 def _push_svi_intent_for_device(device_id, adapter_device_id):
-    """Build and push the full owned SVI/IRB intent snapshot for a device (M35).
+    """Build and push the full owned SVI/IRB intent snapshot for a device.
 
     Store-only (deferred): the single device Apply commits via the svi-reconciler.
     Only owned rows (_OWNED_PUSH_STATUSES, incl. apply_failed) are included.
@@ -819,7 +819,7 @@ def _on_svi_state_save(sender, instance, **kwargs):
 
 
 def _push_subinterface_intent_for_device(device_id, adapter_device_id):
-    """Build and push the full owned dot1q subinterface intent snapshot (M36).
+    """Build and push the full owned dot1q subinterface intent snapshot.
 
     Store-only (deferred): the single device Apply commits via the
     subinterface-reconciler. Only owned rows (_OWNED_PUSH_STATUSES, incl. apply_failed) included.
@@ -929,7 +929,7 @@ def _on_mtu_state_save(sender, instance, **kwargs):
 
 
 def _push_vlan_intent_for_device(device_id, adapter_device_id, force=False):
-    """Build and push the full owned VLAN-database intent snapshot for a device (M34 write).
+    """Build and push the full owned VLAN-database intent snapshot for a device (write).
 
     Store-only (deferred): the single device Apply commits via the vlan-reconciler.
     Only owned rows (_OWNED_PUSH_STATUSES, incl. apply_failed) are included; the VLAN name pushed
@@ -1458,7 +1458,7 @@ def _on_routing_isis_flex_algo_pre_delete(sender, instance, **kwargs):
 
 
 def _push_l2_sap_intent_for_device(device_id, adapter_device_id):
-    """Build and push the full Nokia L2 SAP intent snapshot for a device (M37 P2b)."""
+    """Build and push the full Nokia L2 SAP intent snapshot for a device."""
     from . import adapter_client as client
     from .models import NSOL2SapState
 
@@ -1507,7 +1507,7 @@ def _on_l2_sap_state_save(sender, instance, **kwargs):
 
 
 def _push_lacp_intent_for_device(device_id, adapter_device_id, force=False):
-    """Build and push (apply) the full LACP bundle intent snapshot for a device (M33).
+    """Build and push (apply) the full LACP bundle intent snapshot for a device.
 
     Committing LACP is a device write, so on accept it only fires when the device
     is in auto-apply mode (see _on_lacp_state_save); the manual device Apply calls
@@ -1572,12 +1572,12 @@ def _on_lacp_state_save(sender, instance, **kwargs):
     )
 
 
-# NetBox interface mode -> NSO switchport vocabulary (M34).
+# NetBox interface mode -> NSO switchport vocabulary.
 _NETBOX_TO_NSO_MODE = {"access": "access", "tagged": "trunk", "tagged-all": "trunk-all"}
 
 
 def _push_switchport_intent_for_device(device_id, adapter_device_id, force=False):
-    """Build and push (apply) the device's owned L2 switchport snapshot (M34).
+    """Build and push (apply) the device's owned L2 switchport snapshot.
 
     A device write, so on accept it only fires in auto-apply mode; the manual
     device Apply calls this with ``force=True`` as part of the single Apply.
@@ -1765,7 +1765,7 @@ def _build_bgp_router_list(routers: dict, scope_afs: dict) -> list:
 
 
 def _push_bgp_intent_for_device(device_id, adapter_device_id):
-    """Build and push the full BGP intent snapshot for a device (M16 B3)."""
+    """Build and push the full BGP intent snapshot for a device."""
     from . import adapter_client as client
     from .models import NSOBGPPeerState
 
@@ -1877,7 +1877,7 @@ def _on_redistribution_state_save(sender, instance, **kwargs):
 
 
 def _push_route_policy_intent_for_device(device_id, adapter_device_id):
-    """Build and push the full route-policy intent snapshot for a device (M17 B3)."""
+    """Build and push the full route-policy intent snapshot for a device."""
     from . import adapter_client as client
     from .models import NSORoutePolicyState
 
@@ -2226,7 +2226,7 @@ def _collect_redistribution_by_dest_ref(device_id: int, dest_protocol: str) -> d
 
 
 def _push_ospf_intent_for_device(device_id, adapter_device_id):
-    """Build and push the full OSPF intent snapshot for a device (M19 B3)."""
+    """Build and push the full OSPF intent snapshot for a device."""
     from . import adapter_client as client
     from .models import NSOOSPFInstanceState, NSOOSPFInterfaceState
 
@@ -2569,7 +2569,7 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_ipaddress_post_delete",
     )
 
-    # SNMP state → intent push (M11 B3)
+    # SNMP state → intent push
     from .models import NSOSnmpCommunityState, NSOSnmpHostState, NSOSnmpSystemInfoState, NSOSnmpV3UserState
 
     for snmp_model in (NSOSnmpCommunityState, NSOSnmpV3UserState, NSOSnmpHostState, NSOSnmpSystemInfoState):
@@ -2588,7 +2588,7 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_logging_host_state_post_save",
     )
 
-    # SVI/IRB state → intent push (M35 write path)
+    # SVI/IRB state → intent push (write path)
     from .models import NSOSVIState
 
     post_save.connect(
@@ -2597,7 +2597,7 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_svi_state_post_save",
     )
 
-    # dot1q subinterface state → intent push (M36 write path)
+    # dot1q subinterface state → intent push (write path)
     from .models import NSOSubinterfaceState
 
     post_save.connect(
@@ -2615,7 +2615,7 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_interface_mtu_state_post_save",
     )
 
-    # VLAN-database state → intent push (M34 write path)
+    # VLAN-database state → intent push (write path)
     from .models import NSOVLANState
 
     post_save.connect(
@@ -2647,7 +2647,7 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_bfd_state_post_save",
     )
 
-    # Static route state → intent push (M10 B3)
+    # Static route state → intent push
     from .models import NSOStaticRouteState
 
     post_save.connect(
@@ -2656,7 +2656,7 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_static_route_state_post_save",
     )
 
-    # L2 SAP state → intent push (M37 P2b)
+    # L2 SAP state → intent push
     from .models import NSOL2SapState
 
     post_save.connect(
@@ -2665,7 +2665,7 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_l2_sap_state_post_save",
     )
 
-    # LACP bundle/member state → intent push + apply (M33)
+    # LACP bundle/member state → intent push + apply
     from .models import NSOLACPBundleState, NSOLACPMemberState
 
     post_save.connect(
@@ -2679,7 +2679,7 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_lacp_member_state_post_save",
     )
 
-    # Switchport state -> intent push + apply (M34)
+    # Switchport state -> intent push + apply
     from .models import NSOSwitchportState
 
     post_save.connect(
@@ -2688,7 +2688,7 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_switchport_state_post_save",
     )
 
-    # IS-IS interface state → intent push (M14 B3)
+    # IS-IS interface state → intent push
     from .models import NSOISISInstanceState, NSOISISInterfaceState
 
     post_save.connect(
@@ -2697,7 +2697,7 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_isis_interface_state_post_save",
     )
 
-    # IS-IS process (instance) state → intent push (M18 B3)
+    # IS-IS process (instance) state → intent push
     post_save.connect(
         _on_isis_instance_state_save,
         sender=NSOISISInstanceState,
@@ -2713,7 +2713,7 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_isis_flex_algo_state_post_save",
     )
 
-    # BGP peer state → intent push (M16 B3)
+    # BGP peer state → intent push
     from .models import NSOBGPPeerState
 
     post_save.connect(
@@ -2722,7 +2722,7 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_bgp_peer_state_post_save",
     )
 
-    # Route-policy state → intent push (M17 B3)
+    # Route-policy state → intent push
     from .models import NSORoutePolicyState
 
     post_save.connect(
@@ -2771,7 +2771,7 @@ def _connect_g_activated():  # pragma: no cover
     except ImportError:
         logger.debug("netbox_routing not installed — route-policy edit/delete signals not registered")
 
-    # OSPF state → intent push (M19 B3)
+    # OSPF state → intent push
     from .models import NSOOSPFInstanceState, NSOOSPFInterfaceState
 
     post_save.connect(
@@ -2785,7 +2785,7 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_ospf_interface_state_post_save",
     )
 
-    # Redistribution state → intent push (M20 B3)
+    # Redistribution state → intent push
     from .models import NSORedistributionState
 
     post_save.connect(

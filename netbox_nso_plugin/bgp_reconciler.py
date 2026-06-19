@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""BGP reconciler for M15 A4.
+"""BGP reconciler for A4.
 
 Reads the adapter's GET /api/v1/devices/{id}/bgp-config response and
 creates/updates the netbox-routing BGP object graph in NetBox.

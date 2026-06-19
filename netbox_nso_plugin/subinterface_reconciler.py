@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""M36: reconcile dot1q L3 subinterfaces from NSO into NetBox.
+"""reconcile dot1q L3 subinterfaces from NSO into NetBox.
 
 Materialises the virtual ``dcim.Interface`` (type=virtual), links it to its
 physical parent via ``Interface.parent`` (looked up by name — never created
 here; the parent comes from normal device sync / the interface export), records
 the interface-local dot1q encapsulation tag on the overlay (NOT an ``ipam.VLAN``),
 and tracks ``NSOSubinterfaceState``. IP addresses are NOT handled here — they
-ride the M12 interface-IP path on the same interface, so this reconcile MUST run
+ride the interface-IP path on the same interface, so this reconcile MUST run
 before ``_reconcile_interface_ips`` (which only attaches IPs to interfaces that
 already exist).
 """

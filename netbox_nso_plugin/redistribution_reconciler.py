@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Redistribution reconciler — moved from template_content.py (Track B, M20).
+"""Redistribution reconciler — moved from template_content.py (Track B).
 
 Also creates/links the netbox-routing Redistribution object: it resolves the
 destination scope (OSPFInstance / ISISInstance / BGPAddressFamily) the routes are

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""M33: reconcile LACP/LAG configuration from the adapter into overlay state models.
+"""reconcile LACP/LAG configuration from the adapter into overlay state models.
 
 Read → model (no device write). Each bundle reported by the adapter's
 ``GET /api/v1/devices/{id}/lag-config`` becomes an ``NSOLACPBundleState`` on the

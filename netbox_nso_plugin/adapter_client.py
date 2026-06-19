@@ -273,22 +273,22 @@ def get_lag_config(adapter_device_id: int) -> dict:
 
 
 def get_vlan_database(adapter_device_id: int) -> dict:
-    """GET /api/v1/devices/{id}/vlan-database (M34)."""
+    """GET /api/v1/devices/{id}/vlan-database."""
     return _request("GET", f"/api/v1/devices/{adapter_device_id}/vlan-database")
 
 
 def get_switchport(adapter_device_id: int) -> dict:
-    """GET /api/v1/devices/{id}/switchport (M34)."""
+    """GET /api/v1/devices/{id}/switchport."""
     return _request("GET", f"/api/v1/devices/{adapter_device_id}/switchport")
 
 
 def get_svi(adapter_device_id: int) -> dict:
-    """GET /api/v1/devices/{id}/svi — L3 VLAN interfaces (SVIs/IRBs) (M35)."""
+    """GET /api/v1/devices/{id}/svi — L3 VLAN interfaces (SVIs/IRBs)."""
     return _request("GET", f"/api/v1/devices/{adapter_device_id}/svi")
 
 
 def get_subinterface(adapter_device_id: int) -> dict:
-    """GET /api/v1/devices/{id}/subinterface — dot1q L3 subinterfaces (M36)."""
+    """GET /api/v1/devices/{id}/subinterface — dot1q L3 subinterfaces."""
     return _request("GET", f"/api/v1/devices/{adapter_device_id}/subinterface")
 
 
@@ -328,7 +328,7 @@ def put_bfd_intent(adapter_device_id, interfaces):
 
 
 def put_vlan_intent(adapter_device_id, vlans):
-    """PUT /api/v1/devices/{id}/vlan-intent — push full VLAN-database intent (M34 write).
+    """PUT /api/v1/devices/{id}/vlan-intent — push full VLAN-database intent (write).
 
     ``vlans`` is a list of dicts: [{"vlan_id": 2213, "name": "X", "accepted_at": "...Z"}, ...].
     Empty list clears all VLAN intent for the device. Returns {"device_id": ..., "count": N}.
@@ -341,7 +341,7 @@ def put_vlan_intent(adapter_device_id, vlans):
 
 
 def apply_switchport_config(adapter_device_id, interfaces):
-    """POST /api/v1/devices/{id}/switchport/apply — push + apply L2 switchport intent (M34).
+    """POST /api/v1/devices/{id}/switchport/apply — push + apply L2 switchport intent.
 
     ``interfaces`` is a list of dicts:
       [{"interface_name": "Gi0/1", "mode": "access", "untagged_vlan": 10, "tagged_vlans": []}, ...]
@@ -625,7 +625,7 @@ def put_static_route_intent(adapter_device_id, routes):
 
 
 def put_l2_sap_intent(adapter_device_id, saps):
-    """PUT /api/v1/devices/{id}/l2-sap-intent — push full Nokia L2 SAP intent (M37 P2b).
+    """PUT /api/v1/devices/{id}/l2-sap-intent — push full Nokia L2 SAP intent.
 
     ``saps`` is a list of dicts:
       [{"service_name": "TL", "service_type": "epipe", "sap_id": "lag-60:3999",
@@ -659,7 +659,7 @@ def put_logging_intent(adapter_device_id, hosts):
 
 
 def put_svi_intent(adapter_device_id, interfaces):
-    """PUT /api/v1/devices/{id}/svi-intent — push full SVI/IRB intent snapshot (M35).
+    """PUT /api/v1/devices/{id}/svi-intent — push full SVI/IRB intent snapshot.
 
     ``interfaces`` is a list of dicts:
       [{"interface_name": "Vlan100", "vlan_id": 100, "type": "svi", "vrf": "",
@@ -675,7 +675,7 @@ def put_svi_intent(adapter_device_id, interfaces):
 
 
 def put_subinterface_intent(adapter_device_id, interfaces):
-    """PUT /api/v1/devices/{id}/subinterface-intent — push full subinterface intent (M36).
+    """PUT /api/v1/devices/{id}/subinterface-intent — push full subinterface intent.
 
     ``interfaces`` is a list of dicts:
       [{"interface_name": "GigabitEthernet0/1.100", "parent_interface": "GigabitEthernet0/1",
@@ -691,7 +691,7 @@ def put_subinterface_intent(adapter_device_id, interfaces):
 
 
 def apply_lag_config(adapter_device_id, bundles):
-    """POST /api/v1/devices/{id}/lag-config/apply — push + apply full LACP bundle intent (M33).
+    """POST /api/v1/devices/{id}/lag-config/apply — push + apply full LACP bundle intent.
 
     ``bundles`` is a list of dicts:
       [{"name": "Port-channel1", "lag_id": 1, "min_links": 2, "system_priority": 100,
@@ -711,7 +711,7 @@ def put_isis_interface_intent(adapter_device_id, interfaces, processes=None):
     """PUT /api/v1/devices/{id}/isis-interface-intent — push full IS-IS intent.
 
     ``interfaces`` is a list of interface intent dicts.
-    ``processes`` is an optional list of process intent dicts (M18 B3):
+    ``processes`` is an optional list of process intent dicts:
       [{"process_tag": "", "net": "49.0001.0001.0001.00", "is_type": "level-2",
         "metric_style": "wide", "overload_bit": None,
         "area_auth_type": None, "area_auth_key": None,
@@ -745,7 +745,7 @@ def put_isis_flex_algo_intent(adapter_device_id, flex_algos):
 
 
 def put_bgp_intent(adapter_device_id, routers):
-    """PUT /api/v1/devices/{id}/bgp-intent — push full BGP intent snapshot (M16 B3).
+    """PUT /api/v1/devices/{id}/bgp-intent — push full BGP intent snapshot.
 
     ``routers`` is a list of dicts following the BgpIntentUpdate schema:
       [{"asn": "65100", "scopes": [{"vrf": "", "address_families": [...], "peers": [...]}]}]
@@ -760,7 +760,7 @@ def put_bgp_intent(adapter_device_id, routers):
 
 
 def put_route_policy_intent(adapter_device_id, objects):
-    """PUT /api/v1/devices/{id}/route-policy-intent — push accepted route-policy objects (M17 B3).
+    """PUT /api/v1/devices/{id}/route-policy-intent — push accepted route-policy objects.
 
     ``objects`` is a list of dicts:
       [{"family": "prefix_list", "name": "PL-RFC1918", "entries": [...], "accepted": true}]

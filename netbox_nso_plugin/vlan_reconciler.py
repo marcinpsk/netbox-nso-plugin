@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""M34: reconcile the adapter VLAN-database + switchport payloads into NetBox.
+"""reconcile the adapter VLAN-database + switchport payloads into NetBox.
 
 VLANs are *seeded* into a per-device ``ipam.VLANGroup`` (slug ``nso-{device.pk}``)
 on first import so imported vids are scoped per device (NetBox enforces

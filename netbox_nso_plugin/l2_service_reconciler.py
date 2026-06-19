@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""M37 Phase 2a: reconcile Nokia L2 services into native vpn.L2VPN + L2VPNTermination.
+"""reconcile Nokia L2 services into native vpn.L2VPN + L2VPNTermination.
 
 Read → model (no device write). Each epipe/vpls service becomes a per-device-scoped
 ``vpn.L2VPN`` (epipe→VPWS, vpls→VPLS); each SAP a ``vpn.L2VPNTermination`` on its port

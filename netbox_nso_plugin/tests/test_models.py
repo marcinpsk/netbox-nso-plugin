@@ -145,7 +145,7 @@ class TestAdapterClientListNSODevices(unittest.TestCase):
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_RESOLVED_CONFIG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_list_nso_devices_returns_list_of_dicts(self, mock_session_cls, _cfg):
-        """list_nso_devices returns list of dicts (not strings) after M7."""
+        """list_nso_devices returns list of dicts (not strings) after."""
         from netbox_nso_plugin.adapter_client import list_nso_devices
 
         session = make_session()

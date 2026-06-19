@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Tests for M12 A4: adapter_client.get_interface_ips and _reconcile_interface_ips."""
+"""Tests for A4: adapter_client.get_interface_ips and _reconcile_interface_ips."""
 
 import unittest
 from unittest.mock import patch

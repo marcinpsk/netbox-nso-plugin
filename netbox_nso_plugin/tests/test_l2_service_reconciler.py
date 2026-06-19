@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""M37 P2a Task 2: reconcile_l2_services → vpn.L2VPN + L2VPNTermination + NSOL2SapState."""
+"""Task 2: reconcile_l2_services → vpn.L2VPN + L2VPNTermination + NSOL2SapState."""
 
 from __future__ import annotations
 

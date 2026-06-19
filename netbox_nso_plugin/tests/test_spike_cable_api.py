@@ -2,7 +2,7 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Phase 1 spike: confirm which NetBox 4.6 Cable/Interface API attributes work.
 
-These tests are deliberately exploratory. They exist to de-risk M8's assumptions
+These tests are deliberately exploratory. They exist to de-risk assumptions
 about cable traversal before any production code is written. Results from these
 tests update the Phase 0 "Allowed APIs" section of docs/m8-derived-intent-plan.md.
 

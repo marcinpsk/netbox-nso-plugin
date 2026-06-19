@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""M34: VLAN + switchport reconcile into NetBox (per-device VLANGroup + native L2)."""
+"""VLAN + switchport reconcile into NetBox (per-device VLANGroup + native L2)."""
 
 from __future__ import annotations
 

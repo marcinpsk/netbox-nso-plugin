@@ -44,10 +44,10 @@ class TestReconcileLoggingConfig(TestCase):
 
         res = _reconcile_logging_config(
             self.device,
-            self._payload({"address": "192.0.2.86", "severity": "warning", "facility": "any", "source": "1.1.1.1"}),
+            self._payload({"address": "198.18.251.86", "severity": "warning", "facility": "any", "source": "1.1.1.1"}),
         )
         self.assertEqual(len(res["hosts"]), 1)
-        h = NSOLoggingHostState.objects.get(management__device=self.device, address="192.0.2.86")
+        h = NSOLoggingHostState.objects.get(management__device=self.device, address="198.18.251.86")
         self.assertEqual(h.severity, "warning")
         self.assertEqual(h.source, "1.1.1.1")
         self.assertEqual(h.status, "imported")

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Tests for M15 A4: adapter_client.get_bgp_config and _reconcile_bgp_config."""
+"""Tests for A4: adapter_client.get_bgp_config and _reconcile_bgp_config."""
 
 import unittest
 from unittest.mock import patch
@@ -298,9 +298,9 @@ class TestReconcileBgpConfig(TestCase):
 
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
 
-        src = IPAddress.objects.create(address="192.0.2.1/32")
+        src = IPAddress.objects.create(address="198.18.255.1/32")
         peer = self._peer_entry()
-        peer["source"] = "192.0.2.1"
+        peer["source"] = "198.18.255.1"
         _reconcile_bgp_config(self.device, self._payload(self._router_payload(peers=[peer])))
 
         bp = BGPPeer.objects.get(peer__address__net_host="10.0.0.2")

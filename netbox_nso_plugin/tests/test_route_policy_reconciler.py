@@ -576,7 +576,7 @@ class TestSharedObjectOwnership(TestCase):
 
 
 class TestRouteMapStructuredMaterialisation(TestCase):
-    """M17 P1: route-map entries materialise the structured fields (match_afi,
+    """route-map entries materialise the structured fields (match_afi,
     set_communities, call_policy, vendor_ext, RouteMap.default_action) from the opaque
     match/set blobs the reader packs — end-to-end through reconcile_route_policy against
     the REAL netbox_routing models + DB. The structured fields are an ADDITIVE projection:
@@ -866,7 +866,7 @@ class TestRouteMapStructuredMaterialisation(TestCase):
 
 
 class TestRoutePolicyVersionsStructuredUI(TestCase):
-    """M17 P2: the 'Versions' surface renders each device's STRUCTURED route-map (via
+    """the 'Versions' surface renders each device's STRUCTURED route-map (via
     summarize_route_map) so operators compare versions without reading raw JSON — end-to-end
     through the real view + template against real models."""
 

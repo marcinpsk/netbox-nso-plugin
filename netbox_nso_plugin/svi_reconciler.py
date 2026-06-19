@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""M35: reconcile L3 VLAN interfaces (SVIs / IRBs) from NSO into NetBox.
+"""reconcile L3 VLAN interfaces (SVIs / IRBs) from NSO into NetBox.
 
 Materialises the virtual ``dcim.Interface`` (type=virtual), links it to its VLAN
-(via M34's per-device VLAN group), and tracks ``NSOSVIState``. IP addresses are
-NOT handled here — they ride the M12 interface-IP path on the same interface, so
+(via per-device VLAN group), and tracks ``NSOSVIState``. IP addresses are
+NOT handled here — they ride the interface-IP path on the same interface, so
 this reconcile MUST run before ``_reconcile_interface_ips`` (which only attaches
 IPs to interfaces that already exist).
 """
