@@ -146,15 +146,26 @@ def netbox_route_map_captured(rm_obj) -> dict:
 def route_policy_state_diff(state) -> dict | None:
     """Diff a NSORoutePolicyState route-map row (device capture vs the NetBox object).
 
-    Returns the :func:`route_map_diff` result, or ``None`` when the row isn't a route-map or
-    has no materialised object to compare against.
+    Returns the :func:`route_map_diff` result (with a ``removed_on_device`` flag), or ``None``
+    when the row isn't a route-map or has no materialised object to compare against.
+
+    When ``device_present`` is False the device has REMOVED this route-map: its ``captured`` is
+    stale (last-seen) and would falsely match the materialised object, so the device side is
+    compared as empty — every NetBox entry reads "only in NetBox" and ``removed_on_device`` /
+    ``any_diff`` are set, so the delta agrees with the row's ``changed`` status.
     """
     if state.family != "route_map":
         return None
     rm_obj = state.assigned_object
     if rm_obj is None:
         return None
-    return route_map_diff(state.captured, netbox_route_map_captured(rm_obj))
+    removed_on_device = not getattr(state, "device_present", True)
+    device_captured = {} if removed_on_device else state.captured
+    diff = route_map_diff(device_captured, netbox_route_map_captured(rm_obj))
+    diff["removed_on_device"] = removed_on_device
+    if removed_on_device:
+        diff["any_diff"] = True
+    return diff
 
 
 _REDIST_FIELDS: tuple[tuple[str, str], ...] = (

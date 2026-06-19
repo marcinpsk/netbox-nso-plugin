@@ -1295,6 +1295,11 @@ class SharedObjectStateMixin(models.Model):
       the device whose ``captured`` currently populates the shared NetBox object.  The
       first device to import an object owns it; an operator can re-point ownership to a
       different device's version (see ``shared_object_ownership.rematerialize``).
+    - ``device_present`` — whether the device still reports this object.  The reconciler sets
+      it False when the object drops out of the device's payload (it was removed on the
+      device) — the row + shared object are KEPT and flagged ``changed`` (no silent delete),
+      and this lets the drift delta render "removed on device" instead of comparing the stale
+      ``captured`` against the object (which would falsely read as "no drift").
 
     Abstract so the route-policy overlay and the future ACL overlay share one contract;
     the family-agnostic machinery in ``shared_object_ownership`` operates purely through
@@ -1303,6 +1308,7 @@ class SharedObjectStateMixin(models.Model):
 
     captured = models.JSONField(default=dict, blank=True)
     is_materialized = models.BooleanField(default=False)
+    device_present = models.BooleanField(default=True)
 
     class Meta:
         abstract = True

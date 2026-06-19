@@ -29,6 +29,15 @@
           </div>
         {% else %}
 
+          {% if diff.removed_on_device %}
+          <div class="alert alert-warning">
+            <span class="mdi mdi-minus-circle-outline me-1"></span>
+            Removed on the device — this route-map is gone from the device but still exists in
+            NetBox (every entry below reads “only in NetBox”). Accept to take ownership, or
+            delete the NetBox object to match the device.
+          </div>
+          {% endif %}
+
           {% if diff.default_action.differs %}
           <div class="mb-3">
             <span class="text-muted small me-2">Default action</span>

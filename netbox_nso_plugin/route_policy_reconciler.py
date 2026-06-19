@@ -437,6 +437,7 @@ def _refresh_owner(state, family, obj, ct, captured, entries_hash, now) -> None:
     state.content_type = ct
     state.object_id = obj.pk
     state.is_materialized = True
+    state.device_present = True
     state.save(
         update_fields=[
             "status",
@@ -446,6 +447,7 @@ def _refresh_owner(state, family, obj, ct, captured, entries_hash, now) -> None:
             "content_type",
             "object_id",
             "is_materialized",
+            "device_present",
         ]
     )
 
@@ -506,7 +508,18 @@ def _upsert_state(mgmt, family, name, obj, ct, captured, now):
     state.last_sync_at = now
     state.content_type = ct
     state.object_id = obj.pk
-    state.save(update_fields=["status", "content_hash", "captured", "last_sync_at", "content_type", "object_id"])
+    state.device_present = True  # the device reported it this pass (flips back if it had vanished)
+    state.save(
+        update_fields=[
+            "status",
+            "content_hash",
+            "captured",
+            "last_sync_at",
+            "content_type",
+            "object_id",
+            "device_present",
+        ]
+    )
     return state, should_fill
 
 
@@ -671,15 +684,23 @@ def _reconcile_route_policy(device, payload: dict) -> list:
         ap_map,
     )
 
-    # Mark stale rows as drift (accepted/deploying intent is preserved by on_reconcile).
+    # Mark stale rows as drift: the device stopped reporting them. Record device_present=False
+    # (so the drift delta shows a real removal, not the stale capture falsely matching the
+    # object) and advance the status (accepted/deploying intent preserved by on_reconcile).
     from . import status_machine as sm
 
     for state in NSORoutePolicyState.objects.filter(management=mgmt):
         if (state.family, state.object_name) in seen_keys:
             continue
+        fields = []
         new_status = sm.on_reconcile(state.status, present=False)
         if new_status != state.status:
             state.status = new_status
-            state.save(update_fields=["status"])
+            fields.append("status")
+        if state.device_present:
+            state.device_present = False
+            fields.append("device_present")
+        if fields:
+            state.save(update_fields=fields)
 
     return list(NSORoutePolicyState.objects.filter(management=mgmt).order_by("family", "object_name"))

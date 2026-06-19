@@ -322,3 +322,25 @@ class TestRedistributionDiff(_RPBase):
         metric = next(f for f in d["fields"] if f["label"] == "Metric")
         self.assertEqual(metric["device"], "removed")
         self.assertTrue(metric["differs"])
+
+
+class TestRouteMapRemovalDiff(_RPBase):
+    def test_removed_route_map_shows_removal_drift(self):
+        """A route-map the device removed (device_present=False) reports drift even though its
+        stale captured still matches the materialized object — the diff shows removal, the
+        NetBox entries reading 'only in NetBox', agreeing with the changed status."""
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_diff import route_policy_state_diff
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._mgmt(self.d1)
+        reconcile_route_policy(self.d1, _rm("RM-REM", [_entry(10, set_={"local_preference": 100})]))
+        st = NSORoutePolicyState.objects.get(family="route_map", object_name="RM-REM")
+        # device stopped reporting it (what the reconciler stale loop records)
+        st.device_present = False
+        st.save(update_fields=["device_present"])
+
+        d = route_policy_state_diff(st)
+        self.assertTrue(d["any_diff"])
+        self.assertTrue(d["removed_on_device"])
+        self.assertTrue(any(e["presence"] == "netbox_only" for e in d["entries"]))

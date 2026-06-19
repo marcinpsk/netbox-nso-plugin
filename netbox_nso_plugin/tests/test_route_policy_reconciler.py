@@ -430,6 +430,34 @@ class TestReconcileRoutePolicy(TestCase):
         pl = PrefixList.objects.get(name="PL-OWN")
         self.assertEqual(PrefixListEntry.objects.filter(prefix_list=pl).count(), 1)  # intent not clobbered
 
+    def test_removed_object_marks_device_absent(self):
+        """A route-policy object the device stops reporting → status=changed AND
+        device_present=False. The row + shared object are kept (no silent delete); the flag
+        lets the drift delta show a real removal instead of stale 'no drift'."""
+        self._make_mgmt(self.device)
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        reconcile_route_policy(
+            self.device,
+            {"route_maps": [{"name": "RM-GONE", "entries": [{"sequence": 10, "action": "permit"}]}]},
+        )
+        st = NSORoutePolicyState.objects.get(family="route_map", object_name="RM-GONE")
+        self.assertTrue(st.device_present)
+
+        reconcile_route_policy(self.device, {"route_maps": []})  # device removed it
+        st.refresh_from_db()
+        self.assertEqual(st.status, "changed")
+        self.assertFalse(st.device_present)
+
+        # Re-appears → device_present flips back to True.
+        reconcile_route_policy(
+            self.device,
+            {"route_maps": [{"name": "RM-GONE", "entries": [{"sequence": 10, "action": "permit"}]}]},
+        )
+        st.refresh_from_db()
+        self.assertTrue(st.device_present)
+
     def test_route_map_expands_matched_community_list_into_match_community(self):
         """A route-map matching a community-list also links that list's member
         Communities into match_community (devices never match communities directly)."""
