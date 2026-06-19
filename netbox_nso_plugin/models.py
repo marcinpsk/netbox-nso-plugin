@@ -1517,6 +1517,12 @@ class NSORedistributionState(_NSODeviceTabURLMixin, NetBoxModel):
         related_name="nso_redistribution_states",
     )
     status = models.CharField(max_length=32, choices=_REDISTRIBUTION_STATUS_CHOICES, default="unknown")
+    # Whether the device still reports this redistribution. The reconciler sets it False when
+    # the entry drops out of the payload (the entry was removed on the device) — the row + its
+    # netbox-routing object are KEPT and flagged ``changed`` (no silent delete), and this flag
+    # lets the drift delta render "removed on device" instead of comparing the stale last-synced
+    # fields against the object (which would falsely read as "no drift").
+    device_present = models.BooleanField(default=True)
     last_sync_at = models.DateTimeField(null=True, blank=True)
     accepted_at = models.DateTimeField(null=True, blank=True)
     last_apply_at = models.DateTimeField(null=True, blank=True)

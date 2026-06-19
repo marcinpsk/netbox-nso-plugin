@@ -16,7 +16,13 @@
         {% if device %}on <a href="{% url 'dcim:device_nso' pk=device.pk %}">{{ device }}</a>{% endif %}
       </h5>
       <div class="card-body">
-        {% if not diff.linked %}
+        {% if diff.removed_on_device %}
+        <div class="alert alert-warning">
+          <span class="mdi mdi-minus-circle-outline me-1"></span>
+          Removed on the device — this redistribution is gone from the device but still exists in
+          NetBox. Accept to take ownership, or delete the NetBox object to match the device.
+        </div>
+        {% elif not diff.linked %}
         <div class="alert alert-info">
           <span class="mdi mdi-information-outline me-1"></span>
           No NetBox redistribution object is linked yet — every value below is device-only.

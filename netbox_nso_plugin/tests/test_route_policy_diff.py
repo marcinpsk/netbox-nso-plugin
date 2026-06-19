@@ -298,3 +298,27 @@ class TestRedistributionDiff(_RPBase):
         self.assertEqual(metric["device"], "99")
         self.assertEqual(metric["netbox"], "10")
         self.assertTrue(metric["differs"])
+
+    def test_removed_on_device_shows_removal_drift(self):
+        """The disjoint the status already knew about: a row the device no longer reports
+        (device_present=False) is a real drift even though its stale stored fields still match
+        the object. The diff must say 'removed', not 'no drift'."""
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import OSPFInstance, Redistribution
+
+        from netbox_nso_plugin.route_policy_diff import redistribution_diff
+
+        ospf = OSPFInstance.objects.create(device=self.d1, process_id=3, router_id="3.3.3.3")
+        ct = ContentType.objects.get_for_model(OSPFInstance)
+        rd = Redistribution.objects.create(
+            destination_type=ct, destination_id=ospf.pk, source_protocol="connected", source_ref="", metric=10
+        )
+        # Stored device metric deliberately EQUALS the object (the phantom case), but the device
+        # removed the entry → device_present False.
+        st = self._redist_state(redistribution=rd, metric=10, status="changed", device_present=False)
+        d = redistribution_diff(st)
+        self.assertTrue(d["any_diff"])  # agrees with status=changed
+        self.assertTrue(d["removed_on_device"])
+        metric = next(f for f in d["fields"] if f["label"] == "Metric")
+        self.assertEqual(metric["device"], "removed")
+        self.assertTrue(metric["differs"])

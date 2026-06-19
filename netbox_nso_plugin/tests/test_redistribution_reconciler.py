@@ -143,6 +143,42 @@ class TestReconcileRedistribution(TestCase):
         redist.refresh_from_db()
         self.assertEqual(redist.metric, 99)  # edit preserved
 
+    def test_removed_entry_marks_device_absent(self):
+        """A redistribution the device stops reporting → status=changed AND device_present=False.
+        The row + its netbox-routing object are kept (no silent delete); the flag records that
+        the device no longer has it, so the drift delta can show a real removal."""
+        self._make_mgmt()
+        from netbox_routing.models import ISISInstance
+
+        ISISInstance.objects.create(device=self.device, process_tag="")
+        from netbox_nso_plugin.models import NSORedistributionState
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+
+        reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
+        s = NSORedistributionState.objects.get(management__device=self.device)
+        self.assertTrue(s.device_present)
+
+        # Device stops reporting the entry entirely.
+        reconcile_redistribution(self.device, {"entries": []})
+        s.refresh_from_db()
+        self.assertEqual(s.status, "changed")
+        self.assertFalse(s.device_present)
+
+    def test_reappearing_entry_restores_present(self):
+        """If the device reports the entry again, device_present flips back to True."""
+        self._make_mgmt()
+        from netbox_routing.models import ISISInstance
+
+        ISISInstance.objects.create(device=self.device, process_tag="")
+        from netbox_nso_plugin.models import NSORedistributionState
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+
+        reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
+        reconcile_redistribution(self.device, {"entries": []})  # removed
+        reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})  # back
+        s = NSORedistributionState.objects.get(management__device=self.device)
+        self.assertTrue(s.device_present)
+
 
 class TestBuildBgpRouterList(TestCase):
     """_build_bgp_router_list must materialize redistribution-only scopes.

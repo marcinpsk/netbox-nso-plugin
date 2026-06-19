@@ -169,9 +169,16 @@ def redistribution_diff(state) -> dict:
 
     The device side is the overlay's own ``route_map`` / ``metric`` / ``metric_type`` (last
     synced from the device); the NetBox side is the linked ``Redistribution`` object. Returns
-    ``{linked, any_diff, fields}``; when no object is linked yet every field reads device-only.
+    ``{linked, removed_on_device, any_diff, fields}``.
+
+    When ``device_present`` is False the device has REMOVED this redistribution: the stored
+    fields are stale (last-seen) and would falsely match the object, so the device side reads
+    "removed" for every field the object still carries and ``removed_on_device``/``any_diff``
+    are set — the delta then agrees with the row's ``changed`` status instead of claiming "no
+    drift". When no object is linked yet every field reads device-only.
     """
     rd = state.redistribution
+    removed_on_device = not getattr(state, "device_present", True)
     device = {"route_map": state.route_map, "metric": state.metric, "metric_type": state.metric_type}
     if rd is not None:
         netbox = {
@@ -183,11 +190,15 @@ def redistribution_diff(state) -> dict:
         netbox = {"route_map": "", "metric": None, "metric_type": ""}
 
     rows = []
-    any_diff = False
+    any_diff = removed_on_device  # a removal is itself drift, even if the object carries no values
     for key, label in _REDIST_FIELDS:
-        dv = "" if device[key] in (None, "") else str(device[key])
         nv = "" if netbox[key] in (None, "") else str(netbox[key])
+        if removed_on_device:
+            # The device no longer reports the entry — show it as gone, not the stale fields.
+            rows.append({"label": label, "device": "removed", "netbox": nv or "—", "differs": nv != ""})
+            continue
+        dv = "" if device[key] in (None, "") else str(device[key])
         differs = dv != nv
         any_diff = any_diff or differs
         rows.append({"label": label, "device": dv or "—", "netbox": nv or "—", "differs": differs})
-    return {"linked": rd is not None, "any_diff": any_diff, "fields": rows}
+    return {"linked": rd is not None, "removed_on_device": removed_on_device, "any_diff": any_diff, "fields": rows}

@@ -198,6 +198,7 @@ def reconcile_redistribution(device, payload: dict) -> list:
         state.route_map = entry.get("route_map") or ""
         state.metric = entry.get("metric")
         state.metric_type = entry.get("metric_type") or ""
+        state.device_present = True  # device reports it this pass (flips back if it had vanished)
         state.last_sync_at = now
         state.save()
         # 3-way merge: device change auto-mirrors when untouched; operator edit →
@@ -208,13 +209,22 @@ def reconcile_redistribution(device, payload: dict) -> list:
         state.save()
         seen_keys.add(key)
 
-    # Mark stale rows (accepted/deploying intent preserved by on_reconcile).
+    # Mark stale rows: the device stopped reporting them. Record device_present=False (so the
+    # drift delta shows a real removal, not the stale fields falsely matching the object) and
+    # advance the status (accepted/deploying intent preserved by on_reconcile).
     for stale in NSORedistributionState.objects.filter(management=mgmt):
         k = (stale.dest_protocol, stale.dest_ref, stale.source_protocol, stale.source_ref)
-        if k not in seen_keys:
-            new_status = sm.on_reconcile(stale.status, present=False)
-            if new_status != stale.status:
-                stale.status = new_status
-                stale.save(update_fields=["status"])
+        if k in seen_keys:
+            continue
+        fields = []
+        new_status = sm.on_reconcile(stale.status, present=False)
+        if new_status != stale.status:
+            stale.status = new_status
+            fields.append("status")
+        if stale.device_present:
+            stale.device_present = False
+            fields.append("device_present")
+        if fields:
+            stale.save(update_fields=fields)
 
     return list(NSORedistributionState.objects.filter(management=mgmt))
