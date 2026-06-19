@@ -209,22 +209,32 @@ def reconcile_redistribution(device, payload: dict) -> list:
         state.save()
         seen_keys.add(key)
 
-    # Mark stale rows: the device stopped reporting them. Record device_present=False (so the
-    # drift delta shows a real removal, not the stale fields falsely matching the object) and
-    # advance the status (accepted/deploying intent preserved by on_reconcile).
+    # Stale rows: the device stopped reporting them.
+    #   - OWNED (accepted/deploying/in_sync/apply_failed): keep the row + its object and flag
+    #     drift (device_present=False) for the operator to resolve — operator intent is never
+    #     auto-removed.
+    #   - UNOWNED: the device no longer has it and nobody claimed it, so track the removal —
+    #     drop the overlay and its (leaf, unshared) Redistribution object once no other overlay
+    #     references it.
     for stale in NSORedistributionState.objects.filter(management=mgmt):
         k = (stale.dest_protocol, stale.dest_ref, stale.source_protocol, stale.source_ref)
         if k in seen_keys:
             continue
-        fields = []
-        new_status = sm.on_reconcile(stale.status, present=False)
-        if new_status != stale.status:
-            stale.status = new_status
-            fields.append("status")
-        if stale.device_present:
-            stale.device_present = False
-            fields.append("device_present")
-        if fields:
-            stale.save(update_fields=fields)
+        if sm.is_owned(stale.status):
+            fields = []
+            new_status = sm.on_reconcile(stale.status, present=False)
+            if new_status != stale.status:
+                stale.status = new_status
+                fields.append("status")
+            if stale.device_present:
+                stale.device_present = False
+                fields.append("device_present")
+            if fields:
+                stale.save(update_fields=fields)
+        else:
+            rd = stale.redistribution
+            stale.delete()
+            if rd is not None and not rd.nso_redistribution_states.exists():
+                rd.delete()
 
     return list(NSORedistributionState.objects.filter(management=mgmt))

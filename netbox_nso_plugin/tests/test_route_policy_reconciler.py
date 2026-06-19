@@ -430,11 +430,12 @@ class TestReconcileRoutePolicy(TestCase):
         pl = PrefixList.objects.get(name="PL-OWN")
         self.assertEqual(PrefixListEntry.objects.filter(prefix_list=pl).count(), 1)  # intent not clobbered
 
-    def test_removed_object_marks_device_absent(self):
-        """A route-policy object the device stops reporting → status=changed AND
-        device_present=False. The row + shared object are kept (no silent delete); the flag
-        lets the drift delta show a real removal instead of stale 'no drift'."""
+    def test_unowned_removed_object_is_deleted(self):
+        """A sole-device UNOWNED object the device stops reporting (referenced by nothing) is
+        tracked away — the shared object and the overlay row are removed, not left as drift."""
         self._make_mgmt(self.device)
+        from netbox_routing.models import RouteMap
+
         from netbox_nso_plugin.models import NSORoutePolicyState
         from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
 
@@ -442,21 +443,37 @@ class TestReconcileRoutePolicy(TestCase):
             self.device,
             {"route_maps": [{"name": "RM-GONE", "entries": [{"sequence": 10, "action": "permit"}]}]},
         )
-        st = NSORoutePolicyState.objects.get(family="route_map", object_name="RM-GONE")
-        self.assertTrue(st.device_present)
+        self.assertTrue(RouteMap.objects.filter(name="RM-GONE").exists())
+
+        reconcile_route_policy(self.device, {"route_maps": []})  # device removed it
+        self.assertFalse(NSORoutePolicyState.objects.filter(family="route_map", object_name="RM-GONE").exists())
+        self.assertFalse(RouteMap.objects.filter(name="RM-GONE").exists())  # object gone too
+
+    def test_owned_removed_object_kept_as_drift(self):
+        """An ACCEPTED object the device removes is KEPT and flagged: status=changed,
+        device_present=False — operator intent is never auto-deleted."""
+        from django.utils import timezone
+
+        self._make_mgmt(self.device)
+        from netbox_routing.models import RouteMap
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        reconcile_route_policy(
+            self.device,
+            {"route_maps": [{"name": "RM-KEEP", "entries": [{"sequence": 10, "action": "permit"}]}]},
+        )
+        st = NSORoutePolicyState.objects.get(family="route_map", object_name="RM-KEEP")
+        st.status = "accepted"
+        st.accepted_at = timezone.now()
+        st.save(update_fields=["status", "accepted_at"])
 
         reconcile_route_policy(self.device, {"route_maps": []})  # device removed it
         st.refresh_from_db()
-        self.assertEqual(st.status, "changed")
         self.assertFalse(st.device_present)
-
-        # Re-appears → device_present flips back to True.
-        reconcile_route_policy(
-            self.device,
-            {"route_maps": [{"name": "RM-GONE", "entries": [{"sequence": 10, "action": "permit"}]}]},
-        )
-        st.refresh_from_db()
-        self.assertTrue(st.device_present)
+        self.assertIn(st.status, ("accepted", "deploying", "in_sync", "apply_failed"))
+        self.assertTrue(RouteMap.objects.filter(name="RM-KEEP").exists())  # kept (operator owns)
 
     def test_route_map_expands_matched_community_list_into_match_community(self):
         """A route-map matching a community-list also links that list's member
@@ -619,6 +636,53 @@ class TestSharedObjectOwnership(TestCase):
         reconcile_route_policy(self.d2, self._pl("PL-MULTI", ["10.0.0.0/8"]))
         s2 = NSORoutePolicyState.objects.get(management__device=self.d2, object_name="PL-MULTI")
         self.assertEqual(s2.status, "conflict")
+
+    def test_owner_removal_repoints_to_sibling(self):
+        """The owner's device removes a shared object another device still reports → re-point
+        ownership to that device (object lives on) and drop the removing device's row."""
+        from netbox_routing.models import PrefixList
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._mgmt(self.d1)
+        self._mgmt(self.d2)
+        reconcile_route_policy(self.d1, self._pl("PL-RP", ["10.0.0.0/8"]))  # d1 owns
+        reconcile_route_policy(self.d2, self._pl("PL-RP", ["10.0.0.0/8"]))  # d2 also reports it
+
+        reconcile_route_policy(self.d1, {"prefix_lists": []})  # d1 removes it
+        self.assertFalse(NSORoutePolicyState.objects.filter(management__device=self.d1, object_name="PL-RP").exists())
+        s2 = NSORoutePolicyState.objects.get(management__device=self.d2, object_name="PL-RP")
+        self.assertTrue(s2.is_materialized)  # d2 is the new owner
+        self.assertTrue(PrefixList.objects.filter(name="PL-RP").exists())  # object kept
+
+    def test_referenced_object_kept_on_removal(self):
+        """A removed unowned object still referenced by a route-map is NOT deleted (that would
+        break the reference) — it is kept and flagged drift instead."""
+        from netbox_routing.models import PrefixList
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._mgmt(self.d1)
+        rmaps = [
+            {
+                "name": "RM-REF",
+                "entries": [{"sequence": 10, "action": "permit", "match_prefix_lists": ["PL-REF"]}],
+            }
+        ]
+        reconcile_route_policy(
+            self.d1,
+            {
+                "prefix_lists": [{"name": "PL-REF", "entries": [{"sequence": 10, "prefix": "10.0.0.0/8"}]}],
+                "route_maps": rmaps,
+            },
+        )
+        # Device drops PL-REF as a top-level prefix-list, but the route-map still references it.
+        reconcile_route_policy(self.d1, {"route_maps": rmaps})
+        pl_state = NSORoutePolicyState.objects.get(family="prefix_list", object_name="PL-REF")
+        self.assertFalse(pl_state.device_present)  # flagged removed
+        self.assertTrue(PrefixList.objects.filter(name="PL-REF").exists())  # kept — still referenced
 
     def test_rematerialize_repoints_ownership(self):
         """Operator picks the second device's version → the shared object is refilled from

@@ -143,12 +143,31 @@ class TestReconcileRedistribution(TestCase):
         redist.refresh_from_db()
         self.assertEqual(redist.metric, 99)  # edit preserved
 
-    def test_removed_entry_marks_device_absent(self):
-        """A redistribution the device stops reporting → status=changed AND device_present=False.
-        The row + its netbox-routing object are kept (no silent delete); the flag records that
-        the device no longer has it, so the drift delta can show a real removal."""
+    def test_unowned_removed_redistribution_is_deleted(self):
+        """An UNOWNED redistribution the device stops reporting is tracked away: the overlay
+        row and its (leaf) Redistribution object are removed (no lingering false drift)."""
         self._make_mgmt()
-        from netbox_routing.models import ISISInstance
+        from netbox_routing.models import ISISInstance, Redistribution
+
+        ISISInstance.objects.create(device=self.device, process_tag="")
+        from netbox_nso_plugin.models import NSORedistributionState
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+
+        reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
+        self.assertEqual(NSORedistributionState.objects.count(), 1)
+        self.assertEqual(Redistribution.objects.count(), 1)
+
+        reconcile_redistribution(self.device, {"entries": []})  # device removed it
+        self.assertEqual(NSORedistributionState.objects.count(), 0)  # overlay gone
+        self.assertEqual(Redistribution.objects.count(), 0)  # object gone
+
+    def test_owned_removed_redistribution_kept_as_drift(self):
+        """An ACCEPTED redistribution the device removes is KEPT and flagged: status=changed,
+        device_present=False — operator intent is never auto-deleted."""
+        from django.utils import timezone
+
+        self._make_mgmt()
+        from netbox_routing.models import ISISInstance, Redistribution
 
         ISISInstance.objects.create(device=self.device, process_tag="")
         from netbox_nso_plugin.models import NSORedistributionState
@@ -156,28 +175,15 @@ class TestReconcileRedistribution(TestCase):
 
         reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
         s = NSORedistributionState.objects.get(management__device=self.device)
-        self.assertTrue(s.device_present)
+        s.status = "accepted"
+        s.accepted_at = timezone.now()
+        s.save(update_fields=["status", "accepted_at"])
 
-        # Device stops reporting the entry entirely.
-        reconcile_redistribution(self.device, {"entries": []})
+        reconcile_redistribution(self.device, {"entries": []})  # device removed it
         s.refresh_from_db()
-        self.assertEqual(s.status, "changed")
         self.assertFalse(s.device_present)
-
-    def test_reappearing_entry_restores_present(self):
-        """If the device reports the entry again, device_present flips back to True."""
-        self._make_mgmt()
-        from netbox_routing.models import ISISInstance
-
-        ISISInstance.objects.create(device=self.device, process_tag="")
-        from netbox_nso_plugin.models import NSORedistributionState
-        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
-
-        reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
-        reconcile_redistribution(self.device, {"entries": []})  # removed
-        reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})  # back
-        s = NSORedistributionState.objects.get(management__device=self.device)
-        self.assertTrue(s.device_present)
+        self.assertIn(s.status, ("accepted", "deploying", "in_sync", "apply_failed"))
+        self.assertEqual(Redistribution.objects.count(), 1)  # object kept (operator owns it)
 
 
 class TestBuildBgpRouterList(TestCase):

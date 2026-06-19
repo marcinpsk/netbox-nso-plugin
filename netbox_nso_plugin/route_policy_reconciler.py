@@ -688,23 +688,93 @@ def _reconcile_route_policy(device, payload: dict) -> list:
         ap_map,
     )
 
-    # Mark stale rows as drift: the device stopped reporting them. Record device_present=False
-    # (so the drift delta shows a real removal, not the stale capture falsely matching the
-    # object) and advance the status (accepted/deploying intent preserved by on_reconcile).
+    # Stale rows: the device stopped reporting these objects.
+    #   - OWNED (anywhere in the shared group): keep + flag drift (device_present=False) for the
+    #     operator — intent is never auto-removed.
+    #   - UNOWNED: track the removal — re-point to a device that still reports it, or delete the
+    #     shared object once no device has it and nothing else references it (see
+    #     :func:`_track_unowned_removal`).
     from . import status_machine as sm
 
-    for state in NSORoutePolicyState.objects.filter(management=mgmt):
+    for state in list(NSORoutePolicyState.objects.filter(management=mgmt)):
         if (state.family, state.object_name) in seen_keys:
             continue
-        fields = []
-        new_status = sm.on_reconcile(state.status, present=False)
-        if new_status != state.status:
-            state.status = new_status
-            fields.append("status")
-        if state.device_present:
-            state.device_present = False
-            fields.append("device_present")
-        if fields:
-            state.save(update_fields=fields)
+        if sm.is_owned(state.status):
+            _flag_removed(state)
+        else:
+            _track_unowned_removal(state)
 
     return list(NSORoutePolicyState.objects.filter(management=mgmt).order_by("family", "object_name"))
+
+
+def _flag_removed(state) -> None:
+    """Keep a stale row but record that the device removed it: device_present=False + drift.
+
+    The shared object and the row are preserved (operator intent, or a still-referenced object);
+    the row advances to ``changed`` via on_reconcile and the diff then shows "removed on device".
+    """
+    from . import status_machine as sm
+
+    fields = []
+    new_status = sm.on_reconcile(state.status, present=False)
+    if new_status != state.status:
+        state.status = new_status
+        fields.append("status")
+    if state.device_present:
+        state.device_present = False
+        fields.append("device_present")
+    if fields:
+        state.save(update_fields=fields)
+
+
+def _object_referenced(obj, family) -> bool:
+    """Return whether another netbox-routing object still references *obj*.
+
+    Deleting a referenced object would break that reference, so removal keeps it instead.
+    Conservative — an unrecognised family is treated as referenced (kept).
+    """
+    if family in ("prefix_list", "as_path"):
+        return obj.route_map_entries.exists()
+    if family == "community_list":
+        return obj.route_map_entries.exists() or obj.set_by_route_map_entries.exists()
+    if family == "route_map":
+        return obj.called_by_entries.exists() or obj.applied_by_entries.exists() or obj.redistribution_entries.exists()
+    return True
+
+
+def _track_unowned_removal(state) -> None:
+    """Track an unowned shared object the device removed (no operator ever claimed it).
+
+    Re-point ownership to a device that still reports it (the object lives on, drift clears);
+    if NO device reports it anymore, delete the object + its overlay rows — unless another
+    netbox-routing object still references it, in which case keep it and flag drift (deleting
+    would break that reference). The removing device's own overlay row is dropped when the
+    object survives elsewhere, or with the object when it is removed entirely.
+    """
+    from . import status_machine as sm
+
+    group = list(ownership.group_rows(state))
+    if any(sm.is_owned(s.status) for s in group):
+        _flag_removed(state)  # operator intent in the group → never auto-remove
+        return
+    siblings = [s for s in group if s.pk != state.pk]
+    live = [s for s in siblings if s.device_present and s.captured]
+    obj = state.assigned_object
+    family = state.family
+    if live:
+        # Some device still reports it → drop this device's row; re-point if we were the owner.
+        was_owner = state.is_materialized
+        state.delete()
+        if was_owner:
+            ownership.rematerialize(live[0])
+        return
+    # No device reports this object anymore.
+    if obj is not None and _object_referenced(obj, family):
+        for s in group:
+            _flag_removed(s)  # still referenced elsewhere → keep the object, flag the rows
+        return
+    for s in siblings:
+        s.delete()
+    state.delete()
+    if obj is not None:
+        obj.delete()
