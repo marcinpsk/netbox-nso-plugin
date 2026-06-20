@@ -189,7 +189,9 @@
   "use strict";
   var rows = document.querySelectorAll('tr[data-onboard-pk]');
   if (!rows.length) return;
-  var csrfToken = (document.cookie.match(/csrftoken=([^;]+)/) || [])[1] || '';
+  // NetBox sets CSRF_COOKIE_HTTPONLY=True, so the csrftoken cookie is NOT readable from
+  // document.cookie — render the token server-side instead (valid for this session).
+  var csrfToken = "{{ csrf_token }}";
   var base = "{% url 'plugins:netbox_nso_plugin:onboard_status' pk=0 %}";
   function statusUrl(pk) { return base.replace(/0\/$/, pk + '/'); }
   var stopped = false;

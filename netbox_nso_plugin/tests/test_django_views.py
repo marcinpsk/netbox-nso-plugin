@@ -119,6 +119,33 @@ class TestOnboardingDashboardView(ViewTestBase):
         self.assertEqual(response.status_code, 302)
         self.assertTrue(NSODeviceManagement.objects.filter(device=ext).exists())
 
+    @patch("netbox_nso_plugin.adapter_client.get_neds", return_value=[])
+    @patch("netbox_nso_plugin.adapter_client.list_instance_devices", return_value=[])
+    def test_provisioning_row_poll_uses_server_rendered_csrf(self, _list, _neds):
+        """A provisioning row renders the poll script with a SERVER-rendered CSRF token.
+
+        NetBox sets CSRF_COOKIE_HTTPONLY=True, so the csrftoken cookie is NOT readable from
+        document.cookie — the dashboard poll must embed the token server-side or every
+        onboard-status POST 403s and the row never advances (caught in live Playwright).
+        """
+        dev = Device.objects.create(
+            name="prov-dash", device_type=self.device.device_type, role=self.device.role, site=self.device.site
+        )
+        NSODeviceManagement.objects.create(
+            device=dev,
+            nso_instance=self.nso_instance,
+            nso_device_name="prov-dash",
+            onboard_status="provisioning",
+            onboard_job_id="123",
+        )
+        url = reverse("plugins:netbox_nso_plugin:onboarding_dashboard")
+        response = self.client.get(url, {"instance": self.nso_instance.adapter_instance_id})
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "data-onboard-pk=")  # the row is pollable
+        self.assertContains(response, 'var csrfToken = "')  # token rendered server-side
+        # The HttpOnly cookie read must NOT be how the poll obtains the token.
+        self.assertNotContains(response, "document.cookie.match(/csrftoken")
+
 
 class TestOnboardStatusView(ViewTestBase):
     """Async-onboarding status-advance endpoint (polled by the dashboard while a row provisions).
