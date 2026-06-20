@@ -583,6 +583,48 @@ def _push_intent_on_interface_edit(sender, instance, created, **kwargs):
     )
 
 
+def _create_greenfield_subif_state(sender, instance, created, **kwargs):
+    """Own + push a routed sub-interface the operator just created in NetBox (greenfield write).
+
+    Mirror of the greenfield IP path: a NEW virtual sub-interface (``parent`` set, a numeric
+    dot1q tag in the name suffix — ``ae99.999`` / ``Gi0/1.100``) on a managed device becomes
+    owned intent immediately, so the subinterface-reconciler creates ``<parent> unit <n>
+    vlan-id <n>`` (+ flexible-vlan-tagging / encapsulation flexible-ethernet-services on Junos —
+    see junos-flexible-ethernet-services-dep) on the device. Adapter-origin writes
+    (imports/applies) are skipped — importing a subif from the device is not an operator create.
+    Nokia ``:`` logical subifs ride the IP-path greenfield binding, so only ``.``<digits>
+    (Junos/IOS) is handled here.
+    """
+    if not created or _is_adapter_origin_write() or instance.parent_id is None:
+        return
+    name = instance.name or ""
+    if "." not in name:
+        return
+    suffix = name.rsplit(".", 1)[1]
+    if not suffix.isdigit():
+        return
+
+    from .models import NSODeviceManagement, NSOSubinterfaceState
+
+    try:
+        mgmt = NSODeviceManagement.objects.get(device_id=instance.device_id)
+    except NSODeviceManagement.DoesNotExist:
+        return
+    if mgmt.adapter_device_id is None:
+        return
+
+    # Brand-new interface → no prior state; create + own it. The post_save signal on the
+    # new state pushes the device's full subinterface intent snapshot to the adapter.
+    NSOSubinterfaceState.objects.create(
+        management=mgmt,
+        interface=instance,
+        parent_interface=instance.parent,
+        dot1q_vlan=int(suffix),
+        status="accepted",
+        accepted_at=timezone.now(),
+    )
+
+
 def _push_ip_intent_for_device(device_id, adapter_device_id):
     """Build and push the full IP intent snapshot for a device."""
     from . import adapter_client as client
@@ -2568,6 +2610,11 @@ def _connect_g_activated():  # pragma: no cover
         _recompute_on_interface_save,
         sender=Interface,
         dispatch_uid="nso_plugin_iface_derived_intent",
+    )
+    post_save.connect(
+        _create_greenfield_subif_state,
+        sender=Interface,
+        dispatch_uid="nso_plugin_iface_greenfield_subif",
     )
     post_save.connect(
         _on_ip_address_change,
