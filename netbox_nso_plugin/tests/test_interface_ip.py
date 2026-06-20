@@ -383,3 +383,66 @@ class TestReconcileInterfaceIps(TestCase):
 
         self.assertEqual(result, [])
         self.assertFalse(NSOInterfaceIPState.objects.filter(address="1.2.3.4/32").exists())
+
+
+class TestAcceptInterfaceIPConflict(TestCase):
+    """The accept view resolves an interface-IP conflict by adopting the device reality.
+
+    Mirrors the live sw01 case: the OOB mgmt IP is reported by NSO on ``vme.0`` but
+    NetBox has it on the ``me0`` onboarding stand-in → conflict. Accepting must
+    reassign the IPAddress onto ``vme.0`` (no device push — the device already has it)
+    and settle the state to in_sync/owned.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        from core.models import ObjectType
+        from django.contrib.contenttypes.models import ContentType
+        from ipam.models import IPAddress
+
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOInterfaceIPState
+
+        mfg = Manufacturer.objects.create(name="Acc Mfg", slug="accmfg")
+        dt = DeviceType.objects.create(manufacturer=mfg, model="AccDev", slug="accdev")
+        role = DeviceRole.objects.create(name="AccRole", slug="accrole")
+        site = Site.objects.create(name="AccSite", slug="accsite")
+        cls.device = Device.objects.create(name="acc-sw01", device_type=dt, role=role, site=site)
+        # me0 = onboarding mgmt stand-in (holds the IP); vme.0 = what the NED reports.
+        cls.me0 = Interface.objects.create(device=cls.device, name="me0", type="virtual", mgmt_only=True)
+        cls.vme0 = Interface.objects.create(device=cls.device, name="vme.0", type="virtual")
+        cls.ip = IPAddress.objects.create(
+            address="172.30.150.90/24",
+            assigned_object_type=ContentType.objects.get_for_model(Interface),
+            assigned_object_id=cls.me0.pk,
+        )
+        nso = NSOInstance.objects.create(name="acc-nso", adapter_instance_id="acc-nso-id")
+        NSODeviceManagement.objects.create(device=cls.device, nso_instance=nso, nso_device_name="acc-sw01")
+        cls.state = NSOInterfaceIPState.objects.create(
+            interface=cls.vme0, address="172.30.150.90/24", vrf="", family="ipv4", status="conflict"
+        )
+        cls._OT = ObjectType
+
+    def setUp(self):
+        from django.contrib.auth import get_user_model
+        from users.models import ObjectPermission
+
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        user = get_user_model().objects.create_user(username="acc-op", password="accpass12345")  # noqa: S106
+        perm = ObjectPermission.objects.create(name="acc-change", actions=["change"])
+        perm.object_types.add(self._OT.objects.get_for_model(NSODeviceManagement))
+        perm.users.add(user)
+        self.client.force_login(user)
+
+    def test_accept_moves_ip_to_ned_interface_and_settles_in_sync(self):
+        from django.urls import reverse
+
+        url = reverse("plugins:netbox_nso_plugin:nsointerfaceipstate_accept", kwargs={"pk": self.state.pk})
+        resp = self.client.post(url)
+        self.assertEqual(resp.status_code, 302)
+
+        self.ip.refresh_from_db()
+        self.assertEqual(self.ip.assigned_object, self.vme0)  # moved me0 -> vme.0
+        self.state.refresh_from_db()
+        self.assertEqual(self.state.status, "in_sync")
+        self.assertIsNotNone(self.state.accepted_at)

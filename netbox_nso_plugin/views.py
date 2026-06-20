@@ -2019,6 +2019,49 @@ class NSOSwitchportStateAcceptView(NSOActionPermissionMixin, View):
         return redirect(_device_nso_tab_url(state.management.device_id))
 
 
+class NSOInterfaceIPStateAcceptView(NSOActionPermissionMixin, View):
+    """Resolve an interface-IP *conflict* by adopting the device's reality into NetBox.
+
+    The IP reconciler flags an address that NSO reports on one interface but which
+    NetBox has assigned to a *different* interface as ``conflict`` (it refuses to
+    silently move an IP). Accepting is the operator override: reassign the existing
+    IPAddress to the NED-reported interface — e.g. move the device's OOB mgmt IP off
+    the onboarding ``me0`` stand-in onto the real ``vme.0``. The device already
+    carries the address (NSO read it there), so NetBox now *matches* the device →
+    status ``in_sync``, and NO device push happens: the reassignment fires the
+    IPAddress signal while the row is still ``conflict``, which skips the push.
+    """
+
+    def post(self, request, pk):  # noqa: D102
+        from django.db import transaction
+        from ipam.models import IPAddress
+
+        try:
+            from ipam.models import VRF
+        except ImportError:
+            VRF = None
+
+        from .models import NSOInterfaceIPState
+
+        state = get_object_or_404(NSOInterfaceIPState, pk=pk)
+        iface = state.interface
+        vrf_obj = VRF.objects.filter(name=state.vrf).first() if state.vrf and VRF is not None else None
+
+        with transaction.atomic():
+            existing = IPAddress.objects.filter(address=state.address, vrf=vrf_obj).first()
+            if existing is None:
+                existing = IPAddress(address=state.address, vrf=vrf_obj, status="active")
+            existing.assigned_object = iface
+            existing.save()  # signal skips the push while this row is still `conflict`
+            # Device already has the address on `iface`; NetBox now matches → in_sync, owned.
+            state.status = "in_sync"
+            state.accepted_at = timezone.now()
+            state.save(update_fields=["status", "accepted_at"])
+
+        messages.success(request, f"Adopted {state.address} onto {iface.name}.")
+        return redirect(_device_nso_tab_url(iface.device_id))
+
+
 class NSOStaticRouteStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
     model_class = NSOStaticRouteState
 

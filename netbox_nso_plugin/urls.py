@@ -170,6 +170,11 @@ urlpatterns = [
         name="nsointerfacestate_accept_device",
     ),
     path(
+        "interface-ip-state/<int:pk>/accept/",
+        views.NSOInterfaceIPStateAcceptView.as_view(),
+        name="nsointerfaceipstate_accept",
+    ),
+    path(
         "interface-state/<int:pk>/edit-field/",
         views.NSOInterfaceEditFieldView.as_view(),
         name="nsointerfacestate_edit_field",
