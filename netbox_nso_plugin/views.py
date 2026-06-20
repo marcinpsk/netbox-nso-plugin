@@ -808,6 +808,37 @@ class NSOFailoverSettingsEditView(generic.ObjectEditView):
         """Return the existing singleton or a blank instance for first-time creation."""
         return NSOFailoverSettings.objects.first() or NSOFailoverSettings()
 
+    def get(self, request, *args, **kwargs):
+        """Render the form, warning first if failover is off at the adapter deployment level."""
+        self._warn_if_deployment_failover_disabled(request)
+        return super().get(request, *args, **kwargs)
+
+    @staticmethod
+    def _warn_if_deployment_failover_disabled(request):
+        """Surface when the adapter's deployment master switch (enable_failover) is off.
+
+        Without this, enabling failover here is a silent no-op: the adapter gates the whole
+        feature (probe loop + onboarding OOB bootstrap) on its static ``enable_failover``, and
+        the runtime toggle these settings drive has no effect until that is on. Best-effort —
+        an unreachable adapter must not block the settings page.
+        """
+        from . import adapter_client as client
+
+        try:
+            cfg = client.get_failover_config()
+        except Exception as exc:  # noqa: BLE001 — adapter may be down; never block the page
+            logger.debug("Could not read adapter failover config for deployment-state hint: %s", exc)
+            return
+        if cfg and cfg.get("deployment_enabled") is False:
+            messages.warning(
+                request,
+                "Mgmt-IP failover is disabled at the adapter deployment level "
+                "(enable_failover is off in the adapter config). These settings are saved but "
+                "have no effect — the failover probe loop is not running and onboarding will not "
+                "fall back to OOB — until the adapter operator sets enable_failover: true and "
+                "restarts the adapter.",
+            )
+
 
 # ── NSO Instance CRUD ────────────────────────────────────────────────────────
 

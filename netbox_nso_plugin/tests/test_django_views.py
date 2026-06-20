@@ -260,6 +260,41 @@ class TestOnboardStatusView(ViewTestBase):
         self.assertEqual(mgmt.onboard_status, "provisioning")
 
 
+class TestFailoverSettingsDeploymentWarning(ViewTestBase):
+    """The failover settings page warns when failover is off at the adapter deployment level.
+
+    Without it, enabling failover here is a silent no-op (the adapter gates the whole feature
+    on its static enable_failover; the runtime toggle has no effect until that is on).
+    """
+
+    URL_NAME = "plugins:netbox_nso_plugin:nsofailoversettings"
+    _WARN = "disabled at the adapter deployment level"
+
+    @patch(
+        "netbox_nso_plugin.adapter_client.get_failover_config",
+        return_value={"deployment_enabled": False, "enabled": True},
+    )
+    def test_warns_when_deployment_failover_disabled(self, _cfg):
+        response = self.client.get(reverse(self.URL_NAME))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, self._WARN)
+
+    @patch(
+        "netbox_nso_plugin.adapter_client.get_failover_config",
+        return_value={"deployment_enabled": True, "enabled": True},
+    )
+    def test_no_warning_when_deployment_failover_enabled(self, _cfg):
+        response = self.client.get(reverse(self.URL_NAME))
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, self._WARN)
+
+    @patch("netbox_nso_plugin.adapter_client.get_failover_config", side_effect=AdapterError("adapter down"))
+    def test_adapter_unreachable_does_not_block_or_warn(self, _cfg):
+        response = self.client.get(reverse(self.URL_NAME))
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, self._WARN)
+
+
 # ── List views ──────────────────────────────────────────────────────────────────
 
 

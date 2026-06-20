@@ -205,6 +205,18 @@ def provision_device(
     return _request("POST", "/api/v1/devices/provision", json=payload)
 
 
+def get_failover_config():
+    """GET /api/v1/config/failover — the adapter's effective failover config.
+
+    Includes ``deployment_enabled`` — the adapter's static ``scheduler.enable_failover``
+    master switch. When it is False the whole failover feature is off at the deployment
+    level (the probe loop isn't registered and onboarding won't bootstrap over OOB), so the
+    runtime ``enabled`` toggle (and the plugin's failover settings) have no effect until the
+    adapter operator sets ``enable_failover: true`` and restarts.
+    """
+    return _request("GET", "/api/v1/config/failover")
+
+
 def put_failover_config(payload):
     """PUT /api/v1/config/failover — push the global mgmt-IP failover tuning singleton.
 

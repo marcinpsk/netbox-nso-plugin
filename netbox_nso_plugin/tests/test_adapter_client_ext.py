@@ -377,6 +377,21 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_get_failover_config_reads_deployment_switch(self, mock_s, _cfg):
+        """get_failover_config GETs /api/v1/config/failover and returns deployment_enabled."""
+        from netbox_nso_plugin.adapter_client import get_failover_config
+
+        session = self._make_session(200, {"enabled": True, "deployment_enabled": False})
+        mock_s.return_value = session
+        result = get_failover_config()
+
+        args, _kwargs = session.request.call_args
+        self.assertEqual(args[0], "GET")
+        self.assertTrue(args[1].endswith("/api/v1/config/failover"))
+        self.assertIs(result["deployment_enabled"], False)
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_delete_device_no_error(self, mock_s, _cfg):
         from netbox_nso_plugin.adapter_client import delete_device
 
