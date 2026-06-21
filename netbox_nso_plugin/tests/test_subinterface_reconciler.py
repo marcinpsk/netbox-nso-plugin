@@ -172,14 +172,22 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
 
     def _state(self, name="ge-0/0/0.100", dot1q=100, status="imported"):
         iface = Interface.objects.create(device=self.device, name=name, type="virtual", parent=self.parent)
-        return NSOSubinterfaceState.objects.create(
+        # Creating a NEW parent+dot1q interface on a managed device (adapter_device_id set)
+        # fires the greenfield post_save signal (_create_greenfield_subif_state), which
+        # ALREADY creates an owned NSOSubinterfaceState. Cooperate with it via
+        # update_or_create rather than a second create that would violate the unique
+        # (management, interface) constraint.
+        state, _ = NSOSubinterfaceState.objects.update_or_create(
             management=self.management,
             interface=iface,
-            parent_interface=self.parent,
-            dot1q_vlan=dot1q,
-            vrf="MTI",
-            status=status,
+            defaults={
+                "parent_interface": self.parent,
+                "dot1q_vlan": dot1q,
+                "vrf": "MTI",
+                "status": status,
+            },
         )
+        return state
 
     def test_reconcile_preserves_owned_status(self):
         from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
