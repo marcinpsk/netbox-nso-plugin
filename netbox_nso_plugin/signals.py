@@ -2159,26 +2159,50 @@ def _on_routing_policy_pre_delete(sender, instance, **kwargs):
 # left to the 3-way reconcile so the edit surfaces as changed/conflict, not force-owned.
 
 
-def _own_route_map_contributors(mgmt, route_map) -> None:
-    """Own (accepted) every prefix-list / community-list / as-path a route-map references.
+def _own_route_map_contributors(mgmt, route_map) -> list:
+    """Own (accepted) the prefix-lists / community-lists / as-paths a route-map references.
 
     Owning a top-level object cascades ownership to everything it depends on: a route-map
     references prefix-lists / community-lists / as-paths by name, and owning the route-map
-    WITHOUT owning them leaves dangling references on the device (the ``match`` line is
-    written, but the referenced list/path object is not pushed — the exact gap that left an
-    ``ip as-path access-list`` missing after a route-map apply). Already-owned contributors
-    (accepted / deploying / in_sync / apply_failed) are left untouched.
+    WITHOUT owning a GREENFIELD reference leaves a dangling reference on the device (the
+    ``match`` line is written but the referenced list/path is never pushed — the exact gap
+    that left an ``ip as-path access-list`` missing after a route-map apply).
+
+    BUT a reference that has DRIFTED on the device (``changed``/``conflict`` — the device has a
+    diverging version) is NOT force-owned: that would silently overwrite the device's version.
+    It already exists on the device, so the route-map's reference still resolves against it — we
+    leave it for explicit drift resolution and RETURN the skipped ``(family, name)`` tuples so
+    the caller can warn the operator. Already-owned contributors (accepted / deploying / in_sync
+    / apply_failed) are left untouched.
     """
     from django.contrib.contenttypes.models import ContentType
 
     from .models import NSORoutePolicyState
+    from .status_machine import CHANGED, CONFLICT
 
     now = timezone.now()
-    referenced = []  # (family, obj)
+    referenced: list = []  # (family, obj), de-duplicated by (family, name)
+    seen_refs: set = set()
+
+    def _add_ref(family, obj):
+        key = (family, obj.name)
+        if key not in seen_refs:
+            seen_refs.add(key)
+            referenced.append((family, obj))
+
     for entry in route_map.route_map_entries.all():
-        referenced += [("prefix_list", o) for o in entry.match_prefix_list.all()]
-        referenced += [("community_list", o) for o in entry.match_community_list.all()]
-        referenced += [("as_path", o) for o in entry.match_aspath.all()]
+        for o in entry.match_prefix_list.all():
+            _add_ref("prefix_list", o)
+        for o in entry.match_community_list.all():
+            _add_ref("community_list", o)
+        for o in entry.match_aspath.all():
+            _add_ref("as_path", o)
+        # SET community-list references (`set community <list> add|delete|…`) are dependencies
+        # too — a `set comm-list delete <CL>` rejects on the device if <CL> isn't defined.
+        for sc in entry.set_communities.all():
+            if sc.community_list_id:
+                _add_ref("community_list", sc.community_list)
+    drifted: list = []
     for family, obj in referenced:
         ct = ContentType.objects.get_for_model(obj)
         state, created = NSORoutePolicyState.objects.get_or_create(
@@ -2187,10 +2211,18 @@ def _own_route_map_contributors(mgmt, route_map) -> None:
             object_name=obj.name,
             defaults={"content_type": ct, "object_id": obj.pk, "status": "accepted", "accepted_at": now},
         )
-        if not created and state.status not in _OWNED_PUSH_STATUSES:
-            state.content_type, state.object_id = ct, obj.pk
-            state.status, state.accepted_at = "accepted", now
-            state.save()
+        if created or state.status in _OWNED_PUSH_STATUSES:
+            continue  # greenfield (just created accepted) or already owned → nothing to do
+        if state.status in (CHANGED, CONFLICT):
+            # The device has a diverging version — don't silently overwrite it. The reference
+            # resolves against the device's existing object; surface it for explicit resolution.
+            drifted.append((family, obj.name))
+            continue
+        # imported / unknown — device matches NetBox (no drift) → safe to adopt.
+        state.content_type, state.object_id = ct, obj.pk
+        state.status, state.accepted_at = "accepted", now
+        state.save()
+    return drifted
 
 
 def _accept_route_policy_object(obj) -> None:

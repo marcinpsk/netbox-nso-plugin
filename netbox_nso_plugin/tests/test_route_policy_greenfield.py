@@ -345,6 +345,57 @@ class TestOwnershipCascade(_RPBase):
         st = NSORoutePolicyState.objects.get(management=mgmt, family="as_path", object_name="50")
         assert st.status == "in_sync"  # an already-owned contributor is left untouched
 
+    def test_cascade_skips_drifted_reference_and_reports_it(self):
+        """A referenced object that DIVERGES on the device (conflict) is NOT force-owned — the
+        cascade leaves it (no silent overwrite of the device's version) and reports it so the
+        operator can resolve the drift explicitly. The reference still resolves against the
+        device's existing object, so the route-map is not left dangling."""
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import PrefixList
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.signals import _own_route_map_contributors, suppress_intent_push
+
+        mgmt = self._mgmt()
+        rm, _ap, _cl, pl = self._route_map_with_refs()
+        with suppress_intent_push():
+            NSORoutePolicyState.objects.create(
+                management=mgmt,
+                family="prefix_list",
+                object_name=pl.name,
+                content_type=ContentType.objects.get_for_model(PrefixList),
+                object_id=pl.pk,
+                status="conflict",
+            )
+        drifted = _own_route_map_contributors(mgmt, rm)
+
+        st = NSORoutePolicyState.objects.get(management=mgmt, family="prefix_list", object_name=pl.name)
+        assert st.status == "conflict"  # left for explicit resolution, NOT overwritten
+        assert ("prefix_list", pl.name) in drifted  # reported to the caller (the Accept view warns)
+        # the greenfield references are still owned (only the drifted one is skipped)
+        assert NSORoutePolicyState.objects.get(management=mgmt, family="as_path", object_name="50").status == "accepted"
+
+    def test_cascade_owns_set_community_list_reference(self):
+        """A community-list referenced by a route-map's SET action (`set comm-list delete <CL>`)
+        is a dependency too — the cascade owns it, else the device rejects the undefined list
+        (the same dangling-reference class as a match reference)."""
+        from netbox_routing.models import CommunityList, RouteMap, RouteMapEntry, RouteMapEntrySetCommunity
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.signals import _own_route_map_contributors, suppress_intent_push
+
+        mgmt = self._mgmt()
+        rm = RouteMap.objects.create(name="RM-SET-COMM")
+        e = RouteMapEntry.objects.create(route_map=rm, sequence=10, action="permit")
+        cl = CommunityList.objects.create(name="CL-SET-DELETE")
+        with suppress_intent_push():
+            RouteMapEntrySetCommunity.objects.create(route_map_entry=e, operation="delete", community_list=cl)
+
+        _own_route_map_contributors(mgmt, rm)
+
+        st = NSORoutePolicyState.objects.get(management=mgmt, family="community_list", object_name="CL-SET-DELETE")
+        assert st.status == "accepted"  # set-referenced list owned alongside the route-map
+
     def test_editing_owned_route_map_cascades_to_new_reference(self):
         """The real fix: adding an as-path to an OWNED route-map auto-owns the as-path
         (so the apply pushes the list, not just `match as-path`)."""

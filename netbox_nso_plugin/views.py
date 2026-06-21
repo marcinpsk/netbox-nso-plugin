@@ -2639,7 +2639,17 @@ class NSORoutePolicyAttachView(NSOActionPermissionMixin, View):
             # Owning a route-map owns its contributors too (else dangling device references).
             from .signals import _own_route_map_contributors
 
-            _own_route_map_contributors(mgmt, obj)
+            drifted = _own_route_map_contributors(mgmt, obj)
+            if drifted:
+                # A referenced object the device already has but that diverges from NetBox was
+                # NOT overwritten — tell the operator so they can resolve it explicitly.
+                refs = ", ".join(f"{fam.replace('_', ' ')} {nm}" for fam, nm in drifted)
+                messages.warning(
+                    request,
+                    f"Route-map {obj.name} references {len(drifted)} object(s) that differ on "
+                    f"{mgmt.device.name} — left as-is (not overwritten); resolve their drift before "
+                    f"they ship: {refs}.",
+                )
         if override:
             # Operator overrode a known-negative verdict — be explicit about what won't land.
             messages.warning(
