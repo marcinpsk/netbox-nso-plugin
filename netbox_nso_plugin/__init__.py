@@ -33,8 +33,15 @@ class NSOPluginConfig(PluginConfig):
 
         _connect_g_activated()
 
+        # Register the shared-object materialization specs (route-policy families) at startup.
+        # They live in route_policy_reconciler (run via its module-level _register_specs()), but
+        # that module was previously imported only lazily during a reconcile — so a web worker
+        # rendering the versions page before any reconcile had an EMPTY registry, making
+        # hash_captured() return "" and every device version falsely read as "matches". Importing
+        # it here guarantees the specs exist in every process (web + worker).
         from django.conf import settings
 
+        from . import route_policy_reconciler  # noqa: F401
         from .derived_intent import _register_description_from_cable, load_sentinel_templates
 
         raw = (

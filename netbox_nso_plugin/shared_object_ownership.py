@@ -127,10 +127,15 @@ def version_items(state_model, family: str, object_name: str) -> list[dict]:
     """
     rows = versions(state_model, family, object_name)
     owner = next((r for r in rows if r.is_materialized), None)
-    owner_hash = hash_captured(family, owner.captured) if owner and owner.captured else None
+    # ``hash_captured`` returns "" when the family's spec is not registered (the import-order
+    # trap: a web worker can render this page before the reconciler module — which registers
+    # the specs — has loaded). An empty digest is NOT a real content hash, so treat it as
+    # "no basis to compare": every captured row would otherwise hash to "" and falsely read
+    # as "matches", making divergent content look in-sync.
+    owner_hash = (hash_captured(family, owner.captured) or None) if owner and owner.captured else None
     items = []
     for r in rows:
-        r_hash = hash_captured(family, r.captured) if r.captured else None
+        r_hash = (hash_captured(family, r.captured) or None) if r.captured else None
         comparable = owner_hash is not None and r_hash is not None
         items.append(
             {

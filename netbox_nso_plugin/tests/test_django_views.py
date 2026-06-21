@@ -2253,6 +2253,54 @@ class TestSharedObjectVersionsAndMaterialize(ViewTestBase):
         self.assertFalse(d2_item["matches_owner"])  # divergent content
         self.assertEqual(d2_item["entry_count"], 2)
 
+    def _seed_divergent_cl(self):
+        """Two devices report the SAME-named community-list with DIFFERENT members."""
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self.mgmt.adapter_device_id = 1
+        self.mgmt.save(update_fields=["adapter_device_id"])
+        d2, _ = self._second_mgmt()
+
+        def cl(members):
+            entries = [{"sequence": 10 * (i + 1), "action": "permit", "community": m} for i, m in enumerate(members)]
+            return {"community_lists": [{"name": "CL-VIEW", "entries": entries}]}
+
+        reconcile_route_policy(self.device, cl(["65000:1", "65000:2"]))  # owner (imported first)
+        reconcile_route_policy(d2, cl(["65000:1"]))  # divergent — missing 65000:2
+        return d2
+
+    def test_versions_community_list_diverges_when_spec_registered(self):
+        """With the family spec registered (the normal app state after the ready()-time
+        import), a community-list whose sibling has different members is correctly reported
+        as NOT matching the owner — the real cnad-test scenario (7 vs 9 members)."""
+        from netbox_nso_plugin import shared_object_ownership as ownership
+        from netbox_nso_plugin.models import NSORoutePolicyState
+
+        d2 = self._seed_divergent_cl()
+        items = ownership.version_items(NSORoutePolicyState, "community_list", "CL-VIEW")
+        sib = next(it for it in items if it["device"] == d2)
+        self.assertTrue(sib["comparable"])
+        self.assertFalse(sib["matches_owner"])  # genuinely different members → diverges
+        self.assertEqual(sib["entry_count"], 1)
+
+    def test_versions_never_false_match_when_spec_unregistered(self):
+        """Regression for the import-order trap: a web worker that renders the versions page
+        before the reconciler module loaded has an EMPTY spec registry, so hash_captured
+        returns '' for every row. version_items must then report 'not comparable' — never a
+        false 'matches' that makes divergent content look in-sync (the bug that showed the
+        7-member ra1 version as 'matches' the 9-member owner)."""
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import shared_object_ownership as ownership
+        from netbox_nso_plugin.models import NSORoutePolicyState
+
+        d2 = self._seed_divergent_cl()
+        with patch.dict(ownership._REGISTRY, {}, clear=True):  # simulate unregistered specs
+            items = ownership.version_items(NSORoutePolicyState, "community_list", "CL-VIEW")
+        sib = next(it for it in items if it["device"] == d2)
+        self.assertFalse(sib["matches_owner"])  # MUST NOT false-match divergent content
+        self.assertFalse(sib["comparable"])  # no spec → no honest basis to compare
+
     def test_versions_page_renders_when_nav_available(self):
         """The versions page renders (guards the template + URL wiring).
 
