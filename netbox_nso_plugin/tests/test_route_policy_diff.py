@@ -26,6 +26,42 @@ def _entry(seq, action="permit", match=None, set_=None, **refs):
     return e
 
 
+class TestInlineTokenDiff(TestCase):
+    """inline_token_diff isolates the exact tokens that differ within one value (pure)."""
+
+    def test_extra_token_on_each_side_is_isolated(self):
+        from netbox_nso_plugin.route_policy_diff import inline_token_diff
+
+        # device has an extra ASN (1239), NetBox has an extra ASN (15169); the rest matches.
+        dev_segs, nb_segs = inline_token_diff("174|701|1239|1273|12956", "174|701|1273|12956|15169")
+        dev_changed = "".join(s["text"] for s in dev_segs if s["changed"])
+        nb_changed = "".join(s["text"] for s in nb_segs if s["changed"])
+        self.assertIn("1239", dev_changed)  # the device-only ASN is highlighted on the device side
+        self.assertNotIn("15169", dev_changed)
+        self.assertIn("15169", nb_changed)  # the netbox-only ASN is highlighted on the NetBox side
+        self.assertNotIn("1239", nb_changed)
+        # the shared ASNs are NOT highlighted on either side
+        self.assertNotIn("12956", dev_changed)
+        self.assertNotIn("701", nb_changed)
+
+    def test_segments_reconstruct_the_original_strings(self):
+        """Joining all segments back together must reproduce each side verbatim (no data loss)."""
+        from netbox_nso_plugin.route_policy_diff import inline_token_diff
+
+        dev = ".* (174|701|1239|12956) .*"
+        nb = ".* (174|701|12956|15169) .*"
+        dev_segs, nb_segs = inline_token_diff(dev, nb)
+        self.assertEqual("".join(s["text"] for s in dev_segs), dev)
+        self.assertEqual("".join(s["text"] for s in nb_segs), nb)
+
+    def test_identical_values_have_no_changed_segments(self):
+        from netbox_nso_plugin.route_policy_diff import inline_token_diff
+
+        dev_segs, nb_segs = inline_token_diff("65000:1, 65000:2", "65000:1, 65000:2")
+        self.assertFalse(any(s["changed"] for s in dev_segs))
+        self.assertFalse(any(s["changed"] for s in nb_segs))
+
+
 class TestRouteMapDiffPure(TestCase):
     """route_map_diff is a pure function over capture dicts (no DB)."""
 
@@ -186,8 +222,9 @@ class TestDiffViews(_RPBase):
         resp = self.client.get(url)
         self.assertEqual(resp.status_code, 200)
         body = resp.content.decode()
-        self.assertIn("local_preference=200", body)  # device on-box
-        self.assertIn("local_preference=100", body)  # NetBox materialised
+        # the differing token is highlighted inline (device marker on device side, netbox on the other)
+        self.assertIn('class="nso-diff-dev">200</span>', body)  # device-only value highlighted
+        self.assertIn('class="nso-diff-nb">100</span>', body)  # netbox-only value highlighted
 
     def test_route_policy_diff_requires_login(self):
         from django.urls import reverse
@@ -446,6 +483,33 @@ class TestSimpleFamilyDiff(_RPBase):
         self.assertEqual(row["device"], "^65001_")
         self.assertEqual(row["netbox"], "^65000_")
 
+    def test_as_path_diff_highlights_exact_differing_asn(self):
+        """End-to-end: a Pattern that differs by ONE ASN carries inline segments isolating just
+        that ASN — device side highlights the device-only ASN, NetBox side the netbox-only one,
+        so the diff page can highlight the exact token instead of the whole regex."""
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_diff import route_policy_state_diff
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._mgmt(self.d1)
+        self._mgmt(self.d2)
+        dev_pat = ".* (174|701|1239|12956) .*"  # device has 1239
+        nb_pat = ".* (174|701|12956|15169) .*"  # NetBox has 15169
+        reconcile_route_policy(self.d1, {"as_paths": [{"name": "APT", "entries": [{"pattern": nb_pat}]}]})
+        reconcile_route_policy(self.d2, {"as_paths": [{"name": "APT", "entries": [{"pattern": dev_pat}]}]})
+        s2 = NSORoutePolicyState.objects.get(management__device=self.d2, object_name="APT")
+        d = route_policy_state_diff(s2)
+        row = next(f for e in d["entries"] for f in e["fields"] if f["label"] == "Pattern")
+        self.assertTrue(row["differs"])
+        dev_changed = "".join(s["text"] for s in row["device_segments"] if s["changed"])
+        nb_changed = "".join(s["text"] for s in row["netbox_segments"] if s["changed"])
+        self.assertIn("1239", dev_changed)  # device-only ASN highlighted on device side
+        self.assertIn("15169", nb_changed)  # netbox-only ASN highlighted on NetBox side
+        self.assertNotIn("12956", dev_changed)  # shared ASN not highlighted
+        # segments reproduce the full patterns (nothing dropped in rendering)
+        self.assertEqual("".join(s["text"] for s in row["device_segments"]), dev_pat)
+        self.assertEqual("".join(s["text"] for s in row["netbox_segments"]), nb_pat)
+
     def test_simple_family_removal_shows_removed(self):
         from netbox_nso_plugin.models import NSORoutePolicyState
         from netbox_nso_plugin.route_policy_diff import route_policy_state_diff
@@ -484,4 +548,6 @@ class TestSimpleFamilyDiff(_RPBase):
         url = reverse("plugins:netbox_nso_plugin:routing_route_policy_diff", kwargs={"pk": s2.pk})
         resp = self.client.get(url)
         self.assertEqual(resp.status_code, 200)
-        self.assertIn("^65001_", resp.content.decode())
+        body = resp.content.decode()
+        self.assertIn('class="nso-diff-dev">65001_</span>', body)  # device-only token highlighted
+        self.assertIn('class="nso-diff-nb">65000_</span>', body)  # netbox-only token highlighted

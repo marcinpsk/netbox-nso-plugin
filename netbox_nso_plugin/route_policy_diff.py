@@ -20,9 +20,74 @@ directly unit-testable; the reconstruction + redistribution readers touch the DB
 
 from __future__ import annotations
 
+import difflib
+import re
 from itertools import zip_longest
 
 from .route_policy_structure import summarize_route_map
+
+# Split a value into value-runs and separator-runs so the inline diff aligns on whole tokens
+# (each ASN / prefix / community / list element) rather than characters — e.g. a single extra
+# ``1239`` in an as-path regex highlights just that ASN, not a smear of shifted characters.
+_TOKEN_RE = re.compile(r"\w+|\W+")
+
+
+def _is_value(token: str) -> bool:
+    """Return whether the token carries content (a value), as opposed to a pure separator run."""
+    return any(ch.isalnum() for ch in token)
+
+
+def _merge_segments(tokens: list[str], changed_idx: set[int]) -> list[dict]:
+    """Fold a token list into ``{"text", "changed"}`` runs, merging adjacent same-state tokens."""
+    segments: list[dict] = []
+    for i, token in enumerate(tokens):
+        changed = i in changed_idx
+        if segments and segments[-1]["changed"] == changed:
+            segments[-1]["text"] += token
+        else:
+            segments.append({"text": token, "changed": changed})
+    return segments
+
+
+def inline_token_diff(device: str, netbox: str) -> tuple[list[dict], list[dict]]:
+    """Token-level delta between two field values, as per-side highlight segments.
+
+    Returns ``(device_segments, netbox_segments)`` where each is a list of
+    ``{"text", "changed"}`` runs whose concatenation reproduces the original string. A run is
+    ``changed`` when it is a VALUE present on this side but not the other (device-only or
+    netbox-only), so the template can highlight exactly what differs (red on the device side,
+    green on the NetBox side) instead of flagging the whole value.
+
+    The alignment runs over the VALUE tokens only — separators (``|``, ``, ``, spaces …) are
+    never matched on and never highlighted. Otherwise two equal-length lists like
+    ``1239|12956`` vs ``12956|15169`` could align their ``|`` delimiters and mis-flag the
+    shared ``12956``; aligning on values alone keeps a shared element shared.
+    """
+    dt = _TOKEN_RE.findall(device)
+    nt = _TOKEN_RE.findall(netbox)
+    dev_values = [(i, t) for i, t in enumerate(dt) if _is_value(t)]
+    nb_values = [(i, t) for i, t in enumerate(nt) if _is_value(t)]
+    matcher = difflib.SequenceMatcher(a=[t for _, t in dev_values], b=[t for _, t in nb_values], autojunk=False)
+    dev_changed: set[int] = set()
+    nb_changed: set[int] = set()
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        dev_changed.update(dev_values[k][0] for k in range(i1, i2))
+        nb_changed.update(nb_values[k][0] for k in range(j1, j2))
+    return _merge_segments(dt, dev_changed), _merge_segments(nt, nb_changed)
+
+
+def _augment_segments(row: dict) -> dict:
+    """Attach inline token-diff segments to a ``{device, netbox, differs}`` row.
+
+    Only when both sides differ AND both carry a real value (not the ``"—"`` placeholder for a
+    side that is absent — there the presence badge / whole-cell highlight already says it all).
+    """
+    if row["differs"] and row["device"] not in ("", "—") and row["netbox"] not in ("", "—"):
+        row["device_segments"], row["netbox_segments"] = inline_token_diff(row["device"], row["netbox"])
+    return row
+
 
 # Per-entry fields compared in the route-map diff, in display order. Each is projected by
 # summarize_route_map into a uniform shape (str / list / dict / list-of-set-community).
@@ -69,7 +134,7 @@ def _diff_entry_fields(device_entry: dict | None, netbox_entry: dict | None) -> 
         nv = _render_field(key, (netbox_entry or {}).get(key))
         if not dv and not nv:
             continue
-        rows.append({"label": label, "device": dv or "—", "netbox": nv or "—", "differs": dv != nv})
+        rows.append(_augment_segments({"label": label, "device": dv or "—", "netbox": nv or "—", "differs": dv != nv}))
     return rows
 
 
@@ -106,11 +171,13 @@ def route_map_diff(device_captured: dict | None, netbox_captured: dict | None) -
             }
         )
 
-    default_action = {
-        "device": dev["default_action"] or "—",
-        "netbox": nb["default_action"] or "—",
-        "differs": dev["default_action"] != nb["default_action"],
-    }
+    default_action = _augment_segments(
+        {
+            "device": dev["default_action"] or "—",
+            "netbox": nb["default_action"] or "—",
+            "differs": dev["default_action"] != nb["default_action"],
+        }
+    )
     any_diff = any_diff or default_action["differs"]
     return {"any_diff": any_diff, "default_action": default_action, "extra": [], "entries": entries}
 
@@ -219,7 +286,9 @@ def _entry_list_diff(device_entries: list[dict], netbox_entries: list[dict], fie
             nv = _render_scalar((ne or {}).get(key))
             if not dv and not nv:
                 continue
-            fields.append({"label": label, "device": dv or "—", "netbox": nv or "—", "differs": dv != nv})
+            fields.append(
+                _augment_segments({"label": label, "device": dv or "—", "netbox": nv or "—", "differs": dv != nv})
+            )
         differs = presence != "both" or any(f["differs"] for f in fields)
         any_diff = any_diff or differs
         entries.append(
@@ -239,7 +308,9 @@ def _simple_family_diff(state, obj, removed: bool) -> dict:
         if dev_inv or nb_inv:
             differs = dev_inv != nb_inv
             diff["extra"].append(
-                {"label": "Invert match", "device": dev_inv or "—", "netbox": nb_inv or "—", "differs": differs}
+                _augment_segments(
+                    {"label": "Invert match", "device": dev_inv or "—", "netbox": nb_inv or "—", "differs": differs}
+                )
             )
             diff["any_diff"] = diff["any_diff"] or differs
     return diff
@@ -318,5 +389,5 @@ def redistribution_diff(state) -> dict:
         dv = "" if device[key] in (None, "") else str(device[key])
         differs = dv != nv
         any_diff = any_diff or differs
-        rows.append({"label": label, "device": dv or "—", "netbox": nv or "—", "differs": differs})
+        rows.append(_augment_segments({"label": label, "device": dv or "—", "netbox": nv or "—", "differs": differs}))
     return {"linked": rd is not None, "removed_on_device": removed_on_device, "any_diff": any_diff, "fields": rows}

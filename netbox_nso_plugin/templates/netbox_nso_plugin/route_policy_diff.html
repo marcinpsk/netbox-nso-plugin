@@ -6,6 +6,12 @@
 {% block title %}Drift delta — {{ object_name }}{% endblock %}
 
 {% block content %}
+{# Inline highlight for the exact differing tokens — a translucent marker behind the text #}
+{# (not a chip/badge), saturated enough to read in light and dark mode. #}
+<style>
+  .nso-diff-dev { background-color: rgba(var(--tblr-danger-rgb), .40); }
+  .nso-diff-nb  { background-color: rgba(var(--tblr-success-rgb), .40); }
+</style>
 <div class="row">
   <div class="col col-md-10 offset-md-1">
     <div class="card">
@@ -17,7 +23,9 @@
       <div class="card-body">
         <p class="text-muted">
           What the device reports on-box versus what NetBox currently holds (the materialised
-          object). Differing values are highlighted; identical entries are summarised.
+          object). Within a differing value the exact changed tokens are highlighted —
+          <span class="nso-diff-dev">only on the device</span>,
+          <span class="nso-diff-nb">only in NetBox</span>. Identical entries are summarised.
         </p>
 
         {% if diff is None %}
@@ -91,8 +99,8 @@
                       </td>
                       {% endif %}
                       <td class="text-nowrap{% if forloop.first %} border-top border-2{% endif %}">{{ f.label }}</td>
-                      <td class="{% if f.differs %}table-warning {% endif %}{% if forloop.first %}border-top border-2{% endif %}"><code class="text-body">{{ f.device }}</code></td>
-                      <td class="{% if f.differs %}table-warning {% endif %}{% if forloop.first %}border-top border-2{% endif %}"><code class="text-body">{{ f.netbox }}</code></td>
+                      {% include "netbox_nso_plugin/categories/_diff_value_cell.html" with value=f.device segments=f.device_segments hl="nso-diff-dev" differs=f.differs first=forloop.first %}
+                      {% include "netbox_nso_plugin/categories/_diff_value_cell.html" with value=f.netbox segments=f.netbox_segments hl="nso-diff-nb" differs=f.differs first=forloop.first %}
                     </tr>
                     {% endfor %}
                   {% endif %}
