@@ -1744,17 +1744,21 @@ def _isis_iface_detail(r):
 
 
 def _apply_preview_interface_changes(device_pk):
-    """Owned interface attributes whose NetBox value differs from the device.
+    """Interface attributes Apply would actually push: OWNED status + value differs from device.
 
-    The value-aware 'pending' the matrix shows and the force-push applies — so the
-    preview agrees with what Apply actually pushes (filtering by status==accepted alone
-    missed an owned attribute that drifted back to 'imported').
+    Apply pushes only intent in an OWNED status (accepted / deploying / in_sync / apply_failed) —
+    that's what the intent-push mirrors to the adapter and what the NSO dry-run reflects. Keying
+    the preview off ``accepted_at`` instead over-reported: an attribute that drifted back to
+    ``imported`` (un-owned) keeps a stale ``accepted_at`` from a past acceptance, so it was listed
+    as "what we push" even though Apply never pushes it and the dry-run shows no change. Filter by
+    owned status so the left panel agrees with the dry-run and the real Apply.
     """
+    from .status_machine import OWNED_STATES
     from .summary import interface_row_state
 
     changes = []
     owned = (
-        NSOInterfaceState.objects.filter(interface__device_id=device_pk, accepted_at__isnull=False)
+        NSOInterfaceState.objects.filter(interface__device_id=device_pk, status__in=OWNED_STATES)
         .select_related("interface")
         .order_by("interface__name", "attribute")
     )

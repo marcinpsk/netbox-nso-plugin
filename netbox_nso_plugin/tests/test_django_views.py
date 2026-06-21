@@ -1224,6 +1224,27 @@ class TestNSOApplyPreviewView(ViewTestBase):
         data = json.loads(self.client.get(url).content)
         self.assertEqual(data["total"], 0)
 
+    def test_preview_excludes_imported_attribute_with_stale_accepted_at(self):
+        """An attribute that is 'imported' (un-owned) must NOT be listed as pending, even if it
+        carries a stale accepted_at from a past acceptance. Apply only pushes OWNED intent, so an
+        imported row never reaches the adapter mirror and the dry-run shows no change — listing it
+        made the modal claim an interface change Apply would never push (observed on a derived
+        ae2.0 description that drifted back to imported)."""
+        import json
+
+        from django.utils import timezone
+
+        self.interface.description = "derived-desc"  # NetBox value differs from the (empty) device
+        self.interface.save(update_fields=["description"])
+        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(
+            attribute="description", status="imported", nso_value="", accepted_at=timezone.now()
+        )
+
+        url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
+        data = json.loads(self.client.get(url).content)
+        self.assertEqual(data["changes"], [])  # imported (un-owned) → not pushed → not previewed
+        self.assertEqual(data["total"], 0)
+
     def test_preview_ospf_interface_lists_pushed_properties(self):
         """An accepted OSPF interface overlay shows its pushed properties (area/cost/network-type)."""
         import json
