@@ -113,6 +113,66 @@ class TestInterfacesContractConsumer(TestCase):
         # Persisted, not just returned.
         self.assertTrue(NSOInterfaceState.objects.filter(interface=self.iface, attribute="description").exists())
 
+    def test_owned_row_not_clobbered_by_adapter_imported(self):
+        """Owned-guard: an adapter sync reporting 'imported' must not drop operator ownership.
+
+        Mirrors interface_mtu_reconciler's guard. Without it the (now status-based) intent
+        push would stop re-applying an owned attribute the moment the adapter read it back as
+        imported — the device-27 ae2.0 class of bug.
+        """
+        self.iface.description = "operator-desc"
+        self.iface.save(update_fields=["description"])
+        NSOInterfaceState.objects.create(
+            interface=self.iface, attribute="description", status="accepted", nso_value="device-old"
+        )
+        # Adapter still reads the OLD device value (operator's value not applied yet) + imported.
+        payload = [
+            {
+                "name": "GE0/0",
+                "netbox_interface_id": 1000,
+                "attrs": {"description": {"nso_value": "device-old", "status": "imported"}},
+            }
+        ]
+        result = _upsert_interface_states(self.device, payload)
+        row = result[("GE0/0", "description")]
+        # Device still differs from the operator's value → ownership preserved (accepted), not imported.
+        self.assertEqual(row.status, "accepted")
+        # The device value is still tracked for the value-aware display.
+        self.assertEqual(row.nso_value, "device-old")
+
+    def test_owned_row_settles_to_in_sync_when_device_matches(self):
+        """Owned-guard settles the row by value: accepted → in_sync once the device catches up."""
+        self.iface.description = "operator-desc"
+        self.iface.save(update_fields=["description"])
+        NSOInterfaceState.objects.create(
+            interface=self.iface, attribute="description", status="accepted", nso_value="device-old"
+        )
+        # Adapter now reads the operator's value on the device → settle accepted → in_sync.
+        payload = [
+            {
+                "name": "GE0/0",
+                "netbox_interface_id": 1000,
+                "attrs": {"description": {"nso_value": "operator-desc", "status": "imported"}},
+            }
+        ]
+        result = _upsert_interface_states(self.device, payload)
+        self.assertEqual(result[("GE0/0", "description")].status, "in_sync")
+
+    def test_unowned_row_tracks_adapter_status(self):
+        """An unowned (imported) row still mirrors the adapter status verbatim (drift visible)."""
+        NSOInterfaceState.objects.create(
+            interface=self.iface, attribute="description", status="imported", nso_value="old"
+        )
+        payload = [
+            {
+                "name": "GE0/0",
+                "netbox_interface_id": 1000,
+                "attrs": {"description": {"nso_value": "new", "status": "changed"}},
+            }
+        ]
+        result = _upsert_interface_states(self.device, payload)
+        self.assertEqual(result[("GE0/0", "description")].status, "changed")
+
     def test_missing_status_key_silently_degrades_to_unknown(self):
         """The consumer does NOT validate the contract at runtime — by decision.
 

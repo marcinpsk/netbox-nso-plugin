@@ -292,13 +292,37 @@ class TestPushIntentOnAccept(_SignalDBBase):
         from netbox_nso_plugin.signals import push_intent_on_accept
 
         self._make_mgmt(adapter_device_id=7)
-        # accepted_at is None → not owned, whatever the sync status.
+        # status not in OWNED_STATES → not owned.
         state = NSOInterfaceState.objects.create(
             interface=self.iface, attribute="description", status="imported", nso_value="x"
         )
 
         with patch(f"{_MOD}.put_intent") as mock_put:
             push_intent_on_accept(sender=NSOInterfaceState, instance=state)
+
+        mock_put.assert_not_called()
+
+    def test_skips_when_status_unowned_despite_stale_accepted_at(self):
+        # Behavior change: ownership is status-based, NOT accepted_at. An attribute reverted/
+        # drifted back to an unowned status keeps a stale accepted_at from a past acceptance
+        # (accepted_at is never cleared) — it must NOT be pushed (the device-27 ae2.0 case).
+        from django.utils import timezone
+
+        from netbox_nso_plugin.models import NSOInterfaceState
+        from netbox_nso_plugin.signals import push_intent_on_accept
+
+        self._make_mgmt(adapter_device_id=7)
+        state = NSOInterfaceState.objects.create(
+            interface=self.iface,
+            attribute="description",
+            status="imported",
+            nso_value="",
+            accepted_at=timezone.now(),  # stale ownership marker
+        )
+
+        with patch(f"{_MOD}.put_intent") as mock_put:
+            with self.captureOnCommitCallbacks(execute=True):
+                push_intent_on_accept(sender=NSOInterfaceState, instance=state)
 
         mock_put.assert_not_called()
 
@@ -337,6 +361,39 @@ class TestPushIntentOnAccept(_SignalDBBase):
 
         attrs = mock_put.call_args[0][1]
         self.assertEqual(attrs[0]["intent_value"], "false")  # str(Interface.enabled).lower()
+
+    def test_snapshot_includes_only_owned_status_rows(self):
+        # The device-wide snapshot filters by status (OWNED_STATES), not accepted_at: an
+        # owned (accepted) row is pushed; a stale-accepted_at row reverted to an unowned
+        # status is NOT — even though accepted_at is set on both (device-27 ae2.0 fix).
+        from dcim.models import Interface
+        from django.utils import timezone
+
+        from netbox_nso_plugin.models import NSOInterfaceState
+        from netbox_nso_plugin.signals import _push_interface_intent_for_device
+
+        self._make_mgmt(adapter_device_id=42)
+        # Owned: accepted status, real NetBox value to push.
+        self.iface.description = "uplink to spine"
+        self.iface.save(update_fields=["description"])
+        self._accepted_state(self.iface, "description", nso_value="")
+        # Unowned despite a stale accepted_at: reverted/drifted back to imported.
+        other = Interface.objects.create(device=self.device, name="GigabitEthernet0/1", type="1000base-t")
+        NSOInterfaceState.objects.create(
+            interface=other,
+            attribute="description",
+            status="imported",
+            nso_value="",
+            accepted_at=timezone.now(),  # stale
+        )
+
+        with patch(f"{_MOD}.put_intent") as mock_put:
+            _push_interface_intent_for_device(self.device.id, 42, force=True)
+
+        mock_put.assert_called_once()
+        attrs = mock_put.call_args[0][1]
+        self.assertEqual([(a["interface"], a["attribute"]) for a in attrs], [("GigabitEthernet0/0", "description")])
+        self.assertEqual(attrs[0]["intent_value"], "uplink to spine")
 
     def test_skips_when_mgmt_does_not_exist(self):
         from netbox_nso_plugin.models import NSOInterfaceState

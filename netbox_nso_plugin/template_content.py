@@ -51,10 +51,21 @@ def _upsert_interface_states(device, interfaces: list) -> dict:
 
     Returns a dict keyed by (interface_name, attribute) → NSOInterfaceState instance.
     Only updates fields that come from the adapter; never overwrites accepted_at.
+
+    Owned rows (status in OWNED_STATES, set by the operator's accept/edit) are NOT
+    clobbered back to the adapter's unowned status — the same owned-guard every other
+    overlay reconciler uses (see ``interface_mtu_reconciler``). Without it, an adapter
+    sync that reports ``imported`` for an attribute the operator owns would silently
+    drop ownership, and the now status-based intent push would stop re-applying it. The
+    owned row instead settles by device-vs-NetBox value (``deploying``/``accepted`` →
+    ``in_sync`` once the device reflects the operator's value). A freshly imported row
+    (created this sync) or an unowned row tracks the adapter status verbatim.
     """
     from dcim.models import Interface
 
+    from . import status_machine as sm
     from .models import NSOInterfaceState
+    from .summary import _COMPARABLE_IFACE_ATTRS, _netbox_value_for, matches_device_value
 
     # Build name → Interface map for this device's interfaces in the DB
     iface_map = {i.name: i for i in Interface.objects.filter(device=device)}
@@ -78,15 +89,25 @@ def _upsert_interface_states(device, interfaces: list) -> dict:
                 except ValueError:
                     pass
 
-            state, _ = NSOInterfaceState.objects.get_or_create(
+            state, created = NSOInterfaceState.objects.get_or_create(
                 interface=iface,
                 attribute=attr_name,
                 defaults={"status": status, "nso_value": nso_value},
             )
-            # Update fields that come from adapter; never touch accepted_at
+            # Resolve the next status BEFORE overwriting it. An EXISTING, operator-owned
+            # row is settled by value (never clobbered to the adapter's unowned status);
+            # a new row (created this sync) or an unowned row mirrors the adapter verbatim.
             update_fields = []
-            if state.status != status:
-                state.status = status
+            if not created and sm.is_owned(state.status):
+                if attr_name in _COMPARABLE_IFACE_ATTRS:
+                    matches = matches_device_value(attr_name, _netbox_value_for(attr_name, iface), nso_value)
+                else:
+                    matches = None
+                new_status = sm.on_reconcile(state.status, matches=matches)
+            else:
+                new_status = status
+            if state.status != new_status:
+                state.status = new_status
                 update_fields.append("status")
             if state.nso_value != nso_value:
                 state.nso_value = nso_value

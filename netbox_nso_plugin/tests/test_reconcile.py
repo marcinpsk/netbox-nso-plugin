@@ -200,9 +200,9 @@ class TestRoutePolicyApplySettle(APITestCase):
         self.assertEqual(row.status, "deploying")
 
     def test_prepare_apply_force_pushes_owned_interface_intent(self):
-        """Apply force-re-pushes the owned interface snapshot, so an owned attribute that
-        drifted back to 'imported' (device differs again) is actually re-applied instead
-        of silently skipped (was shown 'pending apply' but never pushed by Apply)."""
+        """Apply force-re-pushes the owned interface snapshot (status-based), so an owned
+        attribute whose adapter intent went stale is actually re-applied instead of silently
+        skipped. Ownership is kept durable by the reconciler's owned-guard."""
         from netbox_nso_plugin.views import _prepare_apply
 
         mgmt, _row = self._setup(status_="accepted")
@@ -217,32 +217,29 @@ class TestRoutePolicyApplySettle(APITestCase):
 
 
 class TestApplyPreviewInterfaceScope(APITestCase):
-    """The Apply preview lists owned interface attributes whose NetBox value differs from
-    the device — the value-aware 'pending' the matrix shows and the force-push applies."""
+    """The Apply preview lists OWNED-status interface attributes whose NetBox value differs
+    from the device — exactly what the matrix shows as 'pending' and the force-push applies.
 
-    def test_preview_includes_owned_interface_that_drifted_to_imported(self):
+    Ownership is status-based (status in OWNED_STATES), NOT accepted_at — a stale accepted_at
+    on an unowned status never makes the preview claim a push Apply would not perform.
+    """
+
+    def test_preview_includes_owned_interface_pending(self):
         from dcim.models import Interface
-        from django.utils import timezone
 
         from netbox_nso_plugin.models import NSOInterfaceState
         from netbox_nso_plugin.views import _apply_preview_interface_changes
 
         device = _make_device("ifprev")
         iface = Interface.objects.create(device=device, name="ae2.0", type="virtual", description="UPLINK")
-        # Owned (accepted_at set) but the adapter status drifted back to 'imported', and the
-        # device description is empty → value differs → genuinely pending, must show + apply.
-        NSOInterfaceState.objects.create(
-            interface=iface,
-            attribute="description",
-            status="imported",
-            nso_value="",
-            accepted_at=timezone.now(),
-        )
+        # Owned status (accepted) and the device description is empty → value differs →
+        # genuinely pending, must show + apply. accepted_at=None proves it's status-driven.
+        NSOInterfaceState.objects.create(interface=iface, attribute="description", status="accepted", nso_value="")
         changes = _apply_preview_interface_changes(device.pk)
         self.assertEqual([(c["interface"], c["attribute"]) for c in changes], [("ae2.0", "description")])
         self.assertEqual(changes[0]["netbox"], "UPLINK")
 
-    def test_preview_excludes_owned_interface_in_sync(self):
+    def test_preview_excludes_unowned_interface_despite_stale_accepted_at(self):
         from dcim.models import Interface
         from django.utils import timezone
 
@@ -250,15 +247,28 @@ class TestApplyPreviewInterfaceScope(APITestCase):
         from netbox_nso_plugin.views import _apply_preview_interface_changes
 
         device = _make_device("ifprev2")
-        iface = Interface.objects.create(device=device, name="ae3.0", type="virtual", description="MATCH")
-        # Owned and the device already matches NetBox → not pending → not in the preview.
+        iface = Interface.objects.create(device=device, name="ae2.0", type="virtual", description="UPLINK")
+        # The device-27 ae2.0 case: an 'imported' (un-owned) attribute carrying a STALE
+        # accepted_at, value differs — Apply won't push it, so it must not be previewed.
         NSOInterfaceState.objects.create(
             interface=iface,
             attribute="description",
             status="imported",
-            nso_value="MATCH",
+            nso_value="",
             accepted_at=timezone.now(),
         )
+        self.assertEqual(_apply_preview_interface_changes(device.pk), [])
+
+    def test_preview_excludes_owned_interface_in_sync(self):
+        from dcim.models import Interface
+
+        from netbox_nso_plugin.models import NSOInterfaceState
+        from netbox_nso_plugin.views import _apply_preview_interface_changes
+
+        device = _make_device("ifprev3")
+        iface = Interface.objects.create(device=device, name="ae3.0", type="virtual", description="MATCH")
+        # Owned (in_sync) and the device already matches NetBox → not pending → not previewed.
+        NSOInterfaceState.objects.create(interface=iface, attribute="description", status="in_sync", nso_value="MATCH")
         self.assertEqual(_apply_preview_interface_changes(device.pk), [])
 
 

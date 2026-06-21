@@ -144,26 +144,46 @@ class TestMatchesDeviceValue(SimpleTestCase):
 class TestInterfaceRowState(SimpleTestCase):
     """interface_row_state(st, iface) -> (kind, label, owned). Value-aware classifier."""
 
-    def test_owned_is_derived_from_accepted_at(self):
-        _, _, owned = interface_row_state(_state(accepted_at=None), _iface())
-        self.assertFalse(owned)
-        _, _, owned = interface_row_state(_state(accepted_at="2026-01-01"), _iface())
-        self.assertTrue(owned)
+    def test_owned_is_derived_from_status_not_accepted_at(self):
+        # Ownership is the canonical status test (status_machine.is_owned), NOT accepted_at
+        # — which is a one-shot timestamp never cleared on un-own. So an owned STATUS reads
+        # owned even with accepted_at=None, and an unowned status reads unowned even with a
+        # stale accepted_at set.
+        for status in ("accepted", "deploying", "in_sync", "apply_failed"):
+            with self.subTest(status=status):
+                _, _, owned = interface_row_state(_state(status=status, accepted_at=None), _iface())
+                self.assertTrue(owned)
+        for status in ("imported", "changed", "conflict", "unknown"):
+            with self.subTest(status=status):
+                _, _, owned = interface_row_state(_state(status=status, accepted_at="2026-01-01"), _iface())
+                self.assertFalse(owned)
 
     def test_matching_values_are_in_sync_even_if_status_says_differ(self):
         # The whole point: values win over the adapter's (possibly stale) status.
         st = _state(status="changed", attribute="description", nso_value="same")
         self.assertEqual(interface_row_state(st, _iface(description="same")), ("in_sync", "in sync", False))
 
-    def test_differing_owned_is_pending_even_if_status_says_match(self):
-        # The device-27 ae2.0 regression: status="imported"/"unknown" but NetBox has a
-        # value the device lacks, and NetBox owns it -> pending apply.
-        for status in ("imported", "unknown", "in_sync"):
+    def test_owned_status_differing_is_pending(self):
+        # An OWNED status (accepted/in_sync) whose NetBox value the device lacks -> pending
+        # apply. accepted_at=None proves ownership is status-driven, not timestamp-driven.
+        for status in ("accepted", "in_sync"):
             with self.subTest(status=status):
-                st = _state(status=status, accepted_at="2026-01-01", attribute="description", nso_value="")
+                st = _state(status=status, accepted_at=None, attribute="description", nso_value="")
                 self.assertEqual(
                     interface_row_state(st, _iface(description="Core Link")),
                     ("pending", "pending apply", True),
+                )
+
+    def test_stale_accepted_at_unowned_status_reads_drift(self):
+        # The device-27 ae2.0 regression (now fixed): status="imported"/"unknown" with a
+        # value the device lacks but a STALE accepted_at from a past acceptance. Apply pushes
+        # by status, so this is unowned -> drift, NOT a false "pending apply".
+        for status in ("imported", "unknown", "changed"):
+            with self.subTest(status=status):
+                st = _state(status=status, accepted_at="2026-06-02", attribute="description", nso_value="")
+                self.assertEqual(
+                    interface_row_state(st, _iface(description="prod-lab03c-ri5.arcos - Core Link - unit")),
+                    ("drift", "drift", False),
                 )
 
     def test_differing_not_owned_is_drift(self):
@@ -173,18 +193,23 @@ class TestInterfaceRowState(SimpleTestCase):
     def test_enabled_attribute_is_value_aware(self):
         st = _state(status="imported", attribute="enabled", nso_value="True")
         self.assertEqual(interface_row_state(st, _iface(enabled=True)), ("in_sync", "in sync", False))
-        st_owned = _state(status="imported", accepted_at="2026-01-01", attribute="enabled", nso_value="True")
+        st_owned = _state(status="accepted", accepted_at=None, attribute="enabled", nso_value="True")
         self.assertEqual(interface_row_state(st_owned, _iface(enabled=False)), ("pending", "pending apply", True))
 
     def test_deploying_bypasses_value_comparison(self):
-        # Even with matching values, an in-flight deploy shows "deploying".
+        # Even with matching values, an in-flight deploy shows "deploying". deploying is an
+        # OWNED status, so owned=True (it's operator intent mid-apply).
         st = _state(status="deploying", attribute="description", nso_value="same")
-        self.assertEqual(interface_row_state(st, _iface(description="same")), ("deploying", "deploying", False))
+        self.assertEqual(interface_row_state(st, _iface(description="same")), ("deploying", "deploying", True))
 
     def test_non_comparable_attribute_falls_back_to_status(self):
-        # mtu isn't in _COMPARABLE_IFACE_ATTRS, so display_state drives it.
+        # mtu isn't in _COMPARABLE_IFACE_ATTRS, so display_state drives it. ownership is
+        # status-based: a "changed" row is unowned -> drift even with a stale accepted_at...
         st = _state(status="changed", accepted_at="2026-01-01", attribute="mtu", nso_value="9000")
-        self.assertEqual(interface_row_state(st, _iface()), ("pending", "pending apply", True))
+        self.assertEqual(interface_row_state(st, _iface()), ("drift", "drift", False))
+        # ...while an owned status (accepted) -> pending apply.
+        st_owned = _state(status="accepted", accepted_at=None, attribute="mtu", nso_value="9000")
+        self.assertEqual(interface_row_state(st_owned, _iface()), ("pending", "pending apply", True))
 
     def test_apply_failed_with_differing_values_is_surfaced(self):
         # Smell #1 fix: a failed apply must not hide as plain "pending apply".
@@ -209,14 +234,14 @@ class TestInterfaceStatusBreakdown(SimpleTestCase):
             _row(status="imported", attribute="description", nso_value="x", description="x"),
             # drift (differ, not owned)
             _row(status="imported", attribute="description", nso_value="", description="Core"),
-            # pending (differ, owned)
+            # drift (differ, status unowned — a STALE accepted_at no longer fakes ownership)
             _row(status="imported", accepted_at="t", attribute="description", nso_value="", description="Core"),
             # deploying -> pending bucket
             _row(status="deploying", attribute="description", nso_value="x", description="x"),
-            # apply_failed (differ, owned) -> pending bucket (it needs operator action)
-            _row(status="apply_failed", accepted_at="t", attribute="description", nso_value="", description="Core"),
+            # apply_failed (differ, owned status) -> pending bucket (it needs operator action)
+            _row(status="apply_failed", attribute="description", nso_value="", description="Core"),
         ]
-        self.assertEqual(interface_status_breakdown(_FakeQS(rows)), {"total": 5, "drift": 1, "pending": 3})
+        self.assertEqual(interface_status_breakdown(_FakeQS(rows)), {"total": 5, "drift": 2, "pending": 2})
 
     def test_empty_queryset(self):
         self.assertEqual(interface_status_breakdown(_FakeQS([])), {"total": 0, "drift": 0, "pending": 0})
@@ -232,10 +257,12 @@ def _row(*, description="", enabled=True, **state_kwargs):
 class TestStatusBreakdown(TestCase):
     """_status_breakdown(qs) -> {total, drift, pending} via ORM aggregation.
 
-    This is the owned-aware, STATUS-driven aggregation still used by every routing
-    category (and historically by interfaces). It cannot see actual values — it trusts
-    the stored status — which is the root behavior that hid the device-27 drift in the
-    counts before interfaces switched to interface_status_breakdown.
+    Used by every routing category (and historically by interfaces). It cannot see actual
+    values — it trusts the stored status — which is the root behavior that hid the device-27
+    drift in the counts before interfaces switched to interface_status_breakdown. Ownership
+    is the canonical status test: a differing status is intrinsically owned (accepted/
+    apply_failed -> pending) or unowned (changed/conflict -> drift); ``accepted_at`` no
+    longer participates.
     """
 
     @classmethod
@@ -271,10 +298,13 @@ class TestStatusBreakdown(TestCase):
         qs = self._qs([("imported", False), ("in_sync", True)])
         self.assertEqual(_status_breakdown(qs), {"total": 2, "drift": 0, "pending": 0})
 
-    def test_differ_splits_on_ownership(self):
-        qs = self._qs([("changed", False), ("changed", True), ("apply_failed", True), ("conflict", False)])
-        # owned differ -> pending (changed+True, apply_failed+True = 2); not-owned differ -> drift (2)
-        self.assertEqual(_status_breakdown(qs), {"total": 4, "drift": 2, "pending": 2})
+    def test_differ_splits_on_status_ownership(self):
+        # Differing statuses are intrinsically owned-or-not: accepted/apply_failed -> pending,
+        # changed/conflict -> drift. The accepted_at flag (2nd tuple element) is now
+        # IRRELEVANT to bucketing — a "changed" row with a stale accepted_at is still drift,
+        # and an apply_failed row with no accepted_at is still pending.
+        qs = self._qs([("changed", False), ("changed", True), ("apply_failed", False), ("conflict", True)])
+        self.assertEqual(_status_breakdown(qs), {"total": 4, "drift": 3, "pending": 1})
 
     def test_deploying_counts_as_pending(self):
         qs = self._qs([("deploying", False)])

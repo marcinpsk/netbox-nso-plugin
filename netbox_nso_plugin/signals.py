@@ -215,19 +215,25 @@ def _push_changed(key, payload, do_push, force=False) -> None:
 def _push_interface_intent_for_device(device_id, adapter_device_id, force=False) -> None:
     """Build the full OWNED interface intent snapshot and push it (change-detected).
 
-    Owned = ``accepted_at`` set (the 2-D model's source-of-truth marker), independent
-    of sync status. Shared by the accept signal, the Decision-G edit signal, and the
-    view-level bulk accept so all three agree on what gets pushed. ``force=True`` (the
-    device Apply) bypasses change-detection so an owned interface whose adapter intent
-    went stale — e.g. it reads as ``imported`` again but NetBox still differs from the
-    device — is re-pushed and actually applied, instead of being silently skipped.
+    Owned = ``status in OWNED_STATES`` (accepted/deploying/in_sync/apply_failed) — the
+    canonical ownership test, identical to every other scope's push predicate and to
+    what the device tab now displays. (Previously this keyed off ``accepted_at``, a
+    one-shot timestamp never cleared on un-own, so a row reverted/drifted back to
+    ``imported`` carried a stale accepted_at and was force-pushed despite reading as
+    drift — the display/push split-brain this fix removes.) Shared by the accept signal,
+    the Decision-G edit signal, and the view-level bulk accept so all three agree on
+    what gets pushed. ``force=True`` (the device Apply) bypasses change-detection so an
+    owned interface whose adapter intent went stale is re-pushed and actually applied,
+    instead of being silently skipped — ownership is kept durable by the reconciler's
+    owned-guard (``template_content._upsert_interface_states``), which no longer lets an
+    adapter sync clobber an owned status back to ``imported``.
     """
     from . import adapter_client as client
     from .models import NSOInterfaceState
 
     states = NSOInterfaceState.objects.filter(
         interface__device_id=device_id,
-        accepted_at__isnull=False,
+        status__in=_OWNED_PUSH_STATUSES,
     ).select_related("interface")
 
     attributes = []
@@ -383,13 +389,14 @@ def push_failover_settings_to_adapter(sender, instance, **kwargs):
 def push_intent_on_accept(sender, instance, **kwargs):
     """Push the full intent snapshot to the adapter when an interface state is OWNED.
 
-    Owned = accepted_at set (NetBox is the source of truth), independent of the sync
-    status — so accepting a value that already matches the device (in_sync) still
+    Owned = ``status in OWNED_STATES`` (accepted/deploying/in_sync/apply_failed) — the
+    canonical test, mirroring :func:`_push_interface_intent_for_device`. Accepting a
+    value that already matches the device sets ``in_sync`` (an owned status), so it still
     records ownership in the adapter and survives the next sync.
 
     The push is coalesced + change-detected via :func:`_schedule_intent_push`.
     """
-    if instance.accepted_at is None:
+    if instance.status not in _OWNED_PUSH_STATUSES:
         return
 
     from .models import NSODeviceManagement

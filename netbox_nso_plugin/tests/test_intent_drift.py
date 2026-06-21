@@ -101,17 +101,21 @@ class TestIntentDrift(IntentPushResetMixin, TestCase):
         self.assertFalse(entry["partial"])
 
     @patch("netbox_nso_plugin.adapter_client.get_intent_summary")
-    def test_interface_scope_owned_by_accepted_at_not_status(self, mock_sum):
-        # 2-D model: accepted_at marks ownership even when sync status says "changed";
-        # the owned counter must mirror the push predicate or drifted-but-owned rows
-        # would read as orphaned.
+    def test_interface_scope_owned_by_status_not_accepted_at(self, mock_sum):
+        # Ownership is status-based (mirrors the now status-based push predicate). An owned
+        # STATUS counts as owned even with accepted_at=None; a "changed" row does NOT count
+        # as owned even with a stale accepted_at set — so the adapter's 1 intent row reads
+        # as orphaned and the scope is flagged.
         mock_sum.return_value = {"scopes": {"interface_intent": {"count": 1, "applied": 0, "failed": 0}}}
         state = NSOInterfaceState.objects.create(
-            interface=self.iface, attribute="description", status="changed", accepted_at=timezone.now()
+            interface=self.iface, attribute="description", status="accepted", accepted_at=None
         )
         drift = intent_drift.compute_intent_drift(self.device, self.mgmt)
         self.assertNotIn("interface", {d["key"] for d in drift})
-        state.accepted_at = None
+        # Flip to an unowned status (with a STALE accepted_at) → owned count drops to 0 →
+        # the adapter's 1 row is now orphaned → flagged.
+        state.status = "changed"
+        state.accepted_at = timezone.now()
         state.save()
         drift = intent_drift.compute_intent_drift(self.device, self.mgmt)
         self.assertIn("interface", {d["key"] for d in drift})

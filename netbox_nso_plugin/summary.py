@@ -14,9 +14,16 @@ from __future__ import annotations
 
 from django.db.models import Count
 
+from .status_machine import OWNED_STATES
+
 # The display state is TWO independent dimensions:
 #   sync     — does the device match NetBox?  match (imported/in_sync) vs differ
-#   owned    — is NetBox the source of truth?  owned == accepted_at is not None
+#   owned    — is NetBox the source of truth?  owned == status in OWNED_STATES
+#              (accepted/deploying/in_sync/apply_failed). This is the canonical
+#              ownership test (status_machine.is_owned) and exactly what Apply pushes —
+#              NOT ``accepted_at``, which is a one-shot timestamp never cleared on
+#              un-own, so a row reverted/drifted back to ``imported`` keeps a stale
+#              accepted_at and would otherwise read as owned forever.
 # Combined into the operator-facing buckets:
 #   in sync       = device matches NetBox (whether owned or not)
 #   drift         = device differs AND NetBox does NOT own it (device changed out-of-band)
@@ -86,7 +93,7 @@ def interface_row_state(st, iface):
     (not owned). In-flight ("deploying") and non-comparable attributes fall back to
     the status-driven :func:`display_state`.
     """
-    owned = st.accepted_at is not None
+    owned = st.status in OWNED_STATES
     if st.status == "deploying" or st.attribute not in _COMPARABLE_IFACE_ATTRS:
         kind, label = display_state(st.status, owned)
         return (kind, label, owned)
@@ -152,26 +159,25 @@ _NON_ROUTING_FLAGS = {"manage_interfaces", "manage_snmp", "manage_logging", "man
 def _status_breakdown(qs) -> dict:
     """Return owned-aware {total, drift, pending} buckets for a state queryset.
 
-    Owned = accepted_at set. differ + owned → pending apply; differ + not-owned → drift;
-    match (imported/in_sync) → in sync (the implicit remainder). A row left at
-    ``unknown`` (or any unrecognized status) is an *anomaly* — reconcilers always set a
-    concrete status — so it is surfaced under drift (needs attention) rather than hidden
-    in the in-sync remainder, where it would read as a false "in sync".
+    Owned = ``status in OWNED_STATES`` (the canonical test — what Apply pushes), NOT
+    ``accepted_at`` (a stale, never-cleared timestamp). A differing status is therefore
+    *intrinsically* owned-or-not: accepted/apply_failed are owned → pending apply;
+    changed/conflict are unowned → drift. match (imported/in_sync) → in sync (the
+    implicit remainder). A row left at ``unknown`` (or any unrecognized status) is an
+    *anomaly* — reconcilers always set a concrete status — so it is surfaced under drift
+    (needs attention) rather than hidden in the in-sync remainder.
     """
-    from django.db.models import Q
-
-    rows = qs.values_list("status").annotate(
-        total=Count("id"),
-        owned=Count("id", filter=Q(accepted_at__isnull=False)),
-    )
+    rows = qs.values_list("status").annotate(total=Count("id"))
     out = {"total": 0, "drift": 0, "pending": 0}
-    for status, total, owned in rows:
+    for status, total in rows:
         out["total"] += total
         if status == "deploying":
             out["pending"] += total
         elif status in _DIFFER_STATUSES:
-            out["pending"] += owned
-            out["drift"] += total - owned
+            if status in OWNED_STATES:
+                out["pending"] += total  # accepted / apply_failed — owned differ
+            else:
+                out["drift"] += total  # changed / conflict — unowned differ
         elif status in _MATCH_STATUSES:
             pass  # in sync — the implicit remainder
         else:

@@ -286,6 +286,7 @@ def _merged_iface_kinds(iface, attr_states, mtu_states, sw_states, ip_states) ->
     (interface_row_state), the rest go through display_state. Returns the SET of kinds
     across all of the interface's cells so the view can bucket it as drift/pending/in_sync.
     """
+    from .status_machine import OWNED_STATES
     from .summary import display_state, interface_row_state
 
     kinds: set[str] = set()
@@ -295,9 +296,9 @@ def _merged_iface_kinds(iface, attr_states, mtu_states, sw_states, ip_states) ->
             kinds.add(interface_row_state(st, iface)[0])
     for st in (mtu_states.get(iface.id), sw_states.get(iface.id)):
         if st is not None:
-            kinds.add(display_state(st.status, st.accepted_at is not None)[0])
+            kinds.add(display_state(st.status, st.status in OWNED_STATES)[0])
     for st in ip_states.get(iface.id, []):
-        kinds.add(display_state(st.status, st.accepted_at is not None)[0])
+        kinds.add(display_state(st.status, st.status in OWNED_STATES)[0])
     return kinds
 
 
@@ -499,6 +500,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
         from django.core.paginator import Paginator
         from django.db.models import Q
 
+        from .status_machine import OWNED_STATES
         from .template_content import _STATUS_BADGE
 
         spec = self._paged_category_specs().get(key)
@@ -530,7 +532,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
         # category) so route_policy / static / redistribution / vlan / svi / subinterface /
         # l2_services all get the drift/pending/in-sync quick-select without per-template work.
         rows = list(qs)
-        bucketed = [(_paged_row_bucket(r.status, r.accepted_at is not None), r) for r in rows]
+        bucketed = [(_paged_row_bucket(r.status, r.status in OWNED_STATES), r) for r in rows]
         state_counts = {"all": len(rows), "drift": 0, "pending": 0, "in_sync": 0}
         for bucket, _row in bucketed:
             state_counts[bucket] += 1
@@ -1270,9 +1272,10 @@ def _prepare_apply(mgmt):
     #   - VLAN: the name lives on ipam.VLAN; renaming it fires no plugin signal, so a
     #     post-accept rename would otherwise be stranded in NetBox (the row stays
     #     'in_sync' and the stale old name is what gets applied).
-    #   - interface description/enabled: an owned attribute that drifted back to
-    #     'imported' (device differs again) is shown 'pending apply' but was being
-    #     silently skipped — force-push so Apply actually re-applies it.
+    #   - interface description/enabled: an owned attribute (status in OWNED_STATES)
+    #     whose adapter intent went stale is force-pushed so Apply actually re-applies
+    #     it. Ownership is status-based and kept durable by the reconciler's owned-guard,
+    #     so this no longer re-pushes a row that genuinely drifted back to 'imported'.
     for push in (
         _push_interface_intent_for_device,
         _push_lacp_intent_for_device,
@@ -1670,8 +1673,9 @@ class NSOBulkAcceptView(NSOActionPermissionMixin, View):
         pending = base.filter(status="changed").update(status="accepted", accepted_at=now)
         updated = settled + pending
 
-        # Push whenever anything became owned — the snapshot is by accepted_at, so even
-        # owned-but-matching rows must be recorded in the adapter to persist ownership.
+        # Push whenever anything became owned — the snapshot is by status (OWNED_STATES),
+        # and matching rows settle to in_sync (an owned status), so even owned-but-matching
+        # rows are recorded in the adapter to persist ownership.
         if updated:
             _push_intent_for_device(device_pk)
         if updated:

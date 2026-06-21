@@ -146,11 +146,11 @@ def _scopes() -> list[dict]:
             "key": "interface",
             "label": "Interface attributes",
             "tables": ["interface_intent"],
-            # 2-D model: ownership marker is accepted_at, independent of sync status (an
-            # owned attribute can sit at status "changed" while drifted). Mirror the push
-            # predicate in _push_interface_intent_for_device exactly, or owned rows in
-            # drift would read as orphaned/partial.
-            "owned": lambda d: NSOInterfaceState.objects.filter(interface__device=d, accepted_at__isnull=False).count(),
+            # Ownership is status-based (status in OWNED_STATES) — the canonical test,
+            # identical to every other scope. Mirror the push predicate in
+            # _push_interface_intent_for_device exactly, or owned rows would read as
+            # orphaned/partial.
+            "owned": lambda d: _owned_count(NSOInterfaceState, d, via="interface__device"),
             "push": signals._push_interface_intent_for_device,
         },
         {

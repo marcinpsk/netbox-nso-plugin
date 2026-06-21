@@ -1200,9 +1200,9 @@ class TestNSOApplyPreviewView(ViewTestBase):
 
         self.interface.description = "intended"
         self.interface.save(update_fields=["description"])
-        # Acceptance always stamps accepted_at alongside status (views accept-flow +
-        # signals). The preview is value-aware and keys ownership off accepted_at, so a
-        # realistic accepted row must set it — status="accepted" alone leaves it unowned.
+        # Ownership is status-based: an 'accepted' status is owned, so the preview lists it.
+        # (accepted_at is stamped too by the real accept-flow, but is no longer what the
+        # preview keys off.)
         NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(
             status="accepted", nso_value="on-device", accepted_at=timezone.now()
         )
@@ -1219,7 +1219,10 @@ class TestNSOApplyPreviewView(ViewTestBase):
     def test_preview_empty_when_nothing_pending(self):
         import json
 
-        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="in_sync")
+        # in_sync AND values match (device == NetBox's empty description) → genuinely nothing
+        # to push. (The fixture's nso_value is "test desc"; clear it so the row is truly in sync
+        # rather than an owned value-difference, which would correctly be pending.)
+        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="in_sync", nso_value="")
         url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
         data = json.loads(self.client.get(url).content)
         self.assertEqual(data["total"], 0)
@@ -1251,7 +1254,8 @@ class TestNSOApplyPreviewView(ViewTestBase):
 
         from netbox_nso_plugin.models import NSOOSPFInterfaceState
 
-        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="in_sync")  # no interface changes
+        # in_sync + matching value (empty == empty) → no interface change in the preview.
+        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="in_sync", nso_value="")
         NSOOSPFInterfaceState.objects.create(
             management=self.mgmt,
             interface=self.interface,
@@ -1279,7 +1283,8 @@ class TestNSOApplyPreviewView(ViewTestBase):
         from netbox_nso_plugin.models import NSOVLANState
         from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
 
-        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="in_sync")  # no interface changes
+        # in_sync + matching value (empty == empty) → no interface change; only the VLAN is pending.
+        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="in_sync", nso_value="")
         vlan = VLAN.objects.create(group=_device_vlan_group(self.device), vid=2213, name="FW_uplink_cpms-01")
         NSOVLANState.objects.create(management=self.mgmt, vlan=vlan, device_name="OLD", status="accepted")
 
@@ -1645,48 +1650,56 @@ class TestDeviceNSOTabView(ViewTestBase):
         NSORoutePolicyState.objects.filter(management=self.mgmt).delete()
 
     def test_interfaces_page_classification_is_value_aware(self):
-        """Display follows NetBox-vs-device values, not the adapter's stale status.
+        """Display follows NetBox-vs-device values + status-based ownership.
 
-        Reproduces the device-27 ae2.0 case: an owned row whose status the adapter
-        still reports as a MATCH ("imported"/"unknown") but whose NetBox value
-        differs from the device must read "pending apply", not hide as "in sync".
-        And a value that matches must read "in sync" even if the status is a DIFFER
-        status.
+        - An OWNED status (accepted) whose NetBox value differs from the device → pending.
+        - A value that matches reads "in sync" even if the status is a DIFFER status.
+        - The device-27 ae2.0 case: an UN-owned status ('imported'/'unknown') with a value
+          that differs and a STALE accepted_at → drift (not pending), because Apply pushes
+          by status and would never push it.
         """
         from dcim.models import Interface
         from django.utils import timezone
 
         from netbox_nso_plugin.models import NSOInterfaceState
 
-        # Owned + status says in-sync, but NetBox has a description the device lacks.
-        owned_drift = Interface.objects.create(
+        # Owned (accepted) + NetBox has a description the device lacks → pending.
+        owned_pending = Interface.objects.create(
             device=self.device, name="ae2.0", type="virtual", description="Core Link"
         )
         NSOInterfaceState.objects.create(
-            interface=owned_drift,
-            attribute="description",
-            status="unknown",
-            nso_value="",
-            accepted_at=timezone.now(),
+            interface=owned_pending, attribute="description", status="accepted", nso_value=""
         )
         # Status says "changed" (DIFFER) but the values actually match → in sync.
         matched = Interface.objects.create(device=self.device, name="ae3.0", type="virtual", description="same")
         NSOInterfaceState.objects.create(interface=matched, attribute="description", status="changed", nso_value="same")
+        # Un-owned status with a STALE accepted_at + differing value → drift, NOT pending.
+        stale = Interface.objects.create(device=self.device, name="ae4.0", type="virtual", description="Core Link")
+        NSOInterfaceState.objects.create(
+            interface=stale, attribute="description", status="imported", nso_value="", accepted_at=timezone.now()
+        )
         url = reverse(
             "plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device.pk, "key": "interfaces"}
         )
 
-        # ae2.0 must surface under the pending filter; ae3.0 must not.
+        # ae2.0 (owned, differs) surfaces under pending; ae3.0 (matches) and ae4.0 (un-owned) do not.
         pending = self.client.get(url, {"state": "pending"}).content.decode()
         self.assertIn("ae2.0", pending)
         self.assertNotIn("ae3.0", pending)
+        self.assertNotIn("ae4.0", pending)
 
-        # ae3.0 (values match) must surface under in_sync; ae2.0 must not.
+        # ae3.0 (values match) surfaces under in_sync; ae2.0/ae4.0 (differ) do not.
         in_sync = self.client.get(url, {"state": "in_sync"}).content.decode()
         self.assertIn("ae3.0", in_sync)
         self.assertNotIn("ae2.0", in_sync)
+        self.assertNotIn("ae4.0", in_sync)
 
-        Interface.objects.filter(device=self.device, name__in=["ae2.0", "ae3.0"]).delete()
+        # ae4.0 (un-owned, differs, stale accepted_at) surfaces under drift; ae2.0 does not.
+        drift = self.client.get(url, {"state": "drift"}).content.decode()
+        self.assertIn("ae4.0", drift)
+        self.assertNotIn("ae2.0", drift)
+
+        Interface.objects.filter(device=self.device, name__in=["ae2.0", "ae3.0", "ae4.0"]).delete()
 
     def test_interfaces_page_apply_failed_renders_distinctly(self):
         """A failed apply shows 'apply failed' + a Retry button, not plain 'pending apply'."""
