@@ -256,6 +256,64 @@ class TestAttachBlockOverride(_CapBase):
         assert resp.status_code == 302
         assert NSORoutePolicyState.objects.filter(object_name="CAP-PL-NOCALL").exists()
 
+    def test_attach_route_map_warns_cross_device_provenance(self):
+        """End-to-end: attaching a route-map whose greenfield reference's NetBox content was
+        sourced (materialized) from ANOTHER device owns the reference here (the route-map needs
+        it) AND warns the operator that applying pushes that other device's version onto this
+        box. Exercises the real view → cascade → message path."""
+        from django.contrib.contenttypes.models import ContentType
+        from django.contrib.messages import get_messages
+        from netbox_routing.models import PrefixList, RouteMap, RouteMapEntry
+
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSORoutePolicyState
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        mgmt = self._mgmt()  # attaching onto self.device
+        rm = RouteMap.objects.create(name="CAP-RM-XDEV")
+        e = RouteMapEntry.objects.create(route_map=rm, sequence=10, action="permit")
+        pl = PrefixList.objects.create(name="CAP-PL-XDEV")
+        with suppress_intent_push():
+            e.match_prefix_list.add(pl)
+
+        # A second device already materialized CAP-PL-XDEV into NetBox (it is the NetBox source).
+        other_dev = Device.objects.create(
+            name="cap-router-x",
+            device_type=self.device.device_type,
+            role=self.device.role,
+            site=self.device.site,
+        )
+        inst, _ = NSOInstance.objects.get_or_create(name="cap-inst", defaults={"adapter_instance_id": "cap-inst"})
+        other_mgmt = NSODeviceManagement.objects.create(
+            device=other_dev, nso_instance=inst, nso_device_name="cap-dev-x", adapter_device_id=298
+        )
+        with suppress_intent_push():
+            NSORoutePolicyState.objects.create(
+                management=other_mgmt,
+                family="prefix_list",
+                object_name=pl.name,
+                content_type=ContentType.objects.get_for_model(PrefixList),
+                object_id=pl.pk,
+                status="in_sync",
+                is_materialized=True,
+            )
+
+        verdict = {"known": True, "fully_supported": True, "unsupported": []}
+        with patch("netbox_nso_plugin.adapter_client._request", side_effect=_request_returning(verdict)):
+            with self.captureOnCommitCallbacks(execute=True):
+                resp = self.client.post(self._attach_url(), {"policy": self._policy_value("route_map", rm)})
+
+        assert resp.status_code == 302  # attached → redirect
+        # The route-map and its greenfield prefix-list reference are both owned on this device…
+        assert NSORoutePolicyState.objects.filter(
+            management=mgmt, object_name="CAP-RM-XDEV", status="accepted"
+        ).exists()
+        assert NSORoutePolicyState.objects.filter(
+            management=mgmt, family="prefix_list", object_name="CAP-PL-XDEV", status="accepted"
+        ).exists()
+        # …and the operator is warned that the prefix-list's version comes from the other device.
+        msgs = [str(m) for m in get_messages(resp.wsgi_request)]
+        assert any("sourced from another device" in m and "cap-router-x" in m for m in msgs), msgs
+
 
 # ── panel badge ───────────────────────────────────────────────────────────────
 
@@ -336,6 +394,53 @@ class TestPanelCapabilityBadge(_CapBase):
             states = self._annotated_states(pl)
 
         assert states[0].capability["state"] == "supported"
+
+    def test_propagation_devices_lists_only_owned_overlays(self):
+        """Edit-propagation surface: the panel reports which devices an edit re-applies to —
+        only the OWNED overlays (accepted / deploying / in_sync / apply_failed). A brownfield
+        (imported) overlay is excluded: editing the shared object doesn't auto-push it (it
+        surfaces via reconcile), so the operator's blast-radius view must not list it."""
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import PrefixList
+
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSORoutePolicyState
+        from netbox_nso_plugin.signals import suppress_intent_push
+        from netbox_nso_plugin.template_content import RoutePolicyNSODevices
+
+        pl = PrefixList.objects.create(name="PROP-PL")
+        owned_mgmt = self._mgmt()  # self.device → owned overlay (accepted)
+        self._attach_overlay("prefix_list", pl, owned_mgmt)
+
+        # A second device carries a brownfield (imported) overlay → NOT in the propagation set.
+        other_dev = Device.objects.create(
+            name="cap-router-2",
+            device_type=self.device.device_type,
+            role=self.device.role,
+            site=self.device.site,
+        )
+        inst, _ = NSOInstance.objects.get_or_create(name="cap-inst", defaults={"adapter_instance_id": "cap-inst"})
+        other_mgmt = NSODeviceManagement.objects.create(
+            device=other_dev, nso_instance=inst, nso_device_name="cap-dev-2", adapter_device_id=295
+        )
+        with suppress_intent_push():
+            NSORoutePolicyState.objects.create(
+                management=other_mgmt,
+                family="prefix_list",
+                object_name=pl.name,
+                content_type=ContentType.objects.get_for_model(PrefixList),
+                object_id=pl.pk,
+                status="imported",
+            )
+
+        ext = object.__new__(RoutePolicyNSODevices)
+        ext.context = {"object": pl}
+        captured = {}
+        ext.render = lambda template, extra_context=None: captured.update(extra_context or {}) or ""
+        with patch("netbox_nso_plugin.adapter_client._request", side_effect=AssertionError("must not call adapter")):
+            ext.full_width_page()
+
+        assert [d.name for d in captured["propagation_devices"]] == [self.device.name]  # owned only
+        assert len(captured["nso_states"]) == 2  # both devices still listed in the table
 
 
 # ── operator capabilities page ────────────────────────────────────────────────

@@ -1831,6 +1831,7 @@ class RoutePolicyNSODevices(PluginTemplateExtension):
         from django.contrib.contenttypes.models import ContentType
 
         from .models import NSORoutePolicyState
+        from .status_machine import OWNED_STATES
 
         obj = self.context["object"]
         ct = ContentType.objects.get_for_model(obj)
@@ -1840,9 +1841,15 @@ class RoutePolicyNSODevices(PluginTemplateExtension):
             )
         )
         self._annotate_capability(obj, states)
+        # Edit-propagation blast radius: this object is shared by name across devices, so an
+        # operator edit here re-asserts ownership + re-pushes to every device that *owns* it
+        # (accepted / deploying / in_sync / apply_failed). Brownfield/un-owned overlays
+        # (imported / changed / conflict) are NOT auto-pushed — they surface via reconcile.
+        # Surfacing the owned set lets the operator see exactly which boxes an edit touches.
+        propagation_devices = [s.management.device for s in states if s.status in OWNED_STATES]
         return self.render(
             "netbox_nso_plugin/route_policy_nso_devices.html",
-            extra_context={"nso_states": states},
+            extra_context={"nso_states": states, "propagation_devices": propagation_devices},
         )
 
     @staticmethod

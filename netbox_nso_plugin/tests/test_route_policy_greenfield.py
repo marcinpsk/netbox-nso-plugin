@@ -367,11 +367,11 @@ class TestOwnershipCascade(_RPBase):
                 object_id=pl.pk,
                 status="conflict",
             )
-        drifted = _own_route_map_contributors(mgmt, rm)
+        cascade = _own_route_map_contributors(mgmt, rm)
 
         st = NSORoutePolicyState.objects.get(management=mgmt, family="prefix_list", object_name=pl.name)
         assert st.status == "conflict"  # left for explicit resolution, NOT overwritten
-        assert ("prefix_list", pl.name) in drifted  # reported to the caller (the Accept view warns)
+        assert ("prefix_list", pl.name) in cascade.drifted  # reported to the caller (the Accept view warns)
         # the greenfield references are still owned (only the drifted one is skipped)
         assert NSORoutePolicyState.objects.get(management=mgmt, family="as_path", object_name="50").status == "accepted"
 
@@ -395,6 +395,50 @@ class TestOwnershipCascade(_RPBase):
 
         st = NSORoutePolicyState.objects.get(management=mgmt, family="community_list", object_name="CL-SET-DELETE")
         assert st.status == "accepted"  # set-referenced list owned alongside the route-map
+
+    def test_cascade_reports_cross_device_provenance_for_greenfield_reference(self):
+        """A GREENFIELD reference (no overlay on THIS device) whose shared NetBox content was
+        materialized from ANOTHER device is still owned — the route-map needs it — but the
+        cascade reports its provenance so the Accept view can warn that owning the route-map
+        here pushes the other device's version of that object onto this device."""
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import PrefixList
+
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSORoutePolicyState
+        from netbox_nso_plugin.signals import _own_route_map_contributors, suppress_intent_push
+
+        mgmt = self._mgmt()  # owning onto self.device
+        rm, _ap, _cl, pl = self._route_map_with_refs()
+
+        # A SECOND device already materialized PL-CASCADE into NetBox (it is the NetBox source).
+        other_dev = Device.objects.create(
+            name="rp-router-2",
+            device_type=self.device.device_type,
+            role=self.device.role,
+            site=self.device.site,
+        )
+        inst, _ = NSOInstance.objects.get_or_create(name="rp-inst", defaults={"adapter_instance_id": "rp-inst"})
+        other_mgmt = NSODeviceManagement.objects.create(
+            device=other_dev, nso_instance=inst, nso_device_name="nso-rp-2", adapter_device_id=297
+        )
+        with suppress_intent_push():
+            NSORoutePolicyState.objects.create(
+                management=other_mgmt,
+                family="prefix_list",
+                object_name=pl.name,
+                content_type=ContentType.objects.get_for_model(PrefixList),
+                object_id=pl.pk,
+                status="in_sync",
+                is_materialized=True,
+            )
+
+        cascade = _own_route_map_contributors(mgmt, rm)
+
+        # Greenfield reference is still owned on this device (route-map needs it)…
+        st = NSORoutePolicyState.objects.get(management=mgmt, family="prefix_list", object_name=pl.name)
+        assert st.status == "accepted"
+        # …but its cross-device provenance is reported (family, name, source device name).
+        assert ("prefix_list", pl.name, other_dev.name) in cascade.cross_device
 
     def test_editing_owned_route_map_cascades_to_new_reference(self):
         """The real fix: adding an as-path to an OWNED route-map auto-owns the as-path

@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import threading
+from collections import namedtuple
 
 from django.db.models.signals import m2m_changed, post_delete, post_save, pre_delete, pre_save
 from django.dispatch import receiver
@@ -2159,7 +2160,14 @@ def _on_routing_policy_pre_delete(sender, instance, **kwargs):
 # left to the 3-way reconcile so the edit surfaces as changed/conflict, not force-owned.
 
 
-def _own_route_map_contributors(mgmt, route_map) -> list:
+# Result of cascading ownership from a route-map onto its referenced objects:
+#   drifted      — (family, name) refs left as-is because the device has a diverging version
+#   cross_device — (family, name, source_device) greenfield refs whose NetBox content was
+#                  sourced (materialized) from a DIFFERENT device than the one we're owning onto
+CascadeResult = namedtuple("CascadeResult", ["drifted", "cross_device"])
+
+
+def _own_route_map_contributors(mgmt, route_map) -> CascadeResult:
     """Own (accepted) the prefix-lists / community-lists / as-paths a route-map references.
 
     Owning a top-level object cascades ownership to everything it depends on: a route-map
@@ -2174,10 +2182,16 @@ def _own_route_map_contributors(mgmt, route_map) -> list:
     leave it for explicit drift resolution and RETURN the skipped ``(family, name)`` tuples so
     the caller can warn the operator. Already-owned contributors (accepted / deploying / in_sync
     / apply_failed) are left untouched.
+
+    A GREENFIELD reference (no overlay on this device yet) whose shared NetBox content was
+    *materialized from a different device* is still owned — the route-map needs it — but its
+    provenance is collected into ``cross_device`` so the caller can warn that owning the
+    route-map here will push another device's version of that object onto this device.
     """
     from django.contrib.contenttypes.models import ContentType
 
     from .models import NSORoutePolicyState
+    from .shared_object_ownership import materialized_row
     from .status_machine import CHANGED, CONFLICT
 
     now = timezone.now()
@@ -2203,6 +2217,7 @@ def _own_route_map_contributors(mgmt, route_map) -> list:
             if sc.community_list_id:
                 _add_ref("community_list", sc.community_list)
     drifted: list = []
+    cross_device: list = []
     for family, obj in referenced:
         ct = ContentType.objects.get_for_model(obj)
         state, created = NSORoutePolicyState.objects.get_or_create(
@@ -2211,8 +2226,15 @@ def _own_route_map_contributors(mgmt, route_map) -> list:
             object_name=obj.name,
             defaults={"content_type": ct, "object_id": obj.pk, "status": "accepted", "accepted_at": now},
         )
-        if created or state.status in _OWNED_PUSH_STATUSES:
-            continue  # greenfield (just created accepted) or already owned → nothing to do
+        if created:
+            # Greenfield on this device — owned. If the shared NetBox content was materialized
+            # from ANOTHER device, owning here pushes that device's version; surface provenance.
+            owner = materialized_row(NSORoutePolicyState, family, obj.name)
+            if owner is not None and owner.management.device_id != mgmt.device_id:
+                cross_device.append((family, obj.name, owner.management.device.name))
+            continue
+        if state.status in _OWNED_PUSH_STATUSES:
+            continue  # already owned → nothing to do
         if state.status in (CHANGED, CONFLICT):
             # The device has a diverging version — don't silently overwrite it. The reference
             # resolves against the device's existing object; surface it for explicit resolution.
@@ -2222,7 +2244,7 @@ def _own_route_map_contributors(mgmt, route_map) -> list:
         state.content_type, state.object_id = ct, obj.pk
         state.status, state.accepted_at = "accepted", now
         state.save()
-    return drifted
+    return CascadeResult(drifted=drifted, cross_device=cross_device)
 
 
 def _accept_route_policy_object(obj) -> None:

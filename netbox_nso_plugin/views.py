@@ -2639,16 +2639,26 @@ class NSORoutePolicyAttachView(NSOActionPermissionMixin, View):
             # Owning a route-map owns its contributors too (else dangling device references).
             from .signals import _own_route_map_contributors
 
-            drifted = _own_route_map_contributors(mgmt, obj)
-            if drifted:
+            cascade = _own_route_map_contributors(mgmt, obj)
+            if cascade.drifted:
                 # A referenced object the device already has but that diverges from NetBox was
                 # NOT overwritten — tell the operator so they can resolve it explicitly.
-                refs = ", ".join(f"{fam.replace('_', ' ')} {nm}" for fam, nm in drifted)
+                refs = ", ".join(f"{fam.replace('_', ' ')} {nm}" for fam, nm in cascade.drifted)
                 messages.warning(
                     request,
-                    f"Route-map {obj.name} references {len(drifted)} object(s) that differ on "
+                    f"Route-map {obj.name} references {len(cascade.drifted)} object(s) that differ on "
                     f"{mgmt.device.name} — left as-is (not overwritten); resolve their drift before "
                     f"they ship: {refs}.",
+                )
+            if cascade.cross_device:
+                # A greenfield reference whose NetBox content came from another device — owning
+                # the route-map here pushes that device's version. Make the provenance explicit.
+                refs = ", ".join(f"{fam.replace('_', ' ')} {nm} (from {src})" for fam, nm, src in cascade.cross_device)
+                messages.warning(
+                    request,
+                    f"Route-map {obj.name} references {len(cascade.cross_device)} shared object(s) whose "
+                    f"NetBox version was sourced from another device — applying here pushes that version "
+                    f"onto {mgmt.device.name}: {refs}.",
                 )
         if override:
             # Operator overrode a known-negative verdict — be explicit about what won't land.
