@@ -168,6 +168,7 @@ class DeviceNSOTabView(generic.ObjectView):
         adapter_error_code = None
         intent_drift = []
         failover = None
+        device_capability = None
         if mgmt is not None and mgmt.adapter_device_id is not None:
             from . import adapter_client as client
             from .intent_drift import compute_intent_drift
@@ -192,6 +193,21 @@ class DeviceNSOTabView(generic.ObjectView):
                 adapter_error_code = exc.code
                 logger.debug("Adapter unavailable for device %s: %s", device.pk, exc)
 
+            # Capability transparency (I2): the device_capability matrix's unsupported/skipped
+            # rows for this device's (ned, sw) — recorded reactively when a prior apply's intent
+            # was rejected by the NED. A cheap cache-only read that fails open, so it never breaks
+            # the tab; only surfaced when the adapter is reachable and there are real gaps.
+            if adapter_error is None:
+                cap = client.get_device_capability(mgmt.adapter_device_id, refresh=False)
+                if cap.get("known"):
+                    gaps = [e for e in cap.get("elements", []) if e.get("status") in ("unsupported", "skipped")]
+                    if gaps:
+                        device_capability = {
+                            "ned_id": cap.get("ned_id", ""),
+                            "sw_version": cap.get("sw_version", ""),
+                            "gaps": gaps,
+                        }
+
         return {
             "mgmt": mgmt,
             "nso_categories": category_summaries(device, mgmt),
@@ -199,6 +215,7 @@ class DeviceNSOTabView(generic.ObjectView):
             "adapter_error_code": adapter_error_code,
             "intent_drift": intent_drift,
             "failover": failover,
+            "device_capability": device_capability,
             "status_badge": _STATUS_BADGE,
         }
 

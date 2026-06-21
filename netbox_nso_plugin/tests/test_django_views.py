@@ -2298,3 +2298,49 @@ class TestSharedObjectVersionsAndMaterialize(ViewTestBase):
         self.assertTrue(s2.is_materialized)
         self.assertFalse(s1.is_materialized)
         self.assertEqual(s1.status, "conflict")
+
+
+class TestDeviceNSOTabCapability(ViewTestBase):
+    """The NSO tab surfaces the device_capability matrix's unsupported/skipped scopes (I2)."""
+
+    def _url(self):
+        return reverse("dcim:device_nso", kwargs={"pk": self.device.pk})
+
+    def _set_adapter_id(self, aid=16):
+        self.mgmt.adapter_device_id = aid
+        self.mgmt.save(update_fields=["adapter_device_id"])
+
+    @patch("netbox_nso_plugin.adapter_client.get_device", return_value={})
+    def test_capability_gaps_render_in_nso_tab(self, _mock_dev):
+        self._set_adapter_id()
+        cap = {
+            "known": True,
+            "ned_id": "cisco-ios-cli-6.114",
+            "sw_version": "17.15",
+            "elements": [
+                {"scope": "static_route", "name": "static_route", "status": "unsupported", "detail": "NED rejected"},
+                {"scope": "bgp", "name": "bgp", "status": "native", "detail": ""},
+            ],
+        }
+        with patch("netbox_nso_plugin.adapter_client.get_device_capability", return_value=cap):
+            resp = self.client.get(self._url())
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, "mdi-alert-octagon-outline")  # the capability panel rendered
+        self.assertContains(resp, "static_route")
+        self.assertContains(resp, "text-bg-danger")  # unsupported badge
+        # the supported (native) scope is NOT listed as a gap
+        self.assertNotContains(resp, "bgp</strong>")
+
+    @patch("netbox_nso_plugin.adapter_client.get_device", return_value={})
+    def test_no_panel_when_all_supported(self, _mock_dev):
+        self._set_adapter_id()
+        cap = {
+            "known": True,
+            "ned_id": "x",
+            "sw_version": "y",
+            "elements": [{"scope": "bgp", "name": "bgp", "status": "native", "detail": ""}],
+        }
+        with patch("netbox_nso_plugin.adapter_client.get_device_capability", return_value=cap):
+            resp = self.client.get(self._url())
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotContains(resp, "mdi-alert-octagon-outline")

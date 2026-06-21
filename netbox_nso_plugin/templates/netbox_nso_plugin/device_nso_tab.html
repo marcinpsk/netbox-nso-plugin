@@ -54,6 +54,35 @@
     </div>
   {% endif %}
 
+  {# ── Device capability gaps — matrix unsupported/skipped on this NED/sw; renders only if any ── #}
+  {% if device_capability %}
+    <div class="alert alert-warning d-flex align-items-start mb-3" role="alert">
+      <span class="mdi mdi-alert-octagon-outline me-2 mt-1"></span>
+      <div class="flex-grow-1">
+        <strong>{{ device_capability.gaps|length }} construct{{ device_capability.gaps|length|pluralize }}
+          won't apply on this device.</strong>
+        The NED <code>{{ device_capability.ned_id }}</code>{% if device_capability.sw_version %}
+        ({{ device_capability.sw_version }}){% endif %} can't realise the intent below — a prior
+        apply was rejected by the device, so it is recorded in the capability matrix. The intent
+        still lands in NetBox; it just won't reach the device until it's supported.
+        <ul class="mb-0 mt-1">
+          {% for g in device_capability.gaps %}
+            <li>
+              <strong>{{ g.scope }}</strong>
+              {% if g.name and g.name != g.scope %}<span class="text-muted">{{ g.name }}</span>{% endif %}
+              {% if g.status == 'unsupported' %}
+                <span class="badge text-bg-danger ms-1">unsupported</span>
+              {% else %}
+                <span class="badge text-bg-warning text-dark ms-1">{{ g.status }}</span>
+              {% endif %}
+              {% if g.detail %}<small class="text-muted ms-1">{{ g.detail }}</small>{% endif %}
+            </li>
+          {% endfor %}
+        </ul>
+      </div>
+    </div>
+  {% endif %}
+
   {# ── What "Accept" means (read this before clicking) ───────────────────── #}
   <div class="alert alert-info d-flex align-items-start mb-3" role="alert">
     <span class="mdi mdi-information-outline me-2 mt-1"></span>
