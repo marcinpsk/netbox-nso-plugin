@@ -22,10 +22,13 @@
       </h5>
       <div class="card-body">
         <p class="text-muted">
-          What the device reports on-box versus what NetBox currently holds (the materialised
-          object). Within a differing value the exact changed tokens are highlighted —
-          <span class="nso-diff-dev">only on the device</span>,
-          <span class="nso-diff-nb">only in NetBox</span>. Identical entries are summarised.
+          The full list in order: <strong>Device (now)</strong> is what the box reports on-box,
+          <strong>NetBox (after push)</strong> is the list a push would write — read it top to
+          bottom for the end result. An entry only in NetBox is
+          <span class="nso-diff-nb">added</span>, one only on the device is
+          <span class="nso-diff-dev">removed</span>, and within a changed entry the exact
+          differing tokens are highlighted (<span class="nso-diff-dev">device</span> /
+          <span class="nso-diff-nb">NetBox</span>).
         </p>
 
         {% if diff is None %}
@@ -41,8 +44,8 @@
           <div class="alert alert-warning">
             <span class="mdi mdi-minus-circle-outline me-1"></span>
             Removed on the device — this {{ family }} is gone from the device but still exists in
-            NetBox (every entry below reads “only in NetBox”). Accept to take ownership, or
-            delete the NetBox object to match the device.
+            NetBox (so every entry below shows as <span class="nso-diff-nb">added</span> back by a
+            push). Accept to take ownership, or delete the NetBox object to match the device.
           </div>
           {% endif %}
 
@@ -66,51 +69,36 @@
             {% endif %}
           {% endfor %}
 
-          {# One table for every differing entry so the Device / NetBox columns line up #}
-          {# down the whole page (each entry was previously its own auto-sized table). #}
+          {# The full list IN ORDER, one row per entry — a push makes the device adopt NetBox's #}
+          {# ordered list, so read the NetBox column top-to-bottom for the post-push result. #}
           <div class="table-responsive">
             <table class="table table-sm align-middle">
               <thead>
                 <tr class="small text-muted">
-                  <th style="width:9rem;">Seq</th>
-                  <th style="width:12rem;">Field</th>
-                  <th class="w-50">Device (on-box)</th>
-                  <th class="w-50">NetBox</th>
+                  <th style="width:8rem;">Seq</th>
+                  <th class="w-50">Device (now)</th>
+                  <th class="w-50">NetBox (after push)</th>
                 </tr>
               </thead>
               <tbody>
                 {% for e in diff.entries %}
-                  {% if e.differs %}
-                    {% for f in e.fields %}
-                    <tr>
-                      {% if forloop.first %}
-                      <td rowspan="{{ e.fields|length }}" class="border-top border-2">
-                        <code>{{ e.sequence }}</code>
-                        {% if e.netbox_sequence and e.netbox_sequence != e.sequence %}<div class="text-muted small">NetBox seq {{ e.netbox_sequence }}</div>{% endif %}
-                        <div class="mt-1">
-                          {% if e.presence == 'device_only' %}
-                            <span class="badge text-bg-warning text-dark" title="This entry is on the device but not in NetBox">only on device</span>
-                          {% elif e.presence == 'netbox_only' %}
-                            <span class="badge text-bg-info" title="NetBox holds this entry but the device no longer reports it">only in NetBox</span>
-                          {% else %}
-                            <span class="badge text-bg-warning text-dark" title="Same sequence, different value on the device vs NetBox">changed</span>
-                          {% endif %}
-                        </div>
-                      </td>
-                      {% endif %}
-                      <td class="text-nowrap{% if forloop.first %} border-top border-2{% endif %}">{{ f.label }}</td>
-                      {% include "netbox_nso_plugin/categories/_diff_value_cell.html" with value=f.device segments=f.device_segments hl="nso-diff-dev" differs=f.differs first=forloop.first %}
-                      {% include "netbox_nso_plugin/categories/_diff_value_cell.html" with value=f.netbox segments=f.netbox_segments hl="nso-diff-nb" differs=f.differs first=forloop.first %}
-                    </tr>
-                    {% endfor %}
-                  {% endif %}
+                <tr>
+                  <td class="text-nowrap">
+                    <code>{{ e.sequence }}</code>
+                    {% if e.presence == 'device_only' %}<span class="badge text-bg-danger ms-1" title="On the device now; the push removes it">removed</span>
+                    {% elif e.presence == 'netbox_only' %}<span class="badge text-bg-success ms-1" title="Not on the device; the push adds it">added</span>
+                    {% elif e.differs %}<span class="badge text-bg-warning text-dark ms-1" title="The push changes this entry">changed</span>{% endif %}
+                  </td>
+                  {% include "netbox_nso_plugin/categories/_diff_value_cell.html" with value=e.line.device segments=e.line.device_segments hl="nso-diff-dev" %}
+                  {% include "netbox_nso_plugin/categories/_diff_value_cell.html" with value=e.line.netbox segments=e.line.netbox_segments hl="nso-diff-nb" %}
+                </tr>
                 {% endfor %}
               </tbody>
             </table>
           </div>
 
           <p class="text-muted small mb-0">
-            Showing only entries that differ. Entries not listed match between the device and NetBox.
+            Showing the full list in order; rows without a badge are unchanged by the push.
           </p>
         {% endif %}
 

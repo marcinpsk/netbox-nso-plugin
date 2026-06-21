@@ -79,13 +79,24 @@ def inline_token_diff(device: str, netbox: str) -> tuple[list[dict], list[dict]]
 
 
 def _augment_segments(row: dict) -> dict:
-    """Attach inline token-diff segments to a ``{device, netbox, differs}`` row.
+    """Attach highlight segments to a ``{device, netbox, differs}`` row.
 
-    Only when both sides differ AND both carry a real value (not the ``"—"`` placeholder for a
-    side that is absent — there the presence badge / whole-cell highlight already says it all).
+    When both sides carry a value, highlight the token-level delta. When only one side has a
+    value (a field present on just the device or just NetBox — including every field of an
+    inserted/removed entry), highlight that whole value, so a device-only difference reads red
+    and a NetBox-only one green, consistent with the legend. The absent ``"—"`` side is left
+    unhighlighted.
     """
-    if row["differs"] and row["device"] not in ("", "—") and row["netbox"] not in ("", "—"):
+    if not row["differs"]:
+        return row
+    dev_present = row["device"] not in ("", "—")
+    nb_present = row["netbox"] not in ("", "—")
+    if dev_present and nb_present:
         row["device_segments"], row["netbox_segments"] = inline_token_diff(row["device"], row["netbox"])
+    elif dev_present:
+        row["device_segments"] = [{"text": row["device"], "changed": True}]
+    elif nb_present:
+        row["netbox_segments"] = [{"text": row["netbox"], "changed": True}]
     return row
 
 
@@ -138,25 +149,100 @@ def _diff_entry_fields(device_entry: dict | None, netbox_entry: dict | None) -> 
     return rows
 
 
+def _route_map_entry_line(entry: dict) -> str:
+    """One-line rendering of a summarised route-map entry for the in-order side-by-side view."""
+    bits = [str(entry.get("action") or "")]
+    for key, label in _ENTRY_FIELDS:
+        if key == "action":
+            continue
+        value = _render_field(key, entry.get(key))
+        if value:
+            bits.append(f"{label.lower()}: {value}")
+    return " · ".join(b for b in bits if b)
+
+
+def _simple_entry_line(family: str, entry: dict) -> str:
+    """One-line rendering of a simple-family entry (prefix-list / as-path / community-list)."""
+    action = entry.get("action") or ""
+    if family == "prefix_list":
+        parts = [action, entry.get("prefix") or ""]
+        if entry.get("ge") not in (None, ""):
+            parts.append(f"ge {entry['ge']}")
+        if entry.get("le") not in (None, ""):
+            parts.append(f"le {entry['le']}")
+    elif family == "as_path":
+        parts = [action, entry.get("pattern") or ""]
+    elif family == "community_list":
+        parts = [action, entry.get("community") or ""]
+    else:
+        parts = [action]
+    return " ".join(p for p in parts if p)
+
+
+def _entry_line(device_line: str, netbox_line: str, differs: bool) -> dict:
+    """Build the ``line`` cell for an aligned entry — the two one-line summaries + highlights.
+
+    A push makes the device adopt NetBox's full ordered list, so the diff is shown in order
+    (Device now | NetBox after push). The whole NetBox line of an added entry reads green, the
+    whole Device line of a removed one red, and a changed entry highlights just its differing
+    tokens — all via the shared :func:`_augment_segments`.
+    """
+    return _augment_segments({"device": device_line or "—", "netbox": netbox_line or "—", "differs": differs})
+
+
+def _align_pairs(device_entries: list, netbox_entries: list, signature) -> list[tuple]:
+    """Pair two entry lists by CONTENT so inserting/removing one entry does not cascade.
+
+    Aligning by position means a single entry one side has but the other lacks (a Junos term
+    added in the middle, an extra prefix-list line) shifts every following entry, so the whole
+    list reads as changed when only one entry really differs. Instead we run an LCS over each
+    entry's ``signature`` (a hashable digest of its comparable content — the sequence number is
+    deliberately excluded, since renumbering on insert is exactly what we want to absorb):
+
+    * equal signatures align (shown unchanged),
+    * an entry only on one side becomes a single insert / delete row, and
+    * a run that genuinely differs on both sides is paired positionally within that run so an
+      in-place field change still shows a field-level delta.
+
+    Returns ``(device_entry|None, netbox_entry|None)`` pairs in display order.
+    """
+    da = [signature(e) for e in device_entries]
+    na = [signature(e) for e in netbox_entries]
+    pairs: list[tuple] = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(a=da, b=na, autojunk=False).get_opcodes():
+        if tag == "equal":
+            pairs.extend((device_entries[i1 + k], netbox_entries[j1 + k]) for k in range(i2 - i1))
+        elif tag == "delete":
+            pairs.extend((device_entries[k], None) for k in range(i1, i2))
+        elif tag == "insert":
+            pairs.extend((None, netbox_entries[k]) for k in range(j1, j2))
+        else:  # replace — a genuinely-different run; pair up in order for field-level diffs
+            pairs.extend(zip_longest(device_entries[i1:i2], netbox_entries[j1:j2]))
+    return pairs
+
+
+def _route_map_entry_signature(entry: dict) -> tuple:
+    """Content digest of a summarised route-map entry (sequence excluded) for content alignment."""
+    return tuple(_render_field(key, entry.get(key)) for key, _ in _ENTRY_FIELDS)
+
+
 def route_map_diff(device_captured: dict | None, netbox_captured: dict | None) -> dict:
     """Diff a device's captured route-map against the NetBox-materialised version.
 
     Both inputs are capture-shaped dicts (``{"entries": [...]}``); they are summarised through
-    the same projection and aligned by sequence. Returns ``{any_diff, default_action, entries}``
-    where each entry carries its per-field rows and a ``presence`` of both / device_only /
-    netbox_only. Pure — no DB.
+    the same projection and aligned by CONTENT (see :func:`_align_pairs`). Returns
+    ``{any_diff, default_action, entries}`` where each entry carries its per-field rows and a
+    ``presence`` of both / device_only / netbox_only. Pure — no DB.
     """
     dev = summarize_route_map(device_captured)
     nb = summarize_route_map(netbox_captured)
 
-    # Align POSITIONALLY, not by sequence number: the reconciler renumbers entries 1..N when it
-    # materialises them (device sequences can overflow the smallint column and Junos prefix-lists
-    # have none), so a device capture (original sequences) and the NetBox object (positional) use
-    # different numbering for the SAME ordered entries. Both summaries preserve entry order, so
-    # position i ↔ position i; label each row with the device's sequence where present.
+    # Align by CONTENT, not position: the reconciler renumbers entries 1..N on materialise, and a
+    # single inserted/removed entry would otherwise shift the rest and read as a cascade of
+    # changes. Label each row with the device's sequence where present, else the NetBox one.
     entries = []
     any_diff = False
-    for de, ne in zip_longest(dev["entries"], nb["entries"]):
+    for de, ne in _align_pairs(dev["entries"], nb["entries"], _route_map_entry_signature):
         presence = "both" if de and ne else ("device_only" if de else "netbox_only")
         fields = _diff_entry_fields(de, ne)
         differs = presence != "both" or any(f["differs"] for f in fields)
@@ -168,6 +254,9 @@ def route_map_diff(device_captured: dict | None, netbox_captured: dict | None) -
                 "presence": presence,
                 "differs": differs,
                 "fields": fields,
+                "line": _entry_line(
+                    _route_map_entry_line(de) if de else "", _route_map_entry_line(ne) if ne else "", differs
+                ),
             }
         )
 
@@ -274,11 +363,15 @@ def _netbox_simple_entries(family: str, obj) -> list[dict]:
     return out
 
 
-def _entry_list_diff(device_entries: list[dict], netbox_entries: list[dict], field_specs) -> dict:
-    """Positional diff of two entry lists into the shared diff shape (no default_action)."""
+def _entry_list_diff(device_entries: list[dict], netbox_entries: list[dict], field_specs, family: str) -> dict:
+    """Content-aligned diff of two entry lists into the shared diff shape (no default_action)."""
     entries = []
     any_diff = False
-    for i, (de, ne) in enumerate(zip_longest(device_entries, netbox_entries), start=1):
+
+    def _sig(entry):
+        return tuple(_render_scalar(entry.get(key)) for key, _ in field_specs)
+
+    for i, (de, ne) in enumerate(_align_pairs(device_entries, netbox_entries, _sig), start=1):
         presence = "both" if de and ne else ("device_only" if de else "netbox_only")
         fields = []
         for key, label in field_specs:
@@ -292,7 +385,16 @@ def _entry_list_diff(device_entries: list[dict], netbox_entries: list[dict], fie
         differs = presence != "both" or any(f["differs"] for f in fields)
         any_diff = any_diff or differs
         entries.append(
-            {"sequence": i, "netbox_sequence": None, "presence": presence, "differs": differs, "fields": fields}
+            {
+                "sequence": i,
+                "netbox_sequence": None,
+                "presence": presence,
+                "differs": differs,
+                "fields": fields,
+                "line": _entry_line(
+                    _simple_entry_line(family, de) if de else "", _simple_entry_line(family, ne) if ne else "", differs
+                ),
+            }
         )
     return {"any_diff": any_diff, "default_action": None, "extra": [], "entries": entries}
 
@@ -301,7 +403,7 @@ def _simple_family_diff(state, obj, removed: bool) -> dict:
     """Diff a prefix-list / as-path / community-list row (device capture vs NetBox object)."""
     family = state.family
     device_entries = [] if removed else _device_simple_entries(family, state.captured)
-    diff = _entry_list_diff(device_entries, _netbox_simple_entries(family, obj), _SIMPLE_FIELDS[family])
+    diff = _entry_list_diff(device_entries, _netbox_simple_entries(family, obj), _SIMPLE_FIELDS[family], family)
     if family == "community_list":
         dev_inv = "" if removed else _render_scalar((state.captured or {}).get("invert_match"))
         nb_inv = _render_scalar(getattr(obj, "invert_match", None))

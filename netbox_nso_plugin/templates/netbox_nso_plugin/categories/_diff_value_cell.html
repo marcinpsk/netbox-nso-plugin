@@ -1,8 +1,7 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
-{# One Device/NetBox diff cell. When token segments are present, highlight only the changed #}
-{# tokens (hl = a Bootstrap subtle/emphasis pair); otherwise flag the whole cell. #}
-{# Expects: value, segments, hl, differs, first. #}
-<td class="{% if differs and not segments %}table-warning {% endif %}{% if first %}border-top border-2{% endif %}">
+{# One Device/NetBox diff cell. Highlight the changed tokens (hl = the device/netbox marker #}
+{# class); the absent side renders its "—" placeholder plain. Expects: value, segments, hl. #}
+<td>
   <code class="text-body text-break">{% if segments %}{% for s in segments %}{% if s.changed %}<span class="{{ hl }}">{{ s.text }}</span>{% else %}{{ s.text }}{% endif %}{% endfor %}{% else %}{{ value }}{% endif %}</code>
 </td>

@@ -441,6 +441,34 @@ class TestSimpleFamilyDiff(_RPBase):
         extra = next(e for e in d["entries"] if e["presence"] == "device_only")
         self.assertTrue(any(f["device"] == "192.168.0.0/16" for f in extra["fields"]))
 
+    def test_inserted_entry_does_not_cascade_as_all_changed(self):
+        """A single entry NetBox has that the device lacks shows as ONE 'only in NetBox' row —
+        not a cascade of 'changed' rows. This is the seq-shift trap: insert/remove one entry
+        (e.g. a Junos term) in the MIDDLE and a naive position-by-position diff reds the whole
+        tail. Content alignment must absorb the shift so only the real difference shows."""
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_diff import route_policy_state_diff
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._mgmt(self.d1)
+        self._mgmt(self.d2)
+
+        def pl(prefixes):
+            entries = [{"sequence": 10 * (i + 1), "action": "permit", "prefix": p} for i, p in enumerate(prefixes)]
+            return {"prefix_lists": [{"name": "PL-SHIFT", "entries": entries}]}
+
+        # NetBox (owner) has an extra 0.0.0.0/0 in the MIDDLE; the device's other three match.
+        reconcile_route_policy(self.d1, pl(["10.0.0.0/8", "0.0.0.0/0", "172.16.0.0/12", "192.168.0.0/16"]))
+        reconcile_route_policy(self.d2, pl(["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]))
+        s2 = NSORoutePolicyState.objects.get(management__device=self.d2, object_name="PL-SHIFT")
+        d = route_policy_state_diff(s2)
+
+        differing = [e for e in d["entries"] if e["differs"]]
+        self.assertEqual(len(differing), 1)  # ONLY the inserted entry — no positional cascade
+        self.assertEqual(differing[0]["presence"], "netbox_only")
+        prefix = next(f for f in differing[0]["fields"] if f["label"] == "Prefix")
+        self.assertEqual(prefix["netbox"], "0.0.0.0/0")
+
     def test_community_list_invert_in_extra(self):
         from netbox_nso_plugin.models import NSORoutePolicyState
         from netbox_nso_plugin.route_policy_diff import route_policy_state_diff
