@@ -513,9 +513,9 @@
                   data-drift="{{ cat.counts.drift|default:0 }}"
                   data-pending="{{ cat.counts.pending|default:0 }}">
               <span class="text-muted ms-1">({{ cat.counts.total|default:0 }})</span>
-              {% if cat.counts.drift %}<span class="badge text-bg-warning text-dark ms-2">{{ cat.counts.drift }} drift</span>{% endif %}
-              {% if cat.counts.pending %}<span class="badge text-bg-info ms-1">{{ cat.counts.pending }} pending apply</span>{% endif %}
-              {% if cat.counts.total and not cat.counts.drift and not cat.counts.pending %}<span class="badge text-bg-success ms-2">in sync</span>{% endif %}
+              {% if cat.counts.drift %}<span class="badge text-bg-warning text-dark ms-2" title="Objects whose on-box content differs from what NetBox holds and that NetBox does not own — open one to see the diff, then Accept or update NetBox.">{{ cat.counts.drift }} drift</span>{% endif %}
+              {% if cat.counts.pending %}<span class="badge text-bg-info ms-1" title="Objects NetBox owns (Accepted) that have not yet been applied to / confirmed on the device. Run Apply to push them.">{{ cat.counts.pending }} pending apply</span>{% endif %}
+              {% if cat.counts.total and not cat.counts.drift and not cat.counts.pending %}<span class="badge text-bg-success ms-2" title="Every object in this category agrees with NetBox — nothing drifted and nothing awaiting apply.">in sync</span>{% endif %}
             </span>
           </span>
           <span>
@@ -550,9 +550,12 @@
       // instead of leaving a stale "pending apply" until a full page reload.
       function renderBadges(total, drift, pending) {
         var h = '<span class="text-muted ms-1">(' + esc(total) + ')</span>';
-        if (drift) { h += '<span class="badge text-bg-warning text-dark ms-2">' + esc(drift) + ' drift</span>'; }
-        if (pending) { h += '<span class="badge text-bg-info ms-1">' + esc(pending) + ' pending apply</span>'; }
-        if (total && !drift && !pending) { h += '<span class="badge text-bg-success ms-2">in sync</span>'; }
+        var driftTip = 'Objects whose on-box content differs from what NetBox holds and that NetBox does not own — open one to see the diff, then Accept or update NetBox.';
+        var pendingTip = 'Objects NetBox owns (Accepted) that have not yet been applied to / confirmed on the device. Run Apply to push them.';
+        var syncTip = 'Every object in this category agrees with NetBox — nothing drifted and nothing awaiting apply.';
+        if (drift) { h += '<span class="badge text-bg-warning text-dark ms-2" title="' + driftTip + '">' + esc(drift) + ' drift</span>'; }
+        if (pending) { h += '<span class="badge text-bg-info ms-1" title="' + pendingTip + '">' + esc(pending) + ' pending apply</span>'; }
+        if (total && !drift && !pending) { h += '<span class="badge text-bg-success ms-2" title="' + syncTip + '">in sync</span>'; }
         return h;
       }
 

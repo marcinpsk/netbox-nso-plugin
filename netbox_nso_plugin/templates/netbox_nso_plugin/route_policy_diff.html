@@ -58,41 +58,48 @@
             {% endif %}
           {% endfor %}
 
-          {% for e in diff.entries %}
-            {% if e.differs %}
-            <div class="card mb-2 border-warning">
-              <div class="card-header py-1 d-flex justify-content-between align-items-center bg-body-tertiary">
-                <span>
-                  <span class="text-muted small">Seq</span> <code>{{ e.sequence }}</code>
-                  {% if e.netbox_sequence and e.netbox_sequence != e.sequence %}<span class="text-muted small">(NetBox seq {{ e.netbox_sequence }})</span>{% endif %}
-                </span>
-                {% if e.presence == 'device_only' %}
-                  <span class="badge text-bg-warning text-dark" title="This entry is on the device but not in NetBox">only on device</span>
-                {% elif e.presence == 'netbox_only' %}
-                  <span class="badge text-bg-info" title="NetBox holds this entry but the device no longer reports it">only in NetBox</span>
-                {% else %}
-                  <span class="badge text-bg-warning text-dark">changed</span>
-                {% endif %}
-              </div>
-              <div class="table-responsive">
-                <table class="table table-sm mb-0 align-middle">
-                  <thead>
-                    <tr class="small text-muted"><th style="width:14rem;">Field</th><th>Device (on-box)</th><th>NetBox</th></tr>
-                  </thead>
-                  <tbody>
+          {# One table for every differing entry so the Device / NetBox columns line up #}
+          {# down the whole page (each entry was previously its own auto-sized table). #}
+          <div class="table-responsive">
+            <table class="table table-sm align-middle">
+              <thead>
+                <tr class="small text-muted">
+                  <th style="width:9rem;">Seq</th>
+                  <th style="width:12rem;">Field</th>
+                  <th class="w-50">Device (on-box)</th>
+                  <th class="w-50">NetBox</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for e in diff.entries %}
+                  {% if e.differs %}
                     {% for f in e.fields %}
-                    <tr{% if f.differs %} class="table-warning"{% endif %}>
-                      <td class="text-nowrap">{{ f.label }}</td>
-                      <td><code class="text-body">{{ f.device }}</code></td>
-                      <td><code class="text-body">{{ f.netbox }}</code></td>
+                    <tr>
+                      {% if forloop.first %}
+                      <td rowspan="{{ e.fields|length }}" class="border-top border-2">
+                        <code>{{ e.sequence }}</code>
+                        {% if e.netbox_sequence and e.netbox_sequence != e.sequence %}<div class="text-muted small">NetBox seq {{ e.netbox_sequence }}</div>{% endif %}
+                        <div class="mt-1">
+                          {% if e.presence == 'device_only' %}
+                            <span class="badge text-bg-warning text-dark" title="This entry is on the device but not in NetBox">only on device</span>
+                          {% elif e.presence == 'netbox_only' %}
+                            <span class="badge text-bg-info" title="NetBox holds this entry but the device no longer reports it">only in NetBox</span>
+                          {% else %}
+                            <span class="badge text-bg-warning text-dark" title="Same sequence, different value on the device vs NetBox">changed</span>
+                          {% endif %}
+                        </div>
+                      </td>
+                      {% endif %}
+                      <td class="text-nowrap{% if forloop.first %} border-top border-2{% endif %}">{{ f.label }}</td>
+                      <td class="{% if f.differs %}table-warning {% endif %}{% if forloop.first %}border-top border-2{% endif %}"><code class="text-body">{{ f.device }}</code></td>
+                      <td class="{% if f.differs %}table-warning {% endif %}{% if forloop.first %}border-top border-2{% endif %}"><code class="text-body">{{ f.netbox }}</code></td>
                     </tr>
                     {% endfor %}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-            {% endif %}
-          {% endfor %}
+                  {% endif %}
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
 
           <p class="text-muted small mb-0">
             Showing only entries that differ. Entries not listed match between the device and NetBox.
