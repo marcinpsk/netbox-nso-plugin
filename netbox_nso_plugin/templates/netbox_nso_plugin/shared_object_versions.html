@@ -16,10 +16,10 @@
       <div class="card-body">
         <p class="text-muted">
           This object is shared by name across devices, but each device has its own
-          on-box content. NetBox mirrors <strong>one</strong> device's version (the
-          <span class="badge text-bg-info">materialized</span> owner). Pick a different
-          device's version to make NetBox mirror it instead — that writes into NetBox
-          only; pushing it to other devices is a separate Accept.
+          on-box content. NetBox mirrors <strong>one</strong> device's version (shown
+          as the <span class="badge text-bg-info">NetBox source</span> below). Pick a
+          different device's version to make NetBox mirror it instead — that writes into
+          NetBox only; pushing it to other devices is a separate Accept.
         </p>
         <table class="table table-sm table-hover">
           <thead>
@@ -46,13 +46,13 @@
               </td>
               <td>
                 {% if it.is_owner %}
-                  <span class="badge text-bg-info" title="NetBox currently mirrors this device's version">materialized</span>
+                  <span class="badge text-bg-info" title="NetBox currently mirrors this device's version">NetBox source</span>
                 {% elif not it.comparable %}
-                  <span class="text-muted" title="Not yet compared — needs a fresh sync from this device (and the owner)">—</span>
+                  <span class="text-muted" title="Not yet compared — needs a fresh sync from this device (and the source)">—</span>
                 {% elif it.matches_owner %}
-                  <span class="badge text-bg-success" title="Same content as the materialized version">matches</span>
+                  <span class="badge text-bg-success" title="Same content as the NetBox source version">matches</span>
                 {% else %}
-                  <span class="badge text-bg-warning text-dark" title="Differs from the materialized version">diverges</span>
+                  <span class="badge text-bg-warning text-dark" title="Differs from the NetBox source version">diverges</span>
                 {% endif %}
               </td>
               <td>
