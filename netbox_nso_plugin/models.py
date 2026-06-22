@@ -1395,6 +1395,45 @@ class NSORoutePolicyState(SharedObjectStateMixin, _NSODeviceTabURLMixin, NetBoxM
         return f"{self.management} / {self.family}:{self.object_name} [{self.status}]"
 
 
+_ROUTE_POLICY_OBJECT_MODE_CHOICES = [
+    ("master", "Master (shared)"),
+    ("local", "Per-device (local)"),
+]
+_ROUTE_POLICY_OBJECT_CLASS_SOURCE_CHOICES = [
+    ("operator", "Operator"),
+    ("heuristic", "Heuristic"),
+    ("default", "Default"),
+]
+
+
+class NSORoutePolicyObjectClass(NetBoxModel):
+    """Classification for a shared route-policy object group ``(family, object_name)``.
+
+    MASTER (the default — implied by the ABSENCE of a row): deduped to one materialized
+    netbox-routing object; a device whose capture diverges from the owner is real drift.
+    LOCAL: the object legitimately differs per device (VRRP, per-region prefix lists), so it
+    is NOT materialized — each device keeps its own ``captured`` version (NSO tab only) and
+    cross-device divergence is NOT flagged as drift. A row exists once an object is marked
+    LOCAL, or the operator explicitly confirms MASTER (silencing the heuristic suggestion).
+    The heuristic "this MASTER group is diverging → suggest LOCAL" verdict is computed live
+    (not persisted), so it always reflects current reality.
+    """
+
+    family = models.CharField(max_length=32, help_text="One of: prefix_list, community_list, as_path, route_map")
+    object_name = models.CharField(max_length=256)
+    mode = models.CharField(max_length=16, choices=_ROUTE_POLICY_OBJECT_MODE_CHOICES, default="master")
+    source = models.CharField(max_length=16, choices=_ROUTE_POLICY_OBJECT_CLASS_SOURCE_CHOICES, default="operator")
+
+    class Meta:
+        ordering = ["family", "object_name"]
+        unique_together = [("family", "object_name")]
+        verbose_name = "NSO Route Policy Object Class"
+        verbose_name_plural = "NSO Route Policy Object Classes"
+
+    def __str__(self):
+        return f"{self.family}:{self.object_name} [{self.mode}]"
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # OSPF plugin state models
 # ──────────────────────────────────────────────────────────────────────────────

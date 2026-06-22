@@ -166,6 +166,59 @@ class TestReconcileRoutePolicy(TestCase):
         reconcile_route_policy(self.device, payload)
         self.assertEqual(PrefixList.objects.get(name="PL-STALE6").family, 6)
 
+    def _pl_payload(self, name, prefix, family=4):
+        return {
+            "prefix_lists": [
+                {"name": name, "family": family, "entries": [{"sequence": 10, "action": "permit", "prefix": prefix}]}
+            ],
+            "community_lists": [],
+            "as_paths": [],
+            "route_maps": [],
+        }
+
+    def test_master_default_conflicts_on_cross_device_divergence(self):
+        """Control: with no classification (implicit MASTER), a second device whose version
+        diverges is real drift — the existing dedup behavior."""
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._make_mgmt(self.device)
+        self._make_mgmt(self.device2)
+        reconcile_route_policy(self.device, self._pl_payload("SHARED-PL", "10.0.0.0/8"))
+        reconcile_route_policy(self.device2, self._pl_payload("SHARED-PL", "10.1.0.0/16"))
+        s2 = NSORoutePolicyState.objects.get(
+            management__device=self.device2, family="prefix_list", object_name="SHARED-PL"
+        )
+        self.assertEqual(s2.status, "conflict")
+
+    def test_local_classification_suppresses_cross_device_conflict(self):
+        """A LOCAL group legitimately differs per device → captured-only, no materialization,
+        and a diverging sibling is NOT flagged conflict (each keeps its own version)."""
+        from netbox_nso_plugin.models import NSORoutePolicyObjectClass, NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._make_mgmt(self.device)
+        self._make_mgmt(self.device2)
+        NSORoutePolicyObjectClass.objects.create(family="prefix_list", object_name="VRRP-PL", mode="local")
+        reconcile_route_policy(self.device, self._pl_payload("VRRP-PL", "10.0.0.0/8"))
+        reconcile_route_policy(self.device2, self._pl_payload("VRRP-PL", "10.1.0.0/16"))
+        s1 = NSORoutePolicyState.objects.get(
+            management__device=self.device, family="prefix_list", object_name="VRRP-PL"
+        )
+        s2 = NSORoutePolicyState.objects.get(
+            management__device=self.device2, family="prefix_list", object_name="VRRP-PL"
+        )
+        self.assertNotEqual(s2.status, "conflict")
+        self.assertFalse(s1.is_materialized)
+        self.assertFalse(s2.is_materialized)
+        # each device keeps its OWN version (no shared canonical)
+        self.assertEqual(s1.captured["entries"][0]["prefix"], "10.0.0.0/8")
+        self.assertEqual(s2.captured["entries"][0]["prefix"], "10.1.0.0/16")
+        # LOCAL is not materialized into netbox-routing
+        from netbox_routing.models import PrefixList
+
+        self.assertFalse(PrefixList.objects.filter(name="VRRP-PL").exists())
+
     def test_community_invert_match_reconciled(self):
         """A community-list reported with invert_match=True sets the field; a plain
         list stays False; an idempotent re-read keeps it stable."""

@@ -561,6 +561,54 @@ def _needs_fill(EntryModel, created: bool, should_fill: bool, **filt) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# MASTER vs LOCAL classification (see docs/master-vs-local-route-policy.md)
+# ---------------------------------------------------------------------------
+
+
+def _group_mode(family: str, object_name: str) -> str:
+    """Classification for a route-policy object group: 'master' (default) or 'local'.
+
+    Absence of a NSORoutePolicyObjectClass row == implicit MASTER (auto-dedup, the default).
+    """
+    from .models import NSORoutePolicyObjectClass
+
+    row = NSORoutePolicyObjectClass.objects.filter(family=family, object_name=object_name).first()
+    return row.mode if row else "master"
+
+
+def _upsert_local_state(mgmt, family, name, captured, now):
+    """Upsert a per-device (LOCAL) overlay row: captured-only, never a cross-device conflict.
+
+    The object legitimately differs per device, so there is no shared canonical to drift
+    against — each device records its own version (shown in the NSO tab). Also de-materializes
+    a row left over from a prior MASTER classification.
+    """
+    from . import status_machine as sm
+    from .models import NSORoutePolicyState
+
+    entries_hash = ownership.hash_captured(family, captured)
+    state, new_row = NSORoutePolicyState.objects.get_or_create(
+        management=mgmt,
+        family=family,
+        object_name=name,
+        defaults={"content_hash": entries_hash, "captured": captured, "status": "imported", "last_sync_at": now},
+    )
+    if not new_row:
+        changed = state.content_hash != entries_hash
+        state.status = sm.on_reconcile(state.status, matches=not changed, conflict=False, settles_owned=False)
+        state.content_hash = entries_hash
+    # LOCAL is never materialized; drop any object link left from a prior MASTER classification.
+    state.captured = captured
+    state.last_sync_at = now
+    state.is_materialized = False
+    state.content_type = None
+    state.object_id = None
+    state.device_present = True
+    state.save()
+    return state
+
+
+# ---------------------------------------------------------------------------
 # Per-family handlers
 # ---------------------------------------------------------------------------
 
@@ -572,6 +620,10 @@ def _reconcile_prefix_lists(mgmt, device, pl_list, PrefixList, ContentType, now,
     for pl_data in pl_list:
         name = pl_data.get("name", "")
         if not name:
+            continue
+        if _group_mode("prefix_list", name) == "local":
+            _upsert_local_state(mgmt, "prefix_list", name, pl_data, now)
+            seen_keys.add(("prefix_list", name))
             continue
         entries = pl_data.get("entries", []) or []
         pl_obj, created = _get_or_create_named(PrefixList, name)
@@ -597,6 +649,10 @@ def _reconcile_community_lists(mgmt, device, cl_list, CommunityList, ContentType
     for cl_data in cl_list:
         name = cl_data.get("name", "")
         if not name:
+            continue
+        if _group_mode("community_list", name) == "local":
+            _upsert_local_state(mgmt, "community_list", name, cl_data, now)
+            seen_keys.add(("community_list", name))
             continue
         entries = cl_data.get("entries", []) or []
         invert_match = bool(cl_data.get("invert_match", False))
@@ -624,6 +680,10 @@ def _reconcile_as_paths(mgmt, device, ap_list, ASPath, ContentType, now, seen_ke
         name = ap_data.get("name", "")
         if not name:
             continue
+        if _group_mode("as_path", name) == "local":
+            _upsert_local_state(mgmt, "as_path", name, ap_data, now)
+            seen_keys.add(("as_path", name))
+            continue
         entries = ap_data.get("entries", []) or []
         ap_obj, created = _get_or_create_named(ASPath, name)
         name_map[name] = ap_obj
@@ -641,6 +701,10 @@ def _reconcile_route_maps(mgmt, device, rm_list, RouteMap, ContentType, now, see
     for rm_data in rm_list:
         name = rm_data.get("name", "")
         if not name:
+            continue
+        if _group_mode("route_map", name) == "local":
+            _upsert_local_state(mgmt, "route_map", name, rm_data, now)
+            seen_keys.add(("route_map", name))
             continue
         entries = rm_data.get("entries", []) or []
         rm_obj, created = _get_or_create_named(RouteMap, name)
