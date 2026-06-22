@@ -84,6 +84,26 @@ def _load_json(value) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _set_prefix_list_family(pl_obj, captured) -> None:
+    """Mirror the owner capture's address family onto the materialized PrefixList.
+
+    family is derived by the device reader (any v6 prefix → family 6); without this the
+    netbox_routing.PrefixList kept the model default (4), so a v6 list (MARTIANS_V6,
+    LGI_PREFIXES_V6, ...) displayed as IPv4 even after the reader was fixed. The dedup hash
+    is entries-only, so a family-only change is a pure display correction (never drift).
+    """
+    family = captured.get("family")
+    if family in (4, 6) and pl_obj.family != family:
+        pl_obj.family = family
+        pl_obj.save(update_fields=["family"])
+
+
+def _fill_prefix_list(pl_obj, captured) -> None:
+    """Materialize a PrefixList from a device capture: address family + entries."""
+    _set_prefix_list_family(pl_obj, captured)
+    _fill_prefix_list_entries(pl_obj, _entries(captured))
+
+
 def _fill_prefix_list_entries(pl_obj, entries: list) -> None:
     from django.contrib.contenttypes.models import ContentType
     from netbox_routing.models import CustomPrefix, PrefixListEntry
@@ -360,7 +380,7 @@ def _register_specs() -> None:
     Spec = ownership.SharedObjectSpec
     ownership.register(
         "prefix_list",
-        Spec(fill=lambda o, c: _fill_prefix_list_entries(o, _entries(c)), hash_captured=lambda c: _hash(_entries(c))),
+        Spec(fill=_fill_prefix_list, hash_captured=lambda c: _hash(_entries(c))),
     )
     ownership.register("community_list", Spec(fill=_cl_fill, hash_captured=_cl_hash))
     ownership.register(
@@ -557,6 +577,13 @@ def _reconcile_prefix_lists(mgmt, device, pl_list, PrefixList, ContentType, now,
         pl_obj, created = _get_or_create_named(PrefixList, name)
         name_map[name] = pl_obj
         state, should_fill = _upsert_state(mgmt, "prefix_list", name, pl_obj, ct, pl_data, now)
+        # family is device-sourced and entry-independent (not in the hash), so refresh it on any
+        # non-conflicting read — _needs_fill skips an already-populated list, leaving a stale v4
+        # on a v6 list. (A conflicting read leaves should_fill False → an owned/diverged row is
+        # untouched; the owner-content-changed path sets it via _fill_prefix_list.) Mirrors the
+        # community_list invert_match refresh below.
+        if should_fill:
+            _set_prefix_list_family(pl_obj, pl_data)
         if _needs_fill(PrefixListEntry, created, should_fill, prefix_list=pl_obj):
             _fill_prefix_list_entries(pl_obj, entries)
             ownership.mark_materialized(state)

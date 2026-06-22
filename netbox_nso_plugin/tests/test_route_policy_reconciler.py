@@ -113,6 +113,59 @@ class TestReconcileRoutePolicy(TestCase):
         self.assertEqual(ASPath.objects.filter(name="AP-PRIVATE").count(), 1)
         self.assertEqual(RouteMap.objects.filter(name="RM-IMPORT").count(), 1)
 
+    def test_prefix_list_family_propagated_from_capture(self):
+        """The materialized PrefixList mirrors the owner capture's address family.
+
+        Without this the netbox_routing.PrefixList kept the model default (4), so every v6
+        list (MARTIANS_V6, LGI_PREFIXES_V6, ...) showed as IPv4 even after the reader was
+        fixed to report family 6.
+        """
+        self._make_mgmt(self.device)
+        from netbox_routing.models import PrefixList
+
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        payload = {
+            "prefix_lists": [
+                {
+                    "name": "PL-V6",
+                    "family": 6,
+                    "entries": [{"sequence": 10, "action": "permit", "prefix": "2001:db8::/32"}],
+                },
+                {
+                    "name": "PL-V4",
+                    "family": 4,
+                    "entries": [{"sequence": 10, "action": "permit", "prefix": "10.0.0.0/8"}],
+                },
+            ],
+            "community_lists": [],
+            "as_paths": [],
+            "route_maps": [],
+        }
+        reconcile_route_policy(self.device, payload)
+        self.assertEqual(PrefixList.objects.get(name="PL-V6").family, 6)
+        self.assertEqual(PrefixList.objects.get(name="PL-V4").family, 4)
+
+    def test_prefix_list_family_corrected_on_owner_re_read(self):
+        """A pre-existing PrefixList created as IPv4 is corrected to v6 when the owner
+        re-imports it with family 6 (the stale-family backfill path)."""
+        self._make_mgmt(self.device)
+        from netbox_routing.models import PrefixList
+
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        PrefixList.objects.create(name="PL-STALE6", family=4)
+        payload = {
+            "prefix_lists": [
+                {"name": "PL-STALE6", "family": 6, "entries": [{"sequence": 10, "action": "permit", "prefix": "::/0"}]}
+            ],
+            "community_lists": [],
+            "as_paths": [],
+            "route_maps": [],
+        }
+        reconcile_route_policy(self.device, payload)
+        self.assertEqual(PrefixList.objects.get(name="PL-STALE6").family, 6)
+
     def test_community_invert_match_reconciled(self):
         """A community-list reported with invert_match=True sets the field; a plain
         list stays False; an idempotent re-read keeps it stable."""
