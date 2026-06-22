@@ -46,6 +46,35 @@ def _adapter_setting(name: str, default: bool = False) -> bool:
     return bool(getattr(cfg, f"_{name}", default))
 
 
+def _resolve_interface_attr_status(state, *, created, attr_name, iface, nso_value, adapter_status, derived_templates):
+    """Resolve the next status for one interface-attr row (ownership-aware).
+
+    Returns ``(new_status, promote)``:
+
+    - An EXISTING operator-owned row settles by device value and is NEVER clobbered to the
+      adapter's unowned status (the owned-guard every other reconciler has).
+    - A derived (topology-computed) description is NetBox intent BY DEFINITION, so it is
+      owned even when the adapter reports ``imported`` (``promote=True`` → caller stamps
+      ``accepted_at``) — matches device → ``in_sync``, differs → ``accepted`` (pending).
+    - Otherwise the adapter's status is mirrored verbatim (unowned mirror / fresh import).
+    """
+    from . import status_machine as sm
+    from .derived_intent import is_managed_description
+    from .summary import _COMPARABLE_IFACE_ATTRS, _netbox_value_for, matches_device_value
+
+    if not created and sm.is_owned(state.status):
+        matches = (
+            matches_device_value(attr_name, _netbox_value_for(attr_name, iface), nso_value)
+            if attr_name in _COMPARABLE_IFACE_ATTRS
+            else None
+        )
+        return sm.on_reconcile(state.status, matches=matches), False
+    if attr_name == "description" and is_managed_description(iface.description or "", derived_templates):
+        matches = matches_device_value("description", iface.description, nso_value)
+        return ("in_sync" if matches else "accepted"), True
+    return adapter_status, False
+
+
 def _upsert_interface_states(device, interfaces: list) -> dict:
     """Sync NSOInterfaceState rows from adapter interface data.
 
@@ -63,9 +92,13 @@ def _upsert_interface_states(device, interfaces: list) -> dict:
     """
     from dcim.models import Interface
 
-    from . import status_machine as sm
     from .models import NSOInterfaceState
-    from .summary import _COMPARABLE_IFACE_ATTRS, _netbox_value_for, matches_device_value
+
+    # Derived-intent templates (e.g. description-from-cable). A description whose NetBox
+    # value matches one is NetBox intent BY DEFINITION (the plugin computes it from
+    # topology), so it must be owned even if the adapter reads it as imported — see
+    # _resolve_interface_attr_status.
+    derived_templates = getattr(apps.get_app_config("netbox_nso_plugin"), "_derived_intent_templates", [])
 
     # Build name → Interface map for this device's interfaces in the DB
     iface_map = {i.name: i for i in Interface.objects.filter(device=device)}
@@ -94,21 +127,23 @@ def _upsert_interface_states(device, interfaces: list) -> dict:
                 attribute=attr_name,
                 defaults={"status": status, "nso_value": nso_value},
             )
-            # Resolve the next status BEFORE overwriting it. An EXISTING, operator-owned
-            # row is settled by value (never clobbered to the adapter's unowned status);
-            # a new row (created this sync) or an unowned row mirrors the adapter verbatim.
+            # Resolve the next status BEFORE overwriting it (ownership-aware — see helper).
             update_fields = []
-            if not created and sm.is_owned(state.status):
-                if attr_name in _COMPARABLE_IFACE_ATTRS:
-                    matches = matches_device_value(attr_name, _netbox_value_for(attr_name, iface), nso_value)
-                else:
-                    matches = None
-                new_status = sm.on_reconcile(state.status, matches=matches)
-            else:
-                new_status = status
+            new_status, promote = _resolve_interface_attr_status(
+                state,
+                created=created,
+                attr_name=attr_name,
+                iface=iface,
+                nso_value=nso_value,
+                adapter_status=status,
+                derived_templates=derived_templates,
+            )
             if state.status != new_status:
                 state.status = new_status
                 update_fields.append("status")
+            if promote and state.accepted_at is None:
+                state.accepted_at = timezone.now()
+                update_fields.append("accepted_at")
             if state.nso_value != nso_value:
                 state.nso_value = nso_value
                 update_fields.append("nso_value")

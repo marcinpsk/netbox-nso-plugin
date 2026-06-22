@@ -173,6 +173,70 @@ class TestInterfacesContractConsumer(TestCase):
         result = _upsert_interface_states(self.device, payload)
         self.assertEqual(result[("GE0/0", "description")].status, "changed")
 
+    def _inject_templates(self, templates):
+        """Monkey-patch _derived_intent_templates on the AppConfig for one test."""
+        from django.apps import apps
+
+        cfg = apps.get_app_config("netbox_nso_plugin")
+        original = getattr(cfg, "_derived_intent_templates", [])
+        cfg._derived_intent_templates = templates
+        self.addCleanup(setattr, cfg, "_derived_intent_templates", original)
+
+    def test_derived_managed_description_is_owned_pending(self):
+        """A derived-managed description is NetBox intent BY DEFINITION: the reconciler owns
+        it even when the adapter reports 'imported', so it pushes instead of reading as drift
+        and never reaching the device (the device-27 ae2.0 recovery). Device empty + NetBox
+        derived value differs → accepted (pending apply)."""
+        from netbox_nso_plugin.derived_intent import SentinelTemplate
+
+        self._inject_templates([SentinelTemplate(sentinel="[auto]", template="[auto] x")])
+        # Set via queryset update (no post_save) so the degenerate test template's recompute
+        # doesn't rewrite the value — we isolate the reconciler's ownership logic here.
+        Interface.objects.filter(pk=self.iface.pk).update(description="[auto] prod - Core Link - unit")
+        payload = [
+            {
+                "name": "GE0/0",
+                "netbox_interface_id": 1000,
+                "attrs": {"description": {"nso_value": "", "status": "imported"}},
+            }
+        ]
+        row = _upsert_interface_states(self.device, payload)[("GE0/0", "description")]
+        self.assertEqual(row.status, "accepted")  # owned, pending apply (device lacks it)
+        self.assertIsNotNone(row.accepted_at)
+
+    def test_derived_managed_description_matching_device_is_in_sync(self):
+        """A derived description the device already holds → owned + in_sync (nothing to push)."""
+        from netbox_nso_plugin.derived_intent import SentinelTemplate
+
+        self._inject_templates([SentinelTemplate(sentinel="[auto]", template="[auto] x")])
+        Interface.objects.filter(pk=self.iface.pk).update(description="[auto] match")
+        payload = [
+            {
+                "name": "GE0/0",
+                "netbox_interface_id": 1000,
+                "attrs": {"description": {"nso_value": "[auto] match", "status": "imported"}},
+            }
+        ]
+        row = _upsert_interface_states(self.device, payload)[("GE0/0", "description")]
+        self.assertEqual(row.status, "in_sync")
+
+    def test_non_derived_description_stays_unowned(self):
+        """A plain (non-derived) description is NOT auto-owned — only operator action owns it."""
+        from netbox_nso_plugin.derived_intent import SentinelTemplate
+
+        self._inject_templates([SentinelTemplate(sentinel="[auto]", template="[auto] x")])
+        Interface.objects.filter(pk=self.iface.pk).update(description="hand-typed, not derived")
+        payload = [
+            {
+                "name": "GE0/0",
+                "netbox_interface_id": 1000,
+                "attrs": {"description": {"nso_value": "", "status": "imported"}},
+            }
+        ]
+        row = _upsert_interface_states(self.device, payload)[("GE0/0", "description")]
+        self.assertEqual(row.status, "imported")
+        self.assertIsNone(row.accepted_at)
+
     def test_missing_status_key_silently_degrades_to_unknown(self):
         """The consumer does NOT validate the contract at runtime — by decision.
 
