@@ -9,17 +9,53 @@
 <div class="row">
   <div class="col col-md-10 offset-md-1">
     <div class="card">
-      <h5 class="card-header">
-        <span class="mdi mdi-source-branch me-1"></span>
-        Device versions of {{ family }} <code>{{ object_name }}</code>
+      <h5 class="card-header d-flex justify-content-between align-items-center">
+        <span><span class="mdi mdi-source-branch me-1"></span>
+        Device versions of {{ family }} <code>{{ object_name }}</code></span>
+        {% if mode == "local" %}
+          <span class="badge text-bg-info" title="Per-device — each device keeps its own version; not deduped into one shared object">Per-device (LOCAL)</span>
+        {% else %}
+          <span class="badge text-bg-primary" title="Shared — deduped into one NetBox object; cross-device divergence is drift">Shared (MASTER)</span>
+        {% endif %}
       </h5>
       <div class="card-body">
+        {% if mode == "local" %}
+        <div class="alert alert-info d-flex justify-content-between align-items-center" role="alert">
+          <div>
+            <span class="mdi mdi-information-outline me-1"></span>
+            This object is <strong>per-device</strong> — each device keeps its own version below and
+            cross-device differences are not treated as drift (it is not mirrored into netbox-routing).
+          </div>
+          <form method="post" action="{% url classify_url_name pk=state.pk %}" class="mb-0">
+            {% csrf_token %}<input type="hidden" name="mode" value="master">
+            <button type="submit" class="btn btn-sm btn-outline-primary text-nowrap">Promote to shared (MASTER)</button>
+          </form>
+        </div>
+        {% elif suggest_local %}
+        <div class="alert alert-warning d-flex justify-content-between align-items-center" role="alert">
+          <div>
+            <span class="mdi mdi-alert-outline me-1"></span>
+            These devices hold <strong>different versions</strong> of this shared object. If that is
+            per-device by design (e.g. a VRRP or per-region list), mark it per-device to stop flagging
+            the difference as drift.
+          </div>
+          <form method="post" action="{% url classify_url_name pk=state.pk %}" class="mb-0">
+            {% csrf_token %}<input type="hidden" name="mode" value="local">
+            <button type="submit" class="btn btn-sm btn-warning text-dark text-nowrap">Mark per-device (LOCAL)</button>
+          </form>
+        </div>
+        {% endif %}
         <p class="text-muted">
+          {% if mode == "local" %}
+          Per-device versions — netbox-routing mirrors none of them; each is shown from its device's
+          own on-box content.
+          {% else %}
           This object is shared by name across devices, but each device has its own
           on-box content. NetBox mirrors <strong>one</strong> device's version (shown
           as the <span class="badge text-bg-info">NetBox source</span> below). Pick a
           different device's version to make NetBox mirror it instead — that writes into
           NetBox only; pushing it to other devices is a separate Accept.
+          {% endif %}
         </p>
         <table class="table table-sm table-hover">
           <thead>
@@ -56,14 +92,23 @@
                 {% endif %}
               </td>
               <td>
-                {% if not it.is_owner %}
-                <form method="post" action="{% url materialize_url_name pk=it.row.pk %}">
-                  {% csrf_token %}
-                  <button type="submit" class="btn btn-xs btn-outline-primary"
-                          title="Make NetBox mirror this device's version of {{ object_name }}">
-                    <span class="mdi mdi-content-copy"></span> Use this version
-                  </button>
-                </form>
+                {% if mode != "local" and not it.is_owner %}
+                <div class="d-flex gap-1">
+                  {% if it.comparable %}
+                  <a href="{% url 'plugins:netbox_nso_plugin:routing_route_policy_diff' pk=it.row.pk %}"
+                     class="btn btn-xs btn-outline-info text-nowrap"
+                     title="Compare this device's version against the NetBox source (master)">
+                    <span class="mdi mdi-file-compare"></span> Diff
+                  </a>
+                  {% endif %}
+                  <form method="post" action="{% url materialize_url_name pk=it.row.pk %}">
+                    {% csrf_token %}
+                    <button type="submit" class="btn btn-xs btn-outline-primary text-nowrap"
+                            title="Make NetBox mirror this device's version of {{ object_name }}">
+                      <span class="mdi mdi-content-copy"></span> Use this version
+                    </button>
+                  </form>
+                </div>
                 {% endif %}
               </td>
             </tr>

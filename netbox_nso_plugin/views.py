@@ -2179,6 +2179,7 @@ class SharedObjectVersionsMixin(LoginRequiredMixin, View):
                 "items": items,
                 "device": getattr(state.management, "device", None),
                 "materialize_url_name": self.materialize_url_name,
+                **self.extra_context(state, items),
             },
         )
 
@@ -2188,6 +2189,13 @@ class SharedObjectVersionsMixin(LoginRequiredMixin, View):
         The surface is family-agnostic; route-policy overrides this to attach a structured
         route-map summary so operators compare versions without reading raw JSON.
         """
+
+    def extra_context(self, state, items) -> dict:
+        """Per-family extra template context (hook; default none).
+
+        Route-policy adds the MASTER/LOCAL classification + the diverging-group suggestion.
+        """
+        return {}
 
 
 class SharedObjectMaterializeMixin(NSOActionPermissionMixin, View):
@@ -2230,6 +2238,48 @@ class NSORoutePolicyVersionsView(SharedObjectVersionsMixin):  # noqa: D101
         for it in items:
             row = it.get("row")
             it["route_map"] = summarize_route_map(getattr(row, "captured", None)) if it.get("has_capture") else None
+
+    def extra_context(self, state, items) -> dict:
+        """MASTER/LOCAL classification + the heuristic 'diverging → suggest LOCAL' verdict.
+
+        ``mode`` defaults MASTER (absence of a NSORoutePolicyObjectClass row); ``diverging`` is
+        computed live from the per-device versions, and ``suggest_local`` flags a diverging
+        MASTER group so the operator can mark it per-device in one click (never auto-applied).
+        """
+        from .models import NSORoutePolicyObjectClass
+
+        row = NSORoutePolicyObjectClass.objects.filter(family=state.family, object_name=state.object_name).first()
+        mode = row.mode if row else "master"
+        diverging = any(it.get("comparable") and not it.get("matches_owner") and not it.get("is_owner") for it in items)
+        return {
+            "mode": mode,
+            "diverging": diverging,
+            "suggest_local": mode == "master" and diverging,
+            "classify_url_name": "plugins:netbox_nso_plugin:routing_classify_route_policy",
+        }
+
+
+class NSORoutePolicyClassifyView(NSOActionPermissionMixin, View):
+    """Classify a route-policy object group MASTER (shared, dedup) or LOCAL (per-device).
+
+    POST ``mode=local`` clears the false drift of a group that legitimately differs per device
+    (each device keeps its own version, NSO tab only); ``mode=master`` re-materializes a shared
+    owner. Re-processes the stored captures immediately (no device read). Gated on the same
+    change permission as the other route-policy actions.
+    """
+
+    def post(self, request, pk):  # noqa: D102
+        from .route_policy_reconciler import set_classification
+
+        state = get_object_or_404(NSORoutePolicyState, pk=pk)
+        mode = request.POST.get("mode")
+        if mode not in ("master", "local"):
+            messages.error(request, "Invalid classification.")
+            return redirect("plugins:netbox_nso_plugin:routing_route_policy_versions", pk=pk)
+        set_classification(state.family, state.object_name, mode)
+        label = "per-device (local)" if mode == "local" else "shared (master)"
+        messages.success(request, f"Marked {state.family.replace('_', '-')} {state.object_name} as {label}.")
+        return redirect("plugins:netbox_nso_plugin:routing_route_policy_versions", pk=pk)
 
 
 class NSORoutePolicyMaterializeView(SharedObjectMaterializeMixin):  # noqa: D101

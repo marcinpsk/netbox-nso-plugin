@@ -261,6 +261,11 @@ urlpatterns = [
         views.NSORoutePolicyMaterializeView.as_view(),
         name="routing_materialize_route_policy",
     ),
+    path(
+        "routing/route-policy-state/<int:pk>/classify/",
+        views.NSORoutePolicyClassifyView.as_view(),
+        name="routing_classify_route_policy",
+    ),
     # Drift delta: device capture vs the materialised NetBox object.
     path(
         "routing/route-policy-state/<int:pk>/diff/",

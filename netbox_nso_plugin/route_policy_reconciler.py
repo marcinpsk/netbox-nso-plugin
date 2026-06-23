@@ -576,6 +576,89 @@ def _group_mode(family: str, object_name: str) -> str:
     return row.mode if row else "master"
 
 
+def _family_model(family: str):
+    """Return the netbox-routing model class for a route-policy family (None if unknown)."""
+    from netbox_routing.models import ASPath, CommunityList, PrefixList, RouteMap
+
+    return {"prefix_list": PrefixList, "community_list": CommunityList, "as_path": ASPath, "route_map": RouteMap}.get(
+        family
+    )
+
+
+def _promote_group_to_master(family, object_name, now) -> None:
+    """Re-materialize a group as MASTER from the stored per-device captures.
+
+    Fills the shared netbox-routing object from the version with the most entries, links every
+    device row to it, and recomputes each sibling's conflict status against it. Owned rows
+    (accepted/deploying/in_sync/apply_failed) are left alone.
+    """
+    from django.contrib.contenttypes.models import ContentType
+
+    from . import status_machine as sm
+    from .models import NSORoutePolicyState
+
+    model = _family_model(family)
+    if model is None:
+        return
+    rows = [
+        r
+        for r in NSORoutePolicyState.objects.filter(family=family, object_name=object_name).select_related("management")
+        if r.captured
+    ]
+    if not rows:
+        return
+    spec = ownership.get_spec(family)
+    ct = ContentType.objects.get_for_model(model)
+    owner = max(rows, key=lambda r: len((r.captured or {}).get("entries") or []))
+    obj, _ = _get_or_create_named(model, object_name)
+    spec.fill(obj, owner.captured)
+    owner_hash = ownership.hash_captured(family, owner.captured)
+    for r in rows:
+        r.content_type = ct
+        r.object_id = obj.pk
+        r_hash = ownership.hash_captured(family, r.captured)
+        r.content_hash = r_hash
+        if r.pk == owner.pk:
+            r.is_materialized = True
+            if not sm.is_owned(r.status):
+                r.status = sm.IMPORTED
+        else:
+            r.is_materialized = False
+            if not sm.is_owned(r.status):
+                r.status = sm.CONFLICT if r_hash != owner_hash else sm.IMPORTED
+        r.save()
+
+
+def set_classification(family: str, object_name: str, mode: str):
+    """Operator action: classify a route-policy object group MASTER or LOCAL (re-processed now).
+
+    Re-processes the existing per-device captures so the change takes effect immediately (no
+    device read). LOCAL → de-materialize every device row + clear cross-device conflicts
+    (captured-only). MASTER → re-materialize an owner from the group's captures + re-compare.
+    """
+    from django.utils import timezone
+
+    from .models import NSORoutePolicyObjectClass, NSORoutePolicyState
+    from .signals import suppress_intent_push
+
+    if mode not in ("master", "local"):
+        raise ValueError(f"invalid mode {mode!r}")
+    obj, _ = NSORoutePolicyObjectClass.objects.update_or_create(
+        family=family, object_name=object_name, defaults={"mode": mode, "source": "operator"}
+    )
+    now = timezone.now()
+    with suppress_intent_push():
+        if mode == "local":
+            rows = NSORoutePolicyState.objects.filter(family=family, object_name=object_name).select_related(
+                "management"
+            )
+            for r in rows:
+                _upsert_local_state(r.management, family, object_name, r.captured or {}, now)
+        else:
+            _promote_group_to_master(family, object_name, now)
+    return obj
+
+
 def _upsert_local_state(mgmt, family, name, captured, now):
     """Upsert a per-device (LOCAL) overlay row: captured-only, never a cross-device conflict.
 

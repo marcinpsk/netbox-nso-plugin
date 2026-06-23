@@ -219,6 +219,76 @@ class TestReconcileRoutePolicy(TestCase):
 
         self.assertFalse(PrefixList.objects.filter(name="VRRP-PL").exists())
 
+    def test_classify_view_marks_local_and_redirects(self):
+        """End-to-end through the classify view: POST mode=local → reclassifies, clears the
+        cross-device conflict, and redirects to the versions page."""
+        from django.contrib.auth import get_user_model
+        from django.urls import reverse
+
+        from netbox_nso_plugin.models import NSORoutePolicyObjectClass, NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._make_mgmt(self.device)
+        self._make_mgmt(self.device2)
+        reconcile_route_policy(self.device, self._pl_payload("LGI", "10.0.0.0/8"))
+        reconcile_route_policy(self.device2, self._pl_payload("LGI", "10.1.0.0/16"))
+        s2 = NSORoutePolicyState.objects.get(management__device=self.device2, family="prefix_list", object_name="LGI")
+        self.assertEqual(s2.status, "conflict")
+
+        su = get_user_model().objects.create_superuser("rp-classify-admin", "a@b.c", "pw")
+        self.client.force_login(su)
+        url = reverse("plugins:netbox_nso_plugin:routing_classify_route_policy", args=[s2.pk])
+        resp = self.client.post(url, {"mode": "local"})
+
+        self.assertEqual(resp.status_code, 302)
+        s2.refresh_from_db()
+        self.assertNotEqual(s2.status, "conflict")
+        self.assertEqual(NSORoutePolicyObjectClass.objects.get(family="prefix_list", object_name="LGI").mode, "local")
+
+    def test_set_classification_local_clears_existing_conflict(self):
+        """Operator marks a diverging MASTER group LOCAL → the cross-device conflict clears and
+        the group de-materializes, re-processing the stored per-device captures (no device read)."""
+        from netbox_nso_plugin.models import NSORoutePolicyObjectClass, NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, set_classification
+
+        self._make_mgmt(self.device)
+        self._make_mgmt(self.device2)
+        reconcile_route_policy(self.device, self._pl_payload("LGI", "10.0.0.0/8"))
+        reconcile_route_policy(self.device2, self._pl_payload("LGI", "10.1.0.0/16"))
+        s2 = NSORoutePolicyState.objects.get(management__device=self.device2, family="prefix_list", object_name="LGI")
+        self.assertEqual(s2.status, "conflict")  # MASTER default → genuine cross-device drift
+
+        set_classification("prefix_list", "LGI", "local")
+
+        s1 = NSORoutePolicyState.objects.get(management__device=self.device, family="prefix_list", object_name="LGI")
+        s2.refresh_from_db()
+        self.assertNotEqual(s2.status, "conflict")
+        self.assertFalse(s1.is_materialized)
+        self.assertFalse(s2.is_materialized)
+        self.assertEqual(NSORoutePolicyObjectClass.objects.get(family="prefix_list", object_name="LGI").mode, "local")
+
+    def test_set_classification_master_re_establishes_drift(self):
+        """Promote a LOCAL group back to MASTER → it re-materializes an owner and a diverging
+        sibling drifts again."""
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, set_classification
+
+        self._make_mgmt(self.device)
+        self._make_mgmt(self.device2)
+        set_classification("prefix_list", "LGI", "local")  # classify before import
+        reconcile_route_policy(self.device, self._pl_payload("LGI", "10.0.0.0/8"))
+        reconcile_route_policy(self.device2, self._pl_payload("LGI", "10.1.0.0/16"))
+        s2 = NSORoutePolicyState.objects.get(management__device=self.device2, family="prefix_list", object_name="LGI")
+        self.assertNotEqual(s2.status, "conflict")  # LOCAL → no cross-device drift
+
+        set_classification("prefix_list", "LGI", "master")
+
+        s2.refresh_from_db()
+        self.assertEqual(s2.status, "conflict")  # divergent sibling drifts against the new master
+        self.assertTrue(
+            NSORoutePolicyState.objects.filter(family="prefix_list", object_name="LGI", is_materialized=True).exists()
+        )
+
     def test_community_invert_match_reconciled(self):
         """A community-list reported with invert_match=True sets the field; a plain
         list stays False; an idempotent re-read keeps it stable."""
