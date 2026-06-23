@@ -21,9 +21,35 @@ import json
 import logging
 
 from . import shared_object_ownership as ownership
-from .route_policy_structure import canonical_route_map
+from .route_policy_structure import canonical_route_map, prefix_list_entry_unit
 
 logger = logging.getLogger(__name__)
+
+# name → tuple of prefix-list units, memoized for one reconcile pass (cleared at its start).
+# Lets canonical_route_map expand prefix-list refs to content without re-querying per call.
+_PL_UNIT_CACHE: dict[str, tuple] = {}
+
+
+def _resolve_prefix_list_units(name: str) -> tuple:
+    """Resolve a prefix-list NAME to its content as ``(action, prefix, ge, le)`` units.
+
+    Reads the GLOBAL materialized version (one NetBox object per name; falls back to any
+    device's capture) so both devices' route-maps expand a shared list to the SAME units —
+    the comparison stays about route-map content, not which box reported the list. A name with
+    no captured prefix-list yet resolves to empty (the term simply has nothing to expand).
+    """
+    key = name.lower()
+    if key in _PL_UNIT_CACHE:
+        return _PL_UNIT_CACHE[key]
+    from .models import NSORoutePolicyState
+
+    row = (
+        NSORoutePolicyState.objects.filter(family="prefix_list", object_name__iexact=name, is_materialized=True).first()
+        or NSORoutePolicyState.objects.filter(family="prefix_list", object_name__iexact=name).first()
+    )
+    units = tuple(prefix_list_entry_unit(e) for e in ((row.captured or {}).get("entries") or [])) if row else ()
+    _PL_UNIT_CACHE[key] = units
+    return units
 
 
 def _hash(obj: object) -> str:
@@ -391,9 +417,14 @@ def _register_specs() -> None:
     # Route-maps dedup on a VENDOR-NEUTRAL SEMANTIC digest (not the raw entries): the same
     # logical policy spelled in Junos vs Nokia encoding (term/terminal labels, family
     # spelling, scalar-vs-leaf-list, fall-through verb, as-path-group placement) converges
-    # instead of showing false cross-vendor conflict. Genuine differences keep a distinct
-    # digest. See route_policy_structure.canonical_route_map.
-    ownership.register("route_map", Spec(fill=_rm_fill, hash_captured=lambda c: _hash(canonical_route_map(c))))
+    # instead of showing false cross-vendor conflict. Prefix matches expand to their CONTENT
+    # (via _resolve_prefix_list_units) so a Junos inline route-filter set converges with the
+    # equivalent named-list refs. Genuine differences keep a distinct digest. See
+    # route_policy_structure.canonical_route_map.
+    ownership.register(
+        "route_map",
+        Spec(fill=_rm_fill, hash_captured=lambda c: _hash(canonical_route_map(c, _resolve_prefix_list_units))),
+    )
 
 
 _register_specs()
@@ -865,6 +896,7 @@ def _reconcile_route_policy(device, payload: dict) -> list:
         return []
 
     now = timezone.now()
+    _PL_UNIT_CACHE.clear()  # fresh prefix-list content each pass (route-map hashes expand it)
     seen_keys: set[tuple] = set()
     pl_map: dict[str, object] = {}
     cl_map: dict[str, object] = {}

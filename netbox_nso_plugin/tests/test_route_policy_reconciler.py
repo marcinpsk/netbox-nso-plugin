@@ -10,6 +10,8 @@ ASPathAccessList->ASPath rename slipped through unnoticed).
 
 from __future__ import annotations
 
+import json
+
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.test import TestCase
 from django.urls import reverse
@@ -246,6 +248,120 @@ class TestReconcileRoutePolicy(TestCase):
         reconcile_route_policy(self.device, self._rm_payload("SET-LP", owner))
         reconcile_route_policy(self.device2, self._rm_payload("SET-LP", diff))
         s2 = NSORoutePolicyState.objects.get(management__device=self.device2, family="route_map", object_name="SET-LP")
+        self.assertEqual(s2.status, "conflict")
+
+    # --- BOGONS: Junos inline route-filter vs Nokia named prefix-lists (content expansion) ---
+    _MARTIANS = [
+        {"sequence": 10, "action": "permit", "prefix": "0.0.0.0/8", "ge": 8, "le": 32},
+        {"sequence": 20, "action": "permit", "prefix": "10.0.0.0/8", "ge": 8, "le": 32},
+    ]
+    _DEFAULT = [
+        {"sequence": 10, "action": "permit", "prefix": "0.0.0.0/0"},  # bare → exact /0
+        {"sequence": 20, "action": "permit", "prefix": "0.0.0.0/0", "ge": 25, "le": 32},
+    ]
+    _DEFAULT_2 = [{"sequence": 10, "action": "permit", "prefix": "0.0.0.0/0", "ge": 1, "le": 7}]
+    _JUNOS_RM_ENTRY = [
+        {
+            "sequence": 10,
+            "action": "deny",
+            "match": json.dumps(
+                {
+                    "_junos_family": "inet",
+                    "_junos_prefix_list_filter": [{"list": "MARTIANS_V4", "match": "orlonger"}],
+                    "_junos_route_filter": [
+                        {"match": "exact", "prefix": "0.0.0.0/0"},
+                        {"match": "prefix-length-range", "arg": "/25-/32", "prefix": "0.0.0.0/0"},
+                        {"match": "prefix-length-range", "arg": "/1-/7", "prefix": "0.0.0.0/0"},
+                    ],
+                    "protocol": "bgp",
+                }
+            ),
+            "set": '{"_junos_terminal": "reject"}',
+        }
+    ]
+
+    def _nokia_rm_entry(self, names):
+        return [
+            {
+                "sequence": 1,
+                "action": "deny",
+                "match_prefix_lists": names,
+                "match": json.dumps({"family": ["ipv4"], "protocol": ["bgp"]}),
+                "set": "{}",
+            }
+        ]
+
+    def _full_payload(self, prefix_lists, route_maps):
+        return {"prefix_lists": prefix_lists, "community_lists": [], "as_paths": [], "route_maps": route_maps}
+
+    def test_bogons_inline_route_filter_converges_with_named_lists(self):
+        """rc1(Junos) inlines a route-filter set; ra1(Nokia) references the equivalent NAMED
+        prefix-lists (MARTIANS_V4 + DEFAULT_ROUTE_IPv4 + DEFAULT_ROUTE_IPv4_2). The route-map
+        hash expands both to prefix CONTENT, so the Nokia version imports — no false conflict.
+        Real end-to-end: real prefix-lists materialise, the real DB resolver expands them."""
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._make_mgmt(self.device)
+        self._make_mgmt(self.device2)
+        # device (Junos, owner): only MARTIANS_V4 exists as a list; the defaults are inline.
+        reconcile_route_policy(
+            self.device,
+            self._full_payload(
+                [{"name": "MARTIANS_V4", "family": 4, "entries": self._MARTIANS}],
+                [{"name": "BOGONS-EXT-V4-out", "entries": self._JUNOS_RM_ENTRY}],
+            ),
+        )
+        # device2 (Nokia): MARTIANS + both DEFAULT lists named; route-map references all three.
+        reconcile_route_policy(
+            self.device2,
+            self._full_payload(
+                [
+                    {"name": "MARTIANS_V4", "family": 4, "entries": self._MARTIANS},
+                    {"name": "DEFAULT_ROUTE_IPv4", "family": 4, "entries": self._DEFAULT},
+                    {"name": "DEFAULT_ROUTE_IPv4_2", "family": 4, "entries": self._DEFAULT_2},
+                ],
+                [
+                    {
+                        "name": "BOGONS-EXT-V4-out",
+                        "entries": self._nokia_rm_entry(["MARTIANS_V4", "DEFAULT_ROUTE_IPv4", "DEFAULT_ROUTE_IPv4_2"]),
+                    }
+                ],
+            ),
+        )
+        s2 = NSORoutePolicyState.objects.get(
+            management__device=self.device2, family="route_map", object_name="BOGONS-EXT-V4-out"
+        )
+        self.assertNotEqual(s2.status, "conflict")
+
+    def test_bogons_extra_inline_filter_still_conflicts(self):
+        """Control: the Nokia INBOUND version references only DEFAULT_ROUTE_IPv4 (no _2), so the
+        Junos term's extra /1-7 filter is a GENUINE content difference → conflict preserved."""
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._make_mgmt(self.device)
+        self._make_mgmt(self.device2)
+        reconcile_route_policy(
+            self.device,
+            self._full_payload(
+                [{"name": "MARTIANS_V4", "family": 4, "entries": self._MARTIANS}],
+                [{"name": "BOGONS-EXT-V4-in", "entries": self._JUNOS_RM_ENTRY}],
+            ),
+        )
+        reconcile_route_policy(
+            self.device2,
+            self._full_payload(
+                [
+                    {"name": "MARTIANS_V4", "family": 4, "entries": self._MARTIANS},
+                    {"name": "DEFAULT_ROUTE_IPv4", "family": 4, "entries": self._DEFAULT},
+                ],
+                [{"name": "BOGONS-EXT-V4-in", "entries": self._nokia_rm_entry(["MARTIANS_V4", "DEFAULT_ROUTE_IPv4"])}],
+            ),
+        )
+        s2 = NSORoutePolicyState.objects.get(
+            management__device=self.device2, family="route_map", object_name="BOGONS-EXT-V4-in"
+        )
         self.assertEqual(s2.status, "conflict")
 
     def test_local_classification_suppresses_cross_device_conflict(self):

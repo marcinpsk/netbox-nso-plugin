@@ -9,6 +9,8 @@ vendor_ext namespacing, and the residual-blob trimming.
 
 from __future__ import annotations
 
+import json
+
 from django.test import SimpleTestCase
 
 from netbox_nso_plugin.route_policy_structure import normalize_afi, structure_entry
@@ -252,3 +254,116 @@ class TestCanonicalRouteMap(SimpleTestCase):
         accept = self._rm([{"sequence": 10, "action": "permit", "match": "{}", "set": '{"_junos_terminal": "accept"}'}])
         cont = self._rm([{"sequence": 10, "action": "permit", "match": "{}", "set": '{"_junos_terminal": "none"}'}])
         self.assertNotEqual(self._canon(accept), self._canon(cont))
+
+
+class TestRouteFilterUnits(SimpleTestCase):
+    """Junos route-filter / prefix-list-entry → normalized (action, prefix, ge, le) units."""
+
+    def test_route_filter_match_types(self):
+        from netbox_nso_plugin.route_policy_structure import _route_filter_unit
+
+        self.assertEqual(_route_filter_unit({"match": "exact", "prefix": "0.0.0.0/0"}), ("permit", "0.0.0.0/0", 0, 0))
+        self.assertEqual(
+            _route_filter_unit({"match": "prefix-length-range", "arg": "/25-/32", "prefix": "0.0.0.0/0"}),
+            ("permit", "0.0.0.0/0", 25, 32),
+        )
+        self.assertEqual(
+            _route_filter_unit({"match": "orlonger", "prefix": "10.0.0.0/8"}), ("permit", "10.0.0.0/8", 8, 32)
+        )
+        self.assertEqual(
+            _route_filter_unit({"match": "orlonger", "prefix": "2001:db8::/32"}), ("permit", "2001:db8::/32", 32, 128)
+        )
+        # Unhandled type round-trips its raw spelling so it can never falsely equate a clean range.
+        self.assertEqual(
+            _route_filter_unit({"match": "through", "arg": "1.2.3.0/24", "prefix": "1.0.0.0/8"})[2],
+            "raw:through:1.2.3.0/24",
+        )
+
+    def test_prefix_list_entry_unit_bare_prefix_is_exact(self):
+        from netbox_nso_plugin.route_policy_structure import prefix_list_entry_unit
+
+        self.assertEqual(prefix_list_entry_unit({"prefix": "0.0.0.0/0"}), ("permit", "0.0.0.0/0", 0, 0))
+        self.assertEqual(
+            prefix_list_entry_unit({"prefix": "10.0.0.0/8", "ge": 8, "le": 32}), ("permit", "10.0.0.0/8", 8, 32)
+        )
+
+
+class TestCanonicalRouteMapPrefixExpansion(SimpleTestCase):
+    """BOGONS: a Junos term that INLINES a route-filter set converges with the Nokia term that
+    references the equivalent NAMED prefix-lists — and only when the content truly matches.
+
+    Mirrors live rc1↔ra1 BOGONS-EXT-V4-out (converges) vs -V4-in (rc1 also filters /1-7 that
+    ra1's inbound list lacks → genuine drift). Resolver fakes the global prefix-list content.
+    """
+
+    _PL = {
+        "MARTIANS_V4": [("permit", "0.0.0.0/8", 8, 32), ("permit", "10.0.0.0/8", 8, 32)],
+        "DEFAULT_ROUTE_IPv4": [("permit", "0.0.0.0/0", 0, 0), ("permit", "0.0.0.0/0", 25, 32)],
+        "DEFAULT_ROUTE_IPv4_2": [("permit", "0.0.0.0/0", 1, 7)],
+    }
+
+    def _resolver(self, name):
+        return self._PL.get(name, [])
+
+    def _canon(self, captured):
+        from netbox_nso_plugin.route_policy_structure import canonical_route_map
+
+        return canonical_route_map(captured, self._resolver)
+
+    def _junos_inline_term(self, length_ranges):
+        # length_ranges: list of route-filter dicts for the default-route filters (besides MARTIANS).
+        rf = [{"match": "exact", "prefix": "0.0.0.0/0"}] + length_ranges
+        match = {
+            "_junos_family": "inet",
+            "_junos_prefix_list_filter": [{"list": "MARTIANS_V4", "match": "orlonger"}],
+            "_junos_route_filter": rf,
+            "_junos_term": "prefix",
+            "protocol": "bgp",
+        }
+        return {
+            "name": "RM",
+            "entries": [
+                {"sequence": 10, "action": "deny", "match": json.dumps(match), "set": '{"_junos_terminal": "reject"}'}
+            ],
+        }
+
+    def _nokia_named_term(self, names):
+        match = {"_timos_description": "prefix", "family": ["ipv4"], "protocol": ["bgp"]}
+        return {
+            "name": "RM",
+            "entries": [
+                {"sequence": 1, "action": "deny", "match_prefix_lists": names, "match": json.dumps(match), "set": "{}"}
+            ],
+        }
+
+    def test_inline_route_filter_converges_with_named_lists(self):
+        # -out: rc1 inline {exact, /25-32, /1-7} == ra1 [MARTIANS, DEFAULT, DEFAULT_2].
+        junos = self._junos_inline_term(
+            [
+                {"match": "prefix-length-range", "arg": "/25-/32", "prefix": "0.0.0.0/0"},
+                {"match": "prefix-length-range", "arg": "/1-/7", "prefix": "0.0.0.0/0"},
+            ]
+        )
+        nokia = self._nokia_named_term(["DEFAULT_ROUTE_IPv4", "DEFAULT_ROUTE_IPv4_2", "MARTIANS_V4"])
+        self.assertEqual(self._canon(junos), self._canon(nokia))
+
+    def test_extra_inline_filter_stays_distinct(self):
+        # -in: rc1 still inlines /1-7, but ra1 inbound references only DEFAULT_ROUTE_IPv4 (no _2).
+        junos = self._junos_inline_term(
+            [
+                {"match": "prefix-length-range", "arg": "/25-/32", "prefix": "0.0.0.0/0"},
+                {"match": "prefix-length-range", "arg": "/1-/7", "prefix": "0.0.0.0/0"},
+            ]
+        )
+        nokia = self._nokia_named_term(["MARTIANS_V4", "DEFAULT_ROUTE_IPv4"])
+        self.assertNotEqual(self._canon(junos), self._canon(nokia))
+
+    def test_without_resolver_prefix_lists_stay_by_name(self):
+        # No resolver → pure DB-free projection keeps the by-name prefix_lists (used by unit tests
+        # that don't exercise expansion); the entry carries no expanded prefix_match.
+        from netbox_nso_plugin.route_policy_structure import canonical_route_map
+
+        nokia = self._nokia_named_term(["MARTIANS_V4", "DEFAULT_ROUTE_IPv4"])
+        c = canonical_route_map(nokia)
+        self.assertIn("prefix_lists", c["entries"][0])
+        self.assertNotIn("prefix_match", c["entries"][0])

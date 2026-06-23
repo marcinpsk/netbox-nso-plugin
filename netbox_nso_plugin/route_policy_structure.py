@@ -22,6 +22,7 @@ unit-tested directly and reused by the write-side later. Name → object resolut
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 # Vendor family spellings → the canonical RoutePolicyAFIChoices set. Anything not here is
@@ -294,12 +295,102 @@ def _is_default_entry(match_blob: dict) -> bool:
     return match_blob.get("_timos_default_action") is True or match_blob.get("_junos_default") is True
 
 
-def _canonical_entry(e: dict) -> dict:
-    """One route-map entry as a vendor-neutral semantic dict (sequence + labels dropped)."""
+def _prefix_len(prefix) -> int:
+    s = str(prefix)
+    if "/" in s:
+        return int(s.split("/", 1)[1])
+    return 128 if ":" in s else 32
+
+
+def _max_len(prefix) -> int:
+    return 128 if ":" in str(prefix) else 32
+
+
+def prefix_list_entry_unit(entry: dict) -> tuple:
+    """One prefix-list entry → a normalized match unit ``(action, prefix, ge, le)``.
+
+    A bare prefix (no ge/le) is an EXACT match (ge == le == prefix length), so it lines up
+    with a Junos ``route-filter ... exact`` unit. Used by the reconciler's prefix-list
+    resolver to express a named list's content in the same shape as inline route-filters.
+    """
+    pfx = str(entry.get("prefix"))
+    plen = _prefix_len(pfx)
+    ge = entry.get("ge")
+    le = entry.get("le")
+    ge = int(ge) if ge is not None else plen
+    le = int(le) if le is not None else plen
+    action = (entry.get("action") or "permit").strip().lower() or "permit"
+    return (action, pfx, ge, le)
+
+
+def _route_filter_unit(rf: dict) -> tuple | None:
+    """One Junos inline ``route-filter`` → a match unit ``(permit, prefix, ge, le)``.
+
+    Maps the Junos match-type to a length range: ``exact`` → [len, len]; ``orlonger`` →
+    [len, max]; ``longer`` → [len+1, max]; ``upto /Z`` → [len, Z]; ``prefix-length-range
+    /X-/Y`` → [X, Y]. An unrecognised type round-trips its raw spelling so it stays distinct
+    (never silently equated with a clean range).
+    """
+    pfx = rf.get("prefix")
+    if not pfx:
+        return None
+    plen = _prefix_len(pfx)
+    match = (rf.get("match") or "").strip().lower()
+    arg = str(rf.get("arg") or "")
+    nums = [int(x) for x in re.findall(r"\d+", arg)]
+    if match == "exact":
+        lo, hi = plen, plen
+    elif match == "orlonger":
+        lo, hi = plen, _max_len(pfx)
+    elif match == "longer":
+        lo, hi = plen + 1, _max_len(pfx)
+    elif match == "upto" and nums:
+        lo, hi = plen, nums[0]
+    elif match == "prefix-length-range" and len(nums) >= 2:
+        lo, hi = nums[0], nums[1]
+    else:
+        return ("permit", str(pfx), f"raw:{match}:{arg}")
+    return ("permit", str(pfx), lo, hi)
+
+
+def _prefix_match_units(entry: dict, resolver) -> list:
+    """Build a route-map entry's prefix match as a sorted set of ``(action, prefix, ge, le)`` units.
+
+    Unions every source of a prefix match into ONE comparable set, regardless of how the
+    vendor spells it: named ``match_prefix_lists`` and Junos ``prefix-list-filter`` refs are
+    resolved to their list content via ``resolver(name)``; Junos inline ``route-filter``
+    blocks are converted directly. So a Junos term that inlines what a Nokia term references
+    by name converges — and a term that matches a genuinely different prefix set does not.
+    """
+    units: set[tuple] = set()
+    match_blob = _loads(entry.get("match"))
+    names = list(entry.get("match_prefix_lists") or [])
+    for plf in match_blob.get("_junos_prefix_list_filter") or []:
+        if isinstance(plf, dict) and plf.get("list"):
+            names.append(plf["list"])
+    for nm in names:
+        for unit in resolver(nm) or ():
+            units.add(tuple(unit))
+    for rf in match_blob.get("_junos_route_filter") or []:
+        unit = _route_filter_unit(rf)
+        if unit is not None:
+            units.add(unit)
+    return sorted(units)
+
+
+def _canonical_entry(e: dict, prefix_resolver=None) -> dict:
+    """One route-map entry as a vendor-neutral semantic dict (sequence + labels dropped).
+
+    With a ``prefix_resolver`` (a callable ``name → iterable of prefix-list units``) the
+    entry's prefix match is expanded to a content tuple-set (``prefix_match``) so inline
+    route-filters and named lists compare apples-to-apples; the now-consumed Junos
+    ``prefix-list-filter`` / ``route-filter`` markers drop out of the residual vendor blob.
+    Without a resolver it keeps the by-NAME ``prefix_lists`` projection (pure, DB-free).
+    """
     s = structure_entry(_loads(e.get("match")), _loads(e.get("set")))
     afi = sorted(set(s.match_afi)) + sorted(set(s.unmapped_afi))
     as_paths = sorted(set(e.get("match_as_paths") or []) | set(_as_path_groups(s.vendor_ext)))
-    return {
+    entry = {
         "action": (e.get("action") or "").strip().lower() or None,
         "flow": _flow(e.get("action"), s.vendor_ext),
         "afi": afi,
@@ -312,9 +403,19 @@ def _canonical_entry(e: dict) -> dict:
         "call_policy": s.call_policy,
         "vendor": _residual_vendor(s.vendor_ext),
     }
+    if prefix_resolver is not None:
+        entry["prefix_match"] = _prefix_match_units(e, prefix_resolver)
+        del entry["prefix_lists"]
+        junos = entry["vendor"].get("junos")
+        if junos:
+            junos.pop("prefix_list_filter", None)
+            junos.pop("route_filter", None)
+            if not junos:
+                entry["vendor"].pop("junos", None)
+    return entry
 
 
-def canonical_route_map(captured: dict | None) -> dict:
+def canonical_route_map(captured: dict | None, prefix_resolver=None) -> dict:
     """Vendor-neutral SEMANTIC projection of a device's captured route-map, for the dedup hash.
 
     Two devices' versions of the same logical route-map hash EQUAL when they differ only in
@@ -328,13 +429,17 @@ def canonical_route_map(captured: dict | None) -> dict:
     Entries are compared POSITIONALLY (the sequence number is dropped — Junos numbers terms
     10/20, Nokia 1/2/1000). The synthetic policy-level default entry (Nokia ``default-action``
     / Junos policy ``then``) is folded into ``default`` rather than counted as an entry.
+
+    With ``prefix_resolver`` (``name → prefix-list units``), each entry's prefix match is
+    expanded to its CONTENT (see :func:`_prefix_match_units`), so a Junos term that inlines a
+    route-filter set converges with the Nokia term that references the equivalent named lists.
     """
     captured = captured or {}
     default = None
     entries: list[dict] = []
     for e in captured.get("entries") or []:
         if _is_default_entry(_loads(e.get("match"))):
-            ce = _canonical_entry(e)
+            ce = _canonical_entry(e, prefix_resolver)
             default = {
                 "action": ce["action"],
                 "flow": ce["flow"],
@@ -342,7 +447,7 @@ def canonical_route_map(captured: dict | None) -> dict:
                 "set_knobs": ce["set_knobs"],
             }
             continue
-        entries.append(_canonical_entry(e))
+        entries.append(_canonical_entry(e, prefix_resolver))
     return {"default": default, "entries": entries}
 
 
