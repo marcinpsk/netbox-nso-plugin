@@ -219,6 +219,133 @@ def _loads(value) -> dict:
         return {}
 
 
+# Vendor-ext sub-keys that are COSMETIC (a label, or already consumed into a vendor-neutral
+# canonical field below) — dropped from the canonical semantic digest so the SAME logical
+# route-map converges across vendors. Anything NOT listed stays in the residual ``vendor``
+# blob, so genuinely vendor-specific content (e.g. Junos ``route_filter``) preserves drift.
+_COSMETIC_VENDOR_EXT: dict[str, set[str]] = {
+    # family→afi, term/flat→label, terminal→flow, default→default_action,
+    # as_path_group→as_paths, from_policy→call_policy, community_op→set_communities.
+    "junos": {"family", "term", "flat", "terminal", "default", "as_path_group", "from_policy", "community_op"},
+    # description→label, action_type/no_action→flow, default_action→default_action,
+    # as_path_group→as_paths.
+    "timos": {"description", "action_type", "no_action", "default_action", "as_path_group"},
+}
+
+
+def _flow(action: str | None, vendor_ext: dict) -> str:
+    """Vendor-neutral flow verb for a route-map entry: ``accept`` | ``reject`` | ``continue``.
+
+    Junos ``_junos_terminal`` (accept|reject|none) and Nokia ``_timos_action_type``
+    (accept|reject|next-policy|next-entry) both encode whether the entry is terminal or
+    falls through — the SAME semantics spelled differently. Normalise both; absent a marker,
+    derive from the permit/deny action (a permit clause accepts, a deny rejects).
+    """
+    junos = vendor_ext.get("junos", {})
+    timos = vendor_ext.get("timos", {})
+    term = str(junos.get("terminal") or "").lower()
+    if term in ("accept", "reject"):
+        return term
+    if term == "none":
+        return "continue"
+    action_type = str(timos.get("action_type") or "").lower()
+    if action_type in ("accept", "reject"):
+        return action_type
+    if action_type in ("next-policy", "next-entry"):
+        return "continue"
+    return "reject" if (action or "").strip().lower() == "deny" else "accept"
+
+
+def _as_path_groups(vendor_ext: dict) -> list[str]:
+    """Junos/Nokia ``as_path_group`` markers — the same match, placed differently per vendor."""
+    out: list[str] = []
+    for ns in ("junos", "timos"):
+        out += [str(x) for x in _as_list(vendor_ext.get(ns, {}).get("as_path_group"))]
+    return out
+
+
+def _residual_vendor(vendor_ext: dict) -> dict:
+    """vendor_ext with the cosmetic/consumed sub-keys stripped (what genuinely still differs)."""
+    out: dict = {}
+    for ns, blob in vendor_ext.items():
+        drop = _COSMETIC_VENDOR_EXT.get(ns, set())
+        kept = {k: v for k, v in blob.items() if k not in drop}
+        if kept:
+            out[ns] = kept
+    return out
+
+
+def _canon_value(value):
+    """Scalar/list-insensitive, type-insensitive knob value: a sorted list of strings.
+
+    ``protocol: "bgp"`` and ``protocol: ["bgp"]`` (one vendor reads a scalar, the other a
+    leaf-list) — and ``250`` vs ``"250"`` — must hash equal. Both sides run through this, so
+    the only thing equated is shape/spelling, never two genuinely different value sets.
+    """
+    return sorted(str(x) for x in _as_list(value))
+
+
+def _canon_knobs(blob: dict) -> dict:
+    return {k: _canon_value(v) for k, v in blob.items()}
+
+
+def _is_default_entry(match_blob: dict) -> bool:
+    """Report whether an entry is the synthetic policy-level default (Nokia or Junos)."""
+    return match_blob.get("_timos_default_action") is True or match_blob.get("_junos_default") is True
+
+
+def _canonical_entry(e: dict) -> dict:
+    """One route-map entry as a vendor-neutral semantic dict (sequence + labels dropped)."""
+    s = structure_entry(_loads(e.get("match")), _loads(e.get("set")))
+    afi = sorted(set(s.match_afi)) + sorted(set(s.unmapped_afi))
+    as_paths = sorted(set(e.get("match_as_paths") or []) | set(_as_path_groups(s.vendor_ext)))
+    return {
+        "action": (e.get("action") or "").strip().lower() or None,
+        "flow": _flow(e.get("action"), s.vendor_ext),
+        "afi": afi,
+        "prefix_lists": sorted(e.get("match_prefix_lists") or []),
+        "community_lists": sorted(e.get("match_community_lists") or []),
+        "as_paths": as_paths,
+        "match_knobs": _canon_knobs(s.residual_match),
+        "set_communities": sorted([c.operation, c.name] for c in s.set_communities),
+        "set_knobs": _canon_knobs(s.residual_set),
+        "call_policy": s.call_policy,
+        "vendor": _residual_vendor(s.vendor_ext),
+    }
+
+
+def canonical_route_map(captured: dict | None) -> dict:
+    """Vendor-neutral SEMANTIC projection of a device's captured route-map, for the dedup hash.
+
+    Two devices' versions of the same logical route-map hash EQUAL when they differ only in
+    cosmetic vendor encoding — term/entry labels, family spelling (``inet`` vs ``ipv4``),
+    scalar-vs-leaf-list (``protocol "bgp"`` vs ``["bgp"]``), the fall-through verb
+    (``_junos_terminal: none`` vs ``_timos_action_type: next-policy``), or where an
+    ``as-path-group`` match lands. Genuinely different content (different prefix-lists,
+    extra terms, Junos inline ``route_filter`` blocks) keeps a distinct digest → honest
+    cross-vendor drift the operator resolves (push one version, or mark the group LOCAL).
+
+    Entries are compared POSITIONALLY (the sequence number is dropped — Junos numbers terms
+    10/20, Nokia 1/2/1000). The synthetic policy-level default entry (Nokia ``default-action``
+    / Junos policy ``then``) is folded into ``default`` rather than counted as an entry.
+    """
+    captured = captured or {}
+    default = None
+    entries: list[dict] = []
+    for e in captured.get("entries") or []:
+        if _is_default_entry(_loads(e.get("match"))):
+            ce = _canonical_entry(e)
+            default = {
+                "action": ce["action"],
+                "flow": ce["flow"],
+                "set_communities": ce["set_communities"],
+                "set_knobs": ce["set_knobs"],
+            }
+            continue
+        entries.append(_canonical_entry(e))
+    return {"default": default, "entries": entries}
+
+
 def summarize_route_map(captured: dict | None) -> dict:
     """Build a display summary of a device's CAPTURED route-map (for the versions UI).
 

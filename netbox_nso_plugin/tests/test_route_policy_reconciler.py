@@ -191,6 +191,63 @@ class TestReconcileRoutePolicy(TestCase):
         )
         self.assertEqual(s2.status, "conflict")
 
+    def _rm_payload(self, name, entries):
+        return {
+            "prefix_lists": [],
+            "community_lists": [],
+            "as_paths": [],
+            "route_maps": [{"name": name, "entries": entries}],
+        }
+
+    def test_cosmetic_cross_vendor_route_map_does_not_conflict(self):
+        """Two devices carry the SAME logical route-map spelled in different vendor encodings
+        (Junos term/terminal markers + scalar protocol vs Nokia action-type + leaf-list
+        protocol) — the canonical route-map hash equates them, so the second device imports
+        instead of a false cross-vendor ``conflict``. Models the live SET-LP-250 (rc1 vs ra1).
+        """
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._make_mgmt(self.device)
+        self._make_mgmt(self.device2)
+        junos = [
+            {
+                "sequence": 10,
+                "action": "permit",
+                "match": '{"_junos_term": "lp250", "protocol": "bgp"}',
+                "set": '{"_junos_terminal": "none", "local_preference": 250}',
+            }
+        ]
+        nokia = [
+            {
+                "sequence": 10,
+                "action": "permit",
+                "match": '{"protocol": ["bgp"]}',
+                "set": '{"_timos_action_type": "next-policy", "local_preference": 250}',
+            }
+        ]
+        reconcile_route_policy(self.device, self._rm_payload("SET-LP-250", junos))
+        reconcile_route_policy(self.device2, self._rm_payload("SET-LP-250", nokia))
+        s2 = NSORoutePolicyState.objects.get(
+            management__device=self.device2, family="route_map", object_name="SET-LP-250"
+        )
+        self.assertNotEqual(s2.status, "conflict")
+
+    def test_genuinely_different_route_map_still_conflicts(self):
+        """Control: the canonical hash must NOT suppress real drift — a second device whose
+        route-map sets a DIFFERENT local-preference is genuine cross-device divergence."""
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._make_mgmt(self.device)
+        self._make_mgmt(self.device2)
+        owner = [{"sequence": 10, "action": "permit", "match": "{}", "set": '{"local_preference": 250}'}]
+        diff = [{"sequence": 10, "action": "permit", "match": "{}", "set": '{"local_preference": 300}'}]
+        reconcile_route_policy(self.device, self._rm_payload("SET-LP", owner))
+        reconcile_route_policy(self.device2, self._rm_payload("SET-LP", diff))
+        s2 = NSORoutePolicyState.objects.get(management__device=self.device2, family="route_map", object_name="SET-LP")
+        self.assertEqual(s2.status, "conflict")
+
     def test_local_classification_suppresses_cross_device_conflict(self):
         """A LOCAL group legitimately differs per device → captured-only, no materialization,
         and a diverging sibling is NOT flagged conflict (each keeps its own version)."""

@@ -21,6 +21,7 @@ import json
 import logging
 
 from . import shared_object_ownership as ownership
+from .route_policy_structure import canonical_route_map
 
 logger = logging.getLogger(__name__)
 
@@ -387,7 +388,12 @@ def _register_specs() -> None:
         "as_path",
         Spec(fill=lambda o, c: _fill_as_path_entries(o, _entries(c)), hash_captured=lambda c: _hash(_entries(c))),
     )
-    ownership.register("route_map", Spec(fill=_rm_fill, hash_captured=lambda c: _hash(_entries(c))))
+    # Route-maps dedup on a VENDOR-NEUTRAL SEMANTIC digest (not the raw entries): the same
+    # logical policy spelled in Junos vs Nokia encoding (term/terminal labels, family
+    # spelling, scalar-vs-leaf-list, fall-through verb, as-path-group placement) converges
+    # instead of showing false cross-vendor conflict. Genuine differences keep a distinct
+    # digest. See route_policy_structure.canonical_route_map.
+    ownership.register("route_map", Spec(fill=_rm_fill, hash_captured=lambda c: _hash(canonical_route_map(c))))
 
 
 _register_specs()
