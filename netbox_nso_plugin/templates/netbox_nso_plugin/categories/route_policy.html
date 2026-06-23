@@ -13,6 +13,9 @@
       <a href="{% url 'plugins:netbox_nso_plugin:route_policy_capabilities' device_pk=object.pk %}" class="btn btn-sm btn-outline-primary" title="What this device can apply for route-maps and communities (by NED + software)">
         <i class="mdi mdi-shield-check-outline"></i> Capabilities
       </a>
+      <a href="{% url 'plugins:netbox_nso_plugin:routing_classify_bulk_route_policy' device_pk=object.pk %}" class="btn btn-sm btn-outline-warning" title="Bulk-mark per-device the shared objects that legitimately differ between devices (VRRP / per-region lists)">
+        <i class="mdi mdi-call-split"></i> Resolve divergent…
+      </a>
     </div>
     <div class="nso-cat-msg"></div>
     <div class="d-flex justify-content-between align-items-center mb-2">
@@ -29,7 +32,7 @@
           {% for rp in route_policy_states %}
           <tr data-status="{{ rp.status }}" data-owned="{{ rp.accepted_at|yesno:'true,false' }}">
             <td>{{ rp.family }}</td>
-            <td>{{ rp.object_name }}</td>
+            <td>{{ rp.object_name }}{% if rp.classification_mode == "local" %} <span class="badge text-bg-info" title="Per-device — not deduped into one shared object; differs by device intentionally">per-device</span>{% endif %}</td>
             <td>{% if rp.assigned_object %}<a href="{{ rp.assigned_object.get_absolute_url }}">{{ rp.assigned_object }}</a>{% else %}—{% endif %}</td>
             <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=rp.status %}</td>
             <td>{{ rp.last_sync_at|default:"—" }}</td>

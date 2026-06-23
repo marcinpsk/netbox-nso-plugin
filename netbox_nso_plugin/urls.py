@@ -266,6 +266,11 @@ urlpatterns = [
         views.NSORoutePolicyClassifyView.as_view(),
         name="routing_classify_route_policy",
     ),
+    path(
+        "devices/<int:device_pk>/route-policy/classify-bulk/",
+        views.NSORoutePolicyClassifyBulkView.as_view(),
+        name="routing_classify_bulk_route_policy",
+    ),
     # Drift delta: device capture vs the materialised NetBox object.
     path(
         "routing/route-policy-state/<int:pk>/diff/",

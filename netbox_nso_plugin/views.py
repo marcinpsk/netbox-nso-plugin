@@ -2282,6 +2282,50 @@ class NSORoutePolicyClassifyView(NSOActionPermissionMixin, View):
         return redirect("plugins:netbox_nso_plugin:routing_route_policy_versions", pk=pk)
 
 
+class NSORoutePolicyClassifyBulkView(NSOActionPermissionMixin, View):
+    """Bulk-mark a device's divergent route-policy groups as per-device (LOCAL).
+
+    Lists this device's drifted (conflict/changed) shared route-policy objects with a Diff link
+    so the operator can batch the genuinely-per-device ones (VRRP / per-region lists) in one POST
+    instead of opening each Versions page. Marking is global per ``(family, name)`` group.
+    """
+
+    template_name = "netbox_nso_plugin/route_policy_classify_bulk.html"
+
+    def _divergent_rows(self, mgmt):
+        return (
+            NSORoutePolicyState.objects.filter(
+                management=mgmt, status__in=("conflict", "changed"), is_materialized=False
+            )
+            .select_related("management__device")
+            .order_by("family", "object_name")
+        )
+
+    def get(self, request, device_pk):  # noqa: D102
+        mgmt = get_object_or_404(NSODeviceManagement, device_id=device_pk)
+        return render(
+            request,
+            self.template_name,
+            {"mgmt": mgmt, "object": mgmt.device, "rows": self._divergent_rows(mgmt)},
+        )
+
+    def post(self, request, device_pk):  # noqa: D102
+        from .route_policy_reconciler import set_classification
+
+        mgmt = get_object_or_404(NSODeviceManagement, device_id=device_pk)
+        wanted = set(request.POST.getlist("state"))
+        seen: set[tuple] = set()
+        for state in self._divergent_rows(mgmt):
+            if str(state.pk) in wanted and (state.family, state.object_name) not in seen:
+                set_classification(state.family, state.object_name, "local")
+                seen.add((state.family, state.object_name))
+        if seen:
+            messages.success(request, f"Marked {len(seen)} object(s) as per-device (local).")
+        else:
+            messages.warning(request, "No objects selected.")
+        return redirect(_device_nso_tab_url(device_pk))
+
+
 class NSORoutePolicyMaterializeView(SharedObjectMaterializeMixin):  # noqa: D101
     model_class = NSORoutePolicyState
 

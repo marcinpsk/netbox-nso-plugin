@@ -659,6 +659,29 @@ def set_classification(family: str, object_name: str, mode: str):
     return obj
 
 
+def resettle_false_conflicts() -> int:
+    """Clear stale 'conflict' rows whose content_hash now equals their materialized owner's.
+
+    A non-owner row goes 'conflict' when it diverges from the owner; if the owner is later
+    re-materialized to matching content (or the row re-converges) but that device is not
+    re-read, the status stays conflict. This recompute settles any such row whose hash now
+    matches the canonical owner — without a device round-trip. Returns the count cleared.
+    """
+    from . import status_machine as sm
+    from .models import NSORoutePolicyState
+
+    cleared = 0
+    for state in NSORoutePolicyState.objects.filter(status=sm.CONFLICT, is_materialized=False):
+        if sm.is_owned(state.status):
+            continue
+        canon = ownership.canonical_hash(NSORoutePolicyState, state.family, state.object_name)
+        if canon is not None and canon == state.content_hash:
+            state.status = sm.on_reconcile(state.status, matches=True, conflict=False, settles_owned=False)
+            state.save(update_fields=["status"])
+            cleared += 1
+    return cleared
+
+
 def _upsert_local_state(mgmt, family, name, captured, now):
     """Upsert a per-device (LOCAL) overlay row: captured-only, never a cross-device conflict.
 
@@ -877,6 +900,10 @@ def _reconcile_route_policy(device, payload: dict) -> list:
             _flag_removed(state)
         else:
             _track_unowned_removal(state)
+
+    # Self-heal: a sibling left 'conflict' before its owner re-materialized to matching content
+    # settles here once the hashes agree (no device round-trip needed).
+    resettle_false_conflicts()
 
     return list(NSORoutePolicyState.objects.filter(management=mgmt).order_by("family", "object_name"))
 

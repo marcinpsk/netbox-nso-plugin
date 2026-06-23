@@ -245,6 +245,57 @@ class TestReconcileRoutePolicy(TestCase):
         self.assertNotEqual(s2.status, "conflict")
         self.assertEqual(NSORoutePolicyObjectClass.objects.get(family="prefix_list", object_name="LGI").mode, "local")
 
+    def test_classify_bulk_view_marks_selected_local(self):
+        """End-to-end through the bulk classify view: POST selected divergent rows → each group
+        is marked LOCAL and its cross-device conflict clears."""
+        from django.contrib.auth import get_user_model
+        from django.urls import reverse
+
+        from netbox_nso_plugin.models import NSORoutePolicyObjectClass, NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._make_mgmt(self.device)
+        self._make_mgmt(self.device2)
+        reconcile_route_policy(self.device, self._pl_payload("LGI", "10.0.0.0/8"))
+        reconcile_route_policy(self.device2, self._pl_payload("LGI", "10.1.0.0/16"))
+        s2 = NSORoutePolicyState.objects.get(management__device=self.device2, family="prefix_list", object_name="LGI")
+        self.assertEqual(s2.status, "conflict")
+
+        su = get_user_model().objects.create_superuser("rp-bulk-admin", "a@b.c", "pw")
+        self.client.force_login(su)
+        url = reverse("plugins:netbox_nso_plugin:routing_classify_bulk_route_policy", args=[self.device2.pk])
+        resp = self.client.post(url, {"state": [str(s2.pk)]})
+
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(NSORoutePolicyObjectClass.objects.get(family="prefix_list", object_name="LGI").mode, "local")
+        s2.refresh_from_db()
+        self.assertNotEqual(s2.status, "conflict")
+
+    def test_resettle_false_conflicts_clears_stale_conflict(self):
+        """A row left 'conflict' after its hash converged with the owner's (the device not
+        re-read) settles via the recompute pass, without a device round-trip."""
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, resettle_false_conflicts
+
+        self._make_mgmt(self.device)
+        self._make_mgmt(self.device2)
+        reconcile_route_policy(self.device, self._pl_payload("SHARED", "10.0.0.0/8"))
+        reconcile_route_policy(self.device2, self._pl_payload("SHARED", "10.1.0.0/16"))
+        s2 = NSORoutePolicyState.objects.get(
+            management__device=self.device2, family="prefix_list", object_name="SHARED"
+        )
+        self.assertEqual(s2.status, "conflict")
+
+        owner = NSORoutePolicyState.objects.get(family="prefix_list", object_name="SHARED", is_materialized=True)
+        s2.content_hash = owner.content_hash  # hashes converged, but device2 wasn't re-read
+        s2.save(update_fields=["content_hash"])
+
+        cleared = resettle_false_conflicts()
+
+        s2.refresh_from_db()
+        self.assertNotEqual(s2.status, "conflict")
+        self.assertGreaterEqual(cleared, 1)
+
     def test_set_classification_local_clears_existing_conflict(self):
         """Operator marks a diverging MASTER group LOCAL → the cross-device conflict clears and
         the group de-materializes, re-processing the stored per-device captures (no device read)."""
