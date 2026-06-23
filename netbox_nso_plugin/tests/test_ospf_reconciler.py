@@ -177,6 +177,21 @@ class TestReconcileOspfFill(TestCase):
         self.assertFalse(OSPFInstance.objects.filter(device=self.device).exists())
         self.assertEqual(res["instances"][0].status, "imported")
 
+    def test_instance_with_literal_none_router_id_skipped_not_crashed(self):
+        """An OSPF process the device exports with no router-id stringifies to the literal
+        ``"None"`` (truthy), which is NOT a valid IP → inserting it into the router_id
+        IPAddressField 500s the whole category. Treat "None" as absent: skip the instance,
+        keep the overlay imported (regression for the device-89 OSPF category 500)."""
+        self._make_mgmt()
+        from netbox_routing.models import OSPFInstance
+
+        from netbox_nso_plugin.template_content import _reconcile_ospf
+
+        res = _reconcile_ospf(self.device, self._payload([self._instance(router_id="None")]))
+        self.assertFalse(OSPFInstance.objects.filter(device=self.device).exists())
+        self.assertEqual(res["instances"][0].status, "imported")
+        self.assertEqual(res["instances"][0].router_id, "")  # "None" normalised away on the overlay too
+
     def test_vrf_linked_when_present(self):
         self._make_mgmt()
         from ipam.models import VRF

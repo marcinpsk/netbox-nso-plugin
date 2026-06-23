@@ -1514,6 +1514,18 @@ def _resolve_ospf_vrf(vrf_name: str):
         return None
 
 
+def _clean_router_id(value) -> str:
+    """Normalise an exported router-id, treating the literal ``"None"`` as absent.
+
+    A process the device runs without an explicit router-id can stringify to ``"None"``
+    upstream — truthy, but not a valid IP. Returns ``""`` for that (and any falsy value) so
+    it never reaches netbox-routing's router_id IPAddressField (which 500s on ``"None"``).
+    """
+    if not value or str(value).strip().lower() == "none":
+        return ""
+    return value
+
+
 def _get_or_create_ospf_instance(device, pid, entry, OSPFInstance, base):
     """3-way reconcile the netbox-routing OSPFInstance for one process.
 
@@ -1527,8 +1539,8 @@ def _get_or_create_ospf_instance(device, pid, entry, OSPFInstance, base):
 
     if OSPFInstance is None:
         return None, True, False, base
-    router_id = entry.get("router_id")
-    if not router_id:
+    router_id = _clean_router_id(entry.get("router_id"))
+    if not router_id:  # no router-id (or the literal "None") → can't build the instance; skip
         return None, True, False, base
     vrf_obj = _resolve_ospf_vrf(entry.get("vrf") or "")
     obj, created = OSPFInstance.objects.get_or_create(
@@ -1713,7 +1725,7 @@ def _reconcile_ospf(device, payload: dict) -> dict:
             process_id=pid,
             defaults={"status": "unknown"},
         )
-        state.router_id = entry.get("router_id") or ""
+        state.router_id = _clean_router_id(entry.get("router_id"))
         state.vrf = entry.get("vrf") or ""
         state.areas = entry.get("areas") or []
         # Admin-state (Nokia 'admin-state enable'): mirror the device value into unowned
