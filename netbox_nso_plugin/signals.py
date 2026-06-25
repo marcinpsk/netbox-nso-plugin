@@ -1883,14 +1883,18 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
                     af_entry["prefixlist_out"] = paf.prefixlist_out.name
                 peer_afs.append(af_entry)
 
-        scopes[vrf_name]["peers"].append(
-            {
-                "peer_address": row.peer_address_str,
-                "enabled": row.enabled if row.enabled is not None else True,
-                "remote_as": row.remote_as_str or None,
-                "address_families": peer_afs,
-            }
-        )
+        peer_dict = {
+            "peer_address": row.peer_address_str,
+            "enabled": row.enabled if row.enabled is not None else True,
+            "remote_as": row.remote_as_str or None,
+            "address_families": peer_afs,
+        }
+        # source → the reconciler's peer/source (Junos/Nokia local-address IP). BGPPeer.source is
+        # an ipam.IPAddress; send its host IP so the session source round-trips. (IOS/IOS-XR
+        # update-source is an interface name the IPAddress model can't represent — separate follow-up.)
+        if row.bgp_peer is not None and row.bgp_peer.source is not None:
+            peer_dict["source"] = str(row.bgp_peer.source.address.ip)
+        scopes[vrf_name]["peers"].append(peer_dict)
 
     router_list = _build_bgp_router_list(routers, scope_afs)
     _push_changed(

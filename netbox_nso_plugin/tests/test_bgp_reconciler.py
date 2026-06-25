@@ -187,6 +187,44 @@ class TestReconcileBgpConfig(TestCase):
         self.assertIsNotNone(state.bgp_peer)
         self.assertTrue(state.enabled)
 
+    def test_push_includes_peer_source_ip(self):
+        """_push_bgp_intent_for_device must send a peer's source (the local-address IP).
+
+        The PUT peer dict previously dropped source entirely, so the reconciler — which can now
+        write local-address/update-source — never received it: the BGP session source was lost on
+        push. Junos/Nokia source is an IP (resolved to an ipam.IPAddress on import); send it back.
+        """
+        from unittest.mock import patch
+
+        from ipam.models import IPAddress
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.signals import _push_bgp_intent_for_device
+
+        mgmt = self._make_mgmt()
+        IPAddress.objects.create(address="84.116.255.1/32")
+        result = _reconcile_bgp_config(
+            self.device,
+            self._payload(self._router_payload(peers=[self._peer_entry(source="84.116.255.1")])),
+        )
+        row = result[0]
+        self.assertIsNotNone(row.bgp_peer.source)  # source resolved to the IPAddress on import
+        # Make the row operator-owned so the intent push picks it up.
+        row.status = "in_sync"
+        row.save(update_fields=["status"])
+
+        captured = {}
+
+        def _capture(adapter_device_id, routers):
+            captured["routers"] = routers
+            return {"device_id": adapter_device_id, "router_count": len(routers)}
+
+        with patch("netbox_nso_plugin.adapter_client.put_bgp_intent", side_effect=_capture):
+            _push_bgp_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+
+        peers = captured["routers"][0]["scopes"][0]["peers"]
+        self.assertEqual(peers[0]["source"], "84.116.255.1")
+
     def test_idempotent_second_call(self):
         """Calling reconcile twice with same payload → same single state row."""
         self._make_mgmt()
