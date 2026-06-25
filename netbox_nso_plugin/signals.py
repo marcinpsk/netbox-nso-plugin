@@ -1825,6 +1825,24 @@ def _build_bgp_router_list(routers: dict, scope_afs: dict) -> list:
     return router_list
 
 
+def _bgp_peer_source_value(bgp_peer):
+    """Return a BGP peer's session source as the reconciler's polymorphic source string.
+
+    The reconciler dispatches ``peer/source`` per-NED at write time: IOS/IOS-XR
+    update-source is an interface NAME (``BGPPeer.update_source``, a dcim.Interface),
+    while Junos/Nokia local-address is an IP (``BGPPeer.source``, an ipam.IPAddress).
+    The interface name wins when set, else the source host IP — so the session source
+    round-trips for every vendor. Returns None when neither is set (or no peer).
+    """
+    if bgp_peer is None:
+        return None
+    if bgp_peer.update_source is not None:
+        return bgp_peer.update_source.name
+    if bgp_peer.source is not None:
+        return str(bgp_peer.source.address.ip)
+    return None
+
+
 def _push_bgp_intent_for_device(device_id, adapter_device_id):
     """Build and push the full BGP intent snapshot for a device."""
     from . import adapter_client as client
@@ -1889,11 +1907,9 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
             "remote_as": row.remote_as_str or None,
             "address_families": peer_afs,
         }
-        # source → the reconciler's peer/source (Junos/Nokia local-address IP). BGPPeer.source is
-        # an ipam.IPAddress; send its host IP so the session source round-trips. (IOS/IOS-XR
-        # update-source is an interface name the IPAddress model can't represent — separate follow-up.)
-        if row.bgp_peer is not None and row.bgp_peer.source is not None:
-            peer_dict["source"] = str(row.bgp_peer.source.address.ip)
+        source_value = _bgp_peer_source_value(row.bgp_peer)
+        if source_value is not None:
+            peer_dict["source"] = source_value
         scopes[vrf_name]["peers"].append(peer_dict)
 
     router_list = _build_bgp_router_list(routers, scope_afs)

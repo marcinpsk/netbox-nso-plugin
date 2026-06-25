@@ -358,6 +358,82 @@ class TestReconcileBgpConfig(TestCase):
 
         self.assertIsNone(BGPPeer.objects.get(peer__address__net_host="10.0.0.2").source_id)
 
+    def test_peer_update_source_iface_linked(self):
+        """source given as an interface name (IOS/IOS-XR update-source) → the device's
+        dcim.Interface lands on BGPPeer.update_source (kept as itself, not collapsed to one
+        of its IPs), and the IPAddress source stays null."""
+        self._make_mgmt()
+
+        from dcim.models import Interface
+        from netbox_routing.models import BGPPeer
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        loopback = Interface.objects.create(device=self.device, name="Loopback0", type="virtual")
+        peer = self._peer_entry()
+        peer["source"] = "Loopback0"
+        _reconcile_bgp_config(self.device, self._payload(self._router_payload(peers=[peer])))
+
+        bp = BGPPeer.objects.get(peer__address__net_host="10.0.0.2")
+        self.assertEqual(bp.update_source, loopback)
+        self.assertIsNone(bp.source_id)
+
+    def test_peer_update_source_unknown_iface_left_null(self):
+        """An update-source interface absent from the device → both source and update_source
+        stay null (we don't fabricate)."""
+        self._make_mgmt()
+
+        from netbox_routing.models import BGPPeer
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        peer = self._peer_entry()
+        peer["source"] = "Loopback99"
+        _reconcile_bgp_config(self.device, self._payload(self._router_payload(peers=[peer])))
+
+        bp = BGPPeer.objects.get(peer__address__net_host="10.0.0.2")
+        self.assertIsNone(bp.source_id)
+        self.assertIsNone(bp.update_source_id)
+
+    def test_push_sends_update_source_iface_name(self):
+        """_push_bgp_intent_for_device sends the update-source interface NAME for a peer whose
+        source is a dcim.Interface (IOS/IOS-XR), so the cisco writer round-trips it.
+
+        Counterpart to test_push_includes_peer_source_ip (Junos/Nokia local-address IP): the
+        same per-NED-dispatched peer/source string carries an interface name here.
+        """
+        from unittest.mock import patch
+
+        from dcim.models import Interface
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.signals import _push_bgp_intent_for_device
+
+        mgmt = self._make_mgmt()
+        Interface.objects.create(device=self.device, name="Loopback0", type="virtual")
+        result = _reconcile_bgp_config(
+            self.device,
+            self._payload(self._router_payload(peers=[self._peer_entry(source="Loopback0")])),
+        )
+        row = result[0]
+        self.assertIsNotNone(row.bgp_peer.update_source)  # resolved to the Interface on import
+        self.assertIsNone(row.bgp_peer.source_id)
+        # Make the row operator-owned so the intent push picks it up.
+        row.status = "in_sync"
+        row.save(update_fields=["status"])
+
+        captured = {}
+
+        def _capture(adapter_device_id, routers):
+            captured["routers"] = routers
+            return {"device_id": adapter_device_id, "router_count": len(routers)}
+
+        with patch("netbox_nso_plugin.adapter_client.put_bgp_intent", side_effect=_capture):
+            _push_bgp_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+
+        peers = captured["routers"][0]["scopes"][0]["peers"]
+        self.assertEqual(peers[0]["source"], "Loopback0")
+
     def test_peer_bfd_enabled_linked(self):
         """peer bfd_enabled flows onto the BGPPeer."""
         self._make_mgmt()

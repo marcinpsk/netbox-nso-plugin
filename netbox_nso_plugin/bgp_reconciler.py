@@ -155,20 +155,23 @@ def _get_or_create_peer_group(name: str, BGPPeerTemplate, remote_asn_obj=None):
 
 
 def _resolve_bgp_source(device, source: str, IPAddress):
-    """Resolve a BGP session source to an ipam.IPAddress.
+    """Resolve a BGP session source to ``(ip_address, interface)``.
 
     ``source`` is either an IP (Junos/Nokia local-address) or an interface name
-    (IOS update-source, e.g. ``Loopback4``). For an IP, match an existing
-    IPAddress; for an interface, take an IP assigned to that device interface.
-    Returns None when nothing matches (we don't fabricate IPs).
+    (IOS/IOS-XR update-source, e.g. ``Loopback4``). Returns a 2-tuple in which at
+    most one element is set: the matching ipam.IPAddress for an IP, or the
+    device's dcim.Interface for an interface name. The interface is kept as itself
+    (not collapsed to one of its IPs) so ``update-source Loopback0`` round-trips
+    losslessly back to the IOS/IOS-XR writer. Both None when nothing matches (we
+    don't fabricate objects).
     """
     if not source:
-        return None
+        return None, None
     import netaddr
 
     try:
         netaddr.IPAddress(source)
-        return IPAddress.objects.filter(address__net_host=source).first()
+        return IPAddress.objects.filter(address__net_host=source).first(), None
     except (netaddr.AddrFormatError, ValueError):
         pass
     try:
@@ -176,17 +179,27 @@ def _resolve_bgp_source(device, source: str, IPAddress):
 
         iface = Interface.objects.filter(device=device, name=source).first()
         if iface is not None:
-            return iface.ip_addresses.first()
+            return None, iface
     except Exception:
         pass
-    return None
+    return None, None
 
 
-_PEER_FIELDS = ("enabled", "remote_as", "local_as", "peer_group", "source", "ttl", "password", "bfd_enabled")
-_PEER_FK_FIELDS = {"remote_as", "local_as", "peer_group", "source"}
+_PEER_FIELDS = (
+    "enabled",
+    "remote_as",
+    "local_as",
+    "peer_group",
+    "source",
+    "update_source",
+    "ttl",
+    "password",
+    "bfd_enabled",
+)
+_PEER_FK_FIELDS = {"remote_as", "local_as", "peer_group", "source", "update_source"}
 
 
-def _peer_desired(peer_data, remote_asn_obj, local_asn_obj, peer_group_obj, source_obj):
+def _peer_desired(peer_data, remote_asn_obj, local_asn_obj, peer_group_obj, source_obj, update_source_obj):
     """Return the device-desired BGPPeer field values (objects for FKs)."""
     return {
         "enabled": peer_data.get("enabled"),
@@ -194,6 +207,7 @@ def _peer_desired(peer_data, remote_asn_obj, local_asn_obj, peer_group_obj, sour
         "local_as": local_asn_obj,
         "peer_group": peer_group_obj,
         "source": source_obj,
+        "update_source": update_source_obj,
         "ttl": peer_data.get("ttl"),
         "password": peer_data.get("password"),
         "bfd_enabled": peer_data.get("bfd_enabled"),
@@ -247,9 +261,25 @@ def _af_object_content(owner_obj) -> list:
     return sorted(afs, key=lambda a: a["af"])
 
 
+def _drop_unset_update_source(content: dict) -> None:
+    """Keep pre-``update_source`` base hashes valid across the migration.
+
+    ``update_source`` (the IOS/IOS-XR update-source interface) is a new content
+    key. Existing ``device_base_hash`` values were computed without it, so we omit
+    it whenever it is unset: Junos/Nokia and cisco-without-update-source peers then
+    keep their old hash (no phantom drift), while a cisco peer that DOES carry an
+    update-source interface differs only on that key — so the 3-way merge
+    auto-mirrors (adopts) it instead of flagging a conflict, migrating the peer off
+    the old lossy source-IP onto the interface at the same time.
+    """
+    if content.get("update_source") is None:
+        content.pop("update_source", None)
+
+
 def _peer_device_content(desired: dict, af_list: list) -> dict:
     """Build canonical device-desired content (peer fields + AF policies), FKs as pks."""
     content = {f: (_pk(desired[f]) if f in _PEER_FK_FIELDS else desired[f]) for f in _PEER_FIELDS}
+    _drop_unset_update_source(content)
     content["afs"] = _af_device_content(af_list)
     return content
 
@@ -259,6 +289,7 @@ def _peer_object_content(bgp_peer) -> dict:
     content = {
         f: (getattr(bgp_peer, f"{f}_id") if f in _PEER_FK_FIELDS else getattr(bgp_peer, f)) for f in _PEER_FIELDS
     }
+    _drop_unset_update_source(content)
     content["afs"] = _af_object_content(bgp_peer)
     return content
 
@@ -379,7 +410,12 @@ def _reconcile_one_peer(
 
     BGPPeer = models["BGPPeer"]
     desired = _peer_desired(
-        peer_entry, resolved["remote_as"], resolved["local_as"], resolved["peer_group"], resolved["source"]
+        peer_entry,
+        resolved["remote_as"],
+        resolved["local_as"],
+        resolved["peer_group"],
+        resolved["source"],
+        resolved["update_source"],
     )
     af_list = peer_entry.get("address_families") or []
 
@@ -522,7 +558,7 @@ def _reconcile_scope(
         local_as_str = str(peer_entry.get("local_as") or "")
         local_asn_obj = _get_or_create_asn(local_as_str, ASN) if local_as_str else None
         peer_group_obj = _get_or_create_peer_group(peer_entry.get("peer_group") or "", BGPPeerTemplate, remote_asn_obj)
-        source_obj = _resolve_bgp_source(mgmt.device, peer_entry.get("source"), IPAddress)
+        source_obj, update_source_obj = _resolve_bgp_source(mgmt.device, peer_entry.get("source"), IPAddress)
 
         _reconcile_one_peer(
             mgmt,
@@ -537,6 +573,7 @@ def _reconcile_scope(
                 "local_as": local_asn_obj,
                 "peer_group": peer_group_obj,
                 "source": source_obj,
+                "update_source": update_source_obj,
             },
             now,
             {"BGPPeer": BGPPeer, "BGPAddressFamily": BGPAddressFamily, "BGPPeerAddressFamily": BGPPeerAddressFamily},
