@@ -880,7 +880,14 @@ def _reconcile_isis_segment_routing(inst, sr: dict | None, *, write: bool = True
         from netbox_routing.models import ISISSegmentRouting
     except Exception:
         return True
+    if sr is None:
+        # Key absent / null → the payload carries NO segment-routing information
+        # (e.g. an older adapter that hasn't wired the bag). Never clobber: a
+        # missing key is "unreported", not "delete this SR child". A device that
+        # genuinely has no SR is reported as an explicit empty ``{}`` below.
+        return True
     if not sr:
+        # Explicit empty ``{}`` → device reports no SR config → remove any stale row.
         exists = ISISSegmentRouting.objects.filter(instance=inst).exists()
         if exists and write:
             ISISSegmentRouting.objects.filter(instance=inst).delete()

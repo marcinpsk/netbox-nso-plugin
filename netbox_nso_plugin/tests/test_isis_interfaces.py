@@ -748,6 +748,48 @@ class TestReconcileIsisProcess(TestCase):
         self.assertEqual(ISISLevel.objects.get(instance=inst, level=2).default_metric, 20)  # auto-mirrored
         self.assertEqual(states[0].status, "imported")
 
+    def test_sr_child_preserved_when_segment_routing_key_absent(self):
+        """A payload that omits ``segment_routing`` must NOT delete an existing SR child.
+
+        The adapter may not report SR in every payload (e.g. an older adapter that
+        hasn't wired the bag). A missing key is "unreported", not "device has no SR" —
+        clobbering it would silently drop SR state for an SR-enabled device.
+        """
+        self._make_mgmt()
+        from netbox_routing.models import ISISInstance, ISISSegmentRouting
+
+        from netbox_nso_plugin.template_content import _reconcile_isis_process
+
+        _reconcile_isis_process(
+            self.device, [{"process_tag": "0", "segment_routing": {"enabled": True, "prefix_sid_range": "global"}}]
+        )
+        inst = ISISInstance.objects.get(device=self.device, process_tag="0")
+        self.assertTrue(ISISSegmentRouting.objects.filter(instance=inst).exists())
+
+        # A later reconcile that carries NO segment_routing key must preserve the child.
+        _reconcile_isis_process(self.device, [{"process_tag": "0", "levels": [{"level": 2, "default_metric": 20}]}])
+        self.assertTrue(
+            ISISSegmentRouting.objects.filter(instance=inst).exists(),
+            "SR child must survive when the payload omits the segment_routing key",
+        )
+
+    def test_sr_child_deleted_on_explicit_empty_segment_routing(self):
+        """An explicit empty ``segment_routing`` ({}) removes a stale SR child."""
+        self._make_mgmt()
+        from netbox_routing.models import ISISInstance, ISISSegmentRouting
+
+        from netbox_nso_plugin.template_content import _reconcile_isis_process
+
+        _reconcile_isis_process(self.device, [{"process_tag": "0", "segment_routing": {"enabled": True}}])
+        inst = ISISInstance.objects.get(device=self.device, process_tag="0")
+        self.assertTrue(ISISSegmentRouting.objects.filter(instance=inst).exists())
+
+        _reconcile_isis_process(self.device, [{"process_tag": "0", "segment_routing": {}}])
+        self.assertFalse(
+            ISISSegmentRouting.objects.filter(instance=inst).exists(),
+            "an explicit empty segment_routing must delete the SR child",
+        )
+
 
 class TestReconcileIsisInterfaceLevels(TestCase):
     """per-level interface child rows."""
