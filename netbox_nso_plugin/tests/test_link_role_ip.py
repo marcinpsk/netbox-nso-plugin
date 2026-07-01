@@ -158,6 +158,18 @@ class TestAssignP2PForRole(_Base):
         self.assertEqual(len(result["errors"]), 1)
         self.assertIn("no cable peer found", result["errors"][0]["reason"])
 
+    def test_p2p_peer_managed_but_no_adapter_device_id(self):
+        self.mgmt_b.adapter_device_id = None
+        self.mgmt_b.save(update_fields=["adapter_device_id"])
+        pool = Prefix.objects.create(prefix="198.18.18.0/24")
+        role = NSOLinkRole.objects.create(
+            name="c10", slug="c10", link_type="p2p", assign_ipv4=True, ipv4_pool_prefix=pool
+        )
+        with patch(_PUSH):
+            result = assign_ips_for_role(self.if_a, role, other_end=self.if_b)
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertIn("peer device has no adapter_device_id", result["errors"][0]["reason"])
+
     def test_p2p_rollback_cascades(self):
         pool = Prefix.objects.create(prefix="198.18.17.0/24")
         role = NSOLinkRole.objects.create(
@@ -244,3 +256,15 @@ class TestAssignSingleForRole(_Base):
             result = assign_ips_for_role(self.lo_a, role)
         self.assertEqual(len(result["errors"]), 1)
         self.assertIn("not managed", result["errors"][0]["reason"])
+
+    def test_managed_but_no_adapter_device_id(self):
+        self.mgmt_a.adapter_device_id = None
+        self.mgmt_a.save(update_fields=["adapter_device_id"])
+        pool = Prefix.objects.create(prefix="198.18.24.0/24")
+        role = NSOLinkRole.objects.create(
+            name="s7", slug="s7", link_type="single", assign_ipv4=True, ipv4_pool_prefix=pool
+        )
+        with patch(_PUSH):
+            result = assign_ips_for_role(self.lo_a, role)
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertIn("no adapter_device_id", result["errors"][0]["reason"])
