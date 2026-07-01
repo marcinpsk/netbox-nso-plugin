@@ -196,3 +196,79 @@ def apply_description_for_role(interface, role, other_end=None) -> dict:
     result["changed"] = changed
     result["description"] = new_value
     return result
+
+
+# ── IGP consumer (Phase 5) ──────────────────────────────────────────────────────
+
+
+def enable_igp_for_role(interface, role) -> dict:
+    """Enable *interface* for the role's IGP (IS-IS or OSPF). Mutates overlay state.
+
+    Creates/updates the matching interface overlay as ``accepted`` — an
+    ``NSOISISInterfaceState`` (af ``ipv4``) with the role's circuit-type / metric /
+    passive / process-tag, or an ``NSOOSPFInterfaceState`` with the role's area /
+    network-type / cost / passive / process-id — then pushes via the existing IGP
+    intent pipe. ``igp=none`` is a no-op. Returns ``{interface, igp, enabled,
+    skipped, error}``. One end only; the orchestrator runs it on both.
+    """
+    from django.utils import timezone
+
+    from .models import NSODeviceManagement, NSOISISInterfaceState, NSOOSPFInterfaceState
+    from .signals import _push_isis_intent_for_device, _push_ospf_intent_for_device, suppress_intent_push
+
+    result = {"interface": str(interface), "igp": role.igp, "enabled": False, "skipped": None, "error": None}
+
+    if role.igp == "none":
+        result["skipped"] = "role does not manage an IGP"
+        return result
+
+    try:
+        mgmt = NSODeviceManagement.objects.get(device_id=interface.device_id)
+    except NSODeviceManagement.DoesNotExist:
+        result["error"] = "Device is not managed by NSO"
+        return result
+    if mgmt.adapter_device_id is None:
+        result["error"] = "Device has no adapter_device_id"
+        return result
+
+    now = timezone.now()
+    if role.igp == "isis":
+        with suppress_intent_push():
+            NSOISISInterfaceState.objects.update_or_create(
+                management=mgmt,
+                interface=interface,
+                af="ipv4",
+                defaults={
+                    "process_tag": role.isis_process_tag,
+                    "circuit_type": role.isis_circuit_type,
+                    "metric": role.isis_metric,
+                    "passive": role.isis_passive,
+                    "status": "accepted",
+                    "accepted_at": now,
+                },
+            )
+        push_fn = _push_isis_intent_for_device
+    else:  # ospf
+        with suppress_intent_push():
+            NSOOSPFInterfaceState.objects.update_or_create(
+                management=mgmt,
+                interface=interface,
+                defaults={
+                    "process_id": role.ospf_process_id or None,
+                    "area_id": role.ospf_area,
+                    "network_type": role.ospf_network_type,
+                    "passive": role.ospf_passive,
+                    "cost": role.ospf_cost,
+                    "status": "accepted",
+                    "accepted_at": now,
+                },
+            )
+        push_fn = _push_ospf_intent_for_device
+
+    try:
+        push_fn(mgmt.device_id, mgmt.adapter_device_id)
+    except Exception as exc:  # noqa: BLE001 — adapter may be down; ownership already recorded
+        logger.warning("enable_igp_for_role: push failed for %s: %s", interface, exc)
+
+    result["enabled"] = True
+    return result
