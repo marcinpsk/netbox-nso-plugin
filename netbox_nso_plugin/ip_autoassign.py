@@ -386,6 +386,7 @@ def _assign_one_p2p_family(
     pool_finder=None,
     no_pool_reason=None,
     override_mask=None,
+    push=True,
 ):
     """Attempt one address-family allocation for a P2P pair.  Mutates *result*.
 
@@ -507,14 +508,15 @@ def _assign_one_p2p_family(
         )
         return
 
-    for dev_id, adapter_id in [
-        (mgmt.device_id, mgmt.adapter_device_id),
-        (peer_mgmt.device_id, peer_mgmt.adapter_device_id),
-    ]:
-        try:
-            _push_ip_intent_for_device(dev_id, adapter_id)
-        except Exception as exc:
-            logger.warning("ip_autoassign.p2p: failed to push intent for device %s: %s", dev_id, exc)
+    if push:
+        for dev_id, adapter_id in [
+            (mgmt.device_id, mgmt.adapter_device_id),
+            (peer_mgmt.device_id, peer_mgmt.adapter_device_id),
+        ]:
+            try:
+                _push_ip_intent_for_device(dev_id, adapter_id)
+            except Exception as exc:
+                logger.warning("ip_autoassign.p2p: failed to push intent for device %s: %s", dev_id, exc)
 
     result["allocated"].extend(
         [
@@ -566,12 +568,13 @@ def _single_family_occupied(interface, family: str) -> bool:
     ).exists()
 
 
-def _reserve_single(interface, mgmt, family: str, pool, result) -> None:
+def _reserve_single(interface, mgmt, family: str, pool, result, push=True) -> None:
     """Draw one host from *pool*, reserve it, create the accepted state, push. Mutates *result*.
 
     The caller has already resolved *pool* and passed the fill-empty guard; this is
     the shared reserve/state/push body used by both the M13 classification path and
-    the link-role single-ended path.
+    the link-role single-ended path. *push* False skips the immediate adapter push
+    (the link-role orchestrator defers pushes to after an atomic commit).
     """
     from django.utils import timezone
     from ipam.models import IPAddress
@@ -627,15 +630,16 @@ def _reserve_single(interface, mgmt, family: str, pool, result) -> None:
         )
         return
 
-    try:
-        _push_ip_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
-    except Exception as exc:
-        logger.warning(
-            "ip_autoassign: failed to push IP intent for device %s after allocating %s: %s",
-            mgmt.device_id,
-            available_str,
-            exc,
-        )
+    if push:
+        try:
+            _push_ip_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+        except Exception as exc:
+            logger.warning(
+                "ip_autoassign: failed to push IP intent for device %s after allocating %s: %s",
+                mgmt.device_id,
+                available_str,
+                exc,
+            )
 
     result["allocated"].append(
         {
@@ -754,7 +758,7 @@ def auto_assign_ip(interface, families: tuple[str, ...] = ("ipv4", "ipv6")) -> d
 # ── Link-role entry point ───────────────────────────────────────────────────────
 
 
-def assign_ips_for_role(interface, role, other_end=None) -> dict:
+def assign_ips_for_role(interface, role, other_end=None, push=True) -> dict:
     """Allocate IPs for *interface* from an ``NSOLinkRole``'s configured pools + mask.
 
     The link-role counterpart to :func:`auto_assign_ip`: the pool (explicit Prefix
@@ -765,8 +769,9 @@ def assign_ips_for_role(interface, role, other_end=None) -> dict:
       ``link_role.resolve_role``); both ends are allocated together.
     * ``single`` role → one host per opted-in family for this interface only.
 
-    Fill-empty-only. Returns the ``{allocated, skipped, errors}`` dict. A role that
-    manages no IP family is a no-op (empty result).
+    Fill-empty-only. *push* False skips the immediate adapter push (the orchestrator
+    defers pushes to after an atomic commit). Returns the ``{allocated, skipped,
+    errors}`` dict. A role that manages no IP family is a no-op (empty result).
     """
     from .link_role import intent_bundle
     from .models import NSODeviceManagement
@@ -818,6 +823,7 @@ def assign_ips_for_role(interface, role, other_end=None) -> dict:
                 pool_finder=(lambda fam, s, _spec=spec: _resolve_role_pool(_spec, None, s)),
                 no_pool_reason=(lambda fam, _slug=role.slug: f"No {fam} pool found for role '{_slug}'"),
                 override_mask=spec.mask,
+                push=push,
             )
         return result
 
@@ -842,6 +848,6 @@ def assign_ips_for_role(interface, role, other_end=None) -> dict:
                 }
             )
             continue
-        _reserve_single(interface, mgmt, spec.family, pool, result)
+        _reserve_single(interface, mgmt, spec.family, pool, result, push=push)
 
     return result

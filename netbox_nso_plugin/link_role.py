@@ -144,7 +144,7 @@ def _render_role_description(template: str, interface, peer) -> str:
     return template.format(**fields)
 
 
-def apply_description_for_role(interface, role, other_end=None) -> dict:
+def apply_description_for_role(interface, role, other_end=None, push=True) -> dict:
     """Render + own the interface description from *role*'s template. Mutates state.
 
     Sets ``dcim.Interface.description`` to the rendered template and marks an
@@ -152,7 +152,9 @@ def apply_description_for_role(interface, role, other_end=None) -> dict:
     is owned and pushed via the existing interface-intent pipe (reuses the M8
     description contract). ``p2p`` roles use *other_end* for the ``peer_*``
     placeholders; ``single`` roles render with those blank. A role with no template
-    is a no-op. Returns ``{interface, changed, description, skipped, error}``.
+    is a no-op. *push* False skips the immediate adapter push (the orchestrator
+    defers pushes to after an atomic commit). Returns ``{interface, changed,
+    description, skipped, error}``.
     """
     from django.utils import timezone
 
@@ -188,10 +190,11 @@ def apply_description_for_role(interface, role, other_end=None) -> dict:
             defaults={"status": "accepted", "accepted_at": timezone.now()},
         )
 
-    try:
-        _push_interface_intent_for_device(mgmt.device_id, mgmt.adapter_device_id, force=True)
-    except Exception as exc:  # noqa: BLE001 — adapter may be down; ownership already recorded
-        logger.warning("apply_description_for_role: push failed for %s: %s", interface, exc)
+    if push:
+        try:
+            _push_interface_intent_for_device(mgmt.device_id, mgmt.adapter_device_id, force=True)
+        except Exception as exc:  # noqa: BLE001 — adapter may be down; ownership already recorded
+            logger.warning("apply_description_for_role: push failed for %s: %s", interface, exc)
 
     result["changed"] = changed
     result["description"] = new_value
@@ -201,15 +204,17 @@ def apply_description_for_role(interface, role, other_end=None) -> dict:
 # ── IGP consumer (Phase 5) ──────────────────────────────────────────────────────
 
 
-def enable_igp_for_role(interface, role) -> dict:
+def enable_igp_for_role(interface, role, push=True) -> dict:
     """Enable *interface* for the role's IGP (IS-IS or OSPF). Mutates overlay state.
 
     Creates/updates the matching interface overlay as ``accepted`` — an
     ``NSOISISInterfaceState`` (af ``ipv4``) with the role's circuit-type / metric /
     passive / process-tag, or an ``NSOOSPFInterfaceState`` with the role's area /
     network-type / cost / passive / process-id — then pushes via the existing IGP
-    intent pipe. ``igp=none`` is a no-op. Returns ``{interface, igp, enabled,
-    skipped, error}``. One end only; the orchestrator runs it on both.
+    intent pipe. ``igp=none`` is a no-op. *push* False skips the immediate adapter
+    push (the orchestrator defers pushes to after an atomic commit). Returns
+    ``{interface, igp, enabled, skipped, error}``. One end only; the orchestrator
+    runs it on both.
     """
     from django.utils import timezone
 
@@ -265,10 +270,137 @@ def enable_igp_for_role(interface, role) -> dict:
             )
         push_fn = _push_ospf_intent_for_device
 
-    try:
-        push_fn(mgmt.device_id, mgmt.adapter_device_id)
-    except Exception as exc:  # noqa: BLE001 — adapter may be down; ownership already recorded
-        logger.warning("enable_igp_for_role: push failed for %s: %s", interface, exc)
+    if push:
+        try:
+            push_fn(mgmt.device_id, mgmt.adapter_device_id)
+        except Exception as exc:  # noqa: BLE001 — adapter may be down; ownership already recorded
+            logger.warning("enable_igp_for_role: push failed for %s: %s", interface, exc)
 
     result["enabled"] = True
     return result
+
+
+# ── Link orchestrator (Phase 6) ─────────────────────────────────────────────────
+
+
+class _ProvisionRollback(Exception):
+    """Internal signal to roll back the provisioning transaction on any consumer error."""
+
+
+def _is_managed(interface) -> bool:
+    """Return True if the interface's device is NSO-managed with an adapter_device_id."""
+    from .models import NSODeviceManagement
+
+    return NSODeviceManagement.objects.filter(device_id=interface.device_id, adapter_device_id__isnull=False).exists()
+
+
+def _push_provisioned(role, device_ids) -> None:
+    """After a successful commit, push each affected (device, category) intent once."""
+    from .models import NSODeviceManagement
+    from .signals import (
+        _push_interface_intent_for_device,
+        _push_ip_intent_for_device,
+        _push_isis_intent_for_device,
+        _push_ospf_intent_for_device,
+    )
+
+    for device_id in device_ids:
+        mgmt = NSODeviceManagement.objects.filter(device_id=device_id).first()
+        if mgmt is None or mgmt.adapter_device_id is None:
+            continue
+        aid = mgmt.adapter_device_id
+        push_fns = []
+        if role.assign_ipv4 or role.assign_ipv6:
+            push_fns.append(_push_ip_intent_for_device)
+        if role.description_template:
+            push_fns.append(_push_interface_intent_for_device)
+        if role.igp == "isis":
+            push_fns.append(_push_isis_intent_for_device)
+        elif role.igp == "ospf":
+            push_fns.append(_push_ospf_intent_for_device)
+        for fn in push_fns:
+            try:
+                fn(device_id, aid)
+            except Exception as exc:  # noqa: BLE001 — adapter may be down; state already owned
+                logger.warning("provision_link_role: push failed for device %s: %s", device_id, exc)
+
+
+def provision_link_role(interface) -> dict:
+    """Provision a whole link/interface from its resolved ``NSOLinkRole``.
+
+    Resolves the role (and, for p2p, the peer via the cable), then runs the IP +
+    description + IGP consumers on both ends **inside one atomic envelope with
+    adapter pushes deferred**. On any consumer error the whole transaction is rolled
+    back (no partial device state, no adapter push); on success each affected
+    (device, category) intent is pushed once. Returns a summary::
+
+        {role, provisioned, rolled_back, skipped, ip, descriptions, igp, errors}
+
+    A missing/disabled role, a p2p role with no cable peer, or an end whose device
+    is not NSO-managed is a clean **skip** (nothing written), distinct from a
+    partial-failure **rollback**.
+    """
+    from django.db import transaction
+
+    from .ip_autoassign import assign_ips_for_role
+    from .signals import suppress_intent_push
+
+    role, other_end = resolve_role(interface)
+    summary = {
+        "role": role.slug if role else None,
+        "provisioned": False,
+        "rolled_back": False,
+        "skipped": None,
+        "ip": None,
+        "descriptions": [],
+        "igp": [],
+        "errors": [],
+    }
+    if role is None:
+        summary["skipped"] = "no link role assigned"
+        return summary
+    if not role.enabled:
+        summary["skipped"] = "link role is disabled"
+        return summary
+
+    if role.link_type == "p2p":
+        if other_end is None:
+            summary["skipped"] = "p2p role but no cable peer"
+            return summary
+        pairs = [(interface, other_end), (other_end, interface)]
+    else:
+        pairs = [(interface, None)]
+
+    # Pre-flight: every end must be NSO-managed — skip rather than half-provision.
+    for end, _peer in pairs:
+        if not _is_managed(end):
+            summary["skipped"] = f"{end} is not NSO-managed"
+            return summary
+
+    def _collect(res, kind):
+        if isinstance(res.get("errors"), list):
+            summary["errors"].extend({"kind": kind, **e} for e in res["errors"])
+        elif res.get("error"):
+            summary["errors"].append({"kind": kind, "reason": res["error"], "interface": res.get("interface")})
+
+    try:
+        with suppress_intent_push(), transaction.atomic():
+            ip_res = assign_ips_for_role(interface, role, other_end, push=False)
+            summary["ip"] = ip_res
+            _collect(ip_res, "ip")
+            for end, peer in pairs:
+                d = apply_description_for_role(end, role, peer, push=False)
+                summary["descriptions"].append(d)
+                _collect(d, "description")
+                g = enable_igp_for_role(end, role, push=False)
+                summary["igp"].append(g)
+                _collect(g, "igp")
+            if summary["errors"]:
+                raise _ProvisionRollback()
+    except _ProvisionRollback:
+        summary["rolled_back"] = True
+        return summary
+
+    _push_provisioned(role, {end.device_id for end, _peer in pairs})
+    summary["provisioned"] = True
+    return summary

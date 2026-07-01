@@ -2033,6 +2033,54 @@ class NSOAutoAssignIPView(NSOActionPermissionMixin, View):
         return redirect(_device_nso_tab_url(device.pk))
 
 
+class NSOProvisionLinkRoleView(NSOActionPermissionMixin, View):
+    """Operator action: provision one or more interfaces from their link roles.
+
+    POST body: ``interface_pks`` (comma-separated or repeated). For each interface
+    the resolved ``NSOLinkRole`` drives IP + description + IGP on both ends (p2p) or
+    the interface (single-ended), atomically. Redirects to the device NSO tab with a
+    per-interface summary flash.
+    """
+
+    def post(self, request, device_pk):
+        """Provision the requested interfaces from their assigned link roles."""
+        from dcim.models import Interface
+
+        from .link_role import provision_link_role
+
+        device = get_object_or_404(Device, pk=device_pk)
+        pks_raw = request.POST.getlist("interface_pks") or request.POST.get("interface_pks", "").split(",")
+        pks = [int(p.strip()) for p in pks_raw if p.strip().isdigit()]
+
+        if not pks:
+            messages.warning(request, "No interfaces selected for link-role provisioning.")
+            return redirect(_device_nso_tab_url(device.pk))
+
+        provisioned, skipped, rolled_back = 0, 0, 0
+        for iface in Interface.objects.filter(pk__in=pks, device=device):
+            summary = provision_link_role(iface)
+            if summary["provisioned"]:
+                provisioned += 1
+            elif summary["rolled_back"]:
+                rolled_back += 1
+                for err in summary["errors"]:
+                    messages.warning(request, f"{iface.name}: {err.get('reason', 'provisioning error')}")
+            elif summary["skipped"]:
+                skipped += 1
+                messages.info(request, f"{iface.name}: {summary['skipped']}")
+
+        if provisioned:
+            messages.success(
+                request,
+                f"Provisioned {provisioned} interface(s) from link roles "
+                f"({skipped} skipped, {rolled_back} rolled back).",
+            )
+        elif rolled_back:
+            messages.error(request, f"Link-role provisioning rolled back for {rolled_back} interface(s).")
+
+        return redirect(_device_nso_tab_url(device.pk))
+
+
 # ── Routing state accept views (Track A) ──────────────────────────────────────
 
 

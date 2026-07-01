@@ -254,6 +254,12 @@ urlpatterns = [
         views.NSOAutoAssignIPView.as_view(),
         name="device_auto_assign_ip",
     ),
+    # Link-role provisioning operator action
+    path(
+        "devices/<int:device_pk>/provision-link-role/",
+        views.NSOProvisionLinkRoleView.as_view(),
+        name="device_provision_link_role",
+    ),
     # AJAX: NSO device names for match form datalist
     path(
         "ajax/nso-device-names/<int:instance_pk>/",
