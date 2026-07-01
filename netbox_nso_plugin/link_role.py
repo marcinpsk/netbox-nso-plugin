@@ -116,3 +116,83 @@ def resolve_role(interface):
                 return role, other
 
     return None, None
+
+
+# ── Description consumer (Phase 4) ──────────────────────────────────────────────
+
+
+def _render_role_description(template: str, interface, peer) -> str:
+    """Render *template* with the M8 placeholder set for *interface* (and *peer*).
+
+    Mirrors ``derived_intent.render_template`` but tolerates ``peer is None``
+    (single-ended roles): the ``peer_*`` placeholders render empty. Placeholders
+    are validated against ``KNOWN_PLACEHOLDERS`` at role save time (``clean()``).
+    """
+    fields = {
+        "self_host": interface.device.name,
+        "self_iface": interface.name,
+        "peer_host": "",
+        "peer_iface": "",
+        "peer_site": "",
+        "peer_role": "",
+    }
+    if peer is not None:
+        fields["peer_host"] = peer.device.name
+        fields["peer_iface"] = peer.name
+        fields["peer_site"] = peer.device.site.name if peer.device.site_id else ""
+        fields["peer_role"] = peer.device.role.name if getattr(peer.device, "role_id", None) else ""
+    return template.format(**fields)
+
+
+def apply_description_for_role(interface, role, other_end=None) -> dict:
+    """Render + own the interface description from *role*'s template. Mutates state.
+
+    Sets ``dcim.Interface.description`` to the rendered template and marks an
+    ``NSOInterfaceState`` (attribute ``description``) as ``accepted`` so the change
+    is owned and pushed via the existing interface-intent pipe (reuses the M8
+    description contract). ``p2p`` roles use *other_end* for the ``peer_*``
+    placeholders; ``single`` roles render with those blank. A role with no template
+    is a no-op. Returns ``{interface, changed, description, skipped, error}``.
+    """
+    from django.utils import timezone
+
+    from .models import NSODeviceManagement, NSOInterfaceState
+    from .signals import _push_interface_intent_for_device, suppress_intent_push
+
+    result = {"interface": str(interface), "changed": False, "description": None, "skipped": None, "error": None}
+
+    if not role.description_template:
+        result["skipped"] = "role does not manage the description"
+        return result
+
+    try:
+        mgmt = NSODeviceManagement.objects.get(device_id=interface.device_id)
+    except NSODeviceManagement.DoesNotExist:
+        result["error"] = "Device is not managed by NSO"
+        return result
+    if mgmt.adapter_device_id is None:
+        result["error"] = "Device has no adapter_device_id"
+        return result
+
+    new_value = _render_role_description(role.description_template, interface, other_end)
+    changed = interface.description != new_value
+
+    # Set the value + own it locally under suppression, then push once explicitly.
+    with suppress_intent_push():
+        if changed:
+            interface.description = new_value
+            interface.save(update_fields=["description"])
+        NSOInterfaceState.objects.update_or_create(
+            interface=interface,
+            attribute="description",
+            defaults={"status": "accepted", "accepted_at": timezone.now()},
+        )
+
+    try:
+        _push_interface_intent_for_device(mgmt.device_id, mgmt.adapter_device_id, force=True)
+    except Exception as exc:  # noqa: BLE001 — adapter may be down; ownership already recorded
+        logger.warning("apply_description_for_role: push failed for %s: %s", interface, exc)
+
+    result["changed"] = changed
+    result["description"] = new_value
+    return result

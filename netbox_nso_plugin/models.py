@@ -2178,6 +2178,18 @@ class NSOLinkRole(NetBoxModel):
             errors[NON_FIELD_ERRORS] = [
                 "A link role must drive at least one output: an IP family, a description template, or an IGP."
             ]
+        # 5. The description template may only use the M8 known placeholders.
+        if self.description_template:
+            import string
+
+            from .derived_intent import KNOWN_PLACEHOLDERS
+
+            used = {fn for _, fn, _, _ in string.Formatter().parse(self.description_template) if fn is not None}
+            unknown = used - KNOWN_PLACEHOLDERS
+            if unknown:
+                errors["description_template"] = (
+                    f"Unknown placeholder(s): {sorted(unknown)}. Known: {sorted(KNOWN_PLACEHOLDERS)}"
+                )
         if errors:
             raise ValidationError(errors)
 
