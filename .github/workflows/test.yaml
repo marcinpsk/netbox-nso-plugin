@@ -24,7 +24,7 @@ jobs:
       max-parallel: 4
       matrix:
         python-version: ["3.12", "3.13"]
-        netbox-version: ["v4.6.0"]
+        netbox-version: ["v4.6.1"]
 
     services:
       redis:
@@ -71,6 +71,8 @@ jobs:
         run: |
           uv pip install --system -r ../netbox/requirements.txt
           uv pip install --system pytest pytest-django tblib coverage
+          # netbox_routing fork: the plugin has hard FKs to its ISIS/OSPF/BGP/StaticRoute models
+          uv pip install --system "netbox-routing @ git+https://github.com/marcinpsk/netbox-routing.git@feature/integration"
           uv pip install --system -e .
 
       - name: Set up NetBox configuration
@@ -93,7 +95,7 @@ jobs:
           }
           SECRET_KEY = 'test-secret-key-not-for-production-1234567890123456'
           API_TOKEN_PEPPERS = {0: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'}
-          PLUGINS = ['netbox_nso_plugin']
+          PLUGINS = ['netbox_routing', 'netbox_nso_plugin']
           PLUGINS_CONFIG = {
               'netbox_nso_plugin': {
                   'adapter_url': 'https://adapter.mock.invalid',
