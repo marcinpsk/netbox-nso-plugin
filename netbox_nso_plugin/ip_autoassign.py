@@ -2,10 +2,18 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """IP auto-assignment from purpose Prefix pools.
 
-Phase A: single-ended allocation for loopback and access interfaces.
-Phase B (P2P reserve-then-activate) is a follow-on milestone.
+Two allocation shapes, both fully implemented:
 
-Public entry point: :func:`auto_assign_ip`.
+* **Single-ended** (loopback / access): draw one host per family, fill-empty-only.
+* **P2P** (core links): reserve-then-activate — carve a child prefix, reserve both
+  host halves, link the two ends, push both, roll back on partial failure.
+
+Public entry points:
+
+* :func:`auto_assign_ip` — classify the interface (M13 heuristic) then allocate.
+* :func:`assign_ips_for_role` — allocate from an :class:`~netbox_nso_plugin.models.NSOLinkRole`'s
+  configured pool + mask (link-role provisioning); reuses the same carve/reserve/
+  rollback machinery, parameterized by the role instead of the hardcoded ``p2p-core``.
 """
 
 from __future__ import annotations
@@ -95,26 +103,16 @@ def classify_interface(interface) -> str | None:
 # ── Pool matching ─────────────────────────────────────────────────────────────
 
 
-def find_pool(classification: str, vrf, site, family: str):
-    """Find the best-matching Prefix pool for (classification, vrf, site, family).
+def _select_pool_by_role_slug(role_slug: str, vrf, site, family: str):
+    """Return the first available Prefix pool with ``role__slug == role_slug``.
 
-    Selection:
-    1. Match ``Prefix.role__slug`` → the classification role slug.
-    2. Narrow by VRF; fall back to global (vrf=None) if no VRF-specific pool.
-    3. Narrow by site scope; skip site filter when no match found.
-    4. Return the first pool with available space.
-
-    Returns a ``Prefix`` instance or ``None`` (no pool / all exhausted).
+    The shared pool-selection core: family + VRF (fall back to global) + site-scope
+    narrowing, first pool with a free host. Used both by :func:`find_pool` (after
+    mapping a classification to a slug) and by the link-role pool resolver (which
+    passes the role's ``ipvX_pool_role`` slug verbatim).
     """
-    from django.apps import apps
+    from django.contrib.contenttypes.models import ContentType
     from ipam.models import Prefix  # NetBox IPAM model
-
-    cfg = apps.get_app_config("netbox_nso_plugin")
-    role_slug_map: dict[str, str] = getattr(cfg, "_ip_pool_role_slugs", _DEFAULT_ROLE_SLUGS)
-    role_slug = role_slug_map.get(classification)
-    if role_slug is None:
-        logger.debug("ip_autoassign: no role slug for classification %r", classification)
-        return None
 
     af = 4 if family == "ipv4" else 6
     base_qs = Prefix.objects.filter(role__slug=role_slug, prefix__family=af)
@@ -128,8 +126,6 @@ def find_pool(classification: str, vrf, site, family: str):
     def _with_site(qs):
         if site is not None:
             try:
-                from django.contrib.contenttypes.models import ContentType
-
                 site_ct = ContentType.objects.get_for_model(site)
                 narrowed = qs.filter(scope_type=site_ct, scope_id=site.pk)
                 return narrowed if narrowed.exists() else qs
@@ -144,18 +140,71 @@ def find_pool(classification: str, vrf, site, family: str):
     return None
 
 
+def find_pool(classification: str, vrf, site, family: str):
+    """Find the best-matching Prefix pool for (classification, vrf, site, family).
+
+    Maps *classification* → a Prefix role slug (via the configurable role-slug map),
+    then delegates to :func:`_select_pool_by_role_slug`.
+
+    Returns a ``Prefix`` instance or ``None`` (no pool / all exhausted).
+    """
+    from django.apps import apps
+
+    cfg = apps.get_app_config("netbox_nso_plugin")
+    role_slug_map: dict[str, str] = getattr(cfg, "_ip_pool_role_slugs", _DEFAULT_ROLE_SLUGS)
+    role_slug = role_slug_map.get(classification)
+    if role_slug is None:
+        logger.debug("ip_autoassign: no role slug for classification %r", classification)
+        return None
+    return _select_pool_by_role_slug(role_slug, vrf, site, family)
+
+
+def _prefix_family(prefix) -> int | None:
+    """Return 4 or 6 for a Prefix, tolerating string-vs-netaddr prefix values."""
+    try:
+        return prefix.prefix.version
+    except Exception:
+        fam = getattr(prefix, "family", None)
+        return fam if fam in (4, 6) else None
+
+
+def _resolve_role_pool(spec, vrf, site):
+    """Resolve a :class:`~netbox_nso_plugin.link_role.PoolSpec` to a Prefix pool.
+
+    The explicit ``prefix`` wins (reloaded fresh and verified to match the spec's
+    family — an FK-cached Prefix can carry an unconverted ``prefix`` value that
+    breaks ``get_first_available_ip``); otherwise the ``role_slug`` is matched via
+    :func:`_select_pool_by_role_slug`. Returns ``None`` when neither yields a pool.
+    """
+    from ipam.models import Prefix
+
+    af = 4 if spec.family == "ipv4" else 6
+    if spec.prefix is not None:
+        pool = Prefix.objects.filter(pk=spec.prefix.pk).first()
+        if pool is None or _prefix_family(pool) != af:
+            return None
+        return pool
+    if spec.role_slug:
+        return _select_pool_by_role_slug(spec.role_slug, vrf, site, spec.family)
+    return None
+
+
 # ── P2P child-prefix carving ──────────────────────────────────────────────────
 
 
-def _get_p2p_child_length(pool, family: str) -> int:
+def _get_p2p_child_length(pool, family: str, override: int | None = None) -> int:
     """Resolve the P2P child-prefix length for *pool* and *family*.
 
     Priority:
+    0. An explicit *override* (e.g. an NSOLinkRole's ``ipv4_mask``/``ipv6_mask``).
     1. Per-pool custom field ``p2p_child_length_v4`` / ``p2p_child_length_v6``.
     2. Plugin-wide config ``p2p_child_length_v4`` / ``p2p_child_length_v6``.
     3. Built-in defaults: 31 (IPv4) / 127 (IPv6).
     """
     from django.apps import apps
+
+    if override is not None:
+        return int(override)
 
     family_key = "v4" if family == "ipv4" else "v6"
     defaults = {"v4": 31, "v6": 127}
@@ -176,13 +225,16 @@ def _get_p2p_child_length(pool, family: str) -> int:
     return defaults[family_key]
 
 
-def carve_p2p_child(pool, family: str):
+def carve_p2p_child(pool, family: str, override_mask: int | None = None):
     """Carve a child prefix from P2P pool *pool* for address-family *family*.
 
     Returns ``(child_prefix, host_a_str, host_b_str)`` where ``host_a_str``
     and ``host_b_str`` are ``'IP/length'`` strings ready for use as
     ``IPAddress.address``.  Returns ``None`` when the pool has no available
     block large enough for the configured child length.
+
+    *override_mask* forces the child length (an NSOLinkRole's mask); when ``None``
+    the length is resolved from the pool CF / config / default.
 
     The carved ``Prefix`` is written to IPAM with ``status="reserved"``
     so that concurrent allocators cannot re-use the same range.
@@ -191,7 +243,7 @@ def carve_p2p_child(pool, family: str):
     """
     from ipam.models import Prefix
 
-    length = _get_p2p_child_length(pool, family)
+    length = _get_p2p_child_length(pool, family, override_mask)
     pool.refresh_from_db()  # ensure pool.prefix is netaddr.IPNetwork, not a string
     available = pool.get_available_prefixes()
 
@@ -242,7 +294,11 @@ def rollback_auto_assigned(state, _cascade: bool = True) -> None:
         return
 
     # Capture P2P references before any deletions (objects may be nulled).
-    peer_state = state.peer_state
+    # Only follow peer_state on the primary (cascading) call: in the cascaded
+    # (peer) call the sibling has already been deleted, and peer_state is
+    # SET_NULL, so re-reading the FK here would raise DoesNotExist against the
+    # stale in-memory id.
+    peer_state = state.peer_state if _cascade else None
     source_pool = state.source_pool
 
     try:
@@ -318,8 +374,27 @@ def _delete_if_set(*objs):
                 pass
 
 
-def _assign_one_p2p_family(interface, peer_iface, mgmt, peer_mgmt, family, site, result):
-    """Attempt one address-family allocation for a P2P pair.  Mutates *result*."""
+def _assign_one_p2p_family(
+    interface,
+    peer_iface,
+    mgmt,
+    peer_mgmt,
+    family,
+    site,
+    result,
+    *,
+    pool_finder=None,
+    no_pool_reason=None,
+    override_mask=None,
+):
+    """Attempt one address-family allocation for a P2P pair.  Mutates *result*.
+
+    By default this resolves the ``p2p-core`` pool via :func:`find_pool` (the M13
+    behavior). The link-role path passes *pool_finder* (a ``(family, site) -> Prefix``
+    callable resolving the role's pool), *no_pool_reason* (a ``family -> str`` for the
+    error message), and *override_mask* (the role's child mask) to reuse the exact
+    same carve/reserve/rollback flow with a role-configured pool instead.
+    """
     from django.db import transaction
     from django.db.models import Q
     from django.utils import timezone
@@ -330,17 +405,20 @@ def _assign_one_p2p_family(interface, peer_iface, mgmt, peer_mgmt, family, site,
 
     _OCCUPIED = ("reserved", "accepted", "deploying", "in_sync")
 
+    if pool_finder is None:
+        pool_finder = lambda fam, s: find_pool("p2p-core", None, s, fam)  # noqa: E731
+    if no_pool_reason is None:
+        no_pool_reason = lambda fam: f"No {fam} p2p-core pool found"  # noqa: E731
+
     # Wrap the occupancy check + carve in a transaction and lock the pool row so
     # concurrent callers for the same pool serialize rather than racing for the
     # same available space.  Without this a TOCTOU window allows two callers to
     # read the same available block and both attempt to create overlapping child
     # prefixes, producing an unhandled IntegrityError from the unique constraint.
     with transaction.atomic():
-        pool = find_pool("p2p-core", None, site, family)
+        pool = pool_finder(family, site)
         if pool is None:
-            result["errors"].append(
-                {"interface": str(interface), "family": family, "reason": f"No {family} p2p-core pool found"}
-            )
+            result["errors"].append({"interface": str(interface), "family": family, "reason": no_pool_reason(family)})
             return
 
         # Row-level lock on the pool prefix: serializes concurrent carves for
@@ -361,7 +439,7 @@ def _assign_one_p2p_family(interface, peer_iface, mgmt, peer_mgmt, family, site,
             )
             return
 
-        carved = carve_p2p_child(pool, family)
+        carved = carve_p2p_child(pool, family, override_mask)
     if carved is None:
         result["errors"].append(
             {
@@ -474,14 +552,112 @@ def _auto_assign_p2p(interface, peer_iface, mgmt, peer_mgmt, families, result):
     return result
 
 
+# ── Single-ended allocation helpers ─────────────────────────────────────────────
+
+
+def _single_family_occupied(interface, family: str) -> bool:
+    """Fill-empty guard: True if a managed IP already exists for (interface, family)."""
+    from .models import NSOInterfaceIPState
+
+    return NSOInterfaceIPState.objects.filter(
+        interface=interface,
+        family=family,
+        status__in=("reserved", "accepted", "deploying", "in_sync"),
+    ).exists()
+
+
+def _reserve_single(interface, mgmt, family: str, pool, result) -> None:
+    """Draw one host from *pool*, reserve it, create the accepted state, push. Mutates *result*.
+
+    The caller has already resolved *pool* and passed the fill-empty guard; this is
+    the shared reserve/state/push body used by both the M13 classification path and
+    the link-role single-ended path.
+    """
+    from django.utils import timezone
+    from ipam.models import IPAddress
+
+    from .models import NSOInterfaceIPState
+    from .signals import _push_ip_intent_for_device
+
+    available_str = pool.get_first_available_ip()
+    if available_str is None:
+        result["errors"].append(
+            {
+                "interface": str(interface),
+                "family": family,
+                "reason": f"Pool {pool} is exhausted (no available IPs)",
+            }
+        )
+        return
+
+    # Reserve the IPAddress in IPAM so concurrent allocations don't collide.
+    try:
+        ip_obj = IPAddress(address=available_str, status="reserved")
+        ip_obj.assigned_object = interface
+        ip_obj.save()
+    except Exception as exc:
+        result["errors"].append(
+            {"interface": str(interface), "family": family, "reason": f"Failed to create IPAddress: {exc}"}
+        )
+        return
+
+    vrf_name = pool.vrf.name if pool.vrf else ""
+
+    # Create (or update the signal-created) NSOInterfaceIPState as 'accepted'.
+    try:
+        state, _ = NSOInterfaceIPState.objects.update_or_create(
+            interface=interface,
+            address=available_str,
+            vrf=vrf_name,
+            defaults={
+                "family": family,
+                "status": "accepted",
+                "auto_assigned": True,
+                "source_pool": pool,
+                "accepted_at": timezone.now(),
+            },
+        )
+    except Exception as exc:
+        try:
+            ip_obj.delete()
+        except Exception:
+            pass
+        result["errors"].append(
+            {"interface": str(interface), "family": family, "reason": f"Failed to create NSOInterfaceIPState: {exc}"}
+        )
+        return
+
+    try:
+        _push_ip_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+    except Exception as exc:
+        logger.warning(
+            "ip_autoassign: failed to push IP intent for device %s after allocating %s: %s",
+            mgmt.device_id,
+            available_str,
+            exc,
+        )
+
+    result["allocated"].append(
+        {
+            "interface": str(interface),
+            "family": family,
+            "address": available_str,
+            "pool": str(pool),
+            "state_id": state.pk,
+        }
+    )
+    logger.info("ip_autoassign: allocated %s (%s) from pool %s for %s", available_str, family, pool, interface)
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 
 def auto_assign_ip(interface, families: tuple[str, ...] = ("ipv4", "ipv6")) -> dict:
     """Allocate one IP per requested address family for *interface*.
 
-    Phase A: loopback and access links (single-ended, fill-empty-only).
-    P2P core (``"p2p-core"`` classification) is deferred to Phase B.
+    Classifies the interface (M13 heuristic): loopback / access links are
+    single-ended (fill-empty-only); ``p2p-core`` links use the P2P
+    reserve-then-activate flow for both ends.
 
     **Fill-empty-only:** an interface that already has an accepted/deploying/
     in_sync/reserved ``NSOInterfaceIPState`` row in the given family is skipped.
@@ -495,11 +671,7 @@ def auto_assign_ip(interface, families: tuple[str, ...] = ("ipv4", "ipv6")) -> d
             "errors":    [{"interface": ..., "family": ..., "reason": ...}, ...],
         }
     """
-    from django.utils import timezone
-    from ipam.models import IPAddress
-
-    from .models import NSODeviceManagement, NSOInterfaceIPState
-    from .signals import _push_ip_intent_for_device
+    from .models import NSODeviceManagement
 
     result: dict = {"allocated": [], "skipped": [], "errors": []}
 
@@ -553,12 +725,7 @@ def auto_assign_ip(interface, families: tuple[str, ...] = ("ipv4", "ipv6")) -> d
 
     for family in families:
         # Fill-empty guard: skip if a managed IP already exists in this family.
-        occupied = NSOInterfaceIPState.objects.filter(
-            interface=interface,
-            family=family,
-            status__in=("reserved", "accepted", "deploying", "in_sync"),
-        ).exists()
-        if occupied:
+        if _single_family_occupied(interface, family):
             result["skipped"].append(
                 {
                     "interface": str(interface),
@@ -579,93 +746,102 @@ def auto_assign_ip(interface, families: tuple[str, ...] = ("ipv4", "ipv6")) -> d
             )
             continue
 
-        available_str = pool.get_first_available_ip()
-        if available_str is None:
+        _reserve_single(interface, mgmt, family, pool, result)
+
+    return result
+
+
+# ── Link-role entry point ───────────────────────────────────────────────────────
+
+
+def assign_ips_for_role(interface, role, other_end=None) -> dict:
+    """Allocate IPs for *interface* from an ``NSOLinkRole``'s configured pools + mask.
+
+    The link-role counterpart to :func:`auto_assign_ip`: the pool (explicit Prefix
+    or role slug) and the p2p child mask come from *role* rather than the M13
+    heuristic, but the carve/reserve/rollback/TOCTOU machinery is shared.
+
+    * ``p2p`` role → *other_end* is the peer interface (from
+      ``link_role.resolve_role``); both ends are allocated together.
+    * ``single`` role → one host per opted-in family for this interface only.
+
+    Fill-empty-only. Returns the ``{allocated, skipped, errors}`` dict. A role that
+    manages no IP family is a no-op (empty result).
+    """
+    from .link_role import intent_bundle
+    from .models import NSODeviceManagement
+
+    result: dict = {"allocated": [], "skipped": [], "errors": []}
+
+    bundle = intent_bundle(role)
+    if not bundle.pools:
+        return result  # role does not manage IP → nothing to do
+
+    # Gate: device must be managed by NSO.
+    try:
+        mgmt = NSODeviceManagement.objects.get(device=interface.device)
+    except NSODeviceManagement.DoesNotExist:
+        result["errors"].append({"interface": str(interface), "reason": "Device is not managed by NSO"})
+        return result
+    if mgmt.adapter_device_id is None:
+        result["errors"].append({"interface": str(interface), "reason": "Device has no adapter_device_id"})
+        return result
+
+    site = getattr(interface.device, "site", None)
+
+    if role.link_type == "p2p":
+        peer_iface = other_end
+        if peer_iface is None:
+            result["errors"].append({"interface": str(interface), "reason": "P2P role: no cable peer found"})
+            return result
+        try:
+            peer_mgmt = NSODeviceManagement.objects.get(device=peer_iface.device)
+        except NSODeviceManagement.DoesNotExist:
             result["errors"].append(
+                {"interface": str(interface), "reason": "P2P role: peer device is not managed by NSO"}
+            )
+            return result
+        if peer_mgmt.adapter_device_id is None:
+            result["errors"].append(
+                {"interface": str(interface), "reason": "P2P role: peer device has no adapter_device_id"}
+            )
+            return result
+        for spec in bundle.pools:
+            _assign_one_p2p_family(
+                interface,
+                peer_iface,
+                mgmt,
+                peer_mgmt,
+                spec.family,
+                site,
+                result,
+                pool_finder=(lambda fam, s, _spec=spec: _resolve_role_pool(_spec, None, s)),
+                no_pool_reason=(lambda fam, _slug=role.slug: f"No {fam} pool found for role '{_slug}'"),
+                override_mask=spec.mask,
+            )
+        return result
+
+    # Single-ended role (loopback / access): one host per opted-in family.
+    for spec in bundle.pools:
+        if _single_family_occupied(interface, spec.family):
+            result["skipped"].append(
                 {
                     "interface": str(interface),
-                    "family": family,
-                    "reason": f"Pool {pool} is exhausted (no available IPs)",
+                    "family": spec.family,
+                    "reason": "Already has a managed IP in this family",
                 }
             )
             continue
-
-        # Reserve the IPAddress in IPAM so concurrent allocations don't collide.
-        try:
-            ip_obj = IPAddress(address=available_str, status="reserved")
-            ip_obj.assigned_object = interface
-            ip_obj.save()
-        except Exception as exc:
+        pool = _resolve_role_pool(spec, None, site)
+        if pool is None:
             result["errors"].append(
                 {
                     "interface": str(interface),
-                    "family": family,
-                    "reason": f"Failed to create IPAddress: {exc}",
+                    "family": spec.family,
+                    "reason": f"No {spec.family} pool found for role '{role.slug}'",
                 }
             )
             continue
-
-        vrf_name = pool.vrf.name if pool.vrf else ""
-
-        # Create (or update the signal-created) NSOInterfaceIPState as 'accepted'.
-        # The IPAddress save above may have triggered _on_ip_address_save which
-        # already created a NSOInterfaceIPState row — update_or_create handles both.
-        try:
-            state, _ = NSOInterfaceIPState.objects.update_or_create(
-                interface=interface,
-                address=available_str,
-                vrf=vrf_name,
-                defaults={
-                    "family": family,
-                    "status": "accepted",
-                    "auto_assigned": True,
-                    "source_pool": pool,
-                    "accepted_at": timezone.now(),
-                },
-            )
-        except Exception as exc:
-            # State creation failed — undo the IPAddress so IPAM stays clean.
-            try:
-                ip_obj.delete()
-            except Exception:
-                pass
-            result["errors"].append(
-                {
-                    "interface": str(interface),
-                    "family": family,
-                    "reason": f"Failed to create NSOInterfaceIPState: {exc}",
-                }
-            )
-            continue
-
-        # Explicitly push the device's IP intent (write pipe) so the new
-        # address is sent to NSO.  Signal-driven push will fire on the next
-        # IPAddress save, but we push now to be immediate.
-        try:
-            _push_ip_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
-        except Exception as exc:
-            logger.warning(
-                "ip_autoassign: failed to push IP intent for device %s after allocating %s: %s",
-                mgmt.device_id,
-                available_str,
-                exc,
-            )
-
-        result["allocated"].append(
-            {
-                "interface": str(interface),
-                "family": family,
-                "address": available_str,
-                "pool": str(pool),
-                "state_id": state.pk,
-            }
-        )
-        logger.info(
-            "ip_autoassign: allocated %s (%s) from pool %s for %s",
-            available_str,
-            family,
-            pool,
-            interface,
-        )
+        _reserve_single(interface, mgmt, spec.family, pool, result)
 
     return result
