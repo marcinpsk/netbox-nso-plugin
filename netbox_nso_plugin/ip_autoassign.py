@@ -310,9 +310,17 @@ def rollback_auto_assigned(state, _cascade: bool = True) -> None:
                 vrf_obj = VRF.objects.get(name=state.vrf)
             except Exception:
                 pass
+        # Scope by BOTH the content type and the id: assigned_object_id is a bare
+        # GenericForeignKey pk shared across content types, so filtering on the id
+        # alone could match (and delete) an IPAddress at the same address+VRF that
+        # is assigned to a non-Interface object whose pk collides with ours.
+        from dcim.models import Interface as _Interface
+        from django.contrib.contenttypes.models import ContentType
+
         ip_obj = IPAddress.objects.filter(
             address=state.address,
             vrf=vrf_obj,
+            assigned_object_type=ContentType.objects.get_for_model(_Interface),
             assigned_object_id=state.interface_id,
         ).first()
         if ip_obj is not None:
@@ -383,18 +391,19 @@ def _assign_one_p2p_family(
     site,
     result,
     *,
-    pool_finder=None,
-    no_pool_reason=None,
+    pool_finder,
+    no_pool_reason,
     override_mask=None,
     push=True,
 ):
     """Attempt one address-family allocation for a P2P pair.  Mutates *result*.
 
-    By default this resolves the ``p2p-core`` pool via :func:`find_pool` (the M13
-    behavior). The link-role path passes *pool_finder* (a ``(family, site) -> Prefix``
-    callable resolving the role's pool), *no_pool_reason* (a ``family -> str`` for the
-    error message), and *override_mask* (the role's child mask) to reuse the exact
-    same carve/reserve/rollback flow with a role-configured pool instead.
+    Both entry points parameterize the pool decision the same way: *pool_finder* is
+    a ``(family, site) -> Prefix`` callable, *no_pool_reason* a ``family -> str`` for
+    the error message, and *override_mask* the child mask. The M13 heuristic path
+    (:func:`_auto_assign_p2p`) resolves ``p2p-core`` via :func:`find_pool`; the
+    link-role path resolves the role's configured pool — both reuse this one
+    carve/reserve/rollback flow.
     """
     from django.db import transaction
     from django.db.models import Q
@@ -405,11 +414,6 @@ def _assign_one_p2p_family(
     from .signals import _push_ip_intent_for_device
 
     _OCCUPIED = ("reserved", "accepted", "deploying", "in_sync")
-
-    if pool_finder is None:
-        pool_finder = lambda fam, s: find_pool("p2p-core", None, s, fam)  # noqa: E731
-    if no_pool_reason is None:
-        no_pool_reason = lambda fam: f"No {fam} p2p-core pool found"  # noqa: E731
 
     # Wrap the occupancy check + carve in a transaction and lock the pool row so
     # concurrent callers for the same pool serialize rather than racing for the
@@ -464,7 +468,9 @@ def _assign_one_p2p_family(
             ip_b.assigned_object = peer_iface
             ip_b.save()
     except Exception as exc:
-        _delete_if_set(ip_a, child_prefix)
+        # ip_b may already be persisted (a post-INSERT signal error can raise after
+        # ip_b.save() committed the row) — clean both ends, not just ip_a.
+        _delete_if_set(ip_a, ip_b, child_prefix)
         result["errors"].append(
             {"interface": str(interface), "family": family, "reason": f"Failed to reserve P2P IPAddresses: {exc}"}
         )
@@ -502,7 +508,9 @@ def _assign_one_p2p_family(
         state_b.peer_state = state_a
         state_b.save(update_fields=["peer_state"])
     except Exception as exc:
-        _delete_if_set(ip_a, ip_b, child_prefix, state_a)
+        # state_b is created before the peer_state links save; include it so a
+        # mid-link failure never leaves an orphan 'accepted' row on the peer end.
+        _delete_if_set(ip_a, ip_b, child_prefix, state_a, state_b)
         result["errors"].append(
             {"interface": str(interface), "family": family, "reason": f"Failed to create P2P state records: {exc}"}
         )
@@ -550,7 +558,17 @@ def _auto_assign_p2p(interface, peer_iface, mgmt, peer_mgmt, families, result):
     """Phase B: reserve-then-activate allocation for both ends of a P2P core link."""
     site = getattr(interface.device, "site", None)
     for family in families:
-        _assign_one_p2p_family(interface, peer_iface, mgmt, peer_mgmt, family, site, result)
+        _assign_one_p2p_family(
+            interface,
+            peer_iface,
+            mgmt,
+            peer_mgmt,
+            family,
+            site,
+            result,
+            pool_finder=lambda fam, s: find_pool("p2p-core", None, s, fam),  # noqa: E731
+            no_pool_reason=lambda fam: f"No {fam} p2p-core pool found",  # noqa: E731
+        )
     return result
 
 
@@ -653,6 +671,27 @@ def _reserve_single(interface, mgmt, family: str, pool, result, push=True) -> No
     logger.info("ip_autoassign: allocated %s (%s) from pool %s for %s", available_str, family, pool, interface)
 
 
+# ── Shared managed-device guard ─────────────────────────────────────────────────
+
+
+def _resolve_managed_mgmt(device, *, subject: str = "Device"):
+    """Return ``(NSODeviceManagement, None)`` for an NSO-managed *device*, else ``(None, reason)``.
+
+    The single guard shared by the IP / description / IGP consumers: a device with
+    no management row, or one without an ``adapter_device_id``, cannot receive
+    intent. *subject* prefixes the reason so a caller can tell the near end from the
+    far (peer) end (e.g. ``"P2P role: peer device"``).
+    """
+    from .models import NSODeviceManagement
+
+    mgmt = NSODeviceManagement.objects.filter(device=device).first()
+    if mgmt is None:
+        return None, f"{subject} is not managed by NSO"
+    if mgmt.adapter_device_id is None:
+        return None, f"{subject} has no adapter_device_id"
+    return mgmt, None
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 
@@ -675,19 +714,12 @@ def auto_assign_ip(interface, families: tuple[str, ...] = ("ipv4", "ipv6")) -> d
             "errors":    [{"interface": ..., "family": ..., "reason": ...}, ...],
         }
     """
-    from .models import NSODeviceManagement
-
     result: dict = {"allocated": [], "skipped": [], "errors": []}
 
     # Gate: device must be managed by NSO.
-    try:
-        mgmt = NSODeviceManagement.objects.get(device=interface.device)
-    except NSODeviceManagement.DoesNotExist:
-        result["errors"].append({"interface": str(interface), "reason": "Device is not managed by NSO"})
-        return result
-
-    if mgmt.adapter_device_id is None:
-        result["errors"].append({"interface": str(interface), "reason": "Device has no adapter_device_id"})
+    mgmt, reason = _resolve_managed_mgmt(interface.device)
+    if mgmt is None:
+        result["errors"].append({"interface": str(interface), "reason": reason})
         return result
 
     classification = classify_interface(interface)
@@ -704,23 +736,9 @@ def auto_assign_ip(interface, families: tuple[str, ...] = ("ipv4", "ipv6")) -> d
                 }
             )
             return result
-        try:
-            peer_mgmt = NSODeviceManagement.objects.get(device=peer_iface.device)
-        except NSODeviceManagement.DoesNotExist:
-            result["errors"].append(
-                {
-                    "interface": str(interface),
-                    "reason": "P2P core link: peer device is not managed by NSO",
-                }
-            )
-            return result
-        if peer_mgmt.adapter_device_id is None:
-            result["errors"].append(
-                {
-                    "interface": str(interface),
-                    "reason": "P2P core link: peer device has no adapter_device_id",
-                }
-            )
+        peer_mgmt, reason = _resolve_managed_mgmt(peer_iface.device, subject="P2P core link: peer device")
+        if peer_mgmt is None:
+            result["errors"].append({"interface": str(interface), "reason": reason})
             return result
         return _auto_assign_p2p(interface, peer_iface, mgmt, peer_mgmt, families, result)
 
@@ -758,7 +776,7 @@ def auto_assign_ip(interface, families: tuple[str, ...] = ("ipv4", "ipv6")) -> d
 # ── Link-role entry point ───────────────────────────────────────────────────────
 
 
-def assign_ips_for_role(interface, role, other_end=None, push=True) -> dict:
+def assign_ips_for_role(interface, role, other_end=None, push=True, *, mgmt=None, peer_mgmt=None) -> dict:
     """Allocate IPs for *interface* from an ``NSOLinkRole``'s configured pools + mask.
 
     The link-role counterpart to :func:`auto_assign_ip`: the pool (explicit Prefix
@@ -774,7 +792,6 @@ def assign_ips_for_role(interface, role, other_end=None, push=True) -> dict:
     errors}`` dict. A role that manages no IP family is a no-op (empty result).
     """
     from .link_role import intent_bundle
-    from .models import NSODeviceManagement
 
     result: dict = {"allocated": [], "skipped": [], "errors": []}
 
@@ -782,15 +799,12 @@ def assign_ips_for_role(interface, role, other_end=None, push=True) -> dict:
     if not bundle.pools:
         return result  # role does not manage IP → nothing to do
 
-    # Gate: device must be managed by NSO.
-    try:
-        mgmt = NSODeviceManagement.objects.get(device=interface.device)
-    except NSODeviceManagement.DoesNotExist:
-        result["errors"].append({"interface": str(interface), "reason": "Device is not managed by NSO"})
-        return result
-    if mgmt.adapter_device_id is None:
-        result["errors"].append({"interface": str(interface), "reason": "Device has no adapter_device_id"})
-        return result
+    # Gate: device must be managed by NSO (resolve unless the orchestrator threaded it).
+    if mgmt is None:
+        mgmt, reason = _resolve_managed_mgmt(interface.device)
+        if mgmt is None:
+            result["errors"].append({"interface": str(interface), "reason": reason})
+            return result
 
     site = getattr(interface.device, "site", None)
 
@@ -799,18 +813,11 @@ def assign_ips_for_role(interface, role, other_end=None, push=True) -> dict:
         if peer_iface is None:
             result["errors"].append({"interface": str(interface), "reason": "P2P role: no cable peer found"})
             return result
-        try:
-            peer_mgmt = NSODeviceManagement.objects.get(device=peer_iface.device)
-        except NSODeviceManagement.DoesNotExist:
-            result["errors"].append(
-                {"interface": str(interface), "reason": "P2P role: peer device is not managed by NSO"}
-            )
-            return result
-        if peer_mgmt.adapter_device_id is None:
-            result["errors"].append(
-                {"interface": str(interface), "reason": "P2P role: peer device has no adapter_device_id"}
-            )
-            return result
+        if peer_mgmt is None:
+            peer_mgmt, reason = _resolve_managed_mgmt(peer_iface.device, subject="P2P role: peer device")
+            if peer_mgmt is None:
+                result["errors"].append({"interface": str(interface), "reason": reason})
+                return result
         for spec in bundle.pools:
             _assign_one_p2p_family(
                 interface,

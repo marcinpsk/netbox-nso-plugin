@@ -841,3 +841,161 @@ class TestReconcileP2PBothInSync(TestCase):
         ip_b.refresh_from_db()
         self.assertEqual(ip_a.status, "active", "Peer IP (end A) must also be activated")
         self.assertEqual(ip_b.status, "active", "End B IP must be activated")
+
+
+class TestRollbackContentTypeScoping(TestCase):
+    """rollback_auto_assigned: the IPAddress lookup is scoped by content type."""
+
+    @classmethod
+    def setUpTestData(cls):
+        manufacturer = Manufacturer.objects.create(name="CtMfg", slug="ctmfg")
+        device_type = DeviceType.objects.create(manufacturer=manufacturer, model="CtDev", slug="ctdev")
+        role = DeviceRole.objects.create(name="CtRole", slug="ctrole")
+        site = Site.objects.create(name="CtSite", slug="ctsite")
+        cls.device = Device.objects.create(name="ct-router", device_type=device_type, role=role, site=site)
+
+    def test_rollback_does_not_delete_ip_of_a_different_content_type(self):
+        """A same-address/VRF IP assigned to a NON-Interface object whose pk collides
+        with the interface pk must survive rollback (GenericForeignKey id collision)."""
+        from django.contrib.contenttypes.models import ContentType
+
+        from netbox_nso_plugin.ip_autoassign import rollback_auto_assigned
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        iface = Interface.objects.create(device=self.device, name="Loopback250", type="virtual")
+        # Decoy: same address, assigned to a Device (not our Interface) at the SAME pk.
+        decoy = IPAddress.objects.create(address="10.210.0.1/32", status="active")
+        decoy.assigned_object_type = ContentType.objects.get_for_model(Device)
+        decoy.assigned_object_id = iface.pk
+        decoy.save()
+
+        state = NSOInterfaceIPState.objects.create(
+            interface=iface,
+            address="10.210.0.1/32",
+            family="ipv4",
+            status="accepted",
+            auto_assigned=True,
+        )
+        rollback_auto_assigned(state)
+
+        self.assertTrue(
+            IPAddress.objects.filter(pk=decoy.pk).exists(),
+            "rollback deleted an IPAddress belonging to a different content type (id collision)",
+        )
+
+
+class TestP2PAllocationFailureCleanup(TestCase):
+    """_assign_one_p2p_family: partial-failure cleanup leaves no orphan rows on the peer end."""
+
+    @classmethod
+    def setUpTestData(cls):
+        mfg = Manufacturer.objects.create(name="P2FailMfg", slug="p2failmfg")
+        dt = DeviceType.objects.create(manufacturer=mfg, model="P2FailDev", slug="p2faildev")
+        role = DeviceRole.objects.create(name="P2FailRole", slug="p2failrole")
+        site = Site.objects.create(name="P2FailSite", slug="p2failsite")
+        cls.device_a = Device.objects.create(name="p2fail-a", device_type=dt, role=role, site=site)
+        cls.device_b = Device.objects.create(name="p2fail-b", device_type=dt, role=role, site=site)
+        cls.p2p_role = Role.objects.create(name="P2P Fail Core", slug="p2p-core")
+        cls.pool = Prefix.objects.create(prefix="10.98.0.0/24", role=cls.p2p_role)
+
+    def _make_mgmt(self, device, name):
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+        inst, _ = NSOInstance.objects.get_or_create(
+            name="test-nso-fail", defaults={"adapter_instance_id": "test-nso-fail"}
+        )
+        return NSODeviceManagement.objects.create(
+            device=device, nso_instance=inst, nso_device_name=name, adapter_device_id=device.pk
+        )
+
+    def _p2p_pair(self):
+        from extras.models import Tag
+
+        self._make_mgmt(self.device_a, "p2fail-dev-a")
+        self._make_mgmt(self.device_b, "p2fail-dev-b")
+        iface_a = Interface.objects.create(device=self.device_a, name="Gi40/0/0", type="1000base-t")
+        iface_b = Interface.objects.create(device=self.device_b, name="Gi40/0/0", type="1000base-t")
+        _make_cable_pair(iface_a, iface_b)
+        iface_a = Interface.objects.get(pk=iface_a.pk)
+        tag, _ = Tag.objects.get_or_create(name="p2p-core-fail", defaults={"slug": "p2p-core"})
+        iface_a.tags.add(tag)
+        return iface_a, iface_b
+
+    def test_state_link_failure_leaves_no_orphan_peer_state(self):
+        """If linking peer_state raises after both state rows exist, neither survives.
+
+        Uses a VRF-scoped pool: ``state_b.vrf`` is then the pool VRF while the
+        reserved ``ip_b`` carries no VRF, so deleting ip_b in the cleanup does NOT
+        cascade to state_b via ``_on_ip_address_delete`` — the state cleanup must
+        remove state_b explicitly. This is exactly the orphan the fix closes.
+        """
+        from ipam.models import VRF
+
+        from netbox_nso_plugin.ip_autoassign import _assign_one_p2p_family
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        vrf = VRF.objects.create(name="P2FAIL-RED")
+        vrf_pool = Prefix.objects.create(prefix="10.96.0.0/24", role=self.p2p_role, vrf=vrf)
+
+        iface_a, iface_b = self._p2p_pair()
+        mgmt_a = iface_a.device.nso_management
+        mgmt_b = iface_b.device.nso_management
+
+        real_save = NSOInterfaceIPState.save
+
+        def boom_on_peer_link(self, *args, **kwargs):
+            if kwargs.get("update_fields") == ["peer_state"]:
+                raise RuntimeError("simulated failure while linking peer_state")
+            return real_save(self, *args, **kwargs)
+
+        result = {"allocated": [], "skipped": [], "errors": []}
+        with (
+            patch.object(NSOInterfaceIPState, "save", boom_on_peer_link),
+            patch("netbox_nso_plugin.signals._push_ip_intent_for_device"),
+        ):
+            _assign_one_p2p_family(
+                iface_a,
+                iface_b,
+                mgmt_a,
+                mgmt_b,
+                "ipv4",
+                iface_a.device.site,
+                result,
+                pool_finder=lambda fam, s: vrf_pool,
+                no_pool_reason=lambda fam: "no pool",
+                push=False,
+            )
+
+        self.assertTrue(result["errors"], "the linking failure should be reported as an error")
+        self.assertEqual(
+            NSOInterfaceIPState.objects.filter(interface=iface_b).count(),
+            0,
+            "a mid-link failure must not leave an orphan NSOInterfaceIPState (state_b) on the peer end",
+        )
+
+    def test_reserve_failure_leaves_no_orphan_peer_ip(self):
+        """If the peer IPAddress post-save signal raises after INSERT, ip_b is cleaned up."""
+        from netbox_nso_plugin.ip_autoassign import auto_assign_ip
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        iface_a, iface_b = self._p2p_pair()
+
+        real_goc = NSOInterfaceIPState.objects.get_or_create
+
+        def boom_on_peer(*args, **kwargs):
+            if kwargs.get("interface") == iface_b:
+                raise RuntimeError("simulated post-save signal failure on the peer IP")
+            return real_goc(*args, **kwargs)
+
+        with (
+            patch.object(NSOInterfaceIPState.objects, "get_or_create", boom_on_peer),
+            patch("netbox_nso_plugin.signals._push_ip_intent_for_device"),
+        ):
+            result = auto_assign_ip(iface_a, families=("ipv4",))
+
+        self.assertTrue(result["errors"], "the reserve failure should be reported as an error")
+        self.assertEqual(
+            IPAddress.objects.filter(status="reserved").count(),
+            0,
+            "a post-INSERT reserve failure must not leave an orphan reserved IPAddress (ip_b)",
+        )
