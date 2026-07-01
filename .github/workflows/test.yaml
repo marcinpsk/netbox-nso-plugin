@@ -71,8 +71,11 @@ jobs:
         run: |
           uv pip install --system -r ../netbox/requirements.txt
           uv pip install --system pytest pytest-django tblib coverage
-          # netbox_routing fork: the plugin has hard FKs to its ISIS/OSPF/BGP/StaticRoute models
-          uv pip install --system "netbox-routing @ git+https://github.com/marcinpsk/netbox-routing.git@feature/integration"
+          # netbox_routing fork: the plugin has hard FKs to its ISIS/OSPF/BGP/StaticRoute models.
+          # Pinned to a commit SHA (not the mutable feature/integration branch) so CI is
+          # reproducible and a fork push cannot silently change what this repo tests against.
+          # This SHA is feature/integration's tip and provides migration 0035_bgppeer_update_source.
+          uv pip install --system "netbox-routing @ git+https://github.com/marcinpsk/netbox-routing.git@47914381ad94ef1a7d0d202917257ead4e88e71d"
           uv pip install --system -e .
 
       - name: Set up NetBox configuration
@@ -110,5 +113,7 @@ jobs:
           NETBOX_CONFIGURATION: netbox.configuration
           COVERAGE_RCFILE: ../../netbox-nso-plugin/pyproject.toml
         run: |
-          coverage run manage.py test netbox_nso_plugin --verbosity=2
+          # --noinput: never block on the "destroy the old test database?" prompt
+          # (a leftover test DB would otherwise hang the job with EOFError).
+          coverage run manage.py test netbox_nso_plugin --verbosity=2 --noinput
           coverage report
