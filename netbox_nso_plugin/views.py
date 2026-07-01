@@ -2057,8 +2057,12 @@ class NSOProvisionLinkRoleView(NSOActionPermissionMixin, View):
             return redirect(_device_nso_tab_url(device.pk))
 
         provisioned, skipped, rolled_back = 0, 0, 0
+        covered: set[int] = set()  # ends already provisioned this batch (p2p link dedup)
         for iface in Interface.objects.filter(pk__in=pks, device=device):
+            if iface.pk in covered:
+                continue  # far end of a link already provisioned from the other side
             summary = provision_link_role(iface)
+            covered.update(summary.get("ends", []))
             if summary["provisioned"]:
                 provisioned += 1
             elif summary["rolled_back"]:

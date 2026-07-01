@@ -215,14 +215,20 @@ def find_peer(interface):
 
 
 def render_template(template: str, *, self_iface, peer_iface) -> str:
-    """Render a sentinel template with the two interface objects."""
+    """Render a sentinel template with the interface objects.
+
+    *peer_iface* may be ``None`` (single-ended link roles): the ``peer_*``
+    placeholders then render empty. Shared by the M8 cable-derived descriptions
+    and the link-role description consumer.
+    """
+    peer_dev = peer_iface.device if peer_iface is not None else None
     return template.format(
         self_host=self_iface.device.name,
         self_iface=self_iface.name,
-        peer_host=peer_iface.device.name,
-        peer_iface=peer_iface.name,
-        peer_site=peer_iface.device.site.name if peer_iface.device.site_id else "",
-        peer_role=(peer_iface.device.role.name if getattr(peer_iface.device, "role_id", None) else ""),
+        peer_host=peer_dev.name if peer_dev is not None else "",
+        peer_iface=peer_iface.name if peer_iface is not None else "",
+        peer_site=peer_dev.site.name if (peer_dev is not None and peer_dev.site_id) else "",
+        peer_role=(peer_dev.role.name if (peer_dev is not None and getattr(peer_dev, "role_id", None)) else ""),
     )
 
 

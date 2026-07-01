@@ -120,6 +120,13 @@ class TestProvisionP2P(_Base):
         self.assertTrue(NSOISISInterfaceState.objects.filter(interface=self.if_a).exists())
         self.assertTrue(NSOISISInterfaceState.objects.filter(interface=self.if_b).exists())
 
+    def test_summary_reports_both_ends(self):
+        """The summary lists both interface pks (the batch view dedups a link on it)."""
+        role = self._p2p_role()
+        NSOLinkRoleAssignment.objects.create(role=role, cable=self.cable)
+        summary, _pushes = self._provision(self.if_a)
+        self.assertEqual(set(summary["ends"]), {self.if_a.pk, self.if_b.pk})
+
     def test_pushes_each_affected_device(self):
         role = self._p2p_role()
         NSOLinkRoleAssignment.objects.create(role=role, cable=self.cable)
@@ -242,3 +249,39 @@ class TestProvisionActionView(_Base):
         self.assertEqual(resp.status_code, 302)
         self.assertTrue(NSOInterfaceIPState.objects.filter(interface=self.if_a, family="ipv4").exists())
         self.assertTrue(NSOInterfaceIPState.objects.filter(interface=self.if_b, family="ipv4").exists())
+
+    def test_view_provisions_a_link_once_when_both_ends_selected(self):
+        """Selecting both terminated interfaces of one link provisions it ONCE.
+
+        provision_link_role governs both ends per call and reports them in ``ends``;
+        the view must skip the already-covered far end rather than re-provisioning it.
+        """
+        from django.urls import reverse
+
+        if_x = Interface.objects.create(device=self.dev_a, name="Gi9/0", type="1000base-t")
+        if_y = Interface.objects.create(device=self.dev_a, name="Gi9/1", type="1000base-t")
+
+        user = get_user_model().objects.create_user(username="lp-dedup", password="lp-pass")
+        perm = ObjectPermission.objects.create(name="change-mgmt-dedup", actions=["change"])
+        perm.object_types.add(ObjectType.objects.get_for_model(NSODeviceManagement))
+        perm.users.add(user)
+        self.client.force_login(user)
+
+        calls = []
+
+        def fake_provision(iface):
+            calls.append(iface.pk)
+            return {
+                "provisioned": True,
+                "rolled_back": False,
+                "skipped": None,
+                "errors": [],
+                "ends": [if_x.pk, if_y.pk],
+            }
+
+        url = reverse("plugins:netbox_nso_plugin:device_provision_link_role", args=[self.dev_a.pk])
+        with patch("netbox_nso_plugin.link_role.provision_link_role", side_effect=fake_provision):
+            resp = self.client.post(url, {"interface_pks": [str(if_x.pk), str(if_y.pk)]})
+
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(calls, [if_x.pk], "the link must be provisioned once, not once per selected end")

@@ -121,30 +121,7 @@ def resolve_role(interface):
 # ── Description consumer (Phase 4) ──────────────────────────────────────────────
 
 
-def _render_role_description(template: str, interface, peer) -> str:
-    """Render *template* with the M8 placeholder set for *interface* (and *peer*).
-
-    Mirrors ``derived_intent.render_template`` but tolerates ``peer is None``
-    (single-ended roles): the ``peer_*`` placeholders render empty. Placeholders
-    are validated against ``KNOWN_PLACEHOLDERS`` at role save time (``clean()``).
-    """
-    fields = {
-        "self_host": interface.device.name,
-        "self_iface": interface.name,
-        "peer_host": "",
-        "peer_iface": "",
-        "peer_site": "",
-        "peer_role": "",
-    }
-    if peer is not None:
-        fields["peer_host"] = peer.device.name
-        fields["peer_iface"] = peer.name
-        fields["peer_site"] = peer.device.site.name if peer.device.site_id else ""
-        fields["peer_role"] = peer.device.role.name if getattr(peer.device, "role_id", None) else ""
-    return template.format(**fields)
-
-
-def apply_description_for_role(interface, role, other_end=None, push=True) -> dict:
+def apply_description_for_role(interface, role, other_end=None, push=True, *, mgmt=None) -> dict:
     """Render + own the interface description from *role*'s template. Mutates state.
 
     Sets ``dcim.Interface.description`` to the rendered template and marks an
@@ -158,7 +135,9 @@ def apply_description_for_role(interface, role, other_end=None, push=True) -> di
     """
     from django.utils import timezone
 
-    from .models import NSODeviceManagement, NSOInterfaceState
+    from .derived_intent import render_template
+    from .ip_autoassign import _resolve_managed_mgmt
+    from .models import NSOInterfaceState
     from .signals import _push_interface_intent_for_device, suppress_intent_push
 
     result = {"interface": str(interface), "changed": False, "description": None, "skipped": None, "error": None}
@@ -167,16 +146,13 @@ def apply_description_for_role(interface, role, other_end=None, push=True) -> di
         result["skipped"] = "role does not manage the description"
         return result
 
-    try:
-        mgmt = NSODeviceManagement.objects.get(device_id=interface.device_id)
-    except NSODeviceManagement.DoesNotExist:
-        result["error"] = "Device is not managed by NSO"
-        return result
-    if mgmt.adapter_device_id is None:
-        result["error"] = "Device has no adapter_device_id"
-        return result
+    if mgmt is None:
+        mgmt, reason = _resolve_managed_mgmt(interface.device)
+        if mgmt is None:
+            result["error"] = reason
+            return result
 
-    new_value = _render_role_description(role.description_template, interface, other_end)
+    new_value = render_template(role.description_template, self_iface=interface, peer_iface=other_end)
     changed = interface.description != new_value
 
     # Set the value + own it locally under suppression, then push once explicitly.
@@ -204,7 +180,7 @@ def apply_description_for_role(interface, role, other_end=None, push=True) -> di
 # ── IGP consumer (Phase 5) ──────────────────────────────────────────────────────
 
 
-def enable_igp_for_role(interface, role, push=True) -> dict:
+def enable_igp_for_role(interface, role, push=True, *, mgmt=None) -> dict:
     """Enable *interface* for the role's IGP (IS-IS or OSPF). Mutates overlay state.
 
     Creates/updates the matching interface overlay as ``accepted`` — an
@@ -218,7 +194,8 @@ def enable_igp_for_role(interface, role, push=True) -> dict:
     """
     from django.utils import timezone
 
-    from .models import NSODeviceManagement, NSOISISInterfaceState, NSOOSPFInterfaceState
+    from .ip_autoassign import _resolve_managed_mgmt
+    from .models import NSOISISInterfaceState, NSOOSPFInterfaceState
     from .signals import _push_isis_intent_for_device, _push_ospf_intent_for_device, suppress_intent_push
 
     result = {"interface": str(interface), "igp": role.igp, "enabled": False, "skipped": None, "error": None}
@@ -227,14 +204,11 @@ def enable_igp_for_role(interface, role, push=True) -> dict:
         result["skipped"] = "role does not manage an IGP"
         return result
 
-    try:
-        mgmt = NSODeviceManagement.objects.get(device_id=interface.device_id)
-    except NSODeviceManagement.DoesNotExist:
-        result["error"] = "Device is not managed by NSO"
-        return result
-    if mgmt.adapter_device_id is None:
-        result["error"] = "Device has no adapter_device_id"
-        return result
+    if mgmt is None:
+        mgmt, reason = _resolve_managed_mgmt(interface.device)
+        if mgmt is None:
+            result["error"] = reason
+            return result
 
     now = timezone.now()
     if role.igp == "isis":
@@ -285,13 +259,6 @@ def enable_igp_for_role(interface, role, push=True) -> dict:
 
 class _ProvisionRollback(Exception):
     """Internal signal to roll back the provisioning transaction on any consumer error."""
-
-
-def _is_managed(interface) -> bool:
-    """Return True if the interface's device is NSO-managed with an adapter_device_id."""
-    from .models import NSODeviceManagement
-
-    return NSODeviceManagement.objects.filter(device_id=interface.device_id, adapter_device_id__isnull=False).exists()
 
 
 def _push_provisioned(role, device_ids) -> None:
@@ -355,6 +322,10 @@ def provision_link_role(interface) -> dict:
         "descriptions": [],
         "igp": [],
         "errors": [],
+        # Interface pks this call governs (both ends for p2p). Callers processing a
+        # batch use it to dedup: a link selected from both ends must be provisioned
+        # once, not once per end.
+        "ends": [interface.pk],
     }
     if role is None:
         summary["skipped"] = "no link role assigned"
@@ -370,12 +341,22 @@ def provision_link_role(interface) -> dict:
         pairs = [(interface, other_end), (other_end, interface)]
     else:
         pairs = [(interface, None)]
+    summary["ends"] = sorted({end.pk for end, _peer in pairs})
 
-    # Pre-flight: every end must be NSO-managed — skip rather than half-provision.
+    # Pre-flight: every end must be NSO-managed — resolve each device's management
+    # row once and thread it to the consumers (they'd otherwise re-query it ~10× per
+    # link). Skip rather than half-provision.
+    from .ip_autoassign import _resolve_managed_mgmt
+
+    mgmt_by_device: dict[int, object] = {}
     for end, _peer in pairs:
-        if not _is_managed(end):
+        if end.device_id in mgmt_by_device:
+            continue
+        end_mgmt, _reason = _resolve_managed_mgmt(end.device)
+        if end_mgmt is None:
             summary["skipped"] = f"{end} is not NSO-managed"
             return summary
+        mgmt_by_device[end.device_id] = end_mgmt
 
     def _collect(res, kind):
         if isinstance(res.get("errors"), list):
@@ -385,14 +366,22 @@ def provision_link_role(interface) -> dict:
 
     try:
         with suppress_intent_push(), transaction.atomic():
-            ip_res = assign_ips_for_role(interface, role, other_end, push=False)
+            ip_res = assign_ips_for_role(
+                interface,
+                role,
+                other_end,
+                push=False,
+                mgmt=mgmt_by_device[interface.device_id],
+                peer_mgmt=(mgmt_by_device.get(other_end.device_id) if other_end is not None else None),
+            )
             summary["ip"] = ip_res
             _collect(ip_res, "ip")
             for end, peer in pairs:
-                d = apply_description_for_role(end, role, peer, push=False)
+                end_mgmt = mgmt_by_device[end.device_id]
+                d = apply_description_for_role(end, role, peer, push=False, mgmt=end_mgmt)
                 summary["descriptions"].append(d)
                 _collect(d, "description")
-                g = enable_igp_for_role(end, role, push=False)
+                g = enable_igp_for_role(end, role, push=False, mgmt=end_mgmt)
                 summary["igp"].append(g)
                 _collect(g, "igp")
             if summary["errors"]:
