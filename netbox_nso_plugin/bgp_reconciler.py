@@ -171,9 +171,14 @@ def _resolve_bgp_source(device, source: str, IPAddress):
 
     try:
         netaddr.IPAddress(source)
-        return IPAddress.objects.filter(address__net_host=source).first(), None
     except (netaddr.AddrFormatError, ValueError):
         pass
+    else:
+        # An IP local-address (Junos/Nokia). Reuse the stub-creating resolver used
+        # for the peer neighbor address so a local-address not yet modeled in IPAM
+        # still round-trips (the source is preserved and re-pushable) instead of
+        # being silently dropped when no matching IPAddress exists.
+        return _resolve_peer_ip(source, IPAddress), None
     try:
         from dcim.models import Interface
 

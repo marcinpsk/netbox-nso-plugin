@@ -344,19 +344,28 @@ class TestReconcileBgpConfig(TestCase):
         bp = BGPPeer.objects.get(peer__address__net_host="10.0.0.2")
         self.assertEqual(bp.source, src)
 
-    def test_peer_source_unknown_ip_left_null(self):
-        """source IP not present in IPAM → BGPPeer.source stays null (not fabricated)."""
+    def test_peer_source_unknown_ip_creates_stub(self):
+        """source IP not present in IPAM → a stub IPAddress is auto-created and linked.
+
+        An IP local-address (Junos/Nokia) not yet modeled in IPAM must still be
+        preserved so the source round-trips and is re-pushable, mirroring how the peer
+        neighbor address is handled (rather than being silently dropped)."""
         self._make_mgmt()
 
+        from ipam.models import IPAddress
         from netbox_routing.models import BGPPeer
 
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
 
+        self.assertFalse(IPAddress.objects.filter(address__net_host="203.0.113.250").exists())
         peer = self._peer_entry()
         peer["source"] = "203.0.113.250"
         _reconcile_bgp_config(self.device, self._payload(self._router_payload(peers=[peer])))
 
-        self.assertIsNone(BGPPeer.objects.get(peer__address__net_host="10.0.0.2").source_id)
+        stub = IPAddress.objects.filter(address__net_host="203.0.113.250").first()
+        self.assertIsNotNone(stub, "an IP local-address absent from IPAM should be auto-created as a stub")
+        bp = BGPPeer.objects.get(peer__address__net_host="10.0.0.2")
+        self.assertEqual(bp.source, stub)
 
     def test_peer_update_source_iface_linked(self):
         """source given as an interface name (IOS/IOS-XR update-source) → the device's
