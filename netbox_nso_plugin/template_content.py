@@ -1258,6 +1258,10 @@ def _reconcile_isis_interfaces(device, interfaces: list) -> list:
 
 # netbox_routing ISISInstance scalar columns synced from NSO. Each is
 # guarded by hasattr so the reconcile no-ops on a fork without the column.
+# NOTE: segment-routing state (the adapter's top-level ``sr_enabled`` /
+# ``sr_node_msd``) is NOT an ISISInstance scalar — netbox-routing moved it to the
+# dedicated 1:1 ``ISISSegmentRouting`` child, reconciled via the ``segment_routing``
+# bag in :func:`_reconcile_isis_segment_routing` (so it is not duplicated here).
 _ISIS_INSTANCE_SCALAR_ATTRS = (
     "spf_initial_wait",
     "spf_max_wait",
@@ -1269,8 +1273,6 @@ _ISIS_INSTANCE_SCALAR_ATTRS = (
     "overload_on_startup",
     "overload_timeout",
     "te_enabled",
-    "sr_enabled",
-    "sr_node_msd",
     "distance",
     "maximum_paths",
     "reference_bandwidth",

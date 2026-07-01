@@ -634,6 +634,9 @@ class TestReconcileIsisProcess(TestCase):
                     "lsp_lifetime": 65535,
                     "lsp_refresh_interval": 32767,
                     "te_enabled": True,
+                    # The adapter still sends the legacy top-level sr_enabled; the
+                    # reconciler must tolerate + ignore it (SR now lives on the
+                    # ISISSegmentRouting child, exercised in the p2 test below).
                     "sr_enabled": True,
                     "spf_initial_wait": 1000,
                     "settings": {"spf_second_wait": "1000", "graceful_restart": "true"},
@@ -645,7 +648,9 @@ class TestReconcileIsisProcess(TestCase):
         self.assertEqual(inst.lsp_refresh_interval, 32767)
         self.assertEqual(inst.spf_initial_wait, 1000)
         self.assertTrue(inst.te_enabled)
-        self.assertTrue(inst.sr_enabled)
+        # sr_enabled is no longer an ISISInstance field (moved to the SR child) —
+        # the reconciler ignored the legacy top-level key without error.
+        self.assertFalse(hasattr(inst, "sr_enabled"))
 
         settings = {s.key: s.value for s in inst.settings.all()}
         self.assertEqual(settings, {"spf_second_wait": "1000", "graceful_restart": "true"})
