@@ -57,6 +57,9 @@ class NSOPluginConfig(PluginConfig):
         cfg = settings.PLUGINS_CONFIG.get("netbox_nso_plugin", {})
         self._interface_ip_auto_create = cfg.get("interface_ip_auto_create", False)
         self._static_route_auto_create = cfg.get("static_route_auto_create", False)
+        # Link-role resolver: opt-in fallback to M13's classify_interface heuristic
+        # when an interface has no explicit NSOLinkRoleAssignment (default off).
+        self._link_role_derived_fallback = cfg.get("link_role_derived_fallback", False)
 
 
 config = NSOPluginConfig
