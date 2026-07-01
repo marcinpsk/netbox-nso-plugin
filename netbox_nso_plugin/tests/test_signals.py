@@ -628,6 +628,33 @@ try:
             mock_put.assert_not_called()
 
         @patch("netbox_nso_plugin.adapter_client.put_ip_intent")
+        def test_suppress_intent_push_silences_ip_handler(self, mock_put):
+            """Under suppress_intent_push() the IP handler must neither push intent nor
+            force-promote a machine-owned 'imported' row to 'accepted'.
+
+            This is the reconcile/import path (rqworker): suppress_intent_push() — not
+            the GET-render guard — is what must keep the IP save from echoing intent back
+            to the adapter and from re-minting 'accepted' rows the operator never clicked.
+            """
+            from ipam.models import IPAddress
+
+            from netbox_nso_plugin.models import NSOInterfaceIPState
+            from netbox_nso_plugin.signals import suppress_intent_push
+
+            NSOInterfaceIPState.objects.create(
+                interface=self.iface, address="10.2.0.1/24", vrf="", status="imported", family="ipv4"
+            )
+
+            with self.captureOnCommitCallbacks(execute=True), suppress_intent_push():
+                IPAddress.objects.create(
+                    address="10.2.0.1/24", assigned_object_type=self._ct(), assigned_object_id=self.iface.pk
+                )
+
+            state = NSOInterfaceIPState.objects.get(interface=self.iface, address="10.2.0.1/24", vrf="")
+            self.assertEqual(state.status, "imported", "suppressed IP save must not force-promote to accepted")
+            mock_put.assert_not_called()
+
+        @patch("netbox_nso_plugin.adapter_client.put_ip_intent")
         def test_no_management_record_skips_push(self, mock_put):
             """IPAddress on an unmanaged device → no push."""
             from ipam.models import IPAddress

@@ -1141,8 +1141,16 @@ def _on_bfd_state_save(sender, instance, **kwargs):
     )
 
 
+@_skip_on_render
 def _on_ip_address_change(sender, instance, **kwargs):
-    """Push IP intent when an IPAddress assigned to a managed interface changes."""
+    """Push IP intent when an IPAddress assigned to a managed interface changes.
+
+    Decorated ``@_skip_on_render`` like every other push handler so that
+    ``suppress_intent_push()`` (the rqworker reconcile/import guard) also silences
+    the IP path — otherwise a reconciler saving an interface IP would push intent
+    back to the adapter and force-promote imported rows to ``accepted``. The
+    P2P-pair guard (``_p2p_allocation_active``) is orthogonal and stays below.
+    """
     from dcim.models import Interface as _Interface
 
     from .models import NSODeviceManagement, NSOInterfaceIPState
@@ -1198,8 +1206,13 @@ def _on_ip_address_change(sender, instance, **kwargs):
         )
 
 
+@_skip_on_render
 def _on_ip_address_delete(sender, instance, **kwargs):
-    """Push IP intent (with the deleted IP removed) when an IPAddress is deleted."""
+    """Push IP intent (with the deleted IP removed) when an IPAddress is deleted.
+
+    Decorated ``@_skip_on_render`` so ``suppress_intent_push()`` silences the push
+    when a reconciler (or a rolled-back allocation) deletes an interface IP.
+    """
     from dcim.models import Interface as _Interface
 
     from .models import NSODeviceManagement, NSOInterfaceIPState
