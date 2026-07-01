@@ -20,6 +20,8 @@ from .filters import (
     NSODeviceManagementFilterSet,
     NSOInstanceFilterSet,
     NSOInterfaceStateFilterSet,
+    NSOLinkRoleAssignmentFilterSet,
+    NSOLinkRoleFilterSet,
     NSOPlatformNedMappingFilterSet,
 )
 from .forms import (
@@ -28,6 +30,8 @@ from .forms import (
     NSOFailoverSettingsForm,
     NSOInstanceForm,
     NSOInterfaceMtuStateForm,
+    NSOLinkRoleAssignmentForm,
+    NSOLinkRoleForm,
     NSOLoggingHostStateForm,
     NSOPlatformNedMappingForm,
     NSOSnmpCommunityStateForm,
@@ -47,6 +51,8 @@ from .models import (
     NSOISISInstanceState,
     NSOISISInterfaceState,
     NSOL2SapState,
+    NSOLinkRole,
+    NSOLinkRoleAssignment,
     NSOLoggingHostState,
     NSOOSPFInstanceState,
     NSOOSPFInterfaceState,
@@ -66,6 +72,8 @@ from .tables import (
     NSODeviceManagementTable,
     NSOInstanceTable,
     NSOInterfaceStateTable,
+    NSOLinkRoleAssignmentTable,
+    NSOLinkRoleTable,
     NSOPlatformNedMappingTable,
 )
 
@@ -899,6 +907,81 @@ class NSOInstanceDeleteView(generic.ObjectDeleteView):
     """Delete view for an NSO instance."""
 
     queryset = NSOInstance.objects.all()
+
+
+# ── Link-role provisioning ─────────────────────────────────────────────────────
+
+
+class NSOLinkRoleListView(generic.ObjectListView):
+    """List view for configurable link roles."""
+
+    queryset = NSOLinkRole.objects.all()
+    table = NSOLinkRoleTable
+    filterset = NSOLinkRoleFilterSet
+    actions = (AddObject, BulkExport, BulkDelete)
+
+
+class NSOLinkRoleView(generic.ObjectView):
+    """Detail view for a link role."""
+
+    queryset = NSOLinkRole.objects.all()
+
+
+class NSOLinkRoleEditView(generic.ObjectEditView):
+    """Create/edit view for a link role."""
+
+    queryset = NSOLinkRole.objects.all()
+    form = NSOLinkRoleForm
+
+
+class NSOLinkRoleDeleteView(generic.ObjectDeleteView):
+    """Delete view for a link role."""
+
+    queryset = NSOLinkRole.objects.all()
+
+
+class NSOLinkRoleBulkDeleteView(generic.BulkDeleteView):
+    """Bulk-delete view for link roles."""
+
+    queryset = NSOLinkRole.objects.all()
+    table = NSOLinkRoleTable
+    filterset = NSOLinkRoleFilterSet
+
+
+class NSOLinkRoleAssignmentListView(generic.ObjectListView):
+    """List view for link-role assignments."""
+
+    queryset = NSOLinkRoleAssignment.objects.select_related("role", "cable", "interface")
+    table = NSOLinkRoleAssignmentTable
+    filterset = NSOLinkRoleAssignmentFilterSet
+    actions = (AddObject, BulkExport, BulkDelete)
+
+
+class NSOLinkRoleAssignmentView(generic.ObjectView):
+    """Detail view for a link-role assignment."""
+
+    queryset = NSOLinkRoleAssignment.objects.select_related("role", "cable", "interface")
+
+
+class NSOLinkRoleAssignmentEditView(generic.ObjectEditView):
+    """Create/edit view for a link-role assignment."""
+
+    queryset = NSOLinkRoleAssignment.objects.all()
+    form = NSOLinkRoleAssignmentForm
+
+
+class NSOLinkRoleAssignmentDeleteView(generic.ObjectDeleteView):
+    """Delete view for a link-role assignment."""
+
+    queryset = NSOLinkRoleAssignment.objects.all()
+
+
+class NSOLinkRoleAssignmentBulkDeleteView(generic.BulkDeleteView):
+    """Bulk-delete view for link-role assignments."""
+
+    queryset = NSOLinkRoleAssignment.objects.all()
+    table = NSOLinkRoleAssignmentTable
+    filterset = NSOLinkRoleAssignmentFilterSet
 
 
 class NSOOnboardingDashboardView(LoginRequiredMixin, View):

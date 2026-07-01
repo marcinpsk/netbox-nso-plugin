@@ -4,7 +4,14 @@ from django.urls import path
 from netbox.views.generic.feature_views import ObjectChangeLogView, ObjectJournalView
 
 from . import views
-from .models import NSODeviceManagement, NSOInstance, NSOInterfaceState, NSOPlatformNedMapping
+from .models import (
+    NSODeviceManagement,
+    NSOInstance,
+    NSOInterfaceState,
+    NSOLinkRole,
+    NSOLinkRoleAssignment,
+    NSOPlatformNedMapping,
+)
 
 app_name = "netbox_nso_plugin"
 
@@ -31,6 +38,58 @@ urlpatterns = [
         ObjectJournalView.as_view(),
         name="nsoinstance_journal",
         kwargs={"model": NSOInstance},
+    ),
+    # Link roles (configurable provisioning catalog)
+    path("link-roles/", views.NSOLinkRoleListView.as_view(), name="nsolinkrole_list"),
+    path("link-roles/add/", views.NSOLinkRoleEditView.as_view(), name="nsolinkrole_add"),
+    path("link-roles/delete/", views.NSOLinkRoleBulkDeleteView.as_view(), name="nsolinkrole_bulk_delete"),
+    path("link-roles/<int:pk>/", views.NSOLinkRoleView.as_view(), name="nsolinkrole"),
+    path("link-roles/<int:pk>/edit/", views.NSOLinkRoleEditView.as_view(), name="nsolinkrole_edit"),
+    path("link-roles/<int:pk>/delete/", views.NSOLinkRoleDeleteView.as_view(), name="nsolinkrole_delete"),
+    path(
+        "link-roles/<int:pk>/changelog/",
+        ObjectChangeLogView.as_view(),
+        name="nsolinkrole_changelog",
+        kwargs={"model": NSOLinkRole},
+    ),
+    path(
+        "link-roles/<int:pk>/journal/",
+        ObjectJournalView.as_view(),
+        name="nsolinkrole_journal",
+        kwargs={"model": NSOLinkRole},
+    ),
+    # Link-role assignments (role ← cable or interface)
+    path("link-role-assignments/", views.NSOLinkRoleAssignmentListView.as_view(), name="nsolinkroleassignment_list"),
+    path(
+        "link-role-assignments/add/",
+        views.NSOLinkRoleAssignmentEditView.as_view(),
+        name="nsolinkroleassignment_add",
+    ),
+    path(
+        "link-role-assignments/delete/",
+        views.NSOLinkRoleAssignmentBulkDeleteView.as_view(),
+        name="nsolinkroleassignment_bulk_delete",
+    ),
+    path(
+        "link-role-assignments/<int:pk>/",
+        views.NSOLinkRoleAssignmentView.as_view(),
+        name="nsolinkroleassignment",
+    ),
+    path(
+        "link-role-assignments/<int:pk>/edit/",
+        views.NSOLinkRoleAssignmentEditView.as_view(),
+        name="nsolinkroleassignment_edit",
+    ),
+    path(
+        "link-role-assignments/<int:pk>/delete/",
+        views.NSOLinkRoleAssignmentDeleteView.as_view(),
+        name="nsolinkroleassignment_delete",
+    ),
+    path(
+        "link-role-assignments/<int:pk>/changelog/",
+        ObjectChangeLogView.as_view(),
+        name="nsolinkroleassignment_changelog",
+        kwargs={"model": NSOLinkRoleAssignment},
     ),
     # Onboarding dashboard (tabs) + onboard action
     path("onboarding/", views.NSOOnboardingDashboardView.as_view(), name="onboarding_dashboard"),

@@ -46,6 +46,28 @@ menu = PluginMenu(
                     ),
                 ),
                 PluginMenuItem(
+                    link="plugins:netbox_nso_plugin:nsolinkrole_list",
+                    link_text="Link Roles",
+                    buttons=(
+                        PluginMenuButton(
+                            link="plugins:netbox_nso_plugin:nsolinkrole_add",
+                            title="Add",
+                            icon_class="mdi mdi-plus-thick",
+                        ),
+                    ),
+                ),
+                PluginMenuItem(
+                    link="plugins:netbox_nso_plugin:nsolinkroleassignment_list",
+                    link_text="Link Role Assignments",
+                    buttons=(
+                        PluginMenuButton(
+                            link="plugins:netbox_nso_plugin:nsolinkroleassignment_add",
+                            title="Add",
+                            icon_class="mdi mdi-plus-thick",
+                        ),
+                    ),
+                ),
+                PluginMenuItem(
                     link="plugins:netbox_nso_plugin:adapterconnection",
                     link_text="Adapter Connection",
                 ),

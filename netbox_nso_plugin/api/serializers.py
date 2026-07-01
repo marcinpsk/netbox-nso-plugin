@@ -3,7 +3,14 @@
 from netbox.api.serializers import NetBoxModelSerializer
 from rest_framework import serializers
 
-from ..models import NSODeviceManagement, NSOInstance, NSOInterfaceState, NSOPlatformNedMapping
+from ..models import (
+    NSODeviceManagement,
+    NSOInstance,
+    NSOInterfaceState,
+    NSOLinkRole,
+    NSOLinkRoleAssignment,
+    NSOPlatformNedMapping,
+)
 
 
 class NSOPlatformNedMappingSerializer(NetBoxModelSerializer):
@@ -137,6 +144,65 @@ class NSOInterfaceStateSerializer(NetBoxModelSerializer):
             "accepted_at",
             "last_apply_at",
             "last_apply_error",
+            "tags",
+            "custom_fields",
+            "created",
+            "last_updated",
+        ]
+
+
+class NSOLinkRoleSerializer(NetBoxModelSerializer):
+    """Serializer for NSOLinkRole (the configurable provisioning catalog)."""
+
+    class Meta:
+        model = NSOLinkRole
+        fields = [
+            "id",
+            "url",
+            "display",
+            "name",
+            "slug",
+            "description",
+            "enabled",
+            "link_type",
+            "assign_ipv4",
+            "ipv4_pool_prefix",
+            "ipv4_pool_role",
+            "ipv4_mask",
+            "assign_ipv6",
+            "ipv6_pool_prefix",
+            "ipv6_pool_role",
+            "ipv6_mask",
+            "description_template",
+            "igp",
+            "isis_circuit_type",
+            "isis_passive",
+            "isis_metric",
+            "isis_process_tag",
+            "ospf_area",
+            "ospf_network_type",
+            "ospf_passive",
+            "ospf_cost",
+            "ospf_process_id",
+            "tags",
+            "custom_fields",
+            "created",
+            "last_updated",
+        ]
+
+
+class NSOLinkRoleAssignmentSerializer(NetBoxModelSerializer):
+    """Serializer for NSOLinkRoleAssignment (role ← cable or interface)."""
+
+    class Meta:
+        model = NSOLinkRoleAssignment
+        fields = [
+            "id",
+            "url",
+            "display",
+            "role",
+            "cable",
+            "interface",
             "tags",
             "custom_fields",
             "created",

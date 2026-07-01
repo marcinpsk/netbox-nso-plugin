@@ -2,6 +2,7 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
+from django.core.exceptions import NON_FIELD_ERRORS, ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.urls import reverse
@@ -1999,3 +2000,255 @@ class NSOBFDInterfaceState(NetBoxModel):
         from django.urls import reverse
 
         return reverse("dcim:device_nso", kwargs={"pk": self.management.device_id})
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Link-role provisioning — configurable role catalog + assignments
+# ──────────────────────────────────────────────────────────────────────────────
+
+_LINK_ROLE_TYPE_CHOICES = [
+    ("p2p", "Point-to-point (cable, both ends)"),
+    ("single", "Single-ended (interface)"),
+]
+
+# EIGRP is intentionally absent and must never be added (operator directive).
+_LINK_ROLE_IGP_CHOICES = [
+    ("none", "None"),
+    ("isis", "IS-IS"),
+    ("ospf", "OSPF"),
+]
+
+
+class NSOLinkRole(NetBoxModel):
+    """Operator-defined, configurable interface/link role — a reusable intent bundle.
+
+    A single role is the source of truth for three derived outputs on the
+    interface(s) it is assigned to (see ``NSOLinkRoleAssignment``): the interface
+    **description** (rendered from an M8 template), an **IP assignment** (pool +
+    mask, reusing the shipped M13 auto-assign engine), and **IGP interface
+    enablement** (IS-IS or OSPF). This replaces M8's and M13's separate hardcoded
+    heuristics with one editable catalog — classify a link once and the whole link
+    comes up on both ends.
+
+    ``link_type`` decides how the role attaches and how addresses are drawn:
+    ``p2p`` binds to a ``dcim.Cable`` and carves a child prefix for both ends;
+    ``single`` binds to one ``dcim.Interface`` (loopback/access) and draws a host.
+    """
+
+    name = models.CharField(max_length=100, unique=True)
+    slug = models.SlugField(max_length=100, unique=True)
+    description = models.CharField(max_length=200, blank=True, default="")
+    enabled = models.BooleanField(
+        default=True,
+        help_text="Disabled roles stay in the catalog but are skipped by the provisioner.",
+    )
+    link_type = models.CharField(
+        max_length=16,
+        choices=_LINK_ROLE_TYPE_CHOICES,
+        default="p2p",
+        help_text=(
+            "p2p → attaches to a cable and carves a child prefix for both ends; "
+            "single → attaches to one interface (loopback/access) and draws a host."
+        ),
+    )
+
+    # ── IP assignment (both pool references supported; explicit Prefix FK wins) ──
+    assign_ipv4 = models.BooleanField(default=True, help_text="Assign an IPv4 address for this role.")
+    assign_ipv6 = models.BooleanField(default=False, help_text="Assign an IPv6 address for this role.")
+    ipv4_pool_prefix = models.ForeignKey(
+        to="ipam.Prefix",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="nso_link_roles_v4",
+        help_text="Explicit IPv4 pool prefix to allocate from (wins over the pool role slug).",
+    )
+    ipv4_pool_role = models.CharField(
+        max_length=100,
+        blank=True,
+        default="",
+        help_text="Fallback: an ipam Prefix role slug used to find the IPv4 pool when no explicit prefix is set.",
+    )
+    ipv6_pool_prefix = models.ForeignKey(
+        to="ipam.Prefix",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="nso_link_roles_v6",
+        help_text="Explicit IPv6 pool prefix to allocate from (wins over the pool role slug).",
+    )
+    ipv6_pool_role = models.CharField(
+        max_length=100,
+        blank=True,
+        default="",
+        help_text="Fallback: an ipam Prefix role slug used to find the IPv6 pool when no explicit prefix is set.",
+    )
+    ipv4_mask = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(1), MaxValueValidator(32)],
+        help_text="p2p child prefix length for IPv4 (e.g. 31). Blank → reuse the M13 per-pool/default.",
+    )
+    ipv6_mask = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(1), MaxValueValidator(128)],
+        help_text="p2p child prefix length for IPv6 (e.g. 127). Blank → reuse the M13 per-pool/default.",
+    )
+
+    # ── Description (M8 template rendered per end) ──
+    description_template = models.CharField(
+        max_length=200,
+        blank=True,
+        default="",
+        help_text=(
+            "M8 description template rendered on each end (placeholders such as "
+            "{peer_host}, {peer_iface}). Blank → do not manage the description."
+        ),
+    )
+
+    # ── IGP interface enablement ──
+    igp = models.CharField(max_length=16, choices=_LINK_ROLE_IGP_CHOICES, default="none")
+    isis_circuit_type = models.CharField(
+        max_length=32, blank=True, default="", help_text="IS-IS circuit type, e.g. point-to-point."
+    )
+    isis_passive = models.BooleanField(default=False)
+    isis_metric = models.PositiveIntegerField(null=True, blank=True)
+    isis_process_tag = models.CharField(max_length=128, blank=True, default="")
+    ospf_area = models.CharField(max_length=64, blank=True, default="")
+    ospf_network_type = models.CharField(max_length=32, blank=True, default="")
+    ospf_passive = models.BooleanField(default=False)
+    ospf_cost = models.PositiveIntegerField(null=True, blank=True)
+    ospf_process_id = models.CharField(max_length=64, blank=True, default="")
+
+    class Meta:
+        ordering = ["name"]
+        verbose_name = "NSO Link Role"
+        verbose_name_plural = "NSO Link Roles"
+
+    def __str__(self):
+        return self.name
+
+    def get_absolute_url(self):
+        """Return the detail URL for this link role."""
+        return reverse("plugins:netbox_nso_plugin:nsolinkrole", args=[self.pk])
+
+    def _has_ipv4_pool(self):
+        return bool(self.ipv4_pool_prefix_id or self.ipv4_pool_role)
+
+    def _has_ipv6_pool(self):
+        return bool(self.ipv6_pool_prefix_id or self.ipv6_pool_role)
+
+    def clean(self):
+        """Validate the intent bundle is internally consistent and drives an output."""
+        super().clean()
+        errors = {}
+        # 1. A pool reference is required for each opted-in family.
+        if self.assign_ipv4 and not self._has_ipv4_pool():
+            errors["ipv4_pool_role"] = "Set an IPv4 pool prefix or pool role when 'Assign IPv4' is on."
+        if self.assign_ipv6 and not self._has_ipv6_pool():
+            errors["ipv6_pool_role"] = "Set an IPv6 pool prefix or pool role when 'Assign IPv6' is on."
+        # 2. Child masks apply only to p2p roles, and must leave room for a host pair.
+        if self.link_type != "p2p":
+            if self.ipv4_mask is not None:
+                errors["ipv4_mask"] = "A child mask only applies to p2p roles."
+            if self.ipv6_mask is not None:
+                errors["ipv6_mask"] = "A child mask only applies to p2p roles."
+        else:
+            if self.ipv4_mask is not None and self.ipv4_mask > 31:
+                errors["ipv4_mask"] = "IPv4 p2p child mask must be /31 or shorter to fit two hosts."
+            if self.ipv6_mask is not None and self.ipv6_mask > 127:
+                errors["ipv6_mask"] = "IPv6 p2p child mask must be /127 or shorter to fit two hosts."
+        # 3. IGP parameters must match the chosen IGP (no stray other-protocol params).
+        if self.igp != "isis" and (
+            self.isis_circuit_type or self.isis_passive or self.isis_metric is not None or self.isis_process_tag
+        ):
+            errors["igp"] = "IS-IS parameters are set but the IGP is not 'isis'."
+        if self.igp != "ospf" and (
+            self.ospf_area
+            or self.ospf_network_type
+            or self.ospf_passive
+            or self.ospf_cost is not None
+            or self.ospf_process_id
+        ):
+            errors["igp"] = "OSPF parameters are set but the IGP is not 'ospf'."
+        # 4. A role must drive at least one output (not a pure no-op).
+        drives_ip = (self.assign_ipv4 and self._has_ipv4_pool()) or (self.assign_ipv6 and self._has_ipv6_pool())
+        if not (drives_ip or self.description_template or self.igp != "none"):
+            errors[NON_FIELD_ERRORS] = [
+                "A link role must drive at least one output: an IP family, a description template, or an IGP."
+            ]
+        if errors:
+            raise ValidationError(errors)
+
+
+class NSOLinkRoleAssignment(NetBoxModel):
+    """Binds an ``NSOLinkRole`` to exactly one network object.
+
+    The nullable ``cable``/``interface`` pair is XOR-constrained (a CheckConstraint
+    enforces exactly one set): ``p2p`` roles attach to a ``dcim.Cable`` (both
+    terminated ends provisioned together), ``single`` roles attach to a single
+    ``dcim.Interface`` (loopback/access). Each cable and each interface may carry at
+    most one assignment.
+    """
+
+    role = models.ForeignKey(to="NSOLinkRole", on_delete=models.PROTECT, related_name="assignments")
+    cable = models.ForeignKey(
+        to="dcim.Cable",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="nso_link_role_assignments",
+    )
+    interface = models.ForeignKey(
+        to="dcim.Interface",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="nso_link_role_assignments",
+    )
+
+    class Meta:
+        ordering = ["role", "pk"]
+        verbose_name = "NSO Link Role Assignment"
+        verbose_name_plural = "NSO Link Role Assignments"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["cable"],
+                condition=models.Q(cable__isnull=False),
+                name="nso_linkrole_unique_cable",
+            ),
+            models.UniqueConstraint(
+                fields=["interface"],
+                condition=models.Q(interface__isnull=False),
+                name="nso_linkrole_unique_interface",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(cable__isnull=False, interface__isnull=True)
+                    | models.Q(cable__isnull=True, interface__isnull=False)
+                ),
+                name="nso_linkrole_cable_xor_interface",
+            ),
+        ]
+
+    def __str__(self):
+        target = self.cable if self.cable_id else self.interface
+        return f"{self.role} → {target}"
+
+    def get_absolute_url(self):
+        """Return the detail URL for this assignment."""
+        return reverse("plugins:netbox_nso_plugin:nsolinkroleassignment", args=[self.pk])
+
+    def clean(self):
+        """Enforce the cable-XOR-interface rule and keep the target consistent with the role type."""
+        super().clean()
+        has_cable = self.cable_id is not None
+        has_iface = self.interface_id is not None
+        if has_cable == has_iface:
+            raise ValidationError("Set exactly one of cable or interface.")
+        if self.role_id:
+            if self.role.link_type == "p2p" and not has_cable:
+                raise ValidationError({"cable": "A point-to-point role must be assigned to a cable."})
+            if self.role.link_type == "single" and not has_iface:
+                raise ValidationError({"interface": "A single-ended role must be assigned to an interface."})

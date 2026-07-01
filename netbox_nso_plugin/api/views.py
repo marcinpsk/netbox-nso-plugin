@@ -6,12 +6,27 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from ..filters import NSODeviceManagementFilterSet, NSOInstanceFilterSet, NSOPlatformNedMappingFilterSet
-from ..models import NSODeviceManagement, NSOInstance, NSOInterfaceState, NSOPlatformNedMapping
+from ..filters import (
+    NSODeviceManagementFilterSet,
+    NSOInstanceFilterSet,
+    NSOLinkRoleAssignmentFilterSet,
+    NSOLinkRoleFilterSet,
+    NSOPlatformNedMappingFilterSet,
+)
+from ..models import (
+    NSODeviceManagement,
+    NSOInstance,
+    NSOInterfaceState,
+    NSOLinkRole,
+    NSOLinkRoleAssignment,
+    NSOPlatformNedMapping,
+)
 from .serializers import (
     NSODeviceManagementSerializer,
     NSOInstanceSerializer,
     NSOInterfaceStateSerializer,
+    NSOLinkRoleAssignmentSerializer,
+    NSOLinkRoleSerializer,
     NSOPlatformNedMappingSerializer,
 )
 
@@ -49,6 +64,22 @@ class NSOInterfaceStateViewSet(NetBoxModelViewSet):
 
     queryset = NSOInterfaceState.objects.select_related("interface")
     serializer_class = NSOInterfaceStateSerializer
+
+
+class NSOLinkRoleViewSet(NetBoxModelViewSet):
+    """REST API for NSOLinkRole — the configurable provisioning catalog."""
+
+    queryset = NSOLinkRole.objects.select_related("ipv4_pool_prefix", "ipv6_pool_prefix")
+    serializer_class = NSOLinkRoleSerializer
+    filterset_class = NSOLinkRoleFilterSet
+
+
+class NSOLinkRoleAssignmentViewSet(NetBoxModelViewSet):
+    """REST API for NSOLinkRoleAssignment — role ← cable or interface."""
+
+    queryset = NSOLinkRoleAssignment.objects.select_related("role", "cable", "interface")
+    serializer_class = NSOLinkRoleAssignmentSerializer
+    filterset_class = NSOLinkRoleAssignmentFilterSet
 
 
 class OnboardingCandidatesView(APIView):

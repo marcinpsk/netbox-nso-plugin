@@ -12,6 +12,8 @@ router.register("instances", views.NSOInstanceViewSet)
 router.register("ned-mappings", views.NSOPlatformNedMappingViewSet)
 router.register("device-management", views.NSODeviceManagementViewSet)
 router.register("interface-state", views.NSOInterfaceStateViewSet)
+router.register("link-roles", views.NSOLinkRoleViewSet)
+router.register("link-role-assignments", views.NSOLinkRoleAssignmentViewSet)
 
 urlpatterns = [
     path("sync-complete/", views.SyncCompleteView.as_view(), name="sync_complete"),

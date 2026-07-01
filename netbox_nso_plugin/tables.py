@@ -3,7 +3,14 @@
 import django_tables2 as tables
 from netbox.tables import NetBoxTable, columns
 
-from .models import NSODeviceManagement, NSOInstance, NSOInterfaceState, NSOPlatformNedMapping
+from .models import (
+    NSODeviceManagement,
+    NSOInstance,
+    NSOInterfaceState,
+    NSOLinkRole,
+    NSOLinkRoleAssignment,
+    NSOPlatformNedMapping,
+)
 
 
 class NSOPlatformNedMappingTable(NetBoxTable):
@@ -103,3 +110,44 @@ class NSOInterfaceStateTable(NetBoxTable):
             "nso_value",
             "last_sync_at",
         )
+
+
+class NSOLinkRoleTable(NetBoxTable):
+    """Table for listing configurable link roles."""
+
+    name = tables.Column(linkify=True)
+    link_type = tables.Column()
+    igp = tables.Column(verbose_name="IGP")
+    assign_ipv4 = columns.BooleanColumn(verbose_name="IPv4")
+    assign_ipv6 = columns.BooleanColumn(verbose_name="IPv6")
+    enabled = columns.BooleanColumn()
+
+    class Meta(NetBoxTable.Meta):
+        model = NSOLinkRole
+        fields = (
+            "pk",
+            "id",
+            "name",
+            "slug",
+            "link_type",
+            "assign_ipv4",
+            "assign_ipv6",
+            "igp",
+            "enabled",
+            "description",
+            "actions",
+        )
+        default_columns = ("name", "link_type", "assign_ipv4", "assign_ipv6", "igp", "enabled")
+
+
+class NSOLinkRoleAssignmentTable(NetBoxTable):
+    """Table for listing link-role assignments (role ← cable or interface)."""
+
+    role = tables.Column(linkify=True)
+    cable = tables.Column(linkify=True)
+    interface = tables.Column(linkify=True)
+
+    class Meta(NetBoxTable.Meta):
+        model = NSOLinkRoleAssignment
+        fields = ("pk", "id", "role", "cable", "interface", "actions")
+        default_columns = ("role", "cable", "interface")

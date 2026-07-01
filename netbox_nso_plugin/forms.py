@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
+from dcim.models import Cable, Interface
 from django import forms
+from ipam.models import Prefix
 from netbox.forms import NetBoxModelForm
+from utilities.forms.fields import DynamicModelChoiceField, SlugField
+from utilities.forms.rendering import FieldSet
 
 from .models import (
     AdapterConnection,
@@ -9,6 +13,8 @@ from .models import (
     NSOFailoverSettings,
     NSOInstance,
     NSOInterfaceMtuState,
+    NSOLinkRole,
+    NSOLinkRoleAssignment,
     NSOLoggingHostState,
     NSOPlatformNedMapping,
     NSOSnmpCommunityState,
@@ -271,3 +277,85 @@ class NSOInterfaceMtuStateForm(NetBoxModelForm):
             obj.save()
             self.save_m2m()
         return obj
+
+
+# ── Link-role provisioning ─────────────────────────────────────────────────────
+
+
+class NSOLinkRoleForm(NetBoxModelForm):
+    """Create/edit a configurable link role — the intent bundle (IP + description + IGP)."""
+
+    slug = SlugField(slug_source="name")
+    ipv4_pool_prefix = DynamicModelChoiceField(queryset=Prefix.objects.all(), required=False, label="IPv4 pool prefix")
+    ipv6_pool_prefix = DynamicModelChoiceField(queryset=Prefix.objects.all(), required=False, label="IPv6 pool prefix")
+
+    fieldsets = (
+        FieldSet("name", "slug", "description", "enabled", "link_type", name="Role"),
+        FieldSet(
+            "assign_ipv4",
+            "ipv4_pool_prefix",
+            "ipv4_pool_role",
+            "ipv4_mask",
+            "assign_ipv6",
+            "ipv6_pool_prefix",
+            "ipv6_pool_role",
+            "ipv6_mask",
+            name="IP assignment",
+        ),
+        FieldSet("description_template", name="Description"),
+        FieldSet(
+            "igp",
+            "isis_circuit_type",
+            "isis_passive",
+            "isis_metric",
+            "isis_process_tag",
+            "ospf_area",
+            "ospf_network_type",
+            "ospf_passive",
+            "ospf_cost",
+            "ospf_process_id",
+            name="IGP",
+        ),
+    )
+
+    class Meta:
+        model = NSOLinkRole
+        fields = [
+            "name",
+            "slug",
+            "description",
+            "enabled",
+            "link_type",
+            "assign_ipv4",
+            "ipv4_pool_prefix",
+            "ipv4_pool_role",
+            "ipv4_mask",
+            "assign_ipv6",
+            "ipv6_pool_prefix",
+            "ipv6_pool_role",
+            "ipv6_mask",
+            "description_template",
+            "igp",
+            "isis_circuit_type",
+            "isis_passive",
+            "isis_metric",
+            "isis_process_tag",
+            "ospf_area",
+            "ospf_network_type",
+            "ospf_passive",
+            "ospf_cost",
+            "ospf_process_id",
+            "tags",
+        ]
+
+
+class NSOLinkRoleAssignmentForm(NetBoxModelForm):
+    """Assign a link role to a cable (p2p) or a single interface (loopback/access)."""
+
+    role = DynamicModelChoiceField(queryset=NSOLinkRole.objects.all())
+    cable = DynamicModelChoiceField(queryset=Cable.objects.all(), required=False)
+    interface = DynamicModelChoiceField(queryset=Interface.objects.all(), required=False)
+
+    class Meta:
+        model = NSOLinkRoleAssignment
+        fields = ["role", "cable", "interface", "tags"]

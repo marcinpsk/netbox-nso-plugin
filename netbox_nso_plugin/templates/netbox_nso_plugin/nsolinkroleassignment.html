@@ -1,0 +1,41 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{% extends 'generic/object.html' %}
+{% load helpers %}
+
+{% block breadcrumbs %}
+  <li class="breadcrumb-item"><a href="{% url 'plugins:netbox_nso_plugin:nsolinkroleassignment_list' %}">Link Role Assignments</a></li>
+  <li class="breadcrumb-item">{{ object }}</li>
+{% endblock %}
+
+{% block content %}
+  <div class="row">
+    <div class="col-12 col-md-6">
+      <div class="card">
+        <h5 class="card-header">Link Role Assignment</h5>
+        <div class="card-body">
+          <table class="table table-hover attr-table">
+            <tr>
+              <th scope="row">Role</th>
+              <td><a href="{{ object.role.get_absolute_url }}">{{ object.role }}</a></td>
+            </tr>
+            <tr>
+              <th scope="row">Cable</th>
+              <td>
+                {% if object.cable %}<a href="{{ object.cable.get_absolute_url }}">{{ object.cable }}</a>
+                {% else %}<span class="text-muted">&mdash;</span>{% endif %}
+              </td>
+            </tr>
+            <tr>
+              <th scope="row">Interface</th>
+              <td>
+                {% if object.interface %}<a href="{{ object.interface.get_absolute_url }}">{{ object.interface }}</a>
+                {% else %}<span class="text-muted">&mdash;</span>{% endif %}
+              </td>
+            </tr>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+{% endblock content %}

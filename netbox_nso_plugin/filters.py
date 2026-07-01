@@ -3,7 +3,14 @@
 import django_filters
 from netbox.filtersets import NetBoxModelFilterSet
 
-from .models import NSODeviceManagement, NSOInstance, NSOInterfaceState, NSOPlatformNedMapping
+from .models import (
+    NSODeviceManagement,
+    NSOInstance,
+    NSOInterfaceState,
+    NSOLinkRole,
+    NSOLinkRoleAssignment,
+    NSOPlatformNedMapping,
+)
 
 
 class NSOPlatformNedMappingFilterSet(NetBoxModelFilterSet):
@@ -57,3 +64,19 @@ class NSOInterfaceStateFilterSet(NetBoxModelFilterSet):
     class Meta:
         model = NSOInterfaceState
         fields = ["id", "interface", "attribute", "status"]
+
+
+class NSOLinkRoleFilterSet(NetBoxModelFilterSet):
+    """FilterSet for NSOLinkRole."""
+
+    class Meta:
+        model = NSOLinkRole
+        fields = ["id", "name", "slug", "link_type", "igp", "enabled"]
+
+
+class NSOLinkRoleAssignmentFilterSet(NetBoxModelFilterSet):
+    """FilterSet for NSOLinkRoleAssignment."""
+
+    class Meta:
+        model = NSOLinkRoleAssignment
+        fields = ["id", "role", "cable", "interface"]
