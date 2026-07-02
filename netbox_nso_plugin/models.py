@@ -370,6 +370,15 @@ class NSODeviceManagement(NetBoxModel):
     )
     last_sync_at = models.DateTimeField(null=True, blank=True)
     last_sync_status = models.CharField(max_length=50, blank=True, default="")
+    degraded_surfaces = models.JSONField(
+        null=True,
+        blank=True,
+        help_text=(
+            "When last_sync_status is 'partial', the routing surfaces (e.g. ['bgp', 'ospf']) "
+            "whose read from NSO failed on the last sync — their mirrored data may be stale. "
+            "NULL when nothing is degraded. Cached from the adapter."
+        ),
+    )
     last_journaled_apply_job = models.CharField(
         max_length=64,
         blank=True,

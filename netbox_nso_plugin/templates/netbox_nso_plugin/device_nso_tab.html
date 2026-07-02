@@ -127,6 +127,8 @@
           <td>
             {% if mgmt.last_sync_status == "succeeded" %}<span class="badge text-bg-success">{{ mgmt.last_sync_status }}</span>
             {% elif mgmt.last_sync_status == "failed" %}<span class="badge text-bg-danger">{{ mgmt.last_sync_status }}</span>
+            {% elif mgmt.last_sync_status == "partial" %}<span class="badge text-bg-warning text-dark" title="Interface sync succeeded, but one or more routing surfaces failed to read from NSO — their mirrored data may be stale.">partial</span>
+              {% if mgmt.degraded_surfaces %}<div class="small text-muted mt-1">Stale (NSO read failed): {% for surface in mgmt.degraded_surfaces %}<span class="badge text-bg-warning text-dark ms-1">{{ surface }}</span>{% endfor %}</div>{% endif %}
             {% elif mgmt.last_sync_status %}<span class="badge text-bg-info">{{ mgmt.last_sync_status }}</span>
             {% else %}—{% endif %}
           </td>

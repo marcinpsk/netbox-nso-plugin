@@ -62,6 +62,9 @@
                   <span class="badge text-bg-warning text-dark"><span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true" style="width:.7rem;height:.7rem;"></span>Provisioning…</span>
                 {% elif m.onboard_status == 'provision_failed' %}
                   <span class="badge text-bg-danger" title="{{ m.onboard_error }}">Provisioning failed</span>
+                {% elif m.last_sync_status == "succeeded" %}<span class="badge text-bg-success">succeeded</span>
+                {% elif m.last_sync_status == "failed" %}<span class="badge text-bg-danger">failed</span>
+                {% elif m.last_sync_status == "partial" %}<span class="badge text-bg-warning text-dark" title="Some routing surfaces failed to read from NSO{% if m.degraded_surfaces %} — stale: {{ m.degraded_surfaces|join:", " }}{% endif %}. Open the NSO tab for detail.">partial{% if m.degraded_surfaces %} ({{ m.degraded_surfaces|length }}){% endif %}</span>
                 {% elif m.last_sync_status %}<span class="badge text-bg-info">{{ m.last_sync_status }}</span>{% else %}{{ ''|placeholder }}{% endif %}
               </td>
               <td class="text-end text-nowrap">

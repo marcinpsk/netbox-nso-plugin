@@ -102,6 +102,24 @@ class TestOnboardingDashboardView(ViewTestBase):
         self.assertContains(response, "Manage")
         self.assertEqual(ext.name, "ext-router-01")
 
+    @patch("netbox_nso_plugin.adapter_client.get_neds", return_value=[])
+    @patch("netbox_nso_plugin.adapter_client.list_instance_devices", return_value=[])
+    def test_dashboard_shows_partial_status_with_degraded_surfaces(self, _list, _neds):
+        """The managed-row status column renders a warning 'partial' badge whose tooltip
+        names the stale surfaces, from the cached mgmt fields (no fresh adapter poll)."""
+        mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+        mgmt.last_sync_status = "partial"
+        mgmt.degraded_surfaces = ["bgp", "ospf"]
+        mgmt.save(update_fields=["last_sync_status", "degraded_surfaces"])
+
+        url = reverse("plugins:netbox_nso_plugin:onboarding_dashboard")
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        html = response.content.decode()
+        self.assertIn("text-bg-warning", html)
+        self.assertIn("partial", html)
+        self.assertIn("bgp, ospf", html)
+
     def test_quick_manage_creates_management(self):
         """POST to quick_manage creates the management record for an external device.
 
@@ -370,6 +388,54 @@ class TestNSODeviceManagementListView(ViewTestBase):
         mgmt.refresh_from_db()
         self.assertEqual(mgmt.last_sync_status, "succeeded")
         self.assertIsNotNone(mgmt.last_sync_at)
+
+        mgmt.adapter_device_id = None
+        mgmt.save(update_fields=["adapter_device_id"])
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config")
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_list_renders_partial_badge_and_caches_degraded_surfaces(self, mock_session_cls, mock_cfg):
+        """A 'partial' device renders a warning badge in the table whose tooltip lists
+        the stale surfaces, and caches degraded_surfaces on the row."""
+        mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+        mgmt.adapter_device_id = 17
+        mgmt.last_sync_status = ""
+        mgmt.degraded_surfaces = None
+        mgmt.save()
+
+        mock_cfg.return_value = {
+            "url": "http://adapter",
+            "token": "tok",
+            "verify_tls": True,
+            "ca_cert_path": None,
+            "timeout": 30,
+        }
+
+        def make_resp(method, url, **kwargs):
+            return make_response(
+                200,
+                json_data={
+                    "id": 17,
+                    "last_sync_at": "2025-06-01T10:00:00+00:00",
+                    "last_sync_status": "partial",
+                    "degraded_surfaces": ["bgp", "ospf"],
+                },
+            )
+
+        session = make_session()
+        session.request = make_resp
+        mock_session_cls.return_value = session
+
+        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_list")
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        html = response.content.decode()
+        self.assertIn("text-bg-warning", html)
+        self.assertIn("partial", html)
+        self.assertIn("bgp, ospf", html)  # tooltip lists the stale surfaces
+
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.degraded_surfaces, ["bgp", "ospf"])
 
         mgmt.adapter_device_id = None
         mgmt.save(update_fields=["adapter_device_id"])
@@ -1458,6 +1524,45 @@ class TestDeviceNSOTabView(ViewTestBase):
         self.assertIn("NetBox owns 2", html)
         self.assertIn(">partial<", html)
         self.assertIn("Re-sync adapter intent", html)
+
+    def test_tab_renders_partial_last_sync_and_caches_degraded_surfaces(self):
+        """A 'partial' last-sync from the adapter renders a warning badge naming the
+        stale routing surfaces, and caches degraded_surfaces on the mgmt row so the
+        list/dashboard can show it without a fresh poll.
+
+        (This 'partial' is the device-level last_sync_status — distinct from the
+        intent split-brain 'partial' badge covered above.)
+        """
+        mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+        mgmt.adapter_device_id = 15
+        mgmt.last_sync_status = ""
+        mgmt.degraded_surfaces = None
+        mgmt.save()
+
+        stack, mocks = self._patch_all_getters()
+        mocks["get_device"].return_value = {
+            "id": 15,
+            "last_sync_at": "2025-06-01T10:00:00+00:00",
+            "last_sync_status": "partial",
+            "degraded_surfaces": ["bgp", "ospf"],
+        }
+        with stack:
+            url = reverse("dcim:device_nso", kwargs={"pk": self.device.pk})
+            response = self.client.get(url)
+
+        mgmt.adapter_device_id = None
+        mgmt.save(update_fields=["adapter_device_id"])
+
+        self.assertEqual(response.status_code, 200)
+        html = response.content.decode()
+        # the sync-status row shows the partial badge and names the stale surfaces
+        self.assertIn("Stale (NSO read failed)", html)
+        self.assertIn(">bgp</span>", html)
+        self.assertIn(">ospf</span>", html)
+        # ...and the surfaces are cached so the list/dashboard need no fresh poll
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.last_sync_status, "partial")
+        self.assertEqual(mgmt.degraded_surfaces, ["bgp", "ospf"])
 
     def test_tab_render_is_counts_only_no_scoped_fetches(self):
         """The tab RENDER fetches no per-scope adapter data — only get_device for the

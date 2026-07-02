@@ -110,6 +110,12 @@ def _refresh_sync_cache(mgmt, adapter_device):
     if mgmt.last_sync_status != last_sync_status:
         mgmt.last_sync_status = last_sync_status
         update_fields.append("last_sync_status")
+    # Which routing surfaces went stale on a "partial" sync (e.g. ["bgp", "ospf"]),
+    # normalized to None when nothing degraded so the display branches on truthiness.
+    degraded_surfaces = adapter_device.get("degraded_surfaces") or None
+    if mgmt.degraded_surfaces != degraded_surfaces:
+        mgmt.degraded_surfaces = degraded_surfaces
+        update_fields.append("degraded_surfaces")
     if update_fields:
         NSODeviceManagement.objects.filter(pk=mgmt.pk).update(**{f: getattr(mgmt, f) for f in update_fields})
     return update_fields

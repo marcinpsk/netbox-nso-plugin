@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 import django_tables2 as tables
+from django.utils.html import format_html
 from netbox.tables import NetBoxTable, columns
 
 from .models import (
@@ -11,6 +12,9 @@ from .models import (
     NSOLinkRoleAssignment,
     NSOPlatformNedMapping,
 )
+
+# Semantic Bootstrap colors for a device's last_sync_status badge (no gray-on-gray).
+_SYNC_STATUS_COLOR = {"succeeded": "success", "failed": "danger", "partial": "warning"}
 
 
 class NSOPlatformNedMappingTable(NetBoxTable):
@@ -69,6 +73,26 @@ class NSODeviceManagementTable(NetBoxTable):
             "last_sync_at",
             "last_sync_status",
         )
+
+    def render_last_sync_status(self, value, record):
+        """Render last_sync_status as a semantic badge.
+
+        For 'partial', list the stale surfaces in a tooltip so the operator sees what
+        went stale without opening the tab.
+        """
+        if not value:
+            return "—"
+        css = "badge text-bg-" + _SYNC_STATUS_COLOR.get(value, "info")
+        if value == "partial":
+            css += " text-dark"  # yellow badge needs dark text for contrast
+            if record.degraded_surfaces:
+                return format_html(
+                    '<span class="{}" title="Stale surfaces (NSO read failed): {}">{}</span>',
+                    css,
+                    ", ".join(record.degraded_surfaces),
+                    value,
+                )
+        return format_html('<span class="{}">{}</span>', css, value)
 
 
 class NSOInterfaceStateTable(NetBoxTable):
