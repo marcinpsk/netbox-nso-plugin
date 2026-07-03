@@ -713,6 +713,7 @@ def enqueue_device_reconcile(device_id: int):
         import django_rq
         from rq.exceptions import NoSuchJobError
         from rq.job import Job as RqJob
+        from rq.registry import StartedJobRegistry
     except ImportError:  # pragma: no cover - RQ ships with NetBox
         logger.warning("django_rq unavailable; running reconcile for device %s inline", device_id)
         run_device_reconcile(device_id)
@@ -725,7 +726,16 @@ def enqueue_device_reconcile(device_id: int):
     except NoSuchJobError:
         existing = None
     if existing is not None:
-        if existing.get_status(refresh=True) in ("queued", "started", "deferred", "scheduled"):
-            return existing  # already pending — don't pile up
-        existing.delete()  # finished/failed: clear so the id can be reused
+        # Only skip re-enqueue when the job is GENUINELY in flight — actually present in the
+        # pending queue, or actively running in the started registry. Do NOT trust the job's
+        # status field: a job whose worker died mid-run (dev auto-reload, prod redeploy/crash)
+        # is left with a stale 'queued'/'started' status yet is tracked by NEITHER registry, and
+        # keying the skip off status alone lets such an orphan block EVERY future reconcile for
+        # this device forever (observed live: an nso-reconcile-<id> stuck 'queued' for a month
+        # silently no-op'd every sync/apply notify, so rows only settled on inline tab renders).
+        pending = job_id in queue.get_job_ids()
+        running = job_id in StartedJobRegistry(queue=queue).get_job_ids()
+        if pending or running:
+            return existing  # truly in flight — don't pile up
+        existing.delete()  # orphaned / finished / failed: clear so the id can be reused
     return queue.enqueue(run_device_reconcile, device_id, job_id=job_id, result_ttl=300, job_timeout=600)

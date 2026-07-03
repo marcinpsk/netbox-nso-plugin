@@ -5,6 +5,7 @@
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
+from django.test import TestCase
 from rest_framework import status
 from utilities.testing import APITestCase
 
@@ -451,3 +452,78 @@ class TestSafeReconcile(APITestCase):
         ctx = {"vlan_states": []}
         _safe_reconcile(ctx, "vlan_states", mgmt, ("NSOVLANState",), lambda *_a: ["ok"], object())
         self.assertEqual(ctx["vlan_states"], ["ok"])
+
+
+class TestEnqueueDeviceReconcileOrphanRecovery(TestCase):
+    """`enqueue_device_reconcile` dedups on a deterministic job id (`nso-reconcile-<id>`) so the
+    15-min sync fan-out doesn't pile up. But an ORPHANED job — worker died mid-run (dev auto-reload,
+    prod redeploy/crash), leaving a stale ``queued``/``started`` status while tracked by NEITHER the
+    pending queue nor the started registry — must NOT block every future reconcile for that device.
+    Observed live: an ``nso-reconcile-90`` stuck ``queued`` since June silently no-op'd every
+    sync/apply notify, so rows only settled on an inline tab-render reconcile.
+
+    Real-behavior: exercises the actual RQ Queue/Job API on the configured Redis, but on an isolated
+    throwaway queue name (no worker consumes it) with a device id that can't collide with real jobs.
+    """
+
+    _DEV = 987654  # won't collide with any real nso-reconcile-<id> job hash
+    _QUEUE = "nso-test-reconcile-orphan"
+    _JOB_ID = f"nso-reconcile-{_DEV}"
+
+    def _queue(self):
+        import django_rq
+        from rq import Queue
+
+        conn = django_rq.get_queue("default").connection
+        return Queue(self._QUEUE, connection=conn)
+
+    def setUp(self):
+        super().setUp()
+        self._clear()
+
+    def tearDown(self):
+        self._clear()
+        super().tearDown()
+
+    def _clear(self):
+        from rq.exceptions import NoSuchJobError
+        from rq.job import Job as RqJob
+
+        q = self._queue()
+        try:
+            RqJob.fetch(self._JOB_ID, connection=q.connection).delete()
+        except NoSuchJobError:
+            pass
+        q.empty()
+
+    def test_orphaned_job_is_cleared_and_reconcile_re_enqueued(self):
+        from netbox_nso_plugin.reconcile import enqueue_device_reconcile, run_device_reconcile
+
+        q = self._queue()
+        # Build an orphan exactly like a worker that died after dequeue: the job hash persists with
+        # a stale 'queued' status, but it's no longer in the pending list.
+        orphan = q.enqueue(run_device_reconcile, self._DEV, job_id=self._JOB_ID)
+        q.remove(orphan.id)
+        self.assertNotIn(self._JOB_ID, q.get_job_ids())  # orphaned: fetchable but not pending
+
+        with patch("django_rq.get_queue", return_value=q):
+            job = enqueue_device_reconcile(self._DEV)
+
+        # The orphan must be cleared and a genuine reconcile enqueued (unfixed code returned the
+        # orphan and never re-enqueued → the id would still be absent from the pending queue).
+        self.assertIsNotNone(job)
+        self.assertEqual(job.id, self._JOB_ID)
+        self.assertIn(self._JOB_ID, q.get_job_ids())
+
+    def test_genuinely_queued_job_is_not_duplicated(self):
+        """A truly-pending reconcile is still deduped (no pile-up) — the fix must not regress that."""
+        from netbox_nso_plugin.reconcile import enqueue_device_reconcile
+
+        q = self._queue()
+        with patch("django_rq.get_queue", return_value=q):
+            first = enqueue_device_reconcile(self._DEV)
+            self.assertIn(self._JOB_ID, q.get_job_ids())
+            second = enqueue_device_reconcile(self._DEV)  # genuinely pending → dedup
+
+        self.assertEqual(second.id, first.id)
+        self.assertEqual(q.get_job_ids().count(self._JOB_ID), 1)
