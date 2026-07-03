@@ -1352,9 +1352,13 @@ def _prepare_apply(mgmt):
     roll them back via :func:`_rollback_prepare_apply` if the Apply fails to enqueue a job.
     """
     from .signals import (
+        _push_bfd_intent_for_device,
         _push_interface_intent_for_device,
+        _push_interface_mtu_intent_for_device,
         _push_lacp_intent_for_device,
         _push_route_policy_intent_for_device,
+        _push_subinterface_intent_for_device,
+        _push_svi_intent_for_device,
         _push_switchport_intent_for_device,
         _push_vlan_intent_for_device,
     )
@@ -1369,14 +1373,20 @@ def _prepare_apply(mgmt):
     #     whose adapter intent went stale is force-pushed so Apply actually re-applies
     #     it. Ownership is status-based and kept durable by the reconciler's owned-guard,
     #     so this no longer re-pushes a row that genuinely drifted back to 'imported'.
-    #   - route-policy: mirrored as adapter intent (reactive push on accept/edit), but that
-    #     mirror can go stale/empty (a failed push, an out-of-band adapter reset). Force-push
-    #     the owned snapshot so Apply re-ships it instead of applying nothing and leaving the
-    #     row stuck 'deploying' (observed on rg03: an owned as-path with no adapter intent row).
+    #   - route-policy / SVI / subinterface / BFD / MTU: mirrored as adapter intent (reactive
+    #     push on accept/edit), but that mirror can go stale/empty (a failed push, an
+    #     out-of-band adapter reset). These are all marked accepted->deploying below, so
+    #     force-push the owned snapshot too — otherwise Apply applies nothing and the row
+    #     sticks 'deploying' forever (observed on rg03 for route-policy: an owned as-path
+    #     with no adapter intent row; SVI/subinterface/BFD/MTU share the same failure mode).
     for push in (
         _push_interface_intent_for_device,
         _push_lacp_intent_for_device,
         _push_route_policy_intent_for_device,
+        _push_svi_intent_for_device,
+        _push_subinterface_intent_for_device,
+        _push_bfd_intent_for_device,
+        _push_interface_mtu_intent_for_device,
         _push_switchport_intent_for_device,
         _push_vlan_intent_for_device,
     ):

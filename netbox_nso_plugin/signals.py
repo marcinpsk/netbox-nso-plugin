@@ -829,11 +829,17 @@ def _on_logging_state_save(sender, instance, **kwargs):
     )
 
 
-def _push_svi_intent_for_device(device_id, adapter_device_id):
+def _push_svi_intent_for_device(device_id, adapter_device_id, force=False):
     """Build and push the full owned SVI/IRB intent snapshot for a device.
 
     Store-only (deferred): the single device Apply commits via the svi-reconciler.
     Only owned rows (_OWNED_PUSH_STATUSES, incl. apply_failed) are included.
+
+    ``force=True`` (the device Apply) bypasses change-detection so an owned SVI whose
+    adapter intent went stale/empty is re-pushed and actually applied instead of being
+    silently skipped — mirrors the interface/VLAN/route-policy force-push. Without it,
+    Apply marks the row 'deploying', pushes nothing, applies 0 items and the row sticks
+    in 'deploying' forever.
     """
     from . import adapter_client as client
     from .models import NSOSVIState
@@ -859,6 +865,7 @@ def _push_svi_intent_for_device(device_id, adapter_device_id):
         (device_id, "svi"),
         interfaces,
         lambda: client.put_svi_intent(adapter_device_id, interfaces),
+        force=force,
     )
 
 
@@ -883,11 +890,16 @@ def _on_svi_state_save(sender, instance, **kwargs):
     )
 
 
-def _push_subinterface_intent_for_device(device_id, adapter_device_id):
+def _push_subinterface_intent_for_device(device_id, adapter_device_id, force=False):
     """Build and push the full owned dot1q subinterface intent snapshot.
 
     Store-only (deferred): the single device Apply commits via the
     subinterface-reconciler. Only owned rows (_OWNED_PUSH_STATUSES, incl. apply_failed) included.
+
+    ``force=True`` (the device Apply) bypasses change-detection so an owned subinterface
+    whose adapter intent went stale/empty is re-pushed and actually applied instead of
+    silently skipped — mirrors the interface/VLAN/route-policy force-push. Without it, Apply
+    marks the row 'deploying', pushes nothing, applies 0 items and it sticks 'deploying'.
     """
     from . import adapter_client as client
     from .models import NSOSubinterfaceState
@@ -915,6 +927,7 @@ def _push_subinterface_intent_for_device(device_id, adapter_device_id):
         (device_id, "subinterface"),
         interfaces,
         lambda: client.put_subinterface_intent(adapter_device_id, interfaces),
+        force=force,
     )
 
 
@@ -939,11 +952,16 @@ def _on_subinterface_state_save(sender, instance, **kwargs):
     )
 
 
-def _push_interface_mtu_intent_for_device(device_id, adapter_device_id):
+def _push_interface_mtu_intent_for_device(device_id, adapter_device_id, force=False):
     """Build and push the full owned per-interface MTU intent snapshot (Phase 2b).
 
     Store-only (deferred): the single device Apply commits via the mtu-reconciler.
     Only owned rows (_OWNED_PUSH_STATUSES, incl. apply_failed) are included.
+
+    ``force=True`` (the device Apply) bypasses change-detection so an owned MTU whose
+    adapter intent went stale/empty is re-pushed and actually applied instead of silently
+    skipped — mirrors the interface/VLAN/route-policy force-push. Without it, Apply marks
+    the row 'deploying', pushes nothing, applies 0 items and it sticks 'deploying'.
     """
     from . import adapter_client as client
     from .models import NSOInterfaceMtuState
@@ -969,6 +987,7 @@ def _push_interface_mtu_intent_for_device(device_id, adapter_device_id):
         (device_id, "interface_mtu"),
         interfaces,
         lambda: client.put_interface_mtu_intent(adapter_device_id, interfaces),
+        force=force,
     )
 
 
@@ -1093,11 +1112,16 @@ def _on_ipam_vlan_pre_delete(sender, instance, **kwargs):
         )
 
 
-def _push_bfd_intent_for_device(device_id, adapter_device_id):
+def _push_bfd_intent_for_device(device_id, adapter_device_id, force=False):
     """Build and push the full owned per-interface BFD intent snapshot for a device.
 
     Store-only (deferred): the single device Apply commits via the bfd-reconciler.
     Only owned rows (_OWNED_PUSH_STATUSES, incl. apply_failed) are included.
+
+    ``force=True`` (the device Apply) bypasses change-detection so an owned BFD whose
+    adapter intent went stale/empty is re-pushed and actually applied instead of silently
+    skipped — mirrors the interface/VLAN/route-policy force-push. Without it, Apply marks
+    the row 'deploying', pushes nothing, applies 0 items and it sticks 'deploying'.
     """
     from . import adapter_client as client
     from .models import NSOBFDInterfaceState
@@ -1121,6 +1145,7 @@ def _push_bfd_intent_for_device(device_id, adapter_device_id):
         (device_id, "bfd"),
         interfaces,
         lambda: client.put_bfd_intent(adapter_device_id, interfaces),
+        force=force,
     )
 
 

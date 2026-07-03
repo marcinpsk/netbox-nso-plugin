@@ -212,6 +212,10 @@ class TestRoutePolicyApplySettle(APITestCase):
             patch("netbox_nso_plugin.signals._push_lacp_intent_for_device"),
             patch("netbox_nso_plugin.signals._push_switchport_intent_for_device"),
             patch("netbox_nso_plugin.signals._push_vlan_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_svi_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_subinterface_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_bfd_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_interface_mtu_intent_for_device"),
             patch("netbox_nso_plugin.signals._push_route_policy_intent_for_device"),
         ):
             _prepare_apply(mgmt)
@@ -230,6 +234,10 @@ class TestRoutePolicyApplySettle(APITestCase):
             patch("netbox_nso_plugin.signals._push_lacp_intent_for_device"),
             patch("netbox_nso_plugin.signals._push_switchport_intent_for_device"),
             patch("netbox_nso_plugin.signals._push_vlan_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_svi_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_subinterface_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_bfd_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_interface_mtu_intent_for_device"),
             patch("netbox_nso_plugin.signals._push_route_policy_intent_for_device"),
         ):
             _prepare_apply(mgmt)
@@ -248,10 +256,38 @@ class TestRoutePolicyApplySettle(APITestCase):
             patch("netbox_nso_plugin.signals._push_lacp_intent_for_device"),
             patch("netbox_nso_plugin.signals._push_switchport_intent_for_device"),
             patch("netbox_nso_plugin.signals._push_vlan_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_svi_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_subinterface_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_bfd_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_interface_mtu_intent_for_device"),
             patch("netbox_nso_plugin.signals._push_route_policy_intent_for_device") as push_rp,
         ):
             _prepare_apply(mgmt)
         push_rp.assert_called_once_with(mgmt.device_id, mgmt.adapter_device_id, force=True)
+
+    def test_prepare_apply_force_pushes_deferred_scopes(self):
+        """Apply marks SVI/subinterface/BFD/MTU accepted->deploying, so it must also force-re-push
+        their owned snapshots. These are mirrored as adapter intent (reactive push on accept/edit),
+        but that mirror can go stale/empty (a failed push, an out-of-band adapter reset). Without a
+        force-push, Apply marks the row 'deploying' but the change-detection cache skips the push →
+        0 items applied → the row sticks in 'deploying' forever (route-policy's rg03 failure mode)."""
+        from netbox_nso_plugin.views import _prepare_apply
+
+        mgmt, _row = self._setup(status_="accepted")
+        with (
+            patch("netbox_nso_plugin.signals._push_interface_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_lacp_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_switchport_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_vlan_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_route_policy_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_svi_intent_for_device") as push_svi,
+            patch("netbox_nso_plugin.signals._push_subinterface_intent_for_device") as push_subif,
+            patch("netbox_nso_plugin.signals._push_bfd_intent_for_device") as push_bfd,
+            patch("netbox_nso_plugin.signals._push_interface_mtu_intent_for_device") as push_mtu,
+        ):
+            _prepare_apply(mgmt)
+        for push in (push_svi, push_subif, push_bfd, push_mtu):
+            push.assert_called_once_with(mgmt.device_id, mgmt.adapter_device_id, force=True)
 
 
 class TestApplyRollbackOnAdapterError(APITestCase):
@@ -287,6 +323,10 @@ class TestApplyRollbackOnAdapterError(APITestCase):
             patch("netbox_nso_plugin.signals._push_lacp_intent_for_device"),
             patch("netbox_nso_plugin.signals._push_switchport_intent_for_device"),
             patch("netbox_nso_plugin.signals._push_vlan_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_svi_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_subinterface_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_bfd_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_interface_mtu_intent_for_device"),
             patch("netbox_nso_plugin.signals._push_route_policy_intent_for_device"),
             patch(
                 "netbox_nso_plugin.adapter_client.trigger_apply",
