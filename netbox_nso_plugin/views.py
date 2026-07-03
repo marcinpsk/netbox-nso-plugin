@@ -2969,12 +2969,23 @@ class NSORoutePolicyCapabilityView(LoginRequiredMixin, View):
     the per-object panel badge.
     """
 
+    #: A live NSO probe (POST, or GET ?refresh=1) is a device-touching action; a plain
+    #: cache-only GET is a read (login-only). Gate only the probe on the change permission.
+    _PROBE_PERMISSION = "netbox_nso_plugin.change_nsodevicemanagement"
+
+    def _require_probe_perm(self, request):
+        if request.user.is_authenticated and not request.user.has_perm(self._PROBE_PERMISSION):
+            raise PermissionDenied
+
     def get(self, request, device_pk):  # noqa: D102
         mgmt = get_object_or_404(NSODeviceManagement, device_id=device_pk)
         refresh = request.GET.get("refresh") == "1"
+        if refresh:
+            self._require_probe_perm(request)  # a forced probe touches the device
         return render(request, "netbox_nso_plugin/route_policy_capabilities.html", self._context(mgmt, refresh))
 
     def post(self, request, device_pk):  # noqa: D102
+        self._require_probe_perm(request)
         mgmt = get_object_or_404(NSODeviceManagement, device_id=device_pk)
         ctx = self._context(mgmt, refresh=True)
         if ctx["known"]:

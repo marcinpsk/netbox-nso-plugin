@@ -89,6 +89,18 @@ class ActionViewPermissionTests(IntentPushResetMixin, TestCase):
         response = self.client.post(url)
         self.assertEqual(response.status_code, 403)
 
+    def test_capability_probe_denied_without_permission(self):
+        """A live route-policy capability probe (POST) touches the device → 403 without change perm."""
+        url = reverse("plugins:netbox_nso_plugin:route_policy_capabilities", kwargs={"device_pk": self.device.pk})
+        response = self.client.post(url)
+        self.assertEqual(response.status_code, 403)
+
+    def test_capability_cache_read_allowed_without_permission(self):
+        """A plain cache-only GET (no ?refresh) stays a login-only read (no probe) — not over-gated."""
+        url = reverse("plugins:netbox_nso_plugin:route_policy_capabilities", kwargs={"device_pk": self.device.pk})
+        response = self.client.get(url)
+        self.assertNotEqual(response.status_code, 403)
+
     # ── add_nsodevicemanagement-gated views (onboard / manage) ────────────────
 
     def test_onboard_denied_without_add_permission(self):

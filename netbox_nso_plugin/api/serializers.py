@@ -101,6 +101,10 @@ class NSODeviceManagementSerializer(NetBoxModelSerializer):
             "created",
             "last_updated",
         ]
+        # Adapter-owned sync bookkeeping — writable only by the plugin/adapter, never by an
+        # API client. Without this a PATCH could forge last_sync_status="in_sync" (a false
+        # "no drift") or null out state_snapshot, corrupting the compliance view.
+        read_only_fields = ["adapter_device_id", "last_sync_at", "last_sync_status", "state_snapshot"]
 
 
 class NSOInterfaceStateSerializer(NetBoxModelSerializer):

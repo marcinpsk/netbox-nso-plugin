@@ -2,13 +2,14 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 from netbox.api.viewsets import NetBoxModelViewSet
 from rest_framework import status
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from ..filters import (
     NSODeviceManagementFilterSet,
     NSOInstanceFilterSet,
+    NSOInterfaceStateFilterSet,
     NSOLinkRoleAssignmentFilterSet,
     NSOLinkRoleFilterSet,
     NSOPlatformNedMappingFilterSet,
@@ -64,6 +65,7 @@ class NSOInterfaceStateViewSet(NetBoxModelViewSet):
 
     queryset = NSOInterfaceState.objects.select_related("interface")
     serializer_class = NSOInterfaceStateSerializer
+    filterset_class = NSOInterfaceStateFilterSet
 
 
 class NSOLinkRoleViewSet(NetBoxModelViewSet):
@@ -144,6 +146,21 @@ class OnboardingCandidatesView(APIView):
         )
 
 
+class HasNSOChangePermission(BasePermission):
+    """Require the NetBox ``change_nsodevicemanagement`` permission (mirrors the UI gate).
+
+    Onboarding provisions a device into NSO (create node → fetch-host-keys → unlock →
+    sync-from), so — like the UI's ``NSOActionPermissionMixin`` — it must not be open to any
+    authenticated API token; a read-only monitoring token must not be able to trigger it.
+    """
+
+    message = "This action requires the netbox_nso_plugin.change_nsodevicemanagement permission."
+
+    def has_permission(self, request, view):  # noqa: D102
+        user = request.user
+        return bool(user and user.is_authenticated and user.has_perm("netbox_nso_plugin.change_nsodevicemanagement"))
+
+
 class OnboardView(APIView):
     """CICD-facing onboard action.
 
@@ -154,7 +171,7 @@ class OnboardView(APIView):
     400 on pre-flight failure (no NED mapping / no primary IP / already managed).
     """
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [HasNSOChangePermission]
 
     def post(self, request):
         """Onboard the posted NetBox device into the selected (or default) NSO instance."""

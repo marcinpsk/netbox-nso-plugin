@@ -132,6 +132,22 @@ class NSODeviceManagementAPITest(APITestCase):
         self.assertIsNone(response.data["primary_ip"])
         self.assertIsNone(response.data["oob_ip"])
 
+    def test_adapter_owned_sync_fields_are_read_only(self):
+        """A PATCH must not be able to forge adapter-owned bookkeeping — last_sync_status (a fake
+        'no drift') or state_snapshot (wipe the compliance snapshot). The serializer marks them
+        read-only, so the write is silently ignored (200, values unchanged)."""
+        url = self._get_detail_url(self.mgmt)
+        response = self.client.patch(
+            url,
+            {"last_sync_status": "in_sync", "state_snapshot": {"forged": True}},
+            format="json",
+            **self.header,
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.mgmt.refresh_from_db()
+        self.assertNotEqual(self.mgmt.last_sync_status, "in_sync")
+        self.assertNotEqual(self.mgmt.state_snapshot, {"forged": True})
+
 
 class NSOInterfaceStateAPITest(APITestCase):
     """Test read operations on NSOInterfaceState via REST API."""
@@ -165,6 +181,42 @@ class NSOInterfaceStateAPITest(APITestCase):
         response = self.client.get(url, **self.header)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["attribute"], "description")
+
+    def test_status_filter_applies(self):
+        """?status= must actually filter — the viewset now declares filterset_class. Before, an
+        unrecognized filter param was silently ignored and every row was returned."""
+        other = NSOInterfaceState.objects.create(
+            interface=self.state.interface, attribute="enabled", status="accepted", nso_value="true"
+        )
+        response = self.client.get(f"{self._get_list_url()}?status=accepted", **self.header)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        ids = {row["id"] for row in response.data["results"]}
+        self.assertIn(other.pk, ids)
+        self.assertNotIn(self.state.pk, ids)  # the 'changed' row is filtered out
+
+
+class OnboardAPIPermissionTest(APITestCase):
+    """The onboard API action provisions a device into NSO (create node → host-keys → unlock →
+    sync-from). Like the UI, it must require change_nsodevicemanagement, not just a valid token —
+    a read-only monitoring token must not be able to trigger a device provision."""
+
+    user_permissions = ()  # authenticated token, but NO change_nsodevicemanagement
+
+    @classmethod
+    def setUpTestData(cls):
+        mfg = Manufacturer.objects.create(name="OnbApiMfg", slug="onbapimfg")
+        dt = DeviceType.objects.create(manufacturer=mfg, model="OnbApiDev", slug="onbapidev")
+        role = DeviceRole.objects.create(name="OnbApiRole", slug="onbapirole")
+        site = Site.objects.create(name="OnbApiSite", slug="onbapisite")
+        cls.device = Device.objects.create(name="onb-api-rtr", device_type=dt, role=role, site=site)
+        cls.instance = NSOInstance.objects.create(name="onb-api", adapter_instance_id="onb-api")
+
+    def test_onboard_denied_without_change_permission(self):
+        from django.urls import reverse
+
+        url = reverse("plugins-api:netbox_nso_plugin-api:onboard")
+        resp = self.client.post(url, {"netbox_device_id": self.device.pk}, format="json", **self.header)
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
 
 
 class OnboardingCandidatesAPITest(APITestCase):
