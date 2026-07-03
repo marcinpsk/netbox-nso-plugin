@@ -223,13 +223,22 @@ class NSOInstance(NetBoxModel):
         The first instance created becomes the default automatically; marking
         another as default clears the previous one.
         """
-        # If no other default exists (e.g. this is the first instance), force this
-        # one to be the default so onboarding always has something to pre-select.
-        if not NSOInstance.objects.exclude(pk=self.pk).filter(is_default=True).exists():
-            self.is_default = True
-        super().save(*args, **kwargs)
-        if self.is_default:
-            NSOInstance.objects.exclude(pk=self.pk).filter(is_default=True).update(is_default=False)
+        from django.db import transaction
+
+        with transaction.atomic():
+            # Lock the other default rows so concurrent saves serialize on the default check:
+            # without this, two concurrent non-default creates both see "no default", both force
+            # themselves default, then each clears the other → zero defaults (get_default()→None).
+            # (Re-query fresh in each spot: on a create self.pk is None until super().save(), so a
+            # single captured queryset would exclude the wrong row and clear its own flag.)
+            other_defaults = NSOInstance.objects.select_for_update().filter(is_default=True).exclude(pk=self.pk)
+            # If no other default exists (e.g. this is the first instance), force this one to be
+            # the default so onboarding always has something to pre-select.
+            if not other_defaults.exists():
+                self.is_default = True
+            super().save(*args, **kwargs)
+            if self.is_default:
+                NSOInstance.objects.filter(is_default=True).exclude(pk=self.pk).update(is_default=False)
 
 
 class NSOPlatformNedMapping(NetBoxModel):

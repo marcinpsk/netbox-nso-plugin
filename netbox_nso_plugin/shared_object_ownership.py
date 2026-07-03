@@ -99,11 +99,19 @@ def mark_materialized(state) -> None:
     Called when a device first fills an empty shared object.  Clears the flag on any
     sibling so the 'exactly one owner' invariant holds even across races.
     """
-    siblings = group_rows(state).filter(is_materialized=True).exclude(pk=state.pk)
-    siblings.update(is_materialized=False)
-    if not state.is_materialized:
-        state.is_materialized = True
-        state.save(update_fields=["is_materialized"])
+    from django.db import transaction
+
+    with transaction.atomic():
+        # Lock the whole group so two devices first-filling the same shared object serialize:
+        # without this both could pass the "no materialized sibling" check and both flag
+        # themselves owner, leaving two materialized owners (this runs on every reconcile of
+        # every shared route-policy object, so the race is realistic). Take the lock, then clear
+        # any sibling and flag self.
+        list(group_rows(state).select_for_update().values_list("pk", flat=True))
+        group_rows(state).filter(is_materialized=True).exclude(pk=state.pk).update(is_materialized=False)
+        if not state.is_materialized:
+            state.is_materialized = True
+            state.save(update_fields=["is_materialized"])
 
 
 def versions(state_model, family: str, object_name: str) -> list:
@@ -199,10 +207,15 @@ def rematerialize(state) -> None:
 
 def _resettle_sibling(row, spec: SharedObjectSpec, owner_hash: str) -> None:
     """Clear a non-owner row's flag and recompute its conflict status against the owner."""
+    from django.utils import timezone
+
     from . import status_machine as sm
 
     row.is_materialized = False
     if not sm.is_owned(row.status) and row.captured:
         diverged = spec.hash_captured(row.captured) != owner_hash
         row.status = sm.CONFLICT if diverged else sm.IMPORTED
-    row.save(update_fields=["is_materialized", "status"])
+    # Bump last_sync_at alongside the status change so the UI's "last seen" isn't stale next to
+    # a freshly-recomputed status.
+    row.last_sync_at = timezone.now()
+    row.save(update_fields=["is_materialized", "status", "last_sync_at"])

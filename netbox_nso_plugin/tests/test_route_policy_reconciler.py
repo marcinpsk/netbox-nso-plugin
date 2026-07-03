@@ -980,6 +980,30 @@ class TestSharedObjectOwnership(TestCase):
         self.assertTrue(st.is_materialized)
         self.assertEqual(st.status, "imported")
 
+    def test_resettle_sibling_bumps_last_sync_at(self):
+        """Re-pointing a shared object resettles the old owner's sibling row and recomputes its
+        status — its last_sync_at must be bumped too, else the UI shows a stale 'last seen' next
+        to the freshly-recomputed status."""
+        from django.utils import timezone
+
+        from netbox_nso_plugin import shared_object_ownership as ownership
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._mgmt(self.d1)
+        self._mgmt(self.d2)
+        reconcile_route_policy(self.d1, self._pl("PL-RS", ["10.0.0.0/8"]))  # d1 owns
+        reconcile_route_policy(self.d2, self._pl("PL-RS", ["10.1.0.0/16"]))  # d2 diverges
+        sib = NSORoutePolicyState.objects.get(management__device=self.d1, object_name="PL-RS")
+        other = NSORoutePolicyState.objects.get(management__device=self.d2, object_name="PL-RS")
+        old = timezone.now() - timezone.timedelta(days=1)
+        NSORoutePolicyState.objects.filter(pk=sib.pk).update(last_sync_at=old)  # backdate to prove the bump
+
+        ownership.rematerialize(other)  # re-point to d2 → resettles the d1 sibling
+
+        sib.refresh_from_db()
+        self.assertGreater(sib.last_sync_at, old)
+
     def test_divergent_second_device_conflicts_without_clobber(self):
         """Two devices, same name, different content → ONE object holding the first
         device's content; the second device is a NON-owner flagged conflict, its own
