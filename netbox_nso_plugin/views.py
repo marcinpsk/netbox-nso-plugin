@@ -1347,6 +1347,9 @@ def _prepare_apply(mgmt):
     'deploying' so they read as "applying" and settle to 'in_sync' on the next
     reconcile once the device reflects them (VLAN value-aware; SVI/subif/BFD when
     re-reported). ``.update()`` avoids firing the per-row push signal.
+
+    Returns the rows moved to 'deploying' as ``[(model, [pks]), …]`` so the caller can
+    roll them back via :func:`_rollback_prepare_apply` if the Apply fails to enqueue a job.
     """
     from .signals import (
         _push_interface_intent_for_device,
@@ -1376,6 +1379,7 @@ def _prepare_apply(mgmt):
         except Exception as exc:  # noqa: BLE001 — one scope's failure must not block the rest
             logger.warning("Apply push failed for device %s: %s", mgmt.device_id, exc)
 
+    moved: list[tuple] = []  # (model, [pks]) actually moved, for rollback if the Apply fails
     for model in (
         NSOVLANState,
         NSOSVIState,
@@ -1385,9 +1389,28 @@ def _prepare_apply(mgmt):
         NSORoutePolicyState,
     ):
         try:
-            model.objects.filter(management=mgmt, status="accepted").update(status="deploying")
+            pks = list(model.objects.filter(management=mgmt, status="accepted").values_list("pk", flat=True))
+            if pks:
+                model.objects.filter(pk__in=pks).update(status="deploying")
+                moved.append((model, pks))
         except Exception as exc:  # noqa: BLE001
             logger.warning("Apply deploying-mark failed for device %s: %s", mgmt.device_id, exc)
+    return moved
+
+
+def _rollback_prepare_apply(moved) -> None:
+    """Revert the accepted→deploying marks when the Apply never enqueued a job.
+
+    Only the rows THIS Apply moved are reverted (by pk), so a genuinely in-flight 'deploying'
+    row from a prior Apply is left untouched. Reverting to 'accepted' is safe — an accepted row
+    still settles to in_sync on the next reconcile once the device matches; leaving it 'deploying'
+    with no apply job would strand it as 'applying' forever (nothing settles it).
+    """
+    for model, pks in moved or []:
+        try:
+            model.objects.filter(pk__in=pks, status="deploying").update(status="accepted")
+        except Exception as exc:  # noqa: BLE001 — best-effort rollback; log and move on
+            logger.warning("Apply rollback failed: %s", exc)
 
 
 class NSODeviceActionView(NSOActionPermissionMixin, View):
@@ -1425,8 +1448,7 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
         # scopes (attrs/IP/SNMP/routing/L2), and here we force-commit the LACP +
         # switchport snapshots, which are owned in NetBox rather than mirrored in the
         # adapter. Accept itself only marks rows owned (no immediate device write).
-        if action == "apply":
-            _prepare_apply(mgmt)
+        prepared = _prepare_apply(mgmt) if action == "apply" else None
 
         try:
             result = action_fn(mgmt.adapter_device_id)
@@ -1438,6 +1460,11 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
             else:
                 messages.success(request, f"{label} triggered.")
         except AdapterError as exc:
+            # The Apply never enqueued a job (adapter unreachable/500, or a conflict rejected
+            # ours), so roll back the deploying marks THIS Apply made — otherwise the rows are
+            # stuck 'applying' with nothing to ever settle them.
+            if prepared:
+                _rollback_prepare_apply(prepared)
             if exc.code == "conflict":
                 job_id = (exc.detail or {}).get("job_id")
                 if is_ajax:

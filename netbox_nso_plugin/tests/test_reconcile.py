@@ -133,6 +133,24 @@ class TestSettleApplyFailures(APITestCase):
         row.refresh_from_db()
         self.assertEqual(row.status, "deploying")
 
+    def test_failed_interface_mtu_scope_marks_apply_failed(self):
+        """interface_mtu joins the deploying→settle flow. _prepare_apply moves accepted MTU
+        rows to deploying, so a failed interface_mtu apply MUST settle the stuck row to
+        apply_failed. Regression: the scope was missing from _APPLY_DEPLOYING_SCOPES, so MTU
+        rows stranded in 'deploying' forever (or were falsely reported in_sync)."""
+        from dcim.models import Interface
+
+        from netbox_nso_plugin.models import NSOInterfaceMtuState
+        from netbox_nso_plugin.reconcile import _settle_apply_failures
+
+        mgmt, _row = self._setup()
+        iface = Interface.objects.create(device=mgmt.device, name="Gi0/5", type="1000base-t")
+        mtu_row = NSOInterfaceMtuState.objects.create(management=mgmt, interface=iface, l2_mtu=9000, status="deploying")
+        _settle_apply_failures(mgmt, {"interface_mtu_count_by_outcome": {"in_sync": 0, "apply_failed": 1}})
+        mtu_row.refresh_from_db()
+        self.assertEqual(mtu_row.status, "apply_failed")
+        self.assertTrue(mtu_row.last_apply_error)
+
 
 class TestRoutePolicyApplySettle(APITestCase):
     """Route-policy joins the deploying→settle flow: Apply marks accepted→deploying,
@@ -214,6 +232,50 @@ class TestRoutePolicyApplySettle(APITestCase):
         ):
             _prepare_apply(mgmt)
         push_if.assert_called_once_with(mgmt.device_id, mgmt.adapter_device_id, force=True)
+
+
+class TestApplyRollbackOnAdapterError(APITestCase):
+    """A failed Apply (adapter unreachable / 500 — no job enqueued) must roll the rows
+    _prepare_apply moved accepted→deploying back to accepted. Otherwise they are stuck
+    'applying' forever: no apply job exists for _settle_apply_failures to ever settle."""
+
+    def _setup(self):
+        from netbox_nso_plugin.models import NSORoutePolicyState
+
+        device = _make_device("apply-rb")
+        inst, _ = NSOInstance.objects.get_or_create(
+            name="apply-rb-inst", defaults={"adapter_instance_id": "apply-rb-inst"}
+        )
+        mgmt = NSODeviceManagement.objects.create(
+            device=device, nso_instance=inst, nso_device_name="apply-rb", adapter_device_id=99
+        )
+        row = NSORoutePolicyState.objects.create(
+            management=mgmt, family="community_list", object_name="CL-RB", status="accepted"
+        )
+        return mgmt, row
+
+    def test_non_conflict_adapter_error_rolls_back_deploying(self):
+        from django.contrib.auth import get_user_model
+
+        from netbox_nso_plugin.adapter_client import AdapterError
+
+        mgmt, row = self._setup()
+        admin = get_user_model().objects.create_superuser(username="apply-rb-admin", password="pw", email="a@x.y")  # noqa: S106
+        self.client.force_login(admin)
+        with (
+            patch("netbox_nso_plugin.signals._push_interface_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_lacp_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_switchport_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_vlan_intent_for_device"),
+            patch(
+                "netbox_nso_plugin.adapter_client.trigger_apply",
+                side_effect=AdapterError("adapter unreachable", code="unreachable"),
+            ),
+        ):
+            resp = self.client.post(f"/plugins/nso/device-management/{mgmt.pk}/actions/apply/")
+        self.assertEqual(resp.status_code, 302)
+        row.refresh_from_db()
+        self.assertEqual(row.status, "accepted")  # rolled back — NOT stuck in deploying
 
 
 class TestApplyPreviewInterfaceScope(APITestCase):

@@ -490,6 +490,7 @@ _APPLY_DEPLOYING_SCOPES = {
     "svi": "NSOSVIState",
     "subinterface": "NSOSubinterfaceState",
     "bfd": "NSOBFDInterfaceState",
+    "interface_mtu": "NSOInterfaceMtuState",
     "route_policy": "NSORoutePolicyState",
 }
 
