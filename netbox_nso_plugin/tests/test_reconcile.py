@@ -212,6 +212,7 @@ class TestRoutePolicyApplySettle(APITestCase):
             patch("netbox_nso_plugin.signals._push_lacp_intent_for_device"),
             patch("netbox_nso_plugin.signals._push_switchport_intent_for_device"),
             patch("netbox_nso_plugin.signals._push_vlan_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_route_policy_intent_for_device"),
         ):
             _prepare_apply(mgmt)
         row.refresh_from_db()
@@ -229,9 +230,28 @@ class TestRoutePolicyApplySettle(APITestCase):
             patch("netbox_nso_plugin.signals._push_lacp_intent_for_device"),
             patch("netbox_nso_plugin.signals._push_switchport_intent_for_device"),
             patch("netbox_nso_plugin.signals._push_vlan_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_route_policy_intent_for_device"),
         ):
             _prepare_apply(mgmt)
         push_if.assert_called_once_with(mgmt.device_id, mgmt.adapter_device_id, force=True)
+
+    def test_prepare_apply_force_pushes_owned_route_policy_intent(self):
+        """Apply must force-re-push owned ROUTE-POLICY intent too (like interface/VLAN). An owned
+        route-policy object whose adapter intent went stale/empty otherwise applies 0 items and
+        the row sticks in 'deploying' forever — observed on rg03, where an owned as-path had NO
+        adapter intent row, so Apply pushed nothing and the row never settled."""
+        from netbox_nso_plugin.views import _prepare_apply
+
+        mgmt, _row = self._setup(status_="accepted")
+        with (
+            patch("netbox_nso_plugin.signals._push_interface_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_lacp_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_switchport_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_vlan_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_route_policy_intent_for_device") as push_rp,
+        ):
+            _prepare_apply(mgmt)
+        push_rp.assert_called_once_with(mgmt.device_id, mgmt.adapter_device_id, force=True)
 
 
 class TestApplyRollbackOnAdapterError(APITestCase):
@@ -267,6 +287,7 @@ class TestApplyRollbackOnAdapterError(APITestCase):
             patch("netbox_nso_plugin.signals._push_lacp_intent_for_device"),
             patch("netbox_nso_plugin.signals._push_switchport_intent_for_device"),
             patch("netbox_nso_plugin.signals._push_vlan_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_route_policy_intent_for_device"),
             patch(
                 "netbox_nso_plugin.adapter_client.trigger_apply",
                 side_effect=AdapterError("adapter unreachable", code="unreachable"),

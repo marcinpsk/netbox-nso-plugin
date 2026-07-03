@@ -2059,8 +2059,15 @@ def _on_redistribution_state_save(sender, instance, **kwargs):
     _schedule_redistribution_push(mgmt.device_id, mgmt.adapter_device_id, instance.dest_protocol)
 
 
-def _push_route_policy_intent_for_device(device_id, adapter_device_id):
-    """Build and push the full route-policy intent snapshot for a device."""
+def _push_route_policy_intent_for_device(device_id, adapter_device_id, force=False):
+    """Build and push the full route-policy intent snapshot for a device.
+
+    ``force=True`` (the device Apply) bypasses change-detection so an owned route-policy
+    object whose adapter intent went stale/empty is re-pushed and actually applied, instead
+    of being silently skipped — mirrors the interface/VLAN force-push. Without it, an owned
+    route-policy row whose adapter intent row is missing applies 0 items and sticks in
+    'deploying' forever (the device never gets the definition, so it never settles).
+    """
     from . import adapter_client as client
     from .models import NSORoutePolicyState
 
@@ -2093,6 +2100,7 @@ def _push_route_policy_intent_for_device(device_id, adapter_device_id):
         (device_id, "route_policy"),
         objects,
         lambda: client.put_route_policy_intent(adapter_device_id, objects),
+        force=force,
     )
 
 

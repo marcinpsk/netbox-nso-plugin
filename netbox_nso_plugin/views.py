@@ -1354,6 +1354,7 @@ def _prepare_apply(mgmt):
     from .signals import (
         _push_interface_intent_for_device,
         _push_lacp_intent_for_device,
+        _push_route_policy_intent_for_device,
         _push_switchport_intent_for_device,
         _push_vlan_intent_for_device,
     )
@@ -1368,9 +1369,14 @@ def _prepare_apply(mgmt):
     #     whose adapter intent went stale is force-pushed so Apply actually re-applies
     #     it. Ownership is status-based and kept durable by the reconciler's owned-guard,
     #     so this no longer re-pushes a row that genuinely drifted back to 'imported'.
+    #   - route-policy: mirrored as adapter intent (reactive push on accept/edit), but that
+    #     mirror can go stale/empty (a failed push, an out-of-band adapter reset). Force-push
+    #     the owned snapshot so Apply re-ships it instead of applying nothing and leaving the
+    #     row stuck 'deploying' (observed on rg03: an owned as-path with no adapter intent row).
     for push in (
         _push_interface_intent_for_device,
         _push_lacp_intent_for_device,
+        _push_route_policy_intent_for_device,
         _push_switchport_intent_for_device,
         _push_vlan_intent_for_device,
     ):
