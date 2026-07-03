@@ -1,0 +1,40 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Lazy-loaded fragment: SVIs / IRBs (L3 VLAN interfaces, M35) — paginated from last-synced state. #}
+<div class="nso-cat-pager"
+     data-url="{% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='svi' %}"
+     data-q="{{ q }}" data-page="{{ page.number }}">
+  <div class="nso-cat-results">
+    {% include "netbox_nso_plugin/categories/_adapter_error.html" %}
+    <div class="nso-cat-msg"></div>
+    {% include "netbox_nso_plugin/categories/_cat_search.html" with placeholder=placeholder q=q %}
+    {% if svi_states %}
+    <p class="text-muted small mb-2">L3 VLAN interfaces materialised into NetBox (virtual interface + VLAN link). IP addresses ride the interface-IP path on the same interface.</p>
+    <div class="table-responsive">
+      <table class="table table-sm table-hover mb-0">
+        <thead>
+          <tr><th>Interface</th><th>Type</th><th>VLAN</th><th>VRF</th><th>Status</th><th>Last Synced</th><th></th></tr>
+        </thead>
+        <tbody>
+          {% for s in svi_states %}
+          <tr data-status="{{ s.status }}" data-owned="{{ s.accepted_at|yesno:'true,false' }}">
+            <td><a href="{{ s.interface.get_absolute_url }}">{{ s.interface.name }}</a></td>
+            <td>{{ s.svi_type }}</td>
+            <td>{% if s.vlan %}<a href="{{ s.vlan.get_absolute_url }}">{{ s.vlan.vid }}</a>{% else %}<span class="text-muted">—</span>{% endif %}</td>
+            <td>{{ s.vrf|default:"global" }}</td>
+            <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=s.status %}</td>
+            <td>{{ s.last_sync_at|default:"—" }}</td>
+            <td>
+              {% url 'plugins:netbox_nso_plugin:svi_accept' pk=s.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=s.status form_class="nso-row-form" title="Make NetBox the source of truth for this SVI (re-materialised on the device on Apply)" %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% include "netbox_nso_plugin/categories/_cat_pager.html" with page=page %}
+    {% else %}
+    <p class="text-muted mb-0">No SVIs / IRBs{% if q %} matching “{{ q }}”{% else %} reported for this device{% endif %}.</p>
+    {% endif %}
+  </div>
+</div>

@@ -1,0 +1,20 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Server-side search box + drift/pending/in-sync quick-select for a paginated #}
+{# category. Re-fetch is driven by the delegated pager JS in device_nso_tab.html. #}
+{# The quick-select renders for EVERY paged category (the shared _render_paged_category #}
+{# always supplies state_counts), so no category can silently ship without it. #}
+{# Params: placeholder, q, state, state_counts. #}
+<div class="d-flex flex-wrap align-items-center gap-2 mb-2">
+  <input type="search" class="form-control form-control-sm nso-cat-filter"
+         placeholder="{{ placeholder|default:'Filter…' }}" value="{{ q }}" autocomplete="off"
+         style="max-width: 280px;">
+  {% if state_counts %}
+  <div class="btn-group btn-group-sm nso-cat-state-group" role="group" aria-label="State filter">
+    <button type="button" class="btn btn-outline-secondary nso-cat-state{% if state == 'all' %} active{% endif %}" data-cat-state="all">All ({{ state_counts.all }})</button>
+    <button type="button" class="btn btn-outline-warning nso-cat-state{% if state == 'drift' %} active{% endif %}" data-cat-state="drift">Drift ({{ state_counts.drift }})</button>
+    <button type="button" class="btn btn-outline-info nso-cat-state{% if state == 'pending' %} active{% endif %}" data-cat-state="pending">Pending apply ({{ state_counts.pending }})</button>
+    <button type="button" class="btn btn-outline-success nso-cat-state{% if state == 'in_sync' %} active{% endif %}" data-cat-state="in_sync">In sync ({{ state_counts.in_sync }})</button>
+  </div>
+  {% endif %}
+</div>

@@ -1,0 +1,68 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Bulk-mark a device's divergent route-policy groups as per-device (LOCAL). #}
+{% extends 'base/layout.html' %}
+
+{% block title %}Resolve divergent route-policy — {{ object }}{% endblock %}
+
+{% block content %}
+<div class="row">
+  <div class="col col-md-10 offset-md-1">
+    <div class="card">
+      <h5 class="card-header">
+        <span class="mdi mdi-call-split me-1"></span>
+        Divergent route-policy on <a href="{% url 'dcim:device_nso' pk=object.pk %}">{{ object }}</a>
+      </h5>
+      <div class="card-body">
+        <p class="text-muted">
+          These shared objects differ between this device and the netbox-routing source (master).
+          Select the ones that are <strong>per-device by design</strong> (e.g. VRRP or per-region
+          prefix lists) and mark them per-device — each device keeps its own version and the
+          difference stops being flagged as drift. This applies to the whole shared group, not just
+          this device. Use <strong>Diff</strong> to compare before deciding.
+        </p>
+        {% if rows %}
+        <form method="post">
+          {% csrf_token %}
+          <table class="table table-sm table-hover">
+            <thead>
+              <tr>
+                <th style="width:1%"><input type="checkbox" class="form-check-input" id="nso-rp-bulk-all"
+                    title="Select all" onclick="document.querySelectorAll('.nso-rp-bulk-cb').forEach(c=>c.checked=this.checked)"></th>
+                <th>Family</th><th>Name</th><th>Status</th><th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for rp in rows %}
+              <tr>
+                <td><input type="checkbox" class="form-check-input nso-rp-bulk-cb" name="state" value="{{ rp.pk }}"></td>
+                <td>{{ rp.family|cut:"_"|capfirst }}</td>
+                <td><code>{{ rp.object_name }}</code></td>
+                <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=rp.status %}</td>
+                <td>
+                  {% if rp.assigned_object %}
+                  <a href="{% url 'plugins:netbox_nso_plugin:routing_route_policy_diff' pk=rp.pk %}"
+                     class="btn btn-xs btn-outline-info text-nowrap" title="Compare this device's version against the NetBox source">
+                    <span class="mdi mdi-file-compare"></span> Diff
+                  </a>
+                  {% endif %}
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+          <button type="submit" class="btn btn-warning text-dark">
+            <span class="mdi mdi-call-split me-1"></span> Mark selected per-device (LOCAL)
+          </button>
+          <a href="{% url 'dcim:device_nso' pk=object.pk %}" class="btn btn-outline-secondary">Cancel</a>
+        </form>
+        {% else %}
+        <p class="text-success mb-0"><span class="mdi mdi-check-circle-outline me-1"></span>
+          No divergent shared route-policy objects on this device.</p>
+        <a href="{% url 'dcim:device_nso' pk=object.pk %}" class="btn btn-outline-secondary mt-3">Back to NSO tab</a>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

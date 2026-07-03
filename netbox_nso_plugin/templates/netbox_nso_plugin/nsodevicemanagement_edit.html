@@ -1,0 +1,197 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{% extends 'generic/object_edit.html' %}
+{% load helpers %}
+{% load form_helpers %}
+
+{% block form %}
+  <div class="field-group mb-5">
+    <div class="row mb-2">
+      <h5 class="offset-sm-3">NSO Device Management</h5>
+    </div>
+    {% render_field form.device %}
+    {% render_field form.nso_instance %}
+    {% render_field form.nso_device_name %}
+  </div>
+
+  {# ── Manage everything (convenience) ──────────────────────────────────────── #}
+  {# Transient toggle: ticks every scope below in one click. auto_apply is not    #}
+  {# included — it stays a separate, explicit opt-in.                             #}
+  <div class="field-group mb-4">
+    {% render_field form.manage_all %}
+  </div>
+
+  {# ── Interfaces group ───────────────────────────────────────────────────── #}
+  {# manage_interfaces is the real master kill-switch; description/enabled are   #}
+  {# indented children. Checking a child auto-checks the master (JS below).      #}
+  <div class="field-group mb-5 nso-scope" data-master="id_manage_interfaces">
+    <div class="row mb-2">
+      <h5 class="offset-sm-3">Interfaces</h5>
+    </div>
+    {% render_field form.manage_interfaces %}
+    <div class="nso-scope-children ms-sm-4 ps-sm-3 border-start">
+      {% render_field form.manage_description %}
+      {% render_field form.manage_enabled %}
+    </div>
+  </div>
+
+  {# ── Routing group ──────────────────────────────────────────────────────── #}
+  <div class="field-group mb-5 nso-scope" data-master="id_manage_routing">
+    <div class="row mb-2">
+      <h5 class="offset-sm-3">Routing</h5>
+    </div>
+    {% render_field form.manage_routing %}
+    <div class="nso-scope-children ms-sm-4 ps-sm-3 border-start">
+      {% render_field form.manage_static %}
+      {% render_field form.manage_isis %}
+      {% render_field form.manage_ospf %}
+      {% render_field form.manage_bgp %}
+      {% render_field form.manage_route_policy %}
+      {% render_field form.manage_redistribution %}
+    </div>
+  </div>
+
+  {# ── Other ──────────────────────────────────────────────────────────────── #}
+  <div class="field-group mb-5">
+    <div class="row mb-2">
+      <h5 class="offset-sm-3">Other</h5>
+    </div>
+    {% render_field form.manage_snmp %}
+    {% render_field form.auto_apply %}
+    {% render_field form.tags %}
+  </div>
+
+  <script>
+  (function () {
+    "use strict";
+    /* Kill-switch group behaviour:
+       - checking any child auto-checks the group master (so a protocol can't be
+         "on" while its master gate is off);
+       - unchecking the master leaves children as-is (selections are remembered),
+         it just disables the whole group via the server-side gate. */
+    document.querySelectorAll('.nso-scope').forEach(function (group) {
+      var master = document.getElementById(group.dataset.master);
+      var children = Array.prototype.slice.call(
+        group.querySelectorAll('.nso-scope-children input[type="checkbox"]')
+      );
+      if (!master || !children.length) return;
+
+      children.forEach(function (child) {
+        child.addEventListener('change', function () {
+          if (child.checked) master.checked = true;
+        });
+      });
+    });
+
+    /* "Manage everything" convenience toggle: ticks/unticks every scope flag
+       (masters + children + SNMP) in one click. auto_apply is intentionally
+       left out. The toggle also re-syncs to reflect the aggregate scope state. */
+    var manageAll = document.getElementById('id_manage_all');
+    if (manageAll) {
+      var scopeBoxes = [
+        'id_manage_interfaces', 'id_manage_description', 'id_manage_enabled',
+        'id_manage_routing', 'id_manage_static', 'id_manage_isis', 'id_manage_ospf',
+        'id_manage_bgp', 'id_manage_route_policy', 'id_manage_redistribution',
+        'id_manage_snmp'
+      ].map(function (id) { return document.getElementById(id); }).filter(Boolean);
+
+      manageAll.addEventListener('change', function () {
+        scopeBoxes.forEach(function (box) { box.checked = manageAll.checked; });
+      });
+      scopeBoxes.forEach(function (box) {
+        box.addEventListener('change', function () {
+          manageAll.checked = scopeBoxes.every(function (b) { return b.checked; });
+        });
+      });
+    }
+  })();
+  </script>
+{% endblock %}
+
+{% block javascript %}
+{{ block.super }}
+<script>
+(function () {
+  "use strict";
+
+  var instanceSelect = document.getElementById('id_nso_instance');
+  var nameInput = document.getElementById('id_nso_device_name');
+  if (!instanceSelect || !nameInput) return;
+
+  // Embed the current NetBox device ID so we can exclude self-claims from warnings.
+  // In edit mode this is the device already linked; in add mode it may be null.
+  var currentNetboxDeviceId = {% if object and object.device %}{{ object.device.pk }}{% else %}null{% endif %};
+
+  var datalist = document.createElement('datalist');
+  datalist.id = 'nso-device-list';
+  nameInput.setAttribute('list', 'nso-device-list');
+  document.body.appendChild(datalist);
+
+  // Inject a warning element directly below the name input.
+  var warningEl = document.createElement('div');
+  warningEl.id = 'nso-device-claimed-warning';
+  warningEl.className = 'text-warning mt-1 small';
+  warningEl.hidden = true;
+  nameInput.parentNode.insertBefore(warningEl, nameInput.nextSibling);
+
+  // Cached enriched device list — populated on instance change.
+  var cachedDevices = [];
+
+  function populateDatalist(devices) {
+    cachedDevices = devices || [];
+    datalist.innerHTML = '';
+    cachedDevices.forEach(function (device) {
+      var opt = document.createElement('option');
+      opt.value = device.name;
+      // Build a disambiguation label: "name — address (platform)"
+      var parts = [];
+      if (device.address) parts.push(device.address);
+      if (device.platform) parts.push('(' + device.platform + ')');
+      if (parts.length > 0) {
+        opt.label = device.name + ' — ' + parts.join(' ');
+      }
+      datalist.appendChild(opt);
+    });
+  }
+
+  function checkAlreadyClaimed(typedName) {
+    var match = cachedDevices.find(function (d) { return d.name === typedName; });
+    if (match && match.onboarded &&
+        match.onboarded_netbox_device_id !== null &&
+        match.onboarded_netbox_device_id !== currentNetboxDeviceId) {
+      warningEl.textContent = '⚠ Already mapped to NetBox device #' +
+                              match.onboarded_netbox_device_id;
+      warningEl.hidden = false;
+    } else {
+      warningEl.hidden = true;
+    }
+  }
+
+  function loadDeviceNames(pk) {
+    if (!pk) { populateDatalist([]); warningEl.hidden = true; return; }
+    fetch('/plugins/nso/ajax/nso-device-names/' + pk + '/')
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+      .then(function (data) {
+        populateDatalist(data.devices || []);
+        // Re-check warning in case input already has a value (edit mode)
+        if (nameInput.value) checkAlreadyClaimed(nameInput.value);
+      })
+      .catch(function (err) {
+        console.warn('NSO device names fetch failed:', err);
+      });
+  }
+
+  nameInput.addEventListener('input', function () {
+    checkAlreadyClaimed(nameInput.value);
+  });
+
+  instanceSelect.addEventListener('change', function () {
+    loadDeviceNames(instanceSelect.value);
+  });
+
+  if (instanceSelect.value) {
+    loadDeviceNames(instanceSelect.value);
+  }
+})();
+</script>
+{% endblock javascript %}

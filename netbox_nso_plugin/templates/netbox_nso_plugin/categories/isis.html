@@ -1,0 +1,80 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Lazy-loaded fragment: IS-IS category (interfaces + instances). #}
+{% include "netbox_nso_plugin/categories/_adapter_error.html" %}
+
+{% if isis_interfaces %}
+  <div class="d-flex justify-content-between align-items-center mb-2">
+    <strong>IS-IS Interfaces</strong>
+    {% url 'plugins:netbox_nso_plugin:routing_bulk_accept_isis_interfaces' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned %}
+  </div>
+  <div id="flt-isis-interfaces">
+  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-isis-interfaces" placeholder="Filter by interface / type…" show_status=True %}
+  <div class="table-responsive mb-3">
+    <table class="table table-sm table-hover mb-0">
+      <thead>
+        <tr><th>Interface</th><th>AF</th><th>Process Tag</th><th>Circuit Type</th><th>Network Type</th><th>Metric</th><th>Passive</th><th>Hello Auth</th><th>Status</th><th>Last Synced</th><th></th></tr>
+      </thead>
+      <tbody>
+        {% for ii in isis_interfaces %}
+        <tr data-status="{{ ii.status }}" data-owned="{{ ii.accepted_at|yesno:'true,false' }}">
+          <td><a href="{{ ii.interface.get_absolute_url }}">{{ ii.interface.name }}</a></td>
+          <td>{{ ii.af }}</td>
+          <td>{{ ii.process_tag|default:"default" }}</td>
+          <td>{{ ii.circuit_type|default:"—" }}</td>
+          <td>{{ ii.network_type|default:"—" }}</td>
+          <td>{{ ii.metric|default:"—" }}</td>
+          <td>{% if ii.passive %}<span class="badge text-bg-warning text-dark">passive</span>{% else %}<span class="badge text-bg-success">active</span>{% endif %}</td>
+          <td>{% if ii.hello_auth_present or ii.hello_auth_type %}<span class="badge text-bg-info" title="Per-interface IIH authentication">{{ ii.hello_auth_type|default:"on" }}</span>{% else %}<span class="text-muted">—</span>{% endif %}</td>
+          <td>
+            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=ii.status %}
+          </td>
+          <td>{{ ii.last_sync_at|default:"—" }}</td>
+          <td>
+            {% url 'plugins:netbox_nso_plugin:routing_accept_isis_interface' pk=ii.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=ii.status %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  </div>
+{% endif %}
+
+{% if isis_processes %}
+  <div class="d-flex justify-content-between align-items-center mb-2">
+    <strong>IS-IS Instances</strong>
+    {% url 'plugins:netbox_nso_plugin:routing_bulk_accept_isis_instances' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned %}
+  </div>
+  <div id="flt-isis-instances">
+  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-isis-instances" placeholder="Filter by process tag / instance…" show_status=True %}
+  <div class="table-responsive">
+    <table class="table table-sm table-hover mb-0">
+      <thead>
+        <tr><th>Process Tag</th><th>IS-IS Instance</th><th>Area Auth</th><th>Domain Auth</th><th>Status</th><th>Last Synced</th><th></th></tr>
+      </thead>
+      <tbody>
+        {% for ip in isis_processes %}
+        <tr data-status="{{ ip.status }}" data-owned="{{ ip.accepted_at|yesno:'true,false' }}">
+          <td>{{ ip.process_tag|default:"default" }}</td>
+          <td>{% if ip.isis_instance %}<a href="{{ ip.isis_instance.get_absolute_url }}">{{ ip.isis_instance }}</a>{% else %}—{% endif %}</td>
+          <td>{{ ip.area_auth_type|default:"—" }}{% if ip.area_auth_present %} ✓{% endif %}</td>
+          <td>{{ ip.domain_auth_type|default:"—" }}{% if ip.domain_auth_present %} ✓{% endif %}</td>
+          <td>
+            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=ip.status %}
+          </td>
+          <td>{{ ip.last_sync_at|default:"—" }}</td>
+          <td>
+            {% url 'plugins:netbox_nso_plugin:routing_accept_isis_instance' pk=ip.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=ip.status %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  </div>
+{% endif %}
+
+{% if not isis_interfaces and not isis_processes %}
+  <p class="text-muted mb-0">No IS-IS configuration.</p>
+{% endif %}

@@ -1,0 +1,121 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Device-vs-NetBox delta for one route-policy overlay row (any family). #}
+{% extends 'base/layout.html' %}
+
+{% block title %}Drift delta — {{ object_name }}{% endblock %}
+
+{% block content %}
+{# Inline highlight for the exact differing tokens — a translucent marker behind the text #}
+{# (not a chip/badge), saturated enough to read in light and dark mode. #}
+<style>
+  .nso-diff-dev { background-color: rgba(var(--tblr-danger-rgb), .40); }
+  .nso-diff-nb  { background-color: rgba(var(--tblr-success-rgb), .40); }
+</style>
+<div class="row">
+  <div class="col col-md-10 offset-md-1">
+    <div class="card">
+      <h5 class="card-header">
+        <span class="mdi mdi-not-equal-variant me-1"></span>
+        Drift delta — {{ family }} <code>{{ object_name }}</code>
+        {% if device %}on <a href="{% url 'dcim:device_nso' pk=device.pk %}">{{ device }}</a>{% endif %}
+      </h5>
+      <div class="card-body">
+        <p class="text-muted">
+          The full list in order: <strong>Device (now)</strong> is what the box reports on-box,
+          <strong>NetBox (after push)</strong> is the list a push would write — read it top to
+          bottom for the end result. An entry only in NetBox is
+          <span class="nso-diff-nb">added</span>, one only on the device is
+          <span class="nso-diff-dev">removed</span>, and within a changed entry the exact
+          differing tokens are highlighted (<span class="nso-diff-dev">device</span> /
+          <span class="nso-diff-nb">NetBox</span>).
+        </p>
+
+        {% if diff is None %}
+          <div class="alert alert-secondary mb-0">No materialised {{ family }} to compare yet.</div>
+        {% elif not diff.any_diff %}
+          <div class="alert alert-success mb-0">
+            <span class="mdi mdi-check-circle-outline me-1"></span>
+            The device and NetBox match — no drift.
+          </div>
+        {% else %}
+
+          {% if diff.removed_on_device %}
+          <div class="alert alert-warning">
+            <span class="mdi mdi-minus-circle-outline me-1"></span>
+            Removed on the device — this {{ family }} is gone from the device but still exists in
+            NetBox (so every entry below shows as <span class="nso-diff-nb">added</span> back by a
+            push). Accept to take ownership, or delete the NetBox object to match the device.
+          </div>
+          {% endif %}
+
+          {% if diff.default_action.differs %}
+          <div class="mb-3">
+            <span class="text-muted small me-2">Default action</span>
+            <span class="badge text-bg-warning text-dark">device: {{ diff.default_action.device }}</span>
+            <span class="mdi mdi-arrow-left-right mx-1 text-muted"></span>
+            <span class="badge text-bg-info">netbox: {{ diff.default_action.netbox }}</span>
+          </div>
+          {% endif %}
+
+          {% for x in diff.extra %}
+            {% if x.differs %}
+            <div class="mb-3">
+              <span class="text-muted small me-2">{{ x.label }}</span>
+              <span class="badge text-bg-warning text-dark">device: {{ x.device }}</span>
+              <span class="mdi mdi-arrow-left-right mx-1 text-muted"></span>
+              <span class="badge text-bg-info">netbox: {{ x.netbox }}</span>
+            </div>
+            {% endif %}
+          {% endfor %}
+
+          {# The full list IN ORDER, one row per entry — a push makes the device adopt NetBox's #}
+          {# ordered list, so read the NetBox column top-to-bottom for the post-push result. #}
+          <div class="table-responsive">
+            <table class="table table-sm align-middle">
+              <thead>
+                <tr class="small text-muted">
+                  <th style="width:8rem;">Seq</th>
+                  <th class="w-50">Device (now)</th>
+                  <th class="w-50">NetBox (after push)</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for e in diff.entries %}
+                <tr>
+                  <td class="text-nowrap">
+                    <code>{{ e.sequence }}</code>
+                    {% if e.presence == 'device_only' %}<span class="badge text-bg-danger ms-1" title="On the device now; the push removes it">removed</span>
+                    {% elif e.presence == 'netbox_only' %}<span class="badge text-bg-success ms-1" title="Not on the device; the push adds it">added</span>
+                    {% elif e.differs %}<span class="badge text-bg-warning text-dark ms-1" title="The push changes this entry">changed</span>{% endif %}
+                  </td>
+                  {% include "netbox_nso_plugin/categories/_diff_value_cell.html" with value=e.line.device segments=e.line.device_segments hl="nso-diff-dev" %}
+                  {% include "netbox_nso_plugin/categories/_diff_value_cell.html" with value=e.line.netbox segments=e.line.netbox_segments hl="nso-diff-nb" %}
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+
+          <p class="text-muted small mb-0">
+            Showing the full list in order; rows without a badge are unchanged by the push.
+          </p>
+        {% endif %}
+
+        {% if device %}
+        <div class="mt-3">
+          <a href="{% url 'dcim:device_nso' pk=device.pk %}" class="btn btn-sm btn-outline-secondary">
+            <span class="mdi mdi-arrow-left"></span> Back to {{ device }}
+          </a>
+          {% if state.assigned_object %}
+          <a href="{% url 'plugins:netbox_nso_plugin:routing_route_policy_versions' pk=state.pk %}" class="btn btn-sm btn-outline-info">
+            <span class="mdi mdi-source-branch"></span> Versions
+          </a>
+          {% endif %}
+        </div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

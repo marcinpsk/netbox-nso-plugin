@@ -1,0 +1,61 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Device-vs-NetBox field delta for one redistribution overlay row. #}
+{% extends 'base/layout.html' %}
+
+{% block title %}Drift delta — redistribution{% endblock %}
+
+{% block content %}
+<div class="row">
+  <div class="col col-md-8 offset-md-2">
+    <div class="card">
+      <h5 class="card-header">
+        <span class="mdi mdi-not-equal-variant me-1"></span>
+        Drift delta — redistribute <code>{{ state.source_protocol }}</code>
+        into <code>{{ state.dest_protocol }}{% if state.dest_ref %} {{ state.dest_ref }}{% endif %}</code>
+        {% if device %}on <a href="{% url 'dcim:device_nso' pk=device.pk %}">{{ device }}</a>{% endif %}
+      </h5>
+      <div class="card-body">
+        {% if diff.removed_on_device %}
+        <div class="alert alert-warning">
+          <span class="mdi mdi-minus-circle-outline me-1"></span>
+          Removed on the device — this redistribution is gone from the device but still exists in
+          NetBox. Accept to take ownership, or delete the NetBox object to match the device.
+        </div>
+        {% elif not diff.linked %}
+        <div class="alert alert-info">
+          <span class="mdi mdi-information-outline me-1"></span>
+          No NetBox redistribution object is linked yet — every value below is device-only.
+        </div>
+        {% elif not diff.any_diff %}
+        <div class="alert alert-success">
+          <span class="mdi mdi-check-circle-outline me-1"></span>
+          The device and NetBox match — no drift.
+        </div>
+        {% endif %}
+        <div class="table-responsive">
+          <table class="table table-sm align-middle mb-0">
+            <thead>
+              <tr class="small text-muted"><th style="width:12rem;">Field</th><th>Device (on-box)</th><th>NetBox</th></tr>
+            </thead>
+            <tbody>
+              {% for f in diff.fields %}
+              <tr{% if f.differs %} class="table-warning"{% endif %}>
+                <td class="text-nowrap">{{ f.label }}</td>
+                <td><code class="text-body">{{ f.device }}</code></td>
+                <td><code class="text-body">{{ f.netbox }}</code></td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% if device %}
+        <a href="{% url 'dcim:device_nso' pk=device.pk %}" class="btn btn-sm btn-outline-secondary mt-3">
+          <span class="mdi mdi-arrow-left"></span> Back to {{ device }}
+        </a>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

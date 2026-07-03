@@ -1,0 +1,150 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{% extends 'generic/object.html' %}
+{% load helpers %}
+
+{% block breadcrumbs %}
+  <li class="breadcrumb-item"><a href="{% url 'plugins:netbox_nso_plugin:nsolinkrole_list' %}">Link Roles</a></li>
+  <li class="breadcrumb-item">{{ object }}</li>
+{% endblock %}
+
+{% block content %}
+  <div class="row">
+    <div class="col-12 col-md-6">
+      <div class="card">
+        <h5 class="card-header">Link Role</h5>
+        <div class="card-body">
+          <table class="table table-hover attr-table">
+            <tr>
+              <th scope="row">Name</th>
+              <td>{{ object.name }}</td>
+            </tr>
+            <tr>
+              <th scope="row">Slug</th>
+              <td><code>{{ object.slug }}</code></td>
+            </tr>
+            <tr>
+              <th scope="row">Description</th>
+              <td>{{ object.description|placeholder }}</td>
+            </tr>
+            <tr>
+              <th scope="row">Enabled</th>
+              <td>
+                {% if object.enabled %}<span class="badge text-bg-success">Yes</span>
+                {% else %}<span class="text-muted">No</span>{% endif %}
+              </td>
+            </tr>
+            <tr>
+              <th scope="row">Link type</th>
+              <td>{{ object.get_link_type_display }}</td>
+            </tr>
+          </table>
+        </div>
+      </div>
+      <div class="card">
+        <h5 class="card-header">Description template</h5>
+        <div class="card-body">
+          {% if object.description_template %}<code>{{ object.description_template }}</code>
+          {% else %}<span class="text-muted">Not managed</span>{% endif %}
+        </div>
+      </div>
+    </div>
+    <div class="col-12 col-md-6">
+      <div class="card">
+        <h5 class="card-header">IP assignment</h5>
+        <div class="card-body">
+          <table class="table table-hover attr-table">
+            <tr>
+              <th scope="row">IPv4</th>
+              <td>
+                {% if object.assign_ipv4 %}<span class="badge text-bg-success">On</span>
+                {% else %}<span class="text-muted">Off</span>{% endif %}
+              </td>
+            </tr>
+            <tr>
+              <th scope="row">IPv4 pool</th>
+              <td>
+                {% if object.ipv4_pool_prefix %}<a href="{{ object.ipv4_pool_prefix.get_absolute_url }}">{{ object.ipv4_pool_prefix }}</a>
+                {% elif object.ipv4_pool_role %}role <code>{{ object.ipv4_pool_role }}</code>
+                {% else %}<span class="text-muted">&mdash;</span>{% endif %}
+              </td>
+            </tr>
+            <tr>
+              <th scope="row">IPv4 mask</th>
+              <td>{% if object.ipv4_mask %}/{{ object.ipv4_mask }}{% else %}<span class="text-muted">default</span>{% endif %}</td>
+            </tr>
+            <tr>
+              <th scope="row">IPv6</th>
+              <td>
+                {% if object.assign_ipv6 %}<span class="badge text-bg-success">On</span>
+                {% else %}<span class="text-muted">Off</span>{% endif %}
+              </td>
+            </tr>
+            <tr>
+              <th scope="row">IPv6 pool</th>
+              <td>
+                {% if object.ipv6_pool_prefix %}<a href="{{ object.ipv6_pool_prefix.get_absolute_url }}">{{ object.ipv6_pool_prefix }}</a>
+                {% elif object.ipv6_pool_role %}role <code>{{ object.ipv6_pool_role }}</code>
+                {% else %}<span class="text-muted">&mdash;</span>{% endif %}
+              </td>
+            </tr>
+            <tr>
+              <th scope="row">IPv6 mask</th>
+              <td>{% if object.ipv6_mask %}/{{ object.ipv6_mask }}{% else %}<span class="text-muted">default</span>{% endif %}</td>
+            </tr>
+          </table>
+        </div>
+      </div>
+      <div class="card">
+        <h5 class="card-header">IGP</h5>
+        <div class="card-body">
+          <table class="table table-hover attr-table">
+            <tr>
+              <th scope="row">Protocol</th>
+              <td>{{ object.get_igp_display }}</td>
+            </tr>
+            {% if object.igp == 'isis' %}
+            <tr>
+              <th scope="row">Circuit type</th>
+              <td>{{ object.isis_circuit_type|placeholder }}</td>
+            </tr>
+            <tr>
+              <th scope="row">Passive</th>
+              <td>{{ object.isis_passive }}</td>
+            </tr>
+            <tr>
+              <th scope="row">Metric</th>
+              <td>{{ object.isis_metric|placeholder }}</td>
+            </tr>
+            <tr>
+              <th scope="row">Process tag</th>
+              <td>{{ object.isis_process_tag|placeholder }}</td>
+            </tr>
+            {% elif object.igp == 'ospf' %}
+            <tr>
+              <th scope="row">Area</th>
+              <td>{{ object.ospf_area|placeholder }}</td>
+            </tr>
+            <tr>
+              <th scope="row">Network type</th>
+              <td>{{ object.ospf_network_type|placeholder }}</td>
+            </tr>
+            <tr>
+              <th scope="row">Passive</th>
+              <td>{{ object.ospf_passive }}</td>
+            </tr>
+            <tr>
+              <th scope="row">Cost</th>
+              <td>{{ object.ospf_cost|placeholder }}</td>
+            </tr>
+            <tr>
+              <th scope="row">Process ID</th>
+              <td>{{ object.ospf_process_id|placeholder }}</td>
+            </tr>
+            {% endif %}
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+{% endblock content %}

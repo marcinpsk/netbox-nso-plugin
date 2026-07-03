@@ -1,0 +1,56 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Lazy-loaded fragment: Route Policy category — paginated from last-synced state. #}
+<div class="nso-cat-pager"
+     data-url="{% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='route_policy' %}"
+     data-q="{{ q }}" data-page="{{ page.number }}">
+  <div class="nso-cat-results">
+    {% include "netbox_nso_plugin/categories/_adapter_error.html" %}
+    <div class="mb-2">
+      <a href="{% url 'plugins:netbox_nso_plugin:route_policy_attach' device_pk=object.pk %}" class="btn btn-sm btn-primary" title="Attach an existing route-policy object to this device — written on Apply">
+        <i class="mdi mdi-plus-thick"></i> Add Route-Policy…
+      </a>
+      <a href="{% url 'plugins:netbox_nso_plugin:route_policy_capabilities' device_pk=object.pk %}" class="btn btn-sm btn-outline-primary" title="What this device can apply for route-maps and communities (by NED + software)">
+        <i class="mdi mdi-shield-check-outline"></i> Capabilities
+      </a>
+      <a href="{% url 'plugins:netbox_nso_plugin:routing_classify_bulk_route_policy' device_pk=object.pk %}" class="btn btn-sm btn-outline-warning" title="Bulk-mark per-device the shared objects that legitimately differ between devices (VRRP / per-region lists)">
+        <i class="mdi mdi-call-split"></i> Resolve divergent…
+      </a>
+    </div>
+    <div class="nso-cat-msg"></div>
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      {% include "netbox_nso_plugin/categories/_cat_search.html" with placeholder=placeholder q=q %}
+      {% url 'plugins:netbox_nso_plugin:routing_bulk_accept_route_policy' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned %}
+    </div>
+    {% if route_policy_states %}
+    <div class="table-responsive">
+      <table class="table table-sm table-hover mb-0">
+        <thead>
+          <tr><th>Family</th><th>Name</th><th>NetBox Object</th><th>Status</th><th>Last Synced</th><th></th></tr>
+        </thead>
+        <tbody>
+          {% for rp in route_policy_states %}
+          <tr data-status="{{ rp.status }}" data-owned="{{ rp.accepted_at|yesno:'true,false' }}">
+            <td>{{ rp.family }}</td>
+            <td>{{ rp.object_name }}{% if rp.classification_mode == "local" %} <span class="badge text-bg-info" title="Per-device — not deduped into one shared object; differs by device intentionally">per-device</span>{% endif %}</td>
+            <td>{% if rp.assigned_object %}<a href="{{ rp.assigned_object.get_absolute_url }}">{{ rp.assigned_object }}</a>{% else %}—{% endif %}</td>
+            <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=rp.status %}</td>
+            <td>{{ rp.last_sync_at|default:"—" }}</td>
+            <td>
+              <div class="d-flex gap-1">
+                {% if rp.assigned_object %}<a href="{% url 'plugins:netbox_nso_plugin:routing_route_policy_diff' pk=rp.pk %}" class="btn btn-xs btn-outline-warning" title="See exactly what differs between this device and NetBox"><span class="mdi mdi-not-equal-variant"></span> Diff</a>{% endif %}
+                {% if rp.assigned_object %}<a href="{% url 'plugins:netbox_nso_plugin:routing_route_policy_versions' pk=rp.pk %}" class="btn btn-xs btn-outline-info" title="See every device's version of this object and pick which one NetBox mirrors"><span class="mdi mdi-source-branch"></span> Versions</a>{% endif %}
+                {% url 'plugins:netbox_nso_plugin:routing_accept_route_policy' pk=rp.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=rp.status form_class="nso-row-form" %}
+              </div>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% include "netbox_nso_plugin/categories/_cat_pager.html" with page=page %}
+    {% else %}
+    <p class="text-muted mb-0">No route policy{% if q %} matching “{{ q }}”{% endif %}.</p>
+    {% endif %}
+  </div>
+</div>

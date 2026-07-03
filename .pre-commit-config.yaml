@@ -1,0 +1,62 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
+---
+repos:
+  # General file checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+      - id: check-json
+      - id: check-toml
+      - id: check-added-large-files
+        args: [--maxkb=1000]
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: check-executables-have-shebangs
+      - id: mixed-line-ending
+        args: [--fix=lf]
+
+  # Python code quality
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.4
+    hooks:
+      - id: ruff-check
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+
+  # Conventional commit message validation
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v4.4.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
+        args: [feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert]
+
+  # REUSE/SPDX compliance
+  - repo: local
+    hooks:
+      - id: reuse-lint
+        name: REUSE Compliance (SPDX headers)
+        entry: reuse lint
+        language: system
+        pass_filenames: false
+
+      # Test-quality guard: no new spec-less MagicMock/Mock (or object-shaped AsyncMock)
+      # in the test tree beyond the grandfathered baseline. Pure stdlib — runs on the host
+      # by file path (the plugin package can't import without NetBox). Regenerate after an
+      # intentional change: python netbox_nso_plugin/tests/mock_discipline.py --update-baseline
+      - id: mock-discipline
+        name: mock discipline (no new spec-less MagicMock/Mock)
+        entry: python3 netbox_nso_plugin/tests/mock_discipline.py
+        language: system
+        pass_filenames: false
+        files: ^netbox_nso_plugin/tests/.*\.py$
+
+# Configuration
+default_install_hook_types: [pre-commit, commit-msg]
+default_stages: [pre-commit]
+fail_fast: false

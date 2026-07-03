@@ -63,3 +63,11 @@ site/
 
 # Brainstorming / design specs (local only, not for version control)
 docs/superpowers/
+
+# Internal working docs (milestone plans/designs) — kept local, never tracked.
+docs/
+
+# Local agent workspace
+.claude/
+.playwright-mcp/
+milestone-status.db

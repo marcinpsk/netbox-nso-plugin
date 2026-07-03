@@ -35,7 +35,7 @@ Follow the standard NetBox plugin pattern and keep responsibilities separated:
 - **`views.py`, `urls.py`, `tables.py`, `forms.py`, `filters.py`, `navigation.py`** — standard NetBox CRUD/UI plumbing for the two Phase 1 models.
 - **`template_content.py`** — `PluginTemplateExtension` hooks for the device NSO tab and interface badge.
 - **`derived_intent.py`** (M8) — computes auto interface descriptions from cable topology using configurable sentinel markers (`DERIVED_INTENT_TEMPLATES` in `PLUGINS_CONFIG`); `signals.py` recomputes on cable/interface change. **Only descriptions starting with a configured sentinel are ever overwritten** — manually entered descriptions are never touched.
-- **`api/`** — DRF serializers/viewsets/router exposing plugin API endpoints, especially `/api/plugins/netbox-nso-plugin/device-management/`.
+- **`api/`** — DRF serializers/viewsets/router exposing plugin API endpoints, especially `/api/plugins/nso/device-management/`.
 - **`migrations/0001_initial.py`** — initial Django migration for the Phase 1 models.
 
 ## Adapter API contract summary

@@ -1,0 +1,106 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{% extends 'generic/object.html' %}
+{% load helpers %}
+
+{% block breadcrumbs %}
+  <li class="breadcrumb-item"><a href="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_list' %}">Managed Devices</a></li>
+  <li class="breadcrumb-item">{{ object }}</li>
+{% endblock %}
+
+{% block content %}
+  <div class="row">
+    <div class="col-12 col-md-6">
+      <div class="card">
+        <h5 class="card-header">Device Management</h5>
+        <div class="card-body">
+          <table class="table table-hover attr-table">
+            <tr>
+              <th scope="row">Device</th>
+              <td>{{ object.device|linkify }}</td>
+            </tr>
+            <tr>
+              <th scope="row">NSO Instance</th>
+              <td>{{ object.nso_instance|linkify }}</td>
+            </tr>
+            <tr>
+              <th scope="row">NSO Device Name</th>
+              <td><code>{{ object.nso_device_name }}</code></td>
+            </tr>
+            <tr>
+              <th scope="row">Managed Scopes</th>
+              <td>{{ object.managed_scopes|join:", "|default:"—" }}</td>
+            </tr>
+            <tr>
+              <th scope="row">Interface Attributes</th>
+              <td>{{ object.managed_attributes|join:", "|default:"—" }}</td>
+            </tr>
+            <tr>
+              <th scope="row">Auto Apply</th>
+              <td>
+                {% if object.auto_apply %}<span class="badge text-bg-success">Enabled</span>
+                {% else %}<span class="badge text-bg-warning text-dark">Disabled</span>{% endif %}
+              </td>
+            </tr>
+            <tr>
+              <th scope="row">Adapter Device ID</th>
+              <td>{{ object.adapter_device_id|default:"—" }}</td>
+            </tr>
+            <tr>
+              <th scope="row">Last Sync</th>
+              <td>{{ object.last_sync_at|date:"Y-m-d H:i"|default:"Never" }}</td>
+            </tr>
+            <tr>
+              <th scope="row">Last Sync Status</th>
+              <td>
+                {% if object.last_sync_status == "succeeded" %}<span class="badge text-bg-success">{{ object.last_sync_status }}</span>
+                {% elif object.last_sync_status == "failed" %}<span class="badge text-bg-danger">{{ object.last_sync_status }}</span>
+                {% elif object.last_sync_status %}<span class="badge text-bg-info">{{ object.last_sync_status }}</span>
+                {% else %}—{% endif %}
+              </td>
+            </tr>
+          </table>
+        </div>
+      </div>
+    </div>
+    {% if compliance %}
+      <div class="col-12 col-md-6">
+        <div class="card">
+          <h5 class="card-header">Compliance Summary</h5>
+          <div class="card-body">
+            <table class="table table-hover attr-table">
+              <tr><th>Managed Interfaces</th><td>{{ compliance.managed_interfaces }}</td></tr>
+              {% with s=compliance.by_status %}
+                <tr><th colspan="2" class="text-muted small fw-normal border-0 pb-0">Status by managed attribute</th></tr>
+                {% if s.in_sync    %}<tr><th>In Sync</th>    <td><span class="badge text-bg-success">{{ s.in_sync }}</span></td></tr>{% endif %}
+                {% if s.imported   %}<tr><th>Imported</th>   <td><span class="badge text-bg-success">{{ s.imported }}</span></td></tr>{% endif %}
+                {% if s.changed    %}<tr><th>Changed</th>    <td><span class="badge text-bg-warning text-dark">{{ s.changed }}</span></td></tr>{% endif %}
+                {% if s.drifted    %}<tr><th>Drifted</th>    <td><span class="badge text-bg-warning text-dark">{{ s.drifted }}</span></td></tr>{% endif %}
+                {% if s.accepted   %}<tr><th>Accepted</th>   <td><span class="badge text-bg-info">{{ s.accepted }}</span></td></tr>{% endif %}
+                {% if s.deploying  %}<tr><th>Deploying</th>  <td><span class="badge text-bg-primary">{{ s.deploying }}</span></td></tr>{% endif %}
+                {% if s.apply_failed %}<tr><th>Apply Failed</th><td><span class="badge text-bg-danger">{{ s.apply_failed }}</span></td></tr>{% endif %}
+                {% if s.error      %}<tr><th>Error</th>      <td><span class="badge text-bg-danger">{{ s.error }}</span></td></tr>{% endif %}
+                {% if s.unknown    %}<tr><th>Unknown</th>    <td><span class="badge text-bg-info">{{ s.unknown }}</span></td></tr>{% endif %}
+              {% endwith %}
+              {% if compliance.last_checked_at %}
+                <tr><th>Last Checked</th><td>{{ compliance.last_checked_at }}</td></tr>
+              {% endif %}
+            </table>
+          </div>
+        </div>
+      </div>
+    {% endif %}
+    {% if adapter_error %}
+      <div class="col-12">
+        <div class="alert alert-warning">
+          <span class="mdi mdi-alert-outline me-1"></span>
+          {% if adapter_error_code == 'not_found' %}
+            This device is no longer in the adapter — it may need re-onboarding. <em>{{ adapter_error }}</em>
+          {% else %}
+            Adapter unreachable — <em>{{ adapter_error }}</em>
+          {% endif %}
+        </div>
+      </div>
+    {% endif %}
+  </div>
+{% endblock content %}

@@ -1,0 +1,41 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Structured summary of ONE device's captured route-map (rm = summarize_route_map output). #}
+{% if rm.default_action %}
+<div class="mb-2">
+  <span class="text-muted small me-1">Default action</span>
+  <span class="badge text-bg-{% if rm.default_action == 'deny' or rm.default_action == 'reject' %}danger{% else %}success{% endif %}">{{ rm.default_action }}</span>
+</div>
+{% endif %}
+{% if rm.entries %}
+<table class="table table-sm table-borderless align-middle mb-0">
+  <thead>
+    <tr class="small text-muted"><th style="width:3rem;">Seq</th><th style="width:5rem;">Action</th><th>Match</th><th>Set</th></tr>
+  </thead>
+  <tbody>
+    {% for e in rm.entries %}
+    <tr>
+      <td class="text-nowrap"><code>{{ e.sequence }}</code></td>
+      <td><span class="badge text-bg-{% if e.action == 'deny' or e.action == 'reject' %}danger{% else %}success{% endif %}">{{ e.action|default:'permit' }}</span></td>
+      <td>
+        {% for af in e.match_afi %}<span class="badge text-bg-info me-1" title="address-family">{{ af }}</span>{% endfor %}
+        {% for nm in e.match_prefix_lists %}<span class="badge text-bg-primary me-1" title="match prefix-list">pl:{{ nm }}</span>{% endfor %}
+        {% for nm in e.match_community_lists %}<span class="badge text-bg-primary me-1" title="match community-list">cl:{{ nm }}</span>{% endfor %}
+        {% for nm in e.match_as_paths %}<span class="badge text-bg-primary me-1" title="match as-path">ap:{{ nm }}</span>{% endfor %}
+        {% for k, v in e.match_knobs.items %}<span class="badge text-bg-light text-dark border me-1" title="match">{{ k }}={{ v }}</span>{% endfor %}
+        {% if not e.match_afi and not e.match_prefix_lists and not e.match_community_lists and not e.match_as_paths and not e.match_knobs %}<span class="text-muted small">any</span>{% endif %}
+      </td>
+      <td>
+        {% for sc in e.set_communities %}<span class="badge text-bg-{% if sc.operation == 'delete' %}danger{% elif sc.operation == 'set' %}primary{% else %}success{% endif %} me-1" title="set community">community {{ sc.operation }} {{ sc.name }}</span>{% endfor %}
+        {% if e.call_policy %}<span class="badge text-bg-warning text-dark me-1" title="call / from policy (match subroutine)">policy {{ e.call_policy }}</span>{% endif %}
+        {% for k, v in e.set_knobs.items %}<span class="badge text-bg-light text-dark border me-1" title="set">{{ k }}={{ v }}</span>{% endfor %}
+        {% for ns, kv in e.vendor_ext.items %}{% for k, v in kv.items %}<span class="badge text-bg-light text-dark border me-1" title="vendor extension ({{ ns }})"><span class="mdi mdi-puzzle-outline"></span> {{ ns }}:{{ k }}</span>{% endfor %}{% endfor %}
+        {% if not e.set_communities and not e.call_policy and not e.set_knobs and not e.vendor_ext %}<span class="text-muted small">—</span>{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<span class="text-muted small">No structured entries.</span>
+{% endif %}

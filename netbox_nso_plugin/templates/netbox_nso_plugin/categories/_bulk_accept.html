@@ -1,0 +1,5 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Bulk "Accept All" form for a category. Params: bulk_url (reversed URL), show #}
+{# (truthy to render — normally category_has_unowned), label (default "Accept All"). #}
+{% if show %}<form method="post" action="{{ bulk_url }}">{% csrf_token %}<button type="submit" class="btn btn-sm btn-outline-success"><span class="mdi mdi-check-all"></span> {{ label|default:"Accept All" }}</button></form>{% endif %}

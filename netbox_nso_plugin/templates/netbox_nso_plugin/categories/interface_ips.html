@@ -1,0 +1,40 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Lazy-loaded fragment: Interface IPs (read-only — IPs imported from NSO per interface). #}
+{% include "netbox_nso_plugin/categories/_adapter_error.html" %}
+
+{% if interface_ips %}
+  <p class="text-muted small mb-2">IP addresses reported by the device, correlated to their NetBox interface. Until accepted (or interface-IP auto-create is enabled) these are <strong>imported</strong> — recorded here but not yet written to NetBox IPAM.</p>
+  <div id="flt-interface-ips">
+  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-interface-ips" placeholder="Filter by interface / address / VRF…" show_status=True %}
+  <div class="table-responsive mb-3">
+    <table class="table table-sm table-hover mb-0">
+      <thead>
+        <tr><th>Interface</th><th>Address</th><th>Family</th><th>VRF</th><th>Secondary</th><th>Status</th><th></th></tr>
+      </thead>
+      <tbody>
+        {% for ip in interface_ips %}
+        <tr data-status="{{ ip.status }}" data-owned="{{ ip.accepted_at|yesno:'true,false' }}">
+          <td><a href="{{ ip.interface.get_absolute_url }}">{{ ip.interface.name }}</a></td>
+          <td><code>{{ ip.address }}</code></td>
+          <td>{{ ip.family }}</td>
+          <td>{% if ip.vrf %}{{ ip.vrf }}{% else %}<span class="text-muted">global</span>{% endif %}</td>
+          <td>{% if ip.secondary %}<span class="badge text-bg-light">secondary</span>{% else %}<span class="text-muted">—</span>{% endif %}</td>
+          <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=ip.status %}</td>
+          <td class="text-end">
+            {% if ip.status == "conflict" %}
+            <form method="post" action="{% url 'plugins:netbox_nso_plugin:nsointerfaceipstate_accept' pk=ip.pk %}" class="d-inline">
+              {% csrf_token %}
+              <button type="submit" class="btn btn-sm btn-warning" title="Adopt this address onto {{ ip.interface.name }} (move it from its current NetBox interface). No device change — the device already has it.">Accept onto {{ ip.interface.name }}</button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  </div>
+{% else %}
+  <p class="text-muted mb-0">No interface IP addresses reported for this device.</p>
+{% endif %}
