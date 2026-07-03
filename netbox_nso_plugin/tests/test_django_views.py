@@ -1363,6 +1363,46 @@ class TestNSOApplyPreviewView(ViewTestBase):
         self.assertEqual(rc["item"], "VLAN 2213")
         self.assertEqual(rc["detail"], "name FW_uplink_cpms-01")
 
+    def test_preview_counts_deploying_interface_change(self):
+        """A 'deploying' interface attr (apply pushed, awaiting device confirmation) must be
+        counted. The tab badges deploying as 'pending apply', so the preview total must agree —
+        otherwise openApply() sees total=0, silently skips the confirm modal and fires Apply."""
+        import json
+
+        from django.utils import timezone
+
+        self.interface.description = "intended"
+        self.interface.save(update_fields=["description"])
+        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(
+            status="deploying", nso_value="on-device", accepted_at=timezone.now()
+        )
+
+        url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
+        data = json.loads(self.client.get(url).content)
+        self.assertEqual(data["total"], 1)
+        self.assertEqual(data["changes"][0]["attribute"], "description")
+
+    def test_preview_counts_deploying_routing_overlay(self):
+        """A 'deploying' routing overlay (e.g. a route-policy row stuck awaiting device
+        confirmation) must be counted by the preview, matching the tab's pending-apply badge —
+        otherwise total=0 and the Apply modal is skipped (observed on rg03 route-policy rows)."""
+        import json
+
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
+
+        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="in_sync", nso_value="")
+        vlan = VLAN.objects.create(group=_device_vlan_group(self.device), vid=2299, name="stuck")
+        NSOVLANState.objects.create(management=self.mgmt, vlan=vlan, device_name="OLD", status="deploying")
+
+        url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
+        data = json.loads(self.client.get(url).content)
+        self.assertEqual(data["total"], 1)
+        self.assertEqual(len(data["routing_changes"]), 1)
+        self.assertEqual(data["routing_changes"][0]["status"], "deploying")
+
 
 class TestNSOBulkAcceptView(ViewTestBase):
     """Tests for NSOBulkAcceptView."""

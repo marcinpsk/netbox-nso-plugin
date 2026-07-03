@@ -1885,7 +1885,10 @@ def _apply_preview_interface_changes(device_pk):
     for st in owned:
         iface = st.interface
         kind, _label, _owned = interface_row_state(st, iface)
-        if kind not in ("pending", "apply_failed"):
+        # 'deploying' (apply pushed, awaiting device confirmation) is counted as pending-apply
+        # by the tab badges, so it must appear here too — else the preview total drops to 0 and
+        # the confirm modal is silently skipped (openApply's `!d.total` short-circuit).
+        if kind not in ("pending", "apply_failed", "deploying"):
             continue
         if st.attribute == "description":
             netbox_val = iface.description or "—"
@@ -1982,7 +1985,10 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
         routing_changes = []
         if mgmt is not None:
             for model, label, item_fn, detail_fn in preview_specs:
-                rows = model.objects.filter(management=mgmt, status__in=("accepted", "apply_failed"))
+                # accepted/apply_failed (owned, differs) AND deploying (apply pushed, not yet
+                # confirmed) are all "pending apply" on the tab — the preview must count the same
+                # set or a device with only deploying rows previews total=0 and skips the modal.
+                rows = model.objects.filter(management=mgmt, status__in=("accepted", "apply_failed", "deploying"))
                 for r in rows:
                     try:
                         item = item_fn(r)
