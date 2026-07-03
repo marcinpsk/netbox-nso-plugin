@@ -1940,6 +1940,7 @@ class RoutePolicyNSODevices(PluginTemplateExtension):
         from . import adapter_client as client
         from .signals import _preflight_constructs
 
+        adapter_down = False  # circuit breaker: the FIRST adapter failure short-circuits the rest
         for state in states:
             community_members, set_keys, match_keys, aspath_names = _preflight_constructs(state.family, obj)
             if not (community_members or set_keys or match_keys or aspath_names):
@@ -1947,12 +1948,25 @@ class RoutePolicyNSODevices(PluginTemplateExtension):
                 state.capability = {"state": "supported", "unsupported": []}
                 continue
             adapter_id = getattr(state.management, "adapter_device_id", None)
-            if not adapter_id:
+            if not adapter_id or adapter_down:
                 state.capability = {"state": "unknown", "unsupported": []}
                 continue
-            verdict = client.preflight_route_policy(
-                adapter_id, community_members, set_keys, match_keys, aspath_names, refresh=False
-            )
+            try:
+                # raise_on_error so a slow/unreachable adapter costs ONE timeout for the whole
+                # panel, not one per device row (this runs on every route-policy detail render).
+                verdict = client.preflight_route_policy(
+                    adapter_id,
+                    community_members,
+                    set_keys,
+                    match_keys,
+                    aspath_names,
+                    refresh=False,
+                    raise_on_error=True,
+                )
+            except client.AdapterError:
+                adapter_down = True
+                state.capability = {"state": "unknown", "unsupported": []}
+                continue
             if not verdict.get("known"):
                 state.capability = {"state": "unknown", "unsupported": []}
             elif verdict.get("coverage_unknown"):

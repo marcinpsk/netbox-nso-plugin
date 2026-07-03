@@ -14,7 +14,7 @@
         {% for s in switchport_states %}
         <tr data-status="{{ s.status }}" data-owned="{{ s.accepted_at|yesno:'true,false' }}">
           <td><a href="{{ s.interface.get_absolute_url }}">{{ s.interface.name }}</a></td>
-          <td>{% if s.mode %}<span class="badge text-bg-secondary">{{ s.mode }}</span>{% else %}<span class="text-muted">—</span>{% endif %}</td>
+          <td>{% if s.mode %}<span class="badge text-bg-light">{{ s.mode }}</span>{% else %}<span class="text-muted">—</span>{% endif %}</td>
           <td>{% if s.untagged_vlan %}{{ s.untagged_vlan.vid }}{% else %}<span class="text-muted">—</span>{% endif %}</td>
           <td>{% with tagged=s.tagged_vlans.all %}{% if tagged %}{% for v in tagged %}{{ v.vid }}{% if not forloop.last %}, {% endif %}{% endfor %}{% else %}<span class="text-muted">—</span>{% endif %}{% endwith %}</td>
           <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=s.status %}</td>

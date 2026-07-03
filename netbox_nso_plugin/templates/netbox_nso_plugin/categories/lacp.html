@@ -21,7 +21,7 @@
           <td>{{ b.lag_id|default:"—" }}</td>
           <td>{{ b.min_links|default:"—" }}</td>
           <td>{{ b.system_priority|default:"—" }}</td>
-          <td>{% if b.timer %}<span class="badge text-bg-secondary">{{ b.timer }}</span>{% else %}<span class="text-muted">—</span>{% endif %}</td>
+          <td>{% if b.timer %}<span class="badge text-bg-light">{{ b.timer }}</span>{% else %}<span class="text-muted">—</span>{% endif %}</td>
           <td>{{ b.admin_key|default:"—" }}</td>
           <td>
             {% with members=b.interface.nso_lacp_member_bundles.all %}

@@ -149,12 +149,16 @@ class TestNoBadgeColorRegression(SimpleTestCase):
     """
 
     def _load_all_templates(self):
+        # Recursive: the category panels live in subdirectories (categories/…); a non-recursive
+        # os.listdir silently skipped them, letting gray-on-gray badges slip through the guard.
         results = {}
-        for fname in os.listdir(_TEMPLATES_DIR):
-            if fname.endswith(".html"):
-                path = os.path.join(_TEMPLATES_DIR, fname)
-                with open(path) as fh:
-                    results[fname] = fh.read()
+        for dirpath, _dirs, files in os.walk(_TEMPLATES_DIR):
+            for fname in files:
+                if fname.endswith(".html"):
+                    path = os.path.join(dirpath, fname)
+                    rel = os.path.relpath(path, _TEMPLATES_DIR)
+                    with open(path) as fh:
+                        results[rel] = fh.read()
         return results
 
     def test_no_bg_secondary_in_templates(self):

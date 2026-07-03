@@ -83,8 +83,10 @@ def _resolve_config() -> dict:
         from .models import AdapterConnection  # noqa: PLC0415
 
         conn = AdapterConnection.objects.filter(enabled=True).first()
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 — DB may be mid-migration; fall back to PLUGINS_CONFIG
+        # Log so a real DB error isn't silently masked as a config fallback (which would surface
+        # later as a misleading "Adapter URL is not configured").
+        logger.debug("AdapterConnection lookup failed, falling back to PLUGINS_CONFIG: %s", exc)
 
     if conn:
         url = conn.url or plugin_cfg.get("adapter_url", "")
@@ -122,6 +124,7 @@ def _request(method, path, **kwargs):
 
     if not cfg["verify_tls"]:
         verify = False
+        logger.warning("TLS verification is DISABLED for adapter requests (verify_tls=False) — MITM exposure.")
     elif cfg["ca_cert_path"]:
         verify = cfg["ca_cert_path"]
     else:
@@ -562,7 +565,7 @@ def get_job(job_id):
 
 def list_jobs(adapter_device_id):
     """GET /api/v1/jobs?device_id={id} — the device's jobs, most-recent-first."""
-    return _request("GET", f"/api/v1/jobs?device_id={adapter_device_id}")
+    return _request("GET", "/api/v1/jobs", params={"device_id": adapter_device_id})
 
 
 def put_intent(adapter_device_id, attributes):
@@ -803,7 +806,13 @@ def get_device_capability(adapter_device_id, refresh=False):
 
 
 def preflight_route_policy(
-    adapter_device_id, community_members=(), set_keys=(), match_keys=(), aspath_names=(), refresh=True
+    adapter_device_id,
+    community_members=(),
+    set_keys=(),
+    match_keys=(),
+    aspath_names=(),
+    refresh=True,
+    raise_on_error=False,
 ):
     """POST /api/v1/devices/{id}/route-policy/preflight — check an attach against the matrix.
 
@@ -812,6 +821,10 @@ def preflight_route_policy(
     ``{known, fully_supported, unsupported:[{scope,element,status,detail}], ned_id, sw_version}``.
     Fails open: any adapter error → ``{known: False, fully_supported: True, unsupported: []}`` so
     an unreachable adapter never blocks an attach (we block only on a KNOWN-negative verdict).
+
+    ``raise_on_error=True`` re-raises instead of failing open — used by the per-row panel
+    annotation so it can short-circuit the whole render on the FIRST adapter failure rather than
+    paying a timeout per device row.
     """
     suffix = "?refresh=false" if not refresh else ""
     try:
@@ -827,6 +840,8 @@ def preflight_route_policy(
         )
     except AdapterError as exc:
         logger.warning("route-policy preflight failed for device %s: %s", adapter_device_id, exc)
+        if raise_on_error:
+            raise
         return {"known": False, "fully_supported": True, "unsupported": [], "coverage_unknown": False}
 
 

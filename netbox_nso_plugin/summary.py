@@ -327,12 +327,12 @@ def _snmp_breakdown(querysets) -> dict:
     for qs in querysets:
         for status, total in qs.values_list("status").annotate(total=Count("id")):
             out["total"] += total
-            if status in ("deploying", "accepted"):
-                out["pending"] += total
+            if status in ("deploying", "accepted", "apply_failed"):
+                out["pending"] += total  # apply_failed is owned + retryable → pending, not drift
             elif status in _MATCH_STATUSES:
                 pass  # in sync — the implicit remainder
             else:
-                out["drift"] += total  # changed/conflict/apply_failed/error/unknown
+                out["drift"] += total  # changed/conflict/error/unknown
     return out
 
 

@@ -7,7 +7,7 @@
 {# <table>; placeholder = search-box placeholder (optional). #}
 <div class="d-flex align-items-center gap-2 mb-2 flex-wrap">
   {% if not text_only %}<div class="btn-group btn-group-sm" role="group" aria-label="State filter">
-    <button type="button" class="btn btn-outline-secondary active" data-kind-filter="{{ fid }}" data-kind="all">All <span class="badge text-bg-secondary ms-1" data-kind-count>0</span></button>
+    <button type="button" class="btn btn-outline-secondary active" data-kind-filter="{{ fid }}" data-kind="all">All <span class="badge text-bg-light ms-1" data-kind-count>0</span></button>
     <button type="button" class="btn btn-outline-warning" data-kind-filter="{{ fid }}" data-kind="drift">Drift <span class="badge text-bg-warning text-dark ms-1" data-kind-count>0</span></button>
     <button type="button" class="btn btn-outline-info" data-kind-filter="{{ fid }}" data-kind="pending">Pending apply <span class="badge text-bg-info ms-1" data-kind-count>0</span></button>
     <button type="button" class="btn btn-outline-success" data-kind-filter="{{ fid }}" data-kind="in_sync">In sync <span class="badge text-bg-success ms-1" data-kind-count>0</span></button>

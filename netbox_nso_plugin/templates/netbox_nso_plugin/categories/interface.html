@@ -87,14 +87,14 @@
           {# ── IPs (read-only) ─────────────────────────────────────── #}
           <td class="c-ip">
             {% for ip in r.ips %}
-              <span class="nso-cell"><code>{{ ip.address }}</code>{% if ip.secondary %}<span class="badge text-bg-secondary">sec</span>{% endif %}{% include "netbox_nso_plugin/categories/_state_badge.html" with status=ip.status compact=True %}</span>{% if not forloop.last %}<br>{% endif %}
+              <span class="nso-cell"><code>{{ ip.address }}</code>{% if ip.secondary %}<span class="badge text-bg-light">sec</span>{% endif %}{% include "netbox_nso_plugin/categories/_state_badge.html" with status=ip.status compact=True %}</span>{% if not forloop.last %}<br>{% endif %}
             {% empty %}<span class="text-muted">—</span>{% endfor %}
           </td>
 
           {# ── Switchport ──────────────────────────────────────────── #}
           <td class="c-sw">
             {% if r.switchport %}
-              <span class="nso-cell">{% if r.switchport.mode %}<span class="badge text-bg-secondary">{{ r.switchport.mode }}</span>{% endif %}<span class="nso-val">{% if r.switchport.untagged_vlan %}u:{{ r.switchport.untagged_vlan.vid }}{% endif %}{% with tagged=r.switchport.tagged_vlans.all %}{% if tagged %} t:{% for v in tagged %}{{ v.vid }}{% if not forloop.last %},{% endif %}{% endfor %}{% endif %}{% endwith %}</span>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=r.switchport.status compact=True %}{% url 'plugins:netbox_nso_plugin:switchport_accept' pk=r.switchport.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=r.switchport.status form_class="nso-row-form" icon_only=True only %}</span>
+              <span class="nso-cell">{% if r.switchport.mode %}<span class="badge text-bg-light">{{ r.switchport.mode }}</span>{% endif %}<span class="nso-val">{% if r.switchport.untagged_vlan %}u:{{ r.switchport.untagged_vlan.vid }}{% endif %}{% with tagged=r.switchport.tagged_vlans.all %}{% if tagged %} t:{% for v in tagged %}{{ v.vid }}{% if not forloop.last %},{% endif %}{% endfor %}{% endif %}{% endwith %}</span>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=r.switchport.status compact=True %}{% url 'plugins:netbox_nso_plugin:switchport_accept' pk=r.switchport.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=r.switchport.status form_class="nso-row-form" icon_only=True only %}</span>
             {% else %}<span class="text-muted">—</span>{% endif %}
           </td>
         </tr>

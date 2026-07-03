@@ -13,7 +13,10 @@ from .models import (
     NSOPlatformNedMapping,
 )
 
-# Semantic Bootstrap colors for a device's last_sync_status badge (no gray-on-gray).
+# Semantic Bootstrap colors for a device's last_sync_status badge (no gray-on-gray). Any status
+# not listed here (a never-synced/in-progress state, or a newly-added one) intentionally falls
+# back to 'info' (blue) via .get(value, "info") below — a neutral, readable "unclassified" colour
+# rather than an unreadable gray. Add a mapping here to give a new status its own colour.
 _SYNC_STATUS_COLOR = {"succeeded": "success", "failed": "danger", "partial": "warning"}
 
 

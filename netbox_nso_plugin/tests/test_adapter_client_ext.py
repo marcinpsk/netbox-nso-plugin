@@ -188,6 +188,24 @@ class TestRequestErrorPaths(unittest.TestCase):
         _, kwargs = session.request.call_args
         self.assertEqual(kwargs["verify"], "/etc/certs/ca.pem")
 
+    def test_list_jobs_passes_device_id_as_query_param(self):
+        """device_id is a proper query param (URL-encoded by requests), not concatenated into
+        the path — so a non-int arg or later path preprocessing can't produce a malformed URL."""
+        from netbox_nso_plugin.adapter_client import list_jobs
+
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
+            patch("netbox_nso_plugin.adapter_client.requests.Session") as mock_s,
+        ):
+            session = make_session()
+            session.request.return_value = _mock_response(200, [])
+            mock_s.return_value = session
+            list_jobs(42)
+
+        args, kwargs = session.request.call_args
+        self.assertEqual(kwargs.get("params"), {"device_id": 42})
+        self.assertNotIn("?", args[1])  # not embedded in the path
+
     def test_session_is_pooled_across_requests(self):
         """The session is built once and reused — connection pooling, not a handshake per call."""
         import netbox_nso_plugin.adapter_client as ac

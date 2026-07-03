@@ -1783,6 +1783,7 @@ class NSOBulkAcceptView(NSOActionPermissionMixin, View):
         Matching (imported) values become in_sync (nothing to apply); differing
         (changed) values become accepted and trigger a single intent push.
         """
+        device = get_object_or_404(Device, pk=device_pk)  # 404 a bad pk BEFORE mutating anything
         now = timezone.now()
         base = NSOInterfaceState.objects.filter(interface__device_id=device_pk)
         settled = base.filter(status="imported").update(status="in_sync", accepted_at=now)
@@ -1799,7 +1800,6 @@ class NSOBulkAcceptView(NSOActionPermissionMixin, View):
         else:
             messages.info(request, "No attributes to accept.")
 
-        device = get_object_or_404(Device, pk=device_pk)
         return redirect(_device_nso_tab_url(device.pk))
 
 

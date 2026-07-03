@@ -1654,8 +1654,6 @@ _LACP_STATUS_CHOICES = [
     ("error", "Error"),
 ]
 
-_LACP_WRITE_PATH_STATUSES = {"accepted", "deploying", "in_sync"}
-
 
 class NSOLACPBundleState(_NSODeviceTabURLMixin, NetBoxModel):
     """Per-(device, LAG interface) LACP bundle compliance overlay.

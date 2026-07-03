@@ -68,8 +68,8 @@
         {% for u in snmp_data.v3_users %}
         <tr data-status="{{ u.status }}" data-owned="{{ u.accepted_at|yesno:'true,false' }}">
           <td>{{ u.username }}</td>
-          <td>{% if u.has_auth_secret %}<span class="badge text-bg-success">set</span>{% else %}<span class="badge text-bg-secondary">none</span>{% endif %}</td>
-          <td>{% if u.has_priv_secret %}<span class="badge text-bg-success">set</span>{% else %}<span class="badge text-bg-secondary">none</span>{% endif %}</td>
+          <td>{% if u.has_auth_secret %}<span class="badge text-bg-success">set</span>{% else %}<span class="badge text-bg-light">none</span>{% endif %}</td>
+          <td>{% if u.has_priv_secret %}<span class="badge text-bg-success">set</span>{% else %}<span class="badge text-bg-light">none</span>{% endif %}</td>
           <td>{% if u.vault_ref %}<code>{{ u.vault_ref }}</code>{% else %}<span class="text-warning" title="Set a Vault ref so the secret can be pushed">missing</span>{% endif %}</td>
           <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=u.status %}</td>
           <td>{{ u.last_sync_at|default:"—" }}</td>

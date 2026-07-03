@@ -384,6 +384,35 @@ class TestPanelCapabilityBadge(_CapBase):
 
         assert states[0].capability["state"] == "unassessed"
 
+    def test_adapter_failure_short_circuits_remaining_rows(self):
+        """A route-policy detail render must not pay a preflight timeout per device row: the FIRST
+        adapter failure trips a circuit breaker so the remaining rows degrade to 'unknown' without
+        further adapter calls."""
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+        cl = self._community_list("CAP-CL-CB", ["color:0:200"])
+        mgmt1 = self._mgmt(adapter_device_id=201)
+        dev2 = Device.objects.create(
+            name="cap-router-2", device_type=self.device.device_type, role=self.device.role, site=self.device.site
+        )
+        inst = NSOInstance.objects.get(name="cap-inst")
+        mgmt2 = NSODeviceManagement.objects.create(
+            device=dev2, nso_instance=inst, nso_device_name="cap-dev-2", adapter_device_id=202
+        )
+        self._attach_overlay("community_list", cl, mgmt1)
+        self._attach_overlay("community_list", cl, mgmt2)
+
+        with patch(
+            "netbox_nso_plugin.adapter_client.preflight_route_policy",
+            side_effect=AdapterError("down", code="nso_unreachable"),
+        ) as pf:
+            states = self._annotated_states(cl)
+
+        self.assertEqual(len(states), 2)
+        self.assertEqual(pf.call_count, 1)  # circuit breaker: one call total, not one per row
+        self.assertTrue(all(s.capability["state"] == "unknown" for s in states))
+
     def test_prefix_list_panel_is_supported_without_adapter_call(self):
         from netbox_routing.models import PrefixList
 
