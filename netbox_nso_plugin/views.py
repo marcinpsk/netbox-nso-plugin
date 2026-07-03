@@ -834,6 +834,7 @@ class AdapterConnectionEditView(generic.ObjectEditView):
 class NSOFailoverSettingsEditView(generic.ObjectEditView):
     """Singleton edit view for NSOFailoverSettings (global mgmt-IP failover tuning)."""
 
+    template_name = "netbox_nso_plugin/settings_object_edit.html"
     queryset = NSOFailoverSettings.objects.all()
     form = NSOFailoverSettingsForm
 
@@ -879,6 +880,7 @@ class NSOFailoverSettingsEditView(generic.ObjectEditView):
 class NSOInstanceListView(generic.ObjectListView):
     """List view for NSO instances."""
 
+    template_name = "netbox_nso_plugin/settings_object_list.html"
     queryset = NSOInstance.objects.all()
     table = NSOInstanceTable
     filterset = NSOInstanceFilterSet
@@ -921,6 +923,7 @@ class NSOInstanceDeleteView(generic.ObjectDeleteView):
 class NSOLinkRoleListView(generic.ObjectListView):
     """List view for configurable link roles."""
 
+    template_name = "netbox_nso_plugin/links_object_list.html"
     queryset = NSOLinkRole.objects.all()
     table = NSOLinkRoleTable
     filterset = NSOLinkRoleFilterSet
@@ -957,6 +960,7 @@ class NSOLinkRoleBulkDeleteView(generic.BulkDeleteView):
 class NSOLinkRoleAssignmentListView(generic.ObjectListView):
     """List view for link-role assignments."""
 
+    template_name = "netbox_nso_plugin/links_object_list.html"
     queryset = NSOLinkRoleAssignment.objects.select_related("role", "cable", "interface")
     table = NSOLinkRoleAssignmentTable
     filterset = NSOLinkRoleAssignmentFilterSet
@@ -1206,6 +1210,7 @@ class NSOOnboardStatusView(NSOActionPermissionMixin, View):
 class NSOPlatformNedMappingListView(generic.ObjectListView):
     """List view for Platform→NED mappings."""
 
+    template_name = "netbox_nso_plugin/settings_object_list.html"
     queryset = NSOPlatformNedMapping.objects.all()
     table = NSOPlatformNedMappingTable
     filterset = NSOPlatformNedMappingFilterSet
@@ -1635,6 +1640,7 @@ class NSOInterfaceStateListView(generic.ObjectListView):
     through to the device tab for the value-aware truth.
     """
 
+    template_name = "netbox_nso_plugin/links_object_list.html"
     queryset = NSOInterfaceState.objects.exclude(status__in=("imported", "in_sync")).select_related(
         "interface", "interface__device"
     )

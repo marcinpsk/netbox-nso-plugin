@@ -2571,3 +2571,48 @@ class TestDeviceNSOTabCapability(ViewTestBase):
             resp = self.client.get(self._url())
         self.assertEqual(resp.status_code, 200)
         self.assertNotContains(resp, "mdi-alert-octagon-outline")
+
+
+class TestNSOAreaTabs(ViewTestBase):
+    """The Settings/Links area screens render a cross-page tab bar (inc/_settings_tabs.html and
+    inc/_links_tabs.html) with the current tab active. Exercises the real request -> view ->
+    template render, so it catches a renamed URL, a broken partial, or a dropped template_name."""
+
+    def _norm(self, url_name):
+        import re
+
+        resp = self.client.get(reverse(f"plugins:netbox_nso_plugin:{url_name}"))
+        self.assertEqual(resp.status_code, 200)
+        return re.sub(r"\s+", " ", resp.content.decode())
+
+    def _url(self, url_name):
+        return reverse(f"plugins:netbox_nso_plugin:{url_name}")
+
+    def test_settings_list_renders_all_settings_tabs_with_active(self):
+        html = self._norm("nsoinstance_list")
+        for label in ("NSO Instances", "Adapter Connection", "Failover Settings", "NED Mappings"):
+            self.assertIn(label, html)
+        # the four tabs link to their screens, and the current one is active
+        self.assertIn(f'nav-link active" href="{self._url("nsoinstance_list")}">NSO Instances', html)
+        self.assertIn(f'href="{self._url("adapterconnection")}">Adapter Connection', html)
+        self.assertIn(f'href="{self._url("nsofailoversettings")}">Failover Settings', html)
+
+    def test_settings_edit_view_also_renders_tabs_with_active(self):
+        """The singleton config EDIT screens (Adapter Connection / Failover) carry the tabs too."""
+        html = self._norm("adapterconnection")
+        self.assertIn(f'nav-link active" href="{self._url("adapterconnection")}">Adapter Connection', html)
+        self.assertIn(">NSO Instances</a>", html)  # sibling tab present
+
+    def test_links_list_renders_all_links_tabs_with_active(self):
+        html = self._norm("nsolinkrole_list")
+        for label in ("Link Roles", "Link Assignments", "Interface Drift"):
+            self.assertIn(label, html)
+        self.assertIn(f'nav-link active" href="{self._url("nsolinkrole_list")}">Link Roles', html)
+
+    def test_link_assignments_active_without_lighting_up_link_roles(self):
+        """'nsolinkrole' is a prefix of 'nsolinkroleassignment' — the Link Roles tab must NOT be
+        active on the Link Assignments page (the partial explicitly excludes the assignment views)."""
+        html = self._norm("nsolinkroleassignment_list")
+        self.assertIn(f'nav-link active" href="{self._url("nsolinkroleassignment_list")}">Link Assignments', html)
+        self.assertIn(f'nav-link" href="{self._url("nsolinkrole_list")}">Link Roles', html)
+        self.assertNotIn(f'nav-link active" href="{self._url("nsolinkrole_list")}">Link Roles', html)

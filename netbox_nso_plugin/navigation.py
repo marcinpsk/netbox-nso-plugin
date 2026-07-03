@@ -2,6 +2,10 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 from netbox.plugins.navigation import PluginMenu, PluginMenuButton, PluginMenuItem
 
+# The sidebar stays lean — three entries. "Settings" and "Links" each land on the first
+# tab of a tabbed area page (rendered by the ``inc/_settings_tabs.html`` /
+# ``inc/_links_tabs.html`` partials), so the individual config/link screens are reached via
+# tabs on the page, not a long flat menu.
 menu = PluginMenu(
     label="NSO",
     groups=(
@@ -21,59 +25,11 @@ menu = PluginMenu(
                 ),
                 PluginMenuItem(
                     link="plugins:netbox_nso_plugin:nsoinstance_list",
-                    link_text="NSO Instances",
-                    buttons=(
-                        PluginMenuButton(
-                            link="plugins:netbox_nso_plugin:nsoinstance_add",
-                            title="Add",
-                            icon_class="mdi mdi-plus-thick",
-                        ),
-                    ),
-                ),
-                PluginMenuItem(
-                    link="plugins:netbox_nso_plugin:nsointerfacestate_list",
-                    link_text="Interface Drift",
-                ),
-                PluginMenuItem(
-                    link="plugins:netbox_nso_plugin:nsoplatformnedmapping_list",
-                    link_text="Platform → NED Mappings",
-                    buttons=(
-                        PluginMenuButton(
-                            link="plugins:netbox_nso_plugin:nsoplatformnedmapping_add",
-                            title="Add",
-                            icon_class="mdi mdi-plus-thick",
-                        ),
-                    ),
+                    link_text="Settings",
                 ),
                 PluginMenuItem(
                     link="plugins:netbox_nso_plugin:nsolinkrole_list",
-                    link_text="Link Roles",
-                    buttons=(
-                        PluginMenuButton(
-                            link="plugins:netbox_nso_plugin:nsolinkrole_add",
-                            title="Add",
-                            icon_class="mdi mdi-plus-thick",
-                        ),
-                    ),
-                ),
-                PluginMenuItem(
-                    link="plugins:netbox_nso_plugin:nsolinkroleassignment_list",
-                    link_text="Link Role Assignments",
-                    buttons=(
-                        PluginMenuButton(
-                            link="plugins:netbox_nso_plugin:nsolinkroleassignment_add",
-                            title="Add",
-                            icon_class="mdi mdi-plus-thick",
-                        ),
-                    ),
-                ),
-                PluginMenuItem(
-                    link="plugins:netbox_nso_plugin:adapterconnection",
-                    link_text="Adapter Connection",
-                ),
-                PluginMenuItem(
-                    link="plugins:netbox_nso_plugin:nsofailoversettings",
-                    link_text="Failover Settings",
+                    link_text="Links",
                 ),
             ),
         ),
