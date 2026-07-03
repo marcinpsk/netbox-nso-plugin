@@ -190,6 +190,30 @@ class TestAutoAssignIP(TestCase):
 
         mgmt.delete()
 
+    def test_reserve_single_carries_pool_vrf(self):
+        """A VRF-scoped pool (as a link-role resolves) must land the reserved IPAddress in that
+        VRF — otherwise it goes into the global table (wrong IPAM accounting) and rollback, which
+        filters by VRF, can't clean it up."""
+        from ipam.models import VRF
+
+        from netbox_nso_plugin.ip_autoassign import _reserve_single
+
+        vrf = VRF.objects.create(name="TENANT-A")
+        self.pool_lo4.vrf = vrf
+        self.pool_lo4.save()
+        # Reload fresh (production resolves the pool via find_pool/_resolve_role_pool) — a
+        # class-attr Prefix carries an unconverted .prefix that breaks get_first_available_ip.
+        pool = Prefix.objects.get(pk=self.pool_lo4.pk)
+        mgmt = self._make_mgmt()
+        iface = Interface.objects.create(device=self.device, name="Loopback150", type="virtual")
+        result = {"allocated": [], "errors": [], "skipped": []}
+        with patch("netbox_nso_plugin.signals._push_ip_intent_for_device"):
+            _reserve_single(iface, mgmt, "ipv4", pool, result, push=False)
+        self.assertTrue(result["allocated"], result)
+        ip = IPAddress.objects.get(address=result["allocated"][0]["address"])
+        self.assertEqual(ip.vrf, vrf)  # was None (global table) before the fix
+        mgmt.delete()
+
     def test_fill_empty_skips_interface_with_managed_ip(self):
         from netbox_nso_plugin.models import NSOInterfaceIPState
 
@@ -587,6 +611,72 @@ class TestAutoAssignIPP2P(TestCase):
         self.assertTrue(state_a.auto_assigned)
         self.assertTrue(state_b.auto_assigned)
 
+        mgmt_a.delete()
+        mgmt_b.delete()
+
+    def test_p2p_allocated_ips_carry_pool_vrf(self):
+        """A VRF-scoped P2P pool (as a link-role resolves) must land BOTH end IPAddresses in that
+        VRF, not the global table."""
+        from ipam.models import VRF
+
+        from netbox_nso_plugin.ip_autoassign import _assign_one_p2p_family
+
+        vrf = VRF.objects.create(name="P2P-VRF")
+        self.pool.vrf = vrf
+        self.pool.save()
+        mgmt_a = self._make_mgmt(self.device_a, "p2p-vrf-a")
+        mgmt_b = self._make_mgmt(self.device_b, "p2p-vrf-b")
+        iface_a = Interface.objects.create(device=self.device_a, name="Gi11/0/0", type="1000base-t")
+        iface_b = Interface.objects.create(device=self.device_b, name="Gi11/0/0", type="1000base-t")
+        result = {"allocated": [], "errors": [], "skipped": []}
+        with patch("netbox_nso_plugin.signals._push_ip_intent_for_device"):
+            _assign_one_p2p_family(
+                iface_a,
+                iface_b,
+                mgmt_a,
+                mgmt_b,
+                "ipv4",
+                None,
+                result,
+                pool_finder=lambda _fam, _s: self.pool,
+                no_pool_reason=lambda _fam: "no pool",
+                push=False,
+            )
+        self.assertEqual(len(result["allocated"]), 2, result)
+        for entry in result["allocated"]:
+            self.assertEqual(IPAddress.objects.get(address=entry["address"]).vrf, vrf)
+        mgmt_a.delete()
+        mgmt_b.delete()
+
+    def test_p2p_state_failure_rolls_back_carve_and_ips(self):
+        """A failure during state creation must roll back the carved child prefix + both reserved
+        IPAddresses (one atomic), leaving no IPAM debris — the standalone M13 path has no outer
+        transaction to clean up after it."""
+        from extras.models import Tag
+
+        from netbox_nso_plugin.ip_autoassign import auto_assign_ip
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        mgmt_a = self._make_mgmt(self.device_a, "p2p-rb-a")
+        mgmt_b = self._make_mgmt(self.device_b, "p2p-rb-b")
+        iface_a = Interface.objects.create(device=self.device_a, name="Gi12/0/0", type="1000base-t")
+        iface_b = Interface.objects.create(device=self.device_b, name="Gi12/0/0", type="1000base-t")
+        _make_cable_pair(iface_a, iface_b)
+        iface_a = Interface.objects.get(pk=iface_a.pk)
+        iface_a.tags.add(Tag.objects.create(name="p2p-core-rb", slug="p2p-core"))
+
+        prefixes_before = Prefix.objects.count()
+        with (
+            patch("netbox_nso_plugin.signals._push_ip_intent_for_device"),
+            patch.object(NSOInterfaceIPState.objects, "update_or_create", side_effect=Exception("state boom")),
+        ):
+            result = auto_assign_ip(iface_a, families=("ipv4",))
+        self.assertTrue(result["errors"], result)
+        self.assertEqual(result["allocated"], [])
+        # Rolled back: no carved child prefix, no reserved IPAddresses, no state rows.
+        self.assertEqual(Prefix.objects.count(), prefixes_before)
+        self.assertEqual(IPAddress.objects.filter(status="reserved").count(), 0)
+        self.assertEqual(NSOInterfaceIPState.objects.filter(interface__in=[iface_a, iface_b]).count(), 0)
         mgmt_a.delete()
         mgmt_b.delete()
 

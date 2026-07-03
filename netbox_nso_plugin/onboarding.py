@@ -277,14 +277,31 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
     # failure it records provision_failed + the steps.
     from django.utils import timezone
 
-    NSODeviceManagement.objects.create(
-        device=device,
-        nso_instance=instance,
-        nso_device_name=nso_name,
-        onboarded_at=timezone.now(),
-        onboard_status="provisioning",
-        onboard_job_id=job_id,
-    )
+    try:
+        NSODeviceManagement.objects.create(
+            device=device,
+            nso_instance=instance,
+            nso_device_name=nso_name,
+            onboarded_at=timezone.now(),
+            onboard_status="provisioning",
+            onboard_job_id=job_id,
+        )
+    except Exception as exc:  # noqa: BLE001 — the adapter job is already running; surface it for recovery
+        # provision_device() already enqueued job_id, so NSO is building the node. Without a
+        # tracking row it would become an untracked "ghost" onboard (a later re-onboard is then
+        # blocked by the name clash), so record the job id prominently instead of raising.
+        logger.error(
+            "onboard_candidate: provision job %s started but tracking-row create failed for %s (%s)",
+            job_id,
+            nso_name,
+            exc,
+        )
+        result["error"] = (
+            f"Provision job {job_id} started, but the NetBox tracking row could not be created "
+            f"({exc}). The NSO node may still be provisioning — recover via job {job_id}."
+        )
+        result["job_id"] = job_id
+        return result
     # Learn the platform→NED mapping from this onboard: the first device of a
     # platform is onboarded with an explicit NED; record it so future devices of
     # the same platform appear as onboardable candidates (no-op if one exists).

@@ -209,6 +209,25 @@ class TestOnboardCandidate(TestCase):
         m = NSOPlatformNedMapping.objects.get(platform=self.ios)
         self.assertEqual(m.ned_id, "cisco-iosxr-cli-7.55:cisco-iosxr-cli-7.55")
 
+    def test_tracking_row_create_failure_reports_job_for_recovery(self):
+        """If the tracking-row create fails AFTER the adapter provision job is enqueued, surface
+        the ghost-onboard (error names the job id) instead of raising — NSO is already building
+        the node, so the operator needs the job id to recover (a bare create would 'ghost' it)."""
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.onboarding import onboard_candidate
+
+        d = self._mapped_device("ghost-rtr")
+        with (
+            patch("netbox_nso_plugin.adapter_client.provision_device", return_value=self._QUEUED) as prov,
+            patch.object(NSODeviceManagement.objects, "create", side_effect=Exception("db down")),
+        ):
+            res = onboard_candidate(d, self.instance)  # must NOT raise
+        prov.assert_called_once()  # the provision job WAS enqueued
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["job_id"], "55")
+        self.assertIn("55", res["error"] or "")  # job id surfaced for recovery
+        self.assertFalse(NSODeviceManagement.objects.filter(device=d).exists())
+
     def test_onboard_does_not_override_existing_mapping(self):
         """If a platform mapping already exists, onboarding leaves it (no-op)."""
         from netbox_nso_plugin.models import NSOPlatformNedMapping

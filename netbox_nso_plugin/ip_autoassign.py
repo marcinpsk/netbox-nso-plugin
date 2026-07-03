@@ -372,16 +372,6 @@ def _suppress_ip_intent_push():
     return _ctx()
 
 
-def _delete_if_set(*objs):
-    """Silently delete each non-None object; used for P2P rollback cleanup."""
-    for obj in objs:
-        if obj is not None:
-            try:
-                obj.delete()
-            except Exception:
-                pass
-
-
 def _assign_one_p2p_family(
     interface,
     peer_iface,
@@ -414,105 +404,90 @@ def _assign_one_p2p_family(
     from .signals import _push_ip_intent_for_device
 
     _OCCUPIED = ("reserved", "accepted", "deploying", "in_sync")
-
-    # Wrap the occupancy check + carve in a transaction and lock the pool row so
-    # concurrent callers for the same pool serialize rather than racing for the
-    # same available space.  Without this a TOCTOU window allows two callers to
-    # read the same available block and both attempt to create overlapping child
-    # prefixes, producing an unhandled IntegrityError from the unique constraint.
-    with transaction.atomic():
-        pool = pool_finder(family, site)
-        if pool is None:
-            result["errors"].append({"interface": str(interface), "family": family, "reason": no_pool_reason(family)})
-            return
-
-        # Row-level lock on the pool prefix: serializes concurrent carves for
-        # the same pool without blocking unrelated allocations.
-        pool = Prefix.objects.select_for_update().get(pk=pool.pk)
-
-        if NSOInterfaceIPState.objects.filter(
-            Q(interface=interface) | Q(interface=peer_iface),
-            family=family,
-            status__in=_OCCUPIED,
-        ).exists():
-            result["skipped"].append(
-                {
-                    "interface": str(interface),
-                    "family": family,
-                    "reason": f"One or both P2P ends already have a managed {family} IP",
-                }
-            )
-            return
-
-        carved = carve_p2p_child(pool, family, override_mask)
-    if carved is None:
-        result["errors"].append(
-            {
-                "interface": str(interface),
-                "family": family,
-                "reason": f"P2P pool {pool} has no available space for a child prefix",
-            }
-        )
-        return
-
-    child_prefix, host_a_str, host_b_str = carved
-    vrf_name = pool.vrf.name if pool.vrf else ""
-    ip_a = ip_b = None
-
-    try:
-        with _suppress_ip_intent_push():
-            ip_a = IPAddress(address=host_a_str, status="reserved")
-            ip_a.assigned_object = interface
-            ip_a.save()
-            ip_b = IPAddress(address=host_b_str, status="reserved")
-            ip_b.assigned_object = peer_iface
-            ip_b.save()
-    except Exception as exc:
-        # ip_b may already be persisted (a post-INSERT signal error can raise after
-        # ip_b.save() committed the row) — clean both ends, not just ip_a.
-        _delete_if_set(ip_a, ip_b, child_prefix)
-        result["errors"].append(
-            {"interface": str(interface), "family": family, "reason": f"Failed to reserve P2P IPAddresses: {exc}"}
-        )
-        return
-
-    state_a = state_b = None
     now = timezone.now()
+    pool = child_prefix = state_a = state_b = None
+    host_a_str = host_b_str = None
+
+    # Carve + reserve both IPs + create both state rows in ONE transaction under the pool
+    # lock. Any failure rolls the whole allocation back automatically — no orphaned child
+    # prefix, reserved IPAddresses, or half-linked peer state — instead of relying on
+    # best-effort _delete_if_set cleanup that can itself fail and leave IPAM debris (the
+    # standalone M13 path has no outer atomic to save it). The lock also closes the TOCTOU
+    # window where two callers carve the same block.
     try:
-        state_a, _ = NSOInterfaceIPState.objects.update_or_create(
-            interface=interface,
-            address=host_a_str,
-            vrf=vrf_name,
-            defaults={
-                "family": family,
-                "status": "accepted",
-                "auto_assigned": True,
-                "source_pool": child_prefix,
-                "accepted_at": now,
-            },
-        )
-        state_b, _ = NSOInterfaceIPState.objects.update_or_create(
-            interface=peer_iface,
-            address=host_b_str,
-            vrf=vrf_name,
-            defaults={
-                "family": family,
-                "status": "accepted",
-                "auto_assigned": True,
-                "source_pool": child_prefix,
-                "accepted_at": now,
-            },
-        )
-        state_a.peer_state = state_b
-        state_a.save(update_fields=["peer_state"])
-        state_b.peer_state = state_a
-        state_b.save(update_fields=["peer_state"])
+        with transaction.atomic():
+            pool = pool_finder(family, site)
+            if pool is None:
+                result["errors"].append(
+                    {"interface": str(interface), "family": family, "reason": no_pool_reason(family)}
+                )
+                return
+            # Row-level lock on the pool prefix: serializes concurrent carves for the same
+            # pool without blocking unrelated allocations.
+            pool = Prefix.objects.select_for_update().get(pk=pool.pk)
+            if NSOInterfaceIPState.objects.filter(
+                Q(interface=interface) | Q(interface=peer_iface),
+                family=family,
+                status__in=_OCCUPIED,
+            ).exists():
+                result["skipped"].append(
+                    {
+                        "interface": str(interface),
+                        "family": family,
+                        "reason": f"One or both P2P ends already have a managed {family} IP",
+                    }
+                )
+                return
+            carved = carve_p2p_child(pool, family, override_mask)
+            if carved is None:
+                result["errors"].append(
+                    {
+                        "interface": str(interface),
+                        "family": family,
+                        "reason": f"P2P pool {pool} has no available space for a child prefix",
+                    }
+                )
+                return
+            child_prefix, host_a_str, host_b_str = carved
+            vrf_name = pool.vrf.name if pool.vrf else ""
+            with _suppress_ip_intent_push():
+                ip_a = IPAddress(address=host_a_str, vrf=pool.vrf, status="reserved")
+                ip_a.assigned_object = interface
+                ip_a.save()
+                ip_b = IPAddress(address=host_b_str, vrf=pool.vrf, status="reserved")
+                ip_b.assigned_object = peer_iface
+                ip_b.save()
+            state_a, _ = NSOInterfaceIPState.objects.update_or_create(
+                interface=interface,
+                address=host_a_str,
+                vrf=vrf_name,
+                defaults={
+                    "family": family,
+                    "status": "accepted",
+                    "auto_assigned": True,
+                    "source_pool": child_prefix,
+                    "accepted_at": now,
+                },
+            )
+            state_b, _ = NSOInterfaceIPState.objects.update_or_create(
+                interface=peer_iface,
+                address=host_b_str,
+                vrf=vrf_name,
+                defaults={
+                    "family": family,
+                    "status": "accepted",
+                    "auto_assigned": True,
+                    "source_pool": child_prefix,
+                    "accepted_at": now,
+                },
+            )
+            state_a.peer_state = state_b
+            state_a.save(update_fields=["peer_state"])
+            state_b.peer_state = state_a
+            state_b.save(update_fields=["peer_state"])
     except Exception as exc:
-        # state_b is created before the peer_state links save; include it so a
-        # mid-link failure never leaves an orphan 'accepted' row on the peer end.
-        _delete_if_set(ip_a, ip_b, child_prefix, state_a, state_b)
         result["errors"].append(
-            {"interface": str(interface), "family": family, "reason": f"Failed to create P2P state records: {exc}"}
+            {"interface": str(interface), "family": family, "reason": f"P2P allocation failed: {exc}"}
         )
         return
 
@@ -611,9 +586,11 @@ def _reserve_single(interface, mgmt, family: str, pool, result, push=True) -> No
         )
         return
 
-    # Reserve the IPAddress in IPAM so concurrent allocations don't collide.
+    # Reserve the IPAddress in IPAM so concurrent allocations don't collide. It carries the
+    # pool's VRF so a VRF-scoped pool lands the address in the right table (and rollback, which
+    # filters by VRF, can find it).
     try:
-        ip_obj = IPAddress(address=available_str, status="reserved")
+        ip_obj = IPAddress(address=available_str, vrf=pool.vrf, status="reserved")
         ip_obj.assigned_object = interface
         ip_obj.save()
     except Exception as exc:
