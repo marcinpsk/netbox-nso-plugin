@@ -48,6 +48,55 @@ class _RPBase(IntentPushResetMixin, TestCase):
         return pl
 
 
+class TestRoutePolicyIntentAcceptedFlag(_RPBase):
+    """Every OWNED route-policy object is pushed accepted=True so the adapter keeps it eligible
+    for Apply. Keying accepted off status=='accepted' dropped the flag once a row advanced to
+    deploying/in_sync/apply_failed → the adapter stamped no accepted_at → the object was
+    ineligible → Apply pushed 0 route-policy items and the row stuck in 'deploying' (live on rg03:
+    an owned as-path whose adapter intent had accepted_at=NULL never applied and never settled)."""
+
+    def _overlay(self, status):
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import PrefixList
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        mgmt = self._mgmt()
+        pl = self._prefix_list()
+        with suppress_intent_push():
+            NSORoutePolicyState.objects.create(
+                management=mgmt,
+                family="prefix_list",
+                object_name=pl.name,
+                content_type=ContentType.objects.get_for_model(PrefixList),
+                object_id=pl.pk,
+                status=status,
+            )
+        return mgmt
+
+    def _push_and_capture(self, mgmt):
+        from netbox_nso_plugin.signals import _push_route_policy_intent_for_device
+
+        pushed = []
+        with patch(
+            "netbox_nso_plugin.adapter_client.put_route_policy_intent",
+            side_effect=lambda adapter_id, objects: pushed.append(objects),
+        ):
+            # force bypasses change-detection (the device Apply path)
+            _push_route_policy_intent_for_device(mgmt.device_id, mgmt.adapter_device_id, force=True)
+        return pushed[-1] if pushed else []
+
+    def test_deploying_row_pushed_accepted_true(self):
+        objs = self._push_and_capture(self._overlay("deploying"))
+        assert len(objs) == 1 and objs[0]["name"] == "TESTNSO-PL"
+        assert objs[0]["accepted"] is True  # owned intent stays eligible on the adapter
+
+    def test_in_sync_row_pushed_accepted_true(self):
+        objs = self._push_and_capture(self._overlay("in_sync"))
+        assert objs[0]["accepted"] is True
+
+
 class TestRoutePolicyEntrySerialization(_RPBase):
     def test_prefix_list_entries_serialize_from_fork_model(self):
         from netbox_nso_plugin.signals import _build_route_policy_entries

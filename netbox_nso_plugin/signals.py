@@ -2085,8 +2085,13 @@ def _push_route_policy_intent_for_device(device_id, adapter_device_id, force=Fal
             {
                 "family": row.family,
                 "name": row.object_name,
+                # Every row here is OWNED (query filters to _OWNED_PUSH_STATUSES), i.e. operator
+                # intent that must stay eligible for Apply. Keying this off status=='accepted'
+                # dropped the flag once a row advanced to deploying/in_sync/apply_failed, so the
+                # adapter stamped no accepted_at and treated the object as ineligible → Apply
+                # applied 0 route-policy items and the row stuck in 'deploying' forever (rg03).
                 "entries": entries,
-                "accepted": row.status == "accepted",
+                "accepted": True,
                 # community-list only: Junos invert-match / Nokia expression NOT(…).
                 **(
                     {"invert_match": bool(getattr(obj, "invert_match", False))}
