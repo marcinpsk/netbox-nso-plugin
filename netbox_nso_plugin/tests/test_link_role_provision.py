@@ -217,6 +217,41 @@ class TestProvisionSingle(_Base):
         self.assertTrue(state.passive)
 
 
+class TestProvisionForcePush(_Base):
+    """Re-provisioning must always re-push each affected scope even when the in-process
+    change-detection cache already holds an identical snapshot (intent-integrity: no silent
+    drop). Regression: _push_provisioned invoked the scope pushers without force=True, so a
+    warm cache silently skipped the push while the local overlay still flipped to accepted."""
+
+    def setUp(self):
+        self.mgmt = self._manage(self.dev_a)
+        self.iface = Interface.objects.create(device=self.dev_a, name="Gi1/1", type="1000base-t", description="to-peer")
+        NSOInterfaceState.objects.update_or_create(
+            interface=self.iface,
+            attribute="description",
+            defaults={"status": "accepted", "nso_value": ""},
+        )
+
+    def test_reprovision_forces_push_despite_warm_cache(self):
+        from netbox_nso_plugin.link_role import _push_provisioned
+        from netbox_nso_plugin.signals import _push_interface_intent_for_device, reset_intent_push_state
+
+        role = NSOLinkRole.objects.create(
+            name="lp-desc",
+            slug="lp-desc",
+            link_type="single",
+            assign_ipv4=False,
+            description_template="{self_host}",
+            igp="none",
+        )
+        reset_intent_push_state()
+        with patch("netbox_nso_plugin.adapter_client.put_intent") as mock_put:
+            _push_interface_intent_for_device(self.dev_a.pk, self.mgmt.adapter_device_id)  # warm the cache
+            self.assertEqual(mock_put.call_count, 1)
+            _push_provisioned(role, [self.dev_a.pk])  # re-provision must push AGAIN (force), not skip
+            self.assertEqual(mock_put.call_count, 2)
+
+
 class TestProvisionActionView(_Base):
     """The device_provision_link_role operator action view."""
 

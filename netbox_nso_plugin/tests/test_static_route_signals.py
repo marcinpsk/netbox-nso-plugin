@@ -301,6 +301,28 @@ class TestGreenfieldStaticRoute(IntentPushResetMixin, TestCase):
             routes = mock_push.call_args[0][1]
             self.assertFalse(any(r["prefix"] == "10.9.10.0/24" for r in routes))
 
+    def test_clear_devices_drops_overlay_and_pushes_removal(self):
+        """StaticRoute.devices.clear() sends pk_set=None (post_clear). The overlay for every
+        detached device must still be dropped + a removal pushed. Regression: `pk_set or []`
+        silently removed nothing, orphaning the overlay and stranding stale adapter intent."""
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.models import NSOStaticRouteState
+
+        mgmt = self._mgmt()
+        sr = StaticRoute.objects.create(prefix="10.9.12.0/24", next_hop="10.0.0.12", metric=1)
+        with self.captureOnCommitCallbacks(execute=True):
+            sr.devices.add(self.device)
+        self.assertTrue(NSOStaticRouteState.objects.filter(management=mgmt, static_route=sr).exists())
+
+        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent") as mock_push:
+            with self.captureOnCommitCallbacks(execute=True):
+                sr.devices.clear()  # pk_set=None on post_clear
+            self.assertFalse(NSOStaticRouteState.objects.filter(management=mgmt, static_route=sr).exists())
+            mock_push.assert_called()
+            routes = mock_push.call_args[0][1]
+            self.assertFalse(any(r["prefix"] == "10.9.12.0/24" for r in routes))
+
     def test_delete_route_pushes_removal(self):
         from netbox_routing.models import StaticRoute
 

@@ -9,6 +9,7 @@ from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer,
 from django.test import TestCase
 
 from ._adapter_http import make_session
+from .mixins import IntentPushResetMixin
 
 _BASE_CFG = {
     "url": "http://adapter.local",
@@ -383,6 +384,50 @@ class TestReconcileInterfaceIps(TestCase):
 
         self.assertEqual(result, [])
         self.assertFalse(NSOInterfaceIPState.objects.filter(address="1.2.3.4/32").exists())
+
+
+class TestInterfaceIPReassignment(IntentPushResetMixin, TestCase):
+    """Reassigning an IPAddress from interface A to B must drop A's overlay.
+
+    Regression: _on_ip_address_change keyed get_or_create on the NEW interface only, so the OLD
+    interface's NSOInterfaceIPState was orphaned and the adapter's full-snapshot push carried both
+    — device A kept an IP NetBox had moved to device/interface B.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+        mfg = Manufacturer.objects.create(name="RaMfg", slug="ramfg")
+        dt = DeviceType.objects.create(manufacturer=mfg, model="RaDev", slug="radev")
+        role = DeviceRole.objects.create(name="RaRole", slug="rarole")
+        site = Site.objects.create(name="RaSite", slug="rasite")
+        cls.device = Device.objects.create(name="ra-router", device_type=dt, role=role, site=site)
+        cls.if_a = Interface.objects.create(device=cls.device, name="GigabitEthernet0/1", type="1000base-t")
+        cls.if_b = Interface.objects.create(device=cls.device, name="GigabitEthernet0/2", type="1000base-t")
+        nso = NSOInstance.objects.create(name="ra-nso", adapter_instance_id="ra-nso")
+        cls.mgmt = NSODeviceManagement.objects.create(
+            device=cls.device, nso_instance=nso, nso_device_name="ra-router", adapter_device_id=321
+        )
+
+    def test_reassign_drops_old_interface_overlay(self):
+        from ipam.models import IPAddress
+
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        with patch("netbox_nso_plugin.adapter_client.put_ip_intent"):
+            ip = IPAddress.objects.create(address="10.44.0.1/24", assigned_object=self.if_a)
+        self.assertTrue(NSOInterfaceIPState.objects.filter(interface=self.if_a, address="10.44.0.1/24").exists())
+
+        with patch("netbox_nso_plugin.adapter_client.put_ip_intent"):
+            ip.assigned_object = self.if_b
+            ip.save()
+
+        self.assertFalse(
+            NSOInterfaceIPState.objects.filter(interface=self.if_a, address="10.44.0.1/24").exists(),
+            "old interface overlay was orphaned on reassignment",
+        )
+        self.assertTrue(NSOInterfaceIPState.objects.filter(interface=self.if_b, address="10.44.0.1/24").exists())
 
 
 class TestAcceptInterfaceIPConflict(TestCase):

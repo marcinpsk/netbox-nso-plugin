@@ -287,7 +287,10 @@ def _push_provisioned(role, device_ids) -> None:
             push_fns.append(_push_ospf_intent_for_device)
         for fn in push_fns:
             try:
-                fn(device_id, aid)
+                # force=True: provisioning must always land its computed intent — the
+                # in-process change-detection cache can otherwise silently skip a re-provision
+                # whose snapshot matches an earlier push (intent-integrity: no silent drop).
+                fn(device_id, aid, force=True)
             except Exception as exc:  # noqa: BLE001 — adapter may be down; state already owned
                 logger.warning("provision_link_role: push failed for device %s: %s", device_id, exc)
 

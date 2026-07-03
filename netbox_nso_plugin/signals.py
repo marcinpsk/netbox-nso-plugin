@@ -633,8 +633,12 @@ def _create_greenfield_subif_state(sender, instance, created, **kwargs):
     )
 
 
-def _push_ip_intent_for_device(device_id, adapter_device_id):
-    """Build and push the full IP intent snapshot for a device."""
+def _push_ip_intent_for_device(device_id, adapter_device_id, force=False):
+    """Build and push the full IP intent snapshot for a device.
+
+    ``force=True`` bypasses change-detection (used by provisioning, which must always land
+    its computed intent even if an identical snapshot was pushed earlier this process).
+    """
     from . import adapter_client as client
     from .models import NSOInterfaceIPState
 
@@ -656,7 +660,7 @@ def _push_ip_intent_for_device(device_id, adapter_device_id):
         entry.update(_nokia_routed_binding(ip_state.interface))
         addresses.append(entry)
 
-    _push_changed((device_id, "ip"), addresses, lambda: client.put_ip_intent(adapter_device_id, addresses))
+    _push_changed((device_id, "ip"), addresses, lambda: client.put_ip_intent(adapter_device_id, addresses), force=force)
 
 
 def _nokia_routed_binding(interface) -> dict:
@@ -1141,6 +1145,70 @@ def _on_bfd_state_save(sender, instance, **kwargs):
     )
 
 
+def _on_ip_address_pre_save(sender, instance, **kwargs):
+    """Stash the IPAddress's pre-save interface binding for the reassignment cleanup.
+
+    A GenericForeignKey change fires a single post_save keyed on the NEW interface; without
+    the previous binding, the OLD interface's ``NSOInterfaceIPState`` is orphaned and its
+    device keeps an IP NetBox just moved away. Not ``@_skip_on_render``: it only reads + stashes
+    on the instance (no push), and post_save's own guard decides whether the cleanup runs.
+    """
+    from dcim.models import Interface as _Interface
+
+    instance._nso_prev_ip_binding = None
+    if not instance.pk:
+        return
+    try:
+        prev = sender.objects.get(pk=instance.pk)
+    except sender.DoesNotExist:
+        return
+    prev_assigned = prev.assigned_object
+    if isinstance(prev_assigned, _Interface):
+        instance._nso_prev_ip_binding = (prev_assigned, str(prev.address), prev.vrf.name if prev.vrf else "")
+
+
+def _cleanup_reassigned_ip_overlay(instance) -> None:
+    """Drop the OLD interface's IP overlay + push the reduced intent when an IP moved.
+
+    Fires when an IPAddress's interface/address/vrf changed vs its pre-save binding (captured by
+    :func:`_on_ip_address_pre_save`): the overlay keyed on the OLD (interface, address, vrf) is
+    orphaned, so delete it and full-replace-push the OLD device's IP intent (which drops it on the
+    device). The new binding's overlay is (re)created by the normal post_save path.
+    """
+    from dcim.models import Interface as _Interface
+
+    from .models import NSODeviceManagement, NSOInterfaceIPState
+
+    prev = getattr(instance, "_nso_prev_ip_binding", None)
+    if not prev:
+        return
+    prev_iface, prev_addr, prev_vrf = prev
+    assigned = instance.assigned_object
+    cur_addr = str(instance.address)
+    cur_vrf = instance.vrf.name if instance.vrf else ""
+    if (
+        isinstance(assigned, _Interface)
+        and assigned.pk == prev_iface.pk
+        and prev_addr == cur_addr
+        and prev_vrf == cur_vrf
+    ):
+        return  # same binding → not a move, nothing to clean
+    try:
+        mgmt = NSODeviceManagement.objects.get(device_id=prev_iface.device_id)
+    except NSODeviceManagement.DoesNotExist:
+        return
+    if mgmt.adapter_device_id is None:
+        return
+    deleted, _ = NSOInterfaceIPState.objects.filter(interface=prev_iface, address=prev_addr, vrf=prev_vrf).delete()
+    if not deleted:
+        return
+    device_id, adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
+    _schedule_intent_push(
+        (device_id, "ip"),
+        lambda: _push_ip_intent_for_device(device_id, adapter_device_id),
+    )
+
+
 @_skip_on_render
 def _on_ip_address_change(sender, instance, **kwargs):
     """Push IP intent when an IPAddress assigned to a managed interface changes.
@@ -1154,6 +1222,10 @@ def _on_ip_address_change(sender, instance, **kwargs):
     from dcim.models import Interface as _Interface
 
     from .models import NSODeviceManagement, NSOInterfaceIPState
+
+    # If this IP was reassigned off another interface (or unassigned), drop the OLD
+    # interface's overlay first so it isn't stranded (device keeps a moved-away IP).
+    _cleanup_reassigned_ip_overlay(instance)
 
     assigned = instance.assigned_object
     if not isinstance(assigned, _Interface):
@@ -1389,8 +1461,20 @@ def _on_routing_static_route_devices_changed(sender, instance, action, pk_set, r
     if action == "post_add":
         for device in Device.objects.filter(pk__in=pk_set or []):
             _accept_static_route_for_device(instance, device)
-    elif action in ("post_remove", "post_clear"):
+    elif action == "post_remove":
         for device in Device.objects.filter(pk__in=pk_set or []):
+            _remove_static_route_for_device(instance, device)
+    elif action == "post_clear":
+        # Django sends pk_set=None on .clear(): every device was detached. `pk_set or []`
+        # would silently remove nothing, orphaning every overlay + leaving stale adapter
+        # intent. Drive the removal from the overlay rows still referencing this route —
+        # their devices are exactly the ones just detached.
+        from .models import NSOStaticRouteState
+
+        device_ids = set(
+            NSOStaticRouteState.objects.filter(static_route=instance).values_list("management__device_id", flat=True)
+        )
+        for device in Device.objects.filter(pk__in=device_ids):
             _remove_static_route_for_device(instance, device)
 
 
@@ -1703,8 +1787,12 @@ def _on_switchport_state_save(sender, instance, **kwargs):
     )
 
 
-def _push_isis_intent_for_device(device_id, adapter_device_id):
-    """Build and push the full IS-IS intent snapshot (interfaces + processes) for a device."""
+def _push_isis_intent_for_device(device_id, adapter_device_id, force=False):
+    """Build and push the full IS-IS intent snapshot (interfaces + processes) for a device.
+
+    ``force=True`` bypasses change-detection (used by provisioning, which must always land
+    its computed intent even if an identical snapshot was pushed earlier this process).
+    """
     from . import adapter_client as client
     from .models import NSOISISInstanceState, NSOISISInterfaceState
 
@@ -1754,6 +1842,7 @@ def _push_isis_intent_for_device(device_id, adapter_device_id):
         (device_id, "isis"),
         [interfaces, processes],
         lambda: client.put_isis_interface_intent(adapter_device_id, interfaces, processes=processes),
+        force=force,
     )
 
 
@@ -2372,8 +2461,12 @@ def _collect_redistribution_by_dest_ref(device_id: int, dest_protocol: str) -> d
     return by_ref
 
 
-def _push_ospf_intent_for_device(device_id, adapter_device_id):
-    """Build and push the full OSPF intent snapshot for a device."""
+def _push_ospf_intent_for_device(device_id, adapter_device_id, force=False):
+    """Build and push the full OSPF intent snapshot for a device.
+
+    ``force=True`` bypasses change-detection (used by provisioning, which must always land
+    its computed intent even if an identical snapshot was pushed earlier this process).
+    """
     from . import adapter_client as client
     from .models import NSOOSPFInstanceState, NSOOSPFInterfaceState
 
@@ -2423,7 +2516,7 @@ def _push_ospf_intent_for_device(device_id, adapter_device_id):
         interfaces.append(entry)
 
     payload = {"instances": instances, "interfaces": interfaces}
-    _push_changed((device_id, "ospf"), payload, lambda: client.put_ospf_intent(adapter_device_id, payload))
+    _push_changed((device_id, "ospf"), payload, lambda: client.put_ospf_intent(adapter_device_id, payload), force=force)
 
 
 @_skip_on_render
@@ -2611,6 +2704,35 @@ def _on_routing_isis_interface_save(sender, instance, **kwargs):
 
 
 @_skip_on_render
+def _on_routing_isis_interface_pre_delete(sender, instance, **kwargs):
+    """Operator deletes an IS-IS interface → drop its overlay + push the removal (parity with OSPF).
+
+    Without this, deleting an ISISInterface only SET_NULLs NSOISISInterfaceState.isis_interface;
+    the overlay row lingers with its owned status and no reduced IS-IS intent is pushed, so the
+    device keeps the IS-IS config NetBox just removed.
+    """
+    from .models import NSODeviceManagement, NSOISISInterfaceState
+
+    iface = instance.interface
+    af = instance.address_family
+    try:
+        mgmt = NSODeviceManagement.objects.get(device=iface.device)
+    except NSODeviceManagement.DoesNotExist:
+        return
+    if mgmt.adapter_device_id is None:
+        return
+    qs = NSOISISInterfaceState.objects.filter(management=mgmt, interface=iface)
+    if af:
+        qs = qs.filter(af=af)  # scope to this ISISInterface's address-family; leave a sibling AF alone
+    qs.delete()
+    device_id, adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
+    _schedule_intent_push(
+        (device_id, "isis"),
+        lambda: _push_isis_intent_for_device(device_id, adapter_device_id),
+    )
+
+
+@_skip_on_render
 def _on_routing_ospf_instance_pre_delete(sender, instance, **kwargs):
     """Operator deletes an OSPF process → drop its overlay + push the removal."""
     from .models import NSODeviceManagement, NSOOSPFInstanceState
@@ -2709,6 +2831,11 @@ def _connect_g_activated():  # pragma: no cover
         _create_greenfield_subif_state,
         sender=Interface,
         dispatch_uid="nso_plugin_iface_greenfield_subif",
+    )
+    pre_save.connect(
+        _on_ip_address_pre_save,
+        sender=IPAddress,
+        dispatch_uid="nso_plugin_ipaddress_pre_save",
     )
     post_save.connect(
         _on_ip_address_change,
@@ -3033,6 +3160,11 @@ def _connect_g_activated():  # pragma: no cover
             _on_routing_isis_interface_save,
             sender=ISISInterface,
             dispatch_uid="nso_plugin_routing_isis_interface_post_save",
+        )
+        pre_delete.connect(
+            _on_routing_isis_interface_pre_delete,
+            sender=ISISInterface,
+            dispatch_uid="nso_plugin_routing_isis_interface_pre_delete",
         )
     except ImportError:
         logger.debug("netbox_routing not installed — IS-IS interface greenfield signals not registered")

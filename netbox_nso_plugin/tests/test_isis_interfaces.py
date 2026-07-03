@@ -189,6 +189,39 @@ class TestReconcileIsisInterfaces(TestCase):
         self.assertEqual(state.network_type, "point-to-point")
         self.assertEqual(state.circuit_type, "level-2-only")
 
+    def test_delete_isis_interface_drops_overlay_and_pushes_removal(self):
+        """Deleting an ISISInterface drops its overlay + pushes reduced intent (parity with OSPF).
+
+        Regression: with no pre_delete handler, deleting the ISISInterface only SET_NULLed
+        NSOISISInterfaceState.isis_interface — the owned overlay lingered and no reduced IS-IS
+        intent was pushed, so the device kept the config NetBox just removed."""
+        from unittest.mock import patch
+
+        from netbox_routing.models import ISISInstance, ISISInterface
+
+        from netbox_nso_plugin.models import NSOISISInterfaceState
+
+        mgmt = self._make_mgmt()
+        inst = ISISInstance.objects.create(device=self.device, process_tag="")
+        with patch("netbox_nso_plugin.adapter_client.put_isis_interface_intent"):
+            with self.captureOnCommitCallbacks(execute=True):
+                isis_if = ISISInterface.objects.create(
+                    interface=self.iface_ge1, address_family="ipv4", instance=inst, metric=55
+                )
+        self.assertTrue(
+            NSOISISInterfaceState.objects.filter(management=mgmt, interface=self.iface_ge1, af="ipv4").exists()
+        )
+        from netbox_nso_plugin.signals import reset_intent_push_state
+
+        reset_intent_push_state()  # cold cache so the removal push isn't change-detection-skipped
+        with patch("netbox_nso_plugin.adapter_client.put_isis_interface_intent") as mock_push:
+            with self.captureOnCommitCallbacks(execute=True):
+                isis_if.delete()
+        self.assertFalse(
+            NSOISISInterfaceState.objects.filter(management=mgmt, interface=self.iface_ge1, af="ipv4").exists()
+        )
+        mock_push.assert_called()
+
     def test_owned_overlay_metric_network_type_not_clobbered(self):
         """A reconcile must not wipe an owned IS-IS row's pushed metric/network-type.
 
