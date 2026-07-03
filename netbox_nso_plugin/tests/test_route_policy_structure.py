@@ -273,11 +273,22 @@ class TestRouteFilterUnits(SimpleTestCase):
         self.assertEqual(
             _route_filter_unit({"match": "orlonger", "prefix": "2001:db8::/32"}), ("permit", "2001:db8::/32", 32, 128)
         )
-        # Unhandled type round-trips its raw spelling so it can never falsely equate a clean range.
+        # Unhandled type round-trips its raw spelling (a 4-tuple with a -1 sentinel length) so it
+        # can never falsely equate a clean range AND stays sortable alongside clean int units.
         self.assertEqual(
-            _route_filter_unit({"match": "through", "arg": "1.2.3.0/24", "prefix": "1.0.0.0/8"})[2],
-            "raw:through:1.2.3.0/24",
+            _route_filter_unit({"match": "through", "arg": "1.2.3.0/24", "prefix": "1.0.0.0/8"}),
+            ("permit", "1.0.0.0/8", -1, "raw:through:1.2.3.0/24"),
         )
+
+    def test_mixed_recognised_and_raw_units_are_sortable(self):
+        """A set mixing a recognised route-filter (4-tuple of ints) and an unrecognised one (raw)
+        must remain sortable — a 3-tuple raw unit made sorted() compare str vs int → TypeError,
+        aborting the whole route-map reconcile for the device."""
+        from netbox_nso_plugin.route_policy_structure import _route_filter_unit
+
+        clean = _route_filter_unit({"match": "exact", "prefix": "10.0.0.0/8"})
+        raw = _route_filter_unit({"match": "through", "arg": "10.255.0.0/16", "prefix": "10.0.0.0/8"})
+        self.assertEqual(len(sorted({clean, raw})), 2)  # no TypeError; both distinct
 
     def test_prefix_list_entry_unit_bare_prefix_is_exact(self):
         from netbox_nso_plugin.route_policy_structure import prefix_list_entry_unit

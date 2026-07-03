@@ -349,7 +349,11 @@ def _route_filter_unit(rf: dict) -> tuple | None:
     elif match == "prefix-length-range" and len(nums) >= 2:
         lo, hi = nums[0], nums[1]
     else:
-        return ("permit", str(pfx), f"raw:{match}:{arg}")
+        # Unrecognised type: keep the raw spelling so it stays distinct, but as a 4-tuple with a
+        # sentinel length (-1, never a real prefix length) so a set mixing recognised + raw units
+        # still sorts (a 3-tuple here made sorted() compare str vs int → TypeError, aborting the
+        # whole route-map reconcile for the device).
+        return ("permit", str(pfx), -1, f"raw:{match}:{arg}")
     return ("permit", str(pfx), lo, hi)
 
 

@@ -609,7 +609,10 @@ def _group_mode(family: str, object_name: str) -> str:
     """
     from .models import NSORoutePolicyObjectClass
 
-    row = NSORoutePolicyObjectClass.objects.filter(family=family, object_name=object_name).first()
+    # Case-insensitive to match the object dedup (name__iexact): otherwise a peer device
+    # reporting a different case (ACCEPT-ALL vs accept-all — the same shared object) misses the
+    # operator's stored classification and silently reverts to implicit MASTER.
+    row = NSORoutePolicyObjectClass.objects.filter(family=family, object_name__iexact=object_name).first()
     return row.mode if row else "master"
 
 

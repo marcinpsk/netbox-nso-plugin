@@ -364,6 +364,17 @@ class TestReconcileRoutePolicy(TestCase):
         )
         self.assertEqual(s2.status, "conflict")
 
+    def test_group_mode_is_case_insensitive(self):
+        """_group_mode must match the object dedup (name__iexact): a peer device reporting a
+        different case (ACCEPT-ALL vs accept-all — the same shared object) must still see the
+        operator's LOCAL classification, not silently revert to implicit MASTER."""
+        from netbox_nso_plugin.models import NSORoutePolicyObjectClass
+        from netbox_nso_plugin.route_policy_reconciler import _group_mode
+
+        NSORoutePolicyObjectClass.objects.create(family="prefix_list", object_name="ACCEPT-ALL", mode="local")
+        self.assertEqual(_group_mode("prefix_list", "accept-all"), "local")  # different case still LOCAL
+        self.assertEqual(_group_mode("prefix_list", "ACCEPT-ALL"), "local")  # exact case unchanged
+
     def test_local_classification_suppresses_cross_device_conflict(self):
         """A LOCAL group legitimately differs per device → captured-only, no materialization,
         and a diverging sibling is NOT flagged conflict (each keeps its own version)."""
