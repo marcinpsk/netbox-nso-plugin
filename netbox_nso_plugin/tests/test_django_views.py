@@ -2616,3 +2616,15 @@ class TestNSOAreaTabs(ViewTestBase):
         self.assertIn(f'nav-link active" href="{self._url("nsolinkroleassignment_list")}">Link Assignments', html)
         self.assertIn(f'nav-link" href="{self._url("nsolinkrole_list")}">Link Roles', html)
         self.assertNotIn(f'nav-link active" href="{self._url("nsolinkrole_list")}">Link Roles', html)
+
+    def test_area_tabs_use_presentation_role_not_a_fake_tablist(self):
+        """The area nav is cross-page NAVIGATION, not an in-page tab widget. NetBox marks the same
+        pattern (its object sub-page tabs, generic/object.html) role='presentation'; our bar must too.
+        role='tablist' would stack a second, FAKE tablist over the native Results/Filters tablist —
+        announcing a "tab list" to assistive tech for links that navigate away and implement none of
+        the tablist keyboard/panel semantics. The area <ul> is identified by its mb-3 spacing class,
+        so this never touches the native Results tablist (class 'nav nav-tabs', no mb-3)."""
+        for url_name in ("nsoinstance_list", "nsolinkrole_list"):
+            html = self._norm(url_name)
+            self.assertIn('class="nav nav-tabs mb-3" role="presentation"', html)
+            self.assertNotIn('class="nav nav-tabs mb-3" role="tablist"', html)
