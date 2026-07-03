@@ -126,6 +126,24 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         reconcile_svi(self.device, {"interfaces": [{"interface_name": "Vlan100", "vlan_id": 100, "type": "svi"}]})
         self.assertEqual(NSOSVIState.objects.get(interface__name="Vlan100").status, "in_sync")
 
+    def test_owned_state_survives_when_interface_drops_from_payload(self):
+        """An owned SVI overlay must NOT be hard-deleted when the device stops reporting it.
+
+        NSOSVIState is in ``_APPLY_DEPLOYING_SCOPES``; a bulk delete of stale rows destroys
+        the in-flight Apply marker + ownership. Intent-pending rows (deploying) are kept; a
+        confirmed row (in_sync) that vanishes surfaces as drift (``changed``), never data-loss.
+        """
+        from netbox_nso_plugin.models import NSOSVIState
+        from netbox_nso_plugin.svi_reconciler import reconcile_svi
+
+        deploying = self._state(name="Vlan100", vid=100, status="deploying")
+        confirmed = self._state(name="Vlan200", vid=200, status="in_sync")
+        reconcile_svi(self.device, {"interfaces": []})  # device stops reporting all SVIs
+        assert NSOSVIState.objects.filter(pk=deploying.pk).exists(), "deploying (apply-in-flight) overlay deleted"
+        assert NSOSVIState.objects.filter(pk=confirmed.pk).exists(), "in_sync overlay deleted"
+        assert NSOSVIState.objects.get(pk=deploying.pk).status == "deploying"
+        assert NSOSVIState.objects.get(pk=confirmed.pk).status == "changed"
+
     def test_push_builds_owned_snapshot(self):
         from unittest.mock import patch
 

@@ -53,9 +53,12 @@ def reconcile_svi(device, payload: dict) -> list:
         state.save()
         rows.append(state)
 
-    # Prune SVI states the device no longer reports (and their virtual interfaces
-    # if we own them and they carry no IPs/other use is out of scope — keep the
-    # interface, just drop the overlay row to avoid orphan churn).
+    # SVI states the device no longer reports: NEVER hard-delete an owned row (operator
+    # intent / in-flight Apply marker — NSOSVIState is in _APPLY_DEPLOYING_SCOPES). An unowned
+    # SVI overlay is a pure device mirror with no separate native config object (the virtual
+    # interface is kept regardless), so a stale unowned row is a vestigial husk → drop it to
+    # avoid orphan churn; owned rows surface as drift (``changed``) instead of data-loss.
     reported = {item.get("interface_name") for item in payload.get("interfaces", [])}
-    NSOSVIState.objects.filter(management=management).exclude(interface__name__in=reported).delete()
+    for stale in NSOSVIState.objects.filter(management=management).exclude(interface__name__in=reported):
+        sm.finalise_stale_overlay(stale, vestigial=True, now=now)
     return rows

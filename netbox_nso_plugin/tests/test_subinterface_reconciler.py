@@ -208,6 +208,26 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
         )
         self.assertEqual(NSOSubinterfaceState.objects.get(interface__name="ge-0/0/0.100").status, "accepted")
 
+    def test_owned_state_survives_when_interface_drops_from_payload(self):
+        """An owned subinterface overlay must NOT be hard-deleted when the device stops reporting it.
+
+        NSOSubinterfaceState is in ``_APPLY_DEPLOYING_SCOPES``; a bulk delete of stale rows
+        destroys the in-flight Apply marker + ownership. Intent-pending rows (deploying) are
+        kept; a confirmed row (in_sync) that vanishes surfaces as drift (``changed``).
+        """
+        from netbox_nso_plugin.models import NSOSubinterfaceState
+        from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
+
+        deploying = self._state(name="ge-0/0/0.100", dot1q=100, status="deploying")
+        confirmed = self._state(name="ge-0/0/0.200", dot1q=200, status="in_sync")
+        reconcile_subinterface(self.device, {"interfaces": []})  # device stops reporting all subifs
+        assert NSOSubinterfaceState.objects.filter(pk=deploying.pk).exists(), (
+            "deploying (apply-in-flight) overlay deleted"
+        )
+        assert NSOSubinterfaceState.objects.filter(pk=confirmed.pk).exists(), "in_sync overlay deleted"
+        assert NSOSubinterfaceState.objects.get(pk=deploying.pk).status == "deploying"
+        assert NSOSubinterfaceState.objects.get(pk=confirmed.pk).status == "changed"
+
     def test_push_builds_owned_snapshot(self):
         from unittest.mock import patch
 

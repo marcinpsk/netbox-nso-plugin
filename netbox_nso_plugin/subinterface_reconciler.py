@@ -66,7 +66,12 @@ def reconcile_subinterface(device, payload: dict) -> list:
         state.save()
         rows.append(state)
 
-    # Prune overlay rows the device no longer reports (keep the dcim.Interface).
+    # Overlay rows the device no longer reports (keep the dcim.Interface): NEVER hard-delete an
+    # owned row (operator intent / in-flight Apply marker — NSOSubinterfaceState is in
+    # _APPLY_DEPLOYING_SCOPES). An unowned subinterface overlay is a pure device mirror with no
+    # separate native config object, so a stale unowned row is a vestigial husk → drop it; owned
+    # rows surface as drift (``changed``) instead of data-loss.
     reported = {item.get("interface_name") for item in payload.get("interfaces", [])}
-    NSOSubinterfaceState.objects.filter(management=management).exclude(interface__name__in=reported).delete()
+    for stale in NSOSubinterfaceState.objects.filter(management=management).exclude(interface__name__in=reported):
+        sm.finalise_stale_overlay(stale, vestigial=True, now=now)
     return rows

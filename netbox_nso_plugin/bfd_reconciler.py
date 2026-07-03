@@ -58,6 +58,37 @@ def _upsert_bfd_state(mgmt, iface, entry: dict, now) -> None:
     state.save()
 
 
+def _prune_stale_bfd(device, mgmt, seen_iface_ids: set, seen_state_iface_ids: set, now) -> None:
+    """Remove BFD rows the device stopped reporting, preserving operator-owned overlays.
+
+    Native ``BFDInterface`` rows for unowned, no-longer-reported interfaces are deleted; an
+    owned overlay (accepted/deploying/in_sync/apply_failed) keeps BOTH its ``NSOBFDInterfaceState``
+    (intent / in-flight Apply marker) and its native ``BFDInterface``, so a transient export gap
+    can't destroy an accepted config. Unowned overlay husks whose ``BFDInterface`` is already gone
+    are vestigial → dropped; owned rows surface as drift (``changed``) instead of data-loss.
+    """
+    from netbox_routing.models import BFDInterface
+
+    from . import status_machine as sm
+    from .models import NSOBFDInterfaceState
+
+    owned_iface_ids: set = set()
+    if mgmt is not None:
+        owned_iface_ids = set(
+            NSOBFDInterfaceState.objects.filter(management=mgmt, status__in=sm.OWNED_STATES).values_list(
+                "interface_id", flat=True
+            )
+        )
+    BFDInterface.objects.filter(interface__device=device).exclude(
+        interface_id__in=seen_iface_ids | owned_iface_ids
+    ).delete()
+    if mgmt is None:
+        return
+    for stale in NSOBFDInterfaceState.objects.filter(management=mgmt).exclude(interface_id__in=seen_state_iface_ids):
+        vestigial = not BFDInterface.objects.filter(interface_id=stale.interface_id).exists()
+        sm.finalise_stale_overlay(stale, vestigial=vestigial, now=now)
+
+
 def reconcile_bfd(device, interfaces: list) -> list:
     """Create/update BFDInterface rows for *device* from the adapter BFD payload.
 
@@ -74,7 +105,7 @@ def reconcile_bfd(device, interfaces: list) -> list:
     from dcim.models import Interface
     from django.utils import timezone
 
-    from .models import NSOBFDInterfaceState, NSODeviceManagement
+    from .models import NSODeviceManagement
 
     iface_map = {i.name: i for i in Interface.objects.filter(device=device)}
     profiles: dict = {}
@@ -121,9 +152,6 @@ def reconcile_bfd(device, interfaces: list) -> list:
             _upsert_bfd_state(mgmt, iface, entry, now)
             seen_state_iface_ids.add(iface.pk)
 
-    # Prune BFDInterface rows for this device's interfaces no longer reporting BFD.
-    BFDInterface.objects.filter(interface__device=device).exclude(interface_id__in=seen_iface_ids).delete()
-    if mgmt is not None:
-        NSOBFDInterfaceState.objects.filter(management=mgmt).exclude(interface_id__in=seen_state_iface_ids).delete()
+    _prune_stale_bfd(device, mgmt, seen_iface_ids, seen_state_iface_ids, now)
 
     return list(BFDInterface.objects.filter(interface__device=device).select_related("interface", "bfd_profile"))

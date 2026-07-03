@@ -141,6 +141,32 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
         )
         assert NSOBFDInterfaceState.objects.get(interface=self.iface).status == "accepted"
 
+    def test_owned_state_survives_when_interface_drops_from_payload(self):
+        """An owned BFD overlay must NOT be hard-deleted when the device stops reporting it.
+
+        The scope is in ``_prepare_apply``/`_APPLY_DEPLOYING_SCOPES``, so a bulk delete of
+        stale rows destroys the in-flight Apply marker + operator ownership. Intent-pending
+        rows (deploying) are kept; a confirmed row (in_sync) that vanishes surfaces as drift
+        (``changed``), never data-loss.
+        """
+        from netbox_nso_plugin.bfd_reconciler import reconcile_bfd
+        from netbox_nso_plugin.models import NSOBFDInterfaceState
+
+        deploying = NSOBFDInterfaceState.objects.create(
+            management=self.management, interface=self.iface, min_tx=300, min_rx=300, multiplier=3, status="deploying"
+        )
+        ge = Interface.objects.create(device=self.device, name="Gi7/7", type="1000base-t")
+        confirmed = NSOBFDInterfaceState.objects.create(
+            management=self.management, interface=ge, min_tx=300, min_rx=300, multiplier=3, status="in_sync"
+        )
+        reconcile_bfd(self.device, [])  # device no longer reports BFD on any interface
+        assert NSOBFDInterfaceState.objects.filter(pk=deploying.pk).exists(), (
+            "deploying (apply-in-flight) overlay deleted"
+        )
+        assert NSOBFDInterfaceState.objects.filter(pk=confirmed.pk).exists(), "in_sync overlay deleted"
+        assert NSOBFDInterfaceState.objects.get(pk=deploying.pk).status == "deploying"
+        assert NSOBFDInterfaceState.objects.get(pk=confirmed.pk).status == "changed"
+
     def test_push_builds_owned_snapshot(self):
         from unittest.mock import patch
 
