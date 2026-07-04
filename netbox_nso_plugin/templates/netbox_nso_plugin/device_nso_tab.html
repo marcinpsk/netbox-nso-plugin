@@ -6,6 +6,31 @@
 {% block content %}
 {% if mgmt %}
 
+  {# ── Adapter link/sync failure — managing this device couldn't reach the adapter ─────── #}
+  {% if mgmt.adapter_link_error %}
+    <div class="alert alert-danger d-flex align-items-start mb-3" role="alert">
+      <span class="mdi mdi-link-variant-off me-2 mt-1"></span>
+      <div class="flex-grow-1">
+        {% if mgmt.adapter_device_id %}
+          <strong>The last adapter sync for this device failed.</strong>
+          Its mirror and intent below may be stale — nothing new was synced or applied.
+        {% else %}
+          <strong>This device isn't linked to the NSO adapter.</strong>
+          Managing it in NetBox couldn't onboard it to the adapter, so nothing below is being
+          mirrored, synced, or applied.
+        {% endif %}
+        Last error: <em>{{ mgmt.adapter_link_error }}</em>
+        <form method="post" class="mt-2"
+              action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_link_retry' mgmt.pk %}">
+          {% csrf_token %}
+          <button type="submit" class="btn btn-sm btn-danger">
+            <span class="mdi mdi-link-variant"></span> Retry adapter link
+          </button>
+        </form>
+      </div>
+    </div>
+  {% endif %}
+
   {# ── Adapter error banner ──────────────────────────────────────────────── #}
   {% if adapter_error %}
     <div class="alert alert-warning d-flex align-items-center mb-3" role="alert">

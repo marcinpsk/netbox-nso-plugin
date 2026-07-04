@@ -341,8 +341,26 @@ def sync_scope_to_adapter(sender, instance, created, **kwargs):
                 instance.device_id,
                 notify_result["job_id"],
             )
+        # Linking succeeded — clear any error left by a prior failed attempt so the tab banner
+        # goes away. .update() (not .save()) so this doesn't re-fire this post_save handler.
+        if instance.adapter_link_error:
+            type(instance).objects.filter(pk=instance.pk).update(adapter_link_error="")
+            instance.adapter_link_error = ""
     except Exception as exc:
         logger.warning("Failed to sync scope to adapter for device %s: %s", instance.device_id, exc)
+        # Surface the failure on the row instead of only logging it: otherwise the device looks
+        # managed in NetBox while silently unlinked from the adapter (adapter_device_id stays None),
+        # with nothing mirrored/applied and no operator-visible signal. .update() avoids recursion.
+        message = str(exc) or repr(exc)
+        instance.adapter_link_error = message
+        # Persist for the tab banner ONLY if the failure didn't already break the surrounding
+        # transaction: a DB-origin error in the try (e.g. a bad adapter response fed into the
+        # adapter_device_id update) marks the connection needs_rollback, and writing then raises
+        # TransactionManagementError — and that save is rolling back regardless, so recording is moot.
+        from django.db import connection
+
+        if not connection.needs_rollback:
+            type(instance).objects.filter(pk=instance.pk).update(adapter_link_error=message)
 
 
 @receiver(post_delete, sender="netbox_nso_plugin.NSODeviceManagement")

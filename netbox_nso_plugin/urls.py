@@ -188,6 +188,12 @@ urlpatterns = [
         views.NSOIntentResyncView.as_view(),
         name="nsodevicemanagement_intent_resync",
     ),
+    # Retry linking a managed device to the adapter after a failed onboard/scope/sync
+    path(
+        "device-management/<int:pk>/link-retry/",
+        views.NSOAdapterLinkRetryView.as_view(),
+        name="nsodevicemanagement_link_retry",
+    ),
     # Adapter job status (JSON, for client-side polling)
     path("jobs/<int:job_id>/status/", views.NSOJobStatusView.as_view(), name="nsojob_status"),
     # Device job-activity summary (JSON: running + last finished) for the tab status strip

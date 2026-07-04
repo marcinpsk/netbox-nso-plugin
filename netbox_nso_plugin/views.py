@@ -1529,6 +1529,27 @@ class NSOIntentResyncView(NSOActionPermissionMixin, View):
         return redirect(_device_nso_tab_url(mgmt.device.pk))
 
 
+class NSOAdapterLinkRetryView(NSOActionPermissionMixin, View):
+    """POST: retry linking a managed device to the adapter after a failed onboard/scope/sync.
+
+    Re-fires ``sync_scope_to_adapter`` by re-saving the management row (the same recovery the
+    async-onboarding status advance uses), which onboards/adopts the adapter device, pushes scope
+    and sends sync-notify. On success the row's ``adapter_link_error`` is cleared and
+    ``adapter_device_id`` set; on a repeated failure the error is refreshed for the tab banner.
+    """
+
+    def post(self, request, pk):
+        """Re-attempt the adapter link for the device, then redirect to the NSO tab."""
+        mgmt = get_object_or_404(NSODeviceManagement, pk=pk)
+        mgmt.save()  # re-fires sync_scope_to_adapter (onboard → scope → sync-notify)
+        mgmt.refresh_from_db()
+        if mgmt.adapter_link_error:
+            messages.error(request, f"Still couldn't link this device to the adapter: {mgmt.adapter_link_error}")
+        else:
+            messages.success(request, "Device linked to the adapter.")
+        return redirect(_device_nso_tab_url(mgmt.device.pk))
+
+
 class NSOJobStatusView(LoginRequiredMixin, View):
     """Return JSON status of an adapter job — used for client-side polling."""
 

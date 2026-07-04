@@ -156,15 +156,43 @@ class TestSyncScopeToAdapter(_SignalDBBase):
         mock_scope.assert_called_once()
         mock_onboard.assert_not_called()
 
-    def test_adapter_error_is_swallowed_with_warning(self):
+    def test_adapter_error_is_recorded_not_silently_swallowed(self):
+        """A failed onboard must be SURFACED on the row (adapter_link_error), not swallowed with only
+        a log line — otherwise the device looks managed in NetBox while silently unlinked from the
+        adapter (adapter_device_id stays None) with no operator-visible signal."""
         from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.signals import sync_scope_to_adapter
 
         mgmt = self._make_mgmt(adapter_device_id=None)
 
-        with patch(f"{_MOD}.onboard_device", side_effect=AdapterError("down", code="nso_unreachable")):
-            # Should not raise — a warning is logged instead.
+        with patch(f"{_MOD}.onboard_device", side_effect=AdapterError("nso down", code="nso_unreachable")):
+            # Must not raise — the failure is recorded on the row instead.
             sync_scope_to_adapter(sender=type(mgmt), instance=mgmt, created=True)
+
+        mgmt.refresh_from_db()
+        self.assertIn("nso down", mgmt.adapter_link_error)  # recorded, not swallowed
+        self.assertIsNone(mgmt.adapter_device_id)  # still unlinked
+
+    def test_successful_link_clears_prior_error(self):
+        """Once linking succeeds, a stale adapter_link_error from a prior failed attempt is cleared
+        so the tab's failure banner disappears."""
+        from netbox_nso_plugin.signals import sync_scope_to_adapter
+
+        mgmt = self._make_mgmt(adapter_device_id=None)
+        # Simulate a leftover error from an earlier failed link attempt.
+        type(mgmt).objects.filter(pk=mgmt.pk).update(adapter_link_error="earlier failure")
+        mgmt.refresh_from_db()
+
+        with (
+            patch(f"{_MOD}.onboard_device", return_value={"id": 88}),
+            patch(f"{_MOD}.set_scope", return_value={}),
+            patch(f"{_MOD}.sync_notify", return_value=None),
+        ):
+            sync_scope_to_adapter(sender=type(mgmt), instance=mgmt, created=True)
+
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.adapter_link_error, "")  # cleared on success
+        self.assertEqual(mgmt.adapter_device_id, 88)
 
     def test_sync_notify_job_logged(self):
         from netbox_nso_plugin.signals import sync_scope_to_adapter

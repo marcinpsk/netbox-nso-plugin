@@ -2628,3 +2628,40 @@ class TestNSOAreaTabs(ViewTestBase):
             html = self._norm(url_name)
             self.assertIn('class="nav nav-tabs mb-3" role="presentation"', html)
             self.assertNotIn('class="nav nav-tabs mb-3" role="tablist"', html)
+
+
+class TestNSOAdapterLinkRetryView(ViewTestBase):
+    """The retry-link action re-fires sync_scope_to_adapter (via a re-save) so an operator can
+    recover a device that failed to onboard/link to the adapter, and refreshes adapter_link_error
+    for the tab banner. Exercises the real request -> view -> signal -> row update."""
+
+    _MOD = "netbox_nso_plugin.adapter_client"
+
+    def _url(self):
+        return reverse("plugins:netbox_nso_plugin:nsodevicemanagement_link_retry", args=[self.mgmt.pk])
+
+    def test_retry_success_clears_error_and_links(self):
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(
+            adapter_device_id=None, adapter_link_error="prior fail", onboard_status=""
+        )
+        with (
+            patch(f"{self._MOD}.onboard_device", return_value={"id": 321}),
+            patch(f"{self._MOD}.set_scope", return_value={}),
+            patch(f"{self._MOD}.sync_notify", return_value=None),
+        ):
+            resp = self.client.post(self._url())
+        self.assertEqual(resp.status_code, 302)  # redirect to the NSO tab
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_link_error, "")  # cleared on success
+        self.assertEqual(self.mgmt.adapter_device_id, 321)  # now linked
+
+    def test_retry_failure_refreshes_error(self):
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(
+            adapter_device_id=None, adapter_link_error="", onboard_status=""
+        )
+        with patch(f"{self._MOD}.onboard_device", side_effect=AdapterError("still down", code="nso_unreachable")):
+            resp = self.client.post(self._url())
+        self.assertEqual(resp.status_code, 302)
+        self.mgmt.refresh_from_db()
+        self.assertIn("still down", self.mgmt.adapter_link_error)  # surfaced for the banner
+        self.assertIsNone(self.mgmt.adapter_device_id)  # still unlinked

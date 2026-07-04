@@ -377,6 +377,15 @@ class NSODeviceManagement(NetBoxModel):
         blank=True,
         help_text="The device ID assigned by the nso-adapter after onboarding.",
     )
+    adapter_link_error = models.TextField(
+        blank=True,
+        default="",
+        help_text=(
+            "Set when the last attempt to link/sync this managed device to the nso-adapter "
+            "(onboard → scope → sync-notify) failed, so the row would otherwise look managed "
+            "while silently unlinked. Cleared once linking succeeds. Surfaced on the NSO tab."
+        ),
+    )
     last_sync_at = models.DateTimeField(null=True, blank=True)
     last_sync_status = models.CharField(max_length=50, blank=True, default="")
     degraded_surfaces = models.JSONField(
