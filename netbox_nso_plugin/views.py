@@ -211,10 +211,17 @@ class DeviceNSOTabView(generic.ObjectView):
             # rows for this device's (ned, sw) — recorded reactively when a prior apply's intent
             # was rejected by the NED. A cheap cache-only read that fails open, so it never breaks
             # the tab; only surfaced when the adapter is reachable and there are real gaps.
+            # source='read' rows (H3: per-scope read-support fed by the live read probe) describe
+            # mirror completeness, not rejected applies — this banner's wording is apply-specific,
+            # so they render on the capabilities page instead (and still warn via apply-preflight).
             if adapter_error is None:
                 cap = client.get_device_capability(mgmt.adapter_device_id, refresh=False)
                 if cap.get("known"):
-                    gaps = [e for e in cap.get("elements", []) if e.get("status") in ("unsupported", "skipped")]
+                    gaps = [
+                        e
+                        for e in cap.get("elements", [])
+                        if e.get("status") in ("unsupported", "skipped") and e.get("source") != "read"
+                    ]
                     if gaps:
                         device_capability = {
                             "ned_id": cap.get("ned_id", ""),
@@ -3056,10 +3063,17 @@ class NSORoutePolicyCapabilityView(LoginRequiredMixin, View):
         coverage_unknown = result.get("coverage_unknown") or any(
             el.get("scope") == "coverage" and el.get("status") == "unknown" for el in result.get("elements", [])
         )
+        # source='read' rows (H3) are per-scope read-support facts fed by the live read probe —
+        # a different axis from the route-policy constructs, so they get their own table and
+        # never count into the flagged-construct summary.
+        read_rows = sorted(
+            (el for el in elements if el.get("source") == "read"), key=lambda el: str(el.get("scope", ""))
+        )
+        constructs = [el for el in elements if el.get("source") != "read"]
         scopes: dict[str, list] = {"community": [], "rm-set": [], "rm-match": []}
-        for el in elements:
+        for el in constructs:
             scopes.setdefault(el.get("scope", "other"), []).append(el)
-        flagged = sum(1 for el in elements if el.get("status") in ("skipped", "unsupported"))
+        flagged = sum(1 for el in constructs if el.get("status") in ("skipped", "unsupported"))
         return {
             "mgmt": mgmt,
             "object": mgmt.device,
@@ -3068,8 +3082,10 @@ class NSORoutePolicyCapabilityView(LoginRequiredMixin, View):
             "ned_id": result.get("ned_id", ""),
             "sw_version": result.get("sw_version", ""),
             "scopes": scopes,
-            "total": len(elements),
+            "total": len(constructs),
             "flagged": flagged,
+            "read_rows": read_rows,
+            "read_readable": sum(1 for el in read_rows if el.get("status") == "native"),
         }
 
 

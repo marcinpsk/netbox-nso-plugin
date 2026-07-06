@@ -38,6 +38,39 @@
             {% endif %}
           </p>
 
+          {% if read_rows %}
+            <h6 class="text-uppercase text-muted mt-3">Read support</h6>
+            <p class="text-muted mb-1">
+              Which config scopes the adapter can read from this platform into the NetBox mirror —
+              fed by the live read probe.
+              <strong>{{ read_readable }}</strong> of {{ read_rows|length }} probed scope{{ read_rows|length|pluralize }} confirmed readable.
+            </p>
+            <table class="table table-sm table-hover">
+              <thead>
+                <tr><th>Scope</th><th>Verdict</th><th>Detail</th></tr>
+              </thead>
+              <tbody>
+                {% for el in read_rows %}
+                  <tr>
+                    <td><code>{{ el.scope }}</code></td>
+                    <td>
+                      {% if el.status == "native" %}
+                        <span class="badge text-bg-success">readable</span>
+                      {% elif el.status == "unknown" %}
+                        <span class="badge text-bg-info" title="The surface read empty — no config on the probed device, or no reader for this NED; no verdict either way">unconfirmed</span>
+                      {% elif el.status == "skipped" %}
+                        <span class="badge text-bg-warning text-dark">n/a on platform</span>
+                      {% else %}
+                        <span class="badge text-bg-danger">{{ el.status }}</span>
+                      {% endif %}
+                    </td>
+                    <td><small class="text-muted">{{ el.detail|default:"—" }}</small></td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          {% endif %}
+
           {% for scope, elements in scopes.items %}
             {% if elements %}
               <h6 class="text-uppercase text-muted mt-3">{{ scope }}</h6>

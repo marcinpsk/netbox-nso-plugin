@@ -559,6 +559,65 @@ class TestCapabilitiesPage(_CapBase):
         assert resp.status_code == 200
         self.assertContains(resp, "never been probed")
 
+    def test_read_support_rows_render_in_their_own_section(self):
+        """source='read' rows (H3: per-scope read-support fed by the live read probe) render in
+        a dedicated Read-support table — split out of the route-policy construct groups and
+        excluded from the flagged-construct count."""
+        self._mgmt()
+        payload = {
+            "known": True,
+            "ned_id": "arcos-v8.1.2X-nc-1.0",
+            "sw_version": "",
+            "elements": [
+                {"scope": "rm-set", "name": "set metric-type", "status": "native", "detail": "", "source": "probe"},
+                {
+                    "scope": "community",
+                    "name": "color:0:128",
+                    "status": "skipped",
+                    "detail": "no home",
+                    "source": "probe",
+                },
+                {
+                    "scope": "bgp",
+                    "name": "read",
+                    "status": "native",
+                    "detail": "read 11 item(s) on rg03",
+                    "source": "read",
+                },
+                {
+                    "scope": "isis",
+                    "name": "read",
+                    "status": "unknown",
+                    "detail": "reads empty on rg03",
+                    "source": "read",
+                },
+                {
+                    "scope": "vlan",
+                    "name": "read",
+                    "status": "skipped",
+                    "detail": "not applicable on this platform",
+                    "source": "read",
+                },
+                {
+                    "scope": "ospf",
+                    "name": "read",
+                    "status": "unsupported",
+                    "detail": "read raised: boom",
+                    "source": "read",
+                },
+            ],
+        }
+        with patch("netbox_nso_plugin.adapter_client._request", return_value=payload):
+            resp = self.client.get(self._url())
+
+        assert resp.status_code == 200
+        self.assertContains(resp, "Read support")
+        self.assertContains(resp, "readable")  # the native read row's badge
+        self.assertContains(resp, "unconfirmed")  # the unknown read row's badge
+        self.assertContains(resp, "of 4 probed scope")  # read summary counts the 4 read rows
+        # the construct summary counts ONLY the probe/apply constructs: 1 flagged of 2
+        self.assertContains(resp, "of 2 construct")
+
     def test_uncovered_platform_shows_not_assessed_banner(self):
         """A Junos/Nokia device (coverage marker) shows the 'not yet assessed' banner."""
         self._mgmt()

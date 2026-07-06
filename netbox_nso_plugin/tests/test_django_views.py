@@ -2572,6 +2572,38 @@ class TestDeviceNSOTabCapability(ViewTestBase):
         self.assertEqual(resp.status_code, 200)
         self.assertNotContains(resp, "mdi-alert-octagon-outline")
 
+    @patch("netbox_nso_plugin.adapter_client.get_device", return_value={})
+    def test_read_rows_are_not_listed_as_apply_gaps(self, _mock_dev):
+        """source='read' rows describe read-support (mirror completeness, H3), not rejected
+        applies — the tab's 'won't apply / a prior apply was rejected' banner must not caption
+        them as apply rejections. They render on the capabilities page instead."""
+        self._set_adapter_id()
+        cap = {
+            "known": True,
+            "ned_id": "arcos-v8.1.2X-nc-1.0",
+            "sw_version": "",
+            "elements": [
+                {
+                    "scope": "vlan",
+                    "name": "read",
+                    "status": "skipped",
+                    "detail": "not applicable on this platform",
+                    "source": "read",
+                },
+                {
+                    "scope": "bgp",
+                    "name": "read",
+                    "status": "unsupported",
+                    "detail": "expected read but got empty",
+                    "source": "read",
+                },
+            ],
+        }
+        with patch("netbox_nso_plugin.adapter_client.get_device_capability", return_value=cap):
+            resp = self.client.get(self._url())
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotContains(resp, "mdi-alert-octagon-outline")
+
 
 class TestNSOAreaTabs(ViewTestBase):
     """The Settings/Links area screens render a cross-page tab bar (inc/_settings_tabs.html and
