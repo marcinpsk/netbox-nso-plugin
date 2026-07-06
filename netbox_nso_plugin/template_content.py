@@ -335,6 +335,42 @@ def _retire_stale_ip_states(device, resolved_keys, VRF, IPAddress, now, transact
         state.save(update_fields=["status", "last_sync_at"])
 
 
+def _settle_existing_ip(
+    state, prev_status, existing_ip, iface, auto_create, address, IPAddress, transaction, logger
+) -> str:
+    """Return the next status for a payload address whose IPAddress already exists in IPAM.
+
+    Three cases:
+    - assigned to *iface* → matches (owned settles in_sync, unowned rests imported);
+      first in_sync of an auto-assigned reserved IP also activates it (+P2P peer).
+    - UNASSIGNED — nothing is "assigned elsewhere", so this is adoption, not a
+      conflict: with auto_create assign it to the reporting interface; record-only
+      mode leaves IPAM untouched. Either way the machine's conflict --reconcile-->
+      imported edge lets rows a stricter past run flagged 'conflict' self-heal.
+    - assigned to a different object → adoption conflict.
+    """
+    if existing_ip.assigned_object == iface:
+        status = sm.on_reconcile(state.status, matches=True)
+        if (
+            state.auto_assigned
+            and status == "in_sync"
+            and prev_status != "in_sync"
+            and existing_ip.status == "reserved"
+        ):
+            _activate_auto_assigned_ip(state, existing_ip, address, iface, IPAddress, logger)
+        return status
+    if existing_ip.assigned_object is None:
+        if auto_create:
+            existing_ip.assigned_object = iface
+            with transaction.atomic():
+                existing_ip.save(update_fields=["assigned_object_type", "assigned_object_id"])
+            return sm.on_reconcile(state.status, matches=True)
+        if not sm.is_owned(state.status):
+            return sm.on_reconcile(state.status, matches=True)
+        return state.status
+    return sm.on_reconcile(state.status, matches=False, conflict=True)
+
+
 def _activate_auto_assigned_ip(state, existing_ip, address, iface, IPAddress, logger):
     """Promote *existing_ip* (and its P2P peer if applicable) from reserved → active.
 
@@ -447,20 +483,9 @@ def _reconcile_interface_ips(device, payload: dict) -> list:
         prev_status = state.status
         existing_ip = IPAddress.objects.filter(address=address, vrf=vrf_obj).first()
         if existing_ip is not None:
-            if existing_ip.assigned_object == iface:
-                # Device reports the IP and it's correctly assigned (materialized):
-                # owned settles to in_sync (device confirms intent), unowned rests imported.
-                state.status = sm.on_reconcile(state.status, matches=True)
-                if (
-                    state.auto_assigned
-                    and state.status == "in_sync"
-                    and prev_status != "in_sync"
-                    and existing_ip.status == "reserved"
-                ):
-                    _activate_auto_assigned_ip(state, existing_ip, address, iface, IPAddress, logger)
-            else:
-                # Address already assigned to a different interface → adoption conflict.
-                state.status = sm.on_reconcile(state.status, matches=False, conflict=True)
+            state.status = _settle_existing_ip(
+                state, prev_status, existing_ip, iface, auto_create, address, IPAddress, transaction, logger
+            )
         elif auto_create and state.status != "conflict":
             result = _create_and_link_ip(address, vrf_obj, iface, Prefix, logger, transaction, ValidationError)
             if not sm.is_owned(state.status):

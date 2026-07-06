@@ -233,6 +233,85 @@ class TestReconcileInterfaceIps(TestCase):
         ip.refresh_from_db()
         self.assertEqual(ip.assigned_object, other_iface)
 
+    def test_existing_unassigned_ip_is_adopted_not_conflict(self):
+        """An IPAM address that exists but is UNASSIGNED is not 'assigned elsewhere':
+        with auto_create the reconciler adopts it (assigns to the reporting interface)
+        instead of flagging a false conflict. Live case: arcos dev-23 loopback IPs
+        pre-existed unassigned in IPAM (harvested months earlier) and every sync
+        flagged them 'conflict' although nothing owned them.
+        """
+        from ipam.models import IPAddress
+
+        from netbox_nso_plugin.template_content import _reconcile_interface_ips
+
+        ip = IPAddress.objects.create(address="10.77.0.1/32")
+
+        payload = self._make_payload(
+            "GigabitEthernet0/0",
+            [{"address": "10.77.0.1/32", "vrf": "", "family": "ipv4", "secondary": False}],
+        )
+        with self._auto_create_ctx(True):
+            result = _reconcile_interface_ips(self.device, payload)
+
+        states = {s.address: s for s in result}
+        self.assertEqual(states["10.77.0.1/32"].status, "imported")
+        ip.refresh_from_db()
+        self.assertEqual(ip.assigned_object, self.iface)
+
+    def test_existing_unassigned_ip_without_auto_create_imported_untouched(self):
+        """auto_create off: an unassigned IPAM match still isn't a conflict — the row
+        lands 'imported' and record-only mode leaves the IPAddress untouched.
+        """
+        from ipam.models import IPAddress
+
+        from netbox_nso_plugin.template_content import _reconcile_interface_ips
+
+        ip = IPAddress.objects.create(address="10.77.0.2/32")
+
+        payload = self._make_payload(
+            "GigabitEthernet0/0",
+            [{"address": "10.77.0.2/32", "vrf": "", "family": "ipv4", "secondary": False}],
+        )
+        with self._auto_create_ctx(False):
+            result = _reconcile_interface_ips(self.device, payload)
+
+        states = {s.address: s for s in result}
+        self.assertEqual(states["10.77.0.2/32"].status, "imported")
+        ip.refresh_from_db()
+        self.assertIsNone(ip.assigned_object)
+
+    def test_stuck_conflict_row_self_heals_when_ip_is_unassigned(self):
+        """A row a previous (buggy) run left at 'conflict' recovers on the next
+        reconcile when the matching IP is unassigned: the machine's
+        conflict --reconcile--> imported edge ('adoption ambiguity resolved').
+        """
+        from ipam.models import IPAddress
+
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+        from netbox_nso_plugin.template_content import _reconcile_interface_ips
+
+        ip = IPAddress.objects.create(address="10.77.0.3/32")
+        NSOInterfaceIPState.objects.create(
+            interface=self.iface,
+            address="10.77.0.3/32",
+            vrf="",
+            family="ipv4",
+            status="conflict",
+            nso_value="10.77.0.3/32",
+        )
+
+        payload = self._make_payload(
+            "GigabitEthernet0/0",
+            [{"address": "10.77.0.3/32", "vrf": "", "family": "ipv4", "secondary": False}],
+        )
+        with self._auto_create_ctx(True):
+            result = _reconcile_interface_ips(self.device, payload)
+
+        states = {s.address: s for s in result}
+        self.assertEqual(states["10.77.0.3/32"].status, "imported")
+        ip.refresh_from_db()
+        self.assertEqual(ip.assigned_object, self.iface)
+
     def test_removed_address_becomes_changed_and_unassigned(self):
         """Address in DB but not in new payload → status=changed, IPAddress unassigned."""
         from django.contrib.contenttypes.models import ContentType
