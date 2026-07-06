@@ -505,6 +505,7 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
         return {"communities": [], "v3_users": [], "hosts": [], "system_info": None}
 
     # ── Communities ────────────────────────────────────────────────────────────
+    value_compare = _snmp_value_compare_supported(device)
     incoming_community_hashes = set()
     for entry in payload.get("communities") or []:
         h = entry.get("community_hash") or ""
@@ -516,7 +517,14 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
         state.acl = entry.get("acl") or ""
         state.has_secret = bool(entry.get("has_secret", True))
         state.last_sync_at = now
-        state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
+        # An OWNED row with a recorded Vault fingerprint has a genuine device
+        # confirmation: the device reporting this hash means the secret landed →
+        # settle accepted → in_sync. Without a fingerprint (or on hash2
+        # platforms) the value is unknowable — mirror semantics (matches=None).
+        matches = None
+        if value_compare and state.vault_secret_hash and sm.is_owned(state.status):
+            matches = state.vault_secret_hash == h
+        state.status = sm.on_reconcile(state.status, matches=matches)
         state.save()
     # Owned rows absent from the payload must SURVIVE (an operator-created or
     # just-rotated row would otherwise lose its vault_ref/status mid-flight

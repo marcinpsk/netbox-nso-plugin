@@ -2931,6 +2931,14 @@ def _connect_g_activated():  # pragma: no cover
             sender=snmp_model,
             dispatch_uid=f"nso_plugin_snmp_{snmp_model.__name__}_post_save",
         )
+        # Deletes must push the REDUCED snapshot too — without this, the adapter
+        # keeps applying a deleted community/user/host until some unrelated SNMP
+        # row is saved (the removal replace-apply never fires).
+        post_delete.connect(
+            _on_snmp_state_save,
+            sender=snmp_model,
+            dispatch_uid=f"nso_plugin_snmp_{snmp_model.__name__}_post_delete",
+        )
 
     # Logging (remote syslog) state → intent push
     from .models import NSOLoggingHostState

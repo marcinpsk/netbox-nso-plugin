@@ -366,6 +366,28 @@ class TestVerifyAndHarvestViews(_SecretBase):
         self.assertEqual(row.vault_ref, "")
 
 
+class TestDeletePropagation(_SecretBase):
+    def test_deleting_owned_community_pushes_reduced_intent(self):
+        """WP7 live finding: SNMP states only wired post_save — deleting an owned
+        community never re-pushed the intent, so the adapter kept applying the
+        deleted community until some unrelated SNMP row was saved. Deleting must
+        push the REDUCED snapshot (the adapter's removal propagation then
+        replace-applies it off the device)."""
+        from netbox_nso_plugin.signals import reset_intent_push_state
+
+        mgmt = self._make_mgmt()
+        row = self._community(
+            mgmt, status="accepted", vault_ref="network/netbox/snmp/community/oldhash1234567890#community"
+        )
+        reset_intent_push_state()
+        with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
+            with self.captureOnCommitCallbacks(execute=True):
+                row.delete()
+        mock_put.assert_called_once()
+        communities = mock_put.call_args[0][1]
+        self.assertEqual(communities, [])
+
+
 class TestV3PushDerivation(_SecretBase):
     def test_push_derives_auth_priv_refs_from_protocols_and_skips_v3_hosts(self):
         from netbox_nso_plugin.models import NSOSnmpHostState, NSOSnmpV3UserState

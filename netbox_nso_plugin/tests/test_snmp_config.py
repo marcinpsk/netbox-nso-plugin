@@ -242,6 +242,32 @@ class TestReconcileSnmpConfig(TestCase):
         # the unowned imported community was still dropped
         self.assertFalse(NSOSnmpCommunityState.objects.filter(community_hash="abcd1234abcd1234").exists())
 
+    def test_accepted_community_with_matching_fingerprint_settles_in_sync(self):
+        """WP7 live finding: an accepted community whose Vault fingerprint equals the
+        device-reported hash is GENUINELY device-confirmed — the reconcile must settle
+        it accepted → in_sync (matches=True), not leave it 'pending apply' forever.
+        Without a fingerprint (or on hash2 platforms) there is no confirmation and the
+        owned status must be preserved."""
+        from netbox_nso_plugin.models import NSOSnmpCommunityState
+        from netbox_nso_plugin.template_content import _reconcile_snmp_config
+
+        mgmt = self._create_mgmt()
+        _reconcile_snmp_config(self.device, _SAMPLE_PAYLOAD)
+
+        # confirmed: fingerprint equals the device hash → settles
+        NSOSnmpCommunityState.objects.filter(management=mgmt, community_hash="abcd1234abcd1234").update(
+            status="accepted", vault_secret_hash="abcd1234abcd1234"
+        )
+        # unconfirmed: no fingerprint recorded → preserved
+        NSOSnmpCommunityState.objects.filter(management=mgmt, community_hash="ef012345ef012345").update(
+            status="accepted", vault_secret_hash=""
+        )
+
+        _reconcile_snmp_config(self.device, _SAMPLE_PAYLOAD)
+
+        self.assertEqual(NSOSnmpCommunityState.objects.get(community_hash="abcd1234abcd1234").status, "in_sync")
+        self.assertEqual(NSOSnmpCommunityState.objects.get(community_hash="ef012345ef012345").status, "accepted")
+
     def test_refresh_preserves_vault_ref_on_update_path(self):
         """A reported row's operator-set vault_ref survives the field refresh."""
         from netbox_nso_plugin.models import NSOSnmpCommunityState
