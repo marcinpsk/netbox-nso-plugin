@@ -30,7 +30,7 @@
   <div class="table-responsive mb-3">
     <table class="table table-sm table-hover mb-0">
       <thead>
-        <tr><th>Community (hash)</th><th>Access</th><th>ACL</th><th>Vault ref</th><th>Status</th><th>Last Synced</th><th></th></tr>
+        <tr><th>Community (hash)</th><th>Access</th><th>ACL</th><th>Vault</th><th>Status</th><th>Last Synced</th><th></th></tr>
       </thead>
       <tbody>
         {% for c in snmp_data.communities %}
@@ -38,13 +38,38 @@
           <td><code>{{ c.community_hash }}</code></td>
           <td>{{ c.access }}</td>
           <td>{{ c.acl|default:"—" }}</td>
-          <td>{% if c.vault_ref %}<code>{{ c.vault_ref }}</code>{% else %}<span class="text-warning" title="Set a Vault ref so the secret can be pushed">missing</span>{% endif %}</td>
+          <td>
+            {% if c.vault_ref %}
+              <code title="{{ c.vault_ref }}">{{ c.vault_ref|truncatechars:34 }}</code>
+              {% if c.vault_secret_hash %}
+                {% if not snmp_data.snmp_value_compare %}
+                  <span class="badge text-bg-info" title="This platform stores communities hashed on-device (Nokia hash2) — value comparison is impossible; the Vault secret is set (v{{ c.vault_secret_version|default:'?' }}).">Vault set — compare n/a</span>
+                {% elif c.vault_secret_hash == c.community_hash %}
+                  <span class="badge text-bg-success" title="sha256 fingerprint of the Vault-held secret equals the device's (v{{ c.vault_secret_version|default:'?' }}).">Vault ✓ matches device</span>
+                {% else %}
+                  <span class="badge text-bg-warning text-dark" title="The Vault-held secret differs from what the device reports — apply is pending, or the device changed out-of-band.">Vault differs</span>
+                {% endif %}
+              {% else %}
+                <span class="badge text-bg-info" title="Vault ref set but the secret has not been verified — use Verify (or set a value) to record its fingerprint.">unverified</span>
+              {% endif %}
+            {% elif c.accepted_at %}
+              <span class="badge text-bg-danger" title="This accepted community has no Vault ref — it is silently excluded from every push until one is set.">no ref — not pushable</span>
+            {% else %}
+              <span class="text-warning" title="Set a Vault ref (or a secret value) so the secret can be pushed">missing</span>
+            {% endif %}
+          </td>
           <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=c.status %}</td>
           <td>{{ c.last_sync_at|default:"—" }}</td>
           <td>
             <div class="d-flex gap-1 align-items-center">
               {% url 'plugins:netbox_nso_plugin:nsosnmpcommunitystate_edit' pk=c.pk as edit_url %}{% include "netbox_nso_plugin/categories/_edit_link.html" with edit_url=edit_url return_url=return_url %}
               {% url 'plugins:netbox_nso_plugin:snmp_accept_community' pk=c.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=c.status %}
+              {% if c.vault_ref %}
+              <form method="post" action="{% url 'plugins:netbox_nso_plugin:snmp_verify_community_secret' pk=c.pk %}">{% csrf_token %}<button type="submit" class="btn btn-xs btn-outline-info" title="Resolve the Vault ref via the adapter and record the secret's fingerprint (values never displayed)"><span class="mdi mdi-shield-search"></span> Verify</button></form>
+              {% endif %}
+              {% if snmp_data.snmp_value_compare %}
+              <form method="post" action="{% url 'plugins:netbox_nso_plugin:snmp_harvest_community_secret' pk=c.pk %}">{% csrf_token %}<button type="submit" class="btn btn-xs btn-outline-primary" title="Adopt the device-held community string into Vault (read from NSO's config mirror; never displayed)"><span class="mdi mdi-database-import"></span> Harvest</button></form>
+              {% endif %}
             </div>
           </td>
         </tr>
@@ -62,21 +87,38 @@
   <div class="table-responsive mb-3">
     <table class="table table-sm table-hover mb-0">
       <thead>
-        <tr><th>Username</th><th>Auth</th><th>Priv</th><th>Vault ref</th><th>Status</th><th>Last Synced</th><th></th></tr>
+        <tr><th>Username</th><th>Device auth/priv</th><th>Protocols</th><th>Vault</th><th>Status</th><th>Last Synced</th><th></th></tr>
       </thead>
       <tbody>
         {% for u in snmp_data.v3_users %}
         <tr data-status="{{ u.status }}" data-owned="{{ u.accepted_at|yesno:'true,false' }}">
           <td>{{ u.username }}</td>
-          <td>{% if u.has_auth_secret %}<span class="badge text-bg-success">set</span>{% else %}<span class="badge text-bg-light">none</span>{% endif %}</td>
-          <td>{% if u.has_priv_secret %}<span class="badge text-bg-success">set</span>{% else %}<span class="badge text-bg-light">none</span>{% endif %}</td>
-          <td>{% if u.vault_ref %}<code>{{ u.vault_ref }}</code>{% else %}<span class="text-warning" title="Set a Vault ref so the secret can be pushed">missing</span>{% endif %}</td>
+          <td>
+            {% if u.has_auth_secret %}<span class="badge text-bg-success">auth</span>{% else %}<span class="badge text-bg-light">no auth</span>{% endif %}
+            {% if u.has_priv_secret %}<span class="badge text-bg-success">priv</span>{% else %}<span class="badge text-bg-light">no priv</span>{% endif %}
+          </td>
+          <td>{{ u.auth_protocol|default:"—" }}{% if u.priv_protocol %} / {{ u.priv_protocol }}{% endif %}</td>
+          <td>
+            {% if u.vault_ref %}
+              <code title="{{ u.vault_ref }} (fields auth/priv)">{{ u.vault_ref|truncatechars:30 }}</code>
+              {% if u.vault_has_auth %}<span class="badge text-bg-success" title="Vault holds an 'auth' field at the ref. Value comparison with the device is impossible for v3 (keys are engine-ID-localized).">auth</span>{% endif %}
+              {% if u.vault_has_priv %}<span class="badge text-bg-success" title="Vault holds a 'priv' field at the ref.">priv</span>{% endif %}
+              {% if not u.vault_has_auth and not u.vault_has_priv %}<span class="badge text-bg-info" title="Vault ref set but not verified — use Verify to record which fields exist.">unverified</span>{% endif %}
+            {% elif u.accepted_at %}
+              <span class="badge text-bg-danger" title="This accepted v3 user has no Vault ref — it is silently excluded from every push until one is set.">no ref — not pushable</span>
+            {% else %}
+              <span class="text-warning" title="Set a Vault ref (or secret values) so the secrets can be pushed">missing</span>
+            {% endif %}
+          </td>
           <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=u.status %}</td>
           <td>{{ u.last_sync_at|default:"—" }}</td>
           <td>
             <div class="d-flex gap-1 align-items-center">
               {% url 'plugins:netbox_nso_plugin:nsosnmpv3userstate_edit' pk=u.pk as edit_url %}{% include "netbox_nso_plugin/categories/_edit_link.html" with edit_url=edit_url return_url=return_url %}
               {% url 'plugins:netbox_nso_plugin:snmp_accept_v3_user' pk=u.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=u.status %}
+              {% if u.vault_ref %}
+              <form method="post" action="{% url 'plugins:netbox_nso_plugin:snmp_verify_v3_user_secret' pk=u.pk %}">{% csrf_token %}<button type="submit" class="btn btn-xs btn-outline-info" title="Resolve the Vault path via the adapter and record which fields (auth/priv) exist"><span class="mdi mdi-shield-search"></span> Verify</button></form>
+              {% endif %}
             </div>
           </td>
         </tr>

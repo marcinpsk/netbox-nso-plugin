@@ -38,6 +38,7 @@ from .forms import (
     NSOSnmpHostStateForm,
     NSOSnmpSystemInfoStateForm,
     NSOSnmpV3UserStateForm,
+    NSOVaultSettingsForm,
 )
 from .models import (
     AdapterConnection,
@@ -66,6 +67,7 @@ from .models import (
     NSOStaticRouteState,
     NSOSubinterfaceState,
     NSOSVIState,
+    NSOVaultSettings,
     NSOVLANState,
 )
 from .tables import (
@@ -879,6 +881,18 @@ class NSOFailoverSettingsEditView(generic.ObjectEditView):
                 "fall back to OOB — until the adapter operator sets enable_failover: true and "
                 "restarts the adapter.",
             )
+
+
+class NSOVaultSettingsEditView(generic.ObjectEditView):
+    """Singleton edit view for NSOVaultSettings (Vault KV layout for generated refs)."""
+
+    template_name = "netbox_nso_plugin/settings_object_edit.html"
+    queryset = NSOVaultSettings.objects.all()
+    form = NSOVaultSettingsForm
+
+    def get_object(self, **kwargs):
+        """Return the existing singleton or a blank instance for first-time creation."""
+        return NSOVaultSettings.objects.first() or NSOVaultSettings()
 
 
 # ── NSO Instance CRUD ────────────────────────────────────────────────────────
@@ -2780,6 +2794,123 @@ class NSOSnmpHostStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
 
 class NSOSnmpSystemInfoStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOSnmpSystemInfoState
+
+
+class NSOSnmpCommunityStateVerifyView(NSOActionPermissionMixin, View):
+    """Resolve the row's Vault ref via the adapter and store the value fingerprint.
+
+    Sets ``vault_secret_hash``/``vault_secret_version`` so the badge can state
+    whether the Vault-held secret matches what the device reports. Values never
+    leave the adapter — only sha256[:16] fingerprints travel.
+    """
+
+    def post(self, request, pk):  # noqa: D102
+        from . import adapter_client
+        from .vault_refs import VaultRefError, parse_vault_ref
+
+        state = get_object_or_404(NSOSnmpCommunityState, pk=pk)
+        redirect_url = _device_nso_tab_url(state.management.device_id)
+        if not state.vault_ref:
+            messages.error(request, "No Vault ref on this community — set one (or a secret value) first.")
+            return redirect(redirect_url)
+        try:
+            key = parse_vault_ref(state.vault_ref, require_key=True).key
+        except VaultRefError as exc:
+            messages.error(request, f"Bad Vault ref: {exc}")
+            return redirect(redirect_url)
+        try:
+            result = adapter_client.verify_secret(state.vault_ref)
+        except AdapterError as exc:
+            messages.error(request, f"Vault verify failed: {exc}")
+            return redirect(redirect_url)
+
+        hashes = result.get("hashes") or {}
+        if result.get("exists") and key in hashes:
+            state.vault_secret_hash = hashes[key]
+            state.vault_secret_version = result.get("version")
+            state.save(update_fields=["vault_secret_hash", "vault_secret_version"])
+            verdict = (
+                "matches the device value"
+                if state.vault_secret_hash == state.community_hash
+                else "DIFFERS from the device value (apply pending, or the device changed out-of-band)"
+            )
+            messages.success(request, f"Vault secret verified (v{result.get('version')}) — {verdict}.")
+        else:
+            messages.warning(request, f"Vault has no {key!r} field at {state.vault_ref!r}.")
+        return redirect(redirect_url)
+
+
+class NSOSnmpV3UserStateVerifyView(NSOActionPermissionMixin, View):
+    """Resolve the v3 user's Vault path and record which fields (auth/priv) exist."""
+
+    def post(self, request, pk):  # noqa: D102
+        from . import adapter_client
+
+        state = get_object_or_404(NSOSnmpV3UserState, pk=pk)
+        redirect_url = _device_nso_tab_url(state.management.device_id)
+        if not state.vault_ref:
+            messages.error(request, "No Vault ref on this v3 user — set one (or secret values) first.")
+            return redirect(redirect_url)
+        try:
+            result = adapter_client.verify_secret(state.vault_ref)
+        except AdapterError as exc:
+            messages.error(request, f"Vault verify failed: {exc}")
+            return redirect(redirect_url)
+
+        fields = set(result.get("fields") or [])
+        state.vault_has_auth = "auth" in fields
+        state.vault_has_priv = "priv" in fields
+        state.save(update_fields=["vault_has_auth", "vault_has_priv"])
+        if fields:
+            messages.success(request, f"Vault holds: {', '.join(sorted(fields))} (v{result.get('version')}).")
+        else:
+            messages.warning(request, f"Vault has no secret at {state.vault_ref!r}.")
+        return redirect(redirect_url)
+
+
+class NSOSnmpCommunityStateHarvestView(NSOActionPermissionMixin, View):
+    """Adopt the device-held community string into Vault by its fingerprint.
+
+    The adapter reads the plaintext from NSO's config mirror (targeted per-NED
+    subtree), writes it to Vault, and returns only ref + fingerprint — the
+    secret is never displayed or stored in NetBox.
+    """
+
+    def post(self, request, pk):  # noqa: D102
+        from . import adapter_client
+        from .forms import _vault_settings_layout
+
+        state = get_object_or_404(NSOSnmpCommunityState, pk=pk)
+        redirect_url = _device_nso_tab_url(state.management.device_id)
+        if state.management.adapter_device_id is None:
+            messages.error(request, "Device is not linked to the adapter — cannot harvest.")
+            return redirect(redirect_url)
+        ref = state.vault_ref
+        if not ref:
+            kv_mount, base_path = _vault_settings_layout()
+            if not (kv_mount and base_path):
+                messages.error(
+                    request,
+                    "No Vault ref on this row and no enabled Vault settings to derive one — "
+                    "configure Settings → Vault first.",
+                )
+                return redirect(redirect_url)
+            ref = f"{kv_mount}/{base_path}/community/{state.community_hash}#community"
+        try:
+            result = adapter_client.harvest_community(state.management.adapter_device_id, state.community_hash, ref)
+        except AdapterError as exc:
+            messages.error(request, f"Harvest failed: {exc}")
+            return redirect(redirect_url)
+
+        state.vault_ref = result.get("vault_ref") or ref
+        state.vault_secret_hash = result.get("secret_hash") or ""
+        state.vault_secret_version = result.get("version")
+        state.save(update_fields=["vault_ref", "vault_secret_hash", "vault_secret_version"])
+        messages.success(
+            request,
+            f"Community harvested into Vault at {state.vault_ref!r} (v{result.get('version')}).",
+        )
+        return redirect(redirect_url)
 
 
 class NSOLoggingHostStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101

@@ -20,6 +20,8 @@ urlpatterns = [
     path("adapter-connection/", views.AdapterConnectionEditView.as_view(), name="adapterconnection"),
     # Failover Settings (singleton)
     path("failover-settings/", views.NSOFailoverSettingsEditView.as_view(), name="nsofailoversettings"),
+    # Vault Settings (singleton)
+    path("vault-settings/", views.NSOVaultSettingsEditView.as_view(), name="nsovaultsettings"),
     # NSO Instances
     path("instances/", views.NSOInstanceListView.as_view(), name="nsoinstance_list"),
     path("instances/add/", views.NSOInstanceEditView.as_view(), name="nsoinstance_add"),
@@ -421,6 +423,16 @@ urlpatterns = [
         name="snmp_accept_community",
     ),
     path(
+        "snmp/community-state/<int:pk>/verify-secret/",
+        views.NSOSnmpCommunityStateVerifyView.as_view(),
+        name="snmp_verify_community_secret",
+    ),
+    path(
+        "snmp/community-state/<int:pk>/harvest-secret/",
+        views.NSOSnmpCommunityStateHarvestView.as_view(),
+        name="snmp_harvest_community_secret",
+    ),
+    path(
         "snmp/v3-user-state/<int:pk>/edit/",
         views.NSOSnmpV3UserStateEditView.as_view(),
         name="nsosnmpv3userstate_edit",
@@ -429,6 +441,11 @@ urlpatterns = [
         "snmp/v3-user-state/<int:pk>/accept/",
         views.NSOSnmpV3UserStateAcceptView.as_view(),
         name="snmp_accept_v3_user",
+    ),
+    path(
+        "snmp/v3-user-state/<int:pk>/verify-secret/",
+        views.NSOSnmpV3UserStateVerifyView.as_view(),
+        name="snmp_verify_v3_user_secret",
     ),
     path(
         "snmp/host-state/<int:pk>/edit/",

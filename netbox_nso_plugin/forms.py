@@ -21,7 +21,17 @@ from .models import (
     NSOSnmpHostState,
     NSOSnmpSystemInfoState,
     NSOSnmpV3UserState,
+    NSOVaultSettings,
 )
+from .vault_refs import VaultRefError, parse_vault_ref, qualify_snmp_ref, secret_fingerprint
+
+
+def _vault_settings_layout():
+    """Return (kv_mount, base_path) from the enabled NSOVaultSettings singleton, else (None, None)."""
+    settings_obj = NSOVaultSettings.objects.first()
+    if settings_obj is None or not settings_obj.enabled:
+        return None, None
+    return settings_obj.kv_mount, settings_obj.base_path
 
 
 class NSOPlatformNedMappingForm(NetBoxModelForm):
@@ -110,6 +120,15 @@ class NSOFailoverSettingsForm(NetBoxModelForm):
             "probe_timeout": "Probe timeout (sec)",
             "sync_from_after_switch": "Sync-from after switch",
         }
+
+
+class NSOVaultSettingsForm(NetBoxModelForm):
+    """Form for the NSOVaultSettings singleton (Vault KV layout for generated refs)."""
+
+    class Meta:
+        model = NSOVaultSettings
+        fields = ["kv_mount", "base_path", "enabled", "tags"]
+        labels = {"kv_mount": "KV mount", "base_path": "Base path"}
 
 
 class NSOInstanceForm(NetBoxModelForm):
@@ -214,19 +233,186 @@ class NSODeviceManagementForm(NetBoxModelForm):
 
 
 class NSOSnmpCommunityStateForm(NetBoxModelForm):
-    """Edit an SNMP community overlay — access/ACL + the Vault ref for the secret."""
+    """Edit an SNMP community overlay — access/ACL, Vault ref, or set a new secret value.
+
+    ``secret_value`` is write-only: it transits one adapter call (which writes
+    Vault and returns ref + fingerprint) and is never bound to a model field.
+    Setting it REKEYS the row (``community_hash`` = fingerprint of the new
+    value), marks it accepted, and re-points sibling trap hosts at the new hash.
+    The Vault write happens during validation — an adapter/Vault failure surfaces
+    as a form error and nothing is saved.
+    """
+
+    secret_value = forms.CharField(
+        required=False,
+        widget=forms.PasswordInput(render_value=False),
+        label="Set secret value",
+        help_text=(
+            "New community string. Written to Vault via the adapter (never stored in NetBox); "
+            "leave blank to keep the current secret. Rekeys this row to the new value's fingerprint."
+        ),
+    )
 
     class Meta:
         model = NSOSnmpCommunityState
         fields = ["access", "acl", "vault_ref", "tags"]
 
+    def clean(self):
+        cleaned = super().clean() or self.cleaned_data
+        secret = cleaned.get("secret_value") or ""
+        ref = (cleaned.get("vault_ref") or "").strip()
+        kv_mount, base_path = _vault_settings_layout()
+        self._old_hash = self.instance.community_hash
+        self._secret_result = None
+
+        new_hash = secret_fingerprint(secret) if secret else None
+        if new_hash:
+            collision = (
+                NSOSnmpCommunityState.objects.filter(management=self.instance.management, community_hash=new_hash)
+                .exclude(pk=self.instance.pk)
+                .exists()
+            )
+            if collision:
+                self.add_error("secret_value", "This value matches another community on the same device.")
+            if not ref:
+                if kv_mount and base_path:
+                    ref = f"{kv_mount}/{base_path}/community/{new_hash}#community"
+                else:
+                    self.add_error(
+                        "secret_value",
+                        "No Vault ref on this row and no enabled Vault settings to derive one — "
+                        "configure Settings → Vault or paste a ref first.",
+                    )
+
+        if ref:
+            try:
+                ref = qualify_snmp_ref(ref, kind="community", kv_mount=kv_mount, base_path=base_path)
+                parse_vault_ref(ref, require_key=True)
+            except VaultRefError as exc:
+                self.add_error("vault_ref", str(exc))
+            else:
+                cleaned["vault_ref"] = ref
+
+        if secret and not self.errors:
+            from . import adapter_client
+
+            key = parse_vault_ref(ref, require_key=True).key
+            try:
+                result = adapter_client.set_secret(ref, {key: secret})
+            except adapter_client.AdapterError as exc:
+                # AdapterError text comes from the adapter, which never echoes values.
+                self.add_error("secret_value", f"Vault write failed: {exc}")
+            else:
+                self._secret_result = {"hash": new_hash, "version": result.get("version")}
+        return cleaned
+
+    def save(self, *args, **kwargs):
+        if self._secret_result:
+            from django.utils import timezone
+
+            self.instance.community_hash = self._secret_result["hash"]
+            self.instance.vault_secret_hash = self._secret_result["hash"]
+            self.instance.vault_secret_version = self._secret_result["version"]
+            self.instance.status = "accepted"
+            self.instance.accepted_at = timezone.now()
+        obj = super().save(*args, **kwargs)
+        if self._secret_result and self._old_hash and self._old_hash != obj.community_hash:
+            # Trap hosts reference the community by hash-as-label; re-point them
+            # so the push doesn't reference the rotated-away hash (which the
+            # reconciler now rejects instead of configuring it as a community).
+            NSOSnmpHostState.objects.filter(management=obj.management, community_hash=self._old_hash).update(
+                community_hash=obj.community_hash
+            )
+        return obj
+
 
 class NSOSnmpV3UserStateForm(NetBoxModelForm):
-    """Edit an SNMP v3 user overlay — the Vault ref for the auth/priv secrets."""
+    """Edit an SNMP v3 user overlay — group/protocols, Vault ref, or set secret values.
+
+    The secret fields are write-only (one adapter call writes Vault; nothing is
+    stored in NetBox). ``vault_ref`` is a PATH ref ('mount/path'); the auth and
+    priv passwords live at its ``auth``/``priv`` fields — writes MERGE, so
+    setting only one leg preserves the other.
+    """
+
+    auth_secret_value = forms.CharField(
+        required=False,
+        widget=forms.PasswordInput(render_value=False),
+        label="Set auth password",
+        help_text="Written to Vault field 'auth' at the ref. Requires an auth protocol.",
+    )
+    priv_secret_value = forms.CharField(
+        required=False,
+        widget=forms.PasswordInput(render_value=False),
+        label="Set priv password",
+        help_text="Written to Vault field 'priv' at the ref. Requires a priv protocol.",
+    )
 
     class Meta:
         model = NSOSnmpV3UserState
-        fields = ["vault_ref", "tags"]
+        fields = ["group_name", "auth_protocol", "priv_protocol", "vault_ref", "tags"]
+
+    def clean(self):
+        cleaned = super().clean() or self.cleaned_data
+        auth_secret = cleaned.get("auth_secret_value") or ""
+        priv_secret = cleaned.get("priv_secret_value") or ""
+        ref = (cleaned.get("vault_ref") or "").strip()
+        kv_mount, base_path = _vault_settings_layout()
+        self._secret_result = None
+
+        if auth_secret and not cleaned.get("auth_protocol"):
+            self.add_error("auth_protocol", "Setting an auth password requires an auth protocol.")
+        if priv_secret and not cleaned.get("priv_protocol"):
+            self.add_error("priv_protocol", "Setting a priv password requires a priv protocol.")
+        if cleaned.get("priv_protocol") and not cleaned.get("auth_protocol"):
+            self.add_error("priv_protocol", "SNMPv3 privacy requires authentication (authPriv).")
+
+        if (auth_secret or priv_secret) and not ref:
+            if kv_mount and base_path:
+                ref = f"{kv_mount}/{base_path}/v3/{self.instance.username}"
+            else:
+                self.add_error(
+                    "auth_secret_value" if auth_secret else "priv_secret_value",
+                    "No Vault ref on this row and no enabled Vault settings to derive one — "
+                    "configure Settings → Vault or paste a ref first.",
+                )
+
+        if ref:
+            try:
+                ref = qualify_snmp_ref(ref, kind="v3", kv_mount=kv_mount, base_path=base_path)
+                parse_vault_ref(ref, require_key=False)
+            except VaultRefError as exc:
+                self.add_error("vault_ref", str(exc))
+            else:
+                cleaned["vault_ref"] = ref
+
+        if (auth_secret or priv_secret) and not self.errors:
+            from . import adapter_client
+
+            values = {}
+            if auth_secret:
+                values["auth"] = auth_secret
+            if priv_secret:
+                values["priv"] = priv_secret
+            try:
+                result = adapter_client.set_secret(ref, values)
+            except adapter_client.AdapterError as exc:
+                self.add_error(None, f"Vault write failed: {exc}")
+            else:
+                self._secret_result = {"fields": set(values), "version": result.get("version")}
+        return cleaned
+
+    def save(self, *args, **kwargs):
+        if self._secret_result:
+            from django.utils import timezone
+
+            if "auth" in self._secret_result["fields"]:
+                self.instance.vault_has_auth = True
+            if "priv" in self._secret_result["fields"]:
+                self.instance.vault_has_priv = True
+            self.instance.status = "accepted"
+            self.instance.accepted_at = timezone.now()
+        return super().save(*args, **kwargs)
 
 
 class NSOSnmpHostStateForm(NetBoxModelForm):

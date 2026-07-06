@@ -206,6 +206,58 @@ class TestReconcileSnmpConfig(TestCase):
         row = NSOSnmpCommunityState.objects.get(community_hash="abcd1234abcd1234")
         self.assertEqual(row.status, "accepted")
 
+    def test_refresh_preserves_owned_rows_absent_from_payload(self):
+        """Operator-owned rows absent from the payload must SURVIVE the refresh.
+
+        Deleting them loses vault_ref/status mid-flight: an operator-created
+        community not yet applied, or a just-rotated one whose new hash the
+        device doesn't report yet, would vanish between Accept and Apply.
+        Unowned (imported/conflict) stale rows are still deleted.
+        """
+        from netbox_nso_plugin.models import NSOSnmpCommunityState, NSOSnmpHostState, NSOSnmpV3UserState
+        from netbox_nso_plugin.template_content import _reconcile_snmp_config
+
+        mgmt = self._create_mgmt()
+        _reconcile_snmp_config(self.device, _SAMPLE_PAYLOAD)
+
+        NSOSnmpCommunityState.objects.filter(management=mgmt, community_hash="ef012345ef012345").update(
+            status="accepted",
+            vault_ref="network/netbox/snmp/community/ef012345ef012345#community",
+        )
+        NSOSnmpV3UserState.objects.filter(management=mgmt, username="nms-user").update(
+            status="deploying", vault_ref="network/netbox/snmp/v3/nms-user"
+        )
+        NSOSnmpHostState.objects.filter(management=mgmt, address="10.0.0.100").update(status="in_sync")
+
+        empty = dict(_SAMPLE_PAYLOAD)
+        empty["communities"], empty["v3_users"], empty["hosts"] = [], [], []
+        _reconcile_snmp_config(self.device, empty)
+
+        # owned rows survived with status + vault_ref intact
+        row = NSOSnmpCommunityState.objects.get(community_hash="ef012345ef012345")
+        self.assertEqual(row.status, "accepted")
+        self.assertEqual(row.vault_ref, "network/netbox/snmp/community/ef012345ef012345#community")
+        self.assertEqual(NSOSnmpV3UserState.objects.get(username="nms-user").status, "deploying")
+        self.assertEqual(NSOSnmpHostState.objects.get(address="10.0.0.100").status, "in_sync")
+        # the unowned imported community was still dropped
+        self.assertFalse(NSOSnmpCommunityState.objects.filter(community_hash="abcd1234abcd1234").exists())
+
+    def test_refresh_preserves_vault_ref_on_update_path(self):
+        """A reported row's operator-set vault_ref survives the field refresh."""
+        from netbox_nso_plugin.models import NSOSnmpCommunityState
+        from netbox_nso_plugin.template_content import _reconcile_snmp_config
+
+        mgmt = self._create_mgmt()
+        _reconcile_snmp_config(self.device, _SAMPLE_PAYLOAD)
+        NSOSnmpCommunityState.objects.filter(management=mgmt, community_hash="abcd1234abcd1234").update(
+            vault_ref="network/netbox/snmp/community/abcd1234abcd1234#community"
+        )
+
+        _reconcile_snmp_config(self.device, _SAMPLE_PAYLOAD)
+
+        row = NSOSnmpCommunityState.objects.get(community_hash="abcd1234abcd1234")
+        self.assertEqual(row.vault_ref, "network/netbox/snmp/community/abcd1234abcd1234#community")
+
     def test_community_acl_and_access_updated(self):
         from netbox_nso_plugin.models import NSOSnmpCommunityState
         from netbox_nso_plugin.template_content import _reconcile_snmp_config

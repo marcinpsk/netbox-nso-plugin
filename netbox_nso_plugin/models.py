@@ -165,6 +165,55 @@ class NSOFailoverSettings(NetBoxModel):
         super().save(*args, **kwargs)
 
 
+class NSOVaultSettings(NetBoxModel):
+    """Singleton — Vault KV layout used to derive refs for UI-managed SNMP secrets.
+
+    No Vault address or credentials live here: the adapter owns the Vault
+    connection (its AppRole must hold create/update/read on ``base_path``), and
+    the NSO snmp-reconciler resolves refs via its own vault-cred-manager config.
+    These settings only shape the ``<kv_mount>/<base_path>/...`` refs the plugin
+    generates when an operator sets a secret value; pasted refs that already
+    contain a ``/`` are stored verbatim.
+    """
+
+    kv_mount = models.CharField(
+        max_length=128,
+        default="network",
+        help_text="Vault KV v2 mount for generated secret refs (e.g. 'network').",
+    )
+    base_path = models.CharField(
+        max_length=256,
+        default="netbox/snmp",
+        help_text=(
+            "Path prefix (within the mount) for generated SNMP secret refs: communities land at "
+            "BASE/community/HASH#community, v3 users at BASE/v3/USERNAME (fields auth/priv)."
+        ),
+    )
+    enabled = models.BooleanField(
+        default=True,
+        help_text="When disabled, secret values cannot be set from the UI (pasted refs still work).",
+    )
+
+    class Meta:
+        verbose_name = "Vault Settings"
+        verbose_name_plural = "Vault Settings"
+
+    def __str__(self):
+        return f"Vault refs: {self.kv_mount}/{self.base_path}"
+
+    def get_absolute_url(self):
+        """Return the URL for the singleton edit view."""
+        return reverse("plugins:netbox_nso_plugin:nsovaultsettings")
+
+    def save(self, *args, **kwargs):
+        """Enforce singleton: reuse the existing row's PK when creating a second instance."""
+        if not self.pk:
+            existing = NSOVaultSettings.objects.first()
+            if existing:
+                self.pk = existing.pk
+        super().save(*args, **kwargs)
+
+
 class _NSODeviceTabURLMixin:
     """Resolve get_absolute_url to the device's NSO tab.
 
@@ -694,6 +743,23 @@ _SNMP_STATUS_CHOICES = [
     ("error", "Error"),
 ]
 
+# snmp-reconciler YANG enum spellings (sent verbatim to the adapter/NSO)
+_SNMP_AUTH_PROTOCOL_CHOICES = [
+    ("md5", "MD5"),
+    ("sha", "SHA"),
+    ("sha-256", "SHA-256"),
+    ("sha-384", "SHA-384"),
+    ("sha-512", "SHA-512"),
+]
+
+_SNMP_PRIV_PROTOCOL_CHOICES = [
+    ("des", "DES"),
+    ("3des", "3DES"),
+    ("aes-128", "AES-128"),
+    ("aes-192", "AES-192"),
+    ("aes-256", "AES-256"),
+]
+
 
 class NSOSnmpCommunityState(NetBoxModel):
     """Per-device SNMP community status overlay (read path).
@@ -731,7 +797,23 @@ class NSOSnmpCommunityState(NetBoxModel):
         max_length=512,
         blank=True,
         default="",
-        help_text="Vault KV path#key for the community string (required for the write path).",
+        help_text=(
+            "Fully-qualified Vault ref 'mount/path#key' for the community string (required for the write path)."
+        ),
+    )
+    vault_secret_hash = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "SHA-256[:16] fingerprint of the Vault-held plaintext, set whenever the adapter "
+            "touches the secret (set/verify/harvest). Equal to community_hash ⇒ Vault matches device."
+        ),
+    )
+    vault_secret_version = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Vault KV v2 version observed when the secret was last set/verified (audit only).",
     )
     status = models.CharField(max_length=32, choices=_SNMP_STATUS_CHOICES, default="unknown")
     last_sync_at = models.DateTimeField(null=True, blank=True)
@@ -771,11 +853,42 @@ class NSOSnmpV3UserState(NetBoxModel):
     username = models.CharField(max_length=128)
     has_auth_secret = models.BooleanField(default=False)
     has_priv_secret = models.BooleanField(default=False)
+    group_name = models.CharField(
+        max_length=128,
+        blank=True,
+        default="",
+        help_text="SNMPv3 group for the write path (optional).",
+    )
+    auth_protocol = models.CharField(
+        max_length=16,
+        blank=True,
+        default="",
+        choices=_SNMP_AUTH_PROTOCOL_CHOICES,
+        help_text="Authentication protocol for the write path (blank = no authentication).",
+    )
+    priv_protocol = models.CharField(
+        max_length=16,
+        blank=True,
+        default="",
+        choices=_SNMP_PRIV_PROTOCOL_CHOICES,
+        help_text="Privacy protocol for the write path (blank = no privacy).",
+    )
     vault_ref = models.CharField(
         max_length=512,
         blank=True,
         default="",
-        help_text="Vault KV path#key for the v3 auth/priv secrets (required for the write path).",
+        help_text=(
+            "Fully-qualified Vault PATH ref 'mount/path' (no #key) — fields 'auth'/'priv' "
+            "by convention. Required for the write path."
+        ),
+    )
+    vault_has_auth = models.BooleanField(
+        default=False,
+        help_text="Vault holds an 'auth' field at the ref (set when the adapter touches the secret).",
+    )
+    vault_has_priv = models.BooleanField(
+        default=False,
+        help_text="Vault holds a 'priv' field at the ref (set when the adapter touches the secret).",
     )
     status = models.CharField(max_length=32, choices=_SNMP_STATUS_CHOICES, default="unknown")
     last_sync_at = models.DateTimeField(null=True, blank=True)

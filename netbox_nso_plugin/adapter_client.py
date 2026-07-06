@@ -622,6 +622,38 @@ def put_snmp_intent(adapter_device_id, communities, v3_users, hosts, system_info
     )
 
 
+def set_secret(vault_ref, values):
+    """POST /api/v1/secrets — merge-write secret fields at a Vault ref.
+
+    ``vault_ref`` "mount/path" (multi-field) or "mount/path#key" (that field);
+    ``values`` {field: plaintext}. The plaintext transits this one call and is
+    never persisted plugin-side. Returns {"vault_ref", "version", "hashes"}
+    where hashes are sha256[:16] fingerprints per field.
+    """
+    return _request("POST", "/api/v1/secrets", json={"vault_ref": vault_ref, "values": values})
+
+
+def verify_secret(vault_ref):
+    """POST /api/v1/secrets/verify — resolve a ref without exposing values.
+
+    Returns {"vault_ref", "exists", "fields", "hashes", "version"}.
+    """
+    return _request("POST", "/api/v1/secrets/verify", json={"vault_ref": vault_ref})
+
+
+def harvest_community(adapter_device_id, community_hash, vault_ref):
+    """POST /api/v1/devices/{id}/secrets/harvest-community.
+
+    Adopt a device-held community string into Vault by its read-mirror
+    fingerprint. Returns {"vault_ref", "secret_hash", "version", "access", "acl"}.
+    """
+    return _request(
+        "POST",
+        f"/api/v1/devices/{adapter_device_id}/secrets/harvest-community",
+        json={"community_hash": community_hash, "vault_ref": vault_ref},
+    )
+
+
 def put_static_route_intent(adapter_device_id, routes):
     """PUT /api/v1/devices/{id}/static-route-intent — push full static route intent.
 

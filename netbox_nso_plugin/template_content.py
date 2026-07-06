@@ -518,7 +518,12 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
         state.last_sync_at = now
         state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
         state.save()
-    NSOSnmpCommunityState.objects.filter(management=mgmt).exclude(community_hash__in=incoming_community_hashes).delete()
+    # Owned rows absent from the payload must SURVIVE (an operator-created or
+    # just-rotated row would otherwise lose its vault_ref/status mid-flight
+    # between Accept and the device reporting the new value).
+    NSOSnmpCommunityState.objects.filter(management=mgmt).exclude(community_hash__in=incoming_community_hashes).exclude(
+        status__in=sm.OWNED_STATES
+    ).delete()
 
     # ── V3 users ───────────────────────────────────────────────────────────────
     incoming_usernames = set()
@@ -533,7 +538,9 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
         state.last_sync_at = now
         state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
         state.save()
-    NSOSnmpV3UserState.objects.filter(management=mgmt).exclude(username__in=incoming_usernames).delete()
+    NSOSnmpV3UserState.objects.filter(management=mgmt).exclude(username__in=incoming_usernames).exclude(
+        status__in=sm.OWNED_STATES
+    ).delete()
 
     # ── Hosts ──────────────────────────────────────────────────────────────────
     incoming_addresses = set()
@@ -550,7 +557,9 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
         state.last_sync_at = now
         state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
         state.save()
-    NSOSnmpHostState.objects.filter(management=mgmt).exclude(address__in=incoming_addresses).delete()
+    NSOSnmpHostState.objects.filter(management=mgmt).exclude(address__in=incoming_addresses).exclude(
+        status__in=sm.OWNED_STATES
+    ).delete()
 
     # ── System info ────────────────────────────────────────────────────────────
     sys_data = payload.get("system_info") or {}
@@ -570,7 +579,27 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
         "system_info": system_info_state,
         "last_refreshed_at": payload.get("last_refreshed_at"),
         "refresh_source": payload.get("refresh_source", "never"),
+        "snmp_value_compare": _snmp_value_compare_supported(device),
     }
+
+
+def _snmp_value_compare_supported(device) -> bool:
+    """Whether vault-vs-device community value comparison is meaningful here.
+
+    Nokia SR OS stores communities hash2-obfuscated on-device (live-confirmed),
+    so the read mirror's hash fingerprints the BLOB, never the plaintext —
+    comparison (and harvest) are impossible in principle on timos.
+    """
+    from .models import NSOPlatformNedMapping
+
+    try:
+        if device.platform_id:
+            mapping = NSOPlatformNedMapping.objects.filter(platform=device.platform).first()
+            if mapping and str(mapping.ned_id).startswith("timos"):
+                return False
+    except Exception:  # noqa: BLE001 — a mapping problem must never break the tab
+        pass
+    return True
 
 
 def _reconcile_logging_config(device, payload: dict) -> dict:

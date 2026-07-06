@@ -730,11 +730,18 @@ def _push_snmp_intent_for_device(device_id, adapter_device_id):
     ):
         if not row.vault_ref:
             continue
+        # vault_ref is a PATH ref ("mount/path"); the auth/priv fields live at
+        # "#auth"/"#priv" by convention. A leg without its protocol is not
+        # derivable on-device, so its ref is withheld (the reconciler would
+        # otherwise resolve a secret it cannot apply).
         v3_users.append(
             {
                 "username": row.username,
-                "auth_vault_ref": row.vault_ref,  # single vault_ref used for auth
-                "priv_vault_ref": None,
+                "group": row.group_name or None,
+                "auth_protocol": row.auth_protocol or None,
+                "priv_protocol": row.priv_protocol or None,
+                "auth_vault_ref": f"{row.vault_ref}#auth" if row.auth_protocol else None,
+                "priv_vault_ref": f"{row.vault_ref}#priv" if row.priv_protocol else None,
             }
         )
 
@@ -743,12 +750,23 @@ def _push_snmp_intent_for_device(device_id, adapter_device_id):
         management__device_id=device_id,
         status__in=_OWNED_PUSH_STATUSES,
     ):
+        if row.version == "v3":
+            # The host model has no v3 username source (community_hash is v1/v2c
+            # only) — pushing would configure a host keyed on an empty user.
+            logger.warning(
+                "SNMP v3 trap host %s on device %s skipped: v3 hosts are not yet pushable "
+                "(no username field on the host overlay)",
+                row.address,
+                device_id,
+            )
+            continue
         hosts.append(
             {
                 "address": row.address,
                 "version": row.version,
                 "notify_type": row.notify_type,
                 "community_or_user": row.community_hash or "",  # hash used as community label reference
+                "port": row.port,
             }
         )
 
