@@ -1848,6 +1848,34 @@ def _on_switchport_state_save(sender, instance, **kwargs):
     )
 
 
+def _isis_levels_for_state(state):
+    """Per-level tuning rows of the state's linked netbox_routing instance.
+
+    A level is accepted with its process: the fork ISISLevel rows (operator-editable)
+    ride the owned instance's push. None fields are omitted per entry; a knobless row
+    contributes nothing. No-op when the fork (or the link) is absent.
+    """
+    inst = getattr(state, "isis_instance", None)
+    if inst is None:
+        return []
+    try:
+        from netbox_routing.models import ISISLevel
+    except ImportError:
+        return []
+    out = []
+    for lv in ISISLevel.objects.filter(instance=inst).order_by("level"):
+        entry = {"level": int(lv.level)}
+        if lv.wide_metrics_only is not None:
+            entry["wide_metrics_only"] = lv.wide_metrics_only
+        if getattr(lv, "labeled_preference", None) is not None:
+            entry["labeled_preference"] = lv.labeled_preference
+        if lv.disabled is not None:
+            entry["disabled"] = lv.disabled
+        if len(entry) > 1:
+            out.append(entry)
+    return out
+
+
 def _push_isis_intent_for_device(device_id, adapter_device_id, force=False):
     """Build and push the full IS-IS intent snapshot (interfaces + processes) for a device.
 
@@ -1897,6 +1925,9 @@ def _push_isis_intent_for_device(device_id, adapter_device_id, force=False):
         proc_redist = redist_by_proc.get(row.process_tag or "", [])
         if proc_redist:
             proc_entry["redistribution"] = proc_redist
+        levels = _isis_levels_for_state(row)
+        if levels:
+            proc_entry["levels"] = levels
         processes.append(proc_entry)
 
     _push_changed(
@@ -2772,6 +2803,51 @@ def _accept_isis_interface(isis_iface) -> None:
 
 
 @_skip_on_render
+def _push_isis_for_routing_level(level) -> None:
+    """Re-push the isis intent when a fork ISISLevel of an OWNED instance changes.
+
+    Levels ride the process intent (a level is accepted with its process), so an
+    operator edit/delete on ISISLevel re-pushes the full snapshot for the owning
+    device — but only when the instance is linked to an owned NSOISISInstanceState
+    (an unowned instance's levels stay NetBox-local).
+    """
+    from .models import NSODeviceManagement, NSOISISInstanceState
+
+    inst = getattr(level, "instance", None)
+    device = getattr(inst, "device", None)
+    if device is None:
+        return
+    try:
+        mgmt = NSODeviceManagement.objects.get(device=device)
+    except NSODeviceManagement.DoesNotExist:
+        return
+    if mgmt.adapter_device_id is None:
+        return
+    if not NSOISISInstanceState.objects.filter(
+        management=mgmt,
+        process_tag=inst.process_tag or "",
+        status__in=_OWNED_PUSH_STATUSES,
+    ).exists():
+        return
+    device_id, adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
+    _schedule_intent_push(
+        (device_id, "isis"),
+        lambda: _push_isis_intent_for_device(device_id, adapter_device_id),
+    )
+
+
+@_skip_on_render
+def _on_routing_isis_level_save(sender, instance, **kwargs):
+    """netbox_routing ISISLevel created/edited → re-push the owning process intent."""
+    _push_isis_for_routing_level(instance)
+
+
+@_skip_on_render
+def _on_routing_isis_level_post_delete(sender, instance, **kwargs):
+    """Operator deletes a per-level row → push the reduced snapshot (full-replace)."""
+    _push_isis_for_routing_level(instance)
+
+
 def _on_routing_isis_interface_save(sender, instance, **kwargs):
     """netbox_routing ISISInterface created/edited → own + push."""
     _accept_isis_interface(instance)
@@ -3232,6 +3308,23 @@ def _connect_g_activated():  # pragma: no cover
         )
     except ImportError:
         logger.debug("netbox_routing not installed — flex-algo greenfield signals not registered")
+
+    # netbox_routing.ISISLevel write path (per-level tuning rides the process intent)
+    try:
+        from netbox_routing.models import ISISLevel
+
+        post_save.connect(
+            _on_routing_isis_level_save,
+            sender=ISISLevel,
+            dispatch_uid="nso_plugin_routing_isis_level_post_save",
+        )
+        post_delete.connect(
+            _on_routing_isis_level_post_delete,
+            sender=ISISLevel,
+            dispatch_uid="nso_plugin_routing_isis_level_post_delete",
+        )
+    except ImportError:
+        logger.debug("netbox_routing not installed — ISIS level signals not registered")
 
     # netbox_routing.ISISInterface greenfield write path (operator-edited metric /
     # network-type / circuit-type → owned overlay → push), parity with OSPF.

@@ -57,6 +57,25 @@ class TestIsisIntentPush(IntentPushResetMixin, TestCase):
         assert "processes" in captured and len(captured["processes"]) == 1
         return captured["processes"][0]
 
+    def test_levels_pushed_from_linked_instance(self):
+        """Per-level tuning rides the process intent: the fork ISISLevel rows of the
+        state's linked instance land as 'levels' (None fields omitted per entry) —
+        a level is accepted with its process."""
+        from netbox_routing.models import ISISInstance, ISISLevel
+
+        fork_inst = ISISInstance.objects.create(device=self.device, process_tag="", net="49.0001.00")
+        ISISLevel.objects.create(instance=fork_inst, level=2, wide_metrics_only=True, labeled_preference=7)
+        ISISLevel.objects.create(instance=fork_inst, level=1, disabled=True)
+        proc = self._push_and_capture(isis_instance=fork_inst)
+        assert proc["levels"] == [
+            {"level": 1, "disabled": True},
+            {"level": 2, "wide_metrics_only": True, "labeled_preference": 7},
+        ]
+
+    def test_no_linked_instance_pushes_no_levels(self):
+        proc = self._push_and_capture()
+        assert "levels" not in proc
+
     def test_unset_key_pushed_as_none(self):
         proc = self._push_and_capture()
         assert proc["net"] == "49.0001.00"
