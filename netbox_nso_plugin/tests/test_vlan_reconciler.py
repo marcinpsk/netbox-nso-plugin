@@ -49,6 +49,22 @@ class TestVlanReconciler(TestCase):
             NSOVLANState.objects.filter(management=self.management, vlan__group=group, vlan__vid=10).exists()
         )
 
+    def test_two_nameless_vlans_get_unique_placeholder_names(self):
+        """Live arcos shape (vlans 5/6, no names): NetBox's (group, name) unique
+        constraint rejects a SECOND name='' VLAN in the per-device group, which
+        crashed the whole category. Nameless imports synthesize 'VLAN <vid>'
+        placeholders; the drift logic already treats a nameless device VLAN as
+        always-matching, so the synthesized name never reads as drift.
+        """
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+
+        rows = reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 5, "name": ""}, {"vlan_id": 6}]})
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({r.status for r in rows}, {"imported"})
+        group = VLANGroup.objects.get(slug=f"nso-{self.device.pk}")
+        self.assertEqual(VLAN.objects.get(group=group, vid=5).name, "VLAN 5")
+        self.assertEqual(VLAN.objects.get(group=group, vid=6).name, "VLAN 6")
+
     def test_operator_rename_is_drift_not_clobbered(self):
         """Renaming a VLAN in NetBox must surface as drift, not be reverted to the device name."""
         from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database

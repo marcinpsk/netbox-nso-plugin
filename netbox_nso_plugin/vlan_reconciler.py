@@ -53,7 +53,12 @@ def _resolve_synced_vlan(management, group, vid, *, name=None, create=True):
     if state is not None:
         return state.vlan
     if create:
-        return VLAN.objects.get_or_create(group=group, vid=vid, defaults={"name": name} if name else {})[0]
+        # A nameless device VLAN (live: the arcos vlans 5/6 database) seeds a
+        # unique "VLAN <vid>" placeholder — NetBox's (group, name) unique
+        # constraint rejects a second name='' VLAN in the group. The drift logic
+        # treats a nameless device VLAN as always-matching, so the placeholder
+        # never reads back as drift.
+        return VLAN.objects.get_or_create(group=group, vid=vid, defaults={"name": name or f"VLAN {vid}"})[0]
     return VLAN.objects.filter(group=group, vid=vid).first()
 
 
