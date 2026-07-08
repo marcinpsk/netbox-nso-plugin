@@ -929,6 +929,57 @@ def _reconcile_child_levels(model, parent_field, parent, cols, levels, *, write:
     return matches
 
 
+# ISISPrefixSID columns mirrored per (interface, algorithm). Unlike the levels
+# reconcile these are mirrored EXACTLY (absent -> None): the export emits an
+# index XOR an absolute label (never both) plus only the flags a device sets, so
+# clearing the counterpart keeps the sid_index/sid_label mutual-exclusion invariant.
+_ISIS_PREFIX_SID_COLS = ("sid_index", "sid_label", "n_flag", "no_php", "explicit_null", "readvertise")
+
+
+def _reconcile_isis_prefix_sids(ri, prefix_sids, *, write: bool = True) -> bool:
+    """Per-loopback ISISPrefixSID rows for the ISISInterface *ri*, keyed by algorithm.
+
+    Clobber-safe brownfield mirror (create/update present, delete dropped); no-op
+    (matches=True) when the fork lacks ISISPrefixSID or *ri* is None. Runs under
+    suppress_intent_push so seeding never trips the accept->push signal.
+    """
+    if ri is None:
+        return True
+    try:
+        from netbox_routing.models import ISISPrefixSID
+    except Exception:
+        return True
+    incoming = {}
+    for ps in prefix_sids or []:
+        try:
+            incoming[int(ps["algorithm"])] = ps
+        except (KeyError, TypeError, ValueError):
+            continue
+    existing = {row.algorithm: row for row in ISISPrefixSID.objects.filter(interface=ri)}
+    matches = True
+    from .signals import suppress_intent_push
+
+    with suppress_intent_push():
+        for algo, data in incoming.items():
+            row = existing.get(algo) or ISISPrefixSID(interface=ri, algorithm=algo)
+            changed = row.pk is None
+            for col in _ISIS_PREFIX_SID_COLS:
+                val = data.get(col)
+                if getattr(row, col, None) != val:
+                    setattr(row, col, val)
+                    changed = True
+            if changed:
+                matches = False
+                if write:
+                    row.save()
+        for algo, row in existing.items():
+            if algo not in incoming:
+                matches = False
+                if write:
+                    row.delete()
+    return matches
+
+
 # Instance-level ISISSegmentRouting columns mirrored from the device SR bag.
 # ``node_sid_index``/``node_sid_label`` (+ their v6 twins) were refactored OUT of
 # ISISSegmentRouting into the per-loopback ``ISISPrefixSID`` child on the
@@ -1150,7 +1201,8 @@ def _isis_interface_pass(state, entry, ri, bfd_enabled, *, write: bool) -> bool:
         )
     except Exception:
         levels_matches = True
-    return scalar_matches and settings_matches and levels_matches
+    prefix_sid_matches = _reconcile_isis_prefix_sids(ri, entry.get("prefix_sids"), write=write)
+    return scalar_matches and settings_matches and levels_matches and prefix_sid_matches
 
 
 def _isis_interface_object_hash(ri) -> str:
@@ -1178,6 +1230,18 @@ def _isis_interface_object_hash(ri) -> str:
                 for r in ISISInterfaceLevel.objects.filter(interface=ri)
             ),
             key=lambda x: x["level"],
+        )
+    except Exception:
+        pass
+    try:
+        from netbox_routing.models import ISISPrefixSID
+
+        content["prefix_sids"] = sorted(
+            (
+                {"algorithm": r.algorithm, **{c: getattr(r, c, None) for c in _ISIS_PREFIX_SID_COLS}}
+                for r in ISISPrefixSID.objects.filter(interface=ri)
+            ),
+            key=lambda x: x["algorithm"],
         )
     except Exception:
         pass

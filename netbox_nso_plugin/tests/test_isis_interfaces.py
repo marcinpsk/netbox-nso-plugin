@@ -317,6 +317,63 @@ class TestReconcileIsisInterfaces(TestCase):
         self.assertEqual(ri.circuit_type, "")
         self.assertEqual(ri.network_type, "")
 
+    def test_prefix_sids_materialized_as_isis_prefixsid_rows(self):
+        """A per-loopback prefix-SID list on the interface entry creates ISISPrefixSID rows.
+
+        This is the item-86 read loop: node-SIDs the netbox-routing refactor moved out of
+        ISISSegmentRouting are now materialized per (ISISInterface, algorithm). Index and
+        absolute-label forms are mutually exclusive; flags (N/E) flow through. Exercised
+        end-to-end through the real reconcile + real netbox_routing ORM.
+        """
+        self._make_mgmt()
+        from netbox_routing.models import ISISInterface, ISISPrefixSID
+
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        entry = self._entry(
+            iface_name="GigabitEthernet0/0",
+            passive=True,
+            prefix_sids=[
+                {"algorithm": 0, "sid_index": 100006, "n_flag": True},
+                {"algorithm": 128, "sid_label": 17128, "explicit_null": True},
+            ],
+        )
+        _reconcile_isis_interfaces(self.device, self._payload(entry))
+
+        ri = ISISInterface.objects.get(interface=self.iface_ge0, address_family="ipv4")
+        sids = {p.algorithm: p for p in ISISPrefixSID.objects.filter(interface=ri)}
+        self.assertEqual(set(sids), {0, 128})
+        # base (algo 0): index form, N-flag set, no absolute label.
+        self.assertEqual(sids[0].sid_index, 100006)
+        self.assertIsNone(sids[0].sid_label)
+        self.assertTrue(sids[0].n_flag)
+        # flex-algo 128: absolute-label form, explicit-null set, no index.
+        self.assertEqual(sids[128].sid_label, 17128)
+        self.assertIsNone(sids[128].sid_index)
+        self.assertTrue(sids[128].explicit_null)
+
+    def test_prefix_sids_reconcile_is_clobber_safe_delete(self):
+        """A later payload dropping an algorithm removes that ISISPrefixSID (brownfield mirror)."""
+        self._make_mgmt()
+        from netbox_routing.models import ISISInterface, ISISPrefixSID
+
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        _reconcile_isis_interfaces(
+            self.device,
+            self._payload(
+                self._entry(prefix_sids=[{"algorithm": 0, "sid_index": 1}, {"algorithm": 128, "sid_index": 2}])
+            ),
+        )
+        ri = ISISInterface.objects.get(interface=self.iface_ge0, address_family="ipv4")
+        self.assertEqual(ISISPrefixSID.objects.filter(interface=ri).count(), 2)
+
+        # Device drops the flex-algo SID; an untouched row auto-mirrors the deletion.
+        _reconcile_isis_interfaces(
+            self.device, self._payload(self._entry(prefix_sids=[{"algorithm": 0, "sid_index": 1}]))
+        )
+        self.assertEqual(set(ISISPrefixSID.objects.filter(interface=ri).values_list("algorithm", flat=True)), {0})
+
     def test_hello_auth_recorded_on_state(self):
         """hello_auth_type / hello_auth_present flow from the adapter payload onto the
         NSOISISInterfaceState overlay (the netbox_routing write is guarded separately)."""
