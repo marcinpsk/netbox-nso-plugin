@@ -929,6 +929,35 @@ def _reconcile_child_levels(model, parent_field, parent, cols, levels, *, write:
     return matches
 
 
+# Instance-level ISISSegmentRouting columns mirrored from the device SR bag.
+# ``node_sid_index``/``node_sid_label`` (+ their v6 twins) were refactored OUT of
+# ISISSegmentRouting into the per-loopback ``ISISPrefixSID`` child on the
+# netbox-routing side. The network-state export is still instance-level, so the
+# payload may keep sending them — they are ignored here (their per-loopback home
+# is populated once the readers emit per-interface prefix-SIDs). ``srlb_*`` and
+# ``srv6_enabled`` are the newer surviving columns. Filtering against the
+# installed model's real fields tolerates fork drift in either direction, so
+# ``save(update_fields=...)`` never names a column the model lacks — a stale
+# name there raises ValueError → HTTP 500 on accept.
+_SR_INSTANCE_COLS = (
+    "enabled",
+    "srv6_enabled",
+    "prefix_sid_range",
+    "srgb_start",
+    "srgb_range",
+    "srlb_start",
+    "srlb_range",
+    "maximum_sid_depth",
+    "tunnel_table_pref",
+)
+
+
+def _sr_instance_cols(model) -> tuple[str, ...]:
+    """``_SR_INSTANCE_COLS`` restricted to the concrete fields *model* actually has."""
+    names = {f.name for f in model._meta.get_fields()}
+    return tuple(c for c in _SR_INSTANCE_COLS if c in names)
+
+
 def _reconcile_isis_segment_routing(inst, sr: dict | None, *, write: bool = True) -> bool:
     """Upsert the netbox_routing ISISSegmentRouting (1:1) for *inst* from *sr*.
 
@@ -954,18 +983,7 @@ def _reconcile_isis_segment_routing(inst, sr: dict | None, *, write: bool = True
         if exists and write:
             ISISSegmentRouting.objects.filter(instance=inst).delete()
         return not exists
-    cols = (
-        "enabled",
-        "prefix_sid_range",
-        "srgb_start",
-        "srgb_range",
-        "node_sid_index",
-        "node_sid_label",
-        "node_sid_v6_index",
-        "node_sid_v6_label",
-        "maximum_sid_depth",
-        "tunnel_table_pref",
-    )
+    cols = _sr_instance_cols(ISISSegmentRouting)
     row, created = ISISSegmentRouting.objects.get_or_create(instance=inst) if write else (None, False)
     if row is None:
         row = ISISSegmentRouting.objects.filter(instance=inst).first()
@@ -1038,18 +1056,6 @@ def _reconcile_isis_flex_algos(inst, flex_algos, *, write: bool = True) -> bool:
 
 _ISIS_LEVEL_COLS = ("default_metric", "wide_metrics_only", "preference", "labeled_preference", "disabled", "auth_type")
 _ISIS_IFACE_LEVEL_COLS = ("metric", "hello_interval", "hello_multiplier", "priority", "passive")
-_ISIS_SR_COLS = (
-    "enabled",
-    "prefix_sid_range",
-    "srgb_start",
-    "srgb_range",
-    "node_sid_index",
-    "node_sid_label",
-    "node_sid_v6_index",
-    "node_sid_v6_label",
-    "maximum_sid_depth",
-    "tunnel_table_pref",
-)
 _ISIS_FLEX_COLS = (
     "metric_type",
     "priority",
@@ -1440,7 +1446,7 @@ def _isis_instance_object_hash(inst) -> str:
         from netbox_routing.models import ISISSegmentRouting
 
         sr = ISISSegmentRouting.objects.filter(instance=inst).first()
-        content["sr"] = {c: getattr(sr, c, None) for c in _ISIS_SR_COLS} if sr else None
+        content["sr"] = {c: getattr(sr, c, None) for c in _sr_instance_cols(ISISSegmentRouting)} if sr else None
     except Exception:
         pass
     try:

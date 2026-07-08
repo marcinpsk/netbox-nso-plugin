@@ -823,6 +823,65 @@ class TestReconcileIsisProcess(TestCase):
             "an explicit empty segment_routing must delete the SR child",
         )
 
+    def test_sr_deprecated_node_sid_keys_ignored_new_cols_written(self):
+        """Instance-level node_sid_* keys are ignored (no crash); srlb_*/srv6 are mirrored.
+
+        netbox-routing refactored node_sid_index/label (+ v6) OFF ISISSegmentRouting into
+        the per-loopback ISISPrefixSID child and added srlb_start/range + srv6_enabled. The
+        network-state export is still instance-level, so the SR bag keeps carrying node_sid_*
+        — the reconcile must skip them. Before the fix they landed in save(update_fields=[...])
+        and raised ValueError ("fields do not exist in this model: node_sid_index, ...") →
+        HTTP 500 on any SR accept. Exercised end-to-end through the real reconcile + real
+        netbox_routing ORM.
+        """
+        self._make_mgmt()
+        from netbox_routing.models import ISISInstance, ISISSegmentRouting
+
+        from netbox_nso_plugin.template_content import _reconcile_isis_process
+
+        _reconcile_isis_process(
+            self.device,
+            [
+                {
+                    "process_tag": "0",
+                    "segment_routing": {
+                        "enabled": True,
+                        "prefix_sid_range": "global",
+                        "srgb_start": 16000,
+                        "srgb_range": 8000,
+                        # deprecated instance-level node-SIDs still emitted by the export:
+                        "node_sid_index": 100,
+                        "node_sid_label": 100100,
+                        "node_sid_v6_index": 200,
+                        "node_sid_v6_label": 100200,
+                        # newer surviving columns:
+                        "srlb_start": 15000,
+                        "srlb_range": 1000,
+                        "srv6_enabled": True,
+                        "maximum_sid_depth": 10,
+                        "tunnel_table_pref": 8,
+                    },
+                }
+            ],
+        )
+        inst = ISISInstance.objects.get(device=self.device, process_tag="0")
+        sr = ISISSegmentRouting.objects.get(instance=inst)
+        # Surviving + new instance columns are mirrored.
+        self.assertTrue(sr.enabled)
+        self.assertEqual(sr.prefix_sid_range, "global")
+        self.assertEqual(sr.srgb_start, 16000)
+        self.assertEqual(sr.srgb_range, 8000)
+        self.assertEqual(sr.srlb_start, 15000)
+        self.assertEqual(sr.srlb_range, 1000)
+        self.assertTrue(sr.srv6_enabled)
+        self.assertEqual(sr.maximum_sid_depth, 10)
+        self.assertEqual(sr.tunnel_table_pref, 8)
+        # node_sid_* are genuinely gone from the model (guards against a silent re-add
+        # that would resurrect the crash path).
+        model_fields = {f.name for f in ISISSegmentRouting._meta.get_fields()}
+        for gone in ("node_sid_index", "node_sid_label", "node_sid_v6_index", "node_sid_v6_label"):
+            self.assertNotIn(gone, model_fields)
+
 
 class TestReconcileIsisInterfaceLevels(TestCase):
     """per-level interface child rows."""
