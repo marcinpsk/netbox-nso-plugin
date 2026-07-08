@@ -1105,6 +1105,77 @@ def _reconcile_isis_flex_algos(inst, flex_algos, *, write: bool = True) -> bool:
     return matches
 
 
+# ISISSRv6Locator columns mirrored per (instance, name). ``prefix`` is required on
+# the model (IPNetworkField, NOT NULL), so a locator without a prefix is skipped; it
+# reads back as an IPNetwork, so it is compared stringified to avoid phantom drift
+# against the incoming CIDR string.
+_ISIS_SRV6_LOCATOR_COLS = (
+    "prefix",
+    "algorithm",
+    "is_anycast",
+    "is_micro_segment",
+    "flavor",
+    "block_length",
+    "node_length",
+    "function_length",
+    "argument_length",
+    "isis_level",
+    "enabled",
+)
+
+
+def _reconcile_isis_srv6_locators(inst, srv6_locators, *, write: bool = True) -> bool:
+    """ISISSRv6Locator rows for *inst* from the adapter's srv6-locator list (keyed by name).
+
+    Clobber-safe brownfield mirror (create/update present, delete dropped); no-op
+    (matches=True) when the fork lacks ISISSRv6Locator or *inst* is None. A locator
+    with no resolvable prefix is skipped (prefix is required on the model). Runs under
+    suppress_intent_push so seeding never trips the accept->push signal.
+    """
+    if inst is None:
+        return True
+    try:
+        from netbox_routing.models import ISISSRv6Locator
+    except Exception:
+        return True
+    incoming = {}
+    for loc in srv6_locators or []:
+        try:
+            name = str(loc["name"])
+        except (KeyError, TypeError):
+            continue
+        if name and loc.get("prefix"):  # prefix is required (IPNetworkField, NOT NULL)
+            incoming[name] = loc
+    existing = {row.name: row for row in ISISSRv6Locator.objects.filter(instance=inst)}
+    matches = True
+    from .signals import suppress_intent_push
+
+    with suppress_intent_push():
+        for name, data in incoming.items():
+            row = existing.get(name) or ISISSRv6Locator(instance=inst, name=name)
+            changed = row.pk is None
+            for col in _ISIS_SRV6_LOCATOR_COLS:
+                val = data.get(col)
+                if val is None:
+                    continue
+                cur = getattr(row, col, None)
+                # prefix reads back as an IPNetwork; compare stringified to avoid churn.
+                differs = (str(cur) != str(val)) if col == "prefix" else (cur != val)
+                if differs:
+                    setattr(row, col, val)
+                    changed = True
+            if changed:
+                matches = False
+                if write:
+                    row.save()
+        for name, row in existing.items():
+            if name not in incoming:
+                matches = False
+                if write:
+                    row.delete()
+    return matches
+
+
 _ISIS_LEVEL_COLS = ("default_metric", "wide_metrics_only", "preference", "labeled_preference", "disabled", "auth_type")
 _ISIS_IFACE_LEVEL_COLS = ("metric", "hello_interval", "hello_multiplier", "priority", "passive")
 _ISIS_FLEX_COLS = (
@@ -1468,7 +1539,8 @@ def _isis_instance_pass(state, entry, inst, *, write: bool) -> bool:
         levels_matches = True
     sr_matches = _reconcile_isis_segment_routing(inst, entry.get("segment_routing"), write=write)
     flex_matches = _reconcile_isis_flex_algos(inst, entry.get("flex_algos"), write=write)
-    return scalar_matches and settings_matches and levels_matches and sr_matches and flex_matches
+    srv6_matches = _reconcile_isis_srv6_locators(inst, entry.get("srv6_locators"), write=write)
+    return scalar_matches and settings_matches and levels_matches and sr_matches and flex_matches and srv6_matches
 
 
 def _isis_instance_object_hash(inst) -> str:
@@ -1522,6 +1594,25 @@ def _isis_instance_object_hash(inst) -> str:
                 for r in ISISFlexAlgo.objects.filter(instance=inst)
             ),
             key=lambda x: x["algo_id"],
+        )
+    except Exception:
+        pass
+    try:
+        from netbox_routing.models import ISISSRv6Locator
+
+        # prefix is an IPNetwork; stringify so the hash is stable vs the device CIDR string.
+        content["srv6"] = sorted(
+            (
+                {
+                    "name": r.name,
+                    **{
+                        c: (str(getattr(r, c)) if c == "prefix" else getattr(r, c, None))
+                        for c in _ISIS_SRV6_LOCATOR_COLS
+                    },
+                }
+                for r in ISISSRv6Locator.objects.filter(instance=inst)
+            ),
+            key=lambda x: x["name"],
         )
     except Exception:
         pass

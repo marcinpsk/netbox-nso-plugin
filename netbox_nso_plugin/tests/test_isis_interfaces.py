@@ -1020,3 +1020,39 @@ class TestReconcileIsisInterfaceLevels(TestCase):
         self.assertEqual(set(fas), {128})  # auto-mirrored
         self.assertEqual(fas[128].metric_type, "delay-metric")  # auto-mirrored
         self.assertEqual(states[0].status, "imported")
+
+    def test_routing_instance_srv6_locators(self):
+        """ISISSRv6Locator rows are reconciled (full-replace by name), no churn, clobber-safe."""
+        self._make_mgmt()
+        from netbox_routing.models import ISISInstance, ISISSRv6Locator
+
+        from netbox_nso_plugin.template_content import _reconcile_isis_process
+
+        payload = [
+            {
+                "process_tag": "0",
+                "srv6_locators": [
+                    {"name": "LOC1", "prefix": "2001:db8:a1::/64", "algorithm": 128, "enabled": True},
+                    {"name": "LOC2", "prefix": "2001:db8:a2::/64", "enabled": True},
+                ],
+            }
+        ]
+        _reconcile_isis_process(self.device, payload)
+        inst = ISISInstance.objects.get(device=self.device, process_tag="0")
+        locs = {loc.name: loc for loc in ISISSRv6Locator.objects.filter(instance=inst)}
+        self.assertEqual(set(locs), {"LOC1", "LOC2"})
+        self.assertEqual(str(locs["LOC1"].prefix), "2001:db8:a1::/64")
+        self.assertEqual(locs["LOC1"].algorithm, 128)
+        self.assertTrue(locs["LOC1"].enabled)
+
+        # Re-running the SAME payload with the object untouched must be a no-op: the
+        # IPNetwork prefix is compared stringified, so it does NOT churn to 'changed'.
+        states = _reconcile_isis_process(self.device, payload)
+        self.assertEqual(states[0].status, "imported")
+
+        # 3-way: device drops LOC2; an untouched object auto-mirrors the deletion.
+        _reconcile_isis_process(
+            self.device,
+            [{"process_tag": "0", "srv6_locators": [{"name": "LOC1", "prefix": "2001:db8:a1::/64"}]}],
+        )
+        self.assertEqual(set(ISISSRv6Locator.objects.filter(instance=inst).values_list("name", flat=True)), {"LOC1"})
