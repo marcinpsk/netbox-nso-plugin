@@ -1056,3 +1056,27 @@ class TestReconcileIsisInterfaceLevels(TestCase):
             [{"process_tag": "0", "srv6_locators": [{"name": "LOC1", "prefix": "2001:db8:a1::/64"}]}],
         )
         self.assertEqual(set(ISISSRv6Locator.objects.filter(instance=inst).values_list("name", flat=True)), {"LOC1"})
+
+    def test_routing_instance_attached_bit(self):
+        """suppress/ignore-attached-bit flow onto ISISInstance; re-reconcile stays in sync."""
+        self._make_mgmt()
+        from netbox_routing.models import ISISInstance
+
+        from netbox_nso_plugin.template_content import _reconcile_isis_process
+
+        payload = [{"process_tag": "0", "suppress_attached_bit": True, "ignore_attached_bit": True}]
+        _reconcile_isis_process(self.device, payload)
+        inst = ISISInstance.objects.get(device=self.device, process_tag="0")
+        self.assertTrue(inst.suppress_attached_bit)
+        self.assertTrue(inst.ignore_attached_bit)
+
+        # Re-running the same payload with the object untouched is a no-op (stays imported).
+        states = _reconcile_isis_process(self.device, payload)
+        self.assertEqual(states[0].status, "imported")
+
+        # A payload that stops reporting the knobs leaves the accepted values intact
+        # (emit-True-only convention: absence is "not reported", never a forced clear).
+        _reconcile_isis_process(self.device, [{"process_tag": "0"}])
+        inst.refresh_from_db()
+        self.assertTrue(inst.suppress_attached_bit)
+        self.assertTrue(inst.ignore_attached_bit)
