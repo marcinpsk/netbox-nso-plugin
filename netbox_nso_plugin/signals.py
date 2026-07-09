@@ -1906,6 +1906,9 @@ def _push_isis_intent_for_device(device_id, adapter_device_id, force=False):
                 "network_type": row.network_type,
                 "metric": row.metric,
                 "passive": row.passive or False,
+                # tri-state: None passes through the adapter's optional bfd_enabled
+                # (no wire leaf emitted → reconcile leaves brownfield BFD untouched).
+                "bfd_enabled": row.bfd_enabled,
             }
         )
 
@@ -2829,6 +2832,9 @@ def _accept_isis_interface(isis_iface) -> None:
     state.network_type = isis_iface.network_type or ""
     state.metric = isis_iface.metric
     state.passive = bool(isis_iface.passive)
+    # tri-state (None/True/False preserved verbatim): clearing bfd_enabled on the
+    # ISISInterface flows None into the overlay → the push retracts the owned BFD.
+    state.bfd_enabled = getattr(isis_iface, "bfd_enabled", None)
     state.isis_interface = isis_iface
     state.last_sync_at = timezone.now()
     state.save()  # → _on_isis_interface_state_save schedules the push

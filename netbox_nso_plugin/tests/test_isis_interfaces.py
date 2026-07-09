@@ -406,6 +406,130 @@ class TestReconcileIsisInterfaces(TestCase):
             ri.refresh_from_db()
             self.assertTrue(ri.bfd_enabled)
 
+    def test_bfd_enabled_mirrored_onto_unowned_overlay(self):
+        """Device bfd_enabled mirrors onto the (unowned) overlay too, so the write path
+        (push/drift) reads the same tri-state the read path wrote to netbox-routing.
+
+        None on the device stays None on the overlay: no opinion → the reconcile leaves
+        any brownfield BFD untouched ('we don't delete what we don't have')."""
+        self._make_mgmt()
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        state = _reconcile_isis_interfaces(self.device, self._payload(self._entry(bfd_enabled=True)))[0]
+        self.assertTrue(state.bfd_enabled)
+        # A later payload with no BFD reported → None on the (still unowned) overlay.
+        state2 = _reconcile_isis_interfaces(self.device, self._payload(self._entry(bfd_enabled=None)))[0]
+        self.assertIsNone(state2.bfd_enabled)
+
+    def test_greenfield_bfd_enabled_owns_overlay_and_is_pushed(self):
+        """Operator sets bfd_enabled on the ISISInterface → owned overlay carries it, and
+        the IS-IS interface push emits bfd_enabled (drive IS-IS BFD from the plugin UI)."""
+        from unittest.mock import patch
+
+        from netbox_routing.models import ISISInstance, ISISInterface
+
+        from netbox_nso_plugin import adapter_client
+        from netbox_nso_plugin.models import NSOISISInterfaceState
+        from netbox_nso_plugin.signals import _push_isis_intent_for_device
+
+        mgmt = self._make_mgmt()
+        inst = ISISInstance.objects.create(device=self.device, process_tag="")
+        with patch("netbox_nso_plugin.adapter_client.put_isis_interface_intent"):
+            with self.captureOnCommitCallbacks(execute=True):
+                ISISInterface.objects.create(
+                    interface=self.iface_ge1, address_family="ipv4", instance=inst, bfd_enabled=True
+                )
+        state = NSOISISInterfaceState.objects.get(management=mgmt, interface=self.iface_ge1, af="ipv4")
+        self.assertEqual(state.status, "accepted")
+        self.assertTrue(state.bfd_enabled)
+
+        captured = {}
+
+        def _fake_put(adapter_id, interfaces, processes=None):
+            captured["interfaces"] = interfaces
+
+        orig = adapter_client.put_isis_interface_intent
+        adapter_client.put_isis_interface_intent = _fake_put
+        try:
+            _push_isis_intent_for_device(mgmt.device_id, mgmt.adapter_device_id, force=True)
+        finally:
+            adapter_client.put_isis_interface_intent = orig
+        entry = next(i for i in captured["interfaces"] if i["interface_name"] == "GigabitEthernet0/1")
+        self.assertTrue(entry["bfd_enabled"])
+
+    def test_clearing_bfd_enabled_flows_none_into_owned_overlay(self):
+        """Clearing bfd_enabled on an owned ISISInterface flows None into the overlay so the
+        adapter's retract fires — 'clearing a setting still remembers we own that intent'."""
+        from unittest.mock import patch
+
+        from netbox_routing.models import ISISInstance, ISISInterface
+
+        from netbox_nso_plugin.models import NSOISISInterfaceState
+
+        mgmt = self._make_mgmt()
+        inst = ISISInstance.objects.create(device=self.device, process_tag="")
+        with patch("netbox_nso_plugin.adapter_client.put_isis_interface_intent"):
+            with self.captureOnCommitCallbacks(execute=True):
+                ri = ISISInterface.objects.create(
+                    interface=self.iface_ge1, address_family="ipv4", instance=inst, bfd_enabled=True
+                )
+        state = NSOISISInterfaceState.objects.get(management=mgmt, interface=self.iface_ge1, af="ipv4")
+        self.assertTrue(state.bfd_enabled)
+        # Operator unchecks BFD → None flows into the owned overlay (retract on push).
+        with patch("netbox_nso_plugin.adapter_client.put_isis_interface_intent"):
+            with self.captureOnCommitCallbacks(execute=True):
+                ri.bfd_enabled = None
+                ri.save()
+        state.refresh_from_db()
+        self.assertIsNone(state.bfd_enabled)
+
+    def test_owned_bfd_enabled_blocks_in_sync_until_device_catches_up(self):
+        """An owned bfd_enabled=True intent keeps the row pending until the device reports BFD."""
+        from unittest.mock import patch
+
+        from netbox_routing.models import ISISInstance, ISISInterface
+
+        from netbox_nso_plugin.models import NSOISISInterfaceState
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        mgmt = self._make_mgmt()
+        inst = ISISInstance.objects.create(device=self.device, process_tag="")
+        with patch("netbox_nso_plugin.adapter_client.put_isis_interface_intent"):
+            with self.captureOnCommitCallbacks(execute=True):
+                ISISInterface.objects.create(
+                    interface=self.iface_ge0, address_family="ipv4", instance=inst, bfd_enabled=True
+                )
+        state = NSOISISInterfaceState.objects.get(management=mgmt, interface=self.iface_ge0, af="ipv4")
+        # Device does NOT yet report BFD → owned row stays pending (not premature in_sync).
+        _reconcile_isis_interfaces(self.device, self._payload(self._entry(circuit_type="", bfd_enabled=None)))
+        state.refresh_from_db()
+        self.assertEqual(state.status, "accepted")
+        # Device catches up (reports bfd_enabled=True) → settles in_sync.
+        _reconcile_isis_interfaces(self.device, self._payload(self._entry(circuit_type="", bfd_enabled=True)))
+        state.refresh_from_db()
+        self.assertEqual(state.status, "in_sync")
+
+    def test_isis_device_matches_intent_bfd_tri_state(self):
+        """The owned-row drift matcher treats bfd_enabled as tri-state: a None intent
+        expresses no opinion (never blocks in_sync); True/False must match the device."""
+        from types import SimpleNamespace
+
+        from netbox_nso_plugin.template_content import _isis_device_matches_intent
+
+        base = {"metric": None, "network_type": "", "circuit_type": "", "passive": False}
+
+        def st(bfd):
+            return SimpleNamespace(metric=None, network_type="", circuit_type="", passive=False, bfd_enabled=bfd)
+
+        # None intent → matches regardless of the device's BFD (no opinion).
+        self.assertTrue(_isis_device_matches_intent({**base, "bfd_enabled": True}, st(None)))
+        # True intent: device with BFD matches; device without does not.
+        self.assertTrue(_isis_device_matches_intent({**base, "bfd_enabled": True}, st(True)))
+        self.assertFalse(_isis_device_matches_intent({**base, "bfd_enabled": None}, st(True)))
+        # False intent: device disabled matches; device enabled does not.
+        self.assertTrue(_isis_device_matches_intent({**base, "bfd_enabled": False}, st(False)))
+        self.assertFalse(_isis_device_matches_intent({**base, "bfd_enabled": True}, st(False)))
+
     def test_no_hello_auth_defaults_blank(self):
         """An entry without hello-auth leaves the state blank/false."""
         self._make_mgmt()

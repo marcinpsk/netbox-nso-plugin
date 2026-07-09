@@ -1248,6 +1248,9 @@ def _isis_device_matches_intent(entry, state) -> bool:
         and (entry.get("network_type") or "") == (state.network_type or "")
         and (entry.get("circuit_type") or "") == (state.circuit_type or "")
         and bool(entry.get("passive", False)) == bool(state.passive)
+        # tri-state: a None intent expresses no opinion, so it never blocks in_sync
+        # (we don't own the device's BFD); True/False must match the device verbatim.
+        and (state.bfd_enabled is None or bool(entry.get("bfd_enabled")) == bool(state.bfd_enabled))
     )
 
 
@@ -1421,6 +1424,8 @@ def _reconcile_isis_interfaces(device, interfaces: list) -> list:
             state.network_type = entry.get("network_type") or ""
             state.metric = entry.get("metric")
             state.passive = bool(entry.get("passive", False))
+            # tri-state, mirror the device verbatim (None when the NED reports no BFD)
+            state.bfd_enabled = entry.get("bfd_enabled")
             state.hello_auth_type = entry.get("hello_auth_type") or ""
             state.hello_auth_present = bool(entry.get("hello_auth_present", False))
         state.last_sync_at = now

@@ -1186,6 +1186,10 @@ class NSOISISInterfaceState(_NSODeviceTabURLMixin, NetBoxModel):
     network_type = models.CharField(max_length=32, blank=True, default="")
     metric = models.PositiveIntegerField(null=True, blank=True)
     passive = models.BooleanField(default=False)
+    # IS-IS BFD enablement, tri-state (null = no opinion / NED default → reconcile
+    # never touches brownfield BFD; True = enable, False = explicitly disable). The
+    # write intent carries it so an operator can drive IS-IS BFD from the plugin UI.
+    bfd_enabled = models.BooleanField(null=True, blank=True)
     # Per-interface IIH (hello) authentication, secret-safe (type + present flag;
     # the key is never imported — Junos exports it $9$-encrypted, Nokia hides it).
     hello_auth_type = models.CharField(max_length=32, blank=True, default="")
