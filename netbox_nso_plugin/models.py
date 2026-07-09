@@ -1525,6 +1525,12 @@ class NSORoutePolicyState(SharedObjectStateMixin, _NSODeviceTabURLMixin, NetBoxM
     accepted_at = models.DateTimeField(null=True, blank=True)
     last_apply_at = models.DateTimeField(null=True, blank=True)
     last_apply_error = models.TextField(blank=True, default="")
+    # community-list members this device's NED cannot hold (e.g. a wildcard color on
+    # Nokia). The adapter reports them on intent push; they are surfaced as "unsupported
+    # on <ned>" so an operator understands why an owned object may sit at "pending apply"
+    # (the codec silently skips them on the device) instead of it looking like an
+    # unexplained/suspicious phantom. Deterministic per (member, ned); [] when all apply.
+    unsupported_members = models.JSONField(default=list, blank=True)
 
     class Meta:
         ordering = ["management", "family", "object_name"]

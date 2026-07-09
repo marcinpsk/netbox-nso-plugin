@@ -520,3 +520,73 @@ class TestOwnershipCascade(_RPBase):
         assert NSORoutePolicyState.objects.filter(
             management=mgmt, family="as_path", object_name="50", status="accepted"
         ).exists()
+
+
+class TestUnsupportedMembersStorage(_RPBase):
+    """The adapter reports community members this device's NED can't hold; the push
+    stores them on the overlay so the UI can show "unsupported on <ned>" instead of a
+    suspicious unexplained "pending apply". Real ORM rows; only the adapter PUT is faked."""
+
+    def _community_overlay(self, name="cnad-test", members=("6830:*", "color:0:12.")):
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import Community, CommunityList, CommunityListEntry
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        mgmt = self._mgmt()
+        cl = CommunityList.objects.create(name=name)
+        for i, value in enumerate(members, start=1):
+            CommunityListEntry.objects.create(
+                community_list=cl, action="permit", community=Community.objects.create(community=value)
+            )
+        with suppress_intent_push():
+            state = NSORoutePolicyState.objects.create(
+                management=mgmt,
+                family="community_list",
+                object_name=name,
+                content_type=ContentType.objects.get_for_model(CommunityList),
+                object_id=cl.pk,
+                status="accepted",
+            )
+        return mgmt, state
+
+    def _push(self, mgmt, resp):
+        from netbox_nso_plugin.signals import _push_route_policy_intent_for_device
+
+        with patch("netbox_nso_plugin.adapter_client.put_route_policy_intent", side_effect=lambda a, o: resp):
+            _push_route_policy_intent_for_device(mgmt.device_id, mgmt.adapter_device_id, force=True)
+
+    def test_unsupported_members_stored_from_adapter_response(self):
+        mgmt, state = self._community_overlay()
+        self._push(mgmt, {"objects": [], "unsupported_members": {"cnad-test": ["color:0:12."]}})
+        state.refresh_from_db()
+        assert state.unsupported_members == ["color:0:12."]
+
+    def test_object_absent_from_map_is_cleared_to_empty(self):
+        # A previously-flagged member that now applies (or a fully-representable object)
+        # must be cleared, else a stale "unsupported" badge lingers forever.
+        mgmt, state = self._community_overlay()
+        state.unsupported_members = ["color:0:12."]
+        state.save(update_fields=["unsupported_members"])
+        self._push(mgmt, {"objects": [], "unsupported_members": {}})
+        state.refresh_from_db()
+        assert state.unsupported_members == []
+
+    def test_skipped_unchanged_push_preserves_recorded_members(self):
+        # force=False + unchanged payload → the adapter PUT is skipped (resp=None); the
+        # last-recorded unsupported set (deterministic per member+ned) must be kept.
+        from netbox_nso_plugin.signals import _push_route_policy_intent_for_device
+
+        mgmt, state = self._community_overlay()
+        state.unsupported_members = ["color:0:12."]
+        state.save(update_fields=["unsupported_members"])
+        # Prime the change-detection cache so the next non-force push is skipped-unchanged.
+        self._push(mgmt, {"objects": [], "unsupported_members": {"cnad-test": ["color:0:12."]}})
+        with patch(
+            "netbox_nso_plugin.adapter_client.put_route_policy_intent",
+            side_effect=AssertionError("PUT must not run when unchanged"),
+        ):
+            _push_route_policy_intent_for_device(mgmt.device_id, mgmt.adapter_device_id, force=False)
+        state.refresh_from_db()
+        assert state.unsupported_members == ["color:0:12."]

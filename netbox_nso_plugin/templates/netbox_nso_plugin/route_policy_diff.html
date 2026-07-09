@@ -21,6 +21,17 @@
         {% if device %}on <a href="{% url 'dcim:device_nso' pk=device.pk %}">{{ device }}</a>{% endif %}
       </h5>
       <div class="card-body">
+        {% if state.unsupported_members %}
+        <div class="alert alert-warning">
+          <span class="mdi mdi-alert-outline me-1"></span>
+          <strong>{{ state.unsupported_members|length }} member{{ state.unsupported_members|length|pluralize }} unsupported on this device's NED</strong>
+          — the adapter silently skips {% if state.unsupported_members|length == 1 %}it{% else %}them{% endif %} on Apply
+          (no exact device form), so this object can sit at <em>pending apply</em> even though a push changes nothing.
+          Remove {% if state.unsupported_members|length == 1 %}it{% else %}them{% endif %} from the NetBox object, or accept
+          {% if state.unsupported_members|length == 1 %}it stays{% else %}they stay{% endif %} NetBox-only:
+          {% for m in state.unsupported_members %}<code>{{ m }}</code>{% if not forloop.last %}, {% endif %}{% endfor %}.
+        </div>
+        {% endif %}
         <p class="text-muted">
           The full list in order: <strong>Device (now)</strong> is what the box reports on-box,
           <strong>NetBox (after push)</strong> is the list a push would write — read it top to

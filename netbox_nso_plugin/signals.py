@@ -192,24 +192,29 @@ def _drain_intent_pushes() -> None:
             logger.warning("Coalesced intent push failed: %s", exc)
 
 
-def _push_changed(key, payload, do_push, force=False) -> None:
+def _push_changed(key, payload, do_push, force=False):
     """Run *do_push* only if *payload* differs from the last push for *key*.
 
     ``do_push`` performs the actual ``client.put_*`` call. Errors are swallowed
     (matching the adapter-unreachable tolerance elsewhere) and the cache is left
     unchanged on failure so the next attempt retries. ``force`` bypasses the
     unchanged-skip (used by the explicit device Apply, which must always commit).
+
+    Returns the ``do_push()`` result on a push that ran (so a caller can read the
+    adapter's response, e.g. the route-policy ``unsupported_members`` map), or ``None``
+    when the push was skipped-unchanged or failed. Most callers ignore the return.
     """
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
     if not force and _last_pushed_hashes.get(key) == digest:
         logger.debug("Intent push skipped (unchanged) for %s", key)
-        return
+        return None
     try:
-        do_push()
+        result = do_push()
     except Exception as exc:  # noqa: BLE001 — adapter may be down; log and retry next time
         logger.warning("Intent push failed for %s: %s", key, exc)
-        return
+        return None
     _last_pushed_hashes[key] = digest
+    return result
 
 
 def _push_interface_intent_for_device(device_id, adapter_device_id, force=False) -> None:
@@ -2163,11 +2168,15 @@ def _push_route_policy_intent_for_device(device_id, adapter_device_id, force=Fal
     from . import adapter_client as client
     from .models import NSORoutePolicyState
 
+    owned_rows = list(
+        NSORoutePolicyState.objects.filter(
+            management__device_id=device_id,
+            status__in=_OWNED_PUSH_STATUSES,
+        ).select_related("management")
+    )
+
     objects = []
-    for row in NSORoutePolicyState.objects.filter(
-        management__device_id=device_id,
-        status__in=_OWNED_PUSH_STATUSES,
-    ).select_related("management"):
+    for row in owned_rows:
         # Build the entries payload from the associated NetBox object via the GFK.
         obj = row.assigned_object
         if obj is None:
@@ -2193,12 +2202,35 @@ def _push_route_policy_intent_for_device(device_id, adapter_device_id, force=Fal
             }
         )
 
-    _push_changed(
+    resp = _push_changed(
         (device_id, "route_policy"),
         objects,
         lambda: client.put_route_policy_intent(adapter_device_id, objects),
         force=force,
     )
+    _store_unsupported_members(owned_rows, resp)
+
+
+def _store_unsupported_members(owned_rows, resp) -> None:
+    """Persist the adapter's per-object ``unsupported_members`` map onto the overlay rows.
+
+    The adapter reports which community-list members this device's NED cannot hold
+    (e.g. a wildcard color on Nokia — the codec silently skips them). Recording them
+    lets the device tab show "unsupported on <ned>" so an owned object sitting at
+    "pending apply" is explained rather than a suspicious phantom. Only community-list
+    rows carry members; a row absent from the map (or all rows, when the push was
+    skipped-unchanged / the adapter is old) is cleared to ``[]``. Runs under
+    ``suppress_intent_push`` so these mirror writes don't re-fire the edit handlers.
+    """
+    if resp is None:
+        return  # push skipped-unchanged or failed — keep whatever we last recorded
+    unsupported = resp.get("unsupported_members") or {}
+    with suppress_intent_push():
+        for row in owned_rows:
+            members = unsupported.get(row.object_name, []) if row.family == "community_list" else []
+            if list(row.unsupported_members or []) != list(members):
+                row.unsupported_members = members
+                row.save(update_fields=["unsupported_members"])
 
 
 def _build_community_list_entries(obj):
