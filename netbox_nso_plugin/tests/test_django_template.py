@@ -373,3 +373,19 @@ class TestInterfaceNSOBadge(TestCase):
             badge.right_page()
 
         self.assertIsNone(captured.get("derived_intent_match"))
+
+
+class TestCliDiffDevicesSubtreeToggle(SimpleTestCase):
+    """#92: the apply modal ships the cli-diff devices-subtree filter + its toggle.
+
+    The filter's tree logic is exercised functionally in the browser (it is exposed
+    as window.nsoCliDevicesSubtree for exactly that); this guards the wiring so a
+    template refactor can't silently drop the toggle.
+    """
+
+    def test_tab_template_ships_filter_and_toggle(self):
+        tpl = pathlib.Path(__file__).resolve().parent.parent / "templates/netbox_nso_plugin/device_nso_tab.html"
+        src = tpl.read_text()
+        self.assertIn("data-clidevonly", src)  # the toggle button
+        self.assertIn("window.nsoCliDevicesSubtree", src)  # the exposed filter
+        self.assertIn("cliDevicesOnly", src)  # the state the renderer honours

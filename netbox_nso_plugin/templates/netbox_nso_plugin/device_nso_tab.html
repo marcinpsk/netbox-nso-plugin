@@ -562,7 +562,25 @@
     // ── diff rendering: NSO `outformat cli` (+/- tree diff) through the vendored
     //    diff2html; device-native syntax available behind a toggle. ──────────────
     var diffMode = 'line-by-line';           // 'line-by-line' | 'side-by-side' | 'native'
+    var cliDevicesOnly = true;               // #92: hide the intent-tree part of the cli diff
     var previewCache = {};                   // outformat → parsed preview response
+
+    // #92: reduce the cli tree-diff to its top-level `devices { … }` block. The cli
+    // outformat shows the WHOLE NSO transaction — device config plus the intent-tree
+    // (service) changes, which usually duplicate what the intent panel already lists.
+    // Depth-tracked over the brace tree, so nested blocks named "devices" elsewhere
+    // never match. Exposed on window for functional verification.
+    function devicesSubtreeOnly(text) {
+      var out = [], depth = 0, keeping = false;
+      String(text).replace(/\n$/, '').split('\n').forEach(function (l) {
+        if (depth === 0) keeping = /^devices\b/.test(l.replace(/^[-+ ]/, '').trim());
+        if (keeping) out.push(l);
+        depth += (l.match(/{/g) || []).length - (l.match(/}/g) || []).length;
+        if (depth < 0) depth = 0;
+      });
+      return out.join('\n');
+    }
+    window.nsoCliDevicesSubtree = devicesSubtreeOnly;
 
     function cliToUnified(scope, text) {
       // NSO's cli output is already a +/- annotated tree; wrap it as a unified-diff
@@ -589,7 +607,17 @@
         return '<p class="text-muted mb-0">No device change — the intent already matches the device (or the diff is unavailable).</p>';
       }
       if (d.outformat === 'cli' && window.Diff2Html) {
-        var unified = keys.map(function (k) { return cliToUnified(k.replace(/_/g, ' '), diff[k]); }).join('');
+        var unified = keys.map(function (k) {
+          var text = diff[k];
+          if (cliDevicesOnly) {
+            var filtered = devicesSubtreeOnly(text);
+            // an intent-only change (e.g. a NED-unrepresentable member) has no device
+            // subtree at all — say so instead of rendering an empty hunk
+            text = filtered.trim() ? filtered
+                 : '(intent-tree change only — no device config delta; toggle "Device subtree" off to view it)';
+          }
+          return cliToUnified(k.replace(/_/g, ' '), text);
+        }).join('');
         try {
           return Diff2Html.html(unified, {
             drawFileList: false,
@@ -614,11 +642,18 @@
         return '<button type="button" class="btn btn-outline-secondary btn-sm' + active + '" data-diffmode="' + mode + '">'
              + '<span class="mdi ' + icon + ' me-1"></span>' + label + '</button>';
       }
+      // #92: the devices-subtree filter applies to the cli tree-diff only (native IS
+      // device syntax) — the toggle renders just for the diff2html modes.
+      var subtree = diffMode === 'native' ? '' :
+        '<div class="btn-group btn-group-sm ms-2" role="group" aria-label="Diff scope">'
+        + '<button type="button" class="btn btn-outline-secondary btn-sm' + (cliDevicesOnly ? ' active' : '') + '"'
+        + ' data-clidevonly="1" title="Show only the devices subtree of the NSO transaction — hide the intent-tree (service) part">'
+        + '<span class="mdi mdi-router me-1"></span>Device subtree</button></div>';
       return '<div class="btn-group btn-group-sm ms-auto" role="group" aria-label="Diff format">'
            + btn('line-by-line', 'mdi-format-list-text', 'Unified')
            + btn('side-by-side', 'mdi-view-split-vertical', 'Split')
            + btn('native', 'mdi-console', 'Device syntax')
-           + '</div>';
+           + '</div>' + subtree;
     }
 
     function renderPreview(d) {
@@ -654,6 +689,8 @@
 
     if (modalBody) {
       modalBody.addEventListener('click', function (ev) {
+        var t = ev.target.closest('[data-clidevonly]');
+        if (t) { cliDevicesOnly = !cliDevicesOnly; rerenderPreview(); return; }
         var b = ev.target.closest('[data-diffmode]');
         if (!b) return;
         diffMode = b.dataset.diffmode;
