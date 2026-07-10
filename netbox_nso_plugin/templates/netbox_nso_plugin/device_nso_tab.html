@@ -257,6 +257,43 @@
     </div>
   </div>
 
+  {# ── Blocked removals (collateral guard) — filled by the jobs poll below ── #}
+  {# A removal the adapter refused because the PUT-replace would flush service rows  #}
+  {# nobody removed (orphaned intent). Persists until the operator re-accepts the    #}
+  {# rows or forces the removal — unlike the job strip, it is not displaced by later #}
+  {# jobs. Capability transparency: while blocked, the retraction is NOT on the device. #}
+  <div id="nso-blocked-removals" class="mb-3 d-none"></div>
+  <template id="nso-blocked-removal-tpl">
+    <div class="alert alert-danger d-flex align-items-start mb-2" role="alert">
+      <span class="mdi mdi-shield-alert-outline me-2 mt-1"></span>
+      <div class="flex-grow-1">
+        <strong>Removal blocked — orphaned <span data-slot="scope"></span> service rows.</strong>
+        Retracting the removed intent would also flush rows nobody removed (stale service
+        rows whose deletion never reached NSO). Nothing was committed:
+        <strong>the intent retraction is not enforced on the device</strong> until this is
+        resolved. Re-accept the rows below in NetBox to keep them on the device, or force
+        the removal to retract them deliberately.
+        <ul class="mb-1 mt-1" data-slot="orphans"></ul>
+        <details class="mb-2">
+          <summary class="small">Dry-run preview of the refused device change</summary>
+          <pre class="small border rounded p-2 mt-1 mb-0"
+               style="max-height: 20rem; overflow: auto; white-space: pre-wrap;"
+               data-slot="preview"></pre>
+        </details>
+        <form method="post" class="d-inline"
+              action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_force_removal' mgmt.pk %}"
+              onsubmit="return confirm('Force removal will RETRACT the listed orphaned rows from the live device. Continue?');">
+          {% csrf_token %}
+          <input type="hidden" name="scope" value="">
+          <button type="submit" class="btn btn-sm btn-danger">
+            <span class="mdi mdi-delete-alert"></span> Force removal
+          </button>
+        </form>
+        <span class="small text-muted ms-2">Job #<span data-slot="job"></span> · blocked <span data-slot="when"></span></span>
+      </div>
+    </div>
+  </template>
+
   {# ── Job activity (loaded on tab open; shows any running job + last finished) ── #}
   <div id="nso-job-activity" class="mb-3"
        data-jobs-url="{% url 'plugins:netbox_nso_plugin:device_nso_jobs' pk=object.pk %}"></div>
@@ -307,11 +344,42 @@
         box.innerHTML = '';
       }
     }
+    var blockedBox = document.getElementById('nso-blocked-removals');
+    var blockedTpl = document.getElementById('nso-blocked-removal-tpl');
+    function renderBlocked(list) {
+      if (!blockedBox || !blockedTpl) return;
+      blockedBox.innerHTML = '';
+      if (!list || !list.length) { blockedBox.classList.add('d-none'); return; }
+      blockedBox.classList.remove('d-none');
+      list.forEach(function (b) {
+        var node = blockedTpl.content.cloneNode(true);
+        node.querySelector('[data-slot="scope"]').textContent = b.scope;
+        var ul = node.querySelector('[data-slot="orphans"]');
+        (b.orphan_interfaces || []).forEach(function (k) {
+          var li = document.createElement('li');
+          li.textContent = Array.isArray(k) ? 'Interface ' + k[0] + ' (' + (k[1] || 'ipv4') + ')' : 'Interface ' + k;
+          ul.appendChild(li);
+        });
+        (b.orphan_processes || []).forEach(function (p) {
+          var li = document.createElement('li');
+          li.textContent = 'Process "' + (p || 'default') + '"';
+          ul.appendChild(li);
+        });
+        var pre = node.querySelector('[data-slot="preview"]');
+        if (b.preview) { pre.textContent = b.preview; }
+        else { pre.closest('details').classList.add('d-none'); }
+        node.querySelector('input[name="scope"]').value = b.scope;
+        node.querySelector('[data-slot="job"]').textContent = b.job_id;
+        node.querySelector('[data-slot="when"]').textContent = rel(b.blocked_at) || '';
+        blockedBox.appendChild(node);
+      });
+    }
     function poll() {
       fetch(url, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
         .then(function (r) { return r.json(); })
         .then(function (d) {
           render(d);
+          renderBlocked(d && d.blocked_removals);
           var running = !!(d && d.running);
           if (running && !timer) { timer = setInterval(poll, 4000); }
           else if (!running && timer) { clearInterval(timer); timer = null; }

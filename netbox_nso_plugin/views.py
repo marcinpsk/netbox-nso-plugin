@@ -1571,6 +1571,52 @@ class NSOAdapterLinkRetryView(NSOActionPermissionMixin, View):
         return redirect(_device_nso_tab_url(mgmt.device.pk))
 
 
+class NSOForceRemovalView(NSOActionPermissionMixin, View):
+    """POST: re-run a blocked removal with the adapter's collateral guard disabled.
+
+    The operator override for a ``removal_blocked_collateral`` failure: the tab banner
+    shows the orphaned service rows and the dry-run device delta the adapter refused to
+    commit; this deliberately flushes them (the adapter re-runs the scope's PUT-replace
+    with ``force=true``). Destructive by design — the button carries a confirm dialog.
+    """
+
+    def post(self, request, pk):
+        """Queue the forced removal for the POSTed scope and report the job id."""
+        from . import adapter_client as client
+
+        mgmt = get_object_or_404(NSODeviceManagement, pk=pk)
+        is_ajax = request.headers.get("X-Requested-With") == "XMLHttpRequest"
+        scope = (request.POST.get("scope") or "").strip()
+
+        if not scope:
+            if is_ajax:
+                return JsonResponse({"status": "error", "message": "Missing removal scope."}, status=400)
+            messages.error(request, "Missing removal scope.")
+            return redirect(_device_nso_tab_url(mgmt.device.pk))
+        if mgmt.adapter_device_id is None:
+            msg = "Device is not yet onboarded to the adapter."
+            if is_ajax:
+                return JsonResponse({"status": "error", "message": msg}, status=409)
+            messages.warning(request, msg)
+            return redirect(_device_nso_tab_url(mgmt.device.pk))
+
+        try:
+            result = client.trigger_force_removal(mgmt.adapter_device_id, scope)
+            job_id = result.get("job_id") if result else None
+            if is_ajax:
+                return JsonResponse({"status": "ok", "job_id": job_id})
+            messages.success(
+                request,
+                f"Force removal ({scope}) queued — Job ID: {job_id}. "
+                "The orphaned service rows will be retracted from the device.",
+            )
+        except AdapterError as exc:
+            if is_ajax:
+                return JsonResponse({"status": "error", "message": str(exc)}, status=502)
+            messages.error(request, f"Adapter error triggering force removal: {exc}")
+        return redirect(_device_nso_tab_url(mgmt.device.pk))
+
+
 class NSOJobStatusView(LoginRequiredMixin, View):
     """Return JSON status of an adapter job — used for client-side polling."""
 
@@ -1585,24 +1631,73 @@ class NSOJobStatusView(LoginRequiredMixin, View):
             return JsonResponse({"error": str(exc)}, status=502)
 
 
+def _removal_job_scope(job):
+    """Best-effort scope attribution for a removal job.
+
+    The queue context carries the scope for every job state; older adapter jobs
+    predate context serialization, so fall back to the terminal result (succeeded)
+    or the error detail (blocked/failed).
+    """
+    for part in (job.get("context"), job.get("result"), (job.get("error") or {}).get("detail")):
+        if part and part.get("scope"):
+            return part["scope"]
+    return None
+
+
+def _blocked_removals(jobs):
+    """Collect scopes whose LATEST removal job was blocked on collateral.
+
+    Newest-first scan: the most recent removal job per scope decides — a later
+    removal for the same scope (queued force re-run, or a clean success after the
+    orphans were re-accepted) masks a stale block, while other scopes' jobs and
+    non-removal jobs never do. A blocked removal means the intent retraction is NOT
+    enforced on the device, so the entry carries everything the operator needs to
+    resolve it: the orphan keys and the dry-run preview the adapter refused to commit.
+    """
+    blocked = []
+    seen_scopes = set()
+    for job in jobs:
+        if job.get("type") != "removal":
+            continue
+        scope = _removal_job_scope(job)
+        if not scope or scope in seen_scopes:
+            continue
+        seen_scopes.add(scope)
+        error = job.get("error") or {}
+        if job.get("status") == "failed" and error.get("code") == "removal_blocked_collateral":
+            detail = error.get("detail") or {}
+            blocked.append(
+                {
+                    "scope": scope,
+                    "job_id": job.get("id"),
+                    "orphan_interfaces": detail.get("orphan_interfaces") or [],
+                    "orphan_processes": detail.get("orphan_processes") or [],
+                    "preview": detail.get("preview") or "",
+                    "blocked_at": job.get("updated_at"),
+                }
+            )
+    return blocked
+
+
 class NSODeviceJobsView(LoginRequiredMixin, View):
     """JSON summary of a device's adapter jobs for the tab's status strip.
 
-    Returns the currently-active job (queued/running) if any, and the most recent
+    Returns the currently-active job (queued/running) if any, the most recent
     finished job (succeeded/failed) so an operator returning to the tab can see at a
-    glance whether work is in flight and how the last run went. Polled client-side
-    while a job is active.
+    glance whether work is in flight and how the last run went, and any removals
+    blocked by the adapter's collateral guard — those persist until resolved rather
+    than being displaced by later jobs. Polled client-side while a job is active.
     """
 
     _ACTIVE = ("queued", "running")
     _TERMINAL = ("succeeded", "failed")
 
     def get(self, request, pk):
-        """Return {onboarded, running, last} for the device's adapter jobs."""
+        """Return {onboarded, running, last, blocked_removals} for the device's adapter jobs."""
         device = get_object_or_404(Device, pk=pk)
         mgmt = getattr(device, "nso_management", None)
         if mgmt is None or mgmt.adapter_device_id is None:
-            return JsonResponse({"onboarded": False, "running": None, "last": None})
+            return JsonResponse({"onboarded": False, "running": None, "last": None, "blocked_removals": []})
 
         from . import adapter_client as client
 
@@ -1614,7 +1709,9 @@ class NSODeviceJobsView(LoginRequiredMixin, View):
         # list_jobs is most-recent-first, so the first match in each bucket is newest.
         running = next((j for j in jobs if j.get("status") in self._ACTIVE), None)
         last = next((j for j in jobs if j.get("status") in self._TERMINAL), None)
-        return JsonResponse({"onboarded": True, "running": running, "last": last})
+        return JsonResponse(
+            {"onboarded": True, "running": running, "last": last, "blocked_removals": _blocked_removals(jobs)}
+        )
 
 
 class NSORefreshStateView(NSOActionPermissionMixin, View):

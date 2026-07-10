@@ -196,6 +196,12 @@ urlpatterns = [
         views.NSOAdapterLinkRetryView.as_view(),
         name="nsodevicemanagement_link_retry",
     ),
+    # Operator override for a collateral-blocked removal (guard skipped, reviewed orphans flushed)
+    path(
+        "device-management/<int:pk>/force-removal/",
+        views.NSOForceRemovalView.as_view(),
+        name="nsodevicemanagement_force_removal",
+    ),
     # Adapter job status (JSON, for client-side polling)
     path("jobs/<int:job_id>/status/", views.NSOJobStatusView.as_view(), name="nsojob_status"),
     # Device job-activity summary (JSON: running + last finished) for the tab status strip

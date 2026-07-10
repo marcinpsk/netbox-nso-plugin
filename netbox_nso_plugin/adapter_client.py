@@ -548,6 +548,17 @@ def trigger_connect(adapter_device_id):
     return _request("POST", f"/api/v1/devices/{adapter_device_id}/actions/connect")
 
 
+def trigger_force_removal(adapter_device_id, scope):
+    """POST /api/v1/devices/{id}/actions/force-removal → job_id.
+
+    Re-runs *scope*'s removal with the adapter's collateral guard DISABLED — the
+    operator override after reviewing a ``removal_blocked_collateral`` job's orphan
+    list and dry-run preview. The orphaned service rows are deliberately retracted
+    from the live device.
+    """
+    return _request("POST", f"/api/v1/devices/{adapter_device_id}/actions/force-removal", json={"scope": scope})
+
+
 def sync_notify(adapter_device_id):
     """POST /api/v1/devices/{id}/sync-notify — notify adapter of scope/intent change.
 
