@@ -21,8 +21,8 @@ move it from the read-only tuple to the pushed tuple and the test keeps you hone
 from __future__ import annotations
 
 # Mirrored into netbox-routing by the reconciler but NOT carried by the intent push.
-# (fast_reroute / microloop_avoidance are not even mirrored yet — still inert on edit,
-# so they belong on the operator-facing list until the #83 writers land.)
+# (The #83 read pipeline now mirrors fast_reroute/microloop_avoidance and
+# frr_enabled/frr_protection; all four stay read-only until the #83 writers land.)
 ISIS_READ_ONLY_FIELDS: dict[str, tuple[str, ...]] = {
     "isis_instance": (
         "spf_initial_wait",
@@ -45,6 +45,8 @@ ISIS_READ_ONLY_FIELDS: dict[str, tuple[str, ...]] = {
     ),
     "isis_interface": (
         "hello_auth_type",
+        "frr_enabled",
+        "frr_protection",
         "csnp_interval",
         "retransmit_interval",
         "lsp_interval",

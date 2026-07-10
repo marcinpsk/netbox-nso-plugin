@@ -406,6 +406,30 @@ class TestReconcileIsisInterfaces(TestCase):
             ri.refresh_from_db()
             self.assertTrue(ri.bfd_enabled)
 
+    def test_frr_written_to_routing_interface(self):
+        """#83: entry frr_enabled/frr_protection flow onto netbox_routing ISISInterface.
+
+        Tri-state: an explicit device-side disable (frr_enabled=False, the arcos
+        bond2 shape) must persist as False — a falsy-drop would erase the signal."""
+        self._make_mgmt()
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        state = _reconcile_isis_interfaces(
+            self.device, self._payload(self._entry(frr_enabled=True, frr_protection="node"))
+        )[0]
+        ri = state.isis_interface
+        if ri is not None and hasattr(ri, "frr_enabled"):
+            ri.refresh_from_db()
+            self.assertIs(ri.frr_enabled, True)
+            self.assertEqual(ri.frr_protection, "node")
+
+        state2 = _reconcile_isis_interfaces(self.device, self._payload(self._entry(frr_enabled=False)))[0]
+        ri2 = state2.isis_interface
+        if ri2 is not None and hasattr(ri2, "frr_enabled"):
+            ri2.refresh_from_db()
+            self.assertIs(ri2.frr_enabled, False)
+            self.assertEqual(ri2.frr_protection, "")
+
     def test_bfd_enabled_mirrored_onto_unowned_overlay(self):
         """Device bfd_enabled mirrors onto the (unowned) overlay too, so the write path
         (push/drift) reads the same tri-state the read path wrote to netbox-routing.
@@ -1204,3 +1228,27 @@ class TestReconcileIsisInterfaceLevels(TestCase):
         inst.refresh_from_db()
         self.assertTrue(inst.suppress_attached_bit)
         self.assertTrue(inst.ignore_attached_bit)
+
+    def test_routing_instance_frr(self):
+        """#83: fast_reroute/microloop_avoidance flow onto ISISInstance; re-reconcile
+        stays in sync; a payload that stops reporting keeps the mirrored values."""
+        self._make_mgmt()
+        from netbox_routing.models import ISISInstance
+
+        from netbox_nso_plugin.template_content import _reconcile_isis_process
+
+        payload = [{"process_tag": "0", "fast_reroute": "ti-lfa", "microloop_avoidance": True}]
+        _reconcile_isis_process(self.device, payload)
+        inst = ISISInstance.objects.get(device=self.device, process_tag="0")
+        self.assertEqual(inst.fast_reroute, "ti-lfa")
+        self.assertTrue(inst.microloop_avoidance)
+
+        # Re-running the same payload with the object untouched is a no-op (stays imported).
+        states = _reconcile_isis_process(self.device, payload)
+        self.assertEqual(states[0].status, "imported")
+
+        # Absence = "not reported", never a forced clear.
+        _reconcile_isis_process(self.device, [{"process_tag": "0"}])
+        inst.refresh_from_db()
+        self.assertEqual(inst.fast_reroute, "ti-lfa")
+        self.assertTrue(inst.microloop_avoidance)

@@ -1204,6 +1204,8 @@ _ISIS_IFACE_SCALAR_ATTRS = (
     "passive",
     "hello_auth_type",
     "bfd_enabled",
+    "frr_enabled",
+    "frr_protection",
     "csnp_interval",
     "retransmit_interval",
     "lsp_interval",
@@ -1225,6 +1227,13 @@ def _isis_interface_routing_fields(state, entry, ri, bfd_enabled):
         rf.append(("hello_auth_type", state.hello_auth_type or ""))
     if hasattr(ri, "bfd_enabled"):
         rf.append(("bfd_enabled", bfd_enabled))
+    # FRR (#83), read-only mirror: frr_enabled is tri-state (None = unconfigured,
+    # False = explicit device-side disable/exclude — a real value, mirrored verbatim);
+    # frr_protection is a NOT NULL CharField, so absent mirrors as ''.
+    if hasattr(ri, "frr_enabled"):
+        rf.append(("frr_enabled", entry.get("frr_enabled")))
+    if hasattr(ri, "frr_protection"):
+        rf.append(("frr_protection", entry.get("frr_protection") or ""))
     if hasattr(ri, "csnp_interval"):
         rf.append(("csnp_interval", entry.get("csnp_interval")))
     if hasattr(ri, "retransmit_interval"):
@@ -1490,6 +1499,8 @@ _ISIS_INSTANCE_SCALAR_ATTRS = (
     "te_enabled",
     "suppress_attached_bit",
     "ignore_attached_bit",
+    "fast_reroute",
+    "microloop_avoidance",
     "distance",
     "maximum_paths",
     "reference_bandwidth",
