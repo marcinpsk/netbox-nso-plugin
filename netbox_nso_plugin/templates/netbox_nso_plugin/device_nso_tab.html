@@ -460,9 +460,23 @@
         h += '</tbody></table></div>';
       }
       if (d.routing_changes && d.routing_changes.length) {
+        var diffScopes = Object.keys(d.device_diff || {});
         h += '<div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Category</th><th>Item</th><th>Properties pushed</th><th>State</th></tr></thead><tbody>';
         d.routing_changes.forEach(function (c) {
-          h += '<tr><td>' + esc(c.category) + '</td><td>' + esc(c.item) + '</td><td><strong>' + esc(c.detail) + '</strong></td><td><span class="text-muted small">' + esc(c.status) + '</span></td></tr>';
+          // A staged row whose scope produced NO dry-run delta is already satisfied on
+          // the device (or unrepresentable on the NED) — say so instead of implying a push.
+          var satisfied = c.scope && diffScopes.indexOf(c.scope) === -1;
+          if (!satisfied && c.scope === 'route_policy' && c.item && c.item.length >= 3) {
+            // Shared-object scope: several policies ride ONE diff — flag the individual
+            // object when its name is absent (boundary-guarded so cnad-test does not
+            // match inside cnad-test-2). Best-effort heuristic; a miss shows no badge.
+            var rx = new RegExp(c.item.replace(/[.*+?^\x24{}()|[\]\\]/g, '\\$&') + '(?=[\\s{;]|$)');
+            satisfied = !rx.test(String(d.device_diff[c.scope] || ''));
+          }
+          var noChange = satisfied
+            ? ' <span class="badge text-bg-info" title="The NSO dry-run shows no device change for this intent — the device already matches it (or the NED cannot express it).">no device change</span>'
+            : '';
+          h += '<tr><td>' + esc(c.category) + '</td><td>' + esc(c.item) + '</td><td><strong>' + esc(c.detail) + '</strong>' + noChange + '</td><td><span class="text-muted small">' + esc(c.status) + '</span></td></tr>';
         });
         h += '</tbody></table></div>';
       }
@@ -535,10 +549,10 @@
       if (!d.total) { return '<p class="text-muted mb-0">Nothing pending — NetBox and the device are in sync.</p>'; }
       return ''
         + '<div class="row g-3">'
-        + '  <div class="col-lg-6"><h6 class="border-bottom pb-1"><span class="mdi mdi-cloud-upload-outline me-1"></span>Intent — what we push</h6>'
+        + '  <div class="col-lg-4"><h6 class="border-bottom pb-1"><span class="mdi mdi-cloud-upload-outline me-1"></span>Intent — what we push</h6>'
         +      renderIntentPanel(d)
         + '  </div>'
-        + '  <div class="col-lg-6"><h6 class="border-bottom pb-1 d-flex align-items-center"><span class="mdi mdi-file-compare me-1"></span>Device diff — NSO dry-run'
+        + '  <div class="col-lg-8"><h6 class="border-bottom pb-1 d-flex align-items-center"><span class="mdi mdi-file-compare me-1"></span>Device diff — NSO dry-run'
         +      diffModeButtons()
         + '  </h6>'
         +      renderDiffPanel(d)

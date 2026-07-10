@@ -1914,6 +1914,11 @@ def _isis_iface_detail(r):
     metric = metric if metric is not None else r.metric
     net = (getattr(src, "network_type", "") if src else "") or r.network_type
     ctype = (getattr(src, "circuit_type", "") if src else "") or r.circuit_type
+    # tri-state BFD (#77): None = no opinion → silent; True/False IS pushed intent and
+    # must be listed (the dry-run diff showed bfd-enabled while this stayed silent —
+    # operator caught the mismatch on the first live preview).
+    bfd = getattr(src, "bfd_enabled", None) if src else None
+    bfd = bfd if bfd is not None else r.bfd_enabled
     return _join_props(
         [
             r.process_tag,
@@ -1922,6 +1927,7 @@ def _isis_iface_detail(r):
             net,
             f"metric {metric}" if metric is not None else "",
             "passive" if r.passive else "",
+            "bfd on" if bfd is True else ("bfd off" if bfd is False else ""),
             "hello-auth" if r.hello_auth_present else "",
         ]
     )
@@ -1998,57 +2004,85 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
             return f"VLAN {r.vlan.vid}" if getattr(r, "vlan", None) else "VLAN"
 
         # (Model, category label, item fn, detail fn) — all read defensively.
+        # 5th element = the adapter apply-diff SCOPE the row's push rides (None =
+        # pushed out-of-band, no dry-run scope). The modal badges rows whose scope
+        # produced no delta as "no device change" — a row staged long ago can be
+        # already-satisfied on the device (the cnad-test case). Redistribution rides
+        # its destination protocol's scope.
         preview_specs = [
-            (NSOVLANState, "VLAN", _vlan_item, lambda r: f"name {r.vlan.name}" if r.vlan else ""),
-            (NSOSwitchportState, "Switchport", _iface, lambda r: r.mode or ""),
+            (NSOVLANState, "VLAN", _vlan_item, lambda r: f"name {r.vlan.name}" if r.vlan else "", "vlan"),
+            (NSOSwitchportState, "Switchport", _iface, lambda r: r.mode or "", None),
             (
                 NSOSVIState,
                 "SVI / IRB",
                 _iface,
                 lambda r: f"VLAN {r.vlan.vid}" if getattr(r, "vlan", None) else (r.vrf or ""),
+                "svi",
             ),
-            (NSOSubinterfaceState, "Subinterface", _iface, lambda r: f"dot1q {r.dot1q_vlan}" if r.dot1q_vlan else ""),
+            (
+                NSOSubinterfaceState,
+                "Subinterface",
+                _iface,
+                lambda r: f"dot1q {r.dot1q_vlan}" if r.dot1q_vlan else "",
+                "subinterface",
+            ),
             (
                 NSOBFDInterfaceState,
                 "BFD",
                 _iface,
                 lambda r: f"tx {r.min_tx or '?'} / rx {r.min_rx or '?'} x{r.multiplier or '?'}",
+                "bfd",
             ),
-            (NSOLACPBundleState, "LACP", _iface, lambda r: f"lag {r.lag_id}" if r.lag_id else ""),
+            (NSOLACPBundleState, "LACP", _iface, lambda r: f"lag {r.lag_id}" if r.lag_id else "", None),
             (
                 NSOStaticRouteState,
                 "Static route",
                 lambda r: r.nso_prefix or "",
                 lambda r: f"→ {r.nso_next_hop}" if r.nso_next_hop else "",
+                "static_route",
             ),
-            (NSOISISInterfaceState, "IS-IS interface", _iface, _isis_iface_detail),
-            (NSOISISInstanceState, "IS-IS", lambda r: r.process_tag or "instance", lambda r: r.net or ""),
-            (NSOOSPFInterfaceState, "OSPF interface", _iface, _ospf_iface_detail),
-            (NSOOSPFInstanceState, "OSPF", lambda r: f"process {r.process_id}", lambda r: r.router_id or ""),
+            (NSOISISInterfaceState, "IS-IS interface", _iface, _isis_iface_detail, "isis"),
+            (NSOISISInstanceState, "IS-IS", lambda r: r.process_tag or "instance", lambda r: r.net or "", "isis"),
+            (NSOOSPFInterfaceState, "OSPF interface", _iface, _ospf_iface_detail, "ospf"),
+            (NSOOSPFInstanceState, "OSPF", lambda r: f"process {r.process_id}", lambda r: r.router_id or "", "ospf"),
             (
                 NSOBGPPeerState,
                 "BGP peer",
                 lambda r: r.peer_address_str or "",
                 lambda r: f"AS {r.remote_as_str}" if r.remote_as_str else "",
+                "bgp",
             ),
-            (NSORoutePolicyState, "Route policy", lambda r: r.object_name or "", lambda r: r.family or ""),
+            (
+                NSORoutePolicyState,
+                "Route policy",
+                lambda r: r.object_name or "",
+                lambda r: r.family or "",
+                "route_policy",
+            ),
             (
                 NSORedistributionState,
                 "Redistribution",
                 lambda r: f"{r.source_protocol} → {r.dest_protocol}",
                 lambda r: r.route_map or "",
+                lambda r: r.dest_protocol or None,
             ),
-            (NSOSnmpCommunityState, "SNMP community", lambda r: "community", lambda r: r.access or ""),
-            (NSOSnmpV3UserState, "SNMP v3 user", lambda r: r.username or "user", lambda r: ""),
-            (NSOSnmpHostState, "SNMP host", lambda r: r.address or "", lambda r: f"v{r.version}" if r.version else ""),
-            (NSOSnmpSystemInfoState, "SNMP system", lambda r: "system-info", lambda r: ""),
-            (NSOLoggingHostState, "Logging host", lambda r: r.address or "", lambda r: r.severity or ""),
-            (NSOL2SapState, "L2 SAP", lambda r: r.sap_id or "", lambda r: r.service_name or ""),
+            (NSOSnmpCommunityState, "SNMP community", lambda r: "community", lambda r: r.access or "", "snmp"),
+            (NSOSnmpV3UserState, "SNMP v3 user", lambda r: r.username or "user", lambda r: "", "snmp"),
+            (
+                NSOSnmpHostState,
+                "SNMP host",
+                lambda r: r.address or "",
+                lambda r: f"v{r.version}" if r.version else "",
+                "snmp",
+            ),
+            (NSOSnmpSystemInfoState, "SNMP system", lambda r: "system-info", lambda r: "", "snmp"),
+            (NSOLoggingHostState, "Logging host", lambda r: r.address or "", lambda r: r.severity or "", "logging"),
+            (NSOL2SapState, "L2 SAP", lambda r: r.sap_id or "", lambda r: r.service_name or "", "l2_sap"),
         ]
 
         routing_changes = []
         if mgmt is not None:
-            for model, label, item_fn, detail_fn in preview_specs:
+            for model, label, item_fn, detail_fn, scope in preview_specs:
                 # accepted/apply_failed (owned, differs) AND deploying (apply pushed, not yet
                 # confirmed) are all "pending apply" on the tab — the preview must count the same
                 # set or a device with only deploying rows previews total=0 and skips the modal.
@@ -2062,7 +2096,10 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
                         detail = detail_fn(r)
                     except Exception:
                         detail = ""
-                    routing_changes.append({"category": label, "item": item, "detail": detail, "status": r.status})
+                    scope_val = scope(r) if callable(scope) else scope
+                    routing_changes.append(
+                        {"category": label, "item": item, "detail": detail, "status": r.status, "scope": scope_val}
+                    )
 
         # Right panel: the diff the Apply would push (NSO dry-run, no commit).
         # outformat=cli → NSO's NED-uniform +/- tree diff (rendered via diff2html);

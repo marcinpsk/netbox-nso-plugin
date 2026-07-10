@@ -1344,6 +1344,50 @@ class TestNSOApplyPreviewView(ViewTestBase):
         gad.assert_called_once_with(78, outformat="native")
         self.assertEqual(data["outformat"], "native")
 
+    def test_preview_isis_interface_detail_includes_bfd(self):
+        """#77 transparency: a tri-state bfd intent MUST appear in 'properties pushed' —
+        the dry-run diff showed bfd-enabled while the intent list stayed silent (operator
+        caught it on the first live preview)."""
+        import json
+
+        from netbox_nso_plugin.models import NSOISISInterfaceState
+
+        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="in_sync", nso_value="")
+        NSOISISInterfaceState.objects.create(
+            management=self.mgmt,
+            interface=self.interface,
+            af="ipv4",
+            process_tag="CORE",
+            bfd_enabled=True,
+            status="accepted",
+        )
+        url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
+        data = json.loads(self.client.get(url).content)
+        rc = next(r for r in data["routing_changes"] if r["category"] == "IS-IS interface")
+        self.assertIn("bfd on", rc["detail"])
+
+    def test_preview_rows_carry_scope_key(self):
+        """Each intent row must name its apply-diff SCOPE so the modal can badge rows
+        whose scope produced no device delta ('no device change') — the operator saw
+        cnad-test listed as intent with no diff and rightly asked why (a row staged
+        weeks ago can be already-satisfied on the device)."""
+        import json
+
+        from netbox_nso_plugin.models import NSOISISInterfaceState
+
+        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="in_sync", nso_value="")
+        NSOISISInterfaceState.objects.create(
+            management=self.mgmt,
+            interface=self.interface,
+            af="ipv4",
+            process_tag="CORE",
+            status="accepted",
+        )
+        url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
+        data = json.loads(self.client.get(url).content)
+        rc = next(r for r in data["routing_changes"] if r["category"] == "IS-IS interface")
+        self.assertEqual(rc["scope"], "isis")
+
     def test_preview_ospf_interface_lists_pushed_properties(self):
         """An accepted OSPF interface overlay shows its pushed properties (area/cost/network-type)."""
         import json
