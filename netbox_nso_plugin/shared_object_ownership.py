@@ -85,7 +85,7 @@ def _renumbered(captured: dict) -> dict:
     return out
 
 
-def device_caught_up(family: str, captured: dict, obj) -> bool | None:
+def device_caught_up(family: str, captured: dict, obj, exclude_members: list | None = None) -> bool | None:
     """Whether the device capture equals the CURRENT NetBox object content (the intent).
 
     True/False when *family* registered an ``extract``; None when it cannot compare
@@ -99,7 +99,19 @@ def device_caught_up(family: str, captured: dict, obj) -> bool | None:
     if spec is None or spec.extract is None or obj is None:
         return None
     try:
-        return spec.hash_captured(_renumbered(spec.extract(obj))) == spec.hash_captured(_renumbered(captured))
+        extracted = spec.extract(obj)
+        if exclude_members:
+            # #101 — compare the REPRESENTABLE intent: members the NED cannot hold
+            # (recorded on the row by the push transparency) are absent from the device
+            # BY DESIGN, not by drift. Filter ONLY the object side: if the device
+            # actually holds a (stale-)excluded member, the sides still differ and the
+            # row correctly does not settle.
+            drop = set(exclude_members)
+            extracted = dict(extracted)
+            extracted["entries"] = [
+                e for e in (extracted.get("entries") or []) if not (isinstance(e, dict) and e.get("community") in drop)
+            ]
+        return spec.hash_captured(_renumbered(extracted)) == spec.hash_captured(_renumbered(captured))
     except Exception:
         logger.warning("device_caught_up: extract/hash failed for %s", family, exc_info=True)
         return None

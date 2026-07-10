@@ -1087,19 +1087,109 @@ class TestDeviceCaughtUpSettle(TestCase):
                 f"{family} roundtrip broke the settle normalization",
             )
 
-    def test_route_map_family_has_no_settle_yet(self):
-        """route_map has no extract (push shape ≠ capture shape) — settle must SKIP,
-        preserving the apply-only lifecycle rather than guessing."""
+    def test_route_map_settles_when_device_matches(self):
+        """#100: route_map extract — a rich entry (match/set blobs, flow_control lifted
+        into the model field, prefix-list name ref) must roundtrip through
+        canonical_route_map and settle when the device re-reports the same content."""
         from netbox_nso_plugin.models import NSORoutePolicyState
         from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
 
         self._make_mgmt(self.device)
-        payload = {"route_maps": [{"name": "RM-NOSETTLE", "entries": [{"seq": 10, "action": "permit"}]}]}
+        payload = {
+            "prefix_lists": [
+                {"name": "PL-RM", "entries": [{"sequence": 10, "action": "permit", "prefix": "10.0.0.0/8"}]}
+            ],
+            "route_maps": [
+                {
+                    "name": "RM-SETTLE",
+                    "entries": [
+                        {
+                            "seq": 10,
+                            "action": "permit",
+                            "match": {"protocol": ["bgp"], "family": "ipv4"},
+                            "set": {"local_preference": 200, "flow_control": 20},
+                            "match_prefix_lists": ["PL-RM"],
+                        },
+                        {"seq": 20, "action": "deny", "match": {}, "set": {}},
+                    ],
+                }
+            ],
+        }
         reconcile_route_policy(self.device, payload)
-        self._accept("route_map", "RM-NOSETTLE")
+        self._accept("route_map", "RM-SETTLE")
         reconcile_route_policy(self.device, payload)
-        st = NSORoutePolicyState.objects.get(family="route_map", object_name="RM-NOSETTLE")
+        st = NSORoutePolicyState.objects.get(family="route_map", object_name="RM-SETTLE")
+        self.assertEqual(st.status, "in_sync")
+
+    def test_route_map_stays_when_device_diverges(self):
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._make_mgmt(self.device)
+        payload = {"route_maps": [{"name": "RM-DIV", "entries": [{"seq": 10, "action": "permit"}]}]}
+        reconcile_route_policy(self.device, payload)
+        self._accept("route_map", "RM-DIV")
+        reconcile_route_policy(
+            self.device,
+            {"route_maps": [{"name": "RM-DIV", "entries": [{"seq": 10, "action": "deny"}]}]},
+        )
+        st = NSORoutePolicyState.objects.get(family="route_map", object_name="RM-DIV")
         self.assertEqual(st.status, "accepted")
+
+    def test_community_settle_ignores_recorded_unsupported_members(self):
+        """#101: the REPRESENTABLE intent — a member the NED cannot hold (recorded in
+        unsupported_members by the push transparency) must not block the settle: the
+        device capture lacks it BY DESIGN, not by drift (the cnad-test-2 wildcard case)."""
+        from netbox_routing.models import Community, CommunityListEntry
+
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._make_mgmt(self.device)
+        payload = {
+            "community_lists": [
+                {
+                    "name": "CL-UNSUP",
+                    "invert_match": False,
+                    "entries": [{"sequence": 10, "action": "permit", "community": "65000:1"}],
+                }
+            ]
+        }
+        reconcile_route_policy(self.device, payload)
+        st = self._accept("community_list", "CL-UNSUP")
+        # operator adds a wildcard the NED can't hold; the push recorded it as unsupported
+        wc, _ = Community.objects.get_or_create(community="color:0:12.")
+        CommunityListEntry.objects.create(community_list=st.assigned_object, community=wc, action="PERMIT")
+        st.unsupported_members = ["color:0:12."]
+        st.save(update_fields=["unsupported_members"])
+        reconcile_route_policy(self.device, payload)  # device still reports only 65000:1
+        st.refresh_from_db()
+        self.assertEqual(st.status, "in_sync")
+
+    def test_community_settle_not_fooled_by_stale_unsupported_list(self):
+        """The exclusion applies ONLY to the object side: if the device actually HOLDS a
+        member that is (stale-)listed as unsupported, the sides differ → no settle."""
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._make_mgmt(self.device)
+        payload = {
+            "community_lists": [
+                {
+                    "name": "CL-STALE",
+                    "invert_match": False,
+                    "entries": [
+                        {"sequence": 10, "action": "permit", "community": "65000:1"},
+                        {"sequence": 20, "action": "permit", "community": "color:0:12."},
+                    ],
+                }
+            ]
+        }
+        reconcile_route_policy(self.device, payload)
+        st = self._accept("community_list", "CL-STALE")
+        st.unsupported_members = ["color:0:12."]  # stale — the device DOES hold it
+        st.save(update_fields=["unsupported_members"])
+        reconcile_route_policy(self.device, payload)
+        st.refresh_from_db()
+        self.assertEqual(st.status, "accepted")  # object-filtered (1) != capture (2)
 
 
 class TestSharedObjectOwnership(TestCase):

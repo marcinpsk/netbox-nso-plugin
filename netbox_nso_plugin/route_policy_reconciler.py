@@ -447,6 +447,34 @@ def _extract_as_path(ap_obj) -> dict:
     }
 
 
+def _extract_route_map(rm_obj) -> dict:
+    """Reverse of _rm_fill, capture-shaped (#100).
+
+    match/set blobs are stored VERBATIM by the fill, so returning them verbatim yields an
+    identical canonical_route_map projection (which drops sequences and sorts the name
+    refs — M2M order is irrelevant); flow_control is re-lifted into set-json (the fill
+    popped it into the model field); the synthetic default-action entry was kept by the
+    fill and rides along like any entry.
+    """
+    entries = []
+    for e in rm_obj.route_map_entries.all().order_by("sequence"):
+        set_data = dict(e.set or {})
+        if e.flow_control is not None and "flow_control" not in set_data:
+            set_data["flow_control"] = e.flow_control
+        entries.append(
+            {
+                "seq": e.sequence,
+                "action": (e.action or "permit").lower(),
+                "match": dict(e.match or {}),
+                "set": set_data,
+                "match_prefix_lists": sorted(e.match_prefix_list.values_list("name", flat=True)),
+                "match_community_lists": sorted(e.match_community_list.values_list("name", flat=True)),
+                "match_as_paths": sorted(e.match_aspath.values_list("name", flat=True)),
+            }
+        )
+    return {"entries": entries}
+
+
 def _register_specs() -> None:
     Spec = ownership.SharedObjectSpec
     ownership.register(
@@ -471,7 +499,11 @@ def _register_specs() -> None:
     # route_policy_structure.canonical_route_map.
     ownership.register(
         "route_map",
-        Spec(fill=_rm_fill, hash_captured=lambda c: _hash(canonical_route_map(c, _resolve_prefix_list_units))),
+        Spec(
+            fill=_rm_fill,
+            hash_captured=lambda c: _hash(canonical_route_map(c, _resolve_prefix_list_units)),
+            extract=_extract_route_map,
+        ),
     )
 
 
@@ -606,7 +638,12 @@ def _upsert_state(mgmt, family, name, obj, ct, captured, now):
     # (The materialized-content 'matches' below can never see this: settles_owned=False
     # kept staged intent pending forever — cnad-test sat 26 days already satisfied.)
     # route_map has no extractor yet (push shape ≠ capture shape) → None → no settle.
-    if sm.is_owned(state.status) and ownership.device_caught_up(family, captured, obj):
+    if sm.is_owned(state.status) and ownership.device_caught_up(
+        family,
+        captured,
+        obj,
+        exclude_members=(list(state.unsupported_members or []) or None) if family == "community_list" else None,
+    ):
         state.status = sm.on_reconcile(state.status, matches=True, settles_owned=True)
 
     # FK/content overlay: 'matches' = materialized (content recorded & unchanged), not
