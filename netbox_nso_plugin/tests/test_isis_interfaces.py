@@ -542,8 +542,16 @@ class TestReconcileIsisInterfaces(TestCase):
 
         base = {"metric": None, "network_type": "", "circuit_type": "", "passive": False}
 
-        def st(bfd):
-            return SimpleNamespace(metric=None, network_type="", circuit_type="", passive=False, bfd_enabled=bfd)
+        def st(bfd, frr=None, prot=""):
+            return SimpleNamespace(
+                metric=None,
+                network_type="",
+                circuit_type="",
+                passive=False,
+                bfd_enabled=bfd,
+                frr_enabled=frr,
+                frr_protection=prot,
+            )
 
         # None intent → matches regardless of the device's BFD (no opinion).
         self.assertTrue(_isis_device_matches_intent({**base, "bfd_enabled": True}, st(None)))
@@ -553,6 +561,17 @@ class TestReconcileIsisInterfaces(TestCase):
         # False intent: device disabled matches; device enabled does not.
         self.assertTrue(_isis_device_matches_intent({**base, "bfd_enabled": False}, st(False)))
         self.assertFalse(_isis_device_matches_intent({**base, "bfd_enabled": True}, st(False)))
+        # FRR (#83): the same tri-state contract; protection only blocks when asserted.
+        self.assertTrue(_isis_device_matches_intent({**base, "frr_enabled": True}, st(None)))
+        self.assertTrue(_isis_device_matches_intent({**base, "frr_enabled": True}, st(None, frr=True)))
+        self.assertFalse(_isis_device_matches_intent({**base, "frr_enabled": None}, st(None, frr=True)))
+        self.assertTrue(_isis_device_matches_intent({**base, "frr_enabled": False}, st(None, frr=False)))
+        self.assertTrue(
+            _isis_device_matches_intent(
+                {**base, "frr_enabled": True, "frr_protection": "node"}, st(None, frr=True, prot="node")
+            )
+        )
+        self.assertFalse(_isis_device_matches_intent({**base, "frr_enabled": True}, st(None, frr=True, prot="node")))
 
     def test_no_hello_auth_defaults_blank(self):
         """An entry without hello-auth leaves the state blank/false."""

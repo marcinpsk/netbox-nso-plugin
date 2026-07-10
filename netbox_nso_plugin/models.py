@@ -1190,6 +1190,9 @@ class NSOISISInterfaceState(_NSODeviceTabURLMixin, NetBoxModel):
     # never touches brownfield BFD; True = enable, False = explicitly disable). The
     # write intent carries it so an operator can drive IS-IS BFD from the plugin UI.
     bfd_enabled = models.BooleanField(null=True, blank=True)
+    # FRR/TI-LFA (#83), same tri-state contract; frr_protection: link | node (Junos).
+    frr_enabled = models.BooleanField(null=True, blank=True)
+    frr_protection = models.CharField(max_length=8, blank=True, default="")
     # Per-interface IIH (hello) authentication, secret-safe (type + present flag;
     # the key is never imported — Junos exports it $9$-encrypted, Nokia hides it).
     hello_auth_type = models.CharField(max_length=32, blank=True, default="")
@@ -1249,6 +1252,10 @@ class NSOISISInstanceState(_NSODeviceTabURLMixin, NetBoxModel):
     domain_auth_type = models.CharField(max_length=10, blank=True, default="")
     domain_auth_present = models.BooleanField(default=False)
     domain_auth_key = models.CharField(max_length=128, blank=True, default="")
+    # FRR/TI-LFA (#83): the instance flavor (lfa | remote-lfa | ti-lfa) +
+    # tri-state microloop-avoidance, pushed since the #83 writers landed.
+    fast_reroute = models.CharField(max_length=16, blank=True, default="")
+    microloop_avoidance = models.BooleanField(null=True, blank=True)
     # Linked netbox-routing object (nullable — may not exist yet)
     isis_instance = models.ForeignKey(
         to="netbox_routing.ISISInstance",

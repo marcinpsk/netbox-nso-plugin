@@ -21,8 +21,6 @@ move it from the read-only tuple to the pushed tuple and the test keeps you hone
 from __future__ import annotations
 
 # Mirrored into netbox-routing by the reconciler but NOT carried by the intent push.
-# (The #83 read pipeline now mirrors fast_reroute/microloop_avoidance and
-# frr_enabled/frr_protection; all four stay read-only until the #83 writers land.)
 ISIS_READ_ONLY_FIELDS: dict[str, tuple[str, ...]] = {
     "isis_instance": (
         "spf_initial_wait",
@@ -40,13 +38,9 @@ ISIS_READ_ONLY_FIELDS: dict[str, tuple[str, ...]] = {
         "distance",
         "maximum_paths",
         "reference_bandwidth",
-        "fast_reroute",
-        "microloop_avoidance",
     ),
     "isis_interface": (
         "hello_auth_type",
-        "frr_enabled",
-        "frr_protection",
         "csnp_interval",
         "retransmit_interval",
         "lsp_interval",
@@ -56,6 +50,8 @@ ISIS_READ_ONLY_FIELDS: dict[str, tuple[str, ...]] = {
 }
 
 # Carried by the push — editing these + Accept genuinely reaches the device.
+# fast_reroute/microloop_avoidance + frr_enabled/frr_protection moved here when
+# the #83 writers landed (per-NED expressibility gaps WARN in the reconciler).
 ISIS_PUSHED_FIELDS: dict[str, tuple[str, ...]] = {
     "isis_instance": (
         "net",
@@ -66,8 +62,18 @@ ISIS_PUSHED_FIELDS: dict[str, tuple[str, ...]] = {
         "area_auth_key",
         "domain_auth_type",
         "domain_auth_key",
+        "fast_reroute",
+        "microloop_avoidance",
     ),
-    "isis_interface": ("circuit_type", "network_type", "metric", "passive", "bfd_enabled"),
+    "isis_interface": (
+        "circuit_type",
+        "network_type",
+        "metric",
+        "passive",
+        "bfd_enabled",
+        "frr_enabled",
+        "frr_protection",
+    ),
     "isis_level": ("wide_metrics_only", "labeled_preference", "disabled"),
 }
 

@@ -1909,6 +1909,9 @@ def _push_isis_intent_for_device(device_id, adapter_device_id, force=False):
                 # tri-state: None passes through the adapter's optional bfd_enabled
                 # (no wire leaf emitted → reconcile leaves brownfield BFD untouched).
                 "bfd_enabled": row.bfd_enabled,
+                # FRR (#83), same tri-state contract; protection '' → None (enum leaf).
+                "frr_enabled": row.frr_enabled,
+                "frr_protection": row.frr_protection or None,
             }
         )
 
@@ -1929,6 +1932,9 @@ def _push_isis_intent_for_device(device_id, adapter_device_id, force=False):
             "area_auth_key": row.area_auth_key or None,
             "domain_auth_type": row.domain_auth_type,
             "domain_auth_key": row.domain_auth_key or None,
+            # FRR (#83): flavor '' → None (enum leaf); microloop tri-state verbatim.
+            "fast_reroute": row.fast_reroute or None,
+            "microloop_avoidance": row.microloop_avoidance,
         }
         proc_redist = redist_by_proc.get(row.process_tag or "", [])
         if proc_redist:
@@ -2835,6 +2841,9 @@ def _accept_isis_interface(isis_iface) -> None:
     # tri-state (None/True/False preserved verbatim): clearing bfd_enabled on the
     # ISISInterface flows None into the overlay → the push retracts the owned BFD.
     state.bfd_enabled = getattr(isis_iface, "bfd_enabled", None)
+    # FRR (#83): same contract as bfd_enabled; the protection kind rides along.
+    state.frr_enabled = getattr(isis_iface, "frr_enabled", None)
+    state.frr_protection = getattr(isis_iface, "frr_protection", "") or ""
     state.isis_interface = isis_iface
     state.last_sync_at = timezone.now()
     state.save()  # → _on_isis_interface_state_save schedules the push

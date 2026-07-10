@@ -1260,6 +1260,10 @@ def _isis_device_matches_intent(entry, state) -> bool:
         # tri-state: a None intent expresses no opinion, so it never blocks in_sync
         # (we don't own the device's BFD); True/False must match the device verbatim.
         and (state.bfd_enabled is None or bool(entry.get("bfd_enabled")) == bool(state.bfd_enabled))
+        # FRR (#83): the same tri-state contract as BFD; the protection kind only
+        # blocks in_sync when the intent asserts one.
+        and (state.frr_enabled is None or bool(entry.get("frr_enabled")) == bool(state.frr_enabled))
+        and (not state.frr_protection or (entry.get("frr_protection") or "") == state.frr_protection)
     )
 
 
@@ -1435,6 +1439,9 @@ def _reconcile_isis_interfaces(device, interfaces: list) -> list:
             state.passive = bool(entry.get("passive", False))
             # tri-state, mirror the device verbatim (None when the NED reports no BFD)
             state.bfd_enabled = entry.get("bfd_enabled")
+            # FRR (#83): same tri-state mirror; protection kind '' when unreported.
+            state.frr_enabled = entry.get("frr_enabled")
+            state.frr_protection = entry.get("frr_protection") or ""
             state.hello_auth_type = entry.get("hello_auth_type") or ""
             state.hello_auth_present = bool(entry.get("hello_auth_present", False))
         state.last_sync_at = now
@@ -1710,6 +1717,9 @@ def _reconcile_isis_process(device, process_list: list) -> list:
         state.domain_auth_type = entry.get("domain_auth_type") or ""
         state.domain_auth_present = bool(entry.get("domain_auth_present", False))
         state.domain_auth_key = entry.get("domain_auth_key") or ""
+        # FRR (#83): flavor '' when unreported; microloop tri-state verbatim.
+        state.fast_reroute = entry.get("fast_reroute") or ""
+        state.microloop_avoidance = entry.get("microloop_avoidance")
         state.last_sync_at = now
 
         # 3-way merge over the whole ISIS graph: device changes auto-mirror when the
