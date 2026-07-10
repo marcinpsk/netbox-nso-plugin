@@ -51,8 +51,7 @@ def _blocked_job(job_id=50, scope="isis", status="failed", updated="2026-07-10T0
             "message": "PUT-replace would retract rows not in intent",
             "detail": {
                 "scope": scope,
-                "orphan_interfaces": [["lo0", "ipv4"], ["lag31", "ipv4"]],
-                "orphan_processes": ["legacy"],
+                "orphans": {"interface-config": [["lo0", "ipv4"], ["lag31", "ipv4"]], "process-config": [["legacy"]]},
                 "preview": "<edit-config>… would delete lo0 …</edit-config>",
                 "hint": "Re-accept them into intent to keep them, or force-removal to flush.",
             },
@@ -126,8 +125,10 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
         entry = data["blocked_removals"][0]
         self.assertEqual(entry["scope"], "isis")
         self.assertEqual(entry["job_id"], 50)
-        self.assertEqual(entry["orphan_interfaces"], [["lo0", "ipv4"], ["lag31", "ipv4"]])
-        self.assertEqual(entry["orphan_processes"], ["legacy"])
+        self.assertEqual(
+            entry["orphans"],
+            {"interface-config": [["lo0", "ipv4"], ["lag31", "ipv4"]], "process-config": [["legacy"]]},
+        )
         self.assertIn("would delete lo0", entry["preview"])
         self.assertEqual(entry["blocked_at"], "2026-07-10T06:00:00Z")
 
@@ -160,6 +161,22 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
         job["context"] = None
         data = self._get_jobs([job])
         self.assertEqual([e["scope"] for e in data["blocked_removals"]], ["isis"])
+
+    def test_legacy_blocked_job_shape_still_surfaces(self):
+        """Blocked jobs from the isis-only guard era (orphan_interfaces/orphan_processes)
+        still raise the banner — their lists compose into the generic orphans dict."""
+        job = _blocked_job(job_id=48)
+        job["error"]["detail"] = {
+            "scope": "isis",
+            "orphan_interfaces": [["lo0", "ipv4"]],
+            "orphan_processes": ["OLD"],
+            "preview": "p",
+        }
+        data = self._get_jobs([job])
+        self.assertEqual(
+            data["blocked_removals"][0]["orphans"],
+            {"interface-config": [["lo0", "ipv4"]], "process-config": ["OLD"]},
+        )
 
     def test_non_removal_jobs_ignored(self):
         """Sync/apply jobs never contribute to blocked_removals or mask a block."""

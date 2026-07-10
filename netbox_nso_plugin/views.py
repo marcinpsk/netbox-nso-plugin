@@ -1666,12 +1666,22 @@ def _blocked_removals(jobs):
         error = job.get("error") or {}
         if job.get("status") == "failed" and error.get("code") == "removal_blocked_collateral":
             detail = error.get("detail") or {}
+            orphans = detail.get("orphans") or {}
+            if not orphans:
+                # pre-generalization job shape (isis-only guard era)
+                orphans = {
+                    label: value
+                    for label, value in (
+                        ("interface-config", detail.get("orphan_interfaces")),
+                        ("process-config", detail.get("orphan_processes")),
+                    )
+                    if value
+                }
             blocked.append(
                 {
                     "scope": scope,
                     "job_id": job.get("id"),
-                    "orphan_interfaces": detail.get("orphan_interfaces") or [],
-                    "orphan_processes": detail.get("orphan_processes") or [],
+                    "orphans": orphans,
                     "preview": detail.get("preview") or "",
                     "blocked_at": job.get("updated_at"),
                 }

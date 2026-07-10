@@ -355,15 +355,13 @@
         var node = blockedTpl.content.cloneNode(true);
         node.querySelector('[data-slot="scope"]').textContent = b.scope;
         var ul = node.querySelector('[data-slot="orphans"]');
-        (b.orphan_interfaces || []).forEach(function (k) {
-          var li = document.createElement('li');
-          li.textContent = Array.isArray(k) ? 'Interface ' + k[0] + ' (' + (k[1] || 'ipv4') + ')' : 'Interface ' + k;
-          ul.appendChild(li);
-        });
-        (b.orphan_processes || []).forEach(function (p) {
-          var li = document.createElement('li');
-          li.textContent = 'Process "' + (p || 'default') + '"';
-          ul.appendChild(li);
+        Object.keys(b.orphans || {}).forEach(function (list) {
+          (b.orphans[list] || []).forEach(function (k) {
+            var li = document.createElement('li');
+            var key = Array.isArray(k) ? k.filter(function (p) { return p !== '' && p != null; }).join(' / ') : String(k);
+            li.textContent = list + ': ' + (key || '(default)');
+            ul.appendChild(li);
+          });
         });
         var pre = node.querySelector('[data-slot="preview"]');
         if (b.preview) { pre.textContent = b.preview; }
