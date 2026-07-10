@@ -579,3 +579,96 @@ class TestSimpleFamilyDiff(_RPBase):
         body = resp.content.decode()
         self.assertIn('class="nso-diff-dev">65001_</span>', body)  # device-only token highlighted
         self.assertIn('class="nso-diff-nb">65000_</span>', body)  # netbox-only token highlighted
+
+
+class TestUnifiedPolicyDiff(_RPBase):
+    """unified_policy_diff (#91): ONE canonical pretty-printer renders BOTH sides,
+    difflib unified-diffs them — diff2html-ready (real ---/+++/@@ headers), and
+    sequence-free so the reconciler's renumbering never reads as drift."""
+
+    def _diverged_route_map_state(self, name="RM-U"):
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._mgmt(self.d1)
+        self._mgmt(self.d2)
+        reconcile_route_policy(self.d1, _rm(name, [_entry(10, set_={"local_preference": 100})]))
+        reconcile_route_policy(self.d2, _rm(name, [_entry(10, set_={"local_preference": 200})]))
+        return NSORoutePolicyState.objects.get(management__device=self.d2, object_name=name)
+
+    def test_route_map_delta_produces_real_unified_hunk(self):
+        from netbox_nso_plugin.route_policy_diff import unified_policy_diff
+
+        text = unified_policy_diff(self._diverged_route_map_state())
+        # both headers carry the SAME label (a from/to mismatch makes diff2html flag "RENAMED")
+        self.assertIn("--- route-map RM-U", text)
+        self.assertIn("+++ route-map RM-U", text)
+        self.assertRegex(text, r"@@ -\d+(,\d+)? \+\d+(,\d+)? @@")  # a REAL hunk header (diff2html requires it)
+        self.assertIn("-  set: local_preference=200", text)  # d2 on-box
+        self.assertIn("+  set: local_preference=100", text)  # materialised owner
+
+    def test_renumbered_identical_content_yields_empty_diff(self):
+        """Device sequences (10/20) vs the reconciler's renumbered materialisation (1..N)
+        must NOT read as drift — the canonical text is sequence-free."""
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_diff import unified_policy_diff
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._mgmt(self.d1)
+        payload = _rm(
+            "RM-SEQ",
+            [
+                _entry(10, set_={"local_preference": 150}, match_prefix_lists=["PL-A"]),
+                _entry(20, action="deny", set_={"as_path_replace": "AS65000"}),
+            ],
+        )
+        payload["prefix_lists"] = [{"name": "PL-A", "entries": []}]
+        reconcile_route_policy(self.d1, payload)
+        st = NSORoutePolicyState.objects.get(family="route_map", object_name="RM-SEQ")
+        self.assertEqual(unified_policy_diff(st), "")
+
+    def test_prefix_list_line_delta(self):
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._mgmt(self.d1)
+        self._mgmt(self.d2)
+        reconcile_route_policy(
+            self.d1,
+            {"prefix_lists": [{"name": "PL-U", "entries": [{"action": "permit", "prefix": "10.0.0.0/8", "ge": 16}]}]},
+        )
+        reconcile_route_policy(
+            self.d2,
+            {"prefix_lists": [{"name": "PL-U", "entries": [{"action": "permit", "prefix": "10.0.0.0/8", "ge": 24}]}]},
+        )
+        from netbox_nso_plugin.route_policy_diff import unified_policy_diff
+
+        s2 = NSORoutePolicyState.objects.get(management__device=self.d2, object_name="PL-U")
+        text = unified_policy_diff(s2)
+        self.assertIn("-permit 10.0.0.0/8 ge 24", text)  # d2 on-box
+        self.assertIn("+permit 10.0.0.0/8 ge 16", text)  # materialised owner
+
+    def test_unmaterialised_state_renders_empty(self):
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_diff import unified_policy_diff
+
+        mgmt = self._mgmt(self.d1)
+        st = NSORoutePolicyState.objects.create(
+            management=mgmt, family="prefix_list", object_name="PL-NONE-U", status="imported"
+        )
+        self.assertEqual(unified_policy_diff(st), "")
+
+    def test_diff_view_embeds_two_panel(self):
+        """The drift page ships the unified diff text + the diff2html container/assets."""
+        from django.contrib.auth import get_user_model
+        from django.urls import reverse
+
+        user = get_user_model().objects.create_user(username="diff-2panel", password="pw")  # noqa: S106
+        self.client.force_login(user)
+        st = self._diverged_route_map_state(name="RM-2P")
+        resp = self.client.get(reverse("plugins:netbox_nso_plugin:routing_route_policy_diff", kwargs={"pk": st.pk}))
+        self.assertEqual(resp.status_code, 200)
+        body = resp.content.decode()
+        self.assertIn('id="nso-rp-two-panel"', body)
+        self.assertIn('id="nso-rp-diff-text"', body)
+        self.assertIn("vendor/diff2html.min.js", body)

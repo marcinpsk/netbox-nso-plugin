@@ -448,6 +448,85 @@ def route_policy_state_diff(state) -> dict | None:
     return diff
 
 
+# ── #91: canonical text rendering + unified diff (the two-panel view's source) ──
+
+
+def _route_map_text_lines(summary: dict) -> list[str]:
+    """Canonical, SEQUENCE-FREE text rendering of a summarised route-map.
+
+    One block per entry: the action header plus an indented line per non-empty field,
+    all through the same ``_render_field`` normalisation as the structured diff — so
+    the two sides render identically exactly when the structured diff sees no
+    difference. Sequence numbers are deliberately omitted (the reconciler renumbers
+    1..N on materialise; numbering would read as drift on every insert).
+    """
+    lines: list[str] = []
+    for entry in summary["entries"]:
+        lines.append(f"entry {entry.get('action') or ''}".rstrip())
+        for key, label in _ENTRY_FIELDS:
+            if key == "action":
+                continue
+            value = _render_field(key, entry.get(key))
+            if value:
+                lines.append(f"  {label.lower()}: {value}")
+    if summary.get("default_action"):
+        lines.append(f"default action: {summary['default_action']}")
+    return lines
+
+
+def _simple_text_lines(state, obj, removed: bool) -> tuple[list[str], list[str]]:
+    """Canonical per-entry text for a simple family, both sides (device, netbox)."""
+    family = state.family
+    device_entries = [] if removed else _device_simple_entries(family, state.captured)
+    dev = [_simple_entry_line(family, e) for e in device_entries]
+    nb = [_simple_entry_line(family, e) for e in _netbox_simple_entries(family, obj)]
+    if family == "community_list":
+        dev_inv = "" if removed else _render_scalar((state.captured or {}).get("invert_match"))
+        nb_inv = _render_scalar(getattr(obj, "invert_match", None))
+        if dev_inv or nb_inv:
+            dev.append(f"invert match: {dev_inv or '—'}")
+            nb.append(f"invert match: {nb_inv or '—'}")
+    return dev, nb
+
+
+def policy_text_sides(state) -> tuple[list[str], list[str]] | None:
+    """Render BOTH sides of a route-policy state through ONE canonical pretty-printer.
+
+    Returns ``(device_lines, netbox_lines)``, or None when there is no materialised
+    object (or an unknown family). Uses the same readers and normalisation as
+    :func:`route_policy_state_diff`, so the text panel and the structured table always
+    agree on whether something differs.
+    """
+    obj = state.assigned_object
+    if obj is None:
+        return None
+    removed = not getattr(state, "device_present", True)
+    if state.family == "route_map":
+        dev = summarize_route_map({} if removed else state.captured)
+        nb = summarize_route_map(netbox_route_map_captured(obj))
+        return _route_map_text_lines(dev), _route_map_text_lines(nb)
+    if state.family in _SIMPLE_FIELDS:
+        return _simple_text_lines(state, obj, removed)
+    return None
+
+
+def unified_policy_diff(state) -> str:
+    """Unified-diff text of the canonical rendering of both sides (diff2html-ready).
+
+    ``difflib.unified_diff`` emits the real ``---``/``+++``/``@@`` headers diff2html's
+    parser requires; identical sides (or an unmaterialised state) yield ``""`` so the
+    caller can skip the panel entirely. Both headers carry the SAME label — differing
+    from/to names make diff2html flag the file as RENAMED, which is noise here (the
+    panel caption already explains left=device / right=NetBox).
+    """
+    sides = policy_text_sides(state)
+    if sides is None:
+        return ""
+    device_lines, netbox_lines = sides
+    label = f"{state.family.replace('_', '-')} {state.object_name}"
+    return "\n".join(difflib.unified_diff(device_lines, netbox_lines, fromfile=label, tofile=label, lineterm=""))
+
+
 _REDIST_FIELDS: tuple[tuple[str, str], ...] = (
     ("route_map", "Route map"),
     ("metric", "Metric"),

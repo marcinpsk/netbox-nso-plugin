@@ -2,10 +2,14 @@
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
 {# Device-vs-NetBox delta for one route-policy overlay row (any family). #}
 {% extends 'base/layout.html' %}
+{% load static %}
 
 {% block title %}Drift delta — {{ object_name }}{% endblock %}
 
 {% block content %}
+{# Vendored diff2html (MIT) — renders the two-panel canonical-text comparison; no CDN. #}
+<link rel="stylesheet" href="{% static 'netbox_nso_plugin/vendor/diff2html.min.css' %}">
+<script src="{% static 'netbox_nso_plugin/vendor/diff2html.min.js' %}"></script>
 {# Inline highlight for the exact differing tokens — a translucent marker behind the text #}
 {# (not a chip/badge), saturated enough to read in light and dark mode. #}
 <style>
@@ -79,6 +83,68 @@
             </div>
             {% endif %}
           {% endfor %}
+
+          {% if unified_diff %}
+          {# ── Two-panel comparison (#91): ONE canonical pretty-printer renders both sides, ── #}
+          {# difflib unified-diffs them, diff2html lays it out split/unified. Sequence-free  #}
+          {# text, so the reconciler's renumbering never reads as drift.                     #}
+          <div class="mb-3">
+            <div class="d-flex align-items-center mb-2">
+              <span class="text-muted small me-auto">
+                Two-panel comparison — the same canonical rendering of both sides
+                (<strong>left: device now</strong>, <strong>right: NetBox after push</strong>), diffed line by line.
+              </span>
+              <div class="btn-group btn-group-sm" role="group" aria-label="Diff layout">
+                <button type="button" class="btn btn-outline-secondary active" id="nso-rp-mode-split">
+                  <span class="mdi mdi-view-split-vertical me-1"></span>Split
+                </button>
+                <button type="button" class="btn btn-outline-secondary" id="nso-rp-mode-unified">
+                  <span class="mdi mdi-format-list-text me-1"></span>Unified
+                </button>
+              </div>
+            </div>
+            {{ unified_diff|json_script:"nso-rp-diff-text" }}
+            <div id="nso-rp-two-panel"></div>
+          </div>
+          <script>
+          (function () {
+            "use strict";
+            var holder = document.getElementById('nso-rp-two-panel');
+            var textEl = document.getElementById('nso-rp-diff-text');
+            if (!holder || !textEl) return;
+            var text = JSON.parse(textEl.textContent);
+            var mode = 'side-by-side';
+            function render() {
+              try {
+                if (!window.Diff2Html) throw new Error('diff2html unavailable');
+                holder.innerHTML = Diff2Html.html(text, {
+                  drawFileList: false,
+                  matching: 'lines',
+                  outputFormat: mode,
+                  colorScheme: document.documentElement.dataset.bsTheme === 'dark' ? 'dark' : 'light',
+                });
+              } catch (e) {
+                var pre = document.createElement('pre');
+                pre.className = 'small border rounded p-2 mb-0';
+                pre.textContent = text;
+                holder.innerHTML = '';
+                holder.appendChild(pre);
+              }
+            }
+            var btnSplit = document.getElementById('nso-rp-mode-split');
+            var btnUnified = document.getElementById('nso-rp-mode-unified');
+            function setMode(m) {
+              mode = m;
+              btnSplit.classList.toggle('active', m === 'side-by-side');
+              btnUnified.classList.toggle('active', m === 'line-by-line');
+              render();
+            }
+            btnSplit.addEventListener('click', function () { setMode('side-by-side'); });
+            btnUnified.addEventListener('click', function () { setMode('line-by-line'); });
+            render();
+          })();
+          </script>
+          {% endif %}
 
           {# The full list IN ORDER, one row per entry — a push makes the device adopt NetBox's #}
           {# ordered list, so read the NetBox column top-to-bottom for the post-push result. #}
