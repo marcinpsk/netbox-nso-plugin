@@ -922,6 +922,186 @@ class TestReconcileRoutePolicy(TestCase):
         self.assertEqual(Community.objects.filter(community__in=["65000:1", "65000:2"]).count(), 2)
 
 
+class TestDeviceCaughtUpSettle(TestCase):
+    """#93: device-caught-up settle for OWNED shared-object rows.
+
+    Route-policy rows never left ``accepted`` on reconcile (settles_owned=False — its
+    'matches' means materialized-content-unchanged, not device confirmation), so intent
+    staged on 2026-06-14 sat for a month with the device long since matching (cnad-test).
+    When the device capture equals the CURRENT NetBox object content, that IS genuine
+    device confirmation → settle accepted→in_sync. Sequence numbers are artifacts on
+    both sides (readers synthesize 10/20/…, the push renumbers 1..n) — position is truth.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        mfg = Manufacturer.objects.create(name="RpSettleMfg", slug="rpsettlemfg")
+        dt = DeviceType.objects.create(manufacturer=mfg, model="RpSettleDev", slug="rpsettledev")
+        role = DeviceRole.objects.create(name="RpSettleRole", slug="rpsettlerole")
+        site = Site.objects.create(name="RpSettleSite", slug="rpsettlesite")
+        cls.device = Device.objects.create(name="rp-settle-router", device_type=dt, role=role, site=site)
+
+    def _make_mgmt(self, device):
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+        inst, _ = NSOInstance.objects.get_or_create(name="rp-inst", defaults={"adapter_instance_id": "rp-inst"})
+        return NSODeviceManagement.objects.get_or_create(
+            device=device,
+            defaults={"nso_instance": inst, "nso_device_name": f"rp-{device.pk}", "adapter_device_id": device.pk},
+        )[0]
+
+    def _accept(self, family, name):
+        from django.utils import timezone
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+
+        st = NSORoutePolicyState.objects.get(family=family, object_name=name)
+        st.status = "accepted"
+        st.accepted_at = timezone.now()
+        st.save(update_fields=["status", "accepted_at"])
+        return st
+
+    def test_accepted_settles_when_device_matches_current_object(self):
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._make_mgmt(self.device)
+        payload = {
+            "prefix_lists": [
+                {"name": "PL-SETTLE", "entries": [{"sequence": 10, "action": "permit", "prefix": "10.0.0.0/8"}]}
+            ]
+        }
+        reconcile_route_policy(self.device, payload)
+        self._accept("prefix_list", "PL-SETTLE")
+        reconcile_route_policy(self.device, payload)  # device still reports the same content
+        st = NSORoutePolicyState.objects.get(family="prefix_list", object_name="PL-SETTLE")
+        self.assertEqual(st.status, "in_sync")
+
+    def test_accepted_stays_when_device_diverges(self):
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._make_mgmt(self.device)
+        reconcile_route_policy(
+            self.device,
+            {
+                "prefix_lists": [
+                    {"name": "PL-DIVERGE", "entries": [{"sequence": 10, "action": "permit", "prefix": "10.0.0.0/8"}]}
+                ]
+            },
+        )
+        self._accept("prefix_list", "PL-DIVERGE")
+        reconcile_route_policy(
+            self.device,
+            {
+                "prefix_lists": [
+                    {"name": "PL-DIVERGE", "entries": [{"sequence": 10, "action": "deny", "prefix": "10.0.0.0/8"}]}
+                ]
+            },
+        )
+        st = NSORoutePolicyState.objects.get(family="prefix_list", object_name="PL-DIVERGE")
+        self.assertEqual(st.status, "accepted")  # intent differs from device → still pending
+
+    def test_settle_is_sequence_insensitive(self):
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._make_mgmt(self.device)
+        reconcile_route_policy(
+            self.device,
+            {
+                "community_lists": [
+                    {
+                        "name": "CL-SEQ",
+                        "invert_match": False,
+                        "entries": [
+                            {"sequence": 10, "action": "permit", "community": "65000:1"},
+                            {"sequence": 20, "action": "permit", "community": "no-export"},
+                        ],
+                    }
+                ]
+            },
+        )
+        self._accept("community_list", "CL-SEQ")
+        # Same members in the same ORDER, different sequence artifacts → device caught up.
+        reconcile_route_policy(
+            self.device,
+            {
+                "community_lists": [
+                    {
+                        "name": "CL-SEQ",
+                        "invert_match": False,
+                        "entries": [
+                            {"sequence": 5, "action": "permit", "community": "65000:1"},
+                            {"sequence": 15, "action": "permit", "community": "no-export"},
+                        ],
+                    }
+                ]
+            },
+        )
+        st = NSORoutePolicyState.objects.get(family="community_list", object_name="CL-SEQ")
+        self.assertEqual(st.status, "in_sync")
+
+    def test_roundtrip_extract_matches_capture(self):
+        """fill() then extract() must land in the same canonical hash for every family
+        with an extractor — the normalization guarantee the settle depends on."""
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+        from netbox_nso_plugin.shared_object_ownership import device_caught_up
+
+        self._make_mgmt(self.device)
+        captures = {
+            "prefix_list": {
+                "name": "PL-RT",
+                "entries": [
+                    {"sequence": 10, "action": "permit", "prefix": "10.0.0.0/8", "ge": 9, "le": 24},
+                    {"sequence": 20, "action": "deny", "prefix": "0.0.0.0/0"},
+                ],
+            },
+            "community_list": {
+                "name": "CL-RT",
+                "invert_match": True,
+                "entries": [
+                    {"sequence": 10, "action": "permit", "community": "65000:*"},
+                    {"sequence": 20, "action": "permit", "community": "large:65000:1:2"},
+                ],
+            },
+            "as_path": {
+                "name": "AP-RT",
+                "entries": [{"sequence": 10, "action": "permit", "pattern": "^65000_"}],
+            },
+        }
+        reconcile_route_policy(
+            self.device,
+            {
+                "prefix_lists": [captures["prefix_list"]],
+                "community_lists": [captures["community_list"]],
+                "as_paths": [captures["as_path"]],
+            },
+        )
+        for family, cap in captures.items():
+            st = NSORoutePolicyState.objects.get(family=family, object_name=cap["name"])
+            self.assertIs(
+                device_caught_up(family, cap, st.assigned_object),
+                True,
+                f"{family} roundtrip broke the settle normalization",
+            )
+
+    def test_route_map_family_has_no_settle_yet(self):
+        """route_map has no extract (push shape ≠ capture shape) — settle must SKIP,
+        preserving the apply-only lifecycle rather than guessing."""
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._make_mgmt(self.device)
+        payload = {"route_maps": [{"name": "RM-NOSETTLE", "entries": [{"seq": 10, "action": "permit"}]}]}
+        reconcile_route_policy(self.device, payload)
+        self._accept("route_map", "RM-NOSETTLE")
+        reconcile_route_policy(self.device, payload)
+        st = NSORoutePolicyState.objects.get(family="route_map", object_name="RM-NOSETTLE")
+        self.assertEqual(st.status, "accepted")
+
+
 class TestSharedObjectOwnership(TestCase):
     """Per-device capture + materialized-owner + operator re-point (universal core).
 

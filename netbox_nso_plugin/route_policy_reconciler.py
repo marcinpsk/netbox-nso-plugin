@@ -403,16 +403,64 @@ def _rm_fill(obj, captured: dict) -> None:
     _fill_route_map_entries(obj, entries, pl_map, cl_map, ap_map)
 
 
+def _extract_prefix_list(pl_obj) -> dict:
+    """Reverse of _fill_prefix_list: CURRENT object content in device-capture shape (#93).
+
+    Key-compatible with the capture entries the fill consumes (prefix/action/ge/le);
+    sequences are positional artifacts and are renumbered by the comparator.
+    """
+    entries = []
+    for e in pl_obj.prefix_list_entries.all().order_by("sequence"):
+        cp = e.assigned_prefix
+        if cp is None:
+            continue
+        entry = {"sequence": e.sequence, "action": (e.action or "permit").lower(), "prefix": str(cp.prefix)}
+        if getattr(e, "ge", None) is not None:
+            entry["ge"] = e.ge
+        if getattr(e, "le", None) is not None:
+            entry["le"] = e.le
+        entries.append(entry)
+    return {"entries": entries}
+
+
+def _extract_community_list(cl_obj) -> dict:
+    """Reverse of _cl_fill: members verbatim + invert_match, capture-shaped (#93)."""
+    entries = []
+    seq = 0
+    for e in cl_obj.communitylistentries.all():
+        if not e.community_id:
+            continue
+        seq += 1
+        entries.append(
+            {"sequence": seq, "action": (e.action or "permit").lower(), "community": str(e.community.community)}
+        )
+    return {"entries": entries, "invert_match": bool(cl_obj.invert_match)}
+
+
+def _extract_as_path(ap_obj) -> dict:
+    """Reverse of _fill_as_path_entries (#93). The fill's key is ``pattern``."""
+    return {
+        "entries": [
+            {"sequence": e.sequence, "action": (e.action or "permit").lower(), "pattern": e.pattern or ""}
+            for e in ap_obj.aspath_entries.all().order_by("sequence")
+        ]
+    }
+
+
 def _register_specs() -> None:
     Spec = ownership.SharedObjectSpec
     ownership.register(
         "prefix_list",
-        Spec(fill=_fill_prefix_list, hash_captured=lambda c: _hash(_entries(c))),
+        Spec(fill=_fill_prefix_list, hash_captured=lambda c: _hash(_entries(c)), extract=_extract_prefix_list),
     )
-    ownership.register("community_list", Spec(fill=_cl_fill, hash_captured=_cl_hash))
+    ownership.register("community_list", Spec(fill=_cl_fill, hash_captured=_cl_hash, extract=_extract_community_list))
     ownership.register(
         "as_path",
-        Spec(fill=lambda o, c: _fill_as_path_entries(o, _entries(c)), hash_captured=lambda c: _hash(_entries(c))),
+        Spec(
+            fill=lambda o, c: _fill_as_path_entries(o, _entries(c)),
+            hash_captured=lambda c: _hash(_entries(c)),
+            extract=_extract_as_path,
+        ),
     )
     # Route-maps dedup on a VENDOR-NEUTRAL SEMANTIC digest (not the raw entries): the same
     # logical policy spelled in Junos vs Nokia encoding (term/terminal labels, family
@@ -551,6 +599,15 @@ def _upsert_state(mgmt, family, name, obj, ct, captured, now):
         return state, True
 
     from . import status_machine as sm
+
+    # #93 — device-caught-up settle for OWNED rows: the operator's intent IS the current
+    # NetBox object; when THIS device's capture equals it, the device has caught up —
+    # genuine confirmation, so it may settle accepted/deploying/apply_failed → in_sync.
+    # (The materialized-content 'matches' below can never see this: settles_owned=False
+    # kept staged intent pending forever — cnad-test sat 26 days already satisfied.)
+    # route_map has no extractor yet (push shape ≠ capture shape) → None → no settle.
+    if sm.is_owned(state.status) and ownership.device_caught_up(family, captured, obj):
+        state.status = sm.on_reconcile(state.status, matches=True, settles_owned=True)
 
     # FK/content overlay: 'matches' = materialized (content recorded & unchanged), not
     # device confirmation, so it must not settle an owned row (settles_owned=False).

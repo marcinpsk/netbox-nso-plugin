@@ -45,6 +45,9 @@ class SharedObjectSpec:
     fill: Callable[[object, dict], None]
     hash_captured: Callable[[dict], str]
     label: str = ""
+    # Reverse of fill: the CURRENT NetBox object content in device-capture shape, for the
+    # device-caught-up settle (#93). None = the family cannot compare (settle skipped).
+    extract: Callable[[object], dict] | None = None
 
 
 _REGISTRY: dict[str, SharedObjectSpec] = {}
@@ -63,6 +66,43 @@ def hash_captured(family: str, captured: dict) -> str:
     """Digest a device capture using the family's spec (empty string if unknown family)."""
     spec = _REGISTRY.get(family)
     return spec.hash_captured(captured) if spec is not None else ""
+
+
+def _renumbered(captured: dict) -> dict:
+    """Positionally renumber ``entries`` sequences (1..n) for the caught-up comparison.
+
+    Sequence numbers are ARTIFACTS on both sides — readers synthesize 10/20/…, the
+    materializer renumbers 1..n (smallint-safe), and some devices (IOS community-lists)
+    have no sequences at all — so position is the only truth the comparison may use.
+    The sequence key is FORCED onto every dict entry so a capture without sequences
+    still lands in the same key-set as an extracted object.
+    """
+    entries = captured.get("entries")
+    if not isinstance(entries, list):
+        return captured
+    out = dict(captured)
+    out["entries"] = [({**e, "sequence": i} if isinstance(e, dict) else e) for i, e in enumerate(entries, start=1)]
+    return out
+
+
+def device_caught_up(family: str, captured: dict, obj) -> bool | None:
+    """Whether the device capture equals the CURRENT NetBox object content (the intent).
+
+    True/False when *family* registered an ``extract``; None when it cannot compare
+    (no extractor, no object, or an extraction error — never settle on a guess).
+    Equality here is GENUINE device confirmation — this device now renders what the
+    operator's object holds — so ``on_reconcile`` may settle owned rows
+    (``settles_owned=True``), unlike the materialized-content 'matches' which only
+    says the recorded import is unchanged. Sequence-insensitive via :func:`_renumbered`.
+    """
+    spec = _REGISTRY.get(family)
+    if spec is None or spec.extract is None or obj is None:
+        return None
+    try:
+        return spec.hash_captured(_renumbered(spec.extract(obj))) == spec.hash_captured(_renumbered(captured))
+    except Exception:
+        logger.warning("device_caught_up: extract/hash failed for %s", family, exc_info=True)
+        return None
 
 
 # ---------------------------------------------------------------------------
