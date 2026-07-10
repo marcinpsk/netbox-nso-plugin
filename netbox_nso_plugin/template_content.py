@@ -2110,6 +2110,44 @@ class InterfaceNSOBadge(PluginTemplateExtension):
         )
 
 
+class ISISWritePolicyPanel(PluginTemplateExtension):
+    """Read-only-mirror warning on the netbox-routing IS-IS object pages (#78).
+
+    The reconciler mirrors far more IS-IS config into netbox-routing than the intent
+    push carries; editing a mirror-only field there and clicking Accept silently
+    re-pushes the same snapshot (the change never reaches the device). This panel —
+    rendered exactly where those edits happen — names which fields are read-only and
+    which genuinely push, from the ``isis_write_policy`` registry (whose truthfulness
+    an integrity test proves against a captured payload).
+    """
+
+    models = ["netbox_routing.isisinstance", "netbox_routing.isisinterface"]
+
+    def full_width_page(self):
+        """Render the write-path coverage card when the object's device is NSO-managed.
+
+        full_width_page, not right_page — the netbox-routing object pages (panel-based
+        UI) render plugin full-width content but no right-column plugin block (same
+        reason RoutePolicyNSODevices is full-width).
+        """
+        from .isis_write_policy import ISIS_CHILD_NOTES, ISIS_PUSHED_FIELDS, ISIS_READ_ONLY_FIELDS
+        from .models import NSODeviceManagement
+
+        obj = self.context["object"]
+        kind = "isis_instance" if obj._meta.model_name == "isisinstance" else "isis_interface"
+        device = getattr(obj, "device", None) or getattr(getattr(obj, "interface", None), "device", None)
+        if device is None or not NSODeviceManagement.objects.filter(device=device).exists():
+            return ""
+        return self.render(
+            "netbox_nso_plugin/isis_write_policy.html",
+            extra_context={
+                "read_only_fields": ISIS_READ_ONLY_FIELDS[kind],
+                "writable_fields": ISIS_PUSHED_FIELDS[kind],
+                "child_notes": ISIS_CHILD_NOTES[kind],
+            },
+        )
+
+
 class RoutePolicyNSODevices(PluginTemplateExtension):
     """Adds an "NSO — applied to devices" panel to the route-policy object pages.
 
@@ -2209,4 +2247,4 @@ class RoutePolicyNSODevices(PluginTemplateExtension):
                 state.capability = {"state": "partial", "unsupported": verdict.get("unsupported", [])}
 
 
-template_extensions = [InterfaceNSOBadge, RoutePolicyNSODevices]
+template_extensions = [InterfaceNSOBadge, RoutePolicyNSODevices, ISISWritePolicyPanel]

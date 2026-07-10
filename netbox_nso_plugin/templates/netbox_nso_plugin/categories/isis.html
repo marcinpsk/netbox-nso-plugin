@@ -3,6 +3,22 @@
 {# Lazy-loaded fragment: IS-IS category (interfaces + instances). #}
 {% include "netbox_nso_plugin/categories/_adapter_error.html" %}
 
+{# #78 intent-integrity: name what the mirror carries that the write path does not, #}
+{# so an edit+Accept on those fields is never silently inert. Registry (and the     #}
+{# payload-proving test) live in isis_write_policy.py; the per-object detail panel  #}
+{# renders on the netbox-routing IS-IS pages themselves.                            #}
+{% if isis_interfaces or isis_processes %}
+  <p class="text-muted small mb-2">
+    <span class="mdi mdi-pencil-off-outline me-1"></span>
+    Some mirrored IS-IS fields are <strong>read-only</strong> (not carried by the NSO write path):
+    per-instance timers/LSP/overload-on-startup/TE/distance/paths/bandwidth/attached-bit,
+    per-interface hello-auth &amp; csnp/retransmit/lsp-interval &amp; mesh-group, level
+    default-metric/preference/auth, and all interface-levels, settings, segment-routing,
+    prefix-SIDs and SRv6 locators. Editing them in NetBox does <em>not</em> reach the device —
+    the IS-IS object pages list the exact fields.
+  </p>
+{% endif %}
+
 {% if isis_interfaces %}
   <div class="d-flex justify-content-between align-items-center mb-2">
     <strong>IS-IS Interfaces</strong>
