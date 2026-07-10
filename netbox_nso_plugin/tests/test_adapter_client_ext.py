@@ -538,3 +538,15 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
         with self.assertRaises(AdapterError) as ctx:
             sync_notify(5)
         self.assertEqual(ctx.exception.code, "nso_unreachable")
+
+
+class TestGetApplyDiffOutformat(TestCase):
+    def test_outformat_param_threaded(self):
+        """outformat rides the query string so NSO renders cli (+/- tree diff) vs native."""
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import adapter_client
+
+        with patch("netbox_nso_plugin.adapter_client._request", return_value={"diffs": {}}) as req:
+            adapter_client.get_apply_diff(5, outformat="cli")
+        req.assert_called_once_with("GET", "/api/v1/devices/5/actions/apply-diff", params={"outformat": "cli"})

@@ -379,9 +379,14 @@ def get_intent_summary(adapter_device_id: int) -> dict:
     return _request("GET", f"/api/v1/devices/{adapter_device_id}/intent-summary")
 
 
-def get_apply_diff(adapter_device_id: int) -> dict:
-    """GET /api/v1/devices/{id}/actions/apply-diff → per-scope native device diff (NSO dry-run)."""
-    return _request("GET", f"/api/v1/devices/{adapter_device_id}/actions/apply-diff")
+def get_apply_diff(adapter_device_id: int, outformat: str = "native") -> dict:
+    """GET /api/v1/devices/{id}/actions/apply-diff → per-scope diff (NSO dry-run, no commit).
+
+    ``outformat="native"``: device-native rendering (CLI for cli NEDs, edit-config XML
+    for netconf NEDs). ``outformat="cli"``: NSO's NED-uniform ``+``/``-`` tree diff —
+    what the apply-preview renders through the vendored diff2html.
+    """
+    return _request("GET", f"/api/v1/devices/{adapter_device_id}/actions/apply-diff", params={"outformat": outformat})
 
 
 def get_snmp_config(adapter_device_id: int) -> dict:

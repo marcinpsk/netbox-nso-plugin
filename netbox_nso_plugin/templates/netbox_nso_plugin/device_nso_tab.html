@@ -2,8 +2,12 @@
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
 {% extends 'generic/object.html' %}
 {% load helpers %}
+{% load static %}
 
 {% block content %}
+{# Vendored diff2html (MIT) — renders the apply-preview's NSO tree diff; no CDN. #}
+<link rel="stylesheet" href="{% static 'netbox_nso_plugin/vendor/diff2html.min.css' %}">
+<script src="{% static 'netbox_nso_plugin/vendor/diff2html.min.js' %}"></script>
 {% if mgmt %}
 
   {# ── Adapter link/sync failure — managing this device couldn't reach the adapter ─────── #}
@@ -331,7 +335,7 @@
   {# ── Apply confirmation modal (self-contained overlay; no Bootstrap-JS dep) ── #}
   <div id="nso-apply-modal" class="d-none"
        style="position:fixed; inset:0; z-index:1080; background:rgba(0,0,0,.5); align-items:flex-start; justify-content:center;">
-    <div class="card shadow" style="max-width:1180px; width:94%; margin-top:4rem; max-height:82vh; display:flex; flex-direction:column;">
+    <div class="card shadow" style="max-width:1560px; width:96%; margin-top:3rem; max-height:86vh; display:flex; flex-direction:column;">
       <div class="card-header d-flex justify-content-between align-items-center">
         <span><span class="mdi mdi-upload-network me-1"></span>Apply intent to the device</span>
         <button type="button" class="btn-close nso-apply-cancel" aria-label="Close"></button>
@@ -465,11 +469,45 @@
       return h;
     }
 
+    // ── diff rendering: NSO `outformat cli` (+/- tree diff) through the vendored
+    //    diff2html; device-native syntax available behind a toggle. ──────────────
+    var diffMode = 'line-by-line';           // 'line-by-line' | 'side-by-side' | 'native'
+    var previewCache = {};                   // outformat → parsed preview response
+
+    function cliToUnified(scope, text) {
+      // NSO's cli output is already a +/- annotated tree; wrap it as a unified-diff
+      // hunk so diff2html can parse it (defensively prefix any unmarked line as context).
+      var lines = String(text).replace(/\n$/, '').split('\n').map(function (l) {
+        var c = l.charAt(0);
+        return (c === '+' || c === '-' || c === ' ') ? l : ' ' + l;
+      });
+      // diff2html requires a REAL hunk header (@@ -start,count +start,count @@) —
+      // count the before (context+deletions) and after (context+additions) sides.
+      var before = 0, after = 0;
+      lines.forEach(function (l) {
+        if (l.charAt(0) !== '+') before += 1;
+        if (l.charAt(0) !== '-') after += 1;
+      });
+      return '--- ' + scope + '\n+++ ' + scope + '\n@@ -1,' + before + ' +1,' + after + ' @@\n'
+           + lines.join('\n') + '\n';
+    }
+
     function renderDiffPanel(d) {
       var diff = d.device_diff || {};
       var keys = Object.keys(diff);
       if (!keys.length) {
         return '<p class="text-muted mb-0">No device change — the intent already matches the device (or the diff is unavailable).</p>';
+      }
+      if (d.outformat === 'cli' && window.Diff2Html) {
+        var unified = keys.map(function (k) { return cliToUnified(k.replace(/_/g, ' '), diff[k]); }).join('');
+        try {
+          return Diff2Html.html(unified, {
+            drawFileList: false,
+            matching: 'lines',
+            outputFormat: diffMode === 'side-by-side' ? 'side-by-side' : 'line-by-line',
+            colorScheme: document.documentElement.dataset.bsTheme === 'dark' ? 'dark' : 'light',
+          });
+        } catch (e) { /* fall through to the <pre> rendering */ }
       }
       var h = '';
       keys.forEach(function (k) {
@@ -480,6 +518,19 @@
       return h;
     }
 
+    function diffModeButtons() {
+      function btn(mode, icon, label) {
+        var active = diffMode === mode ? ' active' : '';
+        return '<button type="button" class="btn btn-outline-secondary btn-sm' + active + '" data-diffmode="' + mode + '">'
+             + '<span class="mdi ' + icon + ' me-1"></span>' + label + '</button>';
+      }
+      return '<div class="btn-group btn-group-sm ms-auto" role="group" aria-label="Diff format">'
+           + btn('line-by-line', 'mdi-format-list-text', 'Unified')
+           + btn('side-by-side', 'mdi-view-split-vertical', 'Split')
+           + btn('native', 'mdi-console', 'Device syntax')
+           + '</div>';
+    }
+
     function renderPreview(d) {
       if (!d.total) { return '<p class="text-muted mb-0">Nothing pending — NetBox and the device are in sync.</p>'; }
       return ''
@@ -487,17 +538,44 @@
         + '  <div class="col-lg-6"><h6 class="border-bottom pb-1"><span class="mdi mdi-cloud-upload-outline me-1"></span>Intent — what we push</h6>'
         +      renderIntentPanel(d)
         + '  </div>'
-        + '  <div class="col-lg-6"><h6 class="border-bottom pb-1"><span class="mdi mdi-file-compare me-1"></span>Device diff — NSO dry-run</h6>'
+        + '  <div class="col-lg-6"><h6 class="border-bottom pb-1 d-flex align-items-center"><span class="mdi mdi-file-compare me-1"></span>Device diff — NSO dry-run'
+        +      diffModeButtons()
+        + '  </h6>'
         +      renderDiffPanel(d)
         + '  </div>'
         + '</div>';
     }
 
+    async function fetchPreview(fmt) {
+      if (previewCache[fmt]) return previewCache[fmt];
+      var r = await fetch(applyForm.dataset.previewUrl + '?outformat=' + fmt,
+                          { headers: { 'X-Requested-With': 'XMLHttpRequest' } });
+      var d = await r.json();
+      previewCache[fmt] = d;
+      return d;
+    }
+
+    async function rerenderPreview() {
+      var fmt = diffMode === 'native' ? 'native' : 'cli';
+      try {
+        modalBody.innerHTML = renderPreview(await fetchPreview(fmt));
+      } catch (e) { setStatus('Could not load apply preview: ' + e.message, 'warning', false); }
+    }
+
+    if (modalBody) {
+      modalBody.addEventListener('click', function (ev) {
+        var b = ev.target.closest('[data-diffmode]');
+        if (!b) return;
+        diffMode = b.dataset.diffmode;
+        rerenderPreview();
+      });
+    }
+
     async function openApply() {
       if (!applyForm) return;
       try {
-        var r = await fetch(applyForm.dataset.previewUrl, { headers: { 'X-Requested-With': 'XMLHttpRequest' } });
-        var d = await r.json();
+        previewCache = {};
+        var d = await fetchPreview(diffMode === 'native' ? 'native' : 'cli');
         if (d.auto_apply || !d.total) { runAction(applyForm); return; }  // auto-apply or nothing pending → just go
         modalBody.innerHTML = renderPreview(d);
         showModal();

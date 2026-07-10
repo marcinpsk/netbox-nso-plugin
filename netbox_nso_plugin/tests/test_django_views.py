@@ -1314,6 +1314,36 @@ class TestNSOApplyPreviewView(ViewTestBase):
         self.assertEqual(data["changes"], [])  # imported (un-owned) → not pushed → not previewed
         self.assertEqual(data["total"], 0)
 
+    def test_preview_forwards_outformat_to_adapter_and_echoes_it(self):
+        """?outformat=cli threads to the adapter apply-diff (NSO's NED-uniform +/- tree
+        diff for the preview's diff-u panel) and is echoed so the JS picks the renderer."""
+        import json
+        from unittest.mock import patch
+
+        self.mgmt.adapter_device_id = 77
+        self.mgmt.save()
+        with patch(
+            "netbox_nso_plugin.adapter_client.get_apply_diff",
+            return_value={"outformat": "cli", "diffs": {"isis": "+ isis bfd"}},
+        ) as gad:
+            url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
+            data = json.loads(self.client.get(url + "?outformat=cli").content)
+        gad.assert_called_once_with(77, outformat="cli")
+        self.assertEqual(data["outformat"], "cli")
+        self.assertEqual(data["device_diff"], {"isis": "+ isis bfd"})
+
+    def test_preview_invalid_outformat_falls_back_to_native(self):
+        import json
+        from unittest.mock import patch
+
+        self.mgmt.adapter_device_id = 78
+        self.mgmt.save()
+        with patch("netbox_nso_plugin.adapter_client.get_apply_diff", return_value={"diffs": {}}) as gad:
+            url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
+            data = json.loads(self.client.get(url + "?outformat=bogus").content)
+        gad.assert_called_once_with(78, outformat="native")
+        self.assertEqual(data["outformat"], "native")
+
     def test_preview_ospf_interface_lists_pushed_properties(self):
         """An accepted OSPF interface overlay shows its pushed properties (area/cost/network-type)."""
         import json
