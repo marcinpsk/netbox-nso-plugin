@@ -476,7 +476,17 @@
           var noChange = satisfied
             ? ' <span class="badge text-bg-info" title="The NSO dry-run shows no device change for this intent — the device already matches it (or the NED cannot express it).">no device change</span>'
             : '';
-          h += '<tr><td>' + esc(c.category) + '</td><td>' + esc(c.item) + '</td><td><strong>' + esc(c.detail) + '</strong>' + noChange + '</td><td><span class="text-muted small">' + esc(c.status) + '</span></td></tr>';
+          // Staged-and-forgotten: accepted ≥7 days ago and still not settled — say it
+          // loudly, whether no apply ever ran or an old apply never converged.
+          var stale = '';
+          if (c.staged_days !== null && c.staged_days >= 7) {
+            var staleLabel = 'staged ' + c.staged_days + 'd' + (c.never_applied ? ', never applied' : '');
+            var staleTitle = c.never_applied
+              ? 'Accepted ' + c.staged_days + ' days ago and never applied — this intent has been waiting in staging ever since.'
+              : 'Accepted ' + c.staged_days + ' days ago and still not in sync — the last apply never converged or the change was re-staged.';
+            stale = ' <span class="badge text-bg-warning text-dark" title="' + staleTitle + '">' + staleLabel + '</span>';
+          }
+          h += '<tr><td>' + esc(c.category) + '</td><td>' + esc(c.item) + '</td><td><strong>' + esc(c.detail) + '</strong>' + noChange + '</td><td><span class="text-muted small">' + esc(c.status) + '</span>' + stale + '</td></tr>';
         });
         h += '</tbody></table></div>';
       }

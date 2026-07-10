@@ -2097,8 +2097,20 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
                     except Exception:
                         detail = ""
                     scope_val = scope(r) if callable(scope) else scope
+                    # Staleness: a row accepted long ago and never applied is staged-and-
+                    # forgotten (cnad-test sat silently for a month) — surface it.
+                    accepted_at = getattr(r, "accepted_at", None)
+                    staged_days = int((timezone.now() - accepted_at).days) if accepted_at else None
                     routing_changes.append(
-                        {"category": label, "item": item, "detail": detail, "status": r.status, "scope": scope_val}
+                        {
+                            "category": label,
+                            "item": item,
+                            "detail": detail,
+                            "status": r.status,
+                            "scope": scope_val,
+                            "staged_days": staged_days,
+                            "never_applied": getattr(r, "last_apply_at", None) is None,
+                        }
                     )
 
         # Right panel: the diff the Apply would push (NSO dry-run, no commit).

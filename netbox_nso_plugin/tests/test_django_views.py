@@ -1388,6 +1388,32 @@ class TestNSOApplyPreviewView(ViewTestBase):
         rc = next(r for r in data["routing_changes"] if r["category"] == "IS-IS interface")
         self.assertEqual(rc["scope"], "isis")
 
+    def test_preview_rows_carry_staleness(self):
+        """A row staged long ago and never applied must SAY so (the cnad-test case:
+        accepted June 14, no apply ever ran, panels silently disagreed for a month).
+        Rows expose staged_days + never_applied so the modal can badge them."""
+        import json
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from netbox_nso_plugin.models import NSOISISInterfaceState
+
+        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="in_sync", nso_value="")
+        NSOISISInterfaceState.objects.create(
+            management=self.mgmt,
+            interface=self.interface,
+            af="ipv4",
+            process_tag="CORE",
+            status="accepted",
+            accepted_at=timezone.now() - timedelta(days=26),
+        )
+        url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
+        data = json.loads(self.client.get(url).content)
+        rc = next(r for r in data["routing_changes"] if r["category"] == "IS-IS interface")
+        self.assertEqual(rc["staged_days"], 26)
+        self.assertTrue(rc["never_applied"])
+
     def test_preview_ospf_interface_lists_pushed_properties(self):
         """An accepted OSPF interface overlay shows its pushed properties (area/cost/network-type)."""
         import json
