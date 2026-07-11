@@ -23,7 +23,7 @@
             <td>{{ s.dot1q_vlan|default:"—" }}</td>
             <td>{{ s.vrf|default:"global" }}</td>
             <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=s.status %}</td>
-            <td>{{ s.last_sync_at|default:"—" }}</td>
+            <td class="text-nowrap">{% if s.last_sync_at %}{{ s.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
             <td>
               {% url 'plugins:netbox_nso_plugin:subinterface_accept' pk=s.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=s.status form_class="nso-row-form" title="Make NetBox the source of truth for this subinterface (re-materialised on the device on Apply)" %}
             </td>

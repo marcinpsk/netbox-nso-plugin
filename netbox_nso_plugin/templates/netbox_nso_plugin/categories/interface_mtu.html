@@ -29,7 +29,7 @@
           <td>{{ s.mpls_mtu|default:"—" }}</td>
           <td>{{ s.bound_port|default:"—" }}</td>
           <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=s.status %}</td>
-          <td>{{ s.last_sync_at|default:"—" }}</td>
+          <td class="text-nowrap">{% if s.last_sync_at %}{{ s.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
           <td class="text-nowrap">
             {% url 'plugins:netbox_nso_plugin:nsointerfacemtustate_edit' pk=s.pk as edit_url %}{% include "netbox_nso_plugin/categories/_edit_link.html" with edit_url=edit_url return_url=return_url %}
             {% url 'plugins:netbox_nso_plugin:interface_mtu_accept' pk=s.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=s.status title="Make NetBox the source of truth for this interface's MTU (re-asserted on the device on Apply)" %}

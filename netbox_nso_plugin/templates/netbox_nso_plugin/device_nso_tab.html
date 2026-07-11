@@ -229,7 +229,7 @@
       <form method="post" class="nso-action-form" data-label="Detect Drift"
             action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_action' mgmt.pk 'detect-drift' %}">
         {% csrf_token %}
-        <button type="submit" class="btn btn-outline-primary nso-action-btn"
+        <button type="submit" class="btn btn-outline-secondary nso-action-btn"
                 title="Re-read the live device via NSO and flag where it differs from NetBox">
           <span class="mdi mdi-compare-horizontal"></span> Detect Drift
         </button>
@@ -252,7 +252,7 @@
       <form method="post"
             action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_reconcile' mgmt.pk %}">
         {% csrf_token %}
-        <button type="submit" class="btn btn-outline-info"
+        <button type="submit" class="btn btn-outline-secondary"
                 title="Re-pull adapter state into the tab cache (no device sync)">
           <span class="mdi mdi-cloud-refresh"></span> Refresh from NSO
         </button>

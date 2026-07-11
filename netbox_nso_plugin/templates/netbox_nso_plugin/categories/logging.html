@@ -53,7 +53,7 @@
                data-pe-v-vrf="{{ h.vrf|default:'' }}">{{ h.vrf|default:"—" }}</a>
           </td>
           <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=h.status %}</td>
-          <td>{{ h.last_sync_at|default:"—" }}</td>
+          <td class="text-nowrap">{% if h.last_sync_at %}{{ h.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
           <td>
             <div class="d-flex gap-1 align-items-center">
               {% url 'plugins:netbox_nso_plugin:nsologginghoststate_edit' pk=h.pk as edit_url %}{% include "netbox_nso_plugin/categories/_edit_link.html" with edit_url=edit_url return_url=return_url %}

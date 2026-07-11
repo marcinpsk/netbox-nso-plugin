@@ -20,8 +20,10 @@
 .nso-ifg .tabulator .tabulator-header .tabulator-col .tabulator-col-title {
   font-weight: 600;
 }
-.nso-ifg .tabulator .tabulator-tableholder {
+.nso-ifg .tabulator .tabulator-tableholder,
+.nso-ifg .tabulator .tabulator-tableholder .tabulator-table {
   background: var(--tblr-bg-surface);
+  color: inherit;
 }
 .nso-ifg .tabulator-row {
   background: var(--tblr-bg-surface);

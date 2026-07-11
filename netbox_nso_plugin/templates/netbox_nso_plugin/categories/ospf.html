@@ -26,7 +26,7 @@
           <td>
             {% include "netbox_nso_plugin/categories/_state_badge.html" with status=oi.status %}
           </td>
-          <td>{{ oi.last_sync_at|default:"—" }}</td>
+          <td class="text-nowrap">{% if oi.last_sync_at %}{{ oi.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
           <td>
             {% url 'plugins:netbox_nso_plugin:routing_accept_ospf_instance' pk=oi.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=oi.status %}
           </td>
@@ -57,7 +57,7 @@
           <td>
             {% include "netbox_nso_plugin/categories/_state_badge.html" with status=oif.status %}
           </td>
-          <td>{{ oif.last_sync_at|default:"—" }}</td>
+          <td class="text-nowrap">{% if oif.last_sync_at %}{{ oif.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
           <td>
             {% url 'plugins:netbox_nso_plugin:routing_accept_ospf_interface' pk=oif.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=oif.status %}
           </td>

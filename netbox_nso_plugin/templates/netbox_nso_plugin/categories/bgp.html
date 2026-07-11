@@ -24,7 +24,7 @@
           <td>
             {% include "netbox_nso_plugin/categories/_state_badge.html" with status=bp.status %}
           </td>
-          <td>{{ bp.last_sync_at|default:"—" }}</td>
+          <td class="text-nowrap">{% if bp.last_sync_at %}{{ bp.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
           <td>
             {% url 'plugins:netbox_nso_plugin:routing_accept_bgp_peer' pk=bp.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=bp.status %}
           </td>
@@ -54,7 +54,7 @@
           <td>{{ tp.remote_as_str|default:"—" }}</td>
           <td>{% if tp.template %}<a href="{{ tp.template.get_absolute_url }}">{{ tp.template }}</a>{% else %}—{% endif %}</td>
           <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=tp.status %}</td>
-          <td>{{ tp.last_sync_at|default:"—" }}</td>
+          <td class="text-nowrap">{% if tp.last_sync_at %}{{ tp.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
           <td>
             {% url 'plugins:netbox_nso_plugin:routing_accept_bgp_peer_template' pk=tp.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=tp.status %}
           </td>

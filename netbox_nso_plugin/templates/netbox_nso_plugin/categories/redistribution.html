@@ -27,7 +27,7 @@
             <td>{{ rs.route_map|default:"—" }}</td>
             <td>{{ rs.metric|default:"—" }}</td>
             <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=rs.status %}</td>
-            <td>{{ rs.last_sync_at|default:"—" }}</td>
+            <td class="text-nowrap">{% if rs.last_sync_at %}{{ rs.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
             <td>
               <div class="d-flex gap-1">
                 <a href="{% url 'plugins:netbox_nso_plugin:routing_redistribution_diff' pk=rs.pk %}" class="btn btn-xs btn-outline-warning" title="See exactly what differs between this device and NetBox"><span class="mdi mdi-not-equal-variant"></span> Diff</a>
