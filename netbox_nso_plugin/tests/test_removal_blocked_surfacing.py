@@ -267,6 +267,82 @@ class TestForceRemovalView(BlockedRemovalTestBase):
         self.assertEqual(response.status_code, 403)
 
 
+def _residue_job(job_id=60, scope="svi", residue=None, updated="2026-07-11T20:00:00Z"):
+    """A SUCCEEDED removal whose post-retract check found device residue (#104-A)."""
+    return {
+        "id": job_id,
+        "type": "removal",
+        "device_id": 10,
+        "status": "succeeded",
+        "result": {
+            "scope": scope,
+            "residue_check": "found",
+            "residue": residue or {"interface": [["Vlan987"]]},
+        },
+        "context": {"scope": scope, "removed": {"interface": [["Vlan987"]]}},
+        "error": None,
+        "created_at": "2026-07-11T19:59:00Z",
+        "updated_at": updated,
+        "started_at": "2026-07-11T19:59:30Z",
+        "heartbeat_at": None,
+    }
+
+
+class TestDeviceJobsResidueRemovals(BlockedRemovalTestBase):
+    """#104-A: a succeeded removal whose result carries residue is surfaced.
+
+    FASTMAP can keep a retracted entry that picked up foreign leaves (the sw03
+    Vlan987 husk) while the removal job reports success — the adapter now records
+    the survivors in job.result.residue and the tab must attribute the reappeared
+    unowned rows to the retraction instead of presenting them as new device config.
+    """
+
+    def test_residue_removal_surfaced_with_detail(self):
+        data = self._get_jobs([_residue_job()])
+        self.assertEqual(len(data["residue_removals"]), 1)
+        entry = data["residue_removals"][0]
+        self.assertEqual(entry["scope"], "svi")
+        self.assertEqual(entry["job_id"], 60)
+        self.assertEqual(entry["residue"], {"interface": [["Vlan987"]]})
+        self.assertEqual(entry["detected_at"], "2026-07-11T20:00:00Z")
+
+    def test_clean_removal_yields_no_entry(self):
+        job = _residue_job()
+        job["result"] = {"scope": "svi", "residue_check": "clean"}
+        data = self._get_jobs([job])
+        self.assertEqual(data["residue_removals"], [])
+
+    def test_newer_clean_removal_masks_stale_residue(self):
+        newer = _residue_job(job_id=61)
+        newer["result"] = {"scope": "svi", "residue_check": "clean"}
+        data = self._get_jobs([newer, _residue_job(job_id=60)])  # most-recent-first
+        self.assertEqual(data["residue_removals"], [])
+
+    def test_other_scope_clean_removal_keeps_residue(self):
+        clean_static = _residue_job(job_id=62, scope="static_route")
+        clean_static["result"] = {"scope": "static_route", "residue_check": "clean"}
+        data = self._get_jobs([clean_static, _residue_job(job_id=60)])
+        self.assertEqual(len(data["residue_removals"]), 1)
+        self.assertEqual(data["residue_removals"][0]["scope"], "svi")
+
+    def test_blocked_removal_not_double_reported_as_residue(self):
+        data = self._get_jobs([_blocked_job()])
+        self.assertEqual(data["residue_removals"], [])
+
+    def test_tab_contains_residue_template(self):
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_ADAPTER_CFG),
+            patch("netbox_nso_plugin.adapter_client.requests.Session") as mock_session_cls,
+        ):
+            mock_session_cls.return_value = make_session(response=make_response(200, json_data={"id": 10}))
+            url = reverse("dcim:device_nso", args=[self.device.pk])
+            response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        html = response.content.decode()
+        self.assertIn('id="nso-residue-removals"', html)
+        self.assertIn('id="nso-residue-removal-tpl"', html)
+
+
 class TestTabBannerWiring(BlockedRemovalTestBase):
     """The NSO tab ships the banner template + force form for the jobs-poll JS to clone."""
 

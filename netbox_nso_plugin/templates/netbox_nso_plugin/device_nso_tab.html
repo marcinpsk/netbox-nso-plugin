@@ -267,6 +267,23 @@
   {# nobody removed (orphaned intent). Persists until the operator re-accepts the    #}
   {# rows or forces the removal — unlike the job strip, it is not displaced by later #}
   {# jobs. Capability transparency: while blocked, the retraction is NOT on the device. #}
+  {# ── #104-A: succeeded removals that left residue on the device (JS-populated) ── #}
+  <div id="nso-residue-removals" class="mb-3 d-none"></div>
+  <template id="nso-residue-removal-tpl">
+    <div class="alert alert-warning d-flex align-items-start mb-2" role="alert">
+      <span class="mdi mdi-broom me-2 mt-1"></span>
+      <div class="flex-grow-1">
+        <strong>Residue after retract — <span data-slot="scope"></span> config survived the removal.</strong>
+        The removal committed, but NSO's ownership diff kept these entries on the device
+        (they had picked up device-rendered values along the way). They will reappear below
+        as <em>imported</em> rows — that is this retraction's residue, not new device
+        config. Remove them with a gated device commit if unwanted, or Accept them to adopt.
+        <ul class="mb-1 mt-1" data-slot="residue"></ul>
+        <span class="small text-muted">Job #<span data-slot="job"></span> · detected <span data-slot="when"></span></span>
+      </div>
+    </div>
+  </template>
+
   <div id="nso-blocked-removals" class="mb-3 d-none"></div>
   <template id="nso-blocked-removal-tpl">
     <div class="alert alert-danger d-flex align-items-start mb-2" role="alert">
@@ -377,12 +394,37 @@
         blockedBox.appendChild(node);
       });
     }
+    var residueBox = document.getElementById('nso-residue-removals');
+    var residueTpl = document.getElementById('nso-residue-removal-tpl');
+    function renderResidue(list) {
+      if (!residueBox || !residueTpl) return;
+      residueBox.innerHTML = '';
+      if (!list || !list.length) { residueBox.classList.add('d-none'); return; }
+      residueBox.classList.remove('d-none');
+      list.forEach(function (r) {
+        var node = residueTpl.content.cloneNode(true);
+        node.querySelector('[data-slot="scope"]').textContent = r.scope;
+        var ul = node.querySelector('[data-slot="residue"]');
+        Object.keys(r.residue || {}).forEach(function (listName) {
+          (r.residue[listName] || []).forEach(function (k) {
+            var li = document.createElement('li');
+            var key = Array.isArray(k) ? k.filter(function (p) { return p !== '' && p != null; }).join(' / ') : String(k);
+            li.textContent = listName + ': ' + (key || '(default)');
+            ul.appendChild(li);
+          });
+        });
+        node.querySelector('[data-slot="job"]').textContent = r.job_id;
+        node.querySelector('[data-slot="when"]').textContent = rel(r.detected_at) || '';
+        residueBox.appendChild(node);
+      });
+    }
     function poll() {
       fetch(url, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
         .then(function (r) { return r.json(); })
         .then(function (d) {
           render(d);
           renderBlocked(d && d.blocked_removals);
+          renderResidue(d && d.residue_removals);
           var running = !!(d && d.running);
           if (running && !timer) { timer = setInterval(poll, 4000); }
           else if (!running && timer) { clearInterval(timer); timer = null; }

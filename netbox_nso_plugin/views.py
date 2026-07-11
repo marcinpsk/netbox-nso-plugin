@@ -1783,6 +1783,39 @@ def _blocked_removals(jobs):
     return blocked
 
 
+def _residue_removals(jobs):
+    """Collect scopes whose LATEST removal job SUCCEEDED but left device residue (#104-A).
+
+    FASTMAP's reverse diff keeps service entries that picked up foreign leaves (the
+    sw03 Vlan987 husk), so a removal can report success while its keys survive on the
+    device; the adapter records survivors in ``job.result.residue``. Same newest-first
+    per-scope masking as :func:`_blocked_removals`: a later removal for the scope
+    (e.g. a clean re-run) displaces a stale residue report. The entry carries the
+    surviving keys so the operator can attribute the re-imported unowned rows to the
+    retraction instead of mistaking them for new device config.
+    """
+    found = []
+    seen_scopes = set()
+    for job in jobs:
+        if job.get("type") != "removal":
+            continue
+        scope = _removal_job_scope(job)
+        if not scope or scope in seen_scopes:
+            continue
+        seen_scopes.add(scope)
+        result = job.get("result") or {}
+        if job.get("status") == "succeeded" and result.get("residue"):
+            found.append(
+                {
+                    "scope": scope,
+                    "job_id": job.get("id"),
+                    "residue": result["residue"],
+                    "detected_at": job.get("updated_at"),
+                }
+            )
+    return found
+
+
 class NSODeviceJobsView(LoginRequiredMixin, View):
     """JSON summary of a device's adapter jobs for the tab's status strip.
 
@@ -1801,7 +1834,15 @@ class NSODeviceJobsView(LoginRequiredMixin, View):
         device = get_object_or_404(Device, pk=pk)
         mgmt = getattr(device, "nso_management", None)
         if mgmt is None or mgmt.adapter_device_id is None:
-            return JsonResponse({"onboarded": False, "running": None, "last": None, "blocked_removals": []})
+            return JsonResponse(
+                {
+                    "onboarded": False,
+                    "running": None,
+                    "last": None,
+                    "blocked_removals": [],
+                    "residue_removals": [],
+                }
+            )
 
         from . import adapter_client as client
 
@@ -1814,7 +1855,13 @@ class NSODeviceJobsView(LoginRequiredMixin, View):
         running = next((j for j in jobs if j.get("status") in self._ACTIVE), None)
         last = next((j for j in jobs if j.get("status") in self._TERMINAL), None)
         return JsonResponse(
-            {"onboarded": True, "running": running, "last": last, "blocked_removals": _blocked_removals(jobs)}
+            {
+                "onboarded": True,
+                "running": running,
+                "last": last,
+                "blocked_removals": _blocked_removals(jobs),
+                "residue_removals": _residue_removals(jobs),
+            }
         )
 
 
