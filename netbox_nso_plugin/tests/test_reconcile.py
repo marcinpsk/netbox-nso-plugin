@@ -153,6 +153,69 @@ class TestSettleApplyFailures(APITestCase):
         self.assertTrue(mtu_row.last_apply_error)
 
 
+class TestStaticRouteApplySettle(APITestCase):
+    """Static routes join the deploying→settle flow (the MTU/route-policy regression class:
+    a scope missing from _prepare_apply/_APPLY_DEPLOYING_SCOPES strands its rows). Found
+    live on rg03: a successfully applied static route stayed 'pending apply' forever —
+    _prepare_apply never marked it deploying and never force-pushed its snapshot."""
+
+    def _setup(self, status_="deploying"):
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.models import NSOStaticRouteState
+
+        device = _make_device("sr-settle")
+        inst, _ = NSOInstance.objects.get_or_create(
+            name="sr-settle-inst", defaults={"adapter_instance_id": "sr-settle-inst"}
+        )
+        mgmt = NSODeviceManagement.objects.create(
+            device=device, nso_instance=inst, nso_device_name="sr-settle", adapter_device_id=89
+        )
+        # No device M2M on the route — the greenfield-accept signal must not fire here;
+        # the overlay row is created directly in the state under test.
+        route = StaticRoute.objects.create(prefix="198.18.99.0/24", next_hop="198.18.0.1", name="sr-settle", metric=1)
+        row = NSOStaticRouteState.objects.create(
+            management=mgmt,
+            static_route=route,
+            nso_prefix="198.18.99.0/24",
+            nso_next_hop="198.18.0.1",
+            status=status_,
+        )
+        return mgmt, row
+
+    def test_failed_static_route_scope_marks_apply_failed(self):
+        from netbox_nso_plugin.reconcile import _settle_apply_failures
+
+        mgmt, row = self._setup()
+        _settle_apply_failures(mgmt, {"static_route_count_by_outcome": {"in_sync": 0, "apply_failed": 1}})
+        row.refresh_from_db()
+        self.assertEqual(row.status, "apply_failed")
+        self.assertTrue(row.last_apply_error)
+
+    def test_prepare_apply_marks_accepted_static_route_deploying(self):
+        from netbox_nso_plugin.views import _prepare_apply
+
+        mgmt, row = self._setup(status_="accepted")
+        with (
+            patch("netbox_nso_plugin.signals._push_interface_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_lacp_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_switchport_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_vlan_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_svi_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_subinterface_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_bfd_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_interface_mtu_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_route_policy_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_static_route_intent_for_device") as push_static,
+        ):
+            _prepare_apply(mgmt)
+        row.refresh_from_db()
+        self.assertEqual(row.status, "deploying")
+        # And the owned snapshot is force-re-pushed so a stale adapter intent still applies.
+        push_static.assert_called_once()
+        self.assertTrue(push_static.call_args.kwargs.get("force"))
+
+
 class TestRoutePolicyApplySettle(APITestCase):
     """Route-policy joins the deploying→settle flow: Apply marks accepted→deploying,
     a failed route_policy scope flips the stuck deploying row → apply_failed."""

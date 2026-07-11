@@ -1384,7 +1384,7 @@ def _on_ip_address_delete(sender, instance, **kwargs):
     )
 
 
-def _push_static_route_intent_for_device(device_id, adapter_device_id):
+def _push_static_route_intent_for_device(device_id, adapter_device_id, force=False):
     """Build and push the full static route intent snapshot for a device."""
     from . import adapter_client as client
     from .models import NSOStaticRouteState
@@ -1413,6 +1413,7 @@ def _push_static_route_intent_for_device(device_id, adapter_device_id):
         (device_id, "static_route"),
         routes,
         lambda: client.put_static_route_intent(adapter_device_id, routes),
+        force=force,
     )
 
 

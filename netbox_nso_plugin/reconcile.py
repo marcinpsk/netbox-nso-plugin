@@ -492,6 +492,7 @@ _APPLY_DEPLOYING_SCOPES = {
     "bfd": "NSOBFDInterfaceState",
     "interface_mtu": "NSOInterfaceMtuState",
     "route_policy": "NSORoutePolicyState",
+    "static_route": "NSOStaticRouteState",
 }
 
 
