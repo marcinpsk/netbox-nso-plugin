@@ -10,7 +10,8 @@
 
 {{ grid_payload|json_script:"nso-ifg-data" }}
 <div class="nso-ifg"
-     data-json-url="{% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='interface' %}?format=json">
+     data-json-url="{% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='interface' %}?format=json"
+     data-mtu-edit-url="{% url 'plugins:netbox_nso_plugin:overlay_field_edit' key='interface_mtu' pk=0 %}">
   <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
     <div class="btn-group btn-group-sm nso-ifg-state" role="group" aria-label="State quick filter">
       <button type="button" class="btn btn-outline-secondary active" data-state="all">All (<span class="nso-ifg-n-all">{{ counts.all }}</span>)</button>
@@ -105,11 +106,30 @@
     return (c.value ? esc(c.value) : MUTED) + cellBadge(c) + acceptBtn(c);
   }
   function fmtMtu(cell) {
-    var c = cell.getRow().getData().mtu;
+    var d = cell.getRow().getData();
+    var c = d.mtu;
     if (!c) return MUTED;
     var t = [c.l2, c.ip, c.mpls].map(function (v) { return v == null ? '—' : esc(v); }).join(' / ');
     var port = c.bound_port ? '<div class="text-muted small">port ' + esc(c.bound_port) + '</div>' : '';
-    return '<span class="font-monospace text-nowrap">' + t + '</span>' + cellBadge(c) + acceptBtn(c) + port;
+    // The value itself is a popedit anchor (three-field popover) — DOM-built so the
+    // data attributes are safely escaped whatever the values contain.
+    var wrap = document.createElement('span');
+    var a = document.createElement('a');
+    a.href = '#';
+    a.className = 'nso-popedit font-monospace text-nowrap';
+    a.title = "Click to edit MTU — an unowned row becomes 'changed' (needs Accept)";
+    a.setAttribute('data-pe-url', root.dataset.mtuEditUrl.replace('/0/', '/' + c.pk + '/'));
+    a.setAttribute('data-pe-title', d.iface.name + ' MTU');
+    a.setAttribute('data-pe-fields', 'l2_mtu:number:L2 MTU,ip_mtu:number:IP MTU,mpls_mtu:number:MPLS MTU');
+    a.setAttribute('data-pe-v-l2_mtu', c.l2 == null ? '' : c.l2);
+    a.setAttribute('data-pe-v-ip_mtu', c.ip == null ? '' : c.ip);
+    a.setAttribute('data-pe-v-mpls_mtu', c.mpls == null ? '' : c.mpls);
+    a.innerHTML = t;
+    wrap.appendChild(a);
+    var rest = document.createElement('span');
+    rest.innerHTML = cellBadge(c) + acceptBtn(c) + port;
+    wrap.appendChild(rest);
+    return wrap;
   }
   function fmtIps(cell) {
     var ips = cell.getRow().getData().ips || [];
@@ -255,6 +275,9 @@
       table.toggleColumn(COL_FIELD[key]);
     }
   });
+
+  // MTU popover saves (nso-popedit) bubble up from inside the grid — refresh rows.
+  root.addEventListener('nso:popedit-saved', function () { reload(); });
 
   if (payload.adapter_error) flash('Adapter: ' + payload.adapter_error, 'warning');
 })();

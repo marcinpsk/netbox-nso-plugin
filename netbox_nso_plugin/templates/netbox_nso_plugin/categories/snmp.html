@@ -10,9 +10,20 @@
 {% if snmp_data.communities or snmp_data.v3_users or snmp_data.hosts or snmp_data.system_info %}
 
   {% if snmp_data.system_info %}
+  {% url 'plugins:netbox_nso_plugin:overlay_field_edit' key='snmp_system_info' pk=snmp_data.system_info.pk as sysinfo_edit_url %}
   <table class="table table-sm mb-3">
-    <tr><th style="width:160px;">Location</th><td>{{ snmp_data.system_info.location|default:"—" }}</td></tr>
-    <tr><th>Contact</th><td>{{ snmp_data.system_info.contact|default:"—" }}</td></tr>
+    <tr><th style="width:160px;">Location</th><td>
+      <a href="#" class="nso-popedit" title="Click to edit"
+         data-pe-url="{{ sysinfo_edit_url }}" data-pe-title="Location"
+         data-pe-fields="location:text:Location"
+         data-pe-v-location="{{ snmp_data.system_info.location|default:'' }}">{{ snmp_data.system_info.location|default:"—" }}</a>
+    </td></tr>
+    <tr><th>Contact</th><td>
+      <a href="#" class="nso-popedit" title="Click to edit"
+         data-pe-url="{{ sysinfo_edit_url }}" data-pe-title="Contact"
+         data-pe-fields="contact:text:Contact"
+         data-pe-v-contact="{{ snmp_data.system_info.contact|default:'' }}">{{ snmp_data.system_info.contact|default:"—" }}</a>
+    </td></tr>
     <tr><th>Status</th><td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=snmp_data.system_info.status %}</td></tr>
     <tr><th>Actions</th><td>
       <div class="d-flex gap-1 align-items-center">
@@ -35,9 +46,20 @@
       <tbody>
         {% for c in snmp_data.communities %}
         <tr data-status="{{ c.status }}" data-owned="{{ c.accepted_at|yesno:'true,false' }}">
+          {% url 'plugins:netbox_nso_plugin:overlay_field_edit' key='snmp_community' pk=c.pk as community_edit_url %}
           <td><code>{{ c.community_hash }}</code></td>
-          <td>{{ c.access }}</td>
-          <td>{{ c.acl|default:"—" }}</td>
+          <td>
+            <a href="#" class="nso-popedit" title="Click to edit"
+               data-pe-url="{{ community_edit_url }}" data-pe-title="Access"
+               data-pe-fields="access:text:Access (ro/rw)"
+               data-pe-v-access="{{ c.access|default:'' }}">{{ c.access|default:"—" }}</a>
+          </td>
+          <td>
+            <a href="#" class="nso-popedit" title="Click to edit"
+               data-pe-url="{{ community_edit_url }}" data-pe-title="ACL"
+               data-pe-fields="acl:text:ACL"
+               data-pe-v-acl="{{ c.acl|default:'' }}">{{ c.acl|default:"—" }}</a>
+          </td>
           <td>
             {% if c.vault_ref %}
               <code title="{{ c.vault_ref }}">{{ c.vault_ref|truncatechars:34 }}</code>

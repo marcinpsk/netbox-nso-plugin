@@ -2033,6 +2033,92 @@ class NSOInterfaceEditFieldView(NSOActionPermissionMixin, View):
         return JsonResponse({"status": "ok", "message": f"Updated {attribute} on {iface.name}."})
 
 
+class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
+    """Inline (popover) field edit on an overlay row from the NSO tab.
+
+    One endpoint for every family the tab edits in place; each family names an
+    explicit field whitelist (anything else is rejected, not ignored — a silent
+    ignore would hide client bugs). Values are validated by the model field
+    itself, then saved with a normal ``save()`` so the same post_save push
+    signals fire as for the full-page edit forms.
+
+    An inline edit TAKES OWNERSHIP (status → accepted, accepted_at set) — the
+    tab's documented inline-edit semantic ("NetBox will own this value — same
+    as Accept"). Anything weaker is silently futile: the category reconcile
+    refreshes unowned rows from the device mirror, so an unowned edit evaporates
+    on the next expand (caught live). Vault-touching fields (community
+    secret/ref) stay in the full form — their validation writes to Vault and
+    cannot run per-field.
+    """
+
+    _FAMILIES = {
+        "snmp_system_info": ("NSOSnmpSystemInfoState", ("location", "contact")),
+        "snmp_community": ("NSOSnmpCommunityState", ("access", "acl")),
+        "logging_host": (
+            "NSOLoggingHostState",
+            ("address", "port", "severity", "facility", "transport", "vrf", "source"),
+        ),
+        "interface_mtu": ("NSOInterfaceMtuState", ("l2_mtu", "ip_mtu", "mpls_mtu")),
+    }
+
+    def post(self, request, key, pk):
+        """Validate and apply whitelisted field values; JSON in, JSON out."""
+        from django.apps import apps
+        from django.core.exceptions import ValidationError
+
+        from . import status_machine as sm
+
+        spec = self._FAMILIES.get(key)
+        if spec is None:
+            return JsonResponse({"status": "error", "message": f"unknown overlay family: {key}"}, status=400)
+        model_name, editable = spec
+
+        rejected = sorted(f for f in request.POST if f not in editable and f != "csrfmiddlewaretoken")
+        if rejected:
+            return JsonResponse(
+                {"status": "error", "message": f"field(s) not editable here: {', '.join(rejected)}"}, status=400
+            )
+        supplied = [f for f in editable if f in request.POST]
+        if not supplied:
+            return JsonResponse({"status": "error", "message": "no editable field supplied"}, status=400)
+
+        obj = get_object_or_404(apps.get_model("netbox_nso_plugin", model_name), pk=pk)
+        errors: dict[str, list[str]] = {}
+        changed = []
+        for f in supplied:
+            field = obj._meta.get_field(f)
+            raw = request.POST.get(f, "")
+            value = raw if raw != "" else (None if field.null else "")
+            try:
+                value = field.clean(value, obj)
+            except ValidationError as exc:
+                errors[f] = [str(m) for m in exc.messages]
+                continue
+            if getattr(obj, f) != value:
+                setattr(obj, f, value)
+                changed.append(f)
+        if errors:
+            return JsonResponse({"status": "error", "errors": errors}, status=400)
+
+        if changed:
+            # Claim ownership (same transition as Accept on a differing value):
+            # the edited value is intent the device doesn't have yet.
+            if not sm.is_owned(obj.status):
+                obj.accepted_at = timezone.now()
+            if obj.status != "deploying":  # don't stomp an apply already in flight
+                obj.status = "accepted"
+            if key == "interface_mtu" and obj.l2_mtu is not None:
+                # Same side effect as the MTU Accept view: NetBox's native
+                # interface MTU follows the managed L2 value (clamped).
+                iface = obj.interface
+                clamped = min(int(obj.l2_mtu), NSOInterfaceMtuStateAcceptView._NETBOX_MTU_MAX)
+                if iface.mtu != clamped:
+                    iface.mtu = clamped
+                    iface.save(update_fields=["mtu"])
+            obj.save()
+        return JsonResponse({"status": "ok", "changed": changed})
+
+
 class NSOBulkAcceptView(NSOActionPermissionMixin, View):
     """Bulk-accept all 'changed' interface states for a device and push a single intent snapshot."""
 

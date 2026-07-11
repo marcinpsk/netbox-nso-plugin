@@ -16,8 +16,15 @@
       <tbody>
         {% for s in interface_mtu_states %}
         <tr data-status="{{ s.status }}" data-owned="{{ s.accepted_at|yesno:'true,false' }}">
+          {% url 'plugins:netbox_nso_plugin:overlay_field_edit' key='interface_mtu' pk=s.pk as mtu_edit_url %}
           <td><a href="{{ s.interface.get_absolute_url }}">{{ s.interface.name }}</a></td>
-          <td>{{ s.l2_mtu|default:"—" }}</td>
+          <td>
+            <a href="#" class="nso-popedit" title="Click to edit — an unowned row becomes 'changed' (needs Accept)"
+               data-pe-url="{{ mtu_edit_url }}" data-pe-title="{{ s.interface.name }} MTU"
+               data-pe-fields="l2_mtu:number:L2 MTU,ip_mtu:number:IP MTU,mpls_mtu:number:MPLS MTU"
+               data-pe-v-l2_mtu="{{ s.l2_mtu|default:'' }}" data-pe-v-ip_mtu="{{ s.ip_mtu|default:'' }}"
+               data-pe-v-mpls_mtu="{{ s.mpls_mtu|default:'' }}">{{ s.l2_mtu|default:"—" }}</a>
+          </td>
           <td>{{ s.ip_mtu|default:"—" }}</td>
           <td>{{ s.mpls_mtu|default:"—" }}</td>
           <td>{{ s.bound_port|default:"—" }}</td>

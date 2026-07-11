@@ -15,12 +15,43 @@
       <tbody>
         {% for h in logging_data.hosts %}
         <tr data-status="{{ h.status }}" data-owned="{{ h.accepted_at|yesno:'true,false' }}">
-          <td>{{ h.address }}</td>
-          <td>{{ h.port|default:"514" }}</td>
-          <td>{{ h.severity|default:"—" }}</td>
-          <td>{{ h.facility|default:"—" }}</td>
-          <td>{{ h.source|default:"—" }}</td>
-          <td>{{ h.vrf|default:"—" }}</td>
+          {% url 'plugins:netbox_nso_plugin:overlay_field_edit' key='logging_host' pk=h.pk as host_edit_url %}
+          <td>
+            <a href="#" class="nso-popedit" title="Click to edit"
+               data-pe-url="{{ host_edit_url }}" data-pe-title="Syslog server"
+               data-pe-fields="address:text:Address"
+               data-pe-v-address="{{ h.address }}">{{ h.address }}</a>
+          </td>
+          <td>
+            <a href="#" class="nso-popedit" title="Click to edit (blank = NED default 514)"
+               data-pe-url="{{ host_edit_url }}" data-pe-title="Port"
+               data-pe-fields="port:number:Port"
+               data-pe-v-port="{{ h.port|default:'' }}">{{ h.port|default:"514" }}</a>
+          </td>
+          <td>
+            <a href="#" class="nso-popedit" title="Click to edit"
+               data-pe-url="{{ host_edit_url }}" data-pe-title="Severity"
+               data-pe-fields="severity:text:Severity"
+               data-pe-v-severity="{{ h.severity|default:'' }}">{{ h.severity|default:"—" }}</a>
+          </td>
+          <td>
+            <a href="#" class="nso-popedit" title="Click to edit"
+               data-pe-url="{{ host_edit_url }}" data-pe-title="Facility"
+               data-pe-fields="facility:text:Facility"
+               data-pe-v-facility="{{ h.facility|default:'' }}">{{ h.facility|default:"—" }}</a>
+          </td>
+          <td>
+            <a href="#" class="nso-popedit" title="Click to edit"
+               data-pe-url="{{ host_edit_url }}" data-pe-title="Source"
+               data-pe-fields="source:text:Source"
+               data-pe-v-source="{{ h.source|default:'' }}">{{ h.source|default:"—" }}</a>
+          </td>
+          <td>
+            <a href="#" class="nso-popedit" title="Click to edit"
+               data-pe-url="{{ host_edit_url }}" data-pe-title="VRF"
+               data-pe-fields="vrf:text:VRF"
+               data-pe-v-vrf="{{ h.vrf|default:'' }}">{{ h.vrf|default:"—" }}</a>
+          </td>
           <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=h.status %}</td>
           <td>{{ h.last_sync_at|default:"—" }}</td>
           <td>

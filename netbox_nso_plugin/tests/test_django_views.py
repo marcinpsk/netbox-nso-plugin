@@ -2557,6 +2557,111 @@ class TestInterfaceMatrixStateChips(ViewTestBase):
         self.assertEqual(resp.status_code, 200)
 
 
+class TestOverlayFieldEditView(ViewTestBase):
+    """Inline (popover) field edits on SNMP / logging / MTU overlay rows.
+
+    One generic endpoint, per-model field whitelist. An inline edit TAKES
+    OWNERSHIP (status → accepted, accepted_at set) — the tab's documented
+    inline-edit semantic ("NetBox will own this value — same as Accept").
+    Anything weaker is silently futile: the next category reconcile refreshes
+    unowned rows from the device mirror and the edit evaporates (caught live)."""
+
+    def _url(self, key, pk):
+        return reverse("plugins:netbox_nso_plugin:overlay_field_edit", kwargs={"key": key, "pk": pk})
+
+    def test_edit_snmp_system_info_field_takes_ownership(self):
+        from netbox_nso_plugin.models import NSOSnmpSystemInfoState
+
+        row = NSOSnmpSystemInfoState.objects.create(
+            management=self.mgmt, location="old-loc", contact="noc@old.example", status="imported"
+        )
+        r = self.client.post(self._url("snmp_system_info", row.pk), {"location": "rack C7"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["status"], "ok")
+        row.refresh_from_db()
+        self.assertEqual(row.location, "rack C7")
+        self.assertEqual(row.contact, "noc@old.example")  # untouched
+        # Edited value diverges from the device → owned, pending apply — and safe
+        # from the reconciler (which refreshes only unowned rows).
+        self.assertEqual(row.status, "accepted")
+        self.assertIsNotNone(row.accepted_at)
+
+    def test_edit_logging_host_fields_take_ownership(self):
+        from netbox_nso_plugin.models import NSOLoggingHostState
+
+        row = NSOLoggingHostState.objects.create(
+            management=self.mgmt, address="198.51.100.9", severity="warning", status="imported"
+        )
+        r = self.client.post(self._url("logging_host", row.pk), {"severity": "informational", "port": "1514"})
+        self.assertEqual(r.status_code, 200)
+        row.refresh_from_db()
+        self.assertEqual(row.severity, "informational")
+        self.assertEqual(row.port, 1514)
+        self.assertEqual(row.status, "accepted")
+
+    def test_edit_mtu_takes_ownership_and_adopts_native_l2(self):
+        from netbox_nso_plugin.models import NSOInterfaceMtuState
+
+        row = NSOInterfaceMtuState.objects.create(
+            management=self.mgmt, interface=self.interface, l2_mtu=9214, status="imported"
+        )
+        r = self.client.post(self._url("interface_mtu", row.pk), {"l2_mtu": "9000"})
+        self.assertEqual(r.status_code, 200)
+        row.refresh_from_db()
+        self.assertEqual(row.l2_mtu, 9000)
+        self.assertEqual(row.status, "accepted")
+        # Same side effect as the Accept view: the native NetBox interface MTU follows.
+        self.interface.refresh_from_db()
+        self.assertEqual(self.interface.mtu, 9000)
+
+    def test_edit_mtu_keeps_owned_status(self):
+        from netbox_nso_plugin.models import NSOInterfaceMtuState
+
+        row = NSOInterfaceMtuState.objects.create(
+            management=self.mgmt, interface=self.interface, l2_mtu=9214, status="accepted"
+        )
+        r = self.client.post(self._url("interface_mtu", row.pk), {"l2_mtu": "9100"})
+        self.assertEqual(r.status_code, 200)
+        row.refresh_from_db()
+        self.assertEqual(row.l2_mtu, 9100)
+        self.assertEqual(row.status, "accepted")
+
+    def test_noop_edit_does_not_claim_ownership(self):
+        from netbox_nso_plugin.models import NSOSnmpSystemInfoState
+
+        row = NSOSnmpSystemInfoState.objects.create(management=self.mgmt, location="same", status="imported")
+        r = self.client.post(self._url("snmp_system_info", row.pk), {"location": "same"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["changed"], [])
+        row.refresh_from_db()
+        self.assertEqual(row.status, "imported")  # nothing changed → nothing owned
+
+    def test_non_whitelisted_field_rejected(self):
+        from netbox_nso_plugin.models import NSOSnmpSystemInfoState
+
+        row = NSOSnmpSystemInfoState.objects.create(management=self.mgmt, location="keep", status="imported")
+        r = self.client.post(self._url("snmp_system_info", row.pk), {"status": "in_sync"})
+        self.assertEqual(r.status_code, 400)
+        row.refresh_from_db()
+        self.assertEqual(row.status, "imported")
+
+    def test_invalid_value_rejected_with_field_error(self):
+        from netbox_nso_plugin.models import NSOInterfaceMtuState
+
+        row = NSOInterfaceMtuState.objects.create(
+            management=self.mgmt, interface=self.interface, l2_mtu=9214, status="imported"
+        )
+        r = self.client.post(self._url("interface_mtu", row.pk), {"l2_mtu": "not-a-number"})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("l2_mtu", r.json()["errors"])
+        row.refresh_from_db()
+        self.assertEqual(row.l2_mtu, 9214)
+
+    def test_unknown_key_400(self):
+        r = self.client.post(self._url("route_policy", 1), {"anything": "x"})
+        self.assertEqual(r.status_code, 400)
+
+
 class TestPagedCategoryQuickSelect(ViewTestBase):
     """Behavioral guard: EVERY paged category in the device NSO tab renders the
     drift/pending/in-sync quick-select. Driven by the view's own paged-category spec,

@@ -80,6 +80,17 @@ class ActionViewPermissionTests(IntentPushResetMixin, TestCase):
         self.iface_state.refresh_from_db()
         self.assertEqual(self.iface_state.status, "accepted")
 
+    def test_overlay_field_edit_denied_without_permission(self):
+        """The inline (popover) overlay field editor mutates intent — 403 for an unprivileged user."""
+        from netbox_nso_plugin.models import NSOSnmpSystemInfoState
+
+        row = NSOSnmpSystemInfoState.objects.create(management=self.mgmt, location="keep-loc", status="imported")
+        url = reverse("plugins:netbox_nso_plugin:overlay_field_edit", kwargs={"key": "snmp_system_info", "pk": row.pk})
+        response = self.client.post(url, {"location": "hacked"})
+        self.assertEqual(response.status_code, 403)
+        row.refresh_from_db()
+        self.assertEqual(row.location, "keep-loc")
+
     def test_device_apply_action_denied_without_permission(self):
         """The scariest action — committing config to the device — is blocked for an unprivileged user."""
         url = reverse(

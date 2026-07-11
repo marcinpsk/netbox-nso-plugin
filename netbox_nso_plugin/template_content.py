@@ -538,18 +538,25 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
             continue
         incoming_community_hashes.add(h)
         state, _ = NSOSnmpCommunityState.objects.get_or_create(management=mgmt, community_hash=h)
-        state.access = entry.get("access") or "RO"
-        state.acl = entry.get("acl") or ""
+        dev_access = entry.get("access") or "RO"
+        dev_acl = entry.get("acl") or ""
         state.has_secret = bool(entry.get("has_secret", True))
         state.last_sync_at = now
-        # An OWNED row with a recorded Vault fingerprint has a genuine device
-        # confirmation: the device reporting this hash means the secret landed →
-        # settle accepted → in_sync. Without a fingerprint (or on hash2
-        # platforms) the value is unknowable — mirror semantics (matches=None).
-        matches = None
-        if value_compare and state.vault_secret_hash and sm.is_owned(state.status):
-            matches = state.vault_secret_hash == h
-        state.status = sm.on_reconcile(state.status, matches=matches)
+        if sm.is_owned(state.status):
+            # Owned: access/acl are operator intent — never clobber them with the
+            # device read (the next snapshot push would silently revert the edit).
+            # Settle only on genuine device confirmation: the device reporting the
+            # Vault-held fingerprint AND the intent attributes. Without a
+            # fingerprint (or on hash2 platforms) the value is unknowable —
+            # mirror semantics (matches=None).
+            matches = None
+            if value_compare and state.vault_secret_hash:
+                matches = state.vault_secret_hash == h and state.access == dev_access and state.acl == dev_acl
+            state.status = sm.on_reconcile(state.status, matches=matches)
+        else:
+            state.access = dev_access
+            state.acl = dev_acl
+            state.status = sm.on_reconcile(state.status, matches=None)
         state.save()
     # Owned rows absent from the payload must SURVIVE (an operator-created or
     # just-rotated row would otherwise lose its vault_ref/status mid-flight
@@ -583,12 +590,22 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
             continue
         incoming_addresses.add(address)
         state, _ = NSOSnmpHostState.objects.get_or_create(management=mgmt, address=address)
-        state.version = entry.get("version") or "v2c"
-        state.notify_type = entry.get("notify_type") or "trap"
-        state.port = entry.get("port")
-        state.community_hash = entry.get("community_hash") or ""
+        dev = {
+            "version": entry.get("version") or "v2c",
+            "notify_type": entry.get("notify_type") or "trap",
+            "port": entry.get("port"),
+            "community_hash": entry.get("community_hash") or "",
+        }
         state.last_sync_at = now
-        state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
+        if sm.is_owned(state.status):
+            # Owned: attributes are operator intent — settle only when the device
+            # reports exactly the intent values, never overwrite them.
+            matches = all(getattr(state, f) == v for f, v in dev.items())
+            state.status = sm.on_reconcile(state.status, matches=matches)
+        else:
+            for f, v in dev.items():
+                setattr(state, f, v)
+            state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
         state.save()
     NSOSnmpHostState.objects.filter(management=mgmt).exclude(address__in=incoming_addresses).exclude(
         status__in=sm.OWNED_STATES
@@ -599,10 +616,18 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
     system_info_state = None
     if sys_data:
         system_info_state, _ = NSOSnmpSystemInfoState.objects.get_or_create(management=mgmt)
-        system_info_state.location = sys_data.get("location") or ""
-        system_info_state.contact = sys_data.get("contact") or ""
+        dev_location = sys_data.get("location") or ""
+        dev_contact = sys_data.get("contact") or ""
         system_info_state.last_sync_at = now
-        system_info_state.status = sm.on_reconcile(system_info_state.status, matches=None)
+        if sm.is_owned(system_info_state.status):
+            # Owned: location/contact are operator intent — never clobber with the
+            # device read; settle accepted → in_sync only when the device matches.
+            matches = system_info_state.location == dev_location and system_info_state.contact == dev_contact
+            system_info_state.status = sm.on_reconcile(system_info_state.status, matches=matches)
+        else:
+            system_info_state.location = dev_location
+            system_info_state.contact = dev_contact
+            system_info_state.status = sm.on_reconcile(system_info_state.status, matches=None)
         system_info_state.save()
 
     return {
@@ -654,21 +679,39 @@ def _reconcile_logging_config(device, payload: dict) -> dict:
     now = timezone.now()
     payload_hosts = {h.get("address"): h for h in (payload.get("hosts") or []) if h.get("address")}
 
-    # Delete rows no longer reported.
-    NSOLoggingHostState.objects.filter(management=mgmt).exclude(address__in=payload_hosts.keys()).delete()
+    # Rows the device no longer reports: owned rows are operator intent (the device
+    # may simply not have caught up yet) → keep, transition via present=False;
+    # unowned vestigial rows are pruned.
+    for stale in NSOLoggingHostState.objects.filter(management=mgmt).exclude(address__in=payload_hosts.keys()):
+        if sm.is_owned(stale.status):
+            stale.status = sm.on_reconcile(stale.status, present=False)
+            stale.last_sync_at = now
+            stale.save(update_fields=["status", "last_sync_at"])
+        else:
+            stale.delete()
 
     for addr, h in payload_hosts.items():
         state, _ = NSOLoggingHostState.objects.get_or_create(
             management=mgmt, address=addr, defaults={"status": "unknown"}
         )
-        state.port = h.get("port")
-        state.severity = h.get("severity") or ""
-        state.facility = h.get("facility") or ""
-        state.transport = h.get("transport") or ""
-        state.vrf = h.get("vrf") or ""
-        state.source = h.get("source") or ""
-        state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
+        dev = {
+            "port": h.get("port"),
+            "severity": h.get("severity") or "",
+            "facility": h.get("facility") or "",
+            "transport": h.get("transport") or "",
+            "vrf": h.get("vrf") or "",
+            "source": h.get("source") or "",
+        }
         state.last_sync_at = now
+        if sm.is_owned(state.status):
+            # Owned: field values are operator intent — never clobber with the
+            # device read; settle only when the device reports the intent exactly.
+            matches = all(getattr(state, f) == v for f, v in dev.items())
+            state.status = sm.on_reconcile(state.status, matches=matches)
+        else:
+            for f, v in dev.items():
+                setattr(state, f, v)
+            state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
         state.save()
 
     return {

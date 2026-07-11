@@ -102,3 +102,85 @@ class TestSnmpLoggingContractConsumer(TestCase):
         maximal = NSOLoggingHostState.objects.get(management=self.mgmt, address="10.0.0.5")
         self.assertEqual(maximal.severity, "informational")
         self.assertEqual(maximal.facility, "local7")
+
+
+class TestOwnedRowsSurviveReconcile(TestCase):
+    """Operator-owned (accepted) values are intent — a reconcile must never clobber
+    them back to device truth, and an owned logging host absent from the payload
+    must survive deletion. Mirrors the MTU reconciler's owned/unowned split (the
+    exemplar); caught live when a popover edit evaporated on the next expand."""
+
+    @classmethod
+    def setUpTestData(cls):
+        mfg = Manufacturer.objects.create(name="SlOwn", slug="slown")
+        dt = DeviceType.objects.create(manufacturer=mfg, model="SlOwnDev", slug="slowndev")
+        role = DeviceRole.objects.create(name="SlOwnRole", slug="slownrole")
+        site = Site.objects.create(name="SlOwnSite", slug="slownsite")
+        cls.device = Device.objects.create(name="sl-own-rtr", device_type=dt, role=role, site=site)
+        inst = NSOInstance.objects.create(name="sl-own-inst", adapter_instance_id="sl-own-inst")
+        cls.mgmt = NSODeviceManagement.objects.create(
+            device=cls.device, nso_instance=inst, nso_device_name="sl-own", adapter_device_id=7970
+        )
+
+    def test_owned_system_info_values_survive_reconcile(self):
+        row = NSOSnmpSystemInfoState.objects.create(
+            management=self.mgmt, location="operator-loc", contact="op@example.net", status="accepted"
+        )
+        _reconcile_snmp_config(self.device, SNMP_PAYLOAD)  # device says DC1 / noc@x
+        row.refresh_from_db()
+        self.assertEqual(row.location, "operator-loc")
+        self.assertEqual(row.contact, "op@example.net")
+        self.assertEqual(row.status, "accepted")  # still differs from device → pending apply
+
+    def test_owned_system_info_settles_in_sync_when_device_matches(self):
+        row = NSOSnmpSystemInfoState.objects.create(
+            management=self.mgmt, location="DC1", contact="noc@x", status="accepted"
+        )
+        _reconcile_snmp_config(self.device, SNMP_PAYLOAD)
+        row.refresh_from_db()
+        self.assertEqual(row.status, "in_sync")  # device confirms the intent
+
+    def test_owned_community_attrs_survive_reconcile(self):
+        row = NSOSnmpCommunityState.objects.create(
+            management=self.mgmt, community_hash="abc", access="RW", acl="OP-ACL", status="accepted"
+        )
+        _reconcile_snmp_config(self.device, SNMP_PAYLOAD)  # device says RO / ACL-1
+        row.refresh_from_db()
+        self.assertEqual(row.access, "RW")
+        self.assertEqual(row.acl, "OP-ACL")
+
+    def test_owned_snmp_host_attrs_survive_reconcile(self):
+        row = NSOSnmpHostState.objects.create(
+            management=self.mgmt, address="10.0.0.9", port=11162, version="3", status="accepted"
+        )
+        _reconcile_snmp_config(self.device, SNMP_PAYLOAD)  # device says port 162 / 2c
+        row.refresh_from_db()
+        self.assertEqual(row.port, 11162)
+        self.assertEqual(row.version, "3")
+
+    def test_owned_logging_host_values_survive_and_absent_owned_not_deleted(self):
+        absent = NSOLoggingHostState.objects.create(
+            management=self.mgmt, address="10.9.9.9", severity="critical", status="accepted"
+        )
+        edited = NSOLoggingHostState.objects.create(
+            management=self.mgmt, address="10.0.0.5", severity="emergency", status="accepted"
+        )
+        _reconcile_logging_config(self.device, LOGGING_PAYLOAD)  # 10.0.0.5 → informational; 10.9.9.9 absent
+        self.assertTrue(
+            NSOLoggingHostState.objects.filter(pk=absent.pk).exists(),
+            "owned row absent from the payload was deleted — operator intent lost",
+        )
+        absent.refresh_from_db()
+        self.assertEqual(absent.status, "accepted")  # device absence is expected pre-apply
+        edited.refresh_from_db()
+        self.assertEqual(edited.severity, "emergency")
+        self.assertEqual(edited.status, "accepted")
+
+    def test_unowned_logging_host_still_mirrors_and_prunes(self):
+        vestigial = NSOLoggingHostState.objects.create(
+            management=self.mgmt, address="10.8.8.8", severity="debug", status="imported"
+        )
+        _reconcile_logging_config(self.device, LOGGING_PAYLOAD)
+        self.assertFalse(NSOLoggingHostState.objects.filter(pk=vestigial.pk).exists())
+        mirrored = NSOLoggingHostState.objects.get(management=self.mgmt, address="10.0.0.5")
+        self.assertEqual(mirrored.severity, "informational")

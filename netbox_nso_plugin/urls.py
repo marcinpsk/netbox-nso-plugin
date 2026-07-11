@@ -253,6 +253,11 @@ urlpatterns = [
         name="nsointerfacestate_edit_field",
     ),
     path(
+        "overlay/<str:key>/<int:pk>/edit-field/",
+        views.NSOOverlayFieldEditView.as_view(),
+        name="overlay_field_edit",
+    ),
+    path(
         "devices/<int:device_pk>/bulk-accept/",
         views.NSOBulkAcceptView.as_view(),
         name="device_bulk_accept",
