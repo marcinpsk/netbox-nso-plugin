@@ -7,13 +7,33 @@ Config resolution (per call, ~30 s in-process cache):
   - Bearer token: PLUGINS_CONFIG/env ONLY — never the database.
 """
 
+import contextvars
 import logging
 import time
+from contextlib import contextmanager
 
 import requests
 from django.conf import settings
 
 logger = logging.getLogger(__name__)
+
+# When set, every adapter request carries ``?store_only=true``: the adapter updates its
+# intent STORE but suppresses the device-touching job enqueues (shrink-removal +
+# auto-apply). This is what lets intent re-sync keep its "never touches the device"
+# promise — without it, a reduced snapshot PUT auto-enqueued a removal job that
+# retracted FASTMAP-owned config from the real device (tracker #103, ra1.lab).
+_store_only_push = contextvars.ContextVar("nso_store_only_push", default=False)
+
+
+@contextmanager
+def store_only_pushes():
+    """Mark every adapter request in this context as store-only (no device writes)."""
+    token = _store_only_push.set(True)
+    try:
+        yield
+    finally:
+        _store_only_push.reset(token)
+
 
 _CACHE_TTL = 30  # seconds
 _cfg_cache: dict = {}
@@ -121,6 +141,11 @@ def _request(method, path, **kwargs):
 
     url = f"{cfg['url']}{path}"
     headers = {"Authorization": f"Bearer {cfg['token']}", "Content-Type": "application/json"}
+
+    if _store_only_push.get():
+        params = dict(kwargs.pop("params", None) or {})
+        params["store_only"] = "true"
+        kwargs["params"] = params
 
     if not cfg["verify_tls"]:
         verify = False

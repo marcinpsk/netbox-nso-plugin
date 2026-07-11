@@ -17,9 +17,19 @@ from netbox_nso_plugin.models import (
     NSOInstance,
     NSOInterfaceIPState,
     NSOInterfaceState,
+    NSOLoggingHostState,
 )
 
+from ._adapter_http import make_session
 from .mixins import IntentPushResetMixin
+
+_ADAPTER_CFG = {
+    "url": "http://adapter.local",
+    "token": "test-token",
+    "verify_tls": True,
+    "ca_cert_path": None,
+    "timeout": 30,
+}
 
 
 class TestIntentDrift(IntentPushResetMixin, TestCase):
@@ -160,3 +170,54 @@ class TestIntentDrift(IntentPushResetMixin, TestCase):
         done = intent_drift.resync_intent(self.device, self.mgmt)
         self.assertIn("interface_ip", done)
         mock_push.assert_called_once_with(self.mgmt.device_id, 88)
+
+
+class TestResyncStoreOnly(IntentPushResetMixin, TestCase):
+    """Tracker #103: a re-sync push must be STORE-ONLY on the adapter side.
+
+    "Re-sync adapter intent" promises it never touches the device, but its reduced
+    snapshot PUT made the adapter auto-enqueue a shrink-removal job that PUT-replace
+    retracted FASTMAP-owned config from the real device (ra1.lab, removal job 31686).
+    The re-sync pushes must therefore carry ``?store_only=true``, which the adapter
+    honours by skipping the removal/auto-apply enqueues. These drive the REAL path —
+    resync_intent → signals push → adapter_client PUT — down to the recorded session.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        mfg = Manufacturer.objects.create(name="SoMfg", slug="somfg")
+        dt = DeviceType.objects.create(manufacturer=mfg, model="SoDev", slug="sodev")
+        role = DeviceRole.objects.create(name="SoRole", slug="sorole")
+        site = Site.objects.create(name="SoSite", slug="sosite")
+        cls.device = Device.objects.create(name="so-rtr", device_type=dt, role=role, site=site)
+        inst = NSOInstance.objects.create(name="SoNSO", adapter_instance_id="nso-so")
+        cls.mgmt = NSODeviceManagement.objects.create(
+            device=cls.device, nso_instance=inst, nso_device_name="so-rtr", adapter_device_id=91
+        )
+        NSOLoggingHostState.objects.create(management=cls.mgmt, address="10.0.0.5", status="accepted")
+
+    def _recorded_requests(self, run):
+        session = make_session(json_data={})
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_ADAPTER_CFG),
+            patch("netbox_nso_plugin.adapter_client._get_session", return_value=session),
+        ):
+            run()
+        return session.request.call_args_list
+
+    def test_resync_push_carries_store_only_flag(self):
+        calls = self._recorded_requests(lambda: intent_drift.resync_intent(self.device, self.mgmt, ["logging"]))
+        self.assertEqual(len(calls), 1)
+        method, url = calls[0].args[0], calls[0].args[1]
+        self.assertEqual(method, "PUT")
+        self.assertIn("/logging-intent", url)
+        params = calls[0].kwargs.get("params") or {}
+        self.assertEqual(params.get("store_only"), "true")
+
+    def test_normal_signal_push_has_no_store_only_flag(self):
+        from netbox_nso_plugin.signals import _push_logging_intent_for_device
+
+        calls = self._recorded_requests(lambda: _push_logging_intent_for_device(self.device.pk, 91))
+        self.assertEqual(len(calls), 1)
+        params = calls[0].kwargs.get("params") or {}
+        self.assertNotIn("store_only", params)

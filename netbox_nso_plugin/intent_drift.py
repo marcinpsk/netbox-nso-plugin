@@ -262,17 +262,26 @@ def resync_intent(device, mgmt, keys: list[str] | None = None) -> list[str]:
     Returns the scope keys re-synced. The push is the plugin's normal full-snapshot push, so
     for a scope NetBox owns nothing in, it sends an empty snapshot and the adapter full-replace
     removes the orphaned rows.
+
+    The pushes run under ``store_only_pushes()`` (→ ``?store_only=true``): re-sync repairs the
+    adapter's intent STORE only, so the adapter must skip its shrink-removal and auto-apply
+    enqueues. Without the flag, the reduced snapshot auto-enqueued a removal job whose
+    PUT-replace retracted FASTMAP-owned config from the real device — the exact opposite of
+    the banner's "does not touch the device" promise (tracker #103, ra1.lab).
     """
     if mgmt is None or mgmt.adapter_device_id is None:
         return []
+    from . import adapter_client as client
+
     if keys is None:
         keys = [d["key"] for d in compute_intent_drift(device, mgmt)]
     by_key = {sc["key"]: sc for sc in _scopes()}
     done: list[str] = []
-    for key in keys:
-        sc = by_key.get(key)
-        if sc is None:
-            continue
-        sc["push"](mgmt.device_id, mgmt.adapter_device_id)
-        done.append(key)
+    with client.store_only_pushes():
+        for key in keys:
+            sc = by_key.get(key)
+            if sc is None:
+                continue
+            sc["push"](mgmt.device_id, mgmt.adapter_device_id)
+            done.append(key)
     return done
