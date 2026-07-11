@@ -1317,3 +1317,101 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
                 management=mgmt, interface=self.iface, mode="trunk", status="accepted"
             )
         self._delete_pushes(row, "apply_switchport_config")
+
+
+class TestDeleteOriginMarking(_SignalDBBase):
+    """#106: only pushes born from a DELETION may let the adapter retract from the
+    device. The adapter treats every UNMARKED intent shrink as an un-own and DETACHES
+    (no-networking + sync-from, device untouched) — so deletion-driven pushes must
+    carry ``?delete_origin=true``, and un-own pushes must not.
+    """
+
+    _CFG = {
+        "url": "http://adapter",
+        "token": "tok",
+        "verify_tls": True,
+        "ca_cert_path": None,
+        "timeout": 30,
+    }
+
+    def _mgmt(self):
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        return NSODeviceManagement.objects.create(
+            device=self.device, nso_instance=self.nso_instance, nso_device_name="core-rtr-01", adapter_device_id=43
+        )
+
+    def _recorded_params(self, act):
+        """Run *act* with the adapter HTTP transport recorded → list of params dicts."""
+        from ._adapter_http import make_response, make_session
+
+        session = make_session(response=make_response(200, json_data={}))
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=self._CFG),
+            patch("netbox_nso_plugin.adapter_client.requests.Session", return_value=session),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            act()
+        return [c.kwargs.get("params") or {} for c in session.request.call_args_list]
+
+    def _owned_svi(self, mgmt):
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin.models import NSOSVIState
+
+        vlan = VLAN.objects.create(vid=444, name="do-v444")
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_svi_intent"),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            return NSOSVIState.objects.create(
+                management=mgmt, interface=self.iface, vlan=vlan, svi_type="irb", status="accepted"
+            )
+
+    def test_overlay_delete_push_is_marked_delete_origin(self):
+        mgmt = self._mgmt()
+        row = self._owned_svi(mgmt)
+        params = self._recorded_params(row.delete)
+        self.assertTrue(params, "the delete must push")
+        self.assertTrue(
+            any(p.get("delete_origin") == "true" for p in params),
+            f"delete push must be marked delete_origin; saw params {params}",
+        )
+
+    def test_unown_save_push_is_unmarked(self):
+        mgmt = self._mgmt()
+        row = self._owned_svi(mgmt)
+
+        def _unown():
+            row.status = "imported"
+            row.save()
+
+        params = self._recorded_params(_unown)
+        self.assertTrue(params, "the un-own shrink must push")
+        self.assertFalse(
+            any("delete_origin" in p for p in params),
+            f"an un-own push must stay unmarked (detach-safe); saw params {params}",
+        )
+
+    def test_native_static_route_delete_is_marked(self):
+        """The native pre_delete safety-net path (routing.StaticRoute) is a deletion —
+        its reduced push must carry the mark too."""
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.models import NSOStaticRouteState
+
+        mgmt = self._mgmt()
+        route = StaticRoute.objects.create(prefix="198.18.77.0/24", next_hop="198.18.0.1", name="do-sr", metric=1)
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_static_route_intent"),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            NSOStaticRouteState.objects.create(
+                management=mgmt, static_route=route, nso_prefix="198.18.77.0/24", status="accepted"
+            )
+        params = self._recorded_params(route.delete)
+        self.assertTrue(params, "the native delete must push")
+        self.assertTrue(
+            any(p.get("delete_origin") == "true" for p in params),
+            f"native-delete push must be marked delete_origin; saw params {params}",
+        )

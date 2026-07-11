@@ -35,6 +35,25 @@ def store_only_pushes():
         _store_only_push.reset(token)
 
 
+# When set, every adapter request carries ``?delete_origin=true``: this intent push was
+# born from a NetBox object DELETION, so the adapter may retract the shrink from the
+# device for real. Every UNMARKED shrink is treated as an un-own and DETACHES instead
+# (no-networking + sync-from, device untouched) — tracker #106: a real PUT-replace of an
+# ADOPTED entry plays FASTMAP's reverse diff against the live device and stripped an IOS
+# route-map filter.
+_delete_origin_push = contextvars.ContextVar("nso_delete_origin_push", default=False)
+
+
+@contextmanager
+def delete_origin_pushes():
+    """Mark every adapter request in this context as deletion-born (may retract)."""
+    token = _delete_origin_push.set(True)
+    try:
+        yield
+    finally:
+        _delete_origin_push.reset(token)
+
+
 _CACHE_TTL = 30  # seconds
 _cfg_cache: dict = {}
 # Distinguishes "caller did not supply this field" (omit → adapter preserves it) from an
@@ -145,6 +164,11 @@ def _request(method, path, **kwargs):
     if _store_only_push.get():
         params = dict(kwargs.pop("params", None) or {})
         params["store_only"] = "true"
+        kwargs["params"] = params
+
+    if _delete_origin_push.get():
+        params = dict(kwargs.pop("params", None) or {})
+        params["delete_origin"] = "true"
         kwargs["params"] = params
 
     if not cfg["verify_tls"]:

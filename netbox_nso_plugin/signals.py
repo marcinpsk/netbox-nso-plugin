@@ -2,6 +2,7 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Signal handlers for NSODeviceManagement scope propagation and intent push."""
 
+import contextvars
 import functools
 import hashlib
 import json
@@ -157,16 +158,57 @@ def reset_intent_push_state() -> None:
     _pending_pushes.map = {}
 
 
+# True while a DELETION-signal receiver is dispatching (see _as_delete_origin). Pushes
+# scheduled under it are stamped ``?delete_origin=true`` so the adapter knows the shrink
+# came from a NetBox object deletion and may retract from the device; every unmarked
+# shrink is an un-own and DETACHES instead (device untouched, #106).
+_DELETE_DISPATCH: contextvars.ContextVar[bool] = contextvars.ContextVar("nso_delete_dispatch", default=False)
+
+
+def _as_delete_origin(handler):
+    """Wrap a deletion-signal receiver so every push it schedules is deletion-marked.
+
+    Connected with ``weak=False`` (the wrapper is otherwise only weakly referenced by
+    the signal registry and would be garbage-collected).
+    """
+
+    @functools.wraps(handler)
+    def _wrapped(sender=None, **kwargs):
+        token = _DELETE_DISPATCH.set(True)
+        try:
+            return handler(sender=sender, **kwargs)
+        finally:
+            _DELETE_DISPATCH.reset(token)
+
+    return _wrapped
+
+
+def _run_intent_push(fn, delete_origin: bool) -> None:
+    """Run one push, under the delete-origin request mark when the flag survived."""
+    if delete_origin:
+        from . import adapter_client
+
+        with adapter_client.delete_origin_pushes():
+            fn()
+    else:
+        fn()
+
+
 def _schedule_intent_push(key, fn) -> None:
     """Coalesce *fn* under *key*, flushing once when the current transaction commits.
 
     Deduped by key, so N saves of the same (device, category) collapse to one push.
     Outside a transaction the push runs immediately (nothing to coalesce).
+
+    The delete-origin mark survives coalescing only when EVERY contributor for the key
+    was a deletion (AND): if an un-own coalesces with a delete, the single shrink push
+    stays unmarked and the adapter detaches — erring toward never touching the device.
     """
     from django.db import connection, transaction
 
+    delete_origin = _DELETE_DISPATCH.get()
     if not connection.in_atomic_block:
-        fn()
+        _run_intent_push(fn, delete_origin)
         return
 
     pending = getattr(_pending_pushes, "map", None)
@@ -174,7 +216,10 @@ def _schedule_intent_push(key, fn) -> None:
         pending = {}
         _pending_pushes.map = pending
     was_empty = not pending
-    pending[key] = fn  # last fn wins — per-key builders are equivalent
+    prev = pending.get(key)
+    if prev is not None:
+        delete_origin = delete_origin and prev[1]
+    pending[key] = (fn, delete_origin)  # last fn wins — per-key builders are equivalent
     if was_empty:
         transaction.on_commit(_drain_intent_pushes)
 
@@ -185,9 +230,9 @@ def _drain_intent_pushes() -> None:
     _pending_pushes.map = {}
     if not pending:
         return
-    for fn in pending.values():
+    for fn, delete_origin in pending.values():
         try:
-            fn()
+            _run_intent_push(fn, delete_origin)
         except Exception as exc:  # noqa: BLE001 — a failed push must not abort siblings
             logger.warning("Coalesced intent push failed: %s", exc)
 
@@ -3023,9 +3068,10 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_cable_post_save",
     )
     post_delete.connect(
-        _recompute_on_cable_delete,
+        _as_delete_origin(_recompute_on_cable_delete),
         sender=Cable,
         dispatch_uid="nso_plugin_cable_post_delete",
+        weak=False,
     )
     post_save.connect(
         _recompute_on_interface_save,
@@ -3048,9 +3094,10 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_ipaddress_post_save",
     )
     post_delete.connect(
-        _on_ip_address_delete,
+        _as_delete_origin(_on_ip_address_delete),
         sender=IPAddress,
         dispatch_uid="nso_plugin_ipaddress_post_delete",
+        weak=False,
     )
 
     # SNMP state → intent push
@@ -3066,9 +3113,10 @@ def _connect_g_activated():  # pragma: no cover
         # keeps applying a deleted community/user/host until some unrelated SNMP
         # row is saved (the removal replace-apply never fires).
         post_delete.connect(
-            _on_snmp_state_save,
+            _as_delete_origin(_on_snmp_state_save),
             sender=snmp_model,
             dispatch_uid=f"nso_plugin_snmp_{snmp_model.__name__}_post_delete",
+            weak=False,
         )
 
     # Logging (remote syslog) state → intent push
@@ -3084,9 +3132,10 @@ def _connect_g_activated():  # pragma: no cover
     # until some unrelated sibling row is saved. Caught live on sw01 — deleting an
     # applied SVI's overlay never retracted the irb unit.
     post_delete.connect(
-        _on_logging_state_save,
+        _as_delete_origin(_on_logging_state_save),
         sender=NSOLoggingHostState,
         dispatch_uid="nso_plugin_logging_host_state_post_delete",
+        weak=False,
     )
 
     # SVI/IRB state → intent push (write path)
@@ -3098,9 +3147,10 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_svi_state_post_save",
     )
     post_delete.connect(
-        _on_svi_state_save,
+        _as_delete_origin(_on_svi_state_save),
         sender=NSOSVIState,
         dispatch_uid="nso_plugin_svi_state_post_delete",
+        weak=False,
     )
 
     # dot1q subinterface state → intent push (write path)
@@ -3112,9 +3162,10 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_subinterface_state_post_save",
     )
     post_delete.connect(
-        _on_subinterface_state_save,
+        _as_delete_origin(_on_subinterface_state_save),
         sender=NSOSubinterfaceState,
         dispatch_uid="nso_plugin_subinterface_state_post_delete",
+        weak=False,
     )
 
     # per-interface MTU state → intent push (Phase 2b write path)
@@ -3126,9 +3177,10 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_interface_mtu_state_post_save",
     )
     post_delete.connect(
-        _on_mtu_state_save,
+        _as_delete_origin(_on_mtu_state_save),
         sender=NSOInterfaceMtuState,
         dispatch_uid="nso_plugin_interface_mtu_state_post_delete",
+        weak=False,
     )
 
     # VLAN-database state → intent push (write path)
@@ -3143,9 +3195,10 @@ def _connect_g_activated():  # pragma: no cover
     # the builder re-queries owned rows, so reusing the save handler is enough. Same
     # pattern for every overlay family below.
     post_delete.connect(
-        _on_vlan_state_save,
+        _as_delete_origin(_on_vlan_state_save),
         sender=NSOVLANState,
         dispatch_uid="nso_plugin_vlan_state_post_delete",
+        weak=False,
     )
 
     # ipam.VLAN rename → overlay drift visibility (no NSOVLANState signal otherwise)
@@ -3157,9 +3210,10 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_ipam_vlan_post_save",
     )
     pre_delete.connect(
-        _on_ipam_vlan_pre_delete,
+        _as_delete_origin(_on_ipam_vlan_pre_delete),
         sender=VLAN,
         dispatch_uid="nso_plugin_ipam_vlan_pre_delete",
+        weak=False,
     )
 
     # BFD state → intent push (BFD write path)
@@ -3171,9 +3225,10 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_bfd_state_post_save",
     )
     post_delete.connect(
-        _on_bfd_state_save,
+        _as_delete_origin(_on_bfd_state_save),
         sender=NSOBFDInterfaceState,
         dispatch_uid="nso_plugin_bfd_state_post_delete",
+        weak=False,
     )
 
     # Static route state → intent push
@@ -3185,9 +3240,10 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_static_route_state_post_save",
     )
     post_delete.connect(
-        _on_static_route_state_save,
+        _as_delete_origin(_on_static_route_state_save),
         sender=NSOStaticRouteState,
         dispatch_uid="nso_plugin_static_route_state_post_delete",
+        weak=False,
     )
 
     # L2 SAP state → intent push
@@ -3199,9 +3255,10 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_l2_sap_state_post_save",
     )
     post_delete.connect(
-        _on_l2_sap_state_save,
+        _as_delete_origin(_on_l2_sap_state_save),
         sender=NSOL2SapState,
         dispatch_uid="nso_plugin_l2_sap_state_post_delete",
+        weak=False,
     )
 
     # LACP bundle/member state → intent push + apply
@@ -3219,14 +3276,16 @@ def _connect_g_activated():  # pragma: no cover
     )
     # Direct-apply family: deletion retracts under the same auto_apply gate as saves.
     post_delete.connect(
-        _on_lacp_state_save,
+        _as_delete_origin(_on_lacp_state_save),
         sender=NSOLACPBundleState,
         dispatch_uid="nso_plugin_lacp_bundle_state_post_delete",
+        weak=False,
     )
     post_delete.connect(
-        _on_lacp_state_save,
+        _as_delete_origin(_on_lacp_state_save),
         sender=NSOLACPMemberState,
         dispatch_uid="nso_plugin_lacp_member_state_post_delete",
+        weak=False,
     )
 
     # Switchport state -> intent push + apply
@@ -3239,9 +3298,10 @@ def _connect_g_activated():  # pragma: no cover
     )
     # Direct-apply family: deletion retracts under the same auto_apply gate as saves.
     post_delete.connect(
-        _on_switchport_state_save,
+        _as_delete_origin(_on_switchport_state_save),
         sender=NSOSwitchportState,
         dispatch_uid="nso_plugin_switchport_state_post_delete",
+        weak=False,
     )
 
     # IS-IS interface state → intent push
@@ -3253,9 +3313,10 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_isis_interface_state_post_save",
     )
     post_delete.connect(
-        _on_isis_interface_state_save,
+        _as_delete_origin(_on_isis_interface_state_save),
         sender=NSOISISInterfaceState,
         dispatch_uid="nso_plugin_isis_interface_state_post_delete",
+        weak=False,
     )
 
     # IS-IS process (instance) state → intent push
@@ -3266,9 +3327,10 @@ def _connect_g_activated():  # pragma: no cover
     )
     # No native ISISInstance pre_delete exists — this is the ONLY retraction path.
     post_delete.connect(
-        _on_isis_instance_state_save,
+        _as_delete_origin(_on_isis_instance_state_save),
         sender=NSOISISInstanceState,
         dispatch_uid="nso_plugin_isis_instance_state_post_delete",
+        weak=False,
     )
 
     # IS-IS Flex-Algo state → intent push
@@ -3280,9 +3342,10 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_isis_flex_algo_state_post_save",
     )
     post_delete.connect(
-        _on_isis_flex_algo_state_save,
+        _as_delete_origin(_on_isis_flex_algo_state_save),
         sender=NSOISISFlexAlgoState,
         dispatch_uid="nso_plugin_isis_flex_algo_state_post_delete",
+        weak=False,
     )
 
     # BGP peer state → intent push
@@ -3296,9 +3359,10 @@ def _connect_g_activated():  # pragma: no cover
     # No native BGPPeer pre_delete exists — this is the ONLY retraction path
     # (gap confirmed live on rg03 during #7).
     post_delete.connect(
-        _on_bgp_peer_state_save,
+        _as_delete_origin(_on_bgp_peer_state_save),
         sender=NSOBGPPeerState,
         dispatch_uid="nso_plugin_bgp_peer_state_post_delete",
+        weak=False,
     )
 
     # Route-policy state → intent push
@@ -3310,9 +3374,10 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_route_policy_state_post_save",
     )
     post_delete.connect(
-        _on_route_policy_state_save,
+        _as_delete_origin(_on_route_policy_state_save),
         sender=NSORoutePolicyState,
         dispatch_uid="nso_plugin_route_policy_state_post_delete",
+        weak=False,
     )
 
     # netbox_routing policy object deletion → drop overlays + push removal (full-replace)
@@ -3330,9 +3395,10 @@ def _connect_g_activated():  # pragma: no cover
 
         for _model in (PrefixList, RouteMap, CommunityList, ASPath):
             pre_delete.connect(
-                _on_routing_policy_pre_delete,
+                _as_delete_origin(_on_routing_policy_pre_delete),
                 sender=_model,
                 dispatch_uid=f"nso_plugin_routing_policy_pre_delete_{_model.__name__.lower()}",
+                weak=False,
             )
             # Editing an owned policy object → re-own + push (mirror OSPF/IS-IS greenfield).
             post_save.connect(
@@ -3348,9 +3414,10 @@ def _connect_g_activated():  # pragma: no cover
                 dispatch_uid=f"nso_plugin_routing_policy_entry_save_{_entry.__name__.lower()}",
             )
             post_delete.connect(
-                _on_routing_policy_entry_delete,
+                _as_delete_origin(_on_routing_policy_entry_delete),
                 sender=_entry,
                 dispatch_uid=f"nso_plugin_routing_policy_entry_delete_{_entry.__name__.lower()}",
+                weak=False,
             )
     except ImportError:
         logger.debug("netbox_routing not installed — route-policy edit/delete signals not registered")
@@ -3369,14 +3436,16 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_ospf_interface_state_post_save",
     )
     post_delete.connect(
-        _on_ospf_instance_state_save,
+        _as_delete_origin(_on_ospf_instance_state_save),
         sender=NSOOSPFInstanceState,
         dispatch_uid="nso_plugin_ospf_instance_state_post_delete",
+        weak=False,
     )
     post_delete.connect(
-        _on_ospf_interface_state_save,
+        _as_delete_origin(_on_ospf_interface_state_save),
         sender=NSOOSPFInterfaceState,
         dispatch_uid="nso_plugin_ospf_interface_state_post_delete",
+        weak=False,
     )
 
     # Redistribution state → intent push
@@ -3389,9 +3458,10 @@ def _connect_g_activated():  # pragma: no cover
     )
     # No native Redistribution pre_delete exists — this is the ONLY retraction path.
     post_delete.connect(
-        _on_redistribution_state_save,
+        _as_delete_origin(_on_redistribution_state_save),
         sender=NSORedistributionState,
         dispatch_uid="nso_plugin_redistribution_state_post_delete",
+        weak=False,
     )
 
     # netbox_routing.Redistribution fork save → intent push (routing accept path B)
@@ -3416,14 +3486,16 @@ def _connect_g_activated():  # pragma: no cover
             dispatch_uid="nso_plugin_routing_static_route_post_save",
         )
         m2m_changed.connect(
-            _on_routing_static_route_devices_changed,
+            _as_delete_origin(_on_routing_static_route_devices_changed),
             sender=StaticRoute.devices.through,
             dispatch_uid="nso_plugin_routing_static_route_devices_changed",
+            weak=False,
         )
         pre_delete.connect(
-            _on_routing_static_route_pre_delete,
+            _as_delete_origin(_on_routing_static_route_pre_delete),
             sender=StaticRoute,
             dispatch_uid="nso_plugin_routing_static_route_pre_delete",
+            weak=False,
         )
     except ImportError:
         logger.debug("netbox_routing not installed — static-route greenfield signals not registered")
@@ -3443,14 +3515,16 @@ def _connect_g_activated():  # pragma: no cover
             dispatch_uid="nso_plugin_routing_ospf_interface_post_save",
         )
         pre_delete.connect(
-            _on_routing_ospf_instance_pre_delete,
+            _as_delete_origin(_on_routing_ospf_instance_pre_delete),
             sender=OSPFInstance,
             dispatch_uid="nso_plugin_routing_ospf_instance_pre_delete",
+            weak=False,
         )
         pre_delete.connect(
-            _on_routing_ospf_interface_pre_delete,
+            _as_delete_origin(_on_routing_ospf_interface_pre_delete),
             sender=OSPFInterface,
             dispatch_uid="nso_plugin_routing_ospf_interface_pre_delete",
+            weak=False,
         )
     except ImportError:
         logger.debug("netbox_routing not installed — OSPF greenfield signals not registered")
@@ -3465,9 +3539,10 @@ def _connect_g_activated():  # pragma: no cover
             dispatch_uid="nso_plugin_routing_isis_flex_algo_post_save",
         )
         pre_delete.connect(
-            _on_routing_isis_flex_algo_pre_delete,
+            _as_delete_origin(_on_routing_isis_flex_algo_pre_delete),
             sender=ISISFlexAlgo,
             dispatch_uid="nso_plugin_routing_isis_flex_algo_pre_delete",
+            weak=False,
         )
     except ImportError:
         logger.debug("netbox_routing not installed — flex-algo greenfield signals not registered")
@@ -3482,9 +3557,10 @@ def _connect_g_activated():  # pragma: no cover
             dispatch_uid="nso_plugin_routing_isis_level_post_save",
         )
         post_delete.connect(
-            _on_routing_isis_level_post_delete,
+            _as_delete_origin(_on_routing_isis_level_post_delete),
             sender=ISISLevel,
             dispatch_uid="nso_plugin_routing_isis_level_post_delete",
+            weak=False,
         )
     except ImportError:
         logger.debug("netbox_routing not installed — ISIS level signals not registered")
@@ -3500,9 +3576,10 @@ def _connect_g_activated():  # pragma: no cover
             dispatch_uid="nso_plugin_routing_isis_interface_post_save",
         )
         pre_delete.connect(
-            _on_routing_isis_interface_pre_delete,
+            _as_delete_origin(_on_routing_isis_interface_pre_delete),
             sender=ISISInterface,
             dispatch_uid="nso_plugin_routing_isis_interface_pre_delete",
+            weak=False,
         )
     except ImportError:
         logger.debug("netbox_routing not installed — IS-IS interface greenfield signals not registered")
