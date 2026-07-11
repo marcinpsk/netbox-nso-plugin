@@ -947,3 +947,98 @@ class TestPushFailoverSettings(TestCase):
         with patch(f"{_MOD}.put_failover_config", side_effect=AdapterError("down", code="nso_unreachable")):
             NSOFailoverSettings.objects.create()  # must not raise
         self.assertEqual(NSOFailoverSettings.objects.count(), 1)
+
+
+class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
+    """Deleting an owned overlay row must re-push the REDUCED intent snapshot —
+    the WP7-P1 SNMP regression class: with only post_save wired, the adapter keeps
+    applying the deleted row until some unrelated sibling is saved. Found live on
+    sw01: deleting an applied SVI's overlay never retracted irb.987."""
+
+    def _mgmt(self):
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        return NSODeviceManagement.objects.create(
+            device=self.device, nso_instance=self.nso_instance, nso_device_name="core-rtr-01", adapter_device_id=42
+        )
+
+    def test_svi_delete_pushes_reduced_snapshot(self):
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin.models import NSOSVIState
+
+        mgmt = self._mgmt()
+        vlan = VLAN.objects.create(vid=987, name="sig-v987")
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_svi_intent") as mock_put,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            row = NSOSVIState.objects.create(
+                management=mgmt, interface=self.iface, vlan=vlan, svi_type="irb", status="accepted"
+            )
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_svi_intent") as mock_put,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            row.delete()
+        mock_put.assert_called_once()
+        _dev, interfaces = mock_put.call_args[0]
+        self.assertEqual(interfaces, [], "Deleted SVI must not appear in the push snapshot")
+
+    def test_subinterface_delete_pushes_reduced_snapshot(self):
+        from dcim.models import Interface
+
+        from netbox_nso_plugin.models import NSOSubinterfaceState
+
+        mgmt = self._mgmt()
+        child = Interface.objects.create(device=self.device, name="GigabitEthernet0/0.99", type="virtual")
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_subinterface_intent"),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            row = NSOSubinterfaceState.objects.create(
+                management=mgmt, interface=child, parent_interface=self.iface, dot1q_vlan=99, status="accepted"
+            )
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_subinterface_intent") as mock_put,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            row.delete()
+        mock_put.assert_called_once()
+        self.assertEqual(mock_put.call_args[0][1], [])
+
+    def test_logging_host_delete_pushes_reduced_snapshot(self):
+        from netbox_nso_plugin.models import NSOLoggingHostState
+
+        mgmt = self._mgmt()
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_logging_intent"),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            row = NSOLoggingHostState.objects.create(management=mgmt, address="198.51.100.7", status="accepted")
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_logging_intent") as mock_put,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            row.delete()
+        mock_put.assert_called_once()
+        self.assertEqual(mock_put.call_args[0][1], [])
+
+    def test_interface_mtu_delete_pushes_reduced_snapshot(self):
+        from netbox_nso_plugin.models import NSOInterfaceMtuState
+
+        mgmt = self._mgmt()
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_interface_mtu_intent"),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            row = NSOInterfaceMtuState.objects.create(
+                management=mgmt, interface=self.iface, l2_mtu=9000, status="accepted"
+            )
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_interface_mtu_intent") as mock_put,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            row.delete()
+        mock_put.assert_called_once()
+        self.assertEqual(mock_put.call_args[0][1], [])

@@ -3072,6 +3072,15 @@ def _connect_g_activated():  # pragma: no cover
         sender=NSOLoggingHostState,
         dispatch_uid="nso_plugin_logging_host_state_post_save",
     )
+    # Deletes must push the REDUCED snapshot too (the WP7-P1 SNMP regression class):
+    # with only post_save wired, the adapter keeps applying a deleted host/SVI/subif/MTU
+    # until some unrelated sibling row is saved. Caught live on sw01 — deleting an
+    # applied SVI's overlay never retracted the irb unit.
+    post_delete.connect(
+        _on_logging_state_save,
+        sender=NSOLoggingHostState,
+        dispatch_uid="nso_plugin_logging_host_state_post_delete",
+    )
 
     # SVI/IRB state → intent push (write path)
     from .models import NSOSVIState
@@ -3080,6 +3089,11 @@ def _connect_g_activated():  # pragma: no cover
         _on_svi_state_save,
         sender=NSOSVIState,
         dispatch_uid="nso_plugin_svi_state_post_save",
+    )
+    post_delete.connect(
+        _on_svi_state_save,
+        sender=NSOSVIState,
+        dispatch_uid="nso_plugin_svi_state_post_delete",
     )
 
     # dot1q subinterface state → intent push (write path)
@@ -3090,6 +3104,11 @@ def _connect_g_activated():  # pragma: no cover
         sender=NSOSubinterfaceState,
         dispatch_uid="nso_plugin_subinterface_state_post_save",
     )
+    post_delete.connect(
+        _on_subinterface_state_save,
+        sender=NSOSubinterfaceState,
+        dispatch_uid="nso_plugin_subinterface_state_post_delete",
+    )
 
     # per-interface MTU state → intent push (Phase 2b write path)
     from .models import NSOInterfaceMtuState
@@ -3098,6 +3117,11 @@ def _connect_g_activated():  # pragma: no cover
         _on_mtu_state_save,
         sender=NSOInterfaceMtuState,
         dispatch_uid="nso_plugin_interface_mtu_state_post_save",
+    )
+    post_delete.connect(
+        _on_mtu_state_save,
+        sender=NSOInterfaceMtuState,
+        dispatch_uid="nso_plugin_interface_mtu_state_post_delete",
     )
 
     # VLAN-database state → intent push (write path)
