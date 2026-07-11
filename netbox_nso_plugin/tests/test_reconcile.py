@@ -153,6 +153,113 @@ class TestSettleApplyFailures(APITestCase):
         self.assertTrue(mtu_row.last_apply_error)
 
 
+class TestEscalateStuckDeploying(APITestCase):
+    """#26: a row still 'deploying' long after a SUCCEEDED apply is a silent drop.
+
+    The adapter's post-apply verify re-issues the committed payload as a native dry-run
+    against NSO's CDB — a writer/NED that silently dropped the value leaves the CDB
+    service tree matching the payload, so that verify passes and the job reports in_sync
+    (proven live on rg03: static route absent from the device, apply job succeeded).
+    The device-truth signal is the reconcile value-match settle; when it never fires,
+    the row must escalate to apply_failed instead of spinning in 'deploying' forever.
+    """
+
+    def _setup(self):
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
+
+        device = _make_device("stuck")
+        inst, _ = NSOInstance.objects.get_or_create(name="stuck-inst", defaults={"adapter_instance_id": "stuck-inst"})
+        mgmt = NSODeviceManagement.objects.create(
+            device=device, nso_instance=inst, nso_device_name="stuck", adapter_device_id=78
+        )
+        vlan = VLAN.objects.create(group=_device_vlan_group(device), vid=101, name="V101")
+        row = NSOVLANState.objects.create(management=mgmt, vlan=vlan, device_name="V101", status="deploying")
+        return mgmt, row
+
+    @staticmethod
+    def _job(status="succeeded", minutes_ago=30, job_id=900):
+        # The adapter serializes timestamps as naive-UTC isoformat + "Z" (api/jobs.py).
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        ts = (timezone.now() - timedelta(minutes=minutes_ago)).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+        return {
+            "id": job_id,
+            "type": "apply",
+            "status": status,
+            "updated_at": ts,
+            "result": {"vlan_count_by_outcome": {"in_sync": 1, "apply_failed": 0}},
+        }
+
+    def test_stale_succeeded_apply_escalates_to_apply_failed(self):
+        from netbox_nso_plugin.reconcile import _escalate_stuck_deploying
+
+        mgmt, row = self._setup()
+        _escalate_stuck_deploying(mgmt, self._job(minutes_ago=30))
+        row.refresh_from_db()
+        self.assertEqual(row.status, "apply_failed")
+        self.assertIn("never", row.last_apply_error)
+
+    def test_within_grace_stays_deploying(self):
+        from netbox_nso_plugin.reconcile import _escalate_stuck_deploying
+
+        mgmt, row = self._setup()
+        _escalate_stuck_deploying(mgmt, self._job(minutes_ago=1))
+        row.refresh_from_db()
+        self.assertEqual(row.status, "deploying")
+
+    def test_failed_job_is_left_to_the_failure_settle(self):
+        from netbox_nso_plugin.reconcile import _escalate_stuck_deploying
+
+        mgmt, row = self._setup()
+        _escalate_stuck_deploying(mgmt, self._job(status="failed", minutes_ago=30))
+        row.refresh_from_db()
+        self.assertEqual(row.status, "deploying")
+
+    def test_missing_job_is_noop(self):
+        from netbox_nso_plugin.reconcile import _escalate_stuck_deploying
+
+        mgmt, row = self._setup()
+        _escalate_stuck_deploying(mgmt, None)
+        row.refresh_from_db()
+        self.assertEqual(row.status, "deploying")
+
+    def test_run_device_reconcile_escalates_after_grace(self):
+        from netbox_nso_plugin import reconcile
+
+        mgmt, row = self._setup()
+        jobs = [self._job(minutes_ago=30)]
+        with (
+            patch.object(reconcile, "reconcile_device", return_value={}),
+            patch("netbox_nso_plugin.adapter_client.list_jobs", return_value=jobs),
+        ):
+            reconcile.run_device_reconcile(mgmt.device_id)
+        row.refresh_from_db()
+        self.assertEqual(row.status, "apply_failed")
+
+    def test_run_device_reconcile_skips_escalation_while_apply_in_flight(self):
+        from netbox_nso_plugin import reconcile
+
+        mgmt, row = self._setup()
+        # A new apply is running: its rows were just re-marked deploying — escalating on
+        # the OLD terminal job's age would misfire.
+        jobs = [
+            {"id": 901, "type": "apply", "status": "running", "updated_at": None, "result": None},
+            self._job(minutes_ago=30),
+        ]
+        with (
+            patch.object(reconcile, "reconcile_device", return_value={}),
+            patch("netbox_nso_plugin.adapter_client.list_jobs", return_value=jobs),
+        ):
+            reconcile.run_device_reconcile(mgmt.device_id)
+        row.refresh_from_db()
+        self.assertEqual(row.status, "deploying")
+
+
 class TestStaticRouteApplySettle(APITestCase):
     """Static routes join the deploying→settle flow (the MTU/route-policy regression class:
     a scope missing from _prepare_apply/_APPLY_DEPLOYING_SCOPES strands its rows). Found

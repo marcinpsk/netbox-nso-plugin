@@ -21,6 +21,9 @@ class NSOPluginConfig(PluginConfig):
         "derived_intent": {
             "description_templates": [],  # list of {sentinel, template}; empty = feature off
         },
+        # A 'deploying' row that outlives a SUCCEEDED apply by this long without the
+        # device ever showing its value escalates to apply_failed (silent drop, #26).
+        "stuck_deploying_grace_minutes": 10,
     }
     author = "Marcin Zieba"
     author_email = "marcinpsk@gmail.com"

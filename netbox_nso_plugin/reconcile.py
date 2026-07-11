@@ -556,22 +556,119 @@ def _settle_apply_failures(mgmt, apply_result: dict | None, job: dict | None = N
                 row.save(update_fields=["status", "last_apply_error"])
 
 
-def _last_apply_job(adapter_device_id) -> dict | None:
-    """Best-effort: the device's most recent terminal apply job (full dict).
+_STUCK_DEPLOYING_ERROR = (
+    "Apply job #{job_id} reported success, but the device never showed this value on any "
+    "later sync — the NED or service writer most likely dropped it silently (the adapter's "
+    "post-apply verify diffs against NSO's CDB, which a silent drop leaves clean). Check "
+    "device/NED support for this construct, then re-apply; the value is still safe in NetBox."
+)
 
-    Returns the whole job ``{id, type, status, result}`` so callers can read both the
-    per-scope outcome (``result``) and the job id (apply-journal idempotency key).
+
+def _stuck_deploying_grace():
+    """How long a 'deploying' row may outlive a SUCCEEDED apply before it's a silent drop.
+
+    Must comfortably cover the apply-triggered refresh + the follow-up sync/reconcile
+    round-trip, so a row that DID land has had every chance to value-match settle first.
+    Configurable: PLUGINS_CONFIG["netbox_nso_plugin"]["stuck_deploying_grace_minutes"].
+    """
+    from datetime import timedelta
+
+    from django.conf import settings as dj_settings
+
+    cfg = dj_settings.PLUGINS_CONFIG.get("netbox_nso_plugin", {})
+    return timedelta(minutes=cfg.get("stuck_deploying_grace_minutes", 10))
+
+
+def _parse_adapter_ts(value):
+    """Parse an adapter job timestamp (naive-UTC isoformat + 'Z') to an aware datetime."""
+    from datetime import UTC, datetime
+
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def _escalate_stuck_deploying(mgmt, job: dict | None) -> None:
+    """Rows still 'deploying' long after a SUCCEEDED apply → apply_failed (silent drop, #26).
+
+    The adapter's post-apply verify re-issues the committed payload as a native dry-run,
+    which diffs against NSO's CDB — a writer/NED that silently dropped a value leaves the
+    CDB service tree matching the payload, so that verify passes and the job counts the
+    item in_sync (proven live on rg03: static route absent from the device, job succeeded).
+    The device-truth check is the reconcile value-match settle, which runs right before
+    this in run_device_reconcile: a row the device really reflects has already settled
+    deploying→in_sync. A row STILL deploying once the grace has elapsed therefore never
+    landed — surface it as apply_failed instead of letting it spin forever while the job
+    history claims success. Callers must skip this while an apply is queued/running (its
+    _prepare_apply just re-marked rows deploying; judging those by the OLD job's age
+    would misfire).
+    """
+    from django.utils import timezone
+
+    from . import models
+    from . import status_machine as sm
+
+    if not job or job.get("status") != "succeeded":
+        return  # failed applies are the failure-settle's job; no job → nothing to judge
+    finished = _parse_adapter_ts(job.get("updated_at"))
+    if finished is None or timezone.now() - finished < _stuck_deploying_grace():
+        return
+    detail = _STUCK_DEPLOYING_ERROR.format(job_id=job.get("id"))
+    for _scope, model_name in _APPLY_DEPLOYING_SCOPES.items():
+        model = getattr(models, model_name)
+        for row in model.objects.filter(management=mgmt, status="deploying"):
+            new_status = sm.on_apply_result(row.status, ok=False)
+            if new_status != row.status:
+                row.status = new_status
+                row.last_apply_error = detail
+                row.save(update_fields=["status", "last_apply_error"])
+                logger.warning(
+                    "nso reconcile: %s %s stuck deploying after successful apply #%s — "
+                    "escalated to apply_failed (silent drop)",
+                    model_name,
+                    row.pk,
+                    job.get("id"),
+                )
+
+
+def _apply_job_state(adapter_device_id) -> tuple[dict | None, bool]:
+    """Best-effort: (most recent terminal apply job, is an apply queued/running now).
+
+    One jobs fetch serves both the failure-settle (which needs the last terminal
+    apply's result) and the stuck-deploying escalation (which must stand down while
+    a new apply is in flight).
     """
     from . import adapter_client as client
 
     try:
         jobs = client.list_jobs(adapter_device_id)  # most-recent-first
     except Exception:  # noqa: BLE001 — adapter transient; settling is best-effort
-        return None
+        return None, False
+    last, active = None, False
     for job in jobs or []:
-        if job.get("type") == "apply" and job.get("status") in ("succeeded", "failed"):
-            return job
-    return None
+        if job.get("type") != "apply":
+            continue
+        if job.get("status") in ("queued", "running"):
+            active = True
+        elif last is None and job.get("status") in ("succeeded", "failed"):
+            last = job
+    return last, active
+
+
+def _last_apply_job(adapter_device_id) -> dict | None:
+    """Best-effort: the device's most recent terminal apply job (full dict).
+
+    Returns the whole job ``{id, type, status, result}`` so callers can read both the
+    per-scope outcome (``result``) and the job id (apply-journal idempotency key).
+    """
+    job, _active = _apply_job_state(adapter_device_id)
+    return job
 
 
 def _last_apply_result(adapter_device_id) -> dict | None:
@@ -688,13 +785,16 @@ def run_device_reconcile(device_id: int) -> dict:
         return {"device_id": device_id, "error": str(exc)}
 
     # Step 4: after the post-sync reconcile, settle any rows left 'deploying' whose
-    # scope's last apply reported a failure → apply_failed (no longer stuck), and record
-    # the route-policy apply outcome in the netbox-routing object journals (idempotent).
+    # scope's last apply reported a failure → apply_failed (no longer stuck), escalate
+    # rows a SUCCEEDED apply left 'deploying' past the grace (silent drop, #26), and
+    # record the route-policy apply outcome in the netbox-routing journals (idempotent).
     try:
         mgmt = device.nso_management
         if mgmt is not None and mgmt.adapter_device_id is not None:
-            job = _last_apply_job(mgmt.adapter_device_id)
+            job, apply_active = _apply_job_state(mgmt.adapter_device_id)
             _settle_apply_failures(mgmt, job.get("result") if job else None, job)
+            if not apply_active:
+                _escalate_stuck_deploying(mgmt, job)
             _journal_route_policy_apply(mgmt, job)
     except Exception as exc:  # noqa: BLE001 — settling is best-effort, never crash the worker
         logger.warning("nso reconcile: apply-failure settle skipped for device %s: %s", device_id, exc)
