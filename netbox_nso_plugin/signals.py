@@ -3139,6 +3139,14 @@ def _connect_g_activated():  # pragma: no cover
         sender=NSOVLANState,
         dispatch_uid="nso_plugin_vlan_state_post_save",
     )
+    # Deleting an owned row must push the REDUCED snapshot (the f282e9e/#105 class);
+    # the builder re-queries owned rows, so reusing the save handler is enough. Same
+    # pattern for every overlay family below.
+    post_delete.connect(
+        _on_vlan_state_save,
+        sender=NSOVLANState,
+        dispatch_uid="nso_plugin_vlan_state_post_delete",
+    )
 
     # ipam.VLAN rename → overlay drift visibility (no NSOVLANState signal otherwise)
     from ipam.models import VLAN
@@ -3162,6 +3170,11 @@ def _connect_g_activated():  # pragma: no cover
         sender=NSOBFDInterfaceState,
         dispatch_uid="nso_plugin_bfd_state_post_save",
     )
+    post_delete.connect(
+        _on_bfd_state_save,
+        sender=NSOBFDInterfaceState,
+        dispatch_uid="nso_plugin_bfd_state_post_delete",
+    )
 
     # Static route state → intent push
     from .models import NSOStaticRouteState
@@ -3171,6 +3184,11 @@ def _connect_g_activated():  # pragma: no cover
         sender=NSOStaticRouteState,
         dispatch_uid="nso_plugin_static_route_state_post_save",
     )
+    post_delete.connect(
+        _on_static_route_state_save,
+        sender=NSOStaticRouteState,
+        dispatch_uid="nso_plugin_static_route_state_post_delete",
+    )
 
     # L2 SAP state → intent push
     from .models import NSOL2SapState
@@ -3179,6 +3197,11 @@ def _connect_g_activated():  # pragma: no cover
         _on_l2_sap_state_save,
         sender=NSOL2SapState,
         dispatch_uid="nso_plugin_l2_sap_state_post_save",
+    )
+    post_delete.connect(
+        _on_l2_sap_state_save,
+        sender=NSOL2SapState,
+        dispatch_uid="nso_plugin_l2_sap_state_post_delete",
     )
 
     # LACP bundle/member state → intent push + apply
@@ -3194,6 +3217,17 @@ def _connect_g_activated():  # pragma: no cover
         sender=NSOLACPMemberState,
         dispatch_uid="nso_plugin_lacp_member_state_post_save",
     )
+    # Direct-apply family: deletion retracts under the same auto_apply gate as saves.
+    post_delete.connect(
+        _on_lacp_state_save,
+        sender=NSOLACPBundleState,
+        dispatch_uid="nso_plugin_lacp_bundle_state_post_delete",
+    )
+    post_delete.connect(
+        _on_lacp_state_save,
+        sender=NSOLACPMemberState,
+        dispatch_uid="nso_plugin_lacp_member_state_post_delete",
+    )
 
     # Switchport state -> intent push + apply
     from .models import NSOSwitchportState
@@ -3202,6 +3236,12 @@ def _connect_g_activated():  # pragma: no cover
         _on_switchport_state_save,
         sender=NSOSwitchportState,
         dispatch_uid="nso_plugin_switchport_state_post_save",
+    )
+    # Direct-apply family: deletion retracts under the same auto_apply gate as saves.
+    post_delete.connect(
+        _on_switchport_state_save,
+        sender=NSOSwitchportState,
+        dispatch_uid="nso_plugin_switchport_state_post_delete",
     )
 
     # IS-IS interface state → intent push
@@ -3212,12 +3252,23 @@ def _connect_g_activated():  # pragma: no cover
         sender=NSOISISInterfaceState,
         dispatch_uid="nso_plugin_isis_interface_state_post_save",
     )
+    post_delete.connect(
+        _on_isis_interface_state_save,
+        sender=NSOISISInterfaceState,
+        dispatch_uid="nso_plugin_isis_interface_state_post_delete",
+    )
 
     # IS-IS process (instance) state → intent push
     post_save.connect(
         _on_isis_instance_state_save,
         sender=NSOISISInstanceState,
         dispatch_uid="nso_plugin_isis_instance_state_post_save",
+    )
+    # No native ISISInstance pre_delete exists — this is the ONLY retraction path.
+    post_delete.connect(
+        _on_isis_instance_state_save,
+        sender=NSOISISInstanceState,
+        dispatch_uid="nso_plugin_isis_instance_state_post_delete",
     )
 
     # IS-IS Flex-Algo state → intent push
@@ -3228,6 +3279,11 @@ def _connect_g_activated():  # pragma: no cover
         sender=NSOISISFlexAlgoState,
         dispatch_uid="nso_plugin_isis_flex_algo_state_post_save",
     )
+    post_delete.connect(
+        _on_isis_flex_algo_state_save,
+        sender=NSOISISFlexAlgoState,
+        dispatch_uid="nso_plugin_isis_flex_algo_state_post_delete",
+    )
 
     # BGP peer state → intent push
     from .models import NSOBGPPeerState
@@ -3237,6 +3293,13 @@ def _connect_g_activated():  # pragma: no cover
         sender=NSOBGPPeerState,
         dispatch_uid="nso_plugin_bgp_peer_state_post_save",
     )
+    # No native BGPPeer pre_delete exists — this is the ONLY retraction path
+    # (gap confirmed live on rg03 during #7).
+    post_delete.connect(
+        _on_bgp_peer_state_save,
+        sender=NSOBGPPeerState,
+        dispatch_uid="nso_plugin_bgp_peer_state_post_delete",
+    )
 
     # Route-policy state → intent push
     from .models import NSORoutePolicyState
@@ -3245,6 +3308,11 @@ def _connect_g_activated():  # pragma: no cover
         _on_route_policy_state_save,
         sender=NSORoutePolicyState,
         dispatch_uid="nso_plugin_route_policy_state_post_save",
+    )
+    post_delete.connect(
+        _on_route_policy_state_save,
+        sender=NSORoutePolicyState,
+        dispatch_uid="nso_plugin_route_policy_state_post_delete",
     )
 
     # netbox_routing policy object deletion → drop overlays + push removal (full-replace)
@@ -3300,6 +3368,16 @@ def _connect_g_activated():  # pragma: no cover
         sender=NSOOSPFInterfaceState,
         dispatch_uid="nso_plugin_ospf_interface_state_post_save",
     )
+    post_delete.connect(
+        _on_ospf_instance_state_save,
+        sender=NSOOSPFInstanceState,
+        dispatch_uid="nso_plugin_ospf_instance_state_post_delete",
+    )
+    post_delete.connect(
+        _on_ospf_interface_state_save,
+        sender=NSOOSPFInterfaceState,
+        dispatch_uid="nso_plugin_ospf_interface_state_post_delete",
+    )
 
     # Redistribution state → intent push
     from .models import NSORedistributionState
@@ -3308,6 +3386,12 @@ def _connect_g_activated():  # pragma: no cover
         _on_redistribution_state_save,
         sender=NSORedistributionState,
         dispatch_uid="nso_plugin_redistribution_state_post_save",
+    )
+    # No native Redistribution pre_delete exists — this is the ONLY retraction path.
+    post_delete.connect(
+        _on_redistribution_state_save,
+        sender=NSORedistributionState,
+        dispatch_uid="nso_plugin_redistribution_state_post_delete",
     )
 
     # netbox_routing.Redistribution fork save → intent push (routing accept path B)

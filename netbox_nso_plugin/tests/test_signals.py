@@ -1042,3 +1042,278 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             row.delete()
         mock_put.assert_called_once()
         self.assertEqual(mock_put.call_args[0][1], [])
+
+    # ── #105 sweep: the 13 families that had post_save ONLY (f282e9e class) ──
+    # Each red-first test: create an OWNED row (push #1 fires and warms the
+    # change-detection cache), then DELETE it — without a post_delete receiver no
+    # push fires and the adapter keeps applying the deleted intent forever.
+
+    def _delete_pushes(self, row, patch_target, expect_empty_list=True):
+        """Delete *row* and assert the reduced snapshot push fired at the client boundary."""
+        with (
+            patch(f"netbox_nso_plugin.adapter_client.{patch_target}") as mock_put,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            row.delete()
+        mock_put.assert_called_once()
+        if expect_empty_list:
+            self.assertEqual(mock_put.call_args[0][1], [], "Deleted row must not appear in the push snapshot")
+        return mock_put
+
+    def test_vlan_delete_pushes_reduced_snapshot(self):
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
+
+        mgmt = self._mgmt()
+        vlan = VLAN.objects.create(group=_device_vlan_group(self.device), vid=105, name="del-v105")
+        with patch("netbox_nso_plugin.adapter_client.put_vlan_intent"), self.captureOnCommitCallbacks(execute=True):
+            row = NSOVLANState.objects.create(management=mgmt, vlan=vlan, device_name="del-v105", status="accepted")
+        self._delete_pushes(row, "put_vlan_intent")
+
+    def test_bfd_delete_pushes_reduced_snapshot(self):
+        from netbox_nso_plugin.models import NSOBFDInterfaceState
+
+        mgmt = self._mgmt()
+        with patch("netbox_nso_plugin.adapter_client.put_bfd_intent"), self.captureOnCommitCallbacks(execute=True):
+            row = NSOBFDInterfaceState.objects.create(
+                management=mgmt, interface=self.iface, min_tx=300, min_rx=300, multiplier=3, status="accepted"
+            )
+        self._delete_pushes(row, "put_bfd_intent")
+
+    def test_static_route_overlay_delete_pushes_reduced_snapshot(self):
+        """Direct OVERLAY deletion (the native StaticRoute pre_delete path is separately
+        covered) must push the reduced snapshot itself."""
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.models import NSOStaticRouteState
+
+        mgmt = self._mgmt()
+        # No devices M2M — the greenfield-accept signal must not interfere here.
+        route = StaticRoute.objects.create(prefix="198.18.99.0/24", next_hop="198.18.0.1", name="del-sr", metric=1)
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_static_route_intent"),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            row = NSOStaticRouteState.objects.create(
+                management=mgmt, static_route=route, nso_prefix="198.18.99.0/24", status="accepted"
+            )
+        self._delete_pushes(row, "put_static_route_intent")
+
+    def test_l2_sap_delete_pushes_reduced_snapshot(self):
+        from netbox_nso_plugin.models import NSOL2SapState
+
+        mgmt = self._mgmt()
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_l2_sap_intent"),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            row = NSOL2SapState.objects.create(
+                management=mgmt,
+                service_name="TL",
+                service_type="epipe",
+                sap_id="lag-60:3999",
+                port="lag-60",
+                outer_tag=3999,
+                status="accepted",
+            )
+        self._delete_pushes(row, "put_l2_sap_intent")
+
+    def test_isis_flex_algo_delete_pushes_reduced_snapshot(self):
+        from netbox_nso_plugin.models import NSOISISFlexAlgoState
+
+        mgmt = self._mgmt()
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_isis_flex_algo_intent"),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            row = NSOISISFlexAlgoState.objects.create(
+                management=mgmt, process_tag="CORE", algo_id=130, status="accepted"
+            )
+        self._delete_pushes(row, "put_isis_flex_algo_intent")
+
+    def test_isis_interface_delete_pushes_reduced_snapshot(self):
+        from netbox_nso_plugin.models import NSOISISInterfaceState
+
+        mgmt = self._mgmt()
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_isis_interface_intent"),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            row = NSOISISInterfaceState.objects.create(
+                management=mgmt, interface=self.iface, af="ipv4", status="accepted"
+            )
+        self._delete_pushes(row, "put_isis_interface_intent")
+
+    def test_isis_instance_delete_pushes_reduced_snapshot(self):
+        """No native pre_delete exists for ISISInstance — the overlay post_delete is the
+        ONLY retraction path for this family."""
+        from netbox_nso_plugin.models import NSOISISInstanceState
+
+        mgmt = self._mgmt()
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_isis_interface_intent"),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            row = NSOISISInstanceState.objects.create(management=mgmt, process_tag="CORE", status="accepted")
+        mock_put = self._delete_pushes(row, "put_isis_interface_intent")
+        self.assertEqual(mock_put.call_args.kwargs.get("processes"), [])
+
+    def test_bgp_peer_delete_pushes_reduced_snapshot(self):
+        """No native pre_delete exists for BGPPeer — the overlay post_delete is the ONLY
+        retraction path (gap confirmed live on rg03, #7)."""
+        from netbox_nso_plugin.models import NSOBGPPeerState
+
+        mgmt = self._mgmt()
+        with patch("netbox_nso_plugin.adapter_client.put_bgp_intent"), self.captureOnCommitCallbacks(execute=True):
+            row = NSOBGPPeerState.objects.create(
+                management=mgmt, asn_str="65000", peer_address_str="192.0.2.1", status="accepted"
+            )
+        self._delete_pushes(row, "put_bgp_intent")
+
+    def test_redistribution_delete_pushes_reduced_snapshot(self):
+        """No native pre_delete exists for Redistribution — the overlay post_delete is
+        the ONLY retraction path. The push rides the DEST protocol (bgp here)."""
+        from netbox_nso_plugin.models import NSORedistributionState
+
+        mgmt = self._mgmt()
+        with patch("netbox_nso_plugin.adapter_client.put_bgp_intent"), self.captureOnCommitCallbacks(execute=True):
+            row = NSORedistributionState.objects.create(
+                management=mgmt,
+                dest_protocol="bgp",
+                dest_ref="65100::ipv4-unicast",
+                source_protocol="connected",
+                source_ref="",
+                status="accepted",
+            )
+        self._delete_pushes(row, "put_bgp_intent")
+
+    def test_route_policy_delete_pushes_reduced_snapshot(self):
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import PrefixList
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+
+        mgmt = self._mgmt()
+        pl = PrefixList.objects.create(name="PL-DEL-105")
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_route_policy_intent"),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            row = NSORoutePolicyState.objects.create(
+                management=mgmt,
+                family="prefix_list",
+                object_name=pl.name,
+                content_type=ContentType.objects.get_for_model(PrefixList),
+                object_id=pl.pk,
+                status="accepted",
+            )
+        self._delete_pushes(row, "put_route_policy_intent")
+
+    def test_ospf_instance_delete_pushes_reduced_snapshot(self):
+        from netbox_nso_plugin.models import NSOOSPFInstanceState
+
+        mgmt = self._mgmt()
+        with patch("netbox_nso_plugin.adapter_client.put_ospf_intent"), self.captureOnCommitCallbacks(execute=True):
+            row = NSOOSPFInstanceState.objects.create(
+                management=mgmt, process_id="999", ospf_instance=None, status="accepted"
+            )
+        self._delete_pushes(row, "put_ospf_intent", expect_empty_list=False)
+
+    def test_ospf_interface_delete_pushes_reduced_snapshot(self):
+        from netbox_nso_plugin.models import NSOOSPFInterfaceState
+
+        mgmt = self._mgmt()
+        with patch("netbox_nso_plugin.adapter_client.put_ospf_intent"), self.captureOnCommitCallbacks(execute=True):
+            row = NSOOSPFInterfaceState.objects.create(
+                management=mgmt, interface=self.iface, process_id="10", area_id="0.0.0.0", status="accepted"
+            )
+        self._delete_pushes(row, "put_ospf_intent", expect_empty_list=False)
+
+    def test_lacp_bundle_delete_pushes_reduced_snapshot(self):
+        """LACP rides the direct-apply path and is auto_apply-gated on save; deletion
+        retracts under the same gate (matching the save-path semantics)."""
+        from dcim.models import Interface
+
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOLACPBundleState
+
+        mgmt = NSODeviceManagement.objects.create(
+            device=self.device,
+            nso_instance=self.nso_instance,
+            nso_device_name="core-rtr-01",
+            adapter_device_id=42,
+            auto_apply=True,
+        )
+        lag = Interface.objects.create(device=self.device, name="Port-channel10", type="lag")
+        with patch("netbox_nso_plugin.adapter_client.apply_lag_config"), self.captureOnCommitCallbacks(execute=True):
+            row = NSOLACPBundleState.objects.create(
+                management=mgmt,
+                interface=lag,
+                lag_id=10,
+                min_links=2,
+                system_priority=100,
+                timer="fast",
+                status="accepted",
+            )
+        self._delete_pushes(row, "apply_lag_config")
+
+    def test_lacp_member_delete_pushes_reduced_snapshot(self):
+        from dcim.models import Interface
+
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOLACPBundleState, NSOLACPMemberState
+
+        mgmt = NSODeviceManagement.objects.create(
+            device=self.device,
+            nso_instance=self.nso_instance,
+            nso_device_name="core-rtr-01",
+            adapter_device_id=42,
+            auto_apply=True,
+        )
+        lag = Interface.objects.create(device=self.device, name="Port-channel11", type="lag")
+        member_iface = Interface.objects.create(device=self.device, name="Gi9/1", type="1000base-t")
+        with patch("netbox_nso_plugin.adapter_client.apply_lag_config"), self.captureOnCommitCallbacks(execute=True):
+            NSOLACPBundleState.objects.create(
+                management=mgmt,
+                interface=lag,
+                lag_id=11,
+                min_links=1,
+                system_priority=100,
+                timer="fast",
+                status="accepted",
+            )
+            member = NSOLACPMemberState.objects.create(
+                management=mgmt,
+                interface=member_iface,
+                lag_bundle=lag,
+                mode="active",
+                port_priority=128,
+                status="accepted",
+            )
+        with (
+            patch("netbox_nso_plugin.adapter_client.apply_lag_config") as mock_put,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            member.delete()
+        mock_put.assert_called_once()
+
+    def test_switchport_delete_pushes_reduced_snapshot(self):
+        """Switchport rides the direct-apply path and is auto_apply-gated on save;
+        deletion retracts under the same gate (matching the save-path semantics)."""
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOSwitchportState
+
+        mgmt = NSODeviceManagement.objects.create(
+            device=self.device,
+            nso_instance=self.nso_instance,
+            nso_device_name="core-rtr-01",
+            adapter_device_id=42,
+            auto_apply=True,
+        )
+        with (
+            patch("netbox_nso_plugin.adapter_client.apply_switchport_config"),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            row = NSOSwitchportState.objects.create(
+                management=mgmt, interface=self.iface, mode="trunk", status="accepted"
+            )
+        self._delete_pushes(row, "apply_switchport_config")
