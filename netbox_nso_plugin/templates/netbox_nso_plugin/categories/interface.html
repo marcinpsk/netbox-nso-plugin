@@ -1,217 +1,261 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
-{# Lazy fragment: consolidated per-interface view — one row per interface, a #}
-{# column per attribute (enabled / description / MTU / IPs / switchport) with a #}
-{# client-side column-select. Each cell reuses that overlay's own status badge + #}
-{# Accept endpoint, so per-attribute Accept/Apply keeps working. Paginated + name- #}
-{# filterable, fetched via AJAX so actions keep the card open. #}
+{# Lazy fragment: consolidated per-interface grid (Tabulator, vendored — loaded once #}
+{# by device_nso_tab.html). One row per interface, a column per attribute; every #}
+{# column sorts, header filters + the state quick-pills filter client-side, and the #}
+{# description / enabled cells edit in place (NetBox takes ownership, same as the #}
+{# old pencil editor). Rows ship embedded via json_script; post-action reloads #}
+{# re-fetch ?format=json. Cell badges/Accept reuse each overlay's own status + endpoint. #}
 {% include "netbox_nso_plugin/categories/_adapter_error.html" %}
-{% url 'dcim:device_nso' pk=object.pk as return_url %}
 
-<style>
-.nso-ifm-table .nso-cell { display: inline-flex; align-items: center; gap: .4rem; }
-.nso-ifm-table .nso-val { white-space: nowrap; }
-.nso-ifm-table td.c-desc .nso-val { white-space: normal; }
-.nso-ifm-table td.c-desc { min-width: 200px; max-width: 380px; }
-.nso-ifm-table .nso-cell form { display: inline; margin: 0; }
-.nso-ifm-table > tbody > tr > td, .nso-ifm-table > thead > tr > th { padding: .45rem .6rem; }
-.nso-ifm-cols .btn:not(.active) { opacity: .45; }
-</style>
-
-<div class="nso-ifm-pager"
-     data-url="{% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='interface' %}"
-     data-q="{{ q }}" data-state="{{ state }}" data-page="{{ page.number }}">
-
-  <div class="nso-ifm-results">
+{{ grid_payload|json_script:"nso-ifg-data" }}
+<div class="nso-ifg"
+     data-json-url="{% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='interface' %}?format=json">
   <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
-    <input type="search" class="form-control form-control-sm nso-ifm-filter"
-           placeholder="Filter by interface name…" value="{{ q }}" autocomplete="off"
-           style="max-width: 260px;">
-    <div class="btn-group btn-group-sm nso-ifm-state" role="group" aria-label="State filter">
-      <button type="button" class="btn btn-outline-secondary{% if state == 'all' %} active{% endif %}" data-state="all">All ({{ counts.all }})</button>
-      <button type="button" class="btn btn-outline-warning{% if state == 'drift' %} active{% endif %}" data-state="drift">Drift ({{ counts.drift }})</button>
-      <button type="button" class="btn btn-outline-info{% if state == 'pending' %} active{% endif %}" data-state="pending">Pending apply ({{ counts.pending }})</button>
-      <button type="button" class="btn btn-outline-success{% if state == 'in_sync' %} active{% endif %}" data-state="in_sync">In sync</button>
+    <div class="btn-group btn-group-sm nso-ifg-state" role="group" aria-label="State quick filter">
+      <button type="button" class="btn btn-outline-secondary active" data-state="all">All (<span class="nso-ifg-n-all">{{ counts.all }}</span>)</button>
+      <button type="button" class="btn btn-outline-warning" data-state="drift">Drift (<span class="nso-ifg-n-drift">{{ counts.drift }}</span>)</button>
+      <button type="button" class="btn btn-outline-info" data-state="pending">Pending apply (<span class="nso-ifg-n-pending">{{ counts.pending }}</span>)</button>
+      <button type="button" class="btn btn-outline-success" data-state="in_sync">In sync</button>
     </div>
     <span class="text-muted small ms-1">Show:</span>
-    <div class="btn-group btn-group-sm nso-ifm-cols" role="group" aria-label="Columns">
+    <div class="btn-group btn-group-sm nso-ifg-cols" role="group" aria-label="Columns">
       <button type="button" class="btn btn-outline-secondary active" data-col="enabled">Enabled</button>
-      <button type="button" class="btn btn-outline-secondary active" data-col="desc">Description</button>
+      <button type="button" class="btn btn-outline-secondary active" data-col="description">Description</button>
       <button type="button" class="btn btn-outline-secondary active" data-col="mtu">MTU</button>
-      <button type="button" class="btn btn-outline-secondary active" data-col="ip">IPs</button>
-      <button type="button" class="btn btn-outline-secondary active" data-col="sw">Switchport</button>
+      <button type="button" class="btn btn-outline-secondary active" data-col="ips">IPs</button>
+      <button type="button" class="btn btn-outline-secondary active" data-col="switchport">Switchport</button>
     </div>
+    <span class="text-muted small ms-auto">Click a Description or Enabled cell to edit — NetBox then owns that value (same as Accept).</span>
   </div>
-  <div class="nso-ifm-msg"></div>
-
-  {% if rows %}
-  <div class="table-responsive mb-2">
-    <table class="table table-sm table-hover align-middle mb-0 nso-ifm-table">
-      <thead>
-        <tr>
-          <th>Interface</th>
-          <th class="c-enabled">Enabled</th>
-          <th class="c-desc">Description</th>
-          <th class="c-mtu text-nowrap">MTU <span class="text-muted fw-normal">L2 / IP / MPLS</span></th>
-          <th class="c-ip">IPs</th>
-          <th class="c-sw">Switchport</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for r in rows %}
-        <tr>
-          <td class="text-nowrap"><a href="{{ r.iface.get_absolute_url }}">{{ r.iface.name }}</a></td>
-
-          {# ── Enabled ─────────────────────────────────────────────── #}
-          <td class="c-enabled">
-            {% if r.enabled %}
-              <span class="nso-cell"><span class="nso-val">{% if r.enabled.nso_value|lower == "true" %}<span class="mdi mdi-check-circle text-success"></span> Enabled{% elif r.enabled.nso_value|lower == "false" %}<span class="mdi mdi-minus-circle text-muted"></span> Disabled{% else %}{{ r.enabled.nso_value|default:"—" }}{% endif %}</span>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=r.enabled.status compact=True %}{% url 'plugins:netbox_nso_plugin:nsointerfacestate_accept' pk=r.enabled.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=r.enabled.status form_class="nso-row-form" icon_only=True only %}</span>
-            {% else %}<span class="text-muted">—</span>{% endif %}
-          </td>
-
-          {# ── Description ─────────────────────────────────────────── #}
-          <td class="c-desc">
-            {% if r.description %}
-              <span class="nso-cell"><span class="nso-val">{{ r.description.nso_value|default:"—" }}</span>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=r.description.status compact=True %}{% url 'plugins:netbox_nso_plugin:nsointerfacestate_accept' pk=r.description.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=r.description.status form_class="nso-row-form" icon_only=True only %}</span>
-            {% else %}<span class="text-muted">—</span>{% endif %}
-          </td>
-
-          {# ── MTU (L2 / IP / MPLS) ────────────────────────────────── #}
-          <td class="c-mtu">
-            {% if r.mtu %}
-              <span class="nso-cell"><span class="nso-val font-monospace">{{ r.mtu.l2_mtu|default:"—" }} / {{ r.mtu.ip_mtu|default:"—" }} / {{ r.mtu.mpls_mtu|default:"—" }}</span>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=r.mtu.status compact=True %}{% url 'plugins:netbox_nso_plugin:interface_mtu_accept' pk=r.mtu.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=r.mtu.status form_class="nso-row-form" icon_only=True only %}</span>
-              {% if r.mtu.bound_port %}<div class="text-muted small">port {{ r.mtu.bound_port }}</div>{% endif %}
-            {% else %}<span class="text-muted">—</span>{% endif %}
-          </td>
-
-          {# ── IPs (read-only) ─────────────────────────────────────── #}
-          <td class="c-ip">
-            {% for ip in r.ips %}
-              <span class="nso-cell"><code>{{ ip.address }}</code>{% if ip.secondary %}<span class="badge text-bg-light">sec</span>{% endif %}{% include "netbox_nso_plugin/categories/_state_badge.html" with status=ip.status compact=True %}</span>{% if not forloop.last %}<br>{% endif %}
-            {% empty %}<span class="text-muted">—</span>{% endfor %}
-          </td>
-
-          {# ── Switchport ──────────────────────────────────────────── #}
-          <td class="c-sw">
-            {% if r.switchport %}
-              <span class="nso-cell">{% if r.switchport.mode %}<span class="badge text-bg-light">{{ r.switchport.mode }}</span>{% endif %}<span class="nso-val">{% if r.switchport.untagged_vlan %}u:{{ r.switchport.untagged_vlan.vid }}{% endif %}{% with tagged=r.switchport.tagged_vlans.all %}{% if tagged %} t:{% for v in tagged %}{{ v.vid }}{% if not forloop.last %},{% endif %}{% endfor %}{% endif %}{% endwith %}</span>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=r.switchport.status compact=True %}{% url 'plugins:netbox_nso_plugin:switchport_accept' pk=r.switchport.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=r.switchport.status form_class="nso-row-form" icon_only=True only %}</span>
-            {% else %}<span class="text-muted">—</span>{% endif %}
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-
-  {% if page.paginator.num_pages > 1 %}
-  <nav class="d-flex align-items-center gap-2">
-    <span class="text-muted small">Page {{ page.number }} of {{ page.paginator.num_pages }} ({{ page.paginator.count }} interfaces)</span>
-    {% if page.has_previous %}<button type="button" class="btn btn-xs btn-outline-secondary nso-ifm-page" data-page="{{ page.previous_page_number }}">&laquo; Prev</button>{% endif %}
-    {% if page.has_next %}<button type="button" class="btn btn-xs btn-outline-secondary nso-ifm-page" data-page="{{ page.next_page_number }}">Next &raquo;</button>{% endif %}
-  </nav>
-  {% endif %}
-  {% else %}
-    <p class="text-muted mb-0">No interface attributes reported for this device{% if q %} matching “{{ q }}”{% endif %}.</p>
-  {% endif %}
-  </div>
-
-  <script>
-  (function () {
-    "use strict";
-    var pager = document.querySelector('.nso-ifm-pager');
-    if (!pager) return;
-    var url = pager.dataset.url;
-    function csrfToken() {
-      var el = document.querySelector('input[name=csrfmiddlewaretoken]');
-      if (el && el.value) return el.value;
-      return (document.cookie.match(/csrftoken=([^;]+)/) || [])[1] || '';
-    }
-    function esc(s) { var d = document.createElement('div'); d.textContent = (s == null ? '' : String(s)); return d.innerHTML; }
-
-    // Column show/hide preference, remembered across re-fetches within the page.
-    var hidden = (window.__nsoIfmHidden = window.__nsoIfmHidden || {});
-    function applyCols(scope) {
-      Object.keys(hidden).forEach(function (col) {
-        if (!hidden[col]) return;
-        scope.querySelectorAll('.c-' + col).forEach(function (el) { el.style.display = 'none'; });
-      });
-      var grp = scope.querySelector('.nso-ifm-cols');
-      if (grp) grp.querySelectorAll('[data-col]').forEach(function (b) {
-        b.classList.toggle('active', !hidden[b.dataset.col]);
-      });
-    }
-
-    var results = pager.querySelector('.nso-ifm-results');
-    var debounce = null;
-
-    function flash(text, type) {
-      var m = pager.querySelector('.nso-ifm-msg');
-      if (!m) return;
-      m.innerHTML = text ? '<div class="alert alert-' + type + ' py-1 px-2 small mb-2">' + text + '</div>' : '';
-    }
-
-    function load(q, state, page) {
-      pager.dataset.q = q; pager.dataset.state = state; pager.dataset.page = page;
-      results.innerHTML = '<div class="text-muted small py-2"><span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Loading…</div>';
-      return fetch(url + '?q=' + encodeURIComponent(q) + '&state=' + encodeURIComponent(state) + '&page=' + page, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
-        .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); })
-        .then(function (html) {
-          var tmp = document.createElement('div'); tmp.innerHTML = html;
-          var fresh = tmp.querySelector('.nso-ifm-results');
-          if (fresh) { results.replaceWith(fresh); results = pager.querySelector('.nso-ifm-results'); applyCols(results); }
-        })
-        .catch(function (e) { results.innerHTML = '<div class="text-danger small">Failed to load: ' + e.message + '</div>'; });
-    }
-    function reload() { return load(pager.dataset.q || '', pager.dataset.state || 'all', pager.dataset.page || 1); }
-
-    function post(action, body) {
-      return fetch(action, {
-        method: 'POST',
-        headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-CSRFToken': csrfToken(), 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: body,
-      }).then(function (r) { return r.json().catch(function () { return {}; }).then(function (d) { return { ok: r.ok, data: d }; }); });
-    }
-
-    pager.addEventListener('input', function (e) {
-      if (!e.target.classList.contains('nso-ifm-filter')) return;
-      clearTimeout(debounce);
-      var v = e.target.value.trim();
-      debounce = setTimeout(function () { load(v, pager.dataset.state || 'all', 1); }, 350);
-    });
-
-    pager.addEventListener('submit', function (e) {
-      var form = e.target.closest('.nso-row-form');
-      if (!form) return;
-      e.preventDefault();
-      form.querySelectorAll('button').forEach(function (b) { b.disabled = true; });
-      post(form.action, new URLSearchParams(new FormData(form))).then(function (res) {
-        if (!res.ok || (res.data && res.data.status === 'error')) {
-          flash('Action failed: ' + esc((res.data && res.data.message) || 'server error'), 'danger');
-        } else {
-          flash('', '');
-          document.dispatchEvent(new CustomEvent('nso:refresh-categories'));
-        }
-        return reload();
-      });
-    });
-
-    pager.addEventListener('click', function (e) {
-      var col = e.target.closest('.nso-ifm-cols [data-col]');
-      if (col) {
-        e.preventDefault();
-        var key = col.dataset.col;
-        hidden[key] = !hidden[key];
-        col.classList.toggle('active', !hidden[key]);
-        pager.querySelectorAll('.c-' + key).forEach(function (el) { el.style.display = hidden[key] ? 'none' : ''; });
-        return;
-      }
-      var stChip = e.target.closest('.nso-ifm-state [data-state]');
-      if (stChip) { e.preventDefault(); load(pager.dataset.q || '', stChip.dataset.state, 1); return; }
-      var pg = e.target.closest('.nso-ifm-page');
-      if (pg) { e.preventDefault(); load(pager.dataset.q || '', pager.dataset.state || 'all', pg.dataset.page); return; }
-    });
-
-    applyCols(pager);
-  })();
-  </script>
+  <div class="nso-ifg-msg"></div>
+  <div class="nso-ifg-table"></div>
 </div>
+
+<script>
+(function () {
+  "use strict";
+  var root = document.querySelector('.nso-ifg');
+  if (!root || typeof Tabulator === 'undefined') return;
+  var payloadEl = document.getElementById('nso-ifg-data');
+  if (!payloadEl) return;
+  var payload = JSON.parse(payloadEl.textContent);
+  var jsonUrl = root.dataset.jsonUrl;
+
+  function esc(s) { var d = document.createElement('div'); d.textContent = (s == null ? '' : String(s)); return d.innerHTML; }
+  function csrfToken() {
+    var el = document.querySelector('input[name=csrfmiddlewaretoken]');
+    if (el && el.value) return el.value;
+    return (document.cookie.match(/csrftoken=([^;]+)/) || [])[1] || '';
+  }
+  function flash(text, type) {
+    var m = root.querySelector('.nso-ifg-msg');
+    if (!m) return;
+    m.innerHTML = text ? '<div class="alert alert-' + type + ' py-1 px-2 small mb-2">' + esc(text) + '</div>' : '';
+  }
+
+  // ── Tabler badge fragments (identical vocabulary to _state_badge.html) ──────
+  var BADGE = {
+    drift: ['text-bg-warning text-dark', 'drift'],
+    pending: ['text-bg-info', 'pending apply'],
+    apply_failed: ['text-bg-danger', 'apply failed'],
+    deploying: ['text-bg-primary', 'deploying'],
+    in_sync: ['text-bg-success', 'in sync'],
+    unknown: ['text-bg-info', 'unknown'],
+  };
+  function badge(kind, label) {
+    var b = BADGE[kind] || BADGE.unknown;
+    return '<span class="badge ' + b[0] + '">' + esc(label || b[1]) + '</span>';
+  }
+  // Value cells stay quiet when in sync (compact) — only trouble gets a badge.
+  function cellBadge(cell) {
+    if (!cell) return '';
+    if (cell.kind === 'in_sync') {
+      return cell.status === 'in_sync'
+        ? ' <span class="mdi mdi-check-circle text-success" title="In sync — NetBox owns this and the device matches."></span>'
+        : '';
+    }
+    return ' ' + badge(cell.kind, cell.label);
+  }
+  function acceptBtn(cell) {
+    if (!cell || !cell.accept_url) return '';
+    return ' <button type="button" class="btn btn-xs btn-outline-success nso-cell-accept" data-accept="' +
+      esc(cell.accept_url) + '" title="Make NetBox the source of truth for this (re-applied to the device on Apply)">' +
+      '<span class="mdi mdi-check"></span></button>';
+  }
+  var MUTED = '<span class="text-muted">—</span>';
+
+  // ── column formatters ────────────────────────────────────────────────────────
+  function fmtName(cell) {
+    var d = cell.getRow().getData();
+    return '<a href="' + esc(d.iface.url) + '" title="Open interface in NetBox">' + esc(d.iface.name) + '</a>';
+  }
+  function fmtEnabled(cell) {
+    var c = cell.getRow().getData().enabled;
+    if (!c) return MUTED;
+    var v = (c.value == null ? '' : String(c.value)).toLowerCase();
+    var icon = v === 'true' ? '<span class="mdi mdi-check-circle text-success"></span> Enabled'
+      : v === 'false' ? '<span class="mdi mdi-minus-circle text-muted"></span> Disabled'
+      : esc(c.value == null ? '—' : c.value);
+    return '<span class="text-nowrap">' + icon + cellBadge(c) + acceptBtn(c) + '</span>';
+  }
+  function fmtDescription(cell) {
+    var c = cell.getRow().getData().description;
+    if (!c) return MUTED;
+    return (c.value ? esc(c.value) : MUTED) + cellBadge(c) + acceptBtn(c);
+  }
+  function fmtMtu(cell) {
+    var c = cell.getRow().getData().mtu;
+    if (!c) return MUTED;
+    var t = [c.l2, c.ip, c.mpls].map(function (v) { return v == null ? '—' : esc(v); }).join(' / ');
+    var port = c.bound_port ? '<div class="text-muted small">port ' + esc(c.bound_port) + '</div>' : '';
+    return '<span class="font-monospace text-nowrap">' + t + '</span>' + cellBadge(c) + acceptBtn(c) + port;
+  }
+  function fmtIps(cell) {
+    var ips = cell.getRow().getData().ips || [];
+    if (!ips.length) return MUTED;
+    return ips.map(function (ip) {
+      var sec = ip.secondary ? ' <span class="badge text-bg-light">sec</span>' : '';
+      var b = ip.kind !== 'in_sync' ? ' ' + badge(ip.kind) : '';
+      return '<code>' + esc(ip.address) + '</code>' + sec + b;
+    }).join('<br>');
+  }
+  function fmtSwitchport(cell) {
+    var c = cell.getRow().getData().switchport;
+    if (!c) return MUTED;
+    var mode = c.mode ? '<span class="badge text-bg-light">' + esc(c.mode) + '</span> ' : '';
+    var vlans = [];
+    if (c.untagged != null) vlans.push('u:' + esc(c.untagged));
+    if (c.tagged && c.tagged.length) vlans.push('t:' + c.tagged.map(esc).join(','));
+    return mode + esc(vlans.join(' ')) + cellBadge(c) + acceptBtn(c);
+  }
+  var SEVERITY = ['apply_failed', 'drift', 'pending', 'deploying', 'unknown', 'in_sync'];
+  function fmtState(cell) {
+    return badge(cell.getValue());
+  }
+
+  // Flat helper fields so sorting / header-filtering works on plain strings.
+  function flatten(rows) {
+    return rows.map(function (r) {
+      r._name = r.iface.name;
+      r._desc = r.description && r.description.value ? r.description.value : '';
+      r._enabled = r.enabled && r.enabled.value != null ? String(r.enabled.value).toLowerCase() : '';
+      return r;
+    });
+  }
+
+  // ── grid ─────────────────────────────────────────────────────────────────────
+  if (window.__nsoIfg) { try { window.__nsoIfg.destroy(); } catch (e) { /* re-render */ } }
+  var table = new Tabulator(root.querySelector('.nso-ifg-table'), {
+    data: flatten(payload.rows),
+    layout: 'fitColumns',
+    maxHeight: '540px',
+    placeholder: 'No interface state yet — click Refresh from NSO or wait for the next sync.',
+    columns: [
+      { title: 'Interface', field: '_name', formatter: fmtName, sorter: 'alphanum', widthGrow: 1.5, minWidth: 140,
+        headerFilter: 'input', headerFilterPlaceholder: 'filter name…' },
+      { title: 'Enabled', field: '_enabled', formatter: fmtEnabled, widthGrow: 1.1, minWidth: 120,
+        editable: function (cell) { return !!cell.getRow().getData().enabled; },
+        editor: 'list', editorParams: { values: { 'true': 'Enabled', 'false': 'Disabled' } },
+        headerFilter: 'list', headerFilterParams: { values: { '': 'All', 'true': 'Enabled', 'false': 'Disabled' } },
+        cssClass: 'nso-editable' },
+      { title: 'Description', field: '_desc', formatter: fmtDescription, widthGrow: 2.4, minWidth: 180,
+        editable: function (cell) { return !!cell.getRow().getData().description; },
+        editor: 'input', headerFilter: 'input', headerFilterPlaceholder: 'filter…', cssClass: 'nso-editable' },
+      { title: 'MTU L2 / IP / MPLS', field: 'mtu', formatter: fmtMtu, widthGrow: 1.3, minWidth: 150, headerSort: false },
+      { title: 'IPs', field: 'ips', formatter: fmtIps, widthGrow: 1.4, minWidth: 130, headerSort: false },
+      { title: 'Switchport', field: 'switchport', formatter: fmtSwitchport, widthGrow: 1.1, minWidth: 110, headerSort: false },
+      { title: 'State', field: 'state', formatter: fmtState, widthGrow: 0.9, minWidth: 110,
+        sorter: function (a, b) { return SEVERITY.indexOf(a) - SEVERITY.indexOf(b); },
+        headerFilter: 'list',
+        headerFilterParams: { values: { '': 'All', drift: 'Drift', pending: 'Pending apply', apply_failed: 'Apply failed', in_sync: 'In sync' } } },
+    ],
+  });
+  window.__nsoIfg = table;
+
+  // Restore the column show/hide preference across re-renders within the page.
+  var hidden = (window.__nsoIfgHidden = window.__nsoIfgHidden || {});
+  var COL_FIELD = { enabled: '_enabled', description: '_desc', mtu: 'mtu', ips: 'ips', switchport: 'switchport' };
+  table.on('tableBuilt', function () {
+    Object.keys(hidden).forEach(function (k) { if (hidden[k]) table.hideColumn(COL_FIELD[k]); });
+    root.querySelectorAll('.nso-ifg-cols [data-col]').forEach(function (b) {
+      b.classList.toggle('active', !hidden[b.dataset.col]);
+    });
+  });
+
+  // ── POST helper + post-action refresh ────────────────────────────────────────
+  function post(url, params) {
+    params.set('csrfmiddlewaretoken', csrfToken());
+    return fetch(url, {
+      method: 'POST',
+      headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-CSRFToken': csrfToken(), 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params,
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (d) { return { ok: r.ok, data: d }; });
+    });
+  }
+  function reload() {
+    return fetch(jsonUrl, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(function (fresh) {
+        table.replaceData(flatten(fresh.rows));
+        ['all', 'drift', 'pending'].forEach(function (k) {
+          var el = root.querySelector('.nso-ifg-n-' + k);
+          if (el) el.textContent = fresh.counts[k];
+        });
+      })
+      .catch(function (e) { flash('Failed to refresh: ' + e.message, 'danger'); });
+  }
+  function afterAction(res) {
+    if (!res.ok || (res.data && res.data.status === 'error')) {
+      flash('Action failed: ' + ((res.data && res.data.message) || 'server error'), 'danger');
+    } else {
+      flash('', '');
+      document.dispatchEvent(new CustomEvent('nso:refresh-categories'));
+    }
+    return reload();
+  }
+
+  // Inline edit of description / enabled — same endpoint + ownership semantics as
+  // the old pencil editor (NSOInterfaceEditFieldView).
+  table.on('cellEdited', function (cell) {
+    var d = cell.getRow().getData();
+    var target = cell.getField() === '_desc' ? d.description : d.enabled;
+    if (!target || !target.edit_url) { cell.restoreOldValue(); return; }
+    post(target.edit_url, new URLSearchParams({ value: cell.getValue() })).then(afterAction);
+  });
+
+  // Per-cell Accept buttons (delegated — cells re-render on every data swap).
+  root.addEventListener('click', function (e) {
+    var acc = e.target.closest('.nso-cell-accept');
+    if (acc) {
+      e.preventDefault();
+      acc.disabled = true;
+      post(acc.dataset.accept, new URLSearchParams()).then(afterAction);
+      return;
+    }
+    // One-click state quick-filter pills (mirrors _filter_ifaces_by_state buckets).
+    var pill = e.target.closest('.nso-ifg-state [data-state]');
+    if (pill) {
+      e.preventDefault();
+      root.querySelectorAll('.nso-ifg-state [data-state]').forEach(function (b) { b.classList.toggle('active', b === pill); });
+      var s = pill.dataset.state;
+      if (s === 'all') table.clearFilter(true);
+      else if (s === 'drift') table.setFilter('state', '=', 'drift');
+      else if (s === 'pending') table.setFilter(function (d) { return d.state === 'pending' || d.state === 'apply_failed'; });
+      else table.setFilter(function (d) { return d.state !== 'drift' && d.state !== 'pending' && d.state !== 'apply_failed'; });
+      return;
+    }
+    var colBtn = e.target.closest('.nso-ifg-cols [data-col]');
+    if (colBtn) {
+      e.preventDefault();
+      var key = colBtn.dataset.col;
+      hidden[key] = !hidden[key];
+      colBtn.classList.toggle('active', !hidden[key]);
+      table.toggleColumn(COL_FIELD[key]);
+    }
+  });
+
+  if (payload.adapter_error) flash('Adapter: ' + payload.adapter_error, 'warning');
+})();
+</script>

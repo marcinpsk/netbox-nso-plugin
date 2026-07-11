@@ -394,6 +394,99 @@ class TestNSODeviceManagementListView(ViewTestBase):
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config")
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_successful_poll_clears_stale_adapter_link_error(self, mock_session_cls, mock_cfg):
+        """A poll that finds the device synced 'succeeded' retires a sticky adapter_link_error.
+
+        The error is set by a failed scope-sync (post_save handler) and was previously only
+        cleared by the *next successful save* — a transient adapter outage left the tab banner
+        claiming "last adapter sync failed" forever, alongside "Last sync: succeeded"."""
+        mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+        mgmt.adapter_device_id = 16
+        mgmt.save(update_fields=["adapter_device_id"])
+        # Stage the stale error exactly as production writes it — .update() fires no signals,
+        # so the save above can't prematurely clear it.
+        NSODeviceManagement.objects.filter(pk=mgmt.pk).update(
+            adapter_link_error="Internal Server Error", last_sync_status=""
+        )
+
+        mock_cfg.return_value = {
+            "url": "http://adapter",
+            "token": "tok",
+            "verify_tls": True,
+            "ca_cert_path": None,
+            "timeout": 30,
+        }
+
+        def make_resp(method, url, **kwargs):
+            return make_response(
+                200,
+                json_data={
+                    "id": 16,
+                    "last_sync_at": "2025-06-01T10:00:00+00:00",
+                    "last_sync_status": "succeeded",
+                },
+            )
+
+        session = make_session()
+        session.request = make_resp
+        mock_session_cls.return_value = session
+
+        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_list")
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.last_sync_status, "succeeded")
+        self.assertEqual(mgmt.adapter_link_error, "")
+
+        mgmt.adapter_device_id = None
+        mgmt.save(update_fields=["adapter_device_id"])
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config")
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_failed_poll_keeps_adapter_link_error(self, mock_session_cls, mock_cfg):
+        """A poll whose device-level sync is NOT 'succeeded' must keep the link error visible."""
+        mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+        mgmt.adapter_device_id = 16
+        mgmt.save(update_fields=["adapter_device_id"])
+        NSODeviceManagement.objects.filter(pk=mgmt.pk).update(
+            adapter_link_error="Internal Server Error", last_sync_status=""
+        )
+
+        mock_cfg.return_value = {
+            "url": "http://adapter",
+            "token": "tok",
+            "verify_tls": True,
+            "ca_cert_path": None,
+            "timeout": 30,
+        }
+
+        def make_resp(method, url, **kwargs):
+            return make_response(
+                200,
+                json_data={
+                    "id": 16,
+                    "last_sync_at": "2025-06-01T10:00:00+00:00",
+                    "last_sync_status": "failed",
+                },
+            )
+
+        session = make_session()
+        session.request = make_resp
+        mock_session_cls.return_value = session
+
+        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_list")
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.adapter_link_error, "Internal Server Error")
+
+        mgmt.adapter_device_id = None
+        mgmt.save(update_fields=["adapter_device_id"])
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config")
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_list_renders_partial_badge_and_caches_degraded_surfaces(self, mock_session_cls, mock_cfg):
         """A 'partial' device renders a warning badge in the table whose tooltip lists
         the stale surfaces, and caches degraded_surfaces on the row."""
@@ -1841,7 +1934,8 @@ class TestDeviceNSOTabView(ViewTestBase):
         r = self.client.get(url)
         self.assertEqual(r.status_code, 200)
         body = r.content.decode()
-        self.assertIn("nso-ifm-cols", body)  # column-select chips
+        self.assertIn("nso-ifg-cols", body)  # column-select chips
+        self.assertIn('id="nso-ifg-data"', body)  # embedded grid payload (json_script)
         self.assertIn("Gi0/1", body)
         self.assertIn("uplink to core", body)  # description device value
         self.assertIn("9216", body)  # L2 MTU
@@ -1849,6 +1943,63 @@ class TestDeviceNSOTabView(ViewTestBase):
         # No leaked Django comments (illegal multi-line {# #} would render as text).
         self.assertNotIn("{#", body)
         self.assertNotIn("#}", body)
+
+        iface.delete()
+
+    def test_merged_interface_category_json_serves_grid_rows(self):
+        """?format=json returns the full (unpaginated) per-interface matrix for the
+        client-side grid: per-cell value + status + kind + accept/edit URLs, a row-level
+        rollup state (worst cell wins), and the quick-filter counts."""
+        from dcim.models import Interface
+
+        from netbox_nso_plugin.models import (
+            NSOInterfaceIPState,
+            NSOInterfaceMtuState,
+            NSOInterfaceState,
+            NSOSwitchportState,
+        )
+
+        iface = Interface.objects.create(device=self.device, name="Gi0/1", type="other", description="nb")
+        NSOInterfaceState.objects.create(interface=iface, attribute="enabled", status="imported", nso_value="true")
+        st_desc = NSOInterfaceState.objects.create(
+            interface=iface, attribute="description", status="changed", nso_value="uplink to core"
+        )
+        NSOInterfaceMtuState.objects.create(
+            management=self.mgmt, interface=iface, l2_mtu=9216, ip_mtu=9000, status="imported"
+        )
+        NSOInterfaceIPState.objects.create(interface=iface, address="10.0.0.1/31", family="ipv4", status="imported")
+        NSOSwitchportState.objects.create(management=self.mgmt, interface=iface, mode="access", status="imported")
+
+        url = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device.pk, "key": "interface"}
+        )
+        r = self.client.get(url, {"format": "json"})
+        self.assertEqual(r.status_code, 200)
+        data = r.json()
+
+        # Counts cover every interface (the shared fixture creates others) and always
+        # agree with the row list itself; our drifting row must be counted.
+        self.assertEqual(data["counts"]["all"], len(data["rows"]))
+        self.assertGreaterEqual(data["counts"]["drift"], 1)
+        row = next(r for r in data["rows"] if r["iface"]["name"] == "Gi0/1")
+        self.assertTrue(row["iface"]["url"])
+
+        # enabled: NetBox True vs device "true" — value-aware in sync (not owned, no accept hidden).
+        self.assertEqual(row["enabled"]["kind"], "in_sync")
+        # description: NetBox "nb" vs device "uplink to core", status=changed, unowned → drift,
+        # with both values shipped (device value displayed, NetBox value prefills the editor).
+        self.assertEqual(row["description"]["kind"], "drift")
+        self.assertEqual(row["description"]["value"], "uplink to core")
+        self.assertEqual(row["description"]["netbox_value"], "nb")
+        self.assertIn(f"/{st_desc.pk}/", row["description"]["accept_url"])
+        self.assertIn(f"/{st_desc.pk}/", row["description"]["edit_url"])
+
+        self.assertEqual(row["mtu"]["l2"], 9216)
+        self.assertEqual(row["mtu"]["ip"], 9000)
+        self.assertEqual(row["ips"][0]["address"], "10.0.0.1/31")
+        self.assertEqual(row["switchport"]["mode"], "access")
+        # Row rollup: the drifting description outranks the in-sync cells.
+        self.assertEqual(row["state"], "drift")
 
         iface.delete()
 
@@ -2396,11 +2547,12 @@ class TestInterfaceMatrixStateChips(ViewTestBase):
     def test_matrix_renders_state_chips(self):
         resp = self.client.get(self._url(), HTTP_X_REQUESTED_WITH="XMLHttpRequest")
         self.assertEqual(resp.status_code, 200)
-        self.assertContains(resp, "nso-ifm-state")
+        self.assertContains(resp, "nso-ifg-state")
         self.assertContains(resp, 'data-state="drift"')
         self.assertContains(resp, 'data-state="pending"')
 
     def test_matrix_accepts_state_param(self):
+        # The grid filters client-side now; a legacy ?state= URL must stay harmless.
         resp = self.client.get(self._url() + "?state=pending", HTTP_X_REQUESTED_WITH="XMLHttpRequest")
         self.assertEqual(resp.status_code, 200)
 

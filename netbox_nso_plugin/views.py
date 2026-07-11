@@ -118,6 +118,14 @@ def _refresh_sync_cache(mgmt, adapter_device):
     if mgmt.degraded_surfaces != degraded_surfaces:
         mgmt.degraded_surfaces = degraded_surfaces
         update_fields.append("degraded_surfaces")
+    # A successful device-level sync proves the adapter link works and the mirror is
+    # current — retire a sticky adapter_link_error left by an earlier failed scope-sync
+    # (otherwise it is only cleared by the next successful *save* of the row, so a
+    # transient adapter outage kept the tab's red "sync failed" banner up forever,
+    # directly above the "Last sync: succeeded" strip).
+    if mgmt.adapter_link_error and last_sync_status == "succeeded":
+        mgmt.adapter_link_error = ""
+        update_fields.append("adapter_link_error")
     if update_fields:
         NSODeviceManagement.objects.filter(pk=mgmt.pk).update(**{f: getattr(mgmt, f) for f in update_fields})
     return update_fields
@@ -300,6 +308,10 @@ class NSOCategoryCountsView(LoginRequiredMixin, View):
 
 
 _PENDING_KINDS = {"pending", "apply_failed"}
+
+# Worst-first ordering of per-cell state kinds, for rolling an interface's cells up
+# into the single row-level state the grid sorts and quick-filters on.
+_KIND_SEVERITY = ("apply_failed", "drift", "pending", "deploying", "unknown", "in_sync")
 
 
 def _merged_iface_kinds(iface, attr_states, mtu_states, sw_states, ip_states) -> set[str]:
@@ -589,14 +601,13 @@ class NSOCategoryView(LoginRequiredMixin, View):
         """Consolidated per-interface view: one row per interface, a column per attribute.
 
         Folds the four scattered per-interface scalar overlays (enabled/description,
-        IPs, MTU, switchport) into a single table with a client-side column-select.
-        Reconciles all four on expand (suppress-wrapped), then pivots the persisted
-        NSO*State rows by interface. Each attribute cell reuses that overlay's own
+        IPs, MTU, switchport) into a single client-side grid. Pivots the persisted
+        NSO*State rows by interface; each attribute cell reuses that overlay's own
         status badge + Accept endpoint, so per-attribute Accept/Apply still works.
-        Filter by interface name (?q=), paginated like the interfaces page.
+        Sorting, filtering and the drift/pending quick-filter all happen in the
+        browser, so every row ships at once (json_script on first paint,
+        ?format=json for post-action reloads).
         """
-        from django.core.paginator import Paginator
-
         from .models import (
             NSOInterfaceIPState,
             NSOInterfaceMtuState,
@@ -641,52 +652,129 @@ class NSOCategoryView(LoginRequiredMixin, View):
         for iface_id, st in sw_states.items():
             ifaces[iface_id] = st.interface
 
-        q = (request.GET.get("q") or "").strip()
         ordered = sorted(ifaces.values(), key=lambda i: i.name)
-        if q:
-            ql = q.lower()
-            ordered = [i for i in ordered if ql in i.name.lower()]
 
-        # Per-interface aggregate state, so the matrix offers the same drift/pending
-        # quick-filter the per-attribute interfaces page has. Counts are over the
-        # name-filtered set (before the state filter); the chips then narrow the rows.
+        # Per-interface aggregate state for the grid's row-level rollup and the
+        # drift/pending quick-filter counts.
         kinds_by_iface = {i.id: _merged_iface_kinds(i, attr_states, mtu_states, sw_states, ip_states) for i in ordered}
         counts = {"all": len(ordered), "drift": 0, "pending": 0}
         for ks in kinds_by_iface.values():
             counts["drift"] += 1 if "drift" in ks else 0
             counts["pending"] += 1 if ks & _PENDING_KINDS else 0
-        state = request.GET.get("state") or "all"
-        ordered = _filter_ifaces_by_state(ordered, kinds_by_iface, state)
 
-        paginator = Paginator(ordered, self._INTERFACES_PER_PAGE)
-        page = paginator.get_page(request.GET.get("page") or 1)
-
-        rows = []
-        for iface in page.object_list:
-            rows.append(
-                {
-                    "iface": iface,
-                    "enabled": attr_states.get((iface.id, "enabled")),
-                    "description": attr_states.get((iface.id, "description")),
-                    "mtu": mtu_states.get(iface.id),
-                    "ips": ip_states.get(iface.id, []),
-                    "switchport": sw_states.get(iface.id),
-                }
-            )
+        # The client-side grid sorts, filters and quick-filters in the browser, so the
+        # payload always carries every row — no server state filter, no pagination.
+        # ?format=json serves the grid's post-action reloads; the plain fragment embeds
+        # the same payload via json_script so first paint needs no second request.
+        payload = self._interface_merged_payload(
+            ordered, kinds_by_iface, counts, attr_states, mtu_states, sw_states, ip_states, adapter_error
+        )
+        if request.GET.get("format") == "json":
+            return JsonResponse(payload)
 
         return render(
             request,
             "netbox_nso_plugin/categories/interface.html",
             {
                 "object": device,
-                "rows": rows,
-                "page": page,
-                "q": q,
-                "state": state,
+                "grid_payload": payload,
                 "counts": counts,
                 "adapter_error": adapter_error,
             },
         )
+
+    # Statuses whose rows offer an Accept action — mirrors _accept_cell.html exactly.
+    _ACCEPTABLE_STATUSES = ("imported", "changed", "conflict", "drifted")
+
+    def _interface_merged_payload(
+        self, ordered, kinds_by_iface, counts, attr_states, mtu_states, sw_states, ip_states, adapter_error
+    ):
+        """Build the merged per-interface matrix payload for the Tabulator grid.
+
+        Cell classification reuses the exact helpers the old server-rendered table
+        used (interface_row_state / display_state), so grid badges, quick-filter
+        buckets and Accept visibility keep the established semantics.
+        """
+        from .status_machine import OWNED_STATES
+        from .summary import _netbox_value_for, display_state, interface_row_state
+
+        def attr_cell(st, iface):
+            if st is None:
+                return None
+            kind, label, owned = interface_row_state(st, iface)
+            return {
+                "pk": st.pk,
+                "value": st.nso_value,
+                "netbox_value": _netbox_value_for(st.attribute, iface),
+                "status": st.status,
+                "kind": kind,
+                "label": label,
+                "owned": owned,
+                "accept_url": (
+                    reverse("plugins:netbox_nso_plugin:nsointerfacestate_accept", args=[st.pk])
+                    if st.status in self._ACCEPTABLE_STATUSES
+                    else None
+                ),
+                "edit_url": reverse("plugins:netbox_nso_plugin:nsointerfacestate_edit_field", args=[st.pk]),
+            }
+
+        def plain_cell(st, accept_route, extra):
+            if st is None:
+                return None
+            owned = st.status in OWNED_STATES
+            kind, label = display_state(st.status, owned)
+            cell = {
+                "pk": st.pk,
+                "status": st.status,
+                "kind": kind,
+                "label": label,
+                "owned": owned,
+                "accept_url": (reverse(accept_route, args=[st.pk]) if st.status in self._ACCEPTABLE_STATUSES else None),
+            }
+            cell.update(extra)
+            return cell
+
+        rows = []
+        for iface in ordered:
+            mtu = mtu_states.get(iface.id)
+            sw = sw_states.get(iface.id)
+            kinds = kinds_by_iface[iface.id]
+            rows.append(
+                {
+                    "iface": {"id": iface.id, "name": iface.name, "url": iface.get_absolute_url()},
+                    "enabled": attr_cell(attr_states.get((iface.id, "enabled")), iface),
+                    "description": attr_cell(attr_states.get((iface.id, "description")), iface),
+                    "mtu": plain_cell(
+                        mtu,
+                        "plugins:netbox_nso_plugin:interface_mtu_accept",
+                        {"l2": mtu.l2_mtu, "ip": mtu.ip_mtu, "mpls": mtu.mpls_mtu, "bound_port": mtu.bound_port}
+                        if mtu
+                        else {},
+                    ),
+                    "ips": [
+                        {
+                            "address": str(st.address),
+                            "secondary": st.secondary,
+                            "status": st.status,
+                            "kind": display_state(st.status, st.status in OWNED_STATES)[0],
+                        }
+                        for st in ip_states.get(iface.id, [])
+                    ],
+                    "switchport": plain_cell(
+                        sw,
+                        "plugins:netbox_nso_plugin:switchport_accept",
+                        {
+                            "mode": sw.mode,
+                            "untagged": sw.untagged_vlan.vid if sw and sw.untagged_vlan else None,
+                            "tagged": [v.vid for v in sw.tagged_vlans.all()] if sw else [],
+                        }
+                        if sw
+                        else {},
+                    ),
+                    "state": next((k for k in _KIND_SEVERITY if k in kinds), "in_sync"),
+                }
+            )
+        return {"rows": rows, "counts": counts, "adapter_error": adapter_error}
 
     def _render_interfaces_page(self, request, device):
         """Per-(interface, attribute) drift/pending view — paginated, filterable, read-only.

@@ -8,6 +8,10 @@
 {# Vendored diff2html (MIT) — renders the apply-preview's NSO tree diff; no CDN. #}
 <link rel="stylesheet" href="{% static 'netbox_nso_plugin/vendor/diff2html.min.css' %}">
 <script src="{% static 'netbox_nso_plugin/vendor/diff2html.min.js' %}"></script>
+{# Vendored Tabulator (MIT) — the Interfaces category grid; no CDN. #}
+<link rel="stylesheet" href="{% static 'netbox_nso_plugin/vendor/tabulator_bootstrap5.min.css' %}">
+<script src="{% static 'netbox_nso_plugin/vendor/tabulator.min.js' %}"></script>
+<link rel="stylesheet" href="{% static 'netbox_nso_plugin/nso.css' %}">
 {% if mgmt %}
 
   {# ── Adapter link/sync failure — managing this device couldn't reach the adapter ─────── #}
@@ -769,6 +773,9 @@
       "use strict";
       function runScripts(container) {
         container.querySelectorAll('script').forEach(function (old) {
+          // Leave data blocks alone (e.g. json_script payloads): recreating them
+          // without their type attribute would execute JSON as JS and throw.
+          if (old.type && old.type !== 'text/javascript' && old.type !== 'module') return;
           var s = document.createElement('script');
           if (old.src) { s.src = old.src; } else { s.textContent = old.textContent; }
           old.parentNode.replaceChild(s, old);
