@@ -493,6 +493,7 @@ _APPLY_DEPLOYING_SCOPES = {
     "interface_mtu": "NSOInterfaceMtuState",
     "route_policy": "NSORoutePolicyState",
     "static_route": "NSOStaticRouteState",
+    "l2_sap": "NSOL2SapState",
 }
 
 

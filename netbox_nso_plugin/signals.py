@@ -1682,8 +1682,14 @@ def _on_routing_isis_flex_algo_pre_delete(sender, instance, **kwargs):
     _remove_isis_flex_algo(instance)
 
 
-def _push_l2_sap_intent_for_device(device_id, adapter_device_id):
-    """Build and push the full Nokia L2 SAP intent snapshot for a device."""
+def _push_l2_sap_intent_for_device(device_id, adapter_device_id, force=False):
+    """Build and push the full Nokia L2 SAP intent snapshot for a device.
+
+    ``force=True`` (the device Apply) bypasses change-detection so an owned SAP whose
+    adapter intent went stale/empty is re-pushed and actually applied — mirrors the
+    SVI/static-route force-push (rows are marked deploying, so a silently skipped push
+    would strand them there forever).
+    """
     from . import adapter_client as client
     from .models import NSOL2SapState
 
@@ -1707,6 +1713,7 @@ def _push_l2_sap_intent_for_device(device_id, adapter_device_id):
         (device_id, "l2_sap"),
         saps,
         lambda: client.put_l2_sap_intent(adapter_device_id, saps),
+        force=force,
     )
 
 

@@ -1469,6 +1469,7 @@ def _prepare_apply(mgmt):
         _push_bfd_intent_for_device,
         _push_interface_intent_for_device,
         _push_interface_mtu_intent_for_device,
+        _push_l2_sap_intent_for_device,
         _push_lacp_intent_for_device,
         _push_route_policy_intent_for_device,
         _push_static_route_intent_for_device,
@@ -1503,6 +1504,7 @@ def _prepare_apply(mgmt):
         _push_subinterface_intent_for_device,
         _push_bfd_intent_for_device,
         _push_interface_mtu_intent_for_device,
+        _push_l2_sap_intent_for_device,
         _push_switchport_intent_for_device,
         _push_vlan_intent_for_device,
     ):
@@ -1520,6 +1522,7 @@ def _prepare_apply(mgmt):
         NSOInterfaceMtuState,
         NSORoutePolicyState,
         NSOStaticRouteState,
+        NSOL2SapState,
     ):
         try:
             pks = list(model.objects.filter(management=mgmt, status="accepted").values_list("pk", flat=True))

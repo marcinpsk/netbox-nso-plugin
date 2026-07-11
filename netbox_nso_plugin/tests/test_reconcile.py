@@ -216,6 +216,67 @@ class TestStaticRouteApplySettle(APITestCase):
         self.assertTrue(push_static.call_args.kwargs.get("force"))
 
 
+class TestL2SapApplySettle(APITestCase):
+    """L2 SAPs join the deploying→settle flow (the MTU/route-policy/static-route regression
+    class: a scope missing from _prepare_apply/_APPLY_DEPLOYING_SCOPES strands its rows).
+    Found by the item-12 real-apply scoping on ra1 (Nokia): an accepted SAP would apply
+    adapter-side but never read 'deploying' nor flip to apply_failed on a failed scope."""
+
+    def _setup(self, status_="deploying"):
+        from netbox_nso_plugin.models import NSOL2SapState
+
+        device = _make_device("sap-settle")
+        inst, _ = NSOInstance.objects.get_or_create(
+            name="sap-settle-inst", defaults={"adapter_instance_id": "sap-settle-inst"}
+        )
+        mgmt = NSODeviceManagement.objects.create(
+            device=device, nso_instance=inst, nso_device_name="sap-settle", adapter_device_id=90
+        )
+        row = NSOL2SapState.objects.create(
+            management=mgmt,
+            service_name="vpls-701",
+            service_type="vpls",
+            sap_id="1/1/c31/3:702",
+            port="1/1/c31/3",
+            outer_tag=702,
+            status=status_,
+        )
+        return mgmt, row
+
+    def test_failed_l2_sap_scope_marks_apply_failed(self):
+        from netbox_nso_plugin.reconcile import _settle_apply_failures
+
+        mgmt, row = self._setup()
+        _settle_apply_failures(mgmt, {"l2_sap_count_by_outcome": {"in_sync": 0, "apply_failed": 1}})
+        row.refresh_from_db()
+        self.assertEqual(row.status, "apply_failed")
+        self.assertTrue(row.last_apply_error)
+
+    def test_prepare_apply_marks_accepted_l2_sap_deploying(self):
+        from netbox_nso_plugin.views import _prepare_apply
+
+        mgmt, row = self._setup(status_="accepted")
+        with (
+            patch("netbox_nso_plugin.signals._push_interface_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_lacp_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_switchport_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_vlan_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_svi_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_subinterface_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_bfd_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_interface_mtu_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_route_policy_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_static_route_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_l2_sap_intent_for_device") as push_sap,
+        ):
+            _prepare_apply(mgmt)
+        row.refresh_from_db()
+        self.assertEqual(row.status, "deploying")
+        # And the owned snapshot is force-re-pushed so a stale adapter intent still applies.
+        push_sap.assert_called_once()
+        self.assertTrue(push_sap.call_args.kwargs.get("force"))
+
+
 class TestRoutePolicyApplySettle(APITestCase):
     """Route-policy joins the deploying→settle flow: Apply marks accepted→deploying,
     a failed route_policy scope flips the stuck deploying row → apply_failed."""
