@@ -2492,6 +2492,139 @@ def _build_community_list_entries(obj):
     return out
 
 
+# Canonical AFI → the Junos family token. The Junos writer does `frm.family = str(fam)`, so it
+# needs the vendor spelling; the inverse of route_policy_structure._AFI_MAP's junos rows.
+_JUNOS_FAMILY_BY_AFI = {
+    "ipv4": "inet",
+    "ipv6": "inet6",
+    "vpn-ipv4": "inet-vpn",
+    "vpn-ipv6": "inet6-vpn",
+}
+
+
+def _set_community_targets(entry):
+    """(operation, name) for every set-community row — by-ref list name, else inline literals."""
+    targets = []
+    for sc in entry.set_communities.all():
+        if sc.community_list_id:
+            targets.append((sc.operation, sc.community_list.name))
+        else:
+            targets.extend((sc.operation, c.community) for c in sc.communities.all())
+    return targets
+
+
+def _project_set_communities(entry, set_data, current) -> None:
+    """Project set-community rows into the writer's community vocabulary.
+
+    Per-NED shapes (verified against route-policy-reconciler):
+      * ``community`` — IOS-XR interpolates it directly (``set community ({v})``) so a single
+        target MUST be a scalar; IOS/Junos wrap either form. >1 target → list (IOS/Junos).
+      * ``community_additive`` — bool, the add-vs-set verb for IOS/IOS-XR.
+      * ``_junos_community_op`` — parallel per-name verb list, so Junos gets the exact op.
+      * ``community_delete`` — IOS-XR only, and SCALAR (``delete community {v}``).
+
+    Delete targets are deliberately kept OUT of ``community``: IOS-XR reads both keys, so a
+    name in each would emit ``set community (X)`` *and* ``delete community X`` for one list.
+    KNOWN LIMIT: that means a delete lands on IOS-XR but NOT on Junos — Junos expresses delete
+    only through ``community`` + ``_junos_community_op``, and there is no Junos-only delete key
+    to route it through. Closing that needs a writer-side key in route-policy-reconciler (P3).
+    """
+    targets = _set_community_targets(entry)
+    if not targets or targets == [(sc.operation, sc.name) for sc in current.set_communities]:
+        return  # unset, or the blob already says the same thing → leave it byte-identical
+
+    writes = [(op, nm) for op, nm in targets if op != "delete"]
+    deletes = [nm for op, nm in targets if op == "delete"]
+
+    if writes:
+        names = [nm for _, nm in writes]
+        set_data["community"] = names[0] if len(names) == 1 else names
+        set_data["community_additive"] = all(op == "add" for op, _ in writes)
+        set_data["_junos_community_op"] = [op for op, _ in writes]
+    if deletes:
+        set_data["community_delete"] = deletes[0]
+        if len(deletes) > 1:
+            logger.warning(
+                "route-policy: entry %s has %d set-community deletes but the writer's "
+                "`delete community` takes ONE set — only %r is pushed; express the rest via vendor_ext",
+                entry.pk,
+                len(deletes),
+                deletes[0],
+            )
+
+
+def _project_vendor_ext(vendor_ext, match_data, set_data) -> None:
+    """Flatten vendor_ext {"junos": {"priority": "high"}} back to the `_junos_priority` key.
+
+    The inverse of route_policy_structure._collect_vendor_ext. The "unmapped" namespace is a
+    lossless record of tokens the reader could not map, NOT a writer key — never emit it.
+    """
+    from .route_policy_structure import _NS_BY_PREFIX
+
+    prefix_by_ns = {ns: prefix for prefix, ns in _NS_BY_PREFIX.items()}
+    for ns, kv in (vendor_ext or {}).items():
+        prefix = prefix_by_ns.get(ns)
+        if prefix is None or not isinstance(kv, dict):
+            continue  # "unmapped" (or junk) — not a writer namespace
+        for key, value in kv.items():
+            # Match-side keys stay on match, everything else rides set; the per-NED writers
+            # read their own namespace off whichever blob the reader put it on. Preserve the
+            # existing side when the key is already present so we do not duplicate it.
+            target = match_data if f"{prefix}{key}" in match_data else set_data
+            target[f"{prefix}{key}"] = value
+
+
+def _project_structured_entry(entry, match_data, set_data) -> None:
+    """Project operator-authored STRUCTURED RouteMapEntry fields back into the match/set blobs.
+
+    The reader DERIVES the structured fields from the blobs and keeps the blobs authoritative
+    for the write side (route_policy_reconciler ~283), so a structured field an operator sets
+    by hand had no path to the device — it was silently dropped at Apply. Each field is written
+    into the exact key the nso-packages writer consumes. Structured WINS on divergence (the
+    operator edited it); an agreeing blob is left byte-identical so the brownfield round-trip
+    does not churn (e.g. a Junos `inet` token is not rewritten to canonical `ipv4`).
+
+    Not projected, deliberately:
+      * ``match_community`` — devices match community-LISTS, never individual communities; it is
+        a display projection of the referenced list's members, not independent intent.
+      * ``match_condition`` — the condition tree has NO key in any per-NED writer; warned below
+        rather than silently dropped.
+    """
+    from .route_policy_structure import structure_entry
+
+    current = structure_entry(match_data, set_data)
+
+    afi = list(entry.match_afi or [])
+    if afi and afi != current.match_afi:
+        match_data["family"] = afi
+        junos_family = _JUNOS_FAMILY_BY_AFI.get(afi[0])
+        if junos_family:
+            match_data["_junos_family"] = junos_family
+
+    call_name = entry.call_policy.name if entry.call_policy_id else None
+    if call_name and call_name != current.call_policy:
+        match_data["_junos_from_policy"] = [call_name]
+
+    # apply_policy has no forward projection in structure_entry, so compare the raw key.
+    apply_name = entry.apply_policy.name if entry.apply_policy_id else None
+    if apply_name:
+        existing = set_data.get("apply")
+        existing = list(existing) if isinstance(existing, (list, tuple)) else ([existing] if existing else [])
+        if apply_name not in [str(p) for p in existing]:
+            set_data["apply"] = [apply_name]
+
+    _project_set_communities(entry, set_data, current)
+    _project_vendor_ext(entry.vendor_ext, match_data, set_data)
+
+    if entry.match_condition:
+        logger.warning(
+            "route-policy: entry %s has a match_condition tree, which NO per-NED writer consumes "
+            "yet — it is NOT pushed to the device (structured-write P3). Use vendor_ext for a "
+            "device-expressible form so the intent is not lost.",
+            entry.pk,
+        )
+
+
 def _build_route_policy_entries(family, obj):
     """Serialize a NetBox route-policy object's entries for the adapter intent payload."""
     if family == "prefix_list":
@@ -2535,6 +2668,11 @@ def _build_route_policy_entries(family, obj):
                 # the read path lifts flow_control out of set-json into the model
                 # field — put it back so the round-trip stays symmetric
                 set_data["flow_control"] = e.flow_control
+            # Same class of fix, for the rest of the structured fields: the reader derives them
+            # FROM the blobs and leaves the blobs authoritative, so an operator-authored
+            # match_afi / call_policy / apply_policy / set-community / vendor_ext would never
+            # reach the device. Project each back into the key its writer reads.
+            _project_structured_entry(e, match_data, set_data)
             # The universal Community model means a community-list of any kind is just the
             # one CommunityList — match_community_list carries every referenced list.
             community_names = list(e.match_community_list.values_list("name", flat=True))

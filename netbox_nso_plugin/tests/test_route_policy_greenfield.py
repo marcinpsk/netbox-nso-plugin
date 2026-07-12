@@ -239,6 +239,137 @@ class TestRoutePolicyEntrySerialization(_RPBase):
         assert json.loads(entries[0]["set-json"]) == {"flow_control": 20}
 
 
+class TestStructuredFieldsProjectIntoJson(_RPBase):
+    """Operator-authored STRUCTURED RouteMapEntry fields must land on the device.
+
+    The reader derives the structured fields (match_afi / call_policy / set_communities /
+    vendor_ext) FROM the match/set blobs and keeps the blobs authoritative for the write side
+    (route_policy_reconciler ~283). So a structured field the operator sets by hand — with no
+    corresponding key in the blob — used to be SILENTLY DROPPED on Apply: the serializer only
+    emitted match/set-json + the M2M refs. That violates the no-silent-drop intent-integrity
+    rule. The write path now projects each structured field back into the exact blob key the
+    nso-packages writer consumes (verified against route-policy-reconciler):
+
+      call_policy   -> match ``_junos_from_policy`` (list)      [_junos.py:293]
+      apply_policy  -> set   ``apply`` (_as_list-tolerant)      [_iosxr.py:198]
+      match_afi     -> match ``family`` + ``_junos_family``     [_junos.py:295, scalar Junos token]
+      set_community -> set   ``community``/``community_additive``/``community_delete``
+      vendor_ext    -> the namespaced ``_rpl_``/``_junos_``/``_timos_`` keys
+
+    Structured WINS on divergence (the operator edited it), but an agreeing blob is left
+    byte-identical so the brownfield round-trip does not churn.
+    """
+
+    def _entry(self, name, **kwargs):
+        from netbox_routing.models import RouteMap, RouteMapEntry
+
+        rm = RouteMap.objects.create(name=name)
+        e = RouteMapEntry.objects.create(route_map=rm, sequence=10, action="permit", **kwargs)
+        return rm, e
+
+    def _push(self, rm):
+        import json
+
+        from netbox_nso_plugin.signals import _build_route_policy_entries
+
+        entries = _build_route_policy_entries("route_map", rm)
+        return json.loads(entries[0]["match-json"]), json.loads(entries[0]["set-json"])
+
+    def test_call_policy_projects_into_match_json(self):
+        """call_policy (Junos from-policy / IOS-XR subroutine) → match ``_junos_from_policy``."""
+        from netbox_routing.models import RouteMap
+
+        target = RouteMap.objects.create(name="TESTNSO-SUBR")
+        rm, e = self._entry("TESTNSO-RM-CALL")
+        e.call_policy = target
+        e.save()
+
+        match_json, _ = self._push(rm)
+        assert match_json["_junos_from_policy"] == ["TESTNSO-SUBR"]
+
+    def test_apply_policy_projects_into_set_json(self):
+        """apply_policy (IOS-XR ``apply`` tail-call / Junos chaining) → set ``apply``."""
+        from netbox_routing.models import RouteMap
+
+        target = RouteMap.objects.create(name="TESTNSO-TAIL")
+        rm, e = self._entry("TESTNSO-RM-APPLY")
+        e.apply_policy = target
+        e.save()
+
+        _, set_json = self._push(rm)
+        assert set_json["apply"] == ["TESTNSO-TAIL"]
+
+    def test_match_afi_projects_family_keys(self):
+        """match_afi → canonical ``family`` + the Junos-token scalar ``_junos_family``."""
+        rm, e = self._entry("TESTNSO-RM-AFI", match_afi=["ipv6"])
+
+        match_json, _ = self._push(rm)
+        assert match_json["family"] == ["ipv6"]
+        # the Junos writer does `frm.family = str(fam)` — it needs the Junos spelling
+        assert match_json["_junos_family"] == "inet6"
+
+    def test_set_community_add_projects_into_set_json(self):
+        """An 'add' row → ``community`` + ``community_additive`` + the Junos per-name verb.
+
+        SCALAR when there is a single target: IOS-XR renders ``set community ({community})``
+        by direct interpolation, so a list would emit ``set community (['X'])``. IOS and Junos
+        both accept a scalar (they wrap it), so scalar is the safe universal shape.
+        """
+        from netbox_routing.models import CommunityList, RouteMapEntrySetCommunity
+
+        add_cl = CommunityList.objects.create(name="TESTNSO-CL-ADD")
+        rm, e = self._entry("TESTNSO-RM-SC-ADD")
+        RouteMapEntrySetCommunity.objects.create(route_map_entry=e, operation="add", community_list=add_cl)
+
+        _, set_json = self._push(rm)
+        assert set_json["community"] == "TESTNSO-CL-ADD"
+        assert set_json["community_additive"] is True
+        assert set_json["_junos_community_op"] == ["add"]
+
+    def test_set_community_delete_projects_scalar_delete_key(self):
+        """A 'delete' row → ``community_delete`` ONLY (IOS-XR ``delete community X``, scalar).
+
+        The delete target must NOT also land in ``community`` — IOS-XR reads both keys, so it
+        would emit ``set community (X)`` AND ``delete community X`` for the same list.
+        """
+        from netbox_routing.models import CommunityList, RouteMapEntrySetCommunity
+
+        del_cl = CommunityList.objects.create(name="TESTNSO-CL-DEL")
+        rm, e = self._entry("TESTNSO-RM-SC-DEL")
+        RouteMapEntrySetCommunity.objects.create(route_map_entry=e, operation="delete", community_list=del_cl)
+
+        _, set_json = self._push(rm)
+        assert set_json["community_delete"] == "TESTNSO-CL-DEL"
+        assert "community" not in set_json
+
+    def test_vendor_ext_projects_namespaced_keys(self):
+        """vendor_ext {"junos": {"priority": "high"}} → the flat ``_junos_priority`` key."""
+        rm, e = self._entry(
+            "TESTNSO-RM-VE",
+            vendor_ext={"junos": {"priority": "high"}, "timos": {"description": "d"}},
+        )
+
+        match_json, set_json = self._push(rm)
+        merged = {**match_json, **set_json}
+        assert merged["_junos_priority"] == "high"
+        assert merged["_timos_description"] == "d"
+
+    def test_agreeing_blob_is_not_churned(self):
+        """Brownfield round-trip: when the blob already expresses the construct, the raw vendor
+        token is preserved byte-identical (projecting canonical over it would churn the diff)."""
+        rm, e = self._entry(
+            "TESTNSO-RM-NOCHURN",
+            # 'inet' is the Junos token the reader captured; structure_entry maps it to ipv4.
+            match={"_junos_family": "inet", "protocol": ["bgp"]},
+            match_afi=["ipv4"],
+        )
+
+        match_json, _ = self._push(rm)
+        # unchanged — NOT rewritten to canonical 'ipv4'
+        assert match_json["_junos_family"] == "inet"
+        assert match_json["protocol"] == ["bgp"]
+
+
 class TestRoutePolicyDeletePropagation(_RPBase):
     def test_delete_prefix_list_pushes_removal_to_attached_device(self):
         from django.contrib.contenttypes.models import ContentType
