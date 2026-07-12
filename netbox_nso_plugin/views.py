@@ -3723,9 +3723,21 @@ class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
 
     @staticmethod
     def _create_peer(device, data):
-        """Assemble the router→scope→peer→AF graph via the reconciler's helpers."""
+        """Assemble the router→scope→peer→AF graph via the reconciler's helpers.
+
+        The whole graph is built inside one ``transaction.atomic()`` block so the intent
+        push — fired by the ``BGPPeer`` post_save signal — is DEFERRED to ``on_commit`` and
+        runs only after the peer's address-families are attached. Without the wrapper the
+        view runs outside any transaction (NetBox sets no ``ATOMIC_REQUESTS``), so
+        ``_schedule_intent_push`` runs the push INLINE at ``BGPPeer.create()`` time — before
+        ``_write_peer_afs`` — and the pushed intent carries an empty ``address_families``.
+        The bgp-reconciler then writes a neighbor with no ``address-family`` activation, i.e.
+        an inert session (device-caught on ra1.lab via a greenfield dry-run). Atomicity also
+        makes the create all-or-nothing on error.
+        """
         from dcim.models import Device
         from django.contrib.contenttypes.models import ContentType
+        from django.db import transaction
         from netbox_routing.models import (
             BGPAddressFamily,
             BGPPeer,
@@ -3736,23 +3748,24 @@ class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
 
         from .bgp_reconciler import _get_or_create_router, _get_or_create_scope, _write_peer_afs
 
-        router = _get_or_create_router(device, data["local_asn"], BGPRouter, ContentType, Device)
-        scope = _get_or_create_scope(router, data.get("vrf"), BGPScope)
-        peer = BGPPeer.objects.create(
-            scope=scope,
-            peer=data["peer"],
-            name=None,
-            remote_as=data.get("remote_as"),
-            local_as=data.get("peer_local_as"),
-            ttl=data.get("ttl"),
-            enabled=data.get("enabled", True),
-            password=data.get("password") or None,
-            peer_group=data.get("peer_group"),
-            source=data.get("source"),
-            update_source=data.get("update_source"),
-        )
-        af_list = [{"af": af, "enabled": True} for af in (data.get("address_families") or ["ipv4-unicast"])]
-        _write_peer_afs(peer, af_list, scope, BGPAddressFamily, BGPPeerAddressFamily)
+        with transaction.atomic():
+            router = _get_or_create_router(device, data["local_asn"], BGPRouter, ContentType, Device)
+            scope = _get_or_create_scope(router, data.get("vrf"), BGPScope)
+            peer = BGPPeer.objects.create(
+                scope=scope,
+                peer=data["peer"],
+                name=None,
+                remote_as=data.get("remote_as"),
+                local_as=data.get("peer_local_as"),
+                ttl=data.get("ttl"),
+                enabled=data.get("enabled", True),
+                password=data.get("password") or None,
+                peer_group=data.get("peer_group"),
+                source=data.get("source"),
+                update_source=data.get("update_source"),
+            )
+            af_list = [{"af": af, "enabled": True} for af in (data.get("address_families") or ["ipv4-unicast"])]
+            _write_peer_afs(peer, af_list, scope, BGPAddressFamily, BGPPeerAddressFamily)
         return peer
 
 

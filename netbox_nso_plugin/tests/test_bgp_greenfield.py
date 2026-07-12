@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer
 from django.contrib.contenttypes.models import ContentType
-from django.test import TestCase
+from django.test import TestCase, TransactionTestCase
 from django.urls import reverse
 from ipam.models import ASN, RIR, IPAddress
 from netbox_routing.models import BGPPeer, BGPRouter, BGPScope
@@ -24,6 +24,47 @@ from netbox_routing.models import BGPPeer, BGPRouter, BGPScope
 from netbox_nso_plugin.models import NSOBGPPeerState, NSODeviceManagement, NSOInstance
 
 from .mixins import IntentPushResetMixin
+
+
+def _find_pushed_peer(router_list, addr):
+    """Locate a peer entry by address in a pushed BGP router_list snapshot."""
+    for router in router_list:
+        for scope in router.get("scopes", []):
+            for peer in scope.get("peers", []):
+                if peer.get("peer_address") == addr:
+                    return peer
+    return None
+
+
+class _CascadeFlushMixin:
+    """Make TransactionTestCase's post-test flush use ``TRUNCATE ... CASCADE``.
+
+    NetBox's schema has tag M2M through-tables (e.g. ``netbox_map_topologysavedview_tags``)
+    that are referenced by foreign keys. Django's default TransactionTestCase teardown only
+    emits CASCADE when ``available_apps`` is set (``allow_cascade = available_apps is not
+    None``), so on PostgreSQL the plain TRUNCATE errors with "cannot truncate a table
+    referenced in a foreign key constraint". This override is a faithful copy of Django's
+    ``_fixture_teardown`` with ``allow_cascade`` forced True — resetting the DB without
+    having to enumerate ``available_apps`` for the whole NetBox app graph.
+    """
+
+    def _fixture_teardown(self):
+        from django.core.management import call_command
+        from django.db import connections
+
+        for db_name in self._databases_names(include_mirrors=False):
+            inhibit_post_migrate = self.available_apps is not None or (
+                self.serialized_rollback and hasattr(connections[db_name], "_test_serialized_contents")
+            )
+            call_command(
+                "flush",
+                verbosity=0,
+                interactive=False,
+                database=db_name,
+                reset_sequences=False,
+                allow_cascade=True,
+                inhibit_post_migrate=inhibit_post_migrate,
+            )
 
 
 def _make_device(suffix="gf"):
@@ -301,3 +342,70 @@ class TestBgpPeerAddView(BgpGreenfieldBase):
         url = reverse("plugins:netbox_nso_plugin:bgp_peer_add", kwargs={"device_pk": self.device.pk})
         resp = self.client.get(url)
         self.assertEqual(resp.status_code, 403)
+
+
+class TestBgpPeerAddViewPushCarriesAf(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    """The greenfield push MUST carry the peer's address-family activation.
+
+    Regression for a write-ordering bug device-caught on ra1.lab: the Add-BGP-peer view
+    creates the ``BGPPeer`` (whose post_save fires the intent push) and only THEN attaches
+    its address-families. In production the view runs OUTSIDE any transaction, so
+    ``_schedule_intent_push`` runs the push INLINE at ``BGPPeer.create()`` time — before the
+    AF rows exist — and the pushed intent carried an empty ``address_families``. The
+    bgp-reconciler then writes a neighbor with no ``address-family ipv4 unicast``: the
+    session comes up but negotiates no AF (an inert peer). Brownfield never hit this — the
+    reconciler materialises peer + AFs together under ``suppress_intent_push`` before any
+    push.
+
+    This runs as a ``TransactionTestCase`` on purpose. A plain ``TestCase`` MASKS the bug:
+    its per-test atomic wrapper makes ``connection.in_atomic_block`` True, so the push is
+    deferred to ``on_commit`` and fires AFTER the AFs land. ``TransactionTestCase`` has no
+    ambient atomic block, mirroring the real HTTP request — the push fires inline, exactly
+    where the bug lives. The fix wraps ``_create_peer``'s graph build in
+    ``transaction.atomic()`` so the push defers to ``on_commit`` (after the AFs).
+    """
+
+    def setUp(self):
+        super().setUp()
+        from users.models import User
+
+        self.device = _make_device("txn")
+        self.rir, _ = RIR.objects.get_or_create(name="GF-RIR-txn", slug="gf-rir-txn")
+        self.asn = ASN.objects.create(asn=65100, rir=self.rir)
+        self.remote_asn = ASN.objects.create(asn=65200, rir=self.rir)
+        self.inst, _ = NSOInstance.objects.get_or_create(
+            name="bgp-gf-inst-txn", defaults={"adapter_instance_id": "bgp-gf-inst-txn"}
+        )
+        self.mgmt = NSODeviceManagement.objects.create(
+            device=self.device, nso_instance=self.inst, nso_device_name="bgp-gf-dev-txn", adapter_device_id=99
+        )
+        self.ip = IPAddress.objects.create(address="10.0.0.2/32")
+        self.client.force_login(User.objects.create_user("bgpgftxnadmin", is_superuser=True))
+
+    def test_push_carries_peer_address_family(self):
+        url = reverse("plugins:netbox_nso_plugin:bgp_peer_add", kwargs={"device_pk": self.device.pk})
+        with patch("netbox_nso_plugin.adapter_client.put_bgp_intent") as mock_put:
+            resp = self.client.post(
+                url,
+                {
+                    "local_asn": self.asn.pk,
+                    "peer": self.ip.pk,
+                    "remote_as": self.remote_asn.pk,
+                    "peer_local_as": self.asn.pk,
+                    "ttl": 3,
+                    "address_families": ["ipv4-unicast"],
+                    "enabled": "on",
+                },
+            )
+        self.assertEqual(resp.status_code, 302)
+        mock_put.assert_called()
+        # The LAST push is the snapshot the adapter stores + applies. Its peer must carry
+        # the ipv4-unicast AF, else the neighbor commits inert on-device.
+        _adapter_id, router_list = mock_put.call_args.args
+        peer_entry = _find_pushed_peer(router_list, "10.0.0.2")
+        self.assertIsNotNone(peer_entry, "peer missing from pushed intent")
+        self.assertEqual(
+            peer_entry["address_families"],
+            [{"af": "ipv4-unicast", "enabled": True}],
+            "greenfield push dropped the peer's address-family → inert neighbor on-device",
+        )
