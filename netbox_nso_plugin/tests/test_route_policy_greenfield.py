@@ -354,6 +354,42 @@ class TestStructuredFieldsProjectIntoJson(_RPBase):
         assert merged["_junos_priority"] == "high"
         assert merged["_timos_description"] == "d"
 
+    def test_structured_edit_drops_rpl_raw_verbatim_body(self):
+        """IOS-XR edit-invalidation: a structured edit must DROP ``_rpl_raw``.
+
+        IOS-XR RPL is opaque text, so the reader preserves the exact body under ``_rpl_raw`` on
+        the route-map's FIRST entry and the writer prefers it verbatim
+        (``body = raw if raw is not None else self._iosxr_rpl_body(...)``, _iosxr.py:245). If we
+        project a structured edit but leave ``_rpl_raw`` in place, the writer replays the STALE
+        body and the operator's edit never reaches the device — a silent drop.
+        """
+        from netbox_routing.models import RouteMap
+
+        target = RouteMap.objects.create(name="TESTNSO-SUBR-X")
+        rm, e = self._entry(
+            "TESTNSO-RM-XR-EDIT",
+            match={"_rpl_raw": "if destination in (10.0.0.0/8) then\n  pass\nendif"},
+        )
+        e.call_policy = target  # the operator edit
+        e.save()
+
+        match_json, _ = self._push(rm)
+        assert "_rpl_raw" not in match_json, "stale verbatim RPL body would override the edit"
+        assert match_json["_junos_from_policy"] == ["TESTNSO-SUBR-X"]
+
+    def test_unedited_policy_keeps_rpl_raw_verbatim_body(self):
+        """The other half: an UNEDITED brownfield policy must KEEP ``_rpl_raw``.
+
+        Dropping it unconditionally would force every IOS-XR policy to re-render from the
+        structured parse, which cannot reproduce the opaque RPL text byte-for-byte — turning a
+        clean round-trip into a fleet-wide spurious diff (455 lines on ra1 before verbatim).
+        """
+        body = "if destination in (10.0.0.0/8) then\n  pass\nendif"
+        rm, _ = self._entry("TESTNSO-RM-XR-CLEAN", match={"_rpl_raw": body})
+
+        match_json, _ = self._push(rm)
+        assert match_json["_rpl_raw"] == body
+
     def test_agreeing_blob_is_not_churned(self):
         """Brownfield round-trip: when the blob already expresses the construct, the raw vendor
         token is preserved byte-identical (projecting canonical over it would churn the diff)."""

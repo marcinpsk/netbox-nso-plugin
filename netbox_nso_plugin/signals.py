@@ -2513,8 +2513,8 @@ def _set_community_targets(entry):
     return targets
 
 
-def _project_set_communities(entry, set_data, current) -> None:
-    """Project set-community rows into the writer's community vocabulary.
+def _project_set_communities(entry, set_data, current) -> bool:
+    """Project set-community rows into the writer's community vocabulary. True when it diverged.
 
     Per-NED shapes (verified against route-policy-reconciler):
       * ``community`` — IOS-XR interpolates it directly (``set community ({v})``) so a single
@@ -2531,7 +2531,7 @@ def _project_set_communities(entry, set_data, current) -> None:
     """
     targets = _set_community_targets(entry)
     if not targets or targets == [(sc.operation, sc.name) for sc in current.set_communities]:
-        return  # unset, or the blob already says the same thing → leave it byte-identical
+        return False  # unset, or the blob already says the same thing → leave it byte-identical
 
     writes = [(op, nm) for op, nm in targets if op != "delete"]
     deletes = [nm for op, nm in targets if op == "delete"]
@@ -2551,6 +2551,7 @@ def _project_set_communities(entry, set_data, current) -> None:
                 len(deletes),
                 deletes[0],
             )
+    return True
 
 
 def _project_vendor_ext(vendor_ext, match_data, set_data) -> None:
@@ -2574,8 +2575,12 @@ def _project_vendor_ext(vendor_ext, match_data, set_data) -> None:
             target[f"{prefix}{key}"] = value
 
 
-def _project_structured_entry(entry, match_data, set_data) -> None:
+def _project_structured_entry(entry, match_data, set_data) -> bool:
     """Project operator-authored STRUCTURED RouteMapEntry fields back into the match/set blobs.
+
+    Returns True when a field DIVERGED from the blob and was projected — i.e. the operator
+    edited it. The caller uses that to invalidate the IOS-XR verbatim body (see
+    _build_route_policy_entries); it must stay False for an untouched brownfield policy.
 
     The reader DERIVES the structured fields from the blobs and keeps the blobs authoritative
     for the write side (route_policy_reconciler ~283), so a structured field an operator sets
@@ -2593,6 +2598,7 @@ def _project_structured_entry(entry, match_data, set_data) -> None:
     from .route_policy_structure import structure_entry
 
     current = structure_entry(match_data, set_data)
+    edited = False
 
     afi = list(entry.match_afi or [])
     if afi and afi != current.match_afi:
@@ -2600,10 +2606,12 @@ def _project_structured_entry(entry, match_data, set_data) -> None:
         junos_family = _JUNOS_FAMILY_BY_AFI.get(afi[0])
         if junos_family:
             match_data["_junos_family"] = junos_family
+        edited = True
 
     call_name = entry.call_policy.name if entry.call_policy_id else None
     if call_name and call_name != current.call_policy:
         match_data["_junos_from_policy"] = [call_name]
+        edited = True
 
     # apply_policy has no forward projection in structure_entry, so compare the raw key.
     apply_name = entry.apply_policy.name if entry.apply_policy_id else None
@@ -2612,8 +2620,11 @@ def _project_structured_entry(entry, match_data, set_data) -> None:
         existing = list(existing) if isinstance(existing, (list, tuple)) else ([existing] if existing else [])
         if apply_name not in [str(p) for p in existing]:
             set_data["apply"] = [apply_name]
+            edited = True
 
-    _project_set_communities(entry, set_data, current)
+    edited |= _project_set_communities(entry, set_data, current)
+    # vendor_ext is re-emitted verbatim (it was DERIVED from these blobs, so it is idempotent for
+    # a brownfield entry) — it never counts as an edit on its own.
     _project_vendor_ext(entry.vendor_ext, match_data, set_data)
 
     if entry.match_condition:
@@ -2623,6 +2634,8 @@ def _project_structured_entry(entry, match_data, set_data) -> None:
             "device-expressible form so the intent is not lost.",
             entry.pk,
         )
+
+    return edited
 
 
 def _build_route_policy_entries(family, obj):
@@ -2661,6 +2674,8 @@ def _build_route_policy_entries(family, obj):
         # route-policy-reconciler — the adapter passes them verbatim into the service
         # payload (m17-route-policy-contract.md §2).
         entries = []
+        match_blobs = []
+        edited = False
         for e in obj.route_map_entries.all().order_by("sequence"):
             match_data = _as_json_dict(e.match)
             set_data = _as_json_dict(e.set)
@@ -2672,7 +2687,7 @@ def _build_route_policy_entries(family, obj):
             # FROM the blobs and leaves the blobs authoritative, so an operator-authored
             # match_afi / call_policy / apply_policy / set-community / vendor_ext would never
             # reach the device. Project each back into the key its writer reads.
-            _project_structured_entry(e, match_data, set_data)
+            edited |= _project_structured_entry(e, match_data, set_data)
             # The universal Community model means a community-list of any kind is just the
             # one CommunityList — match_community_list carries every referenced list.
             community_names = list(e.match_community_list.values_list("name", flat=True))
@@ -2682,10 +2697,23 @@ def _build_route_policy_entries(family, obj):
                 "match-prefix-lists": list(e.match_prefix_list.values_list("name", flat=True)),
                 "match-community-lists": community_names,
                 "match-as-paths": list(e.match_aspath.values_list("name", flat=True)),
-                "match-json": json.dumps(match_data, sort_keys=True),
-                "set-json": json.dumps(set_data, sort_keys=True),
             }
             entries.append(entry)
+            match_blobs.append((entry, match_data, set_data))
+
+        # IOS-XR EDIT-INVALIDATION. RPL is opaque text, so the reader preserves the verbatim body
+        # under `_rpl_raw` on the route-map's FIRST entry and the writer PREFERS it
+        # (`body = raw if raw is not None else self._iosxr_rpl_body(...)`, _iosxr.py:245). Leaving
+        # it in place after a structured edit would replay the STALE body and silently discard the
+        # edit. Drop it so the writer falls back to the structured render — but ONLY on a real
+        # edit: dropping it unconditionally would force every untouched IOS-XR policy to re-render
+        # from a parse that cannot reproduce the text byte-for-byte (fleet-wide spurious diff).
+        if edited and match_blobs:
+            match_blobs[0][1].pop("_rpl_raw", None)
+
+        for entry, match_data, set_data in match_blobs:
+            entry["match-json"] = json.dumps(match_data, sort_keys=True)
+            entry["set-json"] = json.dumps(set_data, sort_keys=True)
         return entries
     return []
 
