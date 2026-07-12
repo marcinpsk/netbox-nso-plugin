@@ -34,7 +34,7 @@
             <td>{{ rp.family }}</td>
             <td>{{ rp.object_name }}{% if rp.classification_mode == "local" %} <span class="badge text-bg-info" title="Per-device — not deduped into one shared object; differs by device intentionally">per-device</span>{% endif %}{% if rp.unsupported_members %} <span class="badge text-bg-warning text-dark" title="This device's NED cannot hold these community members, so they are silently skipped on Apply (which is why this object may sit at ‘pending apply’). Remove them from the NetBox object, or accept they stay NetBox-only: {{ rp.unsupported_members|join:', ' }}"><span class="mdi mdi-alert-outline"></span> {{ rp.unsupported_members|length }} unsupported on NED</span>{% endif %}</td>
             <td>{% if rp.assigned_object %}<a href="{{ rp.assigned_object.get_absolute_url }}">{{ rp.assigned_object }}</a>{% else %}—{% endif %}</td>
-            <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=rp.status %}</td>
+            <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=rp.status residue=rp.residue_survivor residue_job=rp.residue_job_id %}</td>
             <td class="text-nowrap">{% if rp.last_sync_at %}{{ rp.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
             <td>
               <div class="d-flex gap-1">

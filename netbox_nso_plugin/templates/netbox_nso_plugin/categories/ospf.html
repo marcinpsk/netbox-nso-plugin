@@ -24,7 +24,7 @@
           <td>{{ oi.router_id|default:"—" }}</td>
           <td>{% if oi.ospf_instance %}<a href="{{ oi.ospf_instance.get_absolute_url }}">{{ oi.ospf_instance }}</a>{% else %}—{% endif %}</td>
           <td>
-            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=oi.status %}
+            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=oi.status residue=oi.residue_survivor residue_job=oi.residue_job_id %}
           </td>
           <td class="text-nowrap">{% if oi.last_sync_at %}{{ oi.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
           <td>
@@ -55,7 +55,7 @@
           <td>{{ oif.cost|default:"—" }}</td>
           <td>{% if oif.passive %}<span class="badge text-bg-warning text-dark">passive</span>{% else %}<span class="badge text-bg-success">active</span>{% endif %}</td>
           <td>
-            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=oif.status %}
+            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=oif.status residue=oif.residue_survivor residue_job=oif.residue_job_id %}
           </td>
           <td class="text-nowrap">{% if oif.last_sync_at %}{{ oif.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
           <td>

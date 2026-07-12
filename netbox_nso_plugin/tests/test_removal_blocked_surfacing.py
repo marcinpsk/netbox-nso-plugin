@@ -343,6 +343,98 @@ class TestDeviceJobsResidueRemovals(BlockedRemovalTestBase):
         self.assertIn('id="nso-residue-removal-tpl"', html)
 
 
+class TestCategoryGridResidueBadges(BlockedRemovalTestBase):
+    """#104 phase-2: grid rows whose key survives a retraction get a per-row badge.
+
+    The tab banner already lists the surviving keys; the badge attributes the
+    re-imported husk IN PLACE so an operator scanning a category grid doesn't
+    read it as new device config. Newest-first masking is shared with the banner
+    (_residue_removals), so a later clean removal clears the badges too.
+    """
+
+    def _get_category(self, key, jobs):
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_ADAPTER_CFG),
+            patch("netbox_nso_plugin.adapter_client.requests.Session") as mock_session_cls,
+        ):
+            mock_session_cls.return_value = make_session(response=make_response(200, json_data=jobs))
+            url = reverse("plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device.pk, "key": key})
+            return self.client.get(url)
+
+    def test_vlan_grid_badges_surviving_key_only(self):
+        """Paged-category path: the surviving vid is badged, its sibling is not; the
+        badge cites the removal job. Residue keys arrive as JSON ints — the match
+        must str-normalize both sides."""
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
+
+        group = _device_vlan_group(self.device)
+        v987 = VLAN.objects.create(group=group, vid=987, name="husk")
+        v100 = VLAN.objects.create(group=group, vid=100, name="fine")
+        NSOVLANState.objects.create(management=self.mgmt, vlan=v987, status="imported")
+        NSOVLANState.objects.create(management=self.mgmt, vlan=v100, status="imported")
+
+        jobs = [_residue_job(job_id=71, scope="vlan", residue={"vlan": [[987]]})]
+        resp = self._get_category("vlan", jobs)
+        self.assertEqual(resp.status_code, 200)
+        html = resp.content.decode()
+        self.assertEqual(html.count("removal residue"), 1)
+        self.assertIn("adapter job #71", html)
+
+    def test_isis_grid_badges_interface_and_process_rows(self):
+        """Reconcile-on-expand path: the compound (interface-name, af) key and the
+        process tag both match their residue lists (export names interface/process,
+        trigger says interface-config/process-config)."""
+        from dcim.models import Interface
+
+        from netbox_nso_plugin.models import NSOISISInstanceState, NSOISISInterfaceState
+
+        iface = Interface.objects.create(device=self.device, name="ge-0/0/0", type="other")
+        iface2 = Interface.objects.create(device=self.device, name="ge-0/0/1", type="other")
+        r1 = NSOISISInterfaceState.objects.create(
+            management=self.mgmt, interface=iface, af="ipv4", process_tag="CORE", status="imported"
+        )
+        r2 = NSOISISInterfaceState.objects.create(
+            management=self.mgmt, interface=iface2, af="ipv4", process_tag="CORE", status="imported"
+        )
+        proc = NSOISISInstanceState.objects.create(management=self.mgmt, process_tag="CORE", status="imported")
+
+        jobs = [
+            _residue_job(
+                job_id=72,
+                scope="isis",
+                residue={"interface-config": [["ge-0/0/0", "ipv4"]], "process-config": [["CORE"]]},
+            )
+        ]
+        with patch(
+            "netbox_nso_plugin.reconcile.reconcile_category",
+            return_value={"isis_interfaces": [r1, r2], "isis_processes": [proc]},
+        ):
+            resp = self._get_category("isis", jobs)
+        self.assertEqual(resp.status_code, 200)
+        html = resp.content.decode()
+        self.assertEqual(html.count("removal residue"), 2)  # the ge-0/0/0 row + the CORE process row
+        self.assertIn("adapter job #72", html)
+
+    def test_grid_renders_unbadged_when_jobs_unavailable(self):
+        """Badges are best-effort decoration: adapter trouble must not break the grid."""
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
+
+        vlan = VLAN.objects.create(group=_device_vlan_group(self.device), vid=200, name="ok")
+        NSOVLANState.objects.create(management=self.mgmt, vlan=vlan, status="imported")
+
+        with patch("netbox_nso_plugin.adapter_client.list_jobs", side_effect=Exception("adapter down")):
+            url = reverse("plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device.pk, "key": "vlan"})
+            resp = self.client.get(url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotIn("removal residue", resp.content.decode())
+
+
 class TestTabBannerWiring(BlockedRemovalTestBase):
     """The NSO tab ships the banner template + force form for the jobs-poll JS to clone."""
 

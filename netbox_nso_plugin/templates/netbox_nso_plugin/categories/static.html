@@ -24,7 +24,7 @@
             <td><a href="{{ sr.static_route.get_absolute_url }}">{{ sr.nso_prefix }}</a></td>
             <td>{{ sr.nso_next_hop|default:"—" }}</td>
             <td>{{ sr.static_route.metric }}</td>
-            <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=sr.status %}</td>
+            <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=sr.status residue=sr.residue_survivor residue_job=sr.residue_job_id %}</td>
             <td class="text-nowrap">{% if sr.last_sync_at %}{{ sr.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
             <td>
               {% url 'plugins:netbox_nso_plugin:routing_accept_static_route' pk=sr.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=sr.status form_class="nso-row-form" %}

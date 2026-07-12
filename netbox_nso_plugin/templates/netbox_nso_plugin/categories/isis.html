@@ -43,7 +43,7 @@
           <td>{% if ii.passive %}<span class="badge text-bg-warning text-dark">passive</span>{% else %}<span class="badge text-bg-success">active</span>{% endif %}</td>
           <td>{% if ii.hello_auth_present or ii.hello_auth_type %}<span class="badge text-bg-info" title="Per-interface IIH authentication">{{ ii.hello_auth_type|default:"on" }}</span>{% else %}<span class="text-muted">—</span>{% endif %}</td>
           <td>
-            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=ii.status %}
+            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=ii.status residue=ii.residue_survivor residue_job=ii.residue_job_id %}
           </td>
           <td class="text-nowrap">{% if ii.last_sync_at %}{{ ii.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
           <td>
@@ -77,7 +77,7 @@
           <td>{{ ip.area_auth_type|default:"—" }}{% if ip.area_auth_present %} ✓{% endif %}</td>
           <td>{{ ip.domain_auth_type|default:"—" }}{% if ip.domain_auth_present %} ✓{% endif %}</td>
           <td>
-            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=ip.status %}
+            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=ip.status residue=ip.residue_survivor residue_job=ip.residue_job_id %}
           </td>
           <td class="text-nowrap">{% if ip.last_sync_at %}{{ ip.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
           <td>

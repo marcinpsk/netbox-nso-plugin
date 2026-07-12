@@ -22,7 +22,7 @@
           <td>{{ bp.remote_as_str|default:"—" }}</td>
           <td>{% if bp.bgp_peer %}<a href="{{ bp.bgp_peer.get_absolute_url }}">{{ bp.bgp_peer }}</a>{% else %}—{% endif %}</td>
           <td>
-            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=bp.status %}
+            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=bp.status residue=bp.residue_survivor residue_job=bp.residue_job_id %}
           </td>
           <td class="text-nowrap">{% if bp.last_sync_at %}{{ bp.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
           <td>

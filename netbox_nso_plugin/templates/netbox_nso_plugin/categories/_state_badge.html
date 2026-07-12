@@ -13,3 +13,4 @@ changed/conflict = not-owned drift; drifted/accepted = owned -> pending apply.
 {% elif status == "error" %}<span class="badge text-bg-danger">error</span>
 {% else %}<span class="badge text-bg-info">{{ status }}</span>{% endif %}
 {% if status == "in_sync" or status == "accepted" or status == "drifted" or status == "deploying" or status == "apply_failed" %}<span class="mdi mdi-shield-check text-success ms-1" title="NetBox is the source of truth (owned)"></span>{% endif %}
+{% if residue %}<span class="badge text-bg-warning text-dark ms-1" title="A retraction (adapter job #{{ residue_job }}) reported success but this key survived on the device — it re-imported here as an unowned mirror, not new device config. Clean up on-device via a gated commit, or Accept to adopt it as intent.">removal residue</span>{% endif %}

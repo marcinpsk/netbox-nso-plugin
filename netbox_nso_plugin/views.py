@@ -439,6 +439,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
             except AdapterError as exc:
                 ctx["adapter_error"] = str(exc)
                 ctx["adapter_error_code"] = exc.code
+        _annotate_residue_rows(ctx, key, mgmt)
         ctx["category_has_unowned"] = _ctx_has_unowned(ctx)
         return render(request, partial, ctx)
 
@@ -595,6 +596,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
             "adapter_error": adapter_error,
             "paged": True,
         }
+        _annotate_residue_rows(ctx, key, mgmt)
         return render(request, spec["partial"], ctx)
 
     def _render_interface_merged(self, request, device):
@@ -1814,6 +1816,115 @@ def _residue_removals(jobs):
                 }
             )
     return found
+
+
+# ── #104 phase-2: per-row residue badges in the category grids ────────────────
+
+
+def _residue_matchers():
+    """Category key → (adapter removal scope, row matchers) for residue badging.
+
+    Each matcher is (ctx path — ``var`` or ``var.subkey`` —, the residue YANG-list
+    label — a per-row callable for route_policy's family bucketing —, row → key
+    tuple). Key tuples mirror the adapter's removed-key grain verbatim; both sides
+    are str-normalized before comparing. snmp communities match on the opaque
+    SHA-256 label the export publishes (never the community string), so no secret
+    is involved anywhere in the residue path.
+    """
+
+    def _iface(r):
+        return (r.interface.name,)
+
+    rp_family_lists = {  # mirrors the adapter's _ROUTE_POLICY_FAMILY_LISTS
+        "prefix_list": "prefix-list",
+        "community_list": "community-list",
+        "as_path": "as-path",
+        "route_map": "route-map",
+    }
+
+    return {
+        "svi": ("svi", [("svi_states", "interface", _iface)]),
+        "subinterface": ("subinterface", [("subinterface_states", "interface", _iface)]),
+        "interface_mtu": ("interface_mtu", [("interface_mtu_states", "interface", _iface)]),
+        "bfd": ("bfd", [("bfd_states", "interface", _iface)]),
+        "static": (
+            "static_route",
+            [("static_routes", "route", lambda r: (r.nso_vrf or "", r.nso_prefix or "", r.nso_next_hop or ""))],
+        ),
+        "vlan": ("vlan", [("vlan_states", "vlan", lambda r: (r.vlan.vid,))]),
+        "logging": ("logging", [("logging_data.hosts", "host", lambda r: (r.address,))]),
+        "l2_services": ("l2_sap", [("l2_sap_states", "sap", lambda r: (r.service_name or "", r.sap_id or ""))]),
+        "bgp": ("bgp", [("bgp_peers", "peer", lambda r: (r.peer_address_str or "",))]),
+        "isis": (
+            "isis",
+            [
+                ("isis_interfaces", "interface-config", lambda r: (r.interface.name, r.af)),
+                ("isis_processes", "process-config", lambda r: (r.process_tag or "",)),
+            ],
+        ),
+        "ospf": (
+            "ospf",
+            [
+                ("ospf_data.interfaces", "interface-config", _iface),
+                ("ospf_data.instances", "process-config", lambda r: (r.process_id,)),
+            ],
+        ),
+        "route_policy": (
+            "route_policy",
+            [("route_policy_states", lambda r: rp_family_lists.get(r.family or ""), lambda r: (r.object_name or "",))],
+        ),
+        "snmp": (
+            "snmp",
+            [
+                ("snmp_data.communities", "community", lambda r: (r.community_hash or "",)),
+                ("snmp_data.v3_users", "v3-user", lambda r: (r.username or "",)),
+                ("snmp_data.hosts", "host", lambda r: (r.address or "",)),
+            ],
+        ),
+    }
+
+
+def _annotate_residue_rows(ctx: dict, key: str, mgmt) -> None:
+    """Mark grid rows that are a retraction's on-device residue (#104 phase-2).
+
+    Reads the device's adapter jobs and reuses :func:`_residue_removals`' newest-
+    first per-scope masking, then flags each row of *key*'s grids whose key is in
+    the scope's latest residue report (``row.residue_survivor`` +
+    ``row.residue_job_id``) — so a re-imported husk is attributable in place
+    instead of reading as new device config. Best-effort decoration: adapter
+    trouble or a half-linked row means no badge, never a broken grid (the tab
+    banner remains the primary surface).
+    """
+    spec = _residue_matchers().get(key)
+    if spec is None or mgmt is None or mgmt.adapter_device_id is None:
+        return
+    scope, matchers = spec
+    from . import adapter_client as client
+
+    try:
+        jobs = client.list_jobs(mgmt.adapter_device_id)
+    except Exception:  # noqa: BLE001 — best-effort decoration only
+        return
+    entry = next((e for e in _residue_removals(jobs) if e.get("scope") == scope), None)
+    if not entry:
+        return
+    keys_by_label = {
+        label: {tuple(str(p) for p in (k if isinstance(k, (list, tuple)) else (k,))) for k in klist or []}
+        for label, klist in (entry.get("residue") or {}).items()
+    }
+    for ctx_path, label, keyfn in matchers:
+        rows = ctx
+        for part in ctx_path.split("."):
+            rows = rows.get(part) if isinstance(rows, dict) else None
+        for row in rows or []:
+            try:
+                row_label = label(row) if callable(label) else label
+                targets = keys_by_label.get(row_label)
+                if targets and tuple(str(p) for p in keyfn(row)) in targets:
+                    row.residue_survivor = True
+                    row.residue_job_id = entry.get("job_id")
+            except Exception:  # noqa: BLE001 — one unmatched row must not kill the grid
+                continue
 
 
 class NSODeviceJobsView(LoginRequiredMixin, View):

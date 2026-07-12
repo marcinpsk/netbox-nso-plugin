@@ -80,7 +80,7 @@
               <span class="text-warning" title="Set a Vault ref (or a secret value) so the secret can be pushed">missing</span>
             {% endif %}
           </td>
-          <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=c.status %}</td>
+          <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=c.status residue=c.residue_survivor residue_job=c.residue_job_id %}</td>
           <td class="text-nowrap">{% if c.last_sync_at %}{{ c.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
           <td>
             <div class="d-flex gap-1 align-items-center">
@@ -132,7 +132,7 @@
               <span class="text-warning" title="Set a Vault ref (or secret values) so the secrets can be pushed">missing</span>
             {% endif %}
           </td>
-          <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=u.status %}</td>
+          <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=u.status residue=u.residue_survivor residue_job=u.residue_job_id %}</td>
           <td class="text-nowrap">{% if u.last_sync_at %}{{ u.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
           <td>
             <div class="d-flex gap-1 align-items-center">
@@ -167,7 +167,7 @@
           <td>{{ h.notify_type }}</td>
           <td>{{ h.version }}</td>
           <td>{{ h.port|default:"162" }}</td>
-          <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=h.status %}</td>
+          <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=h.status residue=h.residue_survivor residue_job=h.residue_job_id %}</td>
           <td class="text-nowrap">{% if h.last_sync_at %}{{ h.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
           <td>
             <div class="d-flex gap-1 align-items-center">

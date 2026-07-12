@@ -52,7 +52,7 @@
                data-pe-fields="vrf:text:VRF"
                data-pe-v-vrf="{{ h.vrf|default:'' }}">{{ h.vrf|default:"—" }}</a>
           </td>
-          <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=h.status %}</td>
+          <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=h.status residue=h.residue_survivor residue_job=h.residue_job_id %}</td>
           <td class="text-nowrap">{% if h.last_sync_at %}{{ h.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
           <td>
             <div class="d-flex gap-1 align-items-center">

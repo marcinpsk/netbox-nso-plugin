@@ -24,7 +24,7 @@
             <td>{{ sap.port }}</td>
             <td>{% if sap.outer_tag is not None %}{{ sap.outer_tag }}{% if sap.inner_tag is not None %}.{{ sap.inner_tag }}{% endif %}{% else %}<span class="text-muted">—</span>{% endif %}</td>
             <td>{% if sap.l2vpn %}<a href="{{ sap.l2vpn.get_absolute_url }}">{{ sap.l2vpn.name }}</a>{% else %}<span class="text-muted">—</span>{% endif %}</td>
-            <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=sap.status %}</td>
+            <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=sap.status residue=sap.residue_survivor residue_job=sap.residue_job_id %}</td>
             <td>
               {% url 'plugins:netbox_nso_plugin:l2_accept_sap' pk=sap.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=sap.status form_class="nso-row-form" title="Make NetBox the source of truth for this SAP (written to the device on Apply, later phase)" %}
             </td>

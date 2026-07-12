@@ -24,7 +24,7 @@
           <td>{{ b.min_tx|default:"—" }}</td>
           <td>{{ b.min_rx|default:"—" }}</td>
           <td>{{ b.multiplier|default:"—" }}</td>
-          <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=b.status %}</td>
+          <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=b.status residue=b.residue_survivor residue_job=b.residue_job_id %}</td>
           <td>
             {% url 'plugins:netbox_nso_plugin:bfd_accept' pk=b.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=b.status title="Make NetBox the source of truth for this interface's BFD timers (written to the device on Apply)" %}
           </td>

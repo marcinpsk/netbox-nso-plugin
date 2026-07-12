@@ -22,7 +22,7 @@
             <td>{{ s.svi_type }}</td>
             <td>{% if s.vlan %}<a href="{{ s.vlan.get_absolute_url }}">{{ s.vlan.vid }}</a>{% else %}<span class="text-muted">—</span>{% endif %}</td>
             <td>{{ s.vrf|default:"global" }}</td>
-            <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=s.status %}</td>
+            <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=s.status residue=s.residue_survivor residue_job=s.residue_job_id %}</td>
             <td class="text-nowrap">{% if s.last_sync_at %}{{ s.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
             <td>
               {% url 'plugins:netbox_nso_plugin:svi_accept' pk=s.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=s.status form_class="nso-row-form" title="Make NetBox the source of truth for this SVI (re-materialised on the device on Apply)" %}
