@@ -1596,6 +1596,115 @@ class TestNSOApplyPreviewView(ViewTestBase):
         self.assertEqual(len(data["routing_changes"]), 1)
         self.assertEqual(data["routing_changes"][0]["status"], "deploying")
 
+    def test_preview_adoption_only_apply_is_not_nothing_pending(self):
+        """#107: accepting an imported (matching) row lands it in_sync — zero itemised
+        preview rows — yet the first Apply still commits the FASTMAP service adoption,
+        which the NSO dry-run shows. The preview must say nothing_pending=False so the
+        confirm modal opens instead of auto-proceeding (the #11 redistribution case:
+        routing_changes=[] total=0 while device_diff.bgp held the real adoption)."""
+        import json
+        from unittest.mock import patch
+
+        from netbox_nso_plugin.models import NSORedistributionState
+
+        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="in_sync", nso_value="")
+        NSORedistributionState.objects.create(
+            management=self.mgmt,
+            dest_protocol="bgp",
+            source_protocol="connected",
+            route_map="RM-CONN",
+            status="in_sync",  # accepted-as-matching (brownfield adoption), never yet applied
+        )
+        self.mgmt.adapter_device_id = 79
+        self.mgmt.save()
+        with patch(
+            "netbox_nso_plugin.adapter_client.get_apply_diff",
+            return_value={"outformat": "cli", "diffs": {"bgp": "+ redistribute connected route-map RM-CONN"}},
+        ):
+            url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
+            data = json.loads(self.client.get(url + "?outformat=cli").content)
+        self.assertEqual(data["total"], 0)  # nothing itemised — the row reads as settled
+        self.assertFalse(data["nothing_pending"])  # but the transaction is real → confirm
+
+    def test_preview_nothing_pending_in_steady_state(self):
+        """No pending rows AND an empty dry-run diff → genuinely nothing to commit, the
+        Apply button may proceed without the confirm modal (unchanged fast path)."""
+        import json
+        from unittest.mock import patch
+
+        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="in_sync", nso_value="")
+        self.mgmt.adapter_device_id = 80
+        self.mgmt.save()
+        with patch("netbox_nso_plugin.adapter_client.get_apply_diff", return_value={"diffs": {}}):
+            url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
+            data = json.loads(self.client.get(url).content)
+        self.assertEqual(data["total"], 0)
+        self.assertTrue(data["nothing_pending"])
+
+    def test_preview_pending_rows_never_nothing_pending(self):
+        """Itemised pending rows force the confirm modal even when the dry-run diff is
+        unavailable (adapter down → device_diff={} is best-effort, not proof of no-op)."""
+        import json
+
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
+
+        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="in_sync", nso_value="")
+        vlan = VLAN.objects.create(group=_device_vlan_group(self.device), vid=2300, name="pending")
+        NSOVLANState.objects.create(management=self.mgmt, vlan=vlan, device_name="OLD", status="accepted")
+
+        url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
+        data = json.loads(self.client.get(url).content)
+        self.assertEqual(data["total"], 1)
+        self.assertFalse(data["nothing_pending"])
+
+
+class TestRoutingStateAcceptView(ViewTestBase):
+    """Per-row routing accepts (RoutingStateAcceptMixin families)."""
+
+    def test_accept_stamps_accepted_at(self):
+        """#107 adjacent: the mixin must stamp accepted_at like every other accept view —
+        without it staged_days stays null for ALL routing families and the apply-preview's
+        'staged Nd' staleness badge can never fire for them."""
+        from netbox_nso_plugin.models import NSORedistributionState
+
+        state = NSORedistributionState.objects.create(
+            management=self.mgmt,
+            dest_protocol="bgp",
+            source_protocol="static",
+            status="changed",
+        )
+        url = reverse("plugins:netbox_nso_plugin:routing_accept_redistribution", kwargs={"pk": state.pk})
+        resp = self.client.post(url)
+        self.assertEqual(resp.status_code, 302)
+        state.refresh_from_db()
+        self.assertEqual(state.status, "accepted")  # differing value → pending apply
+        self.assertIsNotNone(state.accepted_at)
+
+    def test_accept_keeps_original_accepted_at_on_reaccept(self):
+        """Re-accepting must not refresh accepted_at — staged_days measures how long the
+        intent has been waiting since FIRST acceptance (mirrors the interface-edit signal)."""
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from netbox_nso_plugin.models import NSORedistributionState
+
+        original = timezone.now() - timedelta(days=12)
+        state = NSORedistributionState.objects.create(
+            management=self.mgmt,
+            dest_protocol="bgp",
+            source_protocol="static",
+            status="changed",
+            accepted_at=original,
+        )
+        url = reverse("plugins:netbox_nso_plugin:routing_accept_redistribution", kwargs={"pk": state.pk})
+        self.client.post(url)
+        state.refresh_from_db()
+        self.assertEqual(state.accepted_at, original)
+
 
 class TestNSOBulkAcceptView(ViewTestBase):
     """Tests for NSOBulkAcceptView."""

@@ -2465,13 +2465,22 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
             except Exception as exc:  # noqa: BLE001
                 logger.debug("apply-diff unavailable for device %s: %s", device_pk, exc)
 
+        # #107: the Apply button auto-proceeds (no confirm modal) only when NOTHING would
+        # be committed. The itemised total alone cannot prove that: accepting an imported
+        # (matching) row lands it in_sync — invisible above — yet the first Apply still
+        # commits the FASTMAP service adoption. The dry-run diff is the ground truth for
+        # that whole class (any registry omission included), so total==0 must be backed
+        # by an EMPTY diff before the modal may be skipped. Pending rows always require
+        # confirmation — an unavailable adapter (device_diff={}) proves nothing.
+        total = len(changes) + len(routing_changes)
         return JsonResponse(
             {
                 "auto_apply": auto_apply,
                 "changes": changes,
                 "routing_changes": routing_changes,
                 "routing": len(routing_changes),
-                "total": len(changes) + len(routing_changes),
+                "total": total,
+                "nothing_pending": total == 0 and not device_diff,
                 "outformat": outformat,
                 "device_diff": device_diff,
             }
@@ -2591,7 +2600,11 @@ class RoutingStateAcceptMixin(NSOActionPermissionMixin, View):
         state = get_object_or_404(self.model_class, pk=pk)
         # Matching (imported/in_sync) → nothing to apply → in_sync; differing → accepted.
         state.status = _status_after_accept(state.status)
-        state.save(update_fields=["status"])
+        # First acceptance only — staged_days measures waiting time since the operator
+        # FIRST took ownership, so a re-accept must not reset it (#107 staleness badge).
+        if state.accepted_at is None:
+            state.accepted_at = timezone.now()
+        state.save(update_fields=["status", "accepted_at"])
         messages.success(request, f"Accepted routing state {state.pk}.")
         return redirect(_device_nso_tab_url(state.management.device_id))
 

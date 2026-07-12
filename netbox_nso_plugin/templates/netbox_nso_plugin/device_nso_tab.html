@@ -563,7 +563,15 @@
     }
 
     function renderIntentPanel(d) {
-      if (!d.total) { return '<p class="text-muted mb-0">Nothing pending.</p>'; }
+      if (!d.total) {
+        // #107: no itemised rows, yet the dry-run shows a transaction — typically the
+        // first commit after accepting config that already matched the device (NSO
+        // service adoption), or NSO re-asserting owned config the device drifted from.
+        if (d.device_diff && Object.keys(d.device_diff).length) {
+          return '<p class="text-muted mb-0">No itemised pending changes, but the NSO dry-run on the right still shows a transaction — typically adoption of accepted-as-matching config into NSO ownership, or re-assertion of owned config. Review the diff before applying.</p>';
+        }
+        return '<p class="text-muted mb-0">Nothing pending.</p>';
+      }
       var h = '';
       if (d.changes && d.changes.length) {
         h += '<div class="table-responsive"><table class="table table-sm align-middle mb-2"><thead><tr><th>Interface</th><th>Attribute</th><th>Device now</th><th>→ NetBox</th></tr></thead><tbody>';
@@ -704,7 +712,10 @@
     }
 
     function renderPreview(d) {
-      if (!d.total) { return '<p class="text-muted mb-0">Nothing pending — NetBox and the device are in sync.</p>'; }
+      // Keyed on THIS payload (not the cli-based skip decision): a non-empty dry-run
+      // must render the two-panel layout even with zero itemised rows (#107).
+      var hasDiff = d.device_diff && Object.keys(d.device_diff).length;
+      if (!d.total && !hasDiff) { return '<p class="text-muted mb-0">Nothing pending — NetBox and the device are in sync.</p>'; }
       return ''
         + '<div class="row g-3">'
         + '  <div class="col-lg-4"><h6 class="border-bottom pb-1"><span class="mdi mdi-cloud-upload-outline me-1"></span>Intent — what we push</h6>'
@@ -749,9 +760,15 @@
       if (!applyForm) return;
       try {
         previewCache = {};
-        var d = await fetchPreview(diffMode === 'native' ? 'native' : 'cli');
-        if (d.auto_apply || !d.total) { runAction(applyForm); return; }  // auto-apply or nothing pending → just go
-        modalBody.innerHTML = renderPreview(d);
+        // The skip-modal decision always reads the cli (full-NSO-transaction) preview:
+        // outformat=native is device syntax only, which is legitimately EMPTY for a
+        // byte-exact adoption commit — deciding on it would auto-proceed past the very
+        // transaction the modal exists to confirm (#107). nothing_pending comes from
+        // the server: total==0 AND an empty dry-run diff (row counts alone miss
+        // adoption-only applies, where accepted-as-matching rows sit in_sync).
+        var d = await fetchPreview('cli');
+        if (d.auto_apply || d.nothing_pending) { runAction(applyForm); return; }  // nothing to commit (or auto-apply) → just go
+        modalBody.innerHTML = renderPreview(diffMode === 'native' ? await fetchPreview('native') : d);
         showModal();
       } catch (e) { setStatus('Could not load apply preview: ' + e.message, 'warning', false); }
     }
