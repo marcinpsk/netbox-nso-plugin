@@ -132,9 +132,10 @@ class TestReconcileBgpConfig(TestCase):
         entry.update(kwargs)
         return entry
 
-    def _router_payload(self, asn="65100", vrf="", peers=None, address_families=None):
+    def _router_payload(self, asn="65100", vrf="", peers=None, address_families=None, router_id=None):
         return {
             "asn": asn,
+            "router_id": router_id,
             "scopes": [
                 {
                     "vrf": vrf,
@@ -279,6 +280,75 @@ class TestReconcileBgpConfig(TestCase):
         self.assertEqual(peer["ttl"], 2)
         self.assertEqual(peer["password"], "s3cr3t")
         self.assertEqual(peer["peer_group"], "EDGE")
+
+    def test_reconcile_imports_router_id(self):
+        """A global router-id in the payload is imported onto BGPRouter on first read."""
+        self._make_mgmt()
+        from netbox_routing.models import BGPRouter
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        _reconcile_bgp_config(
+            self.device,
+            self._payload(self._router_payload(router_id="10.255.0.1", peers=[self._peer_entry()])),
+        )
+        router = BGPRouter.objects.get(asn__asn=65100)
+        self.assertEqual(str(router.router_id), "10.255.0.1")
+
+    def test_reconcile_does_not_clobber_operator_router_id(self):
+        """An operator-edited router-id is preserved when a later device read differs.
+
+        router-id has no per-field overlay, so the import-once guard is the only thing
+        keeping a pending operator edit from being reverted before it can be pushed.
+        """
+        self._make_mgmt()
+        from netbox_routing.models import BGPRouter
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        # Initial import establishes the router + the brownfield value.
+        _reconcile_bgp_config(
+            self.device,
+            self._payload(self._router_payload(router_id="1.1.1.1", peers=[self._peer_entry()])),
+        )
+        router = BGPRouter.objects.get(asn__asn=65100)
+        router.router_id = "9.9.9.9"  # operator edit, not yet accepted
+        router.save(update_fields=["router_id"])
+
+        # A subsequent read still reporting the OLD device value must not overwrite it.
+        _reconcile_bgp_config(
+            self.device,
+            self._payload(self._router_payload(router_id="1.1.1.1", peers=[self._peer_entry()])),
+        )
+        router.refresh_from_db()
+        self.assertEqual(str(router.router_id), "9.9.9.9")
+
+    def test_push_includes_router_id(self):
+        """An owned router's global router-id is emitted in the pushed intent."""
+        from unittest.mock import patch
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.signals import _push_bgp_intent_for_device
+
+        mgmt = self._make_mgmt()
+        result = _reconcile_bgp_config(
+            self.device,
+            self._payload(self._router_payload(router_id="10.255.0.1", peers=[self._peer_entry()])),
+        )
+        row = result[0]
+        row.status = "in_sync"  # own it so the push picks up the router
+        row.save(update_fields=["status"])
+
+        captured = {}
+
+        def _capture(adapter_device_id, routers):
+            captured["routers"] = routers
+            return {"device_id": adapter_device_id, "router_count": len(routers)}
+
+        with patch("netbox_nso_plugin.adapter_client.put_bgp_intent", side_effect=_capture):
+            _push_bgp_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+
+        self.assertEqual(captured["routers"][0]["router_id"], "10.255.0.1")
 
     def test_idempotent_second_call(self):
         """Calling reconcile twice with same payload → same single state row."""

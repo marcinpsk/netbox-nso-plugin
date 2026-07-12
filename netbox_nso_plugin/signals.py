@@ -2047,8 +2047,13 @@ def _on_isis_instance_state_save(sender, instance, **kwargs):
     )
 
 
-def _build_bgp_router_list(routers: dict, scope_afs: dict) -> list:
-    """Convert the routers dict + scope_afs into the adapter router_list format."""
+def _build_bgp_router_list(routers: dict, scope_afs: dict, router_ids: dict | None = None) -> list:
+    """Convert the routers dict + scope_afs into the adapter router_list format.
+
+    ``router_ids`` maps asn_str → the owned global router-id; when present for an ASN it
+    is emitted as ``router_id`` on that router so the adapter/bgp-reconciler adopts it.
+    """
+    router_ids = router_ids or {}
     router_list = []
     covered: set[tuple[str, str]] = set()
     for asn_str, router_data in routers.items():
@@ -2060,7 +2065,10 @@ def _build_bgp_router_list(routers: dict, scope_afs: dict) -> list:
             scope_out = dict(scope_data)
             scope_out["address_families"] = afs_out
             scopes_out.append(scope_out)
-        router_list.append({"asn": asn_str, "scopes": scopes_out})
+        router_entry = {"asn": asn_str, "scopes": scopes_out}
+        if router_ids.get(asn_str):
+            router_entry["router_id"] = router_ids[asn_str]
+        router_list.append(router_entry)
 
     # Redistribution-only scopes: an accepted redistribution row whose (asn, vrf)
     # has no owned peer still needs its router/scope/AF in the payload — without
@@ -2072,6 +2080,8 @@ def _build_bgp_router_list(routers: dict, scope_afs: dict) -> list:
         router = by_asn.get(asn_str)
         if router is None:
             router = {"asn": asn_str, "scopes": []}
+            if router_ids.get(asn_str):
+                router["router_id"] = router_ids[asn_str]
             by_asn[asn_str] = router
             router_list.append(router)
         router["scopes"].append(
@@ -2126,6 +2136,28 @@ def _bgp_peer_model_fields(bgp_peer) -> dict:
     if bgp_peer.peer_group is not None:
         fields["peer_group"] = bgp_peer.peer_group.name
     return fields
+
+
+def _bgp_router_id_map(device_id) -> dict:
+    """Map asn_str → owned global router-id for every BGPRouter on this device.
+
+    Empty when netbox_routing is absent or no router-id is set. Only routers already in
+    the peer/redistribution-driven push pick their entry up (router-id rides along with
+    an owned peer under the same ASN).
+    """
+    try:
+        from netbox_routing.models import BGPRouter
+    except ImportError:
+        return {}
+    from dcim.models import Device
+    from django.contrib.contenttypes.models import ContentType
+
+    ct = ContentType.objects.get_for_model(Device)
+    out: dict = {}
+    for router in BGPRouter.objects.filter(assigned_object_type=ct, assigned_object_id=device_id).select_related("asn"):
+        if router.router_id:
+            out[str(router.asn.asn)] = str(router.router_id)
+    return out
 
 
 def _push_bgp_intent_for_device(device_id, adapter_device_id):
@@ -2198,7 +2230,7 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
         peer_dict.update(_bgp_peer_model_fields(row.bgp_peer))
         scopes[vrf_name]["peers"].append(peer_dict)
 
-    router_list = _build_bgp_router_list(routers, scope_afs)
+    router_list = _build_bgp_router_list(routers, scope_afs, _bgp_router_id_map(device_id))
     _push_changed(
         (device_id, "bgp"),
         router_list,

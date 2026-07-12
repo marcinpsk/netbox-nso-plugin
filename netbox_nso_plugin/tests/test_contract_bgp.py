@@ -28,7 +28,8 @@ from netbox_nso_plugin.models import NSOBGPPeerState, NSOBGPPeerTemplateState, N
 
 # ── The contract. MUST match nso-adapter/tests/api/test_contract_bgp.py exactly. ──
 REQUIRED_TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "routers"}
-REQUIRED_ROUTER_KEYS = {"asn", "scopes"}
+# router_id is always present (null when unset), like the top-level last_refreshed_at.
+REQUIRED_ROUTER_KEYS = {"asn", "router_id", "scopes"}
 REQUIRED_SCOPE_KEYS = {"vrf", "address_families", "peers", "peer_groups"}
 REQUIRED_PEER_KEYS = {"peer_address", "enabled", "address_families"}
 OPTIONAL_PEER_KEYS = {"peer_group", "remote_as", "local_as", "ttl", "password", "source", "bfd_enabled"}
@@ -49,6 +50,7 @@ CONTRACT_PAYLOAD = {
     "routers": [
         {
             "asn": "65100",
+            "router_id": "10.255.0.1",
             "scopes": [
                 {
                     "vrf": "",

@@ -81,6 +81,21 @@ def _get_or_create_router(device, asn_obj, BGPRouter, ContentType, Device):
     return obj
 
 
+def _apply_router_id(router_obj, value) -> None:
+    """Import the device's global BGP router-id onto BGPRouter on first read (when empty).
+
+    router-id has no per-field overlay, so once it is set — whether by this import or by
+    a later operator edit — the reconciler leaves it untouched. That keeps a pending
+    operator edit from being clobbered before it can be accepted and pushed, while still
+    mirroring the brownfield value on the initial import.
+    """
+    if not value or router_obj.router_id:
+        return
+    router_obj.router_id = value
+    router_obj.save(update_fields=["router_id"])
+    logger.debug("BGP: imported router-id %s on %s", value, router_obj)
+
+
 def _get_or_create_scope(router_obj, vrf_obj, BGPScope):
     """Find or create a BGPScope for (router, vrf)."""
     obj, created = BGPScope.objects.get_or_create(
@@ -669,6 +684,7 @@ def _reconcile_bgp_config(device, payload: dict) -> list:
         if asn_obj is None:
             continue
         router_obj = _get_or_create_router(device, asn_obj, BGPRouter, ContentType, Device)
+        _apply_router_id(router_obj, router_entry.get("router_id"))
         for scope_entry in router_entry.get("scopes") or []:
             _reconcile_scope(
                 mgmt,
