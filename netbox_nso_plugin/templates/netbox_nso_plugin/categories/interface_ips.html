@@ -20,7 +20,7 @@
           <td>{{ ip.family }}</td>
           <td>{% if ip.vrf %}{{ ip.vrf }}{% else %}<span class="text-muted">global</span>{% endif %}</td>
           <td>{% if ip.secondary %}<span class="badge text-bg-light">secondary</span>{% else %}<span class="text-muted">—</span>{% endif %}</td>
-          <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=ip.status %}</td>
+          <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=ip.status residue=ip.residue_survivor residue_job=ip.residue_job_id %}</td>
           <td class="text-end">
             {% if ip.status == "conflict" %}
             <form method="post" action="{% url 'plugins:netbox_nso_plugin:nsointerfaceipstate_accept' pk=ip.pk %}" class="d-inline">

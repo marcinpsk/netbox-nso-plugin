@@ -418,6 +418,39 @@ class TestCategoryGridResidueBadges(BlockedRemovalTestBase):
         self.assertEqual(html.count("removal residue"), 2)  # the ge-0/0/0 row + the CORE process row
         self.assertIn("adapter job #72", html)
 
+    def test_interface_ips_grid_badges_surviving_address_values(self):
+        """#104 phase-3: interface_config residue is VALUE-grain — the surviving
+        (interface, address, vrf) triples are badged, siblings are not. The trigger
+        reports the NetBox text form while the re-imported row carries the device
+        form, so IPv6 case/zero-compression must normalize before matching."""
+        from dcim.models import Interface
+
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        iface = Interface.objects.create(device=self.device, name="Gi0/3", type="other")
+        survivor = NSOInterfaceIPState.objects.create(interface=iface, address="10.0.0.2/24", vrf="", status="imported")
+        survivor_v6 = NSOInterfaceIPState.objects.create(
+            interface=iface, address="2001:db8::1/64", vrf="CUST", family="ipv6", status="imported"
+        )
+        sibling = NSOInterfaceIPState.objects.create(interface=iface, address="10.0.0.1/24", vrf="", status="imported")
+
+        jobs = [
+            _residue_job(
+                job_id=73,
+                scope="interface_config",
+                residue={"address": [["Gi0/3", "10.0.0.2/24", ""], ["Gi0/3", "2001:DB8:0:0::1/64", "CUST"]]},
+            )
+        ]
+        with patch(
+            "netbox_nso_plugin.reconcile.reconcile_category",
+            return_value={"interface_ips": [survivor, survivor_v6, sibling]},
+        ):
+            resp = self._get_category("interface_ips", jobs)
+        self.assertEqual(resp.status_code, 200)
+        html = resp.content.decode()
+        self.assertEqual(html.count("removal residue"), 2)
+        self.assertIn("adapter job #73", html)
+
     def test_grid_renders_unbadged_when_jobs_unavailable(self):
         """Badges are best-effort decoration: adapter trouble must not break the grid."""
         from ipam.models import VLAN

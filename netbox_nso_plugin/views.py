@@ -1821,15 +1821,33 @@ def _residue_removals(jobs):
 # ── #104 phase-2: per-row residue badges in the category grids ────────────────
 
 
+def _norm_ip_triple(t):
+    """Canonicalize an (interface, address, vrf) key for residue matching.
+
+    The adapter reports the trigger's NetBox text form while the re-imported row
+    carries the device form of the same address — IPv6 case and zero-compression
+    can differ. Unparseable addresses fall back to the raw string.
+    """
+    import ipaddress
+
+    iface, address, vrf = (tuple(t) + ("", "", ""))[:3]
+    try:
+        address = str(ipaddress.ip_interface(address))
+    except ValueError:
+        pass
+    return (iface, address, vrf)
+
+
 def _residue_matchers():
-    """Category key → (adapter removal scope, row matchers) for residue badging.
+    """Category key → (adapter removal scope, row matchers[, key normalizer]) for residue badging.
 
     Each matcher is (ctx path — ``var`` or ``var.subkey`` —, the residue YANG-list
     label — a per-row callable for route_policy's family bucketing —, row → key
     tuple). Key tuples mirror the adapter's removed-key grain verbatim; both sides
-    are str-normalized before comparing. snmp communities match on the opaque
-    SHA-256 label the export publishes (never the community string), so no secret
-    is involved anywhere in the residue path.
+    are str-normalized before comparing, then passed through the spec's optional
+    normalizer (interface_ips: IPv6 text forms). snmp communities match on the
+    opaque SHA-256 label the export publishes (never the community string), so no
+    secret is involved anywhere in the residue path.
     """
 
     def _iface(r):
@@ -1881,6 +1899,13 @@ def _residue_matchers():
                 ("snmp_data.hosts", "host", lambda r: (r.address or "",)),
             ],
         ),
+        # #104 phase-3: interface_config residue is VALUE-grain — the adapter reports
+        # the removed (interface, address, vrf) triples that survived the retraction.
+        "interface_ips": (
+            "interface_config",
+            [("interface_ips", "address", lambda r: (r.interface.name, r.address, r.vrf or ""))],
+            _norm_ip_triple,
+        ),
     }
 
 
@@ -1898,7 +1923,8 @@ def _annotate_residue_rows(ctx: dict, key: str, mgmt) -> None:
     spec = _residue_matchers().get(key)
     if spec is None or mgmt is None or mgmt.adapter_device_id is None:
         return
-    scope, matchers = spec
+    scope, matchers = spec[0], spec[1]
+    norm = spec[2] if len(spec) > 2 else (lambda t: t)
     from . import adapter_client as client
 
     try:
@@ -1909,7 +1935,7 @@ def _annotate_residue_rows(ctx: dict, key: str, mgmt) -> None:
     if not entry:
         return
     keys_by_label = {
-        label: {tuple(str(p) for p in (k if isinstance(k, (list, tuple)) else (k,))) for k in klist or []}
+        label: {norm(tuple(str(p) for p in (k if isinstance(k, (list, tuple)) else (k,)))) for k in klist or []}
         for label, klist in (entry.get("residue") or {}).items()
     }
     for ctx_path, label, keyfn in matchers:
@@ -1920,7 +1946,7 @@ def _annotate_residue_rows(ctx: dict, key: str, mgmt) -> None:
             try:
                 row_label = label(row) if callable(label) else label
                 targets = keys_by_label.get(row_label)
-                if targets and tuple(str(p) for p in keyfn(row)) in targets:
+                if targets and norm(tuple(str(p) for p in keyfn(row))) in targets:
                     row.residue_survivor = True
                     row.residue_job_id = entry.get("job_id")
             except Exception:  # noqa: BLE001 — one unmatched row must not kill the grid
