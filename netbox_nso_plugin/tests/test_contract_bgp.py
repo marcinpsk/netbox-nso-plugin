@@ -161,6 +161,11 @@ class TestBgpConfigContractConsumer(TestCase):
         self.assertEqual(maximal.remote_as_str, "65001")
         self.assertFalse(maximal.enabled)  # enabled=false consumed
         self.assertIsNotNone(maximal.bgp_peer)
+        # WS-A symmetric fields (ttl + local-as) land on the materialised BGPPeer — proves
+        # the plugin consumes the same leaves the reconciler writes back (read==write).
+        self.assertEqual(maximal.bgp_peer.ttl, 2)
+        self.assertIsNotNone(maximal.bgp_peer.local_as)
+        self.assertEqual(maximal.bgp_peer.local_as.asn, 65100)
 
         # Per-AF policies resolved by name onto the BGPPeer's AF row.
         from django.contrib.contenttypes.models import ContentType

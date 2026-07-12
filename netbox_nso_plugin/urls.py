@@ -524,6 +524,11 @@ urlpatterns = [
         name="vlan_attach",
     ),
     path(
+        "device/<int:device_pk>/bgp/add-peer/",
+        views.NSOBgpPeerCreateView.as_view(),
+        name="bgp_peer_add",
+    ),
+    path(
         "device/<int:device_pk>/route-policy/attach/",
         views.NSORoutePolicyAttachView.as_view(),
         name="route_policy_attach",

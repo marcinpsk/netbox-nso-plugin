@@ -2,10 +2,13 @@
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
 {# Lazy-loaded fragment: BGP Peers category. #}
 {% include "netbox_nso_plugin/categories/_adapter_error.html" %}
+<div class="d-flex justify-content-end align-items-center gap-2 mb-2">
+  <a href="{% url 'plugins:netbox_nso_plugin:bgp_peer_add' device_pk=object.pk %}" class="btn btn-sm btn-primary" title="Create a new BGP neighbor on this device — written on Apply">
+    <i class="mdi mdi-plus-thick"></i> Add BGP peer…
+  </a>
+  {% if bgp_peers %}{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_bgp_peers' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned %}{% endif %}
+</div>
 {% if bgp_peers %}
-  <div class="d-flex justify-content-end mb-2">
-    {% url 'plugins:netbox_nso_plugin:routing_bulk_accept_bgp_peers' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned %}
-  </div>
   <div id="flt-bgp">
   {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-bgp" placeholder="Filter by peer / ASN / VRF…" show_status=True %}
   <div class="table-responsive">

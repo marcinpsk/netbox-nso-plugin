@@ -2,7 +2,7 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 from dcim.models import Cable, Interface
 from django import forms
-from ipam.models import Prefix
+from ipam.models import ASN, VRF, IPAddress, Prefix
 from netbox.forms import NetBoxModelForm
 from utilities.forms.fields import DynamicModelChoiceField, SlugField
 from utilities.forms.rendering import FieldSet
@@ -545,3 +545,127 @@ class NSOLinkRoleAssignmentForm(NetBoxModelForm):
     class Meta:
         model = NSOLinkRoleAssignment
         fields = ["role", "cable", "interface", "tags"]
+
+
+# Fallback address-family choices used only if netbox_routing is somehow unimportable at
+# form-build time; the real BGPAddressFamilyChoices supersede these in __init__.
+_BGP_AF_FALLBACK = (
+    ("ipv4-unicast", "IPv4 Unicast"),
+    ("ipv6-unicast", "IPv6 Unicast"),
+    ("vpnv4-unicast", "VPNv4 Unicast"),
+    ("vpnv6-unicast", "VPNv6 Unicast"),
+)
+
+
+class NSOBgpPeerGreenfieldForm(forms.Form):
+    """Create a greenfield BGP peer scoped to one managed device (in-tab "Add BGP peer").
+
+    Device-scoped: the operator only supplies the local ASN (pre-filled from an existing
+    BGPRouter when the device already has one), an optional VRF, the neighbor address, and
+    the per-peer attributes. The view assembles the netbox-routing object graph
+    (BGPRouter → BGPScope → BGPPeer + address-families) the reconciler would build for a
+    brownfield peer, so the greenfield signal owns it as an accepted overlay and a later
+    reconcile of the same peer reuses that identity (no duplicate).
+    """
+
+    local_asn = DynamicModelChoiceField(
+        queryset=ASN.objects.all(),
+        label="Local ASN",
+        help_text="This device's local BGP ASN (its BGPRouter). Pre-filled if already known.",
+    )
+    vrf = DynamicModelChoiceField(
+        queryset=VRF.objects.all(),
+        required=False,
+        label="VRF",
+        help_text="Leave blank for the global routing table.",
+    )
+    peer = DynamicModelChoiceField(
+        queryset=IPAddress.objects.all(),
+        label="Peer address",
+        help_text="The neighbor's IP address.",
+    )
+    remote_as = DynamicModelChoiceField(
+        queryset=ASN.objects.all(),
+        required=False,
+        label="Remote AS",
+    )
+    peer_local_as = DynamicModelChoiceField(
+        queryset=ASN.objects.all(),
+        required=False,
+        label="Peer local-as",
+        help_text="Optional per-peer local-as override (BGP local-as).",
+    )
+    ttl = forms.IntegerField(
+        required=False,
+        min_value=0,
+        max_value=255,
+        label="TTL",
+        help_text="eBGP multihop / GTSM TTL (0–255).",
+    )
+    source = DynamicModelChoiceField(
+        queryset=IPAddress.objects.all(),
+        required=False,
+        label="Source address",
+        help_text="Junos / Nokia local-address (an IP).",
+    )
+    update_source = DynamicModelChoiceField(
+        queryset=Interface.objects.all(),
+        required=False,
+        label="Update source",
+        help_text="IOS / IOS-XR update-source (an interface on this device).",
+    )
+    password = forms.CharField(
+        required=False,
+        widget=forms.PasswordInput(render_value=True),
+        label="Password",
+    )
+    enabled = forms.BooleanField(required=False, initial=True, label="Enabled")
+    address_families = forms.MultipleChoiceField(
+        required=False,
+        choices=_BGP_AF_FALLBACK,
+        initial=["ipv4-unicast"],
+        label="Address families",
+        help_text="Activate the neighbor under these AFs (default IPv4 Unicast).",
+    )
+
+    def __init__(self, *args, device=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.device = device
+        # Real AF vocabulary from netbox_routing when available.
+        try:
+            from netbox_routing.choices import BGPAddressFamilyChoices
+
+            self.fields["address_families"].choices = BGPAddressFamilyChoices
+        except ImportError:
+            pass
+        # Optional peer-group field only when netbox_routing exposes the template model.
+        try:
+            from netbox_routing.models import BGPPeerTemplate
+
+            self.fields["peer_group"] = DynamicModelChoiceField(
+                queryset=BGPPeerTemplate.objects.all(),
+                required=False,
+                label="Peer group",
+            )
+        except ImportError:
+            pass
+        if device is not None:
+            # Scope the update-source picker to this device's interfaces.
+            self.fields["update_source"].queryset = Interface.objects.filter(device=device)
+            self.fields["update_source"].widget.add_query_param("device_id", device.pk)
+            # Pre-fill the local ASN from an existing BGPRouter on this device.
+            if not self.is_bound:
+                self.fields["local_asn"].initial = self._existing_local_asn(device)
+
+    @staticmethod
+    def _existing_local_asn(device):
+        """Return the ASN pk of a BGPRouter already assigned to *device*, or None."""
+        try:
+            from dcim.models import Device
+            from django.contrib.contenttypes.models import ContentType
+            from netbox_routing.models import BGPRouter
+        except ImportError:
+            return None
+        ct = ContentType.objects.get_for_model(Device)
+        router = BGPRouter.objects.filter(assigned_object_type=ct, assigned_object_id=device.pk).first()
+        return router.asn_id if router else None

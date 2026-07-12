@@ -1,0 +1,35 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{% extends 'base/layout.html' %}
+{% load form_helpers %}
+
+{% block title %}Add BGP Peer — {{ object }}{% endblock %}
+
+{% block content %}
+<div class="row">
+  <div class="col col-md-8 offset-md-2">
+    <div class="card">
+      <h5 class="card-header">Add BGP peer to {{ object }}</h5>
+      <div class="card-body">
+        <p class="text-muted">
+          Create a new BGP neighbor under <strong>{{ object }}</strong>. This builds the
+          netbox-routing objects (BGP router, scope and peer) scoped to this device and marks
+          the peer <strong>accepted</strong>, so it is written to the device on the next
+          <strong>Apply</strong>. Give the local ASN (the device's own AS), the neighbor
+          address and its remote AS; the rest is optional.
+        </p>
+        <form method="post">
+          {% csrf_token %}
+          {% render_form form %}
+          <div class="text-end">
+            <a href="{% url 'dcim:device_nso' pk=object.pk %}" class="btn btn-outline-secondary">Cancel</a>
+            <button type="submit" class="btn btn-primary">
+              <span class="mdi mdi-plus-thick"></span> Create peer
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

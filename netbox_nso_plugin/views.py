@@ -26,6 +26,7 @@ from .filters import (
 )
 from .forms import (
     AdapterConnectionForm,
+    NSOBgpPeerGreenfieldForm,
     NSODeviceManagementForm,
     NSOFailoverSettingsForm,
     NSOInstanceForm,
@@ -3686,6 +3687,73 @@ class NSORoutePolicyAttachView(NSOActionPermissionMixin, View):
         return client.preflight_route_policy(
             mgmt.adapter_device_id, community_members, set_keys, match_keys, aspath_names, refresh=True
         )
+
+
+class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
+    """Create a greenfield BGP peer scoped to one managed device (in-tab "Add BGP peer").
+
+    Builds the netbox-routing object graph (BGPRouter → BGPScope → BGPPeer + address
+    families) the reconciler would build for a brownfield peer, reusing the reconciler's
+    own get_or_create helpers so a greenfield peer and a later reconcile of the same peer
+    converge on one identity. The BGPPeer save fires the greenfield signal, which owns an
+    accepted NSOBGPPeerState overlay and pushes the (owned-only) BGP intent — written to
+    the device on the next Apply.
+    """
+
+    def get(self, request, device_pk):  # noqa: D102
+        mgmt = get_object_or_404(NSODeviceManagement, device_id=device_pk)
+        form = NSOBgpPeerGreenfieldForm(device=mgmt.device)
+        return render(request, "netbox_nso_plugin/bgp_peer_form.html", self._ctx(mgmt, form))
+
+    def post(self, request, device_pk):  # noqa: D102
+        mgmt = get_object_or_404(NSODeviceManagement, device_id=device_pk)
+        form = NSOBgpPeerGreenfieldForm(request.POST, device=mgmt.device)
+        if not form.is_valid():
+            return render(request, "netbox_nso_plugin/bgp_peer_form.html", self._ctx(mgmt, form))
+        peer = self._create_peer(mgmt.device, form.cleaned_data)
+        messages.success(
+            request,
+            f"Created BGP peer {peer.peer.address.ip} on {mgmt.device.name} — Apply to write it.",
+        )
+        return redirect(_device_nso_tab_url(mgmt.device_id))
+
+    @staticmethod
+    def _ctx(mgmt, form):
+        return {"form": form, "object": mgmt.device, "mgmt": mgmt}
+
+    @staticmethod
+    def _create_peer(device, data):
+        """Assemble the router→scope→peer→AF graph via the reconciler's helpers."""
+        from dcim.models import Device
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import (
+            BGPAddressFamily,
+            BGPPeer,
+            BGPPeerAddressFamily,
+            BGPRouter,
+            BGPScope,
+        )
+
+        from .bgp_reconciler import _get_or_create_router, _get_or_create_scope, _write_peer_afs
+
+        router = _get_or_create_router(device, data["local_asn"], BGPRouter, ContentType, Device)
+        scope = _get_or_create_scope(router, data.get("vrf"), BGPScope)
+        peer = BGPPeer.objects.create(
+            scope=scope,
+            peer=data["peer"],
+            name=None,
+            remote_as=data.get("remote_as"),
+            local_as=data.get("peer_local_as"),
+            ttl=data.get("ttl"),
+            enabled=data.get("enabled", True),
+            password=data.get("password") or None,
+            peer_group=data.get("peer_group"),
+            source=data.get("source"),
+            update_source=data.get("update_source"),
+        )
+        af_list = [{"af": af, "enabled": True} for af in (data.get("address_families") or ["ipv4-unicast"])]
+        _write_peer_afs(peer, af_list, scope, BGPAddressFamily, BGPPeerAddressFamily)
+        return peer
 
 
 class NSORoutePolicyCapabilityView(LoginRequiredMixin, View):

@@ -1161,8 +1161,11 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
         self.assertEqual(mock_put.call_args.kwargs.get("processes"), [])
 
     def test_bgp_peer_delete_pushes_reduced_snapshot(self):
-        """No native pre_delete exists for BGPPeer — the overlay post_delete is the ONLY
-        retraction path (gap confirmed live on rg03, #7)."""
+        """Deleting the overlay row directly pushes the reduced (owned-only) snapshot.
+
+        This is the mechanism the native BGPPeer pre_delete reuses (it drops the overlay
+        row, firing this post_delete); greenfield end-to-end coverage is in
+        test_bgp_greenfield.TestBgpPeerGreenfieldDelete."""
         from netbox_nso_plugin.models import NSOBGPPeerState
 
         mgmt = self._mgmt()

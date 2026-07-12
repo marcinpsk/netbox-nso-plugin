@@ -634,8 +634,22 @@ def _reconcile_bgp_config(device, payload: dict) -> list:
     - Creates/updates NSOBGPPeerState overlay rows for compliance tracking.
     - Marks stale state rows (no longer reported) as status='changed'.
 
+    Runs under ``suppress_intent_push()``: unlike the OSPF reconciler (which only links
+    to existing native objects), this one MATERIALIZES ``BGPPeer`` rows, and a materialized
+    peer now carries a greenfield-ownership ``post_save`` signal. Suppression stops that
+    signal from force-owning + pushing brownfield adoption back to the adapter. Reentrant,
+    so nesting under the sync path's own suppression (reconcile.py) is a harmless no-op.
+
     Returns a list of NSOBGPPeerState instances for this device.
     """
+    from .signals import suppress_intent_push
+
+    with suppress_intent_push():
+        return _reconcile_bgp_config_impl(device, payload)
+
+
+def _reconcile_bgp_config_impl(device, payload: dict) -> list:
+    """Body of :func:`_reconcile_bgp_config` (see it for the contract)."""
     from django.contrib.contenttypes.models import ContentType
     from django.utils import timezone
 
