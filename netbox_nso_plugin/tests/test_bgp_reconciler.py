@@ -225,6 +225,61 @@ class TestReconcileBgpConfig(TestCase):
         peers = captured["routers"][0]["scopes"][0]["peers"]
         self.assertEqual(peers[0]["source"], "84.116.255.1")
 
+    def test_push_includes_local_as_ttl_password_peer_group(self):
+        """_push_bgp_intent_for_device must send local_as, ttl, password, and peer-group.
+
+        These leaves are imported from the device onto the netbox-routing BGPPeer and are
+        fully supported by the adapter intent schema + reconciler YANG, but the PUT peer dict
+        dropped them — so an accepted brownfield peer's password / ttl / local-AS / peer-group
+        silently vanished from the pushed intent (the #99 write-integrity gap). The overlay row
+        denormalizes only remote_as + enabled, so the push must read them off ``row.bgp_peer``.
+        """
+        from unittest.mock import patch
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.signals import _push_bgp_intent_for_device
+
+        mgmt = self._make_mgmt()
+        result = _reconcile_bgp_config(
+            self.device,
+            self._payload(
+                self._router_payload(
+                    peers=[
+                        self._peer_entry(
+                            local_as="65199",
+                            ttl=2,
+                            password="s3cr3t",
+                            peer_group="EDGE",
+                        )
+                    ]
+                )
+            ),
+        )
+        row = result[0]
+        # Sanity: the reconciler imported all four onto the linked BGPPeer.
+        self.assertEqual(str(row.bgp_peer.local_as.asn), "65199")
+        self.assertEqual(row.bgp_peer.ttl, 2)
+        self.assertEqual(row.bgp_peer.password, "s3cr3t")
+        self.assertEqual(row.bgp_peer.peer_group.name, "EDGE")
+        # Own the row so the intent push picks it up.
+        row.status = "in_sync"
+        row.save(update_fields=["status"])
+
+        captured = {}
+
+        def _capture(adapter_device_id, routers):
+            captured["routers"] = routers
+            return {"device_id": adapter_device_id, "router_count": len(routers)}
+
+        with patch("netbox_nso_plugin.adapter_client.put_bgp_intent", side_effect=_capture):
+            _push_bgp_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+
+        peer = captured["routers"][0]["scopes"][0]["peers"][0]
+        self.assertEqual(peer["local_as"], "65199")
+        self.assertEqual(peer["ttl"], 2)
+        self.assertEqual(peer["password"], "s3cr3t")
+        self.assertEqual(peer["peer_group"], "EDGE")
+
     def test_idempotent_second_call(self):
         """Calling reconcile twice with same payload → same single state row."""
         self._make_mgmt()

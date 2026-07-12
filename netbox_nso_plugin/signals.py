@@ -2104,6 +2104,30 @@ def _bgp_peer_source_value(bgp_peer):
     return None
 
 
+def _bgp_peer_model_fields(bgp_peer) -> dict:
+    """Return the write-path peer leaves the overlay row does not denormalize.
+
+    ``local_as`` / ``ttl`` / ``password`` / ``peer_group`` live only on the linked
+    netbox-routing ``BGPPeer`` (``NSOBGPPeerState`` carries just ``remote_as_str`` +
+    ``enabled``), yet the reconciler + adapter both write them. Dropping them from the
+    pushed intent silently un-managed a brownfield peer's password / ttl / local-AS /
+    peer-group. Absent = the reconciler treats the leaf as "do not touch", so include a
+    key only when it holds a value — mirroring :func:`_bgp_peer_source_value`.
+    """
+    fields: dict = {}
+    if bgp_peer is None:
+        return fields
+    if bgp_peer.local_as is not None:
+        fields["local_as"] = str(bgp_peer.local_as.asn)
+    if bgp_peer.ttl is not None:
+        fields["ttl"] = bgp_peer.ttl
+    if bgp_peer.password:
+        fields["password"] = bgp_peer.password
+    if bgp_peer.peer_group is not None:
+        fields["peer_group"] = bgp_peer.peer_group.name
+    return fields
+
+
 def _push_bgp_intent_for_device(device_id, adapter_device_id):
     """Build and push the full BGP intent snapshot for a device."""
     from . import adapter_client as client
@@ -2129,7 +2153,7 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
     for row in NSOBGPPeerState.objects.filter(
         management__device_id=device_id,
         status__in=_OWNED_PUSH_STATUSES,
-    ).select_related("management", "bgp_peer"):
+    ).select_related("management", "bgp_peer", "bgp_peer__local_as", "bgp_peer__peer_group"):
         asn_str = row.asn_str
         vrf_name = row.vrf_name or ""
         if asn_str not in routers:
@@ -2171,6 +2195,7 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
         source_value = _bgp_peer_source_value(row.bgp_peer)
         if source_value is not None:
             peer_dict["source"] = source_value
+        peer_dict.update(_bgp_peer_model_fields(row.bgp_peer))
         scopes[vrf_name]["peers"].append(peer_dict)
 
     router_list = _build_bgp_router_list(routers, scope_afs)
