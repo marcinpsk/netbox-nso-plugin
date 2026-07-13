@@ -433,7 +433,10 @@ class TestV3PushDerivation(_SecretBase):
                 }
             ],
         )
-        # the v3 host is skipped (no username source); the v2c host is pushed with its port
+        # CR-P16: a v3 host with NO user name is still refused — both NSO writers key the receiver
+        # on that field, so pushing it would key the host on an empty user. (A v3 host WITH a user
+        # name now pushes; see test_a_v3_host_WITH_a_user_name_is_pushed below.)
         self.assertEqual(len(hosts), 1)
         self.assertEqual(hosts[0]["address"], "10.0.0.6")
         self.assertEqual(hosts[0]["port"], 1162)
+        self.assertEqual(hosts[0]["community_or_user"], "oldhash1234567890")

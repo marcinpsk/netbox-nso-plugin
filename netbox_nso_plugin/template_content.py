@@ -645,6 +645,10 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
             "notify_type": entry.get("notify_type") or "trap",
             "port": entry.get("port"),
             "community_hash": entry.get("community_hash") or "",
+            # CR-P16. v3 hosts only — the export gates it on version so a v1/v2c host's COMMUNITY
+            # (the same NED field) can never arrive here. This is what makes an imported v3 trap
+            # host pushable at all: both NSO writers key the receiver on the user name.
+            "username": entry.get("username") or "",
         }
         state.last_sync_at = now
         if sm.is_owned(state.status):

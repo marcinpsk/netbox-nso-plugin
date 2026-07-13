@@ -30,7 +30,9 @@ from netbox_nso_plugin.template_content import _reconcile_logging_config, _recon
 SNMP_TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "communities", "v3_users", "hosts", "system_info"}
 SNMP_COMMUNITY_KEYS = {"community_hash", "access", "acl"}
 SNMP_V3USER_KEYS = {"username", "has_auth_secret", "has_priv_secret"}
-SNMP_HOST_KEYS = {"address", "version", "notify_type", "port"}
+# `username` = the SNMPv3 security user name (v3 hosts only). NOT a secret, and the field both
+# NSO host writers KEY the receiver on — without it a v3 trap host cannot be pushed (CR-P16).
+SNMP_HOST_KEYS = {"address", "version", "notify_type", "port", "username"}
 SNMP_SYSINFO_KEYS = {"location", "contact"}
 LOGGING_TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "hosts"}
 LOGGING_HOST_REQUIRED_KEYS = {"address"}
@@ -42,7 +44,7 @@ SNMP_PAYLOAD = {
     "refresh_source": "poll",
     "communities": [{"community_hash": "abc", "access": "RO", "acl": "ACL-1"}],
     "v3_users": [{"username": "netops", "has_auth_secret": True, "has_priv_secret": False}],
-    "hosts": [{"address": "10.0.0.9", "version": "2c", "notify_type": "trap", "port": 162}],
+    "hosts": [{"address": "10.0.0.9", "version": "2c", "notify_type": "trap", "port": 162, "username": None}],
     "system_info": {"location": "DC1", "contact": "noc@x"},
 }
 LOGGING_PAYLOAD = {

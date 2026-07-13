@@ -158,7 +158,7 @@
   <div class="table-responsive">
     <table class="table table-sm table-hover mb-0">
       <thead>
-        <tr><th>Address</th><th>Type</th><th>Version</th><th>Port</th><th>Status</th><th>Last Synced</th><th></th></tr>
+        <tr><th>Address</th><th>Type</th><th>Version</th><th>Port</th><th>v3 User</th><th>Status</th><th>Last Synced</th><th></th></tr>
       </thead>
       <tbody>
         {% for h in snmp_data.hosts %}
@@ -167,6 +167,12 @@
           <td>{{ h.notify_type }}</td>
           <td>{{ h.version }}</td>
           <td>{{ h.port|default:"162" }}</td>
+          {% comment %}
+            The v3 security user name: not a secret, and the field both NSO writers key the receiver
+            on — a v3 host without one cannot be pushed at all (CR-P16). Blank for v1/v2c, whose
+            corresponding field is the community string and never leaves the device.
+          {% endcomment %}
+          <td>{% if h.username %}<code>{{ h.username }}</code>{% else %}<span class="text-muted">&mdash;</span>{% endif %}</td>
           <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=h.status residue=h.residue_survivor residue_job=h.residue_job_id %}</td>
           <td class="text-nowrap">{% if h.last_sync_at %}{{ h.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
           <td>

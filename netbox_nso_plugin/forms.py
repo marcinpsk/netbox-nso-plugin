@@ -416,11 +416,16 @@ class NSOSnmpV3UserStateForm(NetBoxModelForm):
 
 
 class NSOSnmpHostStateForm(NetBoxModelForm):
-    """Edit an SNMP trap/inform host overlay."""
+    """Edit an SNMP trap/inform host overlay.
+
+    ``username`` is the SNMPv3 security user name. It is editable because a v3 host cannot be
+    pushed without one — both NSO writers key the receiver on it — and an operator provisioning a
+    greenfield v3 host has no device to import it from (CR-P16).
+    """
 
     class Meta:
         model = NSOSnmpHostState
-        fields = ["address", "version", "notify_type", "port", "tags"]
+        fields = ["address", "version", "notify_type", "port", "username", "tags"]
 
 
 class NSOSnmpSystemInfoStateForm(NetBoxModelForm):

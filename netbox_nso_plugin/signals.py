@@ -824,6 +824,19 @@ def snmp_v3_user_push_blocker(row) -> str:
     return ""
 
 
+def _host_is_v3(version) -> bool:
+    """Report whether a trap host runs SNMPv3 — tolerating BOTH spellings of the version.
+
+    This is not pedantry, it is the bug. The reconciler stores `version` VERBATIM from the adapter,
+    which carries the NED's grain — `"3"` — while the NetBox-side forms and fixtures say `"v3"`. The
+    old `row.version == "v3"` check therefore matched a hand-created row and NEVER an imported one:
+    every v3 trap host actually read off a device sailed straight past the refusal that exists to
+    stop it, and got pushed with an EMPTY community_or_user. IOS-XR cannot even form the key from
+    that (the user is the third key component); IOS would write a host bound to no user at all.
+    """
+    return str(version or "").strip().lower().lstrip("v") == "3"
+
+
 def snmp_host_push_blocker(row) -> str:
     """Why *row* cannot be faithfully pushed, or "" when it can.
 
@@ -832,10 +845,16 @@ def snmp_host_push_blocker(row) -> str:
     with only a server-side log line therefore left an 'accepted' row that looked green in
     the tab forever while nothing had been (or could be) applied.
     """
-    if row.version == "v3":
+    if _host_is_v3(row.version) and not row.username:
+        # CR-P16 made v3 hosts pushable by exporting the user name. The refusal stays for the one
+        # case that is still unpushable: a v3 host whose user name we do not have (an older row
+        # imported before the export carried it, or a device that never had one). Both writers KEY
+        # the receiver on that field, so pushing it would key the host on an EMPTY user — IOS-XR
+        # cannot even form the key, and IOS would write a host bound to no user at all.
         return (
-            "SNMPv3 trap hosts are not pushable — the host overlay carries no v3 username "
-            "(community_hash is v1/v2c only), so the host would be keyed on an empty user."
+            "this SNMPv3 trap host has no security user name — the NSO writers key the receiver on "
+            "it, so pushing would key the host on an empty user. Re-import the device (the user "
+            "name is read from it) or set one."
         )
     return ""
 
@@ -920,7 +939,10 @@ def _push_snmp_intent_for_device(device_id, adapter_device_id, force=False):
                 "address": row.address,
                 "version": row.version,
                 "notify_type": row.notify_type,
-                "community_or_user": row.community_hash or "",  # hash used as community label reference
+                # ONE NED field, two meanings — which is the whole reason v3 hosts were unpushable
+                # (CR-P16). On v1/v2c it is the community (referenced by its label); on v3 it is the
+                # security user name, which both host writers key the receiver on.
+                "community_or_user": (row.username if _host_is_v3(row.version) else row.community_hash) or "",
                 "port": row.port,
             }
         )

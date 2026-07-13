@@ -934,6 +934,16 @@ class NSOSnmpHostState(NetBoxModel):
         default="",
         help_text="Hash of the community string used for this host (v1/v2c only).",
     )
+    username = models.CharField(
+        max_length=128,
+        blank=True,
+        default="",
+        help_text=(
+            "SNMPv3 security user name for this receiver (v3 only). Not a secret — the same "
+            "identity as the v3-user rows. Both NSO host writers KEY the receiver on this field, "
+            "so a v3 host without it cannot be pushed."
+        ),
+    )
     status = models.CharField(max_length=32, choices=_SNMP_STATUS_CHOICES, default="unknown")
     last_sync_at = models.DateTimeField(null=True, blank=True)
     accepted_at = models.DateTimeField(
