@@ -239,3 +239,103 @@ class TestBuildBgpRouterList(TestCase):
         scope = out[0]["scopes"][0]
         self.assertEqual(scope["address_families"], [{"af": "ipv4-unicast", "redistribution": redist}])
         self.assertEqual(len(scope["peers"]), 1)
+
+
+def _peer(addr="192.0.2.1", afs=()):
+    return {
+        "peer_address": addr,
+        "enabled": True,
+        "remote_as": "1",
+        "address_families": list(afs),
+    }
+
+
+def _routers(vrf="", peers=()):
+    return {
+        "2222": {
+            "asn": "2222",
+            "scopes": {vrf: {"vrf": vrf, "address_families": [], "peers": list(peers)}},
+        }
+    }
+
+
+class TestScopeAddressFamiliesIncludePeerAfs(TestCase):
+    """BGP-T1-1: the scope's address-family list was built from REDISTRIBUTION ROWS ONLY.
+
+    `_build_bgp_router_list` did::
+
+        af_map = scope_afs.get((asn_str, vrf_str), {})   # scope_afs <- accepted redistribution
+        scope_out["address_families"] = afs_out          # OVERWRITES the scope's own list
+
+    A peer's address-families are built separately into `peer["address_families"]` and never
+    reached the scope. So on the ORDINARY path — peers accepted, no redistribution accepted —
+    the scope arrived at bgp-reconciler with an EMPTY address-family list, and the writer drives
+    all of the following off `scope.address_family`:
+
+      * AF activation,
+      * per-AF policy binding (route-map / prefix-list in+out), and
+      * `_apply_ios_vrf_scope` in its ENTIRETY (its whole body is inside that loop).
+
+    Consequences, all silent — the commit succeeds and NetBox reports in_sync:
+      * the peer's route-maps and prefix-lists NEVER BIND -> the peer comes up UNFILTERED;
+      * every IOS VRF peer is NEVER WRITTEN AT ALL;
+      * IPv6 / VPNv4 address-families are never explicitly activated.
+
+    (IOS auto-activates ipv4-unicast for a `neighbor ... remote-as`, which is why global peers
+    still came up and the bug looked like nothing was wrong.)
+
+    The scope's AFs must therefore be the UNION of the AFs carrying redistribution and the AFs
+    any peer in that scope actually uses.
+    """
+
+    def test_peer_af_reaches_the_scope_without_any_redistribution(self):
+        from netbox_nso_plugin.signals import _build_bgp_router_list
+
+        peer = _peer(afs=[{"af": "ipv4-unicast", "enabled": True, "routemap_in": "RM-IN"}])
+        out = _build_bgp_router_list(_routers(peers=[peer]), {})
+        scope = out[0]["scopes"][0]
+        self.assertEqual(
+            scope["address_families"],
+            [{"af": "ipv4-unicast", "redistribution": []}],
+            "the peer's AF never reached the scope — the writer binds no policy and the peer comes up UNFILTERED",
+        )
+
+    def test_peer_af_and_redistribution_af_are_unioned_not_replaced(self):
+        from netbox_nso_plugin.signals import _build_bgp_router_list
+
+        redist = [{"source_protocol": "static", "source_ref": ""}]
+        peer = _peer(afs=[{"af": "ipv6-unicast", "enabled": True}])
+        out = _build_bgp_router_list(_routers(peers=[peer]), {("2222", ""): {"ipv4-unicast": redist}})
+        afs = {a["af"]: a["redistribution"] for a in out[0]["scopes"][0]["address_families"]}
+        self.assertEqual(afs, {"ipv4-unicast": redist, "ipv6-unicast": []})
+
+    def test_an_af_carrying_both_is_not_duplicated_and_keeps_its_redistribution(self):
+        from netbox_nso_plugin.signals import _build_bgp_router_list
+
+        redist = [{"source_protocol": "connected", "source_ref": ""}]
+        peer = _peer(afs=[{"af": "ipv4-unicast", "enabled": True}])
+        out = _build_bgp_router_list(_routers(peers=[peer]), {("2222", ""): {"ipv4-unicast": redist}})
+        self.assertEqual(
+            out[0]["scopes"][0]["address_families"],
+            [{"af": "ipv4-unicast", "redistribution": redist}],
+        )
+
+    def test_vrf_scope_peer_af_reaches_the_scope(self):
+        """The IOS VRF writer's ENTIRE body is inside `for af_entry in scope.address_family`."""
+        from netbox_nso_plugin.signals import _build_bgp_router_list
+
+        peer = _peer(addr="10.9.9.1", afs=[{"af": "ipv4-unicast", "enabled": True}])
+        out = _build_bgp_router_list(_routers(vrf="CUST-A", peers=[peer]), {})
+        scope = out[0]["scopes"][0]
+        self.assertEqual(scope["vrf"], "CUST-A")
+        self.assertEqual(
+            scope["address_families"],
+            [{"af": "ipv4-unicast", "redistribution": []}],
+            "with an empty AF list the IOS VRF writer is a total no-op — the peer is never written",
+        )
+
+    def test_a_peer_with_no_afs_still_yields_an_empty_list(self):
+        from netbox_nso_plugin.signals import _build_bgp_router_list
+
+        out = _build_bgp_router_list(_routers(peers=[_peer()]), {})
+        self.assertEqual(out[0]["scopes"][0]["address_families"], [])

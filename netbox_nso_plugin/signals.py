@@ -2182,7 +2182,24 @@ def _build_bgp_router_list(routers: dict, scope_afs: dict, router_ids: dict | No
         for vrf_str, scope_data in router_data["scopes"].items():
             af_map = scope_afs.get((asn_str, vrf_str), {})
             covered.add((asn_str, vrf_str))
-            afs_out = [{"af": af_str, "redistribution": redist_entries} for af_str, redist_entries in af_map.items()]
+            # The scope's AF list must be the UNION of the AFs that carry an accepted
+            # redistribution row AND the AFs the scope's peers actually use.
+            #
+            # It used to be the redistribution AFs alone, which on the ORDINARY path (peers
+            # accepted, no redistribution) left it EMPTY — and bgp-reconciler drives AF
+            # activation, per-AF policy binding, and the whole of `_apply_ios_vrf_scope` off
+            # `scope.address_family`. So the peer's route-maps and prefix-lists never bound (the
+            # peer came up UNFILTERED) and every IOS VRF peer was never written at all, silently,
+            # with the commit reporting success. IOS auto-activates ipv4-unicast for a plain
+            # `neighbor … remote-as`, which is why the peer still came up and nothing looked wrong.
+            peer_afs = [
+                af["af"]
+                for peer in scope_data.get("peers", [])
+                for af in peer.get("address_families", [])
+                if af.get("af") and af["af"] not in af_map
+            ]
+            afs_out = [{"af": af_str, "redistribution": redist} for af_str, redist in af_map.items()]
+            afs_out += [{"af": af_str, "redistribution": []} for af_str in dict.fromkeys(peer_afs)]
             scope_out = dict(scope_data)
             scope_out["address_families"] = afs_out
             scopes_out.append(scope_out)
