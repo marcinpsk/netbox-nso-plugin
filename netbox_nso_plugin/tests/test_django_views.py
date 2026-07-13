@@ -1437,6 +1437,36 @@ class TestNSOApplyPreviewView(ViewTestBase):
         gad.assert_called_once_with(78, outformat="native")
         self.assertEqual(data["outformat"], "native")
 
+    def test_preview_reports_whether_the_dry_run_actually_ran(self):
+        """An EMPTY diff and an UNAVAILABLE diff are both {} on the wire but mean opposite
+        things. The panel reads meaning INTO emptiness — a staged row whose scope has no
+        diff gets a "no device change" badge, and total==0 + empty diff lets Apply skip the
+        confirm modal. When the dry-run THREW, both read the failure as reassurance. So the
+        preview must say which case it is.
+        """
+        import json
+        from unittest.mock import patch
+
+        from netbox_nso_plugin.adapter_client import AdapterError
+
+        self.mgmt.adapter_device_id = 79
+        self.mgmt.save()
+        url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
+
+        with patch(
+            "netbox_nso_plugin.adapter_client.get_apply_diff",
+            side_effect=AdapterError("Adapter unreachable: nope", code="nso_unreachable"),
+        ):
+            failed = json.loads(self.client.get(url).content)
+        self.assertEqual(failed["device_diff"], {})
+        self.assertFalse(failed["diff_available"], "a dry-run that threw must not read as an empty diff")
+        self.assertFalse(failed["nothing_pending"], "and it must never let Apply skip the confirm modal")
+
+        with patch("netbox_nso_plugin.adapter_client.get_apply_diff", return_value={"diffs": {}}):
+            clean = json.loads(self.client.get(url).content)
+        self.assertEqual(clean["device_diff"], {})
+        self.assertTrue(clean["diff_available"], "a dry-run that ran and found nothing is a real answer")
+
     def test_preview_isis_interface_detail_includes_bfd(self):
         """#77 transparency: a tri-state bfd intent MUST appear in 'properties pushed' —
         the dry-run diff showed bfd-enabled while the intent list stayed silent (operator
@@ -2112,6 +2142,44 @@ class TestDeviceNSOTabView(ViewTestBase):
 
         iface.delete()
 
+    def test_quick_filter_counts_agree_with_the_row_state_they_filter_on(self):
+        """The grid collapses each interface's cells to ONE worst-first row state, and every
+        quick-filter pill matches on exactly that value. The chip counts were still computed
+        by set-membership over the raw cell kinds, so an interface that is BOTH drifted and
+        apply_failed collapses to apply_failed — the Drift filter (state == 'drift') hides it,
+        yet the Drift chip counted it. The chip promised a row its own filter would not show.
+        """
+        from dcim.models import Interface
+
+        from netbox_nso_plugin.models import NSOInterfaceMtuState, NSOInterfaceState
+
+        iface = Interface.objects.create(device=self.device, name="Gi0/9", type="other", description="nb")
+        # cell 1 → apply_failed. Only the value-aware attribute cells can produce that kind
+        # (interface_row_state); display_state folds apply_failed into "pending".
+        NSOInterfaceState.objects.create(
+            interface=iface, attribute="description", status="apply_failed", nso_value="device-side"
+        )
+        # cell 2 → drift (unowned differ). apply_failed outranks drift in _KIND_SEVERITY,
+        # so the ROW collapses to apply_failed while the raw kind set still holds "drift".
+        NSOInterfaceMtuState.objects.create(management=self.mgmt, interface=iface, l2_mtu=9216, status="changed")
+
+        url = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device.pk, "key": "interface"}
+        )
+        data = self.client.get(url, {"format": "json"}).json()
+
+        row = next(r for r in data["rows"] if r["iface"]["name"] == "Gi0/9")
+        self.assertEqual(row["state"], "apply_failed", "the worst cell wins the row state")
+
+        # What each pill would actually show, by the grid's own filter predicates.
+        shown_drift = [r for r in data["rows"] if r["state"] == "drift"]
+        shown_pending = [r for r in data["rows"] if r["state"] in ("pending", "apply_failed")]
+        self.assertEqual(data["counts"]["drift"], len(shown_drift))
+        self.assertEqual(data["counts"]["pending"], len(shown_pending))
+        self.assertNotIn(row, shown_drift)
+
+        iface.delete()
+
     def test_paged_category_reads_persisted_paginated_and_searchable(self):
         """Single-table categories render paginated from last-synced state with NO
         adapter call on plain expand; ?page navigates, ?q filters server-side."""
@@ -2707,6 +2775,27 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(row.severity, "informational")
         self.assertEqual(row.port, 1514)
         self.assertEqual(row.status, "accepted")
+
+    def test_editing_an_address_onto_a_sibling_row_is_a_400_not_a_500(self):
+        """field.clean() is FIELD-level only — it never checks unique/unique_together. The
+        logging_host popover exposes `address`, half of NSOLoggingHostState's (management,
+        address) unique constraint, so retyping it as a sibling's address sailed through
+        validation into obj.save() and raised an unhandled IntegrityError: HTTP 500, and a
+        popover that just spins with no error shown.
+        """
+        from netbox_nso_plugin.models import NSOLoggingHostState
+
+        NSOLoggingHostState.objects.create(management=self.mgmt, address="198.51.100.1", status="imported")
+        row = NSOLoggingHostState.objects.create(management=self.mgmt, address="198.51.100.2", status="imported")
+
+        r = self.client.post(self._url("logging_host", row.pk), {"address": "198.51.100.1"})
+
+        self.assertEqual(r.status_code, 400)
+        body = r.json()
+        self.assertEqual(body["status"], "error")
+        self.assertTrue(body.get("errors") or body.get("message"), "the collision must be reported to the popover")
+        row.refresh_from_db()
+        self.assertEqual(row.address, "198.51.100.2", "the colliding edit must not be persisted")
 
     def test_edit_mtu_takes_ownership_and_adopts_native_l2(self):
         from netbox_nso_plugin.models import NSOInterfaceMtuState

@@ -2,6 +2,7 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Signal handlers for NSODeviceManagement scope propagation and intent push."""
 
+import contextlib
 import contextvars
 import functools
 import hashlib
@@ -165,8 +166,23 @@ def reset_intent_push_state() -> None:
 _DELETE_DISPATCH: contextvars.ContextVar[bool] = contextvars.ContextVar("nso_delete_dispatch", default=False)
 
 
+@contextlib.contextmanager
+def _delete_origin_dispatch():
+    """Mark every push scheduled inside the block as deletion-driven."""
+    token = _DELETE_DISPATCH.set(True)
+    try:
+        yield
+    finally:
+        _DELETE_DISPATCH.reset(token)
+
+
 def _as_delete_origin(handler):
     """Wrap a deletion-signal receiver so every push it schedules is deletion-marked.
+
+    Only for receivers that fire EXCLUSIVELY on deletion (pre_delete/post_delete). A
+    multi-action signal such as m2m_changed must not be wrapped — it would stamp an ADD
+    as a deletion; those handlers open :func:`_delete_origin_dispatch` around their
+    removal branch instead.
 
     Connected with ``weak=False`` (the wrapper is otherwise only weakly referenced by
     the signal registry and would be garbage-collected).
@@ -174,11 +190,8 @@ def _as_delete_origin(handler):
 
     @functools.wraps(handler)
     def _wrapped(sender=None, **kwargs):
-        token = _DELETE_DISPATCH.set(True)
-        try:
+        with _delete_origin_dispatch():
             return handler(sender=sender, **kwargs)
-        finally:
-            _DELETE_DISPATCH.reset(token)
 
     return _wrapped
 
@@ -192,6 +205,22 @@ def _run_intent_push(fn, delete_origin: bool) -> None:
             fn()
     else:
         fn()
+
+
+def _device_is_managed(device_id) -> bool:
+    """Whether *device_id* still has an adapter-linked NSODeviceManagement row.
+
+    Deleting that row — unmanaging, or deleting the Device, which CASCADEs into it —
+    tears down every NSO*State overlay with it, and each of those post_deletes is
+    _as_delete_origin-wrapped. Without this guard the drain would then build one snapshot
+    per scope from the now-EMPTY overlay and ship it as ?delete_origin=true: the adapter
+    reads an authorized full-replace to nothing and retracts every NSO-owned service from
+    the LIVE device. Unmanaging is NetBox-side bookkeeping; the device config must not move
+    (the offboard DELETE is the only adapter call a teardown makes).
+    """
+    from .models import NSODeviceManagement
+
+    return NSODeviceManagement.objects.filter(device_id=device_id, adapter_device_id__isnull=False).exists()
 
 
 def _schedule_intent_push(key, fn) -> None:
@@ -208,7 +237,8 @@ def _schedule_intent_push(key, fn) -> None:
 
     delete_origin = _DELETE_DISPATCH.get()
     if not connection.in_atomic_block:
-        _run_intent_push(fn, delete_origin)
+        if _device_is_managed(key[0]):
+            _run_intent_push(fn, delete_origin)
         return
 
     pending = getattr(_pending_pushes, "map", None)
@@ -225,12 +255,19 @@ def _schedule_intent_push(key, fn) -> None:
 
 
 def _drain_intent_pushes() -> None:
-    """Run every coalesced push once, isolating failures so one can't abort the rest."""
+    """Run every coalesced push once, isolating failures so one can't abort the rest.
+
+    Re-checked against the COMMITTED state: a push scheduled by the overlay cascade of a
+    device teardown must be dropped here, not shipped (see _device_is_managed).
+    """
     pending = getattr(_pending_pushes, "map", None)
     _pending_pushes.map = {}
     if not pending:
         return
-    for fn, delete_origin in pending.values():
+    for (device_id, scope), (fn, delete_origin) in pending.items():
+        if not _device_is_managed(device_id):
+            logger.info("Device %s is no longer NSO-managed — dropping the coalesced %s intent push", device_id, scope)
+            continue
         try:
             _run_intent_push(fn, delete_origin)
         except Exception as exc:  # noqa: BLE001 — a failed push must not abort siblings
@@ -463,13 +500,23 @@ def push_intent_on_accept(sender, instance, **kwargs):
     records ownership in the adapter and survives the next sync.
 
     The push is coalesced + change-detected via :func:`_schedule_intent_push`.
+
+    Also wired to post_delete (deletion-marked, see _connect_g_activated): deleting an owned
+    row must push the REDUCED snapshot, or the adapter keeps applying the intent NetBox just
+    dropped. The device is resolved through the FK id rather than ``instance.interface`` —
+    on the post_delete leg the Interface may already be gone (a cascade from its own
+    deletion), and a receiver that raised there would abort the whole delete.
     """
     if instance.status not in _OWNED_PUSH_STATUSES:
         return
 
+    from dcim.models import Interface
+
     from .models import NSODeviceManagement
 
-    device_id = instance.interface.device_id
+    device_id = Interface.objects.filter(pk=instance.interface_id).values_list("device_id", flat=True).first()
+    if device_id is None:
+        return
     try:
         mgmt = NSODeviceManagement.objects.get(device_id=device_id)
     except NSODeviceManagement.DoesNotExist:
@@ -752,7 +799,67 @@ def _nokia_routed_binding(interface) -> dict:
     return {"routed": True, "parent_binding": parent.name, "encap_tag": tag}
 
 
-def _push_snmp_intent_for_device(device_id, adapter_device_id):
+def snmp_v3_user_push_blocker(row) -> str:
+    """Why *row* cannot be faithfully pushed, or "" when it can.
+
+    The read mirror reports only WHETHER a v3 user holds auth/priv secrets
+    (``has_auth_secret``/``has_priv_secret``) — never which protocols they use; the
+    protocols are operator intent, entered on the row. Pushing a user whose device-held
+    secret has no declared protocol emits ``auth_protocol: null``, and the apply then
+    rewrites an authPriv user as **noAuthNoPriv** — a silent security DOWNGRADE of the live
+    device. Such a row is not pushable; it must be surfaced, not quietly degraded.
+    """
+    if row.has_auth_secret and not row.auth_protocol:
+        return (
+            "the device reports an authentication secret for this user but no auth protocol is set — "
+            "pushing would rewrite it as noAuthNoPriv. Set the auth protocol (and its Vault ref) first."
+        )
+    if row.has_priv_secret and not row.priv_protocol:
+        return (
+            "the device reports a privacy secret for this user but no priv protocol is set — "
+            "pushing would rewrite it without privacy. Set the priv protocol (and its Vault ref) first."
+        )
+    if row.priv_protocol and not row.auth_protocol:
+        return "privacy requires authentication — set an auth protocol as well."
+    return ""
+
+
+def snmp_host_push_blocker(row) -> str:
+    """Why *row* cannot be faithfully pushed, or "" when it can.
+
+    put_snmp_intent is a FULL-REPLACE snapshot, so a host left out of it is not merely
+    unapplied — it is a shrink, and the adapter detaches it from intent. Dropping a v3 host
+    with only a server-side log line therefore left an 'accepted' row that looked green in
+    the tab forever while nothing had been (or could be) applied.
+    """
+    if row.version == "v3":
+        return (
+            "SNMPv3 trap hosts are not pushable — the host overlay carries no v3 username "
+            "(community_hash is v1/v2c only), so the host would be keyed on an empty user."
+        )
+    return ""
+
+
+def _drop_unpushable_snmp_rows(model, rows, blocker):
+    """Split *rows* into (pushable, blocked) and surface each blocked row as an error.
+
+    ``.update()`` (not ``.save()``) — a save would re-enter the post_save receiver and
+    schedule another push of the snapshot we are building right now.
+    """
+    pushable, blocked = [], []
+    for row in rows:
+        reason = blocker(row)
+        if reason:
+            blocked.append(row)
+            logger.warning("SNMP intent: %s excluded from the snapshot — %s", row, reason)
+        else:
+            pushable.append(row)
+    if blocked:
+        model.objects.filter(pk__in=[r.pk for r in blocked]).exclude(status="error").update(status="error")
+    return pushable
+
+
+def _push_snmp_intent_for_device(device_id, adapter_device_id, force=False):
     """Build and push the full SNMP intent snapshot for a device."""
     from . import adapter_client as client
     from .models import NSOSnmpCommunityState, NSOSnmpHostState, NSOSnmpSystemInfoState, NSOSnmpV3UserState
@@ -774,16 +881,21 @@ def _push_snmp_intent_for_device(device_id, adapter_device_id):
         )
 
     v3_users = []
-    for row in NSOSnmpV3UserState.objects.filter(
-        management__device_id=device_id,
-        status__in=_OWNED_PUSH_STATUSES,
-    ):
-        if not row.vault_ref:
-            continue
+    owned_v3 = [
+        row
+        for row in NSOSnmpV3UserState.objects.filter(
+            management__device_id=device_id,
+            status__in=_OWNED_PUSH_STATUSES,
+        )
+        if row.vault_ref
+    ]
+    for row in _drop_unpushable_snmp_rows(NSOSnmpV3UserState, owned_v3, snmp_v3_user_push_blocker):
         # vault_ref is a PATH ref ("mount/path"); the auth/priv fields live at
         # "#auth"/"#priv" by convention. A leg without its protocol is not
         # derivable on-device, so its ref is withheld (the reconciler would
-        # otherwise resolve a secret it cannot apply).
+        # otherwise resolve a secret it cannot apply). snmp_v3_user_push_blocker
+        # has already rejected the case where the DEVICE holds a secret whose
+        # protocol was never declared — withholding there would downgrade the user.
         v3_users.append(
             {
                 "username": row.username,
@@ -796,20 +908,13 @@ def _push_snmp_intent_for_device(device_id, adapter_device_id):
         )
 
     hosts = []
-    for row in NSOSnmpHostState.objects.filter(
-        management__device_id=device_id,
-        status__in=_OWNED_PUSH_STATUSES,
-    ):
-        if row.version == "v3":
-            # The host model has no v3 username source (community_hash is v1/v2c
-            # only) — pushing would configure a host keyed on an empty user.
-            logger.warning(
-                "SNMP v3 trap host %s on device %s skipped: v3 hosts are not yet pushable "
-                "(no username field on the host overlay)",
-                row.address,
-                device_id,
-            )
-            continue
+    owned_hosts = list(
+        NSOSnmpHostState.objects.filter(
+            management__device_id=device_id,
+            status__in=_OWNED_PUSH_STATUSES,
+        )
+    )
+    for row in _drop_unpushable_snmp_rows(NSOSnmpHostState, owned_hosts, snmp_host_push_blocker):
         hosts.append(
             {
                 "address": row.address,
@@ -837,6 +942,7 @@ def _push_snmp_intent_for_device(device_id, adapter_device_id):
         (device_id, "snmp"),
         [communities, v3_users, hosts, system_info],
         lambda: client.put_snmp_intent(adapter_device_id, communities, v3_users, hosts, system_info),
+        force=force,
     )
 
 
@@ -861,7 +967,7 @@ def _on_snmp_state_save(sender, instance, **kwargs):
     )
 
 
-def _push_logging_intent_for_device(device_id, adapter_device_id):
+def _push_logging_intent_for_device(device_id, adapter_device_id, force=False):
     """Build and push the full remote-syslog (logging) intent snapshot for a device.
 
     Store-only (deferred): the device commit happens on the single device Apply via
@@ -891,6 +997,7 @@ def _push_logging_intent_for_device(device_id, adapter_device_id):
         (device_id, "logging"),
         hosts,
         lambda: client.put_logging_intent(adapter_device_id, hosts),
+        force=force,
     )
 
 
@@ -1111,6 +1218,7 @@ def _push_vlan_intent_for_device(device_id, adapter_device_id, force=False):
     """
     from . import adapter_client as client
     from .models import NSOVLANState
+    from .vlan_reconciler import is_placeholder_vlan_name
 
     vlans = []
     for row in NSOVLANState.objects.filter(
@@ -1119,7 +1227,11 @@ def _push_vlan_intent_for_device(device_id, adapter_device_id, force=False):
     ).select_related("vlan"):
         if row.vlan is None:
             continue
-        vlans.append({"vlan_id": row.vlan.vid, "name": row.vlan.name or ""})
+        # A nameless device VLAN was imported under a fabricated "VLAN <vid>" placeholder
+        # (NetBox cannot hold two name='' VLANs in one group). Pushing it verbatim would
+        # write a name the device never had; the writer omits the name when it is empty.
+        name = "" if is_placeholder_vlan_name(row) else (row.vlan.name or "")
+        vlans.append({"vlan_id": row.vlan.vid, "name": name})
 
     _push_changed(
         (device_id, "vlan"),
@@ -1561,7 +1673,13 @@ def _on_routing_static_route_save(sender, instance, **kwargs):
 
 @_skip_on_render
 def _on_routing_static_route_devices_changed(sender, instance, action, pk_set, reverse, **kwargs):
-    """Device assigned to / removed from a route → own / remove + push (greenfield)."""
+    """Device assigned to / removed from a route → own / remove + push (greenfield).
+
+    m2m_changed is NOT a deletion-only signal, so this handler must not be registered under
+    _as_delete_origin: that would stamp ``?delete_origin=true`` on the push born from an
+    ADD, authorizing the adapter to retract from the live device any route the full-replace
+    snapshot happens not to carry. Only the removal branches open the mark.
+    """
     from dcim.models import Device
 
     try:
@@ -1574,8 +1692,9 @@ def _on_routing_static_route_devices_changed(sender, instance, action, pk_set, r
         for device in Device.objects.filter(pk__in=pk_set or []):
             _accept_static_route_for_device(instance, device)
     elif action == "post_remove":
-        for device in Device.objects.filter(pk__in=pk_set or []):
-            _remove_static_route_for_device(instance, device)
+        with _delete_origin_dispatch():
+            for device in Device.objects.filter(pk__in=pk_set or []):
+                _remove_static_route_for_device(instance, device)
     elif action == "post_clear":
         # Django sends pk_set=None on .clear(): every device was detached. `pk_set or []`
         # would silently remove nothing, orphaning every overlay + leaving stale adapter
@@ -1586,8 +1705,9 @@ def _on_routing_static_route_devices_changed(sender, instance, action, pk_set, r
         device_ids = set(
             NSOStaticRouteState.objects.filter(static_route=instance).values_list("management__device_id", flat=True)
         )
-        for device in Device.objects.filter(pk__in=device_ids):
-            _remove_static_route_for_device(instance, device)
+        with _delete_origin_dispatch():
+            for device in Device.objects.filter(pk__in=device_ids):
+                _remove_static_route_for_device(instance, device)
 
 
 @_skip_on_render
@@ -1600,7 +1720,7 @@ def _on_routing_static_route_pre_delete(sender, instance, **kwargs):
 # ── IS-IS Flex-Algorithm intent (process-tag scoped) ────────────────────────
 
 
-def _push_isis_flex_algo_intent_for_device(device_id, adapter_device_id):
+def _push_isis_flex_algo_intent_for_device(device_id, adapter_device_id, force=False):
     """Build and push the full IS-IS Flex-Algo intent snapshot for a device."""
     from . import adapter_client as client
     from .models import NSOISISFlexAlgoState
@@ -1626,6 +1746,7 @@ def _push_isis_flex_algo_intent_for_device(device_id, adapter_device_id):
         (device_id, "isis_flex_algo"),
         flex_algos,
         lambda: client.put_isis_flex_algo_intent(adapter_device_id, flex_algos),
+        force=force,
     )
 
 
@@ -2160,7 +2281,7 @@ def _bgp_router_id_map(device_id) -> dict:
     return out
 
 
-def _push_bgp_intent_for_device(device_id, adapter_device_id):
+def _push_bgp_intent_for_device(device_id, adapter_device_id, force=False):
     """Build and push the full BGP intent snapshot for a device."""
     from . import adapter_client as client
     from .models import NSOBGPPeerState
@@ -2235,6 +2356,7 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
         (device_id, "bgp"),
         router_list,
         lambda: client.put_bgp_intent(adapter_device_id, router_list),
+        force=force,
     )
 
 
@@ -3439,6 +3561,22 @@ def _connect_g_activated():  # pragma: no cover
         weak=False,
     )
 
+    # Interface state → intent push. post_save is wired by the @receiver on
+    # push_intent_on_accept; the DELETE leg belongs here with the other families.
+    #
+    # NSOInterfaceState is the family with single AND bulk overlay delete views, so an
+    # operator can delete an owned description/enabled intent straight from the UI. Without
+    # this the reduced snapshot is never pushed and the adapter keeps applying the intent
+    # NetBox just dropped.
+    from .models import NSOInterfaceState
+
+    post_delete.connect(
+        _as_delete_origin(push_intent_on_accept),
+        sender=NSOInterfaceState,
+        dispatch_uid="nso_plugin_interface_state_post_delete",
+        weak=False,
+    )
+
     # SNMP state → intent push
     from .models import NSOSnmpCommunityState, NSOSnmpHostState, NSOSnmpSystemInfoState, NSOSnmpV3UserState
 
@@ -3825,11 +3963,12 @@ def _connect_g_activated():  # pragma: no cover
             sender=StaticRoute,
             dispatch_uid="nso_plugin_routing_static_route_post_save",
         )
+        # NOT _as_delete_origin: m2m_changed also carries post_add — the handler opens the
+        # deletion mark itself, around its post_remove / post_clear branches only.
         m2m_changed.connect(
-            _as_delete_origin(_on_routing_static_route_devices_changed),
+            _on_routing_static_route_devices_changed,
             sender=StaticRoute.devices.through,
             dispatch_uid="nso_plugin_routing_static_route_devices_changed",
-            weak=False,
         )
         pre_delete.connect(
             _as_delete_origin(_on_routing_static_route_pre_delete),

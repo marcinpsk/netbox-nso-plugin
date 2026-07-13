@@ -123,6 +123,24 @@
     }
 
     function save() {
+      // A type=number input the browser cannot parse ("12a", "1.2.3") reports value === ""
+      // together with validity.badInput. On the wire that is indistinguishable from a
+      // deliberately emptied field — which the edit view maps to an explicit clear-to-NULL,
+      // and the next push RETRACTS the value from the live device. So a typo would silently
+      // remove config. Refuse to submit a bad-input field; an intentional clear is empty AND
+      // valid, and still goes through.
+      var bad = fields.filter(function (f) {
+        var el = inputs[f.name];
+        return el.validity && el.validity.badInput;
+      });
+      if (bad.length) {
+        var badErrs = {};
+        bad.forEach(function (f) {
+          badErrs[f.name] = ["Enter a valid number, or clear the field to remove the value."];
+        });
+        showErrors(badErrs);
+        return;
+      }
       saveBtn.disabled = true;
       var params = new URLSearchParams();
       fields.forEach(function (f) { params.set(f.name, inputs[f.name].value.trim()); });

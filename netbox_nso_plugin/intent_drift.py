@@ -282,6 +282,11 @@ def resync_intent(device, mgmt, keys: list[str] | None = None) -> list[str]:
             sc = by_key.get(key)
             if sc is None:
                 continue
-            sc["push"](mgmt.device_id, mgmt.adapter_device_id)
+            # force=True is load-bearing, not belt-and-braces. Re-sync exists precisely for
+            # the split-brain where the ADAPTER lost the intent while the plugin's
+            # process-global _last_pushed_hashes still holds the digest of the last push —
+            # which is exactly the condition _push_changed reads as "unchanged, skip". The
+            # re-sync would then silently no-op while the view reported success.
+            sc["push"](mgmt.device_id, mgmt.adapter_device_id, force=True)
             done.append(key)
     return done

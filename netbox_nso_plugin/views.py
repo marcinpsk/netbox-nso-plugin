@@ -147,13 +147,21 @@ class NSOActionPermissionMixin(LoginRequiredMixin):
     NetBox's auth backend (a superuser and any holder of a matching ObjectPermission pass).
     An authenticated user lacking it gets 403; an anonymous user still follows the normal
     login redirect (so the login-required behaviour is unchanged).
+
+    ``required_permission`` may name a single permission or a sequence of them — ALL are
+    required. A view that mints objects in ANOTHER app (the in-tab BGP-peer create builds a
+    netbox_routing graph) must name that app's permission too, or the NSO permission alone
+    would silently become a grant to create routing objects.
     """
 
     required_permission = "netbox_nso_plugin.change_nsodevicemanagement"
 
     def dispatch(self, request, *args, **kwargs):
-        """Enforce ``required_permission`` for authenticated users before the handler runs."""
-        if request.user.is_authenticated and not request.user.has_perm(self.required_permission):
+        """Enforce every ``required_permission`` for authenticated users before the handler runs."""
+        required = self.required_permission
+        if isinstance(required, str):
+            required = (required,)
+        if request.user.is_authenticated and not all(request.user.has_perm(perm) for perm in required):
             raise PermissionDenied
         return super().dispatch(request, *args, **kwargs)
 
@@ -313,6 +321,19 @@ _PENDING_KINDS = {"pending", "apply_failed"}
 # Worst-first ordering of per-cell state kinds, for rolling an interface's cells up
 # into the single row-level state the grid sorts and quick-filters on.
 _KIND_SEVERITY = ("apply_failed", "drift", "pending", "deploying", "unknown", "in_sync")
+
+
+def _row_state(kinds) -> str:
+    """Collapse one interface's cell kinds to the single worst-first row state.
+
+    THE row state: the grid sorts on it and every quick-filter pill matches on it, so the
+    chip counts must be derived from this same value. Counting by set-membership instead
+    (``"drift" in kinds``) double-classified an interface with both a drifted cell and an
+    apply_failed cell: it collapses to ``apply_failed``, so the Drift filter (state == drift)
+    hid it — while the Drift chip still counted it. The chip promised a row the filter would
+    not show.
+    """
+    return next((k for k in _KIND_SEVERITY if k in kinds), "in_sync")
 
 
 def _merged_iface_kinds(iface, attr_states, mtu_states, sw_states, ip_states) -> set[str]:
@@ -660,10 +681,13 @@ class NSOCategoryView(LoginRequiredMixin, View):
         # Per-interface aggregate state for the grid's row-level rollup and the
         # drift/pending quick-filter counts.
         kinds_by_iface = {i.id: _merged_iface_kinds(i, attr_states, mtu_states, sw_states, ip_states) for i in ordered}
+        # Counted off the COLLAPSED row state — the exact value each quick-filter pill matches
+        # on — so a chip can never promise rows its own filter hides (see _row_state).
         counts = {"all": len(ordered), "drift": 0, "pending": 0}
         for ks in kinds_by_iface.values():
-            counts["drift"] += 1 if "drift" in ks else 0
-            counts["pending"] += 1 if ks & _PENDING_KINDS else 0
+            state = _row_state(ks)
+            counts["drift"] += 1 if state == "drift" else 0
+            counts["pending"] += 1 if state in _PENDING_KINDS else 0
 
         # The client-side grid sorts, filters and quick-filters in the browser, so the
         # payload always carries every row — no server state filter, no pagination.
@@ -774,7 +798,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
                         if sw
                         else {},
                     ),
-                    "state": next((k for k in _KIND_SEVERITY if k in kinds), "in_sync"),
+                    "state": _row_state(kinds),
                 }
             )
         return {"rows": rows, "counts": counts, "adapter_error": adapter_error}
@@ -2224,6 +2248,31 @@ class NSOInterfaceEditFieldView(NSOActionPermissionMixin, View):
         return JsonResponse({"status": "ok", "message": f"Updated {attribute} on {iface.name}."})
 
 
+def _unique_collision_response(obj, editable):
+    """400 JSON when *obj* would violate a unique constraint, else None.
+
+    ``field.clean()`` is FIELD-level only: it never checks unique / unique_together. So an
+    inline edit to a value that collides with a sibling row — ``logging_host`` exposes
+    ``address``, half of NSOLoggingHostState's (management, address) unique_together — sailed
+    through validation, reached ``obj.save()``, and raised an unhandled IntegrityError: HTTP
+    500, and a popover that just spins. Report the collision like any other field error.
+    """
+    from django.core.exceptions import ValidationError
+
+    try:
+        obj.validate_unique()
+    except ValidationError as exc:
+        collisions = {f: [str(m) for m in msgs] for f, msgs in exc.message_dict.items() if f in editable}
+        elsewhere = [str(m) for f, msgs in exc.message_dict.items() if f not in editable for m in msgs]
+        payload: dict = {"status": "error"}
+        if collisions:
+            payload["errors"] = collisions
+        if elsewhere:
+            payload["message"] = " ".join(elsewhere)
+        return JsonResponse(payload, status=400)
+    return None
+
+
 class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
     """Inline (popover) field edit on an overlay row from the NSO tab.
 
@@ -2292,6 +2341,10 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
             return JsonResponse({"status": "error", "errors": errors}, status=400)
 
         if changed:
+            collision = _unique_collision_response(obj, editable)
+            if collision is not None:
+                return collision
+
             # Claim ownership (same transition as Accept on a differing value):
             # the edited value is intent the device doesn't have yet.
             if not sm.is_owned(obj.status):
@@ -2593,6 +2646,11 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
         if outformat not in ("native", "cli"):
             outformat = "native"
         device_diff = {}
+        # An EMPTY diff and an UNAVAILABLE diff are both {} on the wire, but they mean
+        # opposite things: "the device already matches this intent" vs "we have no idea".
+        # Every consumer that reads meaning INTO emptiness (the per-row "no device change"
+        # badge, the skip-the-confirm-modal gate) must therefore know which one it got.
+        diff_available = False
         if mgmt is not None and mgmt.adapter_device_id is not None:
             from . import adapter_client as client
 
@@ -2600,6 +2658,7 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
                 device_diff = (client.get_apply_diff(mgmt.adapter_device_id, outformat=outformat) or {}).get(
                     "diffs", {}
                 )
+                diff_available = True
             except Exception as exc:  # noqa: BLE001
                 logger.debug("apply-diff unavailable for device %s: %s", device_pk, exc)
 
@@ -2609,7 +2668,8 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
         # commits the FASTMAP service adoption. The dry-run diff is the ground truth for
         # that whole class (any registry omission included), so total==0 must be backed
         # by an EMPTY diff before the modal may be skipped. Pending rows always require
-        # confirmation — an unavailable adapter (device_diff={}) proves nothing.
+        # confirmation — an unavailable adapter (device_diff={}) proves nothing, which is
+        # why the gate demands diff_available and not merely an empty dict.
         total = len(changes) + len(routing_changes)
         return JsonResponse(
             {
@@ -2618,9 +2678,10 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
                 "routing_changes": routing_changes,
                 "routing": len(routing_changes),
                 "total": total,
-                "nothing_pending": total == 0 and not device_diff,
+                "nothing_pending": total == 0 and diff_available and not device_diff,
                 "outformat": outformat,
                 "device_diff": device_diff,
+                "diff_available": diff_available,
             }
         )
 
@@ -3314,8 +3375,21 @@ class OverlayStateAcceptMixin(NSOActionPermissionMixin, View):
 
     model_class = None
 
+    def push_blocker(self, state) -> str:
+        """Why accepting *state* could not be faithfully applied, or "" when it can.
+
+        Owning a row that the push must then skip is worse than refusing the accept: the
+        snapshot is a FULL-REPLACE, so the skipped row is a shrink the adapter detaches,
+        and the operator is left with a row that reads 'accepted' but was never applied.
+        """
+        return ""
+
     def post(self, request, pk):  # noqa: D102
         state = get_object_or_404(self.model_class, pk=pk)
+        blocker = self.push_blocker(state)
+        if blocker:
+            messages.error(request, f"Cannot accept {state}: {blocker}")
+            return redirect(_device_nso_tab_url(state.management.device_id))
         state.status = _status_after_accept(state.status)
         state.accepted_at = timezone.now()
         state.save(update_fields=["status", "accepted_at"])
@@ -3330,9 +3404,21 @@ class NSOSnmpCommunityStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
 class NSOSnmpV3UserStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOSnmpV3UserState
 
+    def push_blocker(self, state):
+        """Never let an accept downgrade a device-held authPriv user to noAuthNoPriv."""
+        from .signals import snmp_v3_user_push_blocker
+
+        return snmp_v3_user_push_blocker(state)
+
 
 class NSOSnmpHostStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOSnmpHostState
+
+    def push_blocker(self, state):
+        """v3 trap hosts have no username source on the overlay — not pushable."""
+        from .signals import snmp_host_push_blocker
+
+        return snmp_host_push_blocker(state)
 
 
 class NSOSnmpSystemInfoStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
@@ -3698,15 +3784,33 @@ class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
     converge on one identity. The BGPPeer save fires the greenfield signal, which owns an
     accepted NSOBGPPeerState overlay and pushes the (owned-only) BGP intent — written to
     the device on the next Apply.
+
+    Authorization is TWO-sided, because this view is a door into another app: the caller
+    must hold the netbox_routing add permission for the object graph it mints (the NSO
+    permission alone must not become a back-door grant to create routing objects), and the
+    target device is looked up through ``restrict()`` so an ObjectPermission scoped to a
+    subset of devices is honoured here as it is in NetBox's own object views.
     """
 
+    required_permission = (
+        "netbox_nso_plugin.change_nsodevicemanagement",
+        "netbox_routing.add_bgppeer",
+    )
+
+    @staticmethod
+    def _mgmt_for(request, device_pk):
+        return get_object_or_404(
+            NSODeviceManagement.objects.restrict(request.user, "change"),
+            device_id=device_pk,
+        )
+
     def get(self, request, device_pk):  # noqa: D102
-        mgmt = get_object_or_404(NSODeviceManagement, device_id=device_pk)
+        mgmt = self._mgmt_for(request, device_pk)
         form = NSOBgpPeerGreenfieldForm(device=mgmt.device)
         return render(request, "netbox_nso_plugin/bgp_peer_form.html", self._ctx(mgmt, form))
 
     def post(self, request, device_pk):  # noqa: D102
-        mgmt = get_object_or_404(NSODeviceManagement, device_id=device_pk)
+        mgmt = self._mgmt_for(request, device_pk)
         form = NSOBgpPeerGreenfieldForm(request.POST, device=mgmt.device)
         if not form.is_valid():
             return render(request, "netbox_nso_plugin/bgp_peer_form.html", self._ctx(mgmt, form))

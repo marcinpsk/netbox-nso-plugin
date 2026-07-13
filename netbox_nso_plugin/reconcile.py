@@ -608,6 +608,13 @@ def _escalate_stuck_deploying(mgmt, job: dict | None) -> None:
     history claims success. Callers must skip this while an apply is queued/running (its
     _prepare_apply just re-marked rows deploying; judging those by the OLD job's age
     would misfire).
+
+    Only scopes THIS job actually applied are judged. The job's result carries a
+    ``<scope>_count_by_outcome`` per scope it carried; a scope missing from it (or carrying
+    zero items) was never in this apply, so the job's success says nothing about that scope's
+    rows. Judging them anyway fabricated a failure — flipping, say, an in-flight route-policy
+    row to apply_failed with a "the NED dropped it silently" message about a job that had
+    only ever applied VLANs.
     """
     from django.utils import timezone
 
@@ -619,8 +626,12 @@ def _escalate_stuck_deploying(mgmt, job: dict | None) -> None:
     finished = _parse_adapter_ts(job.get("updated_at"))
     if finished is None or timezone.now() - finished < _stuck_deploying_grace():
         return
+    result = job.get("result") or {}
     detail = _STUCK_DEPLOYING_ERROR.format(job_id=job.get("id"))
-    for _scope, model_name in _APPLY_DEPLOYING_SCOPES.items():
+    for scope, model_name in _APPLY_DEPLOYING_SCOPES.items():
+        counts = result.get(f"{scope}_count_by_outcome") or {}
+        if sum(int(count or 0) for count in counts.values()) <= 0:
+            continue  # this job never applied this scope — it cannot testify about its rows
         model = getattr(models, model_name)
         for row in model.objects.filter(management=mgmt, status="deploying"):
             new_status = sm.on_apply_result(row.status, ok=False)
@@ -804,6 +815,37 @@ def run_device_reconcile(device_id: int) -> dict:
     return summary
 
 
+#: How long an RQ job tracked by NEITHER registry must have gone untouched before we treat
+#: it as an orphan and reclaim its id. Covers the worker HAND-OFF window (see below); an
+#: orphan from a dead worker is minutes-to-months stale, so it is still reclaimed promptly.
+_ORPHAN_RECLAIM_GRACE_S = 60
+
+
+def _job_recently_touched(job) -> bool:
+    """Whether *job* carries a fresh timestamp — i.e. it is mid-hand-off, not an orphan.
+
+    An RQ worker pops the job (it leaves ``queue.get_job_ids()``) and only then adds it to
+    ``StartedJobRegistry``. In between it is in NEITHER, and is indistinguishable from a job
+    orphaned by a dead worker. Reclaiming it there deletes a job that is about to run and
+    enqueues a second one, so two reconciles for the same device run CONCURRENTLY and race
+    on the overlay upserts (get_or_create → IntegrityError). Its timestamps are seconds old,
+    though, while a real orphan's are not — that is the distinction.
+    """
+    from datetime import UTC, datetime
+
+    stamps = [
+        getattr(job, "last_heartbeat", None),
+        getattr(job, "started_at", None),
+        getattr(job, "enqueued_at", None),
+    ]
+    latest = max((s for s in stamps if s is not None), default=None)
+    if latest is None:
+        return False
+    if latest.tzinfo is None:  # RQ historically stamped naive UTC
+        latest = latest.replace(tzinfo=UTC)
+    return (datetime.now(UTC) - latest).total_seconds() < _ORPHAN_RECLAIM_GRACE_S
+
+
 def enqueue_device_reconcile(device_id: int):
     """Enqueue a background reconcile for *device_id*, deduped per device.
 
@@ -839,5 +881,11 @@ def enqueue_device_reconcile(device_id: int):
         running = job_id in StartedJobRegistry(queue=queue).get_job_ids()
         if pending or running:
             return existing  # truly in flight — don't pile up
+        if _job_recently_touched(existing):
+            # In neither registry, but freshly stamped: a worker has just DEQUEUED it and has
+            # not yet registered it as started. Reclaiming here would run a SECOND reconcile
+            # for this device alongside the one about to start.
+            logger.debug("nso reconcile: job %s is mid-hand-off to a worker; not re-enqueuing", job_id)
+            return existing
         existing.delete()  # orphaned / finished / failed: clear so the id can be reused
     return queue.enqueue(run_device_reconcile, device_id, job_id=job_id, result_ttl=300, job_timeout=600)

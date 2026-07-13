@@ -233,12 +233,17 @@ class TestReconcileSnmpConfig(TestCase):
         empty["communities"], empty["v3_users"], empty["hosts"] = [], [], []
         _reconcile_snmp_config(self.device, empty)
 
-        # owned rows survived with status + vault_ref intact
+        # owned rows survived with vault_ref intact — and accepted/deploying keep their
+        # status, because that intent is not yet confirmed on the device anyway.
         row = NSOSnmpCommunityState.objects.get(community_hash="ef012345ef012345")
         self.assertEqual(row.status, "accepted")
         self.assertEqual(row.vault_ref, "network/netbox/snmp/community/ef012345ef012345#community")
         self.assertEqual(NSOSnmpV3UserState.objects.get(username="nms-user").status, "deploying")
-        self.assertEqual(NSOSnmpHostState.objects.get(address="10.0.0.100").status, "in_sync")
+        # ...but an APPLIED row the device has stopped reporting is drift, not "in sync".
+        # Surviving the refresh is only half the contract: without the present=False leg the
+        # row sat green forever while the config it describes had been removed out-of-band.
+        # (This assertion used to read `in_sync`.)
+        self.assertEqual(NSOSnmpHostState.objects.get(address="10.0.0.100").status, "changed")
         # the unowned imported community was still dropped
         self.assertFalse(NSOSnmpCommunityState.objects.filter(community_hash="abcd1234abcd1234").exists())
 

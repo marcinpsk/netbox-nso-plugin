@@ -34,6 +34,30 @@ def _device_vlan_group(device):
     return group
 
 
+def placeholder_vlan_name(vid) -> str:
+    """Return the name seeded for a device VLAN that has none.
+
+    NetBox's (group, name) unique constraint rejects a second name='' VLAN in the same
+    per-device group (live: the arcos ``vlans 5``/``6`` database, both nameless), so the
+    import has to invent something. It is a NetBox-side display placeholder, NOT operator
+    intent — :func:`netbox_nso_plugin.signals._push_vlan_intent_for_device` must not ship it
+    to the device as a name the VLAN never had.
+    """
+    return f"VLAN {vid}"
+
+
+def is_placeholder_vlan_name(row) -> bool:
+    """Whether *row*'s NetBox VLAN name is still the import-seeded placeholder.
+
+    True only when the DEVICE reported no name (``device_name == ""``) AND the NetBox name
+    is untouched — so an operator rename is always honoured. An operator who deliberately
+    types the exact placeholder string is indistinguishable from one who never renamed it;
+    that ambiguity resolves to "leave the device's VLAN name alone", the direction that
+    cannot write config the device never had.
+    """
+    return not row.device_name and row.vlan is not None and row.vlan.name == placeholder_vlan_name(row.vlan.vid)
+
+
 def _resolve_synced_vlan(management, group, vid, *, name=None, create=True):
     """Return the ipam.VLAN this device's *vid* is synced to.
 
@@ -53,12 +77,12 @@ def _resolve_synced_vlan(management, group, vid, *, name=None, create=True):
     if state is not None:
         return state.vlan
     if create:
-        # A nameless device VLAN (live: the arcos vlans 5/6 database) seeds a
-        # unique "VLAN <vid>" placeholder — NetBox's (group, name) unique
-        # constraint rejects a second name='' VLAN in the group. The drift logic
-        # treats a nameless device VLAN as always-matching, so the placeholder
-        # never reads back as drift.
-        return VLAN.objects.get_or_create(group=group, vid=vid, defaults={"name": name or f"VLAN {vid}"})[0]
+        # A nameless device VLAN seeds a unique placeholder (see placeholder_vlan_name).
+        # The drift logic treats a nameless device VLAN as always-matching, so the
+        # placeholder never reads back as drift.
+        return VLAN.objects.get_or_create(group=group, vid=vid, defaults={"name": name or placeholder_vlan_name(vid)})[
+            0
+        ]
     return VLAN.objects.filter(group=group, vid=vid).first()
 
 

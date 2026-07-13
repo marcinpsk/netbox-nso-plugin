@@ -1060,6 +1060,28 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             self.assertEqual(mock_put.call_args[0][1], [], "Deleted row must not appear in the push snapshot")
         return mock_put
 
+    def test_interface_state_delete_pushes_reduced_snapshot(self):
+        """NSOInterfaceState is the one family with single AND bulk overlay delete views, so
+        an operator can drop an owned description/enabled intent straight from the UI — but
+        only post_save was wired, so the reduced snapshot was never pushed and the adapter
+        kept applying the intent NetBox had just deleted."""
+        from netbox_nso_plugin.models import NSOInterfaceState
+
+        self._mgmt()  # links the device to the adapter (intent is keyed off the Interface FK)
+        self.iface.description = "owned-by-nso"
+        self.iface.save()
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_intent"),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            row = NSOInterfaceState.objects.create(
+                interface=self.iface,
+                attribute="description",
+                nso_value="owned-by-nso",
+                status="accepted",
+            )
+        self._delete_pushes(row, "put_intent")
+
     def test_vlan_delete_pushes_reduced_snapshot(self):
         from ipam.models import VLAN
 
@@ -1344,8 +1366,8 @@ class TestDeleteOriginMarking(_SignalDBBase):
             device=self.device, nso_instance=self.nso_instance, nso_device_name="core-rtr-01", adapter_device_id=43
         )
 
-    def _recorded_params(self, act):
-        """Run *act* with the adapter HTTP transport recorded → list of params dicts."""
+    def _recorded_calls(self, act):
+        """Run *act* with the adapter HTTP transport recorded → [(method, url, params), ...]."""
         from ._adapter_http import make_response, make_session
 
         session = make_session(response=make_response(200, json_data={}))
@@ -1355,7 +1377,11 @@ class TestDeleteOriginMarking(_SignalDBBase):
             self.captureOnCommitCallbacks(execute=True),
         ):
             act()
-        return [c.kwargs.get("params") or {} for c in session.request.call_args_list]
+        return [(c.args[0], c.args[1], c.kwargs.get("params") or {}) for c in session.request.call_args_list]
+
+    def _recorded_params(self, act):
+        """Run *act* with the adapter HTTP transport recorded → list of params dicts."""
+        return [params for _method, _url, params in self._recorded_calls(act)]
 
     def _owned_svi(self, mgmt):
         from ipam.models import VLAN
@@ -1418,3 +1444,73 @@ class TestDeleteOriginMarking(_SignalDBBase):
             any(p.get("delete_origin") == "true" for p in params),
             f"native-delete push must be marked delete_origin; saw params {params}",
         )
+
+    def test_assigning_a_device_to_a_static_route_is_unmarked(self):
+        """m2m_changed is not a deletion-only signal: it also carries post_add. Registering
+        the handler under _as_delete_origin stamped the ADD's push ?delete_origin=true —
+        authorizing the adapter to retract from the LIVE device any static route the
+        full-replace snapshot happens not to carry (e.g. one un-owned earlier).
+        """
+        from netbox_routing.models import StaticRoute
+
+        mgmt = self._mgmt()
+        route = StaticRoute.objects.create(prefix="198.18.88.0/24", next_hop="198.18.0.1", name="do-add", metric=1)
+
+        params = self._recorded_params(lambda: route.devices.add(mgmt.device))
+        self.assertTrue(params, "assigning the device must push the (grown) snapshot")
+        self.assertFalse(
+            any("delete_origin" in p for p in params),
+            f"an ADD is not a deletion — its push must stay unmarked; saw params {params}",
+        )
+
+    def test_unassigning_a_device_from_a_static_route_is_marked(self):
+        """post_remove IS a deletion — the reduced snapshot must still carry the mark."""
+        from netbox_routing.models import StaticRoute
+
+        mgmt = self._mgmt()
+        route = StaticRoute.objects.create(prefix="198.18.88.0/24", next_hop="198.18.0.1", name="do-rm", metric=1)
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_static_route_intent"),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            route.devices.add(mgmt.device)
+
+        params = self._recorded_params(lambda: route.devices.remove(mgmt.device))
+        self.assertTrue(params, "un-assigning the device must push the reduced snapshot")
+        self.assertTrue(
+            any(p.get("delete_origin") == "true" for p in params),
+            f"un-assigning is a deletion — its push must be marked; saw params {params}",
+        )
+
+    # ── teardown must never be read as a retraction ───────────────────────────
+    #
+    # Deleting NSODeviceManagement (unmanage) — or the Device, which CASCADEs into it —
+    # tears down every NSO*State overlay row. Each of those post_deletes is
+    # _as_delete_origin-wrapped, so an unguarded teardown schedules a push per scope that
+    # builds its snapshot from the now-EMPTY overlay and ships it as ?delete_origin=true:
+    # the adapter reads an authorized full-replace to nothing and retracts every NSO-owned
+    # service from the LIVE device. Unmanaging is a NetBox-side bookkeeping act — the only
+    # adapter call it may make is the offboard DELETE.
+
+    def _assert_teardown_touched_only_the_offboard(self, calls):
+        retracting = [(m, u, p) for m, u, p in calls if p.get("delete_origin") == "true"]
+        self.assertEqual(
+            retracting,
+            [],
+            f"teardown must never push a delete-origin snapshot (it would retract from the live device); saw {retracting}",
+        )
+        self.assertEqual(
+            [(m, u) for m, u, _p in calls],
+            [("DELETE", "http://adapter/api/v1/devices/43")],
+            f"the only adapter call for a teardown is the offboard DELETE; saw {calls}",
+        )
+
+    def test_unmanaging_a_device_pushes_no_intent(self):
+        mgmt = self._mgmt()
+        self._owned_svi(mgmt)
+        self._assert_teardown_touched_only_the_offboard(self._recorded_calls(mgmt.delete))
+
+    def test_deleting_a_device_pushes_no_intent(self):
+        mgmt = self._mgmt()
+        self._owned_svi(mgmt)
+        self._assert_teardown_touched_only_the_offboard(self._recorded_calls(self.device.delete))

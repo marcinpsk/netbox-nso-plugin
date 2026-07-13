@@ -154,7 +154,9 @@ class TestIntentDrift(IntentPushResetMixin, TestCase):
     def test_resync_calls_push_for_scope(self, mock_push):
         done = intent_drift.resync_intent(self.device, self.mgmt, ["interface_ip"])
         self.assertEqual(done, ["interface_ip"])
-        mock_push.assert_called_once_with(self.mgmt.device_id, 88)
+        # force=True: the split-brain re-sync must bypass _push_changed's unchanged-skip —
+        # the plugin's cached digest is precisely what is stale here (see TestResyncStoreOnly).
+        mock_push.assert_called_once_with(self.mgmt.device_id, 88, force=True)
 
     def test_resync_no_adapter_id_noop(self):
         self.mgmt.adapter_device_id = None
@@ -169,7 +171,7 @@ class TestIntentDrift(IntentPushResetMixin, TestCase):
         )
         done = intent_drift.resync_intent(self.device, self.mgmt)
         self.assertIn("interface_ip", done)
-        mock_push.assert_called_once_with(self.mgmt.device_id, 88)
+        mock_push.assert_called_once_with(self.mgmt.device_id, 88, force=True)
 
 
 class TestResyncStoreOnly(IntentPushResetMixin, TestCase):
@@ -221,3 +223,25 @@ class TestResyncStoreOnly(IntentPushResetMixin, TestCase):
         self.assertEqual(len(calls), 1)
         params = calls[0].kwargs.get("params") or {}
         self.assertNotIn("store_only", params)
+
+    def test_resync_pushes_even_when_the_hash_cache_says_unchanged(self):
+        """The split-brain re-sync exists for: the ADAPTER lost the intent while the plugin
+        still holds the digest of its last (successful) push in the process-global
+        _last_pushed_hashes. That is exactly the state _push_changed reads as "unchanged,
+        skip" — so without force=True the re-sync silently pushed NOTHING while the view
+        reported success, and the operator's split-brain was never repaired.
+        """
+        from netbox_nso_plugin.signals import _push_logging_intent_for_device
+
+        # Prime the cache the way a normal, successful push would.
+        primed = self._recorded_requests(lambda: _push_logging_intent_for_device(self.device.pk, 91))
+        self.assertEqual(len(primed), 1)
+
+        # A second identical ordinary push is correctly skipped as unchanged...
+        again = self._recorded_requests(lambda: _push_logging_intent_for_device(self.device.pk, 91))
+        self.assertEqual(len(again), 0, "an unchanged ordinary push is still skipped")
+
+        # ...but the re-sync must go out regardless.
+        calls = self._recorded_requests(lambda: intent_drift.resync_intent(self.device, self.mgmt, ["logging"]))
+        self.assertEqual(len(calls), 1, "the re-sync must push even when the payload digest is unchanged")
+        self.assertEqual((calls[0].kwargs.get("params") or {}).get("store_only"), "true")

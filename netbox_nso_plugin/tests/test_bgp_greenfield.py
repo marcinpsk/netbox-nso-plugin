@@ -343,6 +343,35 @@ class TestBgpPeerAddView(BgpGreenfieldBase):
         resp = self.client.get(url)
         self.assertEqual(resp.status_code, 403)
 
+    def test_add_peer_also_requires_the_netbox_routing_permission(self):
+        """This view is a door into ANOTHER app: it mints a BGPRouter→BGPScope→BGPPeer graph
+        in netbox_routing. Gating it on the NSO permission alone turned that permission into
+        a back-door grant to create routing objects — a user who may manage NSO devices but
+        was never given netbox_routing rights could still create BGP peers.
+        """
+        from core.models import ObjectType
+        from netbox_routing.models import BGPPeer
+        from users.models import ObjectPermission, User
+
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        self._mgmt()
+        user = User.objects.create_user("bgpgfnsoonly")
+        nso_perm = ObjectPermission.objects.create(name="bgpgf-change-mgmt", actions=["change"])
+        nso_perm.object_types.add(ObjectType.objects.get_for_model(NSODeviceManagement))
+        nso_perm.users.add(user)
+        self.client.force_login(user)
+        url = reverse("plugins:netbox_nso_plugin:bgp_peer_add", kwargs={"device_pk": self.device.pk})
+
+        self.assertEqual(self.client.get(url).status_code, 403, "the NSO permission alone must not open this view")
+
+        routing_perm = ObjectPermission.objects.create(name="bgpgf-add-peer", actions=["add"])
+        routing_perm.object_types.add(ObjectType.objects.get_for_model(BGPPeer))
+        routing_perm.users.add(user)
+        self.client.force_login(User.objects.get(pk=user.pk))  # drop the cached permission set
+
+        self.assertEqual(self.client.get(url).status_code, 200, "both permissions together must open it")
+
 
 class TestBgpPeerAddViewPushCarriesAf(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     """The greenfield push MUST carry the peer's address-family activation.

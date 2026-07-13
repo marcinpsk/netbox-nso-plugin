@@ -500,6 +500,60 @@ def _reconcile_interface_ips(device, payload: dict) -> list:
     return list(NSOInterfaceIPState.objects.filter(interface__device=device).select_related("interface"))
 
 
+def _retire_absent_snmp_rows(model, mgmt, key_field, incoming):
+    """Handle rows the device stopped reporting: delete unowned mirrors, DRIFT owned ones.
+
+    Excluding owned rows from the stale delete (so a just-accepted row is not destroyed
+    mid-flight) is only half the contract. Without the ``present=False`` leg the other half
+    was missing: an OWNED community/user/host that the device no longer reports kept whatever
+    status it had — an applied row sat at ``in_sync``, green, forever, even though the config
+    had been removed out-of-band. Every other family (VLAN, IP, interface) already drifts
+    these to ``changed``; SNMP now does too.
+    """
+    absent = model.objects.filter(management=mgmt).exclude(**{f"{key_field}__in": incoming})
+    absent.exclude(status__in=sm.OWNED_STATES).delete()
+    for row in absent.filter(status__in=sm.OWNED_STATES):
+        new_status = sm.on_reconcile(row.status, present=False)
+        if new_status != row.status:
+            row.status = new_status
+            row.save(update_fields=["status"])
+
+
+def _reconcile_snmp_system_info(mgmt, sys_data: dict, now):
+    """Reconcile the SNMP system-info singleton; return the row (or None when there is none).
+
+    An empty ``sys_data`` is the singleton form of "the device stopped reporting it": an
+    OWNED row must drift rather than keep reading in_sync (see _retire_absent_snmp_rows).
+    """
+    from .models import NSOSnmpSystemInfoState
+
+    if not sys_data:
+        owned = NSOSnmpSystemInfoState.objects.filter(management=mgmt, status__in=sm.OWNED_STATES).first()
+        if owned is None:
+            return None
+        new_status = sm.on_reconcile(owned.status, present=False)
+        if new_status != owned.status:
+            owned.status = new_status
+            owned.save(update_fields=["status"])
+        return owned
+
+    state, _ = NSOSnmpSystemInfoState.objects.get_or_create(management=mgmt)
+    dev_location = sys_data.get("location") or ""
+    dev_contact = sys_data.get("contact") or ""
+    state.last_sync_at = now
+    if sm.is_owned(state.status):
+        # Owned: location/contact are operator intent — never clobber with the
+        # device read; settle accepted → in_sync only when the device matches.
+        matches = state.location == dev_location and state.contact == dev_contact
+        state.status = sm.on_reconcile(state.status, matches=matches)
+    else:
+        state.location = dev_location
+        state.contact = dev_contact
+        state.status = sm.on_reconcile(state.status, matches=None)
+    state.save()
+    return state
+
+
 def _reconcile_snmp_config(device, payload: dict) -> dict:
     """Full-replace import of SNMP config from adapter into plugin SNMP state models.
 
@@ -518,7 +572,6 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
         NSODeviceManagement,
         NSOSnmpCommunityState,
         NSOSnmpHostState,
-        NSOSnmpSystemInfoState,
         NSOSnmpV3UserState,
     )
 
@@ -560,10 +613,9 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
         state.save()
     # Owned rows absent from the payload must SURVIVE (an operator-created or
     # just-rotated row would otherwise lose its vault_ref/status mid-flight
-    # between Accept and the device reporting the new value).
-    NSOSnmpCommunityState.objects.filter(management=mgmt).exclude(community_hash__in=incoming_community_hashes).exclude(
-        status__in=sm.OWNED_STATES
-    ).delete()
+    # between Accept and the device reporting the new value) — but they must DRIFT,
+    # not stay green: see _retire_absent_snmp_rows.
+    _retire_absent_snmp_rows(NSOSnmpCommunityState, mgmt, "community_hash", incoming_community_hashes)
 
     # ── V3 users ───────────────────────────────────────────────────────────────
     incoming_usernames = set()
@@ -578,9 +630,7 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
         state.last_sync_at = now
         state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
         state.save()
-    NSOSnmpV3UserState.objects.filter(management=mgmt).exclude(username__in=incoming_usernames).exclude(
-        status__in=sm.OWNED_STATES
-    ).delete()
+    _retire_absent_snmp_rows(NSOSnmpV3UserState, mgmt, "username", incoming_usernames)
 
     # ── Hosts ──────────────────────────────────────────────────────────────────
     incoming_addresses = set()
@@ -607,28 +657,9 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
                 setattr(state, f, v)
             state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
         state.save()
-    NSOSnmpHostState.objects.filter(management=mgmt).exclude(address__in=incoming_addresses).exclude(
-        status__in=sm.OWNED_STATES
-    ).delete()
+    _retire_absent_snmp_rows(NSOSnmpHostState, mgmt, "address", incoming_addresses)
 
-    # ── System info ────────────────────────────────────────────────────────────
-    sys_data = payload.get("system_info") or {}
-    system_info_state = None
-    if sys_data:
-        system_info_state, _ = NSOSnmpSystemInfoState.objects.get_or_create(management=mgmt)
-        dev_location = sys_data.get("location") or ""
-        dev_contact = sys_data.get("contact") or ""
-        system_info_state.last_sync_at = now
-        if sm.is_owned(system_info_state.status):
-            # Owned: location/contact are operator intent — never clobber with the
-            # device read; settle accepted → in_sync only when the device matches.
-            matches = system_info_state.location == dev_location and system_info_state.contact == dev_contact
-            system_info_state.status = sm.on_reconcile(system_info_state.status, matches=matches)
-        else:
-            system_info_state.location = dev_location
-            system_info_state.contact = dev_contact
-            system_info_state.status = sm.on_reconcile(system_info_state.status, matches=None)
-        system_info_state.save()
+    system_info_state = _reconcile_snmp_system_info(mgmt, payload.get("system_info") or {}, now)
 
     return {
         "communities": list(NSOSnmpCommunityState.objects.filter(management=mgmt)),

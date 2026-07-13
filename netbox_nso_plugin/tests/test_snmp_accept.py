@@ -118,3 +118,147 @@ class TestSnmpApplyPreview(_SnmpBase):
         resp = self.client.get(f"/plugins/nso/devices/{self.device.pk}/apply-preview/")
         assert resp.status_code == 200
         assert resp.json()["routing"] >= 1
+
+
+class TestSnmpUnpushableRowsAreRefusedNotDowngraded(_SnmpBase):
+    """A FULL-REPLACE snapshot has no way to say "leave this one alone": a row the push
+    skips is a shrink the adapter detaches, and a row pushed with missing fields REWRITES
+    the device with those fields absent. So a row that cannot be faithfully pushed must be
+    refused at accept and surfaced — never accepted-then-silently-dropped, and never
+    pushed in a degraded form.
+    """
+
+    def _v3_user(self, mgmt, **kwargs):
+        from netbox_nso_plugin.models import NSOSnmpV3UserState
+
+        fields = {
+            "management": mgmt,
+            "username": "nms-ro",
+            "has_auth_secret": True,
+            "has_priv_secret": True,
+            "vault_ref": "network/netbox/snmp/v3/nms",
+            "status": "imported",
+        }
+        fields.update(kwargs)
+        return NSOSnmpV3UserState.objects.create(**fields)
+
+    def _host(self, mgmt, **kwargs):
+        from netbox_nso_plugin.models import NSOSnmpHostState
+
+        fields = {
+            "management": mgmt,
+            "address": "198.18.9.9",
+            "version": "v3",
+            "notify_type": "trap",
+            "status": "imported",
+        }
+        fields.update(kwargs)
+        return NSOSnmpHostState.objects.create(**fields)
+
+    def test_accepting_a_v3_user_without_its_protocols_is_refused(self):
+        """The read mirror reports only THAT the device holds auth/priv secrets, never which
+        protocols — so an imported v3 user always arrives with auth_protocol=''. Accepting it
+        as-is pushed auth_protocol=null and the apply rewrote an authPriv user as
+        noAuthNoPriv: a silent security downgrade of the live device."""
+        from netbox_nso_plugin.signals import reset_intent_push_state
+
+        mgmt = self._make_mgmt()
+        user = self._v3_user(mgmt)
+        self.client.force_login(_superuser())
+        reset_intent_push_state()
+
+        # Drain on_commit, or "no push happened" would be true no matter what the view did.
+        with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
+            with self.captureOnCommitCallbacks(execute=True):
+                resp = self.client.post(f"/plugins/nso/snmp/v3-user-state/{user.pk}/accept/")
+
+        assert resp.status_code == 302
+        user.refresh_from_db()
+        assert user.status == "imported", f"the accept must be refused, not recorded (status={user.status})"
+        mock_put.assert_not_called()
+
+    def test_accepting_a_v3_user_with_its_protocols_declared_pushes_them(self):
+        from netbox_nso_plugin.signals import reset_intent_push_state
+
+        mgmt = self._make_mgmt()
+        user = self._v3_user(mgmt, auth_protocol="sha", priv_protocol="aes-128")
+        self.client.force_login(_superuser())
+        # Creating the row already fired the real signal (coalesced on the rolled-back test
+        # txn); clear that stale coalescing state, then drain this accept's on_commit push.
+        reset_intent_push_state()
+
+        with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
+            with self.captureOnCommitCallbacks(execute=True):
+                resp = self.client.post(f"/plugins/nso/snmp/v3-user-state/{user.pk}/accept/")
+
+        assert resp.status_code == 302
+        user.refresh_from_db()
+        # Accepting a row that already MATCHES the device lands in_sync — still an owned
+        # status, so it is pushed to record ownership (_status_after_accept).
+        assert user.status == "in_sync"
+        mock_put.assert_called_once()
+        pushed = mock_put.call_args[0][2]  # (adapter_device_id, communities, v3_users, ...)
+        assert pushed == [
+            {
+                "username": "nms-ro",
+                "group": None,
+                "auth_protocol": "sha",
+                "priv_protocol": "aes-128",
+                "auth_vault_ref": "network/netbox/snmp/v3/nms#auth",
+                "priv_vault_ref": "network/netbox/snmp/v3/nms#priv",
+            }
+        ]
+
+    def test_an_already_owned_v3_user_missing_protocols_is_never_pushed_degraded(self):
+        """Defence in depth for rows owned before the accept-time guard existed (or via the
+        API): the snapshot builder must drop them AND surface them, not emit a null protocol."""
+        from netbox_nso_plugin.signals import _push_snmp_intent_for_device
+
+        mgmt = self._make_mgmt()
+        user = self._v3_user(mgmt, status="accepted")  # owned, protocols never declared
+
+        with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
+            _push_snmp_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+
+        mock_put.assert_called_once()
+        assert mock_put.call_args[0][2] == [], "a protocol-less v3 user must not reach the device"
+        user.refresh_from_db()
+        assert user.status == "error", f"the dropped row must be surfaced, not left green (status={user.status})"
+
+    def test_accepting_a_v3_trap_host_is_refused(self):
+        """The host overlay has no v3 username source, so a v3 host can only ever be pushed
+        keyed on an empty user. It used to accept, then be dropped with a server-side log
+        line — leaving a row that read 'accepted' forever while nothing was applied."""
+        from netbox_nso_plugin.signals import reset_intent_push_state
+
+        mgmt = self._make_mgmt()
+        host = self._host(mgmt)
+        self.client.force_login(_superuser())
+        reset_intent_push_state()
+
+        with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
+            with self.captureOnCommitCallbacks(execute=True):
+                resp = self.client.post(f"/plugins/nso/snmp/host-state/{host.pk}/accept/")
+
+        assert resp.status_code == 302
+        host.refresh_from_db()
+        assert host.status == "imported", f"the accept must be refused (status={host.status})"
+        mock_put.assert_not_called()
+
+    def test_a_v2c_trap_host_still_accepts_and_pushes(self):
+        from netbox_nso_plugin.signals import reset_intent_push_state
+
+        mgmt = self._make_mgmt()
+        host = self._host(mgmt, version="v2c", community_hash="abcd1234abcd1234")
+        self.client.force_login(_superuser())
+        reset_intent_push_state()  # drop the coalescing state left by the row creation
+
+        with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
+            with self.captureOnCommitCallbacks(execute=True):
+                resp = self.client.post(f"/plugins/nso/snmp/host-state/{host.pk}/accept/")
+
+        assert resp.status_code == 302
+        host.refresh_from_db()
+        assert host.status == "in_sync"  # accepted-as-matching is still owned
+        mock_put.assert_called_once()
+        assert [h["address"] for h in mock_put.call_args[0][3]] == ["198.18.9.9"]

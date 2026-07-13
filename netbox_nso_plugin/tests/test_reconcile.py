@@ -228,6 +228,50 @@ class TestEscalateStuckDeploying(APITestCase):
         row.refresh_from_db()
         self.assertEqual(row.status, "deploying")
 
+    def test_a_scope_the_job_never_applied_is_not_escalated(self):
+        """The escalation used to flip EVERY deploying row in all 8 scopes purely on the AGE
+        of the last terminal apply — with nothing tying that job to those rows. A job that
+        only ever applied VLANs would fabricate a failure on an in-flight route-policy row,
+        with a message blaming the NED for silently dropping a value that job never carried.
+        The job's own per-scope outcome counts are the linkage.
+        """
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.reconcile import _escalate_stuck_deploying
+
+        mgmt, vlan_row = self._setup()
+        rp = NSORoutePolicyState.objects.create(
+            management=mgmt,
+            family="route_map",
+            object_name="RM-STUCK",
+            status="deploying",
+        )
+
+        # The job carried VLANs only — no route_policy_count_by_outcome at all.
+        _escalate_stuck_deploying(mgmt, self._job(minutes_ago=30))
+
+        vlan_row.refresh_from_db()
+        rp.refresh_from_db()
+        self.assertEqual(vlan_row.status, "apply_failed", "the scope the job DID apply still escalates")
+        self.assertEqual(rp.status, "deploying", "a scope this job never applied must not be judged by it")
+        self.assertFalse(rp.last_apply_error, "and no failure may be fabricated on it")
+
+    def test_a_scope_the_job_applied_with_zero_items_is_not_escalated(self):
+        """An empty count block means the job carried nothing for that scope either."""
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.reconcile import _escalate_stuck_deploying
+
+        mgmt, _vlan_row = self._setup()
+        rp = NSORoutePolicyState.objects.create(
+            management=mgmt, family="route_map", object_name="RM-EMPTY", status="deploying"
+        )
+        job = self._job(minutes_ago=30)
+        job["result"]["route_policy_count_by_outcome"] = {"in_sync": 0, "apply_failed": 0}
+
+        _escalate_stuck_deploying(mgmt, job)
+
+        rp.refresh_from_db()
+        self.assertEqual(rp.status, "deploying")
+
     def test_run_device_reconcile_escalates_after_grace(self):
         from netbox_nso_plugin import reconcile
 
@@ -727,13 +771,31 @@ class TestEnqueueDeviceReconcileOrphanRecovery(TestCase):
             pass
         q.empty()
 
+    def _stale(self, job, hours=1):
+        """Age *job*'s timestamps — a real orphan has gone untouched for a long time.
+
+        Freshness is the ONLY thing separating an orphan from a job a worker has just
+        dequeued and not yet registered as started: by registry membership alone the two are
+        identical (in neither). So an orphan fixture that is seconds old is not an orphan
+        fixture at all.
+        """
+        from datetime import UTC, datetime, timedelta
+
+        old = datetime.now(UTC) - timedelta(hours=hours)
+        job.enqueued_at = old
+        job.started_at = None
+        job.last_heartbeat = old
+        job.save()
+        return job
+
     def test_orphaned_job_is_cleared_and_reconcile_re_enqueued(self):
         from netbox_nso_plugin.reconcile import enqueue_device_reconcile, run_device_reconcile
 
         q = self._queue()
         # Build an orphan exactly like a worker that died after dequeue: the job hash persists with
-        # a stale 'queued' status, but it's no longer in the pending list.
-        orphan = q.enqueue(run_device_reconcile, self._DEV, job_id=self._JOB_ID)
+        # a stale 'queued' status, but it's no longer in the pending list — and nothing has touched
+        # it since (live: an nso-reconcile-<id> stuck 'queued' for a month).
+        orphan = self._stale(q.enqueue(run_device_reconcile, self._DEV, job_id=self._JOB_ID))
         q.remove(orphan.id)
         self.assertNotIn(self._JOB_ID, q.get_job_ids())  # orphaned: fetchable but not pending
 
@@ -745,6 +807,31 @@ class TestEnqueueDeviceReconcileOrphanRecovery(TestCase):
         self.assertIsNotNone(job)
         self.assertEqual(job.id, self._JOB_ID)
         self.assertIn(self._JOB_ID, q.get_job_ids())
+
+    def test_a_job_mid_handoff_to_a_worker_is_not_reclaimed(self):
+        """An RQ worker POPS the job (it leaves the pending queue) and only then adds it to
+        StartedJobRegistry. In between it is in NEITHER — by registry membership alone it is
+        indistinguishable from an orphan. Reclaiming it there deletes a job that is about to
+        run and enqueues a second one, so two reconciles for the same device run CONCURRENTLY
+        and race on the overlay upserts (get_or_create → IntegrityError). Its timestamps are
+        seconds old, which is exactly what an orphan's are not.
+        """
+        from netbox_nso_plugin.reconcile import enqueue_device_reconcile, run_device_reconcile
+
+        q = self._queue()
+        job = q.enqueue(run_device_reconcile, self._DEV, job_id=self._JOB_ID)
+        q.remove(job.id)  # the worker has just popped it; it has not registered it yet
+        self.assertNotIn(self._JOB_ID, q.get_job_ids())
+
+        with patch("django_rq.get_queue", return_value=q):
+            returned = enqueue_device_reconcile(self._DEV)
+
+        self.assertEqual(returned.id, self._JOB_ID)
+        self.assertNotIn(
+            self._JOB_ID,
+            q.get_job_ids(),
+            "a second reconcile must not be enqueued behind the worker's back",
+        )
 
     def test_genuinely_queued_job_is_not_duplicated(self):
         """A truly-pending reconcile is still deduped (no pile-up) — the fix must not regress that."""

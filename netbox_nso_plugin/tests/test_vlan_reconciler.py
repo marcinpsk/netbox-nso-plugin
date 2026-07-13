@@ -65,6 +65,53 @@ class TestVlanReconciler(TestCase):
         self.assertEqual(VLAN.objects.get(group=group, vid=5).name, "VLAN 5")
         self.assertEqual(VLAN.objects.get(group=group, vid=6).name, "VLAN 6")
 
+    def test_the_placeholder_name_is_never_pushed_to_the_device(self):
+        """The 'VLAN <vid>' name is a NetBox display placeholder invented at import for a
+        NAMELESS device VLAN — not operator intent. Pushing it verbatim made Apply write a
+        name the device never had. The writer omits an empty name, so the placeholder must
+        go out as ''.
+        """
+        from unittest.mock import patch
+
+        from netbox_nso_plugin.signals import _push_vlan_intent_for_device
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+
+        self.management.adapter_device_id = 42
+        self.management.save()
+        rows = reconcile_vlan_database(
+            self.device, {"vlans": [{"vlan_id": 5, "name": ""}, {"vlan_id": 7, "name": "V7"}]}
+        )
+        for row in rows:  # the operator accepts both, renaming neither
+            row.status = "accepted"
+            row.save()
+
+        with patch("netbox_nso_plugin.adapter_client.put_vlan_intent") as mock_put:
+            _push_vlan_intent_for_device(self.device.pk, 42, force=True)
+
+        pushed = {v["vlan_id"]: v["name"] for v in mock_put.call_args[0][1]}
+        self.assertEqual(pushed[5], "", "the fabricated placeholder must not be pushed as a device VLAN name")
+        self.assertEqual(pushed[7], "V7", "a real device name still round-trips")
+
+    def test_an_operator_rename_of_a_nameless_vlan_is_pushed(self):
+        """The suppression keys on the name being UNTOUCHED — a rename is real intent."""
+        from unittest.mock import patch
+
+        from netbox_nso_plugin.signals import _push_vlan_intent_for_device
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+
+        self.management.adapter_device_id = 42
+        self.management.save()
+        (row,) = reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 5, "name": ""}]})
+        row.vlan.name = "STORAGE"
+        row.vlan.save()
+        row.status = "accepted"
+        row.save()
+
+        with patch("netbox_nso_plugin.adapter_client.put_vlan_intent") as mock_put:
+            _push_vlan_intent_for_device(self.device.pk, 42, force=True)
+
+        self.assertEqual(mock_put.call_args[0][1], [{"vlan_id": 5, "name": "STORAGE"}])
+
     def test_operator_rename_is_drift_not_clobbered(self):
         """Renaming a VLAN in NetBox must surface as drift, not be reverted to the device name."""
         from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database

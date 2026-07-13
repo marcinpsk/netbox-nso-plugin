@@ -586,7 +586,11 @@
         d.routing_changes.forEach(function (c) {
           // A staged row whose scope produced NO dry-run delta is already satisfied on
           // the device (or unrepresentable on the NED) — say so instead of implying a push.
-          var satisfied = c.scope && diffScopes.indexOf(c.scope) === -1;
+          // But ONLY when a dry-run actually ran: if it threw (adapter down, NSO busy) the
+          // server also sends device_diff={}, and reading that as "no device change" told
+          // the operator every staged row already matched the device — the one moment the
+          // panel knows least is the one it sounded most certain.
+          var satisfied = d.diff_available && c.scope && diffScopes.indexOf(c.scope) === -1;
           if (!satisfied && c.scope === 'route_policy' && c.item && c.item.length >= 3) {
             // Shared-object scope: several policies ride ONE diff — flag the individual
             // object when its name is absent (boundary-guarded so cnad-test does not
@@ -659,7 +663,10 @@
       var diff = d.device_diff || {};
       var keys = Object.keys(diff);
       if (!keys.length) {
-        return '<p class="text-muted mb-0">No device change — the intent already matches the device (or the diff is unavailable).</p>';
+        if (!d.diff_available) {
+          return '<p class="text-warning mb-0"><span class="mdi mdi-alert-outline me-1"></span>The NSO dry-run could not be run (the adapter or NSO did not answer), so what this Apply would change on the device is <strong>unknown</strong>. Retry before applying.</p>';
+        }
+        return '<p class="text-muted mb-0">No device change — the intent already matches the device.</p>';
       }
       if (d.outformat === 'cli' && window.Diff2Html) {
         var unified = keys.map(function (k) {
