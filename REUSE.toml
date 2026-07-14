@@ -13,6 +13,8 @@ path = [
     ".gitignore",
     ".envrc",
     ".editorconfig",
+    "package.json",
+    "package-lock.json",
     ".devcontainer/devcontainer.json",
     ".devcontainer/.env.example",
     ".github/copilot-instructions.md",
