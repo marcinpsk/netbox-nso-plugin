@@ -3449,3 +3449,94 @@ class TestGridCategoryPayloads(ViewTestBase):
                 self.assertEqual(resp.status_code, 200)
                 # A multi-line {# #} comment renders as literal text (the CR-P16 leak).
                 self.assertNotIn("{#", resp.content.decode())
+
+
+class TestUnlinkedReconcileOnExpandCategories(ViewTestBase):
+    """The six reconcile-on-expand categories must render PERSISTED rows when the
+    reconcile cannot run — an unlinked device (adapter_device_id is None) or a dead
+    adapter. reconcile_category yields an empty context in both cases, and a panel
+    keyed off that context claims "nothing configured" while NetBox is holding rows:
+    the operator watches their accepted config vanish. The grids already render from
+    persisted state (TestBfdGrid.test_unlinked_device_still_shows_persisted_rows);
+    these six were left on the old path.
+    """
+
+    # category -> (row marker that must render, empty-state text that must not)
+    CASES = {
+        "interface_ips": ("192.0.2.5/30", "No interface IP addresses reported"),
+        "interface_mtu": ("9111", "No interface MTU reported"),
+        "lacp": ("Po1", "No LACP bundles reported"),
+        "logging": ("192.0.2.99", "No remote syslog servers configured"),
+        "snmp": ("abcd1234abcd1234", "No SNMP configuration"),
+        "switchport": ("Gi0/11", "No switchports reported"),
+    }
+
+    @classmethod
+    def setUpTestData(cls):
+        super().setUpTestData()
+        from netbox_nso_plugin.models import (
+            NSOInterfaceIPState,
+            NSOInterfaceMtuState,
+            NSOLACPBundleState,
+            NSOLACPMemberState,
+            NSOLoggingHostState,
+            NSOSnmpCommunityState,
+            NSOSwitchportState,
+        )
+
+        cls.gi = Interface.objects.create(device=cls.device, name="Gi0/11", type="1000base-t")
+        cls.lag = Interface.objects.create(device=cls.device, name="Po1", type="lag")
+        NSOInterfaceIPState.objects.create(interface=cls.gi, address="192.0.2.5/30", family="ipv4", status="imported")
+        NSOInterfaceMtuState.objects.create(management=cls.mgmt, interface=cls.gi, l2_mtu=9111, status="imported")
+        NSOLACPBundleState.objects.create(
+            management=cls.mgmt, interface=cls.lag, lag_id=1, min_links=2, status="imported"
+        )
+        NSOLACPMemberState.objects.create(
+            management=cls.mgmt, interface=cls.gi, lag_bundle=cls.lag, mode="active", status="imported"
+        )
+        NSOLoggingHostState.objects.create(
+            management=cls.mgmt, address="192.0.2.99", severity="warning", status="imported"
+        )
+        NSOSnmpCommunityState.objects.create(
+            management=cls.mgmt, community_hash="abcd1234abcd1234", access="RO", status="imported"
+        )
+        NSOSwitchportState.objects.create(management=cls.mgmt, interface=cls.gi, mode="access", status="imported")
+
+    def _get(self, key):
+        url = reverse("plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device.pk, "key": key})
+        return self.client.get(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+
+    def test_unlinked_device_renders_persisted_rows_not_empty(self):
+        self.assertIsNone(self.mgmt.adapter_device_id)  # the precondition under test
+
+        for key, (marker, empty_msg) in self.CASES.items():
+            with self.subTest(category=key):
+                resp = self._get(key)
+                self.assertEqual(resp.status_code, 200)
+                body = resp.content.decode()
+                self.assertNotIn(empty_msg, body)
+                self.assertIn(marker, body)
+
+    def test_lacp_members_render_under_their_bundle(self):
+        """The member sub-loop reads a reverse relation off the LAG interface — a
+        DB-only rebuild must reach it (bundle -> interface -> member rows)."""
+        self.assertIsNone(self.mgmt.adapter_device_id)
+        body = self._get("lacp").content.decode()
+        self.assertIn("Gi0/11", body)  # the member row, not just the bundle
+
+    def test_adapter_error_still_renders_persisted_rows(self):
+        """Adapter down on a LINKED device is the same bug: the error banner must not
+        come with a false 'nothing configured' underneath it."""
+        self.mgmt.adapter_device_id = 4242
+        self.mgmt.save()
+
+        with patch(
+            "netbox_nso_plugin.adapter_client.get_logging_config",
+            side_effect=AdapterError("adapter is down", code="unreachable"),
+        ):
+            resp = self._get("logging")
+
+        body = resp.content.decode()
+        self.assertIn("adapter is down", body)  # the banner
+        self.assertNotIn("No remote syslog servers configured", body)
+        self.assertIn("192.0.2.99", body)  # persisted rows still render

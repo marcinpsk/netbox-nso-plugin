@@ -288,6 +288,90 @@ def _ctx_has_unowned(ctx) -> bool:
     return False
 
 
+def _persisted_category_context(device, mgmt, key: str) -> dict:
+    """Build a reconcile-on-expand category's display context from persisted state only.
+
+    What renders when the reconcile cannot run: the device is unlinked
+    (adapter_device_id is None) or the adapter errored. reconcile_category
+    returns an empty context in both cases, and a panel keyed off that context
+    reads "nothing configured" while NetBox is holding rows for it — an operator
+    who unlinks a device watches their accepted config vanish. The grid
+    categories already render from persisted state for exactly this reason
+    (_grid_payload); these are the remaining server-rendered panels. Every value
+    the six templates render is a model column, so the DB can serve all of it.
+    """
+    from .models import (
+        NSOInterfaceIPState,
+        NSOInterfaceMtuState,
+        NSOLACPBundleState,
+        NSOLoggingHostState,
+        NSOSnmpCommunityState,
+        NSOSnmpHostState,
+        NSOSnmpSystemInfoState,
+        NSOSnmpV3UserState,
+        NSOSwitchportState,
+    )
+
+    def by_mgmt(model, *related):
+        if mgmt is None:
+            return []
+        qs = model.objects.filter(management=mgmt)
+        return list(qs.select_related(*related) if related else qs)
+
+    if key == "interface_ips":
+        # Keyed on interface, not management — the one overlay that survives even
+        # a deleted management row.
+        return {
+            "interface_ips": list(
+                NSOInterfaceIPState.objects.filter(interface__device=device).select_related("interface")
+            )
+        }
+    if key == "interface_mtu":
+        return {"interface_mtu_states": by_mgmt(NSOInterfaceMtuState, "interface")}
+    if key == "lacp":
+        bundles = (
+            []
+            if mgmt is None
+            else list(
+                NSOLACPBundleState.objects.filter(management=mgmt)
+                .select_related("interface")
+                # The template lists members via bundle.interface.nso_lacp_member_bundles.
+                .prefetch_related("interface__nso_lacp_member_bundles__interface")
+            )
+        )
+        return {"lacp_bundle_states": bundles}
+    if key == "logging":
+        return {"logging_data": {"hosts": by_mgmt(NSOLoggingHostState)}}
+    if key == "snmp":
+        # snmp_value_compare is device-platform-derived, not payload-derived — without
+        # it the Vault/Harvest affordances silently degrade.
+        from .template_content import _snmp_value_compare_supported
+
+        return {
+            "snmp_data": {
+                "communities": by_mgmt(NSOSnmpCommunityState),
+                "v3_users": by_mgmt(NSOSnmpV3UserState),
+                "hosts": by_mgmt(NSOSnmpHostState),
+                "system_info": (
+                    NSOSnmpSystemInfoState.objects.filter(management=mgmt).first() if mgmt is not None else None
+                ),
+                "snmp_value_compare": _snmp_value_compare_supported(device),
+            }
+        }
+    if key == "switchport":
+        states = (
+            []
+            if mgmt is None
+            else list(
+                NSOSwitchportState.objects.filter(management=mgmt)
+                .select_related("interface", "untagged_vlan")
+                .prefetch_related("tagged_vlans")
+            )
+        )
+        return {"switchport_states": states}
+    return {}
+
+
 class NSOCategoryCountsView(LoginRequiredMixin, View):
     """JSON of every category's live counts for the device NSO tab.
 
@@ -466,6 +550,12 @@ class NSOCategoryView(LoginRequiredMixin, View):
             except AdapterError as exc:
                 ctx["adapter_error"] = str(exc)
                 ctx["adapter_error_code"] = exc.code
+                # The banner explains the failed refresh; the rows must not vanish
+                # with it — render last-synced state underneath.
+                ctx.update(_persisted_category_context(device, mgmt, key))
+        else:
+            # Unlinked device: nothing to reconcile, but NetBox still holds state.
+            ctx.update(_persisted_category_context(device, mgmt, key))
         _annotate_residue_rows(ctx, key, mgmt)
         ctx["category_has_unowned"] = _ctx_has_unowned(ctx)
         return render(request, partial, ctx)
