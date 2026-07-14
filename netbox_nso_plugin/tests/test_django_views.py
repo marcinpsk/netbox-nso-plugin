@@ -2073,7 +2073,7 @@ class TestDeviceNSOTabView(ViewTestBase):
         r = self.client.get(url)
         self.assertEqual(r.status_code, 200)
         body = r.content.decode()
-        self.assertIn("nso-ifg-cols", body)  # column-select chips
+        self.assertIn("nso-grid-cols", body)  # column-select chips (shared nso-grid.js contract)
         self.assertIn('id="nso-ifg-data"', body)  # embedded grid payload (json_script)
         self.assertIn("Gi0/1", body)
         self.assertIn("uplink to core", body)  # description device value
@@ -2724,7 +2724,7 @@ class TestInterfaceMatrixStateChips(ViewTestBase):
     def test_matrix_renders_state_chips(self):
         resp = self.client.get(self._url(), HTTP_X_REQUESTED_WITH="XMLHttpRequest")
         self.assertEqual(resp.status_code, 200)
-        self.assertContains(resp, "nso-ifg-state")
+        self.assertContains(resp, "nso-grid-state")
         self.assertContains(resp, 'data-state="drift"')
         self.assertContains(resp, 'data-state="pending"')
 

@@ -1,26 +1,27 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
-{# Lazy fragment: consolidated per-interface grid (Tabulator, vendored — loaded once #}
-{# by device_nso_tab.html). One row per interface, a column per attribute; every #}
-{# column sorts, header filters + the state quick-pills filter client-side, and the #}
-{# description / enabled cells edit in place (NetBox takes ownership, same as the #}
-{# old pencil editor). Rows ship embedded via json_script; post-action reloads #}
-{# re-fetch ?format=json. Cell badges/Accept reuse each overlay's own status + endpoint. #}
+{# Lazy fragment: consolidated per-interface grid. One row per interface, a column #}
+{# per attribute; every column sorts, header filters + the state quick-pills filter #}
+{# client-side, and the description / enabled cells edit in place (NetBox takes #}
+{# ownership, same as Accept). Rows ship embedded via json_script; post-action #}
+{# reloads re-fetch ?format=json. Cell badges/Accept reuse each overlay's own status #}
+{# + endpoint. The grid machinery itself lives in nso-grid.js (shared by all panels); #}
+{# this template supplies only the column definitions. #}
 {% include "netbox_nso_plugin/categories/_adapter_error.html" %}
 
 {{ grid_payload|json_script:"nso-ifg-data" }}
-<div class="nso-ifg"
+<div class="nso-grid nso-ifg"
      data-json-url="{% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='interface' %}?format=json"
      data-mtu-edit-url="{% url 'plugins:netbox_nso_plugin:overlay_field_edit' key='interface_mtu' pk=0 %}">
   <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
-    <div class="btn-group btn-group-sm nso-ifg-state" role="group" aria-label="State quick filter">
-      <button type="button" class="btn btn-outline-secondary active" data-state="all">All (<span class="nso-ifg-n-all">{{ counts.all }}</span>)</button>
-      <button type="button" class="btn btn-outline-warning" data-state="drift">Drift (<span class="nso-ifg-n-drift">{{ counts.drift }}</span>)</button>
-      <button type="button" class="btn btn-outline-info" data-state="pending">Pending apply (<span class="nso-ifg-n-pending">{{ counts.pending }}</span>)</button>
+    <div class="btn-group btn-group-sm nso-grid-state" role="group" aria-label="State quick filter">
+      <button type="button" class="btn btn-outline-secondary active" data-state="all">All (<span class="nso-grid-n-all">{{ counts.all }}</span>)</button>
+      <button type="button" class="btn btn-outline-warning" data-state="drift">Drift (<span class="nso-grid-n-drift">{{ counts.drift }}</span>)</button>
+      <button type="button" class="btn btn-outline-info" data-state="pending">Pending apply (<span class="nso-grid-n-pending">{{ counts.pending }}</span>)</button>
       <button type="button" class="btn btn-outline-success" data-state="in_sync">In sync</button>
     </div>
     <span class="text-muted small ms-1">Show:</span>
-    <div class="btn-group btn-group-sm nso-ifg-cols" role="group" aria-label="Columns">
+    <div class="btn-group btn-group-sm nso-grid-cols" role="group" aria-label="Columns">
       <button type="button" class="btn btn-outline-secondary active" data-col="enabled">Enabled</button>
       <button type="button" class="btn btn-outline-secondary active" data-col="description">Description</button>
       <button type="button" class="btn btn-outline-secondary active" data-col="mtu">MTU</button>
@@ -29,62 +30,19 @@
     </div>
     <span class="text-muted small ms-auto">Click a Description or Enabled cell to edit — NetBox then owns that value (same as Accept).</span>
   </div>
-  <div class="nso-ifg-msg"></div>
-  <div class="nso-ifg-table"></div>
+  <div class="nso-grid-msg"></div>
+  <div class="nso-grid-table"></div>
 </div>
 
 <script>
 (function () {
   "use strict";
   var root = document.querySelector('.nso-ifg');
-  if (!root || typeof Tabulator === 'undefined') return;
   var payloadEl = document.getElementById('nso-ifg-data');
-  if (!payloadEl) return;
+  if (!root || !payloadEl || !window.NSOGrid) return;
   var payload = JSON.parse(payloadEl.textContent);
-  var jsonUrl = root.dataset.jsonUrl;
-
-  function esc(s) { var d = document.createElement('div'); d.textContent = (s == null ? '' : String(s)); return d.innerHTML; }
-  function csrfToken() {
-    var el = document.querySelector('input[name=csrfmiddlewaretoken]');
-    if (el && el.value) return el.value;
-    return (document.cookie.match(/csrftoken=([^;]+)/) || [])[1] || '';
-  }
-  function flash(text, type) {
-    var m = root.querySelector('.nso-ifg-msg');
-    if (!m) return;
-    m.innerHTML = text ? '<div class="alert alert-' + type + ' py-1 px-2 small mb-2">' + esc(text) + '</div>' : '';
-  }
-
-  // ── Tabler badge fragments (identical vocabulary to _state_badge.html) ──────
-  var BADGE = {
-    drift: ['text-bg-warning text-dark', 'drift'],
-    pending: ['text-bg-info', 'pending apply'],
-    apply_failed: ['text-bg-danger', 'apply failed'],
-    deploying: ['text-bg-primary', 'deploying'],
-    in_sync: ['text-bg-success', 'in sync'],
-    unknown: ['text-bg-info', 'unknown'],
-  };
-  function badge(kind, label) {
-    var b = BADGE[kind] || BADGE.unknown;
-    return '<span class="badge ' + b[0] + '">' + esc(label || b[1]) + '</span>';
-  }
-  // Value cells stay quiet when in sync (compact) — only trouble gets a badge.
-  function cellBadge(cell) {
-    if (!cell) return '';
-    if (cell.kind === 'in_sync') {
-      return cell.status === 'in_sync'
-        ? ' <span class="mdi mdi-check-circle text-success" title="In sync — NetBox owns this and the device matches."></span>'
-        : '';
-    }
-    return ' ' + badge(cell.kind, cell.label);
-  }
-  function acceptBtn(cell) {
-    if (!cell || !cell.accept_url) return '';
-    return ' <button type="button" class="btn btn-xs btn-outline-success nso-cell-accept" data-accept="' +
-      esc(cell.accept_url) + '" title="Make NetBox the source of truth for this (re-applied to the device on Apply)">' +
-      '<span class="mdi mdi-check"></span></button>';
-  }
-  var MUTED = '<span class="text-muted">—</span>';
+  var G = window.NSOGrid;
+  var esc = G.esc, badge = G.badge, cellBadge = G.cellBadge, acceptBtn = G.acceptBtn, MUTED = G.MUTED;
 
   // ── column formatters ────────────────────────────────────────────────────────
   function fmtName(cell) {
@@ -100,11 +58,7 @@
       : esc(c.value == null ? '—' : c.value);
     return '<span class="text-nowrap">' + icon + cellBadge(c) + acceptBtn(c) + '</span>';
   }
-  function fmtDescription(cell) {
-    var c = cell.getRow().getData().description;
-    if (!c) return MUTED;
-    return (c.value ? esc(c.value) : MUTED) + cellBadge(c) + acceptBtn(c);
-  }
+  var fmtDescription = G.valueFormatter('description');
   function fmtMtu(cell) {
     var d = cell.getRow().getData();
     var c = d.mtu;
@@ -149,28 +103,23 @@
     if (c.tagged && c.tagged.length) vlans.push('t:' + c.tagged.map(esc).join(','));
     return mode + esc(vlans.join(' ')) + cellBadge(c) + acceptBtn(c);
   }
-  var SEVERITY = ['apply_failed', 'drift', 'pending', 'deploying', 'unknown', 'in_sync'];
-  function fmtState(cell) {
-    return badge(cell.getValue());
-  }
 
-  // Flat helper fields so sorting / header-filtering works on plain strings.
-  function flatten(rows) {
-    return rows.map(function (r) {
-      r._name = r.iface.name;
-      r._desc = r.description && r.description.value ? r.description.value : '';
-      r._enabled = r.enabled && r.enabled.value != null ? String(r.enabled.value).toLowerCase() : '';
-      return r;
-    });
-  }
-
-  // ── grid ─────────────────────────────────────────────────────────────────────
-  if (window.__nsoIfg) { try { window.__nsoIfg.destroy(); } catch (e) { /* re-render */ } }
-  var table = new Tabulator(root.querySelector('.nso-ifg-table'), {
-    data: flatten(payload.rows),
-    layout: 'fitColumns',
-    maxHeight: '540px',
+  G.mount(root, {
+    key: 'interface',
+    payload: payload,
+    jsonUrl: root.dataset.jsonUrl,
     placeholder: 'No interface state yet — click Refresh from NSO or wait for the next sync.',
+    // Flat helper fields so sorting / header-filtering works on plain strings.
+    flatten: function (rows) {
+      return rows.map(function (r) {
+        r._name = r.iface.name;
+        r._desc = r.description && r.description.value ? r.description.value : '';
+        r._enabled = r.enabled && r.enabled.value != null ? String(r.enabled.value).toLowerCase() : '';
+        return r;
+      });
+    },
+    colFields: { enabled: '_enabled', description: '_desc', mtu: 'mtu', ips: 'ips', switchport: 'switchport' },
+    cellKeys: { _enabled: 'enabled', _desc: 'description' },
     columns: [
       { title: 'Interface', field: '_name', formatter: fmtName, sorter: 'alphanum', widthGrow: 1.5, minWidth: 140,
         headerFilter: 'input', headerFilterPlaceholder: 'filter name…' },
@@ -185,100 +134,8 @@
       { title: 'MTU L2 / IP / MPLS', field: 'mtu', formatter: fmtMtu, widthGrow: 1.3, minWidth: 150, headerSort: false },
       { title: 'IPs', field: 'ips', formatter: fmtIps, widthGrow: 1.4, minWidth: 130, headerSort: false },
       { title: 'Switchport', field: 'switchport', formatter: fmtSwitchport, widthGrow: 1.1, minWidth: 110, headerSort: false },
-      { title: 'State', field: 'state', formatter: fmtState, widthGrow: 0.9, minWidth: 110,
-        sorter: function (a, b) { return SEVERITY.indexOf(a) - SEVERITY.indexOf(b); },
-        headerFilter: 'list',
-        headerFilterParams: { values: { '': 'All', drift: 'Drift', pending: 'Pending apply', apply_failed: 'Apply failed', in_sync: 'In sync' } } },
+      G.stateColumn(),
     ],
   });
-  window.__nsoIfg = table;
-
-  // Restore the column show/hide preference across re-renders within the page.
-  var hidden = (window.__nsoIfgHidden = window.__nsoIfgHidden || {});
-  var COL_FIELD = { enabled: '_enabled', description: '_desc', mtu: 'mtu', ips: 'ips', switchport: 'switchport' };
-  table.on('tableBuilt', function () {
-    Object.keys(hidden).forEach(function (k) { if (hidden[k]) table.hideColumn(COL_FIELD[k]); });
-    root.querySelectorAll('.nso-ifg-cols [data-col]').forEach(function (b) {
-      b.classList.toggle('active', !hidden[b.dataset.col]);
-    });
-  });
-
-  // ── POST helper + post-action refresh ────────────────────────────────────────
-  function post(url, params) {
-    params.set('csrfmiddlewaretoken', csrfToken());
-    return fetch(url, {
-      method: 'POST',
-      headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-CSRFToken': csrfToken(), 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: params,
-    }).then(function (r) {
-      return r.json().catch(function () { return {}; }).then(function (d) { return { ok: r.ok, data: d }; });
-    });
-  }
-  function reload() {
-    return fetch(jsonUrl, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
-      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
-      .then(function (fresh) {
-        table.replaceData(flatten(fresh.rows));
-        ['all', 'drift', 'pending'].forEach(function (k) {
-          var el = root.querySelector('.nso-ifg-n-' + k);
-          if (el) el.textContent = fresh.counts[k];
-        });
-      })
-      .catch(function (e) { flash('Failed to refresh: ' + e.message, 'danger'); });
-  }
-  function afterAction(res) {
-    if (!res.ok || (res.data && res.data.status === 'error')) {
-      flash('Action failed: ' + ((res.data && res.data.message) || 'server error'), 'danger');
-    } else {
-      flash('', '');
-      document.dispatchEvent(new CustomEvent('nso:refresh-categories'));
-    }
-    return reload();
-  }
-
-  // Inline edit of description / enabled — same endpoint + ownership semantics as
-  // the old pencil editor (NSOInterfaceEditFieldView).
-  table.on('cellEdited', function (cell) {
-    var d = cell.getRow().getData();
-    var target = cell.getField() === '_desc' ? d.description : d.enabled;
-    if (!target || !target.edit_url) { cell.restoreOldValue(); return; }
-    post(target.edit_url, new URLSearchParams({ value: cell.getValue() })).then(afterAction);
-  });
-
-  // Per-cell Accept buttons (delegated — cells re-render on every data swap).
-  root.addEventListener('click', function (e) {
-    var acc = e.target.closest('.nso-cell-accept');
-    if (acc) {
-      e.preventDefault();
-      acc.disabled = true;
-      post(acc.dataset.accept, new URLSearchParams()).then(afterAction);
-      return;
-    }
-    // One-click state quick-filter pills (mirrors _filter_ifaces_by_state buckets).
-    var pill = e.target.closest('.nso-ifg-state [data-state]');
-    if (pill) {
-      e.preventDefault();
-      root.querySelectorAll('.nso-ifg-state [data-state]').forEach(function (b) { b.classList.toggle('active', b === pill); });
-      var s = pill.dataset.state;
-      if (s === 'all') table.clearFilter(true);
-      else if (s === 'drift') table.setFilter('state', '=', 'drift');
-      else if (s === 'pending') table.setFilter(function (d) { return d.state === 'pending' || d.state === 'apply_failed'; });
-      else table.setFilter(function (d) { return d.state !== 'drift' && d.state !== 'pending' && d.state !== 'apply_failed'; });
-      return;
-    }
-    var colBtn = e.target.closest('.nso-ifg-cols [data-col]');
-    if (colBtn) {
-      e.preventDefault();
-      var key = colBtn.dataset.col;
-      hidden[key] = !hidden[key];
-      colBtn.classList.toggle('active', !hidden[key]);
-      table.toggleColumn(COL_FIELD[key]);
-    }
-  });
-
-  // MTU popover saves (nso-popedit) bubble up from inside the grid — refresh rows.
-  root.addEventListener('nso:popedit-saved', function () { reload(); });
-
-  if (payload.adapter_error) flash('Adapter: ' + payload.adapter_error, 'warning');
 })();
 </script>

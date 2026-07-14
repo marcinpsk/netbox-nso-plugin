@@ -8,11 +8,14 @@
 {# Vendored diff2html (MIT) — renders the apply-preview's NSO tree diff; no CDN. #}
 <link rel="stylesheet" href="{% static 'netbox_nso_plugin/vendor/diff2html.min.css' %}">
 <script src="{% static 'netbox_nso_plugin/vendor/diff2html.min.js' %}"></script>
-{# Vendored Tabulator (MIT) — the Interfaces category grid; no CDN. #}
+{# Vendored Tabulator (MIT) — the category grids; no CDN. #}
 <link rel="stylesheet" href="{% static 'netbox_nso_plugin/vendor/tabulator_bootstrap5.min.css' %}">
 <script src="{% static 'netbox_nso_plugin/vendor/tabulator.min.js' %}"></script>
 <link rel="stylesheet" href="{% static 'netbox_nso_plugin/nso.css' %}">
 <script src="{% static 'netbox_nso_plugin/nso-popedit.js' %}"></script>
+{# Shared grid harness — badge vocabulary, per-cell Accept, inline-edit-owns, state #}
+{# pills. Must load before any lazy category fragment runs its column definitions. #}
+<script src="{% static 'netbox_nso_plugin/nso-grid.js' %}"></script>
 {% if mgmt %}
 
   {# ── Adapter link/sync failure — managing this device couldn't reach the adapter ─────── #}

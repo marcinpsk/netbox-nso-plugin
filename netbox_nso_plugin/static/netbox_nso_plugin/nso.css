@@ -4,45 +4,46 @@
 /* Plugin-wide stylesheet. Colors come from NetBox's Tabler CSS variables
    (--tblr-*), so everything follows the light/dark theme automatically. */
 
-/* ── Interfaces grid (Tabulator) — restyled to read like a native Tabler table ── */
-.nso-ifg .tabulator {
+/* ── NSO category grids (Tabulator) — restyled to read like a native Tabler table.
+   Scoped to .nso-grid, the wrapper every category grid uses (see nso-grid.js). ── */
+.nso-grid .tabulator {
   font-size: 0.8125rem;
   background: transparent;
   border: 1px solid var(--tblr-border-color);
   border-radius: 4px;
 }
-.nso-ifg .tabulator .tabulator-header,
-.nso-ifg .tabulator .tabulator-header .tabulator-col {
+.nso-grid .tabulator .tabulator-header,
+.nso-grid .tabulator .tabulator-header .tabulator-col {
   background: var(--tblr-bg-surface-tertiary, var(--tblr-bg-surface));
   color: inherit;
   border-color: var(--tblr-border-color);
 }
-.nso-ifg .tabulator .tabulator-header .tabulator-col .tabulator-col-title {
+.nso-grid .tabulator .tabulator-header .tabulator-col .tabulator-col-title {
   font-weight: 600;
 }
-.nso-ifg .tabulator .tabulator-tableholder,
-.nso-ifg .tabulator .tabulator-tableholder .tabulator-table {
+.nso-grid .tabulator .tabulator-tableholder,
+.nso-grid .tabulator .tabulator-tableholder .tabulator-table {
   background: var(--tblr-bg-surface);
   color: inherit;
 }
-.nso-ifg .tabulator-row {
+.nso-grid .tabulator-row {
   background: var(--tblr-bg-surface);
   color: inherit;
   border-bottom: 1px solid var(--tblr-border-color-translucent, var(--tblr-border-color));
   min-height: 2.1rem;
 }
-.nso-ifg .tabulator-row.tabulator-row-even {
+.nso-grid .tabulator-row.tabulator-row-even {
   background: var(--tblr-bg-surface); /* no zebra — NetBox tables don't stripe */
 }
-.nso-ifg .tabulator-row.tabulator-selectable:hover {
+.nso-grid .tabulator-row.tabulator-selectable:hover {
   background: var(--tblr-active-bg, rgba(var(--tblr-secondary-rgb, 102, 112, 133), 0.08));
 }
-.nso-ifg .tabulator-cell {
+.nso-grid .tabulator-cell {
   padding: 0.45rem 0.6rem;
   border-right: none;
 }
-.nso-ifg .tabulator-header-filter input,
-.nso-ifg .tabulator-header-filter select {
+.nso-grid .tabulator-header-filter input,
+.nso-grid .tabulator-header-filter select {
   font-size: 0.75rem;
   padding: 0.15rem 0.35rem;
   background: var(--tblr-bg-forms, var(--tblr-bg-surface));
@@ -50,18 +51,18 @@
   border: 1px solid var(--tblr-border-color);
   border-radius: 4px;
 }
-.nso-ifg .tabulator .tabulator-footer {
+.nso-grid .tabulator .tabulator-footer {
   background: var(--tblr-bg-surface-tertiary, var(--tblr-bg-surface));
   border-top: 1px solid var(--tblr-border-color);
   color: var(--tblr-secondary, inherit);
 }
 /* Cells being edited get a normal form control, not Tabulator's default chrome. */
-.nso-ifg .tabulator-cell.tabulator-editing {
+.nso-grid .tabulator-cell.tabulator-editing {
   border: 1px solid var(--tblr-primary, #206bc4);
   padding: 0.15rem 0.3rem;
 }
-.nso-ifg .tabulator-cell.tabulator-editing input,
-.nso-ifg .tabulator-cell.tabulator-editing select {
+.nso-grid .tabulator-cell.tabulator-editing input,
+.nso-grid .tabulator-cell.tabulator-editing select {
   background: var(--tblr-bg-forms, var(--tblr-bg-surface));
   color: inherit;
   border: 0;
@@ -70,10 +71,10 @@
 
 /* Per-cell Accept buttons stay hidden until the row is hovered (the old
    icon_only accept cells behaved the same way visually — low noise). */
-.nso-ifg .nso-cell-accept {
+.nso-grid .nso-cell-accept {
   visibility: hidden;
 }
-.nso-ifg .tabulator-row:hover .nso-cell-accept {
+.nso-grid .tabulator-row:hover .nso-cell-accept {
   visibility: visible;
 }
 
@@ -99,10 +100,10 @@ a.nso-popedit.nso-popedit-open {
 }
 
 /* Editable cells advertise themselves with a subtle pencil on hover. */
-.nso-ifg .tabulator-cell.nso-editable {
+.nso-grid .tabulator-cell.nso-editable {
   cursor: text;
 }
-.nso-ifg .tabulator-cell.nso-editable:hover::after {
+.nso-grid .tabulator-cell.nso-editable:hover::after {
   content: "\f64f"; /* mdi-pencil */
   font-family: "Material Design Icons";
   opacity: 0.45;
