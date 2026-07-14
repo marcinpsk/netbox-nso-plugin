@@ -170,9 +170,12 @@
           var target = anchor;
           close();
           target.dispatchEvent(new CustomEvent("nso:popedit-saved", { bubbles: true }));
-          // Self-refreshing containers (the interfaces grid) reload themselves off the
+          // Self-refreshing containers (any nso-grid mount) reload themselves off the
           // event above; server-rendered fragments re-fetch via the tab-wide hook.
-          if (!target.closest(".nso-ifg")) {
+          // Scoped to .nso-grid — the harness class every grid has — not .nso-ifg,
+          // which only the interfaces panel kept: a save inside any other grid would
+          // reload its own grid AND re-fetch every open category.
+          if (!target.closest(".nso-grid")) {
             document.dispatchEvent(new CustomEvent("nso:refresh-categories"));
           }
         })
