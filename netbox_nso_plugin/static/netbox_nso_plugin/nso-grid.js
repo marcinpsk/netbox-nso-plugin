@@ -198,6 +198,15 @@
         return rows;
       };
 
+    /* Which slice of the category JSON this grid renders. A single-table panel is the
+     * whole document; a multi-table one (OSPF instances + interfaces) mounts one grid
+     * per section against the SAME JSON, each picking its own. */
+    var pick =
+      opts.extract ||
+      function (json) {
+        return json;
+      };
+
     function flash(text, type) {
       var m = root.querySelector(".nso-grid-msg");
       if (!m) return;
@@ -216,7 +225,7 @@
     }
 
     var table = new Tabulator(tableEl, {
-      data: flatten((opts.payload.rows || []).slice()),
+      data: flatten(((pick(opts.payload) || {}).rows || []).slice()),
       layout: "fitColumns",
       maxHeight: opts.maxHeight || "540px",
       placeholder: opts.placeholder || "Nothing here yet — click Refresh from NSO or wait for the next sync.",
@@ -244,10 +253,12 @@
           return r.json();
         })
         .then(function (fresh) {
-          table.replaceData(flatten((fresh.rows || []).slice()));
-          Object.keys(fresh.counts || {}).forEach(function (k) {
+          var section = pick(fresh) || {};
+          table.replaceData(flatten((section.rows || []).slice()));
+          // Counts are scoped to THIS grid's root, so sibling sections keep their own.
+          Object.keys(section.counts || {}).forEach(function (k) {
             var el = root.querySelector(".nso-grid-n-" + k);
-            if (el) el.textContent = fresh.counts[k];
+            if (el) el.textContent = section.counts[k];
           });
         })
         .catch(function (e) {

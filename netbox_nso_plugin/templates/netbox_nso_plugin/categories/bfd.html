@@ -1,39 +1,92 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
-{# Lazy-loaded fragment: per-interface BFD. Accept = NetBox owns the BFD timers; #}
-{# pushed to the device on Apply via the bfd-reconciler. #}
+{# Lazy fragment: per-interface BFD, as a client-side grid (nso-grid.js). Accept = #}
+{# NetBox owns the BFD timers; pushed to the device on Apply via the bfd-reconciler. #}
+{# BFD owns the whole ROW (one status, one accept_url), so Accept is a trailing #}
+{# column rather than the per-cell Accept the Interfaces grid uses. #}
 {% include "netbox_nso_plugin/categories/_adapter_error.html" %}
 
-{% if bfd_states %}
+{% if grid_payload.rows %}
   <p class="text-muted small mb-2">BFD is an interface property; protocols (BGP/IS-IS/OSPF) just enable it. Accept to make NetBox the source of truth for the timers; Apply writes them to the device.</p>
-  <div id="flt-bfd">
-  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-bfd" placeholder="Filter by interface…" show_status=True %}
-  <div class="table-responsive mb-3">
-    <table class="table table-sm table-hover mb-0">
-      <thead>
-        <tr><th>Interface</th><th>Mode</th><th>Min TX</th><th>Min RX</th><th>Multiplier</th><th>Status</th><th></th></tr>
-      </thead>
-      <tbody>
-        {% for b in bfd_states %}
-        <tr data-status="{{ b.status }}" data-owned="{{ b.accepted_at|yesno:'true,false' }}">
-          <td><a href="{{ b.interface.get_absolute_url }}">{{ b.interface.name }}</a></td>
-          <td>
-            {% if b.micro_bfd %}<span class="badge text-bg-info" title="Per-LAG-member, RFC 7130">micro-BFD</span>
-            {% else %}<span class="badge text-bg-light border">normal</span>{% endif %}
-          </td>
-          <td>{{ b.min_tx|default:"—" }}</td>
-          <td>{{ b.min_rx|default:"—" }}</td>
-          <td>{{ b.multiplier|default:"—" }}</td>
-          <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=b.status residue=b.residue_survivor residue_job=b.residue_job_id %}</td>
-          <td>
-            {% url 'plugins:netbox_nso_plugin:bfd_accept' pk=b.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=b.status title="Make NetBox the source of truth for this interface's BFD timers (written to the device on Apply)" %}
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+  {{ grid_payload|json_script:"nso-bfd-data" }}
+  <div class="nso-grid nso-bfd"
+       data-json-url="{% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='bfd' %}?format=json">
+    <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
+      <div class="btn-group btn-group-sm nso-grid-state" role="group" aria-label="State quick filter">
+        <button type="button" class="btn btn-outline-secondary active" data-state="all">All (<span class="nso-grid-n-all">{{ counts.all }}</span>)</button>
+        <button type="button" class="btn btn-outline-warning" data-state="drift">Drift (<span class="nso-grid-n-drift">{{ counts.drift }}</span>)</button>
+        <button type="button" class="btn btn-outline-info" data-state="pending">Pending apply (<span class="nso-grid-n-pending">{{ counts.pending }}</span>)</button>
+        <button type="button" class="btn btn-outline-success" data-state="in_sync">In sync</button>
+      </div>
+    </div>
+    <div class="nso-grid-msg"></div>
+    <div class="nso-grid-table"></div>
   </div>
-  </div>
+
+  <script>
+  (function () {
+    "use strict";
+    var root = document.querySelector('.nso-bfd');
+    var payloadEl = document.getElementById('nso-bfd-data');
+    if (!root || !payloadEl || !window.NSOGrid) return;
+    var G = window.NSOGrid;
+    var esc = G.esc, MUTED = G.MUTED;
+
+    function fmtIface(cell) {
+      var d = cell.getRow().getData();
+      return '<a href="' + esc(d.iface.url) + '" title="Open interface in NetBox">' + esc(d.iface.name) + '</a>';
+    }
+    function fmtMode(cell) {
+      return cell.getRow().getData().micro_bfd
+        ? '<span class="badge text-bg-info" title="Per-LAG-member, RFC 7130">micro-BFD</span>'
+        : '<span class="badge text-bg-light border">normal</span>';
+    }
+    // Timers are plain numbers on the row (BFD owns the row, not the cell).
+    function num(field) {
+      return function (cell) {
+        var v = cell.getRow().getData()[field];
+        return v == null ? MUTED : esc(v);
+      };
+    }
+    // The residue badge the server-rendered table showed via _state_badge.html.
+    function fmtState(cell) {
+      var d = cell.getRow().getData();
+      var out = G.badge(d.state, d.label);
+      if (d.residue) {
+        out += ' <span class="badge text-bg-danger" title="Left on the device by a retraction' +
+          (d.residue_job ? ' (job ' + esc(d.residue_job) + ')' : '') + '">residue</span>';
+      }
+      return out;
+    }
+
+    G.mount(root, {
+      key: 'bfd',
+      payload: JSON.parse(payloadEl.textContent),
+      jsonUrl: root.dataset.jsonUrl,
+      placeholder: 'No BFD-configured interfaces found on this device.',
+      flatten: function (rows) {
+        return rows.map(function (r) {
+          r._iface = r.iface.name;
+          r._mode = r.micro_bfd ? 'micro-bfd' : 'normal';
+          return r;
+        });
+      },
+      columns: [
+        { title: 'Interface', field: '_iface', formatter: fmtIface, sorter: 'alphanum', widthGrow: 1.6, minWidth: 140,
+          headerFilter: 'input', headerFilterPlaceholder: 'filter interface…' },
+        { title: 'Mode', field: '_mode', formatter: fmtMode, widthGrow: 0.9, minWidth: 100,
+          headerFilter: 'list', headerFilterParams: { values: { '': 'All', 'micro-bfd': 'micro-BFD', normal: 'normal' } } },
+        { title: 'Min TX', field: 'min_tx', formatter: num('min_tx'), widthGrow: 0.7, minWidth: 80, hozAlign: 'right' },
+        { title: 'Min RX', field: 'min_rx', formatter: num('min_rx'), widthGrow: 0.7, minWidth: 80, hozAlign: 'right' },
+        { title: 'Multiplier', field: 'multiplier', formatter: num('multiplier'), widthGrow: 0.8, minWidth: 95, hozAlign: 'right' },
+        G.stateColumn({ formatter: fmtState }),
+        { title: 'Last Synced', field: 'last_sync', widthGrow: 1, minWidth: 120,
+          formatter: function (cell) { return cell.getValue() ? esc(cell.getValue()) : MUTED; } },
+        G.acceptColumn(),
+      ],
+    });
+  })();
+  </script>
 {% else %}
   <p class="text-muted mb-0">No BFD-configured interfaces found on this device.</p>
 {% endif %}

@@ -440,6 +440,10 @@ class NSOCategoryView(LoginRequiredMixin, View):
 
         mgmt = getattr(device, "nso_management", None)
 
+        # A grid's post-action reload wants the rows back, not a re-reconcile.
+        if key in self._GRID_CATEGORIES and request.GET.get("format") == "json":
+            return JsonResponse(self._grid_payload_from_db(key, device, mgmt))
+
         # Large single-table categories render paginated from last-synced state
         # (fast); ?refresh=1 (the Refresh icon) forces a live reconcile first.
         paged = self._render_paged_category(request, device, mgmt, key)
@@ -463,6 +467,15 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 ctx["adapter_error_code"] = exc.code
         _annotate_residue_rows(ctx, key, mgmt)
         ctx["category_has_unowned"] = _ctx_has_unowned(ctx)
+        if key in self._GRID_CATEGORIES:
+            if ctx.get(self._GRID_CTX_VAR[key]):
+                payload = self._grid_payload_from_ctx(key, ctx)
+            else:
+                # Reconcile did not run (unlinked device) or returned nothing — show what
+                # NetBox has persisted rather than claiming the category is empty.
+                payload = self._grid_payload_from_db(key, device, mgmt, ctx.get("adapter_error"))
+            ctx["grid_payload"] = payload
+            ctx["counts"] = payload["counts"]
         return render(request, partial, ctx)
 
     # Single-table overlay categories that render paginated from last-synced state.
@@ -712,6 +725,99 @@ class NSOCategoryView(LoginRequiredMixin, View):
 
     # Statuses whose rows offer an Accept action — mirrors _accept_cell.html exactly.
     _ACCEPTABLE_STATUSES = ("imported", "changed", "conflict", "drifted")
+
+    # Categories that render as a client-side grid (nso-grid.js) instead of a
+    # server-rendered table. Unlike Interfaces — where each attribute is its own
+    # overlay row and Accept is per CELL — these own the whole row: one status, one
+    # accept_url. They keep the on-expand reconcile, but answer ?format=json straight
+    # from persisted overlay state so the grid's post-action reload never re-hits the
+    # adapter (every Accept click would otherwise trigger a fresh reconcile).
+    _GRID_CATEGORIES = ("bfd",)
+
+    # The ctx list each grid category's reconcile fills, so the fragment can tell
+    # "reconcile gave me rows" from "reconcile never ran".
+    _GRID_CTX_VAR = {"bfd": "bfd_states"}
+
+    def _bfd_grid_payload(self, states, adapter_error=None):
+        """Rows for the BFD grid, from already-fetched (and residue-annotated) state.
+
+        Takes the rows rather than re-querying: the caller's ctx rows have been through
+        _annotate_residue_rows, which reads the device's adapter jobs — re-deriving them
+        here would pay for that adapter round-trip twice on a single expand.
+
+        kind/label come from summary.display_state, the same helper the server-rendered
+        table used, so badges, quick-filter buckets and Accept visibility keep their
+        established meaning. The client never re-derives them.
+        """
+        from .status_machine import OWNED_STATES
+        from .summary import display_state
+
+        rows = []
+        counts = {"all": 0, "drift": 0, "pending": 0}
+        for st in states:
+            owned = st.status in OWNED_STATES
+            kind, label = display_state(st.status, owned)
+            counts["all"] += 1
+            if kind == "drift":
+                counts["drift"] += 1
+            elif kind in _PENDING_KINDS:
+                counts["pending"] += 1
+            rows.append(
+                {
+                    "pk": st.pk,
+                    "iface": {"name": st.interface.name, "url": st.interface.get_absolute_url()},
+                    "micro_bfd": st.micro_bfd,
+                    "min_tx": st.min_tx,
+                    "min_rx": st.min_rx,
+                    "multiplier": st.multiplier,
+                    "last_sync": st.last_sync_at.strftime("%Y-%m-%d %H:%M") if st.last_sync_at else None,
+                    "status": st.status,
+                    "state": kind,
+                    "kind": kind,
+                    "label": label,
+                    "residue": bool(getattr(st, "residue_survivor", False)),
+                    "residue_job": getattr(st, "residue_job_id", None),
+                    "accept_url": (
+                        reverse("plugins:netbox_nso_plugin:bfd_accept", args=[st.pk])
+                        if st.status in self._ACCEPTABLE_STATUSES
+                        else None
+                    ),
+                }
+            )
+        return {"rows": rows, "counts": counts, "adapter_error": adapter_error}
+
+    def _grid_payload_from_db(self, key, device, mgmt, adapter_error=None):
+        """Build a grid category's payload from persisted overlay state alone.
+
+        Serves the ?format=json reload, and also backs the fragment whenever reconcile
+        did not run — a device with no adapter_device_id (never linked, or unlinked) gets
+        an empty reconcile context, and keying the panel off that context would claim
+        "No BFD-configured interfaces" while NetBox is holding rows for them. The
+        Interfaces grid already renders from persisted state for exactly this reason.
+        """
+        from .models import NSOBFDInterfaceState
+
+        if key == "bfd":
+            ctx = {
+                "bfd_states": list(
+                    NSOBFDInterfaceState.objects.filter(management__device=device)
+                    .select_related("interface")
+                    .order_by("interface__name")
+                )
+            }
+            _annotate_residue_rows(ctx, key, mgmt)
+            return self._bfd_grid_payload(ctx["bfd_states"], adapter_error)
+        raise ValueError(f"no grid payload builder for {key}")  # pragma: no cover
+
+    def _grid_payload_from_ctx(self, key, ctx):
+        """Grid payload for the on-expand fragment, reusing the reconciled ctx rows.
+
+        Reuses them rather than re-querying because they have already been through
+        _annotate_residue_rows, which reads the device's adapter jobs.
+        """
+        if key == "bfd":
+            return self._bfd_grid_payload(ctx.get("bfd_states") or [], ctx.get("adapter_error"))
+        raise ValueError(f"no grid payload builder for {key}")  # pragma: no cover
 
     def _interface_merged_payload(
         self, ordered, kinds_by_iface, counts, attr_states, mtu_states, sw_states, ip_states, adapter_error

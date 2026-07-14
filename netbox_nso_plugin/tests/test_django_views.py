@@ -7,6 +7,7 @@ Adapter calls are mocked so no live adapter is needed.
 """
 
 import json
+import re
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
@@ -3252,3 +3253,148 @@ class TestNSOAdapterLinkRetryView(ViewTestBase):
         self.mgmt.refresh_from_db()
         self.assertIn("still down", self.mgmt.adapter_link_error)  # surfaced for the banner
         self.assertIsNone(self.mgmt.adapter_device_id)  # still unlinked
+
+
+class TestBfdGrid(ViewTestBase):
+    """The BFD category renders as a client-side grid (nso-grid.js).
+
+    BFD owns the whole ROW — one status, one accept_url — unlike Interfaces, where each
+    attribute is its own overlay row with its own Accept. These assert the payload the
+    grid actually consumes: the kinds the badges/quick-filter buckets are drawn from,
+    and Accept visibility.
+    """
+
+    def setUp(self):
+        super().setUp()
+        from netbox_nso_plugin.models import NSOBFDInterfaceState
+
+        self.ifaces = {}
+        for name in ("Gi0/1", "Gi0/2", "Gi0/3"):
+            self.ifaces[name] = Interface.objects.create(device=self.device, name=name, type="1000base-t")
+        # changed + unowned -> drift; accepted -> owned -> pending; in_sync -> in sync.
+        NSOBFDInterfaceState.objects.create(
+            management=self.mgmt,
+            interface=self.ifaces["Gi0/1"],
+            status="changed",
+            min_tx=300,
+            min_rx=300,
+            multiplier=3,
+        )
+        NSOBFDInterfaceState.objects.create(
+            management=self.mgmt,
+            interface=self.ifaces["Gi0/2"],
+            status="accepted",
+            min_tx=50,
+            min_rx=50,
+            multiplier=3,
+            micro_bfd=True,
+        )
+        NSOBFDInterfaceState.objects.create(
+            management=self.mgmt,
+            interface=self.ifaces["Gi0/3"],
+            status="in_sync",
+            min_tx=100,
+            min_rx=100,
+            multiplier=5,
+        )
+
+    def _url(self):
+        return reverse(
+            "plugins:netbox_nso_plugin:device_nso_category",
+            kwargs={"pk": self.device.pk, "key": "bfd"},
+        )
+
+    def test_json_reload_serves_rows_without_touching_the_adapter(self):
+        """?format=json is the grid's post-action reload — it must read persisted state.
+
+        Nothing here is patched: if the reload reconciled (as the on-expand fragment
+        does), it would hit the adapter and blow up rather than return rows. That is
+        the whole point of serving this path from the DB — an Accept click would
+        otherwise trigger a fresh device read per click.
+        """
+        resp = self.client.get(self._url() + "?format=json", HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+        self.assertEqual(resp.status_code, 200)
+        data = json.loads(resp.content)
+
+        self.assertEqual(data["counts"], {"all": 3, "drift": 1, "pending": 1})
+        by_iface = {r["iface"]["name"]: r for r in data["rows"]}
+        self.assertEqual(set(by_iface), {"Gi0/1", "Gi0/2", "Gi0/3"})
+
+        # The kind drives the badge AND the quick-filter bucket — assert it, not the status.
+        self.assertEqual(by_iface["Gi0/1"]["state"], "drift")
+        self.assertEqual(by_iface["Gi0/2"]["state"], "pending")
+        self.assertEqual(by_iface["Gi0/3"]["state"], "in_sync")
+
+        # Accept shows only for a not-yet-owned row (mirrors _accept_cell.html).
+        self.assertTrue(by_iface["Gi0/1"]["accept_url"])
+        self.assertIsNone(by_iface["Gi0/2"]["accept_url"])
+        self.assertIsNone(by_iface["Gi0/3"]["accept_url"])
+
+        # Timers + mode survive the round trip.
+        self.assertEqual(by_iface["Gi0/1"]["min_tx"], 300)
+        self.assertEqual(by_iface["Gi0/1"]["multiplier"], 3)
+        self.assertTrue(by_iface["Gi0/2"]["micro_bfd"])
+        self.assertFalse(by_iface["Gi0/1"]["micro_bfd"])
+
+    def test_accept_url_actually_resolves_and_takes_ownership(self):
+        """The accept_url the grid ships must be a real, working endpoint.
+
+        A grid that renders a dead Accept button looks identical to a working one until
+        an operator clicks it, so drive the URL from the payload end-to-end.
+        """
+        from netbox_nso_plugin.models import NSOBFDInterfaceState
+
+        resp = self.client.get(self._url() + "?format=json", HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+        row = next(r for r in json.loads(resp.content)["rows"] if r["iface"]["name"] == "Gi0/1")
+
+        with self.captureOnCommitCallbacks(execute=True):
+            accepted = self.client.post(row["accept_url"])
+        self.assertIn(accepted.status_code, (200, 302))
+
+        st = NSOBFDInterfaceState.objects.get(pk=row["pk"])
+        self.assertIsNotNone(st.accepted_at)  # NetBox now owns the timers
+
+        # ... and the reloaded grid reflects it: owned -> pending, Accept gone.
+        again = self.client.get(self._url() + "?format=json", HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+        data = json.loads(again.content)
+        row2 = next(r for r in data["rows"] if r["iface"]["name"] == "Gi0/1")
+        self.assertEqual(row2["state"], "pending")
+        self.assertIsNone(row2["accept_url"])
+        self.assertEqual(data["counts"]["drift"], 0)
+        self.assertEqual(data["counts"]["pending"], 2)
+
+    @patch("netbox_nso_plugin.adapter_client.get_bfd", return_value={"interfaces": []})
+    def test_fragment_embeds_the_grid_payload(self, _mock_bfd):
+        """The on-expand fragment paints from an embedded payload — no second request."""
+        resp = self.client.get(self._url(), HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.content.decode()
+        self.assertIn('id="nso-bfd-data"', body)  # json_script payload
+        self.assertIn("nso-grid-state", body)  # quick-filter pills
+        self.assertIn("nso-grid-table", body)  # grid mount point
+        self.assertNotIn("{#", body)  # no leaked multi-line Django comment
+
+    def test_unlinked_device_still_shows_persisted_rows(self):
+        """An unlinked device (no adapter_device_id) must not read as an EMPTY category.
+
+        reconcile_category returns an empty context when there is no adapter_device_id,
+        so a panel keyed off that context renders "No BFD-configured interfaces" while
+        NetBox is holding rows for them — the operator sees their accepted BFD timers
+        vanish the moment the device is unlinked. The grid renders persisted state
+        instead (the Interfaces grid already worked this way).
+        """
+        self.assertIsNone(self.mgmt.adapter_device_id)  # the precondition under test
+
+        resp = self.client.get(self._url(), HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.content.decode()
+
+        # Not the empty-state <p>. (Bare-substring matching would pass either way: the
+        # same wording is also the grid's Tabulator placeholder, so it appears even on a
+        # fully-populated grid.)
+        self.assertNotIn('<p class="text-muted mb-0">No BFD-configured', body)
+
+        # The embedded payload really carries the persisted rows.
+        embedded = json.loads(re.search(r'<script id="nso-bfd-data"[^>]*>(.*?)</script>', body, re.S).group(1))
+        self.assertEqual({r["iface"]["name"] for r in embedded["rows"]}, {"Gi0/1", "Gi0/2", "Gi0/3"})
+        self.assertEqual(embedded["counts"], {"all": 3, "drift": 1, "pending": 1})
