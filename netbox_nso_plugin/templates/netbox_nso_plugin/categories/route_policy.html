@@ -1,56 +1,90 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
-{# Lazy-loaded fragment: Route Policy category — paginated from last-synced state. #}
-<div class="nso-cat-pager"
-     data-url="{% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='route_policy' %}"
-     data-q="{{ q }}" data-page="{{ page.number }}">
-  <div class="nso-cat-results">
-    {% include "netbox_nso_plugin/categories/_adapter_error.html" %}
-    <div class="mb-2">
-      <a href="{% url 'plugins:netbox_nso_plugin:route_policy_attach' device_pk=object.pk %}" class="btn btn-sm btn-primary" title="Attach an existing route-policy object to this device — written on Apply">
-        <i class="mdi mdi-plus-thick"></i> Add Route-Policy…
-      </a>
-      <a href="{% url 'plugins:netbox_nso_plugin:route_policy_capabilities' device_pk=object.pk %}" class="btn btn-sm btn-outline-primary" title="What this device can apply for route-maps and communities (by NED + software)">
-        <i class="mdi mdi-shield-check-outline"></i> Capabilities
-      </a>
-      <a href="{% url 'plugins:netbox_nso_plugin:routing_classify_bulk_route_policy' device_pk=object.pk %}" class="btn btn-sm btn-outline-warning" title="Bulk-mark per-device the shared objects that legitimately differ between devices (VRRP / per-region lists)">
-        <i class="mdi mdi-call-split"></i> Resolve divergent…
-      </a>
-    </div>
-    <div class="nso-cat-msg"></div>
-    <div class="d-flex justify-content-between align-items-center mb-2">
-      {% include "netbox_nso_plugin/categories/_cat_search.html" with placeholder=placeholder q=q %}
-      {% url 'plugins:netbox_nso_plugin:routing_bulk_accept_route_policy' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned %}
-    </div>
-    {% if route_policy_states %}
-    <div class="table-responsive">
-      <table class="table table-sm table-hover mb-0">
-        <thead>
-          <tr><th>Family</th><th>Name</th><th>NetBox Object</th><th>Status</th><th>Last Synced</th><th></th></tr>
-        </thead>
-        <tbody>
-          {% for rp in route_policy_states %}
-          <tr data-status="{{ rp.status }}" data-owned="{{ rp.accepted_at|yesno:'true,false' }}">
-            <td>{{ rp.family }}</td>
-            <td>{{ rp.object_name }}{% if rp.classification_mode == "local" %} <span class="badge text-bg-info" title="Per-device — not deduped into one shared object; differs by device intentionally">per-device</span>{% endif %}{% if rp.unsupported_members %} <span class="badge text-bg-warning text-dark" title="This device's NED cannot hold these community members, so they are silently skipped on Apply (which is why this object may sit at ‘pending apply’). Remove them from the NetBox object, or accept they stay NetBox-only: {{ rp.unsupported_members|join:', ' }}"><span class="mdi mdi-alert-outline"></span> {{ rp.unsupported_members|length }} unsupported on NED</span>{% endif %}</td>
-            <td>{% if rp.assigned_object %}<a href="{{ rp.assigned_object.get_absolute_url }}">{{ rp.assigned_object }}</a>{% else %}—{% endif %}</td>
-            <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=rp.status residue=rp.residue_survivor residue_job=rp.residue_job_id %}</td>
-            <td class="text-nowrap">{% if rp.last_sync_at %}{{ rp.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
-            <td>
-              <div class="d-flex gap-1">
-                {% if rp.assigned_object %}<a href="{% url 'plugins:netbox_nso_plugin:routing_route_policy_diff' pk=rp.pk %}" class="btn btn-xs btn-outline-warning" title="See exactly what differs between this device and NetBox"><span class="mdi mdi-not-equal-variant"></span> Diff</a>{% endif %}
-                {% if rp.assigned_object %}<a href="{% url 'plugins:netbox_nso_plugin:routing_route_policy_versions' pk=rp.pk %}" class="btn btn-xs btn-outline-info" title="See every device's version of this object and pick which one NetBox mirrors"><span class="mdi mdi-source-branch"></span> Versions</a>{% endif %}
-                {% url 'plugins:netbox_nso_plugin:routing_accept_route_policy' pk=rp.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=rp.status form_class="nso-row-form" %}
-              </div>
-            </td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-    {% include "netbox_nso_plugin/categories/_cat_pager.html" with page=page %}
-    {% else %}
-    <p class="text-muted mb-0">No route policy{% if q %} matching “{{ q }}”{% endif %}.</p>
-    {% endif %}
+{# Lazy fragment: Route Policy — a client-side grid. Used to paginate + search #}
+{# server-side (137 rows on the big devices); every row now ships at once and #}
+{# sorts/filters in the browser. Rows keep their Diff / Versions actions. #}
+{% include "netbox_nso_plugin/categories/_adapter_error.html" %}
+
+<div class="d-flex justify-content-between align-items-center mb-2">
+  <div>
+    <a href="{% url 'plugins:netbox_nso_plugin:route_policy_attach' device_pk=object.pk %}" class="btn btn-sm btn-primary" title="Attach an existing route-policy object to this device — written on Apply">
+      <i class="mdi mdi-plus-thick"></i> Add Route-Policy…
+    </a>
+    <a href="{% url 'plugins:netbox_nso_plugin:route_policy_capabilities' device_pk=object.pk %}" class="btn btn-sm btn-outline-primary" title="What this device can apply for route-maps and communities (by NED + software)">
+      <i class="mdi mdi-shield-check-outline"></i> Capabilities
+    </a>
+    <a href="{% url 'plugins:netbox_nso_plugin:routing_classify_bulk_route_policy' device_pk=object.pk %}" class="btn btn-sm btn-outline-warning" title="Bulk-mark per-device the shared objects that legitimately differ between devices (VRRP / per-region lists)">
+      <i class="mdi mdi-call-split"></i> Resolve divergent…
+    </a>
   </div>
+  {% url 'plugins:netbox_nso_plugin:routing_bulk_accept_route_policy' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned %}
 </div>
+
+{% if grid_payload.rows %}
+  {{ grid_payload|json_script:"nso-rp-data" }}
+  {% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='route_policy' as cat_url %}
+  {% include "netbox_nso_plugin/categories/_grid.html" with cls="nso-rp" json_url=cat_url|add:"?format=json" counts=grid_payload.counts %}
+
+  <script>
+  (function () {
+    "use strict";
+    var root = document.querySelector('.nso-rp');
+    var payloadEl = document.getElementById('nso-rp-data');
+    if (!root || !payloadEl || !window.NSOGrid) return;
+    var G = window.NSOGrid;
+    var esc = G.esc, MUTED = G.MUTED;
+
+    function plain(field) {
+      return function (cell) {
+        var v = cell.getRow().getData()[field];
+        return v == null || v === '' ? MUTED : esc(v);
+      };
+    }
+    // Name carries the per-device and unsupported-members badges the server table had.
+    function fmtName(cell) {
+      var d = cell.getRow().getData();
+      var out = esc(d.name);
+      if (d.per_device) {
+        out += ' <span class="badge text-bg-info" title="Per-device — not deduped into one shared object; differs by device intentionally">per-device</span>';
+      }
+      if (d.unsupported && d.unsupported.length) {
+        out += ' <span class="badge text-bg-warning text-dark" title="This device’s NED cannot hold these community members, so they are silently skipped on Apply (which is why this object may sit at ‘pending apply’). Remove them from the NetBox object, or accept they stay NetBox-only: ' +
+          esc(d.unsupported.join(', ')) + '"><span class="mdi mdi-alert-outline"></span> ' +
+          d.unsupported.length + ' unsupported on NED</span>';
+      }
+      return out;
+    }
+    // Diff + Versions sit alongside Accept, so this row's actions column carries all three.
+    function fmtActions(cell) {
+      var d = cell.getRow().getData();
+      var out = '';
+      if (d.diff_url) {
+        out += '<a href="' + esc(d.diff_url) + '" class="btn btn-xs btn-outline-warning" title="See exactly what differs between this device and NetBox"><span class="mdi mdi-not-equal-variant"></span></a>';
+      }
+      if (d.versions_url) {
+        out += '<a href="' + esc(d.versions_url) + '" class="btn btn-xs btn-outline-info" title="See every device’s version of this object and pick which one NetBox mirrors"><span class="mdi mdi-source-branch"></span></a>';
+      }
+      return '<span class="d-flex gap-1">' + out + (G.acceptBtn(d) || '') + '</span>';
+    }
+
+    G.mount(root, {
+      key: 'route_policy',
+      payload: JSON.parse(payloadEl.textContent),
+      jsonUrl: root.dataset.jsonUrl,
+      placeholder: 'No route policy.',
+      columns: [
+        { title: 'Family', field: 'family', formatter: plain('family'), sorter: 'alphanum', widthGrow: 0.9, minWidth: 105,
+          headerFilter: 'input', headerFilterPlaceholder: 'filter…' },
+        { title: 'Name', field: 'name', formatter: fmtName, widthGrow: 1.8, minWidth: 170, headerFilter: 'input' },
+        { title: 'NetBox Object', field: 'obj', headerSort: false, widthGrow: 1.3, minWidth: 130,
+          formatter: function (cell) { return G.linkCell(cell.getRow().getData().obj); } },
+        G.stateColumn(),
+        G.lastSyncColumn(),
+        { title: '', field: 'diff_url', headerSort: false, widthGrow: 0.9, minWidth: 112, formatter: fmtActions },
+      ],
+    });
+  })();
+  </script>
+{% else %}
+  <p class="text-muted mb-0">No route policy.</p>
+{% endif %}

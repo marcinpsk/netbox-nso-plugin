@@ -567,7 +567,6 @@ class NSOCategoryView(LoginRequiredMixin, View):
     def _paged_category_specs(self):
         from .models import (
             NSOL2SapState,
-            NSORoutePolicyState,
             NSOSubinterfaceState,
             NSOSVIState,
             NSOVLANState,
@@ -575,18 +574,9 @@ class NSOCategoryView(LoginRequiredMixin, View):
 
         base = "netbox_nso_plugin/categories/"
         return {
-            "route_policy": dict(
-                model=NSORoutePolicyState,
-                ctx="route_policy_states",
-                partial=base + "route_policy.html",
-                search=["object_name", "family"],
-                order=["family", "object_name"],
-                sr=["content_type"],
-                ph="Filter by name / family…",
-            ),
-            # static + redistribution used to live here. They are client-side grids now
-            # (_GRID_CATEGORIES) — all rows at once, sorted/filtered in the browser — so
-            # they no longer paginate or search server-side.
+            # route_policy + static + redistribution used to live here. They are
+            # client-side grids now (_GRID_CATEGORIES) — all rows at once, sorted/
+            # filtered in the browser — so they no longer paginate or search server-side.
             "vlan": dict(
                 model=NSOVLANState,
                 ctx="vlan_states",
@@ -809,7 +799,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
     # reconcile_on_expand: these categories reconcile when first expanded (they used to
     # live on the reconcile-on-expand path). static/redistribution came off the paginated
     # path and reconcile only when the Refresh icon asks (?refresh=1).
-    _GRID_CATEGORIES = ("bfd", "ospf", "isis", "bgp", "static", "redistribution")
+    _GRID_CATEGORIES = ("bfd", "ospf", "isis", "bgp", "static", "redistribution", "route_policy")
 
     def _grid_specs(self):
         """Per-category grid spec: sub-tables, their rows, and their display fields.
@@ -828,6 +818,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
             NSOOSPFInstanceState,
             NSOOSPFInterfaceState,
             NSORedistributionState,
+            NSORoutePolicyState,
             NSOStaticRouteState,
         )
 
@@ -989,6 +980,39 @@ class NSOCategoryView(LoginRequiredMixin, View):
                             "route_map": lambda st: st.route_map or None,
                             "metric": lambda st: st.metric,
                             "diff_url": lambda st: reverse(r + "routing_redistribution_diff", args=[st.pk]),
+                        },
+                    )
+                },
+            },
+            "route_policy": {
+                # Came off the paginated path (like static/redistribution): reconciles
+                # only when the Refresh icon asks (?refresh=1), renders from persisted
+                # state otherwise. Diff / Versions only exist once a NetBox object is
+                # matched, so their urls are None until then and the client skips them.
+                "reconcile_on_expand": False,
+                "sections": {
+                    None: dict(
+                        ctx="route_policy_states",
+                        qs=lambda d: (
+                            by_device(NSORoutePolicyState, d, "content_type")
+                            .prefetch_related("assigned_object")
+                            .order_by("family", "object_name")
+                        ),
+                        accept=r + "routing_accept_route_policy",
+                        fields={
+                            "family": lambda st: st.family,
+                            "name": lambda st: st.object_name,
+                            "per_device": lambda st: st.classification_mode == "local",
+                            "unsupported": lambda st: list(st.unsupported_members or []),
+                            "obj": lambda st: linked(st.assigned_object),
+                            "diff_url": lambda st: (
+                                reverse(r + "routing_route_policy_diff", args=[st.pk]) if st.assigned_object else None
+                            ),
+                            "versions_url": lambda st: (
+                                reverse(r + "routing_route_policy_versions", args=[st.pk])
+                                if st.assigned_object
+                                else None
+                            ),
                         },
                     )
                 },

@@ -2183,45 +2183,37 @@ class TestDeviceNSOTabView(ViewTestBase):
 
     def test_paged_category_reads_persisted_paginated_and_searchable(self):
         """Single-table categories render paginated from last-synced state with NO
-        adapter call on plain expand; ?page navigates, ?q filters server-side."""
-        from django.contrib.contenttypes.models import ContentType
+        adapter call on plain expand; ?page navigates, ?q filters server-side.
+        (vlan is the representative — route_policy, the previous one, is a grid now.)"""
+        from ipam.models import VLAN
 
-        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.models import NSOVLANState
 
-        ct = ContentType.objects.get_for_model(self.device.__class__)
         for n in range(60):
-            NSORoutePolicyState.objects.create(
-                management=self.mgmt,
-                family="prefix_list",
-                object_name=("MATCHME" if n == 0 else f"PL{n:02d}"),
-                content_type=ct,
-                object_id=self.device.id,
-                status="imported",
-            )
-        url = reverse(
-            "plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device.pk, "key": "route_policy"}
-        )
+            vlan = VLAN.objects.create(vid=100 + n, name=("MATCHME" if n == 0 else f"VL{n:02d}"))
+            NSOVLANState.objects.create(management=self.mgmt, vlan=vlan, status="imported")
+        url = reverse("plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device.pk, "key": "vlan"})
 
         # Plain expand reads persisted state — no adapter round-trip — and paginates.
-        with patch("netbox_nso_plugin.adapter_client.get_route_policy") as getter:
+        with patch("netbox_nso_plugin.adapter_client.get_vlan_database") as getter:
             r = self.client.get(url)
         getter.assert_not_called()
         self.assertEqual(r.status_code, 200)
         body = r.content.decode()
         self.assertIn("nso-cat-pager", body)
         self.assertIn("Page 1 of 2", body)
-        self.assertIn("PL01", body)
-        self.assertNotIn("PL55", body)  # 50/page → page 2
+        self.assertIn("VL01", body)
+        self.assertNotIn("VL55", body)  # 50/page → page 2
         self.assertNotIn("{#", body)
         self.assertNotIn("#}", body)
 
         # ?page navigates; ?q filters server-side.
-        self.assertIn("PL55", self.client.get(url, {"page": 2}).content.decode())
+        self.assertIn("VL55", self.client.get(url, {"page": 2}).content.decode())
         bodyq = self.client.get(url, {"q": "MATCHME"}).content.decode()
         self.assertIn("MATCHME", bodyq)
-        self.assertNotIn("PL01", bodyq)
+        self.assertNotIn("VL01", bodyq)
 
-        NSORoutePolicyState.objects.filter(management=self.mgmt).delete()
+        NSOVLANState.objects.filter(management=self.mgmt).delete()
 
     def test_interfaces_page_classification_is_value_aware(self):
         """Display follows NetBox-vs-device values + status-based ownership.
@@ -2873,7 +2865,7 @@ class TestPagedCategoryQuickSelect(ViewTestBase):
         from netbox_nso_plugin.views import NSOCategoryView
 
         keys = list(NSOCategoryView()._paged_category_specs().keys())
-        self.assertIn("route_policy", keys)  # guard the introspection found the specs
+        self.assertIn("vlan", keys)  # guard the introspection found the specs (route_policy is a grid now)
         for key in keys:
             url = reverse(
                 "plugins:netbox_nso_plugin:device_nso_category",
@@ -3540,3 +3532,97 @@ class TestUnlinkedReconcileOnExpandCategories(ViewTestBase):
         self.assertIn("adapter is down", body)  # the banner
         self.assertNotIn("No remote syslog servers configured", body)
         self.assertIn("192.0.2.99", body)  # persisted rows still render
+
+
+class TestRoutePolicyGrid(ViewTestBase):
+    """route_policy as a client-side grid: the payload is built from persisted
+    NSORoutePolicyState (no adapter call), rows carry the per-device / unsupported
+    badge inputs and the Diff / Versions urls only once a NetBox object is matched."""
+
+    @classmethod
+    def setUpTestData(cls):
+        super().setUpTestData()
+        from django.contrib.contenttypes.models import ContentType
+
+        from netbox_nso_plugin.models import NSORoutePolicyObjectClass, NSORoutePolicyState
+
+        # The GFK target only needs str() + get_absolute_url(); the device itself
+        # serves (same trick the old paged test used) — no netbox-routing dependency.
+        ct = ContentType.objects.get_for_model(cls.device.__class__)
+        cls.rp_linked = NSORoutePolicyState.objects.create(
+            management=cls.mgmt,
+            family="route_map",
+            object_name="RM-EDGE",
+            content_type=ct,
+            object_id=cls.device.id,
+            status="imported",
+        )
+        cls.rp_unmatched = NSORoutePolicyState.objects.create(
+            management=cls.mgmt,
+            family="prefix_list",
+            object_name="PL-LOOPBACKS",
+            status="in_sync",
+        )
+        cls.rp_flagged = NSORoutePolicyState.objects.create(
+            management=cls.mgmt,
+            family="community_list",
+            object_name="CL-DIVERGENT",
+            status="imported",
+            unsupported_members=["65000:1", "65000:2"],
+        )
+        NSORoutePolicyObjectClass.objects.create(family="community_list", object_name="CL-DIVERGENT", mode="local")
+
+    def _url(self):
+        return reverse(
+            "plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device.pk, "key": "route_policy"}
+        )
+
+    def test_json_payload_serves_persisted_rows_without_adapter(self):
+        with patch("netbox_nso_plugin.adapter_client.get_route_policy") as getter:
+            resp = self.client.get(self._url(), {"format": "json"})
+        getter.assert_not_called()
+        self.assertEqual(resp.status_code, 200)
+        data = json.loads(resp.content)
+
+        rows = {r["name"]: r for r in data["rows"]}
+        self.assertEqual(set(rows), {"RM-EDGE", "PL-LOOPBACKS", "CL-DIVERGENT"})
+        # family, object_name ordering
+        self.assertEqual([r["name"] for r in data["rows"]], ["CL-DIVERGENT", "PL-LOOPBACKS", "RM-EDGE"])
+
+        linked = rows["RM-EDGE"]
+        self.assertIsNotNone(linked["accept_url"])  # imported → acceptable
+        self.assertEqual(linked["obj"]["label"], str(self.device))
+        self.assertEqual(linked["obj"]["url"], self.device.get_absolute_url())
+        self.assertIn(str(self.rp_linked.pk), linked["diff_url"])
+        self.assertIn(str(self.rp_linked.pk), linked["versions_url"])
+        self.assertFalse(linked["per_device"])
+        self.assertEqual(linked["unsupported"], [])
+
+        unmatched = rows["PL-LOOPBACKS"]
+        self.assertIsNone(unmatched["accept_url"])  # in_sync → owned, no Accept
+        self.assertIsNone(unmatched["obj"])
+        self.assertIsNone(unmatched["diff_url"])  # no NetBox object -> nothing to diff
+        self.assertIsNone(unmatched["versions_url"])
+
+        flagged = rows["CL-DIVERGENT"]
+        self.assertTrue(flagged["per_device"])
+        self.assertEqual(flagged["unsupported"], ["65000:1", "65000:2"])
+
+        self.assertEqual(data["counts"]["all"], 3)
+
+    def test_fragment_embeds_payload_and_keeps_the_action_buttons(self):
+        resp = self.client.get(self._url(), HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.content.decode()
+        self.assertIn('id="nso-rp-data"', body)  # embedded grid payload
+        self.assertNotIn("nso-cat-pager", body)  # the server-side pager is gone
+        self.assertIn("Add Route-Policy", body)
+        self.assertIn("Capabilities", body)
+        self.assertIn("Resolve divergent", body)
+        self.assertNotIn("{#", body)  # the CR-P16 multi-line comment leak
+
+    def test_unlinked_device_still_serves_rows(self):
+        """Grid payloads come from the DB — an unlinked device keeps its rows."""
+        self.assertIsNone(self.mgmt.adapter_device_id)
+        data = json.loads(self.client.get(self._url(), {"format": "json"}).content)
+        self.assertEqual(len(data["rows"]), 3)
