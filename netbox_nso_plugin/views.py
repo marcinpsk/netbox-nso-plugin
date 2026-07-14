@@ -440,9 +440,10 @@ class NSOCategoryView(LoginRequiredMixin, View):
 
         mgmt = getattr(device, "nso_management", None)
 
-        # A grid's post-action reload wants the rows back, not a re-reconcile.
-        if key in self._GRID_CATEGORIES and request.GET.get("format") == "json":
-            return JsonResponse(self._grid_payload_from_db(key, device, mgmt))
+        # Client-side grids: all rows at once, filtered/sorted in the browser. Must come
+        # before the paginated path — static/redistribution used to render from it.
+        if key in self._GRID_CATEGORIES:
+            return self._render_grid_category(request, device, mgmt, key)
 
         # Large single-table categories render paginated from last-synced state
         # (fast); ?refresh=1 (the Refresh icon) forces a live reconcile first.
@@ -467,15 +468,6 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 ctx["adapter_error_code"] = exc.code
         _annotate_residue_rows(ctx, key, mgmt)
         ctx["category_has_unowned"] = _ctx_has_unowned(ctx)
-        if key in self._GRID_CATEGORIES:
-            if ctx.get(self._GRID_CTX_VAR[key]):
-                payload = self._grid_payload_from_ctx(key, ctx)
-            else:
-                # Reconcile did not run (unlinked device) or returned nothing — show what
-                # NetBox has persisted rather than claiming the category is empty.
-                payload = self._grid_payload_from_db(key, device, mgmt, ctx.get("adapter_error"))
-            ctx["grid_payload"] = payload
-            ctx["counts"] = payload["counts"]
         return render(request, partial, ctx)
 
     # Single-table overlay categories that render paginated from last-synced state.
@@ -485,9 +477,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
     def _paged_category_specs(self):
         from .models import (
             NSOL2SapState,
-            NSORedistributionState,
             NSORoutePolicyState,
-            NSOStaticRouteState,
             NSOSubinterfaceState,
             NSOSVIState,
             NSOVLANState,
@@ -504,24 +494,9 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 sr=["content_type"],
                 ph="Filter by name / family…",
             ),
-            "static": dict(
-                model=NSOStaticRouteState,
-                ctx="static_routes",
-                partial=base + "static.html",
-                search=["nso_prefix", "nso_vrf", "nso_next_hop"],
-                order=["nso_prefix"],
-                sr=["static_route"],
-                ph="Filter by prefix / VRF / next hop…",
-            ),
-            "redistribution": dict(
-                model=NSORedistributionState,
-                ctx="redistribution_states",
-                partial=base + "redistribution.html",
-                search=["dest_protocol", "dest_ref", "source_protocol", "route_map"],
-                order=["dest_protocol", "source_protocol"],
-                sr=[],
-                ph="Filter by protocol / ref / route-map…",
-            ),
+            # static + redistribution used to live here. They are client-side grids now
+            # (_GRID_CATEGORIES) — all rows at once, sorted/filtered in the browser — so
+            # they no longer paginate or search server-side.
             "vlan": dict(
                 model=NSOVLANState,
                 ctx="vlan_states",
@@ -726,28 +701,220 @@ class NSOCategoryView(LoginRequiredMixin, View):
     # Statuses whose rows offer an Accept action — mirrors _accept_cell.html exactly.
     _ACCEPTABLE_STATUSES = ("imported", "changed", "conflict", "drifted")
 
-    # Categories that render as a client-side grid (nso-grid.js) instead of a
-    # server-rendered table. Unlike Interfaces — where each attribute is its own
-    # overlay row and Accept is per CELL — these own the whole row: one status, one
-    # accept_url. They keep the on-expand reconcile, but answer ?format=json straight
-    # from persisted overlay state so the grid's post-action reload never re-hits the
-    # adapter (every Accept click would otherwise trigger a fresh reconcile).
-    _GRID_CATEGORIES = ("bfd",)
+    # ── Category grids (nso-grid.js) ─────────────────────────────────────────────
+    #
+    # Categories rendered as a client-side grid instead of a server-rendered table.
+    # Unlike Interfaces — where each attribute is its own overlay row and Accept is per
+    # CELL — every routing overlay owns the whole ROW: one status, one accept_url. So
+    # they all share one row serializer and differ only in their display fields.
+    #
+    # The payload is ALWAYS built from persisted overlay state, never from the reconcile's
+    # return value. reconcile_category yields an empty context for a device with no
+    # adapter_device_id, and a panel keyed off that context claims the category is empty
+    # while NetBox is holding rows for it — an operator who unlinks a device watches their
+    # accepted config vanish from the UI. Reading the DB is also what lets ?format=json
+    # serve the grid's post-action reload without re-reconciling: the grid re-fetches after
+    # every action, so reconciling there would mean a fresh device read per Accept click.
+    #
+    # reconcile_on_expand: these categories reconcile when first expanded (they used to
+    # live on the reconcile-on-expand path). static/redistribution came off the paginated
+    # path and reconcile only when the Refresh icon asks (?refresh=1).
+    _GRID_CATEGORIES = ("bfd", "ospf", "isis", "bgp", "static", "redistribution")
 
-    # The ctx list each grid category's reconcile fills, so the fragment can tell
-    # "reconcile gave me rows" from "reconcile never ran".
-    _GRID_CTX_VAR = {"bfd": "bfd_states"}
+    def _grid_specs(self):
+        """Per-category grid spec: sub-tables, their rows, and their display fields.
 
-    def _bfd_grid_payload(self, states, adapter_error=None):
-        """Rows for the BFD grid, from already-fetched (and residue-annotated) state.
+        sections maps section name -> (queryset, accept route, display fields). A
+        single-section category ships a flat {rows, counts} payload; a multi-section one
+        ships {"<section>": {rows, counts}, ...} and each grid picks its own section
+        client-side (nso-grid.js opts.extract).
+        """
+        from .models import (
+            NSOBFDInterfaceState,
+            NSOBGPPeerState,
+            NSOBGPPeerTemplateState,
+            NSOISISInstanceState,
+            NSOISISInterfaceState,
+            NSOOSPFInstanceState,
+            NSOOSPFInterfaceState,
+            NSORedistributionState,
+            NSOStaticRouteState,
+        )
 
-        Takes the rows rather than re-querying: the caller's ctx rows have been through
-        _annotate_residue_rows, which reads the device's adapter jobs — re-deriving them
-        here would pay for that adapter round-trip twice on a single expand.
+        r = "plugins:netbox_nso_plugin:"
 
-        kind/label come from summary.display_state, the same helper the server-rendered
-        table used, so badges, quick-filter buckets and Accept visibility keep their
-        established meaning. The client never re-derives them.
+        def iface(st):
+            return {"name": st.interface.name, "url": st.interface.get_absolute_url()}
+
+        def linked(obj):
+            """Render a resolved netbox-routing object, or None when it never matched."""
+            return {"label": str(obj), "url": obj.get_absolute_url()} if obj else None
+
+        def by_device(model, device, *sr):
+            qs = model.objects.filter(management__device=device)
+            return qs.select_related(*sr) if sr else qs
+
+        return {
+            "bfd": {
+                "reconcile_on_expand": True,
+                "sections": {
+                    None: dict(
+                        ctx="bfd_states",
+                        qs=lambda d: by_device(NSOBFDInterfaceState, d, "interface").order_by("interface__name"),
+                        accept=r + "bfd_accept",
+                        fields={
+                            "iface": iface,
+                            "micro_bfd": lambda st: st.micro_bfd,
+                            "min_tx": lambda st: st.min_tx,
+                            "min_rx": lambda st: st.min_rx,
+                            "multiplier": lambda st: st.multiplier,
+                        },
+                    )
+                },
+            },
+            "ospf": {
+                "reconcile_on_expand": True,
+                "sections": {
+                    "instances": dict(
+                        ctx="ospf_data.instances",
+                        qs=lambda d: by_device(NSOOSPFInstanceState, d, "ospf_instance").order_by("process_id"),
+                        accept=r + "routing_accept_ospf_instance",
+                        fields={
+                            "process_id": lambda st: st.process_id,
+                            "vrf": lambda st: st.vrf or "global",
+                            "router_id": lambda st: st.router_id or None,
+                            "instance": lambda st: linked(st.ospf_instance),
+                        },
+                    ),
+                    "interfaces": dict(
+                        ctx="ospf_data.interfaces",
+                        qs=lambda d: by_device(NSOOSPFInterfaceState, d, "interface").order_by("interface__name"),
+                        accept=r + "routing_accept_ospf_interface",
+                        fields={
+                            "iface": iface,
+                            "process_id": lambda st: st.process_id,
+                            "area_id": lambda st: st.area_id or None,
+                            "network_type": lambda st: st.network_type or None,
+                            "cost": lambda st: st.cost,
+                            "passive": lambda st: st.passive,
+                        },
+                    ),
+                },
+            },
+            "isis": {
+                "reconcile_on_expand": True,
+                "sections": {
+                    "interfaces": dict(
+                        ctx="isis_interfaces",
+                        qs=lambda d: by_device(NSOISISInterfaceState, d, "interface").order_by("interface__name", "af"),
+                        accept=r + "routing_accept_isis_interface",
+                        fields={
+                            "iface": iface,
+                            "af": lambda st: st.af,
+                            "process_tag": lambda st: st.process_tag or "default",
+                            "circuit_type": lambda st: st.circuit_type or None,
+                            "network_type": lambda st: st.network_type or None,
+                            "metric": lambda st: st.metric,
+                            "passive": lambda st: st.passive,
+                            "hello_auth": lambda st: (
+                                (st.hello_auth_type or "on") if (st.hello_auth_present or st.hello_auth_type) else None
+                            ),
+                        },
+                    ),
+                    "instances": dict(
+                        ctx="isis_processes",
+                        qs=lambda d: by_device(NSOISISInstanceState, d, "isis_instance").order_by("process_tag"),
+                        accept=r + "routing_accept_isis_instance",
+                        fields={
+                            "process_tag": lambda st: st.process_tag or "default",
+                            "instance": lambda st: linked(st.isis_instance),
+                            "area_auth": lambda st: f"{st.area_auth_type or '—'}{' ✓' if st.area_auth_present else ''}",
+                            "domain_auth": lambda st: (
+                                f"{st.domain_auth_type or '—'}{' ✓' if st.domain_auth_present else ''}"
+                            ),
+                        },
+                    ),
+                },
+            },
+            "bgp": {
+                "reconcile_on_expand": True,
+                "sections": {
+                    "peers": dict(
+                        ctx="bgp_peers",
+                        qs=lambda d: by_device(NSOBGPPeerState, d, "bgp_peer").order_by(
+                            "asn_str", "vrf_name", "peer_address_str"
+                        ),
+                        accept=r + "routing_accept_bgp_peer",
+                        fields={
+                            "asn": lambda st: st.asn_str,
+                            "vrf": lambda st: st.vrf_name or "global",
+                            "peer_address": lambda st: st.peer_address_str,
+                            "remote_as": lambda st: st.remote_as_str or None,
+                            # Junos deactivate / admin-down: the row exists but is inert.
+                            "disabled": lambda st: st.enabled is False,
+                            "peer": lambda st: linked(st.bgp_peer),
+                        },
+                    ),
+                    "templates": dict(
+                        ctx="bgp_peer_templates",
+                        qs=lambda d: by_device(NSOBGPPeerTemplateState, d, "template").order_by("template_name"),
+                        accept=r + "routing_accept_bgp_peer_template",
+                        fields={
+                            "template_name": lambda st: st.template_name,
+                            "remote_as": lambda st: st.remote_as_str or None,
+                            "template": lambda st: linked(st.template),
+                        },
+                    ),
+                },
+            },
+            "static": {
+                "reconcile_on_expand": False,
+                "sections": {
+                    None: dict(
+                        ctx="static_routes",
+                        qs=lambda d: by_device(NSOStaticRouteState, d, "static_route").order_by("nso_prefix"),
+                        accept=r + "routing_accept_static_route",
+                        fields={
+                            "vrf": lambda st: st.nso_vrf or "global",
+                            "prefix": lambda st: st.nso_prefix,
+                            "next_hop": lambda st: st.nso_next_hop or None,
+                            "metric": lambda st: st.static_route.metric if st.static_route else None,
+                            "route": lambda st: linked(st.static_route),
+                        },
+                    )
+                },
+            },
+            "redistribution": {
+                "reconcile_on_expand": False,
+                "sections": {
+                    None: dict(
+                        ctx="redistribution_states",
+                        qs=lambda d: by_device(NSORedistributionState, d).order_by("dest_protocol", "source_protocol"),
+                        accept=r + "routing_accept_redistribution",
+                        fields={
+                            "dest_protocol": lambda st: st.dest_protocol,
+                            "dest_ref": lambda st: st.dest_ref or None,
+                            "source_protocol": lambda st: st.source_protocol,
+                            "source_ref": lambda st: st.source_ref or None,
+                            "route_map": lambda st: st.route_map or None,
+                            "metric": lambda st: st.metric,
+                            "diff_url": lambda st: reverse(r + "routing_redistribution_diff", args=[st.pk]),
+                        },
+                    )
+                },
+            },
+        }
+
+    def _grid_section(self, states, accept_route, fields):
+        """Serialize one grid sub-table: its rows plus the quick-filter counts.
+
+        kind/label come from summary.display_state — the same helper the server-rendered
+        tables used — so badges, quick-filter buckets and Accept visibility keep their
+        established meaning, and the client never re-derives them (a second, drifting
+        implementation would show a row that its own filter then hides).
+
+        The counts are taken off the SAME kind the pills filter on, so a chip can never
+        promise rows its own filter would hide.
         """
         from .status_machine import OWNED_STATES
         from .summary import display_state
@@ -755,69 +922,97 @@ class NSOCategoryView(LoginRequiredMixin, View):
         rows = []
         counts = {"all": 0, "drift": 0, "pending": 0}
         for st in states:
-            owned = st.status in OWNED_STATES
-            kind, label = display_state(st.status, owned)
+            kind, label = display_state(st.status, st.status in OWNED_STATES)
             counts["all"] += 1
             if kind == "drift":
                 counts["drift"] += 1
             elif kind in _PENDING_KINDS:
                 counts["pending"] += 1
-            rows.append(
-                {
-                    "pk": st.pk,
-                    "iface": {"name": st.interface.name, "url": st.interface.get_absolute_url()},
-                    "micro_bfd": st.micro_bfd,
-                    "min_tx": st.min_tx,
-                    "min_rx": st.min_rx,
-                    "multiplier": st.multiplier,
-                    "last_sync": st.last_sync_at.strftime("%Y-%m-%d %H:%M") if st.last_sync_at else None,
-                    "status": st.status,
-                    "state": kind,
-                    "kind": kind,
-                    "label": label,
-                    "residue": bool(getattr(st, "residue_survivor", False)),
-                    "residue_job": getattr(st, "residue_job_id", None),
-                    "accept_url": (
-                        reverse("plugins:netbox_nso_plugin:bfd_accept", args=[st.pk])
-                        if st.status in self._ACCEPTABLE_STATUSES
-                        else None
-                    ),
-                }
-            )
-        return {"rows": rows, "counts": counts, "adapter_error": adapter_error}
-
-    def _grid_payload_from_db(self, key, device, mgmt, adapter_error=None):
-        """Build a grid category's payload from persisted overlay state alone.
-
-        Serves the ?format=json reload, and also backs the fragment whenever reconcile
-        did not run — a device with no adapter_device_id (never linked, or unlinked) gets
-        an empty reconcile context, and keying the panel off that context would claim
-        "No BFD-configured interfaces" while NetBox is holding rows for them. The
-        Interfaces grid already renders from persisted state for exactly this reason.
-        """
-        from .models import NSOBFDInterfaceState
-
-        if key == "bfd":
-            ctx = {
-                "bfd_states": list(
-                    NSOBFDInterfaceState.objects.filter(management__device=device)
-                    .select_related("interface")
-                    .order_by("interface__name")
-                )
+            row = {
+                "pk": st.pk,
+                "status": st.status,
+                "state": kind,
+                "kind": kind,
+                "label": label,
+                "residue": bool(getattr(st, "residue_survivor", False)),
+                "residue_job": getattr(st, "residue_job_id", None),
+                "last_sync": st.last_sync_at.strftime("%Y-%m-%d %H:%M") if st.last_sync_at else None,
+                "accept_url": (reverse(accept_route, args=[st.pk]) if st.status in self._ACCEPTABLE_STATUSES else None),
             }
-            _annotate_residue_rows(ctx, key, mgmt)
-            return self._bfd_grid_payload(ctx["bfd_states"], adapter_error)
-        raise ValueError(f"no grid payload builder for {key}")  # pragma: no cover
+            row.update({name: fn(st) for name, fn in fields.items()})
+            rows.append(row)
+        return {"rows": rows, "counts": counts}
 
-    def _grid_payload_from_ctx(self, key, ctx):
-        """Grid payload for the on-expand fragment, reusing the reconciled ctx rows.
+    def _grid_payload(self, key, device, mgmt, adapter_error=None):
+        """Build a grid category's whole payload from persisted overlay state."""
+        spec = self._grid_specs()[key]
+        states = {name: list(section["qs"](device)) for name, section in spec["sections"].items()}
 
-        Reuses them rather than re-querying because they have already been through
-        _annotate_residue_rows, which reads the device's adapter jobs.
-        """
-        if key == "bfd":
-            return self._bfd_grid_payload(ctx.get("bfd_states") or [], ctx.get("adapter_error"))
-        raise ValueError(f"no grid payload builder for {key}")  # pragma: no cover
+        # Residue decoration reads the device's adapter jobs, so annotate the WHOLE
+        # category in one pass rather than once per sub-table. _annotate_residue_rows
+        # looks for each sub-table under the ctx path its matcher names (_residue_matchers,
+        # e.g. "ospf_data.interfaces"), which is why every section carries that path
+        # verbatim — get it wrong and the rows silently lose their residue badge.
+        ctx: dict = {}
+        for name, section in spec["sections"].items():
+            path = section["ctx"]
+            if "." in path:
+                head, leaf = path.split(".", 1)
+                ctx.setdefault(head, {})[leaf] = states[name]
+            else:
+                ctx[path] = states[name]
+        _annotate_residue_rows(ctx, key, mgmt)
+
+        payload: dict = {"adapter_error": adapter_error}
+        for name, section in spec["sections"].items():
+            built = self._grid_section(states[name], section["accept"], section["fields"])
+            if name is None:
+                payload.update(built)
+            else:
+                payload[name] = built
+        return payload
+
+    def _render_grid_category(self, request, device, mgmt, key):
+        """Render a grid category — or, for ?format=json, serve just its rows."""
+        spec = self._grid_specs()[key]
+        want_json = request.GET.get("format") == "json"
+
+        adapter_error = None
+        # Never reconcile for the JSON reload: the grid re-fetches after every action, so
+        # that would be a device read per Accept click.
+        may_reconcile = not want_json and mgmt is not None and mgmt.adapter_device_id is not None
+        if may_reconcile and (spec["reconcile_on_expand"] or request.GET.get("refresh")):
+            from .reconcile import reconcile_category
+
+            try:
+                reconcile_category(device, mgmt, key)
+            except AdapterError as exc:
+                adapter_error = str(exc)
+
+        payload = self._grid_payload(key, device, mgmt, adapter_error)
+        if want_json:
+            return JsonResponse(payload)
+
+        # Bulk-accept shows only when something is still unowned — i.e. some row offers
+        # an Accept, which is exactly the accept_url the grid itself renders.
+        sections = [payload] if None in spec["sections"] else [payload[n] for n in spec["sections"]]
+        has_unowned = any(row["accept_url"] for s in sections for row in s["rows"])
+
+        from .template_content import _STATUS_BADGE
+
+        return render(
+            request,
+            self._PARTIALS[key],
+            {
+                "object": device,
+                "mgmt": mgmt,
+                "status_badge": _STATUS_BADGE,
+                "grid_payload": payload,
+                "counts": payload.get("counts"),
+                "adapter_error": adapter_error,
+                "category_has_unowned": has_unowned,
+            },
+        )
 
     def _interface_merged_payload(
         self, ordered, kinds_by_iface, counts, attr_states, mtu_states, sw_states, ip_states, adapter_error

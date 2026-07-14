@@ -1,70 +1,101 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
-{# Lazy-loaded fragment: BGP Peers category. #}
+{# Lazy fragment: BGP category — peers + peer-group templates, two grids over ONE payload. #}
 {% include "netbox_nso_plugin/categories/_adapter_error.html" %}
 <div class="d-flex justify-content-end align-items-center gap-2 mb-2">
   <a href="{% url 'plugins:netbox_nso_plugin:bgp_peer_add' device_pk=object.pk %}" class="btn btn-sm btn-primary" title="Create a new BGP neighbor on this device — written on Apply">
     <i class="mdi mdi-plus-thick"></i> Add BGP peer…
   </a>
-  {% if bgp_peers %}{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_bgp_peers' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned %}{% endif %}
+  {% if grid_payload.peers.rows %}{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_bgp_peers' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned %}{% endif %}
 </div>
-{% if bgp_peers %}
-  <div id="flt-bgp">
-  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-bgp" placeholder="Filter by peer / ASN / VRF…" show_status=True %}
-  <div class="table-responsive">
-    <table class="table table-sm table-hover mb-0">
-      <thead>
-        <tr><th>ASN</th><th>VRF</th><th>Peer Address</th><th>Remote AS</th><th>BGP Peer</th><th>Status</th><th>Last Synced</th><th></th></tr>
-      </thead>
-      <tbody>
-        {% for bp in bgp_peers %}
-        <tr data-status="{{ bp.status }}" data-owned="{{ bp.accepted_at|yesno:'true,false' }}">
-          <td>{{ bp.asn_str }}</td>
-          <td>{{ bp.vrf_name|default:"global" }}</td>
-          <td>{{ bp.peer_address_str }}{% if bp.enabled is False %} <span class="badge text-bg-warning text-dark ms-1" title="Deactivated on the device (Junos deactivate / admin down)">disabled</span>{% endif %}</td>
-          <td>{{ bp.remote_as_str|default:"—" }}</td>
-          <td>{% if bp.bgp_peer %}<a href="{{ bp.bgp_peer.get_absolute_url }}">{{ bp.bgp_peer }}</a>{% else %}—{% endif %}</td>
-          <td>
-            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=bp.status residue=bp.residue_survivor residue_job=bp.residue_job_id %}
-          </td>
-          <td class="text-nowrap">{% if bp.last_sync_at %}{{ bp.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
-          <td>
-            {% url 'plugins:netbox_nso_plugin:routing_accept_bgp_peer' pk=bp.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=bp.status %}
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-  </div>
+
+{{ grid_payload|json_script:"nso-bgp-data" }}
+{% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='bgp' as cat_url %}
+
+{% if grid_payload.peers.rows %}
+  {% include "netbox_nso_plugin/categories/_grid.html" with cls="nso-bgp-peers" json_url=cat_url|add:"?format=json" counts=grid_payload.peers.counts %}
 {% else %}
   <p class="text-muted mb-0">No BGP peers.</p>
 {% endif %}
 
-{% if bgp_peer_templates %}
+{% if grid_payload.templates.rows %}
   <h6 class="mt-3 mb-2">Peer-group templates</h6>
-  <div id="flt-bgp-tmpl">
-  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-bgp-tmpl" placeholder="Filter by peer-group / remote AS…" show_status=True %}
-  <div class="table-responsive">
-    <table class="table table-sm table-hover mb-0">
-      <thead>
-        <tr><th>Peer-group</th><th>Remote AS</th><th>Template</th><th>Status</th><th>Last Synced</th><th></th></tr>
-      </thead>
-      <tbody>
-        {% for tp in bgp_peer_templates %}
-        <tr data-status="{{ tp.status }}" data-owned="{{ tp.accepted_at|yesno:'true,false' }}">
-          <td>{{ tp.template_name }}</td>
-          <td>{{ tp.remote_as_str|default:"—" }}</td>
-          <td>{% if tp.template %}<a href="{{ tp.template.get_absolute_url }}">{{ tp.template }}</a>{% else %}—{% endif %}</td>
-          <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=tp.status %}</td>
-          <td class="text-nowrap">{% if tp.last_sync_at %}{{ tp.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
-          <td>
-            {% url 'plugins:netbox_nso_plugin:routing_accept_bgp_peer_template' pk=tp.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=tp.status %}
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-  </div>
+  {% include "netbox_nso_plugin/categories/_grid.html" with cls="nso-bgp-tmpl" json_url=cat_url|add:"?format=json" counts=grid_payload.templates.counts %}
 {% endif %}
+
+<script>
+(function () {
+  "use strict";
+  var payloadEl = document.getElementById('nso-bgp-data');
+  if (!payloadEl || !window.NSOGrid) return;
+  var G = window.NSOGrid;
+  var esc = G.esc, MUTED = G.MUTED;
+  var payload = JSON.parse(payloadEl.textContent);
+
+  function plain(field) {
+    return function (cell) {
+      var v = cell.getRow().getData()[field];
+      return v == null || v === '' ? MUTED : esc(v);
+    };
+  }
+
+  var peers = document.querySelector('.nso-bgp-peers');
+  if (peers) {
+    G.mount(peers, {
+      key: 'bgp-peers',
+      payload: payload,
+      extract: function (j) { return j.peers; },
+      jsonUrl: peers.dataset.jsonUrl,
+      placeholder: 'No BGP peers.',
+      flatten: function (rows) {
+        return rows.map(function (r) { r._peer = r.peer_address || ''; return r; });
+      },
+      columns: [
+        { title: 'ASN', field: 'asn', formatter: plain('asn'), sorter: 'alphanum', widthGrow: 0.8, minWidth: 85,
+          headerFilter: 'input', headerFilterPlaceholder: 'filter…' },
+        { title: 'VRF', field: 'vrf', formatter: plain('vrf'), widthGrow: 0.9, minWidth: 90, headerFilter: 'input' },
+        { title: 'Peer Address', field: '_peer', widthGrow: 1.6, minWidth: 150, sorter: 'alphanum',
+          headerFilter: 'input', headerFilterPlaceholder: 'filter peer…',
+          formatter: function (cell) {
+            var d = cell.getRow().getData();
+            var out = esc(d.peer_address);
+            if (d.disabled) {
+              out += ' <span class="badge text-bg-warning text-dark ms-1" title="Deactivated on the device (Junos deactivate / admin down)">disabled</span>';
+            }
+            return out;
+          } },
+        { title: 'Remote AS', field: 'remote_as', formatter: plain('remote_as'), widthGrow: 0.9, minWidth: 95 },
+        { title: 'BGP Peer', field: 'peer', headerSort: false, widthGrow: 1.4, minWidth: 120,
+          formatter: function (cell) { return G.linkCell(cell.getRow().getData().peer); } },
+        G.stateColumn(),
+        G.lastSyncColumn(),
+        G.acceptColumn(),
+      ],
+    });
+  }
+
+  var tmpl = document.querySelector('.nso-bgp-tmpl');
+  if (tmpl) {
+    G.mount(tmpl, {
+      key: 'bgp-templates',
+      payload: payload,
+      extract: function (j) { return j.templates; },
+      jsonUrl: tmpl.dataset.jsonUrl,
+      placeholder: 'No peer-group templates.',
+      flatten: function (rows) {
+        return rows.map(function (r) { r._name = r.template_name || ''; return r; });
+      },
+      columns: [
+        { title: 'Peer-group', field: '_name', formatter: plain('template_name'), sorter: 'alphanum', widthGrow: 1.4, minWidth: 130,
+          headerFilter: 'input', headerFilterPlaceholder: 'filter…' },
+        { title: 'Remote AS', field: 'remote_as', formatter: plain('remote_as'), widthGrow: 0.9, minWidth: 95 },
+        { title: 'Template', field: 'template', headerSort: false, widthGrow: 1.4, minWidth: 120,
+          formatter: function (cell) { return G.linkCell(cell.getRow().getData().template); } },
+        G.stateColumn(),
+        G.lastSyncColumn(),
+        G.acceptColumn(),
+      ],
+    });
+  }
+})();
+</script>

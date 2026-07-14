@@ -1,13 +1,13 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
-{# Lazy-loaded fragment: IS-IS category (interfaces + instances). #}
+{# Lazy fragment: IS-IS category — two grids (interfaces + instances) over ONE payload. #}
 {% include "netbox_nso_plugin/categories/_adapter_error.html" %}
 
 {# #78 intent-integrity: name what the mirror carries that the write path does not, #}
-{# so an edit+Accept on those fields is never silently inert. Registry (and the     #}
-{# payload-proving test) live in isis_write_policy.py; the per-object detail panel  #}
-{# renders on the netbox-routing IS-IS pages themselves.                            #}
-{% if isis_interfaces or isis_processes %}
+{# so an edit+Accept on those fields is never silently inert. Registry (and the #}
+{# payload-proving test) live in isis_write_policy.py; the per-object detail panel #}
+{# renders on the netbox-routing IS-IS pages themselves. #}
+{% if grid_payload.interfaces.rows or grid_payload.instances.rows %}
   <p class="text-muted small mb-2">
     <span class="mdi mdi-pencil-off-outline me-1"></span>
     Some mirrored IS-IS fields are <strong>read-only</strong> (not carried by the NSO write path):
@@ -17,80 +17,116 @@
     prefix-SIDs and SRv6 locators. Editing them in NetBox does <em>not</em> reach the device —
     the IS-IS object pages list the exact fields.
   </p>
-{% endif %}
 
-{% if isis_interfaces %}
-  <div class="d-flex justify-content-between align-items-center mb-2">
-    <h6 class="mb-1 d-inline-block">IS-IS Interfaces</h6>
-    {% url 'plugins:netbox_nso_plugin:routing_bulk_accept_isis_interfaces' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned %}
-  </div>
-  <div id="flt-isis-interfaces">
-  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-isis-interfaces" placeholder="Filter by interface / type…" show_status=True %}
-  <div class="table-responsive mb-3">
-    <table class="table table-sm table-hover mb-0">
-      <thead>
-        <tr><th>Interface</th><th>AF</th><th>Process Tag</th><th>Circuit Type</th><th>Network Type</th><th>Metric</th><th>Passive</th><th>Hello Auth</th><th>Status</th><th>Last Synced</th><th></th></tr>
-      </thead>
-      <tbody>
-        {% for ii in isis_interfaces %}
-        <tr data-status="{{ ii.status }}" data-owned="{{ ii.accepted_at|yesno:'true,false' }}">
-          <td><a href="{{ ii.interface.get_absolute_url }}">{{ ii.interface.name }}</a></td>
-          <td>{{ ii.af }}</td>
-          <td>{{ ii.process_tag|default:"default" }}</td>
-          <td>{{ ii.circuit_type|default:"—" }}</td>
-          <td>{{ ii.network_type|default:"—" }}</td>
-          <td>{{ ii.metric|default:"—" }}</td>
-          <td>{% if ii.passive %}<span class="badge text-bg-warning text-dark">passive</span>{% else %}<span class="badge text-bg-success">active</span>{% endif %}</td>
-          <td>{% if ii.hello_auth_present or ii.hello_auth_type %}<span class="badge text-bg-info" title="Per-interface IIH authentication">{{ ii.hello_auth_type|default:"on" }}</span>{% else %}<span class="text-muted">—</span>{% endif %}</td>
-          <td>
-            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=ii.status residue=ii.residue_survivor residue_job=ii.residue_job_id %}
-          </td>
-          <td class="text-nowrap">{% if ii.last_sync_at %}{{ ii.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
-          <td>
-            {% url 'plugins:netbox_nso_plugin:routing_accept_isis_interface' pk=ii.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=ii.status %}
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-  </div>
-{% endif %}
+  {{ grid_payload|json_script:"nso-isis-data" }}
+  {% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='isis' as cat_url %}
 
-{% if isis_processes %}
-  <div class="d-flex justify-content-between align-items-center mb-2">
-    <h6 class="mb-1 d-inline-block">IS-IS Instances</h6>
-    {% url 'plugins:netbox_nso_plugin:routing_bulk_accept_isis_instances' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned %}
-  </div>
-  <div id="flt-isis-instances">
-  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-isis-instances" placeholder="Filter by process tag / instance…" show_status=True %}
-  <div class="table-responsive">
-    <table class="table table-sm table-hover mb-0">
-      <thead>
-        <tr><th>Process Tag</th><th>IS-IS Instance</th><th>Area Auth</th><th>Domain Auth</th><th>Status</th><th>Last Synced</th><th></th></tr>
-      </thead>
-      <tbody>
-        {% for ip in isis_processes %}
-        <tr data-status="{{ ip.status }}" data-owned="{{ ip.accepted_at|yesno:'true,false' }}">
-          <td>{{ ip.process_tag|default:"default" }}</td>
-          <td>{% if ip.isis_instance %}<a href="{{ ip.isis_instance.get_absolute_url }}">{{ ip.isis_instance }}</a>{% else %}—{% endif %}</td>
-          <td>{{ ip.area_auth_type|default:"—" }}{% if ip.area_auth_present %} ✓{% endif %}</td>
-          <td>{{ ip.domain_auth_type|default:"—" }}{% if ip.domain_auth_present %} ✓{% endif %}</td>
-          <td>
-            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=ip.status residue=ip.residue_survivor residue_job=ip.residue_job_id %}
-          </td>
-          <td class="text-nowrap">{% if ip.last_sync_at %}{{ ip.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
-          <td>
-            {% url 'plugins:netbox_nso_plugin:routing_accept_isis_instance' pk=ip.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=ip.status %}
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-  </div>
-{% endif %}
+  {% if grid_payload.interfaces.rows %}
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      <h6 class="mb-1 d-inline-block">IS-IS Interfaces</h6>
+      {% url 'plugins:netbox_nso_plugin:routing_bulk_accept_isis_interfaces' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned %}
+    </div>
+    {% include "netbox_nso_plugin/categories/_grid.html" with cls="nso-isis-if" json_url=cat_url|add:"?format=json" counts=grid_payload.interfaces.counts %}
+  {% endif %}
 
-{% if not isis_interfaces and not isis_processes %}
+  {% if grid_payload.instances.rows %}
+    <div class="d-flex justify-content-between align-items-center mb-2 mt-3">
+      <h6 class="mb-1 d-inline-block">IS-IS Instances</h6>
+      {% url 'plugins:netbox_nso_plugin:routing_bulk_accept_isis_instances' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned %}
+    </div>
+    {% include "netbox_nso_plugin/categories/_grid.html" with cls="nso-isis-inst" json_url=cat_url|add:"?format=json" counts=grid_payload.instances.counts %}
+  {% endif %}
+
+  <script>
+  (function () {
+    "use strict";
+    var payloadEl = document.getElementById('nso-isis-data');
+    if (!payloadEl || !window.NSOGrid) return;
+    var G = window.NSOGrid;
+    var esc = G.esc, MUTED = G.MUTED;
+    var payload = JSON.parse(payloadEl.textContent);
+
+    function plain(field) {
+      return function (cell) {
+        var v = cell.getRow().getData()[field];
+        return v == null || v === '' ? MUTED : esc(v);
+      };
+    }
+
+    var ifg = document.querySelector('.nso-isis-if');
+    if (ifg) {
+      G.mount(ifg, {
+        key: 'isis-interfaces',
+        payload: payload,
+        extract: function (j) { return j.interfaces; },
+        jsonUrl: ifg.dataset.jsonUrl,
+        placeholder: 'No IS-IS interfaces.',
+        flatten: function (rows) {
+          return rows.map(function (r) {
+            r._iface = r.iface.name;
+            r._passive = r.passive ? 'passive' : 'active';
+            return r;
+          });
+        },
+        columns: [
+          { title: 'Interface', field: '_iface', widthGrow: 1.5, minWidth: 140, sorter: 'alphanum',
+            formatter: function (cell) {
+              var d = cell.getRow().getData();
+              return '<a href="' + esc(d.iface.url) + '" title="Open interface in NetBox">' + esc(d.iface.name) + '</a>';
+            },
+            headerFilter: 'input', headerFilterPlaceholder: 'filter interface…' },
+          { title: 'AF', field: 'af', formatter: plain('af'), widthGrow: 0.6, minWidth: 70,
+            headerFilter: 'list', headerFilterParams: { values: { '': 'All', ipv4: 'ipv4', ipv6: 'ipv6' } } },
+          { title: 'Process Tag', field: 'process_tag', formatter: plain('process_tag'), widthGrow: 1, minWidth: 100 },
+          { title: 'Circuit Type', field: 'circuit_type', formatter: plain('circuit_type'), widthGrow: 1, minWidth: 100 },
+          { title: 'Network Type', field: 'network_type', formatter: plain('network_type'), widthGrow: 1, minWidth: 105 },
+          { title: 'Metric', field: 'metric', formatter: plain('metric'), widthGrow: 0.7, minWidth: 75, hozAlign: 'right' },
+          { title: 'Passive', field: '_passive', widthGrow: 0.8, minWidth: 90,
+            formatter: function (cell) {
+              return G.boolBadge(cell.getRow().getData().passive,
+                'passive', 'text-bg-warning text-dark', 'active', 'text-bg-success');
+            },
+            headerFilter: 'list', headerFilterParams: { values: { '': 'All', passive: 'passive', active: 'active' } } },
+          { title: 'Hello Auth', field: 'hello_auth', widthGrow: 0.9, minWidth: 95, headerSort: false,
+            formatter: function (cell) {
+              var v = cell.getRow().getData().hello_auth;
+              return v
+                ? '<span class="badge text-bg-info" title="Per-interface IIH authentication">' + esc(v) + '</span>'
+                : MUTED;
+            } },
+          G.stateColumn(),
+          G.lastSyncColumn(),
+          G.acceptColumn(),
+        ],
+      });
+    }
+
+    var inst = document.querySelector('.nso-isis-inst');
+    if (inst) {
+      G.mount(inst, {
+        key: 'isis-instances',
+        payload: payload,
+        extract: function (j) { return j.instances; },
+        jsonUrl: inst.dataset.jsonUrl,
+        placeholder: 'No IS-IS instances.',
+        flatten: function (rows) {
+          return rows.map(function (r) { r._tag = r.process_tag || ''; return r; });
+        },
+        columns: [
+          { title: 'Process Tag', field: '_tag', formatter: plain('process_tag'), sorter: 'alphanum', widthGrow: 1.1, minWidth: 110,
+            headerFilter: 'input', headerFilterPlaceholder: 'filter…' },
+          { title: 'IS-IS Instance', field: 'instance', headerSort: false, widthGrow: 1.5, minWidth: 140,
+            formatter: function (cell) { return G.linkCell(cell.getRow().getData().instance); } },
+          { title: 'Area Auth', field: 'area_auth', formatter: plain('area_auth'), widthGrow: 1, minWidth: 100 },
+          { title: 'Domain Auth', field: 'domain_auth', formatter: plain('domain_auth'), widthGrow: 1, minWidth: 110 },
+          G.stateColumn(),
+          G.lastSyncColumn(),
+          G.acceptColumn(),
+        ],
+      });
+    }
+  })();
+  </script>
+{% else %}
   <p class="text-muted mb-0">No IS-IS configuration.</p>
 {% endif %}

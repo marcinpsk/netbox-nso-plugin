@@ -14,6 +14,7 @@ permission gating, JSON shapes — runs for real.
 """
 
 import json
+import re
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
@@ -415,8 +416,20 @@ class TestCategoryGridResidueBadges(BlockedRemovalTestBase):
             resp = self._get_category("isis", jobs)
         self.assertEqual(resp.status_code, 200)
         html = resp.content.decode()
-        self.assertEqual(html.count("removal residue"), 2)  # the ge-0/0/0 row + the CORE process row
-        self.assertIn("adapter job #72", html)
+
+        # IS-IS is a client-side grid now: the residue flag rides in the embedded payload
+        # and nso-grid.js draws the badge. Assert the flag lands on exactly the surviving
+        # rows — stronger than counting badge strings, which could not tell WHICH row was
+        # badged, and so would have passed had the residue been pinned to the wrong one.
+        payload = json.loads(re.search(r'<script id="nso-isis-data"[^>]*>(.*?)</script>', html, re.S).group(1))
+        by_iface = {(r["iface"]["name"], r["af"]): r for r in payload["interfaces"]["rows"]}
+        self.assertTrue(by_iface[("ge-0/0/0", "ipv4")]["residue"])  # survived the retraction
+        self.assertFalse(by_iface[("ge-0/0/1", "ipv4")]["residue"])  # sibling did not
+        self.assertEqual(by_iface[("ge-0/0/0", "ipv4")]["residue_job"], 72)
+
+        procs = {r["process_tag"]: r for r in payload["instances"]["rows"]}
+        self.assertTrue(procs["CORE"]["residue"])
+        self.assertEqual(procs["CORE"]["residue_job"], 72)
 
     def test_interface_ips_grid_badges_surviving_address_values(self):
         """#104 phase-3: interface_config residue is VALUE-grain — the surviving

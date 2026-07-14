@@ -1,73 +1,111 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
-{# Lazy-loaded fragment: OSPF category (instances + interfaces). #}
+{# Lazy fragment: OSPF category — two grids (instances + interfaces) over ONE category #}
+{# payload. Each mount pulls its own section (nso-grid.js opts.extract), so an Accept in #}
+{# one section re-reads the shared JSON but only repaints its own rows and counts. #}
 {% include "netbox_nso_plugin/categories/_adapter_error.html" %}
 
-{% if ospf_data.instances or ospf_data.interfaces %}
-  <div class="d-flex justify-content-end mb-2 gap-1">
-    {% url 'plugins:netbox_nso_plugin:routing_bulk_accept_ospf_instances' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned label="Accept All Instances" %}
-    {% url 'plugins:netbox_nso_plugin:routing_bulk_accept_ospf_interfaces' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned label="Accept All Interfaces" %}
-  </div>
-  {% if ospf_data.instances %}
-  <div id="flt-ospf-instances">
-  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-ospf-instances" placeholder="Filter by process / VRF / router-id…" show_status=True %}
-  <div class="table-responsive mb-3">
-    <table class="table table-sm table-hover mb-0">
-      <thead>
-        <tr><th>Process ID</th><th>VRF</th><th>Router ID</th><th>OSPF Instance</th><th>Status</th><th>Last Synced</th><th></th></tr>
-      </thead>
-      <tbody>
-        {% for oi in ospf_data.instances %}
-        <tr data-status="{{ oi.status }}" data-owned="{{ oi.accepted_at|yesno:'true,false' }}">
-          <td>{{ oi.process_id }}</td>
-          <td>{{ oi.vrf|default:"global" }}</td>
-          <td>{{ oi.router_id|default:"—" }}</td>
-          <td>{% if oi.ospf_instance %}<a href="{{ oi.ospf_instance.get_absolute_url }}">{{ oi.ospf_instance }}</a>{% else %}—{% endif %}</td>
-          <td>
-            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=oi.status residue=oi.residue_survivor residue_job=oi.residue_job_id %}
-          </td>
-          <td class="text-nowrap">{% if oi.last_sync_at %}{{ oi.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
-          <td>
-            {% url 'plugins:netbox_nso_plugin:routing_accept_ospf_instance' pk=oi.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=oi.status %}
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-  </div>
+{% if grid_payload.instances.rows or grid_payload.interfaces.rows %}
+  {{ grid_payload|json_script:"nso-ospf-data" }}
+  {% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='ospf' as cat_url %}
+
+  {% if grid_payload.instances.rows %}
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      <h6 class="mb-1 d-inline-block">OSPF Instances</h6>
+      {% url 'plugins:netbox_nso_plugin:routing_bulk_accept_ospf_instances' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned label="Accept All Instances" %}
+    </div>
+    {% include "netbox_nso_plugin/categories/_grid.html" with cls="nso-ospf-inst" json_url=cat_url|add:"?format=json" counts=grid_payload.instances.counts %}
   {% endif %}
-  {% if ospf_data.interfaces %}
-  <div id="flt-ospf-interfaces">
-  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-ospf-interfaces" placeholder="Filter by interface / area…" show_status=True %}
-  <div class="table-responsive">
-    <table class="table table-sm table-hover mb-0">
-      <thead>
-        <tr><th>Interface</th><th>Process ID</th><th>Area</th><th>Network Type</th><th>Cost</th><th>Passive</th><th>Status</th><th>Last Synced</th><th></th></tr>
-      </thead>
-      <tbody>
-        {% for oif in ospf_data.interfaces %}
-        <tr data-status="{{ oif.status }}" data-owned="{{ oif.accepted_at|yesno:'true,false' }}">
-          <td><a href="{{ oif.interface.get_absolute_url }}">{{ oif.interface.name }}</a></td>
-          <td>{{ oif.process_id|default:"—" }}</td>
-          <td>{{ oif.area_id|default:"—" }}</td>
-          <td>{{ oif.network_type|default:"—" }}</td>
-          <td>{{ oif.cost|default:"—" }}</td>
-          <td>{% if oif.passive %}<span class="badge text-bg-warning text-dark">passive</span>{% else %}<span class="badge text-bg-success">active</span>{% endif %}</td>
-          <td>
-            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=oif.status residue=oif.residue_survivor residue_job=oif.residue_job_id %}
-          </td>
-          <td class="text-nowrap">{% if oif.last_sync_at %}{{ oif.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
-          <td>
-            {% url 'plugins:netbox_nso_plugin:routing_accept_ospf_interface' pk=oif.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=oif.status %}
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-  </div>
+
+  {% if grid_payload.interfaces.rows %}
+    <div class="d-flex justify-content-between align-items-center mb-2 mt-3">
+      <h6 class="mb-1 d-inline-block">OSPF Interfaces</h6>
+      {% url 'plugins:netbox_nso_plugin:routing_bulk_accept_ospf_interfaces' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned label="Accept All Interfaces" %}
+    </div>
+    {% include "netbox_nso_plugin/categories/_grid.html" with cls="nso-ospf-if" json_url=cat_url|add:"?format=json" counts=grid_payload.interfaces.counts %}
   {% endif %}
+
+  <script>
+  (function () {
+    "use strict";
+    var payloadEl = document.getElementById('nso-ospf-data');
+    if (!payloadEl || !window.NSOGrid) return;
+    var G = window.NSOGrid;
+    var esc = G.esc, MUTED = G.MUTED;
+    var payload = JSON.parse(payloadEl.textContent);
+
+    function plain(field) {
+      return function (cell) {
+        var v = cell.getRow().getData()[field];
+        return v == null || v === '' ? MUTED : esc(v);
+      };
+    }
+    function fmtIface(cell) {
+      var d = cell.getRow().getData();
+      return '<a href="' + esc(d.iface.url) + '" title="Open interface in NetBox">' + esc(d.iface.name) + '</a>';
+    }
+
+    var inst = document.querySelector('.nso-ospf-inst');
+    if (inst) {
+      G.mount(inst, {
+        key: 'ospf-instances',
+        payload: payload,
+        extract: function (j) { return j.instances; },
+        jsonUrl: inst.dataset.jsonUrl,
+        placeholder: 'No OSPF instances.',
+        flatten: function (rows) {
+          return rows.map(function (r) { r._proc = r.process_id || ''; return r; });
+        },
+        columns: [
+          { title: 'Process ID', field: '_proc', formatter: plain('process_id'), sorter: 'alphanum', widthGrow: 1, minWidth: 100,
+            headerFilter: 'input', headerFilterPlaceholder: 'filter…' },
+          { title: 'VRF', field: 'vrf', formatter: plain('vrf'), widthGrow: 1, minWidth: 90, headerFilter: 'input' },
+          { title: 'Router ID', field: 'router_id', formatter: plain('router_id'), widthGrow: 1.1, minWidth: 110 },
+          { title: 'OSPF Instance', field: 'instance', headerSort: false, widthGrow: 1.4, minWidth: 130,
+            formatter: function (cell) { return G.linkCell(cell.getRow().getData().instance); } },
+          G.stateColumn(),
+          G.lastSyncColumn(),
+          G.acceptColumn(),
+        ],
+      });
+    }
+
+    var ifg = document.querySelector('.nso-ospf-if');
+    if (ifg) {
+      G.mount(ifg, {
+        key: 'ospf-interfaces',
+        payload: payload,
+        extract: function (j) { return j.interfaces; },
+        jsonUrl: ifg.dataset.jsonUrl,
+        placeholder: 'No OSPF interfaces.',
+        flatten: function (rows) {
+          return rows.map(function (r) {
+            r._iface = r.iface.name;
+            r._passive = r.passive ? 'passive' : 'active';
+            return r;
+          });
+        },
+        columns: [
+          { title: 'Interface', field: '_iface', formatter: fmtIface, sorter: 'alphanum', widthGrow: 1.5, minWidth: 140,
+            headerFilter: 'input', headerFilterPlaceholder: 'filter interface…' },
+          { title: 'Process ID', field: 'process_id', formatter: plain('process_id'), widthGrow: 0.9, minWidth: 95 },
+          { title: 'Area', field: 'area_id', formatter: plain('area_id'), widthGrow: 0.9, minWidth: 90, headerFilter: 'input' },
+          { title: 'Network Type', field: 'network_type', formatter: plain('network_type'), widthGrow: 1.1, minWidth: 110 },
+          { title: 'Cost', field: 'cost', formatter: plain('cost'), widthGrow: 0.6, minWidth: 70, hozAlign: 'right' },
+          { title: 'Passive', field: '_passive', widthGrow: 0.8, minWidth: 90,
+            formatter: function (cell) {
+              return G.boolBadge(cell.getRow().getData().passive,
+                'passive', 'text-bg-warning text-dark', 'active', 'text-bg-success');
+            },
+            headerFilter: 'list', headerFilterParams: { values: { '': 'All', passive: 'passive', active: 'active' } } },
+          G.stateColumn(),
+          G.lastSyncColumn(),
+          G.acceptColumn(),
+        ],
+      });
+    }
+  })();
+  </script>
 {% else %}
   <p class="text-muted mb-0">No OSPF configuration.</p>
 {% endif %}

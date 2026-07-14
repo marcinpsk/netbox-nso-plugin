@@ -161,12 +161,29 @@
     return Object.assign(col, extra || {});
   }
 
+  /* The State column every row-owned panel uses: the status badge, plus the residue
+   * badge when this row is a retraction's on-device leftover (what _state_badge.html
+   * rendered server-side). Built in once here so seven panels cannot each spell it
+   * differently — or quietly forget the residue badge, which is the whole point of
+   * being able to attribute a re-imported husk instead of reading it as new config. */
   function stateColumn(extra) {
     var col = {
       title: "State",
       field: "state",
       formatter: function (cell) {
-        return badge(cell.getValue());
+        var d = cell.getRow().getData();
+        var out = badge(d.state, d.label);
+        if (d.residue) {
+          // Same wording and explanation as _state_badge.html — an operator must not have
+          // to learn two names for the same thing depending on which panel they are on.
+          out +=
+            ' <span class="badge text-bg-warning text-dark ms-1" title="A retraction (adapter job #' +
+            esc(d.residue_job) +
+            ') reported success but this key survived on the device — it re-imported here as an ' +
+            'unowned mirror, not new device config. Clean up on-device via a gated commit, or ' +
+            'Accept to adopt it as intent.">removal residue</span>';
+        }
+        return out;
       },
       widthGrow: 0.9,
       minWidth: 110,
@@ -185,6 +202,36 @@
       },
     };
     return Object.assign(col, extra || {});
+  }
+
+  /* A resolved netbox-routing object ({label, url}), or an em-dash when the overlay
+   * never matched one. Server sends null rather than a half-built link. */
+  function linkCell(obj) {
+    if (!obj || !obj.url) return MUTED;
+    return '<a href="' + esc(obj.url) + '">' + esc(obj.label) + "</a>";
+  }
+
+  /* Compact "Last Synced" column — every routing panel carries one. */
+  function lastSyncColumn(extra) {
+    var col = {
+      title: "Last Synced",
+      field: "last_sync",
+      widthGrow: 1,
+      minWidth: 118,
+      formatter: function (cell) {
+        return cell.getValue() ? esc(cell.getValue()) : MUTED;
+      },
+    };
+    return Object.assign(col, extra || {});
+  }
+
+  /* Yes/no style badge pair (passive/active, disabled, …). */
+  function boolBadge(on, onLabel, onClass, offLabel, offClass) {
+    return on
+      ? '<span class="badge ' + onClass + '">' + esc(onLabel) + "</span>"
+      : offLabel
+        ? '<span class="badge ' + offClass + '">' + esc(offLabel) + "</span>"
+        : MUTED;
   }
 
   function mount(root, opts) {
@@ -347,6 +394,9 @@
     valueFormatter: valueFormatter,
     stateColumn: stateColumn,
     acceptColumn: acceptColumn,
+    lastSyncColumn: lastSyncColumn,
+    boolBadge: boolBadge,
+    linkCell: linkCell,
     esc: esc,
     post: post,
     MUTED: MUTED,

@@ -3398,3 +3398,54 @@ class TestBfdGrid(ViewTestBase):
         embedded = json.loads(re.search(r'<script id="nso-bfd-data"[^>]*>(.*?)</script>', body, re.S).group(1))
         self.assertEqual({r["iface"]["name"] for r in embedded["rows"]}, {"Gi0/1", "Gi0/2", "Gi0/3"})
         self.assertEqual(embedded["counts"], {"all": 3, "drift": 1, "pending": 1})
+
+
+class TestGridCategoryPayloads(ViewTestBase):
+    """Structural guard for every client-side grid category (nso-grid.js).
+
+    Driven by the view's OWN _GRID_CATEGORIES / _grid_specs, so a category added to the
+    grid path without a working payload fails here rather than at an operator's expand.
+    """
+
+    def _url(self, key):
+        return reverse(
+            "plugins:netbox_nso_plugin:device_nso_category",
+            kwargs={"pk": self.device.pk, "key": key},
+        )
+
+    def test_json_reload_serves_every_grid_category_without_the_adapter(self):
+        """?format=json is the post-action reload — it must come from persisted state.
+
+        Nothing is patched: the grid re-fetches after every Accept, so a category that
+        reconciled here would hit the adapter once per click. If any of them starts
+        reconciling, this blows up instead of quietly costing a device read per click.
+        """
+        from netbox_nso_plugin.views import NSOCategoryView
+
+        view = NSOCategoryView()
+        specs = view._grid_specs()
+        self.assertTrue(view._GRID_CATEGORIES)  # guard the introspection found something
+
+        for key in view._GRID_CATEGORIES:
+            with self.subTest(category=key):
+                resp = self.client.get(self._url(key) + "?format=json", HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+                self.assertEqual(resp.status_code, 200)
+                data = json.loads(resp.content)
+
+                for name in specs[key]["sections"]:
+                    body = data if name is None else data[name]
+                    self.assertIn("rows", body)
+                    # The pills filter on these three buckets; a missing one silently
+                    # renders an empty chip.
+                    self.assertEqual(set(body["counts"]), {"all", "drift", "pending"})
+
+    def test_fragment_renders_for_every_grid_category(self):
+        """Each grid fragment paints from an embedded payload — no second request."""
+        from netbox_nso_plugin.views import NSOCategoryView
+
+        for key in NSOCategoryView()._GRID_CATEGORIES:
+            with self.subTest(category=key):
+                resp = self.client.get(self._url(key), HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+                self.assertEqual(resp.status_code, 200)
+                # A multi-line {# #} comment renders as literal text (the CR-P16 leak).
+                self.assertNotIn("{#", resp.content.decode())
