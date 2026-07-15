@@ -204,6 +204,23 @@
     return Object.assign(col, extra || {});
   }
 
+  /* Muted "device: <value>" annotation for a cell whose INTENT lives in NetBox
+   * (netbox_value) while the overlay mirrors the device (value) — the Interfaces
+   * description/enabled cells. Such a cell displays and edits the NetBox value;
+   * this is the only place the device's disagreeing value still shows. Whether
+   * the values differ is the server's call (it compared them value-aware to
+   * derive kind) — no client-side re-derivation here. */
+  var DEVICE_NOTE_KINDS = ["drift", "pending", "apply_failed", "deploying"];
+  function deviceNote(cell) {
+    if (!cell || DEVICE_NOTE_KINDS.indexOf(cell.kind) === -1) return "";
+    var dev = cell.value == null || String(cell.value) === "" ? "—" : String(cell.value);
+    return (
+      ' <span class="text-muted small nso-dev-note" title="Value currently on the device (NSO), from the last sync.">device: ' +
+      esc(dev) +
+      "</span>"
+    );
+  }
+
   /* A resolved netbox-routing object ({label, url}), or an em-dash when the overlay
    * never matched one. Server sends null rather than a half-built link. */
   function linkCell(obj) {
@@ -396,6 +413,7 @@
     acceptColumn: acceptColumn,
     lastSyncColumn: lastSyncColumn,
     boolBadge: boolBadge,
+    deviceNote: deviceNote,
     linkCell: linkCell,
     esc: esc,
     post: post,

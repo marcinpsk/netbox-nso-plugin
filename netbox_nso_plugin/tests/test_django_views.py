@@ -2076,6 +2076,7 @@ class TestDeviceNSOTabView(ViewTestBase):
         body = r.content.decode()
         self.assertIn("nso-grid-cols", body)  # column-select chips (shared nso-grid.js contract)
         self.assertIn('id="nso-ifg-data"', body)  # embedded grid payload (json_script)
+        self.assertIn("NSOGridInterface", body)  # fragment mounts the static column module
         self.assertIn("Gi0/1", body)
         self.assertIn("uplink to core", body)  # description device value
         self.assertIn("9216", body)  # L2 MTU
@@ -2127,7 +2128,8 @@ class TestDeviceNSOTabView(ViewTestBase):
         # enabled: NetBox True vs device "true" — value-aware in sync (not owned, no accept hidden).
         self.assertEqual(row["enabled"]["kind"], "in_sync")
         # description: NetBox "nb" vs device "uplink to core", status=changed, unowned → drift,
-        # with both values shipped (device value displayed, NetBox value prefills the editor).
+        # with both values shipped: the cell displays + the editor prefills the NetBox value
+        # (the intent an edit writes); the device mirror renders only as the "device:" note.
         self.assertEqual(row["description"]["kind"], "drift")
         self.assertEqual(row["description"]["value"], "uplink to core")
         self.assertEqual(row["description"]["netbox_value"], "nb")

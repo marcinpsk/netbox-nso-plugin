@@ -29,19 +29,27 @@
       var d = cell.getRow().getData();
       return '<a href="' + esc(d.iface.url) + '" title="Open interface in NetBox">' + esc(d.iface.name) + "</a>";
     }
+    // Both attr cells show the NETBOX value — the intent an inline edit writes and
+    // Apply enforces. The overlay's own value is the device MIRROR; rendering it
+    // here is the bug where a freshly saved description kept showing (and, via the
+    // flattened field the editor prefills from, re-offering) the device's old text.
+    // The mirror survives as G.deviceNote when the server says the values differ.
     function fmtEnabled(cell) {
       var c = cell.getRow().getData().enabled;
       if (!c) return MUTED;
-      var v = (c.value == null ? "" : String(c.value)).toLowerCase();
+      var v = (c.netbox_value == null ? "" : String(c.netbox_value)).toLowerCase();
       var icon =
         v === "true"
           ? '<span class="mdi mdi-check-circle text-success"></span> Enabled'
           : v === "false"
             ? '<span class="mdi mdi-minus-circle text-muted"></span> Disabled'
-            : esc(c.value == null ? "—" : c.value);
-      return '<span class="text-nowrap">' + icon + cellBadge(c) + acceptBtn(c) + "</span>";
+            : esc(c.netbox_value == null ? "—" : c.netbox_value);
+      return '<span class="text-nowrap">' + icon + cellBadge(c) + acceptBtn(c) + "</span>" + G.deviceNote(c);
     }
-    var fmtDescription = G.valueFormatter("description");
+    var fmtDescription = G.valueFormatter("description", function (c) {
+      var main = c.netbox_value == null || c.netbox_value === "" ? MUTED : esc(c.netbox_value);
+      return main + G.deviceNote(c);
+    });
     function fmtMtu(cell) {
       var d = cell.getRow().getData();
       var c = d.mtu;
@@ -99,11 +107,14 @@
       jsonUrl: root.dataset.jsonUrl,
       placeholder: "No interface state yet — click Refresh from NSO or wait for the next sync.",
       // Flat helper fields so sorting / header-filtering works on plain strings.
+      // NETBOX values, not the device mirror: Tabulator's inline editor prefills
+      // from these fields, and an edit writes NetBox's value — prefilling the
+      // mirror hands the operator back the text their own save just replaced.
       flatten: function (rows) {
         return rows.map(function (r) {
           r._name = r.iface.name;
-          r._desc = r.description && r.description.value ? r.description.value : "";
-          r._enabled = r.enabled && r.enabled.value != null ? String(r.enabled.value).toLowerCase() : "";
+          r._desc = r.description && r.description.netbox_value ? r.description.netbox_value : "";
+          r._enabled = r.enabled && r.enabled.netbox_value != null ? String(r.enabled.netbox_value).toLowerCase() : "";
           return r;
         });
       },
