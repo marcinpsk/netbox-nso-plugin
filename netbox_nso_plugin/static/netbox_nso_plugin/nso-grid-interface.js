@@ -27,7 +27,20 @@
     // ── column formatters ──────────────────────────────────────────────────────
     function fmtName(cell) {
       var d = cell.getRow().getData();
-      return '<a href="' + esc(d.iface.url) + '" title="Open interface in NetBox">' + esc(d.iface.name) + "</a>";
+      var out = '<a href="' + esc(d.iface.url) + '" title="Open interface in NetBox">' + esc(d.iface.name) + "</a>";
+      if (!d.link) return out;
+      var cable = d.link.cable || {};
+      var cableIcon = '<span class="mdi mdi-link-variant" aria-hidden="true"></span>';
+      var cablePart = cable.url
+        ? '<a href="' + esc(cable.url) + '" title="Open ' + esc(cable.label || "cable") + '">' + cableIcon + "</a>"
+        : '<span title="Cabled">' + cableIcon + "</span>";
+      var peerPart = d.link.peer
+        ? ' <a class="nso-if-peer" href="' + esc(d.link.peer.url) + '" title="Cable peer: ' +
+          esc(d.link.peer.device) + " / " +
+          esc(d.link.peer.name) + '">' +
+          esc(d.link.peer.device) + " / " + esc(d.link.peer.name) + "</a>"
+        : ' <span title="The far end is not a single NetBox interface">cabled</span>';
+      return out + '<div class="small text-muted nso-if-link">' + cablePart + peerPart + "</div>";
     }
     // Both attr cells show the NETBOX value — the intent an inline edit writes and
     // Apply enforces. The overlay's own value is the device MIRROR; rendering it
@@ -83,13 +96,57 @@
     function fmtIps(cell) {
       var ips = cell.getRow().getData().ips || [];
       if (!ips.length) return MUTED;
-      return ips
-        .map(function (ip) {
-          var sec = ip.secondary ? ' <span class="badge text-bg-light">sec</span>' : "";
-          var b = ip.kind !== "in_sync" ? " " + badge(ip.kind) : "";
-          return "<code>" + esc(ip.address) + "</code>" + sec + b;
-        })
-        .join("<br>");
+      var wrap = document.createElement("span");
+      ips.forEach(function (ip, index) {
+        if (index) wrap.appendChild(document.createElement("br"));
+        var line = document.createElement("span");
+        line.className = "text-nowrap nso-if-ip";
+        var code = document.createElement("code");
+        code.textContent = ip.address;
+        if (ip.url) {
+          var detail = document.createElement("a");
+          detail.href = ip.url;
+          detail.title = "Open IP address in NetBox";
+          detail.appendChild(code);
+          line.appendChild(detail);
+        } else {
+          code.title = "Observed in NSO; no native NetBox IPAddress exists yet";
+          line.appendChild(code);
+        }
+        var status = document.createElement("span");
+        status.innerHTML =
+          (ip.secondary ? ' <span class="badge text-bg-light">sec</span>' : "") +
+          (ip.kind !== "in_sync" ? " " + badge(ip.kind, ip.label) : "") +
+          acceptBtn(ip);
+        line.appendChild(status);
+
+        if (ip.edit_url) {
+          var edit = document.createElement("a");
+          edit.href = "#";
+          edit.className = "nso-popedit ms-1";
+          edit.title = ip.peer
+            ? "Edit this IP; optionally change the cable peer in the same transaction"
+            : "Edit this IP in NetBox";
+          edit.setAttribute("aria-label", "Edit " + ip.address);
+          edit.setAttribute("data-pe-url", ip.edit_url);
+          edit.setAttribute(
+            "data-pe-title",
+            cell.getRow().getData().iface.name + (ip.peer ? " ↔ " + ip.peer.interface : " IP"),
+          );
+          edit.setAttribute(
+            "data-pe-fields",
+            "address:text:IP address" + (ip.peer ? ",peer_address:text:Peer IP (optional)" : ""),
+          );
+          edit.setAttribute("data-pe-v-address", ip.address);
+          if (ip.peer) {
+            edit.setAttribute("data-pe-v-peer_address", ip.peer.address);
+          }
+          edit.innerHTML = '<span class="mdi mdi-pencil" aria-hidden="true"></span>';
+          line.appendChild(edit);
+        }
+        wrap.appendChild(line);
+      });
+      return wrap;
     }
     function fmtSwitchport(cell) {
       var c = cell.getRow().getData().switchport;
@@ -127,7 +184,7 @@
           formatter: fmtName,
           sorter: "alphanum",
           widthGrow: 1.5,
-          minWidth: 140,
+          minWidth: 170,
           headerFilter: "input",
           headerFilterPlaceholder: "filter name…",
         },
@@ -161,7 +218,7 @@
           cssClass: "nso-editable",
         },
         { title: "MTU L2 / IP / MPLS", field: "mtu", formatter: fmtMtu, widthGrow: 1.3, minWidth: 150, headerSort: false },
-        { title: "IPs", field: "ips", formatter: fmtIps, widthGrow: 1.4, minWidth: 130, headerSort: false },
+        { title: "IPs", field: "ips", formatter: fmtIps, widthGrow: 1.6, minWidth: 220, headerSort: false },
         { title: "Switchport", field: "switchport", formatter: fmtSwitchport, widthGrow: 1.1, minWidth: 110, headerSort: false },
         G.stateColumn(),
       ],

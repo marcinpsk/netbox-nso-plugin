@@ -146,6 +146,60 @@ describe("mount wiring", () => {
     expect(a.getAttribute("data-pe-url")).toBe("/overlay/interface_mtu/77/");
     expect(a.getAttribute("data-pe-v-l2_mtu")).toBe("9216");
   });
+
+  it("links a materialized IP and builds the local/peer popedit", () => {
+    const ip = {
+      pk: 31,
+      address: "198.18.30.0/31",
+      status: "imported",
+      kind: "in_sync",
+      url: "/ipam/ip-addresses/91/",
+      edit_url: "/interface-ip-state/31/edit/",
+      peer: { pk: 32, address: "198.18.30.1/31", interface: "peer-01 / Gi0/2" },
+    };
+    const { col } = mountRows([row({ ips: [ip] })]);
+    const out = col("ips").formatter(fakeCell(row({ ips: [ip] })));
+    const detail = out.querySelector('a[href="/ipam/ip-addresses/91/"]');
+    const edit = out.querySelector("a.nso-popedit");
+
+    expect(detail.textContent).toBe("198.18.30.0/31");
+    expect(edit.getAttribute("data-pe-url")).toBe("/interface-ip-state/31/edit/");
+    expect(edit.getAttribute("data-pe-fields")).toContain("peer_address:text:Peer IP (optional)");
+    expect(edit.getAttribute("data-pe-v-peer_address")).toBe("198.18.30.1/31");
+    expect(edit.getAttribute("data-pe-title")).toContain("peer-01 / Gi0/2");
+  });
+
+  it("keeps an overlay-only IP editable without inventing a broken detail link", () => {
+    const ip = {
+      pk: 33,
+      address: "198.18.31.1/32",
+      status: "imported",
+      kind: "in_sync",
+      url: null,
+      edit_url: "/interface-ip-state/33/edit/",
+      peer: null,
+    };
+    const { col } = mountRows([row({ ips: [ip] })]);
+    const out = col("ips").formatter(fakeCell(row({ ips: [ip] })));
+
+    expect(out.querySelector('a[href^="/ipam/ip-addresses/"]')).toBeNull();
+    expect(out.querySelector("code").textContent).toBe("198.18.31.1/32");
+    expect(out.querySelector("a.nso-popedit")).not.toBeNull();
+  });
+
+  it("shows cable and far-end interface beneath the local interface", () => {
+    const linked = row({
+      link: {
+        cable: { label: "#44", url: "/dcim/cables/44/" },
+        peer: { name: "Gi0/2", url: "/dcim/interfaces/2/", device: "peer-01" },
+      },
+    });
+    const { col } = mountRows([linked]);
+    const out = parse(col("_name").formatter(fakeCell(linked)));
+
+    expect(out.querySelector('a[href="/dcim/cables/44/"]')).not.toBeNull();
+    expect(out.querySelector('a[href="/dcim/interfaces/2/"]').textContent).toContain("peer-01 / Gi0/2");
+  });
 });
 
 describe("attr cells carry the NetBox intent (device-55 regression)", () => {

@@ -2145,6 +2145,64 @@ class TestDeviceNSOTabView(ViewTestBase):
 
         iface.delete()
 
+    def test_merged_interface_grid_links_native_ip_and_surfaces_cable_peer(self):
+        """A cabled interface exposes its cable/peer in the compact row payload, and
+        an observed address links to its native IPAddress while offering pair editing.
+
+        The peer state lives on the far-end device: the device-local overlay queryset
+        alone is therefore insufficient to build the optional two-ended editor.
+        """
+        from dcim.models import Cable, CableTermination, Device, Interface
+        from ipam.models import IPAddress
+
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        local = Interface.objects.create(device=self.device, name="Gi0/10", type="other")
+        peer_device = Device.objects.create(
+            name="view-router-02",
+            device_type=self.device.device_type,
+            role=self.device.role,
+            site=self.device.site,
+        )
+        peer = Interface.objects.create(device=peer_device, name="Gi0/20", type="other")
+        cable = Cable.objects.create(status="connected")
+        CableTermination.objects.create(cable=cable, cable_end="A", termination=local)
+        CableTermination.objects.create(cable=cable, cable_end="B", termination=peer)
+
+        native = IPAddress.objects.create(address="198.18.10.0/31", assigned_object=local)
+        IPAddress.objects.create(address="198.18.10.1/31", assigned_object=peer)
+        local_state = NSOInterfaceIPState.objects.create(
+            interface=local,
+            address="198.18.10.0/31",
+            family="ipv4",
+            status="imported",
+        )
+        peer_state = NSOInterfaceIPState.objects.create(
+            interface=peer,
+            address="198.18.10.1/31",
+            family="ipv4",
+            status="imported",
+        )
+
+        url = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device.pk, "key": "interface"}
+        )
+        data = self.client.get(url, {"format": "json"}).json()
+        row = next(item for item in data["rows"] if item["iface"]["name"] == local.name)
+
+        self.assertEqual(row["link"]["cable"]["url"], cable.get_absolute_url())
+        self.assertEqual(row["link"]["peer"]["name"], peer.name)
+        self.assertEqual(row["link"]["peer"]["device"], peer_device.name)
+        ip = row["ips"][0]
+        self.assertEqual(ip["url"], native.get_absolute_url())
+        self.assertIn(f"/{local_state.pk}/", ip["edit_url"])
+        self.assertEqual(ip["peer"]["pk"], peer_state.pk)
+        self.assertEqual(ip["peer"]["address"], "198.18.10.1/31")
+
+        cable.delete()
+        peer_device.delete()
+        local.delete()
+
     def test_quick_filter_counts_agree_with_the_row_state_they_filter_on(self):
         """The grid collapses each interface's cells to ONE worst-first row state, and every
         quick-filter pill matches on exactly that value. The chip counts were still computed

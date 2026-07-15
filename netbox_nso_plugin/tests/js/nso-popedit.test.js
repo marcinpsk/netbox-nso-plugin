@@ -96,6 +96,15 @@ describe("open / close", () => {
     click(anchor);
     expect(card()).toBeNull();
   });
+
+  it("stays clickable above Django Debug Toolbar in the dev UI", () => {
+    const debugRoot = document.createElement("div");
+    debugRoot.id = "djDebugRoot";
+    document.body.appendChild(debugRoot);
+    click(makeAnchor());
+
+    expect(Number(card().style.zIndex)).toBeGreaterThan(100000000);
+  });
 });
 
 describe("save", () => {

@@ -570,3 +570,197 @@ class TestAcceptInterfaceIPConflict(TestCase):
         self.state.refresh_from_db()
         self.assertEqual(self.state.status, "in_sync")
         self.assertIsNotNone(self.state.accepted_at)
+
+
+class TestInterfaceIPInlineEdit(IntentPushResetMixin, TestCase):
+    """The NSO-grid IP editor changes native IPAM objects without bypassing safety.
+
+    These are real request -> view -> ORM tests. The management rows intentionally have
+    no adapter id, keeping the external adapter boundary out of the test while exercising
+    the same native IPAddress and overlay writes used in production.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        from dcim.models import Cable, CableTermination
+        from django.contrib.auth import get_user_model
+        from ipam.models import IPAddress
+
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOInterfaceIPState
+
+        cls.user = get_user_model().objects.create_superuser(
+            username="ip-inline-admin",
+            password="testpass789",  # noqa: S106
+            email="ip-inline@test.example",
+        )
+        mfg = Manufacturer.objects.create(name="IP Inline Mfg", slug="ip-inline-mfg")
+        dt = DeviceType.objects.create(manufacturer=mfg, model="IP Inline", slug="ip-inline")
+        role = DeviceRole.objects.create(name="IP Inline Role", slug="ip-inline-role")
+        site = Site.objects.create(name="IP Inline Site", slug="ip-inline-site")
+        cls.device_a = Device.objects.create(name="ip-inline-a", device_type=dt, role=role, site=site)
+        cls.device_b = Device.objects.create(name="ip-inline-b", device_type=dt, role=role, site=site)
+        cls.local = Interface.objects.create(device=cls.device_a, name="Gi0/1", type="1000base-t")
+        cls.peer = Interface.objects.create(device=cls.device_b, name="Gi0/2", type="1000base-t")
+        cls.other = Interface.objects.create(device=cls.device_a, name="Gi0/3", type="1000base-t")
+        cable = Cable.objects.create(status="connected")
+        CableTermination.objects.create(cable=cable, cable_end="A", termination=cls.local)
+        CableTermination.objects.create(cable=cable, cable_end="B", termination=cls.peer)
+
+        nso = NSOInstance.objects.create(name="ip-inline-nso", adapter_instance_id="ip-inline-nso")
+        NSODeviceManagement.objects.create(device=cls.device_a, nso_instance=nso, nso_device_name=cls.device_a.name)
+        NSODeviceManagement.objects.create(device=cls.device_b, nso_instance=nso, nso_device_name=cls.device_b.name)
+
+        cls.local_ip = IPAddress.objects.create(address="198.18.20.0/31", assigned_object=cls.local)
+        cls.peer_ip = IPAddress.objects.create(address="198.18.20.1/31", assigned_object=cls.peer)
+        cls.used_ip = IPAddress.objects.create(address="198.18.20.10/32", assigned_object=cls.other)
+        cls.local_state = NSOInterfaceIPState.objects.create(
+            interface=cls.local,
+            address="198.18.20.0/31",
+            family="ipv4",
+            status="imported",
+        )
+        cls.peer_state = NSOInterfaceIPState.objects.create(
+            interface=cls.peer,
+            address="198.18.20.1/31",
+            family="ipv4",
+            status="imported",
+        )
+
+    def setUp(self):
+        super().setUp()
+        self.client.force_login(self.user)
+
+    def _url(self, state=None):
+        from django.urls import reverse
+
+        return reverse(
+            "plugins:netbox_nso_plugin:nsointerfaceipstate_edit",
+            kwargs={"pk": (state or self.local_state).pk},
+        )
+
+    def test_edit_rekeys_native_ip_and_overlay(self):
+        response = self.client.post(
+            self._url(),
+            {"address": "198.18.20.2/31"},
+            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+        )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        self.local_ip.refresh_from_db()
+        self.local_state.refresh_from_db()
+        self.assertEqual(str(self.local_ip.address), "198.18.20.2/31")
+        self.assertEqual(self.local_ip.assigned_object, self.local)
+        self.assertEqual(self.local_state.address, "198.18.20.2/31")
+        self.assertEqual(self.local_state.status, "accepted")
+
+    def test_unchanged_prefilled_peer_is_not_modified(self):
+        """The real two-field popover always submits the displayed peer value.
+
+        Leaving that field untouched must not silently take ownership of the far end.
+        """
+        response = self.client.post(
+            self._url(),
+            {
+                "address": "198.18.20.2/31",
+                "peer_address": "198.18.20.1/31",
+            },
+            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+        )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertIn("Updated 1 interface address", response.json()["message"])
+        self.peer_ip.refresh_from_db()
+        self.peer_state.refresh_from_db()
+        self.assertEqual(str(self.peer_ip.address), "198.18.20.1/31")
+        self.assertEqual(self.peer_state.status, "imported")
+
+    def test_invalid_address_returns_field_error_without_writing(self):
+        response = self.client.post(
+            self._url(),
+            {"address": "not-an-address"},
+            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("valid IPv4 or IPv6", " ".join(response.json()["errors"]["address"]))
+        self.local_ip.refresh_from_db()
+        self.local_state.refresh_from_db()
+        self.assertEqual(str(self.local_ip.address), "198.18.20.0/31")
+        self.assertEqual(self.local_state.address, "198.18.20.0/31")
+
+    def test_overlay_only_edit_materializes_native_ip(self):
+        from ipam.models import IPAddress
+
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        iface = Interface.objects.create(device=self.device_a, name="Gi0/4", type="1000base-t")
+        state = NSOInterfaceIPState.objects.create(
+            interface=iface,
+            address="198.18.20.20/31",
+            family="ipv4",
+            status="imported",
+        )
+
+        response = self.client.post(
+            self._url(state),
+            {"address": "198.18.20.22/31"},
+            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+        )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        native = IPAddress.objects.get(address="198.18.20.22/31")
+        self.assertEqual(native.assigned_object, iface)
+        state.refresh_from_db()
+        self.assertEqual(state.address, "198.18.20.22/31")
+        self.assertEqual(state.status, "accepted")
+
+    def test_rejects_host_already_used_even_with_different_mask(self):
+        response = self.client.post(
+            self._url(),
+            {"address": "198.18.20.10/31"},
+            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("already exists", " ".join(response.json()["errors"]["address"]))
+        self.local_ip.refresh_from_db()
+        self.local_state.refresh_from_db()
+        self.assertEqual(str(self.local_ip.address), "198.18.20.0/31")
+        self.assertEqual(self.local_state.address, "198.18.20.0/31")
+
+    def test_can_edit_both_cable_ends_atomically(self):
+        response = self.client.post(
+            self._url(),
+            {
+                "address": "198.18.20.4/31",
+                "peer_address": "198.18.20.5/31",
+            },
+            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+        )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        self.local_ip.refresh_from_db()
+        self.peer_ip.refresh_from_db()
+        self.local_state.refresh_from_db()
+        self.peer_state.refresh_from_db()
+        self.assertEqual(str(self.local_ip.address), "198.18.20.4/31")
+        self.assertEqual(str(self.peer_ip.address), "198.18.20.5/31")
+        self.assertEqual(self.local_state.address, "198.18.20.4/31")
+        self.assertEqual(self.peer_state.address, "198.18.20.5/31")
+
+    def test_peer_collision_rolls_back_local_change(self):
+        response = self.client.post(
+            self._url(),
+            {
+                "address": "198.18.20.6/31",
+                "peer_address": "198.18.20.10/31",
+            },
+            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("peer_address", response.json()["errors"])
+        self.local_ip.refresh_from_db()
+        self.peer_ip.refresh_from_db()
+        self.assertEqual(str(self.local_ip.address), "198.18.20.0/31")
+        self.assertEqual(str(self.peer_ip.address), "198.18.20.1/31")

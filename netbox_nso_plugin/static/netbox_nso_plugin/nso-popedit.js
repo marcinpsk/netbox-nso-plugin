@@ -53,6 +53,10 @@
 
     var card = document.createElement("div");
     card.className = "card nso-popedit-card shadow";
+    // Django Debug Toolbar uses z-index 100000000 and otherwise intercepts the
+    // popover's Save/Cancel buttons in the development UI. Elevate only when that
+    // toolbar is present; production keeps the normal modal stacking from nso.css.
+    if (document.getElementById("djDebugRoot")) card.style.zIndex = "100000001";
     var head = document.createElement("div");
     head.className = "card-header py-1 px-2 small fw-semibold";
     head.textContent = anchor.dataset.peTitle || "Edit";

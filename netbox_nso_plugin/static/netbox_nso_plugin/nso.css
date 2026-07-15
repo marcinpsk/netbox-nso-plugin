@@ -99,6 +99,22 @@ a.nso-popedit.nso-popedit-open {
   border: 1px solid var(--tblr-border-color);
 }
 
+/* Cable peers can be much longer than an interface cell. Keep the compact second
+   line inside its column; the complete peer remains available in the link title. */
+.nso-grid .nso-if-link {
+  display: flex;
+  gap: 0.2rem;
+  max-width: 100%;
+  min-width: 0;
+  white-space: nowrap;
+}
+.nso-grid .nso-if-peer {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* Editable cells advertise themselves with a subtle pencil on hover. */
 .nso-grid .tabulator-cell.nso-editable {
   cursor: text;

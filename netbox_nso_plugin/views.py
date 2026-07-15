@@ -443,6 +443,137 @@ def _merged_iface_kinds(iface, attr_states, mtu_states, sw_states, ip_states) ->
     return kinds
 
 
+def _matching_peer_ip_state(state, candidates):
+    """Return the unambiguous far-end address corresponding to *state*.
+
+    A link-role allocation records ``peer_state`` explicitly. Brownfield imports do
+    not, so fall back to a single same-family/VRF address, then to the one address in
+    the local subnet. Ambiguous multi-address peers deliberately yield ``None``: the
+    compact editor must never guess which far-end address an operator meant to change.
+    """
+    from ipaddress import ip_interface
+
+    eligible = [
+        candidate for candidate in candidates if candidate.family == state.family and candidate.vrf == state.vrf
+    ]
+    if state.peer_state_id:
+        direct = next((candidate for candidate in eligible if candidate.pk == state.peer_state_id), None)
+        if direct is not None:
+            return direct
+    if len(eligible) == 1:
+        return eligible[0]
+    try:
+        network = ip_interface(state.address).network
+        in_subnet = [candidate for candidate in eligible if ip_interface(candidate.address).ip in network]
+    except ValueError:
+        return None
+    return in_subnet[0] if len(in_subnet) == 1 else None
+
+
+def _interface_topology_payload(interfaces, ip_states):
+    """Build cable/peer row metadata and an optional peer state per local IP.
+
+    ``Interface.link_peers`` is NetBox's canonical cable-path traversal API. Only
+    cabled interfaces invoke it, and peer Interface/Device plus Cable objects are
+    then bulk-loaded for serialization. Far-end IP states are also loaded in one
+    query so a peer on another device can participate in the two-ended editor.
+    """
+    from dcim.models import Cable, Interface
+
+    from .derived_intent import find_peer
+    from .models import NSOInterfaceIPState
+
+    raw_peers = {}
+    for iface in interfaces:
+        if iface.cable_id is not None:
+            peer = find_peer(iface)
+            if peer is not None:
+                raw_peers[iface.pk] = peer.pk
+
+    peers = Interface.objects.filter(pk__in=set(raw_peers.values())).select_related("device").in_bulk()
+    cables = Cable.objects.in_bulk({iface.cable_id for iface in interfaces if iface.cable_id is not None})
+    peer_states = {}
+    states_by_peer = {}
+    for state in (
+        NSOInterfaceIPState.objects.filter(interface_id__in=set(raw_peers.values()))
+        .select_related("interface", "interface__device")
+        .order_by("address")
+    ):
+        states_by_peer.setdefault(state.interface_id, []).append(state)
+
+    links = {}
+    for iface in interfaces:
+        if iface.cable_id is None:
+            continue
+        cable = cables.get(iface.cable_id)
+        peer = peers.get(raw_peers.get(iface.pk))
+        links[iface.pk] = {
+            "cable": (
+                {"label": str(cable), "url": cable.get_absolute_url()}
+                if cable is not None
+                else {"label": f"Cable {iface.cable_id}", "url": None}
+            ),
+            "peer": (
+                {
+                    "id": peer.pk,
+                    "name": peer.name,
+                    "url": peer.get_absolute_url(),
+                    "device": peer.device.name,
+                    "device_url": peer.device.get_absolute_url(),
+                }
+                if peer is not None
+                else None
+            ),
+        }
+        if peer is None:
+            continue
+        candidates = states_by_peer.get(peer.pk, [])
+        for state in ip_states.get(iface.pk, []):
+            match = _matching_peer_ip_state(state, candidates)
+            if match is not None:
+                peer_states[state.pk] = match
+    return links, peer_states
+
+
+def _native_ip_by_state(ip_states):
+    """Resolve each overlay to the matching native IPAddress, if one exists.
+
+    Prefer an object assigned to the reporting interface, then an unassigned object,
+    then any matching object (the conflict case). The latter is linkable for diagnosis
+    but is not considered editable by :func:`_editable_native_ip` below.
+    """
+    from dcim.models import Interface
+    from django.contrib.contenttypes.models import ContentType
+    from ipam.models import IPAddress
+
+    states = [state for values in ip_states.values() for state in values]
+    if not states:
+        return {}
+    interface_type_id = ContentType.objects.get_for_model(Interface).pk
+    candidates = {}
+    for ip_obj in IPAddress.objects.filter(address__in={state.address for state in states}).select_related("vrf"):
+        key = (str(ip_obj.address), ip_obj.vrf.name if ip_obj.vrf else "")
+        candidates.setdefault(key, []).append(ip_obj)
+
+    resolved = {}
+    for state in states:
+        matches = candidates.get((state.address, state.vrf), [])
+        own = next(
+            (
+                ip_obj
+                for ip_obj in matches
+                if ip_obj.assigned_object_type_id == interface_type_id
+                and ip_obj.assigned_object_id == state.interface_id
+            ),
+            None,
+        )
+        unassigned = next((ip_obj for ip_obj in matches if ip_obj.assigned_object_id is None), None)
+        linked = own or unassigned or (matches[0] if matches else None)
+        if linked is not None:
+            resolved[state.pk] = linked
+    return resolved
+
+
 def _paged_row_bucket(status: str, owned: bool) -> str:
     """Bucket one paged-overlay row into the drift / pending / in_sync quick-filter group.
 
@@ -745,6 +876,8 @@ class NSOCategoryView(LoginRequiredMixin, View):
             ifaces[iface_id] = st.interface
 
         ordered = sorted(ifaces.values(), key=lambda i: i.name)
+        links_by_iface, peer_ip_states = _interface_topology_payload(ordered, ip_states)
+        native_ips = _native_ip_by_state(ip_states)
 
         # Per-interface aggregate state for the grid's row-level rollup and the
         # drift/pending quick-filter counts.
@@ -762,7 +895,17 @@ class NSOCategoryView(LoginRequiredMixin, View):
         # ?format=json serves the grid's post-action reloads; the plain fragment embeds
         # the same payload via json_script so first paint needs no second request.
         payload = self._interface_merged_payload(
-            ordered, kinds_by_iface, counts, attr_states, mtu_states, sw_states, ip_states, adapter_error
+            ordered,
+            kinds_by_iface,
+            counts,
+            attr_states,
+            mtu_states,
+            sw_states,
+            ip_states,
+            links_by_iface,
+            peer_ip_states,
+            native_ips,
+            adapter_error,
         )
         if request.GET.get("format") == "json":
             return JsonResponse(payload)
@@ -1129,7 +1272,18 @@ class NSOCategoryView(LoginRequiredMixin, View):
         )
 
     def _interface_merged_payload(
-        self, ordered, kinds_by_iface, counts, attr_states, mtu_states, sw_states, ip_states, adapter_error
+        self,
+        ordered,
+        kinds_by_iface,
+        counts,
+        attr_states,
+        mtu_states,
+        sw_states,
+        ip_states,
+        links_by_iface,
+        peer_ip_states,
+        native_ips,
+        adapter_error,
     ):
         """Build the merged per-interface matrix payload for the Tabulator grid.
 
@@ -1176,6 +1330,37 @@ class NSOCategoryView(LoginRequiredMixin, View):
             cell.update(extra)
             return cell
 
+        def ip_cell(st):
+            owned = st.status in OWNED_STATES
+            kind, label = display_state(st.status, owned)
+            native = native_ips.get(st.pk)
+            peer = peer_ip_states.get(st.pk)
+            return {
+                "pk": st.pk,
+                "address": str(st.address),
+                "secondary": st.secondary,
+                "status": st.status,
+                "kind": kind,
+                "label": label,
+                "owned": owned,
+                "url": native.get_absolute_url() if native is not None else None,
+                "accept_url": (
+                    reverse("plugins:netbox_nso_plugin:nsointerfaceipstate_accept", args=[st.pk])
+                    if st.status in self._ACCEPTABLE_STATUSES
+                    else None
+                ),
+                "edit_url": reverse("plugins:netbox_nso_plugin:nsointerfaceipstate_edit", args=[st.pk]),
+                "peer": (
+                    {
+                        "pk": peer.pk,
+                        "address": peer.address,
+                        "interface": f"{peer.interface.device.name} / {peer.interface.name}",
+                    }
+                    if peer is not None
+                    else None
+                ),
+            }
+
         rows = []
         for iface in ordered:
             mtu = mtu_states.get(iface.id)
@@ -1184,6 +1369,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
             rows.append(
                 {
                     "iface": {"id": iface.id, "name": iface.name, "url": iface.get_absolute_url()},
+                    "link": links_by_iface.get(iface.id),
                     "enabled": attr_cell(attr_states.get((iface.id, "enabled")), iface),
                     "description": attr_cell(attr_states.get((iface.id, "description")), iface),
                     "mtu": plain_cell(
@@ -1193,15 +1379,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
                         if mtu
                         else {},
                     ),
-                    "ips": [
-                        {
-                            "address": str(st.address),
-                            "secondary": st.secondary,
-                            "status": st.status,
-                            "kind": display_state(st.status, st.status in OWNED_STATES)[0],
-                        }
-                        for st in ip_states.get(iface.id, [])
-                    ],
+                    "ips": [ip_cell(st) for st in ip_states.get(iface.id, [])],
                     "switchport": plain_cell(
                         sw,
                         "plugins:netbox_nso_plugin:switchport_accept",
@@ -3298,6 +3476,231 @@ class NSOSwitchportStateAcceptView(NSOActionPermissionMixin, View):
             state.save(update_fields=["status", "accepted_at"])
         messages.success(request, f"Accepted switchport {state.interface.name}.")
         return redirect(_device_nso_tab_url(state.management.device_id))
+
+
+def _editable_native_ip(state, vrf_obj):
+    """Return the native IP backing *state*, or one safe unassigned candidate.
+
+    A matching object assigned elsewhere is intentionally not editable through this
+    state: it remains a conflict link for inspection, and the operator may instead
+    enter a free address for this interface.
+    """
+    from dcim.models import Interface
+    from django.contrib.contenttypes.models import ContentType
+    from ipam.models import IPAddress
+
+    interface_type_id = ContentType.objects.get_for_model(Interface).pk
+    matches = list(IPAddress.objects.filter(address=state.address, vrf=vrf_obj))
+    own = next(
+        (
+            ip_obj
+            for ip_obj in matches
+            if ip_obj.assigned_object_type_id == interface_type_id and ip_obj.assigned_object_id == state.interface_id
+        ),
+        None,
+    )
+    if own is not None:
+        return own
+    unassigned = [ip_obj for ip_obj in matches if ip_obj.assigned_object_id is None]
+    return unassigned[0] if len(unassigned) == 1 else None
+
+
+def _peer_ip_state_for_edit(state):
+    """Resolve the unambiguous IP state on *state*'s cable peer, if any."""
+    from .derived_intent import find_peer
+    from .models import NSOInterfaceIPState
+
+    if state.interface.cable_id is None:
+        return None
+    peer = find_peer(state.interface)
+    if peer is None:
+        return None
+    candidates = list(
+        NSOInterfaceIPState.objects.filter(interface=peer)
+        .select_related("interface", "interface__device")
+        .order_by("address")
+    )
+    return _matching_peer_ip_state(state, candidates)
+
+
+def _prepare_ip_update(state, field, raw):
+    """Normalize one submitted address and resolve its VRF/native object."""
+    from ipaddress import ip_interface
+
+    from ipam.models import VRF
+
+    value = (raw or "").strip()
+    if not value:
+        return None, "Enter an IP address with a prefix length."
+    try:
+        parsed = ip_interface(value)
+    except ValueError:
+        return None, "Enter a valid IPv4 or IPv6 address with a prefix length."
+    if "/" not in value:
+        return None, "Include the prefix length (for example, /31 or /128)."
+    vrf_obj = VRF.objects.filter(name=state.vrf).first() if state.vrf else None
+    if state.vrf and vrf_obj is None:
+        return None, f"VRF '{state.vrf}' does not exist in NetBox."
+    return {
+        "field": field,
+        "state": state,
+        "address": str(parsed),
+        "host": str(parsed.ip),
+        "family": "ipv6" if parsed.version == 6 else "ipv4",
+        "vrf": vrf_obj,
+        "native": _editable_native_ip(state, vrf_obj),
+    }, None
+
+
+def _ip_update_collision_errors(updates):
+    """Return field errors for an IP/state host collision in the same VRF."""
+    from ipaddress import ip_interface
+
+    from ipam.models import IPAddress
+
+    errors = {}
+    for update in updates:
+        native = update["native"]
+        clash = IPAddress.objects.filter(address__net_host=update["host"], vrf=update["vrf"])
+        if native is not None:
+            clash = clash.exclude(pk=native.pk)
+        if clash.exists():
+            errors[update["field"]] = [
+                f"IP address {update['host']} already exists in this VRF; choose an unused address."
+            ]
+            continue
+        state = update["state"]
+        siblings = state.__class__.objects.filter(interface=state.interface, vrf=state.vrf).exclude(pk=state.pk)
+        for sibling in siblings:
+            try:
+                same_host = str(ip_interface(sibling.address).ip) == update["host"]
+            except ValueError:
+                same_host = False
+            if same_host:
+                errors[update["field"]] = [
+                    f"IP address {update['host']} is already tracked on this interface; choose an unused address."
+                ]
+                break
+
+    if len(updates) == 2 and updates[0]["vrf"] == updates[1]["vrf"] and updates[0]["host"] == updates[1]["host"]:
+        errors[updates[0]["field"]] = ["The local and peer addresses must be different."]
+        errors[updates[1]["field"]] = ["The local and peer addresses must be different."]
+    return errors
+
+
+def _apply_ip_update(update, now):
+    """Re-key one overlay and create/update its assigned native IPAddress."""
+    from ipam.models import IPAddress
+
+    state = update["state"]
+    changed = update["address"] != state.address
+    state.address = update["address"]
+    state.family = update["family"]
+    state.status = "accepted" if changed else _status_after_accept(state.status)
+    state.accepted_at = now
+    update_fields = ["address", "family", "status", "accepted_at"]
+    if changed and state.auto_assigned:
+        if state.peer_state_id:
+            state.__class__.objects.filter(pk=state.peer_state_id, peer_state_id=state.pk).update(peer_state=None)
+        state.auto_assigned = False
+        state.source_pool = None
+        state.peer_state = None
+        update_fields.extend(["auto_assigned", "source_pool", "peer_state"])
+    state.full_clean()
+    state.save(update_fields=update_fields)
+
+    ip_obj = update["native"] or IPAddress(vrf=update["vrf"], status="active")
+    ip_obj.address = update["address"]
+    ip_obj.vrf = update["vrf"]
+    ip_obj.assigned_object = state.interface
+    ip_obj.full_clean()
+    ip_obj.save()
+
+
+class NSOInterfaceIPStateEditView(NSOActionPermissionMixin, View):
+    """Edit/materialize an interface IP from the merged grid, optionally with its peer.
+
+    The local address is always updated. ``peer_address`` is opt-in: the popover
+    prefills it for context, but an unchanged/blank value leaves the far end alone.
+    Both requested updates validate before writing and commit atomically.
+    """
+
+    def post(self, request, pk):
+        """Validate, atomically write native IPAM + overlays, then push owned intent."""
+        from django.core.exceptions import ValidationError
+        from django.db import IntegrityError, transaction
+
+        from .models import NSODeviceManagement, NSOInterfaceIPState
+        from .signals import _push_ip_intent_for_device, _schedule_intent_push, suppress_intent_push
+
+        state = get_object_or_404(
+            NSOInterfaceIPState.objects.select_related("interface", "interface__device"),
+            pk=pk,
+        )
+        local, error = _prepare_ip_update(state, "address", request.POST.get("address"))
+        if error:
+            return JsonResponse({"status": "error", "errors": {"address": [error]}}, status=400)
+
+        updates = [local]
+        peer_raw = (request.POST.get("peer_address") or "").strip()
+        if peer_raw:
+            peer_state = _peer_ip_state_for_edit(state)
+            if peer_state is None:
+                return JsonResponse(
+                    {
+                        "status": "error",
+                        "errors": {"peer_address": ["No unambiguous IP address exists on the cable peer."]},
+                    },
+                    status=400,
+                )
+            peer, error = _prepare_ip_update(peer_state, "peer_address", peer_raw)
+            if error:
+                return JsonResponse({"status": "error", "errors": {"peer_address": [error]}}, status=400)
+            if peer["address"] != peer_state.address:
+                updates.append(peer)
+
+        errors = _ip_update_collision_errors(updates)
+        if errors:
+            return JsonResponse({"status": "error", "errors": errors}, status=400)
+
+        for update in updates:
+            permission = "ipam.change_ipaddress" if update["native"] is not None else "ipam.add_ipaddress"
+            if not request.user.has_perm(permission):
+                raise PermissionDenied
+
+        try:
+            with transaction.atomic():
+                now = timezone.now()
+                with suppress_intent_push():
+                    for update in updates:
+                        _apply_ip_update(update, now)
+
+                device_ids = {update["state"].interface.device_id for update in updates}
+                for mgmt in NSODeviceManagement.objects.filter(
+                    device_id__in=device_ids,
+                    adapter_device_id__isnull=False,
+                ):
+                    device_id = mgmt.device_id
+                    adapter_device_id = mgmt.adapter_device_id
+                    _schedule_intent_push(
+                        (device_id, "ip"),
+                        lambda device_id=device_id, adapter_device_id=adapter_device_id: _push_ip_intent_for_device(
+                            device_id, adapter_device_id
+                        ),
+                    )
+        except (ValidationError, IntegrityError) as exc:
+            messages_list = getattr(exc, "messages", None) or ["The address conflicts with an existing object."]
+            return JsonResponse(
+                {"status": "error", "errors": {updates[-1]["field"]: [str(message) for message in messages_list]}},
+                status=400,
+            )
+
+        return JsonResponse(
+            {
+                "status": "ok",
+                "message": f"Updated {len(updates)} interface address{'es' if len(updates) != 1 else ''}.",
+            }
+        )
 
 
 class NSOInterfaceIPStateAcceptView(NSOActionPermissionMixin, View):
