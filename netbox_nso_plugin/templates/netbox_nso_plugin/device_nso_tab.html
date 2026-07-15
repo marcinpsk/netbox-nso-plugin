@@ -16,6 +16,8 @@
 {# Shared grid harness — badge vocabulary, per-cell Accept, inline-edit-owns, state #}
 {# pills. Must load before any lazy category fragment runs its column definitions. #}
 <script src="{% static 'netbox_nso_plugin/nso-grid.js' %}"></script>
+{# Interfaces panel column definitions — static (testable); the fragment only mounts. #}
+<script src="{% static 'netbox_nso_plugin/nso-grid-interface.js' %}"></script>
 {% if mgmt %}
 
   {# ── Adapter link/sync failure — managing this device couldn't reach the adapter ─────── #}
