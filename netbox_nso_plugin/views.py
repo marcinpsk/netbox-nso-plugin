@@ -1207,7 +1207,14 @@ class NSOCategoryView(LoginRequiredMixin, View):
                             "prefix": lambda st: st.nso_prefix,
                             "next_hop": lambda st: st.nso_next_hop or None,
                             "metric": lambda st: st.static_route.metric if st.static_route else None,
+                            "permanent": lambda st: st.static_route.permanent if st.static_route else None,
+                            "tag": lambda st: st.static_route.tag if st.static_route else None,
                             "route": lambda st: linked(st.static_route),
+                            "edit_url": lambda st: (
+                                reverse(r + "overlay_field_edit", args=["static_route", st.pk])
+                                if st.static_route_id
+                                else None
+                            ),
                         },
                     )
                 },
@@ -3135,6 +3142,26 @@ def _redistribution_errors(obj):
     return errors
 
 
+def _static_route_errors(obj):
+    """Validate native static-route policy without exposing route identity inline."""
+    from django.core.exceptions import ValidationError
+
+    native = obj.static_route
+    if native is None:
+        return {"metric": ["Only a linked NetBox static route can be edited inline."]}
+    if native.metric is None:
+        return {"metric": ["Metric is required."]}
+
+    errors = {}
+    try:
+        native.full_clean()
+    except ValidationError as exc:
+        for field, messages in exc.message_dict.items():
+            target = field if field in ("metric", "permanent", "tag") else "metric"
+            errors.setdefault(target, []).extend(str(message) for message in messages)
+    return errors
+
+
 def _sync_native_bfd(obj):
     """Keep netbox-routing's native BFD row aligned with an edited overlay."""
     try:
@@ -3297,6 +3324,11 @@ def _save_owned_overlay_edit(obj, key):
             _sync_native_bgp_peer(obj)
         if key == "redistribution":
             _sync_native_redistribution(obj)
+        if key == "static_route":
+            from .signals import suppress_intent_push
+
+            with suppress_intent_push():
+                obj.static_route.save(update_fields=["metric", "permanent", "tag"])
         obj.save()
 
 
@@ -3432,6 +3464,8 @@ def _overlay_family_errors(key, obj, old_values):
         return _bgp_peer_errors(obj)
     if key == "redistribution":
         return _redistribution_errors(obj)
+    if key == "static_route":
+        return _static_route_errors(obj)
     if key == "route_map_name":
         return _route_map_name_errors(obj, old_values["object_name"])
     return {}
@@ -3484,6 +3518,7 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
         ),
         "bgp_peer": ("NSOBGPPeerState", ("remote_as_str", "enabled")),
         "redistribution": ("NSORedistributionState", ("route_map", "metric", "metric_type")),
+        "static_route": ("NSOStaticRouteState", ("metric", "permanent", "tag")),
         "route_map_name": ("NSORoutePolicyState", ("object_name",)),
     }
 
@@ -3507,22 +3542,23 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
             return JsonResponse({"status": "error", "message": "no editable field supplied"}, status=400)
 
         obj = get_object_or_404(apps.get_model("netbox_nso_plugin", model_name), pk=pk)
-        old_values = {field: getattr(obj, field) for field in editable}
+        edit_obj = obj.static_route if key == "static_route" else obj
+        old_values = {field: getattr(edit_obj, field) for field in editable}
         errors: dict[str, list[str]] = {}
         changed = []
         for f in supplied:
-            field = obj._meta.get_field(f)
+            field = edit_obj._meta.get_field(f)
             raw = request.POST.get(f, "")
             if key in ("route_map_name", "bgp_peer", "redistribution"):
                 raw = raw.strip()
             value = raw if raw != "" else (None if field.null else "")
             try:
-                value = field.clean(value, obj)
+                value = field.clean(value, edit_obj)
             except ValidationError as exc:
                 errors[f] = [str(m) for m in exc.messages]
                 continue
-            if getattr(obj, f) != value:
-                setattr(obj, f, value)
+            if getattr(edit_obj, f) != value:
+                setattr(edit_obj, f, value)
                 changed.append(f)
         if errors:
             return JsonResponse({"status": "error", "errors": errors}, status=400)
@@ -3532,7 +3568,7 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
             return JsonResponse({"status": "error", "errors": errors}, status=400)
 
         if changed:
-            collision = _unique_collision_response(obj, editable)
+            collision = None if key == "static_route" else _unique_collision_response(obj, editable)
             if collision is not None:
                 return collision
 

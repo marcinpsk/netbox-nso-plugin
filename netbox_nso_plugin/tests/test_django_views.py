@@ -3445,6 +3445,65 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual((row.route_map, row.metric, row.metric_type, row.status), ("RM-KEEP", 5, "1", "imported"))
         self.assertEqual(native.route_map, route_map)
 
+    def test_edit_static_route_updates_native_policy_and_takes_ownership(self):
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.models import NSOStaticRouteState
+
+        native = StaticRoute.objects.create(
+            prefix="198.51.100.0/24",
+            next_hop="192.0.2.1",
+            metric=10,
+            permanent=False,
+        )
+        row = NSOStaticRouteState.objects.create(
+            management=self.mgmt,
+            static_route=native,
+            nso_prefix=str(native.prefix),
+            nso_next_hop=str(native.next_hop),
+            status="imported",
+        )
+
+        response = self.client.post(
+            self._url("static_route", row.pk),
+            {"metric": "25", "permanent": "True", "tag": "120"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        row.refresh_from_db()
+        native.refresh_from_db()
+        self.assertEqual((native.metric, native.permanent, native.tag), (25, True, 120))
+        self.assertEqual(row.status, "accepted")
+        self.assertIsNotNone(row.accepted_at)
+
+    def test_edit_static_route_rejects_metric_above_device_model_limit(self):
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.models import NSOStaticRouteState
+
+        native = StaticRoute.objects.create(
+            prefix="203.0.113.0/24",
+            next_hop="192.0.2.2",
+            metric=10,
+            permanent=False,
+        )
+        row = NSOStaticRouteState.objects.create(
+            management=self.mgmt,
+            static_route=native,
+            nso_prefix=str(native.prefix),
+            nso_next_hop=str(native.next_hop),
+            status="imported",
+        )
+
+        response = self.client.post(self._url("static_route", row.pk), {"metric": "256"})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("metric", response.json()["errors"])
+        row.refresh_from_db()
+        native.refresh_from_db()
+        self.assertEqual(native.metric, 10)
+        self.assertEqual(row.status, "imported")
+
     def test_edit_route_map_name_updates_shared_object_overlays_and_dependent_intent(self):
         from django.contrib.contenttypes.models import ContentType
         from netbox_routing.models import OSPFInstance, Redistribution, RouteMap

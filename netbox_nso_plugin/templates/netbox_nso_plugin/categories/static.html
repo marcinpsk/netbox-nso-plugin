@@ -1,60 +1,18 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
-{# Lazy fragment: Static Routes — a client-side grid. Used to paginate + search #}
-{# server-side; every row now ships at once and sorts/filters in the browser. #}
 {% include "netbox_nso_plugin/categories/_adapter_error.html" %}
 
 {% if grid_payload.rows %}
   <div class="d-flex justify-content-end align-items-center mb-2">
     {% url 'plugins:netbox_nso_plugin:routing_bulk_accept_static_routes' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned %}
   </div>
+  <p class="text-muted small mb-2">Prefix, VRF, and next hop identify the route. Edit metric, permanence, and tag inline; open the prefix for broader route changes.</p>
   {{ grid_payload|json_script:"nso-static-data" }}
   {% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='static' as cat_url %}
   {% include "netbox_nso_plugin/categories/_grid.html" with cls="nso-static" json_url=cat_url|add:"?format=json" counts=grid_payload.counts %}
 
   <script>
-  (function () {
-    "use strict";
-    var root = document.querySelector('.nso-static');
-    var payloadEl = document.getElementById('nso-static-data');
-    if (!root || !payloadEl || !window.NSOGrid) return;
-    var G = window.NSOGrid;
-    var esc = G.esc, MUTED = G.MUTED;
-
-    function plain(field) {
-      return function (cell) {
-        var v = cell.getRow().getData()[field];
-        return v == null || v === '' ? MUTED : esc(v);
-      };
-    }
-
-    G.mount(root, {
-      key: 'static',
-      payload: JSON.parse(payloadEl.textContent),
-      jsonUrl: root.dataset.jsonUrl,
-      placeholder: 'No static routes.',
-      flatten: function (rows) {
-        return rows.map(function (r) { r._prefix = r.prefix || ''; return r; });
-      },
-      columns: [
-        { title: 'VRF', field: 'vrf', formatter: plain('vrf'), widthGrow: 0.9, minWidth: 90, headerFilter: 'input' },
-        { title: 'Prefix', field: '_prefix', sorter: 'alphanum', widthGrow: 1.6, minWidth: 150,
-          headerFilter: 'input', headerFilterPlaceholder: 'filter prefix…',
-          formatter: function (cell) {
-            var d = cell.getRow().getData();
-            // The overlay may never have resolved a netbox-routing StaticRoute — show the
-            // device's prefix regardless, rather than a dead link or an em-dash.
-            return d.route ? '<a href="' + esc(d.route.url) + '">' + esc(d.prefix) + '</a>' : esc(d.prefix);
-          } },
-        { title: 'Next Hop', field: 'next_hop', formatter: plain('next_hop'), widthGrow: 1.4, minWidth: 130,
-          headerFilter: 'input', headerFilterPlaceholder: 'filter next hop…' },
-        { title: 'Metric', field: 'metric', formatter: plain('metric'), widthGrow: 0.6, minWidth: 75, hozAlign: 'right' },
-        G.stateColumn(),
-        G.lastSyncColumn(),
-        G.acceptColumn(),
-      ],
-    });
-  })();
+  window.NSOGridStatic && window.NSOGridStatic.mount(document.querySelector('.nso-static'));
   </script>
 {% else %}
   <p class="text-muted mb-0">No static routes.</p>
