@@ -3070,6 +3070,16 @@ def _bfd_field_errors(obj):
     return errors
 
 
+def _logging_host_errors(obj):
+    """Validate values against the logging-reconciler service contract."""
+    errors = {}
+    if obj.port is not None and not 1 <= obj.port <= 65_535:
+        errors["port"] = ["Enter a port between 1 and 65535."]
+    if obj.transport not in ("", "udp", "tcp"):
+        errors["transport"] = ["Transport must be UDP, TCP, or device default."]
+    return errors
+
+
 def _ospf_instance_errors(obj):
     """Validate an inline router-ID edit against the linked native instance."""
     from django.core.exceptions import ValidationError
@@ -3653,6 +3663,8 @@ def _overlay_family_errors(key, obj, old_values):
     """Run validation that spans fields or the linked native object."""
     if key == "bfd":
         return _bfd_field_errors(obj)
+    if key == "logging_host":
+        return _logging_host_errors(obj)
     if key == "ospf_instance":
         return _ospf_instance_errors(obj)
     if key == "ospf_interface":

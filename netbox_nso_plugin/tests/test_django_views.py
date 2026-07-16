@@ -2933,6 +2933,73 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(row.port, 1514)
         self.assertEqual(row.status, "accepted")
 
+    def test_logging_host_rejects_port_outside_writer_uint16(self):
+        from netbox_nso_plugin.models import NSOLoggingHostState
+
+        row = NSOLoggingHostState.objects.create(
+            management=self.mgmt, address="198.51.100.19", port=514, status="imported"
+        )
+
+        response = self.client.post(self._url("logging_host", row.pk), {"port": "65536"})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("port", response.json()["errors"])
+        row.refresh_from_db()
+        self.assertEqual(row.port, 514)
+        self.assertEqual(row.status, "imported")
+
+    def test_logging_host_rejects_transport_the_writer_cannot_apply(self):
+        from netbox_nso_plugin.models import NSOLoggingHostState
+
+        row = NSOLoggingHostState.objects.create(
+            management=self.mgmt, address="198.51.100.20", transport="udp", status="imported"
+        )
+
+        response = self.client.post(self._url("logging_host", row.pk), {"transport": "sctp"})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("transport", response.json()["errors"])
+        row.refresh_from_db()
+        self.assertEqual(row.transport, "udp")
+        self.assertEqual(row.status, "imported")
+
+    def test_logging_category_groups_inline_fields_into_compact_columns(self):
+        from netbox_nso_plugin.models import NSOLoggingHostState
+
+        row = NSOLoggingHostState.objects.create(
+            management=self.mgmt,
+            address="198.51.100.21",
+            port=1514,
+            severity="warning",
+            facility="local7",
+            transport="tcp",
+            vrf="management",
+            source="Loopback0",
+            status="imported",
+        )
+        url = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category",
+            kwargs={"pk": self.device.pk, "key": "logging"},
+        )
+
+        response = self.client.get(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+
+        self.assertEqual(response.status_code, 200)
+        edit_url = self._url("logging_host", row.pk)
+        self.assertContains(response, edit_url)
+        self.assertContains(response, 'data-pe-fields="port:number:Port,transport:select:Transport"')
+        self.assertContains(response, 'data-pe-fields="severity:text:Severity,facility:text:Facility"')
+        self.assertContains(response, 'data-pe-fields="source:text:Source,vrf:text:VRF"')
+        self.assertContains(response, "Status / Synced")
+        full_edit_url = reverse("plugins:netbox_nso_plugin:nsologginghoststate_edit", kwargs={"pk": row.pk})
+        self.assertNotContains(response, full_edit_url)
+        self.assertNotContains(response, 'data-pe-fields="address:text:Address"')
+        self.assertNotContains(response, "<th>Port</th>", html=True)
+        self.assertNotContains(response, "<th>Severity</th>", html=True)
+        self.assertNotContains(response, "<th>Facility</th>", html=True)
+        self.assertNotContains(response, "<th>Source</th>", html=True)
+        self.assertNotContains(response, "<th>VRF</th>", html=True)
+
     def test_editing_an_address_onto_a_sibling_row_is_a_400_not_a_500(self):
         """field.clean() is FIELD-level only — it never checks unique/unique_together. The
         logging_host popover exposes `address`, half of NSOLoggingHostState's (management,

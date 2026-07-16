@@ -1,64 +1,49 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
-{# Lazy-loaded fragment: Logging category (remote syslog servers). Read-only. #}
+{# Lazy-loaded fragment: Logging category (remote syslog servers). #}
 {% include "netbox_nso_plugin/categories/_adapter_error.html" %}
-{% url 'dcim:device_nso' pk=object.pk as return_url %}
 
 {% if logging_data.hosts %}
+  <p class="text-muted small mb-2">Edit destination options, policy, and source context inline. The server address is the structural identity; changing it is a remove-and-create operation rather than a field edit.</p>
   <div id="flt-logging-hosts">
   {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-logging-hosts" placeholder="Filter by server / severity…" show_status=True %}
   <div class="table-responsive">
     <table class="table table-sm table-hover mb-0">
       <thead>
-        <tr><th>Syslog server</th><th>Port</th><th>Severity</th><th>Facility</th><th>Source</th><th>VRF</th><th>Status</th><th>Last Synced</th><th></th></tr>
+        <tr><th>Destination</th><th>Policy</th><th>Source context</th><th>Status / Synced</th><th></th></tr>
       </thead>
       <tbody>
         {% for h in logging_data.hosts %}
         <tr data-status="{{ h.status }}" data-owned="{{ h.accepted_at|yesno:'true,false' }}">
           {% url 'plugins:netbox_nso_plugin:overlay_field_edit' key='logging_host' pk=h.pk as host_edit_url %}
           <td>
-            <a href="#" class="nso-popedit" title="Click to edit"
-               data-pe-url="{{ host_edit_url }}" data-pe-title="Syslog server"
-               data-pe-fields="address:text:Address"
-               data-pe-v-address="{{ h.address }}">{{ h.address }}</a>
-          </td>
-          <td>
-            <a href="#" class="nso-popedit" title="Click to edit (blank = NED default 514)"
-               data-pe-url="{{ host_edit_url }}" data-pe-title="Port"
-               data-pe-fields="port:number:Port"
-               data-pe-v-port="{{ h.port|default:'' }}">{{ h.port|default:"514" }}</a>
-          </td>
-          <td>
-            <a href="#" class="nso-popedit" title="Click to edit"
-               data-pe-url="{{ host_edit_url }}" data-pe-title="Severity"
-               data-pe-fields="severity:text:Severity"
-               data-pe-v-severity="{{ h.severity|default:'' }}">{{ h.severity|default:"—" }}</a>
-          </td>
-          <td>
-            <a href="#" class="nso-popedit" title="Click to edit"
-               data-pe-url="{{ host_edit_url }}" data-pe-title="Facility"
-               data-pe-fields="facility:text:Facility"
-               data-pe-v-facility="{{ h.facility|default:'' }}">{{ h.facility|default:"—" }}</a>
-          </td>
-          <td>
-            <a href="#" class="nso-popedit" title="Click to edit"
-               data-pe-url="{{ host_edit_url }}" data-pe-title="Source"
-               data-pe-fields="source:text:Source"
-               data-pe-v-source="{{ h.source|default:'' }}">{{ h.source|default:"—" }}</a>
-          </td>
-          <td>
-            <a href="#" class="nso-popedit" title="Click to edit"
-               data-pe-url="{{ host_edit_url }}" data-pe-title="VRF"
-               data-pe-fields="vrf:text:VRF"
-               data-pe-v-vrf="{{ h.vrf|default:'' }}">{{ h.vrf|default:"—" }}</a>
-          </td>
-          <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=h.status residue=h.residue_survivor residue_job=h.residue_job_id %}</td>
-          <td class="text-nowrap">{% if h.last_sync_at %}{{ h.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
-          <td>
-            <div class="d-flex gap-1 align-items-center">
-              {% url 'plugins:netbox_nso_plugin:nsologginghoststate_edit' pk=h.pk as edit_url %}{% include "netbox_nso_plugin/categories/_edit_link.html" with edit_url=edit_url return_url=return_url %}
-              {% url 'plugins:netbox_nso_plugin:logging_accept_host' pk=h.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=h.status %}
+            <span class="fw-semibold">{{ h.address }}</span>
+            <div class="small">
+              <a href="#" class="nso-popedit" title="Edit port and transport; this takes ownership"
+                 data-pe-url="{{ host_edit_url }}" data-pe-title="{{ h.address }} destination options"
+                 data-pe-fields="port:number:Port,transport:select:Transport"
+                 data-pe-v-port="{{ h.port|default:'' }}" data-pe-v-transport="{{ h.transport|default:'' }}"
+                 data-pe-o-transport='[{"value":"","label":"Device default"},{"value":"udp","label":"UDP"},{"value":"tcp","label":"TCP"}]'>{{ h.transport|default:"default"|upper }} · {{ h.port|default:"514" }}</a>
             </div>
+          </td>
+          <td>
+            <a href="#" class="nso-popedit" title="Edit severity and facility; this takes ownership"
+               data-pe-url="{{ host_edit_url }}" data-pe-title="{{ h.address }} logging policy"
+               data-pe-fields="severity:text:Severity,facility:text:Facility"
+               data-pe-v-severity="{{ h.severity|default:'' }}" data-pe-v-facility="{{ h.facility|default:'' }}">{{ h.severity|default:"device default" }} · {{ h.facility|default:"any facility" }}</a>
+          </td>
+          <td>
+            <a href="#" class="nso-popedit" title="Edit source and VRF; this takes ownership"
+               data-pe-url="{{ host_edit_url }}" data-pe-title="{{ h.address }} source context"
+               data-pe-fields="source:text:Source,vrf:text:VRF"
+               data-pe-v-source="{{ h.source|default:'' }}" data-pe-v-vrf="{{ h.vrf|default:'' }}">{{ h.source|default:"device default" }} · {{ h.vrf|default:"global" }}</a>
+          </td>
+          <td>
+            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=h.status residue=h.residue_survivor residue_job=h.residue_job_id %}
+            <div class="text-muted small text-nowrap">{% if h.last_sync_at %}{{ h.last_sync_at|date:"Y-m-d H:i" }}{% else %}not synced{% endif %}</div>
+          </td>
+          <td class="text-nowrap">
+            {% url 'plugins:netbox_nso_plugin:logging_accept_host' pk=h.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=h.status %}
           </td>
         </tr>
         {% endfor %}
