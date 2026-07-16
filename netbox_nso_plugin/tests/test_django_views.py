@@ -3068,6 +3068,180 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(str(native.router_id), "192.0.2.10")
         self.assertEqual(row.status, "accepted")
 
+    def test_edit_isis_interface_updates_overlay_and_native_object(self):
+        from netbox_routing.models import ISISInstance, ISISInterface
+
+        from netbox_nso_plugin.models import NSOISISInterfaceState
+
+        instance = ISISInstance.objects.create(device=self.device, process_tag="CORE")
+        native = ISISInterface.objects.create(
+            instance=instance,
+            interface=self.interface,
+            address_family="ipv4",
+            circuit_type="level-1-2",
+            network_type="broadcast",
+            metric=10,
+            passive=False,
+        )
+        row = NSOISISInterfaceState.objects.create(
+            management=self.mgmt,
+            interface=self.interface,
+            af="ipv4",
+            process_tag="CORE",
+            circuit_type="level-1-2",
+            network_type="broadcast",
+            metric=10,
+            passive=False,
+            isis_interface=native,
+            status="imported",
+        )
+
+        response = self.client.post(
+            self._url("isis_interface", row.pk),
+            {
+                "circuit_type": "level-2-only",
+                "network_type": "point-to-point",
+                "metric": "25",
+                "passive": "True",
+                "bfd_enabled": "True",
+                "frr_enabled": "True",
+                "frr_protection": "node",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        row.refresh_from_db()
+        native.refresh_from_db()
+        self.assertEqual(row.status, "accepted")
+        self.assertIsNotNone(row.accepted_at)
+        self.assertEqual(
+            (
+                row.circuit_type,
+                row.network_type,
+                row.metric,
+                row.passive,
+                row.bfd_enabled,
+                row.frr_enabled,
+                row.frr_protection,
+            ),
+            ("level-2-only", "point-to-point", 25, True, True, True, "node"),
+        )
+        self.assertEqual(
+            (
+                native.circuit_type,
+                native.network_type,
+                native.metric,
+                native.passive,
+                native.bfd_enabled,
+                native.frr_enabled,
+                native.frr_protection,
+            ),
+            ("level-2-only", "point-to-point", 25, True, True, True, "node"),
+        )
+
+    def test_edit_isis_instance_updates_safe_core_fields(self):
+        from netbox_routing.models import ISISInstance
+
+        from netbox_nso_plugin.models import NSOISISInstanceState
+
+        native = ISISInstance.objects.create(
+            device=self.device,
+            process_tag="CORE",
+            net="49.0001.0000.0000.0001.00",
+            is_type="level-1-2",
+            metric_style="narrow",
+        )
+        row = NSOISISInstanceState.objects.create(
+            management=self.mgmt,
+            process_tag="CORE",
+            net=native.net,
+            is_type=native.is_type,
+            metric_style=native.metric_style,
+            isis_instance=native,
+            status="imported",
+        )
+
+        response = self.client.post(
+            self._url("isis_instance", row.pk),
+            {
+                "net": "49.0001.0000.0000.0002.00",
+                "is_type": "level-2-only",
+                "metric_style": "wide",
+                "overload_bit": "True",
+                "fast_reroute": "ti-lfa",
+                "microloop_avoidance": "True",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        row.refresh_from_db()
+        native.refresh_from_db()
+        expected = ("49.0001.0000.0000.0002.00", "level-2-only", "wide", True, "ti-lfa", True)
+        self.assertEqual(
+            (row.net, row.is_type, row.metric_style, row.overload_bit, row.fast_reroute, row.microloop_avoidance),
+            expected,
+        )
+        self.assertEqual(
+            (
+                native.net,
+                native.is_type,
+                native.metric_style,
+                native.overload_bit,
+                native.fast_reroute,
+                native.microloop_avoidance,
+            ),
+            expected,
+        )
+        self.assertEqual(row.status, "accepted")
+
+    def test_edit_isis_rejects_invalid_net_and_inconsistent_frr(self):
+        from netbox_routing.models import ISISInstance, ISISInterface
+
+        from netbox_nso_plugin.models import NSOISISInstanceState, NSOISISInterfaceState
+
+        instance = ISISInstance.objects.create(
+            device=self.device,
+            process_tag="EDGE",
+            net="49.0001.0000.0000.0003.00",
+        )
+        process_row = NSOISISInstanceState.objects.create(
+            management=self.mgmt,
+            process_tag="EDGE",
+            net=instance.net,
+            isis_instance=instance,
+            status="imported",
+        )
+        native_iface = ISISInterface.objects.create(
+            instance=instance,
+            interface=self.interface,
+            address_family="ipv4",
+        )
+        iface_row = NSOISISInterfaceState.objects.create(
+            management=self.mgmt,
+            interface=self.interface,
+            af="ipv4",
+            process_tag="EDGE",
+            isis_interface=native_iface,
+            status="imported",
+        )
+
+        bad_net = self.client.post(self._url("isis_instance", process_row.pk), {"net": "not-a-net"})
+        bad_frr = self.client.post(
+            self._url("isis_interface", iface_row.pk),
+            {"frr_enabled": "False", "frr_protection": "node"},
+        )
+
+        self.assertEqual(bad_net.status_code, 400)
+        self.assertIn("net", bad_net.json()["errors"])
+        self.assertEqual(bad_frr.status_code, 400)
+        self.assertIn("frr_protection", bad_frr.json()["errors"])
+        process_row.refresh_from_db()
+        iface_row.refresh_from_db()
+        self.assertEqual(process_row.net, "49.0001.0000.0000.0003.00")
+        self.assertIsNone(iface_row.frr_enabled)
+        self.assertEqual(iface_row.frr_protection, "")
+        self.assertEqual((process_row.status, iface_row.status), ("imported", "imported"))
+
     def test_edit_route_map_name_updates_shared_object_overlays_and_dependent_intent(self):
         from django.contrib.contenttypes.models import ContentType
         from netbox_routing.models import OSPFInstance, Redistribution, RouteMap

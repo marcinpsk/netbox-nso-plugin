@@ -1047,8 +1047,16 @@ class NSOCategoryView(LoginRequiredMixin, View):
                             "network_type": lambda st: st.network_type or None,
                             "metric": lambda st: st.metric,
                             "passive": lambda st: st.passive,
+                            "bfd_enabled": lambda st: st.bfd_enabled,
+                            "frr_enabled": lambda st: st.frr_enabled,
+                            "frr_protection": lambda st: st.frr_protection or None,
                             "hello_auth": lambda st: (
                                 (st.hello_auth_type or "on") if (st.hello_auth_present or st.hello_auth_type) else None
+                            ),
+                            "edit_url": lambda st: (
+                                reverse(r + "overlay_field_edit", args=["isis_interface", st.pk])
+                                if st.isis_interface_id
+                                else None
                             ),
                         },
                     ),
@@ -1059,9 +1067,20 @@ class NSOCategoryView(LoginRequiredMixin, View):
                         fields={
                             "process_tag": lambda st: st.process_tag or "default",
                             "instance": lambda st: linked(st.isis_instance),
+                            "net": lambda st: st.net or None,
+                            "is_type": lambda st: st.is_type or None,
+                            "metric_style": lambda st: st.metric_style or None,
+                            "overload_bit": lambda st: st.overload_bit,
+                            "fast_reroute": lambda st: st.fast_reroute or None,
+                            "microloop_avoidance": lambda st: st.microloop_avoidance,
                             "area_auth": lambda st: f"{st.area_auth_type or '—'}{' ✓' if st.area_auth_present else ''}",
                             "domain_auth": lambda st: (
                                 f"{st.domain_auth_type or '—'}{' ✓' if st.domain_auth_present else ''}"
+                            ),
+                            "edit_url": lambda st: (
+                                reverse(r + "overlay_field_edit", args=["isis_instance", st.pk])
+                                if st.isis_instance_id
+                                else None
                             ),
                         },
                     ),
@@ -2936,6 +2955,56 @@ def _ospf_interface_errors(obj):
     return errors
 
 
+def _isis_instance_errors(obj):
+    """Validate safe process knobs without exposing authentication keys inline."""
+    from django.core.exceptions import ValidationError
+    from netbox_routing.helpers.isis import NET_RE
+
+    native = obj.isis_instance
+    if native is None:
+        return {"net": ["Only a linked NetBox IS-IS instance can be edited inline."]}
+    errors = {}
+    if obj.net and not NET_RE.match(obj.net):
+        errors["net"] = ["Enter a valid NET, e.g. 49.0001.0000.0000.0001.00."]
+    for name in ("is_type", "metric_style", "overload_bit", "fast_reroute", "microloop_avoidance"):
+        try:
+            native._meta.get_field(name).clean(getattr(obj, name), native)
+        except ValidationError as exc:
+            errors[name] = [str(message) for message in exc.messages]
+    return errors
+
+
+def _isis_interface_errors(obj):
+    """Validate safe interface knobs against the linked native IS-IS object."""
+    from django.core.exceptions import ValidationError
+    from netbox_routing.models import ISISInstance
+
+    native = obj.isis_interface
+    if native is None:
+        return {"circuit_type": ["Only a linked NetBox IS-IS interface can be edited inline."]}
+    if native.address_family != obj.af:
+        return {"circuit_type": ["The linked NetBox IS-IS interface uses a different address family."]}
+    errors = {}
+    if not ISISInstance.objects.filter(device=obj.interface.device, process_tag=obj.process_tag).exists():
+        errors["circuit_type"] = [f"IS-IS process {obj.process_tag!r} does not exist on this device in NetBox."]
+    for name in (
+        "circuit_type",
+        "network_type",
+        "metric",
+        "passive",
+        "bfd_enabled",
+        "frr_enabled",
+        "frr_protection",
+    ):
+        try:
+            native._meta.get_field(name).clean(getattr(obj, name), native)
+        except ValidationError as exc:
+            errors[name] = [str(message) for message in exc.messages]
+    if obj.frr_protection and obj.frr_enabled is not True:
+        errors.setdefault("frr_protection", []).append("FRR protection requires FRR to be enabled.")
+    return errors
+
+
 def _sync_native_bfd(obj):
     """Keep netbox-routing's native BFD row aligned with an edited overlay."""
     try:
@@ -3004,6 +3073,41 @@ def _sync_native_ospf_interface(obj):
         )
 
 
+def _sync_native_isis_instance(obj):
+    """Mirror editable process intent into the native IS-IS instance."""
+    from .signals import suppress_intent_push
+
+    native = obj.isis_instance
+    fields = ("net", "is_type", "metric_style", "overload_bit", "fast_reroute", "microloop_avoidance")
+    for name in fields:
+        setattr(native, name, getattr(obj, name))
+    with suppress_intent_push():
+        native.save(update_fields=list(fields))
+
+
+def _sync_native_isis_interface(obj):
+    """Mirror editable interface intent into the native IS-IS interface."""
+    from netbox_routing.models import ISISInstance
+
+    from .signals import suppress_intent_push
+
+    native = obj.isis_interface
+    native.instance = ISISInstance.objects.get(device=obj.interface.device, process_tag=obj.process_tag)
+    fields = (
+        "circuit_type",
+        "network_type",
+        "metric",
+        "passive",
+        "bfd_enabled",
+        "frr_enabled",
+        "frr_protection",
+    )
+    for name in fields:
+        setattr(native, name, getattr(obj, name))
+    with suppress_intent_push():
+        native.save(update_fields=["instance", *fields])
+
+
 def _save_owned_overlay_edit(obj, key):
     """Claim an edited overlay and update its matching native NetBox object atomically."""
     from django.db import transaction
@@ -3027,6 +3131,10 @@ def _save_owned_overlay_edit(obj, key):
             _sync_native_ospf_instance(obj)
         if key == "ospf_interface":
             _sync_native_ospf_interface(obj)
+        if key == "isis_instance":
+            _sync_native_isis_instance(obj)
+        if key == "isis_interface":
+            _sync_native_isis_interface(obj)
         obj.save()
 
 
@@ -3154,6 +3262,10 @@ def _overlay_family_errors(key, obj, old_values):
         return _ospf_instance_errors(obj)
     if key == "ospf_interface":
         return _ospf_interface_errors(obj)
+    if key == "isis_instance":
+        return _isis_instance_errors(obj)
+    if key == "isis_interface":
+        return _isis_interface_errors(obj)
     if key == "route_map_name":
         return _route_map_name_errors(obj, old_values["object_name"])
     return {}
@@ -3196,6 +3308,14 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
         "bfd": ("NSOBFDInterfaceState", ("min_tx", "min_rx", "multiplier", "micro_bfd")),
         "ospf_instance": ("NSOOSPFInstanceState", ("router_id",)),
         "ospf_interface": ("NSOOSPFInterfaceState", ("area_id", "network_type", "cost", "passive")),
+        "isis_instance": (
+            "NSOISISInstanceState",
+            ("net", "is_type", "metric_style", "overload_bit", "fast_reroute", "microloop_avoidance"),
+        ),
+        "isis_interface": (
+            "NSOISISInterfaceState",
+            ("circuit_type", "network_type", "metric", "passive", "bfd_enabled", "frr_enabled", "frr_protection"),
+        ),
         "route_map_name": ("NSORoutePolicyState", ("object_name",)),
     }
 
