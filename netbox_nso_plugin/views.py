@@ -942,7 +942,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
     # reconcile_on_expand: these categories reconcile when first expanded (they used to
     # live on the reconcile-on-expand path). static/redistribution came off the paginated
     # path and reconcile only when the Refresh icon asks (?refresh=1).
-    _GRID_CATEGORIES = ("bfd", "ospf", "isis", "bgp", "static", "redistribution", "route_policy")
+    _GRID_CATEGORIES = ("lacp", "bfd", "ospf", "isis", "bgp", "static", "redistribution", "route_policy")
 
     def _grid_specs(self):
         """Per-category grid spec: sub-tables, their rows, and their display fields.
@@ -958,6 +958,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
             NSOBGPPeerTemplateState,
             NSOISISInstanceState,
             NSOISISInterfaceState,
+            NSOLACPBundleState,
             NSOOSPFInstanceState,
             NSOOSPFInterfaceState,
             NSORedistributionState,
@@ -1014,7 +1015,51 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 *({"value": value, "label": label} for value, label in options.get(state.dest_protocol, ())),
             ]
 
+        def lacp_member_states(state):
+            return [
+                member
+                for member in state.interface.nso_lacp_member_bundles.all()
+                if member.management_id == state.management_id
+            ]
+
+        def lacp_members(state):
+            return [
+                {
+                    "interface": iface(member),
+                    "mode": member.mode or None,
+                    "port_priority": member.port_priority,
+                    "edit_url": reverse(r + "overlay_field_edit", args=["lacp_member", member.pk]),
+                }
+                for member in lacp_member_states(state)
+            ]
+
         return {
+            "lacp": {
+                "reconcile_on_expand": True,
+                "sections": {
+                    None: dict(
+                        ctx="lacp_bundle_states",
+                        qs=lambda d: (
+                            by_device(NSOLACPBundleState, d, "interface")
+                            .prefetch_related("interface__nso_lacp_member_bundles__interface")
+                            .order_by("interface__name")
+                        ),
+                        accept=r + "lacp_accept_bundle",
+                        related=lacp_member_states,
+                        fields={
+                            "bundle": iface,
+                            "lag_id": lambda st: st.lag_id,
+                            "min_links": lambda st: st.min_links,
+                            "system_priority": lambda st: st.system_priority,
+                            "system_id": lambda st: st.system_id or None,
+                            "timer": lambda st: st.timer or None,
+                            "admin_key": lambda st: st.admin_key,
+                            "members": lacp_members,
+                            "edit_url": lambda st: reverse(r + "overlay_field_edit", args=["lacp_bundle", st.pk]),
+                        },
+                    )
+                },
+            },
             "bfd": {
                 "reconcile_on_expand": True,
                 "sections": {
@@ -1287,7 +1332,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
             },
         }
 
-    def _grid_section(self, states, accept_route, fields):
+    def _grid_section(self, states, accept_route, fields, related=None):
         """Serialize one grid sub-table: its rows plus the quick-filter counts.
 
         kind/label come from summary.display_state — the same helper the server-rendered
@@ -1304,7 +1349,10 @@ class NSOCategoryView(LoginRequiredMixin, View):
         rows = []
         counts = {"all": 0, "drift": 0, "pending": 0}
         for st in states:
-            kind, label = display_state(st.status, st.status in OWNED_STATES)
+            status_rows = [st, *(list(related(st)) if related else [])]
+            displayed = [display_state(row.status, row.status in OWNED_STATES) for row in status_rows]
+            kind = _row_state({item[0] for item in displayed})
+            label = next(item[1] for item in displayed if item[0] == kind)
             counts["all"] += 1
             if kind == "drift":
                 counts["drift"] += 1
@@ -1319,7 +1367,11 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 "residue": bool(getattr(st, "residue_survivor", False)),
                 "residue_job": getattr(st, "residue_job_id", None),
                 "last_sync": st.last_sync_at.strftime("%Y-%m-%d %H:%M") if st.last_sync_at else None,
-                "accept_url": (reverse(accept_route, args=[st.pk]) if st.status in self._ACCEPTABLE_STATUSES else None),
+                "accept_url": (
+                    reverse(accept_route, args=[st.pk])
+                    if any(row.status in self._ACCEPTABLE_STATUSES for row in status_rows)
+                    else None
+                ),
             }
             row.update({name: fn(st) for name, fn in fields.items()})
             rows.append(row)
@@ -1347,7 +1399,9 @@ class NSOCategoryView(LoginRequiredMixin, View):
 
         payload: dict = {"adapter_error": adapter_error}
         for name, section in spec["sections"].items():
-            built = self._grid_section(states[name], section["accept"], section["fields"])
+            built = self._grid_section(
+                states[name], section["accept"], section["fields"], related=section.get("related")
+            )
             if name is None:
                 payload.update(built)
             else:
@@ -3162,6 +3216,32 @@ def _static_route_errors(obj):
     return errors
 
 
+def _lacp_errors(key, obj):
+    """Validate LACP knobs against the uint16/string contract exposed by NSO."""
+    errors = {}
+    if key == "lacp_bundle":
+        for field in ("min_links", "system_priority", "admin_key"):
+            value = getattr(obj, field)
+            if value is not None and not 0 <= value <= 65_535:
+                errors[field] = ["Enter a value between 0 and 65535."]
+        if obj.timer not in ("", "fast", "slow"):
+            errors["timer"] = ["Timer must be fast, slow, or default."]
+        return errors
+
+    from .models import NSOLACPBundleState
+
+    if (
+        obj.lag_bundle_id is None
+        or not NSOLACPBundleState.objects.filter(management=obj.management, interface=obj.lag_bundle).exists()
+    ):
+        errors["mode"] = ["This member is not linked to a tracked LACP bundle."]
+    if obj.mode not in ("", "active", "passive", "on"):
+        errors["mode"] = ["Mode must be active, passive, on, or default."]
+    if obj.port_priority is not None and not 0 <= obj.port_priority <= 65_535:
+        errors["port_priority"] = ["Enter a value between 0 and 65535."]
+    return errors
+
+
 def _sync_native_bfd(obj):
     """Keep netbox-routing's native BFD row aligned with an edited overlay."""
     try:
@@ -3448,6 +3528,45 @@ def _save_route_map_name_edit(state, old_name):
         transaction.on_commit(push_dependents)
 
 
+def _save_lacp_edit(obj, key):
+    """Own a complete LACP bundle while preserving which member actually changed."""
+    from django.db import transaction
+
+    from . import status_machine as sm
+    from .models import NSOLACPBundleState, NSOLACPMemberState
+
+    with transaction.atomic():
+        if key == "lacp_bundle":
+            bundle = obj
+        else:
+            bundle = NSOLACPBundleState.objects.select_for_update().get(
+                management=obj.management, interface=obj.lag_bundle
+            )
+        members = list(
+            NSOLACPMemberState.objects.select_for_update().filter(
+                management=bundle.management, lag_bundle=bundle.interface
+            )
+        )
+        now = timezone.now()
+        for member in members:
+            if member.pk == getattr(obj, "pk", None) and key == "lacp_member":
+                member = obj
+                target_status = "accepted"
+            else:
+                target_status = _status_after_accept(member.status)
+            if not sm.is_owned(member.status):
+                member.accepted_at = now
+            if member.status != "deploying":
+                member.status = target_status
+            member.save()
+
+        if not sm.is_owned(bundle.status):
+            bundle.accepted_at = now
+        if bundle.status != "deploying":
+            bundle.status = "accepted"
+        bundle.save()
+
+
 def _overlay_family_errors(key, obj, old_values):
     """Run validation that spans fields or the linked native object."""
     if key == "bfd":
@@ -3466,6 +3585,8 @@ def _overlay_family_errors(key, obj, old_values):
         return _redistribution_errors(obj)
     if key == "static_route":
         return _static_route_errors(obj)
+    if key in ("lacp_bundle", "lacp_member"):
+        return _lacp_errors(key, obj)
     if key == "route_map_name":
         return _route_map_name_errors(obj, old_values["object_name"])
     return {}
@@ -3475,6 +3596,8 @@ def _save_overlay_edit(obj, key, old_values):
     """Dispatch a validated edit to its family-specific atomic save path."""
     if key == "route_map_name":
         _save_route_map_name_edit(obj, old_values["object_name"])
+    elif key in ("lacp_bundle", "lacp_member"):
+        _save_lacp_edit(obj, key)
     else:
         _save_owned_overlay_edit(obj, key)
 
@@ -3519,6 +3642,8 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
         "bgp_peer": ("NSOBGPPeerState", ("remote_as_str", "enabled")),
         "redistribution": ("NSORedistributionState", ("route_map", "metric", "metric_type")),
         "static_route": ("NSOStaticRouteState", ("metric", "permanent", "tag")),
+        "lacp_bundle": ("NSOLACPBundleState", ("min_links", "system_priority", "timer", "admin_key")),
+        "lacp_member": ("NSOLACPMemberState", ("mode", "port_priority")),
         "route_map_name": ("NSORoutePolicyState", ("object_name",)),
     }
 
@@ -3549,7 +3674,7 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
         for f in supplied:
             field = edit_obj._meta.get_field(f)
             raw = request.POST.get(f, "")
-            if key in ("route_map_name", "bgp_peer", "redistribution"):
+            if key in ("route_map_name", "bgp_peer", "redistribution", "lacp_bundle", "lacp_member"):
                 raw = raw.strip()
             value = raw if raw != "" else (None if field.null else "")
             try:

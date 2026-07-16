@@ -3504,6 +3504,85 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(native.metric, 10)
         self.assertEqual(row.status, "imported")
 
+    def test_edit_lacp_bundle_updates_parameters_and_owns_members(self):
+        from netbox_nso_plugin.models import NSOLACPBundleState, NSOLACPMemberState
+
+        lag = Interface.objects.create(device=self.device, name="Port-channel10", type="lag")
+        member = Interface.objects.create(device=self.device, name="GigabitEthernet0/10", type="1000base-t")
+        bundle = NSOLACPBundleState.objects.create(
+            management=self.mgmt,
+            interface=lag,
+            lag_id=10,
+            min_links=1,
+            system_priority=32768,
+            timer="slow",
+            status="imported",
+        )
+        member_state = NSOLACPMemberState.objects.create(
+            management=self.mgmt,
+            interface=member,
+            lag_bundle=lag,
+            mode="active",
+            port_priority=32768,
+            status="imported",
+        )
+
+        response = self.client.post(
+            self._url("lacp_bundle", bundle.pk),
+            {"min_links": "2", "system_priority": "100", "timer": "fast", "admin_key": "10"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        bundle.refresh_from_db()
+        member_state.refresh_from_db()
+        self.assertEqual(
+            (bundle.min_links, bundle.system_priority, bundle.timer, bundle.admin_key), (2, 100, "fast", 10)
+        )
+        self.assertEqual((bundle.status, member_state.status), ("accepted", "in_sync"))
+        self.assertIsNotNone(bundle.accepted_at)
+        self.assertIsNotNone(member_state.accepted_at)
+
+    def test_edit_lacp_member_owns_bundle_and_rejects_values_outside_yang_contract(self):
+        from netbox_nso_plugin.models import NSOLACPBundleState, NSOLACPMemberState
+
+        lag = Interface.objects.create(device=self.device, name="ae10", type="lag")
+        member = Interface.objects.create(device=self.device, name="ge-0/0/10", type="1000base-t")
+        bundle = NSOLACPBundleState.objects.create(
+            management=self.mgmt,
+            interface=lag,
+            lag_id=10,
+            min_links=1,
+            status="imported",
+        )
+        member_state = NSOLACPMemberState.objects.create(
+            management=self.mgmt,
+            interface=member,
+            lag_bundle=lag,
+            mode="active",
+            port_priority=100,
+            status="imported",
+        )
+
+        response = self.client.post(
+            self._url("lacp_member", member_state.pk),
+            {"mode": "passive", "port_priority": "65535"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        bundle.refresh_from_db()
+        member_state.refresh_from_db()
+        self.assertEqual((member_state.mode, member_state.port_priority), ("passive", 65535))
+        self.assertEqual((bundle.status, member_state.status), ("accepted", "accepted"))
+
+        bad_priority = self.client.post(self._url("lacp_member", member_state.pk), {"port_priority": "65536"})
+        bad_mode = self.client.post(self._url("lacp_member", member_state.pk), {"mode": "unknown"})
+        self.assertEqual(bad_priority.status_code, 400)
+        self.assertIn("port_priority", bad_priority.json()["errors"])
+        self.assertEqual(bad_mode.status_code, 400)
+        self.assertIn("mode", bad_mode.json()["errors"])
+        member_state.refresh_from_db()
+        self.assertEqual((member_state.mode, member_state.port_priority), ("passive", 65535))
+
     def test_edit_route_map_name_updates_shared_object_overlays_and_dependent_intent(self):
         from django.contrib.contenttypes.models import ContentType
         from netbox_routing.models import OSPFInstance, Redistribution, RouteMap
@@ -4305,6 +4384,25 @@ class TestUnlinkedReconcileOnExpandCategories(ViewTestBase):
         self.assertIsNone(self.mgmt.adapter_device_id)
         body = self._get("lacp").content.decode()
         self.assertIn("Gi0/11", body)  # the member row, not just the bundle
+
+    def test_lacp_grid_rolls_member_drift_into_bundle_state_and_accept_action(self):
+        """A nested member is part of the bundle row, so its drift must drive that row."""
+        from netbox_nso_plugin.models import NSOLACPBundleState, NSOLACPMemberState
+
+        NSOLACPBundleState.objects.filter(management=self.mgmt, interface=self.lag).update(status="in_sync")
+        NSOLACPMemberState.objects.filter(management=self.mgmt, lag_bundle=self.lag).update(status="changed")
+
+        url = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category",
+            kwargs={"pk": self.device.pk, "key": "lacp"},
+        )
+        response = self.client.get(url + "?format=json", HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["counts"], {"all": 1, "drift": 1, "pending": 0})
+        self.assertEqual(payload["rows"][0]["state"], "drift")
+        self.assertIsNotNone(payload["rows"][0]["accept_url"])
 
     def test_adapter_error_still_renders_persisted_rows(self):
         """Adapter down on a LINKED device is the same bug: the error banner must not

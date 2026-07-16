@@ -1,45 +1,16 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
-{# Lazy-loaded fragment: LACP/LAG bundle + member parameters (M33). Read-mirror of #}
-{# the device LACP config; this overlay tracks the params NetBox has no native column #}
-{# for (min-links, system-priority, system-id, timer, admin-key, per-member priority). #}
 {% include "netbox_nso_plugin/categories/_adapter_error.html" %}
 
-{% if lacp_bundle_states %}
-  <p class="text-muted small mb-2">LACP bundle parameters reported by NSO. The LAG membership itself lives on the native NetBox interfaces; this overlay carries the LACP knobs (min-links, system-priority, timer, admin-key) and per-member port-priority.</p>
-  <div id="flt-lacp">
-  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-lacp" placeholder="Filter by bundle / member…" show_status=True %}
-  <div class="table-responsive mb-3">
-    <table class="table table-sm table-hover mb-0">
-      <thead>
-        <tr><th>Bundle</th><th>LAG&nbsp;ID</th><th>Min&nbsp;links</th><th>Sys&nbsp;priority</th><th>Timer</th><th>Admin&nbsp;key</th><th>Members</th><th>Status</th><th></th></tr>
-      </thead>
-      <tbody>
-        {% for b in lacp_bundle_states %}
-        <tr data-status="{{ b.status }}" data-owned="{{ b.accepted_at|yesno:'true,false' }}">
-          <td><a href="{{ b.interface.get_absolute_url }}">{{ b.interface.name }}</a></td>
-          <td>{{ b.lag_id|default:"—" }}</td>
-          <td>{{ b.min_links|default:"—" }}</td>
-          <td>{{ b.system_priority|default:"—" }}</td>
-          <td>{% if b.timer %}<span class="badge text-bg-light">{{ b.timer }}</span>{% else %}<span class="text-muted">—</span>{% endif %}</td>
-          <td>{{ b.admin_key|default:"—" }}</td>
-          <td>
-            {% with members=b.interface.nso_lacp_member_bundles.all %}
-              {% if members %}
-                {% for m in members %}<div><code>{{ m.interface.name }}</code>{% if m.mode %} <span class="text-muted">{{ m.mode }}</span>{% endif %}{% if m.port_priority is not None %} <span class="badge text-bg-light text-dark">pri {{ m.port_priority }}</span>{% endif %}</div>{% endfor %}
-              {% else %}<span class="text-muted">—</span>{% endif %}
-            {% endwith %}
-          </td>
-          <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=b.status %}</td>
-          <td>
-            {% url 'plugins:netbox_nso_plugin:lacp_accept_bundle' pk=b.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=b.status title="Make NetBox the source of truth for this LACP bundle (committed to the device on Apply)" %}
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-  </div>
+{% if grid_payload.rows %}
+  <p class="text-muted small mb-2">Edit bundle parameters or member mode/priority inline. Membership and LAG identity remain native interface changes; editing either level owns the complete bundle and member set.</p>
+  {{ grid_payload|json_script:"nso-lacp-data" }}
+  {% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='lacp' as cat_url %}
+  {% include "netbox_nso_plugin/categories/_grid.html" with cls="nso-lacp" json_url=cat_url|add:"?format=json" counts=grid_payload.counts %}
+
+  <script>
+  window.NSOGridLACP && window.NSOGridLACP.mount(document.querySelector('.nso-lacp'));
+  </script>
 {% else %}
   <p class="text-muted mb-0">No LACP bundles reported for this device.</p>
 {% endif %}
