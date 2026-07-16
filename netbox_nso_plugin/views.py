@@ -1149,6 +1149,11 @@ class NSOCategoryView(LoginRequiredMixin, View):
                             "per_device": lambda st: st.classification_mode == "local",
                             "unsupported": lambda st: list(st.unsupported_members or []),
                             "obj": lambda st: linked(st.assigned_object),
+                            "edit_url": lambda st: (
+                                reverse(r + "overlay_field_edit", args=["route_map_name", st.pk])
+                                if st.family == "route_map" and st.assigned_object
+                                else None
+                            ),
                             "diff_url": lambda st: (
                                 reverse(r + "routing_route_policy_diff", args=[st.pk]) if st.assigned_object else None
                             ),
@@ -2927,6 +2932,139 @@ def _save_owned_overlay_edit(obj, key):
         obj.save()
 
 
+def _route_map_name_errors(state, old_name):
+    """Validate a route-map rename across its native and shared-overlay identities."""
+    from django.core.exceptions import ValidationError
+
+    from .models import NSORoutePolicyObjectClass, NSORoutePolicyState
+
+    route_map = state.assigned_object
+    if state.family != "route_map" or route_map is None or route_map._meta.label_lower != "netbox_routing.routemap":
+        return {"object_name": ["Only a linked NetBox route map can be renamed inline."]}
+
+    errors = {}
+    try:
+        route_map._meta.get_field("name").clean(state.object_name, route_map)
+    except ValidationError as exc:
+        errors["object_name"] = [str(message) for message in exc.messages]
+    if type(route_map).objects.filter(name__iexact=state.object_name).exclude(pk=route_map.pk).exists():
+        errors.setdefault("object_name", []).append("A route map with this name already exists.")
+
+    attached = NSORoutePolicyState.objects.filter(
+        content_type_id=state.content_type_id,
+        object_id=state.object_id,
+    )
+    attached_mgmt_ids = attached.values_list("management_id", flat=True)
+    if (
+        NSORoutePolicyState.objects.filter(
+            management_id__in=attached_mgmt_ids,
+            family="route_map",
+            object_name__iexact=state.object_name,
+        )
+        .exclude(content_type_id=state.content_type_id, object_id=state.object_id)
+        .exists()
+    ):
+        errors.setdefault("object_name", []).append("A route-map row with this name already exists on a device.")
+
+    old_class = NSORoutePolicyObjectClass.objects.filter(family="route_map", object_name__iexact=old_name)
+    if old_class.exists() and (
+        NSORoutePolicyObjectClass.objects.filter(family="route_map", object_name__iexact=state.object_name)
+        .exclude(pk__in=old_class.values("pk"))
+        .exists()
+    ):
+        errors.setdefault("object_name", []).append("A route-map classification with this name already exists.")
+    return errors
+
+
+def _route_map_dependent_pushes(route_map, old_name):
+    """Return dependent BGP/redistribution intent targets for a route-map rename."""
+    from django.db.models import Q
+
+    from . import signals
+    from .models import NSOBGPPeerState, NSORedistributionState
+
+    owned = signals._OWNED_PUSH_STATUSES
+    bgp_targets = set(
+        NSOBGPPeerState.objects.filter(
+            Q(bgp_peer__address_families__routemap_in=route_map)
+            | Q(bgp_peer__address_families__routemap_out=route_map),
+            status__in=owned,
+            management__adapter_device_id__isnull=False,
+        ).values_list("management__device_id", "management__adapter_device_id")
+    )
+
+    redistribution = NSORedistributionState.objects.filter(
+        Q(redistribution__route_map=route_map) | Q(redistribution__isnull=True, route_map__iexact=old_name),
+        status__in=owned,
+    )
+    redistribution_targets = set(
+        redistribution.filter(management__adapter_device_id__isnull=False).values_list(
+            "management__device_id", "management__adapter_device_id", "dest_protocol"
+        )
+    )
+    redistribution.filter(redistribution__isnull=True, route_map__iexact=old_name).update(route_map=route_map.name)
+    return bgp_targets, redistribution_targets
+
+
+def _save_route_map_name_edit(state, old_name):
+    """Atomically rename a shared route map and refresh every dependent intent scope."""
+    from django.db import transaction
+
+    from . import signals
+    from . import status_machine as sm
+    from .models import NSORoutePolicyObjectClass, NSORoutePolicyState
+
+    route_map = state.assigned_object
+    new_name = state.object_name
+    with transaction.atomic():
+        attached = NSORoutePolicyState.objects.select_for_update().filter(
+            content_type_id=state.content_type_id,
+            object_id=state.object_id,
+        )
+        attached.exclude(pk=state.pk).update(object_name=new_name)
+        NSORoutePolicyObjectClass.objects.select_for_update().filter(
+            family="route_map", object_name__iexact=old_name
+        ).update(object_name=new_name)
+
+        if not sm.is_owned(state.status):
+            state.accepted_at = timezone.now()
+        if state.status != "deploying":
+            state.status = "accepted"
+        state.save()
+
+        route_map.name = new_name
+        route_map.save(update_fields=["name"])
+        bgp_targets, redistribution_targets = _route_map_dependent_pushes(route_map, old_name)
+
+        def push_dependents():
+            for device_id, adapter_device_id in bgp_targets:
+                signals._schedule_intent_push(
+                    (device_id, "bgp"),
+                    lambda d=device_id, a=adapter_device_id: signals._push_bgp_intent_for_device(d, a),
+                )
+            for device_id, adapter_device_id, dest_protocol in redistribution_targets:
+                signals._schedule_redistribution_push(device_id, adapter_device_id, dest_protocol)
+
+        transaction.on_commit(push_dependents)
+
+
+def _overlay_family_errors(key, obj, old_values):
+    """Run validation that spans fields or the linked native object."""
+    if key == "bfd":
+        return _bfd_field_errors(obj)
+    if key == "route_map_name":
+        return _route_map_name_errors(obj, old_values["object_name"])
+    return {}
+
+
+def _save_overlay_edit(obj, key, old_values):
+    """Dispatch a validated edit to its family-specific atomic save path."""
+    if key == "route_map_name":
+        _save_route_map_name_edit(obj, old_values["object_name"])
+    else:
+        _save_owned_overlay_edit(obj, key)
+
+
 class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
     """Inline (popover) field edit on an overlay row from the NSO tab.
 
@@ -2954,6 +3092,7 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
         ),
         "interface_mtu": ("NSOInterfaceMtuState", ("l2_mtu", "ip_mtu", "mpls_mtu")),
         "bfd": ("NSOBFDInterfaceState", ("min_tx", "min_rx", "multiplier", "micro_bfd")),
+        "route_map_name": ("NSORoutePolicyState", ("object_name",)),
     }
 
     def post(self, request, key, pk):
@@ -2976,11 +3115,14 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
             return JsonResponse({"status": "error", "message": "no editable field supplied"}, status=400)
 
         obj = get_object_or_404(apps.get_model("netbox_nso_plugin", model_name), pk=pk)
+        old_values = {field: getattr(obj, field) for field in editable}
         errors: dict[str, list[str]] = {}
         changed = []
         for f in supplied:
             field = obj._meta.get_field(f)
             raw = request.POST.get(f, "")
+            if key == "route_map_name":
+                raw = raw.strip()
             value = raw if raw != "" else (None if field.null else "")
             try:
                 value = field.clean(value, obj)
@@ -2993,10 +3135,9 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
         if errors:
             return JsonResponse({"status": "error", "errors": errors}, status=400)
 
-        if key == "bfd":
-            errors = _bfd_field_errors(obj)
-            if errors:
-                return JsonResponse({"status": "error", "errors": errors}, status=400)
+        errors = _overlay_family_errors(key, obj, old_values)
+        if errors:
+            return JsonResponse({"status": "error", "errors": errors}, status=400)
 
         if changed:
             collision = _unique_collision_response(obj, editable)
@@ -3005,7 +3146,7 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
 
             # Claim ownership (same transition as Accept on a differing value):
             # the edited value is intent the device doesn't have yet.
-            _save_owned_overlay_edit(obj, key)
+            _save_overlay_edit(obj, key, old_values)
         return JsonResponse({"status": "ok", "changed": changed})
 
 

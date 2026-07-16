@@ -21,69 +21,13 @@
 </div>
 
 {% if grid_payload.rows %}
+  <p class="text-muted small mb-2">Open a policy name to edit its entries in NetBox. Route-map names can be renamed here; dependent route-policy, BGP, and redistribution intent is updated together.</p>
   {{ grid_payload|json_script:"nso-rp-data" }}
   {% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='route_policy' as cat_url %}
   {% include "netbox_nso_plugin/categories/_grid.html" with cls="nso-rp" json_url=cat_url|add:"?format=json" counts=grid_payload.counts %}
 
   <script>
-  (function () {
-    "use strict";
-    var root = document.querySelector('.nso-rp');
-    var payloadEl = document.getElementById('nso-rp-data');
-    if (!root || !payloadEl || !window.NSOGrid) return;
-    var G = window.NSOGrid;
-    var esc = G.esc, MUTED = G.MUTED;
-
-    function plain(field) {
-      return function (cell) {
-        var v = cell.getRow().getData()[field];
-        return v == null || v === '' ? MUTED : esc(v);
-      };
-    }
-    // Name carries the per-device and unsupported-members badges the server table had.
-    function fmtName(cell) {
-      var d = cell.getRow().getData();
-      var out = esc(d.name);
-      if (d.per_device) {
-        out += ' <span class="badge text-bg-info" title="Per-device — not deduped into one shared object; differs by device intentionally">per-device</span>';
-      }
-      if (d.unsupported && d.unsupported.length) {
-        out += ' <span class="badge text-bg-warning text-dark" title="This device’s NED cannot hold these community members, so they are silently skipped on Apply (which is why this object may sit at ‘pending apply’). Remove them from the NetBox object, or accept they stay NetBox-only: ' +
-          esc(d.unsupported.join(', ')) + '"><span class="mdi mdi-alert-outline"></span> ' +
-          d.unsupported.length + ' unsupported on NED</span>';
-      }
-      return out;
-    }
-    // Diff + Versions sit alongside Accept, so this row's actions column carries all three.
-    function fmtActions(cell) {
-      var d = cell.getRow().getData();
-      var out = '';
-      if (d.diff_url) {
-        out += '<a href="' + esc(d.diff_url) + '" class="btn btn-xs btn-outline-warning" title="See exactly what differs between this device and NetBox"><span class="mdi mdi-not-equal-variant"></span></a>';
-      }
-      if (d.versions_url) {
-        out += '<a href="' + esc(d.versions_url) + '" class="btn btn-xs btn-outline-info" title="See every device’s version of this object and pick which one NetBox mirrors"><span class="mdi mdi-source-branch"></span></a>';
-      }
-      return '<span class="d-flex gap-1">' + out + (G.acceptBtn(d) || '') + '</span>';
-    }
-
-    G.mount(root, {
-      key: 'route_policy',
-      payload: JSON.parse(payloadEl.textContent),
-      jsonUrl: root.dataset.jsonUrl,
-      placeholder: 'No route policy.',
-      columns: [
-        { title: 'Family', field: 'family', formatter: plain('family'), sorter: 'alphanum', widthGrow: 0.9, minWidth: 105,
-          headerFilter: 'input', headerFilterPlaceholder: 'filter…' },
-        { title: 'Name', field: 'name', formatter: fmtName, widthGrow: 1.8, minWidth: 170, headerFilter: 'input' },
-        { title: 'NetBox Object', field: 'obj', headerSort: false, widthGrow: 1.3, minWidth: 130,
-          formatter: function (cell) { return G.linkCell(cell.getRow().getData().obj); } },
-        G.stateColumn(),
-        G.lastSyncColumn(),
-        { title: '', field: 'diff_url', headerSort: false, widthGrow: 0.9, minWidth: 112, formatter: fmtActions },
-      ],
-    });
-  })();
+  window.NSOGridRoutePolicy && window.NSOGridRoutePolicy.mount(document.querySelector('.nso-rp'));
   </script>
 {% else %}
   <p class="text-muted mb-0">No route policy.</p>

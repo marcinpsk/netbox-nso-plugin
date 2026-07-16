@@ -2941,6 +2941,107 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(row.min_tx, 300)
         self.assertEqual(row.status, "imported")
 
+    def test_edit_route_map_name_updates_shared_object_overlays_and_dependent_intent(self):
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import OSPFInstance, Redistribution, RouteMap
+
+        from netbox_nso_plugin.models import (
+            NSOOSPFInstanceState,
+            NSORedistributionState,
+            NSORoutePolicyObjectClass,
+            NSORoutePolicyState,
+        )
+
+        route_map = RouteMap.objects.create(name="RM-INLINE-OLD")
+        route_map_ct = ContentType.objects.get_for_model(RouteMap)
+        row = NSORoutePolicyState.objects.create(
+            management=self.mgmt,
+            family="route_map",
+            object_name=route_map.name,
+            content_type=route_map_ct,
+            object_id=route_map.pk,
+            status="imported",
+        )
+        policy_class = NSORoutePolicyObjectClass.objects.create(
+            family="route_map", object_name=route_map.name, mode="master"
+        )
+        ospf = OSPFInstance.objects.create(
+            device=self.device,
+            name="inline-ospf",
+            process_id="7",
+            router_id="192.0.2.7",
+        )
+        ospf_ct = ContentType.objects.get_for_model(OSPFInstance)
+        redistribution = Redistribution.objects.create(
+            destination_type=ospf_ct,
+            destination_id=ospf.pk,
+            source_protocol="connected",
+            route_map=route_map,
+        )
+        NSOOSPFInstanceState.objects.create(
+            management=self.mgmt,
+            process_id="7",
+            status="accepted",
+        )
+        NSORedistributionState.objects.create(
+            management=self.mgmt,
+            dest_protocol="ospf",
+            dest_ref="7",
+            source_protocol="connected",
+            redistribution=redistribution,
+            status="accepted",
+        )
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_device_id=321)
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_route_policy_intent") as put_policy,
+            patch("netbox_nso_plugin.adapter_client.put_ospf_intent") as put_ospf,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            response = self.client.post(
+                self._url("route_map_name", row.pk),
+                {"object_name": "RM-INLINE-NEW"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        route_map.refresh_from_db()
+        row.refresh_from_db()
+        policy_class.refresh_from_db()
+        self.assertEqual(route_map.name, "RM-INLINE-NEW")
+        self.assertEqual(row.object_name, "RM-INLINE-NEW")
+        self.assertEqual(row.status, "accepted")
+        self.assertEqual(policy_class.object_name, "RM-INLINE-NEW")
+        self.assertEqual(put_policy.call_args.args[1][0]["name"], "RM-INLINE-NEW")
+        ospf_payload = put_ospf.call_args.args[1]
+        self.assertEqual(ospf_payload["instances"][0]["redistribution"][0]["route_map"], "RM-INLINE-NEW")
+
+    def test_edit_route_map_name_rejects_native_name_collision_without_writing(self):
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import RouteMap
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+
+        route_map = RouteMap.objects.create(name="RM-KEEP")
+        RouteMap.objects.create(name="RM-TAKEN")
+        row = NSORoutePolicyState.objects.create(
+            management=self.mgmt,
+            family="route_map",
+            object_name=route_map.name,
+            content_type=ContentType.objects.get_for_model(RouteMap),
+            object_id=route_map.pk,
+            status="imported",
+        )
+
+        response = self.client.post(self._url("route_map_name", row.pk), {"object_name": "rm-taken"})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("object_name", response.json()["errors"])
+        route_map.refresh_from_db()
+        row.refresh_from_db()
+        self.assertEqual(route_map.name, "RM-KEEP")
+        self.assertEqual(row.object_name, "RM-KEEP")
+        self.assertEqual(row.status, "imported")
+
     def test_noop_edit_does_not_claim_ownership(self):
         from netbox_nso_plugin.models import NSOSnmpSystemInfoState
 
@@ -2973,7 +3074,7 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(row.l2_mtu, 9214)
 
     def test_unknown_key_400(self):
-        r = self.client.post(self._url("route_policy", 1), {"anything": "x"})
+        r = self.client.post(self._url("does_not_exist", 1), {"anything": "x"})
         self.assertEqual(r.status_code, 400)
 
 
@@ -3669,18 +3770,18 @@ class TestRoutePolicyGrid(ViewTestBase):
     def setUpTestData(cls):
         super().setUpTestData()
         from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import RouteMap
 
         from netbox_nso_plugin.models import NSORoutePolicyObjectClass, NSORoutePolicyState
 
-        # The GFK target only needs str() + get_absolute_url(); the device itself
-        # serves (same trick the old paged test used) — no netbox-routing dependency.
-        ct = ContentType.objects.get_for_model(cls.device.__class__)
+        route_map = RouteMap.objects.create(name="RM-EDGE")
+        ct = ContentType.objects.get_for_model(RouteMap)
         cls.rp_linked = NSORoutePolicyState.objects.create(
             management=cls.mgmt,
             family="route_map",
             object_name="RM-EDGE",
             content_type=ct,
-            object_id=cls.device.id,
+            object_id=route_map.id,
             status="imported",
         )
         cls.rp_unmatched = NSORoutePolicyState.objects.create(
@@ -3717,8 +3818,9 @@ class TestRoutePolicyGrid(ViewTestBase):
 
         linked = rows["RM-EDGE"]
         self.assertIsNotNone(linked["accept_url"])  # imported → acceptable
-        self.assertEqual(linked["obj"]["label"], str(self.device))
-        self.assertEqual(linked["obj"]["url"], self.device.get_absolute_url())
+        self.assertEqual(linked["obj"]["label"], "RM-EDGE")
+        self.assertEqual(linked["obj"]["url"], self.rp_linked.assigned_object.get_absolute_url())
+        self.assertIn(f"/overlay/route_map_name/{self.rp_linked.pk}/edit-field/", linked["edit_url"])
         self.assertIn(str(self.rp_linked.pk), linked["diff_url"])
         self.assertIn(str(self.rp_linked.pk), linked["versions_url"])
         self.assertFalse(linked["per_device"])
@@ -3745,6 +3847,7 @@ class TestRoutePolicyGrid(ViewTestBase):
         self.assertIn("Add Route-Policy", body)
         self.assertIn("Capabilities", body)
         self.assertIn("Resolve divergent", body)
+        self.assertIn("NSOGridRoutePolicy.mount", body)
         self.assertNotIn("{#", body)  # the CR-P16 multi-line comment leak
 
     def test_unlinked_device_still_serves_rows(self):
