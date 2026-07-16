@@ -2920,6 +2920,136 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(row.status, "accepted")
         self.assertIsNotNone(row.accepted_at)
 
+    def test_snmp_community_rejects_access_the_writer_cannot_apply(self):
+        from netbox_nso_plugin.models import NSOSnmpCommunityState
+
+        row = NSOSnmpCommunityState.objects.create(
+            management=self.mgmt,
+            community_hash="1111222233334444",
+            access="RO",
+            status="imported",
+        )
+
+        response = self.client.post(self._url("snmp_community", row.pk), {"access": "READ"})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("access", response.json()["errors"])
+        row.refresh_from_db()
+        self.assertEqual(row.access, "RO")
+        self.assertEqual(row.status, "imported")
+
+    def test_snmp_host_rejects_values_outside_writer_contract(self):
+        from netbox_nso_plugin.models import NSOSnmpHostState
+
+        row = NSOSnmpHostState.objects.create(
+            management=self.mgmt,
+            address="198.51.100.31",
+            version="v2c",
+            notify_type="trap",
+            port=162,
+            community_hash="1111222233334444",
+            status="imported",
+        )
+        cases = (
+            ({"version": "v4"}, "version"),
+            ({"notify_type": "poll"}, "notify_type"),
+            ({"port": "65536"}, "port"),
+        )
+
+        for values, field in cases:
+            with self.subTest(field=field):
+                response = self.client.post(self._url("snmp_host", row.pk), values)
+                self.assertEqual(response.status_code, 400)
+                self.assertIn(field, response.json()["errors"])
+                row.refresh_from_db()
+                self.assertEqual(row.status, "imported")
+
+    def test_snmp_host_rejects_v3_without_security_username(self):
+        from netbox_nso_plugin.models import NSOSnmpHostState
+
+        row = NSOSnmpHostState.objects.create(
+            management=self.mgmt,
+            address="198.51.100.32",
+            version="v2c",
+            notify_type="trap",
+            community_hash="1111222233334444",
+            status="imported",
+        )
+
+        response = self.client.post(
+            self._url("snmp_host", row.pk),
+            {"version": "v3", "username": ""},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("username", response.json()["errors"])
+        row.refresh_from_db()
+        self.assertEqual(row.version, "v2c")
+        self.assertEqual(row.status, "imported")
+
+    def test_snmp_category_compacts_sections_and_exposes_safe_inline_fields(self):
+        from netbox_nso_plugin.models import (
+            NSOSnmpCommunityState,
+            NSOSnmpHostState,
+            NSOSnmpSystemInfoState,
+            NSOSnmpV3UserState,
+        )
+
+        system_info = NSOSnmpSystemInfoState.objects.create(
+            management=self.mgmt,
+            location="Lab A",
+            contact="operations@example.test",
+            status="imported",
+        )
+        community = NSOSnmpCommunityState.objects.create(
+            management=self.mgmt,
+            community_hash="5555666677778888",
+            access="RO",
+            acl="SNMP-MGMT",
+            status="imported",
+        )
+        NSOSnmpV3UserState.objects.create(
+            management=self.mgmt,
+            username="monitor",
+            auth_protocol="sha",
+            priv_protocol="aes-128",
+            status="imported",
+        )
+        host = NSOSnmpHostState.objects.create(
+            management=self.mgmt,
+            address="198.51.100.33",
+            version="3",
+            notify_type="informs",
+            port=1162,
+            username="monitor",
+            status="imported",
+        )
+        url = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category",
+            kwargs={"pk": self.device.pk, "key": "snmp"},
+        )
+
+        response = self.client.get(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, self._url("snmp_system_info", system_info.pk))
+        self.assertContains(response, 'data-pe-fields="location:text:Location,contact:text:Contact"')
+        self.assertContains(response, self._url("snmp_community", community.pk))
+        self.assertContains(response, 'data-pe-fields="access:select:Access,acl:text:ACL"')
+        self.assertContains(response, self._url("snmp_host", host.pk))
+        self.assertContains(response, 'data-pe-v-version="v3"')
+        self.assertContains(response, 'data-pe-v-notify_type="inform"')
+        self.assertContains(
+            response,
+            'data-pe-fields="version:select:Version,notify_type:select:Notification,port:number:Port,username:text:v3 User"',
+        )
+        self.assertContains(response, "Status / Synced")
+        self.assertNotContains(response, "<th>Last Synced</th>", html=True)
+        self.assertNotContains(response, "<th>Device auth/priv</th>", html=True)
+        self.assertNotContains(response, "<th>Protocols</th>", html=True)
+        self.assertNotContains(response, "<th>Version</th>", html=True)
+        self.assertNotContains(response, "<th>Port</th>", html=True)
+
     def test_edit_logging_host_fields_take_ownership(self):
         from netbox_nso_plugin.models import NSOLoggingHostState
 

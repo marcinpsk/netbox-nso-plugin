@@ -8,30 +8,32 @@
 {% url 'dcim:device_nso' pk=object.pk as return_url %}
 
 {% if snmp_data.communities or snmp_data.v3_users or snmp_data.hosts or snmp_data.system_info %}
+  <p class="text-muted small mb-2">Edit non-secret policy inline. Community strings and v3 passwords stay secret-safe and are managed through the Vault-aware edit actions; identity fields remain read-only here.</p>
 
   {% if snmp_data.system_info %}
   {% url 'plugins:netbox_nso_plugin:overlay_field_edit' key='snmp_system_info' pk=snmp_data.system_info.pk as sysinfo_edit_url %}
-  <table class="table table-sm mb-3">
-    <tr><th style="width:160px;">Location</th><td>
-      <a href="#" class="nso-popedit" title="Click to edit"
-         data-pe-url="{{ sysinfo_edit_url }}" data-pe-title="Location"
-         data-pe-fields="location:text:Location"
-         data-pe-v-location="{{ snmp_data.system_info.location|default:'' }}">{{ snmp_data.system_info.location|default:"—" }}</a>
-    </td></tr>
-    <tr><th>Contact</th><td>
-      <a href="#" class="nso-popedit" title="Click to edit"
-         data-pe-url="{{ sysinfo_edit_url }}" data-pe-title="Contact"
-         data-pe-fields="contact:text:Contact"
-         data-pe-v-contact="{{ snmp_data.system_info.contact|default:'' }}">{{ snmp_data.system_info.contact|default:"—" }}</a>
-    </td></tr>
-    <tr><th>Status</th><td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=snmp_data.system_info.status %}</td></tr>
-    <tr><th>Actions</th><td>
-      <div class="d-flex gap-1 align-items-center">
-        {% url 'plugins:netbox_nso_plugin:nsosnmpsysteminfostate_edit' pk=snmp_data.system_info.pk as edit_url %}{% include "netbox_nso_plugin/categories/_edit_link.html" with edit_url=edit_url return_url=return_url %}
+  <h6 class="mb-1">System Information</h6>
+  <div class="table-responsive mb-3">
+  <table class="table table-sm table-hover mb-0">
+    <thead><tr><th>Location / Contact</th><th>Status / Synced</th><th></th></tr></thead>
+    <tbody><tr data-status="{{ snmp_data.system_info.status }}" data-owned="{{ snmp_data.system_info.accepted_at|yesno:'true,false' }}">
+      <td>
+        <a href="#" class="nso-popedit" title="Edit location and contact; this takes ownership"
+           data-pe-url="{{ sysinfo_edit_url }}" data-pe-title="SNMP system information"
+           data-pe-fields="location:text:Location,contact:text:Contact"
+           data-pe-v-location="{{ snmp_data.system_info.location|default:'' }}"
+           data-pe-v-contact="{{ snmp_data.system_info.contact|default:'' }}">{{ snmp_data.system_info.location|default:"no location" }} · {{ snmp_data.system_info.contact|default:"no contact" }}</a>
+      </td>
+      <td>
+        {% include "netbox_nso_plugin/categories/_state_badge.html" with status=snmp_data.system_info.status %}
+        <div class="text-muted small text-nowrap">{% if snmp_data.system_info.last_sync_at %}{{ snmp_data.system_info.last_sync_at|date:"Y-m-d H:i" }}{% else %}not synced{% endif %}</div>
+      </td>
+      <td class="text-nowrap">
         {% url 'plugins:netbox_nso_plugin:snmp_accept_system_info' pk=snmp_data.system_info.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=snmp_data.system_info.status %}
-      </div>
-    </td></tr>
+      </td>
+    </tr></tbody>
   </table>
+  </div>
   {% endif %}
 
   {% if snmp_data.communities %}
@@ -41,24 +43,21 @@
   <div class="table-responsive mb-3">
     <table class="table table-sm table-hover mb-0">
       <thead>
-        <tr><th>Community (hash)</th><th>Access</th><th>ACL</th><th>Vault</th><th>Status</th><th>Last Synced</th><th></th></tr>
+        <tr><th>Community / Policy</th><th>Vault</th><th>Status / Synced</th><th></th></tr>
       </thead>
       <tbody>
         {% for c in snmp_data.communities %}
         <tr data-status="{{ c.status }}" data-owned="{{ c.accepted_at|yesno:'true,false' }}">
           {% url 'plugins:netbox_nso_plugin:overlay_field_edit' key='snmp_community' pk=c.pk as community_edit_url %}
-          <td><code>{{ c.community_hash }}</code></td>
           <td>
-            <a href="#" class="nso-popedit" title="Click to edit"
-               data-pe-url="{{ community_edit_url }}" data-pe-title="Access"
-               data-pe-fields="access:text:Access (ro/rw)"
-               data-pe-v-access="{{ c.access|default:'' }}">{{ c.access|default:"—" }}</a>
-          </td>
-          <td>
-            <a href="#" class="nso-popedit" title="Click to edit"
-               data-pe-url="{{ community_edit_url }}" data-pe-title="ACL"
-               data-pe-fields="acl:text:ACL"
-               data-pe-v-acl="{{ c.acl|default:'' }}">{{ c.acl|default:"—" }}</a>
+            <code>{{ c.community_hash }}</code>
+            <div class="small">
+              <a href="#" class="nso-popedit" title="Edit access and ACL; this takes ownership"
+                 data-pe-url="{{ community_edit_url }}" data-pe-title="Community policy"
+                 data-pe-fields="access:select:Access,acl:text:ACL"
+                 data-pe-v-access="{{ c.access|default:'RO' }}" data-pe-v-acl="{{ c.acl|default:'' }}"
+                 data-pe-o-access='[{"value":"RO","label":"Read only"},{"value":"RW","label":"Read/write"}]'>{{ c.access|default:"RO" }} · {{ c.acl|default:"no ACL" }}</a>
+            </div>
           </td>
           <td>
             {% if c.vault_ref %}
@@ -80,8 +79,10 @@
               <span class="text-warning" title="Set a Vault ref (or a secret value) so the secret can be pushed">missing</span>
             {% endif %}
           </td>
-          <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=c.status residue=c.residue_survivor residue_job=c.residue_job_id %}</td>
-          <td class="text-nowrap">{% if c.last_sync_at %}{{ c.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
+          <td>
+            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=c.status residue=c.residue_survivor residue_job=c.residue_job_id %}
+            <div class="text-muted small text-nowrap">{% if c.last_sync_at %}{{ c.last_sync_at|date:"Y-m-d H:i" }}{% else %}not synced{% endif %}</div>
+          </td>
           <td>
             <div class="d-flex gap-1 align-items-center">
               {% url 'plugins:netbox_nso_plugin:nsosnmpcommunitystate_edit' pk=c.pk as edit_url %}{% include "netbox_nso_plugin/categories/_edit_link.html" with edit_url=edit_url return_url=return_url %}
@@ -109,17 +110,19 @@
   <div class="table-responsive mb-3">
     <table class="table table-sm table-hover mb-0">
       <thead>
-        <tr><th>Username</th><th>Device auth/priv</th><th>Protocols</th><th>Vault</th><th>Status</th><th>Last Synced</th><th></th></tr>
+        <tr><th>User / Security</th><th>Vault</th><th>Status / Synced</th><th></th></tr>
       </thead>
       <tbody>
         {% for u in snmp_data.v3_users %}
         <tr data-status="{{ u.status }}" data-owned="{{ u.accepted_at|yesno:'true,false' }}">
-          <td>{{ u.username }}</td>
           <td>
+            <span class="fw-semibold">{{ u.username }}</span>
+            <div class="small">
             {% if u.has_auth_secret %}<span class="badge text-bg-success">auth</span>{% else %}<span class="badge text-bg-light">no auth</span>{% endif %}
             {% if u.has_priv_secret %}<span class="badge text-bg-success">priv</span>{% else %}<span class="badge text-bg-light">no priv</span>{% endif %}
+            {% if u.auth_protocol or u.priv_protocol %} · {{ u.auth_protocol|default:"no auth protocol" }}{% if u.priv_protocol %} / {{ u.priv_protocol }}{% endif %}{% endif %}
+            </div>
           </td>
-          <td>{{ u.auth_protocol|default:"—" }}{% if u.priv_protocol %} / {{ u.priv_protocol }}{% endif %}</td>
           <td>
             {% if u.vault_ref %}
               <code title="{{ u.vault_ref }} (fields auth/priv)">{{ u.vault_ref|truncatechars:30 }}</code>
@@ -132,8 +135,10 @@
               <span class="text-warning" title="Set a Vault ref (or secret values) so the secrets can be pushed">missing</span>
             {% endif %}
           </td>
-          <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=u.status residue=u.residue_survivor residue_job=u.residue_job_id %}</td>
-          <td class="text-nowrap">{% if u.last_sync_at %}{{ u.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
+          <td>
+            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=u.status residue=u.residue_survivor residue_job=u.residue_job_id %}
+            <div class="text-muted small text-nowrap">{% if u.last_sync_at %}{{ u.last_sync_at|date:"Y-m-d H:i" }}{% else %}not synced{% endif %}</div>
+          </td>
           <td>
             <div class="d-flex gap-1 align-items-center">
               {% url 'plugins:netbox_nso_plugin:nsosnmpv3userstate_edit' pk=u.pk as edit_url %}{% include "netbox_nso_plugin/categories/_edit_link.html" with edit_url=edit_url return_url=return_url %}
@@ -158,28 +163,32 @@
   <div class="table-responsive">
     <table class="table table-sm table-hover mb-0">
       <thead>
-        <tr><th>Address</th><th>Type</th><th>Version</th><th>Port</th><th>v3 User</th><th>Status</th><th>Last Synced</th><th></th></tr>
+        <tr><th>Destination</th><th>Notification</th><th>Status / Synced</th><th></th></tr>
       </thead>
       <tbody>
         {% for h in snmp_data.hosts %}
         <tr data-status="{{ h.status }}" data-owned="{{ h.accepted_at|yesno:'true,false' }}">
-          <td>{{ h.address }}</td>
-          <td>{{ h.notify_type }}</td>
-          <td>{{ h.version }}</td>
-          <td>{{ h.port|default:"162" }}</td>
-          {% comment %}
-            The v3 security user name: not a secret, and the field both NSO writers key the receiver
-            on — a v3 host without one cannot be pushed at all (CR-P16). Blank for v1/v2c, whose
-            corresponding field is the community string and never leaves the device.
-          {% endcomment %}
-          <td>{% if h.username %}<code>{{ h.username }}</code>{% else %}<span class="text-muted">&mdash;</span>{% endif %}</td>
-          <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=h.status residue=h.residue_survivor residue_job=h.residue_job_id %}</td>
-          <td class="text-nowrap">{% if h.last_sync_at %}{{ h.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
+          {% url 'plugins:netbox_nso_plugin:overlay_field_edit' key='snmp_host' pk=h.pk as host_edit_url %}
           <td>
-            <div class="d-flex gap-1 align-items-center">
-              {% url 'plugins:netbox_nso_plugin:nsosnmphoststate_edit' pk=h.pk as edit_url %}{% include "netbox_nso_plugin/categories/_edit_link.html" with edit_url=edit_url return_url=return_url %}
+            <span class="fw-semibold">{{ h.address }}</span>
+            <div class="text-muted small">UDP {{ h.port|default:"162" }}</div>
+          </td>
+          <td>
+            <a href="#" class="nso-popedit" title="Edit notification settings; this takes ownership"
+               data-pe-url="{{ host_edit_url }}" data-pe-title="{{ h.address }} notification"
+               data-pe-fields="version:select:Version,notify_type:select:Notification,port:number:Port,username:text:v3 User"
+               data-pe-v-version="{% if h.version == '1' or h.version == 'v1' %}v1{% elif h.version == '2' or h.version == '2c' or h.version == 'v2c' %}v2c{% else %}v3{% endif %}"
+               data-pe-v-notify_type="{% if h.notify_type == 'inform' or h.notify_type == 'informs' %}inform{% else %}trap{% endif %}"
+               data-pe-v-port="{{ h.port|default:'' }}" data-pe-v-username="{{ h.username }}"
+               data-pe-o-version='[{"value":"v1","label":"v1"},{"value":"v2c","label":"v2c"},{"value":"v3","label":"v3"}]'
+               data-pe-o-notify_type='[{"value":"trap","label":"Trap"},{"value":"inform","label":"Inform"}]'>{% if h.notify_type == "inform" or h.notify_type == "informs" %}inform{% else %}trap{% endif %} · {% if h.version == "1" or h.version == "v1" %}v1{% elif h.version == "2" or h.version == "2c" or h.version == "v2c" %}v2c{% else %}v3{% endif %}{% if h.username %} · {{ h.username }}{% endif %}</a>
+          </td>
+          <td>
+            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=h.status residue=h.residue_survivor residue_job=h.residue_job_id %}
+            <div class="text-muted small text-nowrap">{% if h.last_sync_at %}{{ h.last_sync_at|date:"Y-m-d H:i" }}{% else %}not synced{% endif %}</div>
+          </td>
+          <td class="text-nowrap">
               {% url 'plugins:netbox_nso_plugin:snmp_accept_host' pk=h.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=h.status %}
-            </div>
           </td>
         </tr>
         {% endfor %}

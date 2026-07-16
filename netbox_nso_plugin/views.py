@@ -3080,6 +3080,27 @@ def _logging_host_errors(obj):
     return errors
 
 
+def _snmp_community_errors(obj):
+    """Validate community policy against the adapter's strict access enum."""
+    if obj.access not in ("RO", "RW", "ro", "rw"):
+        return {"access": ["Access must be RO or RW."]}
+    return {}
+
+
+def _snmp_host_errors(obj):
+    """Validate trap/inform settings before the row becomes owned intent."""
+    errors = {}
+    if obj.version not in ("1", "v1", "2", "2c", "v2c", "3", "v3"):
+        errors["version"] = ["Version must be v1, v2c, or v3."]
+    if obj.notify_type not in ("trap", "traps", "inform", "informs"):
+        errors["notify_type"] = ["Notification must be trap or inform."]
+    if obj.port is not None and not 1 <= obj.port <= 65_535:
+        errors["port"] = ["Enter a port between 1 and 65535."]
+    if obj.version in ("3", "v3") and not obj.username:
+        errors["username"] = ["A v3 security user is required for an SNMPv3 host."]
+    return errors
+
+
 def _ospf_instance_errors(obj):
     """Validate an inline router-ID edit against the linked native instance."""
     from django.core.exceptions import ValidationError
@@ -3661,10 +3682,15 @@ def _save_vlan_name_edit(obj):
 
 def _overlay_family_errors(key, obj, old_values):
     """Run validation that spans fields or the linked native object."""
+    simple_validator = {
+        "logging_host": _logging_host_errors,
+        "snmp_community": _snmp_community_errors,
+        "snmp_host": _snmp_host_errors,
+    }.get(key)
+    if simple_validator is not None:
+        return simple_validator(obj)
     if key == "bfd":
         return _bfd_field_errors(obj)
-    if key == "logging_host":
-        return _logging_host_errors(obj)
     if key == "ospf_instance":
         return _ospf_instance_errors(obj)
     if key == "ospf_interface":
@@ -3723,6 +3749,7 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
     _FAMILIES = {
         "snmp_system_info": ("NSOSnmpSystemInfoState", ("location", "contact")),
         "snmp_community": ("NSOSnmpCommunityState", ("access", "acl")),
+        "snmp_host": ("NSOSnmpHostState", ("version", "notify_type", "port", "username")),
         "logging_host": (
             "NSOLoggingHostState",
             ("address", "port", "severity", "facility", "transport", "vrf", "source"),
@@ -3788,6 +3815,7 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
                 "vlan_name",
                 "svi",
                 "subinterface",
+                "snmp_host",
             ):
                 raw = raw.strip()
             value = raw if raw != "" else (None if field.null else "")
