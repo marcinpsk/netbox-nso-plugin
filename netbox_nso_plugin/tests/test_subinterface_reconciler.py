@@ -208,6 +208,46 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
         )
         self.assertEqual(NSOSubinterfaceState.objects.get(interface__name="ge-0/0/0.100").status, "accepted")
 
+    def test_reconcile_preserves_owned_values_until_the_device_matches(self):
+        """A refresh must compare device values without replacing pending NetBox intent."""
+        from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
+
+        state = self._state(name="ge-0/0/0.100", dot1q=100, status="accepted")
+        NSOSubinterfaceState.objects.filter(pk=state.pk).update(dot1q_vlan=200, vrf="CUSTOMER")
+        old_device = {
+            "interfaces": [
+                {
+                    "interface_name": "ge-0/0/0.100",
+                    "parent_interface": "ge-0/0/0",
+                    "dot1q_vlan": 100,
+                    "type": "subinterface",
+                    "vrf": "MTI",
+                }
+            ]
+        }
+
+        reconcile_subinterface(self.device, old_device)
+
+        state.refresh_from_db()
+        self.assertEqual((state.dot1q_vlan, state.vrf), (200, "CUSTOMER"))
+        self.assertEqual(state.status, "accepted")
+
+        desired_device = {
+            "interfaces": [
+                {
+                    "interface_name": "ge-0/0/0.100",
+                    "parent_interface": "ge-0/0/0",
+                    "dot1q_vlan": 200,
+                    "type": "subinterface",
+                    "vrf": "CUSTOMER",
+                }
+            ]
+        }
+        reconcile_subinterface(self.device, desired_device)
+        state.refresh_from_db()
+        self.assertEqual((state.dot1q_vlan, state.vrf), (200, "CUSTOMER"))
+        self.assertEqual(state.status, "in_sync")
+
     def test_owned_state_survives_when_interface_drops_from_payload(self):
         """An owned subinterface overlay must NOT be hard-deleted when the device stops reporting it.
 
@@ -297,3 +337,23 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
         assert resp.status_code == 302
         state.refresh_from_db()
         assert state.status == "accepted" and state.accepted_at is not None
+
+    def test_accept_refuses_a_row_the_push_snapshot_would_skip(self):
+        from django.contrib.auth import get_user_model
+
+        state = self._state(name="ge-0/0/0.400", dot1q=None, status="conflict")
+        original_accepted_at = state.accepted_at
+        User = get_user_model()
+        admin = User.objects.create_superuser(
+            username="subif-block-admin",
+            password="pw",  # noqa: S106
+            email="blocked@test.example",
+        )
+        self.client.force_login(admin)
+
+        response = self.client.post(f"/plugins/nso/subinterface/state/{state.pk}/accept/")
+
+        self.assertEqual(response.status_code, 302)
+        state.refresh_from_db()
+        self.assertEqual(state.status, "conflict")
+        self.assertEqual(state.accepted_at, original_accepted_at)

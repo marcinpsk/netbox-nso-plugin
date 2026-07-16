@@ -9,22 +9,32 @@
     <div class="nso-cat-msg"></div>
     {% include "netbox_nso_plugin/categories/_cat_search.html" with placeholder=placeholder q=q %}
     {% if subinterface_states %}
-    <p class="text-muted small mb-2">dot1q L3 subinterfaces materialised into NetBox (virtual interface + parent link). The dot1q tag is interface-local encapsulation, not a device VLAN. IP addresses ride the interface-IP path on the same interface.</p>
+    <p class="text-muted small mb-2">Edit dot1q encapsulation and VRF inline. Interface and parent form the structural identity; IP addresses remain on the linked interface.</p>
     <div class="table-responsive">
       <table class="table table-sm table-hover mb-0">
         <thead>
-          <tr><th>Interface</th><th>Parent</th><th>dot1q VLAN</th><th>VRF</th><th>Status</th><th>Last Synced</th><th></th></tr>
+          <tr><th>Interface</th><th>L3 configuration</th><th>Status</th><th>Last Synced</th><th></th></tr>
         </thead>
         <tbody>
           {% for s in subinterface_states %}
           <tr data-status="{{ s.status }}" data-owned="{{ s.accepted_at|yesno:'true,false' }}">
-            <td><a href="{{ s.interface.get_absolute_url }}">{{ s.interface.name }}</a></td>
-            <td>{% if s.parent_interface %}<a href="{{ s.parent_interface.get_absolute_url }}">{{ s.parent_interface.name }}</a>{% else %}<span class="text-warning" title="Parent not yet present in NetBox">—</span>{% endif %}</td>
-            <td>{{ s.dot1q_vlan|default:"—" }}</td>
-            <td>{{ s.vrf|default:"global" }}</td>
+            <td>
+              <a href="{{ s.interface.get_absolute_url }}">{{ s.interface.name }}</a>
+              <div class="small">
+                {% if s.parent_interface %}<span class="text-muted">parent:</span> <a href="{{ s.parent_interface.get_absolute_url }}">{{ s.parent_interface.name }}</a>{% else %}<span class="text-warning" title="Parent not yet present in NetBox">parent missing</span>{% endif %}
+              </div>
+            </td>
+            <td>
+              {% url 'plugins:netbox_nso_plugin:overlay_field_edit' key='subinterface' pk=s.pk as subinterface_edit_url %}
+              <a href="#" class="nso-popedit" title="Edit encapsulation and VRF; this takes ownership"
+                 data-pe-url="{{ subinterface_edit_url }}" data-pe-title="{{ s.interface.name }} L3 configuration"
+                 data-pe-fields="dot1q_vlan:number:dot1q VLAN,vrf:text:VRF"
+                 data-pe-v-dot1q_vlan="{{ s.dot1q_vlan|default:'' }}"
+                 data-pe-v-vrf="{{ s.vrf }}">dot1q {{ s.dot1q_vlan|default:"—" }} · {{ s.vrf|default:"global" }}</a>
+            </td>
             <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=s.status residue=s.residue_survivor residue_job=s.residue_job_id %}</td>
             <td class="text-nowrap">{% if s.last_sync_at %}{{ s.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
-            <td>
+            <td class="text-nowrap">
               {% url 'plugins:netbox_nso_plugin:subinterface_accept' pk=s.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=s.status form_class="nso-row-form" title="Make NetBox the source of truth for this subinterface (re-materialised on the device on Apply)" %}
             </td>
           </tr>

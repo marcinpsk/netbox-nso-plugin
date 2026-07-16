@@ -3255,6 +3255,36 @@ def _vlan_name_errors(obj):
     return errors
 
 
+def _subinterface_errors(obj):
+    """Validate inline L3 values before owning a pushable subinterface row."""
+    errors = {}
+    tag = obj.dot1q_vlan
+    if tag is None:
+        errors["dot1q_vlan"] = ["A dot1q VLAN tag is required."]
+    elif not 1 <= tag <= 4094:
+        errors["dot1q_vlan"] = ["Must be between 1 and 4094."]
+
+    parent = obj.parent_interface
+    if parent is None or parent.device_id != obj.management.device_id:
+        message = "A parent interface on this managed device is required before this row can be owned."
+        errors.setdefault("dot1q_vlan", []).append(message)
+        errors.setdefault("vrf", []).append(message)
+    elif tag is not None and (
+        type(obj)
+        .objects.filter(
+            management=obj.management,
+            parent_interface=parent,
+            dot1q_vlan=tag,
+        )
+        .exclude(pk=obj.pk)
+        .exists()
+    ):
+        errors.setdefault("dot1q_vlan", []).append(
+            f"dot1q VLAN {tag} is already used by another subinterface on {parent.name}."
+        )
+    return errors
+
+
 def _sync_native_bfd(obj):
     """Keep netbox-routing's native BFD row aligned with an edited overlay."""
     try:
@@ -3628,6 +3658,8 @@ def _overlay_family_errors(key, obj, old_values):
         return _lacp_errors(key, obj)
     if key == "vlan_name":
         return _vlan_name_errors(obj)
+    if key == "subinterface":
+        return _subinterface_errors(obj)
     if key == "route_map_name":
         return _route_map_name_errors(obj, old_values["object_name"])
     return {}
@@ -3689,6 +3721,7 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
         "lacp_member": ("NSOLACPMemberState", ("mode", "port_priority")),
         "vlan_name": ("NSOVLANState", ("name",)),
         "svi": ("NSOSVIState", ("vrf",)),
+        "subinterface": ("NSOSubinterfaceState", ("dot1q_vlan", "vrf")),
         "route_map_name": ("NSORoutePolicyState", ("object_name",)),
     }
 
@@ -3729,6 +3762,7 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
                 "lacp_member",
                 "vlan_name",
                 "svi",
+                "subinterface",
             ):
                 raw = raw.strip()
             value = raw if raw != "" else (None if field.null else "")
@@ -5193,6 +5227,11 @@ class NSOSVIStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
 
 class NSOSubinterfaceStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOSubinterfaceState
+
+    def push_blocker(self, state):
+        """Refuse ownership when the full-replace serializer would omit the row."""
+        messages_by_field = _subinterface_errors(state)
+        return " ".join(dict.fromkeys(message for messages in messages_by_field.values() for message in messages))
 
 
 class NSOInterfaceMtuStateAcceptView(OverlayStateAcceptMixin):

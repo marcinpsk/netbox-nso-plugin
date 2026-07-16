@@ -49,19 +49,30 @@ def reconcile_subinterface(device, payload: dict) -> list:
             iface_map[name] = iface
 
         # Resolve the physical parent from the map; never create it (device sync owns it).
-        parent = iface_map.get(item.get("parent_interface"))
-        if parent and iface.parent_id != parent.id:
-            iface.parent = parent
-            iface.save(update_fields=["parent"])
-
+        device_parent_name = item.get("parent_interface") or ""
+        parent = iface_map.get(device_parent_name)
+        device_dot1q = item.get("dot1q_vlan")
+        device_vrf = item.get("vrf") or ""
         state, _ = NSOSubinterfaceState.objects.get_or_create(management=management, interface=iface)
-        state.parent_interface = parent
-        state.dot1q_vlan = item.get("dot1q_vlan")
-        state.vrf = item.get("vrf") or ""
-        # 'parent present' is structural materialization, not device confirmation, so
-        # it must not settle an owned row (settles_owned=False): unowned → imported
-        # (ok) / changed (no parent); owned preserved, settling only via Apply.
-        state.status = sm.on_reconcile(state.status, matches=parent is not None, settles_owned=False)
+        if sm.is_owned(state.status):
+            # Owned values are NetBox intent. A refresh compares the device read but
+            # never restores the old dot1q/VRF/parent before Apply can push them.
+            desired_parent_name = state.parent_interface.name if state.parent_interface else ""
+            matches = (
+                desired_parent_name == device_parent_name
+                and state.dot1q_vlan == device_dot1q
+                and state.vrf == device_vrf
+            )
+            state.status = sm.on_reconcile(state.status, matches=matches)
+        else:
+            if parent and iface.parent_id != parent.id:
+                iface.parent = parent
+                iface.save(update_fields=["parent"])
+            state.parent_interface = parent
+            state.dot1q_vlan = device_dot1q
+            state.vrf = device_vrf
+            # Parent presence is structural materialization, not device confirmation.
+            state.status = sm.on_reconcile(state.status, matches=parent is not None, settles_owned=False)
         state.last_sync_at = now
         state.save()
         rows.append(state)

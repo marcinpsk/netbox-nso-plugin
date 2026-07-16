@@ -2342,6 +2342,43 @@ class TestDeviceNSOTabView(ViewTestBase):
         self.assertNotContains(response, "<th>Type</th>", html=True)
         self.assertNotContains(response, "<th>VLAN</th>", html=True)
 
+    def test_subinterface_category_renders_compact_inline_l3_editor(self):
+        from netbox_nso_plugin.models import NSOSubinterfaceState
+
+        parent = Interface.objects.create(device=self.device, name="GigabitEthernet0/1", type="1000base-t")
+        interface = Interface.objects.create(
+            device=self.device,
+            name="GigabitEthernet0/1.220",
+            type="virtual",
+            parent=parent,
+        )
+        state = NSOSubinterfaceState.objects.create(
+            management=self.mgmt,
+            interface=interface,
+            parent_interface=parent,
+            dot1q_vlan=220,
+            vrf="CUSTOMER",
+            status="changed",
+        )
+        url = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category",
+            kwargs={"pk": self.device.pk, "key": "subinterface"},
+        )
+
+        response = self.client.get(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'data-pe-fields="dot1q_vlan:number:dot1q VLAN,vrf:text:VRF"')
+        edit_url = reverse(
+            "plugins:netbox_nso_plugin:overlay_field_edit",
+            kwargs={"key": "subinterface", "pk": state.pk},
+        )
+        self.assertContains(response, edit_url)
+        self.assertContains(response, "GigabitEthernet0/1.220")
+        self.assertContains(response, "dot1q 220")
+        self.assertNotContains(response, "<th>Parent</th>", html=True)
+        self.assertNotContains(response, "<th>dot1q VLAN</th>", html=True)
+
     def test_interfaces_page_classification_is_value_aware(self):
         """Display follows NetBox-vs-device values + status-based ownership.
 
@@ -3719,6 +3756,91 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(state.interface_id, interface.pk)
         self.assertEqual(state.vlan_id, vlan.pk)
         self.assertEqual(state.svi_type, "svi")
+
+    def test_edit_subinterface_l3_values_takes_ownership_without_changing_identity(self):
+        from netbox_nso_plugin.models import NSOSubinterfaceState
+
+        parent = Interface.objects.create(device=self.device, name="GigabitEthernet0/1", type="1000base-t")
+        interface = Interface.objects.create(
+            device=self.device,
+            name="GigabitEthernet0/1.100",
+            type="virtual",
+            parent=parent,
+        )
+        state = NSOSubinterfaceState.objects.create(
+            management=self.mgmt,
+            interface=interface,
+            parent_interface=parent,
+            dot1q_vlan=100,
+            vrf="OLD-VRF",
+            status="imported",
+        )
+
+        response = self.client.post(
+            self._url("subinterface", state.pk),
+            {"dot1q_vlan": "220", "vrf": "CUSTOMER"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        state.refresh_from_db()
+        self.assertEqual((state.dot1q_vlan, state.vrf), (220, "CUSTOMER"))
+        self.assertEqual(state.status, "accepted")
+        self.assertIsNotNone(state.accepted_at)
+        self.assertEqual(state.interface_id, interface.pk)
+        self.assertEqual(state.parent_interface_id, parent.pk)
+
+    def test_edit_subinterface_rejects_invalid_duplicate_or_unpushable_values(self):
+        from netbox_nso_plugin.models import NSOSubinterfaceState
+
+        parent = Interface.objects.create(device=self.device, name="GigabitEthernet0/2", type="1000base-t")
+        first_interface = Interface.objects.create(
+            device=self.device,
+            name="GigabitEthernet0/2.100",
+            type="virtual",
+            parent=parent,
+        )
+        second_interface = Interface.objects.create(
+            device=self.device,
+            name="GigabitEthernet0/2.200",
+            type="virtual",
+            parent=parent,
+        )
+        NSOSubinterfaceState.objects.create(
+            management=self.mgmt,
+            interface=first_interface,
+            parent_interface=parent,
+            dot1q_vlan=100,
+            status="imported",
+        )
+        state = NSOSubinterfaceState.objects.create(
+            management=self.mgmt,
+            interface=second_interface,
+            parent_interface=parent,
+            dot1q_vlan=200,
+            status="imported",
+        )
+        orphan_interface = Interface.objects.create(device=self.device, name="orphan.300", type="virtual")
+        orphan = NSOSubinterfaceState.objects.create(
+            management=self.mgmt,
+            interface=orphan_interface,
+            dot1q_vlan=300,
+            status="changed",
+        )
+
+        too_high = self.client.post(self._url("subinterface", state.pk), {"dot1q_vlan": "4095"})
+        duplicate = self.client.post(self._url("subinterface", state.pk), {"dot1q_vlan": "100"})
+        missing_parent = self.client.post(self._url("subinterface", orphan.pk), {"vrf": "CUSTOMER"})
+
+        self.assertEqual(too_high.status_code, 400)
+        self.assertIn("dot1q_vlan", too_high.json()["errors"])
+        self.assertEqual(duplicate.status_code, 400)
+        self.assertIn("dot1q_vlan", duplicate.json()["errors"])
+        self.assertEqual(missing_parent.status_code, 400)
+        self.assertIn("vrf", missing_parent.json()["errors"])
+        state.refresh_from_db()
+        orphan.refresh_from_db()
+        self.assertEqual((state.dot1q_vlan, state.status), (200, "imported"))
+        self.assertEqual((orphan.vrf, orphan.status), ("", "changed"))
 
     def test_edit_vlan_name_rejects_a_group_name_collision_without_writing(self):
         from ipam.models import VLAN, VLANGroup
