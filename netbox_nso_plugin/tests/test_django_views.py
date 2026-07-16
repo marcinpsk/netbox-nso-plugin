@@ -3353,6 +3353,98 @@ class TestOverlayFieldEditView(ViewTestBase):
         template_row = response.json()["templates"]["rows"][0]
         self.assertEqual(template_row["template"], {"label": "EDGE-PEERS"})
 
+    def test_edit_redistribution_updates_policy_fields_and_native_object(self):
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import OSPFInstance, Redistribution, RouteMap
+
+        from netbox_nso_plugin.models import NSORedistributionState
+
+        instance = OSPFInstance.objects.create(
+            device=self.device,
+            name="inline-redistribution",
+            process_id="10",
+            router_id="192.0.2.10",
+        )
+        old_route_map = RouteMap.objects.create(name="RM-OLD")
+        new_route_map = RouteMap.objects.create(name="RM-NEW")
+        native = Redistribution.objects.create(
+            destination_type=ContentType.objects.get_for_model(instance),
+            destination_id=instance.pk,
+            source_protocol="static",
+            route_map=old_route_map,
+            metric=10,
+            metric_type="2",
+        )
+        row = NSORedistributionState.objects.create(
+            management=self.mgmt,
+            dest_protocol="ospf",
+            dest_ref="10",
+            source_protocol="static",
+            route_map=old_route_map.name,
+            metric=10,
+            metric_type="2",
+            redistribution=native,
+            status="imported",
+        )
+
+        response = self.client.post(
+            self._url("redistribution", row.pk),
+            {"route_map": new_route_map.name, "metric": "25", "metric_type": "1"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        row.refresh_from_db()
+        native.refresh_from_db()
+        self.assertEqual((row.route_map, row.metric, row.metric_type), ("RM-NEW", 25, "1"))
+        self.assertEqual(row.status, "accepted")
+        self.assertIsNotNone(row.accepted_at)
+        self.assertEqual((native.route_map, native.metric, native.metric_type), (new_route_map, 25, "1"))
+
+    def test_edit_redistribution_rejects_missing_route_map_without_writing(self):
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import OSPFInstance, Redistribution, RouteMap
+
+        from netbox_nso_plugin.models import NSORedistributionState
+
+        instance = OSPFInstance.objects.create(
+            device=self.device,
+            name="invalid-inline-redistribution",
+            process_id="11",
+            router_id="192.0.2.11",
+        )
+        route_map = RouteMap.objects.create(name="RM-KEEP")
+        native = Redistribution.objects.create(
+            destination_type=ContentType.objects.get_for_model(instance),
+            destination_id=instance.pk,
+            source_protocol="connected",
+            route_map=route_map,
+            metric=5,
+            metric_type="1",
+        )
+        row = NSORedistributionState.objects.create(
+            management=self.mgmt,
+            dest_protocol="ospf",
+            dest_ref="11",
+            source_protocol="connected",
+            route_map=route_map.name,
+            metric=5,
+            metric_type="1",
+            redistribution=native,
+            status="imported",
+        )
+
+        response = self.client.post(self._url("redistribution", row.pk), {"route_map": "RM-MISSING"})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("route_map", response.json()["errors"])
+        invalid_type = self.client.post(self._url("redistribution", row.pk), {"metric_type": "external"})
+        self.assertEqual(invalid_type.status_code, 400)
+        self.assertIn("metric_type", invalid_type.json()["errors"])
+        row.refresh_from_db()
+        native.refresh_from_db()
+        self.assertEqual((row.route_map, row.metric, row.metric_type, row.status), ("RM-KEEP", 5, "1", "imported"))
+        self.assertEqual(native.route_map, route_map)
+
     def test_edit_route_map_name_updates_shared_object_overlays_and_dependent_intent(self):
         from django.contrib.contenttypes.models import ContentType
         from netbox_routing.models import OSPFInstance, Redistribution, RouteMap

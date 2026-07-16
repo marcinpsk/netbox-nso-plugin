@@ -1004,6 +1004,16 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 )
             return sorted(out, key=lambda item: item["af"])
 
+        def redistribution_metric_types(state):
+            options = {
+                "ospf": (("1", "Type 1"), ("2", "Type 2")),
+                "isis": (("internal", "Internal"), ("external", "External")),
+            }
+            return [
+                {"value": "", "label": "Default"},
+                *({"value": value, "label": label} for value, label in options.get(state.dest_protocol, ())),
+            ]
+
         return {
             "bfd": {
                 "reconcile_on_expand": True,
@@ -1207,7 +1217,9 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 "sections": {
                     None: dict(
                         ctx="redistribution_states",
-                        qs=lambda d: by_device(NSORedistributionState, d).order_by("dest_protocol", "source_protocol"),
+                        qs=lambda d: by_device(NSORedistributionState, d, "redistribution").order_by(
+                            "dest_protocol", "source_protocol"
+                        ),
                         accept=r + "routing_accept_redistribution",
                         fields={
                             "dest_protocol": lambda st: st.dest_protocol,
@@ -1216,6 +1228,13 @@ class NSOCategoryView(LoginRequiredMixin, View):
                             "source_ref": lambda st: st.source_ref or None,
                             "route_map": lambda st: st.route_map or None,
                             "metric": lambda st: st.metric,
+                            "metric_type": lambda st: st.metric_type or None,
+                            "metric_type_options": redistribution_metric_types,
+                            "edit_url": lambda st: (
+                                reverse(r + "overlay_field_edit", args=["redistribution", st.pk])
+                                if st.redistribution_id
+                                else None
+                            ),
                             "diff_url": lambda st: reverse(r + "routing_redistribution_diff", args=[st.pk]),
                         },
                     )
@@ -3088,6 +3107,34 @@ def _bgp_peer_errors(obj):
     return {}
 
 
+def _redistribution_errors(obj):
+    """Validate policy knobs against the linked native redistribution scope."""
+    from django.core.exceptions import ValidationError
+    from netbox_routing.models import RouteMap
+
+    native = obj.redistribution
+    if native is None:
+        return {"route_map": ["Only a linked NetBox redistribution can be edited inline."]}
+
+    errors = {}
+    route_map = None
+    if obj.route_map:
+        route_map = RouteMap.objects.filter(name=obj.route_map).first()
+        if route_map is None:
+            errors["route_map"] = [f"Route map {obj.route_map!r} does not exist in NetBox."]
+
+    native.route_map = route_map if route_map is not None or not obj.route_map else native.route_map
+    native.metric = obj.metric
+    native.metric_type = obj.metric_type
+    try:
+        native.full_clean()
+    except ValidationError as exc:
+        for field, messages in exc.message_dict.items():
+            target = field if field in ("route_map", "metric", "metric_type") else "metric_type"
+            errors.setdefault(target, []).extend(str(message) for message in messages)
+    return errors
+
+
 def _sync_native_bfd(obj):
     """Keep netbox-routing's native BFD row aligned with an edited overlay."""
     try:
@@ -3205,6 +3252,20 @@ def _sync_native_bgp_peer(obj):
         native.save(update_fields=["remote_as", "enabled"])
 
 
+def _sync_native_redistribution(obj):
+    """Mirror route-map and metric policy into the linked native redistribution."""
+    from netbox_routing.models import RouteMap
+
+    from .signals import suppress_intent_push
+
+    native = obj.redistribution
+    native.route_map = RouteMap.objects.filter(name=obj.route_map).first() if obj.route_map else None
+    native.metric = obj.metric
+    native.metric_type = obj.metric_type
+    with suppress_intent_push():
+        native.save(update_fields=["route_map", "metric", "metric_type"])
+
+
 def _save_owned_overlay_edit(obj, key):
     """Claim an edited overlay and update its matching native NetBox object atomically."""
     from django.db import transaction
@@ -3234,6 +3295,8 @@ def _save_owned_overlay_edit(obj, key):
             _sync_native_isis_interface(obj)
         if key == "bgp_peer":
             _sync_native_bgp_peer(obj)
+        if key == "redistribution":
+            _sync_native_redistribution(obj)
         obj.save()
 
 
@@ -3367,6 +3430,8 @@ def _overlay_family_errors(key, obj, old_values):
         return _isis_interface_errors(obj)
     if key == "bgp_peer":
         return _bgp_peer_errors(obj)
+    if key == "redistribution":
+        return _redistribution_errors(obj)
     if key == "route_map_name":
         return _route_map_name_errors(obj, old_values["object_name"])
     return {}
@@ -3418,6 +3483,7 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
             ("circuit_type", "network_type", "metric", "passive", "bfd_enabled", "frr_enabled", "frr_protection"),
         ),
         "bgp_peer": ("NSOBGPPeerState", ("remote_as_str", "enabled")),
+        "redistribution": ("NSORedistributionState", ("route_map", "metric", "metric_type")),
         "route_map_name": ("NSORoutePolicyState", ("object_name",)),
     }
 
@@ -3447,7 +3513,7 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
         for f in supplied:
             field = obj._meta.get_field(f)
             raw = request.POST.get(f, "")
-            if key in ("route_map_name", "bgp_peer"):
+            if key in ("route_map_name", "bgp_peer", "redistribution"):
                 raw = raw.strip()
             value = raw if raw != "" else (None if field.null else "")
             try:

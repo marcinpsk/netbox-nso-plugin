@@ -1,66 +1,18 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
-{# Lazy fragment: Redistribution — a client-side grid. Used to paginate + search #}
-{# server-side; every row now ships at once and sorts/filters in the browser. #}
-{# Each row keeps its Diff link (what differs between this device and NetBox). #}
 {% include "netbox_nso_plugin/categories/_adapter_error.html" %}
 
 {% if grid_payload.rows %}
   <div class="d-flex justify-content-end align-items-center mb-2">
     {% url 'plugins:netbox_nso_plugin:routing_bulk_accept_redistribution' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned %}
   </div>
+  <p class="text-muted small mb-2">Destination and source identify the redistribution statement. Edit its linked route map, metric, and protocol-specific metric type inline.</p>
   {{ grid_payload|json_script:"nso-redist-data" }}
   {% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='redistribution' as cat_url %}
   {% include "netbox_nso_plugin/categories/_grid.html" with cls="nso-redist" json_url=cat_url|add:"?format=json" counts=grid_payload.counts %}
 
   <script>
-  (function () {
-    "use strict";
-    var root = document.querySelector('.nso-redist');
-    var payloadEl = document.getElementById('nso-redist-data');
-    if (!root || !payloadEl || !window.NSOGrid) return;
-    var G = window.NSOGrid;
-    var esc = G.esc, MUTED = G.MUTED;
-
-    function plain(field) {
-      return function (cell) {
-        var v = cell.getRow().getData()[field];
-        return v == null || v === '' ? MUTED : esc(v);
-      };
-    }
-    // Diff sits alongside Accept, so this row's actions column carries both.
-    function fmtActions(cell) {
-      var d = cell.getRow().getData();
-      var diff = '<a href="' + esc(d.diff_url) + '" class="btn btn-xs btn-outline-warning" ' +
-        'title="See exactly what differs between this device and NetBox">' +
-        '<span class="mdi mdi-not-equal-variant"></span></a>';
-      return '<span class="d-flex gap-1">' + diff + (G.acceptBtn(d) || '') + '</span>';
-    }
-
-    G.mount(root, {
-      key: 'redistribution',
-      payload: JSON.parse(payloadEl.textContent),
-      jsonUrl: root.dataset.jsonUrl,
-      placeholder: 'No redistribution.',
-      flatten: function (rows) {
-        return rows.map(function (r) { r._dest = r.dest_protocol || ''; return r; });
-      },
-      columns: [
-        { title: 'Dest Protocol', field: '_dest', formatter: plain('dest_protocol'), sorter: 'alphanum', widthGrow: 1.1, minWidth: 110,
-          headerFilter: 'input', headerFilterPlaceholder: 'filter…' },
-        { title: 'Dest Ref', field: 'dest_ref', formatter: plain('dest_ref'), widthGrow: 0.9, minWidth: 90 },
-        { title: 'Source Protocol', field: 'source_protocol', formatter: plain('source_protocol'), widthGrow: 1.2, minWidth: 115,
-          headerFilter: 'input' },
-        { title: 'Source Ref', field: 'source_ref', formatter: plain('source_ref'), widthGrow: 0.9, minWidth: 95 },
-        { title: 'Route Map', field: 'route_map', formatter: plain('route_map'), widthGrow: 1.2, minWidth: 110,
-          headerFilter: 'input' },
-        { title: 'Metric', field: 'metric', formatter: plain('metric'), widthGrow: 0.6, minWidth: 75, hozAlign: 'right' },
-        G.stateColumn(),
-        G.lastSyncColumn(),
-        { title: '', field: 'diff_url', headerSort: false, widthGrow: 0.6, minWidth: 78, formatter: fmtActions },
-      ],
-    });
-  })();
+  window.NSOGridRedistribution && window.NSOGridRedistribution.mount(document.querySelector('.nso-redist'));
   </script>
 {% else %}
   <p class="text-muted mb-0">No redistribution.</p>
