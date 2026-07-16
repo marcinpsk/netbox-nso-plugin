@@ -2275,6 +2275,38 @@ class TestDeviceNSOTabView(ViewTestBase):
 
         NSOVLANState.objects.filter(management=self.mgmt).delete()
 
+    def test_vlan_category_renders_compact_inline_name_editor(self):
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin.models import NSOVLANState
+
+        group = VLANGroup.objects.create(name="Compact VLANs", slug="compact-vlans")
+        vlan = VLAN.objects.create(group=group, vid=120, name="CUSTOMER-A")
+        state = NSOVLANState.objects.create(
+            management=self.mgmt,
+            vlan=vlan,
+            device_name="DEVICE-A",
+            status="changed",
+        )
+        url = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category",
+            kwargs={"pk": self.device.pk, "key": "vlan"},
+        )
+
+        response = self.client.get(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'data-pe-fields="name:text:Name"')
+        edit_url = reverse(
+            "plugins:netbox_nso_plugin:overlay_field_edit",
+            kwargs={"key": "vlan_name", "pk": state.pk},
+        )
+        self.assertContains(response, edit_url)
+        self.assertContains(response, "VID 120")
+        self.assertContains(response, "Compact VLANs")
+        self.assertNotContains(response, "Name (NetBox)")
+        self.assertNotContains(response, "<th>Device</th>", html=True)
+
     def test_interfaces_page_classification_is_value_aware(self):
         """Display follows NetBox-vs-device values + status-based ownership.
 
@@ -3582,6 +3614,72 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertIn("mode", bad_mode.json()["errors"])
         member_state.refresh_from_db()
         self.assertEqual((member_state.mode, member_state.port_priority), ("passive", 65535))
+
+    def test_edit_shared_vlan_name_updates_native_object_and_owns_every_attached_device(self):
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin.models import NSOVLANState
+
+        group = VLANGroup.objects.create(name="Shared Inline VLANs", slug="shared-inline-vlans")
+        vlan = VLAN.objects.create(group=group, vid=120, name="OLD-NAME")
+        first = NSOVLANState.objects.create(
+            management=self.mgmt,
+            vlan=vlan,
+            device_name="OLD-NAME",
+            status="imported",
+        )
+        other_device = Device.objects.create(
+            name="view-router-vlan-02",
+            device_type=self.device.device_type,
+            role=self.device.role,
+            site=self.device.site,
+        )
+        other_mgmt = NSODeviceManagement.objects.create(
+            device=other_device,
+            nso_instance=self.nso_instance,
+            nso_device_name=other_device.name,
+        )
+        second = NSOVLANState.objects.create(
+            management=other_mgmt,
+            vlan=vlan,
+            device_name="OLD-NAME",
+            status="imported",
+        )
+
+        response = self.client.post(self._url("vlan_name", first.pk), {"name": "CUSTOMER-A"})
+
+        self.assertEqual(response.status_code, 200, response.content)
+        vlan.refresh_from_db()
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertEqual(vlan.name, "CUSTOMER-A")
+        self.assertEqual((first.status, second.status), ("accepted", "accepted"))
+        self.assertIsNotNone(first.accepted_at)
+        self.assertIsNotNone(second.accepted_at)
+
+    def test_edit_vlan_name_rejects_a_group_name_collision_without_writing(self):
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin.models import NSOVLANState
+
+        group = VLANGroup.objects.create(name="Collision Inline VLANs", slug="collision-inline-vlans")
+        vlan = VLAN.objects.create(group=group, vid=121, name="KEEP-NAME")
+        VLAN.objects.create(group=group, vid=122, name="TAKEN-NAME")
+        state = NSOVLANState.objects.create(
+            management=self.mgmt,
+            vlan=vlan,
+            device_name="KEEP-NAME",
+            status="imported",
+        )
+
+        response = self.client.post(self._url("vlan_name", state.pk), {"name": "TAKEN-NAME"})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("name", response.json()["errors"])
+        vlan.refresh_from_db()
+        state.refresh_from_db()
+        self.assertEqual(vlan.name, "KEEP-NAME")
+        self.assertEqual(state.status, "imported")
 
     def test_edit_route_map_name_updates_shared_object_overlays_and_dependent_intent(self):
         from django.contrib.contenttypes.models import ContentType

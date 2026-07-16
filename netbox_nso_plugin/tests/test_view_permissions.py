@@ -91,6 +91,33 @@ class ActionViewPermissionTests(IntentPushResetMixin, TestCase):
         row.refresh_from_db()
         self.assertEqual(row.location, "keep-loc")
 
+    def test_vlan_name_edit_also_requires_native_vlan_change_permission(self):
+        """Plugin intent access alone must not grant permission to rename a native VLAN."""
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin.models import NSOVLANState
+
+        self._grant("change", NSODeviceManagement)
+        vlan = VLAN.objects.create(vid=120, name="KEEP-NAME")
+        row = NSOVLANState.objects.create(
+            management=self.mgmt,
+            vlan=vlan,
+            device_name="KEEP-NAME",
+            status="imported",
+        )
+        url = reverse(
+            "plugins:netbox_nso_plugin:overlay_field_edit",
+            kwargs={"key": "vlan_name", "pk": row.pk},
+        )
+
+        response = self.client.post(url, {"name": "DENIED-NAME"})
+
+        self.assertEqual(response.status_code, 403)
+        vlan.refresh_from_db()
+        row.refresh_from_db()
+        self.assertEqual(vlan.name, "KEEP-NAME")
+        self.assertEqual(row.status, "imported")
+
     def test_device_apply_action_denied_without_permission(self):
         """The scariest action — committing config to the device — is blocked for an unprivileged user."""
         url = reverse(

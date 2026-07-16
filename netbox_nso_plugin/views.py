@@ -3242,6 +3242,19 @@ def _lacp_errors(key, obj):
     return errors
 
 
+def _vlan_name_errors(obj):
+    """Validate a shared native VLAN rename, including its group/name constraint."""
+    from django.core.exceptions import ValidationError
+
+    errors = {}
+    try:
+        obj.vlan.full_clean()
+    except ValidationError as exc:
+        for messages in exc.message_dict.values():
+            errors.setdefault("name", []).extend(str(message) for message in messages)
+    return errors
+
+
 def _sync_native_bfd(obj):
     """Keep netbox-routing's native BFD row aligned with an edited overlay."""
     try:
@@ -3567,6 +3580,32 @@ def _save_lacp_edit(obj, key):
         bundle.save()
 
 
+def _save_vlan_name_edit(obj):
+    """Rename one shared VLAN and take ownership on every attached managed device."""
+    from django.db import transaction
+
+    from . import status_machine as sm
+    from .models import NSOVLANState
+    from .signals import suppress_intent_push
+    from .vlan_reconciler import is_placeholder_vlan_name
+
+    with transaction.atomic():
+        vlan = obj.vlan
+        states = list(NSOVLANState.objects.select_for_update(of=("self",)).filter(vlan_id=vlan.pk))
+        with suppress_intent_push():
+            vlan.save(update_fields=["name"])
+
+        now = timezone.now()
+        for state in states:
+            state.vlan = vlan
+            if not sm.is_owned(state.status):
+                state.accepted_at = now
+            matches = state.device_name == vlan.name if state.device_name else is_placeholder_vlan_name(state)
+            if state.status != "deploying":
+                state.status = "in_sync" if matches else "accepted"
+            state.save()
+
+
 def _overlay_family_errors(key, obj, old_values):
     """Run validation that spans fields or the linked native object."""
     if key == "bfd":
@@ -3587,6 +3626,8 @@ def _overlay_family_errors(key, obj, old_values):
         return _static_route_errors(obj)
     if key in ("lacp_bundle", "lacp_member"):
         return _lacp_errors(key, obj)
+    if key == "vlan_name":
+        return _vlan_name_errors(obj)
     if key == "route_map_name":
         return _route_map_name_errors(obj, old_values["object_name"])
     return {}
@@ -3598,6 +3639,8 @@ def _save_overlay_edit(obj, key, old_values):
         _save_route_map_name_edit(obj, old_values["object_name"])
     elif key in ("lacp_bundle", "lacp_member"):
         _save_lacp_edit(obj, key)
+    elif key == "vlan_name":
+        _save_vlan_name_edit(obj)
     else:
         _save_owned_overlay_edit(obj, key)
 
@@ -3644,6 +3687,7 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
         "static_route": ("NSOStaticRouteState", ("metric", "permanent", "tag")),
         "lacp_bundle": ("NSOLACPBundleState", ("min_links", "system_priority", "timer", "admin_key")),
         "lacp_member": ("NSOLACPMemberState", ("mode", "port_priority")),
+        "vlan_name": ("NSOVLANState", ("name",)),
         "route_map_name": ("NSORoutePolicyState", ("object_name",)),
     }
 
@@ -3667,14 +3711,23 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
             return JsonResponse({"status": "error", "message": "no editable field supplied"}, status=400)
 
         obj = get_object_or_404(apps.get_model("netbox_nso_plugin", model_name), pk=pk)
-        edit_obj = obj.static_route if key == "static_route" else obj
+        if key == "vlan_name":
+            self._require_vlan_name_permissions(request, obj)
+        edit_obj = obj.static_route if key == "static_route" else obj.vlan if key == "vlan_name" else obj
         old_values = {field: getattr(edit_obj, field) for field in editable}
         errors: dict[str, list[str]] = {}
         changed = []
         for f in supplied:
             field = edit_obj._meta.get_field(f)
             raw = request.POST.get(f, "")
-            if key in ("route_map_name", "bgp_peer", "redistribution", "lacp_bundle", "lacp_member"):
+            if key in (
+                "route_map_name",
+                "bgp_peer",
+                "redistribution",
+                "lacp_bundle",
+                "lacp_member",
+                "vlan_name",
+            ):
                 raw = raw.strip()
             value = raw if raw != "" else (None if field.null else "")
             try:
@@ -3693,7 +3746,7 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
             return JsonResponse({"status": "error", "errors": errors}, status=400)
 
         if changed:
-            collision = None if key == "static_route" else _unique_collision_response(obj, editable)
+            collision = None if key in ("static_route", "vlan_name") else _unique_collision_response(obj, editable)
             if collision is not None:
                 return collision
 
@@ -3701,6 +3754,27 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
             # the edited value is intent the device doesn't have yet.
             _save_overlay_edit(obj, key, old_values)
         return JsonResponse({"status": "ok", "changed": changed})
+
+    @staticmethod
+    def _require_vlan_name_permissions(request, state):
+        """Require native VLAN access and every device affected by a shared rename."""
+        from ipam.models import VLAN
+
+        if not request.user.has_perm("ipam.change_vlan"):
+            raise PermissionDenied
+        if not VLAN.objects.restrict(request.user, "change").filter(pk=state.vlan_id).exists():
+            raise PermissionDenied
+
+        from .models import NSODeviceManagement, NSOVLANState
+
+        management_ids = set(NSOVLANState.objects.filter(vlan_id=state.vlan_id).values_list("management_id", flat=True))
+        permitted_ids = set(
+            NSODeviceManagement.objects.restrict(request.user, "change")
+            .filter(pk__in=management_ids)
+            .values_list("pk", flat=True)
+        )
+        if permitted_ids != management_ids:
+            raise PermissionDenied
 
 
 class NSOBulkAcceptView(NSOActionPermissionMixin, View):
