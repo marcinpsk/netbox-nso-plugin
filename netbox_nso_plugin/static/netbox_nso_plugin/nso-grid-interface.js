@@ -157,11 +157,30 @@
       if (c.tagged && c.tagged.length) vlans.push("t:" + c.tagged.map(esc).join(","));
       return mode + esc(vlans.join(" ")) + cellBadge(c) + acceptBtn(c);
     }
+    function fmtNetwork(cell) {
+      var d = cell.getRow().getData();
+      var hasIps = !!(d.ips && d.ips.length);
+      var hasSwitchport = !!d.switchport;
+      if (!hasIps && !hasSwitchport) return MUTED;
+
+      var wrap = document.createElement("span");
+      if (hasIps) wrap.appendChild(fmtIps(cell));
+      if (hasIps && hasSwitchport) wrap.appendChild(document.createElement("br"));
+      if (hasSwitchport) {
+        var switching = document.createElement("span");
+        switching.innerHTML = fmtSwitchport(cell);
+        wrap.appendChild(switching);
+      }
+      return wrap;
+    }
 
     return G.mount(root, {
       key: "interface",
       payload: payload,
       jsonUrl: root.dataset.jsonUrl,
+      // Let the device page own vertical scrolling. A nested 540px Tabulator
+      // viewport makes a long interface list awkward to scan and navigate.
+      maxHeight: false,
       placeholder: "No interface state yet — click Refresh from NSO or wait for the next sync.",
       // Flat helper fields so sorting / header-filtering works on plain strings.
       // NETBOX values, not the device mirror: Tabulator's inline editor prefills
@@ -172,10 +191,11 @@
           r._name = r.iface.name;
           r._desc = r.description && r.description.netbox_value ? r.description.netbox_value : "";
           r._enabled = r.enabled && r.enabled.netbox_value != null ? String(r.enabled.netbox_value).toLowerCase() : "";
+          r._network = r.ips && r.ips.length ? "ip" : r.switchport ? "switchport" : "";
           return r;
         });
       },
-      colFields: { enabled: "_enabled", description: "_desc", mtu: "mtu", ips: "ips", switchport: "switchport" },
+      colFields: { enabled: "_enabled", description: "_desc", mtu: "mtu", network: "_network" },
       cellKeys: { _enabled: "enabled", _desc: "description" },
       columns: [
         {
@@ -184,7 +204,7 @@
           formatter: fmtName,
           sorter: "alphanum",
           widthGrow: 1.5,
-          minWidth: 170,
+          minWidth: 140,
           headerFilter: "input",
           headerFilterPlaceholder: "filter name…",
         },
@@ -218,8 +238,14 @@
           cssClass: "nso-editable",
         },
         { title: "MTU L2 / IP / MPLS", field: "mtu", formatter: fmtMtu, widthGrow: 1.3, minWidth: 150, headerSort: false },
-        { title: "IPs", field: "ips", formatter: fmtIps, widthGrow: 1.6, minWidth: 220, headerSort: false },
-        { title: "Switchport", field: "switchport", formatter: fmtSwitchport, widthGrow: 1.1, minWidth: 110, headerSort: false },
+        {
+          title: "IP / Switchport",
+          field: "_network",
+          formatter: fmtNetwork,
+          widthGrow: 1.7,
+          minWidth: 140,
+          headerSort: false,
+        },
         G.stateColumn(),
       ],
     });

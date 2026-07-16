@@ -992,6 +992,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
                             "min_tx": lambda st: st.min_tx,
                             "min_rx": lambda st: st.min_rx,
                             "multiplier": lambda st: st.multiplier,
+                            "edit_url": lambda st: reverse(r + "overlay_field_edit", args=["bfd", st.pk]),
                         },
                     )
                 },
@@ -2866,6 +2867,66 @@ def _unique_collision_response(obj, editable):
     return None
 
 
+def _bfd_field_errors(obj):
+    """Return netbox-routing's BFD timer bounds as popover field errors."""
+    errors = {}
+    for name in ("min_tx", "min_rx"):
+        value = getattr(obj, name)
+        if value is not None and not 60 <= value <= 60000:
+            errors[name] = ["Must be between 60 and 60000 ms."]
+    if obj.multiplier is not None and not 0 <= obj.multiplier <= 255:
+        errors["multiplier"] = ["Must be between 0 and 255."]
+    return errors
+
+
+def _sync_native_bfd(obj):
+    """Keep netbox-routing's native BFD row aligned with an edited overlay."""
+    try:
+        from netbox_routing.models import BFDInterface, BFDProfile
+    except ImportError:
+        return
+
+    from .bfd_reconciler import _get_or_create_bfd_profile
+
+    profile = _get_or_create_bfd_profile(
+        {"min_tx": obj.min_tx, "min_rx": obj.min_rx, "multiplier": obj.multiplier},
+        BFDProfile,
+        {},
+    )
+    native, created = BFDInterface.objects.get_or_create(
+        interface=obj.interface,
+        defaults={"bfd_profile": profile, "micro_bfd": obj.micro_bfd, "enabled": True},
+    )
+    if not created and (
+        native.bfd_profile_id != (profile.pk if profile else None) or native.micro_bfd != obj.micro_bfd
+    ):
+        native.bfd_profile = profile
+        native.micro_bfd = obj.micro_bfd
+        native.save(update_fields=["bfd_profile", "micro_bfd"])
+
+
+def _save_owned_overlay_edit(obj, key):
+    """Claim an edited overlay and update its matching native NetBox object atomically."""
+    from django.db import transaction
+
+    from . import status_machine as sm
+
+    with transaction.atomic():
+        if not sm.is_owned(obj.status):
+            obj.accepted_at = timezone.now()
+        if obj.status != "deploying":  # don't stomp an apply already in flight
+            obj.status = "accepted"
+        if key == "interface_mtu" and obj.l2_mtu is not None:
+            iface = obj.interface
+            clamped = min(int(obj.l2_mtu), NSOInterfaceMtuStateAcceptView._NETBOX_MTU_MAX)
+            if iface.mtu != clamped:
+                iface.mtu = clamped
+                iface.save(update_fields=["mtu"])
+        if key == "bfd":
+            _sync_native_bfd(obj)
+        obj.save()
+
+
 class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
     """Inline (popover) field edit on an overlay row from the NSO tab.
 
@@ -2892,14 +2953,13 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
             ("address", "port", "severity", "facility", "transport", "vrf", "source"),
         ),
         "interface_mtu": ("NSOInterfaceMtuState", ("l2_mtu", "ip_mtu", "mpls_mtu")),
+        "bfd": ("NSOBFDInterfaceState", ("min_tx", "min_rx", "multiplier", "micro_bfd")),
     }
 
     def post(self, request, key, pk):
         """Validate and apply whitelisted field values; JSON in, JSON out."""
         from django.apps import apps
         from django.core.exceptions import ValidationError
-
-        from . import status_machine as sm
 
         spec = self._FAMILIES.get(key)
         if spec is None:
@@ -2933,6 +2993,11 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
         if errors:
             return JsonResponse({"status": "error", "errors": errors}, status=400)
 
+        if key == "bfd":
+            errors = _bfd_field_errors(obj)
+            if errors:
+                return JsonResponse({"status": "error", "errors": errors}, status=400)
+
         if changed:
             collision = _unique_collision_response(obj, editable)
             if collision is not None:
@@ -2940,19 +3005,7 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
 
             # Claim ownership (same transition as Accept on a differing value):
             # the edited value is intent the device doesn't have yet.
-            if not sm.is_owned(obj.status):
-                obj.accepted_at = timezone.now()
-            if obj.status != "deploying":  # don't stomp an apply already in flight
-                obj.status = "accepted"
-            if key == "interface_mtu" and obj.l2_mtu is not None:
-                # Same side effect as the MTU Accept view: NetBox's native
-                # interface MTU follows the managed L2 value (clamped).
-                iface = obj.interface
-                clamped = min(int(obj.l2_mtu), NSOInterfaceMtuStateAcceptView._NETBOX_MTU_MAX)
-                if iface.mtu != clamped:
-                    iface.mtu = clamped
-                    iface.save(update_fields=["mtu"])
-            obj.save()
+            _save_owned_overlay_edit(obj, key)
         return JsonResponse({"status": "ok", "changed": changed})
 
 

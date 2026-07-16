@@ -2877,6 +2877,70 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(row.l2_mtu, 9100)
         self.assertEqual(row.status, "accepted")
 
+    def test_edit_bfd_updates_overlay_and_native_profile(self):
+        from netbox_routing.models import BFDInterface, BFDProfile
+
+        from netbox_nso_plugin.models import NSOBFDInterfaceState
+
+        old_profile = BFDProfile.objects.create(
+            name="bfd-inline-old",
+            min_tx_int=300,
+            min_rx_int=300,
+            multiplier=3,
+        )
+        native = BFDInterface.objects.create(
+            interface=self.interface,
+            bfd_profile=old_profile,
+            micro_bfd=False,
+            enabled=True,
+        )
+        row = NSOBFDInterfaceState.objects.create(
+            management=self.mgmt,
+            interface=self.interface,
+            min_tx=300,
+            min_rx=300,
+            multiplier=3,
+            micro_bfd=False,
+            status="imported",
+        )
+
+        response = self.client.post(
+            self._url("bfd", row.pk),
+            {"min_tx": "500", "min_rx": "600", "multiplier": "5", "micro_bfd": "True"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        row.refresh_from_db()
+        self.assertEqual((row.min_tx, row.min_rx, row.multiplier, row.micro_bfd), (500, 600, 5, True))
+        self.assertEqual(row.status, "accepted")
+        self.assertIsNotNone(row.accepted_at)
+        native.refresh_from_db()
+        self.assertTrue(native.micro_bfd)
+        self.assertEqual(
+            (native.bfd_profile.min_tx_int, native.bfd_profile.min_rx_int, native.bfd_profile.multiplier),
+            (500, 600, 5),
+        )
+
+    def test_edit_bfd_rejects_out_of_range_timer_without_writing(self):
+        from netbox_nso_plugin.models import NSOBFDInterfaceState
+
+        row = NSOBFDInterfaceState.objects.create(
+            management=self.mgmt,
+            interface=self.interface,
+            min_tx=300,
+            min_rx=300,
+            multiplier=3,
+            status="imported",
+        )
+
+        response = self.client.post(self._url("bfd", row.pk), {"min_tx": "59"})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("min_tx", response.json()["errors"])
+        row.refresh_from_db()
+        self.assertEqual(row.min_tx, 300)
+        self.assertEqual(row.status, "imported")
+
     def test_noop_edit_does_not_claim_ownership(self):
         from netbox_nso_plugin.models import NSOSnmpSystemInfoState
 
@@ -3387,6 +3451,7 @@ class TestBfdGrid(ViewTestBase):
         self.assertEqual(by_iface["Gi0/1"]["multiplier"], 3)
         self.assertTrue(by_iface["Gi0/2"]["micro_bfd"])
         self.assertFalse(by_iface["Gi0/1"]["micro_bfd"])
+        self.assertIn(f"/overlay/bfd/{by_iface['Gi0/1']['pk']}/edit-field/", by_iface["Gi0/1"]["edit_url"])
 
     def test_accept_url_actually_resolves_and_takes_ownership(self):
         """The accept_url the grid ships must be a real, working endpoint.
@@ -3424,6 +3489,7 @@ class TestBfdGrid(ViewTestBase):
         self.assertIn('id="nso-bfd-data"', body)  # json_script payload
         self.assertIn("nso-grid-state", body)  # quick-filter pills
         self.assertIn("nso-grid-table", body)  # grid mount point
+        self.assertIn("NSOGridBfd.mount", body)
         self.assertNotIn("{#", body)  # no leaked multi-line Django comment
 
     def test_unlinked_device_still_shows_persisted_rows(self):

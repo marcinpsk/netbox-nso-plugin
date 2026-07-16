@@ -135,7 +135,45 @@ describe("mount wiring", () => {
     const { table } = mountRows([row({ description: Object.assign({}, PENDING_DESC) })]);
     expect(table.data).toHaveLength(1);
     const fields = table.config.columns.map((c) => c.field);
-    expect(fields).toEqual(["_name", "_enabled", "_desc", "mtu", "ips", "switchport", "state"]);
+    expect(fields).toEqual(["_name", "_enabled", "_desc", "mtu", "_network", "state"]);
+  });
+
+  it("expands with the page instead of creating a nested vertical viewport", () => {
+    const { table } = mountRows([row()]);
+
+    // The device tab owns the page scrollbar; a capped Tabulator creates a second one.
+    expect(table.config.maxHeight).toBe(false);
+  });
+
+  it("keeps the original no-horizontal-scroll column budget", () => {
+    const { table } = mountRows([row()]);
+    const minimumWidth = table.config.columns.reduce((total, column) => total + (column.minWidth || 0), 0);
+
+    expect(minimumWidth).toBeLessThanOrEqual(850);
+  });
+
+  it("renders IP and switchport data through one compact network column", () => {
+    const ip = {
+      pk: 31,
+      address: "198.18.30.0/31",
+      status: "imported",
+      kind: "in_sync",
+      url: "/ipam/ip-addresses/91/",
+      edit_url: "/interface-ip-state/31/edit/",
+      peer: null,
+    };
+    const switchport = { mode: "access", untagged: 120, tagged: [], status: "in_sync", kind: "in_sync" };
+    const { col } = mountRows([row({ ips: [ip] }), row({ switchport })]);
+    const network = col("_network");
+
+    expect(network).toBeDefined();
+    expect(network.title).toBe("IP / Switchport");
+    expect(network.formatter(fakeCell(row({ ips: [ip] }))).querySelector("code").textContent).toBe(ip.address);
+    expect(network.formatter(fakeCell(row({ switchport }))).textContent).toContain("access");
+
+    const combined = network.formatter(fakeCell(row({ ips: [ip], switchport })));
+    expect(combined.textContent).toContain(ip.address);
+    expect(combined.textContent).toContain("access");
   });
 
   it("builds the MTU popedit anchor against this row's overlay pk", () => {
@@ -158,7 +196,7 @@ describe("mount wiring", () => {
       peer: { pk: 32, address: "198.18.30.1/31", interface: "peer-01 / Gi0/2" },
     };
     const { col } = mountRows([row({ ips: [ip] })]);
-    const out = col("ips").formatter(fakeCell(row({ ips: [ip] })));
+    const out = col("_network").formatter(fakeCell(row({ ips: [ip] })));
     const detail = out.querySelector('a[href="/ipam/ip-addresses/91/"]');
     const edit = out.querySelector("a.nso-popedit");
 
@@ -180,7 +218,7 @@ describe("mount wiring", () => {
       peer: null,
     };
     const { col } = mountRows([row({ ips: [ip] })]);
-    const out = col("ips").formatter(fakeCell(row({ ips: [ip] })));
+    const out = col("_network").formatter(fakeCell(row({ ips: [ip] })));
 
     expect(out.querySelector('a[href^="/ipam/ip-addresses/"]')).toBeNull();
     expect(out.querySelector("code").textContent).toBe("198.18.31.1/32");

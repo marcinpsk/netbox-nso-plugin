@@ -7,9 +7,10 @@
  *   class="nso-popedit"
  *   data-pe-url    POST target (the overlay_field_edit endpoint)
  *   data-pe-title  popover heading
- *   data-pe-fields "name:type:Label" CSV — type ∈ text|number (multi-field allowed,
+ *   data-pe-fields "name:type:Label" CSV — type ∈ text|number|select (multi-field allowed,
  *                  e.g. "l2_mtu:number:L2 MTU,ip_mtu:number:IP MTU")
  *   data-pe-v-<name>  current value for each field ("" for unset)
+ *   data-pe-o-<name>  JSON [{value, label}] options for select fields
  *
  * Saving POSTs the fields form-encoded with CSRF, then fires a bubbling
  * "nso:popedit-saved" event from the anchor. Containers that self-refresh (the
@@ -42,6 +43,14 @@
         type: (bits[1] || "text").trim(),
         label: (bits[2] || name).trim(),
         value: anchor.getAttribute("data-pe-v-" + name) || "",
+        options: (function () {
+          try {
+            var parsed = JSON.parse(anchor.getAttribute("data-pe-o-" + name) || "[]");
+            return Array.isArray(parsed) ? parsed : [];
+          } catch (_err) {
+            return [];
+          }
+        })(),
       };
     });
   }
@@ -74,9 +83,21 @@
         lab.textContent = f.label;
         wrap.appendChild(lab);
       }
-      var input = document.createElement("input");
-      input.type = f.type === "number" ? "number" : "text";
-      input.className = "form-control form-control-sm";
+      var input;
+      if (f.type === "select") {
+        input = document.createElement("select");
+        input.className = "form-select form-select-sm";
+        f.options.forEach(function (choice) {
+          var option = document.createElement("option");
+          option.value = choice.value;
+          option.textContent = choice.label;
+          input.appendChild(option);
+        });
+      } else {
+        input = document.createElement("input");
+        input.type = f.type === "number" ? "number" : "text";
+        input.className = "form-control form-control-sm";
+      }
       input.value = f.value;
       input.setAttribute("aria-label", f.label);
       inputs[f.name] = input;
@@ -107,14 +128,19 @@
     // Position under the anchor, clamped to the viewport's right edge.
     var r = anchor.getBoundingClientRect();
     var left = Math.min(r.left + window.scrollX, window.scrollX + document.documentElement.clientWidth - card.offsetWidth - 12);
-    card.style.top = r.bottom + window.scrollY + 4 + "px";
+    var top = r.bottom + window.scrollY + 4;
+    var viewportBottom = window.scrollY + document.documentElement.clientHeight;
+    if (top + card.offsetHeight > viewportBottom - 8) {
+      top = Math.max(window.scrollY + 8, r.top + window.scrollY - card.offsetHeight - 4);
+    }
+    card.style.top = top + "px";
     card.style.left = Math.max(left, window.scrollX + 8) + "px";
 
     open = { card: card, anchor: anchor };
     anchor.classList.add("nso-popedit-open");
     var first = inputs[fields[0].name];
     first.focus();
-    first.select();
+    if (typeof first.select === "function") first.select();
 
     function showErrors(errs) {
       card.querySelectorAll(".nso-popedit-err").forEach(function (el) {

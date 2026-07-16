@@ -91,6 +91,26 @@ describe("open / close", () => {
     expect([...card().querySelectorAll("input")].map((i) => i.value)).toEqual(["9100", "9000"]);
   });
 
+  it("renders a select field from JSON options and preserves its current value", () => {
+    makeAnchor({
+      "data-pe-fields": "micro_bfd:select:Mode",
+      "data-pe-v-micro_bfd": "True",
+      "data-pe-o-micro_bfd": JSON.stringify([
+        { value: "False", label: "Normal BFD" },
+        { value: "True", label: "micro-BFD" },
+      ]),
+    });
+    click(document.querySelector(".nso-popedit"));
+
+    const select = card().querySelector("select");
+    expect(select).not.toBeNull();
+    expect([...select.options].map((option) => [option.value, option.textContent])).toEqual([
+      ["False", "Normal BFD"],
+      ["True", "micro-BFD"],
+    ]);
+    expect(select.value).toBe("True");
+  });
+
   it("an anchor with no fields opens nothing", () => {
     const anchor = makeAnchor({ "data-pe-fields": "" });
     click(anchor);
@@ -104,6 +124,34 @@ describe("open / close", () => {
     click(makeAnchor());
 
     expect(Number(card().style.zIndex)).toBeGreaterThan(100000000);
+  });
+
+  it("places a tall multi-field editor above an anchor near the viewport bottom", () => {
+    const anchor = makeAnchor({
+      "data-pe-fields": "a:number:A,b:number:B,c:number:C,d:select:D",
+      "data-pe-o-d": JSON.stringify([{ value: "x", label: "X" }]),
+    });
+    vi.spyOn(anchor, "getBoundingClientRect").mockReturnValue({
+      left: 400,
+      right: 420,
+      top: 650,
+      bottom: 670,
+      width: 20,
+      height: 20,
+      x: 400,
+      y: 650,
+      toJSON: () => ({}),
+    });
+    const height = vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function () {
+      return this.classList.contains("nso-popedit-card") ? 300 : 0;
+    });
+    const viewport = vi.spyOn(document.documentElement, "clientHeight", "get").mockReturnValue(768);
+
+    click(anchor);
+
+    expect(parseFloat(card().style.top)).toBeLessThan(650);
+    height.mockRestore();
+    viewport.mockRestore();
   });
 });
 

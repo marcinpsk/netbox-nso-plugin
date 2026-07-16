@@ -291,7 +291,7 @@
     var table = new Tabulator(tableEl, {
       data: flatten(((pick(opts.payload) || {}).rows || []).slice()),
       layout: "fitColumns",
-      maxHeight: opts.maxHeight || "540px",
+      maxHeight: opts.maxHeight === false ? false : opts.maxHeight || "540px",
       placeholder: opts.placeholder || "Nothing here yet — click Refresh from NSO or wait for the next sync.",
       columns: opts.columns,
     });
