@@ -1009,6 +1009,11 @@ class NSOCategoryView(LoginRequiredMixin, View):
                             "vrf": lambda st: st.vrf or "global",
                             "router_id": lambda st: st.router_id or None,
                             "instance": lambda st: linked(st.ospf_instance),
+                            "edit_url": lambda st: (
+                                reverse(r + "overlay_field_edit", args=["ospf_instance", st.pk])
+                                if st.ospf_instance_id
+                                else None
+                            ),
                         },
                     ),
                     "interfaces": dict(
@@ -1022,6 +1027,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
                             "network_type": lambda st: st.network_type or None,
                             "cost": lambda st: st.cost,
                             "passive": lambda st: st.passive,
+                            "edit_url": lambda st: reverse(r + "overlay_field_edit", args=["ospf_interface", st.pk]),
                         },
                     ),
                 },
@@ -2884,6 +2890,52 @@ def _bfd_field_errors(obj):
     return errors
 
 
+def _ospf_instance_errors(obj):
+    """Validate an inline router-ID edit against the linked native instance."""
+    from django.core.exceptions import ValidationError
+
+    native = obj.ospf_instance
+    if native is None:
+        return {"router_id": ["Only a linked NetBox OSPF instance can be edited inline."]}
+    errors = {}
+    try:
+        native._meta.get_field("router_id").clean(obj.router_id, native)
+    except ValidationError as exc:
+        errors["router_id"] = [str(message) for message in exc.messages]
+    if obj.vrf and not native._meta.get_field("vrf").remote_field.model.objects.filter(name=obj.vrf).exists():
+        errors.setdefault("router_id", []).append(f"The overlay VRF {obj.vrf!r} does not exist in NetBox.")
+    return errors
+
+
+def _ospf_interface_errors(obj):
+    """Validate editable OSPF knobs using netbox-routing's real model rules."""
+    from django.core.exceptions import ValidationError
+    from netbox_routing.models import OSPFArea, OSPFInstance, OSPFInterface
+
+    errors = {}
+    if not OSPFInterface.objects.filter(interface=obj.interface).exists():
+        return {"area_id": ["Only a linked NetBox OSPF interface can be edited inline."]}
+    if not OSPFInstance.objects.filter(device=obj.interface.device, process_id=obj.process_id).exists():
+        errors["area_id"] = [f"OSPF process {obj.process_id!r} does not exist on this device in NetBox."]
+    if not obj.area_id:
+        errors.setdefault("area_id", []).append("Area is required.")
+    else:
+        try:
+            OSPFArea(area_id=obj.area_id, area_type="standard").full_clean()
+        except ValidationError as exc:
+            messages = exc.message_dict.get("area_id", exc.messages)
+            errors.setdefault("area_id", []).extend(str(message) for message in messages)
+
+    native = OSPFInterface.objects.filter(interface=obj.interface).first()
+    if native is not None:
+        for overlay_field, native_field in (("network_type", "network_type"), ("cost", "cost")):
+            try:
+                native._meta.get_field(native_field).clean(getattr(obj, overlay_field), native)
+            except ValidationError as exc:
+                errors[overlay_field] = [str(message) for message in exc.messages]
+    return errors
+
+
 def _sync_native_bfd(obj):
     """Keep netbox-routing's native BFD row aligned with an edited overlay."""
     try:
@@ -2910,6 +2962,48 @@ def _sync_native_bfd(obj):
         native.save(update_fields=["bfd_profile", "micro_bfd"])
 
 
+def _sync_native_ospf_instance(obj):
+    """Keep the native OSPF instance aligned with an edited overlay."""
+    from .signals import suppress_intent_push
+
+    native = obj.ospf_instance
+    vrf_model = native._meta.get_field("vrf").remote_field.model
+    vrf = vrf_model.objects.filter(name=obj.vrf).first() if obj.vrf else None
+    native.router_id = obj.router_id
+    native.vrf = vrf
+    with suppress_intent_push():
+        native.save(update_fields=["router_id", "vrf"])
+
+
+def _sync_native_ospf_interface(obj):
+    """Mirror the whole owned overlay row into its native OSPF interface."""
+    from netbox_routing.models import OSPFArea, OSPFInstance, OSPFInterface
+
+    from .signals import suppress_intent_push
+    from .template_content import _OSPF_AUTH_MAP, _resolve_ospf_area
+
+    native = OSPFInterface.objects.get(interface=obj.interface)
+    native.instance = OSPFInstance.objects.get(device=obj.interface.device, process_id=obj.process_id)
+    native.area = _resolve_ospf_area(OSPFArea, obj.area_id)
+    native.passive = obj.passive
+    native.priority = obj.priority
+    native.cost = obj.cost
+    native.network_type = obj.network_type or None
+    native.authentication = _OSPF_AUTH_MAP.get(obj.auth_type or "")
+    with suppress_intent_push():
+        native.save(
+            update_fields=[
+                "instance",
+                "area",
+                "passive",
+                "priority",
+                "cost",
+                "network_type",
+                "authentication",
+            ]
+        )
+
+
 def _save_owned_overlay_edit(obj, key):
     """Claim an edited overlay and update its matching native NetBox object atomically."""
     from django.db import transaction
@@ -2929,6 +3023,10 @@ def _save_owned_overlay_edit(obj, key):
                 iface.save(update_fields=["mtu"])
         if key == "bfd":
             _sync_native_bfd(obj)
+        if key == "ospf_instance":
+            _sync_native_ospf_instance(obj)
+        if key == "ospf_interface":
+            _sync_native_ospf_interface(obj)
         obj.save()
 
 
@@ -3052,6 +3150,10 @@ def _overlay_family_errors(key, obj, old_values):
     """Run validation that spans fields or the linked native object."""
     if key == "bfd":
         return _bfd_field_errors(obj)
+    if key == "ospf_instance":
+        return _ospf_instance_errors(obj)
+    if key == "ospf_interface":
+        return _ospf_interface_errors(obj)
     if key == "route_map_name":
         return _route_map_name_errors(obj, old_values["object_name"])
     return {}
@@ -3092,6 +3194,8 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
         ),
         "interface_mtu": ("NSOInterfaceMtuState", ("l2_mtu", "ip_mtu", "mpls_mtu")),
         "bfd": ("NSOBFDInterfaceState", ("min_tx", "min_rx", "multiplier", "micro_bfd")),
+        "ospf_instance": ("NSOOSPFInstanceState", ("router_id",)),
+        "ospf_interface": ("NSOOSPFInterfaceState", ("area_id", "network_type", "cost", "passive")),
         "route_map_name": ("NSORoutePolicyState", ("object_name",)),
     }
 

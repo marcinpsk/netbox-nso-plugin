@@ -6,6 +6,7 @@
 {% include "netbox_nso_plugin/categories/_adapter_error.html" %}
 
 {% if grid_payload.instances.rows or grid_payload.interfaces.rows %}
+  <p class="text-muted small mb-2">Edit router IDs and interface OSPF knobs inline, or Accept the full row. Editing makes NetBox the source of truth; process IDs and VRFs remain relationship changes in the full NetBox routing UI.</p>
   {{ grid_payload|json_script:"nso-ospf-data" }}
   {% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='ospf' as cat_url %}
 
@@ -26,85 +27,8 @@
   {% endif %}
 
   <script>
-  (function () {
-    "use strict";
-    var payloadEl = document.getElementById('nso-ospf-data');
-    if (!payloadEl || !window.NSOGrid) return;
-    var G = window.NSOGrid;
-    var esc = G.esc, MUTED = G.MUTED;
-    var payload = JSON.parse(payloadEl.textContent);
-
-    function plain(field) {
-      return function (cell) {
-        var v = cell.getRow().getData()[field];
-        return v == null || v === '' ? MUTED : esc(v);
-      };
-    }
-    function fmtIface(cell) {
-      var d = cell.getRow().getData();
-      return '<a href="' + esc(d.iface.url) + '" title="Open interface in NetBox">' + esc(d.iface.name) + '</a>';
-    }
-
-    var inst = document.querySelector('.nso-ospf-inst');
-    if (inst) {
-      G.mount(inst, {
-        key: 'ospf-instances',
-        payload: payload,
-        extract: function (j) { return j.instances; },
-        jsonUrl: inst.dataset.jsonUrl,
-        placeholder: 'No OSPF instances.',
-        flatten: function (rows) {
-          return rows.map(function (r) { r._proc = r.process_id || ''; return r; });
-        },
-        columns: [
-          { title: 'Process ID', field: '_proc', formatter: plain('process_id'), sorter: 'alphanum', widthGrow: 1, minWidth: 100,
-            headerFilter: 'input', headerFilterPlaceholder: 'filter…' },
-          { title: 'VRF', field: 'vrf', formatter: plain('vrf'), widthGrow: 1, minWidth: 90, headerFilter: 'input' },
-          { title: 'Router ID', field: 'router_id', formatter: plain('router_id'), widthGrow: 1.1, minWidth: 110 },
-          { title: 'OSPF Instance', field: 'instance', headerSort: false, widthGrow: 1.4, minWidth: 130,
-            formatter: function (cell) { return G.linkCell(cell.getRow().getData().instance); } },
-          G.stateColumn(),
-          G.lastSyncColumn(),
-          G.acceptColumn(),
-        ],
-      });
-    }
-
-    var ifg = document.querySelector('.nso-ospf-if');
-    if (ifg) {
-      G.mount(ifg, {
-        key: 'ospf-interfaces',
-        payload: payload,
-        extract: function (j) { return j.interfaces; },
-        jsonUrl: ifg.dataset.jsonUrl,
-        placeholder: 'No OSPF interfaces.',
-        flatten: function (rows) {
-          return rows.map(function (r) {
-            r._iface = r.iface.name;
-            r._passive = r.passive ? 'passive' : 'active';
-            return r;
-          });
-        },
-        columns: [
-          { title: 'Interface', field: '_iface', formatter: fmtIface, sorter: 'alphanum', widthGrow: 1.5, minWidth: 140,
-            headerFilter: 'input', headerFilterPlaceholder: 'filter interface…' },
-          { title: 'Process ID', field: 'process_id', formatter: plain('process_id'), widthGrow: 0.9, minWidth: 95 },
-          { title: 'Area', field: 'area_id', formatter: plain('area_id'), widthGrow: 0.9, minWidth: 90, headerFilter: 'input' },
-          { title: 'Network Type', field: 'network_type', formatter: plain('network_type'), widthGrow: 1.1, minWidth: 110 },
-          { title: 'Cost', field: 'cost', formatter: plain('cost'), widthGrow: 0.6, minWidth: 70, hozAlign: 'right' },
-          { title: 'Passive', field: '_passive', widthGrow: 0.8, minWidth: 90,
-            formatter: function (cell) {
-              return G.boolBadge(cell.getRow().getData().passive,
-                'passive', 'text-bg-warning text-dark', 'active', 'text-bg-success');
-            },
-            headerFilter: 'list', headerFilterParams: { values: { '': 'All', passive: 'passive', active: 'active' } } },
-          G.stateColumn(),
-          G.lastSyncColumn(),
-          G.acceptColumn(),
-        ],
-      });
-    }
-  })();
+  window.NSOGridOspf && window.NSOGridOspf.mount(document.querySelector('.nso-ospf-inst'), 'instances');
+  window.NSOGridOspf && window.NSOGridOspf.mount(document.querySelector('.nso-ospf-if'), 'interfaces');
   </script>
 {% else %}
   <p class="text-muted mb-0">No OSPF configuration.</p>

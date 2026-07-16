@@ -2941,6 +2941,133 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(row.min_tx, 300)
         self.assertEqual(row.status, "imported")
 
+    def test_edit_ospf_interface_updates_overlay_and_native_object(self):
+        from netbox_routing.models import OSPFArea, OSPFInstance, OSPFInterface
+
+        from netbox_nso_plugin.models import NSOOSPFInterfaceState
+
+        instance = OSPFInstance.objects.create(
+            device=self.device,
+            name="inline-ospf",
+            process_id="7",
+            router_id="192.0.2.7",
+        )
+        old_area = OSPFArea.objects.create(area_id="0.0.0.0", area_type="standard")
+        native = OSPFInterface.objects.create(
+            instance=instance,
+            area=old_area,
+            interface=self.interface,
+            passive=False,
+            cost=10,
+            network_type="broadcast",
+        )
+        row = NSOOSPFInterfaceState.objects.create(
+            management=self.mgmt,
+            interface=self.interface,
+            process_id="7",
+            area_id="0.0.0.0",
+            passive=False,
+            cost=10,
+            network_type="broadcast",
+            status="imported",
+        )
+
+        response = self.client.post(
+            self._url("ospf_interface", row.pk),
+            {
+                "area_id": "0.0.0.1",
+                "network_type": "point-to-point",
+                "cost": "25",
+                "passive": "True",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        row.refresh_from_db()
+        native.refresh_from_db()
+        self.assertEqual(row.status, "accepted")
+        self.assertIsNotNone(row.accepted_at)
+        self.assertEqual(
+            (row.area_id, row.network_type, row.cost, row.passive), ("0.0.0.1", "point-to-point", 25, True)
+        )
+        self.assertEqual(native.area.area_id, "0.0.0.1")
+        self.assertEqual((native.network_type, native.cost, native.passive), ("point-to-point", 25, True))
+
+    def test_edit_ospf_interface_rejects_invalid_config_without_writing(self):
+        from netbox_routing.models import OSPFArea, OSPFInstance, OSPFInterface
+
+        from netbox_nso_plugin.models import NSOOSPFInterfaceState
+
+        instance = OSPFInstance.objects.create(
+            device=self.device,
+            name="invalid-inline-ospf",
+            process_id="8",
+            router_id="192.0.2.8",
+        )
+        area = OSPFArea.objects.create(area_id="0.0.0.0", area_type="standard")
+        native = OSPFInterface.objects.create(
+            instance=instance,
+            area=area,
+            interface=self.interface,
+            passive=False,
+            cost=10,
+            network_type="broadcast",
+        )
+        row = NSOOSPFInterfaceState.objects.create(
+            management=self.mgmt,
+            interface=self.interface,
+            process_id="8",
+            area_id="0.0.0.0",
+            passive=False,
+            cost=10,
+            network_type="broadcast",
+            status="imported",
+        )
+
+        response = self.client.post(
+            self._url("ospf_interface", row.pk),
+            {"area_id": "not-an-area", "network_type": "invented", "cost": "0"},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(set(response.json()["errors"]), {"area_id", "network_type", "cost"})
+        row.refresh_from_db()
+        native.refresh_from_db()
+        self.assertEqual((row.area_id, row.network_type, row.cost), ("0.0.0.0", "broadcast", 10))
+        self.assertEqual((native.area.area_id, native.network_type, native.cost), ("0.0.0.0", "broadcast", 10))
+        self.assertEqual(row.status, "imported")
+
+    def test_edit_ospf_instance_router_id_updates_native_object(self):
+        from netbox_routing.models import OSPFInstance
+
+        from netbox_nso_plugin.models import NSOOSPFInstanceState
+
+        native = OSPFInstance.objects.create(
+            device=self.device,
+            name="router-id-inline-ospf",
+            process_id="9",
+            router_id="192.0.2.9",
+        )
+        row = NSOOSPFInstanceState.objects.create(
+            management=self.mgmt,
+            process_id="9",
+            router_id="192.0.2.9",
+            ospf_instance=native,
+            status="imported",
+        )
+
+        response = self.client.post(
+            self._url("ospf_instance", row.pk),
+            {"router_id": "192.0.2.10"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        row.refresh_from_db()
+        native.refresh_from_db()
+        self.assertEqual(row.router_id, "192.0.2.10")
+        self.assertEqual(str(native.router_id), "192.0.2.10")
+        self.assertEqual(row.status, "accepted")
+
     def test_edit_route_map_name_updates_shared_object_overlays_and_dependent_intent(self):
         from django.contrib.contenttypes.models import ContentType
         from netbox_routing.models import OSPFInstance, Redistribution, RouteMap
