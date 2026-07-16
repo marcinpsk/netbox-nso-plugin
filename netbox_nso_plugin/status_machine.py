@@ -344,6 +344,10 @@ def on_reconcile(
       to the device): an owned row must then settle only via Apply (``deploying →
       in_sync``), never by reconcile.
 
+      For a value-aware overlay in ``deploying``, an explicit ``matches=False`` keeps
+      the Apply in flight; merely re-reporting the row is not confirmation that the
+      intended values landed. Pure mirrors (``matches=None``) still settle on presence.
+
     Ownership is preserved: an owned row is never pulled back to ``imported``.
     """
     if not present:
@@ -356,6 +360,8 @@ def on_reconcile(
         return advance(current, DRIFT, to=CHANGED)
     if is_owned(current):
         if current == DEPLOYING:
+            if matches is False and settles_owned:
+                return current
             return advance(current, RECONCILE, to=IN_SYNC)
         if matches is None or not settles_owned:
             return current  # owned + no device-confirmed value → preserve accepted/in_sync

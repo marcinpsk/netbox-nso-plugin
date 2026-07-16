@@ -2307,6 +2307,41 @@ class TestDeviceNSOTabView(ViewTestBase):
         self.assertNotContains(response, "Name (NetBox)")
         self.assertNotContains(response, "<th>Device</th>", html=True)
 
+    def test_svi_category_renders_compact_inline_vrf_editor(self):
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin.models import NSOSVIState
+
+        group = VLANGroup.objects.create(name="Compact SVI VLANs", slug="compact-svi-vlans")
+        vlan = VLAN.objects.create(group=group, vid=220, name="CUSTOMER-A")
+        interface = Interface.objects.create(device=self.device, name="Vlan220", type="virtual")
+        state = NSOSVIState.objects.create(
+            management=self.mgmt,
+            interface=interface,
+            vlan=vlan,
+            svi_type="svi",
+            vrf="CUSTOMER",
+            status="changed",
+        )
+        url = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category",
+            kwargs={"pk": self.device.pk, "key": "svi"},
+        )
+
+        response = self.client.get(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'data-pe-fields="vrf:text:VRF"')
+        edit_url = reverse(
+            "plugins:netbox_nso_plugin:overlay_field_edit",
+            kwargs={"key": "svi", "pk": state.pk},
+        )
+        self.assertContains(response, edit_url)
+        self.assertContains(response, "Vlan220")
+        self.assertContains(response, "VID 220")
+        self.assertNotContains(response, "<th>Type</th>", html=True)
+        self.assertNotContains(response, "<th>VLAN</th>", html=True)
+
     def test_interfaces_page_classification_is_value_aware(self):
         """Display follows NetBox-vs-device values + status-based ownership.
 
@@ -3656,6 +3691,34 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual((first.status, second.status), ("accepted", "accepted"))
         self.assertIsNotNone(first.accepted_at)
         self.assertIsNotNone(second.accepted_at)
+
+    def test_edit_svi_vrf_takes_ownership_without_changing_structural_identity(self):
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin.models import NSOSVIState
+
+        group = VLANGroup.objects.create(name="Inline SVI VLANs", slug="inline-svi-vlans")
+        vlan = VLAN.objects.create(group=group, vid=220, name="CUSTOMER-A")
+        interface = Interface.objects.create(device=self.device, name="Vlan220", type="virtual")
+        state = NSOSVIState.objects.create(
+            management=self.mgmt,
+            interface=interface,
+            vlan=vlan,
+            svi_type="svi",
+            vrf="OLD-VRF",
+            status="imported",
+        )
+
+        response = self.client.post(self._url("svi", state.pk), {"vrf": "CUSTOMER"})
+
+        self.assertEqual(response.status_code, 200, response.content)
+        state.refresh_from_db()
+        self.assertEqual(state.vrf, "CUSTOMER")
+        self.assertEqual(state.status, "accepted")
+        self.assertIsNotNone(state.accepted_at)
+        self.assertEqual(state.interface_id, interface.pk)
+        self.assertEqual(state.vlan_id, vlan.pk)
+        self.assertEqual(state.svi_type, "svi")
 
     def test_edit_vlan_name_rejects_a_group_name_collision_without_writing(self):
         from ipam.models import VLAN, VLANGroup

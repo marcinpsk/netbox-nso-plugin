@@ -41,14 +41,22 @@ def reconcile_svi(device, payload: dict) -> list:
         iface, _ = Interface.objects.get_or_create(device=device, name=name, defaults={"type": "virtual"})
         vid = item.get("vlan_id")
         vlan = VLAN.objects.filter(group=group, vid=vid).first() if vid else None
+        device_type = item.get("type") or "svi"
+        device_vrf = item.get("vrf") or ""
         state, _ = NSOSVIState.objects.get_or_create(management=management, interface=iface)
-        state.vlan = vlan
-        state.svi_type = item.get("type") or "svi"
-        state.vrf = item.get("vrf") or ""
-        # Mirror overlay (no separate editable value): a fresh import lands
-        # 'imported'; owned statuses are preserved, except 'deploying' (Apply in
-        # flight) → 'in_sync' once the device reports the SVI again (apply landed).
-        state.status = sm.on_reconcile(state.status, matches=None)
+        if sm.is_owned(state.status):
+            # Owned values are NetBox intent. Compare the device read to them without
+            # replacing them; otherwise a refresh between inline edit and Apply silently
+            # restores the old device VRF and the pending change is lost.
+            desired_vid = state.vlan.vid if state.vlan else None
+            matches = desired_vid == vid and state.svi_type == device_type and state.vrf == device_vrf
+            state.status = sm.on_reconcile(state.status, matches=matches)
+        else:
+            # Unowned rows are device mirrors and continue tracking every reported value.
+            state.vlan = vlan
+            state.svi_type = device_type
+            state.vrf = device_vrf
+            state.status = sm.on_reconcile(state.status, matches=None)
         state.last_sync_at = now
         state.save()
         rows.append(state)

@@ -3688,6 +3688,7 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
         "lacp_bundle": ("NSOLACPBundleState", ("min_links", "system_priority", "timer", "admin_key")),
         "lacp_member": ("NSOLACPMemberState", ("mode", "port_priority")),
         "vlan_name": ("NSOVLANState", ("name",)),
+        "svi": ("NSOSVIState", ("vrf",)),
         "route_map_name": ("NSORoutePolicyState", ("object_name",)),
     }
 
@@ -3727,6 +3728,7 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
                 "lacp_bundle",
                 "lacp_member",
                 "vlan_name",
+                "svi",
             ):
                 raw = raw.strip()
             value = raw if raw != "" else (None if field.null else "")

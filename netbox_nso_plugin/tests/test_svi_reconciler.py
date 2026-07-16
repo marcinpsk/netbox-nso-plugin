@@ -117,13 +117,44 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
 
         self.assertEqual(NSOSVIState.objects.get(interface__name="Vlan100").status, "accepted")
 
-    def test_deploying_settles_in_sync_on_reconcile(self):
-        """A 'deploying' SVI (Apply in flight) settles to in_sync once re-reported by the device."""
+    def test_reconcile_preserves_owned_values_until_the_device_matches(self):
+        """A refresh must not replace pending NetBox intent with the old device value."""
+        from netbox_nso_plugin.svi_reconciler import reconcile_svi
+
+        state = self._state(name="Vlan100", vid=100, status="accepted")
+        state.vrf = "CUSTOMER"
+        state.save(update_fields=["vrf"])
+
+        reconcile_svi(
+            self.device,
+            {"interfaces": [{"interface_name": "Vlan100", "vlan_id": 100, "type": "svi", "vrf": "MGMT"}]},
+        )
+
+        state.refresh_from_db()
+        self.assertEqual(state.vrf, "CUSTOMER")
+        self.assertEqual(state.status, "accepted")
+
+        reconcile_svi(
+            self.device,
+            {"interfaces": [{"interface_name": "Vlan100", "vlan_id": 100, "type": "svi", "vrf": "CUSTOMER"}]},
+        )
+        state.refresh_from_db()
+        self.assertEqual(state.vrf, "CUSTOMER")
+        self.assertEqual(state.status, "in_sync")
+
+    def test_deploying_waits_for_matching_device_values_before_settling(self):
+        """Reappearance alone must not confirm an Apply while the device still has old values."""
         from netbox_nso_plugin.models import NSOSVIState
         from netbox_nso_plugin.svi_reconciler import reconcile_svi
 
         self._state(name="Vlan100", vid=100, status="deploying")
         reconcile_svi(self.device, {"interfaces": [{"interface_name": "Vlan100", "vlan_id": 100, "type": "svi"}]})
+        self.assertEqual(NSOSVIState.objects.get(interface__name="Vlan100").status, "deploying")
+
+        reconcile_svi(
+            self.device,
+            {"interfaces": [{"interface_name": "Vlan100", "vlan_id": 100, "type": "svi", "vrf": "MGMT"}]},
+        )
         self.assertEqual(NSOSVIState.objects.get(interface__name="Vlan100").status, "in_sync")
 
     def test_owned_state_survives_when_interface_drops_from_payload(self):
