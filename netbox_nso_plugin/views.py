@@ -978,6 +978,32 @@ class NSOCategoryView(LoginRequiredMixin, View):
             qs = model.objects.filter(management__device=device)
             return qs.select_related(*sr) if sr else qs
 
+        def bgp_source(peer):
+            if peer is None:
+                return None
+            if peer.update_source_id:
+                return peer.update_source.name
+            if peer.source_id:
+                return str(peer.source.address).split("/")[0]
+            return None
+
+        def bgp_address_families(owner):
+            if owner is None:
+                return []
+            out = []
+            for paf in owner.address_families.all():
+                inbound = [obj.name for obj in (paf.prefixlist_in, paf.routemap_in) if obj is not None]
+                outbound = [obj.name for obj in (paf.prefixlist_out, paf.routemap_out) if obj is not None]
+                out.append(
+                    {
+                        "af": paf.address_family.address_family,
+                        "enabled": paf.enabled is not False,
+                        "inbound": ", ".join(inbound) or None,
+                        "outbound": ", ".join(outbound) or None,
+                    }
+                )
+            return sorted(out, key=lambda item: item["af"])
+
         return {
             "bfd": {
                 "reconcile_on_expand": True,
@@ -1091,8 +1117,24 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 "sections": {
                     "peers": dict(
                         ctx="bgp_peers",
-                        qs=lambda d: by_device(NSOBGPPeerState, d, "bgp_peer").order_by(
-                            "asn_str", "vrf_name", "peer_address_str"
+                        qs=lambda d: (
+                            by_device(
+                                NSOBGPPeerState,
+                                d,
+                                "bgp_peer",
+                                "bgp_peer__local_as",
+                                "bgp_peer__peer_group",
+                                "bgp_peer__source",
+                                "bgp_peer__update_source",
+                            )
+                            .prefetch_related(
+                                "bgp_peer__address_families__address_family",
+                                "bgp_peer__address_families__prefixlist_in",
+                                "bgp_peer__address_families__prefixlist_out",
+                                "bgp_peer__address_families__routemap_in",
+                                "bgp_peer__address_families__routemap_out",
+                            )
+                            .order_by("asn_str", "vrf_name", "peer_address_str")
                         ),
                         accept=r + "routing_accept_bgp_peer",
                         fields={
@@ -1103,16 +1145,42 @@ class NSOCategoryView(LoginRequiredMixin, View):
                             # Junos deactivate / admin-down: the row exists but is inert.
                             "disabled": lambda st: st.enabled is False,
                             "peer": lambda st: linked(st.bgp_peer),
+                            "enabled": lambda st: st.enabled,
+                            "local_as": lambda st: (
+                                str(st.bgp_peer.local_as.asn) if st.bgp_peer_id and st.bgp_peer.local_as_id else None
+                            ),
+                            "peer_group": lambda st: (
+                                st.bgp_peer.peer_group.name if st.bgp_peer_id and st.bgp_peer.peer_group_id else None
+                            ),
+                            "source": lambda st: bgp_source(st.bgp_peer),
+                            "ttl": lambda st: st.bgp_peer.ttl if st.bgp_peer_id else None,
+                            "bfd_enabled": lambda st: st.bgp_peer.bfd_enabled if st.bgp_peer_id else None,
+                            "address_families": lambda st: bgp_address_families(st.bgp_peer),
+                            "edit_url": lambda st: (
+                                reverse(r + "overlay_field_edit", args=["bgp_peer", st.pk]) if st.bgp_peer_id else None
+                            ),
                         },
                     ),
                     "templates": dict(
                         ctx="bgp_peer_templates",
-                        qs=lambda d: by_device(NSOBGPPeerTemplateState, d, "template").order_by("template_name"),
+                        qs=lambda d: (
+                            by_device(NSOBGPPeerTemplateState, d, "template")
+                            .prefetch_related(
+                                "template__address_families__address_family",
+                                "template__address_families__prefixlist_in",
+                                "template__address_families__prefixlist_out",
+                                "template__address_families__routemap_in",
+                                "template__address_families__routemap_out",
+                            )
+                            .order_by("template_name")
+                        ),
                         accept=r + "routing_accept_bgp_peer_template",
                         fields={
                             "template_name": lambda st: st.template_name,
                             "remote_as": lambda st: st.remote_as_str or None,
-                            "template": lambda st: linked(st.template),
+                            # BGPPeerTemplate intentionally has no detail view in the fork.
+                            "template": lambda st: {"label": str(st.template)} if st.template else None,
+                            "address_families": lambda st: bgp_address_families(st.template),
                         },
                     ),
                 },
@@ -3005,6 +3073,21 @@ def _isis_interface_errors(obj):
     return errors
 
 
+def _bgp_peer_errors(obj):
+    """Validate the editable BGP peer fields without changing peer identity."""
+    if obj.bgp_peer is None:
+        return {"remote_as_str": ["Only a linked NetBox BGP peer can be edited inline."]}
+    if not obj.remote_as_str:
+        return {}
+    try:
+        asn = int(obj.remote_as_str)
+    except (TypeError, ValueError):
+        return {"remote_as_str": ["Enter a valid ASN."]}
+    if not 1 <= asn <= 4_294_967_295:
+        return {"remote_as_str": ["ASN must be between 1 and 4294967295."]}
+    return {}
+
+
 def _sync_native_bfd(obj):
     """Keep netbox-routing's native BFD row aligned with an edited overlay."""
     try:
@@ -3108,6 +3191,20 @@ def _sync_native_isis_interface(obj):
         native.save(update_fields=["instance", *fields])
 
 
+def _sync_native_bgp_peer(obj):
+    """Mirror remote-AS and admin state into the linked native BGP peer."""
+    from ipam.models import ASN
+
+    from .bgp_reconciler import _get_or_create_asn
+    from .signals import suppress_intent_push
+
+    native = obj.bgp_peer
+    native.remote_as = _get_or_create_asn(obj.remote_as_str, ASN) if obj.remote_as_str else None
+    native.enabled = obj.enabled
+    with suppress_intent_push():
+        native.save(update_fields=["remote_as", "enabled"])
+
+
 def _save_owned_overlay_edit(obj, key):
     """Claim an edited overlay and update its matching native NetBox object atomically."""
     from django.db import transaction
@@ -3135,6 +3232,8 @@ def _save_owned_overlay_edit(obj, key):
             _sync_native_isis_instance(obj)
         if key == "isis_interface":
             _sync_native_isis_interface(obj)
+        if key == "bgp_peer":
+            _sync_native_bgp_peer(obj)
         obj.save()
 
 
@@ -3266,6 +3365,8 @@ def _overlay_family_errors(key, obj, old_values):
         return _isis_instance_errors(obj)
     if key == "isis_interface":
         return _isis_interface_errors(obj)
+    if key == "bgp_peer":
+        return _bgp_peer_errors(obj)
     if key == "route_map_name":
         return _route_map_name_errors(obj, old_values["object_name"])
     return {}
@@ -3316,6 +3417,7 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
             "NSOISISInterfaceState",
             ("circuit_type", "network_type", "metric", "passive", "bfd_enabled", "frr_enabled", "frr_protection"),
         ),
+        "bgp_peer": ("NSOBGPPeerState", ("remote_as_str", "enabled")),
         "route_map_name": ("NSORoutePolicyState", ("object_name",)),
     }
 
@@ -3345,7 +3447,7 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
         for f in supplied:
             field = obj._meta.get_field(f)
             raw = request.POST.get(f, "")
-            if key == "route_map_name":
+            if key in ("route_map_name", "bgp_peer"):
                 raw = raw.strip()
             value = raw if raw != "" else (None if field.null else "")
             try:

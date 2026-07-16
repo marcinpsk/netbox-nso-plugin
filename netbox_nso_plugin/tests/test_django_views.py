@@ -3242,6 +3242,117 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(iface_row.frr_protection, "")
         self.assertEqual((process_row.status, iface_row.status), ("imported", "imported"))
 
+    def test_edit_bgp_peer_updates_remote_as_enabled_and_native_object(self):
+        from django.contrib.contenttypes.models import ContentType
+        from ipam.models import ASN, RIR, IPAddress
+        from netbox_routing.models import BGPPeer, BGPRouter, BGPScope
+
+        from netbox_nso_plugin.models import NSOBGPPeerState
+
+        rir = RIR.objects.create(name="Inline BGP Private", slug="inline-bgp-private", is_private=True)
+        local_as = ASN.objects.create(asn=64512, rir=rir)
+        old_remote = ASN.objects.create(asn=64513, rir=rir)
+        router = BGPRouter.objects.create(
+            name="inline-bgp",
+            assigned_object_type=ContentType.objects.get_for_model(self.device),
+            assigned_object_id=self.device.pk,
+            asn=local_as,
+        )
+        scope = BGPScope.objects.create(router=router)
+        peer_ip = IPAddress.objects.create(address="192.0.2.20/32")
+        native = BGPPeer.objects.create(scope=scope, peer=peer_ip, remote_as=old_remote, enabled=True)
+        row = NSOBGPPeerState.objects.create(
+            management=self.mgmt,
+            asn_str="64512",
+            peer_address_str="192.0.2.20",
+            remote_as_str="64513",
+            enabled=True,
+            bgp_peer=native,
+            status="imported",
+        )
+
+        response = self.client.post(
+            self._url("bgp_peer", row.pk),
+            {"remote_as_str": "64514", "enabled": "False"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        row.refresh_from_db()
+        native.refresh_from_db()
+        self.assertEqual((row.remote_as_str, row.enabled, row.status), ("64514", False, "accepted"))
+        self.assertIsNotNone(row.accepted_at)
+        self.assertEqual(native.remote_as.asn, 64514)
+        self.assertFalse(native.enabled)
+
+    def test_edit_bgp_peer_rejects_out_of_range_asn_without_writing(self):
+        from django.contrib.contenttypes.models import ContentType
+        from ipam.models import ASN, RIR, IPAddress
+        from netbox_routing.models import BGPPeer, BGPRouter, BGPScope
+
+        from netbox_nso_plugin.models import NSOBGPPeerState
+
+        rir = RIR.objects.create(name="Invalid Inline BGP", slug="invalid-inline-bgp", is_private=True)
+        local_as = ASN.objects.create(asn=64520, rir=rir)
+        remote_as = ASN.objects.create(asn=64521, rir=rir)
+        router = BGPRouter.objects.create(
+            name="invalid-inline-bgp",
+            assigned_object_type=ContentType.objects.get_for_model(self.device),
+            assigned_object_id=self.device.pk,
+            asn=local_as,
+        )
+        scope = BGPScope.objects.create(router=router)
+        native = BGPPeer.objects.create(
+            scope=scope,
+            peer=IPAddress.objects.create(address="192.0.2.21/32"),
+            remote_as=remote_as,
+            enabled=True,
+        )
+        row = NSOBGPPeerState.objects.create(
+            management=self.mgmt,
+            asn_str="64520",
+            peer_address_str="192.0.2.21",
+            remote_as_str="64521",
+            enabled=True,
+            bgp_peer=native,
+            status="imported",
+        )
+
+        response = self.client.post(self._url("bgp_peer", row.pk), {"remote_as_str": "9999999999"})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("remote_as_str", response.json()["errors"])
+        row.refresh_from_db()
+        native.refresh_from_db()
+        self.assertEqual((row.remote_as_str, row.status), ("64521", "imported"))
+        self.assertEqual(native.remote_as.asn, 64521)
+
+    def test_bgp_template_json_does_not_require_a_nonexistent_detail_url(self):
+        from ipam.models import ASN, RIR
+        from netbox_routing.models import BGPPeerTemplate
+
+        from netbox_nso_plugin.models import NSOBGPPeerTemplateState
+
+        rir = RIR.objects.create(name="Template Inline BGP", slug="template-inline-bgp", is_private=True)
+        remote_as = ASN.objects.create(asn=64530, rir=rir)
+        template = BGPPeerTemplate.objects.create(name="EDGE-PEERS", remote_as=remote_as)
+        NSOBGPPeerTemplateState.objects.create(
+            management=self.mgmt,
+            template_name=template.name,
+            template=template,
+            remote_as_str=str(remote_as.asn),
+            status="imported",
+        )
+        url = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category",
+            kwargs={"pk": self.device.pk, "key": "bgp"},
+        )
+
+        response = self.client.get(url + "?format=json", HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+
+        self.assertEqual(response.status_code, 200, response.content)
+        template_row = response.json()["templates"]["rows"][0]
+        self.assertEqual(template_row["template"], {"label": "EDGE-PEERS"})
+
     def test_edit_route_map_name_updates_shared_object_overlays_and_dependent_intent(self):
         from django.contrib.contenttypes.models import ContentType
         from netbox_routing.models import OSPFInstance, Redistribution, RouteMap
