@@ -10,6 +10,7 @@ from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer,
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 from django.urls import reverse
+from django.utils import timezone
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOL2SapState
 
@@ -114,6 +115,31 @@ class TestL2ServicesCategoryViewAndAccept(TestCase):
         assert "nso-cat-filter" in html  # server-side pager search box present
         assert "vpls" in html
 
+    def test_category_compacts_service_and_sap_identity(self):
+        self.client.force_login(self.user)
+        from netbox_nso_plugin.reconcile import reconcile_category
+
+        with patch("netbox_nso_plugin.adapter_client.get_l2_services", return_value=_PAYLOAD):
+            reconcile_category(self.device, self.mgmt, "l2_services")
+        url = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category",
+            kwargs={"pk": self.device.pk, "key": "l2_services"},
+        )
+
+        response = self.client.get(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "SAP endpoint")
+        self.assertContains(response, "Last Synced")
+        self.assertContains(response, "lag-60:3999")
+        port = Interface.objects.get(device=self.device, name="lag-60")
+        self.assertContains(response, f'href="{port.get_absolute_url()}"')
+        self.assertNotContains(response, "<th>Type</th>", html=True)
+        self.assertNotContains(response, "<th>Port</th>", html=True)
+        self.assertNotContains(response, "<th>Encap</th>", html=True)
+        self.assertNotContains(response, "<th>L2VPN</th>", html=True)
+        self.assertNotContains(response, "write-back is a later phase")
+
     def test_accept_marks_owned(self):
         self.client.force_login(self.user)
         from netbox_nso_plugin.reconcile import reconcile_category
@@ -129,3 +155,67 @@ class TestL2ServicesCategoryViewAndAccept(TestCase):
         st.refresh_from_db()
         assert st.accepted_at is not None
         assert st.status == "accepted"
+
+    def test_reaccept_keeps_first_accepted_timestamp(self):
+        self.client.force_login(self.user)
+        state = NSOL2SapState.objects.create(
+            management=self.mgmt,
+            service_name="KEEP-TIME",
+            service_type="epipe",
+            sap_id="lag-60:100",
+            port="lag-60",
+            outer_tag=100,
+            status="changed",
+            accepted_at=timezone.now() - timezone.timedelta(days=3),
+        )
+        first_accepted_at = state.accepted_at
+
+        url = reverse("plugins:netbox_nso_plugin:l2_accept_sap", kwargs={"pk": state.pk})
+        response = self.client.post(url)
+
+        self.assertEqual(response.status_code, 302)
+        state.refresh_from_db()
+        self.assertEqual(state.accepted_at, first_accepted_at)
+
+    def test_accept_rejects_service_types_the_writer_cannot_apply(self):
+        self.client.force_login(self.user)
+        state = NSOL2SapState.objects.create(
+            management=self.mgmt,
+            service_name="READ-ONLY-CPIPE",
+            service_type="cpipe",
+            sap_id="lag-60:100",
+            port="lag-60",
+            outer_tag=100,
+            status="changed",
+        )
+
+        url = reverse("plugins:netbox_nso_plugin:l2_accept_sap", kwargs={"pk": state.pk})
+        response = self.client.post(url)
+
+        self.assertEqual(response.status_code, 302)
+        state.refresh_from_db()
+        self.assertEqual(state.status, "changed")
+        self.assertIsNone(state.accepted_at)
+
+    def test_unsupported_service_type_renders_read_only_without_accept(self):
+        self.client.force_login(self.user)
+        state = NSOL2SapState.objects.create(
+            management=self.mgmt,
+            service_name="READ-ONLY-IPIPE",
+            service_type="ipipe",
+            sap_id="lag-60:200",
+            port="lag-60",
+            outer_tag=200,
+            status="changed",
+        )
+        url = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category",
+            kwargs={"pk": self.device.pk, "key": "l2_services"},
+        )
+
+        response = self.client.get(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "read-only")
+        accept_url = reverse("plugins:netbox_nso_plugin:l2_accept_sap", kwargs={"pk": state.pk})
+        self.assertNotContains(response, accept_url)

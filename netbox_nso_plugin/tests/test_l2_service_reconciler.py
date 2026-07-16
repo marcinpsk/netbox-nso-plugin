@@ -129,3 +129,52 @@ class TestReconcileL2Services(TestCase):
         reconcile_l2_services(self.device, p)
         assert L2VPNTermination.objects.filter(assigned_object_id=self.port.pk).count() == 1
         assert NSOL2SapState.objects.filter(management=self.mgmt, service_name="701").count() == 1
+
+    def test_owned_sap_keeps_service_type_intent_when_device_differs(self):
+        reconcile_l2_services(
+            self.device,
+            _payload(
+                [
+                    {
+                        "service_name": "701",
+                        "service_type": "vpls",
+                        "saps": [
+                            {
+                                "sap_id": "1/1/c31/3:701",
+                                "port": "1/1/c31/3",
+                                "outer_tag": 701,
+                                "inner_tag": None,
+                            }
+                        ],
+                    }
+                ]
+            ),
+        )
+        state = NSOL2SapState.objects.get(management=self.mgmt, service_name="701")
+        state.status = "accepted"
+        state.service_type = "epipe"
+        state.save()
+
+        reconcile_l2_services(
+            self.device,
+            _payload(
+                [
+                    {
+                        "service_name": "701",
+                        "service_type": "vpls",
+                        "saps": [
+                            {
+                                "sap_id": "1/1/c31/3:701",
+                                "port": "1/1/c31/3",
+                                "outer_tag": 701,
+                                "inner_tag": None,
+                            }
+                        ],
+                    }
+                ]
+            ),
+        )
+
+        state.refresh_from_db()
+        assert state.service_type == "epipe"
+        assert state.status == "accepted"

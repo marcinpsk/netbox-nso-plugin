@@ -802,12 +802,25 @@ class NSOCategoryView(LoginRequiredMixin, View):
         has_unowned = any(r.status in _UNOWNED_STATUSES for _b, r in bucketed)
         paginator = Paginator(rows, self._INTERFACES_PER_PAGE)
         page = paginator.get_page(request.GET.get("page") or 1)
+        page_rows = list(page.object_list)
+        if key == "l2_services":
+            from dcim.models import Interface
+
+            port_urls = {
+                interface.name: interface.get_absolute_url()
+                for interface in Interface.objects.filter(
+                    device=device,
+                    name__in={row.port for row in page_rows if row.port},
+                )
+            }
+            for row in page_rows:
+                row.port_url = port_urls.get(row.port)
 
         ctx = {
             "object": device,
             "mgmt": mgmt,
             "status_badge": _STATUS_BADGE,
-            spec["ctx"]: list(page.object_list),
+            spec["ctx"]: page_rows,
             "page": page,
             "q": q,
             "state": state,
@@ -4267,8 +4280,16 @@ class NSOL2SapStateAcceptView(NSOActionPermissionMixin, View):
 
     def post(self, request, pk):  # noqa: D102
         state = get_object_or_404(NSOL2SapState, pk=pk)
+        if state.service_type not in ("epipe", "vpls"):
+            messages.error(
+                request,
+                f"Cannot accept {state.service_type or 'unknown'} L2 service {state.service_name}: "
+                "the current writer supports only epipe and vpls SAPs.",
+            )
+            return redirect(_device_nso_tab_url(state.management.device_id))
         state.status = _status_after_accept(state.status)
-        state.accepted_at = timezone.now()
+        if state.accepted_at is None:
+            state.accepted_at = timezone.now()
         state.save(update_fields=["status", "accepted_at"])
         messages.success(request, f"Accepted L2 SAP {state.service_name}:{state.sap_id}.")
         return redirect(_device_nso_tab_url(state.management.device_id))

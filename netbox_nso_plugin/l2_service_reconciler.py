@@ -49,8 +49,13 @@ def _reconcile_sap(NSOL2SapState, L2VPNTermination, mgmt, l2vpn, svc, sap, iface
         sap_id=sap["sap_id"],
         defaults={"service_type": svc.get("service_type", ""), "port": sap.get("port", "")},
     )
-    state.service_type = svc.get("service_type", "")
+    observed_service_type = svc.get("service_type", "")
+    owned = sm.is_owned(state.status)
+    if not owned:
+        state.service_type = observed_service_type
     state.service_id = svc.get("service_id")
+    # These are a decomposition of the immutable SAP key, not independent
+    # writer inputs: the Nokia NED creates the SAP from ``sap_id`` itself.
     state.port = sap.get("port", "")
     state.outer_tag = sap.get("outer_tag")
     state.inner_tag = sap.get("inner_tag")
@@ -76,7 +81,8 @@ def _reconcile_sap(NSOL2SapState, L2VPNTermination, mgmt, l2vpn, svc, sap, iface
             state.termination = term
     # FK overlay: 'matches'=termination materialized (not device confirmation) →
     # settles_owned=False. Unowned: conflict→conflict, else imported. Owned preserved.
-    state.status = sm.on_reconcile(state.status, matches=not conflict, conflict=conflict, settles_owned=False)
+    matches = not conflict and state.service_type == observed_service_type
+    state.status = sm.on_reconcile(state.status, matches=matches, conflict=conflict, settles_owned=False)
     state.save()
 
 

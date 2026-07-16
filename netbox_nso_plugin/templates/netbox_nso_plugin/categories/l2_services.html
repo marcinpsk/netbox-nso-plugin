@@ -9,24 +9,34 @@
     <div class="nso-cat-msg"></div>
     {% include "netbox_nso_plugin/categories/_cat_search.html" with placeholder=placeholder q=q %}
     {% if l2_sap_states %}
-    <p class="text-muted small mb-2">L2 services (epipe = point-to-point, vpls = multipoint) reconciled into NetBox <strong>L2VPN</strong> + terminations. The dot1q tag is per-SAP <strong>interface-local encap</strong> (not a VLAN). Accept makes NetBox the source of truth; the SAP write-back is a later phase.</p>
-    <div class="table-responsive mb-3">
+    <p class="text-muted small mb-2">Service and SAP ID form the structural identity. The SAP ID includes its port and interface-local dot1q encapsulation (not a VLAN). Accept makes NetBox the source of truth and writes the SAP on Apply; epipe and vpls are supported.</p>
+    <div class="table-responsive">
       <table class="table table-sm table-hover mb-0">
         <thead>
-          <tr><th>Service</th><th>Type</th><th>SAP</th><th>Port</th><th>Encap</th><th>L2VPN</th><th>Status</th><th></th></tr>
+          <tr><th>Service</th><th>SAP endpoint</th><th>Status</th><th>Last Synced</th><th></th></tr>
         </thead>
         <tbody>
           {% for sap in l2_sap_states %}
           <tr data-status="{{ sap.status }}" data-owned="{{ sap.accepted_at|yesno:'true,false' }}">
-            <td>{{ sap.service_name }}</td>
-            <td>{% if sap.service_type == "vpls" %}<span class="badge text-bg-primary">vpls</span>{% else %}<span class="badge text-bg-info">{{ sap.service_type|default:"epipe" }}</span>{% endif %}</td>
-            <td><code>{{ sap.sap_id }}</code></td>
-            <td>{{ sap.port }}</td>
-            <td>{% if sap.outer_tag is not None %}{{ sap.outer_tag }}{% if sap.inner_tag is not None %}.{{ sap.inner_tag }}{% endif %}{% else %}<span class="text-muted">—</span>{% endif %}</td>
-            <td>{% if sap.l2vpn %}<a href="{{ sap.l2vpn.get_absolute_url }}">{{ sap.l2vpn.name }}</a>{% else %}<span class="text-muted">—</span>{% endif %}</td>
-            <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=sap.status residue=sap.residue_survivor residue_job=sap.residue_job_id %}</td>
             <td>
-              {% url 'plugins:netbox_nso_plugin:l2_accept_sap' pk=sap.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=sap.status form_class="nso-row-form" title="Make NetBox the source of truth for this SAP (written to the device on Apply, later phase)" %}
+              <span class="fw-semibold">{{ sap.service_name }}</span>
+              <div class="small">
+                {% if sap.service_type == "vpls" %}<span class="badge text-bg-primary">vpls</span>{% elif sap.service_type == "epipe" %}<span class="badge text-bg-info">epipe</span>{% else %}<span class="badge text-bg-secondary">{{ sap.service_type|default:"unknown" }}</span>{% endif %}
+                {% if sap.l2vpn %} · <a href="{{ sap.l2vpn.get_absolute_url }}">L2VPN</a>{% endif %}
+              </div>
+            </td>
+            <td>
+              <code class="text-break">{{ sap.sap_id }}</code>
+              {% if sap.port %}<div class="small"><span class="text-muted">port:</span> {% if sap.port_url %}<a href="{{ sap.port_url }}">{{ sap.port }}</a>{% else %}<span class="text-warning" title="Port not present in NetBox">{{ sap.port }}</span>{% endif %}</div>{% endif %}
+            </td>
+            <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=sap.status residue=sap.residue_survivor residue_job=sap.residue_job_id %}</td>
+            <td class="text-nowrap">{% if sap.last_sync_at %}{{ sap.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
+            <td class="text-nowrap">
+              {% if sap.service_type == "epipe" or sap.service_type == "vpls" %}
+                {% url 'plugins:netbox_nso_plugin:l2_accept_sap' pk=sap.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=sap.status form_class="nso-row-form" title="Make NetBox the source of truth for this SAP (written to the device on Apply)" %}
+              {% else %}
+                <span class="badge text-bg-secondary" title="The current SAP writer supports only epipe and vpls services">read-only</span>
+              {% endif %}
             </td>
           </tr>
           {% endfor %}
