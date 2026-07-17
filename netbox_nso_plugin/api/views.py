@@ -241,3 +241,39 @@ class SyncCompleteView(APIView):
 
         enqueue_device_reconcile(int(device_id))
         return Response({"queued": True, "netbox_device_id": int(device_id)}, status=status.HTTP_202_ACCEPTED)
+
+
+class ProvisionCompleteView(APIView):
+    """Adapter → plugin callback: a device-provision job finished, advance its onboarding row.
+
+    POSTed by the adapter when a provision job reaches a terminal state (succeeded / failed /
+    timeout). The plugin advances the gated NSODeviceManagement row OFF the request path — flipping
+    it to ready (→ the un-gated signal maps/scopes/syncs) or provision_failed — instead of relying
+    on the dashboard poll being open when the job completes. Enqueues a background advance and
+    returns 202; the device-tab self-heal and hourly sweep remain as backstops for a missed call.
+
+    Endpoint: ``POST /api/plugins/nso/provision-complete/``
+    Body: ``{"provision_job_id": <int>}`` — the adapter provision job id (== the row's onboard_job_id).
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        """Resolve the onboarding row by its provision job id and enqueue its advance."""
+        from ..reconcile import enqueue_onboard_advance
+
+        job_id = request.data.get("provision_job_id")
+        if job_id in (None, ""):
+            return Response({"detail": "provision_job_id is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        mgmt = NSODeviceManagement.objects.filter(onboard_job_id=str(job_id)).first()
+        if mgmt is None:
+            # Unknown / untracked provision job (row deleted, or a provision not driven by the
+            # plugin) — ack so the best-effort adapter callback does not treat it as retryable.
+            return Response(
+                {"queued": False, "detail": f"no onboarding row for provision_job_id={job_id}"},
+                status=status.HTTP_202_ACCEPTED,
+            )
+
+        enqueue_onboard_advance(mgmt.id)
+        return Response({"queued": True, "mgmt_id": mgmt.id}, status=status.HTTP_202_ACCEPTED)

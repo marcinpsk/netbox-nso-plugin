@@ -17,6 +17,7 @@ router.register("link-role-assignments", views.NSOLinkRoleAssignmentViewSet)
 
 urlpatterns = [
     path("sync-complete/", views.SyncCompleteView.as_view(), name="sync_complete"),
+    path("provision-complete/", views.ProvisionCompleteView.as_view(), name="provision_complete"),
     path("onboarding-candidates/", views.OnboardingCandidatesView.as_view(), name="onboarding_candidates"),
     path("onboard/", views.OnboardView.as_view(), name="onboard"),
     *router.urls,

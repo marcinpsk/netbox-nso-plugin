@@ -166,3 +166,39 @@ class TestAdvanceStaleOnboardingSweep(TestCase):
 
         self.assertIn(AdvanceStaleOnboardingJob, registry["system_jobs"])
         self.assertEqual(registry["system_jobs"][AdvanceStaleOnboardingJob]["interval"], 60)
+
+
+class TestOnboardAdvanceJob(TestCase):
+    """run_onboard_advance is the RQ job body enqueued by the provision-complete callback."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.instance = NSOInstance.objects.create(name="advjob", adapter_instance_id="advjob")
+
+    @patch("netbox_nso_plugin.adapter_client.sync_notify", return_value=None)
+    @patch("netbox_nso_plugin.adapter_client.set_scope")
+    @patch("netbox_nso_plugin.adapter_client.onboard_device", return_value={"id": 909})
+    @patch("netbox_nso_plugin.adapter_client.get_job", return_value=_SUCCEEDED_OK)
+    def test_run_onboard_advance_flips_ready_and_maps(self, _job, onboard, _scope, _notify):
+        """The job advances a finished provisioning row to ready and fires the mapping signal."""
+        from netbox_nso_plugin.reconcile import run_onboard_advance
+
+        dev = _device("advjob-rtr")
+        mgmt = NSODeviceManagement.objects.create(
+            device=dev,
+            nso_instance=self.instance,
+            nso_device_name="advjob-rtr",
+            onboard_status="provisioning",
+            onboard_job_id="J1",
+        )
+        run_onboard_advance(mgmt.id)
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.onboard_status, "")
+        self.assertEqual(mgmt.adapter_device_id, 909)
+        onboard.assert_called_once()
+
+    def test_run_onboard_advance_missing_row_is_noop(self):
+        """A deleted/unknown row id is a safe no-op (the callback can race a row delete)."""
+        from netbox_nso_plugin.reconcile import run_onboard_advance
+
+        run_onboard_advance(9_999_999)  # must not raise

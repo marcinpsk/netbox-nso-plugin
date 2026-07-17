@@ -91,6 +91,45 @@ class TestSyncCompleteEndpoint(APITestCase):
         m.assert_called_once_with(device.pk)
 
 
+class TestProvisionCompleteEndpoint(APITestCase):
+    """POST /api/plugins/nso/provision-complete/ — the adapter's provision-done callback."""
+
+    def _url(self):
+        return "/api/plugins/nso/provision-complete/"
+
+    def _provisioning_row(self, job_id="55"):
+        device = _make_device(f"prov-{job_id}")
+        inst = NSOInstance.objects.create(name=f"prov-nso-{job_id}", adapter_instance_id=f"prov-nso-{job_id}")
+        return NSODeviceManagement.objects.create(
+            device=device,
+            nso_instance=inst,
+            nso_device_name=f"prov-{job_id}",
+            onboard_status="provisioning",
+            onboard_job_id=job_id,
+        )
+
+    def test_missing_job_id_returns_400(self):
+        response = self.client.post(self._url(), {}, format="json", **self.header)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_known_job_enqueues_advance_and_returns_202(self):
+        """A provision_job_id matching a row's onboard_job_id enqueues that row's advance."""
+        mgmt = self._provisioning_row("77")
+        with patch("netbox_nso_plugin.reconcile.enqueue_onboard_advance") as m:
+            response = self.client.post(self._url(), {"provision_job_id": 77}, format="json", **self.header)
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        m.assert_called_once_with(mgmt.id)  # matched by str(77) == onboard_job_id
+        self.assertTrue(response.data["queued"])
+
+    def test_unknown_job_acked_without_enqueue(self):
+        """An untracked provision job is acked (202) without enqueue — the callback is best-effort."""
+        with patch("netbox_nso_plugin.reconcile.enqueue_onboard_advance") as m:
+            response = self.client.post(self._url(), {"provision_job_id": 999999}, format="json", **self.header)
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        self.assertFalse(response.data["queued"])
+        m.assert_not_called()
+
+
 class TestSettleApplyFailures(APITestCase):
     """Step 4: a stuck 'deploying' row in a scope whose apply failed → apply_failed."""
 
