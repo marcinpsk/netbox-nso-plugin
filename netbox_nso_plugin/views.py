@@ -4946,15 +4946,16 @@ class NSORedistributionDiffView(LoginRequiredMixin, View):
     template_name = "netbox_nso_plugin/redistribution_diff.html"
 
     def get(self, request, pk):  # noqa: D102
-        from .route_policy_diff import redistribution_diff
+        from .route_policy_diff import redistribution_diff, unified_redistribution_diff
 
-        state = get_object_or_404(NSORedistributionState.objects.select_related("redistribution"), pk=pk)
+        state = get_object_or_404(NSORedistributionState.objects.select_related("redistribution__route_map"), pk=pk)
         return render(
             request,
             self.template_name,
             {
                 "state": state,
                 "diff": redistribution_diff(state),
+                "unified_diff": unified_redistribution_diff(state),
                 "device": getattr(state.management, "device", None),
             },
         )

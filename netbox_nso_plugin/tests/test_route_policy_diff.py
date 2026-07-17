@@ -206,7 +206,7 @@ class TestDiffViews(_RPBase):
         user = get_user_model().objects.create_user(username="diff-op", password="pw")  # noqa: S106
         self.client.force_login(user)
 
-    def test_route_policy_diff_page_shows_field_delta(self):
+    def test_route_policy_diff_page_uses_shared_diff_viewer(self):
         from django.urls import reverse
 
         from netbox_nso_plugin.models import NSORoutePolicyState
@@ -222,9 +222,11 @@ class TestDiffViews(_RPBase):
         resp = self.client.get(url)
         self.assertEqual(resp.status_code, 200)
         body = resp.content.decode()
-        # the differing token is highlighted inline (device marker on device side, netbox on the other)
-        self.assertIn('class="nso-diff-dev">200</span>', body)  # device-only value highlighted
-        self.assertIn('class="nso-diff-nb">100</span>', body)  # netbox-only value highlighted
+        self.assertIn("data-nso-diff-viewer", body)
+        self.assertIn("diff2html.min.js", body)
+        self.assertIn("local_preference=200", body)
+        self.assertIn("local_preference=100", body)
+        self.assertNotIn('<th style="width:8rem;">Seq</th>', body)
 
     def test_route_policy_diff_requires_login(self):
         from django.urls import reverse
@@ -240,7 +242,7 @@ class TestDiffViews(_RPBase):
         resp = self.client.get(url)
         self.assertEqual(resp.status_code, 302)  # redirect to login
 
-    def test_redistribution_diff_page_renders(self):
+    def test_redistribution_diff_page_uses_shared_diff_viewer(self):
         from django.contrib.contenttypes.models import ContentType
         from django.urls import reverse
         from netbox_routing.models import OSPFInstance, Redistribution
@@ -267,8 +269,11 @@ class TestDiffViews(_RPBase):
         resp = self.client.get(url)
         self.assertEqual(resp.status_code, 200)
         body = resp.content.decode()
+        self.assertIn("data-nso-diff-viewer", body)
+        self.assertIn("diff2html.min.js", body)
         self.assertIn("99", body)
         self.assertIn("10", body)
+        self.assertNotIn('<th style="width:12rem;">Field</th>', body)
 
 
 class TestRedistributionDiff(_RPBase):
@@ -336,6 +341,26 @@ class TestRedistributionDiff(_RPBase):
         self.assertEqual(metric["device"], "99")
         self.assertEqual(metric["netbox"], "10")
         self.assertTrue(metric["differs"])
+
+    def test_unified_diff_uses_canonical_device_and_netbox_text(self):
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import OSPFInstance, Redistribution
+
+        from netbox_nso_plugin.route_policy_diff import unified_redistribution_diff
+
+        ospf = OSPFInstance.objects.create(device=self.d1, process_id=9, router_id="192.0.2.9")
+        ct = ContentType.objects.get_for_model(OSPFInstance)
+        rd = Redistribution.objects.create(
+            destination_type=ct, destination_id=ospf.pk, source_protocol="connected", source_ref="", metric=10
+        )
+        st = self._redist_state(redistribution=rd, metric=99)
+
+        text = unified_redistribution_diff(st)
+
+        self.assertIn("--- redistribute connected into ospf 1", text)
+        self.assertIn("+++ redistribute connected into ospf 1", text)
+        self.assertIn("-metric: 99", text)
+        self.assertIn("+metric: 10", text)
 
     def test_removed_on_device_shows_removal_drift(self):
         """The disjoint the status already knew about: a row the device no longer reports
@@ -577,8 +602,9 @@ class TestSimpleFamilyDiff(_RPBase):
         resp = self.client.get(url)
         self.assertEqual(resp.status_code, 200)
         body = resp.content.decode()
-        self.assertIn('class="nso-diff-dev">65001_</span>', body)  # device-only token highlighted
-        self.assertIn('class="nso-diff-nb">65000_</span>', body)  # netbox-only token highlighted
+        self.assertIn("data-nso-diff-viewer", body)
+        self.assertIn("-permit ^65001_", body)
+        self.assertIn("+permit ^65000_", body)
 
 
 class TestUnifiedPolicyDiff(_RPBase):
@@ -669,6 +695,6 @@ class TestUnifiedPolicyDiff(_RPBase):
         resp = self.client.get(reverse("plugins:netbox_nso_plugin:routing_route_policy_diff", kwargs={"pk": st.pk}))
         self.assertEqual(resp.status_code, 200)
         body = resp.content.decode()
-        self.assertIn('id="nso-rp-two-panel"', body)
-        self.assertIn('id="nso-rp-diff-text"', body)
+        self.assertIn("data-nso-diff-viewer", body)
+        self.assertIn('id="nso-diff-text"', body)
         self.assertIn("vendor/diff2html.min.js", body)

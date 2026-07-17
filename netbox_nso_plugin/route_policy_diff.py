@@ -11,8 +11,8 @@ operator can see it:
   capture shape. BOTH sides then go through :func:`route_policy_structure.summarize_route_map`,
   so the comparison is apples-to-apples (identical normalisation) and a difference is a real
   config difference, never a serialisation artefact.
-* **Redistribution** — a flat per-field compare of the overlay's device-reported values
-  against the linked netbox-routing ``Redistribution`` object.
+* **Redistribution** — the overlay's device-reported values and linked netbox-routing
+  ``Redistribution`` object are compared both as fields and as canonical text.
 
 The route-map diff core (:func:`route_map_diff`) is a pure function over capture dicts so it is
 directly unit-testable; the reconstruction + redistribution readers touch the DB (thin reads).
@@ -572,3 +572,41 @@ def redistribution_diff(state) -> dict:
         any_diff = any_diff or differs
         rows.append(_augment_segments({"label": label, "device": dv or "—", "netbox": nv or "—", "differs": differs}))
     return {"linked": rd is not None, "removed_on_device": removed_on_device, "any_diff": any_diff, "fields": rows}
+
+
+def _redistribution_label(state) -> str:
+    """Return the stable redistribution identity shown in diff headers and content."""
+    source = " ".join(part for part in (state.source_protocol, state.source_ref) if part)
+    destination = " ".join(part for part in (state.dest_protocol, state.dest_ref) if part)
+    return f"redistribute {source} into {destination}"
+
+
+def _redistribution_text_lines(label: str, values: dict) -> list[str]:
+    """Render one present redistribution through the canonical text representation."""
+    lines = [label]
+    for key, field_label in _REDIST_FIELDS:
+        value = values[key]
+        if value not in (None, ""):
+            lines.append(f"{field_label.lower()}: {value}")
+    return lines
+
+
+def unified_redistribution_diff(state) -> str:
+    """Return a diff2html-ready comparison of device and NetBox redistribution state."""
+    label = _redistribution_label(state)
+    device_values = {"route_map": state.route_map, "metric": state.metric, "metric_type": state.metric_type}
+    device_lines = []
+    if getattr(state, "device_present", True):
+        device_lines = _redistribution_text_lines(label, device_values)
+
+    rd = state.redistribution
+    netbox_lines = []
+    if rd is not None:
+        netbox_values = {
+            "route_map": rd.route_map.name if rd.route_map_id else "",
+            "metric": rd.metric,
+            "metric_type": rd.metric_type,
+        }
+        netbox_lines = _redistribution_text_lines(label, netbox_values)
+
+    return "\n".join(difflib.unified_diff(device_lines, netbox_lines, fromfile=label, tofile=label, lineterm=""))

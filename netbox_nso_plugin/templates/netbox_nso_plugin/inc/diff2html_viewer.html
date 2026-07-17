@@ -1,0 +1,68 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{% load static %}
+
+<link rel="stylesheet" href="{% static 'netbox_nso_plugin/vendor/diff2html.min.css' %}">
+<script src="{% static 'netbox_nso_plugin/vendor/diff2html.min.js' %}"></script>
+
+<div class="mb-3" data-nso-diff-viewer>
+  <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
+    <span class="text-muted small me-auto">
+      <strong>Left: device now.</strong> <strong>Right: NetBox after push.</strong>
+      Red lines are removed or changed; green lines are added or changed.
+    </span>
+    <div class="btn-group btn-group-sm" role="group" aria-label="Diff layout">
+      <button type="button" class="btn btn-outline-secondary active" data-nso-diff-mode="side-by-side">
+        <span class="mdi mdi-view-split-vertical me-1"></span>Split
+      </button>
+      <button type="button" class="btn btn-outline-secondary" data-nso-diff-mode="line-by-line">
+        <span class="mdi mdi-format-list-text me-1"></span>Unified
+      </button>
+    </div>
+  </div>
+  {{ unified_diff|json_script:"nso-diff-text" }}
+  <div data-nso-diff-output></div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var viewer = document.querySelector('[data-nso-diff-viewer]');
+  var textEl = document.getElementById('nso-diff-text');
+  var output = viewer && viewer.querySelector('[data-nso-diff-output]');
+  if (!viewer || !textEl || !output) return;
+  var text = JSON.parse(textEl.textContent);
+  var mode = 'side-by-side';
+
+  function render() {
+    try {
+      if (!window.Diff2Html) throw new Error('diff2html unavailable');
+      output.innerHTML = window.Diff2Html.html(text, {
+        drawFileList: false,
+        matching: 'lines',
+        outputFormat: mode,
+        colorScheme: document.documentElement.dataset.bsTheme === 'dark' ? 'dark' : 'light',
+      });
+    } catch (error) {
+      var pre = document.createElement('pre');
+      pre.className = 'small border rounded p-2 mb-0';
+      pre.textContent = text;
+      output.replaceChildren(pre);
+    }
+  }
+
+  viewer.querySelectorAll('[data-nso-diff-mode]').forEach(function (button) {
+    button.addEventListener('click', function () {
+      mode = button.dataset.nsoDiffMode;
+      viewer.querySelectorAll('[data-nso-diff-mode]').forEach(function (candidate) {
+        candidate.classList.toggle('active', candidate === button);
+      });
+      render();
+    });
+  });
+  new MutationObserver(function () {
+    render();
+  }).observe(document.documentElement, { attributes: true, attributeFilter: ['data-bs-theme'] });
+  render();
+})();
+</script>

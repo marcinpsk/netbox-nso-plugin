@@ -7,7 +7,7 @@
 
 {% block content %}
 <div class="row">
-  <div class="col col-md-8 offset-md-2">
+  <div class="col col-md-10 offset-md-1">
     <div class="card">
       <h5 class="card-header">
         <span class="mdi mdi-not-equal-variant me-1"></span>
@@ -25,7 +25,8 @@
         {% elif not diff.linked %}
         <div class="alert alert-info">
           <span class="mdi mdi-information-outline me-1"></span>
-          No NetBox redistribution object is linked yet — every value below is device-only.
+          No NetBox redistribution object is linked yet — the comparison shows the device-only
+          intent that can be materialised.
         </div>
         {% elif not diff.any_diff %}
         <div class="alert alert-success">
@@ -33,22 +34,9 @@
           The device and NetBox match — no drift.
         </div>
         {% endif %}
-        <div class="table-responsive">
-          <table class="table table-sm align-middle mb-0">
-            <thead>
-              <tr class="small text-muted"><th style="width:12rem;">Field</th><th>Device (on-box)</th><th>NetBox</th></tr>
-            </thead>
-            <tbody>
-              {% for f in diff.fields %}
-              <tr{% if f.differs %} class="table-warning"{% endif %}>
-                <td class="text-nowrap">{{ f.label }}</td>
-                <td><code class="text-body">{{ f.device }}</code></td>
-                <td><code class="text-body">{{ f.netbox }}</code></td>
-              </tr>
-              {% endfor %}
-            </tbody>
-          </table>
-        </div>
+        {% if unified_diff %}
+          {% include "netbox_nso_plugin/inc/diff2html_viewer.html" %}
+        {% endif %}
         {% if device %}
         <a href="{% url 'dcim:device_nso' pk=device.pk %}" class="btn btn-sm btn-outline-secondary mt-3">
           <span class="mdi mdi-arrow-left"></span> Back to {{ device }}
