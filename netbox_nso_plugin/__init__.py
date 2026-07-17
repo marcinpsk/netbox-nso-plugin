@@ -31,7 +31,10 @@ class NSOPluginConfig(PluginConfig):
     def ready(self):  # pragma: no cover
         """Connect signal handlers after all apps are loaded."""
         super().ready()
-        from . import signals  # noqa: F401
+        from . import (
+            jobs,  # noqa: F401 — registers the @system_job hourly onboarding sweep
+            signals,  # noqa: F401
+        )
         from .signals import _connect_g_activated
 
         _connect_g_activated()

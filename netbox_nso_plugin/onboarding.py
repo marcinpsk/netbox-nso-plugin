@@ -316,6 +316,103 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
     return result
 
 
+def _summarize_provision_failure(steps) -> str:
+    """Build a one-line summary of the first failed step in a provision result."""
+    for step in steps or []:
+        if step.get("status") == "failed":
+            detail = step.get("detail")
+            return f"{step.get('step')} failed" + (f": {detail}" if detail else "")
+    return "Provisioning failed."
+
+
+def advance_provisioning(mgmt) -> dict:
+    """Poll a provisioning row's adapter job and advance it. Idempotent + best-effort.
+
+    Shared by three callers so a stranded async onboard self-heals no matter which runs
+    first: the dashboard status poll (:class:`~netbox_nso_plugin.views.NSOOnboardStatusView`),
+    the device NSO tab render, and the hourly
+    :class:`~netbox_nso_plugin.jobs.AdvanceStaleOnboardingJob` sweep. On success it flips
+    ``onboard_status`` to "" and re-saves — re-firing the (now un-gated)
+    ``sync_scope_to_adapter`` signal → adapter mapping + scope + sync-notify.
+
+    Returns the dict shape the poll endpoint serialises: ``{"status": ...}`` with the onboard
+    state ("ready"/"provisioning"/"provision_failed"), plus ``error`` on failure or
+    ``poll_error`` on a transient adapter outage (the row is kept provisioning so callers retry).
+    """
+    from . import adapter_client as client
+    from .adapter_client import AdapterError
+
+    # Terminal or ready row → just report it (never re-poll). Keeps the sweep/tab cheap and
+    # the poll endpoint idempotent.
+    if mgmt.onboard_status != "provisioning":
+        return {"status": mgmt.onboard_status or "ready", "error": mgmt.onboard_error}
+
+    if not mgmt.onboard_job_id:
+        mgmt.onboard_status = "provision_failed"
+        mgmt.onboard_error = "No provision job id recorded."
+        mgmt.save(update_fields=["onboard_status", "onboard_error"])
+        return {"status": "provision_failed", "error": mgmt.onboard_error}
+
+    try:
+        job = client.get_job(mgmt.onboard_job_id)
+    except AdapterError as exc:
+        # Transient — leave the row provisioning so the next poll/tab/sweep retries.
+        return {"status": "provisioning", "poll_error": str(exc)}
+
+    job_status = (job or {}).get("status")
+    if job_status in ("queued", "running"):
+        return {"status": "provisioning"}
+
+    if job_status == "succeeded":
+        result = (job or {}).get("result") or {}
+        steps = result.get("steps") or []
+        if result.get("ok"):
+            # NSO node is up — flip to ready; the full save() re-fires the un-gated
+            # sync_scope_to_adapter signal (adapter mapping + scope + sync-notify).
+            mgmt.onboard_status = ""
+            mgmt.onboard_steps = steps
+            mgmt.onboard_error = ""
+            mgmt.save()
+            return {"status": "ready"}
+        mgmt.onboard_status = "provision_failed"
+        mgmt.onboard_steps = steps
+        mgmt.onboard_error = _summarize_provision_failure(steps)
+        mgmt.save(update_fields=["onboard_status", "onboard_steps", "onboard_error"])
+        return {"status": "provision_failed", "error": mgmt.onboard_error}
+
+    # failed / timeout / unknown-terminal
+    err = (job or {}).get("error") or {}
+    mgmt.onboard_status = "provision_failed"
+    mgmt.onboard_error = err.get("message") or "Provision job failed."
+    mgmt.save(update_fields=["onboard_status", "onboard_error"])
+    return {"status": "provision_failed", "error": mgmt.onboard_error}
+
+
+def advance_stale_onboarding_rows() -> tuple:
+    """Advance every row still in 'provisioning' by polling its job — the periodic backstop.
+
+    The dashboard/device-tab poll advances a row the moment its provision job finishes, but
+    only while someone has that page open. This sweep (run hourly by
+    :class:`~netbox_nso_plugin.jobs.AdvanceStaleOnboardingJob`) catches rows stranded because
+    no page was open when the job completed. Returns ``(checked, advanced)``.
+    """
+    from .models import NSODeviceManagement
+
+    rows = list(NSODeviceManagement.objects.filter(onboard_status="provisioning"))
+    advanced = 0
+    for mgmt in rows:
+        try:
+            res = advance_provisioning(mgmt)
+        except Exception:  # noqa: BLE001 — one bad row must not abort the whole sweep
+            logger.exception("advance_stale_onboarding_rows: failed for mgmt %s", mgmt.pk)
+            continue
+        if res.get("status") != "provisioning":
+            advanced += 1
+    if rows:
+        logger.info("advance_stale_onboarding_rows: %d checked, %d advanced", len(rows), advanced)
+    return len(rows), advanced
+
+
 def manage_existing(device, instance, nso_device_name) -> dict:
     """Bring an already-in-NSO device under plugin management (no provisioning).
 
