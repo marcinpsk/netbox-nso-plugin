@@ -4,6 +4,7 @@ from netbox.api.serializers import NetBoxModelSerializer
 from rest_framework import serializers
 
 from ..models import (
+    NSODerivedIntentTemplate,
     NSODeviceManagement,
     NSOInstance,
     NSOInterfaceState,
@@ -11,6 +12,25 @@ from ..models import (
     NSOLinkRoleAssignment,
     NSOPlatformNedMapping,
 )
+
+
+class NSODerivedIntentTemplateSerializer(NetBoxModelSerializer):
+    """Serializer for database-managed derived-intent templates."""
+
+    class Meta:
+        model = NSODerivedIntentTemplate
+        fields = [
+            "id",
+            "url",
+            "display",
+            "sentinel",
+            "template",
+            "enabled",
+            "tags",
+            "custom_fields",
+            "created",
+            "last_updated",
+        ]
 
 
 class NSOPlatformNedMappingSerializer(NetBoxModelSerializer):

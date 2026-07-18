@@ -5,6 +5,7 @@ from django.utils.html import format_html
 from netbox.tables import NetBoxTable, columns
 
 from .models import (
+    NSODerivedIntentTemplate,
     NSODeviceManagement,
     NSOInstance,
     NSOInterfaceState,
@@ -18,6 +19,18 @@ from .models import (
 # back to 'info' (blue) via .get(value, "info") below — a neutral, readable "unclassified" colour
 # rather than an unreadable gray. Add a mapping here to give a new status its own colour.
 _SYNC_STATUS_COLOR = {"succeeded": "success", "failed": "danger", "partial": "warning"}
+
+
+class NSODerivedIntentTemplateTable(NetBoxTable):
+    """Table for database-managed interface-description templates."""
+
+    sentinel = tables.Column(linkify=True)
+    enabled = columns.BooleanColumn()
+
+    class Meta(NetBoxTable.Meta):
+        model = NSODerivedIntentTemplate
+        fields = ("pk", "id", "sentinel", "template", "enabled", "actions")
+        default_columns = ("sentinel", "template", "enabled")
 
 
 class NSOPlatformNedMappingTable(NetBoxTable):

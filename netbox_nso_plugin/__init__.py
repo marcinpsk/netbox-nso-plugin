@@ -18,9 +18,6 @@ class NSOPluginConfig(PluginConfig):
     default_settings = {
         "adapter_url": "",
         "adapter_token": "",
-        "derived_intent": {
-            "description_templates": [],  # list of {sentinel, template}; empty = feature off
-        },
         # A 'deploying' row that outlives a SUCCEEDED apply by this long without the
         # device ever showing its value escalates to apply_failed (silent drop, #26).
         "stuck_deploying_grace_minutes": 10,
@@ -48,17 +45,10 @@ class NSOPluginConfig(PluginConfig):
         from django.conf import settings
 
         from . import route_policy_reconciler  # noqa: F401
-        from .derived_intent import _register_description_from_cable, load_sentinel_templates
+        from .derived_intent import _register_description_from_cable
 
-        raw = (
-            settings.PLUGINS_CONFIG.get("netbox_nso_plugin", {})
-            .get("derived_intent", {})
-            .get("description_templates", [])
-        )
-        # Fail-fast: raises ConfigError on bad config — surfaces in NetBox boot log.
-        self._derived_intent_templates = load_sentinel_templates(raw)
-        if self._derived_intent_templates:
-            _register_description_from_cable()
+        # The field is always available; enabled templates are read live from NetBox.
+        _register_description_from_cable()
 
         cfg = settings.PLUGINS_CONFIG.get("netbox_nso_plugin", {})
         self._interface_ip_auto_create = cfg.get("interface_ip_auto_create", False)

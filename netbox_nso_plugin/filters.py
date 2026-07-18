@@ -4,6 +4,7 @@ import django_filters
 from netbox.filtersets import NetBoxModelFilterSet
 
 from .models import (
+    NSODerivedIntentTemplate,
     NSODeviceManagement,
     NSOInstance,
     NSOInterfaceState,
@@ -11,6 +12,14 @@ from .models import (
     NSOLinkRoleAssignment,
     NSOPlatformNedMapping,
 )
+
+
+class NSODerivedIntentTemplateFilterSet(NetBoxModelFilterSet):
+    """FilterSet for database-managed derived-intent templates."""
+
+    class Meta:
+        model = NSODerivedIntentTemplate
+        fields = ["id", "sentinel", "template", "enabled"]
 
 
 class NSOPlatformNedMappingFilterSet(NetBoxModelFilterSet):

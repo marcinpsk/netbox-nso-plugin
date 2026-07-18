@@ -92,13 +92,14 @@ def _upsert_interface_states(device, interfaces: list) -> dict:
     """
     from dcim.models import Interface
 
+    from .derived_intent import get_sentinel_templates
     from .models import NSOInterfaceState
 
     # Derived-intent templates (e.g. description-from-cable). A description whose NetBox
     # value matches one is NetBox intent BY DEFINITION (the plugin computes it from
     # topology), so it must be owned even if the adapter reads it as imported — see
     # _resolve_interface_attr_status.
-    derived_templates = getattr(apps.get_app_config("netbox_nso_plugin"), "_derived_intent_templates", [])
+    derived_templates = get_sentinel_templates()
 
     # Build name → Interface map for this device's interfaces in the DB
     iface_map = {i.name: i for i in Interface.objects.filter(device=device)}
@@ -2196,8 +2197,9 @@ class InterfaceNSOBadge(PluginTemplateExtension):
 
         interface = self.context["object"]
         states = {s.attribute: s for s in NSOInterfaceState.objects.filter(interface=interface)}
-        cfg = apps.get_app_config("netbox_nso_plugin")
-        templates = getattr(cfg, "_derived_intent_templates", [])
+        from .derived_intent import get_sentinel_templates
+
+        templates = get_sentinel_templates()
         match = is_managed_description(interface.description or "", templates)
         return self.render(
             "netbox_nso_plugin/interface_nso_badge.html",

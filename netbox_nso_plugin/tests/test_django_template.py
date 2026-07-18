@@ -10,10 +10,9 @@ import re
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
-from django.apps import apps
 from django.test import RequestFactory, SimpleTestCase, TestCase
 
-from netbox_nso_plugin.models import NSOInterfaceState
+from netbox_nso_plugin.models import NSODerivedIntentTemplate, NSOInterfaceState
 
 
 class TestTemplateCommentSyntax(SimpleTestCase):
@@ -309,18 +308,13 @@ class TestInterfaceNSOBadge(TestCase):
             captured.update(extra_context or {})
             return ""
 
-        cfg = apps.get_app_config("netbox_nso_plugin")
-        with (
-            patch.object(cfg, "_derived_intent_templates", []),
-            patch.object(InterfaceNSOBadge, "render", side_effect=fake_render),
-        ):
+        with patch.object(InterfaceNSOBadge, "render", side_effect=fake_render):
             badge.right_page()
 
         self.assertIsNone(captured.get("derived_intent_match"))
 
     def test_right_page_managed_auto_sentinel(self):
         """right_page() passes derived_intent_match with sentinel when description matches."""
-        from netbox_nso_plugin.derived_intent import SentinelTemplate
         from netbox_nso_plugin.template_content import InterfaceNSOBadge
 
         self.interface.description = "[auto] link to peer"
@@ -335,12 +329,11 @@ class TestInterfaceNSOBadge(TestCase):
             captured.update(extra_context or {})
             return ""
 
-        template = SentinelTemplate(sentinel="[auto]", template="[auto] {peer_device}:{peer_iface}")
-        cfg = apps.get_app_config("netbox_nso_plugin")
-        with (
-            patch.object(cfg, "_derived_intent_templates", [template]),
-            patch.object(InterfaceNSOBadge, "render", side_effect=fake_render),
-        ):
+        NSODerivedIntentTemplate.objects.create(
+            sentinel="[auto]",
+            template="[auto] {peer_host}:{peer_iface}",
+        )
+        with patch.object(InterfaceNSOBadge, "render", side_effect=fake_render):
             badge.right_page()
 
         match = captured.get("derived_intent_match")
@@ -349,7 +342,6 @@ class TestInterfaceNSOBadge(TestCase):
 
     def test_right_page_unmanaged_description_no_match(self):
         """right_page() passes derived_intent_match=None when description is unmanaged."""
-        from netbox_nso_plugin.derived_intent import SentinelTemplate
         from netbox_nso_plugin.template_content import InterfaceNSOBadge
 
         self.interface.description = "manually configured"
@@ -364,12 +356,11 @@ class TestInterfaceNSOBadge(TestCase):
             captured.update(extra_context or {})
             return ""
 
-        template = SentinelTemplate(sentinel="[auto]", template="[auto] {peer_device}:{peer_iface}")
-        cfg = apps.get_app_config("netbox_nso_plugin")
-        with (
-            patch.object(cfg, "_derived_intent_templates", [template]),
-            patch.object(InterfaceNSOBadge, "render", side_effect=fake_render),
-        ):
+        NSODerivedIntentTemplate.objects.create(
+            sentinel="[auto]",
+            template="[auto] {peer_host}:{peer_iface}",
+        )
+        with patch.object(InterfaceNSOBadge, "render", side_effect=fake_render):
             badge.right_page()
 
         self.assertIsNone(captured.get("derived_intent_match"))

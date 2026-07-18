@@ -8,6 +8,7 @@ from . import views
 app_name = "netbox_nso_plugin"
 
 router = NetBoxRouter()
+router.register("derived-intent-templates", views.NSODerivedIntentTemplateViewSet)
 router.register("instances", views.NSOInstanceViewSet)
 router.register("ned-mappings", views.NSOPlatformNedMappingViewSet)
 router.register("device-management", views.NSODeviceManagementViewSet)

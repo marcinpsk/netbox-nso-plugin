@@ -27,11 +27,13 @@ from django.test import TestCase
 from netbox_nso_plugin.derived_intent import (
     SentinelTemplate,
 )
+from netbox_nso_plugin.models import NSODerivedIntentTemplate
 from netbox_nso_plugin.signals import (
     _affected_interfaces,
     _recompute_on_cable_change,
     _recompute_on_interface_save,
     _recompute_one,
+    _templates,
 )
 
 SENTINEL_AUTO = SentinelTemplate(
@@ -39,6 +41,22 @@ SENTINEL_AUTO = SentinelTemplate(
     template="[auto] to {peer_host}:{peer_iface}",
 )
 TEMPLATES = [SENTINEL_AUTO]
+
+
+class TestDatabaseTemplateLoading(TestCase):
+    """Derived intent uses live NetBox data so operators can change it without a restart."""
+
+    def test_templates_are_loaded_from_the_database(self):
+        template_model = apps.get_model("netbox_nso_plugin", "NSODerivedIntentTemplate")
+        template_model.objects.create(
+            sentinel="[auto]",
+            template="[auto] to {peer_host}:{peer_iface}",
+        )
+
+        self.assertEqual(
+            _templates(),
+            [SentinelTemplate(sentinel="[auto]", template="[auto] to {peer_host}:{peer_iface}")],
+        )
 
 
 def _make_device(name, dt, role, site):
@@ -56,12 +74,12 @@ def _make_cable(iface_a, iface_b):
     return cable
 
 
-def _inject_templates(test_instance, templates):
-    """Monkey-patch _derived_intent_templates on the AppConfig for one test."""
-    cfg = apps.get_app_config("netbox_nso_plugin")
-    original = getattr(cfg, "_derived_intent_templates", [])
-    cfg._derived_intent_templates = templates
-    test_instance.addCleanup(setattr, cfg, "_derived_intent_templates", original)
+def _configure_templates(templates):
+    """Store the enabled derived-intent templates used by one test."""
+    NSODerivedIntentTemplate.objects.all().delete()
+    NSODerivedIntentTemplate.objects.bulk_create(
+        NSODerivedIntentTemplate(sentinel=item.sentinel, template=item.template) for item in templates
+    )
 
 
 class TestRecomputeOne(TestCase):
@@ -168,7 +186,7 @@ class TestCableSignalHandlers(TestCase):
         iface2.description = "[auto]"
         iface2.save(update_fields=["description"])
 
-        _inject_templates(self, TEMPLATES)
+        _configure_templates(TEMPLATES)
 
         cable = _make_cable(iface1, iface2)
         cable_fresh = Cable.objects.prefetch_related("terminations__termination").get(pk=cable.pk)
@@ -187,23 +205,14 @@ class TestCableSignalHandlers(TestCase):
         iface2.description = "[auto] to cblsig-dev1:Gi0/3-cbl"
         iface2.save(update_fields=["description"])
 
-        _inject_templates(self, TEMPLATES)
+        _configure_templates(TEMPLATES)
 
         cable = _make_cable(iface1, iface2)
-        # Simulate post_delete: cable still has terminations in memory
         cable_with_terms = Cable.objects.prefetch_related("terminations__termination").get(pk=cable.pk)
-
-        # Manually disconnect — simulate what delete does to the DB but keep FK refs
         cable_with_terms.delete()
 
-        # After deletion, ifaces no longer have link_peers; recompute → bare sentinel
-        iface1_fresh = Interface.objects.get(pk=iface1.pk)
-        iface2_fresh = Interface.objects.get(pk=iface2.pk)
-
-        # Manually call recompute (simulating what the delete handler does)
-        _recompute_one(iface1_fresh, TEMPLATES)
-        _recompute_one(iface2_fresh, TEMPLATES)
-
+        # The real post-delete handler must recompute immediately; no later interface save
+        # should be required to clear the peer-derived suffix.
         iface1_final = Interface.objects.get(pk=iface1.pk)
         iface2_final = Interface.objects.get(pk=iface2.pk)
         self.assertEqual(iface1_final.description, "[auto]")
@@ -215,8 +224,7 @@ class TestCableSignalHandlers(TestCase):
         iface1.description = "[auto]"
         iface1.save(update_fields=["description"])
 
-        # Feature off: empty templates on AppConfig
-        _inject_templates(self, [])
+        _configure_templates([])
         cable = _make_cable(iface1, iface2)
         cable_fresh = Cable.objects.prefetch_related("terminations__termination").get(pk=cable.pk)
         _recompute_on_cable_change(sender=Cable, instance=cable_fresh)
@@ -268,7 +276,7 @@ class TestInterfaceSaveHandler(TestCase):
         iface1.description = "[auto]"
         iface1.save(update_fields=["description"])
 
-        _inject_templates(self, TEMPLATES)
+        _configure_templates(TEMPLATES)
 
         iface1_fresh = Interface.objects.get(pk=iface1.pk)
         _recompute_on_interface_save(sender=Interface, instance=iface1_fresh, created=False)
@@ -281,7 +289,7 @@ class TestInterfaceSaveHandler(TestCase):
         iface.description = "[auto]"
         iface.save(update_fields=["description"])
 
-        _inject_templates(self, [])
+        _configure_templates([])
         _recompute_on_interface_save(sender=Interface, instance=iface, created=False)
 
         iface_after = Interface.objects.get(pk=iface.pk)

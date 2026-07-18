@@ -5,6 +5,7 @@ from netbox.views.generic.feature_views import ObjectChangeLogView, ObjectJourna
 
 from . import views
 from .models import (
+    NSODerivedIntentTemplate,
     NSODeviceManagement,
     NSOInstance,
     NSOInterfaceState,
@@ -98,6 +99,49 @@ urlpatterns = [
     path("onboard/", views.NSOOnboardView.as_view(), name="onboard"),
     path("onboard-status/<int:pk>/", views.NSOOnboardStatusView.as_view(), name="onboard_status"),
     path("manage/", views.NSOQuickManageView.as_view(), name="quick_manage"),
+    # Derived-intent interface-description templates
+    path(
+        "derived-intent-templates/",
+        views.NSODerivedIntentTemplateListView.as_view(),
+        name="nsoderivedintenttemplate_list",
+    ),
+    path(
+        "derived-intent-templates/add/",
+        views.NSODerivedIntentTemplateEditView.as_view(),
+        name="nsoderivedintenttemplate_add",
+    ),
+    path(
+        "derived-intent-templates/delete/",
+        views.NSODerivedIntentTemplateBulkDeleteView.as_view(),
+        name="nsoderivedintenttemplate_bulk_delete",
+    ),
+    path(
+        "derived-intent-templates/<int:pk>/",
+        views.NSODerivedIntentTemplateView.as_view(),
+        name="nsoderivedintenttemplate",
+    ),
+    path(
+        "derived-intent-templates/<int:pk>/edit/",
+        views.NSODerivedIntentTemplateEditView.as_view(),
+        name="nsoderivedintenttemplate_edit",
+    ),
+    path(
+        "derived-intent-templates/<int:pk>/delete/",
+        views.NSODerivedIntentTemplateDeleteView.as_view(),
+        name="nsoderivedintenttemplate_delete",
+    ),
+    path(
+        "derived-intent-templates/<int:pk>/changelog/",
+        ObjectChangeLogView.as_view(),
+        name="nsoderivedintenttemplate_changelog",
+        kwargs={"model": NSODerivedIntentTemplate},
+    ),
+    path(
+        "derived-intent-templates/<int:pk>/journal/",
+        ObjectJournalView.as_view(),
+        name="nsoderivedintenttemplate_journal",
+        kwargs={"model": NSODerivedIntentTemplate},
+    ),
     # Platform → NED mappings (onboarding)
     path("ned-mappings/", views.NSOPlatformNedMappingListView.as_view(), name="nsoplatformnedmapping_list"),
     path("ned-mappings/add/", views.NSOPlatformNedMappingEditView.as_view(), name="nsoplatformnedmapping_add"),

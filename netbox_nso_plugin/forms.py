@@ -9,6 +9,7 @@ from utilities.forms.rendering import FieldSet
 
 from .models import (
     AdapterConnection,
+    NSODerivedIntentTemplate,
     NSODeviceManagement,
     NSOFailoverSettings,
     NSOInstance,
@@ -75,6 +76,14 @@ class NSOPlatformNedMappingForm(NetBoxModelForm):
             return [(n["ned_id"], f"{n['ned_id']} ({n.get('vendor') or '?'})") for n in neds if n.get("ned_id")]
         except Exception:
             return []
+
+
+class NSODerivedIntentTemplateForm(NetBoxModelForm):
+    """Form for database-managed interface-description templates."""
+
+    class Meta:
+        model = NSODerivedIntentTemplate
+        fields = ["sentinel", "template", "enabled", "tags"]
 
 
 class AdapterConnectionForm(NetBoxModelForm):

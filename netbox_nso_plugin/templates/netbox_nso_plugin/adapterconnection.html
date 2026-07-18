@@ -36,8 +36,10 @@
 </div>
 
 <div class="card mb-3">
-  <div class="card-header">
+  <div class="card-header d-flex justify-content-between align-items-center">
     <strong><span class="mdi mdi-auto-fix me-1"></span>Derived Intent Templates</strong>
+    <a href="{% url 'plugins:netbox_nso_plugin:nsoderivedintenttemplate_list' %}"
+       class="btn btn-sm btn-outline-primary">Manage templates</a>
   </div>
   <div class="card-body">
     {% if derived_intent_templates %}
@@ -52,7 +54,7 @@
           {% for tpl in derived_intent_templates %}
             <tr>
               <td><code>{{ tpl.sentinel }}</code></td>
-              <td><code>{{ tpl.pattern }}</code></td>
+              <td><code>{{ tpl.template }}</code></td>
             </tr>
           {% endfor %}
         </tbody>
@@ -60,9 +62,7 @@
     {% else %}
       <p class="text-muted mb-0">
         No derived intent templates configured.
-        Add <code>DERIVED_INTENT_TEMPLATES</code> to
-        <code>PLUGINS_CONFIG["netbox_nso_plugin"]</code> to enable automatic
-        interface description management.
+        Add one in NetBox to enable automatic interface description management.
       </p>
     {% endif %}
   </div>

@@ -91,6 +91,55 @@ class AdapterConnection(NetBoxModel):
         super().save(*args, **kwargs)
 
 
+class NSODerivedIntentTemplate(NetBoxModel):
+    """Database-managed sentinel and interface-description template mapping."""
+
+    sentinel = models.CharField(
+        max_length=64,
+        unique=True,
+        help_text="Prefix marking an interface description as derived intent, for example '[auto]'.",
+    )
+    template = models.CharField(
+        max_length=500,
+        help_text=(
+            "Description pattern. It must begin with the sentinel and may use: "
+            "{peer_host}, {peer_iface}, {peer_site}, {peer_role}, {self_host}, {self_iface}."
+        ),
+    )
+    enabled = models.BooleanField(
+        default=True,
+        help_text="Use this template for automatic interface description management.",
+    )
+
+    class Meta:
+        ordering = ["sentinel"]
+        verbose_name = "NSO Derived Intent Template"
+        verbose_name_plural = "NSO Derived Intent Templates"
+
+    def __str__(self):
+        return self.sentinel
+
+    def get_absolute_url(self):
+        """Return the detail URL for this template."""
+        return reverse("plugins:netbox_nso_plugin:nsoderivedintenttemplate", args=[self.pk])
+
+    def clean(self):
+        """Validate this pattern and reject ambiguous enabled sentinel prefixes."""
+        super().clean()
+        from .derived_intent import ConfigError, load_sentinel_templates
+
+        raw = [{"sentinel": self.sentinel, "template": self.template}]
+        try:
+            load_sentinel_templates(raw)
+            if self.enabled:
+                existing = list(
+                    type(self).objects.filter(enabled=True).exclude(pk=self.pk).values("sentinel", "template")
+                )
+                load_sentinel_templates([*existing, *raw])
+        except ConfigError as exc:
+            raise ValidationError({"template": str(exc)}) from exc
+
+
 class NSOFailoverSettings(NetBoxModel):
     """Singleton — global mgmt-IP failover tuning, pushed to the adapter on save.
 

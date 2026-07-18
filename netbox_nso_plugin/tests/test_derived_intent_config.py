@@ -100,6 +100,17 @@ class TestLoadSentinelTemplatesInvalid(SimpleTestCase):
                 ]
             )
 
+    def test_prefix_overlap_raises_when_an_unrelated_sentinel_sorts_between(self):
+        """Every pair is checked; an unrelated length must not hide an ambiguous prefix."""
+        with self.assertRaises(ConfigError):
+            load_sentinel_templates(
+                [
+                    {"sentinel": "[a]", "template": "[a] {peer_host}"},
+                    {"sentinel": "[bb]", "template": "[bb] {peer_host}"},
+                    {"sentinel": "[a]-edge", "template": "[a]-edge {peer_host}"},
+                ]
+            )
+
     def test_non_string_sentinel_raises(self):
         with self.assertRaises(ConfigError):
             load_sentinel_templates([{"sentinel": 42, "template": "42 to {peer_host}"}])

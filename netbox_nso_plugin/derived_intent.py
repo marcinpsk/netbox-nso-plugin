@@ -5,14 +5,14 @@
 Implements — Description-from-Cable-Topology. See docs/m8-derived-intent-plan.md
 for the full design spec.  The public surface is:
 
-  * ``load_sentinel_templates(raw)`` — validate and parse the config-time sentinel list.
+  * ``load_sentinel_templates(raw)`` — validate and parse sentinel mappings.
   * ``is_managed_description(value, templates)`` — check if a description is managed.
   * ``compute_description(interface, sentinel)`` — pure compute returning the target value.
   * ``register() / registered_fields() / fields_for_attribute()`` — generic registry for
     future derived fields (LLDP, MTU, …).
 
 Registration of ``description_from_cable`` happens in ``PluginConfig.ready()`` via
-``_register_description_from_cable()`` so tests can isolate without side effects.
+``_register_description_from_cable()``; enabled templates are read live from NetBox.
 """
 
 import logging
@@ -33,7 +33,7 @@ KNOWN_PLACEHOLDERS: frozenset[str] = frozenset(
 
 @dataclass(frozen=True)
 class SentinelTemplate:
-    """Parsed, validated sentinel → template mapping from PLUGINS_CONFIG."""
+    """Parsed, validated sentinel → template mapping."""
 
     sentinel: str
     template: str
@@ -43,41 +43,47 @@ class ConfigError(ValueError):
     """Raised when the ``derived_intent`` config block is malformed."""
 
 
-def load_sentinel_templates(raw: list) -> list[SentinelTemplate]:
-    """Validate and parse ``description_templates`` from PLUGINS_CONFIG.
+def get_sentinel_templates() -> list[SentinelTemplate]:
+    """Return enabled templates from NetBox, reflecting UI changes immediately."""
+    from .models import NSODerivedIntentTemplate
 
-    Raises ``ConfigError`` on any malformed entry so NetBox surfaces the
-    problem at boot time rather than silently at runtime.
+    raw = list(
+        NSODerivedIntentTemplate.objects.filter(enabled=True).order_by("sentinel").values("sentinel", "template")
+    )
+    return load_sentinel_templates(raw)
+
+
+def load_sentinel_templates(raw: list) -> list[SentinelTemplate]:
+    """Validate and parse raw sentinel/template mappings.
+
+    Raises ``ConfigError`` on any malformed entry.
     """
     if not isinstance(raw, list):
-        raise ConfigError(f"derived_intent.description_templates must be a list, got {type(raw).__name__}")
+        raise ConfigError(f"Derived intent templates must be a list, got {type(raw).__name__}")
 
     result: list[SentinelTemplate] = []
     for i, item in enumerate(raw):
         if not isinstance(item, dict):
-            raise ConfigError(f"description_templates[{i}] must be a dict, got {type(item).__name__}")
+            raise ConfigError(f"Template {i + 1} must be a mapping, got {type(item).__name__}")
         unknown_keys = set(item) - {"sentinel", "template"}
         if unknown_keys:
             raise ConfigError(
-                f"description_templates[{i}] has unexpected keys: {sorted(unknown_keys)} — "
-                "did you mean 'template' (singular)?"
+                f"Template {i + 1} has unexpected keys: {sorted(unknown_keys)} — did you mean 'template' (singular)?"
             )
         if "sentinel" not in item:
-            raise ConfigError(f"description_templates[{i}] is missing key 'sentinel'")
+            raise ConfigError(f"Template {i + 1} is missing 'sentinel'")
         if "template" not in item:
-            raise ConfigError(f"description_templates[{i}] is missing key 'template'")
+            raise ConfigError(f"Template {i + 1} is missing 'template'")
 
         sentinel = item["sentinel"]
         template = item["template"]
 
         if not isinstance(sentinel, str) or not sentinel:
-            raise ConfigError(f"description_templates[{i}].sentinel must be a non-empty string")
+            raise ConfigError(f"Template {i + 1} sentinel must be a non-empty string")
         if not isinstance(template, str):
-            raise ConfigError(f"description_templates[{i}].template must be a string")
+            raise ConfigError(f"Template {i + 1} pattern must be a string")
         if not template.startswith(sentinel):
-            raise ConfigError(
-                f"description_templates[{i}].template must start with its sentinel {sentinel!r}, got {template!r}"
-            )
+            raise ConfigError(f"Template {i + 1} pattern must start with its sentinel {sentinel!r}, got {template!r}")
 
         # Validate placeholders via stdlib Formatter — no regex
         field_names = {
@@ -86,15 +92,15 @@ def load_sentinel_templates(raw: list) -> list[SentinelTemplate]:
         unknown = field_names - KNOWN_PLACEHOLDERS
         if unknown:
             raise ConfigError(
-                f"description_templates[{i}].template references unknown "
+                f"Template {i + 1} references unknown "
                 f"placeholder(s): {sorted(unknown)}.  Known: {sorted(KNOWN_PLACEHOLDERS)}"
             )
 
         result.append(SentinelTemplate(sentinel=sentinel, template=template))
 
-    # Reject prefix-overlapping sentinels: sort by length ascending (shorter first),
-    # then check each against the next — a shorter sentinel is always a prefix candidate.
-    sorted_sentinels = sorted((t.sentinel for t in result), key=lambda s: (len(s), s))
+    # Reject prefix-overlapping sentinels. Lexicographic sorting keeps every string
+    # immediately beside any longer strings that share its prefix.
+    sorted_sentinels = sorted(t.sentinel for t in result)
     for idx in range(len(sorted_sentinels) - 1):
         curr = sorted_sentinels[idx]
         nxt = sorted_sentinels[idx + 1]

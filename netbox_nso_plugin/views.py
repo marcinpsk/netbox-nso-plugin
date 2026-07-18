@@ -17,6 +17,7 @@ from utilities.views import ViewTab, register_model_view
 
 from .adapter_client import AdapterError
 from .filters import (
+    NSODerivedIntentTemplateFilterSet,
     NSODeviceManagementFilterSet,
     NSOInstanceFilterSet,
     NSOInterfaceStateFilterSet,
@@ -27,6 +28,7 @@ from .filters import (
 from .forms import (
     AdapterConnectionForm,
     NSOBgpPeerGreenfieldForm,
+    NSODerivedIntentTemplateForm,
     NSODeviceManagementForm,
     NSOFailoverSettingsForm,
     NSOInstanceForm,
@@ -45,6 +47,7 @@ from .models import (
     AdapterConnection,
     NSOBFDInterfaceState,
     NSOBGPPeerState,
+    NSODerivedIntentTemplate,
     NSODeviceManagement,
     NSOFailoverSettings,
     NSOInstance,
@@ -72,6 +75,7 @@ from .models import (
     NSOVLANState,
 )
 from .tables import (
+    NSODerivedIntentTemplateTable,
     NSODeviceManagementTable,
     NSOInstanceTable,
     NSOInterfaceStateTable,
@@ -1737,15 +1741,13 @@ class AdapterConnectionEditView(generic.ObjectEditView):
         ONLY from PLUGINS_CONFIG / env (never the DB), so show its source + whether
         it is configured — otherwise the page is misleading about the effective config.
         """
-        from django.apps import apps
-
         from . import adapter_client
+        from .derived_intent import get_sentinel_templates
 
-        app_cfg = apps.get_app_config("netbox_nso_plugin")
         resolved = adapter_client._resolve_config()
         db_url = (getattr(instance, "url", "") or "") if getattr(instance, "enabled", False) else ""
         return {
-            "derived_intent_templates": getattr(app_cfg, "_derived_intent_templates", []),
+            "derived_intent_templates": get_sentinel_templates(),
             "token_configured": bool(resolved.get("token")),
             "effective_url": resolved.get("url") or "",
             "url_source": "Adapter Connection (DB)" if db_url else "PLUGINS_CONFIG / env",
@@ -2097,6 +2099,46 @@ class NSOOnboardStatusView(NSOActionPermissionMixin, View):
 
         mgmt = get_object_or_404(NSODeviceManagement, pk=pk)
         return JsonResponse(advance_provisioning(mgmt))
+
+
+class NSODerivedIntentTemplateListView(generic.ObjectListView):
+    """List database-managed interface-description templates."""
+
+    template_name = "netbox_nso_plugin/settings_object_list.html"
+    queryset = NSODerivedIntentTemplate.objects.all()
+    table = NSODerivedIntentTemplateTable
+    filterset = NSODerivedIntentTemplateFilterSet
+    actions = (AddObject, BulkExport, BulkDelete)
+
+
+class NSODerivedIntentTemplateBulkDeleteView(generic.BulkDeleteView):
+    """Bulk-delete derived-intent templates."""
+
+    template_name = "netbox_nso_plugin/settings_bulk_delete.html"
+    queryset = NSODerivedIntentTemplate.objects.all()
+    table = NSODerivedIntentTemplateTable
+    filterset = NSODerivedIntentTemplateFilterSet
+
+
+class NSODerivedIntentTemplateView(generic.ObjectView):
+    """Display a derived-intent template."""
+
+    queryset = NSODerivedIntentTemplate.objects.all()
+
+
+class NSODerivedIntentTemplateEditView(generic.ObjectEditView):
+    """Create or edit a derived-intent template."""
+
+    template_name = "netbox_nso_plugin/settings_object_edit.html"
+    queryset = NSODerivedIntentTemplate.objects.all()
+    form = NSODerivedIntentTemplateForm
+
+
+class NSODerivedIntentTemplateDeleteView(generic.ObjectDeleteView):
+    """Delete a derived-intent template."""
+
+    template_name = "netbox_nso_plugin/settings_object_delete.html"
+    queryset = NSODerivedIntentTemplate.objects.all()
 
 
 class NSOPlatformNedMappingListView(generic.ObjectListView):

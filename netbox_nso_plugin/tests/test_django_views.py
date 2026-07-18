@@ -16,7 +16,13 @@ from django.test import SimpleTestCase, TestCase
 from django.urls import reverse
 
 from netbox_nso_plugin.adapter_client import AdapterError
-from netbox_nso_plugin.models import AdapterConnection, NSODeviceManagement, NSOInstance, NSOInterfaceState
+from netbox_nso_plugin.models import (
+    AdapterConnection,
+    NSODerivedIntentTemplate,
+    NSODeviceManagement,
+    NSOInstance,
+    NSOInterfaceState,
+)
 
 from ._adapter_http import make_response, make_session
 from .mixins import IntentPushResetMixin
@@ -854,6 +860,89 @@ class TestAdapterConnectionEditView(ViewTestBase):
         response = self.client.get(url)
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"Derived Intent Templates", response.content)
+
+    def test_derived_intent_templates_are_managed_in_the_ui(self):
+        """The adapter page exposes database-backed template management, not deployment config."""
+        NSODerivedIntentTemplate.objects.create(
+            sentinel="[auto]",
+            template="[auto] to {peer_host}:{peer_iface}",
+        )
+
+        response = self.client.get(reverse("plugins:netbox_nso_plugin:adapterconnection"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "[auto] to {peer_host}:{peer_iface}")
+        self.assertContains(response, reverse("plugins:netbox_nso_plugin:nsoderivedintenttemplate_list"))
+        self.assertNotContains(response, "Add <code>DERIVED_INTENT_TEMPLATES</code>")
+
+
+class TestNSODerivedIntentTemplateViews(ViewTestBase):
+    """Database-backed derived-intent templates are fully manageable through NetBox."""
+
+    def test_list_and_add_pages_are_available(self):
+        for url_name in ("nsoderivedintenttemplate_list", "nsoderivedintenttemplate_add"):
+            with self.subTest(url_name=url_name):
+                response = self.client.get(reverse(f"plugins:netbox_nso_plugin:{url_name}"))
+                self.assertEqual(response.status_code, 200)
+                self.assertContains(response, "Derived Intent")
+
+    def test_create_valid_template(self):
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:nsoderivedintenttemplate_add"),
+            {
+                "sentinel": "[auto]",
+                "template": "[auto] to {peer_host}:{peer_iface}",
+                "enabled": "on",
+            },
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(NSODerivedIntentTemplate.objects.filter(sentinel="[auto]", enabled=True).exists())
+
+    def test_detail_edit_and_delete_pages_are_available(self):
+        template = NSODerivedIntentTemplate.objects.create(
+            sentinel="[auto]",
+            template="[auto] to {peer_host}:{peer_iface}",
+        )
+        for url_name in (
+            "nsoderivedintenttemplate",
+            "nsoderivedintenttemplate_edit",
+            "nsoderivedintenttemplate_delete",
+        ):
+            with self.subTest(url_name=url_name):
+                response = self.client.get(reverse(f"plugins:netbox_nso_plugin:{url_name}", args=[template.pk]))
+                self.assertEqual(response.status_code, 200)
+                self.assertContains(response, "[auto]")
+
+    def test_unknown_placeholder_is_rejected_in_the_form(self):
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:nsoderivedintenttemplate_add"),
+            {
+                "sentinel": "[auto]",
+                "template": "[auto] to {unknown_peer}",
+                "enabled": "on",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "unknown placeholder")
+        self.assertFalse(NSODerivedIntentTemplate.objects.exists())
+
+    def test_overlapping_enabled_sentinel_is_rejected(self):
+        NSODerivedIntentTemplate.objects.create(sentinel="[auto]", template="[auto] {peer_host}")
+
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:nsoderivedintenttemplate_add"),
+            {
+                "sentinel": "[auto]-edge",
+                "template": "[auto]-edge {peer_host}",
+                "enabled": "on",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "ambiguous match order")
+        self.assertEqual(NSODerivedIntentTemplate.objects.count(), 1)
 
 
 # ── NSO Device Names AJAX view ───────────────────────────────────────────────────
@@ -4548,7 +4637,7 @@ class TestNSOAreaTabs(ViewTestBase):
 
     def test_settings_list_renders_all_settings_tabs_with_active(self):
         html = self._norm("nsoinstance_list")
-        for label in ("NSO Instances", "Adapter Connection", "Failover Settings", "NED Mappings"):
+        for label in ("NSO Instances", "Adapter Connection", "Failover Settings", "Derived Intent", "NED Mappings"):
             self.assertIn(label, html)
         # the four tabs link to their screens, and the current one is active
         self.assertIn(f'nav-link active" href="{self._url("nsoinstance_list")}">NSO Instances', html)
@@ -4569,6 +4658,7 @@ class TestNSOAreaTabs(ViewTestBase):
             ("nsoinstance", [self.nso_instance.pk]),
             ("nsoinstance_edit", [self.nso_instance.pk]),
             ("nsoinstance_delete", [deletable.pk]),
+            ("nsoderivedintenttemplate_add", None),
             ("nsoplatformnedmapping_add", None),
         )
         for url_name, args in pages:

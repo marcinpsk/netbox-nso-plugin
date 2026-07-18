@@ -533,14 +533,10 @@ def push_intent_on_accept(sender, instance, **kwargs):
 
 
 def _templates():
-    """Return the parsed derived-intent template list from the AppConfig.
+    """Return enabled derived-intent templates from the database."""
+    from .derived_intent import get_sentinel_templates
 
-    Returns an empty list when the feature is off (config absent or empty).
-    """
-    from django.apps import apps
-
-    cfg = apps.get_app_config("netbox_nso_plugin")
-    return getattr(cfg, "_derived_intent_templates", [])
+    return get_sentinel_templates()
 
 
 def _affected_interfaces(cable):
@@ -603,6 +599,13 @@ def _recompute_on_cable_delete(sender, instance, **kwargs):
     if not templates:
         return
     for iface in _affected_interfaces(instance):
+        # The termination objects retained by Django's post_delete signal still carry
+        # the deleted cable's PK. NetBox's cached ``link_peers`` property would follow
+        # that stale FK and raise Cable.DoesNotExist instead of seeing a disconnected
+        # interface. Mirror the database's post-delete state on the in-memory object.
+        iface.cable_id = None
+        iface._state.fields_cache.pop("cable", None)
+        iface.__dict__.pop("link_peers", None)
         _recompute_one(iface, templates)
 
 

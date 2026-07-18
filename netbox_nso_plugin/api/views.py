@@ -7,6 +7,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from ..filters import (
+    NSODerivedIntentTemplateFilterSet,
     NSODeviceManagementFilterSet,
     NSOInstanceFilterSet,
     NSOInterfaceStateFilterSet,
@@ -15,6 +16,7 @@ from ..filters import (
     NSOPlatformNedMappingFilterSet,
 )
 from ..models import (
+    NSODerivedIntentTemplate,
     NSODeviceManagement,
     NSOInstance,
     NSOInterfaceState,
@@ -23,6 +25,7 @@ from ..models import (
     NSOPlatformNedMapping,
 )
 from .serializers import (
+    NSODerivedIntentTemplateSerializer,
     NSODeviceManagementSerializer,
     NSOInstanceSerializer,
     NSOInterfaceStateSerializer,
@@ -30,6 +33,14 @@ from .serializers import (
     NSOLinkRoleSerializer,
     NSOPlatformNedMappingSerializer,
 )
+
+
+class NSODerivedIntentTemplateViewSet(NetBoxModelViewSet):
+    """REST API for database-managed derived-intent templates."""
+
+    queryset = NSODerivedIntentTemplate.objects.all()
+    serializer_class = NSODerivedIntentTemplateSerializer
+    filterset_class = NSODerivedIntentTemplateFilterSet
 
 
 class NSOPlatformNedMappingViewSet(NetBoxModelViewSet):

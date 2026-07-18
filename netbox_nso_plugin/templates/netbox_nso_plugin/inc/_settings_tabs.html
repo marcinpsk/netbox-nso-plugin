@@ -24,6 +24,10 @@
        href="{% url 'plugins:netbox_nso_plugin:nsovaultsettings' %}">Vault</a>
   </li>
   <li class="nav-item">
+    <a class="nav-link{% if 'nsoderivedintenttemplate' in un %} active{% endif %}"
+       href="{% url 'plugins:netbox_nso_plugin:nsoderivedintenttemplate_list' %}">Derived Intent</a>
+  </li>
+  <li class="nav-item">
     <a class="nav-link{% if 'nsoplatformnedmapping' in un %} active{% endif %}"
        href="{% url 'plugins:netbox_nso_plugin:nsoplatformnedmapping_list' %}">Platform &rarr; NED Mappings</a>
   </li>

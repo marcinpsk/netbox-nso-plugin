@@ -20,7 +20,7 @@ from __future__ import annotations
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
 from django.test import TestCase
 
-from netbox_nso_plugin.models import NSOInterfaceState
+from netbox_nso_plugin.models import NSODerivedIntentTemplate, NSOInterfaceState
 from netbox_nso_plugin.template_content import _upsert_interface_states
 
 # Must match nso-adapter/tests/api/test_contract_interfaces.py exactly.
@@ -174,13 +174,11 @@ class TestInterfacesContractConsumer(TestCase):
         self.assertEqual(result[("GE0/0", "description")].status, "changed")
 
     def _inject_templates(self, templates):
-        """Monkey-patch _derived_intent_templates on the AppConfig for one test."""
-        from django.apps import apps
-
-        cfg = apps.get_app_config("netbox_nso_plugin")
-        original = getattr(cfg, "_derived_intent_templates", [])
-        cfg._derived_intent_templates = templates
-        self.addCleanup(setattr, cfg, "_derived_intent_templates", original)
+        """Store the enabled derived-intent templates used by one test."""
+        NSODerivedIntentTemplate.objects.all().delete()
+        NSODerivedIntentTemplate.objects.bulk_create(
+            NSODerivedIntentTemplate(sentinel=item.sentinel, template=item.template) for item in templates
+        )
 
     def test_derived_managed_description_is_owned_pending(self):
         """A derived-managed description is NetBox intent BY DEFINITION: the reconciler owns
