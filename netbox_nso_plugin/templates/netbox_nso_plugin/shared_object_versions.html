@@ -96,6 +96,11 @@
                 <div class="d-flex gap-1">
                   {% if it.comparable %}
                   <a href="{% url 'plugins:netbox_nso_plugin:routing_route_policy_diff' pk=it.row.pk %}"
+                     hx-get="{% url 'plugins:netbox_nso_plugin:routing_route_policy_diff' pk=it.row.pk %}"
+                     hx-target="#nso-diff-modal-content"
+                     hx-swap="innerHTML"
+                     data-bs-toggle="modal"
+                     data-bs-target="#nso-diff-modal"
                      class="btn btn-xs btn-outline-info text-nowrap"
                      title="Compare this device's version against the NetBox source (master)">
                     <span class="mdi mdi-file-compare"></span> Diff
@@ -133,6 +138,17 @@
         {% endif %}
       </div>
     </div>
+  </div>
+</div>
+
+<style>
+  .nso-diff-modal-dialog {
+    max-width: min(96vw, 1400px);
+  }
+</style>
+<div class="modal fade" id="nso-diff-modal" tabindex="-1" aria-label="Route policy diff" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered modal-dialog-scrollable nso-diff-modal-dialog">
+    <div class="modal-content" id="nso-diff-modal-content"></div>
   </div>
 </div>
 {% endblock %}

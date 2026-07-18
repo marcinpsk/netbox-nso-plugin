@@ -206,17 +206,20 @@ class TestDiffViews(_RPBase):
         user = get_user_model().objects.create_user(username="diff-op", password="pw")  # noqa: S106
         self.client.force_login(user)
 
-    def test_route_policy_diff_page_uses_shared_diff_viewer(self):
-        from django.urls import reverse
-
+    def _diverged_state(self, name):
         from netbox_nso_plugin.models import NSORoutePolicyState
         from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
 
         self._mgmt(self.d1)
         self._mgmt(self.d2)
-        reconcile_route_policy(self.d1, _rm("RM-V", [_entry(10, set_={"local_preference": 100})]))
-        reconcile_route_policy(self.d2, _rm("RM-V", [_entry(10, set_={"local_preference": 200})]))
-        s2 = NSORoutePolicyState.objects.get(management__device=self.d2, object_name="RM-V")
+        reconcile_route_policy(self.d1, _rm(name, [_entry(10, set_={"local_preference": 100})]))
+        reconcile_route_policy(self.d2, _rm(name, [_entry(10, set_={"local_preference": 200})]))
+        return NSORoutePolicyState.objects.get(management__device=self.d2, object_name=name)
+
+    def test_route_policy_diff_page_uses_shared_diff_viewer(self):
+        from django.urls import reverse
+
+        s2 = self._diverged_state("RM-V")
 
         url = reverse("plugins:netbox_nso_plugin:routing_route_policy_diff", kwargs={"pk": s2.pk})
         resp = self.client.get(url)
@@ -227,6 +230,38 @@ class TestDiffViews(_RPBase):
         self.assertIn("local_preference=200", body)
         self.assertIn("local_preference=100", body)
         self.assertNotIn('<th style="width:8rem;">Seq</th>', body)
+
+    def test_versions_diff_opens_in_the_shared_htmx_modal(self):
+        from django.urls import reverse
+
+        state = self._diverged_state("RM-MODAL-LINK")
+        versions_url = reverse("plugins:netbox_nso_plugin:routing_route_policy_versions", kwargs={"pk": state.pk})
+        diff_url = reverse("plugins:netbox_nso_plugin:routing_route_policy_diff", kwargs={"pk": state.pk})
+
+        response = self.client.get(versions_url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'id="nso-diff-modal"')
+        self.assertContains(response, 'id="nso-diff-modal-content"')
+        self.assertContains(response, f'hx-get="{diff_url}"')
+        self.assertContains(response, 'hx-target="#nso-diff-modal-content"')
+        self.assertContains(response, 'data-bs-target="#nso-diff-modal"')
+        self.assertNotContains(response, "hx-push-url")
+
+    def test_htmx_diff_request_returns_closeable_modal_fragment(self):
+        from django.urls import reverse
+
+        state = self._diverged_state("RM-MODAL-BODY")
+        diff_url = reverse("plugins:netbox_nso_plugin:routing_route_policy_diff", kwargs={"pk": state.pk})
+
+        response = self.client.get(diff_url, headers={"HX-Request": "true"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'class="modal-header"')
+        self.assertContains(response, 'data-bs-dismiss="modal"')
+        self.assertContains(response, "data-nso-diff-viewer")
+        self.assertNotContains(response, "<html")
+        self.assertNotContains(response, "Back to")
 
     def test_route_policy_diff_requires_login(self):
         from django.urls import reverse

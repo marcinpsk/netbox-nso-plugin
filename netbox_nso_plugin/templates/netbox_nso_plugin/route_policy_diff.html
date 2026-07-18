@@ -15,45 +15,7 @@
         {% if device %}on <a href="{% url 'dcim:device_nso' pk=device.pk %}">{{ device }}</a>{% endif %}
       </h5>
       <div class="card-body">
-        {% if state.unsupported_members %}
-        <div class="alert alert-warning">
-          <span class="mdi mdi-alert-outline me-1"></span>
-          <strong>{{ state.unsupported_members|length }} member{{ state.unsupported_members|length|pluralize }} unsupported on this device's NED</strong>
-          — the adapter silently skips {% if state.unsupported_members|length == 1 %}it{% else %}them{% endif %} on Apply
-          (no exact device form), so this object can sit at <em>pending apply</em> even though a push changes nothing.
-          Remove {% if state.unsupported_members|length == 1 %}it{% else %}them{% endif %} from the NetBox object, or accept
-          {% if state.unsupported_members|length == 1 %}it stays{% else %}they stay{% endif %} NetBox-only:
-          {% for m in state.unsupported_members %}<code>{{ m }}</code>{% if not forloop.last %}, {% endif %}{% endfor %}.
-        </div>
-        {% endif %}
-        <p class="text-muted">
-          This compares the device's current ordered policy with the canonical policy NetBox
-          would write. Sequence numbers are omitted because materialisation can renumber entries
-          without changing policy behaviour.
-        </p>
-
-        {% if diff is None %}
-          <div class="alert alert-secondary mb-0">No materialised {{ family }} to compare yet.</div>
-        {% elif not diff.any_diff %}
-          <div class="alert alert-success mb-0">
-            <span class="mdi mdi-check-circle-outline me-1"></span>
-            The device and NetBox match — no drift.
-          </div>
-        {% else %}
-
-          {% if diff.removed_on_device %}
-          <div class="alert alert-warning">
-            <span class="mdi mdi-minus-circle-outline me-1"></span>
-            Removed on the device — this {{ family }} is gone from the device but still exists in
-            NetBox, so a push would add it back. Accept to take ownership, or delete the NetBox
-            object to match the device.
-          </div>
-          {% endif %}
-
-          {% if unified_diff %}
-            {% include "netbox_nso_plugin/inc/diff2html_viewer.html" %}
-          {% endif %}
-        {% endif %}
+        {% include "netbox_nso_plugin/inc/route_policy_diff_content.html" %}
 
         {% if device %}
         <div class="mt-3">

@@ -4960,15 +4960,17 @@ class NSORoutePolicyDiffView(LoginRequiredMixin, View):
     """
 
     template_name = "netbox_nso_plugin/route_policy_diff.html"
+    modal_template_name = "netbox_nso_plugin/route_policy_diff_modal.html"
 
     def get(self, request, pk):  # noqa: D102
         from .route_policy_diff import route_policy_state_diff, unified_policy_diff
 
         state = get_object_or_404(NSORoutePolicyState, pk=pk)
         diff = route_policy_state_diff(state)
+        template_name = self.modal_template_name if request.headers.get("HX-Request") == "true" else self.template_name
         return render(
             request,
-            self.template_name,
+            template_name,
             {
                 "state": state,
                 "object_name": state.object_name,
