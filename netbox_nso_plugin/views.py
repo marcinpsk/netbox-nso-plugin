@@ -1826,6 +1826,7 @@ class NSOInstanceListView(generic.ObjectListView):
 class NSOInstanceBulkDeleteView(generic.BulkDeleteView):
     """Bulk-delete view for NSO instances."""
 
+    template_name = "netbox_nso_plugin/settings_bulk_delete.html"
     queryset = NSOInstance.objects.all()
     table = NSOInstanceTable
     filterset = NSOInstanceFilterSet
@@ -1840,6 +1841,7 @@ class NSOInstanceView(generic.ObjectView):
 class NSOInstanceEditView(generic.ObjectEditView):
     """Create/edit view for an NSO instance."""
 
+    template_name = "netbox_nso_plugin/settings_object_edit.html"
     queryset = NSOInstance.objects.all()
     form = NSOInstanceForm
 
@@ -1847,6 +1849,7 @@ class NSOInstanceEditView(generic.ObjectEditView):
 class NSOInstanceDeleteView(generic.ObjectDeleteView):
     """Delete view for an NSO instance."""
 
+    template_name = "netbox_nso_plugin/settings_object_delete.html"
     queryset = NSOInstance.objects.all()
 
 
@@ -1872,6 +1875,7 @@ class NSOLinkRoleView(generic.ObjectView):
 class NSOLinkRoleEditView(generic.ObjectEditView):
     """Create/edit view for a link role."""
 
+    template_name = "netbox_nso_plugin/links_object_edit.html"
     queryset = NSOLinkRole.objects.all()
     form = NSOLinkRoleForm
 
@@ -1879,12 +1883,14 @@ class NSOLinkRoleEditView(generic.ObjectEditView):
 class NSOLinkRoleDeleteView(generic.ObjectDeleteView):
     """Delete view for a link role."""
 
+    template_name = "netbox_nso_plugin/links_object_delete.html"
     queryset = NSOLinkRole.objects.all()
 
 
 class NSOLinkRoleBulkDeleteView(generic.BulkDeleteView):
     """Bulk-delete view for link roles."""
 
+    template_name = "netbox_nso_plugin/links_bulk_delete.html"
     queryset = NSOLinkRole.objects.all()
     table = NSOLinkRoleTable
     filterset = NSOLinkRoleFilterSet
@@ -1909,6 +1915,7 @@ class NSOLinkRoleAssignmentView(generic.ObjectView):
 class NSOLinkRoleAssignmentEditView(generic.ObjectEditView):
     """Create/edit view for a link-role assignment."""
 
+    template_name = "netbox_nso_plugin/links_object_edit.html"
     queryset = NSOLinkRoleAssignment.objects.all()
     form = NSOLinkRoleAssignmentForm
 
@@ -1916,12 +1923,14 @@ class NSOLinkRoleAssignmentEditView(generic.ObjectEditView):
 class NSOLinkRoleAssignmentDeleteView(generic.ObjectDeleteView):
     """Delete view for a link-role assignment."""
 
+    template_name = "netbox_nso_plugin/links_object_delete.html"
     queryset = NSOLinkRoleAssignment.objects.all()
 
 
 class NSOLinkRoleAssignmentBulkDeleteView(generic.BulkDeleteView):
     """Bulk-delete view for link-role assignments."""
 
+    template_name = "netbox_nso_plugin/links_bulk_delete.html"
     queryset = NSOLinkRoleAssignment.objects.all()
     table = NSOLinkRoleAssignmentTable
     filterset = NSOLinkRoleAssignmentFilterSet
@@ -2103,6 +2112,7 @@ class NSOPlatformNedMappingListView(generic.ObjectListView):
 class NSOPlatformNedMappingBulkDeleteView(generic.BulkDeleteView):
     """Bulk-delete view for Platform→NED mappings."""
 
+    template_name = "netbox_nso_plugin/settings_bulk_delete.html"
     queryset = NSOPlatformNedMapping.objects.all()
     table = NSOPlatformNedMappingTable
     filterset = NSOPlatformNedMappingFilterSet
@@ -2117,6 +2127,7 @@ class NSOPlatformNedMappingView(generic.ObjectView):
 class NSOPlatformNedMappingEditView(generic.ObjectEditView):
     """Create/edit view for a Platform→NED mapping."""
 
+    template_name = "netbox_nso_plugin/settings_object_edit.html"
     queryset = NSOPlatformNedMapping.objects.all()
     form = NSOPlatformNedMappingForm
 
@@ -2124,10 +2135,21 @@ class NSOPlatformNedMappingEditView(generic.ObjectEditView):
 class NSOPlatformNedMappingDeleteView(generic.ObjectDeleteView):
     """Delete view for a Platform→NED mapping."""
 
+    template_name = "netbox_nso_plugin/settings_object_delete.html"
     queryset = NSOPlatformNedMapping.objects.all()
 
 
 # ── NSO Device Management CRUD ───────────────────────────────────────────────
+
+
+class NSODevicesReturnMixin:
+    """Return device-management forms to their originating NSO surface."""
+
+    default_return_url = "plugins:netbox_nso_plugin:onboarding_dashboard"
+
+    def get_return_url(self, request, obj=None):
+        """Honor an explicit safe return URL, otherwise use the NSO Devices dashboard."""
+        return super().get_return_url(request)
 
 
 class NSODeviceManagementListView(generic.ObjectListView):
@@ -2161,9 +2183,10 @@ class NSODeviceManagementListView(generic.ObjectListView):
         return qs
 
 
-class NSODeviceManagementBulkDeleteView(generic.BulkDeleteView):
+class NSODeviceManagementBulkDeleteView(NSODevicesReturnMixin, generic.BulkDeleteView):
     """Bulk-delete view for managed NSO devices."""
 
+    template_name = "netbox_nso_plugin/nsodevicemanagement_bulk_delete.html"
     queryset = NSODeviceManagement.objects.select_related("device", "nso_instance")
     table = NSODeviceManagementTable
     filterset = NSODeviceManagementFilterSet
@@ -2203,17 +2226,28 @@ class NSODeviceManagementView(generic.ObjectView):
         }
 
 
-class NSODeviceManagementEditView(generic.ObjectEditView):
+class NSODeviceManagementEditView(NSODevicesReturnMixin, generic.ObjectEditView):
     """Create/edit view for an NSO device management record."""
 
     queryset = NSODeviceManagement.objects.all()
     form = NSODeviceManagementForm
     template_name = "netbox_nso_plugin/nsodevicemanagement_edit.html"
 
+    def get_extra_context(self, request, instance):
+        """Label the persistent return control for the actual originating surface."""
+        context = super().get_extra_context(request, instance)
+        return_url = self.get_return_url(request, instance)
+        if return_url.startswith("/dcim/devices/") and return_url.endswith("/nso/"):
+            context["nso_return_label"] = "Back to device NSO tab"
+        else:
+            context["nso_return_label"] = "Back to NSO Devices"
+        return context
 
-class NSODeviceManagementDeleteView(generic.ObjectDeleteView):
+
+class NSODeviceManagementDeleteView(NSODevicesReturnMixin, generic.ObjectDeleteView):
     """Delete view for an NSO device management record."""
 
+    template_name = "netbox_nso_plugin/nsodevicemanagement_delete.html"
     queryset = NSODeviceManagement.objects.all()
 
 
@@ -2852,6 +2886,7 @@ class NSOInterfaceStateListView(generic.ObjectListView):
 class NSOInterfaceStateBulkDeleteView(generic.BulkDeleteView):
     """Bulk-delete view for NSOInterfaceState rows (cleanup)."""
 
+    template_name = "netbox_nso_plugin/links_bulk_delete.html"
     queryset = NSOInterfaceState.objects.all()
     table = NSOInterfaceStateTable
     filterset = NSOInterfaceStateFilterSet
@@ -2866,6 +2901,7 @@ class NSOInterfaceStateView(generic.ObjectView):
 class NSOInterfaceStateDeleteView(generic.ObjectDeleteView):
     """Delete view for an NSOInterfaceState record."""
 
+    template_name = "netbox_nso_plugin/links_object_delete.html"
     queryset = NSOInterfaceState.objects.all()
 
 

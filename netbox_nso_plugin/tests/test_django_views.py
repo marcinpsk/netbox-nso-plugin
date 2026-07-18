@@ -768,6 +768,37 @@ class TestNSODeviceManagementEditView(ViewTestBase):
         response = self.client.get(url)
         self.assertEqual(response.status_code, 200)
 
+    def test_add_has_visible_return_to_nso_devices_dashboard(self):
+        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_add")
+        dashboard = reverse("plugins:netbox_nso_plugin:onboarding_dashboard")
+
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, f'href="{dashboard}"')
+        self.assertContains(response, "Back to NSO Devices")
+        self.assertEqual(response.context["return_url"], dashboard)
+
+    def test_edit_preserves_explicit_device_tab_return(self):
+        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_edit", args=[self.mgmt.pk])
+        device_tab = reverse("dcim:device_nso", args=[self.device.pk])
+
+        response = self.client.get(url, {"return_url": device_tab})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, f'href="{device_tab}"')
+        self.assertEqual(response.context["return_url"], device_tab)
+
+    def test_bulk_delete_has_visible_dashboard_return(self):
+        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_bulk_delete")
+        dashboard = reverse("plugins:netbox_nso_plugin:onboarding_dashboard")
+
+        response = self.client.post(url, {"pk": self.mgmt.pk})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Back to NSO Devices")
+        self.assertEqual(response.context["return_url"], dashboard)
+
     def test_form_auto_fills_nso_device_name_from_device(self):
         """NSODeviceManagementForm pre-populates nso_device_name from a device pk in initial."""
         from netbox_nso_plugin.forms import NSODeviceManagementForm
@@ -4505,10 +4536,10 @@ class TestNSOAreaTabs(ViewTestBase):
     inc/_links_tabs.html) with the current tab active. Exercises the real request -> view ->
     template render, so it catches a renamed URL, a broken partial, or a dropped template_name."""
 
-    def _norm(self, url_name):
+    def _norm(self, url_name, args=None):
         import re
 
-        resp = self.client.get(reverse(f"plugins:netbox_nso_plugin:{url_name}"))
+        resp = self.client.get(reverse(f"plugins:netbox_nso_plugin:{url_name}", args=args))
         self.assertEqual(resp.status_code, 200)
         return re.sub(r"\s+", " ", resp.content.decode())
 
@@ -4530,6 +4561,23 @@ class TestNSOAreaTabs(ViewTestBase):
         self.assertIn(f'nav-link active" href="{self._url("adapterconnection")}">Adapter Connection', html)
         self.assertIn(">NSO Instances</a>", html)  # sibling tab present
 
+    def test_settings_crud_pages_keep_area_tabs(self):
+        """Entering an instance form/detail/delete must not drop the Settings navigation."""
+        deletable = NSOInstance.objects.create(name="nav-delete", adapter_instance_id="nav-delete")
+        pages = (
+            ("nsoinstance_add", None),
+            ("nsoinstance", [self.nso_instance.pk]),
+            ("nsoinstance_edit", [self.nso_instance.pk]),
+            ("nsoinstance_delete", [deletable.pk]),
+            ("nsoplatformnedmapping_add", None),
+        )
+        for url_name, args in pages:
+            with self.subTest(url_name=url_name):
+                html = self._norm(url_name, args)
+                self.assertIn(">NSO Instances</a>", html)
+                self.assertIn(">Adapter Connection</a>", html)
+                self.assertIn(">Platform &rarr; NED Mappings</a>", html)
+
     def test_links_list_renders_all_links_tabs_with_active(self):
         html = self._norm("nsolinkrole_list")
         for label in ("Link Roles", "Link Assignments", "Interface Drift"):
@@ -4543,6 +4591,41 @@ class TestNSOAreaTabs(ViewTestBase):
         self.assertIn(f'nav-link active" href="{self._url("nsolinkroleassignment_list")}">Link Assignments', html)
         self.assertIn(f'nav-link" href="{self._url("nsolinkrole_list")}">Link Roles', html)
         self.assertNotIn(f'nav-link active" href="{self._url("nsolinkrole_list")}">Link Roles', html)
+
+    def test_links_crud_pages_keep_area_tabs(self):
+        """Entering a role form/detail/delete or drift detail must retain sibling navigation."""
+        from netbox_nso_plugin.models import NSOLinkRole
+
+        role = NSOLinkRole.objects.create(name="Nav role", slug="nav-role", assign_ipv4=False)
+        pages = (
+            ("nsolinkrole_add", None),
+            ("nsolinkrole", [role.pk]),
+            ("nsolinkrole_edit", [role.pk]),
+            ("nsolinkrole_delete", [role.pk]),
+            ("nsolinkroleassignment_add", None),
+            ("nsointerfacestate", [self.iface_state.pk]),
+        )
+        for url_name, args in pages:
+            with self.subTest(url_name=url_name):
+                html = self._norm(url_name, args)
+                self.assertIn(">Link Roles</a>", html)
+                self.assertIn(">Link Assignments</a>", html)
+                self.assertIn(">Interface Drift</a>", html)
+
+    def test_bulk_delete_pages_keep_area_tabs(self):
+        from netbox_nso_plugin.models import NSOLinkRole
+
+        role = NSOLinkRole.objects.create(name="Bulk nav role", slug="bulk-nav-role", assign_ipv4=False)
+        pages = (
+            ("nsoinstance_bulk_delete", self.nso_instance.pk, ">Adapter Connection</a>"),
+            ("nsolinkrole_bulk_delete", role.pk, ">Link Assignments</a>"),
+            ("nsointerfacestate_bulk_delete", self.iface_state.pk, ">Interface Drift</a>"),
+        )
+        for url_name, pk, sibling in pages:
+            with self.subTest(url_name=url_name):
+                response = self.client.post(self._url(url_name), {"pk": pk})
+                self.assertEqual(response.status_code, 200)
+                self.assertContains(response, sibling)
 
     def test_area_tabs_use_presentation_role_not_a_fake_tablist(self):
         """The area nav is cross-page NAVIGATION, not an in-page tab widget. NetBox marks the same

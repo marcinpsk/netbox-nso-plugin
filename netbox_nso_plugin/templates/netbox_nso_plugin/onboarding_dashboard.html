@@ -37,7 +37,7 @@
   {# ── Managed: plugin-managed devices (NSODeviceManagement) ───────────────── #}
   <div class="tab-pane fade show active" id="tab-managed" role="tabpanel">
     <div class="d-flex mb-2">
-      <a href="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_add' %}" class="btn btn-sm btn-primary ms-auto">
+      <a href="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_add' %}?return_url={{ request.get_full_path|urlencode }}" class="btn btn-sm btn-primary ms-auto">
         <span class="mdi mdi-plus-thick"></span> Add managed device
       </a>
     </div>
@@ -69,8 +69,8 @@
               </td>
               <td class="text-end text-nowrap">
                 <a href="{% url 'dcim:device_nso' pk=m.device.pk %}" class="btn btn-sm btn-outline-primary">NSO tab</a>
-                <a href="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_edit' pk=m.pk %}" class="btn btn-sm btn-outline-secondary" title="Edit"><span class="mdi mdi-pencil"></span></a>
-                <a href="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_delete' pk=m.pk %}" class="btn btn-sm btn-outline-danger" title="Delete"><span class="mdi mdi-trash-can-outline"></span></a>
+                <a href="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_edit' pk=m.pk %}?return_url={{ request.get_full_path|urlencode }}" class="btn btn-sm btn-outline-secondary" title="Edit"><span class="mdi mdi-pencil"></span></a>
+                <a href="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_delete' pk=m.pk %}?return_url={{ request.get_full_path|urlencode }}" class="btn btn-sm btn-outline-danger" title="Delete"><span class="mdi mdi-trash-can-outline"></span></a>
               </td>
             </tr>
             {% empty %}

@@ -3,6 +3,11 @@
 {% extends 'generic/object.html' %}
 {% load helpers %}
 
+{% block tabs %}
+  {% include 'netbox_nso_plugin/inc/_settings_tabs.html' %}
+  {{ block.super }}
+{% endblock %}
+
 {% block breadcrumbs %}
   <li class="breadcrumb-item"><a href="{% url 'plugins:netbox_nso_plugin:nsoplatformnedmapping_list' %}">NSO Platform-NED Mappings</a></li>
   <li class="breadcrumb-item">{{ object }}</li>

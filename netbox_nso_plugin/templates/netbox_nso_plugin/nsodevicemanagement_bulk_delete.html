@@ -1,0 +1,10 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{% extends 'generic/bulk_delete.html' %}
+
+{% block controls %}
+  <a href="{{ return_url }}" class="btn btn-outline-secondary">
+    <i class="mdi mdi-arrow-left" aria-hidden="true"></i> Back to NSO Devices
+  </a>
+  {{ block.super }}
+{% endblock %}

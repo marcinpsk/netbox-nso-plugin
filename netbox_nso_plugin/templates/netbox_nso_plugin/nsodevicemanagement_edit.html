@@ -4,6 +4,12 @@
 {% load helpers %}
 {% load form_helpers %}
 
+{% block controls %}
+  <a href="{{ return_url }}" class="btn btn-outline-secondary">
+    <span class="mdi mdi-arrow-left"></span> {{ nso_return_label }}
+  </a>
+{% endblock %}
+
 {% block form %}
   <div class="field-group mb-5">
     <div class="row mb-2">

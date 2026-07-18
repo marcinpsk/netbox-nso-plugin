@@ -3,6 +3,11 @@
 {% extends 'generic/object.html' %}
 {% load helpers %}
 
+{% block tabs %}
+  {% include 'netbox_nso_plugin/inc/_links_tabs.html' %}
+  {{ block.super }}
+{% endblock %}
+
 {% block breadcrumbs %}
   <li class="breadcrumb-item"><a href="{% url 'plugins:netbox_nso_plugin:nsolinkroleassignment_list' %}">Link Role Assignments</a></li>
   <li class="breadcrumb-item">{{ object }}</li>
