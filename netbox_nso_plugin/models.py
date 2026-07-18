@@ -177,7 +177,12 @@ class NSOFailoverSettings(NetBoxModel):
     probe_timeout = models.PositiveIntegerField(
         default=10,
         validators=[MinValueValidator(1), MaxValueValidator(120)],
-        help_text="Seconds before an unreachable connect is given up — short, so a down device can't stall the loop.",
+        help_text="Seconds allowed for an inactive-address flip probe — short, so a down path can't stall the loop.",
+    )
+    active_probe_timeout = models.PositiveIntegerField(
+        default=45,
+        validators=[MinValueValidator(1), MaxValueValidator(120)],
+        help_text="Seconds allowed for the active address to establish a cold NSO session.",
     )
     probe_concurrency = models.PositiveIntegerField(
         default=8,

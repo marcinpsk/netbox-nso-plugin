@@ -479,6 +479,7 @@ def push_failover_settings_to_adapter(sender, instance, **kwargs):
         "failure_threshold": instance.failure_threshold,
         "success_threshold": instance.success_threshold,
         "probe_timeout": instance.probe_timeout,
+        "active_probe_timeout": instance.active_probe_timeout,
         "probe_concurrency": instance.probe_concurrency,
         "max_flips_per_tick": instance.max_flips_per_tick,
         "sync_from_after_switch": instance.sync_from_after_switch,

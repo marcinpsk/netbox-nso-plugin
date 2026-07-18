@@ -248,6 +248,7 @@ class TestNSOFailoverSettingsModel(TestCase):
         self.assertEqual((s.primary_probe_interval, s.oob_probe_interval), (15, 360))
         self.assertEqual((s.failure_threshold, s.success_threshold), (3, 5))
         self.assertEqual(s.probe_timeout, 10)
+        self.assertEqual(s.active_probe_timeout, 45)
         self.assertEqual((s.probe_concurrency, s.max_flips_per_tick), (8, 8))
         self.assertTrue(s.sync_from_after_switch)
 

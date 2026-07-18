@@ -934,6 +934,7 @@ class TestPushFailoverSettings(TestCase):
                 "failure_threshold",
                 "success_threshold",
                 "probe_timeout",
+                "active_probe_timeout",
                 "probe_concurrency",
                 "max_flips_per_tick",
                 "sync_from_after_switch",

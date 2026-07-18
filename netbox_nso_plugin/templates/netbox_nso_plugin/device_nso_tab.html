@@ -212,18 +212,29 @@
           <th>Last Probe</th>
           <td>
             {% if failover.last_probe_result == "ok" %}<span class="badge text-bg-success">OK</span>
-            {% elif failover.last_probe_result == "fail" %}<span class="badge text-bg-danger">Failed</span>
+            {% elif failover.last_probe_result == "timeout" %}<span class="badge text-bg-warning text-dark" title="The probe window expired; the address may still be reachable.">Timed out</span>
+            {% elif failover.last_probe_result == "unreachable" %}<span class="badge text-bg-danger">Unreachable</span>
+            {% elif failover.last_probe_result == "error" %}<span class="badge text-bg-danger">Probe error</span>
+            {% elif failover.last_probe_result %}<span class="badge text-bg-info">Unknown</span>
             {% else %}—{% endif %}
+            {% if failover.last_probe_target %}<span class="badge text-bg-info ms-1">{{ failover.last_probe_target|upper }} target</span>{% endif %}
             {% if failover.last_probe_at %}<small class="text-muted ms-1">{{ failover.last_probe_at|date:"Y-m-d H:i" }}</small>{% endif %}
+            {% if failover.last_probe_detail %}<div class="small text-muted mt-1" title="{{ failover.last_probe_detail }}">{{ failover.last_probe_detail|truncatechars:160 }}</div>{% endif %}
           </td>
         </tr>
         <tr>
           <th>OOB Fallback Health</th>
           <td>
-            {% if failover.oob_healthy is True %}<span class="badge text-bg-success">Healthy</span>
-            {% elif failover.oob_healthy is False %}<span class="badge text-bg-danger">Unreachable</span>
+            {% if failover.oob_health_result == "ok" %}<span class="badge text-bg-success">Healthy</span>
+            {% elif failover.oob_health_result == "timeout" %}<span class="badge text-bg-warning text-dark" title="The probe window expired; the OOB address may still be reachable.">Timed out</span>
+            {% elif failover.oob_health_result == "unreachable" %}<span class="badge text-bg-danger">Unreachable</span>
+            {% elif failover.oob_health_result == "error" %}<span class="badge text-bg-danger">Probe error</span>
+            {% elif failover.oob_health_result %}<span class="badge text-bg-info">Unknown</span>
+            {% elif failover.oob_healthy is True %}<span class="badge text-bg-success">Healthy</span>
+            {% elif failover.oob_healthy is False %}<span class="badge text-bg-info">Unknown</span>
             {% else %}<span title="Not yet checked">—</span>{% endif %}
             {% if failover.oob_health_checked_at %}<small class="text-muted ms-1">{{ failover.oob_health_checked_at|date:"Y-m-d H:i" }}</small>{% endif %}
+            {% if failover.oob_health_detail %}<div class="small text-muted mt-1" title="{{ failover.oob_health_detail }}">{{ failover.oob_health_detail|truncatechars:160 }}</div>{% endif %}
           </td>
         </tr>
         <tr>

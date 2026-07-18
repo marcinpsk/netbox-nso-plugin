@@ -84,6 +84,7 @@ class TestNSOFailoverSettingsForm(TestCase):
         "failure_threshold": 3,
         "success_threshold": 5,
         "probe_timeout": 10,
+        "active_probe_timeout": 45,
         "probe_concurrency": 8,
         "max_flips_per_tick": 8,
         "sync_from_after_switch": True,

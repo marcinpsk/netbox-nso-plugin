@@ -1900,6 +1900,44 @@ class TestDeviceNSOTabView(ViewTestBase):
         self.assertIn(response.status_code, [200, 302])  # may redirect if no tab
         device2.delete()
 
+    def test_oob_probe_timeout_is_not_rendered_as_unreachable(self):
+        """The adapter can still connect after its short health window; preserve that as a
+        timeout with the target/detail instead of claiming the active OOB is unreachable."""
+        mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+        mgmt.adapter_device_id = 15
+        mgmt.save(update_fields=["adapter_device_id"])
+        stack, mocks = self._patch_all_getters()
+        mocks["get_device"].return_value = {
+            "id": 15,
+            "last_sync_at": None,
+            "last_sync_status": "succeeded",
+            "failover": {
+                "active_address": "oob",
+                "oob_ip": "192.0.2.5",
+                "primary_ip": "10.0.0.1",
+                "last_probe_result": "timeout",
+                "last_probe_target": "oob",
+                "last_probe_detail": "cold connect exceeded probe window",
+                "last_probe_at": "2026-07-18T09:23:48Z",
+                "oob_healthy": False,
+                "oob_health_result": "timeout",
+                "oob_health_detail": "cold connect exceeded probe window",
+                "oob_health_checked_at": "2026-07-18T09:23:48Z",
+                "last_switch_at": "2026-07-15T13:00:46Z",
+                "manual_override": False,
+            },
+        }
+
+        with stack:
+            response = self.client.get(reverse("dcim:device_nso", kwargs={"pk": self.device.pk}))
+
+        self.assertEqual(response.status_code, 200)
+        body = response.content.decode()
+        self.assertIn("Timed out", body)
+        self.assertIn("OOB target", body)
+        self.assertIn("cold connect exceeded probe window", body)
+        self.assertNotIn(">Unreachable<", body)
+
     def _patch_all_getters(self):
         """Patch every adapter getter the tab view may call; return the patch context
         and a dict of the mocks keyed by attribute name."""

@@ -117,6 +117,7 @@ class NSOFailoverSettingsForm(NetBoxModelForm):
             "failure_threshold",
             "success_threshold",
             "probe_timeout",
+            "active_probe_timeout",
             "probe_concurrency",
             "max_flips_per_tick",
             "sync_from_after_switch",
@@ -126,7 +127,8 @@ class NSOFailoverSettingsForm(NetBoxModelForm):
         labels = {
             "primary_probe_interval": "Primary probe interval (min)",
             "oob_probe_interval": "OOB probe interval (min)",
-            "probe_timeout": "Probe timeout (sec)",
+            "probe_timeout": "Inactive-address probe timeout (sec)",
+            "active_probe_timeout": "Active-address probe timeout (sec)",
             "sync_from_after_switch": "Sync-from after switch",
         }
 

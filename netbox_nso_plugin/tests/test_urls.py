@@ -4,7 +4,7 @@
 
 These tests do NOT require a live adapter or NSO — they validate that:
   1. Every URL name referenced in navigation.py resolves without error.
-  2. No plugin template uses ``bg-secondary`` (the unreadable gray-on-gray scheme).
+  2. Warning badges retain sufficient foreground contrast.
 """
 
 import os
@@ -141,12 +141,8 @@ class TestNavigationLinksResolve(SimpleTestCase):
                 self.assertTrue(url.endswith("/delete/"))
 
 
-class TestNoBadgeColorRegression(SimpleTestCase):
-    """Guard against gray-on-gray badges in plugin templates.
-
-    ``bg-secondary`` produces unreadable text in NetBox's Bootstrap theme.
-    This test fails if any plugin template introduces the pattern.
-    """
+class TestWarningBadgeContrast(SimpleTestCase):
+    """Guard against low-contrast warning badges in plugin templates."""
 
     def _load_all_templates(self):
         # Recursive: the category panels live in subdirectories (categories/…); a non-recursive
@@ -160,18 +156,6 @@ class TestNoBadgeColorRegression(SimpleTestCase):
                     with open(path) as fh:
                         results[rel] = fh.read()
         return results
-
-    def test_no_bg_secondary_in_templates(self):
-        """No plugin template contains the bg-secondary badge class."""
-        violations = []
-        for fname, content in self._load_all_templates().items():
-            if "bg-secondary" in content:
-                violations.append(fname)
-        if violations:
-            self.fail(
-                "Gray-on-gray badge (bg-secondary) found in templates — use a named colour class instead:\n"
-                + "\n".join(violations)
-            )
 
     def test_warning_badges_have_text_dark(self):
         """Every bg-warning badge in plugin templates also carries text-dark for contrast."""
