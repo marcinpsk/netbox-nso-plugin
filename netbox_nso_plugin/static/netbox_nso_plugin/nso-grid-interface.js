@@ -23,6 +23,155 @@
       cellBadge = G.cellBadge,
       acceptBtn = G.acceptBtn,
       MUTED = G.MUTED;
+    var rowsById = {};
+    var activeDiffRow = null;
+    var diffMode = "side-by-side";
+
+    function comparableValue(value) {
+      if (value == null) return "";
+      var text = String(value);
+      var lower = text.toLowerCase();
+      return lower === "true" || lower === "false" ? lower : text;
+    }
+
+    function same(a, b) {
+      return comparableValue(a) === comparableValue(b);
+    }
+
+    function displayValue(value) {
+      if (value == null || value === "") return "—";
+      if (value === true || value === "true" || value === "True") return "true";
+      if (value === false || value === "false" || value === "False") return "false";
+      return String(value);
+    }
+
+    function changedValue(lines, label, device, netbox) {
+      if (same(device, netbox)) {
+        lines.push("   " + label + ": " + displayValue(device));
+      } else {
+        lines.push("-  " + label + ": " + displayValue(device));
+        lines.push("+  " + label + ": " + displayValue(netbox));
+      }
+    }
+
+    function switchportLines(lines, cell) {
+      var netbox = cell.netbox || {};
+      lines.push(" switchport:");
+      changedValue(lines, "mode", cell.mode, netbox.mode);
+      changedValue(lines, "untagged_vlan", cell.untagged, netbox.untagged);
+      lines.push("   tagged_vlans (differences only):");
+      var device = (cell.tagged || []).map(Number).sort(function (a, b) { return a - b; });
+      var desired = (netbox.tagged || []).map(Number).sort(function (a, b) { return a - b; });
+      var deviceSet = new Set(device);
+      var desiredSet = new Set(desired);
+      Array.from(new Set(device.concat(desired))).sort(function (a, b) { return a - b; }).forEach(function (vid) {
+        if (deviceSet.has(vid) && desiredSet.has(vid)) return;
+        if (deviceSet.has(vid)) lines.push("-    - " + vid);
+        else lines.push("+    - " + vid);
+      });
+    }
+
+    function switchportDiffers(cell) {
+      var netbox = cell.netbox || {};
+      return (
+        !same(cell.mode, netbox.mode) ||
+        !same(cell.untagged, netbox.untagged) ||
+        !same((cell.tagged || []).map(Number).sort().join(","), (netbox.tagged || []).map(Number).sort().join(","))
+      );
+    }
+
+    function ipLines(lines, ip, ifaceName) {
+      if (!ip.netbox || (ip.kind !== "drift" && ip.kind !== "conflict")) return;
+      var section = [];
+      changedValue(section, "presence", ip.device_present ? "present" : "not reported", ip.netbox.present ? "present" : "absent");
+      changedValue(section, "address", ip.device_present ? ip.address : null, ip.netbox.address);
+      changedValue(section, "vrf", ip.device_present ? (ip.vrf || "global") : null, ip.netbox.present ? (ip.netbox.vrf || "global") : null);
+      changedValue(section, "assignment", ip.device_present ? ifaceName : null, ip.netbox.assignment);
+      if (section.some(function (line) { return line.charAt(0) === "-" || line.charAt(0) === "+"; })) {
+        lines.push(" ip " + ip.address + ":");
+        Array.prototype.push.apply(lines, section);
+      }
+    }
+
+    function interfaceUnifiedDiff(row) {
+      var lines = [];
+      ["enabled", "description"].forEach(function (key) {
+        var c = row[key];
+        if (!c || same(c.netbox_value, c.value)) return;
+        lines.push(" " + key + ":");
+        changedValue(lines, "value", c.value, c.netbox_value);
+      });
+      if (row.switchport && row.switchport.netbox && switchportDiffers(row.switchport)) {
+        switchportLines(lines, row.switchport);
+      }
+      (row.ips || []).forEach(function (ip) {
+        ipLines(lines, ip, row.iface.name);
+      });
+      if (!lines.length) return "";
+      var before = lines.filter(function (line) { return line.charAt(0) !== "+"; }).length;
+      var after = lines.filter(function (line) { return line.charAt(0) !== "-"; }).length;
+      return (
+        "--- interface " + row.iface.name + "\n" +
+        "+++ interface " + row.iface.name + "\n" +
+        "@@ -1," + before + " +1," + after + " @@\n" +
+        lines.join("\n") + "\n"
+      );
+    }
+
+    function fmtState(cell) {
+      var d = cell.getRow().getData();
+      var out = badge(d.state, d.label);
+      if (interfaceUnifiedDiff(d)) {
+        out +=
+          ' <button type="button" class="btn btn-xs btn-outline-warning nso-if-diff" data-iface-id="' +
+          esc(d.iface.id) +
+          '" title="See exactly what differs between this device and NetBox" aria-label="Compare interface ' +
+          esc(d.iface.name) +
+          '"><span class="mdi mdi-not-equal-variant" aria-hidden="true"></span></button>';
+      }
+      return out;
+    }
+
+    function renderDiff() {
+      var body = root.querySelector(".nso-if-diff-body");
+      var unified = activeDiffRow && interfaceUnifiedDiff(activeDiffRow);
+      if (!body || !unified) return;
+      if (window.Diff2Html) {
+        body.innerHTML = window.Diff2Html.html(unified, {
+          drawFileList: false,
+          matching: "lines",
+          outputFormat: diffMode,
+          colorScheme: document.documentElement.dataset.bsTheme === "dark" ? "dark" : "light",
+        });
+      } else {
+        var pre = document.createElement("pre");
+        pre.className = "border rounded bg-body-tertiary p-2 mb-0";
+        pre.textContent = unified;
+        body.replaceChildren(pre);
+      }
+    }
+
+    function showDiff(row) {
+      var modal = root.querySelector(".nso-if-diff-modal");
+      var title = root.querySelector(".nso-if-diff-title");
+      var unified = interfaceUnifiedDiff(row);
+      if (!modal || !title || !unified) return;
+      activeDiffRow = row;
+      title.textContent = row.iface.name + " — Device vs NetBox";
+      renderDiff();
+      modal.classList.remove("d-none");
+      modal.style.display = "flex";
+      var close = modal.querySelector(".nso-if-diff-close");
+      if (close) close.focus();
+    }
+
+    function hideDiff() {
+      var modal = root.querySelector(".nso-if-diff-modal");
+      if (!modal) return;
+      activeDiffRow = null;
+      modal.classList.add("d-none");
+      modal.style.display = "none";
+    }
 
     // ── column formatters ──────────────────────────────────────────────────────
     function fmtName(cell) {
@@ -174,7 +323,7 @@
       return wrap;
     }
 
-    return G.mount(root, {
+    var mounted = G.mount(root, {
       key: "interface",
       payload: payload,
       jsonUrl: root.dataset.jsonUrl,
@@ -187,7 +336,9 @@
       // from these fields, and an edit writes NetBox's value — prefilling the
       // mirror hands the operator back the text their own save just replaced.
       flatten: function (rows) {
+        rowsById = {};
         return rows.map(function (r) {
+          rowsById[String(r.iface.id)] = r;
           r._name = r.iface.name;
           r._desc = r.description && r.description.netbox_value ? r.description.netbox_value : "";
           r._enabled = r.enabled && r.enabled.netbox_value != null ? String(r.enabled.netbox_value).toLowerCase() : "";
@@ -246,9 +397,31 @@
           minWidth: 140,
           headerSort: false,
         },
-        G.stateColumn(),
+        G.stateColumn({ formatter: fmtState, minWidth: 120 }),
       ],
     });
+
+    root.addEventListener("click", function (event) {
+      var open = event.target.closest(".nso-if-diff");
+      if (open) {
+        event.preventDefault();
+        showDiff(rowsById[open.dataset.ifaceId]);
+        return;
+      }
+      var mode = event.target.closest("[data-nso-diff-mode]");
+      if (mode && activeDiffRow) {
+        diffMode = mode.dataset.nsoDiffMode;
+        root.querySelectorAll("[data-nso-diff-mode]").forEach(function (candidate) {
+          candidate.classList.toggle("active", candidate === mode);
+        });
+        renderDiff();
+        return;
+      }
+      var modal = root.querySelector(".nso-if-diff-modal");
+      if (event.target.closest(".nso-if-diff-close") || event.target === modal) hideDiff();
+    });
+
+    return mounted;
   }
 
   window.NSOGridInterface = { mount: mount };

@@ -32,6 +32,36 @@
   </div>
   <div class="nso-grid-msg"></div>
   <div class="nso-grid-table"></div>
+  <div class="nso-if-diff-modal d-none"
+       role="dialog" aria-modal="true" aria-labelledby="nso-if-diff-title"
+       style="position:fixed; inset:0; z-index:1090; background:rgba(0,0,0,.5); align-items:flex-start; justify-content:center;">
+    <div class="card shadow" style="max-width:1400px; width:96%; margin-top:3rem; max-height:86vh; display:flex; flex-direction:column;">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <span id="nso-if-diff-title" class="nso-if-diff-title fw-semibold"></span>
+        <button type="button" class="btn-close nso-if-diff-close" aria-label="Close"></button>
+      </div>
+      <div class="card-body" style="overflow:auto;">
+        <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
+          <span class="text-muted small me-auto">
+            <strong>Left: device now.</strong> <strong>Right: NetBox now.</strong>
+            Red lines are removed or changed; green lines are added or changed. Unchanged tagged VLANs are omitted.
+          </span>
+          <div class="btn-group btn-group-sm" role="group" aria-label="Diff layout">
+            <button type="button" class="btn btn-outline-secondary active" data-nso-diff-mode="side-by-side">
+              <span class="mdi mdi-view-split-vertical me-1"></span>Split
+            </button>
+            <button type="button" class="btn btn-outline-secondary" data-nso-diff-mode="line-by-line">
+              <span class="mdi mdi-format-list-text me-1"></span>Unified
+            </button>
+          </div>
+        </div>
+        <div class="nso-if-diff-body"></div>
+      </div>
+      <div class="card-footer d-flex justify-content-end">
+        <button type="button" class="btn btn-outline-secondary nso-if-diff-close">Close</button>
+      </div>
+    </div>
+  </div>
 </div>
 
 <script>

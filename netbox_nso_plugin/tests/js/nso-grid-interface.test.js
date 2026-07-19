@@ -34,6 +34,9 @@ class FakeTabulator {
   replaceData(rows) {
     this.data = rows;
   }
+  getData() {
+    return this.data;
+  }
   hideColumn() {}
   toggleColumn() {}
   setFilter() {}
@@ -46,7 +49,15 @@ function ifaceRoot() {
   root.className = "nso-grid nso-ifg";
   root.dataset.jsonUrl = "/json";
   root.dataset.mtuEditUrl = "/overlay/interface_mtu/0/";
-  root.innerHTML = '<div class="nso-grid-msg"></div><div class="nso-grid-table"></div>';
+  root.innerHTML = `
+    <div class="nso-grid-msg"></div><div class="nso-grid-table"></div>
+    <div class="nso-if-diff-modal d-none">
+      <span class="nso-if-diff-title"></span>
+      <button type="button" class="active" data-nso-diff-mode="side-by-side">Split</button>
+      <button type="button" data-nso-diff-mode="line-by-line">Unified</button>
+      <div class="nso-if-diff-body"></div>
+      <button type="button" class="nso-if-diff-close">Close</button>
+    </div>`;
   document.body.appendChild(root);
   return root;
 }
@@ -174,6 +185,96 @@ describe("mount wiring", () => {
     const combined = network.formatter(fakeCell(row({ ips: [ip], switchport })));
     expect(combined.textContent).toContain(ip.address);
     expect(combined.textContent).toContain("access");
+  });
+
+  it("opens a Diff2Html modal for a drifted switchport row", () => {
+    const switchport = {
+      mode: "tagged",
+      untagged: null,
+      tagged: [100, 300],
+      netbox: { mode: "tagged", untagged: null, tagged: [100, 200] },
+      status: "changed",
+      kind: "drift",
+      label: "drift",
+    };
+    const enabled = {
+      value: "false",
+      netbox_value: true,
+      status: "accepted",
+      kind: "pending",
+      label: "pending apply",
+    };
+    const drifted = row({ enabled, description: Object.assign({}, PENDING_DESC), switchport, state: "drift" });
+    const { root, col } = mountRows([drifted]);
+    vi.stubGlobal("Diff2Html", { html: vi.fn(() => '<div class="rendered-diff">diff</div>') });
+
+    const state = parse(col("state").formatter(fakeCell(drifted)));
+    const button = state.querySelector(".nso-if-diff");
+    expect(button).not.toBeNull();
+    expect(button.querySelector(".mdi-not-equal-variant")).not.toBeNull();
+    root.appendChild(button);
+    button.click();
+
+    expect(root.querySelector(".nso-if-diff-modal").classList.contains("d-none")).toBe(false);
+    expect(root.querySelector(".nso-if-diff-title").textContent).toContain("1/1/c1/1");
+    expect(root.querySelector(".nso-if-diff-body .rendered-diff")).not.toBeNull();
+    const unified = window.Diff2Html.html.mock.calls[0][0];
+    expect(unified).toContain("--- interface 1/1/c1/1");
+    expect(unified).toContain("+++ interface 1/1/c1/1");
+    expect(unified).toContain("-  value: false");
+    expect(unified).toContain("+  value: true");
+    expect(unified).toContain("-  value: old device text");
+    expect(unified).toContain("+  value: uplink to sw01 (new)");
+    expect(unified).toContain("-    - 300");
+    expect(unified).toContain("+    - 200");
+    expect(unified).not.toContain("- 100");
+    expect(window.Diff2Html.html.mock.calls[0][1].outputFormat).toBe("side-by-side");
+
+    root.querySelector('[data-nso-diff-mode="line-by-line"]').click();
+    expect(window.Diff2Html.html.mock.calls.at(-1)[1].outputFormat).toBe("line-by-line");
+  });
+
+  it("offers the same diff modal for a removed device IP that remains in NetBox", () => {
+    const ip = {
+      pk: 31,
+      address: "198.18.30.0/31",
+      vrf: "",
+      status: "changed",
+      kind: "drift",
+      label: "drift",
+      device_present: false,
+      netbox: { present: true, address: "198.18.30.0/31", vrf: "", assignment: "unassigned" },
+    };
+    const drifted = row({ ips: [ip], state: "drift" });
+    const { root, col } = mountRows([drifted]);
+    vi.stubGlobal("Diff2Html", { html: vi.fn(() => '<div class="rendered-diff">diff</div>') });
+
+    const state = parse(col("state").formatter(fakeCell(drifted)));
+    const button = state.querySelector(".nso-if-diff");
+    expect(button).not.toBeNull();
+    root.appendChild(button);
+    button.click();
+
+    const unified = window.Diff2Html.html.mock.calls[0][0];
+    expect(unified).toContain("ip 198.18.30.0/31:");
+    expect(unified).toContain("-  presence: not reported");
+    expect(unified).toContain("+  presence: present");
+    expect(unified).toContain("+  assignment: unassigned");
+  });
+
+  it("does not offer a diff for equivalent boolean representations", () => {
+    const enabled = {
+      value: "True",
+      netbox_value: true,
+      status: "imported",
+      kind: "in_sync",
+      label: "in sync",
+    };
+    const inSync = row({ enabled, state: "in_sync" });
+    const { col } = mountRows([inSync]);
+
+    const state = parse(col("state").formatter(fakeCell(inSync)));
+    expect(state.querySelector(".nso-if-diff")).toBeNull();
   });
 
   it("builds the MTU popedit anchor against this row's overlay pk", () => {
