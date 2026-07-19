@@ -2095,6 +2095,34 @@ class TestDeviceNSOTabView(ViewTestBase):
         self.assertEqual(mgmt.last_sync_status, "partial")
         self.assertEqual(mgmt.degraded_surfaces, ["bgp", "ospf"])
 
+    def test_tab_renders_honest_freshness_labels(self):
+        """C2/C3: the overlay-only button reads 'Refresh overlays' (not the misleading 'Refresh
+        from NSO'), the genuine device-reread 'Sync Now' remains, and the device-sync banner is
+        labelled 'Last device sync' so it is not mistaken for the tab-overlay freshness."""
+        mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+        mgmt.adapter_device_id = 15
+        mgmt.save(update_fields=["adapter_device_id"])
+
+        stack, mocks = self._patch_all_getters()
+        mocks["get_device"].return_value = {
+            "id": 15,
+            "last_sync_at": "2025-06-01T10:00:00+00:00",
+            "last_sync_status": "succeeded",
+        }
+        with stack:
+            url = reverse("dcim:device_nso", kwargs={"pk": self.device.pk})
+            response = self.client.get(url)
+
+        mgmt.adapter_device_id = None
+        mgmt.save(update_fields=["adapter_device_id"])
+
+        self.assertEqual(response.status_code, 200)
+        html = response.content.decode()
+        self.assertIn("Refresh overlays", html)
+        self.assertNotIn("Refresh from NSO", html)
+        self.assertIn("Last device sync", html)
+        self.assertIn("Sync Now", html)  # the genuine device-reread action is unchanged
+
     def test_tab_render_is_counts_only_no_scoped_fetches(self):
         """The tab RENDER fetches no per-scope adapter data — only get_device for the
         banner. Counts come from persisted NSO*State; rows (and their adapter fetches)

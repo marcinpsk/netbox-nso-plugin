@@ -176,7 +176,10 @@
             {% else %}<span class="badge text-bg-warning text-dark">Disabled</span>{% endif %}
           </td>
         </tr>
-        <tr><th>Last Sync</th><td>{{ mgmt.last_sync_at|date:"Y-m-d H:i"|default:"Never" }}</td></tr>
+        <tr>
+          <th title="When the adapter last read the live device via NSO (interface attributes, IP, routing surfaces). The tab category data below is reconciled from the adapter mirror separately — off-render by the sync-complete job, or on demand via Refresh overlays.">Last device sync</th>
+          <td>{{ mgmt.last_sync_at|date:"Y-m-d H:i"|default:"Never" }}</td>
+        </tr>
         <tr>
           <th>Last Sync Status</th>
           <td>
@@ -285,8 +288,8 @@
             action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_reconcile' mgmt.pk %}">
         {% csrf_token %}
         <button type="submit" class="btn btn-outline-secondary"
-                title="Re-pull adapter state into the tab cache (no device sync)">
-          <span class="mdi mdi-cloud-refresh"></span> Refresh from NSO
+                title="Re-pull the adapter's mirrored state into the tab overlays (no device read — use Sync Now to re-read the device via NSO)">
+          <span class="mdi mdi-cloud-refresh"></span> Refresh overlays
         </button>
       </form>
       {# Bulk Accept — rendered via JS by the interfaces fragment once loaded #}

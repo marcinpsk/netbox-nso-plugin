@@ -2936,7 +2936,7 @@ class NSODeviceReconcileView(NSOActionPermissionMixin, View):
             messages.warning(request, "Device is not yet onboarded to the adapter.")
         else:
             enqueue_device_reconcile(mgmt.device_id)
-            messages.success(request, "Refresh from NSO queued — category counts will update shortly.")
+            messages.success(request, "Refresh overlays queued — category counts will update shortly.")
         return redirect(_device_nso_tab_url(mgmt.device_id))
 
 

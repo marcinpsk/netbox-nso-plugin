@@ -103,14 +103,14 @@
       <span class="mdi mdi-alert-outline me-1"></span>
       Interface management is enabled, but no interface attributes are selected — so there is
       nothing to sync. Edit this device's <strong>NSO management</strong> and enable
-      <strong>description</strong> and/or <strong>enabled</strong>, then Refresh from NSO.
+      <strong>description</strong> and/or <strong>enabled</strong>, then Sync Now.
     </div>
     {% else %}
     <p class="text-muted mb-0">
       {% if state == 'drift' %}No drift — the device matches NetBox.
       {% elif state == 'pending' %}Nothing pending apply.
       {% elif q %}No interfaces matching “{{ q }}”.
-      {% else %}No interface state yet — click <strong>Refresh from NSO</strong> or wait for the next sync.{% endif %}
+      {% else %}No interface state yet — click <strong>Sync Now</strong> or wait for the next sync.{% endif %}
     </p>
     {% endif %}
   {% endif %}
