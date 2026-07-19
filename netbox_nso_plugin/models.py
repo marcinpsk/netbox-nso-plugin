@@ -1883,6 +1883,12 @@ class NSOLACPBundleState(_NSODeviceTabURLMixin, NetBoxModel):
     system_id = models.CharField(max_length=17, blank=True, default="")
     timer = models.CharField(max_length=8, blank=True, default="")
     admin_key = models.PositiveIntegerField(null=True, blank=True)
+    # NX-P2 vPC preserve/REFUSE: True when the bundle carries a per-bundle vPC discriminator
+    # (vpc <id>/peer-link/orphan-port). Such a bundle is REPORTED for visibility but is NOT
+    # onboardable — the lag-reconciler refuses it zero-write (a retract of an adopted vPC
+    # peer-link would delete it → dual-active split-brain), so Accept is gated on this flag and
+    # a vpc-sensitive bundle is never included in the pushed write intent.
+    vpc_sensitive = models.BooleanField(default=False)
     status = models.CharField(max_length=32, choices=_LACP_STATUS_CHOICES, default="unknown")
     last_sync_at = models.DateTimeField(null=True, blank=True)
     accepted_at = models.DateTimeField(null=True, blank=True)

@@ -1942,8 +1942,13 @@ def _push_lacp_intent_for_device(device_id, adapter_device_id, force=False):
 
     _owned = ("accepted", "deploying", "in_sync")
     bundles = []
-    for b in NSOLACPBundleState.objects.filter(management__device_id=device_id, status__in=_owned).select_related(
-        "interface"
+    # NX-P2 belt-and-suspenders: a vPC-protected bundle can never be owned (the Accept view
+    # refuses it), but exclude it here too so it can NEVER enter the write intent — the writer
+    # refuses the whole service on a vPC bundle, which would block the legitimate bundles.
+    for b in (
+        NSOLACPBundleState.objects.filter(management__device_id=device_id, status__in=_owned)
+        .exclude(vpc_sensitive=True)
+        .select_related("interface")
     ):
         members = []
         for m in NSOLACPMemberState.objects.filter(

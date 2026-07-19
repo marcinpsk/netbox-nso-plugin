@@ -102,6 +102,24 @@ class TestPushLacpIntentForDevice(_LacpBase):
         mock_apply.assert_called_once()
         assert mock_apply.call_args[0][1] == []
 
+    def test_excludes_vpc_sensitive_bundles(self):
+        # NX-P2 belt-and-suspenders: an (impossibly-)accepted vPC bundle is excluded from the
+        # push — the writer refuses the whole service on ANY vPC bundle, which would block the
+        # legitimate bundles too. The Accept view already refuses it; this is defence in depth.
+        from netbox_nso_plugin.models import NSOLACPBundleState
+        from netbox_nso_plugin.signals import _push_lacp_intent_for_device
+
+        mgmt = self._make_mgmt()
+        NSOLACPBundleState.objects.create(
+            management=mgmt, interface=self.lag, lag_id=1, status="accepted", vpc_sensitive=True
+        )
+
+        with patch("netbox_nso_plugin.adapter_client.apply_lag_config") as mock_apply:
+            _push_lacp_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+
+        mock_apply.assert_called_once()
+        assert mock_apply.call_args[0][1] == []  # the vPC bundle never enters the write intent
+
     def test_adapter_error_swallowed(self):
         from netbox_nso_plugin.signals import _push_lacp_intent_for_device
 

@@ -2250,6 +2250,7 @@ class TestDeviceNSOTabView(ViewTestBase):
         client-side grid: per-cell value + status + kind + accept/edit URLs, a row-level
         rollup state (worst cell wins), and the quick-filter counts."""
         from dcim.models import Interface
+        from ipam.models import IPAddress
 
         from netbox_nso_plugin.models import (
             NSOInterfaceIPState,
@@ -2267,6 +2268,13 @@ class TestDeviceNSOTabView(ViewTestBase):
             management=self.mgmt, interface=iface, l2_mtu=9216, ip_mtu=9000, status="imported"
         )
         NSOInterfaceIPState.objects.create(interface=iface, address="10.0.0.1/31", family="ipv4", status="imported")
+        IPAddress.objects.create(address="198.18.30.0/31")
+        NSOInterfaceIPState.objects.create(
+            interface=iface,
+            address="198.18.30.0/31",
+            family="ipv4",
+            status="changed",
+        )
         NSOSwitchportState.objects.create(management=self.mgmt, interface=iface, mode="access", status="imported")
 
         url = reverse(
@@ -2297,7 +2305,27 @@ class TestDeviceNSOTabView(ViewTestBase):
         self.assertEqual(row["mtu"]["l2"], 9216)
         self.assertEqual(row["mtu"]["ip"], 9000)
         self.assertEqual(row["ips"][0]["address"], "10.0.0.1/31")
+        self.assertTrue(row["ips"][0]["device_present"])
+        self.assertEqual(
+            row["ips"][0]["netbox"],
+            {"present": False, "address": None, "vrf": "", "assignment": "absent"},
+        )
+        stale_ip = next(ip for ip in row["ips"] if ip["address"] == "198.18.30.0/31")
+        self.assertFalse(stale_ip["device_present"])
+        self.assertEqual(
+            stale_ip["netbox"],
+            {
+                "present": True,
+                "address": "198.18.30.0/31",
+                "vrf": "",
+                "assignment": "unassigned",
+            },
+        )
         self.assertEqual(row["switchport"]["mode"], "access")
+        self.assertEqual(
+            row["switchport"]["netbox"],
+            {"mode": "", "untagged": None, "tagged": []},
+        )
         # Row rollup: the drifting description outranks the in-sync cells.
         self.assertEqual(row["state"], "drift")
 
@@ -2353,6 +2381,16 @@ class TestDeviceNSOTabView(ViewTestBase):
         self.assertEqual(row["link"]["peer"]["device"], peer_device.name)
         ip = row["ips"][0]
         self.assertEqual(ip["url"], native.get_absolute_url())
+        self.assertTrue(ip["device_present"])
+        self.assertEqual(
+            ip["netbox"],
+            {
+                "present": True,
+                "address": "198.18.10.0/31",
+                "vrf": "",
+                "assignment": local.name,
+            },
+        )
         self.assertIn(f"/{local_state.pk}/", ip["edit_url"])
         self.assertEqual(ip["peer"]["pk"], peer_state.pk)
         self.assertEqual(ip["peer"]["address"], "198.18.10.1/31")
@@ -5094,6 +5132,23 @@ class TestUnlinkedReconcileOnExpandCategories(ViewTestBase):
         self.assertEqual(payload["counts"], {"all": 1, "drift": 1, "pending": 0})
         self.assertEqual(payload["rows"][0]["state"], "drift")
         self.assertIsNotNone(payload["rows"][0]["accept_url"])
+
+    def test_accept_refused_for_vpc_sensitive_lacp_bundle(self):
+        """NX-P2: a vPC-protected LACP bundle cannot be onboarded — Accept is refused and the
+        row stays unowned (the lag-reconciler refuses a vPC bundle zero-write; adopting a vPC
+        peer-link and retracting would delete it -> dual-active split-brain)."""
+        from netbox_nso_plugin.models import NSOLACPBundleState
+
+        state = NSOLACPBundleState.objects.get(management=self.mgmt, interface=self.lag)
+        state.vpc_sensitive = True
+        state.save(update_fields=["vpc_sensitive"])
+        url = reverse("plugins:netbox_nso_plugin:lacp_accept_bundle", kwargs={"pk": state.pk})
+
+        self.client.post(url)
+
+        state.refresh_from_db()
+        self.assertEqual(state.status, "imported")  # refused → NOT accepted/owned
+        self.assertIsNone(state.accepted_at)
 
     def test_adapter_error_still_renders_persisted_rows(self):
         """Adapter down on a LINKED device is the same bug: the error banner must not

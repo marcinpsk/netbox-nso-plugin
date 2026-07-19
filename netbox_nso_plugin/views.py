@@ -904,7 +904,15 @@ class NSOCategoryView(LoginRequiredMixin, View):
         for iface_id, st in sw_states.items():
             ifaces[iface_id] = st.interface
 
-        ordered = sorted(ifaces.values(), key=lambda i: i.name)
+        # The drift modal compares the observed switchport against the LIVE native
+        # Interface value. Reload the small interface set with both VLAN relations
+        # prefetched so serialising that second side does not become an N+1 query.
+        from dcim.models import Interface
+
+        ordered = sorted(
+            Interface.objects.filter(pk__in=ifaces).select_related("untagged_vlan").prefetch_related("tagged_vlans"),
+            key=lambda i: i.name,
+        )
         links_by_iface, peer_ip_states = _interface_topology_payload(ordered, ip_states)
         native_ips = _native_ip_by_state(ip_states)
 
@@ -1083,6 +1091,9 @@ class NSOCategoryView(LoginRequiredMixin, View):
                             "system_id": lambda st: st.system_id or None,
                             "timer": lambda st: st.timer or None,
                             "admin_key": lambda st: st.admin_key,
+                            # NX-P2: surface the vPC-protected flag so the operator sees which
+                            # bundles are not onboardable (Accept is refused for them).
+                            "vpc_sensitive": lambda st: st.vpc_sensitive,
                             "members": lacp_members,
                             "edit_url": lambda st: reverse(r + "overlay_field_edit", args=["lacp_bundle", st.pk]),
                         },
@@ -1499,8 +1510,13 @@ class NSOCategoryView(LoginRequiredMixin, View):
         used (interface_row_state / display_state), so grid badges, quick-filter
         buckets and Accept visibility keep the established semantics.
         """
+        from dcim.models import Interface
+        from django.contrib.contenttypes.models import ContentType
+
         from .status_machine import OWNED_STATES
         from .summary import _netbox_value_for, display_state, interface_row_state
+
+        interface_type_id = ContentType.objects.get_for_model(Interface).pk
 
         def attr_cell(st, iface):
             if st is None:
@@ -1543,15 +1559,33 @@ class NSOCategoryView(LoginRequiredMixin, View):
             kind, label = display_state(st.status, owned)
             native = native_ips.get(st.pk)
             peer = peer_ip_states.get(st.pk)
+            if native is None:
+                assignment = "absent"
+            elif native.assigned_object_id is None:
+                assignment = "unassigned"
+            elif native.assigned_object_type_id == interface_type_id and native.assigned_object_id == st.interface_id:
+                assignment = st.interface.name
+            else:
+                assignment = "another object"
             return {
                 "pk": st.pk,
                 "address": str(st.address),
+                "vrf": st.vrf,
                 "secondary": st.secondary,
                 "status": st.status,
                 "kind": kind,
                 "label": label,
                 "owned": owned,
                 "url": native.get_absolute_url() if native is not None else None,
+                # A changed IP row is retained only when the latest device snapshot
+                # stopped reporting it; conflict/imported rows are still present.
+                "device_present": st.status != "changed",
+                "netbox": {
+                    "present": native is not None,
+                    "address": str(native.address) if native is not None else None,
+                    "vrf": native.vrf.name if native is not None and native.vrf else "",
+                    "assignment": assignment,
+                },
                 "accept_url": (
                     reverse("plugins:netbox_nso_plugin:nsointerfaceipstate_accept", args=[st.pk])
                     if st.status in self._ACCEPTABLE_STATUSES
@@ -1594,7 +1628,12 @@ class NSOCategoryView(LoginRequiredMixin, View):
                         {
                             "mode": sw.mode,
                             "untagged": sw.untagged_vlan.vid if sw and sw.untagged_vlan else None,
-                            "tagged": [v.vid for v in sw.tagged_vlans.all()] if sw else [],
+                            "tagged": sorted(v.vid for v in sw.tagged_vlans.all()) if sw else [],
+                            "netbox": {
+                                "mode": iface.mode or "",
+                                "untagged": iface.untagged_vlan.vid if iface.untagged_vlan else None,
+                                "tagged": sorted(v.vid for v in iface.tagged_vlans.all()),
+                            },
                         }
                         if sw
                         else {},
@@ -4389,6 +4428,16 @@ class NSOLACPBundleStateAcceptView(NSOActionPermissionMixin, View):
         from .models import NSOLACPBundleState, NSOLACPMemberState
 
         state = get_object_or_404(NSOLACPBundleState, pk=pk)
+        # NX-P2 vPC preserve/REFUSE: a vPC-protected bundle cannot be onboarded — the
+        # lag-reconciler refuses it zero-write (a retract of an adopted vPC peer-link would
+        # delete it → dual-active split-brain). Refuse Accept so it never becomes owned/writable.
+        if state.vpc_sensitive:
+            messages.error(
+                request,
+                f"LACP bundle {state.interface.name} is vPC-protected (a vPC member/peer-link/"
+                f"orphan port) — NSO refuses to write it, so it cannot be onboarded. Left unmanaged.",
+            )
+            return redirect(_device_nso_tab_url(state.management.device_id))
         now = timezone.now()
         # Accept the bundle + all its members in ONE transaction so the per-save intent
         # pushes coalesce (via _schedule_intent_push) into a single snapshot push at commit —

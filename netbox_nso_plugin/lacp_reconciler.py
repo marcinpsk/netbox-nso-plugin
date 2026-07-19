@@ -72,6 +72,9 @@ def reconcile_lag_config(device, payload: dict) -> list:
         state.system_id = bundle_data.get("system_id") or ""
         state.timer = bundle_data.get("timer") or ""
         state.admin_key = bundle_data.get("admin_key")
+        # NX-P2: a vPC-protected bundle is reported (visible) but refused zero-write by the
+        # writer, so the Accept view gates on this and the intent push excludes it.
+        state.vpc_sensitive = bool(bundle_data.get("vpc_sensitive"))
         state.last_sync_at = now
         state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
         state.save()

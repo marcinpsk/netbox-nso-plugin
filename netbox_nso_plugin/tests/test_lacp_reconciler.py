@@ -53,6 +53,18 @@ class TestReconcileLagConfig(TestCase):
         assert state.timer == "fast"
         assert state.status == "imported"
 
+    def test_stores_vpc_sensitive_flag(self):
+        # NX-P2: a vPC-protected bundle carries vpc_sensitive=True (absent = ordinary). The
+        # reconciler stores it so Accept can be gated and the push can exclude it.
+        reconcile_lag_config(self.device, _payload([self._bundle(vpc_sensitive=True)]))
+        state = NSOLACPBundleState.objects.get(management=self.mgmt, interface=self.lag)
+        assert state.vpc_sensitive is True
+
+    def test_ordinary_bundle_not_vpc_sensitive(self):
+        reconcile_lag_config(self.device, _payload([self._bundle()]))  # no vpc_sensitive key
+        state = NSOLACPBundleState.objects.get(management=self.mgmt, interface=self.lag)
+        assert state.vpc_sensitive is False
+
     def test_creates_member_states(self):
         reconcile_lag_config(
             self.device,
