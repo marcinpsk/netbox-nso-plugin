@@ -74,9 +74,11 @@ jobs:
           # netbox_routing fork: the plugin has hard FKs to its ISIS/OSPF/BGP/StaticRoute models.
           # Pinned to a commit SHA (not the mutable feature/integration branch) so CI is
           # reproducible and a fork push cannot silently change what this repo tests against.
-          # This SHA is feature/integration's tip and provides migration 0039_bgprouter_router_id
-          # (BGPRouter.router_id, BGPPeer.source/local_as/ttl, IS-IS FRR + SRv6 prefix-SID).
-          uv pip install --system "netbox-routing @ git+https://github.com/marcinpsk/netbox-routing.git@f7fec6beb046aac2372d26eb021bb0458c947b12"
+          # This SHA is feature/integration's tip and provides the netbox_routing.helpers.isis
+          # module (NET_RE, auth_pair_errors) that views.py imports, plus migration
+          # 0039_bgprouter_router_id (BGPRouter.router_id, BGPPeer.source/local_as/ttl,
+          # IS-IS FRR + SRv6 prefix-SID).
+          uv pip install --system "netbox-routing @ git+https://github.com/marcinpsk/netbox-routing.git@fef7d918b7949ecfa97cb6b550e65f98e578113a"
           uv pip install --system -e .
 
       - name: Set up NetBox configuration
