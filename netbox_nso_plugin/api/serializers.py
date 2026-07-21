@@ -263,6 +263,7 @@ from ..models import (  # noqa: E402
     NSOLACPBundleState,
     NSOLACPMemberState,
     NSOLoggingHostState,
+    NSOLoggingLevelState,
     NSOOSPFInstanceState,
     NSOOSPFInterfaceState,
     NSORedistributionState,
@@ -312,6 +313,12 @@ class NSOSnmpSystemInfoStateSerializer(ModelSerializer):  # noqa: D101
 class NSOLoggingHostStateSerializer(ModelSerializer):  # noqa: D101
     class Meta:
         model = NSOLoggingHostState
+        fields = "__all__"
+
+
+class NSOLoggingLevelStateSerializer(ModelSerializer):  # noqa: D101
+    class Meta:
+        model = NSOLoggingLevelState
         fields = "__all__"
 
 

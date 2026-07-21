@@ -276,9 +276,14 @@ def _category_counts(key: str, device, mgmt) -> dict:  # noqa: C901
             )
         )
     if key == "logging":
-        from .models import NSOLoggingHostState
+        from .models import NSOLoggingHostState, NSOLoggingLevelState
 
-        return _snmp_breakdown((NSOLoggingHostState.objects.filter(management=mgmt),))
+        return _snmp_breakdown(
+            (
+                NSOLoggingHostState.objects.filter(management=mgmt),
+                NSOLoggingLevelState.objects.filter(management=mgmt),
+            )
+        )
     if key == "l2_services":
         from .models import NSOL2SapState
 

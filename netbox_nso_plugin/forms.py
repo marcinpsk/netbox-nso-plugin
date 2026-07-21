@@ -17,6 +17,7 @@ from .models import (
     NSOLinkRole,
     NSOLinkRoleAssignment,
     NSOLoggingHostState,
+    NSOLoggingLevelState,
     NSOPlatformNedMapping,
     NSOSnmpCommunityState,
     NSOSnmpHostState,
@@ -453,6 +454,14 @@ class NSOLoggingHostStateForm(NetBoxModelForm):
     class Meta:
         model = NSOLoggingHostState
         fields = ["address", "port", "severity", "facility", "transport", "vrf", "source", "tags"]
+
+
+class NSOLoggingLevelStateForm(NetBoxModelForm):
+    """Edit the per-device local logging severity levels overlay (console/monitor/module)."""
+
+    class Meta:
+        model = NSOLoggingLevelState
+        fields = ["console_severity", "monitor_severity", "module_severity", "tags"]
 
 
 class NSOInterfaceMtuStateForm(NetBoxModelForm):

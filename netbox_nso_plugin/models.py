@@ -1090,6 +1090,65 @@ class NSOLoggingHostState(NetBoxModel):
         return reverse("dcim:device_nso", kwargs={"pk": self.management.device_id})
 
 
+#: The closed OC severity vocabulary — the logging-reconciler's ``log-severity-oc``
+#: YANG enum verbatim (NX-P4). Sent to the adapter unmapped.
+_OC_SEVERITY_CHOICES = [
+    ("EMERGENCY", "Emergency"),
+    ("ALERT", "Alert"),
+    ("CRITICAL", "Critical"),
+    ("ERROR", "Error"),
+    ("WARNING", "Warning"),
+    ("NOTICE", "Notice"),
+    ("INFORMATIONAL", "Informational"),
+    ("DEBUG", "Debug"),
+]
+
+
+class NSOLoggingLevelState(NetBoxModel):
+    """Per-device local logging severity levels overlay (console/monitor/module).
+
+    At most one row per device management object (OneToOneField) — the
+    NSOSnmpSystemInfoState singleton shape. A blank severity means that
+    destination is unmanaged. Un-accepting an owned row RETRACTS the managed
+    leaves from the reconciler service; on NX that renders ``no logging <dest>``,
+    which DISABLES the destination rather than reverting it to a previous level —
+    the un-accept flow surfaces this before acting.
+    """
+
+    SEVERITY_FIELDS = ("console_severity", "monitor_severity", "module_severity")
+
+    management = models.OneToOneField(
+        to="NSODeviceManagement",
+        on_delete=models.CASCADE,
+        related_name="logging_level_state",
+    )
+    console_severity = models.CharField(max_length=16, blank=True, default="", choices=_OC_SEVERITY_CHOICES)
+    monitor_severity = models.CharField(max_length=16, blank=True, default="", choices=_OC_SEVERITY_CHOICES)
+    module_severity = models.CharField(max_length=16, blank=True, default="", choices=_OC_SEVERITY_CHOICES)
+    status = models.CharField(max_length=32, choices=_SNMP_STATUS_CHOICES, default="unknown")
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(
+        null=True, blank=True, help_text="When an operator accepted this row (NetBox becomes source of truth)."
+    )
+
+    class Meta:
+        verbose_name = "NSO Logging Level State"
+        verbose_name_plural = "NSO Logging Level States"
+
+    def __str__(self):
+        return f"{self.management} / local-levels [{self.status}]"
+
+    def set_severities(self) -> dict:
+        """Return the managed (non-blank) severities as ``{field_name: OC value}``."""
+        return {f: getattr(self, f) for f in self.SEVERITY_FIELDS if getattr(self, f)}
+
+    def get_absolute_url(self):
+        """Return the device NSO tab URL (the overlay's detail; used by edit redirects)."""
+        from django.urls import reverse
+
+        return reverse("dcim:device_nso", kwargs={"pk": self.management.device_id})
+
+
 _STATIC_ROUTE_STATUS_CHOICES = [
     ("unknown", "Unknown"),
     ("imported", "Imported"),

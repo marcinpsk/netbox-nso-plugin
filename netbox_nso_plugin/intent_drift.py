@@ -58,6 +58,7 @@ def _scopes() -> list[dict]:
         NSOISISInterfaceState,
         NSOL2SapState,
         NSOLoggingHostState,
+        NSOLoggingLevelState,
         NSOOSPFInstanceState,
         NSOOSPFInterfaceState,
         NSORoutePolicyState,
@@ -203,8 +204,8 @@ def _scopes() -> list[dict]:
         {
             "key": "logging",
             "label": "Logging",
-            "tables": ["logging_host_intent"],
-            "owned": lambda d: _owned_count(NSOLoggingHostState, d),
+            "tables": ["logging_host_intent", "logging_levels_intent"],
+            "owned": lambda d: _owned_count(NSOLoggingHostState, d) + _owned_count(NSOLoggingLevelState, d),
             "push": signals._push_logging_intent_for_device,
         },
     ]

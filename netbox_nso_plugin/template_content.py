@@ -696,12 +696,48 @@ def _snmp_value_compare_supported(device) -> bool:
     return True
 
 
-def _reconcile_logging_config(device, payload: dict) -> dict:
-    """Full-replace import of logging/syslog hosts into NSOLoggingHostState.
+def _reconcile_logging_levels(mgmt, levels_data: dict, now):
+    """Reconcile the local logging-levels singleton; return the row (or None when there is none).
 
-    Rows whose address matches the payload are updated; rows absent from the
-    payload are deleted; new rows are created with status='imported'. Read-only
-    overlay (no write path yet) so status stays imported. Returns {"hosts": [...]}.
+    An empty/absent ``local_levels`` payload is the singleton form of "the device
+    stopped reporting it": an OWNED row must drift rather than keep reading
+    in_sync (the _reconcile_snmp_system_info precedent).
+    """
+    from .models import NSOLoggingLevelState
+
+    if not levels_data:
+        owned = NSOLoggingLevelState.objects.filter(management=mgmt, status__in=sm.OWNED_STATES).first()
+        if owned is None:
+            return None
+        new_status = sm.on_reconcile(owned.status, present=False)
+        if new_status != owned.status:
+            owned.status = new_status
+            owned.save(update_fields=["status"])
+        return owned
+
+    state, _ = NSOLoggingLevelState.objects.get_or_create(management=mgmt)
+    dev = {f: (levels_data.get(f) or "") for f in NSOLoggingLevelState.SEVERITY_FIELDS}
+    state.last_sync_at = now
+    if sm.is_owned(state.status):
+        # Owned: severities are operator intent — never clobber with the device
+        # read; settle accepted → in_sync only when the device matches exactly.
+        matches = all(getattr(state, f) == v for f, v in dev.items())
+        state.status = sm.on_reconcile(state.status, matches=matches)
+    else:
+        for f, v in dev.items():
+            setattr(state, f, v)
+        state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
+    state.save()
+    return state
+
+
+def _reconcile_logging_config(device, payload: dict) -> dict:
+    """Full-replace import of logging config into the NSOLogging* overlays.
+
+    Syslog hosts: rows whose address matches the payload are updated; rows absent
+    from the payload are deleted; new rows are created with status='imported'.
+    The ``local_levels`` scalar block reconciles into the NSOLoggingLevelState
+    singleton. Returns {"hosts": [...], "local_levels": row-or-None, ...}.
     """
     from django.utils import timezone
 
@@ -710,7 +746,7 @@ def _reconcile_logging_config(device, payload: dict) -> dict:
     try:
         mgmt = device.nso_management
     except NSODeviceManagement.DoesNotExist:
-        return {"hosts": [], "last_refreshed_at": None, "refresh_source": "never"}
+        return {"hosts": [], "local_levels": None, "last_refreshed_at": None, "refresh_source": "never"}
 
     now = timezone.now()
     payload_hosts = {h.get("address"): h for h in (payload.get("hosts") or []) if h.get("address")}
@@ -750,8 +786,11 @@ def _reconcile_logging_config(device, payload: dict) -> dict:
             state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
         state.save()
 
+    levels_state = _reconcile_logging_levels(mgmt, payload.get("local_levels") or {}, now)
+
     return {
         "hosts": list(NSOLoggingHostState.objects.filter(management=mgmt)),
+        "local_levels": levels_state,
         "last_refreshed_at": payload.get("last_refreshed_at"),
         "refresh_source": payload.get("refresh_source", "never"),
     }

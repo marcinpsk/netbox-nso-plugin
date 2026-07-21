@@ -753,20 +753,27 @@ def put_l2_sap_intent(adapter_device_id, saps):
     )
 
 
-def put_logging_intent(adapter_device_id, hosts):
-    """PUT /api/v1/devices/{id}/logging-intent — push full remote-syslog intent.
+def put_logging_intent(adapter_device_id, hosts, local_levels):
+    """PUT /api/v1/devices/{id}/logging-intent — push full logging intent.
 
     ``hosts`` is a list of dicts:
       [{"address": "10.0.0.1", "port": None, "severity": "informational",
         "facility": "", "transport": "", "vrf": "", "source": "",
         "accepted_at": "...Z"}, ...]
-    Empty list clears all logging intent for the device.
+    Empty list clears all logging host intent for the device.
+
+    ``local_levels`` is the owned local-severity singleton: a dict of set OC
+    severities ({"console_severity": "CRITICAL", ...}) or None. The key is ALWAYS
+    sent — the adapter reads it presence-sensitively, and None (JSON null) means
+    "un-manage" (delete the levels intent + retract the owned leaves). Omitting
+    the key would mean "preserve", which is never what the plugin's full-replace
+    snapshot intends.
     Returns {"device_id": ..., "count": N}.
     """
     return _request(
         "PUT",
         f"/api/v1/devices/{adapter_device_id}/logging-intent",
-        json={"hosts": hosts},
+        json={"hosts": hosts, "local_levels": local_levels},
     )
 
 

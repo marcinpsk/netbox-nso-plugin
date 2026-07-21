@@ -538,6 +538,21 @@ urlpatterns = [
         name="logging_accept_host",
     ),
     path(
+        "logging/level-state/<int:pk>/edit/",
+        views.NSOLoggingLevelStateEditView.as_view(),
+        name="nsologginglevelstate_edit",
+    ),
+    path(
+        "logging/level-state/<int:pk>/accept/",
+        views.NSOLoggingLevelStateAcceptView.as_view(),
+        name="logging_accept_levels",
+    ),
+    path(
+        "logging/level-state/<int:pk>/unaccept/",
+        views.NSOLoggingLevelStateUnacceptView.as_view(),
+        name="logging_unaccept_levels",
+    ),
+    path(
         "svi/state/<int:pk>/accept/",
         views.NSOSVIStateAcceptView.as_view(),
         name="svi_accept",

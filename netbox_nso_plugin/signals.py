@@ -994,13 +994,17 @@ def _on_snmp_state_save(sender, instance, **kwargs):
 
 
 def _push_logging_intent_for_device(device_id, adapter_device_id, force=False):
-    """Build and push the full remote-syslog (logging) intent snapshot for a device.
+    """Build and push the full logging intent snapshot (hosts + local levels) for a device.
 
     Store-only (deferred): the device commit happens on the single device Apply via
-    the adapter's logging-reconciler. Only owned rows are included.
+    the adapter's logging-reconciler. Only owned rows are included. The local-levels
+    singleton rides along presence-sensitively: a dict of set severities when the
+    row is owned, else an explicit null — which the adapter reads as "un-manage"
+    (delete the levels intent + retract the owned leaves). This is what makes
+    un-accept an actual retraction rather than a stale-intent leak.
     """
     from . import adapter_client as client
-    from .models import NSOLoggingHostState
+    from .models import NSOLoggingHostState, NSOLoggingLevelState
 
     hosts = []
     for row in NSOLoggingHostState.objects.filter(
@@ -1019,17 +1023,24 @@ def _push_logging_intent_for_device(device_id, adapter_device_id, force=False):
             }
         )
 
+    local_levels = None
+    levels_row = NSOLoggingLevelState.objects.filter(management__device_id=device_id).first()
+    if levels_row is not None and levels_row.status in _OWNED_PUSH_STATUSES:
+        # An owned row with every severity blank manages nothing → null (un-manage);
+        # the #83 cleared-owned-scalar shape, same as deleting the row.
+        local_levels = levels_row.set_severities() or None
+
     _push_changed(
         (device_id, "logging"),
-        hosts,
-        lambda: client.put_logging_intent(adapter_device_id, hosts),
+        [hosts, local_levels],
+        lambda: client.put_logging_intent(adapter_device_id, hosts, local_levels),
         force=force,
     )
 
 
 @_skip_on_render
 def _on_logging_state_save(sender, instance, **kwargs):
-    """Push logging intent whenever an NSOLoggingHostState row is saved (accept → push)."""
+    """Push logging intent whenever an NSOLogging*State row is saved (accept → push)."""
     from .models import NSODeviceManagement
 
     try:
@@ -3644,24 +3655,25 @@ def _connect_g_activated():  # pragma: no cover
             weak=False,
         )
 
-    # Logging (remote syslog) state → intent push
-    from .models import NSOLoggingHostState
+    # Logging (remote syslog + local levels) state → intent push
+    from .models import NSOLoggingHostState, NSOLoggingLevelState
 
-    post_save.connect(
-        _on_logging_state_save,
-        sender=NSOLoggingHostState,
-        dispatch_uid="nso_plugin_logging_host_state_post_save",
-    )
-    # Deletes must push the REDUCED snapshot too (the WP7-P1 SNMP regression class):
-    # with only post_save wired, the adapter keeps applying a deleted host/SVI/subif/MTU
-    # until some unrelated sibling row is saved. Caught live on sw01 — deleting an
-    # applied SVI's overlay never retracted the irb unit.
-    post_delete.connect(
-        _as_delete_origin(_on_logging_state_save),
-        sender=NSOLoggingHostState,
-        dispatch_uid="nso_plugin_logging_host_state_post_delete",
-        weak=False,
-    )
+    for logging_model in (NSOLoggingHostState, NSOLoggingLevelState):
+        post_save.connect(
+            _on_logging_state_save,
+            sender=logging_model,
+            dispatch_uid=f"nso_plugin_logging_{logging_model.__name__}_post_save",
+        )
+        # Deletes must push the REDUCED snapshot too (the WP7-P1 SNMP regression class):
+        # with only post_save wired, the adapter keeps applying a deleted host/SVI/subif/MTU
+        # until some unrelated sibling row is saved. Caught live on sw01 — deleting an
+        # applied SVI's overlay never retracted the irb unit.
+        post_delete.connect(
+            _as_delete_origin(_on_logging_state_save),
+            sender=logging_model,
+            dispatch_uid=f"nso_plugin_logging_{logging_model.__name__}_post_delete",
+            weak=False,
+        )
 
     # SVI/IRB state → intent push (write path)
     from .models import NSOSVIState

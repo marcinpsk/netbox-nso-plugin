@@ -89,6 +89,7 @@ OVERLAYS_WITHOUT_DRIFT_STATE: frozenset[str] = frozenset(
         "NSOSnmpSystemInfoState",
         "NSOSnmpV3UserState",
         "NSOLoggingHostState",
+        "NSOLoggingLevelState",
     }
 )
 
@@ -175,6 +176,12 @@ TRANSITIONS: tuple[Transition, ...] = (
     Transition(ACCEPT, CONFLICT, ACCEPTED, True, "resolve adoption ambiguity"),
     Transition(ACCEPT, APPLY_FAILED, ACCEPTED, True, "retry after a failed apply"),
     Transition(REVERT, ACCEPTED, IMPORTED, True, "edit back to device value clears pending (c160039)"),
+    # Un-accept (P4b): the operator releases ownership of an owned row; the next
+    # snapshot push drops it, so the adapter retracts the previously-owned intent.
+    # There is deliberately no edge from ``deploying`` — an in-flight Apply must
+    # settle before ownership can be released (the un-accept views refuse it).
+    Transition(REVERT, IN_SYNC, IMPORTED, True, "operator un-accepts: intent retracted, row returns to mirror"),
+    Transition(REVERT, APPLY_FAILED, IMPORTED, True, "operator un-accepts a failed apply instead of retrying"),
     # -- operator: apply ------------------------------------------------------
     Transition(APPLY, ACCEPTED, DEPLOYING, True, "_prepare_apply marks owned accepted→deploying"),
     Transition(APPLY_OK, DEPLOYING, IN_SYNC, True, "apply worker reported success"),

@@ -36,6 +36,7 @@ from .forms import (
     NSOLinkRoleAssignmentForm,
     NSOLinkRoleForm,
     NSOLoggingHostStateForm,
+    NSOLoggingLevelStateForm,
     NSOPlatformNedMappingForm,
     NSOSnmpCommunityStateForm,
     NSOSnmpHostStateForm,
@@ -59,6 +60,7 @@ from .models import (
     NSOLinkRole,
     NSOLinkRoleAssignment,
     NSOLoggingHostState,
+    NSOLoggingLevelState,
     NSOOSPFInstanceState,
     NSOOSPFInterfaceState,
     NSOPlatformNedMapping,
@@ -357,7 +359,14 @@ def _persisted_category_context(device, mgmt, key: str) -> dict:
         )
         return {"lacp_bundle_states": bundles}
     if key == "logging":
-        return {"logging_data": {"hosts": by_mgmt(NSOLoggingHostState)}}
+        return {
+            "logging_data": {
+                "hosts": by_mgmt(NSOLoggingHostState),
+                "local_levels": (
+                    NSOLoggingLevelState.objects.filter(management=mgmt).first() if mgmt is not None else None
+                ),
+            }
+        }
     if key == "snmp":
         # snmp_value_compare is device-platform-derived, not payload-derived — without
         # it the Vault/Harvest affordances silently degrade.
@@ -3833,6 +3842,10 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
             "NSOLoggingHostState",
             ("address", "port", "severity", "facility", "transport", "vrf", "source"),
         ),
+        "logging_levels": (
+            "NSOLoggingLevelState",
+            ("console_severity", "monitor_severity", "module_severity"),
+        ),
         "interface_mtu": ("NSOInterfaceMtuState", ("l2_mtu", "ip_mtu", "mpls_mtu")),
         "bfd": ("NSOBFDInterfaceState", ("min_tx", "min_rx", "multiplier", "micro_bfd")),
         "ospf_instance": ("NSOOSPFInstanceState", ("router_id",)),
@@ -4184,6 +4197,13 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
             ),
             (NSOSnmpSystemInfoState, "SNMP system", lambda r: "system-info", lambda r: "", "snmp"),
             (NSOLoggingHostState, "Logging host", lambda r: r.address or "", lambda r: r.severity or "", "logging"),
+            (
+                NSOLoggingLevelState,
+                "Logging levels",
+                lambda r: "local-levels",
+                lambda r: ", ".join(f"{f.split('_')[0]}={v}" for f, v in r.set_severities().items()),
+                "logging",
+            ),
             (NSOL2SapState, "L2 SAP", lambda r: r.sap_id or "", lambda r: r.service_name or "", "l2_sap"),
         ]
 
@@ -5374,6 +5394,50 @@ class NSOLoggingHostStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOLoggingHostState
 
 
+class NSOLoggingLevelStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
+    model_class = NSOLoggingLevelState
+
+    def push_blocker(self, state):
+        """Refuse ownership of an all-blank row — it manages nothing, so the push would un-manage."""
+        if not state.set_severities():
+            return "no severity level is set; set at least one destination level before accepting"
+        return ""
+
+
+class NSOLoggingLevelStateUnacceptView(NSOActionPermissionMixin, View):
+    """Release ownership of the logging-levels singleton (un-accept = RETRACT).
+
+    Dropping the row from the owned set makes the next snapshot push carry
+    ``local_levels: null``, so the adapter deletes the levels intent and enqueues
+    a PUT-replace retract — FASTMAP withdraws the owned severity leaves. On NX
+    that renders ``no logging <dest>``, which DISABLES the destination (the NED
+    default is not "revert to the previous severity"); the confirm dialog on the
+    tab says so before this view is ever reached. ``deploying`` refuses: an
+    in-flight Apply must settle before ownership can be released.
+    """
+
+    def post(self, request, pk):  # noqa: D102
+        from . import status_machine as sm
+
+        state = get_object_or_404(NSOLoggingLevelState, pk=pk)
+        device_id = state.management.device_id
+        if state.status == "deploying":
+            messages.error(request, f"Cannot un-accept {state}: an Apply is in flight.")
+            return redirect(_device_nso_tab_url(device_id))
+        if not sm.is_owned(state.status):
+            messages.error(request, f"Cannot un-accept {state}: it is not owned.")
+            return redirect(_device_nso_tab_url(device_id))
+        state.status = sm.advance(state.status, sm.REVERT, to=sm.IMPORTED)
+        state.accepted_at = None
+        state.save(update_fields=["status", "accepted_at"])
+        messages.warning(
+            request,
+            f"Un-accepted {state}: the managed levels are being retracted from the device — "
+            "on NX this disables the affected destination(s) rather than reverting them.",
+        )
+        return redirect(_device_nso_tab_url(device_id))
+
+
 class NSOSVIStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOSVIState
 
@@ -5851,6 +5915,11 @@ class NSOSnmpSystemInfoStateEditView(generic.ObjectEditView):  # noqa: D101
 class NSOLoggingHostStateEditView(generic.ObjectEditView):  # noqa: D101
     queryset = NSOLoggingHostState.objects.all()
     form = NSOLoggingHostStateForm
+
+
+class NSOLoggingLevelStateEditView(generic.ObjectEditView):  # noqa: D101
+    queryset = NSOLoggingLevelState.objects.all()
+    form = NSOLoggingLevelStateForm
 
 
 class NSOInterfaceMtuStateEditView(generic.ObjectEditView):  # noqa: D101

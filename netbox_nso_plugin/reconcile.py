@@ -322,7 +322,7 @@ def reconcile_device(device, mgmt=None) -> dict:
                 ctx,
                 "logging_data",
                 mgmt,
-                ("NSOLoggingHostState",),
+                ("NSOLoggingHostState", "NSOLoggingLevelState"),
                 _reconcile_logging_config,
                 device,
                 client.get_logging_config(dev_id),
