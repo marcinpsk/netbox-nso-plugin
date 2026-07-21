@@ -924,12 +924,17 @@
       var countsEl = document.querySelector('[data-cat-counts-url]');
       var countsUrl = countsEl ? countsEl.dataset.catCountsUrl : null;
 
+      var headersGate = window.NSOBadges.makeGenGate();
       function refreshHeaders() {
         if (!countsUrl) { return Promise.resolve(null); }
+        var gen = headersGate.next();
         return fetch(countsUrl, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
           .then(function (r) { return r.ok ? r.json() : null; })
           .then(function (d) {
             if (!d || !d.categories) { return null; }
+            // An older in-flight response must never overwrite a newer render
+            // (codex B5-F7) — its data still returns for the caller's bookkeeping.
+            if (!headersGate.isCurrent(gen)) { return d.categories; }
             // READSEM S4 (R11/R12): keep the device-wide reset banner honest on the
             // dynamic path too (a reload is not required to learn of a store reset).
             var resetBanner = document.querySelector('[data-nso-reset-banner]');
@@ -954,7 +959,10 @@
       // state) until the next user action. Keep polling counts on a short bounded
       // interval until the chips stop moving and none is transient (D10 self-heal).
       var settleTimer = null;
+      var settleToken = null;
       function startSettlePoll() {
+        var token = {};
+        settleToken = token;
         var prev = null;
         var deadline = Date.now() + 30000;
         if (settleTimer) { clearInterval(settleTimer); }
@@ -963,6 +971,9 @@
           // (e.g. a stale-cached NSOBadges without the settle helpers).
           if (Date.now() >= deadline) { clearInterval(settleTimer); settleTimer = null; return; }
           refreshHeaders().then(function (categories) {
+            // A superseded poll's late response must not clear the CURRENT poll's
+            // timer or feed its state (codex B5-F7).
+            if (settleToken !== token) { return; }
             var curr = categories && window.NSOBadges.chipStates(categories);
             if (!window.NSOBadges.needsAnotherTick(prev, curr)) {
               clearInterval(settleTimer); settleTimer = null;

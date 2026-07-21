@@ -205,9 +205,14 @@ class DeviceReadLease:
         return False
 
 
-def acquire_for_web(conn, key: str, *, ttl_s: int = LEASE_TTL_S) -> DeviceReadLease | None:
-    """WEB call class: one attempt, fail fast (the UI renders 'refresh in progress')."""
-    lease = DeviceReadLease(conn, key, ttl_s=ttl_s)
+def acquire_for_web(conn, key: str, *, ttl_s: int = LEASE_TTL_S, device_id=None, queue=None) -> DeviceReadLease | None:
+    """WEB call class: one attempt, fail fast (the UI renders 'refresh in progress').
+
+    Carries ``device_id``/``queue`` so a web-owned lease's release ALSO consumes a
+    pending RQ handoff marker (codex B5-F3) — otherwise an RQ reconcile that
+    deferred behind a web refresh is stranded until the cadence backstop.
+    """
+    lease = DeviceReadLease(conn, key, ttl_s=ttl_s, device_id=device_id, queue=queue)
     try:
         got = lease.acquire()
     except _redis_errors() as exc:
@@ -413,12 +418,16 @@ def _register_incarnation_observation(m, inc: str, born) -> None:
 def _adopt_incarnation(m, inc: str, born) -> None:
     """Adopt *inc* and RESET every family row for this management (→ unknown).
 
-    Clears the pending/conflict markers only when this adoption reaches them
-    (born > pending_born, or the exact pending pair).
+    Blanked rows are OLD overlay data with no read-state behind them — they must
+    not render healthy, so when any exist the adoption RETARGETS the pending
+    marker at the adopted pair instead of clearing it (codex B5-F1); the marker
+    then clears via :func:`_maybe_clear_reset_marker` once every family has
+    re-observed. Only a marker this adoption reaches (born > pending_born, or the
+    exact pending pair) is touched — a NEWER pending pair stays.
     """
     from .models import NSOFamilyReadState
 
-    NSOFamilyReadState.objects.filter(management=m).update(**_RESET_FIELDS)
+    blanked = NSOFamilyReadState.objects.filter(management=m).update(**_RESET_FIELDS)
     m.adapter_incarnation = inc
     m.adapter_incarnation_born = born
     if (
@@ -426,10 +435,36 @@ def _adopt_incarnation(m, inc: str, born) -> None:
         or born > m.reset_pending_born
         or (inc == m.reset_pending_incarnation and born == m.reset_pending_born)
     ):
-        m.reset_pending_incarnation = ""
-        m.reset_pending_born = None
-        m.reset_conflict_born = None
+        if blanked:
+            m.reset_pending_incarnation = inc
+            m.reset_pending_born = born
+        else:
+            m.reset_pending_incarnation = ""
+            m.reset_pending_born = None
+            m.reset_conflict_born = None
     m.save(update_fields=_MARKER_FIELDS)
+
+
+def _maybe_clear_reset_marker(m) -> bool:
+    """Clear the pending/conflict markers once NO family row is blank (B5-F1).
+
+    Only when the pending marker points at the ADOPTED pair — a marker for a
+    newer incarnation clears when its own adoption completes. Runs inside the
+    caller's locked transaction; returns True when it cleared.
+    """
+    from .models import NSOFamilyReadState
+
+    if m.reset_pending_born is None:
+        return False
+    if m.reset_pending_incarnation != m.adapter_incarnation or m.reset_pending_born != m.adapter_incarnation_born:
+        return False
+    if NSOFamilyReadState.objects.filter(management=m, observed_outcome="").exists():
+        return False
+    m.reset_pending_incarnation = ""
+    m.reset_pending_born = None
+    m.reset_conflict_born = None
+    m.save(update_fields=_MARKER_FIELDS)
+    return True
 
 
 def _gate_and_record(mgmt, family: str, read_state: dict | None, *, epoch) -> _Decision:
@@ -491,13 +526,34 @@ def _gate_and_record(mgmt, family: str, read_state: dict | None, *, epoch) -> _D
             row.applied_attempt_id = incoming
             row.applied_incarnation = inc
             row.save()
+            _maybe_clear_reset_marker(m)
             return _Decision(RAN, True)
 
         # non-authoritative (unavailable / result=error / tuple-fail / unknown values):
         # observed advances monotonically, applied untouched, body skipped
         if _advance_observed(row, read_state, inc, born, epoch):
             row.save()
+            _maybe_clear_reset_marker(m)
         return _Decision(SKIPPED_UNAVAILABLE, False)
+
+
+def _admission_still_current(mgmt, family: str, incoming) -> bool:
+    """Body fence (codex B5-F2): check OUR admission is still the newest applied attempt.
+
+    Between the admission commit and the body there is no lock; a successor may
+    have admitted AND materialized a newer attempt (or a newer incarnation may
+    have adopted, blanking ``applied``). One re-select refuses the stale body.
+    The mid-body window remains the design's documented bounded last-writer-wins,
+    logged loudly by the lease heartbeat.
+    """
+    from .models import NSOFamilyReadState
+
+    applied = (
+        NSOFamilyReadState.objects.filter(management=mgmt, family=family)
+        .values_list("applied_attempt_id", flat=True)
+        .first()
+    )
+    return applied == incoming
 
 
 def gated_family_run(mgmt, family: str, read_state: dict | None, body: Callable[[], Any], *, epoch) -> GateResult:
@@ -506,10 +562,15 @@ def gated_family_run(mgmt, family: str, read_state: dict | None, body: Callable[
     The admission transaction commits BEFORE the body runs, so a body failure after
     admission keeps ``applied_*`` advanced (deliberate — the read was real; the
     materialization failure surfaces via the caller's existing scope-error path).
+    An admitted body is fenced right before it runs (B5-F2): if a successor already
+    applied a newer attempt, the stale body is refused. LEGACY has no attempt
+    ordering — it runs unfenced.
     """
     decision = _gate_and_record(mgmt, family, read_state, epoch=epoch)
     if not decision.run_body:
         return GateResult(decision.disposition)
+    if decision.disposition == RAN and not _admission_still_current(mgmt, family, read_state.get("attempt_id")):
+        return GateResult(SKIPPED_STALE_ATTEMPT)
     return GateResult(decision.disposition, body())
 
 
@@ -559,4 +620,5 @@ def observe_aggregate(mgmt, read_states: dict[str, dict | None], *, epoch) -> bo
                 wrote = True
         if marker_dirty:
             m.save(update_fields=_MARKER_FIELDS)
-        return wrote or marker_dirty
+        cleared = _maybe_clear_reset_marker(m) if wrote else False
+        return wrote or marker_dirty or cleared

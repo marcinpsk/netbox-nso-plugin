@@ -310,6 +310,32 @@ class TestGateTransitions(TestCase):
         self.assertEqual(body.calls, 0)
         self.assertFalse(NSOFamilyReadState.objects.filter(management=self.mgmt, family="bfd").exists())
 
+    def test_admitted_body_is_fenced_against_a_newer_applied_attempt(self):
+        """codex B5-F2: worker A admits attempt 5, stalls before its body runs, and a
+        successor admits AND materializes attempt 6. When A resumes, the body fence
+        must refuse A's stale body — otherwise the overlays regress to attempt-5 data
+        while the read-state row still claims 6."""
+        import netbox_nso_plugin.read_gate as read_gate
+        from netbox_nso_plugin.read_gate import SKIPPED_STALE_ATTEMPT
+
+        real = read_gate._gate_and_record
+        raced = {"done": False}
+
+        def racing(mgmt, family, read_state, *, epoch):
+            decision = real(mgmt, family, read_state, epoch=epoch)
+            if not raced["done"]:
+                raced["done"] = True
+                # B runs to completion in A's stall window (after A's admission commit)
+                read_gate.gated_family_run(mgmt, family, _rs(attempt_id=6), _Recorder(), epoch=epoch)
+            return decision
+
+        body_a = _Recorder()
+        with patch.object(read_gate, "_gate_and_record", side_effect=racing):
+            result = read_gate.gated_family_run(self.mgmt, "bfd", _rs(attempt_id=5), body_a, epoch=self.epoch)
+        self.assertEqual(result.disposition, SKIPPED_STALE_ATTEMPT)
+        self.assertEqual(body_a.calls, 0)
+        self.assertEqual(self._row().applied_attempt_id, 6)
+
     def test_legacy_key_absent_marks_row_legacy_and_runs_body(self):
         from netbox_nso_plugin.read_gate import LEGACY
 
@@ -379,6 +405,54 @@ class TestIncarnationAdoption(TestCase):
         row = self._row("bfd")
         self.assertEqual(row.observed_incarnation, _INC_B[0])
         self.assertEqual(row.applied_attempt_id, 1)
+
+    def test_adoption_with_existing_rows_keeps_reset_marker_until_all_reobserved(self):
+        """codex B5-F1: adoption blanks every family row; until each one re-observes
+        under the adopted incarnation, old overlay rows must not render healthy —
+        the device-wide reset marker has to SURVIVE the adoption."""
+        self._run(_rs(attempt_id=5), family="bfd")
+        self._run(_rs(attempt_id=6), family="ospf")
+        self._run(_rs(attempt_id=1, incarnation=_INC_B[0], incarnation_born=_INC_B[1]), family="bfd")
+        m = self._mgmt()
+        self.assertEqual(m.adapter_incarnation, _INC_B[0])
+        self.assertIsNotNone(m.reset_pending_born)
+        self.assertEqual(m.reset_pending_incarnation, _INC_B[0])
+
+    def test_reset_marker_clears_when_last_blank_family_reobserves(self):
+        self._run(_rs(attempt_id=5), family="bfd")
+        self._run(_rs(attempt_id=6), family="ospf")
+        self._run(_rs(attempt_id=1, incarnation=_INC_B[0], incarnation_born=_INC_B[1]), family="bfd")
+        self._run(_rs(attempt_id=2, incarnation=_INC_B[0], incarnation_born=_INC_B[1]), family="ospf")
+        m = self._mgmt()
+        self.assertIsNone(m.reset_pending_born)
+        self.assertEqual(m.reset_pending_incarnation, "")
+
+    def test_observe_aggregate_completing_reobservation_clears_marker(self):
+        """The tab's aggregate observation also completes the re-observation: once no
+        family row is blank the marker clears (per-family states take over)."""
+        self._run(_rs(attempt_id=5), family="bfd")
+        self._run(_rs(attempt_id=6), family="ospf")
+        self._run(_rs(attempt_id=1, incarnation=_INC_B[0], incarnation_born=_INC_B[1]), family="bfd")
+        self.assertIsNotNone(self._mgmt().reset_pending_born)
+        self._observe({"ospf": _synth(incarnation=_INC_B[0], incarnation_born=_INC_B[1])})
+        self.assertIsNone(self._mgmt().reset_pending_born)
+
+    def test_newer_pending_marker_survives_older_adoption_completion(self):
+        """Completing incarnation B's re-observation must not clear a pending marker
+        that already points at a NEWER incarnation D."""
+        self._run(_rs(attempt_id=5), family="bfd")
+        self._run(_rs(attempt_id=6), family="ospf")
+        self._run(_rs(attempt_id=1, incarnation=_INC_B[0], incarnation_born=_INC_B[1]), family="bfd")
+        self._observe({"bfd": _synth(incarnation=_INC_D[0], incarnation_born=_INC_D[1])})
+        self._run(_rs(attempt_id=2, incarnation=_INC_B[0], incarnation_born=_INC_B[1]), family="ospf")
+        m = self._mgmt()
+        self.assertEqual(m.reset_pending_incarnation, _INC_D[0])
+        self.assertIsNotNone(m.reset_pending_born)
+
+    def test_fresh_device_adoption_sets_no_marker(self):
+        """First contact (no pre-existing family rows) adopts clean — no reset chip."""
+        self._run(_rs(attempt_id=1))
+        self.assertIsNone(self._mgmt().reset_pending_born)
 
     def test_older_born_replay_rejected(self):
         from netbox_nso_plugin.read_gate import SKIPPED_STALE_ATTEMPT
@@ -725,6 +799,20 @@ class TestContentionPolicies(TestCase):
         lease = acquire_for_web(self.conn, self.key)
         self.assertIsNotNone(lease)
         lease.release()
+
+    def test_web_lease_release_consumes_pending_marker_and_enqueues_successor(self):
+        """codex B5-F3: an RQ reconcile that deferred while a WEB reconcile held the
+        lease must still get its successor — the web release has to consume the
+        pending marker too, or the handoff is stranded until the cadence backstop."""
+        from netbox_nso_plugin.read_gate import acquire_for_web, handoff_job_id, marker_key
+
+        lease = acquire_for_web(self.conn, self.key, device_id=self.device_id, queue=self.queue)
+        self.assertIsNotNone(lease)
+        nonce = uuid.uuid4().hex
+        self.conn.set(marker_key(self.device_id), nonce, ex=60)
+        lease.release()
+        self.assertIsNone(self.conn.get(marker_key(self.device_id)))  # consumed
+        self.assertIn(handoff_job_id(self.device_id, nonce), [j.id for j in self.queue.jobs])
 
     def test_rq_retries_then_defers_with_marker(self):
         from netbox_nso_plugin.read_gate import Deferred, acquire_for_rq, marker_key

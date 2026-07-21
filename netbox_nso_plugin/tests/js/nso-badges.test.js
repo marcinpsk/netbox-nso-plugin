@@ -84,6 +84,22 @@ describe("settle-poll predicates", () => {
   it("a failed counts fetch (null current) retries", () => {
     expect(B.needsAnotherTick({ isis: null }, null)).toBe(true);
   });
+
+  it("transient: reset_pending keeps polling even when unchanged (codex B5-F6)", () => {
+    const s = { isis: "reset_pending" };
+    expect(B.needsAnotherTick(s, { ...s })).toBe(true);
+  });
+});
+
+describe("makeGenGate (codex B5-F7)", () => {
+  it("only the newest generation is current — a stale in-flight callback is rejected", () => {
+    const gate = B.makeGenGate();
+    const a = gate.next();
+    expect(gate.isCurrent(a)).toBe(true);
+    const b = gate.next();
+    expect(gate.isCurrent(b)).toBe(true);
+    expect(gate.isCurrent(a)).toBe(false);
+  });
 });
 
 describe("renderBadges", () => {

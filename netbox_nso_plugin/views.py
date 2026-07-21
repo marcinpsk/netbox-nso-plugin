@@ -2988,7 +2988,17 @@ class NSORefreshStateView(NSOActionPermissionMixin, View):
 
         try:
             compliance = client.get_state(mgmt.adapter_device_id)
-            interfaces = client.get_interfaces_doc(mgmt.adapter_device_id).get("interfaces", [])
+            doc = client.get_interfaces_doc(mgmt.adapter_device_id)
+            interfaces = doc.get("interfaces", [])
+            read_state = doc.get("read_state")
+            authoritative = read_state is None or (  # None = pre-S4 adapter (legacy)
+                isinstance(read_state, dict) and read_state.get("outcome") in ("present", "absent_authoritative")
+            )
+            if not authoritative:
+                # a non-authoritative doc (e.g. not_ready after a store reset) serves a
+                # legitimately EMPTY list — keep the last-known interfaces (codex B5-F5)
+                interfaces = (mgmt.state_snapshot or {}).get("interfaces", [])
+                messages.warning(request, "Interface read unavailable — kept last-known interface data.")
             NSODeviceManagement.objects.filter(pk=mgmt.pk).update(
                 state_snapshot={
                     "compliance": compliance,

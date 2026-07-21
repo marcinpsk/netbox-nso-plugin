@@ -118,7 +118,7 @@ def _acquire_reconcile_lease(mgmt, device_pk: int, call_class: str) -> _LeaseOut
     queue = django_rq.get_queue(_RECONCILE_QUEUE)
     key = lease_key(mgmt.pk)
     if call_class == "web":
-        lease = acquire_for_web(queue.connection, key)
+        lease = acquire_for_web(queue.connection, key, device_id=device_pk, queue=queue)
         return _LeaseOutcome(state="busy") if lease is None else _LeaseOutcome(lease=lease)
     out = acquire_for_rq(queue.connection, key, device_pk, queue, retry_budget_s=_RQ_RETRY_BUDGET_S)
     if isinstance(out, Deferred):
@@ -138,6 +138,10 @@ def _gated(ctx: dict, mgmt, family: str, payload, body, *, epoch, ctx_key: str |
     from .read_gate import LEGACY, RAN, gated_family_run
 
     read_state = payload.get("read_state") if isinstance(payload, dict) else None
+    if read_state is None and isinstance(payload, dict) and "read_state" in payload:
+        # explicit `"read_state": null` — a MALFORMED S4 block, not a pre-S4 adapter:
+        # fail closed via the gate's incarnation check (codex B5-F4)
+        read_state = {}
     result = gated_family_run(mgmt, family, read_state, body, epoch=epoch)
     ctx.setdefault("_gate", {})[family] = result.disposition
     if ctx_key is not None and result.disposition in (RAN, LEGACY):

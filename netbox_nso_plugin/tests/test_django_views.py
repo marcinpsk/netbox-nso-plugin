@@ -1299,6 +1299,43 @@ class TestNSORefreshStateView(ViewTestBase):
         mgmt.adapter_device_id = None
         mgmt.save(update_fields=["adapter_device_id"])
 
+    @patch("netbox_nso_plugin.adapter_client.get_interfaces_doc")
+    @patch("netbox_nso_plugin.adapter_client.get_state")
+    def test_unavailable_interfaces_doc_keeps_last_known_snapshot(self, mock_state, mock_doc):
+        """codex B5-F5: an interfaces-doc declaring unavailable (e.g. not_ready after a
+        store reset) legitimately serves an EMPTY list — the cached snapshot must keep
+        the last-known interfaces instead of being wiped by the non-authoritative read."""
+        mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+        mgmt.adapter_device_id = 11
+        mgmt.state_snapshot = {
+            "compliance": {"compliant": True},
+            "interfaces": [{"name": "ge-0/0/0"}],
+            "refreshed_at": "2026-07-20T00:00:00Z",
+        }
+        mgmt.save(update_fields=["adapter_device_id", "state_snapshot"])
+
+        mock_state.return_value = {"compliant": True}
+        mock_doc.return_value = {
+            "interfaces": [],
+            "read_state": {
+                "outcome": "unavailable",
+                "reason": "not_ready",
+                "succeeded": None,
+                "result": None,
+                "attempt_id": None,
+                "incarnation": "11111111-aaaa-4aaa-8aaa-111111111111",
+                "incarnation_born": "2026-07-01T00:00:10Z",
+            },
+        }
+        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_refresh", args=[mgmt.pk])
+        response = self.client.post(url)
+        self.assertEqual(response.status_code, 302)
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.state_snapshot["interfaces"], [{"name": "ge-0/0/0"}])
+
+        mgmt.adapter_device_id = None
+        mgmt.save(update_fields=["adapter_device_id"])
+
     @patch("netbox_nso_plugin.adapter_client._resolve_config")
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_post_adapter_error_redirects(self, mock_session_cls, mock_cfg):

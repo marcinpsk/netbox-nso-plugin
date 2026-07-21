@@ -66,8 +66,9 @@
   }
 
   /* Poll again? First tick and fetch failures always retry (the caller bounds
-   * the loop); otherwise keep going while states still move or any chip is
-   * refresh_pending (a reconcile is known to be in flight for it). */
+   * the loop); otherwise keep going while states still move or any chip is in a
+   * transient state — refresh_pending and reset_pending both mean a reconcile is
+   * known to be in flight for it (codex B5-F6). */
   function needsAnotherTick(prev, curr) {
     if (!prev || !curr) {
       return true;
@@ -76,8 +77,23 @@
       return true;
     }
     return Object.keys(curr).some(function (k) {
-      return curr[k] === "refresh_pending";
+      return curr[k] === "refresh_pending" || curr[k] === "reset_pending";
     });
+  }
+
+  /* Generation gate (codex B5-F7): counts responses may resolve out of order —
+   * only the newest-started fetch may write the DOM. */
+  function makeGenGate() {
+    var gen = 0;
+    return {
+      next: function () {
+        gen += 1;
+        return gen;
+      },
+      isCurrent: function (g) {
+        return g === gen;
+      },
+    };
   }
 
   window.NSOBadges = {
@@ -86,5 +102,6 @@
     renderBadges: renderBadges,
     chipStates: chipStates,
     needsAnotherTick: needsAnotherTick,
+    makeGenGate: makeGenGate,
   };
 })();

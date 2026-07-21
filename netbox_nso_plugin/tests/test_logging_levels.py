@@ -363,9 +363,18 @@ class TestLoggingLevelsViews(LevelsTestBase):
         self.assertEqual(row.status, "imported")
 
     def test_category_fragment_renders_the_levels_row(self):
+        # Patch the category fetch: unpatched it reaches the LIVE adapter, and whether
+        # that fetch 404s (persisted fallback) or succeeds (real device's payload —
+        # usually WITHOUT local_levels → the seeded row is legitimately dropped)
+        # depends on whether this test device's pk collides with a real adapter
+        # device id. The suite's pk sequence must never decide this test.
         row = self._row(console_severity="CRITICAL", monitor_severity="NOTICE", status="imported")
         url = reverse("plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device.pk, "key": "logging"})
-        r = self.client.get(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+        with patch(
+            "netbox_nso_plugin.adapter_client.get_logging_config",
+            return_value=self._payload(local_levels={"console_severity": "CRITICAL", "monitor_severity": "NOTICE"}),
+        ):
+            r = self.client.get(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
         self.assertEqual(r.status_code, 200)
         self.assertContains(r, 'data-pe-fields="console_severity:select:Console severity"')
         accept_url = reverse("plugins:netbox_nso_plugin:logging_accept_levels", kwargs={"pk": row.pk})
@@ -375,9 +384,15 @@ class TestLoggingLevelsViews(LevelsTestBase):
         self.assertNotContains(r, unaccept_url)
 
     def test_category_fragment_offers_unaccept_with_the_retract_warning_when_owned(self):
+        # Deterministic fetch (see test_category_fragment_renders_the_levels_row):
+        # the device reports the owned severities → the row stays in_sync/owned.
         row = self._row(console_severity="CRITICAL", status="in_sync", accepted_at=timezone.now())
         url = reverse("plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device.pk, "key": "logging"})
-        r = self.client.get(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+        with patch(
+            "netbox_nso_plugin.adapter_client.get_logging_config",
+            return_value=self._payload(local_levels={"console_severity": "CRITICAL"}),
+        ):
+            r = self.client.get(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
         unaccept_url = reverse("plugins:netbox_nso_plugin:logging_unaccept_levels", kwargs={"pk": row.pk})
         self.assertContains(r, unaccept_url)
         # The honest surfacing (design R3-1): the confirm dialog states the NX consequence.

@@ -155,6 +155,17 @@ class TestGatedReconcileBehavior(_L2Base):
         self.assertIn("NEW", _sap_names(self.mgmt))
         self.assertEqual(ctx["_gate"]["l2_service"], "legacy")
 
+    def test_explicit_null_read_state_fails_closed_not_legacy(self):
+        """codex B5-F4: `"read_state": null` in an S4 response is malformed — it must
+        fail CLOSED (rows kept, body skipped), never fall back to legacy semantics
+        that would happily drift/replace rows from a defective response."""
+        self._prime()
+        doc = _l2_payload(("NEW",))
+        doc["read_state"] = None  # explicit null — distinct from an absent key
+        ctx = self._reconcile(doc)
+        self.assertEqual(_sap_names(self.mgmt), ["TL"])  # rows untouched
+        self.assertEqual(ctx["_gate"]["l2_service"], "skipped_unavailable")
+
     def test_strictly_older_attempt_skips(self):
         self._prime(attempt_id=5)
         ctx = self._reconcile(_l2_payload(("OTHER",), read_state=_rs(attempt_id=4)))
