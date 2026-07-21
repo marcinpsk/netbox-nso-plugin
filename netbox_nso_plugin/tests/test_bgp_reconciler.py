@@ -61,14 +61,15 @@ class TestGetBgpConfig(unittest.TestCase):
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
-    def test_404_returns_empty_routers(self, mock_session_cls, _mock_cfg):
-        from netbox_nso_plugin.adapter_client import get_bgp_config
+    def test_404_raises_adapter_error(self, mock_session_cls, _mock_cfg):
+        # READSEM S4 D4: 404 raises even without an ErrorEnvelope body (code "404").
+        from netbox_nso_plugin.adapter_client import AdapterError, get_bgp_config
 
         session = self._make_session(status=404, json_data={})
         mock_session_cls.return_value = session
 
-        result = get_bgp_config(7)
-        self.assertEqual(result, {"device_id": 7, "routers": []})
+        with self.assertRaises(AdapterError):
+            get_bgp_config(7)
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")

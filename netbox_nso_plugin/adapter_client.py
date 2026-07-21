@@ -438,6 +438,47 @@ def get_apply_diff(adapter_device_id: int, outformat: str = "native") -> dict:
     return _request("GET", f"/api/v1/devices/{adapter_device_id}/actions/apply-diff", params={"outformat": outformat})
 
 
+# READSEM S4 D4/R2-4: per-adapter capability memo for /interfaces-doc. A route-level 404
+# (client code "404"/"route_not_found" — NOT the ErrorEnvelope's "not_found", which means
+# device-absent and must raise) marks the adapter as pre-S4; the legacy list endpoint is
+# then used directly until the TTL lapses (same 30s discipline as _resolve_config).
+_ifdoc_capability: dict = {}
+
+
+def reset_interfaces_doc_capability() -> None:
+    """Drop the /interfaces-doc capability memo (tests; or after an adapter upgrade)."""
+    _ifdoc_capability.clear()
+
+
+def _legacy_interfaces_as_doc(adapter_device_id: int) -> dict:
+    """Wrap the legacy bare-list /interfaces as a KEY-ABSENT doc.
+
+    No read_state key ⇒ the reconcile gate takes the legacy path (D3).
+    """
+    interfaces = _request("GET", f"/api/v1/devices/{adapter_device_id}/interfaces")
+    return {"device_id": adapter_device_id, "interfaces": interfaces}
+
+
+def get_interfaces_doc(adapter_device_id: int) -> dict:
+    """GET /api/v1/devices/{id}/interfaces-doc — the S4 object doc (interfaces + read_state).
+
+    S3-floor compatibility: a ROUTE-level 404 falls back to the legacy list wrapped as a
+    key-absent doc and memoizes the capability; a device-level 404 ("not_found") raises
+    on either path.
+    """
+    cfg = _resolve_config()
+    memo = _ifdoc_capability.get(cfg["url"])
+    if memo is not None and memo["legacy"] and (time.monotonic() - memo["at"]) < _CACHE_TTL:
+        return _legacy_interfaces_as_doc(adapter_device_id)
+    try:
+        return _request("GET", f"/api/v1/devices/{adapter_device_id}/interfaces-doc")
+    except AdapterError as exc:
+        if exc.code in ("404", "route_not_found"):
+            _ifdoc_capability[cfg["url"]] = {"legacy": True, "at": time.monotonic()}
+            return _legacy_interfaces_as_doc(adapter_device_id)
+        raise
+
+
 def get_snmp_config(adapter_device_id: int) -> dict:
     """GET /api/v1/devices/{id}/snmp-config."""
     return _request("GET", f"/api/v1/devices/{adapter_device_id}/snmp-config")
@@ -464,112 +505,75 @@ def get_static_routes(adapter_device_id: int) -> dict:
 
 
 def get_isis_interfaces(adapter_device_id: int) -> dict:
-    """GET /api/v1/devices/{id}/isis-interfaces → dict with 'processes' and 'interfaces' lists.
+    """GET /api/v1/devices/{id}/isis-interfaces → dict with 'processes'/'interfaces' (+ read_state).
 
-    Returns an empty dict when the device has no IS-IS state (404).
-    Raises AdapterError on transport or server errors.
+    READSEM S4 D4: a 404 RAISES (device-not-found is its only meaning) — the old
+    404→empty fabrication carried no read_state and masqueraded as authoritative-empty
+    under the reconcile gate. The shape rebuild passes ``read_state`` through.
     """
-    try:
-        data = _request("GET", f"/api/v1/devices/{adapter_device_id}/isis-interfaces")
-    except AdapterError as exc:
-        if exc.code in ("not_found", "404"):
-            return {"processes": [], "interfaces": []}
-        raise
-    return {"processes": data.get("processes", []), "interfaces": data.get("interfaces", [])}
+    data = _request("GET", f"/api/v1/devices/{adapter_device_id}/isis-interfaces")
+    out = {"processes": data.get("processes", []), "interfaces": data.get("interfaces", [])}
+    if "read_state" in data:
+        out["read_state"] = data["read_state"]
+    return out
 
 
 def get_l2_services(adapter_device_id: int) -> dict:
     """GET /api/v1/devices/{id}/l2-services → dict with 'services' (Nokia epipe/vpls + SAPs).
 
-    Returns an empty shape when the device has no L2 services (404).
-    Raises AdapterError on transport or server errors.
+    READSEM S4 D4: a 404 RAISES — no fabricated empties (see get_isis_interfaces).
+    The shape rebuild passes ``read_state`` through.
     """
-    try:
-        data = _request("GET", f"/api/v1/devices/{adapter_device_id}/l2-services")
-    except AdapterError as exc:
-        if exc.code in ("not_found", "404"):
-            return {"services": []}
-        raise
-    return {"services": data.get("services", [])}
+    data = _request("GET", f"/api/v1/devices/{adapter_device_id}/l2-services")
+    out = {"services": data.get("services", [])}
+    if "read_state" in data:
+        out["read_state"] = data["read_state"]
+    return out
 
 
 def get_bfd(adapter_device_id: int) -> dict:
     """GET /api/v1/devices/{id}/bfd → dict with 'interfaces' (per-interface BFD).
 
-    Returns an empty dict when the device has no BFD state (404).
+    READSEM S4 D4: a 404 RAISES — no fabricated empties (see get_isis_interfaces).
+    The shape rebuild passes ``read_state`` through.
     """
-    try:
-        data = _request("GET", f"/api/v1/devices/{adapter_device_id}/bfd")
-    except AdapterError as exc:
-        if exc.code in ("not_found", "404"):
-            return {"interfaces": []}
-        raise
-    return {"interfaces": data.get("interfaces", [])}
+    data = _request("GET", f"/api/v1/devices/{adapter_device_id}/bfd")
+    out = {"interfaces": data.get("interfaces", [])}
+    if "read_state" in data:
+        out["read_state"] = data["read_state"]
+    return out
 
 
 def get_bgp_config(adapter_device_id: int) -> dict:
     """GET /api/v1/devices/{id}/bgp-config → BGP router hierarchy dict.
 
-    Returns empty dict with ``routers: []`` when the device has no BGP state (404).
-    Raises AdapterError on transport or server errors.
+    READSEM S4 D4: a 404 RAISES — no fabricated empties (see get_isis_interfaces).
     """
-    try:
-        return _request("GET", f"/api/v1/devices/{adapter_device_id}/bgp-config")
-    except AdapterError as exc:
-        if exc.code in ("not_found", "404"):
-            return {"device_id": adapter_device_id, "routers": []}
-        raise
+    return _request("GET", f"/api/v1/devices/{adapter_device_id}/bgp-config")
 
 
 def get_route_policy(adapter_device_id: int) -> dict:
     """GET /api/v1/devices/{id}/route-policy → route-policy objects dict.
 
-    Returns an empty payload when the device has no route-policy state (404).
-    Raises AdapterError on transport or server errors.
+    READSEM S4 D4: a 404 RAISES — no fabricated empties (see get_isis_interfaces).
     """
-    _empty: dict = {
-        "device_id": adapter_device_id,
-        "prefix_lists": [],
-        "community_lists": [],
-        "as_paths": [],
-        "route_maps": [],
-    }
-    try:
-        return _request("GET", f"/api/v1/devices/{adapter_device_id}/route-policy")
-    except AdapterError as exc:
-        if exc.code in ("not_found", "404"):
-            return _empty
-        raise
+    return _request("GET", f"/api/v1/devices/{adapter_device_id}/route-policy")
 
 
 def get_ospf(adapter_device_id: int) -> dict:
     """GET /api/v1/devices/{id}/ospf → dict with 'instances' and 'interfaces' lists.
 
-    Returns an empty payload when the device has no OSPF state (404).
-    Raises AdapterError on transport or server errors.
+    READSEM S4 D4: a 404 RAISES — no fabricated empties (see get_isis_interfaces).
     """
-    _empty: dict = {"device_id": adapter_device_id, "instances": [], "interfaces": []}
-    try:
-        return _request("GET", f"/api/v1/devices/{adapter_device_id}/ospf")
-    except AdapterError as exc:
-        if exc.code in ("not_found", "404"):
-            return _empty
-        raise
+    return _request("GET", f"/api/v1/devices/{adapter_device_id}/ospf")
 
 
 def get_redistribution(adapter_device_id: int) -> dict:
     """GET /api/v1/devices/{id}/redistribution → dict with 'entries' list.
 
-    Returns an empty payload when the device has no redistribution state (404).
-    Raises AdapterError on transport or server errors.
+    READSEM S4 D4: a 404 RAISES — no fabricated empties (see get_isis_interfaces).
     """
-    _empty: dict = {"device_id": adapter_device_id, "entries": []}
-    try:
-        return _request("GET", f"/api/v1/devices/{adapter_device_id}/redistribution")
-    except AdapterError as exc:
-        if exc.code in ("not_found", "404"):
-            return _empty
-        raise
+    return _request("GET", f"/api/v1/devices/{adapter_device_id}/redistribution")
 
 
 def put_ospf_intent(adapter_device_id: int, payload: dict) -> dict:

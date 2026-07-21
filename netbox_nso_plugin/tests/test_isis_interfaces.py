@@ -68,14 +68,15 @@ class TestGetIsisInterfaces(unittest.TestCase):
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
-    def test_404_returns_empty_list(self, mock_session_cls, _mock_cfg):
-        from netbox_nso_plugin.adapter_client import get_isis_interfaces
+    def test_404_raises_adapter_error(self, mock_session_cls, _mock_cfg):
+        # READSEM S4 D4: 404 raises even without an ErrorEnvelope body (code "404").
+        from netbox_nso_plugin.adapter_client import AdapterError, get_isis_interfaces
 
         session = self._make_session(status=404, json_data={})
         mock_session_cls.return_value = session
 
-        result = get_isis_interfaces(99)
-        self.assertEqual(result, {"processes": [], "interfaces": []})
+        with self.assertRaises(AdapterError):
+            get_isis_interfaces(99)
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
