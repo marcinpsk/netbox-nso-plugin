@@ -2369,6 +2369,7 @@ def _prepare_apply(mgmt):
         _push_interface_mtu_intent_for_device,
         _push_l2_sap_intent_for_device,
         _push_lacp_intent_for_device,
+        _push_logging_intent_for_device,
         _push_route_policy_intent_for_device,
         _push_static_route_intent_for_device,
         _push_subinterface_intent_for_device,
@@ -2396,6 +2397,7 @@ def _prepare_apply(mgmt):
     for push in (
         _push_interface_intent_for_device,
         _push_lacp_intent_for_device,
+        _push_logging_intent_for_device,
         _push_route_policy_intent_for_device,
         _push_static_route_intent_for_device,
         _push_svi_intent_for_device,
@@ -2421,6 +2423,7 @@ def _prepare_apply(mgmt):
         NSORoutePolicyState,
         NSOStaticRouteState,
         NSOL2SapState,
+        NSOLoggingLevelState,
     ):
         try:
             pks = list(model.objects.filter(management=mgmt, status="accepted").values_list("pk", flat=True))
@@ -3768,6 +3771,26 @@ def _save_vlan_name_edit(obj):
             state.save()
 
 
+def _logging_levels_errors(obj, old_values):
+    """Reject an inline edit that would clear the LAST managed severity.
+
+    An all-blank owned row pushes ``local_levels: null`` — the un-manage wire shape
+    that retracts every owned leaf (on NX: destination DISABLED). That retract must
+    only be reachable through the Un-accept flow, whose confirm dialog states the
+    consequence; a casual popover clear must not trigger it silently.
+    """
+    if obj.set_severities():
+        return {}
+    cleared = [f for f in obj.SEVERITY_FIELDS if not getattr(obj, f) and old_values.get(f)]
+    if not cleared:
+        return {}
+    msg = (
+        "Clearing the last managed severity would un-manage local levels and RETRACT them "
+        "from the device (on NX this disables the destination). Use Un-accept instead."
+    )
+    return {f: [msg] for f in cleared}
+
+
 def _overlay_family_errors(key, obj, old_values):
     """Run validation that spans fields or the linked native object."""
     simple_validator = {
@@ -3777,6 +3800,8 @@ def _overlay_family_errors(key, obj, old_values):
     }.get(key)
     if simple_validator is not None:
         return simple_validator(obj)
+    if key == "logging_levels":
+        return _logging_levels_errors(obj, old_values)
     if key == "bfd":
         return _bfd_field_errors(obj)
     if key == "ospf_instance":

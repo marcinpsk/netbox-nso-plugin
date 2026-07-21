@@ -384,6 +384,90 @@ class TestLoggingLevelsViews(LevelsTestBase):
         self.assertContains(r, "DISABLED, not reverted")
 
 
+class TestLoggingLevelsApplyLifecycle(LevelsTestBase):
+    """codex P4b triage: the levels singleton must ride the device Apply lifecycle.
+
+    Without these, an accepted levels intent whose accept-time PUT was swallowed
+    (adapter down) is silently skipped by Apply forever, and a gate-off apply
+    failure (`logging_count_by_outcome.apply_failed`) never reaches the row.
+    """
+
+    def test_prepare_apply_force_pushes_logging_and_marks_deploying(self):
+        from netbox_nso_plugin.views import _prepare_apply
+
+        row = self._row(console_severity="CRITICAL", status="accepted", accepted_at=timezone.now())
+        # Prime the change-detection digest the way a successful accept-time push would —
+        # the Apply-time push must bypass it (force=True), not read "unchanged, skip".
+        with patch("netbox_nso_plugin.adapter_client.put_logging_intent"), self.captureOnCommitCallbacks(execute=True):
+            row.save()
+        with patch("netbox_nso_plugin.adapter_client.put_logging_intent") as mock_put:
+            moved = _prepare_apply(self.mgmt)
+        mock_put.assert_called_once()
+        self.assertEqual(mock_put.call_args.args[2], {"console_severity": "CRITICAL"})
+        row.refresh_from_db()
+        self.assertEqual(row.status, "deploying")
+        self.assertIn(row.pk, [pk for model, pks in moved for pk in pks if model.__name__ == "NSOLoggingLevelState"])
+
+    def test_settle_apply_failures_marks_levels_apply_failed(self):
+        from netbox_nso_plugin.reconcile import _settle_apply_failures
+
+        row = self._row(console_severity="CRITICAL", status="deploying", accepted_at=timezone.now())
+        _settle_apply_failures(self.mgmt, {"logging_count_by_outcome": {"in_sync": 0, "apply_failed": 1}})
+        row.refresh_from_db()
+        self.assertEqual(row.status, "apply_failed")
+        self.assertTrue(row.last_apply_error)
+
+    def test_deploying_row_settles_in_sync_when_device_matches(self):
+        from netbox_nso_plugin.template_content import _reconcile_logging_config
+
+        row = self._row(console_severity="CRITICAL", status="deploying", accepted_at=timezone.now())
+        _reconcile_logging_config(
+            self.device, {"hosts": [], "local_levels": {"console_severity": "CRITICAL"}, "refresh_source": "test"}
+        )
+        row.refresh_from_db()
+        self.assertEqual(row.status, "in_sync")
+
+
+class TestLoggingLevelsInlineClearGuard(LevelsTestBase):
+    """codex P4b triage: clearing the LAST severity inline must not silently retract.
+
+    An all-blank owned row pushes ``local_levels: null`` — the un-manage/retract wire
+    shape — so reaching it through a casual popover edit would bypass the Un-accept
+    flow's explicit disable warning. The edit is rejected; Un-accept is the exit.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.superuser = User.objects.create_superuser(
+            username=f"lvlclr-{self._testMethodName[:20]}", password=TEST_PASSWORD
+        )
+        self.client.force_login(self.superuser)
+
+    def _edit(self, row, **data):
+        url = reverse("plugins:netbox_nso_plugin:overlay_field_edit", kwargs={"key": "logging_levels", "pk": row.pk})
+        return self.client.post(url, data)
+
+    def test_clearing_the_last_severity_is_rejected(self):
+        row = self._row(console_severity="CRITICAL", status="in_sync", accepted_at=timezone.now())
+        r = self._edit(row, console_severity="")
+        self.assertEqual(r.status_code, 400)
+        row.refresh_from_db()
+        self.assertEqual(row.console_severity, "CRITICAL", "the destructive clear must not be persisted")
+        self.assertEqual(row.status, "in_sync")
+
+    def test_clearing_one_of_two_severities_is_allowed(self):
+        row = self._row(
+            console_severity="CRITICAL", monitor_severity="NOTICE", status="in_sync", accepted_at=timezone.now()
+        )
+        with patch("netbox_nso_plugin.adapter_client.put_logging_intent"), self.captureOnCommitCallbacks(execute=True):
+            r = self._edit(row, monitor_severity="")
+        self.assertEqual(r.status_code, 200)
+        row.refresh_from_db()
+        self.assertEqual(row.monitor_severity, "")
+        self.assertEqual(row.console_severity, "CRITICAL")
+        self.assertEqual(row.status, "accepted")
+
+
 class TestLoggingLevelsWiring(LevelsTestBase):
     """Summary counts, overlay URL/serializer resolution."""
 

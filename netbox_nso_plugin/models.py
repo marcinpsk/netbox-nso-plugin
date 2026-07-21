@@ -1130,6 +1130,8 @@ class NSOLoggingLevelState(NetBoxModel):
     accepted_at = models.DateTimeField(
         null=True, blank=True, help_text="When an operator accepted this row (NetBox becomes source of truth)."
     )
+    last_apply_at = models.DateTimeField(null=True, blank=True)
+    last_apply_error = models.TextField(blank=True, default="")
 
     class Meta:
         verbose_name = "NSO Logging Level State"

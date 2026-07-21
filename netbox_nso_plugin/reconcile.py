@@ -494,6 +494,11 @@ _APPLY_DEPLOYING_SCOPES = {
     "route_policy": "NSORoutePolicyState",
     "static_route": "NSOStaticRouteState",
     "l2_sap": "NSOL2SapState",
+    # Levels only — NSOLoggingHostState still settles via reconcile-matching alone
+    # (the pre-existing family behavior). The levels singleton needs the failure leg:
+    # a CLOSED adapter write-gate fails the whole logging scope by design (NX-P4a),
+    # and without apply_failed surfacing the row would read accepted/green forever.
+    "logging": "NSOLoggingLevelState",
 }
 
 
