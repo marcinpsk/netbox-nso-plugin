@@ -489,6 +489,19 @@ class NSODeviceManagement(NetBoxModel):
             "while silently unlinked. Cleared once linking succeeds. Surfaced on the NSO tab."
         ),
     )
+    # ── READSEM S4 (D5): adopted store incarnation + durable reset markers ──────
+    # The adapter store mints an (incarnation UUID, born) pair on every DB rebuild;
+    # the gated reconcile ADOPTS the newest born (resetting per-family read state),
+    # while tab observations may only RECORD a pending rebuild here — greatest born
+    # wins (monotonic), and reset_conflict_born pins the highest born at which two
+    # DIFFERENT incarnation UUIDs collided (equal-born ambiguity fails closed until
+    # a strictly-later born adopts). Born values are compared only against other
+    # adapter-born values — never against this host's clock.
+    adapter_incarnation = models.CharField(max_length=64, blank=True, default="")
+    adapter_incarnation_born = models.DateTimeField(null=True, blank=True)
+    reset_pending_incarnation = models.CharField(max_length=64, blank=True, default="")
+    reset_pending_born = models.DateTimeField(null=True, blank=True)
+    reset_conflict_born = models.DateTimeField(null=True, blank=True)
     last_sync_at = models.DateTimeField(null=True, blank=True)
     last_sync_status = models.CharField(max_length=50, blank=True, default="")
     degraded_surfaces = models.JSONField(
@@ -619,6 +632,52 @@ class NSODeviceManagement(NetBoxModel):
         if self.manage_logging:
             scopes.append("Logging")
         return scopes
+
+
+class NSOFamilyReadState(NetBoxModel):
+    """Declared read-outcome bookkeeping for one (management, family) — READSEM S4 D5.
+
+    ``observed_*`` is the newest declared outcome seen from the adapter (via the tab's
+    aggregate observation or a reconcile gate decision); ``applied_*`` is the identity
+    of the last payload actually ADMITTED to a reconciler body. The reconcile fence
+    compares against APPLIED only — a tab observation must never strand overlay rows
+    by fencing out a slightly-older worker payload. Ordering is incarnation adoption
+    (by born) then ``attempt_id`` within the adopted incarnation; ``observed_read_at``
+    is display-only (never an ordering key). A blank ``observed_outcome`` means
+    unknown/legacy — the UI ignores the row.
+    """
+
+    management = models.ForeignKey(
+        to="NSODeviceManagement",
+        on_delete=models.CASCADE,
+        related_name="family_read_states",
+    )
+    family = models.CharField(max_length=64)
+    observed_outcome = models.CharField(max_length=32, blank=True, default="")
+    observed_reason = models.CharField(max_length=32, blank=True, default="")
+    observed_freshness = models.CharField(max_length=16, blank=True, default="")
+    observed_result = models.CharField(max_length=16, blank=True, default="")
+    observed_succeeded = models.BooleanField(null=True, blank=True)
+    observed_read_at = models.DateTimeField(null=True, blank=True)
+    observed_attempt_id = models.BigIntegerField(null=True, blank=True)
+    observed_incarnation = models.CharField(max_length=64, blank=True, default="")
+    observed_incarnation_born = models.DateTimeField(null=True, blank=True)
+    observed_epoch = models.IntegerField(
+        null=True,
+        blank=True,
+        help_text="The adapter_device_id this observation was fetched from (replay guard).",
+    )
+    applied_attempt_id = models.BigIntegerField(null=True, blank=True)
+    applied_incarnation = models.CharField(max_length=64, blank=True, default="")
+
+    class Meta:
+        ordering = ["management", "family"]
+        unique_together = [("management", "family")]
+        verbose_name = "NSO Family Read State"
+        verbose_name_plural = "NSO Family Read States"
+
+    def __str__(self):
+        return f"{self.management} / {self.family} [{self.observed_outcome or 'unknown'}]"
 
 
 class NSOInterfaceState(NetBoxModel):
