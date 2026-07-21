@@ -925,11 +925,11 @@
       var countsUrl = countsEl ? countsEl.dataset.catCountsUrl : null;
 
       function refreshHeaders() {
-        if (!countsUrl) { return Promise.resolve(); }
+        if (!countsUrl) { return Promise.resolve(null); }
         return fetch(countsUrl, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
           .then(function (r) { return r.ok ? r.json() : null; })
           .then(function (d) {
-            if (!d || !d.categories) { return; }
+            if (!d || !d.categories) { return null; }
             // READSEM S4 (R11/R12): keep the device-wide reset banner honest on the
             // dynamic path too (a reload is not required to learn of a store reset).
             var resetBanner = document.querySelector('[data-nso-reset-banner]');
@@ -943,14 +943,40 @@
               // this rebuild — READSEM S4).
               badges.innerHTML = window.NSOBadges.renderBadges(c.total, c.drift, c.pending, c.read);
             });
+            return d.categories;
           })
-          .catch(function () { /* best-effort: leave headers as-is on failure */ });
+          .catch(function () { return null; /* best-effort: leave headers as-is on failure */ });
+      }
+
+      // The completion-time refresh is reliably too early: the RQ reconcile that
+      // applies the observations lands seconds after the adapter job the status UI
+      // polls, so a single fetch freezes chips on refresh_pending (or a pre-recovery
+      // state) until the next user action. Keep polling counts on a short bounded
+      // interval until the chips stop moving and none is transient (D10 self-heal).
+      var settleTimer = null;
+      function startSettlePoll() {
+        var prev = null;
+        var deadline = Date.now() + 30000;
+        if (settleTimer) { clearInterval(settleTimer); }
+        settleTimer = setInterval(function () {
+          // Deadline check FIRST — the poll must terminate even if a tick throws
+          // (e.g. a stale-cached NSOBadges without the settle helpers).
+          if (Date.now() >= deadline) { clearInterval(settleTimer); settleTimer = null; return; }
+          refreshHeaders().then(function (categories) {
+            var curr = categories && window.NSOBadges.chipStates(categories);
+            if (!window.NSOBadges.needsAnotherTick(prev, curr)) {
+              clearInterval(settleTimer); settleTimer = null;
+            }
+            prev = curr;
+          });
+        }, 3000);
       }
 
       // A state-changing action (Sync / Detect Drift / Apply) finished → refresh the
       // headers and re-pull any already-expanded category bodies.
       document.addEventListener('nso:refresh-categories', function () {
         refreshHeaders();
+        startSettlePoll();
         document.querySelectorAll('.nso-category').forEach(function (card) {
           var body = card.querySelector('.nso-cat-body');
           if (body && !body.classList.contains('d-none')) {

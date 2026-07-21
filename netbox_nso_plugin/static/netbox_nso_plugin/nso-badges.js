@@ -48,5 +48,43 @@
     return h;
   }
 
-  window.NSOBadges = { esc: esc, chipHtml: chipHtml, renderBadges: renderBadges };
+  /* ── settle poll (D10 "self-heals via the counts poll") ──────────────────────
+   * The one refresh fired at job completion is reliably too early: the RQ
+   * reconcile that applies the observations lands seconds AFTER the adapter job
+   * the UI polls, so chips freeze on refresh_pending (or a pre-recovery state)
+   * until the next user action. The tab keeps re-fetching counts on a short
+   * bounded interval until the chips stop moving and nothing is transient. */
+
+  /* Collapse a counts-JSON `categories` object to {key: chipState|null}. */
+  function chipStates(categories) {
+    var out = {};
+    Object.keys(categories || {}).forEach(function (k) {
+      var read = categories[k] && categories[k].read;
+      out[k] = read && read.state ? read.state : null;
+    });
+    return out;
+  }
+
+  /* Poll again? First tick and fetch failures always retry (the caller bounds
+   * the loop); otherwise keep going while states still move or any chip is
+   * refresh_pending (a reconcile is known to be in flight for it). */
+  function needsAnotherTick(prev, curr) {
+    if (!prev || !curr) {
+      return true;
+    }
+    if (JSON.stringify(prev) !== JSON.stringify(curr)) {
+      return true;
+    }
+    return Object.keys(curr).some(function (k) {
+      return curr[k] === "refresh_pending";
+    });
+  }
+
+  window.NSOBadges = {
+    esc: esc,
+    chipHtml: chipHtml,
+    renderBadges: renderBadges,
+    chipStates: chipStates,
+    needsAnotherTick: needsAnotherTick,
+  };
 })();
