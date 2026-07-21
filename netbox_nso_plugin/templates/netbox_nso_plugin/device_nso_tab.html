@@ -13,6 +13,7 @@
 <script src="{% static 'netbox_nso_plugin/vendor/tabulator.min.js' %}"></script>
 <link rel="stylesheet" href="{% static 'netbox_nso_plugin/nso.css' %}">
 <script src="{% static 'netbox_nso_plugin/nso-popedit.js' %}"></script>
+<script src="{% static 'netbox_nso_plugin/nso-badges.js' %}"></script>
 {# Shared grid harness — badge vocabulary, per-cell Accept, inline-edit-owns, state #}
 {# pills. Must load before any lazy category fragment runs its column definitions. #}
 <script src="{% static 'netbox_nso_plugin/nso-grid.js' %}"></script>
@@ -834,6 +835,21 @@
   {# ── NSO configuration: counts-first, rows loaded lazily on expand ──────── #}
   {% if nso_categories %}
     <h4 class="mt-4 mb-2"><span class="mdi mdi-format-list-bulleted"></span> NSO Configuration</h4>
+    {# READSEM S4 (R11/R12): device-wide reset banner — always in the DOM so the #}
+    {# counts poll can toggle it; honored by every render path incl. adapter-down. #}
+    <div class="alert alert-warning py-2 {% if not read_reset_pending %}d-none{% endif %}" data-nso-reset-banner>
+      <span class="mdi mdi-database-refresh me-1"></span>
+      Refresh pending — the adapter's data store was reset. Showing last-known state
+      until the next reconcile adopts the new dataset.
+    </div>
+    {% if families_version_mismatch %}
+    <div class="alert alert-danger py-2">
+      <span class="mdi mdi-alert me-1"></span>
+      Adapter read-state vocabulary v{{ families_version_mismatch.served }} does not match this
+      plugin (v{{ families_version_mismatch.expected }}) — update the older side; read chips may be
+      incomplete or unknown.
+    </div>
+    {% endif %}
     <p class="text-muted small mb-2"
        data-cat-counts-url="{% url 'plugins:netbox_nso_plugin:device_nso_category_counts' device_pk=object.pk %}">
       Counts reflect the last sync. Click a category to load its rows.
@@ -854,6 +870,7 @@
               {% if cat.counts.drift %}<span class="badge text-bg-warning text-dark ms-2" title="Objects whose on-box content differs from what NetBox holds and that NetBox does not own — open one to see the diff, then Accept or update NetBox.">{{ cat.counts.drift }} drift</span>{% endif %}
               {% if cat.counts.pending %}<span class="badge text-bg-info ms-1" title="Objects NetBox owns (Accepted) that have not yet been applied to / confirmed on the device. Run Apply to push them.">{{ cat.counts.pending }} pending apply</span>{% endif %}
               {% if cat.counts.total and not cat.counts.drift and not cat.counts.pending %}<span class="badge text-bg-success ms-2" title="Every object in this category agrees with NetBox — nothing drifted and nothing awaiting apply.">in sync</span>{% endif %}
+              {% if cat.read %}<span class="badge {{ cat.read.css }} ms-2" title="{{ cat.read.tip }}">{{ cat.read.label }}</span>{% endif %}
             </span>
           </span>
           <span>
@@ -869,6 +886,24 @@
         </div>
       </div>
     {% endfor %}
+    {# READSEM S4 (D8/R4-4): families the adapter reports that this plugin does not #}
+    {# know — rendered generically from the LIVE response (no fetcher/gate exists). #}
+    {% if read_state_unknown %}
+      <div class="card mb-2">
+        <div class="card-header">
+          <span class="mdi mdi-help-box me-1"></span><strong>Other families</strong>
+          <span class="text-muted small ms-1">reported by the adapter but unknown to this plugin version</span>
+        </div>
+        <div class="card-body py-2">
+          {% for u in read_state_unknown %}
+            <span class="badge border text-muted me-2"
+                  title="{{ u.read_state.outcome|default:'?' }}{% if u.read_state.reason %} / {{ u.read_state.reason }}{% endif %}">
+              {{ u.family }}: {{ u.read_state.outcome|default:"?" }}
+            </span>
+          {% endfor %}
+        </div>
+      </div>
+    {% endif %}
 
     <script>
     (function () {
@@ -886,20 +921,6 @@
 
       function esc(s) { var d = document.createElement('div'); d.textContent = (s == null ? '' : String(s)); return d.innerHTML; }
 
-      // Rebuild a category header's badge block from fresh counts (mirrors the
-      // server-side render) so a Sync/Apply that clears rows also clears the header,
-      // instead of leaving a stale "pending apply" until a full page reload.
-      function renderBadges(total, drift, pending) {
-        var h = '<span class="text-muted ms-1">(' + esc(total) + ')</span>';
-        var driftTip = 'Objects whose on-box content differs from what NetBox holds and that NetBox does not own — open one to see the diff, then Accept or update NetBox.';
-        var pendingTip = 'Objects NetBox owns (Accepted) that have not yet been applied to / confirmed on the device. Run Apply to push them.';
-        var syncTip = 'Every object in this category agrees with NetBox — nothing drifted and nothing awaiting apply.';
-        if (drift) { h += '<span class="badge text-bg-warning text-dark ms-2" title="' + driftTip + '">' + esc(drift) + ' drift</span>'; }
-        if (pending) { h += '<span class="badge text-bg-info ms-1" title="' + pendingTip + '">' + esc(pending) + ' pending apply</span>'; }
-        if (total && !drift && !pending) { h += '<span class="badge text-bg-success ms-2" title="' + syncTip + '">in sync</span>'; }
-        return h;
-      }
-
       var countsEl = document.querySelector('[data-cat-counts-url]');
       var countsUrl = countsEl ? countsEl.dataset.catCountsUrl : null;
 
@@ -909,12 +930,18 @@
           .then(function (r) { return r.ok ? r.json() : null; })
           .then(function (d) {
             if (!d || !d.categories) { return; }
+            // READSEM S4 (R11/R12): keep the device-wide reset banner honest on the
+            // dynamic path too (a reload is not required to learn of a store reset).
+            var resetBanner = document.querySelector('[data-nso-reset-banner]');
+            if (resetBanner) { resetBanner.classList.toggle('d-none', !d.reset_pending); }
             document.querySelectorAll('.nso-category').forEach(function (card) {
               var c = d.categories[card.dataset.catKey];
               var badges = card.querySelector('.nso-cat-badges');
               if (!c || !badges) { return; }
               badges.dataset.total = c.total; badges.dataset.drift = c.drift; badges.dataset.pending = c.pending;
-              badges.innerHTML = renderBadges(c.total, c.drift, c.pending);
+              // NSOBadges renders counts + the D10 read chip (chips must survive
+              // this rebuild — READSEM S4).
+              badges.innerHTML = window.NSOBadges.renderBadges(c.total, c.drift, c.pending, c.read);
             });
           })
           .catch(function () { /* best-effort: leave headers as-is on failure */ });

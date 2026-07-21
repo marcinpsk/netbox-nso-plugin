@@ -138,6 +138,43 @@ def _refresh_sync_cache(mgmt, adapter_device):
     return update_fields
 
 
+def _observe_live_read_state(device, mgmt):
+    """READSEM S4 (D8b): fetch + observe the live per-family read-state on tab render.
+
+    Runs beside ``get_device`` on its own SHORT budget (R5-5) with SEPARATE failure
+    handling — a hung/absent read-state endpoint (incl. the S3 route-404) leaves the
+    sync cache valid while family chips fall back to persisted rows. On success the
+    observed states upsert through the R6-3 observe-only protocol (never adopts; a
+    newer incarnation only sets the durable reset-pending marker). Returns
+    ``(unknown_families, families_version_mismatch)`` for the tab's banners.
+    """
+    from . import adapter_client as client
+    from .adapter_client import AdapterError
+    from .families import ALL_FAMILY_KEYS, FAMILIES_VERSION
+    from .read_gate import observe_aggregate
+
+    try:
+        rs_doc = client.get_device_read_state(mgmt.adapter_device_id)
+    except AdapterError as exc:
+        logger.debug("read-state unavailable for device %s: %s", device.pk, exc)
+        return [], None
+    families = rs_doc.get("families") or {}
+    try:
+        observe_aggregate(mgmt, families, epoch=mgmt.adapter_device_id)
+    except Exception:  # noqa: BLE001 — the tab must never 500 on read-state bookkeeping
+        logger.exception("read-state observation failed for device %s", device.pk)
+    mgmt.refresh_from_db()
+    unknown = [{"family": f, "read_state": families[f]} for f in sorted(set(families) - set(ALL_FAMILY_KEYS))]
+    mismatch = None
+    served_version = rs_doc.get("families_version")
+    if served_version is not None and served_version != FAMILIES_VERSION:
+        mismatch = {"served": served_version, "expected": FAMILIES_VERSION}
+        logger.warning(
+            "adapter families_version %s != plugin %s — update the older side", served_version, FAMILIES_VERSION
+        )
+    return unknown, mismatch
+
+
 # ── Authorization for NSO action views ───────────────────────────────────────
 
 
@@ -220,6 +257,8 @@ class DeviceNSOTabView(generic.ObjectView):
         intent_drift = []
         failover = None
         device_capability = None
+        read_state_unknown = []
+        families_version_mismatch = None
         if mgmt is not None and mgmt.adapter_device_id is not None:
             from . import adapter_client as client
             from .intent_drift import compute_intent_drift
@@ -252,6 +291,9 @@ class DeviceNSOTabView(generic.ObjectView):
             # mirror completeness, not rejected applies — this banner's wording is apply-specific,
             # so they render on the capabilities page instead (and still warn via apply-preflight).
             if adapter_error is None:
+                read_state_unknown, families_version_mismatch = _observe_live_read_state(device, mgmt)
+
+            if adapter_error is None:
                 cap = client.get_device_capability(mgmt.adapter_device_id, refresh=False)
                 if cap.get("known"):
                     gaps = [
@@ -274,6 +316,11 @@ class DeviceNSOTabView(generic.ObjectView):
             "intent_drift": intent_drift,
             "failover": failover,
             "device_capability": device_capability,
+            # READSEM S4 (D8/D10): honored by EVERY render path — including the
+            # adapter-down persisted-rows fallback (R12: durable reset knowledge).
+            "read_reset_pending": bool(mgmt is not None and mgmt.reset_pending_born is not None),
+            "read_state_unknown": read_state_unknown,
+            "families_version_mismatch": families_version_mismatch,
             "status_badge": _STATUS_BADGE,
         }
 
@@ -409,7 +456,13 @@ class NSOCategoryCountsView(LoginRequiredMixin, View):
     """
 
     def get(self, request, device_pk):
-        """Return {categories: {key: {total, drift, pending}}} for the device."""
+        """Return {categories: {key: {total, drift, pending, read}}, reset_pending}.
+
+        ``read`` is the D10 per-category read chip (None = healthy/no chip) so the
+        dynamic renderBadges path keeps chips honest across the
+        ``nso:refresh-categories`` rebuild; ``reset_pending`` is the device-wide
+        R11/R12 marker (the JS shows/keeps the reset banner from it).
+        """
         from .summary import category_summaries
 
         device = get_object_or_404(Device, pk=device_pk)
@@ -419,10 +472,16 @@ class NSOCategoryCountsView(LoginRequiredMixin, View):
                 "total": c["counts"].get("total", 0),
                 "drift": c["counts"].get("drift", 0),
                 "pending": c["counts"].get("pending", 0),
+                "read": c.get("read"),
             }
             for c in category_summaries(device, mgmt)
         }
-        return JsonResponse({"categories": out})
+        return JsonResponse(
+            {
+                "categories": out,
+                "reset_pending": bool(mgmt is not None and mgmt.reset_pending_born is not None),
+            }
+        )
 
 
 _PENDING_KINDS = {"pending", "apply_failed"}

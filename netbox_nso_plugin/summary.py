@@ -144,7 +144,9 @@ _CATEGORIES = [
     ("isis", "IS-IS", "lan", "manage_isis"),
     ("ospf", "OSPF", "lan", "manage_ospf"),
     ("bgp", "BGP", "router-network", "manage_bgp"),
-    ("bfd", "BFD", "pulse", "manage_isis"),
+    # R3-7: BFD is reconciled whenever ANY of bgp/isis/ospf is managed
+    # (reconcile.py's rider predicate) — its card must be visible for each.
+    ("bfd", "BFD", "pulse", ("manage_isis", "manage_bgp", "manage_ospf")),
     ("route_policy", "Route Policy", "script-text", "manage_route_policy"),
     ("redistribution", "Redistribution", "swap-horizontal", "manage_redistribution"),
     ("snmp", "SNMP", "console-network", "manage_snmp"),
@@ -341,21 +343,157 @@ def _snmp_breakdown(querysets) -> dict:
     return out
 
 
+# ── READSEM S4 (D10): per-category read chips from NSOFamilyReadState ──────────
+
+_RS_AUTHORITATIVE_OUTCOMES = ("present", "absent_authoritative")
+_RS_ADMIT_RESULTS = ("replaced", "cleared")
+
+#: worst-first merge order for a category's family display states (D8 + the two
+#: pending states). Healthy renders NO chip, so it never appears here.
+_CHIP_SEVERITY = (
+    "reset_pending",
+    "unavailable",
+    "unknown",
+    "stale",
+    "aged",
+    "refresh_pending",
+    "not_authoritative",
+    "unsupported",
+)
+
+#: D10 render matrix — css classes only from the approved palette (never bg-secondary).
+_CHIP_RENDER = {
+    "reset_pending": {
+        "css": "text-bg-warning text-dark",
+        "label": "refresh pending — data reset",
+        "tip": "The adapter's data store was rebuilt. Showing last-known state until the next reconcile adopts the new dataset.",
+    },
+    "unavailable": {
+        "css": "text-bg-danger",
+        "label": "NSO read unavailable — last-known data",
+        "tip": "The newest declared read for this category failed (export down / read error / not ready) or its materialization errored. Rows show the last successful read.",
+    },
+    "unknown": {
+        "css": "text-bg-danger",
+        "label": "unknown read state",
+        "tip": "The adapter reported a read state this plugin does not recognize — failing closed. Rows show last-known data.",
+    },
+    "stale": {
+        "css": "text-bg-warning text-dark",
+        "label": "showing last-known data",
+        "tip": "The newest read succeeded but served an older cached snapshot (stale). Rows were still replaced from it.",
+    },
+    "aged": {
+        "css": "text-bg-warning text-dark",
+        "label": "showing last-known data",
+        "tip": "The newest read succeeded but its snapshot is aged. Rows were still replaced from it.",
+    },
+    "refresh_pending": {
+        "css": "text-bg-info",
+        "label": "refresh pending",
+        "tip": "A newer successful read was observed but its rows have not been applied yet. The next reconcile settles this.",
+    },
+    "not_authoritative": {
+        "css": "border text-muted",
+        "label": "no authoritative read",
+        "tip": "The adapter has no authoritative read for this category on this device yet.",
+    },
+    "unsupported": {
+        "css": "border text-muted",
+        "label": "unsupported on this platform",
+        "tip": "This device's NED does not support reading this category; nothing to mirror.",
+    },
+}
+
+
+def _family_read_display(row, adopted_incarnation: str) -> str | None:
+    """Collapse one NSOFamilyReadState row to its D10 display state (None = no chip).
+
+    Legacy rows (blank outcome) and rows from a NON-adopted incarnation are ignored
+    entirely (D3/D5). Healthy — fresh-present OR authoritative-empty — returns None:
+    a successful clear must never render unknown despite its null freshness (R2-7).
+    Healthy additionally requires the observation to be APPLIED: a newer unapplied
+    observation renders refresh-pending, never healthy (R5-3).
+    """
+    if not row.observed_outcome:
+        return None
+    if adopted_incarnation and row.observed_incarnation != adopted_incarnation:
+        return None
+    outcome, reason = row.observed_outcome, row.observed_reason
+    if outcome == "unavailable":
+        if reason in ("not_authoritative", "unsupported"):
+            return reason
+        if reason in ("export_down", "read_error", "not_ready"):
+            return "unavailable"
+        return "unknown"
+    if outcome in _RS_AUTHORITATIVE_OUTCOMES:
+        if row.observed_result == "error":
+            return "unavailable"  # materialization error — red (D10)
+        if not (row.observed_succeeded is True and row.observed_result in _RS_ADMIT_RESULTS):
+            return "unknown"  # inconsistent tuple — fail closed, visibly
+        obs, applied = row.observed_attempt_id, row.applied_attempt_id
+        if obs is not None and (applied is None or obs > applied):
+            return "refresh_pending"
+        if row.observed_freshness in ("stale", "aged"):
+            return row.observed_freshness
+        return None  # healthy
+    return "unknown"
+
+
+def category_read_chip(mgmt, key: str, rows_by_family: dict) -> dict | None:
+    """Merge a category's family read states into ONE chip dict (None = no chip).
+
+    Worst-first across the families the category DISPLAYS (families.CATEGORY_FAMILIES);
+    a set reset-pending marker overrides everything device-wide (R11/R12 — old rows
+    must never render healthy while a reset is pending).
+    """
+    from .families import CATEGORY_FAMILIES
+
+    if mgmt.reset_pending_born is not None:
+        state = "reset_pending"
+    else:
+        states = set()
+        for family in CATEGORY_FAMILIES.get(key, ()):
+            row = rows_by_family.get(family)
+            if row is None:
+                continue
+            display = _family_read_display(row, mgmt.adapter_incarnation)
+            if display:
+                states.add(display)
+        if not states:
+            return None
+        state = next(s for s in _CHIP_SEVERITY if s in states)
+    return {"state": state, **_CHIP_RENDER[state]}
+
+
 def category_summaries(device, mgmt) -> list[dict]:
     """Return the collapsed-view summary for every scope this device opted into.
 
     Read-only: cheap aggregate queries over persisted NSO*State.
-    Each entry: {key, label, icon, counts:{status:n,'total':N,...}}.
+    Each entry: {key, label, icon, counts:{...}, read: chip-dict|None} — ``read`` is
+    the D10 per-category read chip from persisted NSOFamilyReadState rows.
     """
+    from .models import NSOFamilyReadState
+
     if mgmt is None:
         return []
+    rows_by_family = {r.family: r for r in NSOFamilyReadState.objects.filter(management=mgmt)}
     summaries = []
     for key, label, icon, flag in _CATEGORIES:
         # Routing leaves are also gated by the manage_routing master kill-switch;
-        # standalone scopes (interfaces, SNMP, L2) are not.
-        if flag not in _NON_ROUTING_FLAGS and not mgmt.manage_routing:
+        # standalone scopes (interfaces, SNMP, L2) are not. A tuple flag = any-of.
+        flags = flag if isinstance(flag, tuple) else (flag,)
+        if any(f not in _NON_ROUTING_FLAGS for f in flags) and not mgmt.manage_routing:
             continue
-        if not getattr(mgmt, flag, False):
+        if not any(getattr(mgmt, f, False) for f in flags):
             continue
-        summaries.append({"key": key, "label": label, "icon": icon, "counts": _category_counts(key, device, mgmt)})
+        summaries.append(
+            {
+                "key": key,
+                "label": label,
+                "icon": icon,
+                "counts": _category_counts(key, device, mgmt),
+                "read": category_read_chip(mgmt, key, rows_by_family),
+            }
+        )
     return summaries

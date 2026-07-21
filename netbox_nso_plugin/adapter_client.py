@@ -179,8 +179,14 @@ def _request(method, path, **kwargs):
     else:
         verify = True
 
-    read_timeout = cfg["timeout"]
-    connect_timeout = min(_CONNECT_TIMEOUT, read_timeout)
+    # READSEM S4 (R5-5): callers may pass an endpoint-specific (connect, read)
+    # timeout — e.g. the tab's live read-state fetch — instead of the configured one.
+    override = kwargs.pop("timeout", None)
+    if override is not None:
+        connect_timeout, read_timeout = override
+    else:
+        read_timeout = cfg["timeout"]
+        connect_timeout = min(_CONNECT_TIMEOUT, read_timeout)
     try:
         session = _get_session()
         resp = session.request(
@@ -477,6 +483,17 @@ def get_interfaces_doc(adapter_device_id: int) -> dict:
             _ifdoc_capability[cfg["url"]] = {"legacy": True, "at": time.monotonic()}
             return _legacy_interfaces_as_doc(adapter_device_id)
         raise
+
+
+def get_device_read_state(adapter_device_id: int) -> dict:
+    """GET /api/v1/devices/{id}/read-state — all 19 families' declared read states.
+
+    READSEM S4 (D8b/R5-5): called LIVE on tab render beside ``get_device`` with a
+    SHORT endpoint-specific budget (connect 5s / read 5s — never the configurable
+    default) so a hung adapter cannot stall the page; its failure is handled
+    separately (family chips fall back to persisted rows).
+    """
+    return _request("GET", f"/api/v1/devices/{adapter_device_id}/read-state", timeout=(5, 5))
 
 
 def get_snmp_config(adapter_device_id: int) -> dict:
