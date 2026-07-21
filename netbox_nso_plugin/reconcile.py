@@ -82,6 +82,138 @@ def _safe_reconcile(ctx: dict, key: str, mgmt, model_names: tuple[str, ...], fn,
         _mark_scope_error(mgmt, model_names)
 
 
+# ── READSEM S4 (D5/D9): the device-wide read mutex + per-family gate plumbing ───
+
+#: RQ contention: bounded in-job retry budget before the marker handoff (patchable in tests).
+_RQ_RETRY_BUDGET_S = 90.0
+
+
+class _LeaseOutcome:
+    """Result of a device-lease acquisition attempt (see _acquire_reconcile_lease)."""
+
+    def __init__(self, lease=None, state: str = "held", attempts: int = 0):
+        self.lease = lease
+        self.state = state  # held | busy | deferred | no_mutex
+        self.attempts = attempts
+
+
+def _acquire_reconcile_lease(mgmt, device_pk: int, call_class: str) -> _LeaseOutcome:
+    """Acquire the device-wide read mutex per call class (D5/R6-1).
+
+    web → single attempt, fail fast (``busy``); rq → bounded backoff retries then the
+    marker handoff (``deferred`` — the lease owner's release enqueues the successor).
+    Raises :class:`~netbox_nso_plugin.read_gate.LockUnavailable` when redis
+    coordination is unreachable — callers fail CLOSED. Without django_rq (no redis
+    configured at all) the run proceeds unserialized (``no_mutex``), matching the
+    enqueue fallback above.
+    """
+    from .read_gate import Deferred, acquire_for_rq, acquire_for_web, lease_key
+
+    try:
+        import django_rq
+    except ImportError:  # pragma: no cover - RQ ships with NetBox
+        logger.warning("django_rq unavailable; reconciling device %s without the read mutex", device_pk)
+        return _LeaseOutcome(state="no_mutex")
+
+    queue = django_rq.get_queue(_RECONCILE_QUEUE)
+    key = lease_key(mgmt.pk)
+    if call_class == "web":
+        lease = acquire_for_web(queue.connection, key)
+        return _LeaseOutcome(state="busy") if lease is None else _LeaseOutcome(lease=lease)
+    out = acquire_for_rq(queue.connection, key, device_pk, queue, retry_budget_s=_RQ_RETRY_BUDGET_S)
+    if isinstance(out, Deferred):
+        return _LeaseOutcome(state="deferred", attempts=out.attempts)
+    return _LeaseOutcome(lease=out)
+
+
+def _gated(ctx: dict, mgmt, family: str, payload, body, *, epoch, ctx_key: str | None = None):
+    """Gate ONE family document (D9): record the disposition, run *body* iff admitted.
+
+    ``payload`` is the fetched family document; its ``read_state`` key (absent on a
+    pre-S4 adapter → legacy) drives the D3 gate. The disposition lands in
+    ``ctx["_gate"][family]``; when *ctx_key* is given and the body ran, its return
+    value is stored there. A skipped family's ctx entries keep their empty defaults
+    (rendering paths fall back to persisted rows) and its overlay rows are untouched.
+    """
+    from .read_gate import LEGACY, RAN, gated_family_run
+
+    read_state = payload.get("read_state") if isinstance(payload, dict) else None
+    result = gated_family_run(mgmt, family, read_state, body, epoch=epoch)
+    ctx.setdefault("_gate", {})[family] = result.disposition
+    if ctx_key is not None and result.disposition in (RAN, LEGACY):
+        ctx[ctx_key] = result.value
+    return result
+
+
+def _mark_all_gated(ctx: dict, families, disposition: str) -> None:
+    """Record one skip *disposition* for every family the aborted run would have gated."""
+    gate = ctx.setdefault("_gate", {})
+    for family in families:
+        gate[family] = disposition
+
+
+def _enabled_device_families(mgmt) -> list[str]:
+    """List the families a full reconcile_device run would gate, per the scope flags."""
+    fams = []
+    if mgmt.manage_interfaces:
+        fams += [
+            "interface_attributes",
+            "svi",
+            "subinterface",
+            "interface_mtu",
+            "interface_ip",
+            "lag_config",
+            "vlan",
+            "switchport",
+        ]
+    if mgmt.manage_snmp:
+        fams.append("snmp")
+    if mgmt.manage_logging:
+        fams.append("logging")
+    if getattr(mgmt, "manage_l2", False):
+        fams.append("l2_service")
+    if mgmt.manage_routing:
+        if mgmt.manage_static:
+            fams.append("static_route")
+        if mgmt.manage_isis:
+            fams.append("isis")
+        if mgmt.manage_route_policy:
+            fams.append("route_policy")
+        if mgmt.manage_ospf:
+            fams.append("ospf")
+        if mgmt.manage_bgp:
+            fams.append("bgp")
+        if mgmt.manage_bgp or mgmt.manage_isis or mgmt.manage_ospf:
+            fams.append("bfd")
+        if mgmt.manage_redistribution:
+            fams.append("redistribution")
+    return fams
+
+
+#: reconcile_category branch → the families that branch gates (busy/lock dispositions).
+_CATEGORY_RECONCILE_FAMILIES: dict[str, tuple[str, ...]] = {
+    "interface": ("interface_attributes", "svi", "subinterface", "interface_ip", "interface_mtu", "vlan", "switchport"),
+    "interfaces": ("interface_attributes", "svi", "subinterface", "interface_ip"),
+    "interface_ips": ("svi", "subinterface", "interface_ip"),
+    "lacp": ("lag_config",),
+    "vlan": ("vlan",),
+    "switchport": ("vlan", "switchport"),
+    "svi": ("svi",),
+    "subinterface": ("subinterface",),
+    "interface_mtu": ("interface_mtu",),
+    "snmp": ("snmp",),
+    "logging": ("logging",),
+    "static": ("static_route",),
+    "isis": ("isis",),
+    "ospf": ("ospf",),
+    "bgp": ("bgp",),
+    "bfd": ("bfd",),
+    "route_policy": ("route_policy",),
+    "redistribution": ("redistribution",),
+    "l2_services": ("l2_service",),
+}
+
+
 def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
     """Reconcile each opted-in routing protocol into *ctx* (gated by kill-switches)."""
     from .bfd_reconciler import reconcile_bfd
@@ -100,76 +232,104 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
     dev_id = mgmt.adapter_device_id
 
     if mgmt.manage_static:
-        _safe_reconcile(
+        static_doc = client.get_static_routes(dev_id)
+        _gated(
             ctx,
-            "static_routes",
             mgmt,
-            ("NSOStaticRouteState",),
-            _reconcile_static_routes,
-            device,
-            client.get_static_routes(dev_id),
+            "static_route",
+            static_doc,
+            lambda: _safe_reconcile(
+                ctx, "static_routes", mgmt, ("NSOStaticRouteState",), _reconcile_static_routes, device, static_doc
+            ),
+            epoch=dev_id,
         )
     if mgmt.manage_isis:
+        # R3-6: ONE isis document → ONE gate decision → ONE compound body driving
+        # both reconcilers (never two gate calls abusing the equality rerun rule).
         isis_payload = client.get_isis_interfaces(dev_id)
-        _safe_reconcile(
-            ctx,
-            "isis_interfaces",
-            mgmt,
-            ("NSOISISInterfaceState",),
-            _reconcile_isis_interfaces,
-            device,
-            isis_payload.get("interfaces", []),
-        )
-        _safe_reconcile(
-            ctx,
-            "isis_processes",
-            mgmt,
-            ("NSOISISInstanceState",),
-            _reconcile_isis_process,
-            device,
-            isis_payload.get("processes", []),
-        )
+
+        def _isis_body():
+            _safe_reconcile(
+                ctx,
+                "isis_interfaces",
+                mgmt,
+                ("NSOISISInterfaceState",),
+                _reconcile_isis_interfaces,
+                device,
+                isis_payload.get("interfaces", []),
+            )
+            _safe_reconcile(
+                ctx,
+                "isis_processes",
+                mgmt,
+                ("NSOISISInstanceState",),
+                _reconcile_isis_process,
+                device,
+                isis_payload.get("processes", []),
+            )
+
+        _gated(ctx, mgmt, "isis", isis_payload, _isis_body, epoch=dev_id)
     if mgmt.manage_route_policy:
-        _safe_reconcile(
+        rp_doc = client.get_route_policy(dev_id)
+        _gated(
             ctx,
-            "route_policy_states",
             mgmt,
-            ("NSORoutePolicyState",),
-            reconcile_route_policy,
-            device,
-            client.get_route_policy(dev_id),
+            "route_policy",
+            rp_doc,
+            lambda: _safe_reconcile(
+                ctx, "route_policy_states", mgmt, ("NSORoutePolicyState",), reconcile_route_policy, device, rp_doc
+            ),
+            epoch=dev_id,
         )
     if mgmt.manage_ospf:
-        _safe_reconcile(
+        ospf_doc = client.get_ospf(dev_id)
+        _gated(
             ctx,
-            "ospf_data",
             mgmt,
-            ("NSOOSPFInstanceState", "NSOOSPFInterfaceState"),
-            _reconcile_ospf,
-            device,
-            client.get_ospf(dev_id),
+            "ospf",
+            ospf_doc,
+            lambda: _safe_reconcile(
+                ctx,
+                "ospf_data",
+                mgmt,
+                ("NSOOSPFInstanceState", "NSOOSPFInterfaceState"),
+                _reconcile_ospf,
+                device,
+                ospf_doc,
+            ),
+            epoch=dev_id,
         )
     if mgmt.manage_bgp:
-        _safe_reconcile(
+        bgp_doc = client.get_bgp_config(dev_id)
+        _gated(
             ctx,
-            "bgp_peers",
             mgmt,
-            ("NSOBGPPeerState",),
-            _reconcile_bgp_config,
-            device,
-            client.get_bgp_config(dev_id),
+            "bgp",
+            bgp_doc,
+            lambda: _safe_reconcile(
+                ctx, "bgp_peers", mgmt, ("NSOBGPPeerState",), _reconcile_bgp_config, device, bgp_doc
+            ),
+            epoch=dev_id,
         )
     # BFD is interface-level + protocol-agnostic; reconcile it whenever any of the
     # protocols that ride it (BGP/IS-IS/OSPF) are managed.
     if mgmt.manage_bgp or mgmt.manage_isis or mgmt.manage_ospf:
-        _safe_reconcile(
+        bfd_doc = client.get_bfd(dev_id)
+        _gated(
             ctx,
-            "bfd_interfaces",
             mgmt,
-            ("NSOBFDInterfaceState",),
-            reconcile_bfd,
-            device,
-            client.get_bfd(dev_id).get("interfaces", []),
+            "bfd",
+            bfd_doc,
+            lambda: _safe_reconcile(
+                ctx,
+                "bfd_interfaces",
+                mgmt,
+                ("NSOBFDInterfaceState",),
+                reconcile_bfd,
+                device,
+                bfd_doc.get("interfaces", []),
+            ),
+            epoch=dev_id,
         )
         from .models import NSOBFDInterfaceState
 
@@ -180,18 +340,26 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
     # ISISInstance / BGPAddressFamily created by the protocol reconciles above, so
     # those must run first (BGP especially — BGP-dest redistribution needs its AF).
     if mgmt.manage_redistribution:
-        _safe_reconcile(
+        redist_doc = client.get_redistribution(dev_id)
+        _gated(
             ctx,
-            "redistribution_states",
             mgmt,
-            ("NSORedistributionState",),
-            reconcile_redistribution,
-            device,
-            client.get_redistribution(dev_id),
+            "redistribution",
+            redist_doc,
+            lambda: _safe_reconcile(
+                ctx,
+                "redistribution_states",
+                mgmt,
+                ("NSORedistributionState",),
+                reconcile_redistribution,
+                device,
+                redist_doc,
+            ),
+            epoch=dev_id,
         )
 
 
-def reconcile_device(device, mgmt=None) -> dict:
+def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
     """Fetch adapter state for *device* and reconcile each opted-in scope.
 
     Persists NSO*State rows as a side effect (suppressed so it never pushes intent),
@@ -218,114 +386,195 @@ def reconcile_device(device, mgmt=None) -> dict:
         return ctx
 
     dev_id = mgmt.adapter_device_id
-    with suppress_intent_push():
+
+    # D5: the whole gated run executes under the device-wide read mutex; contention
+    # and coordination failures abort BEFORE any fetch (fail closed, rows untouched).
+    from .read_gate import SKIPPED_BUSY, SKIPPED_LOCK_UNAVAILABLE, LockUnavailable
+
+    try:
+        held = _acquire_reconcile_lease(mgmt, device.pk, call_class)
+    except LockUnavailable:
+        logger.warning(
+            "device %s reconcile: redis coordination unreachable — failing closed (no reads applied)", device.pk
+        )
+        _mark_all_gated(ctx, _enabled_device_families(mgmt), SKIPPED_LOCK_UNAVAILABLE)
+        ctx["_lock_unavailable"] = True
+        return ctx
+    if held.state == "busy":
+        _mark_all_gated(ctx, _enabled_device_families(mgmt), SKIPPED_BUSY)
+        return ctx
+    if held.state == "deferred":
+        ctx["_deferred"] = held.attempts
+        return ctx
+
+    from contextlib import nullcontext
+
+    with held.lease if held.lease is not None else nullcontext(), suppress_intent_push():
         if mgmt.manage_interfaces:
-            ctx["interfaces"] = client.get_interfaces(dev_id)
+            # S4: the object-shaped interfaces-doc (read_state inline); on an S3
+            # adapter the client falls back to the legacy list as a key-absent doc.
+            interfaces_doc = client.get_interfaces_doc(dev_id)
+            ctx["interfaces"] = interfaces_doc.get("interfaces", [])
             ctx["state"] = client.get_state(dev_id)
-            _safe_reconcile(
+            _gated(
                 ctx,
-                "interface_states",
                 mgmt,
-                ("NSOInterfaceState",),
-                _upsert_interface_states,
-                device,
-                ctx["interfaces"],
+                "interface_attributes",
+                interfaces_doc,
+                lambda: _safe_reconcile(
+                    ctx,
+                    "interface_states",
+                    mgmt,
+                    ("NSOInterfaceState",),
+                    _upsert_interface_states,
+                    device,
+                    ctx["interfaces"],
+                ),
+                epoch=dev_id,
             )
             # materialise SVIs/IRBs (virtual interfaces + VLAN link) BEFORE the IP
             # reconcile, which only attaches IPs to interfaces that already exist —
             # otherwise an SVI's IPs are dropped until the next refresh.
             from .svi_reconciler import reconcile_svi
 
-            _safe_reconcile(ctx, "svi_states", mgmt, ("NSOSVIState",), reconcile_svi, device, client.get_svi(dev_id))
+            svi_doc = client.get_svi(dev_id)
+            _gated(
+                ctx,
+                mgmt,
+                "svi",
+                svi_doc,
+                lambda: _safe_reconcile(ctx, "svi_states", mgmt, ("NSOSVIState",), reconcile_svi, device, svi_doc),
+                epoch=dev_id,
+            )
             # materialise dot1q subinterfaces (virtual interface + Interface.parent
             # link) BEFORE the IP reconcile, for the same ordering reason as SVIs.
             from .subinterface_reconciler import reconcile_subinterface
 
-            _safe_reconcile(
+            sub_doc = client.get_subinterface(dev_id)
+            _gated(
                 ctx,
-                "subinterface_states",
                 mgmt,
-                ("NSOSubinterfaceState",),
-                reconcile_subinterface,
-                device,
-                client.get_subinterface(dev_id),
+                "subinterface",
+                sub_doc,
+                lambda: _safe_reconcile(
+                    ctx, "subinterface_states", mgmt, ("NSOSubinterfaceState",), reconcile_subinterface, device, sub_doc
+                ),
+                epoch=dev_id,
             )
             # Phase 2b: per-interface MTU read mirror (read-only display).
             from .interface_mtu_reconciler import reconcile_interface_mtu
 
-            _safe_reconcile(
+            mtu_doc = client.get_interface_mtu(dev_id)
+            _gated(
                 ctx,
-                "interface_mtu_states",
                 mgmt,
-                ("NSOInterfaceMtuState",),
-                reconcile_interface_mtu,
-                device,
-                client.get_interface_mtu(dev_id),
+                "interface_mtu",
+                mtu_doc,
+                lambda: _safe_reconcile(
+                    ctx,
+                    "interface_mtu_states",
+                    mgmt,
+                    ("NSOInterfaceMtuState",),
+                    reconcile_interface_mtu,
+                    device,
+                    mtu_doc,
+                ),
+                epoch=dev_id,
             )
             # Import interface IP addresses onto their (now first-class, logical-named)
             # NetBox interfaces. Runs AFTER the adapter sync created the interfaces;
             # gated internally by interface_ip_auto_create (off → lands as pending).
-            _safe_reconcile(
+            ip_doc = client.get_interface_ips(dev_id)
+            _gated(
                 ctx,
-                "interface_ips",
                 mgmt,
-                ("NSOInterfaceIPState",),
-                _reconcile_interface_ips,
-                device,
-                client.get_interface_ips(dev_id),
+                "interface_ip",
+                ip_doc,
+                lambda: _safe_reconcile(
+                    ctx, "interface_ips", mgmt, ("NSOInterfaceIPState",), _reconcile_interface_ips, device, ip_doc
+                ),
+                epoch=dev_id,
             )
             # LACP/LAG bundle + member overlay states (interface-level).
             from .lacp_reconciler import reconcile_lag_config
 
-            _safe_reconcile(
+            lag_doc = client.get_lag_config(dev_id)
+            _gated(
                 ctx,
-                "lacp_bundle_states",
                 mgmt,
-                ("NSOLACPBundleState", "NSOLACPMemberState"),
-                reconcile_lag_config,
-                device,
-                client.get_lag_config(dev_id),
+                "lag_config",
+                lag_doc,
+                lambda: _safe_reconcile(
+                    ctx,
+                    "lacp_bundle_states",
+                    mgmt,
+                    ("NSOLACPBundleState", "NSOLACPMemberState"),
+                    reconcile_lag_config,
+                    device,
+                    lag_doc,
+                ),
+                epoch=dev_id,
             )
             # VLAN database + L2 switchport (VLAN DB first — switchport links to it).
             from .vlan_reconciler import reconcile_switchport, reconcile_vlan_database
 
-            _safe_reconcile(
+            vlan_doc = client.get_vlan_database(dev_id)
+            _gated(
                 ctx,
-                "vlan_states",
                 mgmt,
-                ("NSOVLANState",),
-                reconcile_vlan_database,
-                device,
-                client.get_vlan_database(dev_id),
+                "vlan",
+                vlan_doc,
+                lambda: _safe_reconcile(
+                    ctx, "vlan_states", mgmt, ("NSOVLANState",), reconcile_vlan_database, device, vlan_doc
+                ),
+                epoch=dev_id,
             )
-            _safe_reconcile(
+            sw_doc = client.get_switchport(dev_id)
+            _gated(
                 ctx,
-                "switchport_states",
                 mgmt,
-                ("NSOSwitchportState",),
-                reconcile_switchport,
-                device,
-                client.get_switchport(dev_id),
+                "switchport",
+                sw_doc,
+                lambda: _safe_reconcile(
+                    ctx, "switchport_states", mgmt, ("NSOSwitchportState",), reconcile_switchport, device, sw_doc
+                ),
+                epoch=dev_id,
             )
         if mgmt.manage_snmp:
-            _safe_reconcile(
+            snmp_doc = client.get_snmp_config(dev_id)
+            _gated(
                 ctx,
-                "snmp_data",
                 mgmt,
-                ("NSOSnmpCommunityState", "NSOSnmpV3UserState", "NSOSnmpHostState", "NSOSnmpSystemInfoState"),
-                _reconcile_snmp_config,
-                device,
-                client.get_snmp_config(dev_id),
+                "snmp",
+                snmp_doc,
+                lambda: _safe_reconcile(
+                    ctx,
+                    "snmp_data",
+                    mgmt,
+                    ("NSOSnmpCommunityState", "NSOSnmpV3UserState", "NSOSnmpHostState", "NSOSnmpSystemInfoState"),
+                    _reconcile_snmp_config,
+                    device,
+                    snmp_doc,
+                ),
+                epoch=dev_id,
             )
         if mgmt.manage_logging:
-            _safe_reconcile(
+            log_doc = client.get_logging_config(dev_id)
+            _gated(
                 ctx,
-                "logging_data",
                 mgmt,
-                ("NSOLoggingHostState", "NSOLoggingLevelState"),
-                _reconcile_logging_config,
-                device,
-                client.get_logging_config(dev_id),
+                "logging",
+                log_doc,
+                lambda: _safe_reconcile(
+                    ctx,
+                    "logging_data",
+                    mgmt,
+                    ("NSOLoggingHostState", "NSOLoggingLevelState"),
+                    _reconcile_logging_config,
+                    device,
+                    log_doc,
+                ),
+                epoch=dev_id,
             )
         if getattr(mgmt, "manage_l2", False):
             # Nokia L2 SAP overlays. Kept in the full reconcile (not just
@@ -333,14 +582,16 @@ def reconcile_device(device, mgmt=None) -> dict:
             # the tab reads these persisted rows without reconciling on expand.
             from .l2_service_reconciler import reconcile_l2_services
 
-            _safe_reconcile(
+            l2_doc = client.get_l2_services(dev_id)
+            _gated(
                 ctx,
-                "l2_sap_states",
                 mgmt,
-                ("NSOL2SapState",),
-                reconcile_l2_services,
-                device,
-                client.get_l2_services(dev_id),
+                "l2_service",
+                l2_doc,
+                lambda: _safe_reconcile(
+                    ctx, "l2_sap_states", mgmt, ("NSOL2SapState",), reconcile_l2_services, device, l2_doc
+                ),
+                epoch=dev_id,
             )
         _reconcile_routing(device, mgmt, client, ctx)
     return ctx
@@ -375,7 +626,29 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
         return ctx
     dev_id = mgmt.adapter_device_id
 
-    with suppress_intent_push():
+    # D5/R6-1: the whole per-category gated run holds the device mutex; the WEB call
+    # class fails fast on contention (the view renders persisted rows + an
+    # in-progress chip) and fails CLOSED when redis coordination is unreachable.
+    from .read_gate import SKIPPED_BUSY, SKIPPED_LOCK_UNAVAILABLE, LockUnavailable
+
+    try:
+        held = _acquire_reconcile_lease(mgmt, device.pk, "web")
+    except LockUnavailable:
+        logger.warning(
+            "device %s category %s: redis coordination unreachable — failing closed (no reads applied)",
+            device.pk,
+            key,
+        )
+        _mark_all_gated(ctx, _CATEGORY_RECONCILE_FAMILIES.get(key, ()), SKIPPED_LOCK_UNAVAILABLE)
+        ctx["_lock_unavailable"] = True
+        return ctx
+    if held.state == "busy":
+        _mark_all_gated(ctx, _CATEGORY_RECONCILE_FAMILIES.get(key, ()), SKIPPED_BUSY)
+        return ctx
+
+    from contextlib import nullcontext
+
+    with held.lease if held.lease is not None else nullcontext(), suppress_intent_push():
         if key == "interface":
             # Merged "Interfaces" card: refresh all four per-interface scalar
             # overlays (enabled/description, IPs, MTU, switchport) so the
@@ -385,76 +658,274 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
             from .svi_reconciler import reconcile_svi
             from .vlan_reconciler import reconcile_switchport, reconcile_vlan_database
 
-            ctx["interfaces"] = client.get_interfaces(dev_id)
+            interfaces_doc = client.get_interfaces_doc(dev_id)
+            ctx["interfaces"] = interfaces_doc.get("interfaces", [])
             ctx["state"] = client.get_state(dev_id)
-            ctx["interface_states"] = _upsert_interface_states(device, ctx["interfaces"])
-            ctx["svi_states"] = reconcile_svi(device, client.get_svi(dev_id))  # before IPs
-            ctx["subinterface_states"] = reconcile_subinterface(device, client.get_subinterface(dev_id))
-            ctx["interface_ips"] = _reconcile_interface_ips(device, client.get_interface_ips(dev_id))
-            ctx["interface_mtu_states"] = reconcile_interface_mtu(device, client.get_interface_mtu(dev_id))
+            _gated(
+                ctx,
+                mgmt,
+                "interface_attributes",
+                interfaces_doc,
+                lambda: _upsert_interface_states(device, ctx["interfaces"]),
+                epoch=dev_id,
+                ctx_key="interface_states",
+            )
+            svi_doc = client.get_svi(dev_id)  # before IPs
+            _gated(
+                ctx, mgmt, "svi", svi_doc, lambda: reconcile_svi(device, svi_doc), epoch=dev_id, ctx_key="svi_states"
+            )
+            sub_doc = client.get_subinterface(dev_id)
+            _gated(
+                ctx,
+                mgmt,
+                "subinterface",
+                sub_doc,
+                lambda: reconcile_subinterface(device, sub_doc),
+                epoch=dev_id,
+                ctx_key="subinterface_states",
+            )
+            ip_doc = client.get_interface_ips(dev_id)
+            _gated(
+                ctx,
+                mgmt,
+                "interface_ip",
+                ip_doc,
+                lambda: _reconcile_interface_ips(device, ip_doc),
+                epoch=dev_id,
+                ctx_key="interface_ips",
+            )
+            mtu_doc = client.get_interface_mtu(dev_id)
+            _gated(
+                ctx,
+                mgmt,
+                "interface_mtu",
+                mtu_doc,
+                lambda: reconcile_interface_mtu(device, mtu_doc),
+                epoch=dev_id,
+                ctx_key="interface_mtu_states",
+            )
             # VLAN DB first so switchport vid lookups resolve in the per-device group.
-            reconcile_vlan_database(device, client.get_vlan_database(dev_id))
-            ctx["switchport_states"] = reconcile_switchport(device, client.get_switchport(dev_id))
+            vlan_doc = client.get_vlan_database(dev_id)
+            _gated(ctx, mgmt, "vlan", vlan_doc, lambda: reconcile_vlan_database(device, vlan_doc), epoch=dev_id)
+            sw_doc = client.get_switchport(dev_id)
+            _gated(
+                ctx,
+                mgmt,
+                "switchport",
+                sw_doc,
+                lambda: reconcile_switchport(device, sw_doc),
+                epoch=dev_id,
+                ctx_key="switchport_states",
+            )
         elif key == "interfaces":
-            ctx["interfaces"] = client.get_interfaces(dev_id)
-            ctx["state"] = client.get_state(dev_id)
-            ctx["interface_states"] = _upsert_interface_states(device, ctx["interfaces"])
+            from .subinterface_reconciler import reconcile_subinterface
             from .svi_reconciler import reconcile_svi
 
-            ctx["svi_states"] = reconcile_svi(device, client.get_svi(dev_id))  # before IPs
-            from .subinterface_reconciler import reconcile_subinterface
-
-            ctx["subinterface_states"] = reconcile_subinterface(device, client.get_subinterface(dev_id))
-            ctx["interface_ips"] = _reconcile_interface_ips(device, client.get_interface_ips(dev_id))
+            interfaces_doc = client.get_interfaces_doc(dev_id)
+            ctx["interfaces"] = interfaces_doc.get("interfaces", [])
+            ctx["state"] = client.get_state(dev_id)
+            _gated(
+                ctx,
+                mgmt,
+                "interface_attributes",
+                interfaces_doc,
+                lambda: _upsert_interface_states(device, ctx["interfaces"]),
+                epoch=dev_id,
+                ctx_key="interface_states",
+            )
+            svi_doc = client.get_svi(dev_id)  # before IPs
+            _gated(
+                ctx, mgmt, "svi", svi_doc, lambda: reconcile_svi(device, svi_doc), epoch=dev_id, ctx_key="svi_states"
+            )
+            sub_doc = client.get_subinterface(dev_id)
+            _gated(
+                ctx,
+                mgmt,
+                "subinterface",
+                sub_doc,
+                lambda: reconcile_subinterface(device, sub_doc),
+                epoch=dev_id,
+                ctx_key="subinterface_states",
+            )
+            ip_doc = client.get_interface_ips(dev_id)
+            _gated(
+                ctx,
+                mgmt,
+                "interface_ip",
+                ip_doc,
+                lambda: _reconcile_interface_ips(device, ip_doc),
+                epoch=dev_id,
+                ctx_key="interface_ips",
+            )
         elif key == "interface_ips":
             from .subinterface_reconciler import reconcile_subinterface
             from .svi_reconciler import reconcile_svi
 
-            ctx["svi_states"] = reconcile_svi(device, client.get_svi(dev_id))  # SVIs exist before IPs
-            ctx["subinterface_states"] = reconcile_subinterface(device, client.get_subinterface(dev_id))
-            ctx["interface_ips"] = _reconcile_interface_ips(device, client.get_interface_ips(dev_id))
+            svi_doc = client.get_svi(dev_id)  # SVIs exist before IPs
+            _gated(
+                ctx, mgmt, "svi", svi_doc, lambda: reconcile_svi(device, svi_doc), epoch=dev_id, ctx_key="svi_states"
+            )
+            sub_doc = client.get_subinterface(dev_id)
+            _gated(
+                ctx,
+                mgmt,
+                "subinterface",
+                sub_doc,
+                lambda: reconcile_subinterface(device, sub_doc),
+                epoch=dev_id,
+                ctx_key="subinterface_states",
+            )
+            ip_doc = client.get_interface_ips(dev_id)
+            _gated(
+                ctx,
+                mgmt,
+                "interface_ip",
+                ip_doc,
+                lambda: _reconcile_interface_ips(device, ip_doc),
+                epoch=dev_id,
+                ctx_key="interface_ips",
+            )
         elif key == "lacp":
             from .lacp_reconciler import reconcile_lag_config
 
-            ctx["lacp_bundle_states"] = reconcile_lag_config(device, client.get_lag_config(dev_id))
+            lag_doc = client.get_lag_config(dev_id)
+            _gated(
+                ctx,
+                mgmt,
+                "lag_config",
+                lag_doc,
+                lambda: reconcile_lag_config(device, lag_doc),
+                epoch=dev_id,
+                ctx_key="lacp_bundle_states",
+            )
         elif key == "vlan":
             from .vlan_reconciler import reconcile_vlan_database
 
-            ctx["vlan_states"] = reconcile_vlan_database(device, client.get_vlan_database(dev_id))
+            vlan_doc = client.get_vlan_database(dev_id)
+            _gated(
+                ctx,
+                mgmt,
+                "vlan",
+                vlan_doc,
+                lambda: reconcile_vlan_database(device, vlan_doc),
+                epoch=dev_id,
+                ctx_key="vlan_states",
+            )
         elif key == "switchport":
             from .vlan_reconciler import reconcile_switchport, reconcile_vlan_database
 
             # VLAN DB first so switchport vid lookups resolve in the per-device group.
-            reconcile_vlan_database(device, client.get_vlan_database(dev_id))
-            ctx["switchport_states"] = reconcile_switchport(device, client.get_switchport(dev_id))
+            vlan_doc = client.get_vlan_database(dev_id)
+            _gated(ctx, mgmt, "vlan", vlan_doc, lambda: reconcile_vlan_database(device, vlan_doc), epoch=dev_id)
+            sw_doc = client.get_switchport(dev_id)
+            _gated(
+                ctx,
+                mgmt,
+                "switchport",
+                sw_doc,
+                lambda: reconcile_switchport(device, sw_doc),
+                epoch=dev_id,
+                ctx_key="switchport_states",
+            )
         elif key == "svi":
             from .svi_reconciler import reconcile_svi
 
-            ctx["svi_states"] = reconcile_svi(device, client.get_svi(dev_id))
+            svi_doc = client.get_svi(dev_id)
+            _gated(
+                ctx, mgmt, "svi", svi_doc, lambda: reconcile_svi(device, svi_doc), epoch=dev_id, ctx_key="svi_states"
+            )
         elif key == "subinterface":
             from .subinterface_reconciler import reconcile_subinterface
 
-            ctx["subinterface_states"] = reconcile_subinterface(device, client.get_subinterface(dev_id))
+            sub_doc = client.get_subinterface(dev_id)
+            _gated(
+                ctx,
+                mgmt,
+                "subinterface",
+                sub_doc,
+                lambda: reconcile_subinterface(device, sub_doc),
+                epoch=dev_id,
+                ctx_key="subinterface_states",
+            )
         elif key == "interface_mtu":
             from .interface_mtu_reconciler import reconcile_interface_mtu
 
-            ctx["interface_mtu_states"] = reconcile_interface_mtu(device, client.get_interface_mtu(dev_id))
+            mtu_doc = client.get_interface_mtu(dev_id)
+            _gated(
+                ctx,
+                mgmt,
+                "interface_mtu",
+                mtu_doc,
+                lambda: reconcile_interface_mtu(device, mtu_doc),
+                epoch=dev_id,
+                ctx_key="interface_mtu_states",
+            )
         elif key == "snmp":
-            ctx["snmp_data"] = _reconcile_snmp_config(device, client.get_snmp_config(dev_id))
+            snmp_doc = client.get_snmp_config(dev_id)
+            _gated(
+                ctx,
+                mgmt,
+                "snmp",
+                snmp_doc,
+                lambda: _reconcile_snmp_config(device, snmp_doc),
+                epoch=dev_id,
+                ctx_key="snmp_data",
+            )
         elif key == "logging":
-            ctx["logging_data"] = _reconcile_logging_config(device, client.get_logging_config(dev_id))
+            log_doc = client.get_logging_config(dev_id)
+            _gated(
+                ctx,
+                mgmt,
+                "logging",
+                log_doc,
+                lambda: _reconcile_logging_config(device, log_doc),
+                epoch=dev_id,
+                ctx_key="logging_data",
+            )
         elif key == "static":
-            ctx["static_routes"] = _reconcile_static_routes(device, client.get_static_routes(dev_id))
+            static_doc = client.get_static_routes(dev_id)
+            _gated(
+                ctx,
+                mgmt,
+                "static_route",
+                static_doc,
+                lambda: _reconcile_static_routes(device, static_doc),
+                epoch=dev_id,
+                ctx_key="static_routes",
+            )
         elif key == "isis":
+            # R3-6: ONE document → ONE gate decision → ONE compound body.
             isis_payload = client.get_isis_interfaces(dev_id)
-            ctx["isis_interfaces"] = _reconcile_isis_interfaces(device, isis_payload.get("interfaces", []))
-            ctx["isis_processes"] = _reconcile_isis_process(device, isis_payload.get("processes", []))
+
+            def _isis_body():
+                ctx["isis_interfaces"] = _reconcile_isis_interfaces(device, isis_payload.get("interfaces", []))
+                ctx["isis_processes"] = _reconcile_isis_process(device, isis_payload.get("processes", []))
+
+            _gated(ctx, mgmt, "isis", isis_payload, _isis_body, epoch=dev_id)
         elif key == "ospf":
-            ctx["ospf_data"] = _reconcile_ospf(device, client.get_ospf(dev_id))
+            ospf_doc = client.get_ospf(dev_id)
+            _gated(
+                ctx,
+                mgmt,
+                "ospf",
+                ospf_doc,
+                lambda: _reconcile_ospf(device, ospf_doc),
+                epoch=dev_id,
+                ctx_key="ospf_data",
+            )
         elif key == "bgp":
             from .models import NSOBGPPeerTemplateState
 
-            ctx["bgp_peers"] = _reconcile_bgp_config(device, client.get_bgp_config(dev_id))
+            bgp_doc = client.get_bgp_config(dev_id)
+            _gated(
+                ctx,
+                mgmt,
+                "bgp",
+                bgp_doc,
+                lambda: _reconcile_bgp_config(device, bgp_doc),
+                epoch=dev_id,
+                ctx_key="bgp_peers",
+            )
             ctx["bgp_peer_templates"] = list(
                 NSOBGPPeerTemplateState.objects.filter(management=mgmt).select_related("template")
             )
@@ -462,20 +933,56 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
             from .bfd_reconciler import reconcile_bfd
             from .models import NSOBFDInterfaceState
 
-            ctx["bfd_interfaces"] = reconcile_bfd(device, client.get_bfd(dev_id).get("interfaces", []))
+            bfd_doc = client.get_bfd(dev_id)
+            _gated(
+                ctx,
+                mgmt,
+                "bfd",
+                bfd_doc,
+                lambda: reconcile_bfd(device, bfd_doc.get("interfaces", [])),
+                epoch=dev_id,
+                ctx_key="bfd_interfaces",
+            )
             ctx["bfd_states"] = list(
                 NSOBFDInterfaceState.objects.filter(management__device=device).select_related("interface")
             )
         elif key == "route_policy":
-            ctx["route_policy_states"] = reconcile_route_policy(device, client.get_route_policy(dev_id))
+            rp_doc = client.get_route_policy(dev_id)
+            _gated(
+                ctx,
+                mgmt,
+                "route_policy",
+                rp_doc,
+                lambda: reconcile_route_policy(device, rp_doc),
+                epoch=dev_id,
+                ctx_key="route_policy_states",
+            )
         elif key == "redistribution":
-            ctx["redistribution_states"] = reconcile_redistribution(device, client.get_redistribution(dev_id))
+            redist_doc = client.get_redistribution(dev_id)
+            _gated(
+                ctx,
+                mgmt,
+                "redistribution",
+                redist_doc,
+                lambda: reconcile_redistribution(device, redist_doc),
+                epoch=dev_id,
+                ctx_key="redistribution_states",
+            )
         elif key == "l2_services":
             # reconcile into native vpn.L2VPN + L2VPNTermination + NSOL2SapState
             # (value-aware drift/accept). The dot1q tag stays per-SAP interface-local encap.
             from .l2_service_reconciler import reconcile_l2_services
 
-            ctx["l2_sap_states"] = reconcile_l2_services(device, client.get_l2_services(dev_id))
+            l2_doc = client.get_l2_services(dev_id)
+            _gated(
+                ctx,
+                mgmt,
+                "l2_service",
+                l2_doc,
+                lambda: reconcile_l2_services(device, l2_doc),
+                epoch=dev_id,
+                ctx_key="l2_sap_states",
+            )
     return ctx
 
 
@@ -799,6 +1306,18 @@ def run_device_reconcile(device_id: int) -> dict:
     except AdapterError as exc:
         logger.warning("nso reconcile: adapter error for device %s: %s", device_id, exc)
         return {"device_id": device_id, "error": str(exc)}
+
+    if ctx.get("_deferred"):
+        # R7-1/R8-1: never a zero-work success — the lease owner's release hook (or
+        # the cadence backstop) runs the successor; this job's summary says so.
+        logger.warning(
+            "nso reconcile deferred for device %s after %s attempts (device lease contended)",
+            device_id,
+            ctx["_deferred"],
+        )
+        return {"device_id": device_id, "deferred": True, "attempts": ctx["_deferred"]}
+    if ctx.get("_lock_unavailable"):
+        return {"device_id": device_id, "skipped": "lock_unavailable"}
 
     # Step 4: after the post-sync reconcile, settle any rows left 'deploying' whose
     # scope's last apply reported a failure → apply_failed (no longer stuck), escalate

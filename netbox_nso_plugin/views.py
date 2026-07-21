@@ -709,6 +709,19 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 # The banner explains the failed refresh; the rows must not vanish
                 # with it — render last-synced state underneath.
                 ctx.update(_persisted_category_context(device, mgmt, key))
+            else:
+                # READSEM S4 (D9): any skip disposition means the reconciler body
+                # never ran — its ctx entries are still empty defaults. Fill THOSE
+                # from persisted rows so last-known state stays visible (fresh
+                # results from families that DID run are kept as-is).
+                gate = ctx.get("_gate") or {}
+                if any(str(d).startswith("skipped_") for d in gate.values()):
+                    from .reconcile import _empty_context
+
+                    defaults = _empty_context()
+                    for pkey, pval in _persisted_category_context(device, mgmt, key).items():
+                        if pkey in defaults and ctx.get(pkey) == defaults[pkey]:
+                            ctx[pkey] = pval
         else:
             # Unlinked device: nothing to reconcile, but NetBox still holds state.
             ctx.update(_persisted_category_context(device, mgmt, key))
@@ -2298,7 +2311,7 @@ class NSODeviceManagementView(generic.ObjectView):
 
         if instance.adapter_device_id is not None:
             try:
-                interfaces = client.get_interfaces(instance.adapter_device_id)
+                interfaces = client.get_interfaces_doc(instance.adapter_device_id).get("interfaces", [])
                 compliance = client.get_state(instance.adapter_device_id)
             except AdapterError as exc:
                 adapter_error = str(exc)
@@ -2916,7 +2929,7 @@ class NSORefreshStateView(NSOActionPermissionMixin, View):
 
         try:
             compliance = client.get_state(mgmt.adapter_device_id)
-            interfaces = client.get_interfaces(mgmt.adapter_device_id)
+            interfaces = client.get_interfaces_doc(mgmt.adapter_device_id).get("interfaces", [])
             NSODeviceManagement.objects.filter(pk=mgmt.pk).update(
                 state_snapshot={
                     "compliance": compliance,
