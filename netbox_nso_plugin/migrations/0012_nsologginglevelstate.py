@@ -9,7 +9,10 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("extras", "0140_imageattachment_image_size"),
+        # Pin the OLDEST extras node the plugin already depends on (0001_initial's pin),
+        # not the generating dev env's head — CI runs the minimum supported NetBox,
+        # where a newer extras migration does not exist (NodeNotFoundError).
+        ("extras", "0138_customfieldchoiceset_choice_colors"),
         ("netbox_nso_plugin", "0011_nsolacpbundlestate_vpc_sensitive"),
     ]
 
