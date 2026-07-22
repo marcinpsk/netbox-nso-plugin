@@ -850,10 +850,14 @@ class TestEnqueueDeviceReconcileOrphanRecovery(TestCase):
     def test_a_job_mid_handoff_to_a_worker_is_not_reclaimed(self):
         """An RQ worker POPS the job (it leaves the pending queue) and only then adds it to
         StartedJobRegistry. In between it is in NEITHER — by registry membership alone it is
-        indistinguishable from an orphan. Reclaiming it there deletes a job that is about to
-        run and enqueues a second one, so two reconciles for the same device run CONCURRENTLY
-        and race on the overlay upserts (get_or_create → IntegrityError). Its timestamps are
-        seconds old, which is exactly what an orphan's are not.
+        indistinguishable from an orphan. The deterministic hash must NOT be reclaimed
+        (deleting/re-enqueuing under the live worker overwrites the job it is about to run).
+
+        S5a F (codex R6-3) UPDATE: the notify itself is no longer suppressed — the popped
+        worker may die before its first read, losing the edge. The hash is preserved AND the
+        notify continues through the unique path, whose job serializes behind the device
+        lease (the old two-concurrent-reconciles race this test once guarded is now the
+        lease layer's job).
         """
         from netbox_nso_plugin.reconcile import enqueue_device_reconcile, run_device_reconcile
 
@@ -865,12 +869,11 @@ class TestEnqueueDeviceReconcileOrphanRecovery(TestCase):
         with patch("django_rq.get_queue", return_value=q):
             returned = enqueue_device_reconcile(self._DEV)
 
-        self.assertEqual(returned.id, self._JOB_ID)
-        self.assertNotIn(
-            self._JOB_ID,
-            q.get_job_ids(),
-            "a second reconcile must not be enqueued behind the worker's back",
-        )
+        # Hash preserved: the deterministic id was NOT reclaimed/re-enqueued.
+        self.assertNotIn(self._JOB_ID, q.get_job_ids())
+        # …but the notify was NOT dropped: a unique notify job now carries the edge.
+        self.assertTrue(returned.id.startswith(f"nso-reconcile-{self._DEV}-notify-"))
+        self.assertIn(returned.id, q.get_job_ids())
 
     def test_genuinely_queued_job_is_not_duplicated(self):
         """A truly-pending reconcile is still deduped (no pile-up) — the fix must not regress that."""
@@ -884,3 +887,182 @@ class TestEnqueueDeviceReconcileOrphanRecovery(TestCase):
 
         self.assertEqual(second.id, first.id)
         self.assertEqual(q.get_job_ids().count(self._JOB_ID), 1)
+
+
+class TestTrailingEdgeNotify(TestCase):
+    """S5a work stream F (codex R1-F1): a notify arriving while the deterministic reconcile
+    is RUNNING (or just finished) was silently dropped by the enqueue-time dedupe — the
+    running job had already snapshotted, so the newest refresh never reached the overlays.
+    The debounced unique enqueue makes every such notify durable; the shipped device lease
+    serializes execution. Real RQ + real Redis on an isolated throwaway queue.
+    """
+
+    _DEV = 987655  # distinct from the orphan-recovery class's device
+    _QUEUE = "nso-test-reconcile-trailing"
+    _JOB_ID = f"nso-reconcile-{_DEV}"
+
+    def _queue(self):
+        import django_rq
+        from rq import Queue
+
+        conn = django_rq.get_queue("default").connection
+        return Queue(self._QUEUE, connection=conn)
+
+    def setUp(self):
+        super().setUp()
+        self._clear()
+
+    def tearDown(self):
+        self._clear()
+        super().tearDown()
+
+    def _clear(self):
+        from rq.exceptions import NoSuchJobError
+        from rq.job import Job as RqJob
+        from rq.registry import StartedJobRegistry
+
+        from netbox_nso_plugin.read_gate import unique_pending_key
+
+        q = self._queue()
+        conn = q.connection
+        for jid in [self._JOB_ID, *q.get_job_ids(), *StartedJobRegistry(queue=q).get_job_ids(cleanup=False)]:
+            try:
+                RqJob.fetch(jid, connection=conn).delete()
+            except NoSuchJobError:
+                pass
+        conn.delete(StartedJobRegistry(queue=q).key)  # drop wip composite entries wholesale
+        conn.delete(unique_pending_key(self._DEV))
+        q.empty()
+
+    def _running_deterministic(self, q):
+        """Fixture: the deterministic job is genuinely RUNNING (in StartedJobRegistry).
+
+        RQ 2.10 stores ``{job_id}:{execution_id}`` composite entries written by the
+        worker's execution machinery (plain ``.add()`` is NotImplemented) — write the
+        entry the way a worker does, scored in the future so cleanup keeps it.
+        """
+        import time as _time
+
+        from rq.registry import StartedJobRegistry
+
+        from netbox_nso_plugin.reconcile import run_device_reconcile
+
+        job = q.enqueue(run_device_reconcile, self._DEV, job_id=self._JOB_ID)
+        q.remove(job.id)
+        registry = StartedJobRegistry(queue=q)
+        registry.connection.zadd(registry.key, {f"{job.id}:testexec": _time.time() + 600})
+        return job
+
+    def test_notify_during_running_reconcile_enqueues_unique_job(self):
+        """RED against the drop: a notify during a RUNNING reconcile must enqueue its own
+        (unique-id) job — the running job's snapshot predates this refresh."""
+        from netbox_nso_plugin.reconcile import enqueue_device_reconcile
+
+        q = self._queue()
+        self._running_deterministic(q)
+
+        with patch("django_rq.get_queue", return_value=q):
+            returned = enqueue_device_reconcile(self._DEV)
+
+        self.assertTrue(
+            returned.id.startswith(f"nso-reconcile-{self._DEV}-notify-"),
+            f"notify during RUNNING must not be suppressed (got {returned.id})",
+        )
+        self.assertIn(returned.id, q.get_job_ids())
+
+    def test_notify_shortly_after_completion_enqueues(self):
+        """RED (codex R2-F2): a notify inside the post-completion result_ttl window saw a
+        fresh terminal hash in no registry and was misread as mid-handoff → dropped."""
+        from netbox_nso_plugin.reconcile import enqueue_device_reconcile, run_device_reconcile
+
+        q = self._queue()
+        job = q.enqueue(run_device_reconcile, self._DEV, job_id=self._JOB_ID)
+        q.remove(job.id)
+        job.set_status("finished")  # terminal, timestamps seconds old
+
+        with patch("django_rq.get_queue", return_value=q):
+            returned = enqueue_device_reconcile(self._DEV)
+
+        self.assertIsNotNone(returned)
+        self.assertIn(returned.id, q.get_job_ids(), "post-completion notify must enqueue")
+
+    def test_validated_pending_unique_absorbs_further_notifies(self):
+        """Steady state: ONE queued unique job absorbs every further notify (it reads
+        post-refresh state when it starts) — the R6-4 pile-up bound."""
+        from netbox_nso_plugin.reconcile import enqueue_device_reconcile
+
+        q = self._queue()
+        self._running_deterministic(q)
+
+        with patch("django_rq.get_queue", return_value=q):
+            first = enqueue_device_reconcile(self._DEV)
+            second = enqueue_device_reconcile(self._DEV)
+            third = enqueue_device_reconcile(self._DEV)
+
+        self.assertEqual(first.id, second.id)
+        self.assertEqual(first.id, third.id)
+        unique_ids = [j for j in q.get_job_ids() if "-notify-" in j]
+        self.assertEqual(len(unique_ids), 1, "exactly one outstanding unique job")
+
+    def test_stale_unique_pointer_fails_open(self):
+        """A pointer referencing a vanished job must NOT suppress — fail open to enqueue
+        (the self-healing half of the R7-2 invariant)."""
+        from netbox_nso_plugin.read_gate import unique_pending_key
+        from netbox_nso_plugin.reconcile import enqueue_device_reconcile
+
+        q = self._queue()
+        self._running_deterministic(q)
+        q.connection.set(unique_pending_key(self._DEV), "nso-reconcile-ghost-notify-dead", ex=900)
+
+        with patch("django_rq.get_queue", return_value=q):
+            returned = enqueue_device_reconcile(self._DEV)
+
+        self.assertIn(returned.id, q.get_job_ids())
+        self.assertTrue(returned.id.startswith(f"nso-reconcile-{self._DEV}-notify-"))
+
+    def test_enqueue_failure_leaves_no_pointer(self):
+        """codex R6-2: the pointer is SET only AFTER a durable enqueue — a crash between
+        them must leave NO pointer (a duplicate later, never a suppressed loss)."""
+        from netbox_nso_plugin.read_gate import unique_pending_key
+        from netbox_nso_plugin.reconcile import enqueue_device_reconcile
+
+        q = self._queue()
+        self._running_deterministic(q)
+
+        with (
+            patch("django_rq.get_queue", return_value=q),
+            patch.object(type(q), "enqueue", side_effect=RuntimeError("redis hiccup")),
+        ):
+            with self.assertRaises(RuntimeError):
+                enqueue_device_reconcile(self._DEV)
+
+        self.assertIsNone(q.connection.get(unique_pending_key(self._DEV)))
+
+    def test_body_cad_consumes_only_own_pointer(self):
+        """Owner-checked compare-and-delete (codex R7-3): an older job's consume must not
+        erase a NEWER job's pointer and reopen the suppression gate early."""
+        from netbox_nso_plugin.read_gate import consume_unique_pending, unique_pending_key
+
+        q = self._queue()
+        conn = q.connection
+        conn.set(unique_pending_key(self._DEV), "job-B", ex=900)
+
+        self.assertFalse(consume_unique_pending(conn, self._DEV, "job-A"))
+        self.assertEqual(conn.get(unique_pending_key(self._DEV)), b"job-B")
+        self.assertTrue(consume_unique_pending(conn, self._DEV, "job-B"))
+        self.assertIsNone(conn.get(unique_pending_key(self._DEV)))
+
+    def test_notify_class_lease_uses_zero_retry_budget(self):
+        """codex R6-4: notify-class jobs must not burn the 90s retry budget on general RQ
+        workers — single attempt, defer-marker, one post-marker attempt (shipped shape)."""
+        from netbox_nso_plugin.read_gate import Deferred
+        from netbox_nso_plugin.reconcile import _acquire_reconcile_lease
+
+        mgmt = type("M", (), {"pk": self._DEV})()
+        with patch("netbox_nso_plugin.read_gate.acquire_for_rq") as acq:
+            acq.return_value = Deferred(attempts=2, nonce="n")
+            out = _acquire_reconcile_lease(mgmt, self._DEV, "notify")
+
+        acq.assert_called_once()
+        self.assertEqual(acq.call_args.kwargs.get("retry_budget_s"), 0.0)
+        self.assertEqual(out.state, "deferred")

@@ -122,6 +122,41 @@ def handoff_job_id(device_id, nonce: str) -> str:
     return f"nso-reconcile-{device_id}-handoff-{nonce}"
 
 
+def unique_pending_key(device_id) -> str:
+    """Per-device pointer to the outstanding unique notify-reconcile job (S5a F).
+
+    Deliberately NOT :func:`marker_key` — that namespace holds the lease-handoff
+    nonces, and colliding would let a lease release consume a job id as a nonce
+    (codex S5a R7-3).
+    """
+    return f"nso-reconcile-unique-pending:{device_id}"
+
+
+def notify_job_id(device_id, nonce: str) -> str:
+    """Return the unique notify-reconcile job id (S5a F).
+
+    Never the deterministic id: RQ's default (non-unique) enqueue overwrites an
+    existing hash, so re-using the deterministic id could clobber a job a worker is
+    still finishing (codex S5a R3-2).
+    """
+    return f"nso-reconcile-{device_id}-notify-{nonce}"
+
+
+def consume_unique_pending(conn, device_id, own_job_id: str) -> bool:
+    """Owner-checked compare-and-delete of the unique-pending pointer (S5a F).
+
+    Called as the FIRST statement of the referenced job's body — before any state
+    read — so a notify arriving after the body begins reading always enqueues its
+    own job (the loss-free invariant's hinge). Owner-checked: an older job's consume
+    must not erase a NEWER job's pointer and reopen the suppression gate early.
+    """
+    try:
+        return bool(conn.eval(_RELEASE_LUA, 1, unique_pending_key(device_id), own_job_id))
+    except _redis_errors() as exc:
+        logger.warning("device %s: unique-pending consume failed: %s", device_id, exc)
+        return False
+
+
 def _redis_errors():
     import redis
 
