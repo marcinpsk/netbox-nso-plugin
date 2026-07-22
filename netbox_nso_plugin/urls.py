@@ -179,7 +179,8 @@ urlpatterns = [
         views.NSOCategoryCountsView.as_view(),
         name="device_nso_category_counts",
     ),
-    # Device NSO tab — background "Refresh from NSO" (reconcile cache only)
+    # Device NSO tab — background "Refresh overlays" (plugin-cache reconcile only; the
+    # adapter-side CDB re-read is the sync-from-nso ACTION, S5a)
     path(
         "device-management/<int:pk>/reconcile/",
         views.NSODeviceReconcileView.as_view(),

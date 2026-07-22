@@ -262,6 +262,14 @@
           <span class="mdi mdi-sync"></span> Sync Now
         </button>
       </form>
+      <form method="post" class="nso-action-form" data-label="Sync from NSO"
+            action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_action' mgmt.pk 'sync-from-nso' %}">
+        {% csrf_token %}
+        <button type="submit" class="btn btn-outline-primary nso-action-btn"
+                title="Re-read NSO's CURRENT config into the mirror — no device contact. Heals stale/never-read family chips without the cost of a device round-trip. (Sync Now asks NSO to re-read the live device first; Refresh overlays only redisplays the mirror.)">
+          <span class="mdi mdi-database-sync"></span> Sync from NSO
+        </button>
+      </form>
       <form method="post" class="nso-action-form" data-label="Detect Drift"
             action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_action' mgmt.pk 'detect-drift' %}">
         {% csrf_token %}
@@ -289,7 +297,7 @@
             action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_reconcile' mgmt.pk %}">
         {% csrf_token %}
         <button type="submit" class="btn btn-outline-secondary"
-                title="Re-pull the adapter's mirrored state into the tab overlays (no device read — use Sync Now to re-read the device via NSO)">
+                title="Redisplay from the adapter's mirror — no NSO contact at all. (Sync from NSO re-reads NSO's config; Sync Now re-reads the live device via NSO.)">
           <span class="mdi mdi-cloud-refresh"></span> Refresh overlays
         </button>
       </form>
@@ -549,7 +557,15 @@
           var job = await r.json();
           if (job.error && job.status !== 'failed') { clearInterval(interval); var jobErr = (job.error && typeof job.error === 'object') ? (job.error.message || JSON.stringify(job.error)) : job.error; setStatus(label + ' error: ' + jobErr, 'danger', false); setButtons(false); return; }
           if (job.status === 'succeeded') {
-            clearInterval(interval); setStatus(label + ' completed (Job #' + jobId + ').', 'success', false); setButtons(false);
+            clearInterval(interval); setButtons(false);
+            // S5a C (codex R1-F2): a succeeded mirror read may still have degraded families
+            // (kept last-known data) — say so instead of a green "completed".
+            var degraded = (job.result && job.result.degraded_surfaces) || [];
+            if (degraded.length) {
+              setStatus(label + ' completed — ' + degraded.length + ' families degraded, last-known data kept (Job #' + jobId + ').', 'warning', false);
+            } else {
+              setStatus(label + ' completed (Job #' + jobId + ').', 'success', false);
+            }
             document.dispatchEvent(new CustomEvent('nso:refresh-categories'));  // clear stale header badges
           } else if (job.status === 'failed') {
             clearInterval(interval);
@@ -573,6 +589,13 @@
         });
         var data = await r.json();
         if (data.status === 'error') { setStatus('Error: ' + data.message, 'danger', false); setButtons(false); }
+        else if (data.status === 'conflict') {
+          // S5a C (codex R1-F7): poll the INCUMBENT under its own name — never claim the
+          // clicked action is running when it was rejected.
+          var who = data.job_type ? ('Another job is already running: ' + data.job_type) : 'Another job is already running';
+          if (data.job_id) { setStatus(who + ' — tracking it (Job #' + data.job_id + ').', 'warning', true); pollJob(data.job_id, data.job_type || 'Job'); }
+          else { setStatus(who + '.', 'warning', false); setButtons(false); }
+        }
         else if (data.job_id) { setStatus(label + ' running… (Job #' + data.job_id + ')', 'info', true); pollJob(data.job_id, label); }
         else { setStatus(label + ' triggered (no job to track).', 'success', false); setButtons(false); }
       } catch (err) { setStatus('Request failed: ' + err.message, 'danger', false); setButtons(false); }

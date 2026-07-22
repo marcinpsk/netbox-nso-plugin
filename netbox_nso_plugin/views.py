@@ -2417,6 +2417,7 @@ class NSODeviceManagementDeleteView(NSODevicesReturnMixin, generic.ObjectDeleteV
 
 _ACTION_LABELS = {
     "sync": "Sync",
+    "sync-from-nso": "Sync from NSO",
     "detect-drift": "Detect Drift",
     "connect": "Test Connection",
     "apply": "Apply Intent",
@@ -2548,6 +2549,7 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
 
         action_fn = {
             "sync": client.trigger_sync,
+            "sync-from-nso": client.trigger_sync_from_nso,
             "detect-drift": client.trigger_detect_drift,
             "connect": client.trigger_connect,
             "apply": client.trigger_apply,
@@ -2576,9 +2578,22 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
                 _rollback_prepare_apply(prepared)
             if exc.code == "conflict":
                 job_id = (exc.detail or {}).get("job_id")
+                # S5a C (codex R1-F7): name the INCUMBENT job — without it the UI polls the
+                # running job under the CLICKED action's label ("Sync from NSO running…"
+                # while an Apply runs). Best-effort: a failed lookup degrades to generic.
+                incumbent_type = None
+                if job_id:
+                    try:
+                        incumbent_type = (client.get_job(job_id) or {}).get("type")
+                    except AdapterError:
+                        incumbent_type = None
                 if is_ajax:
-                    return JsonResponse({"status": "conflict", "job_id": job_id})
-                msg = "A job is already running for this device."
+                    return JsonResponse({"status": "conflict", "job_id": job_id, "job_type": incumbent_type})
+                msg = (
+                    f"Another job is already running: {incumbent_type}."
+                    if incumbent_type
+                    else "A job is already running for this device."
+                )
                 if job_id:
                     msg += f" (Job ID: {job_id})"
                 messages.warning(request, msg)

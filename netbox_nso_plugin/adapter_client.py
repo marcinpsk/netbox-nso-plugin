@@ -608,6 +608,15 @@ def trigger_sync(adapter_device_id):
     return _request("POST", f"/api/v1/devices/{adapter_device_id}/actions/sync")
 
 
+def trigger_sync_from_nso(adapter_device_id):
+    """POST /api/v1/devices/{id}/actions/sync-from-nso → job_id.
+
+    S5a: comprehensive CDB-only mirror read — no device round-trip (Sync Now runs the
+    device ``sync-from`` first; this button re-reads what NSO already knows).
+    """
+    return _request("POST", f"/api/v1/devices/{adapter_device_id}/actions/sync-from-nso")
+
+
 def trigger_detect_drift(adapter_device_id):
     """POST /api/v1/devices/{id}/actions/detect-drift → job_id."""
     return _request("POST", f"/api/v1/devices/{adapter_device_id}/actions/detect-drift")
