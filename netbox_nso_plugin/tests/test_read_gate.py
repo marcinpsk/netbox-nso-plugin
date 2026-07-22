@@ -336,6 +336,39 @@ class TestGateTransitions(TestCase):
         self.assertEqual(body_a.calls, 0)
         self.assertEqual(self._row().applied_attempt_id, 6)
 
+    def test_admitted_body_is_fenced_across_incarnations(self):
+        """codex B5-R2-1: attempts RESTART after a store rebuild, so an attempt-id-only
+        fence admits a stale body when a successor ADOPTED a newer incarnation and
+        applied the SAME attempt number. The fence must compare the incarnation too."""
+        import netbox_nso_plugin.read_gate as read_gate
+        from netbox_nso_plugin.read_gate import SKIPPED_STALE_ATTEMPT
+
+        real = read_gate._gate_and_record
+        raced = {"done": False}
+
+        def racing(mgmt, family, read_state, *, epoch):
+            decision = real(mgmt, family, read_state, epoch=epoch)
+            if not raced["done"]:
+                raced["done"] = True
+                # B adopts the NEWER incarnation and applies the SAME attempt number
+                read_gate.gated_family_run(
+                    mgmt,
+                    family,
+                    _rs(attempt_id=5, incarnation=_INC_B[0], incarnation_born=_INC_B[1]),
+                    _Recorder(),
+                    epoch=epoch,
+                )
+            return decision
+
+        body_a = _Recorder()
+        with patch.object(read_gate, "_gate_and_record", side_effect=racing):
+            result = read_gate.gated_family_run(self.mgmt, "bfd", _rs(attempt_id=5), body_a, epoch=self.epoch)
+        self.assertEqual(result.disposition, SKIPPED_STALE_ATTEMPT)
+        self.assertEqual(body_a.calls, 0)
+        row = self._row()
+        self.assertEqual(row.applied_incarnation, _INC_B[0])
+        self.assertEqual(row.applied_attempt_id, 5)
+
     def test_legacy_key_absent_marks_row_legacy_and_runs_body(self):
         from netbox_nso_plugin.read_gate import LEGACY
 
@@ -482,6 +515,21 @@ class TestIncarnationAdoption(TestCase):
         result, _ = self._run(_rs(attempt_id=50), family="ospf")  # _INC_A default
         self.assertEqual(result.disposition, SKIPPED_STALE_ATTEMPT)
         self.assertEqual(self._row("ospf").applied_attempt_id, 2)
+
+    def test_equal_born_against_the_pending_marker_is_a_conflict_not_an_adoption(self):
+        """codex B5-R2-2: A@10 adopted, B@20 recorded PENDING by an observation — a
+        gated C@20 (equal born, different UUID vs the PENDING pair) must fail closed
+        as a durable conflict, never adopt an ambiguous incarnation (R15 algebra)."""
+        from netbox_nso_plugin.read_gate import SKIPPED_STALE_ATTEMPT
+
+        self._run(_rs(attempt_id=5))  # adopt A@10
+        self._observe({"bfd": _synth(incarnation=_INC_B[0], incarnation_born=_INC_B[1])})  # pending B@20
+        result, body = self._run(_rs(attempt_id=1, incarnation=_INC_C[0], incarnation_born=_INC_C[1]))  # C@20
+        self.assertEqual(result.disposition, SKIPPED_STALE_ATTEMPT)
+        self.assertEqual(body.calls, 0)
+        m = self._mgmt()
+        self.assertEqual(m.adapter_incarnation, _INC_A[0])  # NOT adopted
+        self.assertIsNotNone(m.reset_conflict_born)  # the collision is durable
 
     def test_equal_born_different_uuid_at_gate_sets_conflict_and_rejects(self):
         from netbox_nso_plugin.read_gate import SKIPPED_STALE_ATTEMPT

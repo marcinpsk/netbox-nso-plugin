@@ -48,41 +48,11 @@
     return h;
   }
 
-  /* ── settle poll (D10 "self-heals via the counts poll") ──────────────────────
-   * The one refresh fired at job completion is reliably too early: the RQ
-   * reconcile that applies the observations lands seconds AFTER the adapter job
-   * the UI polls, so chips freeze on refresh_pending (or a pre-recovery state)
-   * until the next user action. The tab keeps re-fetching counts on a short
-   * bounded interval until the chips stop moving and nothing is transient. */
-
-  /* Collapse a counts-JSON `categories` object to {key: chipState|null}. */
-  function chipStates(categories) {
-    var out = {};
-    Object.keys(categories || {}).forEach(function (k) {
-      var read = categories[k] && categories[k].read;
-      out[k] = read && read.state ? read.state : null;
-    });
-    return out;
-  }
-
-  /* Poll again? First tick and fetch failures always retry (the caller bounds
-   * the loop); otherwise keep going while states still move or any chip is in a
-   * transient state — refresh_pending and reset_pending both mean a reconcile is
-   * known to be in flight for it (codex B5-F6). */
-  function needsAnotherTick(prev, curr) {
-    if (!prev || !curr) {
-      return true;
-    }
-    if (JSON.stringify(prev) !== JSON.stringify(curr)) {
-      return true;
-    }
-    return Object.keys(curr).some(function (k) {
-      return curr[k] === "refresh_pending" || curr[k] === "reset_pending";
-    });
-  }
-
-  /* Generation gate (codex B5-F7): counts responses may resolve out of order —
-   * only the newest-started fetch may write the DOM. */
+  /* Generation gate (codex B5-F7/R2-5): counts responses may resolve out of
+   * order — only the newest-started fetch may write the DOM or feed a caller.
+   * The settle poll itself runs its FULL 30s budget with no early stop (codex
+   * B5-R2-6: any settled-looking predicate can be fooled by a pre-recovery
+   * state that changes right after two identical reads). */
   function makeGenGate() {
     var gen = 0;
     return {
@@ -100,8 +70,6 @@
     esc: esc,
     chipHtml: chipHtml,
     renderBadges: renderBadges,
-    chipStates: chipStates,
-    needsAnotherTick: needsAnotherTick,
     makeGenGate: makeGenGate,
   };
 })();

@@ -50,47 +50,6 @@ describe("chipHtml", () => {
   });
 });
 
-describe("settle-poll predicates", () => {
-  const cats = (m) => {
-    const out = {};
-    for (const [k, s] of Object.entries(m)) {
-      out[k] = { total: 1, drift: 0, pending: 0, read: s ? { state: s, css: "", label: s, tip: "" } : null };
-    }
-    return out;
-  };
-
-  it("chipStates extracts each category's chip state, null for healthy", () => {
-    expect(B.chipStates(cats({ isis: "unavailable", bgp: null }))).toEqual({ isis: "unavailable", bgp: null });
-  });
-
-  it("first tick (no previous fetch) always polls again", () => {
-    expect(B.needsAnotherTick(null, { isis: null })).toBe(true);
-  });
-
-  it("settled: unchanged states with nothing transient stops the poll", () => {
-    const s = { isis: "unavailable", bgp: null };
-    expect(B.needsAnotherTick(s, { ...s })).toBe(false);
-  });
-
-  it("still moving: a state change keeps the poll alive", () => {
-    expect(B.needsAnotherTick({ isis: "unavailable" }, { isis: null })).toBe(true);
-  });
-
-  it("transient: refresh_pending keeps polling even when unchanged", () => {
-    const s = { isis: "refresh_pending" };
-    expect(B.needsAnotherTick(s, { ...s })).toBe(true);
-  });
-
-  it("a failed counts fetch (null current) retries", () => {
-    expect(B.needsAnotherTick({ isis: null }, null)).toBe(true);
-  });
-
-  it("transient: reset_pending keeps polling even when unchanged (codex B5-F6)", () => {
-    const s = { isis: "reset_pending" };
-    expect(B.needsAnotherTick(s, { ...s })).toBe(true);
-  });
-});
-
 describe("makeGenGate (codex B5-F7)", () => {
   it("only the newest generation is current — a stale in-flight callback is rejected", () => {
     const gate = B.makeGenGate();

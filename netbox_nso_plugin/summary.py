@@ -456,6 +456,12 @@ def category_read_chip(mgmt, key: str, rows_by_family: dict) -> dict | None:
         for family in CATEGORY_FAMILIES.get(key, ()):
             row = rows_by_family.get(family)
             if row is None:
+                # A family with NO read-state row at ALL on an ADOPTED device (e.g.
+                # pre-S4 overlay data right after the 0014 upgrade) must not render
+                # healthy — the adapter has never declared a read for it (codex
+                # B5-R2-3). A never-adopted device stays chip-free (pre-S4 render).
+                if mgmt.adapter_incarnation:
+                    states.add("not_authoritative")
                 continue
             display = _family_read_display(row, mgmt.adapter_incarnation)
             if display:

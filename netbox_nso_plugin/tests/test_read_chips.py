@@ -163,10 +163,24 @@ class TestFamilyChipMatrix(TestCase):
         chip = _chip(self.device, self.mgmt, "l2_services")
         self.assertEqual(chip["state"], "refresh_pending")
 
-    def test_legacy_and_missing_rows_render_no_chip(self):
-        # missing row entirely
+    def test_missing_row_on_an_adopted_device_renders_no_authoritative_read(self):
+        """codex B5-R2-3: a family with NO read-state row at all on an ADOPTED device
+        (e.g. pre-S4 overlay data right after the 0014 upgrade) must not render
+        healthy — it gets the muted 'no authoritative read' chip until first read."""
+        chip = _chip(self.device, self.mgmt, "l2_services")
+        self.assertIsNotNone(chip)
+        self.assertEqual(chip["state"], "not_authoritative")
+
+    def test_missing_row_on_a_never_adopted_device_renders_no_chip(self):
+        """Pre-S4 continuity: no adopted incarnation → no chips at all (R1-F9)."""
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(
+            adapter_incarnation="", adapter_incarnation_born=None
+        )
+        self.mgmt.refresh_from_db()
         self.assertIsNone(_chip(self.device, self.mgmt, "l2_services"))
-        # legacy row (blank outcome) — the UI ignores it
+
+    def test_legacy_blank_row_renders_no_chip(self):
+        # legacy row (blank outcome, e.g. a pre-S4 rollback blanked it) — ignored
         _row(self.mgmt, "l2_service", outcome="", freshness="", result="", succeeded=None)
         self.assertIsNone(_chip(self.device, self.mgmt, "l2_services"))
 

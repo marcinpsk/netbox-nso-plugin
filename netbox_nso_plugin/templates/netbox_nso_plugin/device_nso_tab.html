@@ -932,9 +932,9 @@
           .then(function (r) { return r.ok ? r.json() : null; })
           .then(function (d) {
             if (!d || !d.categories) { return null; }
-            // An older in-flight response must never overwrite a newer render
-            // (codex B5-F7) — its data still returns for the caller's bookkeeping.
-            if (!headersGate.isCurrent(gen)) { return d.categories; }
+            // An older in-flight response must never overwrite a newer render, nor
+            // feed any caller's bookkeeping (codex B5-F7/R2-5).
+            if (!headersGate.isCurrent(gen)) { return null; }
             // READSEM S4 (R11/R12): keep the device-wide reset banner honest on the
             // dynamic path too (a reload is not required to learn of a store reset).
             var resetBanner = document.querySelector('[data-nso-reset-banner]');
@@ -956,30 +956,25 @@
       // The completion-time refresh is reliably too early: the RQ reconcile that
       // applies the observations lands seconds after the adapter job the status UI
       // polls, so a single fetch freezes chips on refresh_pending (or a pre-recovery
-      // state) until the next user action. Keep polling counts on a short bounded
-      // interval until the chips stop moving and none is transient (D10 self-heal).
+      // state) until the next user action. Poll counts every 3s for the FULL 30s
+      // budget (D10 self-heal) — no early stop: any settled-looking predicate can be
+      // fooled by a pre-recovery state that changes right after two identical reads
+      // (codex B5-R2-5/R2-6), and ten light JSON fetches per explicit action are
+      // cheaper than a frozen chip.
       var settleTimer = null;
       var settleToken = null;
       function startSettlePoll() {
         var token = {};
         settleToken = token;
-        var prev = null;
         var deadline = Date.now() + 30000;
         if (settleTimer) { clearInterval(settleTimer); }
         settleTimer = setInterval(function () {
-          // Deadline check FIRST — the poll must terminate even if a tick throws
-          // (e.g. a stale-cached NSOBadges without the settle helpers).
+          // Superseded poll (a newer action owns settling now) — this timer was
+          // already cleared; never touch the CURRENT poll's timer (codex B5-F7).
+          if (settleToken !== token) { return; }
+          // Deadline check FIRST — the poll must terminate even if a tick throws.
           if (Date.now() >= deadline) { clearInterval(settleTimer); settleTimer = null; return; }
-          refreshHeaders().then(function (categories) {
-            // A superseded poll's late response must not clear the CURRENT poll's
-            // timer or feed its state (codex B5-F7).
-            if (settleToken !== token) { return; }
-            var curr = categories && window.NSOBadges.chipStates(categories);
-            if (!window.NSOBadges.needsAnotherTick(prev, curr)) {
-              clearInterval(settleTimer); settleTimer = null;
-            }
-            prev = curr;
-          });
+          refreshHeaders();
         }, 3000);
       }
 

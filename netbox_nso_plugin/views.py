@@ -2988,12 +2988,15 @@ class NSORefreshStateView(NSOActionPermissionMixin, View):
 
         try:
             compliance = client.get_state(mgmt.adapter_device_id)
+            from .read_gate import _is_authoritative
+
             doc = client.get_interfaces_doc(mgmt.adapter_device_id)
             interfaces = doc.get("interfaces", [])
+            # The FULL gate tuple decides authoritativeness (codex B5-R2-4) — an
+            # outcome=present with succeeded=false/result=error is a failed read.
+            # Key absent = pre-S4 adapter (legacy, replace); explicit null = malformed.
             read_state = doc.get("read_state")
-            authoritative = read_state is None or (  # None = pre-S4 adapter (legacy)
-                isinstance(read_state, dict) and read_state.get("outcome") in ("present", "absent_authoritative")
-            )
+            authoritative = "read_state" not in doc or (isinstance(read_state, dict) and _is_authoritative(read_state))
             if not authoritative:
                 # a non-authoritative doc (e.g. not_ready after a store reset) serves a
                 # legitimately EMPTY list — keep the last-known interfaces (codex B5-F5)

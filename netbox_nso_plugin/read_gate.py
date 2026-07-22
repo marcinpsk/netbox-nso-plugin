@@ -499,17 +499,31 @@ def _gate_and_record(mgmt, family: str, read_state: dict | None, *, epoch) -> _D
             return _Decision(SKIPPED_UNAVAILABLE, False)
 
         if not (m.adapter_incarnation and inc == m.adapter_incarnation):
+            # Equal-born/different-UUID vs the PENDING pair is the same ambiguity as
+            # vs the adopted pair — adopting it would materialize an ambiguous
+            # incarnation (codex B5-R2-2, the R15 algebra).
+            pending_collision = (
+                m.reset_pending_born is not None and born == m.reset_pending_born and inc != m.reset_pending_incarnation
+            )
             adoptable = (
-                m.adapter_incarnation == ""
-                or (m.adapter_incarnation_born is not None and born > m.adapter_incarnation_born)
-            ) and (m.reset_conflict_born is None or born > m.reset_conflict_born)
+                (
+                    m.adapter_incarnation == ""
+                    or (m.adapter_incarnation_born is not None and born > m.adapter_incarnation_born)
+                )
+                and (m.reset_conflict_born is None or born > m.reset_conflict_born)
+                and not pending_collision
+            )
             if not adoptable:
                 # equal-born/different-UUID is a durable CONFLICT in every branch (R15-1)
                 if (
-                    m.adapter_incarnation_born is not None
-                    and born == m.adapter_incarnation_born
-                    and inc != m.adapter_incarnation
-                ) or (m.reset_conflict_born is not None and born == m.reset_conflict_born):
+                    (
+                        m.adapter_incarnation_born is not None
+                        and born == m.adapter_incarnation_born
+                        and inc != m.adapter_incarnation
+                    )
+                    or (m.reset_conflict_born is not None and born == m.reset_conflict_born)
+                    or pending_collision
+                ):
                     _register_incarnation_observation(m, inc, born)
                     m.save(update_fields=_MARKER_FIELDS)
                 return _Decision(SKIPPED_STALE_ATTEMPT, False)
@@ -537,23 +551,25 @@ def _gate_and_record(mgmt, family: str, read_state: dict | None, *, epoch) -> _D
         return _Decision(SKIPPED_UNAVAILABLE, False)
 
 
-def _admission_still_current(mgmt, family: str, incoming) -> bool:
-    """Body fence (codex B5-F2): check OUR admission is still the newest applied attempt.
+def _admission_still_current(mgmt, family: str, incoming, inc: str) -> bool:
+    """Body fence (codex B5-F2 + R2-1): check OUR admission is still the applied one.
 
     Between the admission commit and the body there is no lock; a successor may
-    have admitted AND materialized a newer attempt (or a newer incarnation may
-    have adopted, blanking ``applied``). One re-select refuses the stale body.
-    The mid-body window remains the design's documented bounded last-writer-wins,
-    logged loudly by the lease heartbeat.
+    have admitted AND materialized a newer attempt — or ADOPTED a newer
+    incarnation whose attempt ids restarted at the same numbers (attempt ids are
+    NOT unique across store rebuilds), so the fence compares the incarnation too.
+    One re-select refuses the stale body. The mid-body window remains the
+    design's documented bounded last-writer-wins, logged loudly by the lease
+    heartbeat.
     """
     from .models import NSOFamilyReadState
 
-    applied = (
+    row = (
         NSOFamilyReadState.objects.filter(management=mgmt, family=family)
-        .values_list("applied_attempt_id", flat=True)
+        .values_list("applied_attempt_id", "applied_incarnation")
         .first()
     )
-    return applied == incoming
+    return row is not None and row[0] == incoming and row[1] == inc
 
 
 def gated_family_run(mgmt, family: str, read_state: dict | None, body: Callable[[], Any], *, epoch) -> GateResult:
@@ -569,7 +585,9 @@ def gated_family_run(mgmt, family: str, read_state: dict | None, body: Callable[
     decision = _gate_and_record(mgmt, family, read_state, epoch=epoch)
     if not decision.run_body:
         return GateResult(decision.disposition)
-    if decision.disposition == RAN and not _admission_still_current(mgmt, family, read_state.get("attempt_id")):
+    if decision.disposition == RAN and not _admission_still_current(
+        mgmt, family, read_state.get("attempt_id"), read_state.get("incarnation") or ""
+    ):
         return GateResult(SKIPPED_STALE_ATTEMPT)
     return GateResult(decision.disposition, body())
 

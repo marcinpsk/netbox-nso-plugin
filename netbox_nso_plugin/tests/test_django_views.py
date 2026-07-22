@@ -1336,6 +1336,42 @@ class TestNSORefreshStateView(ViewTestBase):
         mgmt.adapter_device_id = None
         mgmt.save(update_fields=["adapter_device_id"])
 
+    @patch("netbox_nso_plugin.adapter_client.get_interfaces_doc")
+    @patch("netbox_nso_plugin.adapter_client.get_state")
+    def test_degraded_authoritative_tuple_keeps_last_known_snapshot(self, mock_state, mock_doc):
+        """codex B5-R2-4: authoritativeness is the FULL gate tuple, not the outcome
+        name — outcome=present with succeeded=false/result=error must not wipe the
+        cached interfaces; explicit read_state:null (malformed S4) must not either."""
+        mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+        mgmt.adapter_device_id = 11
+        mgmt.state_snapshot = {"compliance": {}, "interfaces": [{"name": "xe-0/0/1"}], "refreshed_at": "x"}
+        mgmt.save(update_fields=["adapter_device_id", "state_snapshot"])
+        mock_state.return_value = {"compliant": True}
+        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_refresh", args=[mgmt.pk])
+
+        mock_doc.return_value = {
+            "interfaces": [],
+            "read_state": {
+                "outcome": "present",
+                "succeeded": False,
+                "result": "error",
+                "attempt_id": 9,
+                "incarnation": "11111111-aaaa-4aaa-8aaa-111111111111",
+                "incarnation_born": "2026-07-01T00:00:10Z",
+            },
+        }
+        self.client.post(url)
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.state_snapshot["interfaces"], [{"name": "xe-0/0/1"}])
+
+        mock_doc.return_value = {"interfaces": [], "read_state": None}  # explicit null
+        self.client.post(url)
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.state_snapshot["interfaces"], [{"name": "xe-0/0/1"}])
+
+        mgmt.adapter_device_id = None
+        mgmt.save(update_fields=["adapter_device_id"])
+
     @patch("netbox_nso_plugin.adapter_client._resolve_config")
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_post_adapter_error_redirects(self, mock_session_cls, mock_cfg):
