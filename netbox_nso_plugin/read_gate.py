@@ -117,44 +117,27 @@ def marker_key(device_id) -> str:
     return f"nso-reconcile-pending:{device_id}"
 
 
-def handoff_job_id(device_id, nonce: str) -> str:
-    """Successor job id — unique per marker GENERATION via the nonce (R10-1)."""
-    return f"nso-reconcile-{device_id}-handoff-{nonce}"
+def carrier_key(device_id) -> str:
+    """Per-device pointer → the id of the one genuinely-queued reconcile carrier (READSEM 1334).
 
-
-def unique_pending_key(device_id) -> str:
-    """Per-device pointer to the outstanding unique notify-reconcile job (S5a F).
-
-    Deliberately NOT :func:`marker_key` — that namespace holds the lease-handoff
-    nonces, and colliding would let a lease release consume a job id as a nonce
-    (codex S5a R7-3).
+    The canonical single-flight slot for :func:`enqueue_reconcile_carrier`. Persistent (no TTL):
+    a carrier queued behind a long backlog must not outlive its pointer (codex r1-f2), and a stale
+    pointer is safe because every producer validates + overwrites it. Deliberately NOT
+    :func:`marker_key` — that namespace holds lease-handoff nonces (codex r7-3 namespace hygiene).
     """
-    return f"nso-reconcile-unique-pending:{device_id}"
+    return f"nso-reconcile-carrier:{device_id}"
 
 
-def notify_job_id(device_id, nonce: str) -> str:
-    """Return the unique notify-reconcile job id (S5a F).
-
-    Never the deterministic id: RQ's default (non-unique) enqueue overwrites an
-    existing hash, so re-using the deterministic id could clobber a job a worker is
-    still finishing (codex S5a R3-2).
-    """
-    return f"nso-reconcile-{device_id}-notify-{nonce}"
+def fresh_carrier_id(device_id) -> str:
+    """Return a never-reused carrier job id (so a persistent pointer can never become a false positive)."""
+    return f"nso-reconcile-{device_id}-carrier-{uuid.uuid4().hex}"
 
 
-def consume_unique_pending(conn, device_id, own_job_id: str) -> bool:
-    """Owner-checked compare-and-delete of the unique-pending pointer (S5a F).
-
-    Called as the FIRST statement of the referenced job's body — before any state
-    read — so a notify arriving after the body begins reading always enqueues its
-    own job (the loss-free invariant's hinge). Owner-checked: an older job's consume
-    must not erase a NEWER job's pointer and reopen the suppression gate early.
-    """
-    try:
-        return bool(conn.eval(_RELEASE_LUA, 1, unique_pending_key(device_id), own_job_id))
-    except _redis_errors() as exc:
-        logger.warning("device %s: unique-pending consume failed: %s", device_id, exc)
-        return False
+def _to_str(value):
+    """Normalize a Redis value (``bytes``/``str``/``None``) to ``str``/``None`` (codex r1-f1)."""
+    if isinstance(value, bytes):
+        return value.decode()
+    return value
 
 
 def _redis_errors():
@@ -312,27 +295,159 @@ def write_defer_marker(conn, device_id) -> str:
     return nonce
 
 
-def consume_marker_and_enqueue_successor(conn, device_id, queue):
-    """Atomically consume the pending marker (GETDEL) and enqueue the successor.
+#: Wall-clock backstop for the arbiter's optimistic-CAS loop (READSEM 1334). NOT a per-count cap: a
+#: WatchError means another producer committed the pointer → the retry re-reads it and (almost always)
+#: suppresses, so the loop converges in ~1-2 tries under real per-device contention. The budget only
+#: guards a request thread from a pathological same-device storm (optimistic CAS is lock-free, not
+#: starvation-free) — tripping it routes to the DEGRADED path (a bounded duplicate, never a lost edge).
+_CAS_LIVENESS_BUDGET_S = 2.0
 
-    Exactly ONE caller can retrieve the nonce, so exactly one successor exists per
-    marker generation regardless of concurrent release hooks or sync-complete
-    callbacks. Returns the enqueued job, or None when there was no marker.
+
+def _queued_carrier(queue, conn, job_id):
+    """Return the ``Job`` iff *job_id* is a GENUINELY-QUEUED carrier (READSEM 1334), else ``None``.
+
+    Genuinely queued = in the RQ queue list (i.e. not yet popped/started) AND its hash is fetchable
+    (a dangling queue entry is not suppressible — codex r1-f4). Suppressing onto such a carrier is
+    loss-free: a job still in the queue list has not been popped, so all its reads follow this
+    producer's mirror refresh. A popped/running/deferred/dead carrier is absent from the list → not
+    suppressible → the caller enqueues a trailing carrier (no StartedRegistry dependency — codex r3-3).
     """
+    if not job_id:
+        return None
+    from rq.exceptions import NoSuchJobError
+    from rq.job import Job as RqJob
+
+    if job_id not in queue.get_job_ids():
+        return None
     try:
-        nonce = conn.getdel(marker_key(device_id))
-    except _redis_errors():
-        logger.exception("device %s: marker consumption failed (redis error)", device_id)
+        return RqJob.fetch(job_id, connection=conn)
+    except NoSuchJobError:
         return None
-    if not nonce:
-        return None
-    if isinstance(nonce, bytes):
-        nonce = nonce.decode()
+
+
+def _degraded_enqueue(conn, queue, device_id, consume_marker):
+    """Fallback OUTSIDE the one-queued-carrier bound (Redis down OR CAS starvation past the budget).
+
+    At most ONE raw enqueue per invocation — a bounded duplicate, never a lost edge (codex r6-note1).
+    Durable job first, then best-effort marker consume: a crash between them retains the marker, so the
+    edge still survives via a later release/producer or the cadence backstop.
+    """
     from .reconcile import run_device_reconcile
 
-    job_id = handoff_job_id(device_id, nonce)
-    logger.info("device %s: consumed reconcile marker %s — enqueuing successor %s", device_id, nonce, job_id)
-    return queue.enqueue(run_device_reconcile, device_id, job_id=job_id, result_ttl=300, job_timeout=600)
+    logger.warning("device %s: reconcile carrier degraded-enqueue (redis/CAS unavailable)", device_id)
+    job = queue.enqueue(run_device_reconcile, device_id, result_ttl=300, job_timeout=600)
+    if consume_marker:
+        try:
+            conn.delete(marker_key(device_id))
+        except _redis_errors():
+            pass
+    return job
+
+
+def _inline_reconcile(conn, queue, device_id, consume_marker):
+    """Synchronous-queue path (``is_async=False``): RQ runs the body inline, so there is no queued slot.
+
+    A caller-owned pipeline would run the job BEFORE ``EXEC``, so the CAS is bypassed here. For a handoff
+    (``consume_marker``), consume the marker FIRST and run the successor only if one was actually pending —
+    otherwise the inline run's own release hook would re-enter forever (codex r3-4). This path cannot make
+    marker-consume + arbitrary Python execution crash-atomic (reduced failure model, documented).
+    """
+    from .reconcile import run_device_reconcile
+
+    if consume_marker:
+        try:
+            present = conn.delete(marker_key(device_id))
+        except _redis_errors():
+            present = 0
+        if not present:
+            return None
+    return queue.enqueue(run_device_reconcile, device_id, result_ttl=300, job_timeout=600)
+
+
+def enqueue_reconcile_carrier(conn, queue, device_id, *, consume_marker=False):
+    """Run the atomic per-device queued-carrier arbiter (READSEM 1334) — one single-flight slot per device.
+
+    Optimistic CAS (``WATCH``/``MULTI``/``EXEC``) on :func:`carrier_key`, reusing RQ's own ``enqueue_job``
+    inside the ``MULTI`` so the job hash, queue push, and pointer commit in one transaction. Suppresses a
+    new edge only onto a GENUINELY-QUEUED carrier (loss-free — see :func:`_queued_carrier`); otherwise
+    enqueues exactly one trailing carrier. ``consume_marker=True`` (the handoff mode) also reads the defer
+    marker UNDER WATCH and deletes it in the SAME ``EXEC`` as the ensured/suppressed carrier — never
+    creating on behalf of a stale/absent nonce (codex r3-1). Returns the (existing or new) ``Job``, or
+    ``None`` on a handoff with no pending marker.
+
+    Bound (soft): under healthy Redis at most one queued carrier per device; the only duplicate-producing
+    escapes are Redis failure and sustained-CAS-starvation past :data:`_CAS_LIVENESS_BUDGET_S`, both routed
+    to :func:`_degraded_enqueue` and both preferring a bounded duplicate over a lost edge.
+    """
+    from redis.exceptions import WatchError
+
+    from .reconcile import run_device_reconcile
+
+    # The sync-queue path uses neither WATCH nor the version pre-warm — decide it FIRST, so a
+    # transient pre-warm failure can never route a synchronous handoff through the async-oriented
+    # (delete-after-run) degraded path instead of _inline_reconcile's consume-first order (codex diff-1).
+    if not queue.is_async:
+        return _inline_reconcile(conn, queue, device_id, consume_marker)
+    try:
+        queue.get_redis_server_version()  # pre-warm the lazy version lookup OUTSIDE the WATCH (codex r2-4)
+    except _redis_errors():
+        return _degraded_enqueue(conn, queue, device_id, consume_marker)
+
+    ckey = carrier_key(device_id)
+    mkey = marker_key(device_id)
+    keys = (ckey, mkey) if consume_marker else (ckey,)
+    deadline = time.monotonic() + _CAS_LIVENESS_BUDGET_S
+    while True:
+        try:
+            with conn.pipeline() as pipe:
+                pipe.watch(*keys)
+                existing = _queued_carrier(queue, conn, _to_str(pipe.get(ckey)))
+                if consume_marker and _to_str(pipe.get(mkey)) is None:
+                    pipe.unwatch()
+                    return existing  # nothing to hand off — never create on behalf of a stale/absent nonce
+                if existing is not None:
+                    if consume_marker:
+                        pipe.multi()
+                        pipe.delete(mkey)  # atomic marker-consume alongside the suppression
+                        pipe.execute()
+                    else:
+                        pipe.unwatch()
+                    return existing
+                job = queue.create_job(
+                    run_device_reconcile,
+                    args=(device_id,),
+                    job_id=fresh_carrier_id(device_id),
+                    result_ttl=300,
+                    timeout=600,
+                )
+                pipe.multi()
+                queue.enqueue_job(job, pipeline=pipe)  # job hash + queue push, buffered into the MULTI
+                pipe.set(ckey, job.id)  # persistent pointer, same EXEC as the durable job
+                if consume_marker:
+                    pipe.delete(mkey)  # consume the marker observed under WATCH, atomically
+                pipe.execute()  # WatchError if carrier/marker moved → retry (a nonce bump ⇒ retry consumes it)
+                return job
+        except WatchError:
+            if time.monotonic() >= deadline:
+                break  # sustained-starvation backstop → degraded path (bounded duplicate)
+            time.sleep(random.uniform(0.0, 0.05))  # jittered backoff caps spin rate
+            continue
+        except _redis_errors():
+            break  # genuine Redis coordination failure → degraded path
+    return _degraded_enqueue(conn, queue, device_id, consume_marker)
+
+
+def consume_marker_and_enqueue_successor(conn, device_id, queue):
+    """Consume a pending defer marker and ensure exactly one queued successor, atomically (READSEM 1334).
+
+    Delegates to :func:`enqueue_reconcile_carrier` in handoff mode: the marker is read UNDER WATCH and
+    deleted in the same ``EXEC`` as the ensured/suppressed carrier, so concurrent release hooks that
+    observe the same marker converge on one carrier + one delete, a nonce bump ``N1→N2`` retries and
+    consumes ``N2``, and an absent marker is a no-op (never a phantom successor). Reworks the old
+    non-atomic ``GETDEL → enqueue`` (which could delete the marker then fail to enqueue → lost edge).
+    Returns the successor ``Job``, or ``None`` when there was no marker.
+    """
+    return enqueue_reconcile_carrier(conn, queue, device_id, consume_marker=True)
 
 
 # ── The gate (transition table + incarnation adoption) ─────────────────────────

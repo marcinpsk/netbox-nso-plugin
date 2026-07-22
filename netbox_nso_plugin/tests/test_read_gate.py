@@ -116,6 +116,16 @@ def _redis():
     return django_rq.get_queue("default").connection
 
 
+_SYNC_RECONCILE_CALLS: list = []
+
+
+def _sync_reconcile_recorder(device_id):
+    """A REAL (picklable) stand-in for run_device_reconcile, so a sync RQ queue can persist + run it
+    inline. A MagicMock cannot be pickled by RQ's sync-queue job store."""
+    _SYNC_RECONCILE_CALLS.append(device_id)
+    return {"ok": True}
+
+
 def _noop_job():
     """RQ needs an importable (module-level) function for enqueued fixtures."""
 
@@ -851,16 +861,17 @@ class TestContentionPolicies(TestCase):
     def test_web_lease_release_consumes_pending_marker_and_enqueues_successor(self):
         """codex B5-F3: an RQ reconcile that deferred while a WEB reconcile held the
         lease must still get its successor — the web release has to consume the
-        pending marker too, or the handoff is stranded until the cadence backstop."""
-        from netbox_nso_plugin.read_gate import acquire_for_web, handoff_job_id, marker_key
+        pending marker too, or the handoff is stranded until the cadence backstop.
+        READSEM 1334: the successor is now a carrier job (arbiter), atomic with the delete."""
+        from netbox_nso_plugin.read_gate import acquire_for_web, marker_key
 
         lease = acquire_for_web(self.conn, self.key, device_id=self.device_id, queue=self.queue)
         self.assertIsNotNone(lease)
-        nonce = uuid.uuid4().hex
-        self.conn.set(marker_key(self.device_id), nonce, ex=60)
+        self.conn.set(marker_key(self.device_id), uuid.uuid4().hex, ex=60)
         lease.release()
         self.assertIsNone(self.conn.get(marker_key(self.device_id)))  # consumed
-        self.assertIn(handoff_job_id(self.device_id, nonce), [j.id for j in self.queue.jobs])
+        carriers = [jid for jid in self.queue.get_job_ids() if f"-{self.device_id}-carrier-" in jid]
+        self.assertEqual(len(carriers), 1)
 
     def test_rq_retries_then_defers_with_marker(self):
         from netbox_nso_plugin.read_gate import Deferred, acquire_for_rq, marker_key
@@ -911,73 +922,69 @@ class TestContentionPolicies(TestCase):
         self.assertEqual(self.queue.get_job_ids(), [])  # no successor was spawned
         out.release()
 
-    def test_owner_release_consumes_marker_and_enqueues_nonce_successor(self):
-        """R9-1: the successor must be created even while the DEFERRER's
-        deterministic-id job still sits in StartedJobRegistry."""
-        from rq.registry import StartedJobRegistry
-
+    def test_owner_release_consumes_marker_and_enqueues_successor(self):
+        """R9-1 / READSEM 1334: a lease release with a pending marker enqueues exactly one
+        carrier successor and consumes the marker — atomically, via the arbiter."""
         from netbox_nso_plugin import read_gate
-        from netbox_nso_plugin.read_gate import (
-            DeviceReadLease,
-            handoff_job_id,
-            write_defer_marker,
-        )
+        from netbox_nso_plugin.read_gate import DeviceReadLease, write_defer_marker
 
-        # the deferrer's deterministic-id job is "still running" — seed the registry
-        # zset directly (this rq version's StartedJobRegistry.add is worker-only)
-        det_job = self.queue.enqueue(_noop_job, job_id=f"nso-reconcile-{self.device_id}")
-        registry = StartedJobRegistry(queue=self.queue)
-        self.conn.zadd(registry.key, {det_job.id: time.time() + 300})
-        self.assertIn(det_job.id, registry.get_job_ids())
-
-        nonce = write_defer_marker(self.conn, self.device_id)
+        write_defer_marker(self.conn, self.device_id)
         holder = DeviceReadLease(self.conn, self.key, device_id=self.device_id, queue=self.queue)
         self.assertTrue(holder.acquire())
         with holder:
-            pass  # release path must GETDEL the marker and enqueue the successor
+            pass  # release path ensures the carrier + consumes the marker in one MULTI
 
-        expected_id = handoff_job_id(self.device_id, nonce)
-        self.assertIn(expected_id, self.queue.get_job_ids())
+        carriers = [jid for jid in self.queue.get_job_ids() if f"-{self.device_id}-carrier-" in jid]
+        self.assertEqual(len(carriers), 1)
         self.assertIsNone(self.conn.get(read_gate.marker_key(self.device_id)))
 
-    def test_two_consecutive_handoffs_get_unique_ids(self):
-        """R10-1: each generation's nonce differs, so the second handoff cannot be
-        absorbed by the first (possibly still-running) handoff job."""
-        from netbox_nso_plugin.read_gate import (
-            DeviceReadLease,
-            handoff_job_id,
-            write_defer_marker,
-        )
+    def test_two_consecutive_handoffs_collapse_to_one_carrier(self):
+        """READSEM 1334 (reworks R10-1): a second handoff, arriving while the first carrier
+        is still QUEUED, suppresses onto it — the arbiter collapses to ONE carrier, not two."""
+        from netbox_nso_plugin.read_gate import DeviceReadLease, write_defer_marker
 
-        ids = []
         for _ in range(2):
-            nonce = write_defer_marker(self.conn, self.device_id)
+            write_defer_marker(self.conn, self.device_id)
             holder = DeviceReadLease(self.conn, self.key, device_id=self.device_id, queue=self.queue)
             self.assertTrue(holder.acquire())
             with holder:
                 pass
-            ids.append(handoff_job_id(self.device_id, nonce))
-        self.assertEqual(len(set(ids)), 2)
-        for job_id in ids:
-            self.assertIn(job_id, self.queue.get_job_ids())
+        carriers = [jid for jid in self.queue.get_job_ids() if f"-{self.device_id}-carrier-" in jid]
+        self.assertEqual(len(carriers), 1)  # the second suppressed onto the first (still queued)
 
-    def test_getdel_exactly_one_successor(self):
-        """Two concurrent release hooks race on ONE marker → exactly one successor."""
+    def test_concurrent_releases_one_successor(self):
+        """Two concurrent release hooks race on ONE marker → exactly one queued carrier
+        (WATCH/MULTI: one wins the create+delete; the other retries, sees the marker gone,
+        suppresses onto the winner's still-queued carrier)."""
         from netbox_nso_plugin.read_gate import consume_marker_and_enqueue_successor, write_defer_marker
 
         write_defer_marker(self.conn, self.device_id)
         results = []
+        errors = []
+        lock = threading.Lock()
 
         def consume():
-            results.append(consume_marker_and_enqueue_successor(self.conn, self.device_id, self.queue))
+            try:
+                r = consume_marker_and_enqueue_successor(self.conn, self.device_id, self.queue)
+            except Exception as exc:  # noqa: BLE001 — a leaked WatchError/redis error is a real failure
+                with lock:
+                    errors.append(exc)
+                return
+            with lock:
+                results.append(r)
 
         threads = [threading.Thread(target=consume) for _ in range(2)]
         for t in threads:
             t.start()
         for t in threads:
             t.join(timeout=10)
-        created = [r for r in results if r is not None]
-        self.assertEqual(len(created), 1)
+        self.assertFalse([t for t in threads if t.is_alive()], "a release thread hung")
+        self.assertEqual(errors, [], "a release leaked an exception")
+        self.assertEqual(len(results), 2, "every release returned")
+        carriers = [jid for jid in self.queue.get_job_ids() if f"-{self.device_id}-carrier-" in jid]
+        self.assertEqual(len(carriers), 1)
+        returned = {r.id for r in results if r is not None}
+        self.assertEqual(returned, set(carriers))  # both callers converged on the one carrier
 
     def test_successor_job_runs_the_reconcile(self):
         from rq import SimpleWorker
@@ -1005,6 +1012,200 @@ class TestContentionPolicies(TestCase):
             acquire_for_web(dead, self.key)
         with self.assertRaises(LockUnavailable):
             acquire_for_rq(dead, self.key, self.device_id, self.queue, retry_budget_s=0.1)
+
+
+class TestQueuedCarrierArbiter(TestCase):
+    """READSEM 1334 — the atomic per-device queued-carrier arbiter (real Redis + isolated queue)."""
+
+    def setUp(self):
+        from rq import Queue
+
+        self.conn = _redis()
+        self.device_id = int(uuid.uuid4().int % 10**9) + 10**9
+        self.queue = Queue(f"nso-test-arbiter-{uuid.uuid4().hex[:12]}", connection=self.conn)
+
+    def tearDown(self):
+        from netbox_nso_plugin.read_gate import carrier_key, marker_key
+
+        for job in self.queue.jobs:
+            job.delete()
+        self.queue.empty()
+        self.conn.delete(carrier_key(self.device_id))
+        self.conn.delete(marker_key(self.device_id))
+
+    def _carriers(self):
+        return [jid for jid in self.queue.get_job_ids() if f"-{self.device_id}-carrier-" in jid]
+
+    def test_absent_slot_enqueues_one_carrier(self):
+        from netbox_nso_plugin.read_gate import carrier_key, enqueue_reconcile_carrier
+
+        job = enqueue_reconcile_carrier(self.conn, self.queue, self.device_id)
+        self.assertEqual(self._carriers(), [job.id])
+        self.assertEqual(self.conn.get(carrier_key(self.device_id)).decode(), job.id)
+
+    def test_second_edge_suppresses_onto_queued_carrier(self):
+        """A second edge onto a genuinely-queued carrier suppresses (one carrier, same id).
+        Also exercises the bytes→str pointer read (codex r1-f1)."""
+        from netbox_nso_plugin.read_gate import enqueue_reconcile_carrier
+
+        first = enqueue_reconcile_carrier(self.conn, self.queue, self.device_id)
+        second = enqueue_reconcile_carrier(self.conn, self.queue, self.device_id)
+        self.assertEqual(first.id, second.id)
+        self.assertEqual(self._carriers(), [first.id])
+
+    def test_concurrent_producers_collapse_to_one_carrier(self):
+        """Bug (a)/(b): N producers racing on an absent slot → exactly ONE carrier. A barrier on
+        the first N queued-checks forces every thread past the read before any commits; the CAS
+        (WATCH/MULTI) then lets exactly one win and the rest retry+suppress."""
+        import netbox_nso_plugin.read_gate as read_gate
+        from netbox_nso_plugin.read_gate import enqueue_reconcile_carrier
+
+        n = 4
+        real = read_gate._queued_carrier
+        barrier = threading.Barrier(n, timeout=10)
+        seen = []
+        seen_lock = threading.Lock()
+
+        def barriered(queue, conn, job_id):
+            with seen_lock:
+                first_wave = len(seen) < n
+                seen.append(1)
+            if first_wave:
+                try:
+                    barrier.wait()
+                except threading.BrokenBarrierError:
+                    pass
+            return real(queue, conn, job_id)
+
+        results = []
+        errors = []
+        res_lock = threading.Lock()
+
+        def produce():
+            try:
+                job = enqueue_reconcile_carrier(self.conn, self.queue, self.device_id)
+            except Exception as exc:  # noqa: BLE001 — a leaked WatchError/redis error is a real failure
+                with res_lock:
+                    errors.append(exc)
+                return
+            with res_lock:
+                results.append(job)
+
+        with patch.object(read_gate, "_queued_carrier", barriered):
+            threads = [threading.Thread(target=produce) for _ in range(n)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=15)
+        self.assertFalse([t for t in threads if t.is_alive()], "a producer thread hung")
+        self.assertEqual(errors, [], "a producer leaked an exception")
+        self.assertEqual(len(results), n, "every producer returned a job")
+        self.assertEqual(len(self._carriers()), 1)
+        self.assertEqual({j.id for j in results}, set(self._carriers()))
+
+    def test_started_carrier_not_suppressible_gets_trailing(self):
+        """r3-2 / pop-boundary: a carrier removed from the queue list (popped/started) is NOT
+        suppressible — a new edge enqueues a DISTINCT trailing carrier and repoints."""
+        from netbox_nso_plugin.read_gate import carrier_key, enqueue_reconcile_carrier
+
+        first = enqueue_reconcile_carrier(self.conn, self.queue, self.device_id)
+        self.queue.remove(first.id)  # simulate the worker popping it (off the queue list; pointer stays)
+        second = enqueue_reconcile_carrier(self.conn, self.queue, self.device_id)
+        self.assertNotEqual(first.id, second.id)
+        self.assertEqual(self._carriers(), [second.id])  # only the trailing one is queued
+        self.assertEqual(self.conn.get(carrier_key(self.device_id)).decode(), second.id)
+
+    def test_stale_pointer_fails_open(self):
+        """A pointer referencing a job absent from the queue list → not suppressible → fresh carrier."""
+        from netbox_nso_plugin.read_gate import carrier_key, enqueue_reconcile_carrier
+
+        self.conn.set(carrier_key(self.device_id), f"nso-reconcile-{self.device_id}-carrier-ghost")
+        job = enqueue_reconcile_carrier(self.conn, self.queue, self.device_id)
+        self.assertEqual(self._carriers(), [job.id])
+        self.assertEqual(self.conn.get(carrier_key(self.device_id)).decode(), job.id)
+
+    def test_persistent_pointer_has_no_ttl(self):
+        """The carrier pointer must NOT expire while its carrier can still be queued (codex r1-f2)."""
+        from netbox_nso_plugin.read_gate import carrier_key, enqueue_reconcile_carrier
+
+        enqueue_reconcile_carrier(self.conn, self.queue, self.device_id)
+        self.assertEqual(self.conn.ttl(carrier_key(self.device_id)), -1)  # -1 = persistent
+
+    def test_committed_job_is_runnable(self):
+        """Real-RQ commit: after EXEC the job hash exists, it is in the queue list, and the pointer matches."""
+        from rq.job import Job as RqJob
+
+        from netbox_nso_plugin.read_gate import carrier_key, enqueue_reconcile_carrier
+
+        job = enqueue_reconcile_carrier(self.conn, self.queue, self.device_id)
+        fetched = RqJob.fetch(job.id, connection=self.conn)
+        self.assertEqual(fetched.func_name, "netbox_nso_plugin.reconcile.run_device_reconcile")
+        self.assertEqual(fetched.args, (self.device_id,))
+        self.assertIn(job.id, self.queue.get_job_ids())
+        self.assertEqual(self.conn.get(carrier_key(self.device_id)).decode(), job.id)
+
+    def test_handoff_absent_marker_is_noop(self):
+        """consume_marker=True with no pending marker → never create a phantom successor (codex r3-1)."""
+        from netbox_nso_plugin.read_gate import enqueue_reconcile_carrier
+
+        result = enqueue_reconcile_carrier(self.conn, self.queue, self.device_id, consume_marker=True)
+        self.assertIsNone(result)
+        self.assertEqual(self._carriers(), [])
+
+    def test_handoff_does_not_lose_edge_when_enqueue_fails(self):
+        """Bug (c) regression: the old GETDEL→enqueue could delete the marker then fail to enqueue,
+        losing the edge. The arbiter deletes the marker only in the SAME EXEC as the durable carrier,
+        so a failing enqueue leaves the edge represented — a successor exists OR the marker is retained."""
+        from netbox_nso_plugin.read_gate import (
+            consume_marker_and_enqueue_successor,
+            marker_key,
+            write_defer_marker,
+        )
+
+        write_defer_marker(self.conn, self.device_id)
+        with patch.object(self.queue, "enqueue", side_effect=RuntimeError("enqueue boom")):
+            try:
+                consume_marker_and_enqueue_successor(self.conn, self.device_id, self.queue)
+            except RuntimeError:
+                pass  # the OLD code raises here (marker already GETDEL'd → the lost edge)
+        edge_represented = bool(self.queue.get_job_ids()) or self.conn.get(marker_key(self.device_id)) is not None
+        self.assertTrue(edge_represented, "handoff lost the edge: marker gone AND no successor")
+
+    def test_handoff_crash_mid_commit_retains_marker(self):
+        """codex r4-3 / diff-2: a crash DURING the CAS commit (before EXEC) must retain the marker and
+        leave NO partial carrier — the marker DELETE is buffered in the same MULTI as the job, so an
+        aborted commit runs neither. Injects the failure at the real CAS path (queue.enqueue_job)."""
+        from netbox_nso_plugin.read_gate import (
+            consume_marker_and_enqueue_successor,
+            marker_key,
+            write_defer_marker,
+        )
+
+        write_defer_marker(self.conn, self.device_id)
+        with patch.object(self.queue, "enqueue_job", side_effect=RuntimeError("crash mid-commit")):
+            with self.assertRaises(RuntimeError):
+                consume_marker_and_enqueue_successor(self.conn, self.device_id, self.queue)
+        self.assertIsNotNone(self.conn.get(marker_key(self.device_id)))  # marker RETAINED (never deleted)
+        self.assertEqual(self._carriers(), [])  # no partial carrier committed
+
+    def test_inline_sync_handoff_consumes_marker_no_recursion(self):
+        """is_async=False (codex r3-4): the handoff consumes the marker once before the inline run,
+        so a re-entry finds no marker and stops — no infinite recursion."""
+        from rq import Queue
+
+        from netbox_nso_plugin.read_gate import enqueue_reconcile_carrier, marker_key, write_defer_marker
+
+        sync_q = Queue(f"nso-test-sync-{uuid.uuid4().hex[:8]}", connection=self.conn, is_async=False)
+        _SYNC_RECONCILE_CALLS.clear()
+        with patch("netbox_nso_plugin.reconcile.run_device_reconcile", new=_sync_reconcile_recorder):
+            # no marker → the recursion guard: nothing to hand off, no inline run
+            self.assertIsNone(enqueue_reconcile_carrier(self.conn, sync_q, self.device_id, consume_marker=True))
+            self.assertEqual(_SYNC_RECONCILE_CALLS, [])
+            # marker present → consume once, run inline once
+            write_defer_marker(self.conn, self.device_id)
+            enqueue_reconcile_carrier(self.conn, sync_q, self.device_id, consume_marker=True)
+        self.assertEqual(_SYNC_RECONCILE_CALLS, [self.device_id])
+        self.assertIsNone(self.conn.get(marker_key(self.device_id)))  # consumed
 
 
 # ---------------------------------------------------------------------------

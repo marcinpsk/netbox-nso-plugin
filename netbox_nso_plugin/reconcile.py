@@ -1293,42 +1293,20 @@ def _journal_route_policy_apply(mgmt, job: dict | None) -> None:
         row.save(update_fields=["last_apply_at"])
 
 
-def _consume_own_unique_pending(device_id: int) -> None:
-    """Owner-checked consume of this job's unique-pending pointer (S5a F), best-effort.
-
-    Outside an RQ job (inline fallback, web render, tests calling directly) there is no
-    current job id to own a pointer — nothing to do.
-    """
-    try:
-        import django_rq
-        from rq import get_current_job
-    except ImportError:  # pragma: no cover - RQ ships with NetBox
-        return
-    job = get_current_job()
-    if job is None:
-        return
-    from .read_gate import consume_unique_pending
-
-    consume_unique_pending(django_rq.get_queue(_RECONCILE_QUEUE).connection, device_id, job.id)
-
-
 def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
     """RQ entrypoint: reconcile one device by NetBox device id, off the request path.
 
     Runs in the rqworker (no HTTP request), so suppress_intent_push() — not the
     GET-render guard — is what keeps the NSO*State writes from pushing intent back.
     AdapterError is swallowed: a transient adapter outage must not crash the worker.
-    ``notify_class=True`` marks a unique notify job (S5a F): its lease acquisition is
-    single-attempt + defer-marker (no 90s retry burn on general RQ workers).
+    ``notify_class=True`` marks a unique notify job: its lease acquisition is
+    single-attempt + defer-marker (no 90s retry burn on general RQ workers). Under READSEM
+    1334 the enqueue plane no longer sets it (all carriers are rq-class), but the param stays
+    for any :func:`enqueue_reconcile_carrier`-external caller and for in-flight jobs across a deploy.
     """
     from dcim.models import Device
 
     from .adapter_client import AdapterError
-
-    # S5a F: consume OUR unique-pending pointer BEFORE any state read — from this point a
-    # new notify must enqueue its own job (the loss-free invariant's hinge). Owner-checked,
-    # so non-notify jobs and superseded pointers are untouched.
-    _consume_own_unique_pending(device_id)
 
     try:
         device = Device.objects.get(pk=device_id)
@@ -1374,129 +1352,27 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
     return summary
 
 
-#: How long an RQ job tracked by NEITHER registry must have gone untouched before we treat
-#: it as an orphan and reclaim its id. Covers the worker HAND-OFF window (see below); an
-#: orphan from a dead worker is minutes-to-months stale, so it is still reclaimed promptly.
-_ORPHAN_RECLAIM_GRACE_S = 60
-
-
-def _job_recently_touched(job) -> bool:
-    """Whether *job* carries a fresh timestamp — i.e. it is mid-hand-off, not an orphan.
-
-    An RQ worker pops the job (it leaves ``queue.get_job_ids()``) and only then adds it to
-    ``StartedJobRegistry``. In between it is in NEITHER, and is indistinguishable from a job
-    orphaned by a dead worker. Reclaiming it there deletes a job that is about to run and
-    enqueues a second one, so two reconciles for the same device run CONCURRENTLY and race
-    on the overlay upserts (get_or_create → IntegrityError). Its timestamps are seconds old,
-    though, while a real orphan's are not — that is the distinction.
-    """
-    from datetime import UTC, datetime
-
-    stamps = [
-        getattr(job, "last_heartbeat", None),
-        getattr(job, "started_at", None),
-        getattr(job, "enqueued_at", None),
-    ]
-    latest = max((s for s in stamps if s is not None), default=None)
-    if latest is None:
-        return False
-    if latest.tzinfo is None:  # RQ historically stamped naive UTC
-        latest = latest.replace(tzinfo=UTC)
-    return (datetime.now(UTC) - latest).total_seconds() < _ORPHAN_RECLAIM_GRACE_S
-
-
 def enqueue_device_reconcile(device_id: int):
-    """Enqueue a background reconcile for *device_id*, deduped per device.
+    """Enqueue a background reconcile for *device_id* via the READSEM 1334 queued-carrier arbiter.
 
-    Uses a deterministic job id so 15-min adapter sync cycles across many devices
-    don't pile up: if a reconcile for this device is already queued/running, the
-    call is a no-op. Returns the (existing or new) RQ job, or None if RQ is absent.
+    Every producer — the adapter sync-complete callback (``api/views.py``), the UI "Refresh overlays"
+    action (``views.py``), and the lease-release handoff — funnels through
+    :func:`~netbox_nso_plugin.read_gate.enqueue_reconcile_carrier`, which single-flights the per-device
+    queued carrier: a new edge either suppresses onto the one genuinely-queued carrier (loss-free — it
+    starts after this edge's mirror refresh) or enqueues exactly one trailing carrier. Returns the
+    (existing or new) RQ job, or None if RQ is absent (run inline).
     """
     try:
         import django_rq
-        from rq.exceptions import NoSuchJobError
-        from rq.job import Job as RqJob
-        from rq.registry import StartedJobRegistry
     except ImportError:  # pragma: no cover - RQ ships with NetBox
         logger.warning("django_rq unavailable; running reconcile for device %s inline", device_id)
         run_device_reconcile(device_id)
         return None
 
+    from .read_gate import enqueue_reconcile_carrier
+
     queue = django_rq.get_queue(_RECONCILE_QUEUE)
-    job_id = f"nso-reconcile-{device_id}"
-    try:
-        existing = RqJob.fetch(job_id, connection=queue.connection)
-    except NoSuchJobError:
-        existing = None
-    if existing is None:
-        return queue.enqueue(run_device_reconcile, device_id, job_id=job_id, result_ttl=300, job_timeout=600)
-    # Dedupe ONLY on a job GENUINELY pending in the queue: it snapshots state when it
-    # STARTS, i.e. after this notify's refresh — suppression is loss-free. Do NOT trust
-    # the job's status field alone: a stale hash can say 'queued' while tracked by
-    # neither the queue nor a registry (the observed month-long orphan block).
-    if job_id in queue.get_job_ids():
-        return existing
-    running = job_id in StartedJobRegistry(queue=queue).get_job_ids()
-    if not running and not _job_recently_touched(existing):
-        # True orphan or an AGED terminal hash: reclaim the deterministic id (unchanged
-        # pre-existing recovery path; freshness is what separates an orphan from a job
-        # a worker has just dequeued).
-        existing.delete()
-        return queue.enqueue(run_device_reconcile, device_id, job_id=job_id, result_ttl=300, job_timeout=600)
-    # RUNNING, or fresh-but-in-no-registry (mid-handoff, just-dequeued, or just-finished
-    # inside the result_ttl window): the job may ALREADY have snapshotted, so suppressing
-    # would silently drop this notify's edge — the S5a F loss class (codex R1-F1/R2-F2/
-    # R6-3). Keep the deterministic hash (deleting under a live worker overwrites the job
-    # it is about to run) and carry the notify on a unique-id job instead; the device
-    # lease serializes execution and its marker handoff coalesces pile-ups.
-    return _enqueue_unique_notify(queue, device_id)
-
-
-def _enqueue_unique_notify(queue, device_id: int):
-    """Pending-unique gate + unique-id enqueue (S5a F — bounded, loss-free).
-
-    Suppress only when the pointer references a job still GENUINELY pending in the
-    queue (it reads post-refresh state at start — same safety as the deterministic
-    dedupe); any validation failure fails OPEN to a fresh enqueue, so a dead job's
-    stale pointer self-heals on the next notify. The pointer is SET only AFTER the
-    job is durably enqueued (codex R6-2): a crash between the two costs a duplicate
-    idempotent run, never a suppressed loss.
-    """
-    import uuid as _uuid
-
-    from rq.exceptions import NoSuchJobError
-    from rq.job import Job as RqJob
-
-    from .read_gate import _redis_errors, notify_job_id, unique_pending_key
-
-    conn = queue.connection
-    key = unique_pending_key(device_id)
-    try:
-        pointed = conn.get(key)
-    except _redis_errors():
-        pointed = None  # can't read the gate → fail open to enqueue
-    if pointed:
-        pointed_id = pointed.decode() if isinstance(pointed, bytes) else pointed
-        try:
-            pointed_job = RqJob.fetch(pointed_id, connection=conn)
-            if pointed_id in queue.get_job_ids():
-                return pointed_job  # validated queued-in-queue — absorbs this notify
-        except NoSuchJobError:
-            pass  # stale pointer — fail open
-    job = queue.enqueue(
-        run_device_reconcile,
-        device_id,
-        notify_class=True,
-        job_id=notify_job_id(device_id, _uuid.uuid4().hex),
-        result_ttl=300,
-        job_timeout=600,
-    )
-    try:
-        conn.set(key, job.id, ex=900)
-    except _redis_errors() as exc:
-        # The job is already durable; the pointer is only the pile-up bound.
-        logger.warning("device %s: unique-pending pointer set failed: %s", device_id, exc)
-    return job
+    return enqueue_reconcile_carrier(queue.connection, queue, device_id)
 
 
 def run_onboard_advance(mgmt_id: int):
