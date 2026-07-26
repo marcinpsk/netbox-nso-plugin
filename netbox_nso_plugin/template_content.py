@@ -1982,7 +1982,17 @@ def _resolve_ospf_area(OSPFArea, area_id):
     return OSPFArea.objects.get_or_create(area_id=canon, defaults={"area_type": "standard"})[0]
 
 
-def _fill_ospf_interface(entry, iface, inst_by_pid, OSPFArea, OSPFInterface, base):
+def _precreate_ospf_areas(OSPFArea, entries) -> dict[str, object]:
+    """Create/load global areas in canonical order before device-local OSPF writes."""
+    if OSPFArea is None:
+        return {}
+    area_ids = {
+        _canonical_area_id(entry.get("area_id") or "0.0.0.0") for entry in entries if entry.get("interface_name")
+    }
+    return {area_id: _resolve_ospf_area(OSPFArea, area_id) for area_id in sorted(area_ids)}
+
+
+def _fill_ospf_interface(entry, iface, inst_by_pid, OSPFArea, OSPFInterface, base, area_by_id=None):
     """3-way reconcile the netbox-routing OSPFInterface + its OSPFArea.
 
     OSPFArea is a global object keyed by area_id. OSPFInterface is OneToOne on the
@@ -1999,7 +2009,8 @@ def _fill_ospf_interface(entry, iface, inst_by_pid, OSPFArea, OSPFInterface, bas
     inst = inst_by_pid.get(pid)
     if inst is None:
         return True, False, base
-    area = _resolve_ospf_area(OSPFArea, entry.get("area_id") or "0.0.0.0")
+    area_id = _canonical_area_id(entry.get("area_id") or "0.0.0.0")
+    area = (area_by_id or {}).get(area_id) or _resolve_ospf_area(OSPFArea, area_id)
 
     cost = entry.get("cost")
     cost = cost if isinstance(cost, int) and 1 <= cost <= 65535 else None
@@ -2151,12 +2162,14 @@ def _reconcile_ospf_interfaces(device, mgmt, payload, now) -> None:
 
     OSPFInstance, OSPFArea, OSPFInterface = _import_ospf_models()
     inst_by_pid = {i.process_id: i for i in OSPFInstance.objects.filter(device=device)} if OSPFInstance else {}
+    entries = payload.get("interfaces") or []
+    area_by_id = _precreate_ospf_areas(OSPFArea, entries)
 
     iface_map = {i.name: i for i in Interface.objects.filter(device=device)}
     seen_iface_pks: set[int] = set()
     dropped: list[str] = []
 
-    for entry in payload.get("interfaces") or []:
+    for entry in entries:
         iface_name = entry.get("interface_name") or ""
         if not iface_name:
             continue
@@ -2193,7 +2206,13 @@ def _reconcile_ospf_interfaces(device, mgmt, payload, now) -> None:
         # 3-way merge: device change auto-mirrors when the OSPFInterface is untouched;
         # an operator edit surfaces as 'changed' and survives; both moved → conflict.
         iface_matches, iface_conflict, new_base = _fill_ospf_interface(
-            entry, iface, inst_by_pid, OSPFArea, OSPFInterface, state.device_base_hash
+            entry,
+            iface,
+            inst_by_pid,
+            OSPFArea,
+            OSPFInterface,
+            state.device_base_hash,
+            area_by_id,
         )
         state.device_base_hash = new_base
         state.status = sm.on_reconcile(state.status, matches=iface_matches, conflict=iface_conflict)

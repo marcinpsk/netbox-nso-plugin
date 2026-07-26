@@ -560,11 +560,11 @@ def _reconcile_scope(
     vrf_obj = _resolve_vrf(vrf_name, VRF)
     scope_obj = _get_or_create_scope(router_obj, vrf_obj, BGPScope)
 
-    for af_str in scope_entry.get("address_families") or []:
+    for af_str in sorted(scope_entry.get("address_families") or []):
         if af_str:
             _get_or_create_address_family(scope_obj, af_str, BGPAddressFamily)
 
-    for peer_entry in scope_entry.get("peers") or []:
+    for peer_entry in sorted(scope_entry.get("peers") or [], key=lambda row: row.get("peer_address") or ""):
         peer_address_str = peer_entry.get("peer_address") or ""
         if not peer_address_str:
             continue
@@ -602,7 +602,7 @@ def _reconcile_scope(
 
     # Peer-group / template OBJECTS: model each as a BGPPeerTemplate carrying its
     # own per-AF route-map / prefix-list policies (not just inlined onto members).
-    for pg_entry in scope_entry.get("peer_groups") or []:
+    for pg_entry in sorted(scope_entry.get("peer_groups") or [], key=lambda row: (row.get("name") or "").casefold()):
         pg_name = pg_entry.get("name") or ""
         if not pg_name:
             continue
@@ -648,6 +648,31 @@ def _reconcile_bgp_config(device, payload: dict) -> list:
         return _reconcile_bgp_config_impl(device, payload)
 
 
+def _precreate_payload_asns(routers: list[dict], asn_model) -> None:
+    """Create shared ASN rows in a stable order before nested BGP writes."""
+    values = {
+        str(value)
+        for router in routers
+        for value in (
+            [router.get("asn")]
+            + [
+                peer.get(key)
+                for scope in router.get("scopes") or []
+                for peer in scope.get("peers") or []
+                for key in ("remote_as", "local_as")
+            ]
+            + [
+                group.get("remote_as")
+                for scope in router.get("scopes") or []
+                for group in scope.get("peer_groups") or []
+            ]
+        )
+        if value not in (None, "")
+    }
+    for value in sorted(values, key=lambda item: (len(item), item)):
+        _get_or_create_asn(value, asn_model)
+
+
 def _reconcile_bgp_config_impl(device, payload: dict) -> list:
     """Body of :func:`_reconcile_bgp_config` (see it for the contract)."""
     from django.contrib.contenttypes.models import ContentType
@@ -690,7 +715,10 @@ def _reconcile_bgp_config_impl(device, payload: dict) -> list:
     seen_keys: set[tuple] = set()
     seen_template_names: set[tuple] = set()
 
-    for router_entry in payload.get("routers") or []:
+    routers = sorted(payload.get("routers") or [], key=lambda row: str(row.get("asn") or ""))
+    _precreate_payload_asns(routers, ASN)
+
+    for router_entry in routers:
         asn_str = str(router_entry.get("asn") or "")
         if not asn_str:
             continue
@@ -699,7 +727,7 @@ def _reconcile_bgp_config_impl(device, payload: dict) -> list:
             continue
         router_obj = _get_or_create_router(device, asn_obj, BGPRouter, ContentType, Device)
         _apply_router_id(router_obj, router_entry.get("router_id"))
-        for scope_entry in router_entry.get("scopes") or []:
+        for scope_entry in sorted(router_entry.get("scopes") or [], key=lambda row: row.get("vrf") or ""):
             _reconcile_scope(
                 mgmt,
                 router_obj,

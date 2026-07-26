@@ -318,7 +318,14 @@ class DeviceNSOTabView(generic.ObjectView):
             "device_capability": device_capability,
             # READSEM S4 (D8/D10): honored by EVERY render path — including the
             # adapter-down persisted-rows fallback (R12: durable reset knowledge).
-            "read_reset_pending": bool(mgmt is not None and mgmt.reset_pending_born is not None),
+            "read_reset_pending": bool(
+                mgmt is not None
+                and (
+                    mgmt.source_rekey_pending
+                    or mgmt.reset_pending_born is not None
+                    or mgmt.reset_pending_source_epoch is not None
+                )
+            ),
             "read_state_unknown": read_state_unknown,
             "families_version_mismatch": families_version_mismatch,
             "status_badge": _STATUS_BADGE,
@@ -479,7 +486,14 @@ class NSOCategoryCountsView(LoginRequiredMixin, View):
         return JsonResponse(
             {
                 "categories": out,
-                "reset_pending": bool(mgmt is not None and mgmt.reset_pending_born is not None),
+                "reset_pending": bool(
+                    mgmt is not None
+                    and (
+                        mgmt.source_rekey_pending
+                        or mgmt.reset_pending_born is not None
+                        or mgmt.reset_pending_source_epoch is not None
+                    )
+                ),
             }
         )
 

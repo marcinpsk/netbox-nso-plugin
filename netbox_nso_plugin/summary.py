@@ -354,6 +354,7 @@ _CHIP_SEVERITY = (
     "reset_pending",
     "unavailable",
     "unknown",
+    "unproven",
     "stale",
     "aged",
     "refresh_pending",
@@ -377,6 +378,11 @@ _CHIP_RENDER = {
         "css": "text-bg-danger",
         "label": "unknown read state",
         "tip": "The adapter reported a read state this plugin does not recognize — failing closed. Rows show last-known data.",
+    },
+    "unproven": {
+        "css": "text-bg-warning text-dark",
+        "label": "payload revision unproven",
+        "tip": "The adapter served a compatibility publication without an atomic payload revision. Rows were applied, but payload/pointer coherence cannot be proven until a revisioned read succeeds.",
     },
     "stale": {
         "css": "text-bg-warning text-dark",
@@ -432,8 +438,12 @@ def _family_read_display(row, adopted_incarnation: str) -> str | None:
         if not (row.observed_succeeded is True and row.observed_result in _RS_ADMIT_RESULTS):
             return "unknown"  # inconsistent tuple — fail closed, visibly
         obs, applied = row.observed_attempt_id, row.applied_attempt_id
-        if obs is not None and (applied is None or obs > applied):
+        if row.applied_publication_sequence != row.publication_sequence or (
+            obs is not None and (applied is None or obs > applied)
+        ):
             return "refresh_pending"
+        if row.applied_payload_revision is None:
+            return "unproven"
         if row.observed_freshness in ("stale", "aged"):
             return row.observed_freshness
         return None  # healthy
@@ -449,7 +459,7 @@ def category_read_chip(mgmt, key: str, rows_by_family: dict) -> dict | None:
     """
     from .families import CATEGORY_FAMILIES
 
-    if mgmt.reset_pending_born is not None:
+    if mgmt.source_rekey_pending or mgmt.reset_pending_born is not None or mgmt.reset_pending_source_epoch is not None:
         state = "reset_pending"
     else:
         states = set()

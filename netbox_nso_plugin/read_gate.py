@@ -476,6 +476,11 @@ def _is_authoritative(rs: dict) -> bool:
 class _Decision:
     disposition: str
     run_body: bool
+    sequence: int | None = None
+    incarnation: str = ""
+    attempt_id: int | None = None
+    source_epoch: int | None = None
+    payload_revision: int | None = None
 
 
 def _locked_row(mgmt, family: str):
@@ -508,8 +513,17 @@ _RESET_FIELDS = {
     "observed_incarnation": "",
     "observed_incarnation_born": None,
     "observed_epoch": None,
+    "observed_source_epoch": None,
+    "observed_payload_revision": None,
+    "admitted_attempt_id": None,
+    "admitted_incarnation": "",
+    "admitted_source_epoch": None,
+    "admitted_payload_revision": None,
     "applied_attempt_id": None,
     "applied_incarnation": "",
+    "applied_source_epoch": None,
+    "applied_payload_revision": None,
+    "applied_publication_sequence": 0,
 }
 
 _MARKER_FIELDS = [
@@ -540,6 +554,8 @@ def _advance_observed(row, rs: dict, inc: str, born, epoch) -> bool:
     row.observed_incarnation = inc
     row.observed_incarnation_born = born
     row.observed_epoch = epoch
+    row.observed_source_epoch = rs.get("source_epoch")
+    row.observed_payload_revision = rs.get("payload_revision")
     return True
 
 
@@ -575,11 +591,20 @@ def _adopt_incarnation(m, inc: str, born) -> None:
     re-observed. Only a marker this adoption reaches (born > pending_born, or the
     exact pending pair) is touched — a NEWER pending pair stays.
     """
+    from django.db.models import F
+
     from .models import NSOFamilyReadState
 
-    blanked = NSOFamilyReadState.objects.filter(management=m).update(**_RESET_FIELDS)
+    blanked = NSOFamilyReadState.objects.filter(management=m).update(
+        **_RESET_FIELDS,
+        publication_sequence=F("publication_sequence") + 1,
+    )
     m.adapter_incarnation = inc
     m.adapter_incarnation_born = born
+    # Source epochs are monotonic only within one adapter-store incarnation.
+    # Keep awareness sticky, but let the new incarnation establish a new floor.
+    m.adapter_source_epoch = None
+    m.reset_pending_source_epoch = None
     if (
         m.reset_pending_born is None
         or born > m.reset_pending_born
@@ -592,7 +617,7 @@ def _adopt_incarnation(m, inc: str, born) -> None:
             m.reset_pending_incarnation = ""
             m.reset_pending_born = None
             m.reset_conflict_born = None
-    m.save(update_fields=_MARKER_FIELDS)
+    m.save(update_fields=[*_MARKER_FIELDS, "adapter_source_epoch", "reset_pending_source_epoch"])
 
 
 def _maybe_clear_reset_marker(m) -> bool:
@@ -617,6 +642,62 @@ def _maybe_clear_reset_marker(m) -> bool:
     return True
 
 
+def _maybe_clear_source_marker(m) -> bool:
+    """Clear a source reset only after every pre-existing family re-observed."""
+    from .models import NSOFamilyReadState
+
+    if m.reset_pending_source_epoch is None:
+        return False
+    if m.reset_pending_source_epoch != m.adapter_source_epoch:
+        return False
+    if NSOFamilyReadState.objects.filter(management=m, observed_outcome="").exists():
+        return False
+    m.reset_pending_source_epoch = None
+    type(m).objects.filter(pk=m.pk).update(reset_pending_source_epoch=None)
+    return True
+
+
+def _adopt_source_epoch(m, row, source_epoch) -> str | None:
+    """Validate/adopt the adapter source generation; return a skip disposition on failure."""
+    if source_epoch is None:
+        return SKIPPED_UNAVAILABLE if m.source_epoch_aware else None
+    if m.reset_pending_source_epoch is not None and source_epoch < m.reset_pending_source_epoch:
+        return SKIPPED_STALE_ATTEMPT
+    if m.adapter_source_epoch is not None and source_epoch < m.adapter_source_epoch:
+        return SKIPPED_STALE_ATTEMPT
+    if m.adapter_source_epoch != source_epoch:
+        from django.db.models import F
+
+        from .models import NSOFamilyReadState
+
+        blanked = NSOFamilyReadState.objects.filter(management=m).update(
+            **_RESET_FIELDS,
+            publication_sequence=F("publication_sequence") + 1,
+        )
+        row.refresh_from_db()
+        m.reset_pending_source_epoch = source_epoch if blanked else None
+    if m.adapter_source_epoch != source_epoch or not m.source_epoch_aware:
+        m.adapter_source_epoch = source_epoch
+        m.source_epoch_aware = True
+        type(m).objects.filter(pk=m.pk).update(
+            adapter_source_epoch=source_epoch,
+            source_epoch_aware=True,
+            reset_pending_source_epoch=m.reset_pending_source_epoch,
+        )
+    return None
+
+
+def _warn_unproven_payload_revision(device_id: int, family: str, payload_revision: int | None) -> None:
+    """Make accepted compatibility publications visible in logs as unproven."""
+    if payload_revision is None:
+        logger.warning(
+            "device %s family %s: authoritative publication has no payload revision; "
+            "payload/pointer coherence is unproven",
+            device_id,
+            family,
+        )
+
+
 def _gate_and_record(mgmt, family: str, read_state: dict | None, *, epoch) -> _Decision:
     """Run step-1 of the D5 protocol.
 
@@ -630,16 +711,22 @@ def _gate_and_record(mgmt, family: str, read_state: dict | None, *, epoch) -> _D
         if m.adapter_device_id is None or epoch is None or m.adapter_device_id != epoch:
             # a response fetched from a link this row no longer has (delayed replay)
             return _Decision(SKIPPED_STALE_ATTEMPT, False)
+        if m.source_rekey_pending:
+            return _Decision(SKIPPED_UNAVAILABLE, False)
 
         row = _locked_row(m, family)
 
         if read_state is None:
             # pre-S4 adapter (key absent) → legacy behavior; blank outcome so the
             # UI ignores any previously-persisted state (rollback hygiene, R1-F9)
-            if row.observed_outcome:
-                row.observed_outcome = ""
-                row.save(update_fields=["observed_outcome"])
-            return _Decision(LEGACY, True)
+            if m.source_epoch_aware:
+                return _Decision(SKIPPED_UNAVAILABLE, False)
+            for field, value in _RESET_FIELDS.items():
+                if field.startswith(("observed_", "admitted_")):
+                    setattr(row, field, value)
+            row.publication_sequence += 1
+            row.save()
+            return _Decision(LEGACY, True, sequence=row.publication_sequence)
 
         inc = read_state.get("incarnation") or ""
         born = _parse_dt(read_state.get("incarnation_born"))
@@ -680,46 +767,113 @@ def _gate_and_record(mgmt, family: str, read_state: dict | None, *, epoch) -> _D
             _adopt_incarnation(m, inc, born)
             row.refresh_from_db()
 
+        source_epoch = read_state.get("source_epoch")
+        if source_disposition := _adopt_source_epoch(m, row, source_epoch):
+            return _Decision(source_disposition, False)
+
         incoming = read_state.get("attempt_id")
-        if row.applied_attempt_id is not None and (incoming is None or incoming < row.applied_attempt_id):
-            # strictly older than APPLIED: nothing advances, body skipped
+        if row.admitted_attempt_id is not None and (incoming is None or incoming < row.admitted_attempt_id):
+            # strictly older than ADMITTED: nothing advances, body skipped
             return _Decision(SKIPPED_STALE_ATTEMPT, False)
 
         if _is_authoritative(read_state):
+            payload_revision = read_state.get("payload_revision")
+            _warn_unproven_payload_revision(m.pk, family, payload_revision)
             _advance_observed(row, read_state, inc, born, epoch)
-            row.applied_attempt_id = incoming
-            row.applied_incarnation = inc
+            row.admitted_attempt_id = incoming
+            row.admitted_incarnation = inc
+            row.admitted_source_epoch = source_epoch
+            row.admitted_payload_revision = payload_revision
+            row.publication_sequence += 1
             row.save()
             _maybe_clear_reset_marker(m)
-            return _Decision(RAN, True)
+            _maybe_clear_source_marker(m)
+            return _Decision(
+                RAN,
+                True,
+                sequence=row.publication_sequence,
+                incarnation=inc,
+                attempt_id=incoming,
+                source_epoch=source_epoch,
+                payload_revision=payload_revision,
+            )
 
         # non-authoritative (unavailable / result=error / tuple-fail / unknown values):
         # observed advances monotonically, applied untouched, body skipped
         if _advance_observed(row, read_state, inc, born, epoch):
             row.save()
             _maybe_clear_reset_marker(m)
+            _maybe_clear_source_marker(m)
         return _Decision(SKIPPED_UNAVAILABLE, False)
 
 
-def _admission_still_current(mgmt, family: str, incoming, inc: str) -> bool:
-    """Body fence (codex B5-F2 + R2-1): check OUR admission is still the applied one.
+def _publication_identity_current(mgmt, family: str, decision: _Decision, epoch) -> bool:
+    """Optimistic identity check used before the body and after a rolled-back failure."""
+    from .models import NSODeviceManagement, NSOFamilyReadState
 
-    Between the admission commit and the body there is no lock; a successor may
-    have admitted AND materialized a newer attempt — or ADOPTED a newer
-    incarnation whose attempt ids restarted at the same numbers (attempt ids are
-    NOT unique across store rebuilds), so the fence compares the incarnation too.
-    One re-select refuses the stale body. The mid-body window remains the
-    design's documented bounded last-writer-wins, logged loudly by the lease
-    heartbeat.
-    """
-    from .models import NSOFamilyReadState
-
-    row = (
-        NSOFamilyReadState.objects.filter(management=mgmt, family=family)
-        .values_list("applied_attempt_id", "applied_incarnation")
+    management_identity = (
+        NSODeviceManagement.objects.filter(pk=mgmt.pk)
+        .values_list("adapter_device_id", "adapter_source_epoch", "source_rekey_pending")
         .first()
     )
-    return row is not None and row[0] == incoming and row[1] == inc
+    row_identity = (
+        NSOFamilyReadState.objects.filter(management=mgmt, family=family)
+        .values_list(
+            "publication_sequence",
+            "admitted_attempt_id",
+            "admitted_incarnation",
+            "admitted_source_epoch",
+            "admitted_payload_revision",
+        )
+        .first()
+    )
+    return management_identity == (epoch, decision.source_epoch, False) and row_identity == (
+        decision.sequence,
+        decision.attempt_id,
+        decision.incarnation,
+        decision.source_epoch,
+        decision.payload_revision,
+    )
+
+
+class _SupersededPublication(Exception):
+    """Raised out of transaction.atomic() so every stale body write rolls back."""
+
+
+def _exception_sqlstate(exc: BaseException) -> str | None:
+    """Find a psycopg SQLSTATE through Django and scope-error exception wrappers."""
+    current = exc
+    while current is not None:
+        if sqlstate := getattr(current, "sqlstate", None):
+            return sqlstate
+        current = current.__cause__
+    return None
+
+
+def _locked_publication_matches(management, row, decision: _Decision, epoch) -> bool:
+    return (
+        management.adapter_device_id == epoch
+        and management.adapter_source_epoch == decision.source_epoch
+        and not management.source_rekey_pending
+        and row.publication_sequence == decision.sequence
+        and row.admitted_attempt_id == decision.attempt_id
+        and row.admitted_incarnation == decision.incarnation
+        and row.admitted_source_epoch == decision.source_epoch
+        and row.admitted_payload_revision == decision.payload_revision
+    )
+
+
+def mark_publication_error_if_current(mgmt, family: str, decision: _Decision, epoch, mark_error) -> bool:
+    """Run *mark_error* only while this failed admission remains current under both locks."""
+    from .models import NSODeviceManagement, NSOFamilyReadState
+
+    with transaction.atomic():
+        management = NSODeviceManagement.objects.select_for_update().get(pk=mgmt.pk)
+        row = NSOFamilyReadState.objects.select_for_update().get(management=management, family=family)
+        if not _locked_publication_matches(management, row, decision, epoch):
+            return False
+        mark_error()
+    return True
 
 
 def gated_family_run(mgmt, family: str, read_state: dict | None, body: Callable[[], Any], *, epoch) -> GateResult:
@@ -735,11 +889,73 @@ def gated_family_run(mgmt, family: str, read_state: dict | None, body: Callable[
     decision = _gate_and_record(mgmt, family, read_state, epoch=epoch)
     if not decision.run_body:
         return GateResult(decision.disposition)
-    if decision.disposition == RAN and not _admission_still_current(
-        mgmt, family, read_state.get("attempt_id"), read_state.get("incarnation") or ""
-    ):
+    if not _publication_identity_current(mgmt, family, decision, epoch):
         return GateResult(SKIPPED_STALE_ATTEMPT)
-    return GateResult(decision.disposition, body())
+    from .models import NSODeviceManagement, NSOFamilyReadState
+
+    try:
+        for deadlock_attempt in range(3):
+            try:
+                with transaction.atomic():
+                    value = body()
+                    current_management = NSODeviceManagement.objects.select_for_update().get(pk=mgmt.pk)
+                    row = NSOFamilyReadState.objects.select_for_update().get(
+                        management=current_management, family=family
+                    )
+                    if not _locked_publication_matches(current_management, row, decision, epoch):
+                        raise _SupersededPublication
+                    row.applied_attempt_id = decision.attempt_id
+                    row.applied_incarnation = decision.incarnation
+                    row.applied_source_epoch = decision.source_epoch
+                    row.applied_payload_revision = decision.payload_revision
+                    row.applied_publication_sequence = decision.sequence
+                    row.save(
+                        update_fields=[
+                            "applied_attempt_id",
+                            "applied_incarnation",
+                            "applied_source_epoch",
+                            "applied_payload_revision",
+                            "applied_publication_sequence",
+                            "last_updated",
+                        ]
+                    )
+                break
+            except Exception as exc:  # noqa: BLE001 — unwrap a scoped PostgreSQL deadlock
+                if _exception_sqlstate(exc) != "40P01" or deadlock_attempt == 2:
+                    raise
+                if not _publication_identity_current(mgmt, family, decision, epoch):
+                    return GateResult(SKIPPED_STALE_ATTEMPT)
+                logger.warning(
+                    "family %s publication deadlocked; retrying body (%d/3)",
+                    family,
+                    deadlock_attempt + 2,
+                )
+    except _SupersededPublication:
+        return GateResult(SKIPPED_STALE_ATTEMPT)
+    except Exception as exc:
+        # The body transaction is already rolled back. Only the still-current
+        # admission may surface/mark its failure; never mark a successor's rows.
+        if not _publication_identity_current(mgmt, family, decision, epoch):
+            return GateResult(SKIPPED_STALE_ATTEMPT)
+        exc._nso_publication_guard = (family, decision, epoch)
+        raise
+    return GateResult(decision.disposition, value)
+
+
+def _observe_source_epoch(m, source_epoch) -> tuple[bool, bool]:
+    """Ratchet source awareness and say whether this document may be observed."""
+    if source_epoch is None:
+        return not m.source_epoch_aware, False
+    dirty = False
+    if not m.source_epoch_aware:
+        m.source_epoch_aware = True
+        dirty = True
+    if m.adapter_source_epoch is None or source_epoch > m.adapter_source_epoch:
+        if m.reset_pending_source_epoch is None or source_epoch > m.reset_pending_source_epoch:
+            m.reset_pending_source_epoch = source_epoch
+            dirty = True
+        return False, dirty
+    return source_epoch == m.adapter_source_epoch, dirty
 
 
 def observe_aggregate(mgmt, read_states: dict[str, dict | None], *, epoch) -> bool:
@@ -758,11 +974,15 @@ def observe_aggregate(mgmt, read_states: dict[str, dict | None], *, epoch) -> bo
         m = NSODeviceManagement.objects.select_for_update().get(pk=mgmt.pk)
         if m.adapter_device_id is None or epoch is None or m.adapter_device_id != epoch:
             return False
+        if m.source_rekey_pending:
+            return False
         if not m.adapter_incarnation:
             # nothing adopted yet — observation REQUIRES the adopted incarnation
             return False
         wrote = False
         marker_dirty = False
+        source_dirty = False
+        source_fenced = False
         for family in sorted(read_states):
             rs = read_states[family]
             if rs is None:
@@ -770,6 +990,20 @@ def observe_aggregate(mgmt, read_states: dict[str, dict | None], *, epoch) -> bo
             inc = rs.get("incarnation") or ""
             born = _parse_dt(rs.get("incarnation_born"))
             if not inc or born is None:
+                continue
+            source_epoch = rs.get("source_epoch")
+            source_current, changed = _observe_source_epoch(m, source_epoch)
+            source_dirty = source_dirty or changed
+            if changed and not source_fenced:
+                from django.db.models import F
+
+                from .models import NSOFamilyReadState
+
+                NSOFamilyReadState.objects.filter(management=m).update(
+                    publication_sequence=F("publication_sequence") + 1
+                )
+                source_fenced = True
+            if not source_current:
                 continue
             if inc != m.adapter_incarnation:
                 if m.adapter_incarnation_born is not None and born < m.adapter_incarnation_born:
@@ -788,5 +1022,11 @@ def observe_aggregate(mgmt, read_states: dict[str, dict | None], *, epoch) -> bo
                 wrote = True
         if marker_dirty:
             m.save(update_fields=_MARKER_FIELDS)
+        if source_dirty:
+            type(m).objects.filter(pk=m.pk).update(
+                source_epoch_aware=m.source_epoch_aware,
+                reset_pending_source_epoch=m.reset_pending_source_epoch,
+            )
         cleared = _maybe_clear_reset_marker(m) if wrote else False
-        return wrote or marker_dirty or cleared
+        source_cleared = _maybe_clear_source_marker(m) if wrote else False
+        return wrote or marker_dirty or source_dirty or cleared or source_cleared

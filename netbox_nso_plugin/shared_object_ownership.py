@@ -124,12 +124,12 @@ def device_caught_up(family: str, captured: dict, obj, exclude_members: list | N
 
 def group_rows(state):
     """All overlay rows (across every device) for this row's (family, object_name)."""
-    return type(state).objects.filter(family=state.family, object_name=state.object_name)
+    return type(state).objects.filter(family=state.family, object_name__iexact=state.object_name)
 
 
 def materialized_row(state_model, family: str, object_name: str):
     """Return the row whose capture currently populates the shared object (or None)."""
-    return state_model.objects.filter(family=family, object_name=object_name, is_materialized=True).first()
+    return state_model.objects.filter(family=family, object_name__iexact=object_name, is_materialized=True).first()
 
 
 def canonical_hash(state_model, family: str, object_name: str) -> str | None:
@@ -168,7 +168,7 @@ def mark_materialized(state) -> None:
 
 def versions(state_model, family: str, object_name: str) -> list:
     """Every device's version of a shared object, owner first (for the versions UI)."""
-    rows = state_model.objects.filter(family=family, object_name=object_name).select_related(
+    rows = state_model.objects.filter(family=family, object_name__iexact=object_name).select_related(
         "management", "management__device"
     )
     return sorted(rows, key=lambda r: (not r.is_materialized, str(getattr(r.management, "device", ""))))

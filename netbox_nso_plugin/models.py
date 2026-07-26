@@ -499,6 +499,10 @@ class NSODeviceManagement(NetBoxModel):
     # adapter-born values — never against this host's clock.
     adapter_incarnation = models.CharField(max_length=64, blank=True, default="")
     adapter_incarnation_born = models.DateTimeField(null=True, blank=True)
+    adapter_source_epoch = models.BigIntegerField(null=True, blank=True)
+    source_epoch_aware = models.BooleanField(default=False)
+    source_rekey_pending = models.BooleanField(default=False)
+    reset_pending_source_epoch = models.BigIntegerField(null=True, blank=True)
     reset_pending_incarnation = models.CharField(max_length=64, blank=True, default="")
     reset_pending_born = models.DateTimeField(null=True, blank=True)
     reset_conflict_born = models.DateTimeField(null=True, blank=True)
@@ -667,8 +671,18 @@ class NSOFamilyReadState(NetBoxModel):
         blank=True,
         help_text="The adapter_device_id this observation was fetched from (replay guard).",
     )
+    observed_source_epoch = models.BigIntegerField(null=True, blank=True)
+    observed_payload_revision = models.BigIntegerField(null=True, blank=True)
+    admitted_attempt_id = models.BigIntegerField(null=True, blank=True)
+    admitted_incarnation = models.CharField(max_length=64, blank=True, default="")
+    admitted_source_epoch = models.BigIntegerField(null=True, blank=True)
+    admitted_payload_revision = models.BigIntegerField(null=True, blank=True)
     applied_attempt_id = models.BigIntegerField(null=True, blank=True)
     applied_incarnation = models.CharField(max_length=64, blank=True, default="")
+    applied_source_epoch = models.BigIntegerField(null=True, blank=True)
+    applied_payload_revision = models.BigIntegerField(null=True, blank=True)
+    publication_sequence = models.BigIntegerField(default=0)
+    applied_publication_sequence = models.BigIntegerField(default=0)
 
     class Meta:
         ordering = ["management", "family"]

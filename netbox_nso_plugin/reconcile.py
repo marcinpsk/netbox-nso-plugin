@@ -18,6 +18,16 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+class ReconcileScopeError(Exception):
+    """Carry scope metadata out of the fenced transaction before error marking."""
+
+    def __init__(self, mgmt, model_names, fn_name):
+        super().__init__(fn_name)
+        self.mgmt = mgmt
+        self.model_names = model_names
+        self.fn_name = fn_name
+
+
 def _empty_context() -> dict:
     """Default (no-op) reconcile result — also the read-only fallback shape."""
     return {
@@ -77,9 +87,8 @@ def _safe_reconcile(ctx: dict, key: str, mgmt, model_names: tuple[str, ...], fn,
         ctx[key] = fn(*args)
     except AdapterError:
         raise
-    except Exception:  # noqa: BLE001 — isolate a faulty scope; mark it + keep going
-        logger.exception("nso reconcile: %s failed; marking %s rows error", fn.__name__, ",".join(model_names))
-        _mark_scope_error(mgmt, model_names)
+    except Exception as exc:  # noqa: BLE001 — the gate rolls the scope transaction back
+        raise ReconcileScopeError(mgmt, model_names, fn.__name__) from exc
 
 
 # ── READSEM S4 (D5/D9): the device-wide read mutex + per-family gate plumbing ───
@@ -147,7 +156,39 @@ def _gated(ctx: dict, mgmt, family: str, payload, body, *, epoch, ctx_key: str |
         # explicit `"read_state": null` — a MALFORMED S4 block, not a pre-S4 adapter:
         # fail closed via the gate's incarnation check (codex B5-F4)
         read_state = {}
-    result = gated_family_run(mgmt, family, read_state, body, epoch=epoch)
+    context_before = dict(ctx)
+    try:
+        result = gated_family_run(mgmt, family, read_state, body, epoch=epoch)
+    except ReconcileScopeError as exc:
+        from .read_gate import (
+            SKIPPED_STALE_ATTEMPT,
+            SKIPPED_UNAVAILABLE,
+            GateResult,
+            mark_publication_error_if_current,
+        )
+
+        guard = getattr(exc, "_nso_publication_guard", None)
+        error_management = exc.mgmt
+        error_models = exc.model_names
+        marked = bool(guard) and mark_publication_error_if_current(
+            mgmt,
+            guard[0],
+            guard[1],
+            guard[2],
+            lambda: _mark_scope_error(error_management, error_models),
+        )
+        if marked:
+            logger.exception(
+                "nso reconcile: %s failed; marking %s rows error",
+                exc.fn_name,
+                ",".join(exc.model_names),
+            )
+        result = GateResult(SKIPPED_UNAVAILABLE if marked else SKIPPED_STALE_ATTEMPT)
+    if result.disposition not in (RAN, LEGACY):
+        # A body can assign display context before the final publication fence
+        # detects supersession. Do not return uncommitted/stale values.
+        ctx.clear()
+        ctx.update(context_before)
     ctx.setdefault("_gate", {})[family] = result.disposition
     if ctx_key is not None and result.disposition in (RAN, LEGACY):
         ctx[ctx_key] = result.value
@@ -423,9 +464,9 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
             # S4: the object-shaped interfaces-doc (read_state inline); on an S3
             # adapter the client falls back to the legacy list as a key-absent doc.
             interfaces_doc = client.get_interfaces_doc(dev_id)
-            ctx["interfaces"] = interfaces_doc.get("interfaces", [])
-            ctx["state"] = client.get_state(dev_id)
-            _gated(
+            fetched_interfaces = interfaces_doc.get("interfaces", [])
+            fetched_state = client.get_state(dev_id)
+            interface_result = _gated(
                 ctx,
                 mgmt,
                 "interface_attributes",
@@ -437,10 +478,13 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                     ("NSOInterfaceState",),
                     _upsert_interface_states,
                     device,
-                    ctx["interfaces"],
+                    fetched_interfaces,
                 ),
                 epoch=dev_id,
             )
+            if interface_result.disposition in ("ran", "legacy"):
+                ctx["interfaces"] = fetched_interfaces
+                ctx["state"] = fetched_state
             # materialise SVIs/IRBs (virtual interfaces + VLAN link) BEFORE the IP
             # reconcile, which only attaches IPs to interfaces that already exist —
             # otherwise an SVI's IPs are dropped until the next refresh.
@@ -668,17 +712,20 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
             from .vlan_reconciler import reconcile_switchport, reconcile_vlan_database
 
             interfaces_doc = client.get_interfaces_doc(dev_id)
-            ctx["interfaces"] = interfaces_doc.get("interfaces", [])
-            ctx["state"] = client.get_state(dev_id)
-            _gated(
+            fetched_interfaces = interfaces_doc.get("interfaces", [])
+            fetched_state = client.get_state(dev_id)
+            interface_result = _gated(
                 ctx,
                 mgmt,
                 "interface_attributes",
                 interfaces_doc,
-                lambda: _upsert_interface_states(device, ctx["interfaces"]),
+                lambda: _upsert_interface_states(device, fetched_interfaces),
                 epoch=dev_id,
                 ctx_key="interface_states",
             )
+            if interface_result.disposition in ("ran", "legacy"):
+                ctx["interfaces"] = fetched_interfaces
+                ctx["state"] = fetched_state
             svi_doc = client.get_svi(dev_id)  # before IPs
             _gated(
                 ctx, mgmt, "svi", svi_doc, lambda: reconcile_svi(device, svi_doc), epoch=dev_id, ctx_key="svi_states"
@@ -731,17 +778,20 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
             from .svi_reconciler import reconcile_svi
 
             interfaces_doc = client.get_interfaces_doc(dev_id)
-            ctx["interfaces"] = interfaces_doc.get("interfaces", [])
-            ctx["state"] = client.get_state(dev_id)
-            _gated(
+            fetched_interfaces = interfaces_doc.get("interfaces", [])
+            fetched_state = client.get_state(dev_id)
+            interface_result = _gated(
                 ctx,
                 mgmt,
                 "interface_attributes",
                 interfaces_doc,
-                lambda: _upsert_interface_states(device, ctx["interfaces"]),
+                lambda: _upsert_interface_states(device, fetched_interfaces),
                 epoch=dev_id,
                 ctx_key="interface_states",
             )
+            if interface_result.disposition in ("ran", "legacy"):
+                ctx["interfaces"] = fetched_interfaces
+                ctx["state"] = fetched_state
             svi_doc = client.get_svi(dev_id)  # before IPs
             _gated(
                 ctx, mgmt, "svi", svi_doc, lambda: reconcile_svi(device, svi_doc), epoch=dev_id, ctx_key="svi_states"

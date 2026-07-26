@@ -61,6 +61,7 @@ def _row(
     succeeded=True,
     observed_attempt_id=5,
     applied_attempt_id=5,
+    payload_revision=5,
     incarnation=None,
 ):
     inc = incarnation if incarnation is not None else mgmt.adapter_incarnation
@@ -76,8 +77,13 @@ def _row(
         observed_incarnation=inc,
         observed_incarnation_born=mgmt.adapter_incarnation_born,
         observed_epoch=mgmt.adapter_device_id,
+        observed_payload_revision=payload_revision,
         applied_attempt_id=applied_attempt_id,
         applied_incarnation=inc if applied_attempt_id is not None else "",
+        admitted_payload_revision=payload_revision,
+        applied_payload_revision=payload_revision,
+        publication_sequence=1,
+        applied_publication_sequence=1,
     )
 
 
@@ -110,6 +116,12 @@ class TestFamilyChipMatrix(TestCase):
             result="cleared",
         )
         self.assertIsNone(_chip(self.device, self.mgmt, "l2_services"))
+
+    def test_missing_payload_revision_renders_unproven(self):
+        """A compatibility publication may apply, but must not look atomically proven."""
+        _row(self.mgmt, "l2_service", payload_revision=None)
+        chip = _chip(self.device, self.mgmt, "l2_services")
+        self.assertEqual(chip["state"], "unproven")
 
     def test_stale_renders_amber_last_known(self):
         _row(self.mgmt, "l2_service", freshness="stale")

@@ -371,8 +371,107 @@ def _schedule_redistribution_push(device_id, adapter_device_id, dest) -> None:
     _schedule_intent_push((device_id, dest), lambda: fn(device_id, adapter_device_id))
 
 
+@receiver(pre_save, sender="netbox_nso_plugin.NSODeviceManagement")
+def remember_adapter_source(sender, instance, **kwargs):
+    """Carry a source change's fail-closed fence in the same durable row update."""
+    if not instance.pk:
+        instance._nso_source_changed = True
+        return
+    previous = (
+        sender.objects.filter(pk=instance.pk)
+        .values_list("nso_instance_id", "nso_device_name", "source_rekey_pending")
+        .first()
+    )
+    changed = previous is not None and (
+        previous[:2] != (instance.nso_instance_id, instance.nso_device_name) or previous[2]
+    )
+    instance._nso_source_changed = changed
+    if changed:
+        # This field is part of the source-tuple UPDATE itself. A process death
+        # before the on_commit callback can therefore never leave the new tuple
+        # admitting payloads from the old adapter source.
+        instance.source_rekey_pending = True
+
+
+def _invalidate_source_admissions(instance) -> int:
+    """Fence every in-flight family body before a remote source rekey."""
+    from django.db.models import F
+
+    from .models import NSOFamilyReadState
+    from .read_gate import _RESET_FIELDS
+
+    return NSOFamilyReadState.objects.filter(management=instance).update(
+        **_RESET_FIELDS,
+        publication_sequence=F("publication_sequence") + 1,
+    )
+
+
+@contextlib.contextmanager
+def _source_rekey_lock(management_id):
+    """Serialize remote rekeys across transactions on this management row."""
+    from django.db import connection
+
+    namespace = 0x4E534F  # "NSO"; two-int PostgreSQL advisory-lock namespace
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT pg_advisory_lock(%s, %s)", [namespace, management_id])
+    try:
+        yield
+    finally:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_advisory_unlock(%s, %s)", [namespace, management_id])
+
+
+def _sync_source_change(instance, client) -> bool:
+    """Serialize a source rekey and adopt its epoch only for the persisted tuple."""
+    from django.db import transaction
+
+    management_model = type(instance)
+    expected_source = (instance.nso_instance_id, instance.nso_device_name)
+    with _source_rekey_lock(instance.pk):
+        with transaction.atomic():
+            current = management_model.objects.select_for_update().select_related("nso_instance").get(pk=instance.pk)
+            if (current.nso_instance_id, current.nso_device_name) != expected_source:
+                return False
+            invalidated = _invalidate_source_admissions(current)
+            management_model.objects.filter(pk=current.pk).update(source_rekey_pending=True)
+            current.source_rekey_pending = True
+
+        result = client.patch_device(
+            adapter_device_id=current.adapter_device_id,
+            nso_instance=current.nso_instance.adapter_instance_id,
+            nso_device_name=current.nso_device_name,
+        )
+        if result.get("source_epoch") is None:
+            raise RuntimeError("adapter rekey response omitted source_epoch; publication remains fenced")
+        with transaction.atomic():
+            current = management_model.objects.select_for_update().get(pk=instance.pk)
+            if (current.nso_instance_id, current.nso_device_name) != expected_source:
+                return False
+            source_epoch = result["source_epoch"]
+            source_aware = True
+            management_model.objects.filter(pk=current.pk).update(
+                adapter_source_epoch=source_epoch,
+                source_epoch_aware=source_aware,
+                source_rekey_pending=False,
+                reset_pending_source_epoch=source_epoch if invalidated else None,
+            )
+    instance.adapter_source_epoch = source_epoch
+    instance.source_epoch_aware = source_aware
+    instance.source_rekey_pending = False
+    return True
+
+
 @receiver(post_save, sender="netbox_nso_plugin.NSODeviceManagement")
 def sync_scope_to_adapter(sender, instance, created, **kwargs):
+    """Run adapter side effects only after the management-row transaction commits."""
+    from django.db import transaction
+
+    if getattr(instance, "onboard_status", "") in ("provisioning", "provision_failed"):
+        return
+    transaction.on_commit(lambda: _sync_committed_scope_to_adapter(sender, instance.pk, created))
+
+
+def _sync_committed_scope_to_adapter(sender, instance_pk, created):
     """Push device + scope to the adapter whenever an NSODeviceManagement record is saved.
 
     After setting scope, calls sync-notify so the adapter starts an immediate sync
@@ -383,6 +482,10 @@ def sync_scope_to_adapter(sender, instance, created, **kwargs):
     yet, so mapping/scope/sync would fail or race. The status-advance view clears the
     status to "" on success and re-saves, which fires this handler normally.
     """
+    try:
+        instance = sender.objects.select_related("nso_instance", "device").get(pk=instance_pk)
+    except sender.DoesNotExist:
+        return
     if getattr(instance, "onboard_status", "") in ("provisioning", "provision_failed"):
         return
 
@@ -395,14 +498,17 @@ def sync_scope_to_adapter(sender, instance, created, **kwargs):
                 nso_device_name=instance.nso_device_name,
                 netbox_device_id=instance.device_id,
             )
-            type(instance).objects.filter(pk=instance.pk).update(adapter_device_id=result["id"])
-            instance.adapter_device_id = result["id"]
-        else:
-            client.patch_device(
-                adapter_device_id=instance.adapter_device_id,
-                nso_instance=instance.nso_instance.adapter_instance_id,
-                nso_device_name=instance.nso_device_name,
+            type(instance).objects.filter(pk=instance.pk).update(
+                adapter_device_id=result["id"],
+                adapter_source_epoch=result.get("source_epoch"),
+                source_epoch_aware=result.get("source_epoch") is not None,
             )
+            instance.adapter_device_id = result["id"]
+            instance.adapter_source_epoch = result.get("source_epoch")
+            instance.source_epoch_aware = result.get("source_epoch") is not None
+        elif instance.source_rekey_pending:
+            if not _sync_source_change(instance, client):
+                return
 
         # Carry the device's management addresses so the adapter's failover loop can probe
         # primary and fall back to OOB. Resolved by the SAME helper onboarding uses, so the

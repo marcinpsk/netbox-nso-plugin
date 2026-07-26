@@ -106,9 +106,13 @@ class _SignalDBBase(IntentPushResetMixin, TestCase):
 class TestSyncScopeToAdapter(_SignalDBBase):
     """Tests for the sync_scope_to_adapter signal handler (real NSODeviceManagement row)."""
 
-    def test_created_onboards_device_and_sets_scope(self):
+    def _sync_scope(self, instance, *, created):
         from netbox_nso_plugin.signals import sync_scope_to_adapter
 
+        with self.captureOnCommitCallbacks(execute=True):
+            sync_scope_to_adapter(sender=type(instance), instance=instance, created=created)
+
+    def test_created_onboards_device_and_sets_scope(self):
         mgmt = self._make_mgmt(adapter_device_id=None)
 
         with (
@@ -117,7 +121,7 @@ class TestSyncScopeToAdapter(_SignalDBBase):
             patch(f"{_MOD}.sync_notify", return_value={"job_id": 5}) as mock_notify,
             patch(f"{_MOD}.patch_device") as mock_patch,
         ):
-            sync_scope_to_adapter(sender=type(mgmt), instance=mgmt, created=True)
+            self._sync_scope(mgmt, created=True)
 
             mock_onboard.assert_called_once_with(
                 nso_instance="nso-prod",
@@ -135,18 +139,18 @@ class TestSyncScopeToAdapter(_SignalDBBase):
         mgmt.refresh_from_db()
         self.assertEqual(mgmt.adapter_device_id, 99)
 
-    def test_update_patches_device_and_sets_scope(self):
-        from netbox_nso_plugin.signals import sync_scope_to_adapter
-
+    def test_source_update_patches_device_and_sets_scope(self):
         mgmt = self._make_mgmt(adapter_device_id=7)
+        type(mgmt).objects.filter(pk=mgmt.pk).update(source_rekey_pending=True)
+        mgmt.source_rekey_pending = True
 
         with (
-            patch(f"{_MOD}.patch_device", return_value=None) as mock_patch,
+            patch(f"{_MOD}.patch_device", return_value={"source_epoch": 2}) as mock_patch,
             patch(f"{_MOD}.set_scope", return_value={}) as mock_scope,
             patch(f"{_MOD}.sync_notify", return_value=None),
             patch(f"{_MOD}.onboard_device") as mock_onboard,
         ):
-            sync_scope_to_adapter(sender=type(mgmt), instance=mgmt, created=False)
+            self._sync_scope(mgmt, created=False)
 
         mock_patch.assert_called_once_with(
             adapter_device_id=7,
@@ -155,19 +159,221 @@ class TestSyncScopeToAdapter(_SignalDBBase):
         )
         mock_scope.assert_called_once()
         mock_onboard.assert_not_called()
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.adapter_source_epoch, 2)
+        self.assertFalse(mgmt.source_rekey_pending)
+
+    def test_source_save_is_fail_closed_before_its_on_commit_callback(self):
+        from netbox_nso_plugin.read_gate import SKIPPED_UNAVAILABLE, gated_family_run
+
+        mgmt = self._make_mgmt(adapter_device_id=7)
+        mgmt.nso_device_name = "replacement-source"
+        with (
+            self.captureOnCommitCallbacks(execute=False) as callbacks,
+            patch(f"{_MOD}.patch_device") as mock_patch,
+        ):
+            mgmt.save()
+
+        self.assertEqual(len(callbacks), 1)
+        mock_patch.assert_not_called()
+        mgmt.refresh_from_db()
+        self.assertTrue(mgmt.source_rekey_pending)
+        body_calls = []
+
+        def body():
+            body_calls.append(True)
+            return "must not run"
+
+        result = gated_family_run(
+            mgmt,
+            "bfd",
+            {
+                "outcome": "present",
+                "freshness": "fresh",
+                "result": "replaced",
+                "succeeded": True,
+                "attempt_id": 1,
+                "incarnation": "11111111-aaaa-4aaa-8aaa-111111111111",
+                "incarnation_born": "2026-07-01T00:00:10Z",
+                "source_epoch": 1,
+                "payload_revision": 1,
+            },
+            body,
+            epoch=7,
+        )
+        self.assertEqual(result.disposition, SKIPPED_UNAVAILABLE)
+        self.assertEqual(body_calls, [])
+
+    def test_source_update_without_epoch_preserves_floor_and_stays_fenced(self):
+        mgmt = self._make_mgmt(adapter_device_id=7)
+        type(mgmt).objects.filter(pk=mgmt.pk).update(adapter_source_epoch=4, source_epoch_aware=True)
+        mgmt.refresh_from_db()
+        type(mgmt).objects.filter(pk=mgmt.pk).update(source_rekey_pending=True)
+        mgmt.source_rekey_pending = True
+
+        with (
+            patch(f"{_MOD}.patch_device", return_value={}),
+            patch(f"{_MOD}.set_scope", return_value={}),
+            patch(f"{_MOD}.sync_notify", return_value=None),
+        ):
+            self._sync_scope(mgmt, created=False)
+
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.adapter_source_epoch, 4)
+        self.assertTrue(mgmt.source_epoch_aware)
+        self.assertTrue(mgmt.source_rekey_pending)
+        self.assertIn("omitted source_epoch", mgmt.adapter_link_error)
+
+    def test_old_wire_rekey_cannot_reopen_legacy_admission(self):
+        from netbox_nso_plugin.read_gate import SKIPPED_UNAVAILABLE, gated_family_run
+
+        mgmt = self._make_mgmt(adapter_device_id=7)
+        type(mgmt).objects.filter(pk=mgmt.pk).update(source_rekey_pending=True)
+        mgmt.source_rekey_pending = True
+        with patch(f"{_MOD}.patch_device", return_value={}):
+            self._sync_scope(mgmt, created=False)
+
+        mgmt.refresh_from_db()
+        self.assertFalse(mgmt.source_epoch_aware)
+        self.assertTrue(mgmt.source_rekey_pending)
+        body_calls = []
+
+        def body():
+            body_calls.append(True)
+            return "must not run"
+
+        result = gated_family_run(mgmt, "bfd", None, body, epoch=7)
+        self.assertEqual(result.disposition, SKIPPED_UNAVAILABLE)
+        self.assertEqual(body_calls, [])
+
+    def test_successful_source_rekey_blanks_old_observations_until_reobserved(self):
+        from netbox_nso_plugin.models import NSOFamilyReadState
+
+        mgmt = self._make_mgmt(adapter_device_id=7)
+        NSOFamilyReadState.objects.create(
+            management=mgmt,
+            family="ospf",
+            observed_outcome="present",
+            observed_attempt_id=8,
+            observed_incarnation="11111111-aaaa-4aaa-8aaa-111111111111",
+            admitted_attempt_id=8,
+            admitted_incarnation="11111111-aaaa-4aaa-8aaa-111111111111",
+            applied_attempt_id=8,
+            applied_incarnation="11111111-aaaa-4aaa-8aaa-111111111111",
+            publication_sequence=4,
+            applied_publication_sequence=4,
+        )
+        type(mgmt).objects.filter(pk=mgmt.pk).update(source_rekey_pending=True)
+        mgmt.source_rekey_pending = True
+
+        with (
+            patch(f"{_MOD}.patch_device", return_value={"source_epoch": 2}),
+            patch(f"{_MOD}.set_scope", return_value={}),
+            patch(f"{_MOD}.sync_notify", return_value=None),
+        ):
+            self._sync_scope(mgmt, created=False)
+
+        row = NSOFamilyReadState.objects.get(management=mgmt, family="ospf")
+        self.assertEqual(row.observed_outcome, "")
+        self.assertIsNone(row.applied_attempt_id)
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.reset_pending_source_epoch, 2)
+
+    def test_committed_callback_rekeys_the_latest_source_tuple(self):
+        mgmt = self._make_mgmt(adapter_device_id=7)
+        stale = type(mgmt).objects.get(pk=mgmt.pk)
+        type(mgmt).objects.filter(pk=mgmt.pk).update(
+            nso_device_name="newer-source",
+            source_rekey_pending=True,
+        )
+
+        with (
+            patch(f"{_MOD}.patch_device", return_value={"source_epoch": 2}) as mock_patch,
+            patch(f"{_MOD}.set_scope", return_value={}) as mock_scope,
+            patch(f"{_MOD}.sync_notify", return_value=None) as mock_notify,
+        ):
+            self._sync_scope(stale, created=False)
+
+        mock_patch.assert_called_once_with(
+            adapter_device_id=7,
+            nso_instance="nso-prod",
+            nso_device_name="newer-source",
+        )
+        mock_scope.assert_called_once()
+        mock_notify.assert_called_once()
+
+    def test_failed_source_patch_keeps_the_committed_publication_fence(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.models import NSOFamilyReadState
+
+        mgmt = self._make_mgmt(adapter_device_id=7)
+        row = NSOFamilyReadState.objects.create(
+            management=mgmt,
+            family="bfd",
+            admitted_attempt_id=8,
+            admitted_incarnation="11111111-aaaa-4aaa-8aaa-111111111111",
+            applied_attempt_id=8,
+            applied_incarnation="11111111-aaaa-4aaa-8aaa-111111111111",
+            publication_sequence=4,
+            applied_publication_sequence=4,
+        )
+        type(mgmt).objects.filter(pk=mgmt.pk).update(source_rekey_pending=True)
+        mgmt.source_rekey_pending = True
+
+        with patch(
+            f"{_MOD}.patch_device",
+            side_effect=AdapterError("patch failed", code="adapter_unreachable"),
+        ):
+            self._sync_scope(mgmt, created=False)
+
+        row.refresh_from_db()
+        self.assertIsNone(row.admitted_attempt_id)
+        self.assertIsNone(row.applied_attempt_id)
+        self.assertEqual(row.publication_sequence, 5)
+        mgmt.refresh_from_db()
+        self.assertTrue(mgmt.adapter_link_error)
+        self.assertTrue(mgmt.source_rekey_pending)
+
+    def test_pending_source_rekey_is_retried_on_an_ordinary_save(self):
+        mgmt = self._make_mgmt(adapter_device_id=7)
+        type(mgmt).objects.filter(pk=mgmt.pk).update(source_rekey_pending=True)
+        mgmt.refresh_from_db()
+        mgmt._nso_source_changed = False
+
+        with (
+            patch(f"{_MOD}.patch_device", return_value={"source_epoch": 2}) as mock_patch,
+            patch(f"{_MOD}.set_scope", return_value={}),
+            patch(f"{_MOD}.sync_notify", return_value=None),
+        ):
+            self._sync_scope(mgmt, created=False)
+
+        mock_patch.assert_called_once()
+        mgmt.refresh_from_db()
+        self.assertFalse(mgmt.source_rekey_pending)
+        self.assertEqual(mgmt.adapter_source_epoch, 2)
+
+    def test_ordinary_update_does_not_patch_device(self):
+        mgmt = self._make_mgmt(adapter_device_id=7)
+        mgmt._nso_source_changed = False
+        with (
+            patch(f"{_MOD}.patch_device") as mock_patch,
+            patch(f"{_MOD}.set_scope", return_value={}),
+            patch(f"{_MOD}.sync_notify", return_value=None),
+        ):
+            self._sync_scope(mgmt, created=False)
+        mock_patch.assert_not_called()
 
     def test_adapter_error_is_recorded_not_silently_swallowed(self):
         """A failed onboard must be SURFACED on the row (adapter_link_error), not swallowed with only
         a log line — otherwise the device looks managed in NetBox while silently unlinked from the
         adapter (adapter_device_id stays None) with no operator-visible signal."""
         from netbox_nso_plugin.adapter_client import AdapterError
-        from netbox_nso_plugin.signals import sync_scope_to_adapter
 
         mgmt = self._make_mgmt(adapter_device_id=None)
 
         with patch(f"{_MOD}.onboard_device", side_effect=AdapterError("nso down", code="nso_unreachable")):
             # Must not raise — the failure is recorded on the row instead.
-            sync_scope_to_adapter(sender=type(mgmt), instance=mgmt, created=True)
+            self._sync_scope(mgmt, created=True)
 
         mgmt.refresh_from_db()
         self.assertIn("nso down", mgmt.adapter_link_error)  # recorded, not swallowed
@@ -176,8 +382,6 @@ class TestSyncScopeToAdapter(_SignalDBBase):
     def test_successful_link_clears_prior_error(self):
         """Once linking succeeds, a stale adapter_link_error from a prior failed attempt is cleared
         so the tab's failure banner disappears."""
-        from netbox_nso_plugin.signals import sync_scope_to_adapter
-
         mgmt = self._make_mgmt(adapter_device_id=None)
         # Simulate a leftover error from an earlier failed link attempt.
         type(mgmt).objects.filter(pk=mgmt.pk).update(adapter_link_error="earlier failure")
@@ -188,15 +392,13 @@ class TestSyncScopeToAdapter(_SignalDBBase):
             patch(f"{_MOD}.set_scope", return_value={}),
             patch(f"{_MOD}.sync_notify", return_value=None),
         ):
-            sync_scope_to_adapter(sender=type(mgmt), instance=mgmt, created=True)
+            self._sync_scope(mgmt, created=True)
 
         mgmt.refresh_from_db()
         self.assertEqual(mgmt.adapter_link_error, "")  # cleared on success
         self.assertEqual(mgmt.adapter_device_id, 88)
 
     def test_sync_notify_job_logged(self):
-        from netbox_nso_plugin.signals import sync_scope_to_adapter
-
         mgmt = self._make_mgmt(adapter_device_id=None)
 
         with (
@@ -205,12 +407,10 @@ class TestSyncScopeToAdapter(_SignalDBBase):
             patch(f"{_MOD}.sync_notify", return_value={"job_id": 7}),
         ):
             with self.assertLogs("netbox_nso_plugin.signals", level="DEBUG"):
-                sync_scope_to_adapter(sender=type(mgmt), instance=mgmt, created=True)
+                self._sync_scope(mgmt, created=True)
 
     def test_created_none_adapter_id_triggers_onboard(self):
         """created=False but adapter_device_id=None should also trigger onboard."""
-        from netbox_nso_plugin.signals import sync_scope_to_adapter
-
         mgmt = self._make_mgmt(adapter_device_id=None)
 
         with (
@@ -218,14 +418,12 @@ class TestSyncScopeToAdapter(_SignalDBBase):
             patch(f"{_MOD}.set_scope", return_value={}),
             patch(f"{_MOD}.sync_notify", return_value=None),
         ):
-            sync_scope_to_adapter(sender=type(mgmt), instance=mgmt, created=False)
+            self._sync_scope(mgmt, created=False)
 
         mock_onboard.assert_called_once()
 
     def test_manage_enabled_included_in_scope(self):
         """manage_enabled=True includes 'enabled' in the managed_attributes scope call."""
-        from netbox_nso_plugin.signals import sync_scope_to_adapter
-
         mgmt = self._make_mgmt(adapter_device_id=None, manage_enabled=True)
 
         with (
@@ -233,7 +431,7 @@ class TestSyncScopeToAdapter(_SignalDBBase):
             patch(f"{_MOD}.set_scope", return_value={}) as mock_scope,
             patch(f"{_MOD}.sync_notify", return_value=None),
         ):
-            sync_scope_to_adapter(sender=type(mgmt), instance=mgmt, created=True)
+            self._sync_scope(mgmt, created=True)
 
         mock_onboard.assert_called_once()
         # Both description and enabled should be in the scope call.
@@ -245,8 +443,6 @@ class TestSyncScopeToAdapter(_SignalDBBase):
         """The scope push carries the device's primary + OOB management IPs as bare host
         strings, so the adapter's failover loop can probe primary and fall back to OOB."""
         from ipam.models import IPAddress
-
-        from netbox_nso_plugin.signals import sync_scope_to_adapter
 
         primary = IPAddress.objects.create(address="10.0.0.1/32", assigned_object=self.iface)
         oob = IPAddress.objects.create(address="192.0.2.5/24", assigned_object=self.iface)
@@ -260,7 +456,7 @@ class TestSyncScopeToAdapter(_SignalDBBase):
             patch(f"{_MOD}.set_scope", return_value={}) as mock_scope,
             patch(f"{_MOD}.sync_notify", return_value=None),
         ):
-            sync_scope_to_adapter(sender=type(mgmt), instance=mgmt, created=False)
+            self._sync_scope(mgmt, created=False)
 
         _, kw = mock_scope.call_args
         self.assertEqual(kw["primary_ip"], "10.0.0.1")  # /32 stripped → host only

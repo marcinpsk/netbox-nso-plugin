@@ -739,12 +739,14 @@ class TestSafeReconcile(APITestCase):
         def boom(*_a):
             raise RuntimeError("malformed payload")
 
-        # No exception escapes; ctx keeps its default; scope rows are reconciled.
-        _safe_reconcile(ctx, "vlan_states", mgmt, ("NSOVLANState",), boom, object())
+        from netbox_nso_plugin.reconcile import ReconcileScopeError
+
+        with self.assertRaises(ReconcileScopeError):
+            _safe_reconcile(ctx, "vlan_states", mgmt, ("NSOVLANState",), boom, object())
         self.assertEqual(ctx["vlan_states"], [])
         imported.refresh_from_db()
         owned.refresh_from_db()
-        self.assertEqual(imported.status, "error")  # unowned → error
+        self.assertEqual(imported.status, "imported")  # marking happens only after the gate rolls back
         self.assertEqual(owned.status, "accepted")  # owned ownership preserved
 
     def test_adapter_error_propagates(self):

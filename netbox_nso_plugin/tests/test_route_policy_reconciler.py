@@ -193,6 +193,38 @@ class TestReconcileRoutePolicy(TestCase):
         )
         self.assertEqual(s2.status, "conflict")
 
+    def test_master_grouping_is_case_insensitive_across_devices(self):
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._make_mgmt(self.device)
+        self._make_mgmt(self.device2)
+        reconcile_route_policy(self.device, self._pl_payload("SHARED-CASE", "10.0.0.0/8"))
+        reconcile_route_policy(self.device2, self._pl_payload("shared-case", "10.1.0.0/16"))
+
+        rows = NSORoutePolicyState.objects.filter(family="prefix_list", object_name__iexact="shared-case")
+        second = rows.get(management__device=self.device2)
+        self.assertEqual(second.status, "conflict")
+        self.assertEqual(rows.filter(is_materialized=True).count(), 1)
+
+    def test_casing_only_rename_is_not_treated_as_stale_on_same_device(self):
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._make_mgmt(self.device)
+        reconcile_route_policy(self.device, self._pl_payload("PRESENT-CASE", "10.0.0.0/8"))
+        reconcile_route_policy(self.device, self._pl_payload("present-case", "10.0.0.0/8"))
+
+        rows = NSORoutePolicyState.objects.filter(
+            management__device=self.device,
+            family="prefix_list",
+            object_name__iexact="present-case",
+        )
+        self.assertEqual(rows.count(), 1)
+        state = rows.get()
+        self.assertTrue(state.device_present)
+        self.assertNotIn(state.status, ("changed", "conflict"))
+
     def _rm_payload(self, name, entries):
         return {
             "prefix_lists": [],

@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from contextvars import ContextVar
 
 from . import shared_object_ownership as ownership
 from .route_policy_structure import canonical_route_map, prefix_list_entry_unit
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 # name → tuple of prefix-list units, memoized for one reconcile pass (cleared at its start).
 # Lets canonical_route_map expand prefix-list refs to content without re-querying per call.
-_PL_UNIT_CACHE: dict[str, tuple] = {}
+_PL_UNIT_CACHE: ContextVar[dict[str, tuple] | None] = ContextVar("route_policy_prefix_units", default=None)
 
 
 def _resolve_prefix_list_units(name: str) -> tuple:
@@ -39,8 +40,12 @@ def _resolve_prefix_list_units(name: str) -> tuple:
     no captured prefix-list yet resolves to empty (the term simply has nothing to expand).
     """
     key = name.lower()
-    if key in _PL_UNIT_CACHE:
-        return _PL_UNIT_CACHE[key]
+    cache = _PL_UNIT_CACHE.get()
+    if cache is None:
+        cache = {}
+        _PL_UNIT_CACHE.set(cache)
+    if key in cache:
+        return cache[key]
     from .models import NSORoutePolicyState
 
     row = (
@@ -48,7 +53,7 @@ def _resolve_prefix_list_units(name: str) -> tuple:
         or NSORoutePolicyState.objects.filter(family="prefix_list", object_name__iexact=name).first()
     )
     units = tuple(prefix_list_entry_unit(e) for e in ((row.captured or {}).get("entries") or [])) if row else ()
-    _PL_UNIT_CACHE[key] = units
+    cache[key] = units
     return units
 
 
@@ -517,6 +522,20 @@ _register_specs()
 _FILL_STATUSES = ("imported", "in_sync")  # safe to (re)fill entries in these states
 
 
+def _lock_policy_groups(groups: set[tuple[str, str]]) -> None:
+    """Take deterministic transaction locks for shared route-policy namespaces."""
+    from django.db import connection
+
+    if connection.vendor != "postgresql":
+        return
+    normalized = {(family, object_name.casefold()) for family, object_name in groups}
+    with connection.cursor() as cursor:
+        for family, object_name in sorted(normalized):
+            digest = hashlib.sha256(f"nso-route-policy:{family}:{object_name}".encode()).digest()[:8]
+            lock_id = int.from_bytes(digest, byteorder="big", signed=True)
+            cursor.execute("SELECT pg_advisory_xact_lock(%s)", [lock_id])
+
+
 def _row_diverged(state, entries_hash, family, name) -> bool:
     """Whether this reconcile's capture diverges from what's materialized in NetBox.
 
@@ -605,19 +624,24 @@ def _upsert_state(mgmt, family, name, obj, ct, captured, now):
     from .models import NSORoutePolicyState
 
     entries_hash = ownership.hash_captured(family, captured)
-    state, new_row = NSORoutePolicyState.objects.get_or_create(
+    state = NSORoutePolicyState.objects.filter(
         management=mgmt,
         family=family,
-        object_name=name,
-        defaults={
-            "content_type": ct,
-            "object_id": obj.pk,
-            "content_hash": entries_hash,
-            "captured": captured,
-            "status": "imported",
-            "last_sync_at": now,
-        },
-    )
+        object_name__iexact=name,
+    ).first()
+    new_row = state is None
+    if state is None:
+        state = NSORoutePolicyState.objects.create(
+            management=mgmt,
+            family=family,
+            object_name=name,
+            content_type=ct,
+            object_id=obj.pk,
+            content_hash=entries_hash,
+            captured=captured,
+            status="imported",
+            last_sync_at=now,
+        )
     if new_row:
         from . import status_machine as sm
 
@@ -736,7 +760,9 @@ def _promote_group_to_master(family, object_name, now) -> None:
         return
     rows = [
         r
-        for r in NSORoutePolicyState.objects.filter(family=family, object_name=object_name).select_related("management")
+        for r in NSORoutePolicyState.objects.filter(family=family, object_name__iexact=object_name).select_related(
+            "management"
+        )
         if r.captured
     ]
     if not rows:
@@ -777,13 +803,22 @@ def set_classification(family: str, object_name: str, mode: str):
 
     if mode not in ("master", "local"):
         raise ValueError(f"invalid mode {mode!r}")
-    obj, _ = NSORoutePolicyObjectClass.objects.update_or_create(
-        family=family, object_name=object_name, defaults={"mode": mode, "source": "operator"}
-    )
+    obj = NSORoutePolicyObjectClass.objects.filter(family=family, object_name__iexact=object_name).first()
+    if obj is None:
+        obj = NSORoutePolicyObjectClass.objects.create(
+            family=family,
+            object_name=object_name,
+            mode=mode,
+            source="operator",
+        )
+    else:
+        obj.mode = mode
+        obj.source = "operator"
+        obj.save(update_fields=["mode", "source"])
     now = timezone.now()
     with suppress_intent_push():
         if mode == "local":
-            rows = NSORoutePolicyState.objects.filter(family=family, object_name=object_name).select_related(
+            rows = NSORoutePolicyState.objects.filter(family=family, object_name__iexact=object_name).select_related(
                 "management"
             )
             for r in rows:
@@ -793,7 +828,7 @@ def set_classification(family: str, object_name: str, mode: str):
     return obj
 
 
-def resettle_false_conflicts() -> int:
+def resettle_false_conflicts(groups: set[tuple[str, str]] | None = None) -> int:
     """Clear stale 'conflict' rows whose content_hash now equals their materialized owner's.
 
     A non-owner row goes 'conflict' when it diverges from the owner; if the owner is later
@@ -801,18 +836,36 @@ def resettle_false_conflicts() -> int:
     re-read, the status stays conflict. This recompute settles any such row whose hash now
     matches the canonical owner — without a device round-trip. Returns the count cleared.
     """
+    from django.db import transaction
+
     from . import status_machine as sm
     from .models import NSORoutePolicyState
 
     cleared = 0
-    for state in NSORoutePolicyState.objects.filter(status=sm.CONFLICT, is_materialized=False):
-        if sm.is_owned(state.status):
-            continue
-        canon = ownership.canonical_hash(NSORoutePolicyState, state.family, state.object_name)
-        if canon is not None and canon == state.content_hash:
-            state.status = sm.on_reconcile(state.status, matches=True, conflict=False, settles_owned=False)
-            state.save(update_fields=["status"])
-            cleared += 1
+    if groups is not None:
+        if not groups:
+            return 0
+    else:
+        groups = set(
+            NSORoutePolicyState.objects.filter(status=sm.CONFLICT, is_materialized=False).values_list(
+                "family", "object_name"
+            )
+        )
+    for family, object_name in sorted(groups):
+        with transaction.atomic():
+            _lock_policy_groups({(family, object_name)})
+            states = NSORoutePolicyState.objects.select_for_update().filter(
+                family=family,
+                object_name__iexact=object_name,
+                status=sm.CONFLICT,
+                is_materialized=False,
+            )
+            canon = ownership.canonical_hash(NSORoutePolicyState, family, object_name)
+            for state in states:
+                if canon is not None and canon == state.content_hash:
+                    state.status = sm.on_reconcile(state.status, matches=True, conflict=False, settles_owned=False)
+                    state.save(update_fields=["status"])
+                    cleared += 1
     return cleared
 
 
@@ -827,12 +880,22 @@ def _upsert_local_state(mgmt, family, name, captured, now):
     from .models import NSORoutePolicyState
 
     entries_hash = ownership.hash_captured(family, captured)
-    state, new_row = NSORoutePolicyState.objects.get_or_create(
+    state = NSORoutePolicyState.objects.filter(
         management=mgmt,
         family=family,
-        object_name=name,
-        defaults={"content_hash": entries_hash, "captured": captured, "status": "imported", "last_sync_at": now},
-    )
+        object_name__iexact=name,
+    ).first()
+    new_row = state is None
+    if state is None:
+        state = NSORoutePolicyState.objects.create(
+            management=mgmt,
+            family=family,
+            object_name=name,
+            content_hash=entries_hash,
+            captured=captured,
+            status="imported",
+            last_sync_at=now,
+        )
     if not new_row:
         changed = state.content_hash != entries_hash
         state.status = sm.on_reconcile(state.status, matches=not changed, conflict=False, settles_owned=False)
@@ -863,7 +926,7 @@ def _reconcile_prefix_lists(mgmt, device, pl_list, PrefixList, ContentType, now,
             continue
         if _group_mode("prefix_list", name) == "local":
             _upsert_local_state(mgmt, "prefix_list", name, pl_data, now)
-            seen_keys.add(("prefix_list", name))
+            seen_keys.add(("prefix_list", name.casefold()))
             continue
         entries = pl_data.get("entries", []) or []
         pl_obj, created = _get_or_create_named(PrefixList, name)
@@ -879,7 +942,7 @@ def _reconcile_prefix_lists(mgmt, device, pl_list, PrefixList, ContentType, now,
         if _needs_fill(PrefixListEntry, created, should_fill, prefix_list=pl_obj):
             _fill_prefix_list_entries(pl_obj, entries)
             ownership.mark_materialized(state)
-        seen_keys.add(("prefix_list", name))
+        seen_keys.add(("prefix_list", name.casefold()))
 
 
 def _reconcile_community_lists(mgmt, device, cl_list, CommunityList, ContentType, now, seen_keys, name_map):
@@ -892,7 +955,7 @@ def _reconcile_community_lists(mgmt, device, cl_list, CommunityList, ContentType
             continue
         if _group_mode("community_list", name) == "local":
             _upsert_local_state(mgmt, "community_list", name, cl_data, now)
-            seen_keys.add(("community_list", name))
+            seen_keys.add(("community_list", name.casefold()))
             continue
         entries = cl_data.get("entries", []) or []
         invert_match = bool(cl_data.get("invert_match", False))
@@ -909,7 +972,7 @@ def _reconcile_community_lists(mgmt, device, cl_list, CommunityList, ContentType
         if _needs_fill(CommunityListEntry, created, should_fill, community_list=cl_obj):
             _fill_community_list_entries(cl_obj, entries)
             ownership.mark_materialized(state)
-        seen_keys.add(("community_list", name))
+        seen_keys.add(("community_list", name.casefold()))
 
 
 def _reconcile_as_paths(mgmt, device, ap_list, ASPath, ContentType, now, seen_keys, name_map):
@@ -922,7 +985,7 @@ def _reconcile_as_paths(mgmt, device, ap_list, ASPath, ContentType, now, seen_ke
             continue
         if _group_mode("as_path", name) == "local":
             _upsert_local_state(mgmt, "as_path", name, ap_data, now)
-            seen_keys.add(("as_path", name))
+            seen_keys.add(("as_path", name.casefold()))
             continue
         entries = ap_data.get("entries", []) or []
         ap_obj, created = _get_or_create_named(ASPath, name)
@@ -931,7 +994,7 @@ def _reconcile_as_paths(mgmt, device, ap_list, ASPath, ContentType, now, seen_ke
         if _needs_fill(ASPathEntry, created, should_fill, aspath=ap_obj):
             _fill_as_path_entries(ap_obj, entries)
             ownership.mark_materialized(state)
-        seen_keys.add(("as_path", name))
+        seen_keys.add(("as_path", name.casefold()))
 
 
 def _reconcile_route_maps(mgmt, device, rm_list, RouteMap, ContentType, now, seen_keys, pl_map, cl_map, ap_map):
@@ -944,7 +1007,7 @@ def _reconcile_route_maps(mgmt, device, rm_list, RouteMap, ContentType, now, see
             continue
         if _group_mode("route_map", name) == "local":
             _upsert_local_state(mgmt, "route_map", name, rm_data, now)
-            seen_keys.add(("route_map", name))
+            seen_keys.add(("route_map", name.casefold()))
             continue
         entries = rm_data.get("entries", []) or []
         rm_obj, created = _get_or_create_named(RouteMap, name)
@@ -952,7 +1015,7 @@ def _reconcile_route_maps(mgmt, device, rm_list, RouteMap, ContentType, now, see
         if _needs_fill(RouteMapEntry, created, should_fill, route_map=rm_obj):
             _fill_route_map_entries(rm_obj, entries, pl_map, cl_map, ap_map)
             ownership.mark_materialized(state)
-        seen_keys.add(("route_map", name))
+        seen_keys.add(("route_map", name.casefold()))
 
 
 # ---------------------------------------------------------------------------
@@ -969,9 +1032,11 @@ def reconcile_route_policy(device, payload: dict) -> list:
     import side-effect-free; it is reentrant, so this is safe whether or not the caller
     (reconcile_device) already suppresses. Returns NSORoutePolicyState instances for the device.
     """
+    from django.db import transaction
+
     from .signals import suppress_intent_push
 
-    with suppress_intent_push():
+    with suppress_intent_push(), transaction.atomic():
         return _reconcile_route_policy(device, payload)
 
 
@@ -992,25 +1057,63 @@ def _reconcile_route_policy(device, payload: dict) -> list:
     except NSODeviceManagement.DoesNotExist:
         return []
 
+    family_payload_keys = {
+        "prefix_list": "prefix_lists",
+        "community_list": "community_lists",
+        "as_path": "as_paths",
+        "route_map": "route_maps",
+    }
+    touched_groups = {
+        (family, row.get("name", ""))
+        for family, key in family_payload_keys.items()
+        for row in payload.get(key) or []
+        if row.get("name")
+    }
+    touched_groups.update(NSORoutePolicyState.objects.filter(management=mgmt).values_list("family", "object_name"))
+    _lock_policy_groups(touched_groups)
+
     now = timezone.now()
-    _PL_UNIT_CACHE.clear()  # fresh prefix-list content each pass (route-map hashes expand it)
+    _PL_UNIT_CACHE.set({})  # context-local: concurrent device reconciles cannot cross-contaminate
     seen_keys: set[tuple] = set()
     pl_map: dict[str, object] = {}
     cl_map: dict[str, object] = {}
     ap_map: dict[str, object] = {}
 
     _reconcile_prefix_lists(
-        mgmt, device, payload.get("prefix_lists", []), PrefixList, ContentType, now, seen_keys, pl_map
+        mgmt,
+        device,
+        sorted(payload.get("prefix_lists") or [], key=lambda row: (row.get("name") or "").casefold()),
+        PrefixList,
+        ContentType,
+        now,
+        seen_keys,
+        pl_map,
     )
     _reconcile_community_lists(
-        mgmt, device, payload.get("community_lists", []), CommunityList, ContentType, now, seen_keys, cl_map
+        mgmt,
+        device,
+        sorted(payload.get("community_lists") or [], key=lambda row: (row.get("name") or "").casefold()),
+        CommunityList,
+        ContentType,
+        now,
+        seen_keys,
+        cl_map,
     )
-    _reconcile_as_paths(mgmt, device, payload.get("as_paths", []), ASPath, ContentType, now, seen_keys, ap_map)
+    _reconcile_as_paths(
+        mgmt,
+        device,
+        sorted(payload.get("as_paths") or [], key=lambda row: (row.get("name") or "").casefold()),
+        ASPath,
+        ContentType,
+        now,
+        seen_keys,
+        ap_map,
+    )
     # Route-maps last: their match M2Ms reference the objects created above.
     _reconcile_route_maps(
         mgmt,
         device,
-        payload.get("route_maps", []),
+        sorted(payload.get("route_maps") or [], key=lambda row: (row.get("name") or "").casefold()),
         RouteMap,
         ContentType,
         now,
@@ -1028,9 +1131,11 @@ def _reconcile_route_policy(device, payload: dict) -> list:
     #     :func:`_track_unowned_removal`).
     from . import status_machine as sm
 
+    touched_groups = set(seen_keys)
     for state in list(NSORoutePolicyState.objects.filter(management=mgmt)):
-        if (state.family, state.object_name) in seen_keys:
+        if (state.family, state.object_name.casefold()) in seen_keys:
             continue
+        touched_groups.add((state.family, state.object_name))
         if sm.is_owned(state.status):
             _flag_removed(state)
         else:
@@ -1038,7 +1143,7 @@ def _reconcile_route_policy(device, payload: dict) -> list:
 
     # Self-heal: a sibling left 'conflict' before its owner re-materialized to matching content
     # settles here once the hashes agree (no device round-trip needed).
-    resettle_false_conflicts()
+    resettle_false_conflicts(touched_groups)
 
     return list(NSORoutePolicyState.objects.filter(management=mgmt).order_by("family", "object_name"))
 
