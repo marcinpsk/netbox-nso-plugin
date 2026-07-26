@@ -2,7 +2,9 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for the logging/syslog read-path: _reconcile_logging_config + category counts."""
 
-from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
+from unittest.mock import patch
+
+from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Platform, Site
 from django.test import TestCase
 
 
@@ -75,6 +77,237 @@ class TestReconcileLoggingConfig(TestCase):
         rows = NSOLoggingHostState.objects.filter(management__device=self.device)
         self.assertEqual(rows.count(), 1)
         self.assertEqual(rows.first().severity, "error")
+
+    def test_omitted_value_suppressed_default_port_matches_owned_intent(self):
+        from netbox_nso_plugin.models import NSOLoggingHostState, NSOPlatformNedMapping
+        from netbox_nso_plugin.template_content import _reconcile_logging_config
+
+        mgmt = self._mgmt()
+        platform = Platform.objects.create(name="Logging Nokia", slug="logging-nokia")
+        NSOPlatformNedMapping.objects.create(platform=platform, ned_id="timos-nc-23.10")
+        self.device.platform = platform
+        self.device.save(update_fields=["platform"])
+        row = NSOLoggingHostState.objects.create(
+            management=mgmt,
+            address="198.18.0.20",
+            port=514,
+            status="accepted",
+        )
+
+        _reconcile_logging_config(self.device, self._payload({"address": row.address}))
+
+        row.refresh_from_db()
+        self.assertEqual(row.port, 514)
+        self.assertEqual(row.status, "in_sync")
+
+    def test_omitted_provenance_explicit_facility_does_not_false_settle(self):
+        from netbox_nso_plugin.models import NSOLoggingHostState, NSOPlatformNedMapping
+        from netbox_nso_plugin.template_content import _reconcile_logging_config
+
+        mgmt = self._mgmt()
+        platform = Platform.objects.create(name="Logging Nokia facility", slug="logging-nokia-facility")
+        NSOPlatformNedMapping.objects.create(platform=platform, ned_id="timos-nc-23.10")
+        self.device.platform = platform
+        self.device.save(update_fields=["platform"])
+        row = NSOLoggingHostState.objects.create(
+            management=mgmt,
+            address="198.18.0.21",
+            facility="local7",
+            status="accepted",
+        )
+
+        _reconcile_logging_config(self.device, self._payload({"address": row.address}))
+
+        row.refresh_from_db()
+        self.assertEqual(row.facility, "local7")
+        self.assertEqual(row.status, "accepted")
+
+    def test_timos_writer_and_reader_tokens_settle_to_one_canonical_value(self):
+        from netbox_nso_plugin.models import NSOLoggingHostState, NSOPlatformNedMapping
+        from netbox_nso_plugin.signals import _push_logging_intent_for_device
+        from netbox_nso_plugin.template_content import _reconcile_logging_config
+
+        mgmt = self._mgmt()
+        platform = Platform.objects.create(name="Logging Nokia tokens", slug="logging-nokia-tokens")
+        NSOPlatformNedMapping.objects.create(platform=platform, ned_id="timos-nc-23.10")
+        self.device.platform = platform
+        self.device.save(update_fields=["platform"])
+        row = NSOLoggingHostState.objects.create(
+            management=mgmt,
+            address="198.18.0.24",
+            severity="INFORMATIONAL",
+            facility="LOCAL6",
+            status="accepted",
+        )
+
+        with patch("netbox_nso_plugin.adapter_client.put_logging_intent") as put:
+            _push_logging_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+        host = put.call_args.args[1][0]
+        self.assertEqual(host["severity"], "info")
+        self.assertEqual(host["facility"], "local6")
+
+        _reconcile_logging_config(
+            self.device,
+            self._payload({"address": row.address, "severity": "info", "facility": "local6"}),
+        )
+
+        row.refresh_from_db()
+        self.assertEqual(row.severity, "INFORMATIONAL")
+        self.assertEqual(row.facility, "LOCAL6")
+        self.assertEqual(row.status, "in_sync")
+
+    def test_junos_writer_and_reader_tokens_settle_to_one_canonical_value(self):
+        from netbox_nso_plugin.models import NSOLoggingHostState, NSOPlatformNedMapping
+        from netbox_nso_plugin.signals import _push_logging_intent_for_device
+        from netbox_nso_plugin.template_content import _reconcile_logging_config
+
+        mgmt = self._mgmt()
+        platform = Platform.objects.create(name="Logging Junos tokens", slug="logging-junos-tokens")
+        NSOPlatformNedMapping.objects.create(platform=platform, ned_id="juniper-junos-nc-4.19")
+        self.device.platform = platform
+        self.device.save(update_fields=["platform"])
+        row = NSOLoggingHostState.objects.create(
+            management=mgmt,
+            address="198.18.0.25",
+            severity="INFORMATIONAL",
+            facility="LOCAL7",
+            status="accepted",
+        )
+
+        with patch("netbox_nso_plugin.adapter_client.put_logging_intent") as put:
+            _push_logging_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+        host = put.call_args.args[1][0]
+        self.assertEqual(host["severity"], "info")
+        self.assertEqual(host["facility"], "local7")
+
+        _reconcile_logging_config(
+            self.device,
+            self._payload({"address": row.address, "severity": "info", "facility": "local7"}),
+        )
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, "in_sync")
+
+    def test_arcos_writer_and_reader_tokens_settle_to_one_canonical_value(self):
+        from netbox_nso_plugin.models import NSOLoggingHostState, NSOPlatformNedMapping
+        from netbox_nso_plugin.signals import _push_logging_intent_for_device
+        from netbox_nso_plugin.template_content import _reconcile_logging_config
+
+        mgmt = self._mgmt()
+        platform = Platform.objects.create(name="Logging ArcOS tokens", slug="logging-arcos-tokens")
+        NSOPlatformNedMapping.objects.create(platform=platform, ned_id="arcos-cli-6.2")
+        self.device.platform = platform
+        self.device.save(update_fields=["platform"])
+        row = NSOLoggingHostState.objects.create(
+            management=mgmt,
+            address="198.18.0.26",
+            severity="informational",
+            facility="any",
+            status="accepted",
+        )
+
+        with patch("netbox_nso_plugin.adapter_client.put_logging_intent") as put:
+            _push_logging_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+        host = put.call_args.args[1][0]
+        self.assertEqual(host["severity"], "INFORMATIONAL")
+        self.assertEqual(host["facility"], "ALL")
+
+        _reconcile_logging_config(
+            self.device,
+            self._payload({"address": row.address, "severity": "INFORMATIONAL", "facility": "ALL"}),
+        )
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, "in_sync")
+
+    def test_cisco_writer_and_reader_tokens_settle_to_one_canonical_value(self):
+        from netbox_nso_plugin.models import NSOLoggingHostState, NSOPlatformNedMapping
+        from netbox_nso_plugin.signals import _push_logging_intent_for_device
+        from netbox_nso_plugin.template_content import _reconcile_logging_config
+
+        mgmt = self._mgmt()
+        for suffix, ned_id in (
+            ("ios", "cisco-ios-cli-6.114"),
+            ("iosxr", "cisco-iosxr-cli-7.76"),
+        ):
+            with self.subTest(ned_id=ned_id):
+                platform = Platform.objects.create(
+                    name=f"Logging {suffix} tokens",
+                    slug=f"logging-{suffix}-tokens",
+                )
+                NSOPlatformNedMapping.objects.create(platform=platform, ned_id=ned_id)
+                self.device.platform = platform
+                self.device.save(update_fields=["platform"])
+                row = NSOLoggingHostState.objects.create(
+                    management=mgmt,
+                    address=f"198.18.1.{10 if suffix == 'ios' else 11}",
+                    severity="INFORMATIONAL",
+                    facility="LOCAL5",
+                    status="accepted",
+                )
+
+                with patch("netbox_nso_plugin.adapter_client.put_logging_intent") as put:
+                    _push_logging_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+                host = put.call_args.args[1][0]
+                self.assertEqual(host["severity"], "informational")
+                self.assertEqual(host["facility"], "local5")
+
+                _reconcile_logging_config(
+                    self.device,
+                    self._payload(
+                        {
+                            "address": row.address,
+                            "severity": "informational",
+                            "facility": "local5",
+                        }
+                    ),
+                )
+                row.refresh_from_db()
+                self.assertEqual(row.status, "in_sync")
+                row.delete()
+
+    def test_value_suppressed_default_port_stays_absent_in_push_payload(self):
+        from netbox_nso_plugin.models import NSOLoggingHostState, NSOPlatformNedMapping
+        from netbox_nso_plugin.signals import _push_logging_intent_for_device
+
+        mgmt = self._mgmt()
+        platform = Platform.objects.create(name="Logging push Nokia", slug="logging-push-nokia")
+        NSOPlatformNedMapping.objects.create(platform=platform, ned_id="timos-nc-23.10")
+        self.device.platform = platform
+        self.device.save(update_fields=["platform"])
+        NSOLoggingHostState.objects.create(
+            management=mgmt,
+            address="198.18.0.22",
+            port=514,
+            status="accepted",
+        )
+
+        with patch("netbox_nso_plugin.adapter_client.put_logging_intent") as put:
+            _push_logging_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+
+        host = put.call_args.args[1][0]
+        self.assertNotIn("port", host)
+
+    def test_default_free_family_preserves_explicit_conventional_port(self):
+        from netbox_nso_plugin.models import NSOLoggingHostState, NSOPlatformNedMapping
+        from netbox_nso_plugin.signals import _push_logging_intent_for_device
+
+        mgmt = self._mgmt()
+        platform = Platform.objects.create(name="Logging push Junos", slug="logging-push-junos")
+        NSOPlatformNedMapping.objects.create(platform=platform, ned_id="juniper-junos-nc-4.19")
+        self.device.platform = platform
+        self.device.save(update_fields=["platform"])
+        NSOLoggingHostState.objects.create(
+            management=mgmt,
+            address="198.18.0.23",
+            port=514,
+            status="accepted",
+        )
+
+        with patch("netbox_nso_plugin.adapter_client.put_logging_intent") as put:
+            _push_logging_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+
+        self.assertEqual(put.call_args.args[1][0]["port"], 514)
 
     def test_category_appears_with_counts(self):
         mgmt = self._mgmt()

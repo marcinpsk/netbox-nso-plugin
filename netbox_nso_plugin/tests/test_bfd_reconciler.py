@@ -2,7 +2,7 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for bfd_reconciler.reconcile_bfd — shared-profile dedup + BFDInterface."""
 
-from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
+from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Platform, Site
 from django.test import TestCase
 
 from .mixins import IntentPushResetMixin
@@ -140,6 +140,140 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
             ],
         )
         assert NSOBFDInterfaceState.objects.get(interface=self.iface).status == "accepted"
+
+    def test_nokia_default_timer_omission_preserves_owned_profile_without_false_settle(self):
+        """Omission preserves intent but cannot prove an explicit-default push landed."""
+        from netbox_routing.models import BFDInterface
+
+        from netbox_nso_plugin.bfd_reconciler import reconcile_bfd
+        from netbox_nso_plugin.models import NSOBFDInterfaceState, NSOPlatformNedMapping
+
+        platform = Platform.objects.create(name="BFD Nokia", slug="bfd-nokia")
+        self.device.platform = platform
+        self.device.save(update_fields=["platform"])
+        NSOPlatformNedMapping.objects.create(platform=platform, ned_id="timos-nc-23.10")
+
+        reconcile_bfd(
+            self.device,
+            [
+                {
+                    "interface_name": "Port-channel1",
+                    "micro_bfd": True,
+                    "enabled": True,
+                    "min_tx": 100,
+                    "min_rx": 100,
+                    "multiplier": 3,
+                }
+            ],
+        )
+        state = NSOBFDInterfaceState.objects.get(management=self.management, interface=self.iface)
+        state.status = "accepted"
+        state.save(update_fields=["status"])
+        profile_id = BFDInterface.objects.get(interface=self.iface).bfd_profile_id
+
+        reconcile_bfd(
+            self.device,
+            [{"interface_name": "Port-channel1", "micro_bfd": True, "enabled": True}],
+        )
+
+        state.refresh_from_db()
+        native = BFDInterface.objects.get(interface=self.iface)
+        self.assertEqual((state.min_tx, state.min_rx, state.multiplier), (100, 100, 3))
+        self.assertEqual(native.bfd_profile_id, profile_id)
+        self.assertEqual(state.status, "accepted")
+
+    def test_junos_omitted_default_multiplier_preserves_owned_profile_without_false_settle(self):
+        from netbox_routing.models import BFDInterface
+
+        from netbox_nso_plugin.bfd_reconciler import reconcile_bfd
+        from netbox_nso_plugin.models import NSOBFDInterfaceState, NSOPlatformNedMapping
+
+        platform = Platform.objects.create(name="BFD Junos", slug="bfd-junos")
+        self.device.platform = platform
+        self.device.save(update_fields=["platform"])
+        NSOPlatformNedMapping.objects.create(platform=platform, ned_id="juniper-junos-nc-4.19")
+        full = {
+            "interface_name": "Port-channel1",
+            "micro_bfd": True,
+            "enabled": True,
+            "min_tx": 300,
+            "min_rx": 300,
+            "multiplier": 3,
+        }
+        reconcile_bfd(self.device, [full])
+        state = NSOBFDInterfaceState.objects.get(management=self.management, interface=self.iface)
+        state.status = "accepted"
+        state.save(update_fields=["status"])
+        profile_id = BFDInterface.objects.get(interface=self.iface).bfd_profile_id
+        corrected = dict(full)
+        corrected.pop("multiplier")
+
+        reconcile_bfd(self.device, [corrected])
+
+        state.refresh_from_db()
+        self.assertEqual(state.multiplier, 3)
+        self.assertEqual(BFDInterface.objects.get(interface=self.iface).bfd_profile_id, profile_id)
+        self.assertEqual(state.status, "accepted")
+
+    def test_device_refresh_cannot_clobber_owned_native_bfd_fields(self):
+        """The native routing row follows owned intent, not stale device state."""
+        from netbox_routing.models import BFDInterface, BFDProfile
+
+        from netbox_nso_plugin.bfd_reconciler import reconcile_bfd
+        from netbox_nso_plugin.models import NSOBFDInterfaceState
+
+        reconcile_bfd(
+            self.device,
+            [
+                {
+                    "interface_name": "Port-channel1",
+                    "micro_bfd": False,
+                    "enabled": False,
+                    "min_tx": 300,
+                    "min_rx": 300,
+                    "multiplier": 3,
+                }
+            ],
+        )
+        intended_profile = BFDProfile.objects.create(
+            name="bfd-100-100-x5",
+            min_tx_int=100,
+            min_rx_int=100,
+            multiplier=5,
+        )
+        native = BFDInterface.objects.get(interface=self.iface)
+        native.bfd_profile = intended_profile
+        native.micro_bfd = True
+        native.enabled = True
+        native.save(update_fields=["bfd_profile", "micro_bfd", "enabled"])
+        state = NSOBFDInterfaceState.objects.get(management=self.management, interface=self.iface)
+        state.min_tx = 100
+        state.min_rx = 100
+        state.multiplier = 5
+        state.micro_bfd = True
+        state.status = "accepted"
+        state.save()
+
+        reconcile_bfd(
+            self.device,
+            [
+                {
+                    "interface_name": "Port-channel1",
+                    "micro_bfd": False,
+                    "enabled": False,
+                    "min_tx": 300,
+                    "min_rx": 300,
+                    "multiplier": 3,
+                }
+            ],
+        )
+
+        native.refresh_from_db()
+        state.refresh_from_db()
+        self.assertEqual(native.bfd_profile_id, intended_profile.pk)
+        self.assertTrue(native.micro_bfd)
+        self.assertTrue(native.enabled)
+        self.assertEqual(state.status, "accepted")
 
     def test_owned_state_survives_when_interface_drops_from_payload(self):
         """An owned BFD overlay must NOT be hard-deleted when the device stops reporting it.

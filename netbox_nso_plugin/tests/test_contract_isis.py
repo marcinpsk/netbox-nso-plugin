@@ -54,6 +54,8 @@ PROC_OPTIONAL_SCALARS = {
     "distance",
     "maximum_paths",
     "reference_bandwidth",
+    "segment_routing_reported",
+    "segment_routing_configured",
 }
 PROC_CONTAINER_KEYS = {"settings", "levels", "segment_routing", "flex_algos"}
 IFACE_REQUIRED_KEYS = {"interface_name", "af", "process_tag", "passive"}
@@ -134,6 +136,8 @@ CONTRACT_PAYLOAD = {
             "distance": 115,
             "maximum_paths": 8,
             "reference_bandwidth": 100000,
+            "segment_routing_reported": True,
+            "segment_routing_configured": True,
             "settings": {"some_knob": "v"},
             "levels": [
                 {

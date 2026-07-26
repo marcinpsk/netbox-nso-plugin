@@ -5,7 +5,7 @@
 import unittest
 from unittest.mock import patch
 
-from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
+from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Platform, Site
 from django.test import TestCase
 
 from ._adapter_http import make_session
@@ -190,6 +190,56 @@ class TestReconcileStaticRoutes(TestCase):
         self.assertEqual(state.nso_prefix, "203.0.113.0/24")
         self.assertEqual(state.management, mgmt)
         self.assertTrue(state.static_route.devices.filter(pk=self.device.pk).exists())
+
+    def test_nokia_omitted_preference_seeds_its_ned_default(self):
+        """Nokia's omitted next-hop preference is 5, not StaticRoute's default 1."""
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.models import NSOPlatformNedMapping
+        from netbox_nso_plugin.template_content import _reconcile_static_routes
+
+        self._make_mgmt(self.device, nso_device_name="sr-nokia-default")
+        platform = Platform.objects.create(name="Static Nokia", slug="static-nokia")
+        NSOPlatformNedMapping.objects.create(platform=platform, ned_id="timos-nc-23.10")
+        self.device.platform = platform
+        self.device.save(update_fields=["platform"])
+        entry = self._route_entry("198.18.40.0/24", "198.18.0.1")
+        entry.pop("metric")
+
+        with self._auto_create_ctx(True):
+            _reconcile_static_routes(self.device, self._route_payload(entry))
+
+        self.assertEqual(StaticRoute.objects.get(prefix="198.18.40.0/24").metric, 5)
+
+    def test_nokia_omitted_preference_does_not_rewrite_shared_metric(self):
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.models import NSOPlatformNedMapping
+        from netbox_nso_plugin.template_content import _reconcile_static_routes
+
+        self._make_mgmt(self.device, nso_device_name="sr-nokia-history")
+        platform = Platform.objects.create(name="Static Nokia history", slug="static-nokia-history")
+        NSOPlatformNedMapping.objects.create(platform=platform, ned_id="timos-nc-23.10")
+        self.device.platform = platform
+        self.device.save(update_fields=["platform"])
+        route = StaticRoute.objects.create(
+            prefix="198.18.41.0/24",
+            next_hop="198.18.0.2",
+            metric=1,
+        )
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        with suppress_intent_push():
+            route.devices.add(self.device)
+        entry = self._route_entry(str(route.prefix), str(route.next_hop))
+        entry.pop("metric")
+
+        _reconcile_static_routes(self.device, self._route_payload(entry))
+
+        route.refresh_from_db()
+        self.assertEqual(route.metric, 1)
+        state = route.nso_states.get(management__device=self.device)
+        self.assertNotEqual(state.status, "in_sync")
 
     def test_idempotent_second_reconcile_same_result(self):
         """Second reconcile with same payload → same state rows, no duplicates."""

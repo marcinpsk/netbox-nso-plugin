@@ -3,9 +3,11 @@
 """Tests for A4: adapter_client.get_isis_interfaces and _reconcile_isis_interfaces."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
+from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Platform, Site
+from django.db import OperationalError
 from django.test import TestCase
 
 from ._adapter_http import make_session
@@ -91,6 +93,21 @@ class TestGetIsisInterfaces(unittest.TestCase):
 
         with self.assertRaises(AdapterError):
             get_isis_interfaces(99)
+
+
+class TestIsisChildFailurePolicy(unittest.TestCase):
+    def test_interface_level_database_error_is_not_treated_as_a_match(self):
+        from netbox_nso_plugin.template_content import _isis_interface_children_match
+
+        with (
+            patch("netbox_nso_plugin.template_content._reconcile_isis_settings", return_value=True),
+            patch(
+                "netbox_nso_plugin.template_content._reconcile_child_levels",
+                side_effect=OperationalError("level query failed"),
+            ),
+        ):
+            with self.assertRaisesRegex(OperationalError, "level query failed"):
+                _isis_interface_children_match({}, SimpleNamespace(), write=False)
 
 
 # ---------------------------------------------------------------------------
@@ -771,6 +788,318 @@ class TestReconcileIsisProcess(TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0].process_tag, "CORE")
 
+    def test_owned_explicit_is_type_survives_device_omission(self):
+        """An omitted NED default is absence, not permission to erase accepted intent."""
+        self._make_mgmt()
+        from netbox_nso_plugin.template_content import _reconcile_isis_process
+
+        state = _reconcile_isis_process(
+            self.device,
+            [{"process_tag": "CORE", "is_type": "level-2-only"}],
+        )[0]
+        state.status = "accepted"
+        state.save(update_fields=["status"])
+
+        state = _reconcile_isis_process(self.device, [{"process_tag": "CORE"}])[0]
+
+        self.assertEqual(state.is_type, "level-2-only")
+        self.assertEqual(state.isis_instance.is_type, "level-2-only")
+        self.assertEqual(state.status, "accepted")
+
+    def test_unowned_historical_default_is_type_migrates_to_absence(self):
+        """A pre-sweep served default must not survive into a later Accept payload."""
+        self._make_mgmt()
+        from netbox_nso_plugin.template_content import _reconcile_isis_process
+
+        state = _reconcile_isis_process(
+            self.device,
+            [{"process_tag": "CORE", "is_type": "level-1-2"}],
+        )[0]
+        self.assertEqual(state.status, "imported")
+
+        state = _reconcile_isis_process(self.device, [{"process_tag": "CORE"}])[0]
+
+        state.isis_instance.refresh_from_db()
+        self.assertEqual(state.is_type, "")
+        self.assertEqual(state.isis_instance.is_type, "")
+        self.assertEqual(state.status, "imported")
+
+    def test_nokia_owned_explicit_default_is_type_does_not_converge_on_omission(self):
+        """A provenance-explicit default must be reported before intent can settle."""
+        from netbox_nso_plugin.models import NSOPlatformNedMapping
+        from netbox_nso_plugin.template_content import _reconcile_isis_process
+
+        platform = Platform.objects.create(
+            name="Nokia SR OS",
+            slug="nokia-sr-os",
+            manufacturer=self.device.device_type.manufacturer,
+        )
+        NSOPlatformNedMapping.objects.create(
+            platform=platform,
+            ned_id="timos-nc-23.10",
+        )
+        self.device.platform = platform
+        self.device.save(update_fields=["platform"])
+        self._make_mgmt()
+
+        state = _reconcile_isis_process(
+            self.device,
+            [{"process_tag": "CORE", "is_type": "level-1-2"}],
+        )[0]
+        state.status = "accepted"
+        state.save(update_fields=["status"])
+
+        state = _reconcile_isis_process(self.device, [{"process_tag": "CORE"}])[0]
+
+        self.assertEqual(state.is_type, "level-1-2")
+        self.assertEqual(state.status, "accepted")
+
+    def test_junos_owned_explicit_default_is_type_does_not_converge_on_omission(self):
+        from netbox_nso_plugin.models import NSOPlatformNedMapping
+        from netbox_nso_plugin.template_content import _reconcile_isis_process
+
+        platform = Platform.objects.create(
+            name="Junos IS-IS",
+            slug="junos-isis",
+            manufacturer=self.device.device_type.manufacturer,
+        )
+        NSOPlatformNedMapping.objects.create(platform=platform, ned_id="juniper-junos-nc-4.19")
+        self.device.platform = platform
+        self.device.save(update_fields=["platform"])
+        self._make_mgmt()
+
+        state = _reconcile_isis_process(
+            self.device,
+            [{"process_tag": "", "is_type": "level-1-2"}],
+        )[0]
+        state.status = "accepted"
+        state.save(update_fields=["status"])
+
+        state = _reconcile_isis_process(self.device, [{"process_tag": ""}])[0]
+
+        self.assertEqual(state.is_type, "level-1-2")
+        self.assertEqual(state.status, "accepted")
+
+    def test_nokia_omitted_defaults_do_not_confirm_owned_nondefaults(self):
+        from netbox_routing.models import ISISSegmentRouting
+
+        from netbox_nso_plugin.models import NSOPlatformNedMapping
+        from netbox_nso_plugin.template_content import _reconcile_isis_process
+
+        platform = Platform.objects.create(
+            name="Nokia IS-IS nondefaults",
+            slug="nokia-isis-nondefaults",
+            manufacturer=self.device.device_type.manufacturer,
+        )
+        NSOPlatformNedMapping.objects.create(platform=platform, ned_id="timos-nc-23.10")
+        self.device.platform = platform
+        self.device.save(update_fields=["platform"])
+        self._make_mgmt()
+        state = _reconcile_isis_process(
+            self.device,
+            [
+                {
+                    "process_tag": "CORE",
+                    "lsp_lifetime": 1300,
+                    "segment_routing": {"enabled": True, "tunnel_table_pref": 20},
+                }
+            ],
+        )[0]
+        state.status = "accepted"
+        state.save(update_fields=["status"])
+
+        state = _reconcile_isis_process(self.device, [{"process_tag": "CORE"}])[0]
+
+        state.isis_instance.refresh_from_db()
+        sr = ISISSegmentRouting.objects.get(instance=state.isis_instance)
+        self.assertEqual(state.isis_instance.lsp_lifetime, 1300)
+        self.assertEqual(sr.tunnel_table_pref, 20)
+        self.assertEqual(state.status, "accepted")
+
+    def test_nokia_omitted_level_default_does_not_settle_owned_level(self):
+        from netbox_routing.models import ISISLevel
+
+        from netbox_nso_plugin.models import NSOPlatformNedMapping
+        from netbox_nso_plugin.template_content import _reconcile_isis_process
+
+        platform = Platform.objects.create(
+            name="Nokia IS-IS level provenance",
+            slug="nokia-isis-level-provenance",
+            manufacturer=self.device.device_type.manufacturer,
+        )
+        NSOPlatformNedMapping.objects.create(platform=platform, ned_id="timos-nc-23.10")
+        self.device.platform = platform
+        self.device.save(update_fields=["platform"])
+        self._make_mgmt()
+        state = _reconcile_isis_process(
+            self.device,
+            [{"process_tag": "CORE", "levels": [{"level": 2, "wide_metrics_only": False}]}],
+        )[0]
+        state.status = "accepted"
+        state.save(update_fields=["status"])
+
+        state = _reconcile_isis_process(self.device, [{"process_tag": "CORE"}])[0]
+
+        level = ISISLevel.objects.get(instance=state.isis_instance, level=2)
+        self.assertFalse(level.wide_metrics_only)
+        self.assertEqual(state.status, "accepted")
+
+    def test_nokia_present_level_with_omitted_default_does_not_settle(self):
+        from netbox_nso_plugin.template_content import _reconcile_isis_process
+
+        self._make_mgmt()
+        state = _reconcile_isis_process(
+            self.device,
+            [{"process_tag": "CORE", "levels": [{"level": 2, "wide_metrics_only": False}]}],
+        )[0]
+        state.status = "accepted"
+        state.save(update_fields=["status"])
+
+        state = _reconcile_isis_process(
+            self.device,
+            [{"process_tag": "CORE", "levels": [{"level": 2}]}],
+        )[0]
+
+        self.assertEqual(state.status, "accepted")
+
+    def test_nokia_omitted_long_scalar_alone_does_not_settle(self):
+        from netbox_nso_plugin.template_content import _reconcile_isis_process
+
+        self._make_mgmt()
+        state = _reconcile_isis_process(
+            self.device,
+            [{"process_tag": "CORE", "lsp_lifetime": 1300}],
+        )[0]
+        state.status = "accepted"
+        state.save(update_fields=["status"])
+
+        state = _reconcile_isis_process(self.device, [{"process_tag": "CORE"}])[0]
+
+        self.assertEqual(state.isis_instance.lsp_lifetime, 1300)
+        self.assertEqual(state.status, "accepted")
+
+    def test_arcos_omitted_locator_default_does_not_confirm_owned_nondefault(self):
+        from netbox_routing.models import ISISSRv6Locator
+
+        from netbox_nso_plugin.models import NSOPlatformNedMapping
+        from netbox_nso_plugin.template_content import _reconcile_isis_process
+
+        platform = Platform.objects.create(
+            name="ArcOS IS-IS nondefaults",
+            slug="arcos-isis-nondefaults",
+            manufacturer=self.device.device_type.manufacturer,
+        )
+        NSOPlatformNedMapping.objects.create(platform=platform, ned_id="arcos-v8.1.2X-nc-1.0")
+        self.device.platform = platform
+        self.device.save(update_fields=["platform"])
+        self._make_mgmt()
+        locator = {
+            "name": "LOC",
+            "prefix": "2001:db8:10::/64",
+            "node_length": 20,
+            "function_length": 20,
+        }
+        state = _reconcile_isis_process(
+            self.device,
+            [{"process_tag": "CORE", "srv6_locators": [locator]}],
+        )[0]
+        state.status = "accepted"
+        state.save(update_fields=["status"])
+        corrected = dict(locator)
+        corrected.pop("node_length")
+        corrected.pop("function_length")
+
+        state = _reconcile_isis_process(
+            self.device,
+            [{"process_tag": "CORE", "srv6_locators": [corrected]}],
+        )[0]
+
+        native = ISISSRv6Locator.objects.get(instance=state.isis_instance, name="LOC")
+        self.assertEqual((native.node_length, native.function_length), (20, 20))
+        self.assertEqual(state.status, "accepted")
+
+    def test_unowned_arcos_locator_omissions_clear_stale_values(self):
+        from netbox_routing.models import ISISSRv6Locator
+
+        from netbox_nso_plugin.models import NSOPlatformNedMapping
+        from netbox_nso_plugin.template_content import _reconcile_isis_process
+
+        platform = Platform.objects.create(
+            name="ArcOS IS-IS omission mirror",
+            slug="arcos-isis-omission-mirror",
+            manufacturer=self.device.device_type.manufacturer,
+        )
+        NSOPlatformNedMapping.objects.create(platform=platform, ned_id="arcos-v8.1.2X-nc-1.0")
+        self.device.platform = platform
+        self.device.save(update_fields=["platform"])
+        self._make_mgmt()
+        locator = {
+            "name": "LOC",
+            "prefix": "2001:db8:10::/64",
+            "node_length": 20,
+            "function_length": 20,
+        }
+        state = _reconcile_isis_process(
+            self.device,
+            [{"process_tag": "CORE", "srv6_locators": [locator]}],
+        )[0]
+        corrected = {"name": "LOC", "prefix": "2001:db8:10::/64"}
+
+        state = _reconcile_isis_process(
+            self.device,
+            [{"process_tag": "CORE", "srv6_locators": [corrected]}],
+        )[0]
+
+        native = ISISSRv6Locator.objects.get(instance=state.isis_instance, name="LOC")
+        self.assertEqual((native.node_length, native.function_length), (None, None))
+        self.assertEqual(state.status, "imported")
+
+    def test_owned_auth_match_uses_presence_without_secret_readback(self):
+        from netbox_nso_plugin.template_content import _isis_process_device_matches_intent
+
+        state = SimpleNamespace(
+            net="",
+            is_type="",
+            metric_style="",
+            overload_bit=None,
+            area_auth_type="sha",
+            area_auth_present=True,
+            area_auth_key="held-out-of-band",
+            domain_auth_type="",
+            domain_auth_present=False,
+            domain_auth_key="",
+            fast_reroute="",
+            microloop_avoidance=None,
+        )
+        reported = {"area_auth_type": "sha", "area_auth_present": True}
+
+        self.assertTrue(_isis_process_device_matches_intent(reported, state))
+        self.assertFalse(_isis_process_device_matches_intent({**reported, "area_auth_present": False}, state))
+
+    def test_owned_false_true_only_process_flags_match_reported_omission(self):
+        from netbox_nso_plugin.template_content import _isis_process_device_matches_intent
+
+        state = SimpleNamespace(
+            net="",
+            is_type="",
+            metric_style="",
+            overload_bit=False,
+            area_auth_type="",
+            area_auth_present=False,
+            area_auth_key="",
+            domain_auth_type="",
+            domain_auth_present=False,
+            domain_auth_key="",
+            fast_reroute="",
+            microloop_avoidance=False,
+        )
+
+        inst = SimpleNamespace(microloop_avoidance=False)
+        self.assertTrue(_isis_process_device_matches_intent({}, state, device=self.device, inst=inst))
+        state.overload_bit = None
+        state.microloop_avoidance = None
+        self.assertTrue(_isis_process_device_matches_intent({"overload_bit": True}, state))
+
     def test_routing_instance_filled_with_all_fields(self):
         """The netbox_routing.ISISInstance is filled with every informational field
         NSO reports — not just net + is_type."""
@@ -1031,8 +1360,8 @@ class TestReconcileIsisProcess(TestCase):
             "SR child must survive when the payload omits the segment_routing key",
         )
 
-    def test_sr_child_deleted_on_explicit_empty_segment_routing(self):
-        """An explicit empty ``segment_routing`` ({}) removes a stale SR child."""
+    def test_sr_child_deleted_on_authoritative_reported_absence(self):
+        """Current-reader provenance can authoritatively remove stale SR state."""
         self._make_mgmt()
         from netbox_routing.models import ISISInstance, ISISSegmentRouting
 
@@ -1042,11 +1371,100 @@ class TestReconcileIsisProcess(TestCase):
         inst = ISISInstance.objects.get(device=self.device, process_tag="0")
         self.assertTrue(ISISSegmentRouting.objects.filter(instance=inst).exists())
 
-        _reconcile_isis_process(self.device, [{"process_tag": "0", "segment_routing": {}}])
+        _reconcile_isis_process(
+            self.device,
+            [
+                {
+                    "process_tag": "0",
+                    "segment_routing_reported": True,
+                    "segment_routing_configured": False,
+                }
+            ],
+        )
         self.assertFalse(
             ISISSegmentRouting.objects.filter(instance=inst).exists(),
-            "an explicit empty segment_routing must delete the SR child",
+            "an authoritative configured=false report must delete the SR child",
         )
+
+    def test_configured_empty_segment_routing_preserves_existing_child(self):
+        from netbox_routing.models import ISISSegmentRouting
+
+        from netbox_nso_plugin.template_content import _reconcile_isis_process
+
+        self._make_mgmt()
+        _reconcile_isis_process(
+            self.device,
+            [{"process_tag": "0", "segment_routing": {"enabled": True}}],
+        )
+        self.assertTrue(ISISSegmentRouting.objects.filter(instance__device=self.device).exists())
+
+        _reconcile_isis_process(
+            self.device,
+            [
+                {
+                    "process_tag": "0",
+                    "segment_routing_reported": True,
+                    "segment_routing_configured": True,
+                }
+            ],
+        )
+
+        self.assertTrue(ISISSegmentRouting.objects.filter(instance__device=self.device).exists())
+
+    def test_configured_empty_segment_routing_creates_child_on_first_import(self):
+        from netbox_routing.models import ISISSegmentRouting
+
+        from netbox_nso_plugin.template_content import _reconcile_isis_process
+
+        self._make_mgmt()
+
+        _reconcile_isis_process(
+            self.device,
+            [
+                {
+                    "process_tag": "0",
+                    "segment_routing_reported": True,
+                    "segment_routing_configured": True,
+                }
+            ],
+        )
+
+        self.assertTrue(ISISSegmentRouting.objects.filter(instance__device=self.device).exists())
+
+    def test_unowned_sr_omitted_columns_are_cleared_before_base_advances(self):
+        from netbox_routing.models import ISISInstance, ISISSegmentRouting
+
+        from netbox_nso_plugin.template_content import _reconcile_isis_process
+
+        self._make_mgmt()
+        _reconcile_isis_process(
+            self.device,
+            [
+                {
+                    "process_tag": "0",
+                    "segment_routing": {
+                        "enabled": True,
+                        "tunnel_table_pref": 20,
+                    },
+                }
+            ],
+        )
+        inst = ISISInstance.objects.get(device=self.device, process_tag="0")
+
+        _reconcile_isis_process(
+            self.device,
+            [
+                {
+                    "process_tag": "0",
+                    "segment_routing_reported": True,
+                    "segment_routing_configured": True,
+                    "segment_routing": {"enabled": True},
+                }
+            ],
+        )
+
+        sr = ISISSegmentRouting.objects.get(instance=inst)
+        self.assertIsNone(sr.tunnel_table_pref)
 
     def test_sr_deprecated_node_sid_keys_ignored_new_cols_written(self):
         """Instance-level node_sid_* keys are ignored (no crash); srlb_*/srv6 are mirrored.
@@ -1152,6 +1570,152 @@ class TestReconcileIsisInterfaceLevels(TestCase):
         self.assertEqual(set(rows), {2})
         self.assertEqual(rows[2].metric, 10)
         self.assertEqual(rows[2].hello_interval, 3)
+
+    def test_unowned_explicit_level_omission_clears_stale_value(self):
+        self._make_mgmt()
+        from netbox_routing.models import ISISInterface, ISISInterfaceLevel
+
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        iface = Interface.objects.create(device=self.device, name="to-omit", type="1000base-t")
+        _reconcile_isis_interfaces(
+            self.device,
+            [
+                {
+                    "interface_name": iface.name,
+                    "af": "ipv4",
+                    "process_tag": "",
+                    "levels": [{"level": 2, "hello_interval": 10}],
+                }
+            ],
+        )
+        ri = ISISInterface.objects.get(interface=iface, address_family="ipv4")
+
+        _reconcile_isis_interfaces(
+            self.device,
+            [
+                {
+                    "interface_name": iface.name,
+                    "af": "ipv4",
+                    "process_tag": "",
+                    "levels": [{"level": 2}],
+                }
+            ],
+        )
+
+        self.assertIsNone(ISISInterfaceLevel.objects.get(interface=ri, level=2).hello_interval)
+
+    def test_nokia_explicit_default_interface_fields_survive_omission_without_false_settle(self):
+        """Provenance-explicit omissions preserve intent but cannot confirm it landed."""
+        self._make_mgmt()
+        from netbox_routing.models import ISISInterface, ISISInterfaceLevel
+
+        from netbox_nso_plugin.models import NSOPlatformNedMapping
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        platform = Platform.objects.create(
+            name="Nokia ISIS defaults",
+            slug="nokia-isis-defaults",
+            manufacturer=self.device.device_type.manufacturer,
+        )
+        NSOPlatformNedMapping.objects.create(platform=platform, ned_id="timos-nc-23.10")
+        self.device.platform = platform
+        self.device.save(update_fields=["platform"])
+        iface = Interface.objects.create(device=self.device, name="to-core", type="1000base-t")
+        initial = {
+            "interface_name": iface.name,
+            "af": "ipv4",
+            "process_tag": "",
+            "circuit_type": "level-1-2",
+            "passive": False,
+            "csnp_interval": 10,
+            "retransmit_interval": 5,
+            "lsp_interval": 100,
+            "levels": [
+                {
+                    "level": 2,
+                    "hello_interval": 9,
+                    "hello_multiplier": 3,
+                    "priority": 64,
+                    "passive": False,
+                }
+            ],
+        }
+        state = _reconcile_isis_interfaces(self.device, [initial])[0]
+        state.status = "accepted"
+        state.save(update_fields=["status"])
+
+        corrected = {
+            "interface_name": iface.name,
+            "af": "ipv4",
+            "process_tag": "",
+            "levels": [],
+        }
+        state = _reconcile_isis_interfaces(self.device, [corrected])[0]
+
+        native = ISISInterface.objects.get(interface=iface, address_family="ipv4")
+        level = ISISInterfaceLevel.objects.get(interface=native, level=2)
+        self.assertEqual(native.circuit_type, "level-1-2")
+        self.assertEqual((native.csnp_interval, native.retransmit_interval, native.lsp_interval), (10, 5, 100))
+        self.assertEqual((level.hello_interval, level.hello_multiplier, level.priority), (9, 3, 64))
+        self.assertEqual(state.status, "accepted")
+
+    def test_nokia_owned_interface_without_timer_intent_converges_on_omission(self):
+        self._make_mgmt()
+        from netbox_nso_plugin.models import NSOPlatformNedMapping
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        platform = Platform.objects.create(
+            name="Nokia ISIS no timers",
+            slug="nokia-isis-no-timers",
+            manufacturer=self.device.device_type.manufacturer,
+        )
+        NSOPlatformNedMapping.objects.create(platform=platform, ned_id="timos-nc-23.10")
+        self.device.platform = platform
+        self.device.save(update_fields=["platform"])
+        iface = Interface.objects.create(device=self.device, name="to-no-timers", type="1000base-t")
+        reported = {
+            "interface_name": iface.name,
+            "af": "ipv4",
+            "process_tag": "",
+            "circuit_type": "",
+            "network_type": "",
+            "metric": None,
+            "passive": False,
+        }
+        state = _reconcile_isis_interfaces(self.device, [reported])[0]
+        state.status = "accepted"
+        state.save(update_fields=["status"])
+
+        state = _reconcile_isis_interfaces(self.device, [reported])[0]
+
+        self.assertEqual(state.status, "in_sync")
+
+    def test_owned_interface_level_omission_does_not_settle_when_scalars_match(self):
+        """A level-only provenance gap must survive the top-level intent comparison."""
+        self._make_mgmt()
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        iface = Interface.objects.create(device=self.device, name="to-level-only", type="1000base-t")
+        initial = {
+            "interface_name": iface.name,
+            "af": "ipv4",
+            "process_tag": "",
+            "circuit_type": "",
+            "network_type": "",
+            "metric": None,
+            "passive": False,
+            "levels": [{"level": 2, "metric": 10}],
+        }
+        state = _reconcile_isis_interfaces(self.device, [initial])[0]
+        state.status = "accepted"
+        state.save(update_fields=["status"])
+
+        reported = dict(initial)
+        reported["levels"] = [{"level": 2}]
+        state = _reconcile_isis_interfaces(self.device, [reported])[0]
+
+        self.assertEqual(state.status, "accepted")
 
     def test_routing_instance_flex_algos(self):
         """ISISFlexAlgo rows are reconciled (full-replace by algo_id)."""

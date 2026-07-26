@@ -9,7 +9,7 @@ destination scope resolved + route-map linked. Uses an IS-IS destination
 
 from __future__ import annotations
 
-from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
+from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Platform, Site
 from django.test import TestCase
 
 
@@ -43,6 +43,14 @@ class TestReconcileRedistribution(TestCase):
         }
         e.update(kw)
         return e
+
+    def _set_ned(self, ned_id: str, slug: str):
+        from netbox_nso_plugin.models import NSOPlatformNedMapping
+
+        platform = Platform.objects.create(name=slug, slug=slug)
+        NSOPlatformNedMapping.objects.create(platform=platform, ned_id=ned_id)
+        self.device.platform = platform
+        self.device.save(update_fields=["platform"])
 
     def test_creates_redistribution_for_isis_dest(self):
         self._make_mgmt()
@@ -81,6 +89,23 @@ class TestReconcileRedistribution(TestCase):
         self.assertIsNone(states[0].redistribution_id)
         self.assertEqual(states[0].status, "imported")
         self.assertEqual(Redistribution.objects.count(), 0)
+
+    def test_missing_destination_cannot_settle_owned_drift(self):
+        """An unresolved destination cannot hide drift in the owned overlay."""
+        self._make_mgmt()
+        from netbox_nso_plugin.models import NSORedistributionState
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+
+        reconcile_redistribution(self.device, {"entries": [self._entry(metric=30)]})
+        state = NSORedistributionState.objects.get()
+        state.metric = 20
+        state.status = "accepted"
+        state.save(update_fields=["metric", "status"])
+
+        state = reconcile_redistribution(self.device, {"entries": [self._entry(metric=30)]})[0]
+
+        self.assertEqual(state.metric, 20)
+        self.assertEqual(state.status, "accepted")
 
     def test_idempotent(self):
         self._make_mgmt()
@@ -125,6 +150,93 @@ class TestReconcileRedistribution(TestCase):
         Redistribution.objects.get(source_protocol="static").refresh_from_db()
         self.assertEqual(Redistribution.objects.get(source_protocol="static").metric, 20)
         self.assertEqual(states[0].status, "imported")
+
+    def test_omitted_default_metric_type_migrates_prior_mirrored_default_to_absence(self):
+        """A corrected reader omits a default-only metric-type.
+
+        A prior unowned mirror may contain the old reader's fabricated default.
+        Migrate that representation to absence so accepting it cannot write an
+        explicit default back to the device.
+        """
+        self._make_mgmt()
+        self._set_ned("cisco-ios-cli-6.114", "redist-ios-default")
+        from netbox_routing.models import ISISInstance, Redistribution
+
+        ISISInstance.objects.create(device=self.device, process_tag="")
+        from netbox_nso_plugin.models import NSORedistributionState
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+
+        reconcile_redistribution(self.device, {"entries": [self._entry(metric_type="internal")]})
+        corrected = self._entry()
+        corrected.pop("metric_type")
+        states = reconcile_redistribution(self.device, {"entries": [corrected]})
+
+        native = Redistribution.objects.get(source_protocol="static")
+        overlay = NSORedistributionState.objects.get()
+        self.assertEqual(native.metric_type, "")
+        self.assertEqual(overlay.metric_type, "")
+        self.assertEqual(states[0].status, "imported")
+
+    def test_omitted_default_metric_type_does_not_confirm_owned_nondefault(self):
+        self._make_mgmt()
+        self._set_ned("cisco-ios-cli-6.114", "redist-ios-owned")
+        from netbox_routing.models import ISISInstance, Redistribution
+
+        ISISInstance.objects.create(device=self.device, process_tag="")
+        from netbox_nso_plugin.models import NSORedistributionState
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+
+        reconcile_redistribution(self.device, {"entries": [self._entry(metric_type="external")]})
+        state = NSORedistributionState.objects.get()
+        state.status = "accepted"
+        state.save(update_fields=["status"])
+        corrected = self._entry()
+        corrected.pop("metric_type")
+
+        state = reconcile_redistribution(self.device, {"entries": [corrected]})[0]
+
+        self.assertEqual(Redistribution.objects.get().metric_type, "external")
+        self.assertEqual(state.metric_type, "external")
+        self.assertEqual(state.status, "accepted")
+
+    def test_omitted_metric_type_does_not_confirm_owned_explicit_default(self):
+        self._make_mgmt()
+        self._set_ned("cisco-ios-cli-6.114", "redist-ios-explicit-default")
+        from netbox_routing.models import ISISInstance, Redistribution
+
+        ISISInstance.objects.create(device=self.device, process_tag="")
+        from netbox_nso_plugin.models import NSORedistributionState
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+
+        reconcile_redistribution(self.device, {"entries": [self._entry()]})
+        state = NSORedistributionState.objects.get()
+        state.redistribution.metric_type = "internal"
+        state.redistribution.save(update_fields=["metric_type"])
+        state.metric_type = "internal"
+        state.status = "accepted"
+        state.save(update_fields=["metric_type", "status"])
+        corrected = self._entry()
+        corrected.pop("metric_type")
+
+        state = reconcile_redistribution(self.device, {"entries": [corrected]})[0]
+
+        self.assertEqual(Redistribution.objects.get().metric_type, "internal")
+        self.assertEqual(state.metric_type, "internal")
+        self.assertEqual(state.status, "accepted")
+
+    def test_non_ios_omission_does_not_invent_ios_metric_type(self):
+        self._make_mgmt()
+        self._set_ned("timos-nc-23.10", "redist-timos")
+        from netbox_routing.models import ISISInstance, Redistribution
+
+        ISISInstance.objects.create(device=self.device, process_tag="")
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+
+        omitted = self._entry()
+        omitted.pop("metric_type")
+        reconcile_redistribution(self.device, {"entries": [omitted]})
+
+        self.assertEqual(Redistribution.objects.get().metric_type, "")
 
     def test_both_moved_is_conflict(self):
         """3-way: object edited AND device changed since base → conflict, edit preserved."""

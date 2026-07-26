@@ -48,12 +48,23 @@ def _upsert_bfd_state(mgmt, iface, entry: dict, now) -> None:
     from .models import NSOBFDInterfaceState
 
     state, _ = NSOBFDInterfaceState.objects.get_or_create(management=mgmt, interface=iface)
-    state.min_tx = entry.get("min_tx")
-    state.min_rx = entry.get("min_rx")
-    state.multiplier = entry.get("multiplier")
-    state.micro_bfd = bool(entry.get("micro_bfd", False))
+    owned = sm.is_owned(state.status)
+    matches = True
+    for field in ("min_tx", "min_rx", "multiplier"):
+        if owned:
+            # These fields are provenance-explicit: an omitted leaf is not proof
+            # that an explicitly owned value equal to the NED default landed.
+            if entry.get(field) != getattr(state, field):
+                matches = False
+        else:
+            setattr(state, field, entry.get(field))
+    reported_micro = bool(entry.get("micro_bfd", False))
+    if owned:
+        matches = matches and state.micro_bfd == reported_micro
+    else:
+        state.micro_bfd = reported_micro
     # Mirror overlay: imported on import; owned preserved; deploying→in_sync on apply.
-    state.status = sm.on_reconcile(state.status, matches=None)
+    state.status = sm.on_reconcile(state.status, matches=matches if owned else None)
     state.last_sync_at = now
     state.save()
 
@@ -113,7 +124,6 @@ def reconcile_bfd(device, interfaces: list) -> list:
     mgmt = NSODeviceManagement.objects.filter(device=device).first()
     now = timezone.now()
     seen_state_iface_ids: set = set()
-
     for entry in interfaces or []:
         name = entry.get("interface_name") or ""
         if not name:
@@ -126,14 +136,44 @@ def reconcile_bfd(device, interfaces: list) -> list:
         if iface is None:
             continue  # interface not modelled in NetBox
 
-        profile = _get_or_create_bfd_profile(entry, BFDProfile, profiles)
-        desired = {
-            "bfd_profile": profile,
-            "micro_bfd": bool(entry.get("micro_bfd", False)),
-            "enabled": bool(entry.get("enabled", True)),
-        }
-        obj, created = BFDInterface.objects.get_or_create(interface=iface, defaults=desired)
-        if not created:
+        existing_state = None
+        if mgmt is not None:
+            from . import status_machine as sm
+            from .models import NSOBFDInterfaceState
+
+            existing_state = NSOBFDInterfaceState.objects.filter(management=mgmt, interface=iface).first()
+        owned = existing_state is not None and sm.is_owned(existing_state.status)
+        if owned:
+            # The overlay and native routing row are the same operator-owned
+            # intent represented in two models.  Device refresh still compares
+            # against the overlay below, but may not mirror stale reported
+            # values into any native field while that intent is owned.
+            owned_profile = _get_or_create_bfd_profile(
+                {
+                    "min_tx": existing_state.min_tx,
+                    "min_rx": existing_state.min_rx,
+                    "multiplier": existing_state.multiplier,
+                },
+                BFDProfile,
+                profiles,
+            )
+            obj, _ = BFDInterface.objects.get_or_create(
+                interface=iface,
+                defaults={
+                    "bfd_profile": owned_profile,
+                    "micro_bfd": existing_state.micro_bfd,
+                    "enabled": True,
+                },
+            )
+        else:
+            profile = _get_or_create_bfd_profile(entry, BFDProfile, profiles)
+            desired = {
+                "bfd_profile": profile,
+                "micro_bfd": bool(entry.get("micro_bfd", False)),
+                "enabled": bool(entry.get("enabled", True)),
+            }
+            obj, created = BFDInterface.objects.get_or_create(interface=iface, defaults=desired)
+        if not owned and not created:
             changed = False
             if obj.bfd_profile_id != (profile.pk if profile else None):
                 obj.bfd_profile = profile

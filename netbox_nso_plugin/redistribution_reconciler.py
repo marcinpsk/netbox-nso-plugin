@@ -66,14 +66,21 @@ def _resolve_redist_destination(device, dest_protocol: str, dest_ref: str):
     return None
 
 
-def _redist_device_content(entry: dict, route_map) -> dict:
+def _redist_metric_type(entry: dict) -> str:
+    """Return only configured intent; absence must stay absent through Apply."""
+    if "metric_type" in entry:
+        return entry.get("metric_type") or ""
+    return ""
+
+
+def _redist_device_content(entry: dict, route_map, device) -> dict:
     """Canonical device-desired Redistribution content (route_map as pk)."""
     from . import merge_util
 
     return {
         "route_map": merge_util.pk(route_map),
         "metric": entry.get("metric"),
-        "metric_type": entry.get("metric_type") or "",
+        "metric_type": _redist_metric_type(entry),
     }
 
 
@@ -86,15 +93,26 @@ def _redist_object_content(redist) -> dict:
     }
 
 
-def _write_redist(redist, route_map, entry: dict) -> None:
+def _redist_overlay_matches_device(state, entry: dict) -> bool:
+    """Compare owned overlay intent with the device row without requiring an FK."""
+    return (
+        state.route_map == (entry.get("route_map") or "")
+        and state.metric == entry.get("metric")
+        and (state.metric_type or "") == _redist_metric_type(entry)
+    )
+
+
+def _write_redist(redist, route_map, entry: dict, device) -> None:
     """Write the device-desired values onto the Redistribution (seed / auto-mirror)."""
     redist.route_map = route_map
     redist.metric = entry.get("metric")
-    redist.metric_type = entry.get("metric_type") or ""
-    redist.save(update_fields=["route_map", "metric", "metric_type"])
+    fields = ["route_map", "metric"]
+    redist.metric_type = _redist_metric_type(entry)
+    fields.append("metric_type")
+    redist.save(update_fields=fields)
 
 
-def _create_or_link_redistribution(state, device, entry: dict) -> tuple[bool, bool]:
+def _create_or_link_redistribution(state, device, entry: dict) -> tuple[bool | None, bool]:
     """3-way reconcile the netbox_routing.Redistribution for this state row.
 
     Returns ``(matches, conflict)``. Device-side changes auto-mirror when the object is
@@ -106,12 +124,12 @@ def _create_or_link_redistribution(state, device, entry: dict) -> tuple[bool, bo
         from django.contrib.contenttypes.models import ContentType
         from netbox_routing.models import Redistribution, RouteMap
     except ImportError:
-        return True, False
+        return None, False
 
     try:
         dest = _resolve_redist_destination(device, state.dest_protocol, state.dest_ref)
         if dest is None:
-            return True, False  # destination scope not modelled (yet) — leave imported
+            return None, False  # destination scope not modelled (yet) — comparison is incomplete
 
         route_map = (
             RouteMap.objects.filter(name=entry.get("route_map") or "").first() if entry.get("route_map") else None
@@ -125,20 +143,26 @@ def _create_or_link_redistribution(state, device, entry: dict) -> tuple[bool, bo
             defaults={
                 "route_map": route_map,
                 "metric": entry.get("metric"),
-                "metric_type": entry.get("metric_type") or "",
+                "metric_type": _redist_metric_type(entry),
             },
         )
         state.redistribution = redist
         state.save(update_fields=["redistribution"])
 
-        dev_hash = merge_util.content_hash(_redist_device_content(entry, route_map))
+        dev_hash = merge_util.content_hash(_redist_device_content(entry, route_map, device))
         obj_hash = merge_util.content_hash(_redist_object_content(redist))
+        from . import status_machine as sm
+
+        if sm.is_owned(state.status):
+            # metric-type is provenance-explicit: an omitted device leaf must not
+            # settle a deliberately owned explicit value equal to its NED default.
+            return obj_hash == dev_hash, False
         action = merge_util.three_way(
             created=created, base=state.device_base_hash, obj_hash=obj_hash, dev_hash=dev_hash
         )
         if action in ("seed", "mirror"):
             if action == "mirror":
-                _write_redist(redist, route_map, entry)
+                _write_redist(redist, route_map, entry, device)
             state.device_base_hash = dev_hash
             return True, False
         if action == "insync":
@@ -149,7 +173,7 @@ def _create_or_link_redistribution(state, device, entry: dict) -> tuple[bool, bo
         return False, True  # conflict
     except Exception as exc:
         logger.debug("_create_or_link_redistribution: error for state %s: %s", state.pk, exc)
-        return True, False
+        return None, False
 
 
 def reconcile_redistribution(device, payload: dict) -> list:
@@ -195,9 +219,10 @@ def reconcile_redistribution(device, payload: dict) -> list:
             source_ref=src_ref,
             defaults={"status": "unknown"},
         )
-        state.route_map = entry.get("route_map") or ""
-        state.metric = entry.get("metric")
-        state.metric_type = entry.get("metric_type") or ""
+        if not sm.is_owned(state.status):
+            state.route_map = entry.get("route_map") or ""
+            state.metric = entry.get("metric")
+            state.metric_type = _redist_metric_type(entry)
         state.device_present = True  # device reports it this pass (flips back if it had vanished)
         state.last_sync_at = now
         state.save()
@@ -205,6 +230,9 @@ def reconcile_redistribution(device, payload: dict) -> list:
         # changed (and survives); both moved → conflict. The helper mutates this same
         # state object (redistribution FK + device_base_hash); the final save persists.
         matches, conflict = _create_or_link_redistribution(state, device, entry)
+        if sm.is_owned(state.status):
+            if matches is None or not _redist_overlay_matches_device(state, entry):
+                matches = False
         state.status = sm.on_reconcile(state.status, matches=matches, conflict=conflict)
         state.save()
         seen_keys.add(key)

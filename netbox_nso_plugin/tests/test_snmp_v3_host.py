@@ -108,7 +108,7 @@ class TestSnmpV3HostPush(IntentPushResetMixin, _HostBase):
 
         Both spellings must be recognised, or the guard protects only the case that never occurs.
         """
-        for grain in ("3", "v3", "V3"):
+        for grain in ("3", "v3", "V3", "snmpv3"):
             row = NSOSnmpHostState(management=self.mgmt, address="10.0.0.8", version=grain, notify_type="trap")
             self.assertNotEqual(snmp_host_push_blocker(row), "", f"version {grain!r} slipped past the v3 guard")
             row.username = "netmon-v3"

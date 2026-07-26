@@ -10,6 +10,7 @@ from django.utils import timezone
 from netbox.plugins import PluginTemplateExtension
 
 from . import status_machine as sm
+from .snmp_versions import canonical_snmp_version
 
 logger = logging.getLogger(__name__)
 
@@ -634,6 +635,7 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
     _retire_absent_snmp_rows(NSOSnmpV3UserState, mgmt, "username", incoming_usernames)
 
     # ── Hosts ──────────────────────────────────────────────────────────────────
+    suppress_default_port = _device_ned_id(device).startswith(("timos", "arcos-", "cisco-ios-cli", "cisco-iosxe-cli"))
     incoming_addresses = set()
     for entry in payload.get("hosts") or []:
         address = entry.get("address") or ""
@@ -655,7 +657,12 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
         if sm.is_owned(state.status):
             # Owned: attributes are operator intent — settle only when the device
             # reports exactly the intent values, never overwrite them.
-            matches = all(getattr(state, f) == v for f, v in dev.items())
+            matches = all(
+                (suppress_default_port and f == "port" and v is None and getattr(state, f) in (None, 162))
+                or (f == "version" and canonical_snmp_version(getattr(state, f)) == canonical_snmp_version(v))
+                or getattr(state, f) == v
+                for f, v in dev.items()
+            )
             state.status = sm.on_reconcile(state.status, matches=matches)
         else:
             for f, v in dev.items():
@@ -731,6 +738,60 @@ def _reconcile_logging_levels(mgmt, levels_data: dict, now):
     return state
 
 
+_TIMOS_LOGGING_SEVERITY = {
+    "emergencies": "emergency",
+    "alerts": "alert",
+    "errors": "error",
+    "warnings": "warning",
+    "notifications": "notice",
+    "informational": "info",
+    "debugging": "debug",
+    "any": "debug",
+}
+
+_JUNOS_LOGGING_SEVERITY = {
+    "emergencies": "emergency",
+    "alerts": "alert",
+    "errors": "error",
+    "warnings": "warning",
+    "notifications": "notice",
+    "informational": "info",
+    "debugging": "any",
+}
+
+_ARCOS_LOGGING_SEVERITY = {
+    "emergencies": "EMERGENCY",
+    "alerts": "ALERT",
+    "errors": "ERROR",
+    "warnings": "WARNING",
+    "notifications": "NOTICE",
+    "informational": "INFORMATIONAL",
+    "debugging": "DEBUG",
+    "info": "INFORMATIONAL",
+    "any": "DEBUG",
+}
+
+
+def _canonical_logging_field(ned_id: str, field: str, value):
+    """Canonicalize operator logging tokens to the value the NED reader returns."""
+    if value in (None, ""):
+        return value
+    token = str(value).lower()
+    if field == "severity":
+        if ned_id.startswith("timos"):
+            return _TIMOS_LOGGING_SEVERITY.get(token, token)
+        if ned_id.startswith("juniper-junos-nc"):
+            return _JUNOS_LOGGING_SEVERITY.get(token, token)
+        if ned_id.startswith("arcos-"):
+            return _ARCOS_LOGGING_SEVERITY.get(token, token.upper())
+        return token
+    if field == "facility":
+        if ned_id.startswith("arcos-"):
+            return "ALL" if token == "any" else token.upper()
+        return token
+    return value
+
+
 def _reconcile_logging_config(device, payload: dict) -> dict:
     """Full-replace import of logging config into the NSOLogging* overlays.
 
@@ -762,6 +823,8 @@ def _reconcile_logging_config(device, payload: dict) -> dict:
         else:
             stale.delete()
 
+    ned_id = _device_ned_id(device)
+    suppress_default_port = ned_id.startswith(("timos", "arcos-"))
     for addr, h in payload_hosts.items():
         state, _ = NSOLoggingHostState.objects.get_or_create(
             management=mgmt, address=addr, defaults={"status": "unknown"}
@@ -778,7 +841,11 @@ def _reconcile_logging_config(device, payload: dict) -> dict:
         if sm.is_owned(state.status):
             # Owned: field values are operator intent — never clobber with the
             # device read; settle only when the device reports the intent exactly.
-            matches = all(getattr(state, f) == v for f, v in dev.items())
+            matches = all(
+                (suppress_default_port and f == "port" and v is None and getattr(state, f) in (None, 514))
+                or _canonical_logging_field(ned_id, f, getattr(state, f)) == v
+                for f, v in dev.items()
+            )
             state.status = sm.on_reconcile(state.status, matches=matches)
         else:
             for f, v in dev.items():
@@ -796,12 +863,14 @@ def _reconcile_logging_config(device, payload: dict) -> dict:
     }
 
 
-def _static_route_metric(entry: dict) -> int:
+def _static_route_metric(entry: dict, device=None) -> int:
     """Clamp the NSO metric to StaticRoute's 0..255 PositiveSmallInt constraint.
 
     Junos route metric/preference can exceed 255; an out-of-range value would fail
     full_clean() and drop the route, so fall back to the model default (1).
     """
+    if "metric" not in entry and device is not None and _device_uses_timos_ned(device):
+        return 5
     m = entry.get("metric")
     return m if isinstance(m, int) and 0 <= m <= 255 else 1
 
@@ -852,7 +921,7 @@ def _resolve_static_route(entry, StaticRoute, VRF, auto_create, vrf_auto_create,
             prefix=prefix,
             next_hop=next_hop,
             interface_next_hop=iface_nh,
-            metric=_static_route_metric(entry),
+            metric=_static_route_metric(entry, device),
             permanent=bool(entry.get("permanent", False)),
             tag=entry.get("tag"),
             name=entry.get("name") or "",
@@ -940,7 +1009,18 @@ def _reconcile_static_routes(device, payload: dict) -> list:
             with suppress_intent_push():
                 route.devices.add(device)
             on_device = True
-        state.status = sm.on_reconcile(state.status, matches=on_device, conflict=not on_device, settles_owned=False)
+        desired_metric = _static_route_metric(entry, device)
+        metric_matches = route.metric == desired_metric
+        # StaticRoute is shared across all associated devices.  A refresh from
+        # one platform must never rewrite its metric to that platform's default:
+        # another device may have a different effective default.  Keep the
+        # shared intent and surface the per-device mismatch through this state.
+        state.status = sm.on_reconcile(
+            state.status,
+            matches=on_device and metric_matches,
+            conflict=not on_device,
+            settles_owned=False,
+        )
         state.save()
 
     stale_qs = NSOStaticRouteState.objects.filter(management=mgmt).exclude(static_route_id__in=seen_route_ids)
@@ -1009,7 +1089,15 @@ def _reconcile_isis_settings(obj, settings: dict | None, *, write: bool = True) 
     return matches
 
 
-def _reconcile_child_levels(model, parent_field, parent, cols, levels, *, write: bool = True) -> bool:
+def _reconcile_child_levels(
+    model,
+    parent_field,
+    parent,
+    cols,
+    levels,
+    *,
+    write: bool = True,
+) -> bool:
     """Per-level child rows (ISISLevel/ISISInterfaceLevel) for *parent*.
 
     Clobber-safe: when ``write`` (seeding on first import) it mirrors the device
@@ -1031,6 +1119,13 @@ def _reconcile_child_levels(model, parent_field, parent, cols, levels, *, write:
         row = existing.get(lvl) or model(**{parent_field: parent, "level": lvl})
         changed = row.pk is None
         for col in cols:
+            if col not in data:
+                if row.pk is not None and getattr(row, col, None) is not None:
+                    matches = False
+                    if write:
+                        setattr(row, col, _model_absent_value(row, col))
+                        changed = True
+                continue
             val = data.get(col)
             if val is not None and getattr(row, col, None) != val:
                 setattr(row, col, val)
@@ -1127,7 +1222,42 @@ def _sr_instance_cols(model) -> tuple[str, ...]:
     return tuple(c for c in _SR_INSTANCE_COLS if c in names)
 
 
-def _reconcile_isis_segment_routing(inst, sr: dict | None, *, write: bool = True) -> bool:
+def _model_absent_value(obj, field_name):
+    """Return the concrete model's representation for an omitted device value."""
+    field = obj._meta.get_field(field_name)
+    if field.null:
+        return None
+    if field.has_default():
+        return field.get_default()
+    raise ValueError(f"{type(obj).__name__}.{field_name} cannot represent an omitted device value")
+
+
+def _sync_isis_segment_routing_values(row, cols, values, *, write: bool) -> bool:
+    """Compare/mirror one existing SR row, treating omitted values as absent."""
+    matches = True
+    fields = []
+    for col in cols:
+        val = values.get(col)
+        if val is None:
+            val = _model_absent_value(row, col)
+        if getattr(row, col, None) != val:
+            matches = False
+            if write:
+                setattr(row, col, val)
+                fields.append(col)
+    if fields:
+        row.save(update_fields=fields)
+    return matches
+
+
+def _reconcile_isis_segment_routing(
+    inst,
+    sr: dict | None,
+    *,
+    reported: bool | None = None,
+    configured: bool | None = None,
+    write: bool = True,
+) -> bool:
     """Upsert the netbox_routing ISISSegmentRouting (1:1) for *inst* from *sr*.
 
     Clobber-safe: mirrors the device only when ``write`` (seeding); otherwise touches
@@ -1138,36 +1268,38 @@ def _reconcile_isis_segment_routing(inst, sr: dict | None, *, write: bool = True
         return True
     try:
         from netbox_routing.models import ISISSegmentRouting
-    except Exception:
+    except (ImportError, AttributeError):
         return True
-    if sr is None:
-        # Key absent / null → the payload carries NO segment-routing information
-        # (e.g. an older adapter that hasn't wired the bag). Never clobber: a
-        # missing key is "unreported", not "delete this SR child". A device that
-        # genuinely has no SR is reported as an explicit empty ``{}`` below.
-        return True
-    if not sr:
-        # Explicit empty ``{}`` → device reports no SR config → remove any stale row.
+    if reported is True and configured is False:
         exists = ISISSegmentRouting.objects.filter(instance=inst).exists()
         if exists and write:
             ISISSegmentRouting.objects.filter(instance=inst).delete()
         return not exists
+    if sr is None and not (reported is True and configured is True):
+        # Legacy adapters did not report SR provenance. Preserve any child and do
+        # not let unknown payload shape block the rest of the process reconcile.
+        return True
+    if not sr:
+        # A configured presence container may have no modeled child values.
+        row = ISISSegmentRouting.objects.filter(instance=inst).first()
+        if row is None:
+            if write:
+                ISISSegmentRouting.objects.create(instance=inst)
+            return False
+        return _sync_isis_segment_routing_values(
+            row,
+            _sr_instance_cols(ISISSegmentRouting),
+            {},
+            write=write,
+        )
     cols = _sr_instance_cols(ISISSegmentRouting)
     row, created = ISISSegmentRouting.objects.get_or_create(instance=inst) if write else (None, False)
     if row is None:
         row = ISISSegmentRouting.objects.filter(instance=inst).first()
-    matches = not created and row is not None
-    fields = []
-    for col in cols:
-        val = sr.get(col)
-        if val is not None and (row is None or getattr(row, col, None) != val):
-            matches = False
-            if write and row is not None:
-                setattr(row, col, val)
-                fields.append(col)
-    if fields:
-        row.save(update_fields=fields)
-    return matches
+    if row is None:
+        return False
+    values_match = _sync_isis_segment_routing_values(row, cols, sr, write=write)
+    return not created and values_match
 
 
 def _reconcile_isis_flex_algos(inst, flex_algos, *, write: bool = True) -> bool:
@@ -1242,6 +1374,31 @@ _ISIS_SRV6_LOCATOR_COLS = (
 )
 
 
+def _isis_srv6_locator_value(data, col, omitted_defaults):
+    value = data.get(col)
+    return omitted_defaults.get(col) if value is None and col in omitted_defaults else value
+
+
+def _sync_isis_srv6_locator_row(row, data, omitted_defaults) -> tuple[bool, bool]:
+    """Return ``(changed, matches)`` while applying reported locator columns."""
+    changed = row.pk is None
+    matches = True
+    for col in _ISIS_SRV6_LOCATOR_COLS:
+        val = _isis_srv6_locator_value(data, col, omitted_defaults)
+        if val is None:
+            if row.pk is not None and getattr(row, col, None) not in (None, ""):
+                matches = False
+                setattr(row, col, _model_absent_value(row, col))
+                changed = True
+            continue
+        cur = getattr(row, col, None)
+        differs = (str(cur) != str(val)) if col == "prefix" else (cur != val)
+        if differs:
+            setattr(row, col, val)
+            changed = True
+    return changed, matches
+
+
 def _reconcile_isis_srv6_locators(inst, srv6_locators, *, write: bool = True) -> bool:
     """ISISSRv6Locator rows for *inst* from the adapter's srv6-locator list (keyed by name).
 
@@ -1265,23 +1422,15 @@ def _reconcile_isis_srv6_locators(inst, srv6_locators, *, write: bool = True) ->
         if name and loc.get("prefix"):  # prefix is required (IPNetworkField, NOT NULL)
             incoming[name] = loc
     existing = {row.name: row for row in ISISSRv6Locator.objects.filter(instance=inst)}
+    omitted_defaults = _isis_srv6_locator_omitted_defaults(inst.device)
     matches = True
     from .signals import suppress_intent_push
 
     with suppress_intent_push():
         for name, data in incoming.items():
             row = existing.get(name) or ISISSRv6Locator(instance=inst, name=name)
-            changed = row.pk is None
-            for col in _ISIS_SRV6_LOCATOR_COLS:
-                val = data.get(col)
-                if val is None:
-                    continue
-                cur = getattr(row, col, None)
-                # prefix reads back as an IPNetwork; compare stringified to avoid churn.
-                differs = (str(cur) != str(val)) if col == "prefix" else (cur != val)
-                if differs:
-                    setattr(row, col, val)
-                    changed = True
+            changed, row_matches = _sync_isis_srv6_locator_row(row, data, omitted_defaults)
+            matches = matches and row_matches
             if changed:
                 matches = False
                 if write:
@@ -1352,28 +1501,38 @@ def _isis_interface_routing_fields(state, entry, ri, bfd_enabled):
         rf.append(("frr_enabled", entry.get("frr_enabled")))
     if hasattr(ri, "frr_protection"):
         rf.append(("frr_protection", entry.get("frr_protection") or ""))
-    if hasattr(ri, "csnp_interval"):
+    if hasattr(ri, "csnp_interval") and "csnp_interval" in entry:
         rf.append(("csnp_interval", entry.get("csnp_interval")))
-    if hasattr(ri, "retransmit_interval"):
+    if hasattr(ri, "retransmit_interval") and "retransmit_interval" in entry:
         rf.append(("retransmit_interval", entry.get("retransmit_interval")))
-    if hasattr(ri, "lsp_interval"):
+    if hasattr(ri, "lsp_interval") and "lsp_interval" in entry:
         rf.append(("lsp_interval", entry.get("lsp_interval")))
     if hasattr(ri, "mesh_group"):
         rf.append(("mesh_group", entry.get("mesh_group") or ""))
     return rf
 
 
-def _isis_device_matches_intent(entry, state) -> bool:
+def _isis_device_matches_intent(entry, state, ri=None, device=None) -> bool:
     """Return True when the device (adapter *entry*) has caught up to the owned overlay intent.
 
     Used for owned IS-IS rows where the clobber guard keeps the overlay == netbox-routing
     object, so the normal overlay-vs-object match can't tell whether the *device* has the
     change yet. Mirrors the OSPF device-vs-netbox status semantics.
     """
+    circuit_matches = (entry.get("circuit_type") or "") == (state.circuit_type or "")
+    long_scalar_fields = ("csnp_interval", "retransmit_interval", "lsp_interval")
+    long_scalars_match = all(
+        entry.get(field) == getattr(ri, field)
+        if field in entry
+        else (getattr(ri, field) is None if device is not None and _device_uses_timos_ned(device) else True)
+        for field in long_scalar_fields
+        if ri is not None and hasattr(ri, field)
+    )
     return (
         entry.get("metric") == state.metric
         and (entry.get("network_type") or "") == (state.network_type or "")
-        and (entry.get("circuit_type") or "") == (state.circuit_type or "")
+        and circuit_matches
+        and long_scalars_match
         and bool(entry.get("passive", False)) == bool(state.passive)
         # tri-state: a None intent expresses no opinion, so it never blocks in_sync
         # (we don't own the device's BFD); True/False must match the device verbatim.
@@ -1383,6 +1542,86 @@ def _isis_device_matches_intent(entry, state) -> bool:
         and (state.frr_enabled is None or bool(entry.get("frr_enabled")) == bool(state.frr_enabled))
         and (not state.frr_protection or (entry.get("frr_protection") or "") == state.frr_protection)
     )
+
+
+def _device_uses_timos_ned(device) -> bool:
+    return _device_ned_id(device).startswith("timos")
+
+
+def _device_ned_id(device) -> str:
+    from .models import NSOPlatformNedMapping
+
+    if not device.platform_id:
+        return ""
+    mapping = NSOPlatformNedMapping.objects.filter(platform_id=device.platform_id).first()
+    return str(mapping.ned_id) if mapping else ""
+
+
+def _isis_instance_omitted_defaults(device) -> dict:
+    ned_id = _device_ned_id(device)
+    if ned_id.startswith("timos"):
+        return {
+            "ignore_attached_bit": False,
+            "suppress_attached_bit": False,
+        }
+    if ned_id.startswith("arcos-"):
+        return {
+            "overload_bit": False,
+            "ignore_attached_bit": False,
+            "suppress_attached_bit": False,
+        }
+    return {}
+
+
+def _isis_srv6_locator_omitted_defaults(device) -> dict:
+    if _device_ned_id(device).startswith("arcos-"):
+        return {
+            "is_micro_segment": False,
+        }
+    return {}
+
+
+def _isis_process_device_matches_intent(entry, state, device=None, inst=None) -> bool:
+    """Return whether device-reported process scalars match an owned overlay."""
+    for field in (
+        "net",
+        "is_type",
+        "metric_style",
+        "area_auth_type",
+        "domain_auth_type",
+        "fast_reroute",
+    ):
+        if (entry.get(field) or "") != getattr(state, field):
+            return False
+    for prefix in ("area", "domain"):
+        reported = bool(entry.get(f"{prefix}_auth_present", False))
+        intended = bool(getattr(state, f"{prefix}_auth_present") or getattr(state, f"{prefix}_auth_key"))
+        if reported != intended:
+            return False
+    for field in ("overload_bit", "microloop_avoidance"):
+        intended = getattr(state, field)
+        if intended is not None and bool(entry.get(field, False)) != intended:
+            return False
+    if inst is not None:
+        omitted_defaults = _isis_instance_omitted_defaults(device)
+        for field in _ISIS_INSTANCE_SCALAR_ATTRS:
+            if field in {"fast_reroute", "microloop_avoidance"}:
+                # These are already compared above. In particular, an omitted
+                # true-only microloop key confirms an owned False value.
+                continue
+            if not hasattr(inst, field):
+                continue
+            if field in entry:
+                reported = entry.get(field)
+                if reported is None:
+                    reported = _model_absent_value(inst, field)
+            elif field in omitted_defaults:
+                reported = omitted_defaults[field]
+            else:
+                reported = _model_absent_value(inst, field)
+            if getattr(inst, field) != reported:
+                return False
+    return True
 
 
 def _isis_interface_pass(state, entry, ri, bfd_enabled, *, write: bool) -> bool:
@@ -1397,17 +1636,30 @@ def _isis_interface_pass(state, entry, ri, bfd_enabled, *, write: bool) -> bool:
                 fields.append(attr)
     if fields:
         ri.save(update_fields=fields)
+    children_match = _isis_interface_children_match(entry, ri, write=write)
+    if write:
+        return True
+    return scalar_matches and children_match
+
+
+def _isis_interface_children_match(entry, ri, *, write: bool) -> bool:
+    """Compare/mirror settings, levels, and prefix-SIDs without top-level defaults."""
     settings_matches = _reconcile_isis_settings(ri, entry.get("settings"), write=write)
     try:
         from netbox_routing.models import ISISInterfaceLevel
-
-        levels_matches = _reconcile_child_levels(
-            ISISInterfaceLevel, "interface", ri, _ISIS_IFACE_LEVEL_COLS, entry.get("levels"), write=write
-        )
-    except Exception:
+    except (ImportError, AttributeError):
         levels_matches = True
+    else:
+        levels_matches = _reconcile_child_levels(
+            ISISInterfaceLevel,
+            "interface",
+            ri,
+            _ISIS_IFACE_LEVEL_COLS,
+            entry.get("levels"),
+            write=write,
+        )
     prefix_sid_matches = _reconcile_isis_prefix_sids(ri, entry.get("prefix_sids"), write=write)
-    return scalar_matches and settings_matches and levels_matches and prefix_sid_matches
+    return settings_matches and levels_matches and prefix_sid_matches
 
 
 def _isis_interface_object_hash(ri) -> str:
@@ -1480,9 +1732,12 @@ def _link_routing_isis_interface(device, iface, af, state, instances: dict, bfd_
     matches = _isis_interface_pass(state, entry, ri, bfd_enabled, write=False)
     if matches:
         return ri, True, _isis_interface_object_hash(ri)
+    if sm.is_owned(state.status):
+        return ri, False, base
     if (not base) or _isis_interface_object_hash(ri) == base:
-        _isis_interface_pass(state, entry, ri, bfd_enabled, write=True)
-        return ri, True, _isis_interface_object_hash(ri)
+        mirrored = _isis_interface_pass(state, entry, ri, bfd_enabled, write=True)
+        if mirrored:
+            return ri, True, _isis_interface_object_hash(ri)
     return ri, False, base
 
 
@@ -1584,7 +1839,12 @@ def _reconcile_isis_interfaces(device, interfaces: list) -> list:
             # device (which would also drop the row from the Apply preview). Instead,
             # gauge whether the DEVICE (entry) has caught up to the pushed intent —
             # mirrors the OSPF device-vs-netbox semantics.
-            iface_matches = _isis_device_matches_intent(entry, state)
+            iface_matches = _isis_device_matches_intent(
+                entry,
+                state,
+                state.isis_interface,
+                device,
+            ) and _isis_interface_children_match(entry, state.isis_interface, write=False)
         state.status = sm.on_reconcile(state.status, matches=iface_matches)
         state.save()
         seen_keys.add((iface.pk, af))
@@ -1632,6 +1892,37 @@ _ISIS_INSTANCE_SCALAR_ATTRS = (
 )
 
 
+def _sync_isis_instance_long_scalars(inst, entry, omitted_defaults, *, write: bool) -> tuple[bool, list[str]]:
+    matches = True
+    fields = []
+    for attr in _ISIS_INSTANCE_SCALAR_ATTRS:
+        if not hasattr(inst, attr):
+            continue
+        if attr not in entry:
+            if attr not in omitted_defaults:
+                # Several process fields are emitted only when the NED reports
+                # them. Their absence is unknown, not an instruction to erase a
+                # previously mirrored value.
+                continue
+            val = omitted_defaults[attr]
+        else:
+            val = entry.get(attr)
+        if val is None:
+            absent = _model_absent_value(inst, attr)
+            if getattr(inst, attr) != absent:
+                matches = False
+                if write:
+                    setattr(inst, attr, absent)
+                    fields.append(attr)
+            continue
+        if getattr(inst, attr) != val:
+            matches = False
+            if write:
+                setattr(inst, attr, val)
+                fields.append(attr)
+    return matches, fields
+
+
 def _isis_instance_pass(state, entry, inst, *, write: bool) -> bool:
     """Compare/mirror the whole device ISIS-instance graph onto *inst*.
 
@@ -1649,7 +1940,12 @@ def _isis_instance_pass(state, entry, inst, *, write: bool) -> bool:
         ("domain_auth_type", state.domain_auth_type),
         ("domain_auth_key", state.domain_auth_key),
     ):
-        if val and getattr(inst, attr) != val:
+        # is_type is provenance-explicit and corrected readers omit an unset
+        # schema default. On an unowned mirror, blank must therefore migrate an
+        # old reader's fabricated level-1-2 value out of the linked object.
+        # The remaining scalars keep their existing absence/no-op semantics.
+        should_compare = bool(val) or attr == "is_type"
+        if should_compare and getattr(inst, attr) != val:
             scalar_matches = False
             if write:
                 setattr(inst, attr, val)
@@ -1659,30 +1955,43 @@ def _isis_instance_pass(state, entry, inst, *, write: bool) -> bool:
         if write:
             inst.overload_bit = state.overload_bit
             inst_fields.append("overload_bit")
-    for attr in _ISIS_INSTANCE_SCALAR_ATTRS:
-        if not hasattr(inst, attr):
-            continue
-        val = entry.get(attr)
-        if val is not None and getattr(inst, attr) != val:
-            scalar_matches = False
-            if write:
-                setattr(inst, attr, val)
-                inst_fields.append(attr)
+    omitted_defaults = _isis_instance_omitted_defaults(inst.device)
+    long_matches, long_fields = _sync_isis_instance_long_scalars(
+        inst,
+        entry,
+        omitted_defaults,
+        write=write,
+    )
+    scalar_matches = scalar_matches and long_matches
+    inst_fields.extend(long_fields)
     if inst_fields:
         inst.save(update_fields=inst_fields)
 
     settings_matches = _reconcile_isis_settings(inst, entry.get("settings"), write=write)
     try:
         from netbox_routing.models import ISISLevel
-
-        levels_matches = _reconcile_child_levels(
-            ISISLevel, "instance", inst, _ISIS_LEVEL_COLS, entry.get("levels"), write=write
-        )
-    except Exception:
+    except (ImportError, AttributeError):
         levels_matches = True
-    sr_matches = _reconcile_isis_segment_routing(inst, entry.get("segment_routing"), write=write)
+    else:
+        levels_matches = _reconcile_child_levels(
+            ISISLevel,
+            "instance",
+            inst,
+            _ISIS_LEVEL_COLS,
+            entry.get("levels"),
+            write=write,
+        )
+    sr_matches = _reconcile_isis_segment_routing(
+        inst,
+        entry.get("segment_routing"),
+        reported=entry.get("segment_routing_reported"),
+        configured=entry.get("segment_routing_configured"),
+        write=write,
+    )
     flex_matches = _reconcile_isis_flex_algos(inst, entry.get("flex_algos"), write=write)
     srv6_matches = _reconcile_isis_srv6_locators(inst, entry.get("srv6_locators"), write=write)
+    if write:
+        return True
     return scalar_matches and settings_matches and levels_matches and sr_matches and flex_matches and srv6_matches
 
 
@@ -1780,10 +2089,13 @@ def _sync_routing_isis_instance(device, tag, state, entry, base):
     matches = _isis_instance_pass(state, entry, inst, write=False)
     if matches:
         return inst, True, _isis_instance_object_hash(inst)
+    if sm.is_owned(state.status):
+        return inst, False, base
     if (not base) or _isis_instance_object_hash(inst) == base:
         # first import (seed) OR device moved while the object was untouched (mirror)
-        _isis_instance_pass(state, entry, inst, write=True)
-        return inst, True, _isis_instance_object_hash(inst)
+        mirrored = _isis_instance_pass(state, entry, inst, write=True)
+        if mirrored:
+            return inst, True, _isis_instance_object_hash(inst)
     return inst, False, base  # operator edited → changed (edit preserved)
 
 
@@ -1825,19 +2137,23 @@ def _reconcile_isis_process(device, process_list: list) -> list:
             process_tag=tag,
             defaults={"status": "unknown"},
         )
-        state.net = entry.get("net") or ""
-        state.is_type = entry.get("is_type") or ""
-        state.metric_style = entry.get("metric_style") or ""
-        state.overload_bit = entry.get("overload_bit")
-        state.area_auth_type = entry.get("area_auth_type") or ""
-        state.area_auth_present = bool(entry.get("area_auth_present", False))
-        state.area_auth_key = entry.get("area_auth_key") or ""
-        state.domain_auth_type = entry.get("domain_auth_type") or ""
-        state.domain_auth_present = bool(entry.get("domain_auth_present", False))
-        state.domain_auth_key = entry.get("domain_auth_key") or ""
-        # FRR (#83): flavor '' when unreported; microloop tri-state verbatim.
-        state.fast_reroute = entry.get("fast_reroute") or ""
-        state.microloop_avoidance = entry.get("microloop_avoidance")
+        # Owned rows hold the intent pushed back to NSO. An omitted configured-only
+        # field (for example a default is-type) is device provenance, not permission
+        # to erase accepted intent from the overlay and the next push snapshot.
+        if not sm.is_owned(state.status):
+            state.net = entry.get("net") or ""
+            state.is_type = entry.get("is_type") or ""
+            state.metric_style = entry.get("metric_style") or ""
+            state.overload_bit = entry.get("overload_bit")
+            state.area_auth_type = entry.get("area_auth_type") or ""
+            state.area_auth_present = bool(entry.get("area_auth_present", False))
+            state.area_auth_key = entry.get("area_auth_key") or ""
+            state.domain_auth_type = entry.get("domain_auth_type") or ""
+            state.domain_auth_present = bool(entry.get("domain_auth_present", False))
+            state.domain_auth_key = entry.get("domain_auth_key") or ""
+            # FRR (#83): flavor '' when unreported; microloop tri-state verbatim.
+            state.fast_reroute = entry.get("fast_reroute") or ""
+            state.microloop_avoidance = entry.get("microloop_avoidance")
         state.last_sync_at = now
 
         # 3-way merge over the whole ISIS graph: device changes auto-mirror when the
@@ -1847,6 +2163,16 @@ def _reconcile_isis_process(device, process_list: list) -> list:
             device, tag, state, entry, state.device_base_hash
         )
         state.device_base_hash = new_base
+        if sm.is_owned(state.status):
+            # The object merge compares NetBox intent with its linked object. Owned
+            # status must additionally be gated by the device report; otherwise an
+            # omitted configured-only default falsely settles accepted intent in_sync.
+            inst_matches = inst_matches and _isis_process_device_matches_intent(
+                entry,
+                state,
+                device,
+                state.isis_instance,
+            )
         state.status = sm.on_reconcile(state.status, matches=inst_matches)
         state.save()
         seen_tags.add(tag)

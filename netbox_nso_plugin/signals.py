@@ -15,6 +15,7 @@ from django.db.models.signals import m2m_changed, post_delete, post_save, pre_de
 from django.dispatch import receiver
 from django.utils import timezone
 
+from .snmp_versions import canonical_snmp_version
 from .status_machine import OWNED_STATES as _OWNED_PUSH_STATUSES
 
 # Every intent-mirror push filters its overlay rows by _OWNED_PUSH_STATUSES (the canonical
@@ -36,6 +37,19 @@ _p2p_allocation_active = threading.local()
 # single authoritative guard for the reconcile path (render today, the background
 # reconcile job and the manual Refresh buttons next); see _skip_on_render.
 _intent_push_suppressed = threading.local()
+
+
+def _ned_id_for_device(device_id: int) -> str:
+    """Return the platform's exact mapped NED id, or an empty string."""
+    from .models import NSODeviceManagement, NSOPlatformNedMapping
+
+    platform_id = (
+        NSODeviceManagement.objects.filter(device_id=device_id).values_list("device__platform_id", flat=True).first()
+    )
+    if platform_id is None:
+        return ""
+    ned_id = NSOPlatformNedMapping.objects.filter(platform_id=platform_id).values_list("ned_id", flat=True).first()
+    return str(ned_id or "")
 
 
 def _is_intent_push_suppressed() -> bool:
@@ -944,7 +958,7 @@ def _host_is_v3(version) -> bool:
     stop it, and got pushed with an EMPTY community_or_user. IOS-XR cannot even form the key from
     that (the user is the third key component); IOS would write a host bound to no user at all.
     """
-    return str(version or "").strip().lower().lstrip("v") == "3"
+    return canonical_snmp_version(version) == "3"
 
 
 def snmp_host_push_blocker(row) -> str:
@@ -1036,6 +1050,7 @@ def _push_snmp_intent_for_device(device_id, adapter_device_id, force=False):
             }
         )
 
+    ned_id = _ned_id_for_device(device_id)
     hosts = []
     owned_hosts = list(
         NSOSnmpHostState.objects.filter(
@@ -1044,18 +1059,21 @@ def _push_snmp_intent_for_device(device_id, adapter_device_id, force=False):
         )
     )
     for row in _drop_unpushable_snmp_rows(NSOSnmpHostState, owned_hosts, snmp_host_push_blocker):
-        hosts.append(
-            {
-                "address": row.address,
-                "version": row.version,
-                "notify_type": row.notify_type,
-                # ONE NED field, two meanings — which is the whole reason v3 hosts were unpushable
-                # (CR-P16). On v1/v2c it is the community (referenced by its label); on v3 it is the
-                # security user name, which both host writers key the receiver on.
-                "community_or_user": (row.username if _host_is_v3(row.version) else row.community_hash) or "",
-                "port": row.port,
-            }
+        host = {
+            "address": row.address,
+            "version": row.version,
+            "notify_type": row.notify_type,
+            # ONE NED field, two meanings — which is the whole reason v3 hosts were unpushable
+            # (CR-P16). On v1/v2c it is the community (referenced by its label); on v3 it is the
+            # security user name, which both host writers key the receiver on.
+            "community_or_user": (row.username if _host_is_v3(row.version) else row.community_hash) or "",
+        }
+        suppress_default_port = row.port == 162 and ned_id.startswith(
+            ("timos", "arcos-", "cisco-ios-cli", "cisco-iosxe-cli")
         )
+        if row.port is not None and not suppress_default_port:
+            host["port"] = row.port
+        hosts.append(host)
 
     system_info = None
     try:
@@ -1111,23 +1129,26 @@ def _push_logging_intent_for_device(device_id, adapter_device_id, force=False):
     """
     from . import adapter_client as client
     from .models import NSOLoggingHostState, NSOLoggingLevelState
+    from .template_content import _canonical_logging_field
 
+    ned_id = _ned_id_for_device(device_id)
     hosts = []
     for row in NSOLoggingHostState.objects.filter(
         management__device_id=device_id,
         status__in=_OWNED_PUSH_STATUSES,
     ):
-        hosts.append(
-            {
-                "address": row.address,
-                "port": row.port,
-                "severity": row.severity or "",
-                "facility": row.facility or "",
-                "transport": row.transport or "",
-                "vrf": row.vrf or "",
-                "source": row.source or "",
-            }
-        )
+        host = {
+            "address": row.address,
+            "severity": _canonical_logging_field(ned_id, "severity", row.severity or ""),
+            "facility": _canonical_logging_field(ned_id, "facility", row.facility or ""),
+            "transport": row.transport or "",
+            "vrf": row.vrf or "",
+            "source": row.source or "",
+        }
+        suppress_default_port = row.port == 514 and ned_id.startswith(("timos", "arcos-"))
+        if row.port is not None and not suppress_default_port:
+            host["port"] = row.port
+        hosts.append(host)
 
     local_levels = None
     levels_row = NSOLoggingLevelState.objects.filter(management__device_id=device_id).first()
@@ -1689,6 +1710,7 @@ def _push_static_route_intent_for_device(device_id, adapter_device_id, force=Fal
     from . import adapter_client as client
     from .models import NSOStaticRouteState
 
+    ned_id = _ned_id_for_device(device_id)
     routes = []
     for row in NSOStaticRouteState.objects.filter(
         management__device_id=device_id,
@@ -1698,16 +1720,17 @@ def _push_static_route_intent_for_device(device_id, adapter_device_id, force=Fal
         if sr.next_hop is None:
             continue  # interface-only next-hop not supported by static-route-reconciler v1
         vrf_name = sr.vrf.name if sr.vrf else ""
-        routes.append(
-            {
-                "vrf": vrf_name,
-                "prefix": str(sr.prefix),
-                "next_hop": str(sr.next_hop),
-                "metric": sr.metric,
-                "permanent": sr.permanent or False,
-                "tag": sr.tag,
-            }
-        )
+        route = {
+            "vrf": vrf_name,
+            "prefix": str(sr.prefix),
+            "next_hop": str(sr.next_hop),
+            "permanent": sr.permanent or False,
+            "tag": sr.tag,
+        }
+        # Nokia preference 5 is value-default-suppressed by the export contract.
+        if sr.metric is not None and not (ned_id.startswith("timos") and sr.metric == 5):
+            route["metric"] = sr.metric
+        routes.append(route)
 
     _push_changed(
         (device_id, "static_route"),

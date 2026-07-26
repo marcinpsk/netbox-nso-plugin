@@ -4,7 +4,7 @@
 
 from unittest.mock import patch
 
-from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
+from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Platform, Site
 from django.test import TestCase
 
 from .mixins import IntentPushResetMixin
@@ -79,6 +79,25 @@ class TestPushStaticRouteIntentForDevice(IntentPushResetMixin, TestCase):
             assert routes[0]["prefix"] == "10.0.0.0/8"
             assert routes[0]["next_hop"] == "192.168.1.1"
             assert routes[0]["vrf"] == ""
+
+    def test_nokia_value_suppressed_default_metric_stays_absent_in_push_payload(self):
+        from netbox_nso_plugin.models import NSOPlatformNedMapping
+        from netbox_nso_plugin.signals import _push_static_route_intent_for_device
+
+        platform = Platform.objects.create(name="Static push Nokia", slug="static-push-nokia")
+        NSOPlatformNedMapping.objects.create(platform=platform, ned_id="timos-nc-23.10")
+        self.device.platform = platform
+        self.device.save(update_fields=["platform"])
+        mgmt = self._make_mgmt()
+        state = self._make_state(mgmt, status="accepted")
+        state.static_route.metric = 5
+        state.static_route.save(update_fields=["metric"])
+
+        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent") as put:
+            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+
+        route = put.call_args.args[1][0]
+        assert "metric" not in route
 
     def test_pushes_apply_failed_routes(self):
         """apply_failed rows stay in the push: intent is still owned (retry-eligible), and

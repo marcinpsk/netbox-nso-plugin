@@ -5,7 +5,7 @@
 import unittest
 from unittest.mock import patch
 
-from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
+from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Platform, Site
 from django.test import TestCase
 
 from ._adapter_http import make_session
@@ -119,6 +119,18 @@ class TestReconcileSnmpConfig(TestCase):
             adapter_device_id=9,
         )
 
+    def _set_ned(self, ned_id):
+        from netbox_nso_plugin.models import NSOPlatformNedMapping
+
+        platform = Platform.objects.create(
+            name=f"SNMP {ned_id}",
+            slug=f"snmp-{ned_id}".replace(".", "-"),
+            manufacturer=self.device.device_type.manufacturer,
+        )
+        NSOPlatformNedMapping.objects.create(platform=platform, ned_id=ned_id)
+        self.device.platform = platform
+        self.device.save(update_fields=["platform"])
+
     def test_empty_payload_returns_empty_lists(self):
         from netbox_nso_plugin.template_content import _reconcile_snmp_config
 
@@ -205,6 +217,185 @@ class TestReconcileSnmpConfig(TestCase):
 
         row = NSOSnmpCommunityState.objects.get(community_hash="abcd1234abcd1234")
         self.assertEqual(row.status, "accepted")
+
+    def test_omitted_default_trap_port_matches_owned_intent(self):
+        from netbox_nso_plugin.models import NSOSnmpHostState
+        from netbox_nso_plugin.template_content import _reconcile_snmp_config
+
+        self._set_ned("arcos-v8.1.2X-nc-1.0")
+        mgmt = self._create_mgmt()
+        row = NSOSnmpHostState.objects.create(
+            management=mgmt,
+            address="198.18.0.30",
+            version="v2c",
+            notify_type="trap",
+            port=162,
+            status="accepted",
+        )
+        _reconcile_snmp_config(
+            self.device,
+            {
+                "communities": [],
+                "v3_users": [],
+                "hosts": [
+                    {
+                        "address": row.address,
+                        "version": "v2c",
+                        "notify_type": "trap",
+                    }
+                ],
+            },
+        )
+
+        row.refresh_from_db()
+        self.assertEqual(row.port, 162)
+        self.assertEqual(row.status, "in_sync")
+
+    def test_package_canonical_2c_settles_owned_v2c_alias(self):
+        from netbox_nso_plugin.models import NSOSnmpHostState
+        from netbox_nso_plugin.template_content import _reconcile_snmp_config
+
+        self._set_ned("arcos-v8.1.2X-nc-1.0")
+        mgmt = self._create_mgmt()
+        row = NSOSnmpHostState.objects.create(
+            management=mgmt,
+            address="198.18.0.34",
+            version="v2c",
+            notify_type="trap",
+            status="accepted",
+        )
+
+        _reconcile_snmp_config(
+            self.device,
+            {
+                "communities": [],
+                "v3_users": [],
+                "hosts": [
+                    {
+                        "address": row.address,
+                        "version": "2c",
+                        "notify_type": "trap",
+                    }
+                ],
+            },
+        )
+
+        row.refresh_from_db()
+        self.assertEqual(row.version, "v2c")
+        self.assertEqual(row.status, "in_sync")
+
+    def test_package_canonical_3_settles_owned_legacy_snmpv3_alias(self):
+        from netbox_nso_plugin.models import NSOSnmpHostState
+        from netbox_nso_plugin.template_content import _reconcile_snmp_config
+
+        self._set_ned("timos-nc-23.10")
+        mgmt = self._create_mgmt()
+        row = NSOSnmpHostState.objects.create(
+            management=mgmt,
+            address="198.18.0.35",
+            version="snmpv3",
+            notify_type="trap",
+            username="netmon-v3",
+            status="accepted",
+        )
+
+        _reconcile_snmp_config(
+            self.device,
+            {
+                "communities": [],
+                "v3_users": [],
+                "hosts": [
+                    {
+                        "address": row.address,
+                        "version": "3",
+                        "notify_type": "trap",
+                        "username": "netmon-v3",
+                    }
+                ],
+            },
+        )
+
+        row.refresh_from_db()
+        self.assertEqual(row.version, "snmpv3")
+        self.assertEqual(row.status, "in_sync")
+
+    def test_value_suppressed_default_trap_port_stays_absent_in_push_payload(self):
+        from netbox_nso_plugin.models import NSOSnmpHostState
+        from netbox_nso_plugin.signals import _push_snmp_intent_for_device
+
+        self._set_ned("arcos-v8.1.2X-nc-1.0")
+        mgmt = self._create_mgmt()
+        NSOSnmpHostState.objects.create(
+            management=mgmt,
+            address="198.18.0.31",
+            version="v2c",
+            notify_type="trap",
+            port=162,
+            status="accepted",
+        )
+
+        with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as put:
+            _push_snmp_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+
+        host = put.call_args.args[3][0]
+        self.assertNotIn("port", host)
+
+    def test_iosxe_default_trap_port_uses_ios_omission_semantics(self):
+        from netbox_nso_plugin.models import NSOSnmpHostState
+        from netbox_nso_plugin.signals import _push_snmp_intent_for_device
+        from netbox_nso_plugin.template_content import _reconcile_snmp_config
+
+        self._set_ned("cisco-iosxe-cli-6.114")
+        mgmt = self._create_mgmt()
+        row = NSOSnmpHostState.objects.create(
+            management=mgmt,
+            address="198.18.0.33",
+            version="v2c",
+            notify_type="trap",
+            port=162,
+            status="accepted",
+        )
+
+        with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as put:
+            _push_snmp_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+        self.assertNotIn("port", put.call_args.args[3][0])
+
+        _reconcile_snmp_config(
+            self.device,
+            {
+                "communities": [],
+                "v3_users": [],
+                "hosts": [
+                    {
+                        "address": row.address,
+                        "version": "v2c",
+                        "notify_type": "trap",
+                    }
+                ],
+            },
+        )
+        row.refresh_from_db()
+        self.assertEqual(row.status, "in_sync")
+
+    def test_default_free_family_preserves_explicit_conventional_port(self):
+        from netbox_nso_plugin.models import NSOSnmpHostState
+        from netbox_nso_plugin.signals import _push_snmp_intent_for_device
+
+        self._set_ned("juniper-junos-nc-4.19")
+        mgmt = self._create_mgmt()
+        NSOSnmpHostState.objects.create(
+            management=mgmt,
+            address="198.18.0.32",
+            version="v2c",
+            notify_type="trap",
+            port=162,
+            status="accepted",
+        )
+
+        with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as put:
+            _push_snmp_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+
+        self.assertEqual(put.call_args.args[3][0]["port"], 162)
 
     def test_refresh_preserves_owned_rows_absent_from_payload(self):
         """Operator-owned rows absent from the payload must SURVIVE the refresh.
