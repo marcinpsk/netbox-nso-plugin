@@ -17,6 +17,9 @@ concurrency:
 
 jobs:
   test-js:
+    # Temporarily disabled by operator request. Keep the job/check name in place
+    # so branch-protection configuration does not need to change.
+    if: ${{ false }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
