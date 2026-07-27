@@ -44,10 +44,11 @@ Plugin settings live in `PLUGINS_CONFIG`:
 
 ```python
 import os
+
 PLUGINS_CONFIG = {
     "netbox_nso_plugin": {
         # URL: bootstrap default; AdapterConnection.url in the UI overrides.
-        "adapter_url":   os.environ.get("NSO_ADAPTER_URL", ""),
+        "adapter_url": os.environ.get("NSO_ADAPTER_URL", ""),
         # Token: env-only, by design (see "Hard guardrails" below). Required.
         "adapter_token": os.environ["NSO_ADAPTER_TOKEN"],
     }
