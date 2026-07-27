@@ -1,0 +1,6 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Per-row Accept form. Params: accept_url (reversed URL), status (row status), #}
+{# label (default "Accept"), title (default deferred-apply wording). The button #}
+{# shows only for not-yet-owned / drifted statuses (imported/changed/conflict/drifted). #}
+{% if status == "imported" or status == "changed" or status == "conflict" or status == "drifted" %}<form method="post" action="{{ accept_url }}" class="{{ form_class }}">{% csrf_token %}<button type="submit" class="btn btn-xs btn-outline-success" title="{{ title|default:'Make NetBox the source of truth for this (re-applied to the device on Apply)' }}"><span class="mdi mdi-check"></span>{% if not icon_only %} {{ label|default:"Accept" }}{% endif %}</button></form>{% endif %}

@@ -1,0 +1,23 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Shared chrome for one category grid: the state quick-filter pills, the message #}
+{# slot and the Tabulator mount point. The panel's own <script> then calls #}
+{# NSOGrid.mount() on this root with its column definitions (see nso-grid.js). #}
+{# #}
+{# Params: cls = extra root class the panel's script selects on (e.g. "nso-ospf-if"); #}
+{# json_url = the category's ?format=json endpoint (the post-action reload); #}
+{# counts = that section's {all, drift, pending}. #}
+{# The counts come from the SAME kind the pills filter on, so a chip can never #}
+{# promise rows its own filter would hide. #}
+<div class="nso-grid {{ cls }}" data-json-url="{{ json_url }}">
+  <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
+    <div class="btn-group btn-group-sm nso-grid-state" role="group" aria-label="State quick filter">
+      <button type="button" class="btn btn-outline-secondary active" data-state="all">All (<span class="nso-grid-n-all">{{ counts.all }}</span>)</button>
+      <button type="button" class="btn btn-outline-warning" data-state="drift">Drift (<span class="nso-grid-n-drift">{{ counts.drift }}</span>)</button>
+      <button type="button" class="btn btn-outline-info" data-state="pending">Pending apply (<span class="nso-grid-n-pending">{{ counts.pending }}</span>)</button>
+      <button type="button" class="btn btn-outline-success" data-state="in_sync">In sync</button>
+    </div>
+  </div>
+  <div class="nso-grid-msg"></div>
+  <div class="nso-grid-table"></div>
+</div>

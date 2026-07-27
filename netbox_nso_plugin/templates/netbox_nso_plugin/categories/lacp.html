@@ -1,0 +1,16 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{% include "netbox_nso_plugin/categories/_adapter_error.html" %}
+
+{% if grid_payload.rows %}
+  <p class="text-muted small mb-2">Edit bundle parameters or member mode/priority inline. Membership and LAG identity remain native interface changes; editing either level owns the complete bundle and member set.</p>
+  {{ grid_payload|json_script:"nso-lacp-data" }}
+  {% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='lacp' as cat_url %}
+  {% include "netbox_nso_plugin/categories/_grid.html" with cls="nso-lacp" json_url=cat_url|add:"?format=json" counts=grid_payload.counts %}
+
+  <script>
+  window.NSOGridLACP && window.NSOGridLACP.mount(document.querySelector('.nso-lacp'));
+  </script>
+{% else %}
+  <p class="text-muted mb-0">No LACP bundles reported for this device.</p>
+{% endif %}

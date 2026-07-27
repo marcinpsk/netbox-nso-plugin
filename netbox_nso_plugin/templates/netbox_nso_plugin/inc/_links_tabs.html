@@ -1,0 +1,23 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Area-navigation tabs for the NSO "Links" screens. 'nsolinkrole' is a prefix of #}
+{# 'nsolinkroleassignment', so the Link Roles tab explicitly excludes the assignment views. #}
+{# role="presentation" (not "tablist"): these are cross-page navigation links, not an in-page tab #}
+{# widget — matches NetBox's own object sub-page tabs (generic/object.html) and avoids stacking a #}
+{# second, fake tablist over the list view's native Results/Filters tablist. #}
+{% with un=request.resolver_match.url_name|default:'' %}
+<ul class="nav nav-tabs mb-3" role="presentation">
+  <li class="nav-item">
+    <a class="nav-link{% if 'nsolinkrole' in un and 'nsolinkroleassignment' not in un %} active{% endif %}"
+       href="{% url 'plugins:netbox_nso_plugin:nsolinkrole_list' %}">Link Roles</a>
+  </li>
+  <li class="nav-item">
+    <a class="nav-link{% if 'nsolinkroleassignment' in un %} active{% endif %}"
+       href="{% url 'plugins:netbox_nso_plugin:nsolinkroleassignment_list' %}">Link Assignments</a>
+  </li>
+  <li class="nav-item">
+    <a class="nav-link{% if 'nsointerfacestate' in un %} active{% endif %}"
+       href="{% url 'plugins:netbox_nso_plugin:nsointerfacestate_list' %}">Interface Drift</a>
+  </li>
+</ul>
+{% endwith %}

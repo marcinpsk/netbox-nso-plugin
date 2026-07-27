@@ -1,0 +1,264 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
+"""Phase 1: SNMP overlay accept + edit + deferred intent push (operator write path)."""
+
+from unittest.mock import patch
+
+from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
+from django.contrib.auth import get_user_model
+from django.test import TestCase
+
+from .mixins import IntentPushResetMixin
+
+
+def _superuser():
+    User = get_user_model()
+    return User.objects.create_superuser(username="snmp-admin", password="pw", email="snmp@test.x")  # noqa: S106
+
+
+class _SnmpBase(IntentPushResetMixin, TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        mfg = Manufacturer.objects.create(name="SnmpAccMfg", slug="snmpaccmfg")
+        dt = DeviceType.objects.create(manufacturer=mfg, model="SnmpAccDev", slug="snmpaccdev")
+        role = DeviceRole.objects.create(name="SnmpAccRole", slug="snmpaccrole")
+        site = Site.objects.create(name="SnmpAccSite", slug="snmpaccsite")
+        cls.device = Device.objects.create(name="snmp-acc-rtr", device_type=dt, role=role, site=site)
+
+    def _make_mgmt(self, adapter_device_id=42):
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+        inst, _ = NSOInstance.objects.get_or_create(
+            name="snmp-acc-inst", defaults={"adapter_instance_id": "snmp-acc-inst"}
+        )
+        return NSODeviceManagement.objects.get_or_create(
+            device=self.device,
+            defaults={
+                "nso_instance": inst,
+                "nso_device_name": "nso-snmp-acc",
+                "adapter_device_id": adapter_device_id,
+                "manage_snmp": True,
+            },
+        )[0]
+
+    def _community(self, mgmt, status="imported", vault_ref=""):
+        from netbox_nso_plugin.models import NSOSnmpCommunityState
+
+        return NSOSnmpCommunityState.objects.create(
+            management=mgmt, community_hash="abcd1234abcd1234", access="RO", status=status, vault_ref=vault_ref
+        )
+
+
+class TestSnmpAcceptView(_SnmpBase):
+    def test_accept_differing_marks_accepted(self):
+        """Accepting a differing (conflict) row creates intent → 'accepted' (pending apply)."""
+        mgmt = self._make_mgmt()
+        c = self._community(mgmt, status="conflict")
+        self.client.force_login(_superuser())
+        with patch("netbox_nso_plugin.adapter_client.put_snmp_intent"):
+            resp = self.client.post(f"/plugins/nso/snmp/community-state/{c.pk}/accept/")
+        assert resp.status_code == 302
+        c.refresh_from_db()
+        assert c.status == "accepted"
+        assert c.accepted_at is not None
+
+    def test_accept_matching_marks_in_sync_owned(self):
+        """Accepting an imported (already-matching) row just marks it owned → in_sync."""
+        mgmt = self._make_mgmt()
+        c = self._community(mgmt, status="imported")
+        self.client.force_login(_superuser())
+        with patch("netbox_nso_plugin.adapter_client.put_snmp_intent"):
+            resp = self.client.post(f"/plugins/nso/snmp/community-state/{c.pk}/accept/")
+        assert resp.status_code == 302
+        c.refresh_from_db()
+        assert c.status == "in_sync"
+        assert c.accepted_at is not None
+
+    def test_accept_with_vault_ref_pushes_intent(self):
+        """Accepting a community that has a Vault ref stores it in the SNMP intent
+        mirror (deferred); the device Apply later commits it."""
+        from netbox_nso_plugin.models import NSOSnmpCommunityState
+        from netbox_nso_plugin.signals import _on_snmp_state_save, reset_intent_push_state
+
+        mgmt = self._make_mgmt()
+        c = self._community(mgmt, status="accepted", vault_ref="secret/snmp#community")
+        # Creating the row already fired the real signal (coalesced on the rolled-back
+        # test txn); clear that stale coalescing state before the assertion run.
+        reset_intent_push_state()
+        with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
+            with self.captureOnCommitCallbacks(execute=True):
+                _on_snmp_state_save(sender=NSOSnmpCommunityState, instance=c)
+            mock_put.assert_called_once()
+            # communities arg carries the vault_ref-bearing row
+            communities = mock_put.call_args[0][1]
+            assert communities and communities[0]["vault_ref"] == "secret/snmp#community"
+
+
+class TestSnmpEditView(_SnmpBase):
+    def test_edit_updates_vault_ref(self):
+        mgmt = self._make_mgmt()
+        c = self._community(mgmt, status="imported")
+        self.client.force_login(_superuser())
+        with patch("netbox_nso_plugin.adapter_client.put_snmp_intent"):
+            resp = self.client.post(
+                f"/plugins/nso/snmp/community-state/{c.pk}/edit/",
+                data={"access": "RW", "acl": "MGMT", "vault_ref": "secret/snmp#c1"},
+            )
+        assert resp.status_code in (200, 302)
+        c.refresh_from_db()
+        assert c.vault_ref == "secret/snmp#c1"
+        assert c.access == "RW"
+
+
+class TestSnmpApplyPreview(_SnmpBase):
+    def test_accepted_snmp_counts_as_pending(self):
+        mgmt = self._make_mgmt()
+        self._community(mgmt, status="accepted")
+        self.client.force_login(_superuser())
+        resp = self.client.get(f"/plugins/nso/devices/{self.device.pk}/apply-preview/")
+        assert resp.status_code == 200
+        assert resp.json()["routing"] >= 1
+
+
+class TestSnmpUnpushableRowsAreRefusedNotDowngraded(_SnmpBase):
+    """A FULL-REPLACE snapshot has no way to say "leave this one alone": a row the push
+    skips is a shrink the adapter detaches, and a row pushed with missing fields REWRITES
+    the device with those fields absent. So a row that cannot be faithfully pushed must be
+    refused at accept and surfaced — never accepted-then-silently-dropped, and never
+    pushed in a degraded form.
+    """
+
+    def _v3_user(self, mgmt, **kwargs):
+        from netbox_nso_plugin.models import NSOSnmpV3UserState
+
+        fields = {
+            "management": mgmt,
+            "username": "nms-ro",
+            "has_auth_secret": True,
+            "has_priv_secret": True,
+            "vault_ref": "network/netbox/snmp/v3/nms",
+            "status": "imported",
+        }
+        fields.update(kwargs)
+        return NSOSnmpV3UserState.objects.create(**fields)
+
+    def _host(self, mgmt, **kwargs):
+        from netbox_nso_plugin.models import NSOSnmpHostState
+
+        fields = {
+            "management": mgmt,
+            "address": "198.18.9.9",
+            "version": "v3",
+            "notify_type": "trap",
+            "status": "imported",
+        }
+        fields.update(kwargs)
+        return NSOSnmpHostState.objects.create(**fields)
+
+    def test_accepting_a_v3_user_without_its_protocols_is_refused(self):
+        """The read mirror reports only THAT the device holds auth/priv secrets, never which
+        protocols — so an imported v3 user always arrives with auth_protocol=''. Accepting it
+        as-is pushed auth_protocol=null and the apply rewrote an authPriv user as
+        noAuthNoPriv: a silent security downgrade of the live device."""
+        from netbox_nso_plugin.signals import reset_intent_push_state
+
+        mgmt = self._make_mgmt()
+        user = self._v3_user(mgmt)
+        self.client.force_login(_superuser())
+        reset_intent_push_state()
+
+        # Drain on_commit, or "no push happened" would be true no matter what the view did.
+        with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
+            with self.captureOnCommitCallbacks(execute=True):
+                resp = self.client.post(f"/plugins/nso/snmp/v3-user-state/{user.pk}/accept/")
+
+        assert resp.status_code == 302
+        user.refresh_from_db()
+        assert user.status == "imported", f"the accept must be refused, not recorded (status={user.status})"
+        mock_put.assert_not_called()
+
+    def test_accepting_a_v3_user_with_its_protocols_declared_pushes_them(self):
+        from netbox_nso_plugin.signals import reset_intent_push_state
+
+        mgmt = self._make_mgmt()
+        user = self._v3_user(mgmt, auth_protocol="sha", priv_protocol="aes-128")
+        self.client.force_login(_superuser())
+        # Creating the row already fired the real signal (coalesced on the rolled-back test
+        # txn); clear that stale coalescing state, then drain this accept's on_commit push.
+        reset_intent_push_state()
+
+        with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
+            with self.captureOnCommitCallbacks(execute=True):
+                resp = self.client.post(f"/plugins/nso/snmp/v3-user-state/{user.pk}/accept/")
+
+        assert resp.status_code == 302
+        user.refresh_from_db()
+        # Accepting a row that already MATCHES the device lands in_sync — still an owned
+        # status, so it is pushed to record ownership (_status_after_accept).
+        assert user.status == "in_sync"
+        mock_put.assert_called_once()
+        pushed = mock_put.call_args[0][2]  # (adapter_device_id, communities, v3_users, ...)
+        assert pushed == [
+            {
+                "username": "nms-ro",
+                "group": None,
+                "auth_protocol": "sha",
+                "priv_protocol": "aes-128",
+                "auth_vault_ref": "network/netbox/snmp/v3/nms#auth",
+                "priv_vault_ref": "network/netbox/snmp/v3/nms#priv",
+            }
+        ]
+
+    def test_an_already_owned_v3_user_missing_protocols_is_never_pushed_degraded(self):
+        """Defence in depth for rows owned before the accept-time guard existed (or via the
+        API): the snapshot builder must drop them AND surface them, not emit a null protocol."""
+        from netbox_nso_plugin.signals import _push_snmp_intent_for_device
+
+        mgmt = self._make_mgmt()
+        user = self._v3_user(mgmt, status="accepted")  # owned, protocols never declared
+
+        with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
+            _push_snmp_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+
+        mock_put.assert_called_once()
+        assert mock_put.call_args[0][2] == [], "a protocol-less v3 user must not reach the device"
+        user.refresh_from_db()
+        assert user.status == "error", f"the dropped row must be surfaced, not left green (status={user.status})"
+
+    def test_accepting_a_v3_trap_host_is_refused(self):
+        """The host overlay has no v3 username source, so a v3 host can only ever be pushed
+        keyed on an empty user. It used to accept, then be dropped with a server-side log
+        line — leaving a row that read 'accepted' forever while nothing was applied."""
+        from netbox_nso_plugin.signals import reset_intent_push_state
+
+        mgmt = self._make_mgmt()
+        host = self._host(mgmt)
+        self.client.force_login(_superuser())
+        reset_intent_push_state()
+
+        with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
+            with self.captureOnCommitCallbacks(execute=True):
+                resp = self.client.post(f"/plugins/nso/snmp/host-state/{host.pk}/accept/")
+
+        assert resp.status_code == 302
+        host.refresh_from_db()
+        assert host.status == "imported", f"the accept must be refused (status={host.status})"
+        mock_put.assert_not_called()
+
+    def test_a_v2c_trap_host_still_accepts_and_pushes(self):
+        from netbox_nso_plugin.signals import reset_intent_push_state
+
+        mgmt = self._make_mgmt()
+        host = self._host(mgmt, version="v2c", community_hash="abcd1234abcd1234")
+        self.client.force_login(_superuser())
+        reset_intent_push_state()  # drop the coalescing state left by the row creation
+
+        with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
+            with self.captureOnCommitCallbacks(execute=True):
+                resp = self.client.post(f"/plugins/nso/snmp/host-state/{host.pk}/accept/")
+
+        assert resp.status_code == 302
+        host.refresh_from_db()
+        assert host.status == "in_sync"  # accepted-as-matching is still owned
+        mock_put.assert_called_once()
+        assert [h["address"] for h in mock_put.call_args[0][3]] == ["198.18.9.9"]

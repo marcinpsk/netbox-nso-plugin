@@ -1,0 +1,122 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{% extends 'base/layout.html' %}
+
+{% block title %}Route-Policy Capabilities — {{ object }}{% endblock %}
+
+{% block content %}
+<div class="row">
+  <div class="col col-md-10 offset-md-1">
+    <div class="card">
+      <h5 class="card-header d-flex justify-content-between align-items-center">
+        <span><span class="mdi mdi-shield-check-outline me-1"></span>Route-Policy Capabilities — {{ object }}</span>
+        <form method="post" class="mb-0">
+          {% csrf_token %}
+          <button type="submit" class="btn btn-sm btn-outline-primary" title="Probe NSO now and refresh this device's verdict">
+            <span class="mdi mdi-refresh me-1"></span>Check now
+          </button>
+        </form>
+      </h5>
+      <div class="card-body">
+        {% if known %}
+          {% if coverage_unknown %}
+          <div class="alert alert-info" role="alert">
+            <span class="mdi mdi-information-outline me-1"></span>
+            Route-policy capability is <strong>not yet assessed</strong> for this platform
+            (<code>{{ ned_id }}</code>). The matrix doesn't claim support either way — attaching is allowed,
+            but won't be capability-checked until probing is implemented for this NED.
+          </div>
+          {% endif %}
+          <p class="text-muted">
+            What this device can apply for route-maps and communities, by
+            <code>{{ ned_id }}</code> / software <code>{{ sw_version }}</code>. Devices with the same NED + software
+            share this verdict.
+            {% if flagged %}
+              <span class="text-warning"><strong>{{ flagged }}</strong> of {{ total }} construct{{ total|pluralize }} won't fully apply.</span>
+            {% elif total %}
+              <span class="text-success">All {{ total }} probed construct{{ total|pluralize }} apply.</span>
+            {% endif %}
+          </p>
+
+          {% if read_rows %}
+            <h6 class="text-uppercase text-muted mt-3">Read support</h6>
+            <p class="text-muted mb-1">
+              Which config scopes the adapter can read from this platform into the NetBox mirror —
+              fed by the live read probe.
+              <strong>{{ read_readable }}</strong> of {{ read_rows|length }} probed scope{{ read_rows|length|pluralize }} confirmed readable.
+            </p>
+            <table class="table table-sm table-hover">
+              <thead>
+                <tr><th>Scope</th><th>Verdict</th><th>Detail</th></tr>
+              </thead>
+              <tbody>
+                {% for el in read_rows %}
+                  <tr>
+                    <td><code>{{ el.scope }}</code></td>
+                    <td>
+                      {% if el.status == "native" %}
+                        <span class="badge text-bg-success">readable</span>
+                      {% elif el.status == "unknown" %}
+                        <span class="badge text-bg-info" title="The surface read empty — no config on the probed device, or no reader for this NED; no verdict either way">unconfirmed</span>
+                      {% elif el.status == "skipped" %}
+                        <span class="badge text-bg-warning text-dark">n/a on platform</span>
+                      {% else %}
+                        <span class="badge text-bg-danger">{{ el.status }}</span>
+                      {% endif %}
+                    </td>
+                    <td><small class="text-muted">{{ el.detail|default:"—" }}</small></td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          {% endif %}
+
+          {% for scope, elements in scopes.items %}
+            {% if elements %}
+              <h6 class="text-uppercase text-muted mt-3">{{ scope }}</h6>
+              <table class="table table-sm table-hover">
+                <thead>
+                  <tr><th>Element</th><th>Verdict</th><th>Source</th><th>Detail</th></tr>
+                </thead>
+                <tbody>
+                  {% for el in elements %}
+                    <tr>
+                      <td><code>{{ el.name }}</code></td>
+                      <td>
+                        {% if el.status == "native" %}
+                          <span class="badge text-bg-success">native</span>
+                        {% elif el.status == "translated" %}
+                          <span class="badge text-bg-info">translated</span>
+                        {% elif el.status == "skipped" %}
+                          <span class="badge text-bg-warning text-dark">skipped</span>
+                        {% else %}
+                          <span class="badge text-bg-danger">{{ el.status }}</span>
+                        {% endif %}
+                      </td>
+                      <td>
+                        {% if el.source == "apply" %}
+                          <span class="badge text-bg-danger" title="Learned from a real device rejection at commit">apply</span>
+                        {% else %}
+                          <span class="badge text-bg-info" title="From the NSO capability probe (what the NED can model)">probe</span>
+                        {% endif %}
+                      </td>
+                      <td><small class="text-muted">{{ el.detail|default:"—" }}</small></td>
+                    </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            {% endif %}
+          {% endfor %}
+        {% else %}
+          <p class="text-warning mb-0">
+            <span class="mdi mdi-help-circle-outline me-1"></span>
+            This device's capabilities aren't known yet — it has never been probed, or the adapter is unreachable.
+            Use <strong>Check now</strong> to probe it.
+          </p>
+        {% endif %}
+        <a href="{% url 'dcim:device_nso' pk=object.pk %}" class="btn btn-outline-secondary mt-3">Back to NSO tab</a>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

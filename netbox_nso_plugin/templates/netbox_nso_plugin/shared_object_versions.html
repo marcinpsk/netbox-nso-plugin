@@ -1,0 +1,154 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Per-device versions of one globally-deduped named object + pick-which-to-own. #}
+{% extends 'base/layout.html' %}
+
+{% block title %}Versions — {{ family }} {{ object_name }}{% endblock %}
+
+{% block content %}
+<div class="row">
+  <div class="col col-md-10 offset-md-1">
+    <div class="card">
+      <h5 class="card-header d-flex justify-content-between align-items-center">
+        <span><span class="mdi mdi-source-branch me-1"></span>
+        Device versions of {{ family }} <code>{{ object_name }}</code></span>
+        {% if mode == "local" %}
+          <span class="badge text-bg-info" title="Per-device — each device keeps its own version; not deduped into one shared object">Per-device (LOCAL)</span>
+        {% else %}
+          <span class="badge text-bg-primary" title="Shared — deduped into one NetBox object; cross-device divergence is drift">Shared (MASTER)</span>
+        {% endif %}
+      </h5>
+      <div class="card-body">
+        {% if mode == "local" %}
+        <div class="alert alert-info d-flex justify-content-between align-items-center" role="alert">
+          <div>
+            <span class="mdi mdi-information-outline me-1"></span>
+            This object is <strong>per-device</strong> — each device keeps its own version below and
+            cross-device differences are not treated as drift (it is not mirrored into netbox-routing).
+          </div>
+          <form method="post" action="{% url classify_url_name pk=state.pk %}" class="mb-0">
+            {% csrf_token %}<input type="hidden" name="mode" value="master">
+            <button type="submit" class="btn btn-sm btn-outline-primary text-nowrap">Promote to shared (MASTER)</button>
+          </form>
+        </div>
+        {% elif suggest_local %}
+        <div class="alert alert-warning d-flex justify-content-between align-items-center" role="alert">
+          <div>
+            <span class="mdi mdi-alert-outline me-1"></span>
+            These devices hold <strong>different versions</strong> of this shared object. If that is
+            per-device by design (e.g. a VRRP or per-region list), mark it per-device to stop flagging
+            the difference as drift.
+          </div>
+          <form method="post" action="{% url classify_url_name pk=state.pk %}" class="mb-0">
+            {% csrf_token %}<input type="hidden" name="mode" value="local">
+            <button type="submit" class="btn btn-sm btn-warning text-dark text-nowrap">Mark per-device (LOCAL)</button>
+          </form>
+        </div>
+        {% endif %}
+        <p class="text-muted">
+          {% if mode == "local" %}
+          Per-device versions — netbox-routing mirrors none of them; each is shown from its device's
+          own on-box content.
+          {% else %}
+          This object is shared by name across devices, but each device has its own
+          on-box content. NetBox mirrors <strong>one</strong> device's version (shown
+          as the <span class="badge text-bg-info">NetBox source</span> below). Pick a
+          different device's version to make NetBox mirror it instead — that writes into
+          NetBox only; pushing it to other devices is a separate Accept.
+          {% endif %}
+        </p>
+        <table class="table table-sm table-hover">
+          <thead>
+            <tr><th>Device</th><th>Status</th><th>Entries</th><th>NetBox mirrors</th><th></th></tr>
+          </thead>
+          <tbody>
+            {% for it in items %}
+            <tr{% if it.is_owner %} class="table-info"{% endif %}>
+              <td>
+                {% if it.device %}<a href="{% url 'dcim:device_nso' pk=it.device.pk %}">{{ it.device }}</a>{% else %}—{% endif %}
+              </td>
+              <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=it.row.status %}</td>
+              <td>
+                {% if it.has_capture %}
+                  {% if it.route_map %}
+                  <button class="btn btn-sm btn-link p-0 text-decoration-none" type="button"
+                          data-bs-toggle="collapse" data-bs-target="#rpv{{ it.row.pk }}"
+                          aria-expanded="false" aria-controls="rpv{{ it.row.pk }}"
+                          title="Show this device's structured route-map">
+                    {{ it.entry_count }} <span class="mdi mdi-chevron-down"></span>
+                  </button>
+                  {% else %}{{ it.entry_count }}{% endif %}
+                {% else %}<span class="text-muted" title="No captured content yet — populated on the next sync from this device">—</span>{% endif %}
+              </td>
+              <td>
+                {% if it.is_owner %}
+                  <span class="badge text-bg-info" title="NetBox currently mirrors this device's version">NetBox source</span>
+                {% elif not it.comparable %}
+                  <span class="text-muted" title="Not yet compared — needs a fresh sync from this device (and the source)">—</span>
+                {% elif it.matches_owner %}
+                  <span class="badge text-bg-success" title="Same content as the NetBox source version">matches</span>
+                {% else %}
+                  <span class="badge text-bg-warning text-dark" title="Differs from the NetBox source version">diverges</span>
+                {% endif %}
+              </td>
+              <td>
+                {% if mode != "local" and not it.is_owner %}
+                <div class="d-flex gap-1">
+                  {% if it.comparable %}
+                  <a href="{% url 'plugins:netbox_nso_plugin:routing_route_policy_diff' pk=it.row.pk %}"
+                     hx-get="{% url 'plugins:netbox_nso_plugin:routing_route_policy_diff' pk=it.row.pk %}"
+                     hx-target="#nso-diff-modal-content"
+                     hx-swap="innerHTML"
+                     data-bs-toggle="modal"
+                     data-bs-target="#nso-diff-modal"
+                     class="btn btn-xs btn-outline-info text-nowrap"
+                     title="Compare this device's version against the NetBox source (master)">
+                    <span class="mdi mdi-file-compare"></span> Diff
+                  </a>
+                  {% endif %}
+                  <form method="post" action="{% url materialize_url_name pk=it.row.pk %}">
+                    {% csrf_token %}
+                    <button type="submit" class="btn btn-xs btn-outline-primary text-nowrap"
+                            title="Make NetBox mirror this device's version of {{ object_name }}">
+                      <span class="mdi mdi-content-copy"></span> Use this version
+                    </button>
+                  </form>
+                </div>
+                {% endif %}
+              </td>
+            </tr>
+            {% if it.route_map %}
+            <tr class="nso-rp-detail">
+              <td colspan="5" class="p-0 border-0">
+                <div class="collapse" id="rpv{{ it.row.pk }}">
+                  <div class="p-3 bg-body-tertiary border-start border-4 border-info">
+                    {% include "netbox_nso_plugin/categories/_route_map_version_detail.html" with rm=it.route_map %}
+                  </div>
+                </div>
+              </td>
+            </tr>
+            {% endif %}
+            {% endfor %}
+          </tbody>
+        </table>
+        {% if device %}
+        <a href="{% url 'dcim:device_nso' pk=device.pk %}" class="btn btn-sm btn-outline-secondary">
+          <span class="mdi mdi-arrow-left"></span> Back to {{ device }}
+        </a>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+
+<style>
+  .nso-diff-modal-dialog {
+    max-width: min(96vw, 1400px);
+  }
+</style>
+<div class="modal fade" id="nso-diff-modal" tabindex="-1" aria-label="Route policy diff" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered modal-dialog-scrollable nso-diff-modal-dialog">
+    <div class="modal-content" id="nso-diff-modal-content"></div>
+  </div>
+</div>
+{% endblock %}

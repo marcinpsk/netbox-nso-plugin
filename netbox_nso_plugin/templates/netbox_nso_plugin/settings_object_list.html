@@ -1,0 +1,10 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# A standard object list for the NSO "Settings" area, with the area-navigation tab bar #}
+{# rendered above the list's own Results/Filters controls. #}
+{% extends 'generic/object_list.html' %}
+
+{% block tabs %}
+  {% include 'netbox_nso_plugin/inc/_settings_tabs.html' %}
+  {{ block.super }}
+{% endblock %}

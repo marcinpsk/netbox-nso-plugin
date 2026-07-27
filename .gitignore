@@ -1,0 +1,76 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+*.so
+
+# Virtual environments
+.venv/
+venv/
+.env
+
+# Testing / coverage
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Ruff / linting
+.ruff_cache/
+.mypy_cache/
+
+# Node (JS test harness)
+node_modules/
+
+# uv
+uv.lock
+
+# IDE
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+._*
+
+# Django
+*.log
+db.sqlite3
+
+# Dev Container
+.devcontainer/.env
+.devcontainer/config/plugin-config.py
+.devcontainer/config/extra-configuration.py
+.devcontainer/config/extra-plugins.py
+
+# Proxy CA certificates (keep local)
+ca-bundle.crt
+*.pem
+.github/hooks/
+site/
+
+# direnv
+.envrc
+
+# Brainstorming / design specs (local only, not for version control)
+docs/superpowers/
+
+# Internal working docs (milestone plans/designs) — kept local, never tracked.
+docs/
+
+# Local agent workspace
+.claude/
+.playwright-mcp/
+milestone-status.db

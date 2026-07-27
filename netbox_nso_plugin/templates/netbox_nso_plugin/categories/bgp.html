@@ -1,0 +1,30 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Lazy fragment: BGP category — peers + peer-group templates, two grids over ONE payload. #}
+{% include "netbox_nso_plugin/categories/_adapter_error.html" %}
+<p class="text-muted small mb-2">Edit a peer's remote AS or admin state inline. Local ASN, VRF, address, source, peer-group membership, and address-family policy remain relationship changes in the full NetBox routing UI. Peer-group templates are mirrored for review but currently have no device apply path.</p>
+<div class="d-flex justify-content-end align-items-center gap-2 mb-2">
+  <a href="{% url 'plugins:netbox_nso_plugin:bgp_peer_add' device_pk=object.pk %}" class="btn btn-sm btn-primary" title="Create a new BGP neighbor on this device — written on Apply">
+    <i class="mdi mdi-plus-thick"></i> Add BGP peer…
+  </a>
+  {% if grid_payload.peers.rows %}{% url 'plugins:netbox_nso_plugin:routing_bulk_accept_bgp_peers' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned %}{% endif %}
+</div>
+
+{{ grid_payload|json_script:"nso-bgp-data" }}
+{% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='bgp' as cat_url %}
+
+{% if grid_payload.peers.rows %}
+  {% include "netbox_nso_plugin/categories/_grid.html" with cls="nso-bgp-peers" json_url=cat_url|add:"?format=json" counts=grid_payload.peers.counts %}
+{% else %}
+  <p class="text-muted mb-0">No BGP peers.</p>
+{% endif %}
+
+{% if grid_payload.templates.rows %}
+  <h6 class="mt-3 mb-2">Peer-group templates</h6>
+  {% include "netbox_nso_plugin/categories/_grid.html" with cls="nso-bgp-tmpl" json_url=cat_url|add:"?format=json" counts=grid_payload.templates.counts %}
+{% endif %}
+
+<script>
+window.NSOGridBgp && window.NSOGridBgp.mount(document.querySelector('.nso-bgp-peers'), 'peers');
+window.NSOGridBgp && window.NSOGridBgp.mount(document.querySelector('.nso-bgp-tmpl'), 'templates');
+</script>

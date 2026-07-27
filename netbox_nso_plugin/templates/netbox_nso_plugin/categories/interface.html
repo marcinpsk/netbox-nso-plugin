@@ -1,0 +1,69 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Lazy fragment: consolidated per-interface grid. One row per interface, a column #}
+{# per attribute; every column sorts, header filters + the state quick-pills filter #}
+{# client-side, and the description / enabled cells edit in place (NetBox takes #}
+{# ownership, same as Accept). Rows ship embedded via json_script; post-action #}
+{# reloads re-fetch ?format=json. Cell badges/Accept reuse each overlay's own status #}
+{# + endpoint. The grid machinery lives in nso-grid.js (shared by all panels) and the #}
+{# column definitions in nso-grid-interface.js (a static file so they are testable); #}
+{# both are loaded by the tab page, this fragment only mounts. #}
+{% include "netbox_nso_plugin/categories/_adapter_error.html" %}
+
+{{ grid_payload|json_script:"nso-ifg-data" }}
+<div class="nso-grid nso-ifg"
+     data-json-url="{% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='interface' %}?format=json"
+     data-mtu-edit-url="{% url 'plugins:netbox_nso_plugin:overlay_field_edit' key='interface_mtu' pk=0 %}">
+  <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
+    <div class="btn-group btn-group-sm nso-grid-state" role="group" aria-label="State quick filter">
+      <button type="button" class="btn btn-outline-secondary active" data-state="all">All (<span class="nso-grid-n-all">{{ counts.all }}</span>)</button>
+      <button type="button" class="btn btn-outline-warning" data-state="drift">Drift (<span class="nso-grid-n-drift">{{ counts.drift }}</span>)</button>
+      <button type="button" class="btn btn-outline-info" data-state="pending">Pending apply (<span class="nso-grid-n-pending">{{ counts.pending }}</span>)</button>
+      <button type="button" class="btn btn-outline-success" data-state="in_sync">In sync</button>
+    </div>
+    <span class="text-muted small ms-1">Show:</span>
+    <div class="btn-group btn-group-sm nso-grid-cols" role="group" aria-label="Columns">
+      <button type="button" class="btn btn-outline-secondary active" data-col="enabled">Enabled</button>
+      <button type="button" class="btn btn-outline-secondary active" data-col="description">Description</button>
+      <button type="button" class="btn btn-outline-secondary active" data-col="mtu">MTU</button>
+      <button type="button" class="btn btn-outline-secondary active" data-col="network">IP / Switchport</button>
+    </div>
+    <span class="text-muted small ms-auto">Click a Description or Enabled cell to edit — NetBox then owns that value (same as Accept).</span>
+  </div>
+  <div class="nso-grid-msg"></div>
+  <div class="nso-grid-table"></div>
+  <div class="nso-if-diff-modal d-none"
+       role="dialog" aria-modal="true" aria-labelledby="nso-if-diff-title"
+       style="position:fixed; inset:0; z-index:1090; background:rgba(0,0,0,.5); align-items:flex-start; justify-content:center;">
+    <div class="card shadow" style="max-width:1400px; width:96%; margin-top:3rem; max-height:86vh; display:flex; flex-direction:column;">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <span id="nso-if-diff-title" class="nso-if-diff-title fw-semibold"></span>
+        <button type="button" class="btn-close nso-if-diff-close" aria-label="Close"></button>
+      </div>
+      <div class="card-body" style="overflow:auto;">
+        <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
+          <span class="text-muted small me-auto">
+            <strong>Left: device now.</strong> <strong>Right: NetBox now.</strong>
+            Red lines are removed or changed; green lines are added or changed. Unchanged tagged VLANs are omitted.
+          </span>
+          <div class="btn-group btn-group-sm" role="group" aria-label="Diff layout">
+            <button type="button" class="btn btn-outline-secondary active" data-nso-diff-mode="side-by-side">
+              <span class="mdi mdi-view-split-vertical me-1"></span>Split
+            </button>
+            <button type="button" class="btn btn-outline-secondary" data-nso-diff-mode="line-by-line">
+              <span class="mdi mdi-format-list-text me-1"></span>Unified
+            </button>
+          </div>
+        </div>
+        <div class="nso-if-diff-body"></div>
+      </div>
+      <div class="card-footer d-flex justify-content-end">
+        <button type="button" class="btn btn-outline-secondary nso-if-diff-close">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  window.NSOGridInterface && window.NSOGridInterface.mount(document.querySelector('.nso-ifg'));
+</script>

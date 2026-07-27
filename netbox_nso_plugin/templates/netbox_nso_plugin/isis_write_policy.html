@@ -1,0 +1,28 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# NSO write-path coverage for an IS-IS object (#78) — which mirrored fields the #}
+{# intent push carries. Rendered on the netbox-routing IS-IS instance/interface  #}
+{# pages when the device is NSO-managed, i.e. exactly where the edit happens.    #}
+<div class="card mb-3">
+  <h5 class="card-header">
+    <span class="mdi mdi-pencil-off-outline me-1"></span> NSO write-path coverage
+  </h5>
+  <div class="card-body">
+    <p class="mb-2">
+      NSO mirrors this object from the device, but the write path carries only some
+      of its fields. The fields below are <strong>read-only mirrors — edits to them
+      are not pushed</strong> to the device (an Accept re-asserts the snapshot
+      without them):
+    </p>
+    <p class="mb-2">
+      {% for f in read_only_fields %}<code class="me-1">{{ f }}</code>{% endfor %}
+    </p>
+    {% for note in child_notes %}
+      <p class="small text-muted mb-1">{{ note }}</p>
+    {% endfor %}
+    <p class="small text-muted mb-0">
+      Writable (pushed on Accept/Apply):
+      {% for f in writable_fields %}<code class="me-1">{{ f }}</code>{% endfor %}
+    </p>
+  </div>
+</div>

@@ -1,0 +1,56 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Lazy-loaded fragment: VLAN database (M34) — paginated from last-synced state. #}
+<div class="nso-cat-pager"
+     data-url="{% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='vlan' %}"
+     data-q="{{ q }}" data-page="{{ page.number }}">
+  <div class="nso-cat-results">
+    {% include "netbox_nso_plugin/categories/_adapter_error.html" %}
+    <div class="mb-2">
+      <a href="{% url 'plugins:netbox_nso_plugin:vlan_attach' device_pk=object.pk %}" class="btn btn-sm btn-primary" title="Attach an existing (shared) VLAN to this device — written on Apply">
+        <i class="mdi mdi-plus-thick"></i> Add VLAN…
+      </a>
+    </div>
+    <div class="nso-cat-msg"></div>
+    {% include "netbox_nso_plugin/categories/_cat_search.html" with placeholder=placeholder q=q %}
+    {% if vlan_states %}
+    <p class="text-muted small mb-2">Rename a VLAN inline; shared VLANs are coordinated across every attached managed device. Change VID or group with Re-scope or from the native VLAN page.</p>
+    <div class="table-responsive mb-3">
+      <table class="table table-sm table-hover mb-0">
+        <thead><tr><th>VLAN</th><th>Name</th><th>Status</th><th>Last Synced</th><th></th></tr></thead>
+        <tbody>
+          {% for s in vlan_states %}
+          <tr data-status="{{ s.status }}" data-owned="{{ s.accepted_at|yesno:'true,false' }}">
+            <td class="text-nowrap">
+              <a href="{{ s.vlan.get_absolute_url }}">VID {{ s.vlan.vid }}</a>
+              {% if s.vlan.group %}<div class="text-muted small" title="VLAN group">{{ s.vlan.group }}</div>{% endif %}
+            </td>
+            <td>
+              {% url 'plugins:netbox_nso_plugin:overlay_field_edit' key='vlan_name' pk=s.pk as vlan_edit_url %}
+              <a href="#" class="nso-popedit" title="Rename in NetBox and take ownership on every attached managed device"
+                 data-pe-url="{{ vlan_edit_url }}" data-pe-title="VLAN {{ s.vlan.vid }} name"
+                 data-pe-fields="name:text:Name"
+                 data-pe-v-name="{{ s.vlan.name }}">{{ s.vlan.name|default:"—" }}</a>
+              {% if s.device_name and s.device_name != s.vlan.name %}
+                <div class="text-warning small text-nowrap" title="Name currently reported by this device">device: {{ s.device_name }}</div>
+              {% endif %}
+            </td>
+            <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=s.status residue=s.residue_survivor residue_job=s.residue_job_id %}</td>
+            <td class="text-nowrap">{% if s.last_sync_at %}{{ s.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
+            <td class="text-nowrap">
+              <div class="d-flex gap-1 align-items-center">
+                {% url 'plugins:netbox_nso_plugin:vlan_accept' pk=s.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=s.status form_class="nso-row-form" title="Make NetBox the source of truth for this VLAN (vid + name written to the device on Apply)" %}
+                <a href="{% url 'plugins:netbox_nso_plugin:vlan_rescope' pk=s.pk %}" class="btn btn-xs btn-outline-secondary" title="Move this VLAN to another group while keeping it synced" aria-label="Re-scope VLAN"><span class="mdi mdi-folder-move-outline"></span></a>
+              </div>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% include "netbox_nso_plugin/categories/_cat_pager.html" with page=page %}
+    {% else %}
+    <p class="text-muted mb-0">No VLAN database{% if q %} matching “{{ q }}”{% else %} reported for this device{% endif %}.</p>
+    {% endif %}
+  </div>
+</div>

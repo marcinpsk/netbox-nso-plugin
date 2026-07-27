@@ -1,0 +1,36 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Device-vs-NetBox delta for one route-policy overlay row (any family). #}
+{% extends 'base/layout.html' %}
+
+{% block title %}Drift delta — {{ object_name }}{% endblock %}
+
+{% block content %}
+<div class="row">
+  <div class="col col-md-10 offset-md-1">
+    <div class="card">
+      <h5 class="card-header">
+        <span class="mdi mdi-not-equal-variant me-1"></span>
+        Drift delta — {{ family }} <code>{{ object_name }}</code>
+        {% if device %}on <a href="{% url 'dcim:device_nso' pk=device.pk %}">{{ device }}</a>{% endif %}
+      </h5>
+      <div class="card-body">
+        {% include "netbox_nso_plugin/inc/route_policy_diff_content.html" %}
+
+        {% if device %}
+        <div class="mt-3">
+          <a href="{% url 'dcim:device_nso' pk=device.pk %}" class="btn btn-sm btn-outline-secondary">
+            <span class="mdi mdi-arrow-left"></span> Back to {{ device }}
+          </a>
+          {% if state.assigned_object %}
+          <a href="{% url 'plugins:netbox_nso_plugin:routing_route_policy_versions' pk=state.pk %}" class="btn btn-sm btn-outline-info">
+            <span class="mdi mdi-source-branch"></span> Versions
+          </a>
+          {% endif %}
+        </div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

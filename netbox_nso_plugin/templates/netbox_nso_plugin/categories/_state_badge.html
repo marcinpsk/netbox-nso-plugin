@@ -1,0 +1,16 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{% comment %}
+State badge from a raw status. Expects `status`. Owned (NetBox is the source of
+truth) is derived from owned statuses and shown as a shield.
+changed/conflict = not-owned drift; drifted/accepted = owned -> pending apply.
+{% endcomment %}
+{% if status == "changed" or status == "conflict" %}<span class="badge text-bg-warning text-dark" title="The device's on-box content differs from what NetBox holds, and NetBox does not own this object — review the diff and Accept to take ownership, or update NetBox to match.">drift</span>
+{% elif status == "drifted" or status == "accepted" %}<span class="badge text-bg-info" title="NetBox owns this object (Accepted) but it has not yet been applied to / confirmed on the device. Run Apply to push NetBox's version to the device.">pending apply</span>
+{% elif status == "apply_failed" %}<span class="badge text-bg-danger" title="The last apply to the device failed — NetBox still owns the intent. See the apply error and retry.">apply failed</span>
+{% elif status == "deploying" %}<span class="badge text-bg-primary" title="An apply is in progress — NetBox is pushing its version to the device.">deploying</span>
+{% elif status == "in_sync" or status == "imported" %}{% if compact %}{% if status == "in_sync" %}<span class="mdi mdi-check-circle text-success" title="In sync — NetBox owns this and the device's last apply matched; device and NetBox agree."></span>{% endif %}{% else %}<span class="badge text-bg-success" title="{% if status == 'in_sync' %}NetBox owns this and the device matches — applied and confirmed; device and NetBox agree.{% else %}Mirrored from the device at import — NetBox does not own it (no apply runs); shown in sync because the device is its source.{% endif %}">in sync</span>{% endif %}
+{% elif status == "error" %}<span class="badge text-bg-danger">error</span>
+{% else %}<span class="badge text-bg-info">{{ status }}</span>{% endif %}
+{% if status == "in_sync" or status == "accepted" or status == "drifted" or status == "deploying" or status == "apply_failed" %}<span class="mdi mdi-shield-check text-success ms-1" title="NetBox is the source of truth (owned)"></span>{% endif %}
+{% if residue %}<span class="badge text-bg-warning text-dark ms-1" title="A retraction (adapter job #{{ residue_job }}) reported success but this key survived on the device — it re-imported here as an unowned mirror, not new device config. Clean up on-device via a gated commit, or Accept to adopt it as intent.">removal residue</span>{% endif %}

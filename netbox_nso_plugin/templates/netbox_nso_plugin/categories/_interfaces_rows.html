@@ -1,0 +1,117 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Swappable interfaces results: state chips + per-attribute table + pagination. #}
+<div class="nso-if-results">
+  <div class="btn-group btn-group-sm mb-2" role="group" aria-label="State filter">
+    <button type="button" class="btn btn-outline-secondary nso-if-state{% if state == 'all' %} active{% endif %}" data-state="all">All ({{ counts.all }})</button>
+    <button type="button" class="btn btn-outline-warning nso-if-state{% if state == 'drift' %} active{% endif %}" data-state="drift">Drift ({{ counts.drift }})</button>
+    <button type="button" class="btn btn-outline-info nso-if-state{% if state == 'pending' %} active{% endif %}" data-state="pending">Pending apply ({{ counts.pending }})</button>
+    <button type="button" class="btn btn-outline-success nso-if-state{% if state == 'in_sync' %} active{% endif %}" data-state="in_sync">In sync</button>
+  </div>
+
+  {% if rows %}
+    <div class="table-responsive">
+      <table class="table table-hover table-sm mb-2">
+        <thead>
+          <tr><th>Interface</th><th>Attribute</th><th>NetBox</th><th>Device (NSO)</th><th>State</th><th></th></tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+            <tr{% if row.kind == 'drift' %} class="table-warning"{% endif %}>
+              <td><a href="{{ row.iface_url }}" title="Open interface in NetBox">{{ row.iface_name }}</a></td>
+              <td><code>{{ row.attribute }}</code></td>
+              <td class="nso-nb-cell" data-state-pk="{{ row.state.pk }}" data-attr="{{ row.attribute }}"
+                  {% if row.attribute == 'enabled' %}data-enabled="{{ row.iface_enabled|yesno:'true,false' }}"{% endif %}>
+                <span class="nso-nb-value">{{ row.netbox_value }}</span>
+                {% if row.attribute == 'description' %}
+                  <button type="button" class="btn btn-sm btn-link p-0 ms-1 nso-edit-desc"
+                          title="Edit description — NetBox will own this value (same as Accept)">
+                    <span class="mdi mdi-pencil"></span>
+                  </button>
+                {% elif row.attribute == 'enabled' %}
+                  <button type="button" class="btn btn-sm btn-link p-0 ms-1 nso-toggle-enabled"
+                          title="Flip enabled — NetBox will own this value (same as Accept)">
+                    <span class="mdi mdi-swap-horizontal"></span>
+                  </button>
+                {% endif %}
+              </td>
+              <td>{{ row.device_value }}</td>
+              <td>
+                {% if row.kind == 'drift' %}<span class="badge text-bg-warning text-dark">{{ row.label }}</span>
+                {% elif row.kind == 'pending' %}<span class="badge text-bg-info">{{ row.label }}</span>
+                {% elif row.kind == 'apply_failed' %}<span class="badge text-bg-danger" title="The last Apply to the device failed — retry">{{ row.label }}</span>
+                {% elif row.kind == 'in_sync' %}<span class="badge text-bg-success">{{ row.label }}</span>
+                {% elif row.kind == 'deploying' %}<span class="badge text-bg-primary">{{ row.label }}</span>
+                {% else %}<span class="badge text-bg-info">{{ row.label }}</span>{% endif %}
+                {% if row.owned %}<span class="mdi mdi-shield-check text-success ms-1" title="NetBox is the source of truth (owned)"></span>{% endif %}
+              </td>
+              <td class="text-nowrap">
+                {% if row.kind == 'drift' %}
+                  <form method="post" class="nso-row-form" action="{% url 'plugins:netbox_nso_plugin:nsointerfacestate_accept_device' row.state.pk %}" style="display:inline">
+                    {% csrf_token %}
+                    <button type="submit" class="btn btn-sm btn-outline-success" title="Adopt the device value into NetBox (becomes in sync)">
+                      <span class="mdi mdi-download"></span> Accept device
+                    </button>
+                  </form>
+                  <form method="post" class="nso-row-form" action="{% url 'plugins:netbox_nso_plugin:nsointerfacestate_accept' row.state.pk %}" style="display:inline">
+                    {% csrf_token %}
+                    <button type="submit" class="btn btn-sm btn-outline-warning" title="Make NetBox the source of truth — its value is pushed to the device on Apply">
+                      <span class="mdi mdi-content-save-check"></span> Keep NetBox
+                    </button>
+                  </form>
+                {% elif row.kind == 'pending' or row.kind == 'apply_failed' %}
+                  <button type="button" class="btn btn-sm {% if row.kind == 'apply_failed' %}btn-outline-danger{% else %}btn-outline-primary{% endif %} nso-apply-btn" data-device="{{ object.pk }}"
+                          title="{% if row.kind == 'apply_failed' %}Retry: push NetBox's value to the device (last attempt failed){% else %}Push pending intent to the device{% endif %}">
+                    <span class="mdi mdi-upload-network"></span> {% if row.kind == 'apply_failed' %}Retry apply{% else %}Apply{% endif %}
+                  </button>
+                {% elif not row.owned %}
+                  <form method="post" class="nso-row-form" action="{% url 'plugins:netbox_nso_plugin:nsointerfacestate_accept' row.state.pk %}" style="display:inline">
+                    {% csrf_token %}
+                    <button type="submit" class="btn btn-sm btn-outline-success" title="Make NetBox the source of truth for this value">
+                      <span class="mdi mdi-check"></span> Accept
+                    </button>
+                  </form>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="d-flex justify-content-between align-items-center">
+      <small class="text-muted">
+        {{ page.paginator.count }} row{{ page.paginator.count|pluralize }} · page {{ page.number }} of {{ page.paginator.num_pages }}
+      </small>
+      <nav>
+        <ul class="pagination pagination-sm mb-0">
+          {% if page.has_previous %}
+            <li class="page-item"><a href="#" class="page-link nso-if-page" data-page="{{ page.previous_page_number }}">‹ Prev</a></li>
+          {% else %}
+            <li class="page-item disabled"><span class="page-link">‹ Prev</span></li>
+          {% endif %}
+          {% if page.has_next %}
+            <li class="page-item"><a href="#" class="page-link nso-if-page" data-page="{{ page.next_page_number }}">Next ›</a></li>
+          {% else %}
+            <li class="page-item disabled"><span class="page-link">Next ›</span></li>
+          {% endif %}
+        </ul>
+      </nav>
+    </div>
+  {% else %}
+    {% if no_attrs_in_scope and not q and state == 'all' %}
+    <div class="alert alert-warning mb-0">
+      <span class="mdi mdi-alert-outline me-1"></span>
+      Interface management is enabled, but no interface attributes are selected — so there is
+      nothing to sync. Edit this device's <strong>NSO management</strong> and enable
+      <strong>description</strong> and/or <strong>enabled</strong>, then Sync Now.
+    </div>
+    {% else %}
+    <p class="text-muted mb-0">
+      {% if state == 'drift' %}No drift — the device matches NetBox.
+      {% elif state == 'pending' %}Nothing pending apply.
+      {% elif q %}No interfaces matching “{{ q }}”.
+      {% else %}No interface state yet — click <strong>Sync Now</strong> or wait for the next sync.{% endif %}
+    </p>
+    {% endif %}
+  {% endif %}
+</div>

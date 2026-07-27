@@ -1,0 +1,34 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Lazy fragment: Route Policy — a client-side grid. Used to paginate + search #}
+{# server-side (137 rows on the big devices); every row now ships at once and #}
+{# sorts/filters in the browser. Rows keep their Diff / Versions actions. #}
+{% include "netbox_nso_plugin/categories/_adapter_error.html" %}
+
+<div class="d-flex justify-content-between align-items-center mb-2">
+  <div>
+    <a href="{% url 'plugins:netbox_nso_plugin:route_policy_attach' device_pk=object.pk %}" class="btn btn-sm btn-primary" title="Attach an existing route-policy object to this device — written on Apply">
+      <i class="mdi mdi-plus-thick"></i> Add Route-Policy…
+    </a>
+    <a href="{% url 'plugins:netbox_nso_plugin:route_policy_capabilities' device_pk=object.pk %}" class="btn btn-sm btn-outline-primary" title="What this device can apply for route-maps and communities (by NED + software)">
+      <i class="mdi mdi-shield-check-outline"></i> Capabilities
+    </a>
+    <a href="{% url 'plugins:netbox_nso_plugin:routing_classify_bulk_route_policy' device_pk=object.pk %}" class="btn btn-sm btn-outline-warning" title="Bulk-mark per-device the shared objects that legitimately differ between devices (VRRP / per-region lists)">
+      <i class="mdi mdi-call-split"></i> Resolve divergent…
+    </a>
+  </div>
+  {% url 'plugins:netbox_nso_plugin:routing_bulk_accept_route_policy' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned %}
+</div>
+
+{% if grid_payload.rows %}
+  <p class="text-muted small mb-2">Open a policy name to edit its entries in NetBox. Route-map names can be renamed here; dependent route-policy, BGP, and redistribution intent is updated together.</p>
+  {{ grid_payload|json_script:"nso-rp-data" }}
+  {% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='route_policy' as cat_url %}
+  {% include "netbox_nso_plugin/categories/_grid.html" with cls="nso-rp" json_url=cat_url|add:"?format=json" counts=grid_payload.counts %}
+
+  <script>
+  window.NSOGridRoutePolicy && window.NSOGridRoutePolicy.mount(document.querySelector('.nso-rp'));
+  </script>
+{% else %}
+  <p class="text-muted mb-0">No route policy.</p>
+{% endif %}

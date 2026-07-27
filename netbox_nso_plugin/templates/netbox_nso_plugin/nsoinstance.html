@@ -1,0 +1,47 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{% extends 'generic/object.html' %}
+{% load helpers %}
+
+{% block tabs %}
+  {% include 'netbox_nso_plugin/inc/_settings_tabs.html' %}
+  {{ block.super }}
+{% endblock %}
+
+{% block breadcrumbs %}
+  <li class="breadcrumb-item"><a href="{% url 'plugins:netbox_nso_plugin:nsoinstance_list' %}">NSO Instances</a></li>
+  <li class="breadcrumb-item">{{ object }}</li>
+{% endblock %}
+
+{% block content %}
+  <div class="row">
+    <div class="col-12 col-md-6">
+      <div class="card">
+        <h5 class="card-header">NSO Instance</h5>
+        <div class="card-body">
+          <table class="table table-hover attr-table">
+            <tr>
+              <th scope="row">Name</th>
+              <td>{{ object.name }}</td>
+            </tr>
+            <tr>
+              <th scope="row">Adapter Instance ID</th>
+              <td><code>{{ object.adapter_instance_id }}</code></td>
+            </tr>
+            <tr>
+              <th scope="row">Default</th>
+              <td>
+                {% if object.is_default %}<span class="badge text-bg-success">Yes</span>
+                {% else %}<span class="text-muted">No</span>{% endif %}
+              </td>
+            </tr>
+            <tr>
+              <th scope="row">Managed Devices</th>
+              <td>{{ object.managed_devices.count }}</td>
+            </tr>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+{% endblock content %}

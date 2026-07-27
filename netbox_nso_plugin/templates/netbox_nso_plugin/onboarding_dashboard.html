@@ -1,0 +1,222 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{% extends 'base/layout.html' %}
+{% load helpers %}
+
+{% block title %}NSO Devices{% endblock %}
+
+{% block content %}
+<div class="row mb-2">
+  <div class="col d-flex align-items-center gap-2">
+    <span class="text-muted">Instance:</span> <strong>{{ data.instance }}</strong>
+    {% if instances|length > 1 %}
+      <span class="ms-2">
+        {% for inst in instances %}
+          <a href="?instance={{ inst.adapter_instance_id }}" class="badge {% if inst.adapter_instance_id == selected %}text-bg-primary{% else %}text-bg-light border{% endif %}">{{ inst.name }}</a>
+        {% endfor %}
+      </span>
+    {% endif %}
+    <a href="{% url 'plugins:netbox_nso_plugin:nsoplatformnedmapping_list' %}" class="btn btn-sm btn-outline-secondary ms-auto">
+      <span class="mdi mdi-sitemap"></span> Platform → NED mappings
+    </a>
+  </div>
+</div>
+
+{% if data.error %}
+  <div class="alert alert-warning"><span class="mdi mdi-alert-outline me-1"></span>Adapter error: {{ data.error }}</div>
+{% endif %}
+
+<ul class="nav nav-tabs mb-3" role="tablist">
+  <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tab-managed" type="button">Managed <span class="badge text-bg-info">{{ managed|length }}</span></button></li>
+  <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-onboarded" type="button">Onboarded in NSO <span class="badge text-bg-success">{{ data.onboarded|length }}</span></button></li>
+  <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-candidates" type="button">Onboardable <span class="badge text-bg-primary">{{ data.candidates|length }}</span></button></li>
+  <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-orphans" type="button">Unmatched in NetBox <span class="badge text-bg-warning text-dark">{{ data.orphans|length }}</span></button></li>
+</ul>
+
+<div class="tab-content">
+  {# ── Managed: plugin-managed devices (NSODeviceManagement) ───────────────── #}
+  <div class="tab-pane fade show active" id="tab-managed" role="tabpanel">
+    <div class="d-flex mb-2">
+      <a href="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_add' %}?return_url={{ request.get_full_path|urlencode }}" class="btn btn-sm btn-primary ms-auto">
+        <span class="mdi mdi-plus-thick"></span> Add managed device
+      </a>
+    </div>
+    <div class="card">
+      <div class="card-body p-0">
+        <table class="table table-hover mb-0">
+          <thead><tr><th>Device</th><th>NSO name</th><th>NED</th><th>Scopes</th><th>Last sync</th><th>Status</th><th></th></tr></thead>
+          <tbody>
+            {% for m in managed %}
+            <tr{% if m.onboard_status == 'provisioning' %} data-onboard-pk="{{ m.pk }}"{% endif %}>
+              <td><a href="{{ m.device.get_absolute_url }}">{{ m.device }}</a></td>
+              <td>{{ m.nso_device_name }}</td>
+              <td><code>{{ m.ned_in_use|placeholder }}</code></td>
+              <td>
+                {% if m.manage_description %}<span class="badge text-bg-light border" title="Sync interface description">desc</span>{% endif %}
+                {% if m.manage_enabled %}<span class="badge text-bg-light border" title="Sync interface enabled/shutdown">enabled</span>{% endif %}
+                {% if m.auto_apply %}<span class="badge text-bg-info" title="Auto-apply accepted intent">auto-apply</span>{% endif %}
+              </td>
+              <td>{{ m.last_sync_at|placeholder }}</td>
+              <td>
+                {% if m.onboard_status == 'provisioning' %}
+                  <span class="badge text-bg-warning text-dark"><span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true" style="width:.7rem;height:.7rem;"></span>Provisioning…</span>
+                {% elif m.onboard_status == 'provision_failed' %}
+                  <span class="badge text-bg-danger" title="{{ m.onboard_error }}">Provisioning failed</span>
+                {% elif m.last_sync_status == "succeeded" %}<span class="badge text-bg-success">succeeded</span>
+                {% elif m.last_sync_status == "failed" %}<span class="badge text-bg-danger">failed</span>
+                {% elif m.last_sync_status == "partial" %}<span class="badge text-bg-warning text-dark" title="Some routing surfaces failed to read from NSO{% if m.degraded_surfaces %} — stale: {{ m.degraded_surfaces|join:", " }}{% endif %}. Open the NSO tab for detail.">partial{% if m.degraded_surfaces %} ({{ m.degraded_surfaces|length }}){% endif %}</span>
+                {% elif m.last_sync_status %}<span class="badge text-bg-info">{{ m.last_sync_status }}</span>{% else %}{{ ''|placeholder }}{% endif %}
+              </td>
+              <td class="text-end text-nowrap">
+                <a href="{% url 'dcim:device_nso' pk=m.device.pk %}" class="btn btn-sm btn-outline-primary">NSO tab</a>
+                <a href="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_edit' pk=m.pk %}?return_url={{ request.get_full_path|urlencode }}" class="btn btn-sm btn-outline-secondary" title="Edit"><span class="mdi mdi-pencil"></span></a>
+                <a href="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_delete' pk=m.pk %}?return_url={{ request.get_full_path|urlencode }}" class="btn btn-sm btn-outline-danger" title="Delete"><span class="mdi mdi-trash-can-outline"></span></a>
+              </td>
+            </tr>
+            {% empty %}
+            <tr><td colspan="7" class="text-muted">No managed devices on this instance.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  {# ── Onboarded in NSO (matched to NetBox) ────────────────────────────────── #}
+  <div class="tab-pane fade" id="tab-onboarded" role="tabpanel">
+    <div class="card">
+      <div class="card-body p-0">
+        <table class="table table-hover mb-0">
+          <thead><tr><th>NSO device</th><th>NetBox</th><th>NED</th><th>Admin state</th><th>Matched by</th><th></th></tr></thead>
+          <tbody>
+            {% for o in data.onboarded %}
+            <tr>
+              <td>{{ o.nso_name }}{% if not o.plugin_managed %} <span class="badge text-bg-warning text-dark" title="In NSO but not managed via this plugin">external</span>{% endif %}</td>
+              <td>{% if o.netbox_device %}<a href="{{ o.netbox_device.get_absolute_url }}">{{ o.netbox_device }}</a>{% else %}{{ ''|placeholder }}{% endif %}</td>
+              <td><code>{{ o.ned_id|placeholder }}</code></td>
+              <td>{{ o.admin_state|placeholder }}</td>
+              <td><span class="badge text-bg-light border">{{ o.matched_by|default:"—" }}</span></td>
+              <td class="text-end">
+                {% if not o.plugin_managed and o.netbox_device %}
+                <form method="post" action="{% url 'plugins:netbox_nso_plugin:quick_manage' %}" class="d-inline">
+                  {% csrf_token %}
+                  <input type="hidden" name="device" value="{{ o.netbox_device.pk }}">
+                  <input type="hidden" name="instance" value="{{ selected }}">
+                  <input type="hidden" name="nso_name" value="{{ o.nso_name }}">
+                  <button type="submit" class="btn btn-sm btn-success" title="Bring under NSO management in NetBox"><span class="mdi mdi-plus-network"></span> Manage</button>
+                </form>
+                {% endif %}
+              </td>
+            </tr>
+            {% empty %}
+            <tr><td colspan="6" class="text-muted">None.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  {# ── Onboardable candidates ──────────────────────────────────────────────── #}
+  <div class="tab-pane fade" id="tab-candidates" role="tabpanel">
+    <p class="text-muted small mb-2">NetBox devices that are active and have a management IP (primary, or OOB for a freshly-deployed box), not yet in NSO. The platform&rsquo;s NED mapping is the default &mdash; pick a different NED to override (software version / testing).</p>
+    <div class="card">
+      <div class="card-body p-0">
+        <table class="table table-hover mb-0">
+          <thead><tr><th>Device</th><th>Platform</th><th>Address</th><th>NED</th><th></th></tr></thead>
+          <tbody>
+            {% for c in data.candidates %}
+            <tr>
+              <td><a href="{{ c.device.get_absolute_url }}">{{ c.device }}</a></td>
+              <td>{{ c.platform|placeholder }}</td>
+              <td>
+                {{ c.mgmt_ip }}
+                {% if c.oob_only %}<span class="badge text-bg-warning text-dark ms-1" title="No primary IP yet — NSO will onboard over the OOB address (the failover loop switches to primary once it comes up)">OOB</span>{% endif %}
+              </td>
+              <td>
+                <form method="post" action="{% url 'plugins:netbox_nso_plugin:onboard' %}" class="d-flex gap-2 align-items-center">
+                  {% csrf_token %}
+                  <input type="hidden" name="device" value="{{ c.device.pk }}">
+                  <input type="hidden" name="instance" value="{{ selected }}">
+                  {% if data.neds %}
+                    <select name="ned_id" class="form-select form-select-sm" style="max-width: 22rem;" required>
+                      <option value="">— select NED —</option>
+                      {% for ned in data.neds %}
+                        <option value="{{ ned }}" {% if ned == c.ned_id %}selected{% endif %}>{{ ned }}</option>
+                      {% endfor %}
+                    </select>
+                  {% else %}
+                    <input type="text" name="ned_id" class="form-control form-control-sm" style="max-width: 22rem;" value="{{ c.ned_id }}" placeholder="ned-id:ned-id" required>
+                  {% endif %}
+                  <button type="submit" class="btn btn-sm btn-success text-nowrap"><span class="mdi mdi-plus-network"></span> Onboard</button>
+                </form>
+              </td>
+              <td></td>
+            </tr>
+            {% empty %}
+            <tr><td colspan="5" class="text-muted">None &mdash; no active devices with a management IP that aren&rsquo;t already in NSO.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  {# ── Unmatched in NetBox (NSO orphans) ───────────────────────────────────── #}
+  <div class="tab-pane fade" id="tab-orphans" role="tabpanel">
+    <p class="text-muted small mb-2">Devices in NSO with no matching NetBox device (by name or primary IP).</p>
+    <div class="card">
+      <div class="card-body p-0">
+        <table class="table table-hover mb-0">
+          <thead><tr><th>NSO device</th><th>Address</th><th>NED</th></tr></thead>
+          <tbody>
+            {% for r in data.orphans %}
+            <tr>
+              <td>{{ r.nso_name }}</td>
+              <td>{{ r.address|placeholder }}</td>
+              <td><code>{{ r.ned_id|placeholder }}</code></td>
+            </tr>
+            {% empty %}
+            <tr><td colspan="3" class="text-muted">None.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+{# ── Live-poll provisioning rows: advance the async onboarding job, reload on terminal ── #}
+<script>
+(function () {
+  "use strict";
+  var rows = document.querySelectorAll('tr[data-onboard-pk]');
+  if (!rows.length) return;
+  // NetBox sets CSRF_COOKIE_HTTPONLY=True, so the csrftoken cookie is NOT readable from
+  // document.cookie — render the token server-side instead (valid for this session).
+  var csrfToken = "{{ csrf_token }}";
+  var base = "{% url 'plugins:netbox_nso_plugin:onboard_status' pk=0 %}";
+  function statusUrl(pk) { return base.replace(/0\/$/, pk + '/'); }
+  var stopped = false;
+  function poll() {
+    if (stopped) return;
+    rows.forEach(function (row) {
+      fetch(statusUrl(row.dataset.onboardPk), {
+        method: 'POST',
+        headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-CSRFToken': csrfToken },
+      })
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          if (d && d.status && d.status !== 'provisioning' && !stopped) {
+            stopped = true;            // a row finished (ready / failed) — refresh tables + badges
+            window.location.reload();
+          }
+        })
+        .catch(function () { /* transient adapter blip — retry next tick */ });
+    });
+  }
+  setInterval(poll, 4000);
+  poll();
+})();
+</script>
+{% endblock %}

@@ -1,0 +1,35 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Area-navigation tabs for the NSO "Settings" screens. Each tab is a cross-page link; the #}
+{# active one is derived from the resolved url_name so it works on list/add/edit/detail pages. #}
+{# role="presentation" (not "tablist"): these are cross-page navigation links, not an in-page tab #}
+{# widget — matches NetBox's own object sub-page tabs (generic/object.html) and avoids stacking a #}
+{# second, fake tablist over the list view's native Results/Filters tablist. #}
+{% with un=request.resolver_match.url_name|default:'' %}
+<ul class="nav nav-tabs mb-3" role="presentation">
+  <li class="nav-item">
+    <a class="nav-link{% if 'nsoinstance' in un %} active{% endif %}"
+       href="{% url 'plugins:netbox_nso_plugin:nsoinstance_list' %}">NSO Instances</a>
+  </li>
+  <li class="nav-item">
+    <a class="nav-link{% if un == 'adapterconnection' %} active{% endif %}"
+       href="{% url 'plugins:netbox_nso_plugin:adapterconnection' %}">Adapter Connection</a>
+  </li>
+  <li class="nav-item">
+    <a class="nav-link{% if un == 'nsofailoversettings' %} active{% endif %}"
+       href="{% url 'plugins:netbox_nso_plugin:nsofailoversettings' %}">Failover Settings</a>
+  </li>
+  <li class="nav-item">
+    <a class="nav-link{% if un == 'nsovaultsettings' %} active{% endif %}"
+       href="{% url 'plugins:netbox_nso_plugin:nsovaultsettings' %}">Vault</a>
+  </li>
+  <li class="nav-item">
+    <a class="nav-link{% if 'nsoderivedintenttemplate' in un %} active{% endif %}"
+       href="{% url 'plugins:netbox_nso_plugin:nsoderivedintenttemplate_list' %}">Derived Intent</a>
+  </li>
+  <li class="nav-item">
+    <a class="nav-link{% if 'nsoplatformnedmapping' in un %} active{% endif %}"
+       href="{% url 'plugins:netbox_nso_plugin:nsoplatformnedmapping_list' %}">Platform &rarr; NED Mappings</a>
+  </li>
+</ul>
+{% endwith %}

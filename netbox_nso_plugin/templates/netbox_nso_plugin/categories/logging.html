@@ -1,0 +1,109 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Lazy-loaded fragment: Logging category (remote syslog servers + local severity levels). #}
+{% include "netbox_nso_plugin/categories/_adapter_error.html" %}
+
+{% if logging_data.local_levels %}
+  {% with ll=logging_data.local_levels %}
+  <div class="mb-3" id="nso-logging-levels">
+    <p class="text-muted small mb-2">Local severity levels (console / monitor / module). Editing takes ownership. Un-accepting RETRACTS the managed levels — on NX the affected destination is <strong>disabled</strong> (<code>no logging &lt;dest&gt;</code>), not reverted to its previous level.</p>
+    <div class="table-responsive">
+      <table class="table table-sm table-hover mb-0">
+        <thead>
+          <tr><th>Console</th><th>Monitor</th><th>Module</th><th>Status / Synced</th><th></th></tr>
+        </thead>
+        <tbody>
+          <tr data-status="{{ ll.status }}" data-owned="{{ ll.accepted_at|yesno:'true,false' }}">
+            {% url 'plugins:netbox_nso_plugin:overlay_field_edit' key='logging_levels' pk=ll.pk as levels_edit_url %}
+            <td>
+              <a href="#" class="nso-popedit" title="Edit the console severity; this takes ownership"
+                 data-pe-url="{{ levels_edit_url }}" data-pe-title="Console logging severity"
+                 data-pe-fields="console_severity:select:Console severity"
+                 data-pe-v-console_severity="{{ ll.console_severity }}"
+                 data-pe-o-console_severity='[{"value":"","label":"Unmanaged"},{"value":"EMERGENCY","label":"EMERGENCY"},{"value":"ALERT","label":"ALERT"},{"value":"CRITICAL","label":"CRITICAL"},{"value":"ERROR","label":"ERROR"},{"value":"WARNING","label":"WARNING"},{"value":"NOTICE","label":"NOTICE"},{"value":"INFORMATIONAL","label":"INFORMATIONAL"},{"value":"DEBUG","label":"DEBUG"}]'>{{ ll.console_severity|default:"unmanaged" }}</a>
+            </td>
+            <td>
+              <a href="#" class="nso-popedit" title="Edit the monitor severity; this takes ownership"
+                 data-pe-url="{{ levels_edit_url }}" data-pe-title="Monitor logging severity"
+                 data-pe-fields="monitor_severity:select:Monitor severity"
+                 data-pe-v-monitor_severity="{{ ll.monitor_severity }}"
+                 data-pe-o-monitor_severity='[{"value":"","label":"Unmanaged"},{"value":"EMERGENCY","label":"EMERGENCY"},{"value":"ALERT","label":"ALERT"},{"value":"CRITICAL","label":"CRITICAL"},{"value":"ERROR","label":"ERROR"},{"value":"WARNING","label":"WARNING"},{"value":"NOTICE","label":"NOTICE"},{"value":"INFORMATIONAL","label":"INFORMATIONAL"},{"value":"DEBUG","label":"DEBUG"}]'>{{ ll.monitor_severity|default:"unmanaged" }}</a>
+            </td>
+            <td>
+              <a href="#" class="nso-popedit" title="Edit the module severity; this takes ownership"
+                 data-pe-url="{{ levels_edit_url }}" data-pe-title="Module logging severity"
+                 data-pe-fields="module_severity:select:Module severity"
+                 data-pe-v-module_severity="{{ ll.module_severity }}"
+                 data-pe-o-module_severity='[{"value":"","label":"Unmanaged"},{"value":"EMERGENCY","label":"EMERGENCY"},{"value":"ALERT","label":"ALERT"},{"value":"CRITICAL","label":"CRITICAL"},{"value":"ERROR","label":"ERROR"},{"value":"WARNING","label":"WARNING"},{"value":"NOTICE","label":"NOTICE"},{"value":"INFORMATIONAL","label":"INFORMATIONAL"},{"value":"DEBUG","label":"DEBUG"}]'>{{ ll.module_severity|default:"unmanaged" }}</a>
+            </td>
+            <td>
+              {% include "netbox_nso_plugin/categories/_state_badge.html" with status=ll.status %}
+              <div class="text-muted small text-nowrap">{% if ll.last_sync_at %}{{ ll.last_sync_at|date:"Y-m-d H:i" }}{% else %}not synced{% endif %}</div>
+            </td>
+            <td class="text-nowrap">
+              {% url 'plugins:netbox_nso_plugin:logging_accept_levels' pk=ll.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=ll.status %}
+              {% if ll.status == "accepted" or ll.status == "in_sync" or ll.status == "apply_failed" %}
+              {% url 'plugins:netbox_nso_plugin:logging_unaccept_levels' pk=ll.pk as unaccept_url %}
+              <form method="post" action="{{ unaccept_url }}" class="d-inline"
+                    onsubmit="return confirm('Un-accepting RETRACTS the managed severity leaves from the device. On NX this renders no-logging for each managed destination — the destination is DISABLED, not reverted to its previous level. Continue?');">{% csrf_token %}<button type="submit" class="btn btn-xs btn-outline-danger" title="Release ownership — retracts the managed levels from the device (on NX: disables the destination)"><span class="mdi mdi-undo-variant"></span> Un-accept</button></form>
+              {% endif %}
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% endwith %}
+{% endif %}
+
+{% if logging_data.hosts %}
+  <p class="text-muted small mb-2">Edit destination options, policy, and source context inline. The server address is the structural identity; changing it is a remove-and-create operation rather than a field edit.</p>
+  <div id="flt-logging-hosts">
+  {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-logging-hosts" placeholder="Filter by server / severity…" show_status=True %}
+  <div class="table-responsive">
+    <table class="table table-sm table-hover mb-0">
+      <thead>
+        <tr><th>Destination</th><th>Policy</th><th>Source context</th><th>Status / Synced</th><th></th></tr>
+      </thead>
+      <tbody>
+        {% for h in logging_data.hosts %}
+        <tr data-status="{{ h.status }}" data-owned="{{ h.accepted_at|yesno:'true,false' }}">
+          {% url 'plugins:netbox_nso_plugin:overlay_field_edit' key='logging_host' pk=h.pk as host_edit_url %}
+          <td>
+            <span class="fw-semibold">{{ h.address }}</span>
+            <div class="small">
+              <a href="#" class="nso-popedit" title="Edit port and transport; this takes ownership"
+                 data-pe-url="{{ host_edit_url }}" data-pe-title="{{ h.address }} destination options"
+                 data-pe-fields="port:number:Port,transport:select:Transport"
+                 data-pe-v-port="{{ h.port|default:'' }}" data-pe-v-transport="{{ h.transport|default:'' }}"
+                 data-pe-o-transport='[{"value":"","label":"Device default"},{"value":"udp","label":"UDP"},{"value":"tcp","label":"TCP"}]'>{{ h.transport|default:"default"|upper }} · {{ h.port|default:"514" }}</a>
+            </div>
+          </td>
+          <td>
+            <a href="#" class="nso-popedit" title="Edit severity and facility; this takes ownership"
+               data-pe-url="{{ host_edit_url }}" data-pe-title="{{ h.address }} logging policy"
+               data-pe-fields="severity:text:Severity,facility:text:Facility"
+               data-pe-v-severity="{{ h.severity|default:'' }}" data-pe-v-facility="{{ h.facility|default:'' }}">{{ h.severity|default:"device default" }} · {{ h.facility|default:"any facility" }}</a>
+          </td>
+          <td>
+            <a href="#" class="nso-popedit" title="Edit source and VRF; this takes ownership"
+               data-pe-url="{{ host_edit_url }}" data-pe-title="{{ h.address }} source context"
+               data-pe-fields="source:text:Source,vrf:text:VRF"
+               data-pe-v-source="{{ h.source|default:'' }}" data-pe-v-vrf="{{ h.vrf|default:'' }}">{{ h.source|default:"device default" }} · {{ h.vrf|default:"global" }}</a>
+          </td>
+          <td>
+            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=h.status residue=h.residue_survivor residue_job=h.residue_job_id %}
+            <div class="text-muted small text-nowrap">{% if h.last_sync_at %}{{ h.last_sync_at|date:"Y-m-d H:i" }}{% else %}not synced{% endif %}</div>
+          </td>
+          <td class="text-nowrap">
+            {% url 'plugins:netbox_nso_plugin:logging_accept_host' pk=h.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=h.status %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  </div>
+{% else %}
+  <p class="text-muted mb-0">No remote syslog servers configured.</p>
+{% endif %}

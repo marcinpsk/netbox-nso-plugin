@@ -1,0 +1,17 @@
+{
+  "name": "netbox-nso-plugin",
+  "private": true,
+  "description": "JS test harness for the plugin's first-party static assets (nso-grid.js, nso-popedit.js)",
+  "license": "Apache-2.0",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "jsdom": "^26.1.0",
+    "vitest": "^3.2.4"
+  }
+}

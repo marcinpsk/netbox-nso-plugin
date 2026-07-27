@@ -1,0 +1,19 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{% include "netbox_nso_plugin/categories/_adapter_error.html" %}
+
+{% if grid_payload.rows %}
+  <div class="d-flex justify-content-end align-items-center mb-2">
+    {% url 'plugins:netbox_nso_plugin:routing_bulk_accept_redistribution' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned %}
+  </div>
+  <p class="text-muted small mb-2">Destination and source identify the redistribution statement. Edit its linked route map, metric, and protocol-specific metric type inline.</p>
+  {{ grid_payload|json_script:"nso-redist-data" }}
+  {% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='redistribution' as cat_url %}
+  {% include "netbox_nso_plugin/categories/_grid.html" with cls="nso-redist" json_url=cat_url|add:"?format=json" counts=grid_payload.counts %}
+
+  <script>
+  window.NSOGridRedistribution && window.NSOGridRedistribution.mount(document.querySelector('.nso-redist'));
+  </script>
+{% else %}
+  <p class="text-muted mb-0">No redistribution.</p>
+{% endif %}

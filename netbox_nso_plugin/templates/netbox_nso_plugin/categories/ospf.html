@@ -1,0 +1,35 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Lazy fragment: OSPF category — two grids (instances + interfaces) over ONE category #}
+{# payload. Each mount pulls its own section (nso-grid.js opts.extract), so an Accept in #}
+{# one section re-reads the shared JSON but only repaints its own rows and counts. #}
+{% include "netbox_nso_plugin/categories/_adapter_error.html" %}
+
+{% if grid_payload.instances.rows or grid_payload.interfaces.rows %}
+  <p class="text-muted small mb-2">Edit router IDs and interface OSPF knobs inline, or Accept the full row. Editing makes NetBox the source of truth; process IDs and VRFs remain relationship changes in the full NetBox routing UI.</p>
+  {{ grid_payload|json_script:"nso-ospf-data" }}
+  {% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='ospf' as cat_url %}
+
+  {% if grid_payload.instances.rows %}
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      <h6 class="mb-1 d-inline-block">OSPF Instances</h6>
+      {% url 'plugins:netbox_nso_plugin:routing_bulk_accept_ospf_instances' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned label="Accept All Instances" %}
+    </div>
+    {% include "netbox_nso_plugin/categories/_grid.html" with cls="nso-ospf-inst" json_url=cat_url|add:"?format=json" counts=grid_payload.instances.counts %}
+  {% endif %}
+
+  {% if grid_payload.interfaces.rows %}
+    <div class="d-flex justify-content-between align-items-center mb-2 mt-3">
+      <h6 class="mb-1 d-inline-block">OSPF Interfaces</h6>
+      {% url 'plugins:netbox_nso_plugin:routing_bulk_accept_ospf_interfaces' device_pk=object.pk as bulk_url %}{% include "netbox_nso_plugin/categories/_bulk_accept.html" with bulk_url=bulk_url show=category_has_unowned label="Accept All Interfaces" %}
+    </div>
+    {% include "netbox_nso_plugin/categories/_grid.html" with cls="nso-ospf-if" json_url=cat_url|add:"?format=json" counts=grid_payload.interfaces.counts %}
+  {% endif %}
+
+  <script>
+  window.NSOGridOspf && window.NSOGridOspf.mount(document.querySelector('.nso-ospf-inst'), 'instances');
+  window.NSOGridOspf && window.NSOGridOspf.mount(document.querySelector('.nso-ospf-if'), 'interfaces');
+  </script>
+{% else %}
+  <p class="text-muted mb-0">No OSPF configuration.</p>
+{% endif %}

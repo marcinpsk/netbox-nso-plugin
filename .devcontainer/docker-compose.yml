@@ -1,0 +1,89 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
+services:
+  devcontainer:
+    image: netboxcommunity/netbox:${NETBOX_VERSION:-latest}
+    volumes:
+      - ../../..:/workspaces:cached
+      - netbox_media:/opt/netbox/netbox/media
+      - netbox_static:/opt/netbox/netbox/static
+      - gh_config:/root/.config/gh
+    command: sleep infinity
+    environment:
+      NETBOX_VERSION: ${NETBOX_VERSION:-latest}
+      DEBUG: ${DEBUG:-True}
+      DEVELOPER: ${DEVELOPER:-True}
+      DB_HOST: ${DB_HOST:-postgres}
+      DB_NAME: ${DB_NAME:-netbox}
+      DB_USER: ${DB_USER:-netbox}
+      DB_PASSWORD: ${DB_PASSWORD:-netbox}
+      REDIS_HOST: ${REDIS_HOST:-redis}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      SECRET_KEY: ${SECRET_KEY:-dummydummydummydummydummydummydummydummydummydummydummydummy}
+      SUPERUSER_NAME: ${SUPERUSER_NAME:-admin}
+      SUPERUSER_EMAIL: ${SUPERUSER_EMAIL:-admin@example.com}
+      SUPERUSER_PASSWORD: ${SUPERUSER_PASSWORD:-admin}
+      SKIP_SUPERUSER: ${SKIP_SUPERUSER:-false}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      http_proxy: ${HTTP_PROXY:-}
+      https_proxy: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-}
+      no_proxy: ${NO_PROXY:-}
+      REQUESTS_CA_BUNDLE: ${REQUESTS_CA_BUNDLE:-}
+      SSL_CERT_FILE: ${SSL_CERT_FILE:-}
+      CURL_CA_BUNDLE: ${CURL_CA_BUNDLE:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    dns_search: ["."]
+    ports:
+      - "8000:8000"
+
+  postgres:
+    image: postgres:18
+    command: postgres -c max_connections=200
+    environment:
+      POSTGRES_DB: ${DB_NAME:-netbox}
+      POSTGRES_USER: ${DB_USER:-netbox}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-netbox}
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-netbox}"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      default:
+        ipv4_address: 172.28.200.3
+
+  redis:
+    image: redis:8-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      default:
+        ipv4_address: 172.28.200.2
+
+volumes:
+  postgres_data:
+  redis_data:
+  netbox_media:
+  netbox_static:
+  gh_config:
+
+networks:
+  default:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: "172.28.200.0/24"

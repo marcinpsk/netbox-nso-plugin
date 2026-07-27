@@ -1,0 +1,1154 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{% extends 'generic/object.html' %}
+{% load helpers %}
+{% load static %}
+
+{% block content %}
+{# Vendored diff2html (MIT) — renders the apply-preview's NSO tree diff; no CDN. #}
+<link rel="stylesheet" href="{% static 'netbox_nso_plugin/vendor/diff2html.min.css' %}">
+<script src="{% static 'netbox_nso_plugin/vendor/diff2html.min.js' %}"></script>
+{# Vendored Tabulator (MIT) — the category grids; no CDN. #}
+<link rel="stylesheet" href="{% static 'netbox_nso_plugin/vendor/tabulator_bootstrap5.min.css' %}">
+<script src="{% static 'netbox_nso_plugin/vendor/tabulator.min.js' %}"></script>
+<link rel="stylesheet" href="{% static 'netbox_nso_plugin/nso.css' %}">
+<script src="{% static 'netbox_nso_plugin/nso-popedit.js' %}"></script>
+<script src="{% static 'netbox_nso_plugin/nso-badges.js' %}"></script>
+{# Shared grid harness — badge vocabulary, per-cell Accept, inline-edit-owns, state #}
+{# pills. Must load before any lazy category fragment runs its column definitions. #}
+<script src="{% static 'netbox_nso_plugin/nso-grid.js' %}"></script>
+{# Interfaces panel column definitions — static (testable); the fragment only mounts. #}
+<script src="{% static 'netbox_nso_plugin/nso-grid-interface.js' %}"></script>
+{# Compact LACP bundle/member parameters with coordinated ownership editing. #}
+<script src="{% static 'netbox_nso_plugin/nso-grid-lacp.js' %}"></script>
+{# BFD compact/editable column definitions — loaded before its lazy fragment mounts. #}
+<script src="{% static 'netbox_nso_plugin/nso-grid-bfd.js' %}"></script>
+{# Compact OSPF process/binding columns with safe inline routing knobs. #}
+<script src="{% static 'netbox_nso_plugin/nso-grid-ospf.js' %}"></script>
+{# Compact IS-IS process/interface columns with safe non-secret editors. #}
+<script src="{% static 'netbox_nso_plugin/nso-grid-isis.js' %}"></script>
+{# Compact BGP peers/templates with safe peer session editing. #}
+<script src="{% static 'netbox_nso_plugin/nso-grid-bgp.js' %}"></script>
+{# Compact static-route identity and native policy editing. #}
+<script src="{% static 'netbox_nso_plugin/nso-grid-static.js' %}"></script>
+{# Compact redistribution identity/policy columns with safe policy editing. #}
+<script src="{% static 'netbox_nso_plugin/nso-grid-redistribution.js' %}"></script>
+{# Route-policy compact object links and safe route-map rename. #}
+<script src="{% static 'netbox_nso_plugin/nso-grid-route-policy.js' %}"></script>
+{% if mgmt %}
+
+  {# ── Adapter link/sync failure — managing this device couldn't reach the adapter ─────── #}
+  {% if mgmt.adapter_link_error %}
+    <div class="alert alert-danger d-flex align-items-start mb-3" role="alert">
+      <span class="mdi mdi-link-variant-off me-2 mt-1"></span>
+      <div class="flex-grow-1">
+        {% if mgmt.adapter_device_id %}
+          <strong>The last adapter sync for this device failed.</strong>
+          Its mirror and intent below may be stale — nothing new was synced or applied.
+        {% else %}
+          <strong>This device isn't linked to the NSO adapter.</strong>
+          Managing it in NetBox couldn't onboard it to the adapter, so nothing below is being
+          mirrored, synced, or applied.
+        {% endif %}
+        Last error: <em>{{ mgmt.adapter_link_error }}</em>
+        <form method="post" class="mt-2"
+              action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_link_retry' mgmt.pk %}">
+          {% csrf_token %}
+          <button type="submit" class="btn btn-sm btn-danger">
+            <span class="mdi mdi-link-variant"></span> Retry adapter link
+          </button>
+        </form>
+      </div>
+    </div>
+  {% endif %}
+
+  {# ── Adapter error banner ──────────────────────────────────────────────── #}
+  {% if adapter_error %}
+    <div class="alert alert-warning d-flex align-items-center mb-3" role="alert">
+      <span class="mdi mdi-alert-outline me-2"></span>
+      {% if adapter_error_code == 'not_found' %}
+        <div>This device is no longer in the adapter — it may need re-onboarding. <em>{{ adapter_error }}</em></div>
+      {% else %}
+        <div>Adapter unreachable — showing cached data. <em>{{ adapter_error }}</em></div>
+      {% endif %}
+    </div>
+  {% endif %}
+
+  {# ── Adapter intent drift (split-brain) — renders ONLY when there is stale intent ── #}
+  {% if intent_drift %}
+    <div class="alert alert-warning d-flex align-items-start mb-3" role="alert">
+      <span class="mdi mdi-sync-alert me-2 mt-1"></span>
+      <div class="flex-grow-1">
+        <strong>Adapter holds intent NetBox no longer owns.</strong>
+        The adapter would push this on a device-wide apply, but NetBox owns fewer rows than
+        the adapter holds (an adapter↔NetBox split-brain). Re-sync drops the stale intent;
+        it does <em>not</em> touch the device.
+        <ul class="mb-2 mt-1">
+          {% for d in intent_drift %}
+            <li>
+              <strong>{{ d.label }}</strong> —
+              {% if d.partial %}
+                {{ d.count }} intent row{{ d.count|pluralize }}, NetBox owns {{ d.owned }}
+                <span class="badge text-bg-warning text-dark ms-1">partial</span>
+              {% else %}
+                {{ d.count }} intent row{{ d.count|pluralize }}
+              {% endif %}
+              {% if d.failed %}<span class="badge text-bg-danger ms-1">{{ d.failed }} apply-failed</span>
+              {% elif d.applied %}<span class="badge text-bg-info ms-1">{{ d.applied }} applied</span>
+              {% else %}<span class="badge text-bg-warning text-dark ms-1">never applied</span>{% endif %}
+            </li>
+          {% endfor %}
+        </ul>
+        <form method="post"
+              action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_intent_resync' mgmt.pk %}">
+          {% csrf_token %}
+          <button type="submit" class="btn btn-sm btn-warning">
+            <span class="mdi mdi-sync"></span> Re-sync adapter intent
+          </button>
+        </form>
+      </div>
+    </div>
+  {% endif %}
+
+  {# ── Device capability gaps — matrix unsupported/skipped on this NED/sw; renders only if any ── #}
+  {% if device_capability %}
+    <div class="alert alert-warning d-flex align-items-start mb-3" role="alert">
+      <span class="mdi mdi-alert-octagon-outline me-2 mt-1"></span>
+      <div class="flex-grow-1">
+        <strong>{{ device_capability.gaps|length }} construct{{ device_capability.gaps|length|pluralize }}
+          won't apply on this device.</strong>
+        The NED <code>{{ device_capability.ned_id }}</code>{% if device_capability.sw_version %}
+        ({{ device_capability.sw_version }}){% endif %} can't realise the intent below — a prior
+        apply was rejected by the device, so it is recorded in the capability matrix. The intent
+        still lands in NetBox; it just won't reach the device until it's supported.
+        <ul class="mb-0 mt-1">
+          {% for g in device_capability.gaps %}
+            <li>
+              <strong>{{ g.scope }}</strong>
+              {% if g.name and g.name != g.scope %}<span class="text-muted">{{ g.name }}</span>{% endif %}
+              {% if g.status == 'unsupported' %}
+                <span class="badge text-bg-danger ms-1">unsupported</span>
+              {% else %}
+                <span class="badge text-bg-warning text-dark ms-1">{{ g.status }}</span>
+              {% endif %}
+              {% if g.detail %}<small class="text-muted ms-1">{{ g.detail }}</small>{% endif %}
+            </li>
+          {% endfor %}
+        </ul>
+      </div>
+    </div>
+  {% endif %}
+
+  {# ── What "Accept" means (read this before clicking) ───────────────────── #}
+  <div class="alert alert-info d-flex align-items-start mb-3" role="alert">
+    <span class="mdi mdi-information-outline me-2 mt-1"></span>
+    <div>
+      <strong>What does “Accept” do?</strong>
+      The values below are <strong>imported</strong> — a read-only mirror of what the
+      device currently has, as seen through NSO. Clicking <strong>Accept</strong> (or
+      <em>Accept All</em>) promotes a value to <strong>intent</strong>: NetBox becomes
+      the source of truth for it, and the adapter will keep the device matching NetBox
+      from then on. Simply viewing this page changes nothing — only an explicit Accept,
+      or editing a value inline below (the <span class="mdi mdi-pencil"></span> description
+      and <span class="mdi mdi-swap-horizontal"></span> enabled controls), makes NetBox
+      govern a value.
+    </div>
+  </div>
+
+  {# ── Management summary ────────────────────────────────────────────────── #}
+  <div class="card mb-3">
+    <h5 class="card-header d-flex justify-content-between align-items-center">
+      NSO Management
+      <a href="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_edit' mgmt.pk %}?return_url={% url 'dcim:device_nso' pk=object.pk %}"
+         class="btn btn-sm btn-outline-secondary">
+        <span class="mdi mdi-pencil"></span> Edit
+      </a>
+    </h5>
+    <div class="card-body">
+      <table class="table table-hover attr-table">
+        <tr><th>NSO Instance</th><td>{{ mgmt.nso_instance }}</td></tr>
+        <tr><th>NSO Device Name</th><td>{{ mgmt.nso_device_name }}</td></tr>
+        <tr><th>Managed Scopes</th><td>{{ mgmt.managed_scopes|join:", "|default:"None" }}</td></tr>
+        <tr><th>Interface Attributes</th><td>{{ mgmt.managed_attributes|join:", "|default:"None" }}</td></tr>
+        <tr>
+          <th>Auto Apply</th>
+          <td>
+            {% if mgmt.auto_apply %}<span class="badge text-bg-success">Enabled</span>
+            {% else %}<span class="badge text-bg-warning text-dark">Disabled</span>{% endif %}
+          </td>
+        </tr>
+        <tr>
+          <th title="When the adapter last read the live device via NSO (interface attributes, IP, routing surfaces). The tab category data below is reconciled from the adapter mirror separately — off-render by the sync-complete job, or on demand via Refresh overlays.">Last device sync</th>
+          <td>{{ mgmt.last_sync_at|date:"Y-m-d H:i"|default:"Never" }}</td>
+        </tr>
+        <tr>
+          <th>Last Sync Status</th>
+          <td>
+            {% if mgmt.last_sync_status == "succeeded" %}<span class="badge text-bg-success">{{ mgmt.last_sync_status }}</span>
+            {% elif mgmt.last_sync_status == "failed" %}<span class="badge text-bg-danger">{{ mgmt.last_sync_status }}</span>
+            {% elif mgmt.last_sync_status == "partial" %}<span class="badge text-bg-warning text-dark" title="Interface sync succeeded, but one or more routing surfaces failed to read from NSO — their mirrored data may be stale.">partial</span>
+              {% if mgmt.degraded_surfaces %}<div class="small text-muted mt-1">Stale (NSO read failed): {% for surface in mgmt.degraded_surfaces %}<span class="badge text-bg-warning text-dark ms-1">{{ surface }}</span>{% endfor %}</div>{% endif %}
+            {% elif mgmt.last_sync_status %}<span class="badge text-bg-info">{{ mgmt.last_sync_status }}</span>
+            {% else %}—{% endif %}
+          </td>
+        </tr>
+        {% if failover %}
+        {# ── Mgmt-IP failover status (adapter-owned; not persisted on the mgmt row) ── #}
+        <tr>
+          <th>Failover Address</th>
+          <td>
+            {% if failover.active_address == "oob" %}
+              <span class="badge text-bg-warning text-dark">OOB (failed over)</span>
+              <span class="text-muted ms-1">{{ failover.oob_ip|default:"" }}</span>
+            {% else %}
+              <span class="badge text-bg-success">Primary</span>
+              <span class="text-muted ms-1">{{ failover.primary_ip|default:"" }}</span>
+            {% endif %}
+            {% if failover.manual_override %}
+              <span class="badge text-bg-warning text-dark ms-1"
+                    title="NSO's management address was set by hand — automatic failover is paused for this device.">
+                Manual override
+              </span>
+            {% endif %}
+          </td>
+        </tr>
+        <tr>
+          <th>Last Probe</th>
+          <td>
+            {% if failover.last_probe_result == "ok" %}<span class="badge text-bg-success">OK</span>
+            {% elif failover.last_probe_result == "timeout" %}<span class="badge text-bg-warning text-dark" title="The probe window expired; the address may still be reachable.">Timed out</span>
+            {% elif failover.last_probe_result == "unreachable" %}<span class="badge text-bg-danger">Unreachable</span>
+            {% elif failover.last_probe_result == "error" %}<span class="badge text-bg-danger">Probe error</span>
+            {% elif failover.last_probe_result %}<span class="badge text-bg-info">Unknown</span>
+            {% else %}—{% endif %}
+            {% if failover.last_probe_target %}<span class="badge text-bg-info ms-1">{{ failover.last_probe_target|upper }} target</span>{% endif %}
+            {% if failover.last_probe_at %}<small class="text-muted ms-1">{{ failover.last_probe_at|date:"Y-m-d H:i" }}</small>{% endif %}
+            {% if failover.last_probe_detail %}<div class="small text-muted mt-1" title="{{ failover.last_probe_detail }}">{{ failover.last_probe_detail|truncatechars:160 }}</div>{% endif %}
+          </td>
+        </tr>
+        <tr>
+          <th>OOB Fallback Health</th>
+          <td>
+            {% if failover.oob_health_result == "ok" %}<span class="badge text-bg-success">Healthy</span>
+            {% elif failover.oob_health_result == "timeout" %}<span class="badge text-bg-warning text-dark" title="The probe window expired; the OOB address may still be reachable.">Timed out</span>
+            {% elif failover.oob_health_result == "unreachable" %}<span class="badge text-bg-danger">Unreachable</span>
+            {% elif failover.oob_health_result == "error" %}<span class="badge text-bg-danger">Probe error</span>
+            {% elif failover.oob_health_result %}<span class="badge text-bg-info">Unknown</span>
+            {% elif failover.oob_healthy is True %}<span class="badge text-bg-success">Healthy</span>
+            {% elif failover.oob_healthy is False %}<span class="badge text-bg-info">Unknown</span>
+            {% else %}<span title="Not yet checked">—</span>{% endif %}
+            {% if failover.oob_health_checked_at %}<small class="text-muted ms-1">{{ failover.oob_health_checked_at|date:"Y-m-d H:i" }}</small>{% endif %}
+            {% if failover.oob_health_detail %}<div class="small text-muted mt-1" title="{{ failover.oob_health_detail }}">{{ failover.oob_health_detail|truncatechars:160 }}</div>{% endif %}
+          </td>
+        </tr>
+        <tr>
+          <th>Last Failover Switch</th>
+          <td>{{ failover.last_switch_at|date:"Y-m-d H:i"|default:"Never" }}</td>
+        </tr>
+        {% endif %}
+      </table>
+    </div>
+  </div>
+
+  {# ── Action buttons ────────────────────────────────────────────────────── #}
+  <div class="card mb-3">
+    <h5 class="card-header">Actions</h5>
+    <div class="card-body d-flex flex-wrap gap-2">
+      <form method="post" class="nso-action-form" data-label="Sync"
+            action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_action' mgmt.pk 'sync' %}">
+        {% csrf_token %}
+        <button type="submit" class="btn btn-primary nso-action-btn"
+                title="Pull the live device via NSO and WRITE it into NetBox — creates missing interfaces and overwrites description/enabled with the device's values. (Detect Drift only flags differences; it never changes NetBox.)">
+          <span class="mdi mdi-sync"></span> Sync Now
+        </button>
+      </form>
+      <form method="post" class="nso-action-form" data-label="Sync from NSO"
+            action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_action' mgmt.pk 'sync-from-nso' %}">
+        {% csrf_token %}
+        <button type="submit" class="btn btn-outline-primary nso-action-btn"
+                title="Re-read NSO's CURRENT config into the mirror — no device contact. Heals stale/never-read family chips without the cost of a device round-trip. (Sync Now asks NSO to re-read the live device first; Refresh overlays only redisplays the mirror.)">
+          <span class="mdi mdi-database-sync"></span> Sync from NSO
+        </button>
+      </form>
+      <form method="post" class="nso-action-form" data-label="Detect Drift"
+            action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_action' mgmt.pk 'detect-drift' %}">
+        {% csrf_token %}
+        <button type="submit" class="btn btn-outline-secondary nso-action-btn"
+                title="Re-read the live device via NSO and flag where it differs from NetBox">
+          <span class="mdi mdi-compare-horizontal"></span> Detect Drift
+        </button>
+      </form>
+      <form method="post" class="nso-action-form" data-label="Test Connection"
+            action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_action' mgmt.pk 'connect' %}">
+        {% csrf_token %}
+        <button type="submit" class="btn btn-outline-secondary nso-action-btn">
+          <span class="mdi mdi-lan-connect"></span> Test Connection
+        </button>
+      </form>
+      <form method="post" class="nso-action-form nso-apply-form" data-label="Apply Intent"
+            data-preview-url="{% url 'plugins:netbox_nso_plugin:device_apply_preview' object.pk %}"
+            action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_action' mgmt.pk 'apply' %}">
+        {% csrf_token %}
+        <button type="submit" class="btn btn-success nso-action-btn">
+          <span class="mdi mdi-upload-network"></span> Apply Intent
+        </button>
+      </form>
+      <form method="post"
+            action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_reconcile' mgmt.pk %}">
+        {% csrf_token %}
+        <button type="submit" class="btn btn-outline-secondary"
+                title="Redisplay from the adapter's mirror — no NSO contact at all. (Sync from NSO re-reads NSO's config; Sync Now re-reads the live device via NSO.)">
+          <span class="mdi mdi-cloud-refresh"></span> Refresh overlays
+        </button>
+      </form>
+      {# Bulk Accept — rendered via JS by the interfaces fragment once loaded #}
+      <div id="nso-bulk-accept-placeholder"></div>
+    </div>
+  </div>
+
+  {# ── Blocked removals (collateral guard) — filled by the jobs poll below ── #}
+  {# A removal the adapter refused because the PUT-replace would flush service rows  #}
+  {# nobody removed (orphaned intent). Persists until the operator re-accepts the    #}
+  {# rows or forces the removal — unlike the job strip, it is not displaced by later #}
+  {# jobs. Capability transparency: while blocked, the retraction is NOT on the device. #}
+  {# ── #104-A: succeeded removals that left residue on the device (JS-populated) ── #}
+  <div id="nso-residue-removals" class="mb-3 d-none"></div>
+  <template id="nso-residue-removal-tpl">
+    <div class="alert alert-warning d-flex align-items-start mb-2" role="alert">
+      <span class="mdi mdi-broom me-2 mt-1"></span>
+      <div class="flex-grow-1">
+        <strong>Residue after retract — <span data-slot="scope"></span> config survived the removal.</strong>
+        The removal committed, but NSO's ownership diff kept these entries on the device
+        (they had picked up device-rendered values along the way). They will reappear below
+        as <em>imported</em> rows — that is this retraction's residue, not new device
+        config. Remove them with a gated device commit if unwanted, or Accept them to adopt.
+        <ul class="mb-1 mt-1" data-slot="residue"></ul>
+        <span class="small text-muted">Job #<span data-slot="job"></span> · detected <span data-slot="when"></span></span>
+      </div>
+    </div>
+  </template>
+
+  <div id="nso-blocked-removals" class="mb-3 d-none"></div>
+  <template id="nso-blocked-removal-tpl">
+    <div class="alert alert-danger d-flex align-items-start mb-2" role="alert">
+      <span class="mdi mdi-shield-alert-outline me-2 mt-1"></span>
+      <div class="flex-grow-1">
+        <strong>Removal blocked — orphaned <span data-slot="scope"></span> service rows.</strong>
+        Retracting the removed intent would also flush rows nobody removed (stale service
+        rows whose deletion never reached NSO). Nothing was committed:
+        <strong>the intent retraction is not enforced on the device</strong> until this is
+        resolved. Re-accept the rows below in NetBox to keep them on the device, or force
+        the removal to retract them deliberately.
+        <ul class="mb-1 mt-1" data-slot="orphans"></ul>
+        <details class="mb-2">
+          <summary class="small">Dry-run preview of the refused device change</summary>
+          <pre class="small border rounded p-2 mt-1 mb-0"
+               style="max-height: 20rem; overflow: auto; white-space: pre-wrap;"
+               data-slot="preview"></pre>
+        </details>
+        <form method="post" class="d-inline"
+              action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_force_removal' mgmt.pk %}"
+              onsubmit="return confirm('Force removal will RETRACT the listed orphaned rows from the live device. Continue?');">
+          {% csrf_token %}
+          <input type="hidden" name="scope" value="">
+          <button type="submit" class="btn btn-sm btn-danger">
+            <span class="mdi mdi-delete-alert"></span> Force removal
+          </button>
+        </form>
+        <span class="small text-muted ms-2">Job #<span data-slot="job"></span> · blocked <span data-slot="when"></span></span>
+      </div>
+    </div>
+  </template>
+
+  {# ── Job activity (loaded on tab open; shows any running job + last finished) ── #}
+  <div id="nso-job-activity" class="mb-3"
+       data-jobs-url="{% url 'plugins:netbox_nso_plugin:device_nso_jobs' pk=object.pk %}"></div>
+  <script>
+  (function () {
+    "use strict";
+    var box = document.getElementById('nso-job-activity');
+    if (!box) return;
+    var url = box.dataset.jobsUrl;
+    var timer = null;
+    function rel(iso) {
+      if (!iso) return '';
+      var t = new Date(iso).getTime();
+      if (isNaN(t)) return '';
+      var s = Math.max(0, Math.round((Date.now() - t) / 1000));
+      if (s < 60) return s + 's ago';
+      if (s < 3600) return Math.round(s / 60) + 'm ago';
+      if (s < 86400) return Math.round(s / 3600) + 'h ago';
+      return Math.round(s / 86400) + 'd ago';
+    }
+    function esc(x) { var d = document.createElement('div'); d.textContent = (x == null ? '' : String(x)); return d.innerHTML; }
+    function errText(e) {
+      if (!e) return '';
+      if (typeof e === 'string') return e;
+      return e.message || e.code || JSON.stringify(e);
+    }
+    function render(d) {
+      if (d.error) {
+        box.innerHTML = '<div class="alert alert-warning mb-0 py-2"><span class="mdi mdi-alert-outline me-1"></span>Adapter unreachable: ' + esc(d.error) + '</div>';
+        return;
+      }
+      if (!d.onboarded) { box.innerHTML = ''; return; }
+      var r = d.running, l = d.last;
+      if (r) {
+        box.innerHTML = '<div class="alert alert-info mb-0 py-2 d-flex align-items-center">'
+          + '<span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>'
+          + '<strong class="me-1">' + esc(r.type) + '</strong> running'
+          + (r.started_at ? ' · started ' + esc(rel(r.started_at)) : ' · queued ' + esc(rel(r.created_at)))
+          + '</div>';
+      } else if (l) {
+        var ok = l.status === 'succeeded';
+        var html = '<div class="alert ' + (ok ? 'alert-success' : 'alert-danger') + ' mb-0 py-2">'
+          + '<span class="mdi mdi-' + (ok ? 'check-circle-outline' : 'alert-circle-outline') + ' me-1"></span>'
+          + 'Last ' + esc(l.type) + ': <strong>' + esc(l.status) + '</strong> · ' + esc(rel(l.updated_at));
+        if (!ok && l.error) html += '<div class="small mt-1">' + esc(errText(l.error)) + '</div>';
+        box.innerHTML = html + '</div>';
+      } else {
+        box.innerHTML = '';
+      }
+    }
+    var blockedBox = document.getElementById('nso-blocked-removals');
+    var blockedTpl = document.getElementById('nso-blocked-removal-tpl');
+    function renderBlocked(list) {
+      if (!blockedBox || !blockedTpl) return;
+      blockedBox.innerHTML = '';
+      if (!list || !list.length) { blockedBox.classList.add('d-none'); return; }
+      blockedBox.classList.remove('d-none');
+      list.forEach(function (b) {
+        var node = blockedTpl.content.cloneNode(true);
+        node.querySelector('[data-slot="scope"]').textContent = b.scope;
+        var ul = node.querySelector('[data-slot="orphans"]');
+        Object.keys(b.orphans || {}).forEach(function (list) {
+          (b.orphans[list] || []).forEach(function (k) {
+            var li = document.createElement('li');
+            var key = Array.isArray(k) ? k.filter(function (p) { return p !== '' && p != null; }).join(' / ') : String(k);
+            li.textContent = list + ': ' + (key || '(default)');
+            ul.appendChild(li);
+          });
+        });
+        var pre = node.querySelector('[data-slot="preview"]');
+        if (b.preview) { pre.textContent = b.preview; }
+        else { pre.closest('details').classList.add('d-none'); }
+        node.querySelector('input[name="scope"]').value = b.scope;
+        node.querySelector('[data-slot="job"]').textContent = b.job_id;
+        node.querySelector('[data-slot="when"]').textContent = rel(b.blocked_at) || '';
+        blockedBox.appendChild(node);
+      });
+    }
+    var residueBox = document.getElementById('nso-residue-removals');
+    var residueTpl = document.getElementById('nso-residue-removal-tpl');
+    function renderResidue(list) {
+      if (!residueBox || !residueTpl) return;
+      residueBox.innerHTML = '';
+      if (!list || !list.length) { residueBox.classList.add('d-none'); return; }
+      residueBox.classList.remove('d-none');
+      list.forEach(function (r) {
+        var node = residueTpl.content.cloneNode(true);
+        node.querySelector('[data-slot="scope"]').textContent = r.scope;
+        var ul = node.querySelector('[data-slot="residue"]');
+        Object.keys(r.residue || {}).forEach(function (listName) {
+          (r.residue[listName] || []).forEach(function (k) {
+            var li = document.createElement('li');
+            var key = Array.isArray(k) ? k.filter(function (p) { return p !== '' && p != null; }).join(' / ') : String(k);
+            li.textContent = listName + ': ' + (key || '(default)');
+            ul.appendChild(li);
+          });
+        });
+        node.querySelector('[data-slot="job"]').textContent = r.job_id;
+        node.querySelector('[data-slot="when"]').textContent = rel(r.detected_at) || '';
+        residueBox.appendChild(node);
+      });
+    }
+    function poll() {
+      fetch(url, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          render(d);
+          renderBlocked(d && d.blocked_removals);
+          renderResidue(d && d.residue_removals);
+          var running = !!(d && d.running);
+          if (running && !timer) { timer = setInterval(poll, 4000); }
+          else if (!running && timer) { clearInterval(timer); timer = null; }
+        })
+        .catch(function () { /* keep last render */ });
+    }
+    poll();
+  })();
+  </script>
+
+  {# ── Job status (populated by JS polling; hidden until an action fires) ── #}
+  <div id="nso-job-status" class="mb-3 d-none"
+       data-job-status-url="{% url 'plugins:netbox_nso_plugin:nsojob_status' job_id=0 %}">
+    <div class="alert alert-info d-flex align-items-center mb-0" role="alert">
+      <span class="spinner-border spinner-border-sm me-2" id="nso-job-spinner" role="status"
+            aria-hidden="true"></span>
+      <span id="nso-job-message"></span>
+    </div>
+  </div>
+
+  {# ── Apply confirmation modal (self-contained overlay; no Bootstrap-JS dep) ── #}
+  <div id="nso-apply-modal" class="d-none"
+       style="position:fixed; inset:0; z-index:1080; background:rgba(0,0,0,.5); align-items:flex-start; justify-content:center;">
+    <div class="card shadow" style="max-width:1560px; width:96%; margin-top:3rem; max-height:86vh; display:flex; flex-direction:column;">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <span><span class="mdi mdi-upload-network me-1"></span>Apply intent to the device</span>
+        <button type="button" class="btn-close nso-apply-cancel" aria-label="Close"></button>
+      </div>
+      <div class="card-body" style="overflow:auto;" id="nso-apply-modal-body"></div>
+      <div class="card-footer d-flex justify-content-end gap-2">
+        <button type="button" class="btn btn-outline-secondary nso-apply-cancel">Cancel</button>
+        <button type="button" class="btn btn-success" id="nso-apply-confirm">
+          <span class="mdi mdi-check"></span> Confirm Apply
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+  (function () {
+    "use strict";
+    var csrfToken = (document.cookie.match(/csrftoken=([^;]+)/) || [])[1] || '';
+    var statusArea = document.getElementById('nso-job-status');
+    var jobUrlTemplate = statusArea.dataset.jobStatusUrl;
+    var spinner = document.getElementById('nso-job-spinner');
+    var messageEl = document.getElementById('nso-job-message');
+
+    function jobStatusUrl(jobId) { return jobUrlTemplate.replace('/0/', '/' + jobId + '/'); }
+
+    function setStatus(msg, type, busy) {
+      var alertEl = statusArea.querySelector('.alert');
+      alertEl.className = 'alert alert-' + type + ' d-flex align-items-center mb-0';
+      messageEl.textContent = msg;
+      spinner.classList.toggle('d-none', !busy);
+      statusArea.classList.remove('d-none');
+    }
+
+    function setButtons(disabled) {
+      document.querySelectorAll('.nso-action-btn').forEach(function (b) { b.disabled = disabled; });
+    }
+
+    // Build a specific failure message: WHICH scopes failed + why, and what DID apply.
+    // The per-device Apply commits every accepted scope, so one failing scope (e.g. a
+    // stale static route) fails the whole job even when the change you made (e.g. a VLAN
+    // rename) succeeded — say so, instead of a cryptic "1 item(s) failed to apply".
+    function formatApplyError(job) {
+      var err = job.error || {};
+      var items = (err.detail && err.detail.items) || [];
+      var failed = items.map(function (it) { return (it.type || 'item') + ' — ' + (it.error || 'failed'); });
+      var msg = failed.length ? failed.join('; ') : (err.message || 'check adapter logs');
+      var ok = [];
+      var res = job.result || {};
+      Object.keys(res).forEach(function (k) {
+        var m = k.match(/^(.+)_count_by_outcome$/);
+        if (m && res[k] && res[k].in_sync) { ok.push(m[1] + ' ×' + res[k].in_sync); }
+      });
+      if (ok.length) { msg += '  (applied OK: ' + ok.join(', ') + ')'; }
+      return msg;
+    }
+
+    function pollJob(jobId, label) {
+      var interval = setInterval(async function () {
+        try {
+          var r = await fetch(jobStatusUrl(jobId));
+          if (!r.ok) { clearInterval(interval); setStatus('Could not retrieve job status.', 'danger', false); setButtons(false); return; }
+          var job = await r.json();
+          if (job.error && job.status !== 'failed') { clearInterval(interval); var jobErr = (job.error && typeof job.error === 'object') ? (job.error.message || JSON.stringify(job.error)) : job.error; setStatus(label + ' error: ' + jobErr, 'danger', false); setButtons(false); return; }
+          if (job.status === 'succeeded') {
+            clearInterval(interval); setButtons(false);
+            // S5a C (codex R1-F2): a succeeded mirror read may still have degraded families
+            // (kept last-known data) — say so instead of a green "completed".
+            var degraded = (job.result && job.result.degraded_surfaces) || [];
+            if (degraded.length) {
+              setStatus(label + ' completed — ' + degraded.length + ' families degraded, last-known data kept (Job #' + jobId + ').', 'warning', false);
+            } else {
+              setStatus(label + ' completed (Job #' + jobId + ').', 'success', false);
+            }
+            document.dispatchEvent(new CustomEvent('nso:refresh-categories'));  // clear stale header badges
+          } else if (job.status === 'failed') {
+            clearInterval(interval);
+            setStatus(label + ' failed — ' + formatApplyError(job) + ' (Job #' + jobId + ').', 'danger', false); setButtons(false);
+            document.dispatchEvent(new CustomEvent('nso:refresh-categories'));  // reflect any partial state change
+          } else {
+            setStatus(label + ' running… (Job #' + jobId + ', status: ' + job.status + ')', 'info', true);
+          }
+        } catch (e) { clearInterval(interval); setStatus('Polling error: ' + e.message, 'warning', false); setButtons(false); }
+      }, 2000);
+    }
+
+    async function runAction(form) {
+      var label = form.dataset.label;
+      setButtons(true); setStatus(label + ' triggered…', 'info', true);
+      try {
+        var r = await fetch(form.action, {
+          method: 'POST',
+          headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-CSRFToken': csrfToken, 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams(new FormData(form)),
+        });
+        var data = await r.json();
+        if (data.status === 'error') { setStatus('Error: ' + data.message, 'danger', false); setButtons(false); }
+        else if (data.status === 'conflict') {
+          // S5a C (codex R1-F7): poll the INCUMBENT under its own name — never claim the
+          // clicked action is running when it was rejected.
+          var who = data.job_type ? ('Another job is already running: ' + data.job_type) : 'Another job is already running';
+          if (data.job_id) { setStatus(who + ' — tracking it (Job #' + data.job_id + ').', 'warning', true); pollJob(data.job_id, data.job_type || 'Job'); }
+          else { setStatus(who + '.', 'warning', false); setButtons(false); }
+        }
+        else if (data.job_id) { setStatus(label + ' running… (Job #' + data.job_id + ')', 'info', true); pollJob(data.job_id, label); }
+        else { setStatus(label + ' triggered (no job to track).', 'success', false); setButtons(false); }
+      } catch (err) { setStatus('Request failed: ' + err.message, 'danger', false); setButtons(false); }
+    }
+
+    // ── Apply Intent: preview-then-confirm ──
+    var applyForm = document.querySelector('.nso-apply-form');
+    var modalEl = document.getElementById('nso-apply-modal');
+    var modalBody = document.getElementById('nso-apply-modal-body');
+    var confirmBtn = document.getElementById('nso-apply-confirm');
+
+    function showModal() { if (modalEl) { modalEl.classList.remove('d-none'); modalEl.style.display = 'flex'; } }
+    function hideModal() { if (modalEl) { modalEl.classList.add('d-none'); modalEl.style.display = 'none'; } }
+    document.querySelectorAll('.nso-apply-cancel').forEach(function (b) { b.addEventListener('click', hideModal); });
+    if (modalEl) { modalEl.addEventListener('click', function (e) { if (e.target === modalEl) hideModal(); }); }
+
+    function esc(s) { var d = document.createElement('div'); d.textContent = (s == null ? '' : String(s)); return d.innerHTML; }
+
+    // Strip the netconf <rpc>/<edit-config> envelope so the panel shows just the config body.
+    function trimNative(s) {
+      s = String(s || '');
+      var m = s.match(/<config[^>]*>([\s\S]*?)<\/config>/i);
+      return (m ? m[1] : s).replace(/^\s*\n/, '').replace(/\s+$/, '');
+    }
+
+    function renderIntentPanel(d) {
+      if (!d.total) {
+        // #107: no itemised rows, yet the dry-run shows a transaction — typically the
+        // first commit after accepting config that already matched the device (NSO
+        // service adoption), or NSO re-asserting owned config the device drifted from.
+        if (d.device_diff && Object.keys(d.device_diff).length) {
+          return '<p class="text-muted mb-0">No itemised pending changes, but the NSO dry-run on the right still shows a transaction — typically adoption of accepted-as-matching config into NSO ownership, or re-assertion of owned config. Review the diff before applying.</p>';
+        }
+        return '<p class="text-muted mb-0">Nothing pending.</p>';
+      }
+      var h = '';
+      if (d.changes && d.changes.length) {
+        h += '<div class="table-responsive"><table class="table table-sm align-middle mb-2"><thead><tr><th>Interface</th><th>Attribute</th><th>Device now</th><th>→ NetBox</th></tr></thead><tbody>';
+        d.changes.forEach(function (c) {
+          h += '<tr><td>' + esc(c.interface) + '</td><td><code>' + esc(c.attribute) + '</code></td><td class="text-muted">' + esc(c.device) + '</td><td><strong>' + esc(c.netbox) + '</strong></td></tr>';
+        });
+        h += '</tbody></table></div>';
+      }
+      if (d.routing_changes && d.routing_changes.length) {
+        var diffScopes = Object.keys(d.device_diff || {});
+        h += '<div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Category</th><th>Item</th><th>Properties pushed</th><th>State</th></tr></thead><tbody>';
+        d.routing_changes.forEach(function (c) {
+          // A staged row whose scope produced NO dry-run delta is already satisfied on
+          // the device (or unrepresentable on the NED) — say so instead of implying a push.
+          // But ONLY when a dry-run actually ran: if it threw (adapter down, NSO busy) the
+          // server also sends device_diff={}, and reading that as "no device change" told
+          // the operator every staged row already matched the device — the one moment the
+          // panel knows least is the one it sounded most certain.
+          var satisfied = d.diff_available && c.scope && diffScopes.indexOf(c.scope) === -1;
+          if (!satisfied && c.scope === 'route_policy' && c.item && c.item.length >= 3) {
+            // Shared-object scope: several policies ride ONE diff — flag the individual
+            // object when its name is absent (boundary-guarded so example-comm does not
+            // match inside example-comm-2). Best-effort heuristic; a miss shows no badge.
+            var rx = new RegExp(c.item.replace(/[.*+?^\x24{}()|[\]\\]/g, '\\$&') + '(?=[\\s{;]|$)');
+            satisfied = !rx.test(String(d.device_diff[c.scope] || ''));
+          }
+          var noChange = satisfied
+            ? ' <span class="badge text-bg-info" title="The NSO dry-run shows no device change for this intent — the device already matches it (or the NED cannot express it).">no device change</span>'
+            : '';
+          // Staged-and-forgotten: accepted ≥7 days ago and still not settled — say it
+          // loudly, whether no apply ever ran or an old apply never converged.
+          var stale = '';
+          if (c.staged_days !== null && c.staged_days >= 7) {
+            var staleLabel = 'staged ' + c.staged_days + 'd' + (c.never_applied ? ', never applied' : '');
+            var staleTitle = c.never_applied
+              ? 'Accepted ' + c.staged_days + ' days ago and never applied — this intent has been waiting in staging ever since.'
+              : 'Accepted ' + c.staged_days + ' days ago and still not in sync — the last apply never converged or the change was re-staged.';
+            stale = ' <span class="badge text-bg-warning text-dark" title="' + staleTitle + '">' + staleLabel + '</span>';
+          }
+          h += '<tr><td>' + esc(c.category) + '</td><td>' + esc(c.item) + '</td><td><strong>' + esc(c.detail) + '</strong>' + noChange + '</td><td><span class="text-muted small">' + esc(c.status) + '</span>' + stale + '</td></tr>';
+        });
+        h += '</tbody></table></div>';
+      }
+      return h;
+    }
+
+    // ── diff rendering: NSO `outformat cli` (+/- tree diff) through the vendored
+    //    diff2html; device-native syntax available behind a toggle. ──────────────
+    var diffMode = 'line-by-line';           // 'line-by-line' | 'side-by-side' | 'native'
+    var cliDevicesOnly = true;               // #92: hide the intent-tree part of the cli diff
+    var previewCache = {};                   // outformat → parsed preview response
+
+    // #92: reduce the cli tree-diff to its top-level `devices { … }` block. The cli
+    // outformat shows the WHOLE NSO transaction — device config plus the intent-tree
+    // (service) changes, which usually duplicate what the intent panel already lists.
+    // Depth-tracked over the brace tree, so nested blocks named "devices" elsewhere
+    // never match. Exposed on window for functional verification.
+    function devicesSubtreeOnly(text) {
+      var out = [], depth = 0, keeping = false;
+      String(text).replace(/\n$/, '').split('\n').forEach(function (l) {
+        if (depth === 0) keeping = /^devices\b/.test(l.replace(/^[-+ ]/, '').trim());
+        if (keeping) out.push(l);
+        depth += (l.match(/{/g) || []).length - (l.match(/}/g) || []).length;
+        if (depth < 0) depth = 0;
+      });
+      return out.join('\n');
+    }
+    window.nsoCliDevicesSubtree = devicesSubtreeOnly;
+
+    function cliToUnified(scope, text) {
+      // NSO's cli output is already a +/- annotated tree; wrap it as a unified-diff
+      // hunk so diff2html can parse it (defensively prefix any unmarked line as context).
+      var lines = String(text).replace(/\n$/, '').split('\n').map(function (l) {
+        var c = l.charAt(0);
+        return (c === '+' || c === '-' || c === ' ') ? l : ' ' + l;
+      });
+      // diff2html requires a REAL hunk header (@@ -start,count +start,count @@) —
+      // count the before (context+deletions) and after (context+additions) sides.
+      var before = 0, after = 0;
+      lines.forEach(function (l) {
+        if (l.charAt(0) !== '+') before += 1;
+        if (l.charAt(0) !== '-') after += 1;
+      });
+      return '--- ' + scope + '\n+++ ' + scope + '\n@@ -1,' + before + ' +1,' + after + ' @@\n'
+           + lines.join('\n') + '\n';
+    }
+
+    function renderDiffPanel(d) {
+      var diff = d.device_diff || {};
+      var keys = Object.keys(diff);
+      if (!keys.length) {
+        if (!d.diff_available) {
+          return '<p class="text-warning mb-0"><span class="mdi mdi-alert-outline me-1"></span>The NSO dry-run could not be run (the adapter or NSO did not answer), so what this Apply would change on the device is <strong>unknown</strong>. Retry before applying.</p>';
+        }
+        return '<p class="text-muted mb-0">No device change — the intent already matches the device.</p>';
+      }
+      if (d.outformat === 'cli' && window.Diff2Html) {
+        var unified = keys.map(function (k) {
+          var text = diff[k];
+          if (cliDevicesOnly) {
+            var filtered = devicesSubtreeOnly(text);
+            // an intent-only change (e.g. a NED-unrepresentable member) has no device
+            // subtree at all — say so instead of rendering an empty hunk
+            text = filtered.trim() ? filtered
+                 : '(intent-tree change only — no device config delta; toggle "Device subtree" off to view it)';
+          }
+          return cliToUnified(k.replace(/_/g, ' '), text);
+        }).join('');
+        try {
+          return Diff2Html.html(unified, {
+            drawFileList: false,
+            matching: 'lines',
+            outputFormat: diffMode === 'side-by-side' ? 'side-by-side' : 'line-by-line',
+            colorScheme: document.documentElement.dataset.bsTheme === 'dark' ? 'dark' : 'light',
+          });
+        } catch (e) { /* fall through to the <pre> rendering */ }
+      }
+      var h = '';
+      keys.forEach(function (k) {
+        h += '<div class="mb-2"><div class="small text-uppercase text-muted">' + esc(k.replace(/_/g, ' ')) + '</div>'
+           + '<pre class="border rounded bg-body-tertiary p-2 mb-0" style="font-size:.78rem; white-space:pre; overflow:auto;">'
+           + esc(trimNative(diff[k])) + '</pre></div>';
+      });
+      return h;
+    }
+
+    function diffModeButtons() {
+      function btn(mode, icon, label) {
+        var active = diffMode === mode ? ' active' : '';
+        return '<button type="button" class="btn btn-outline-secondary btn-sm' + active + '" data-diffmode="' + mode + '">'
+             + '<span class="mdi ' + icon + ' me-1"></span>' + label + '</button>';
+      }
+      // #92: the devices-subtree filter applies to the cli tree-diff only (native IS
+      // device syntax) — the toggle renders just for the diff2html modes.
+      var subtree = diffMode === 'native' ? '' :
+        '<div class="btn-group btn-group-sm ms-2" role="group" aria-label="Diff scope">'
+        + '<button type="button" class="btn btn-outline-secondary btn-sm' + (cliDevicesOnly ? ' active' : '') + '"'
+        + ' data-clidevonly="1" title="Show only the devices subtree of the NSO transaction — hide the intent-tree (service) part">'
+        + '<span class="mdi mdi-router me-1"></span>Device subtree</button></div>';
+      return '<div class="btn-group btn-group-sm ms-auto" role="group" aria-label="Diff format">'
+           + btn('line-by-line', 'mdi-format-list-text', 'Unified')
+           + btn('side-by-side', 'mdi-view-split-vertical', 'Split')
+           + btn('native', 'mdi-console', 'Device syntax')
+           + '</div>' + subtree;
+    }
+
+    function renderPreview(d) {
+      // Keyed on THIS payload (not the cli-based skip decision): a non-empty dry-run
+      // must render the two-panel layout even with zero itemised rows (#107).
+      var hasDiff = d.device_diff && Object.keys(d.device_diff).length;
+      if (!d.total && !hasDiff) { return '<p class="text-muted mb-0">Nothing pending — NetBox and the device are in sync.</p>'; }
+      return ''
+        + '<div class="row g-3">'
+        + '  <div class="col-lg-4"><h6 class="border-bottom pb-1"><span class="mdi mdi-cloud-upload-outline me-1"></span>Intent — what we push</h6>'
+        +      renderIntentPanel(d)
+        + '  </div>'
+        + '  <div class="col-lg-8"><h6 class="border-bottom pb-1 d-flex align-items-center"><span class="mdi mdi-file-compare me-1"></span>Device diff — NSO dry-run'
+        +      diffModeButtons()
+        + '  </h6>'
+        +      renderDiffPanel(d)
+        + '  </div>'
+        + '</div>';
+    }
+
+    async function fetchPreview(fmt) {
+      if (previewCache[fmt]) return previewCache[fmt];
+      var r = await fetch(applyForm.dataset.previewUrl + '?outformat=' + fmt,
+                          { headers: { 'X-Requested-With': 'XMLHttpRequest' } });
+      var d = await r.json();
+      previewCache[fmt] = d;
+      return d;
+    }
+
+    async function rerenderPreview() {
+      var fmt = diffMode === 'native' ? 'native' : 'cli';
+      try {
+        modalBody.innerHTML = renderPreview(await fetchPreview(fmt));
+      } catch (e) { setStatus('Could not load apply preview: ' + e.message, 'warning', false); }
+    }
+
+    if (modalBody) {
+      modalBody.addEventListener('click', function (ev) {
+        var t = ev.target.closest('[data-clidevonly]');
+        if (t) { cliDevicesOnly = !cliDevicesOnly; rerenderPreview(); return; }
+        var b = ev.target.closest('[data-diffmode]');
+        if (!b) return;
+        diffMode = b.dataset.diffmode;
+        rerenderPreview();
+      });
+    }
+
+    async function openApply() {
+      if (!applyForm) return;
+      try {
+        previewCache = {};
+        // The skip-modal decision always reads the cli (full-NSO-transaction) preview:
+        // outformat=native is device syntax only, which is legitimately EMPTY for a
+        // byte-exact adoption commit — deciding on it would auto-proceed past the very
+        // transaction the modal exists to confirm (#107). nothing_pending comes from
+        // the server: total==0 AND an empty dry-run diff (row counts alone miss
+        // adoption-only applies, where accepted-as-matching rows sit in_sync).
+        var d = await fetchPreview('cli');
+        if (d.auto_apply || d.nothing_pending) { runAction(applyForm); return; }  // nothing to commit (or auto-apply) → just go
+        modalBody.innerHTML = renderPreview(diffMode === 'native' ? await fetchPreview('native') : d);
+        showModal();
+      } catch (e) { setStatus('Could not load apply preview: ' + e.message, 'warning', false); }
+    }
+
+    if (confirmBtn) { confirmBtn.addEventListener('click', function () { hideModal(); runAction(applyForm); }); }
+
+    document.querySelectorAll('.nso-action-form').forEach(function (form) {
+      form.addEventListener('submit', function (e) {
+        e.preventDefault();
+        if (form.classList.contains('nso-apply-form')) { openApply(); return; }
+        runAction(form);
+      });
+    });
+    // Per-row Apply buttons load lazily inside category fragments → delegate.
+    document.addEventListener('click', function (e) {
+      if (e.target.closest('.nso-apply-btn')) { e.preventDefault(); openApply(); }
+    });
+  })();
+  </script>
+
+  {# ── NSO configuration: counts-first, rows loaded lazily on expand ──────── #}
+  {% if nso_categories %}
+    <h4 class="mt-4 mb-2"><span class="mdi mdi-format-list-bulleted"></span> NSO Configuration</h4>
+    {# READSEM S4 (R11/R12): device-wide reset banner — always in the DOM so the #}
+    {# counts poll can toggle it; honored by every render path incl. adapter-down. #}
+    <div class="alert alert-warning py-2 {% if not read_reset_pending %}d-none{% endif %}" data-nso-reset-banner>
+      <span class="mdi mdi-database-refresh me-1"></span>
+      Refresh pending — the adapter's data store was reset. Showing last-known state
+      until the next reconcile adopts the new dataset.
+    </div>
+    {% if families_version_mismatch %}
+    <div class="alert alert-danger py-2">
+      <span class="mdi mdi-alert me-1"></span>
+      Adapter read-state vocabulary v{{ families_version_mismatch.served }} does not match this
+      plugin (v{{ families_version_mismatch.expected }}) — update the older side; read chips may be
+      incomplete or unknown.
+    </div>
+    {% endif %}
+    <p class="text-muted small mb-2"
+       data-cat-counts-url="{% url 'plugins:netbox_nso_plugin:device_nso_category_counts' device_pk=object.pk %}">
+      Counts reflect the last sync. Click a category to load its rows.
+    </p>
+    {% for cat in nso_categories %}
+      <div class="card mb-2 nso-category"
+           data-cat-key="{{ cat.key }}"
+           data-cat-url="{% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key=cat.key %}">
+        <div class="card-header d-flex justify-content-between align-items-center nso-cat-toggle"
+             role="button" tabindex="0" aria-expanded="false" style="cursor: pointer;">
+          <span>
+            <span class="mdi mdi-{{ cat.icon }} me-1"></span><strong>{{ cat.label }}</strong>
+            <span class="nso-cat-badges"
+                  data-total="{{ cat.counts.total|default:0 }}"
+                  data-drift="{{ cat.counts.drift|default:0 }}"
+                  data-pending="{{ cat.counts.pending|default:0 }}">
+              <span class="text-muted ms-1">({{ cat.counts.total|default:0 }})</span>
+              {% if cat.counts.drift %}<span class="badge text-bg-warning text-dark ms-2" title="Objects whose on-box content differs from what NetBox holds and that NetBox does not own — open one to see the diff, then Accept or update NetBox.">{{ cat.counts.drift }} drift</span>{% endif %}
+              {% if cat.counts.pending %}<span class="badge text-bg-info ms-1" title="Objects NetBox owns (Accepted) that have not yet been applied to / confirmed on the device. Run Apply to push them.">{{ cat.counts.pending }} pending apply</span>{% endif %}
+              {% if cat.counts.total and not cat.counts.drift and not cat.counts.pending %}<span class="badge text-bg-success ms-2" title="Every object in this category agrees with NetBox — nothing drifted and nothing awaiting apply.">in sync</span>{% endif %}
+              {% if cat.read %}<span class="badge {{ cat.read.css }} ms-2" title="{{ cat.read.tip }}">{{ cat.read.label }}</span>{% endif %}
+            </span>
+          </span>
+          <span>
+            <span class="mdi mdi-refresh nso-cat-refresh me-2" role="button"
+                  title="Refresh this category" aria-label="Refresh this category"></span>
+            <span class="mdi mdi-chevron-down nso-cat-chevron"></span>
+          </span>
+        </div>
+        <div class="card-body nso-cat-body d-none">
+          <div class="text-muted small">
+            <span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Loading…
+          </div>
+        </div>
+      </div>
+    {% endfor %}
+    {# READSEM S4 (D8/R4-4): families the adapter reports that this plugin does not #}
+    {# know — rendered generically from the LIVE response (no fetcher/gate exists). #}
+    {% if read_state_unknown %}
+      <div class="card mb-2">
+        <div class="card-header">
+          <span class="mdi mdi-help-box me-1"></span><strong>Other families</strong>
+          <span class="text-muted small ms-1">reported by the adapter but unknown to this plugin version</span>
+        </div>
+        <div class="card-body py-2">
+          {% for u in read_state_unknown %}
+            <span class="badge border text-muted me-2"
+                  title="{{ u.read_state.outcome|default:'?' }}{% if u.read_state.reason %} / {{ u.read_state.reason }}{% endif %}">
+              {{ u.family }}: {{ u.read_state.outcome|default:"?" }}
+            </span>
+          {% endfor %}
+        </div>
+      </div>
+    {% endif %}
+
+    <script>
+    (function () {
+      "use strict";
+      function runScripts(container) {
+        container.querySelectorAll('script').forEach(function (old) {
+          // Leave data blocks alone (e.g. json_script payloads): recreating them
+          // without their type attribute would execute JSON as JS and throw.
+          if (old.type && old.type !== 'text/javascript' && old.type !== 'module') return;
+          var s = document.createElement('script');
+          if (old.src) { s.src = old.src; } else { s.textContent = old.textContent; }
+          old.parentNode.replaceChild(s, old);
+        });
+      }
+
+      function esc(s) { var d = document.createElement('div'); d.textContent = (s == null ? '' : String(s)); return d.innerHTML; }
+
+      var countsEl = document.querySelector('[data-cat-counts-url]');
+      var countsUrl = countsEl ? countsEl.dataset.catCountsUrl : null;
+
+      var headersGate = window.NSOBadges.makeGenGate();
+      function refreshHeaders() {
+        if (!countsUrl) { return Promise.resolve(null); }
+        var gen = headersGate.next();
+        return fetch(countsUrl, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (d) {
+            if (!d || !d.categories) { return null; }
+            // An older in-flight response must never overwrite a newer render, nor
+            // feed any caller's bookkeeping (codex B5-F7/R2-5).
+            if (!headersGate.isCurrent(gen)) { return null; }
+            // READSEM S4 (R11/R12): keep the device-wide reset banner honest on the
+            // dynamic path too (a reload is not required to learn of a store reset).
+            var resetBanner = document.querySelector('[data-nso-reset-banner]');
+            if (resetBanner) { resetBanner.classList.toggle('d-none', !d.reset_pending); }
+            document.querySelectorAll('.nso-category').forEach(function (card) {
+              var c = d.categories[card.dataset.catKey];
+              var badges = card.querySelector('.nso-cat-badges');
+              if (!c || !badges) { return; }
+              badges.dataset.total = c.total; badges.dataset.drift = c.drift; badges.dataset.pending = c.pending;
+              // NSOBadges renders counts + the D10 read chip (chips must survive
+              // this rebuild — READSEM S4).
+              badges.innerHTML = window.NSOBadges.renderBadges(c.total, c.drift, c.pending, c.read);
+            });
+            return d.categories;
+          })
+          .catch(function () { return null; /* best-effort: leave headers as-is on failure */ });
+      }
+
+      // The completion-time refresh is reliably too early: the RQ reconcile that
+      // applies the observations lands seconds after the adapter job the status UI
+      // polls, so a single fetch freezes chips on refresh_pending (or a pre-recovery
+      // state) until the next user action. Poll counts every 3s for the FULL 30s
+      // budget (D10 self-heal) — no early stop: any settled-looking predicate can be
+      // fooled by a pre-recovery state that changes right after two identical reads
+      // (codex B5-R2-5/R2-6), and ten light JSON fetches per explicit action are
+      // cheaper than a frozen chip.
+      var settleTimer = null;
+      var settleToken = null;
+      function startSettlePoll() {
+        var token = {};
+        settleToken = token;
+        var deadline = Date.now() + 30000;
+        if (settleTimer) { clearInterval(settleTimer); }
+        settleTimer = setInterval(function () {
+          // Superseded poll (a newer action owns settling now) — this timer was
+          // already cleared; never touch the CURRENT poll's timer (codex B5-F7).
+          if (settleToken !== token) { return; }
+          // Deadline check FIRST — the poll must terminate even if a tick throws.
+          if (Date.now() >= deadline) { clearInterval(settleTimer); settleTimer = null; return; }
+          refreshHeaders();
+        }, 3000);
+      }
+
+      // A state-changing action (Sync / Detect Drift / Apply) finished → refresh the
+      // headers and re-pull any already-expanded category bodies.
+      document.addEventListener('nso:refresh-categories', function () {
+        refreshHeaders();
+        startSettlePoll();
+        document.querySelectorAll('.nso-category').forEach(function (card) {
+          var body = card.querySelector('.nso-cat-body');
+          if (body && !body.classList.contains('d-none')) {
+            card.dispatchEvent(new CustomEvent('nso:refetch-rows'));
+          }
+        });
+      });
+
+      document.querySelectorAll('.nso-category').forEach(function (card) {
+        var header = card.querySelector('.nso-cat-toggle');
+        var body = card.querySelector('.nso-cat-body');
+        var chevron = card.querySelector('.nso-cat-chevron');
+        var refreshIcon = card.querySelector('.nso-cat-refresh');
+        var loaded = false;
+
+        // Paginated categories render from last-synced state (fast). Pass refresh=1
+        // to force a live reconcile (the Refresh icon) before rendering.
+        function fetchRows(refresh) {
+          var url = card.dataset.catUrl + (refresh ? '?refresh=1' : '');
+          body.innerHTML = '<div class="text-muted small"><span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Loading…</div>';
+          fetch(url, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+            .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); })
+            .then(function (html) { body.innerHTML = html; runScripts(body); })
+            .catch(function (e) { body.innerHTML = '<div class="text-danger small">Failed to load: ' + e.message + '</div>'; });
+        }
+
+        function toggle() {
+          var nowHidden = body.classList.toggle('d-none');
+          header.setAttribute('aria-expanded', String(!nowHidden));
+          chevron.classList.toggle('mdi-chevron-down', nowHidden);
+          chevron.classList.toggle('mdi-chevron-up', !nowHidden);
+          if (!nowHidden && !loaded) { loaded = true; fetchRows(); }
+        }
+
+        header.addEventListener('click', toggle);
+        header.addEventListener('keydown', function (e) {
+          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
+        });
+        // Programmatic re-pull (fired after a Sync/Apply for already-open categories).
+        card.addEventListener('nso:refetch-rows', function () { loaded = true; fetchRows(); });
+        if (refreshIcon) {
+          refreshIcon.addEventListener('click', function (e) {
+            e.stopPropagation();  // don't toggle the card
+            refreshHeaders();  // a manual refresh must also clear a stale header badge
+            if (body.classList.contains('d-none')) { body.classList.remove('d-none'); header.setAttribute('aria-expanded', 'true'); chevron.classList.replace('mdi-chevron-down', 'mdi-chevron-up'); }
+            loaded = true; fetchRows(true);  // force a live reconcile, then render
+          });
+        }
+      });
+    })();
+
+    // ── Generic category pager (read-from-last-synced, paginated) ──────────────
+    // Delegated on document so it works for every .nso-cat-pager fragment, even
+    // several open at once. Fragments carry only markup; this drives search/page
+    // re-fetch (q + page, no reconcile) and AJAX Accept (keeps the card open).
+    (function () {
+      "use strict";
+      function csrf() {
+        var el = document.querySelector('input[name=csrfmiddlewaretoken]');
+        return (el && el.value) || (document.cookie.match(/csrftoken=([^;]+)/) || [])[1] || '';
+      }
+      function esc(s) { var d = document.createElement('div'); d.textContent = (s == null ? '' : String(s)); return d.innerHTML; }
+      function flash(pager, text, type) {
+        var m = pager.querySelector('.nso-cat-msg');
+        if (m) m.innerHTML = text ? '<div class="alert alert-' + type + ' py-1 px-2 small mb-2">' + text + '</div>' : '';
+      }
+      // Current quick-select state = the active pill (re-rendered server-side each load),
+      // so the pager div needs no per-template data-state attribute.
+      function curState(pager) {
+        var a = pager.querySelector('.nso-cat-state.active');
+        return (a && a.dataset.catState) || 'all';
+      }
+      function load(pager, q, state, page) {
+        pager.dataset.q = q; pager.dataset.page = page;
+        var results = pager.querySelector('.nso-cat-results');
+        results.innerHTML = '<div class="text-muted small py-2"><span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Loading…</div>';
+        return fetch(pager.dataset.url + '?q=' + encodeURIComponent(q) + '&state=' + encodeURIComponent(state) + '&page=' + page, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+          .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); })
+          .then(function (html) {
+            var t = document.createElement('div'); t.innerHTML = html;
+            var fresh = t.querySelector('.nso-cat-results');
+            if (fresh) pager.querySelector('.nso-cat-results').replaceWith(fresh);
+          })
+          .catch(function (e) { pager.querySelector('.nso-cat-results').innerHTML = '<div class="text-danger small">Failed to load: ' + esc(e.message) + '</div>'; });
+      }
+      var debounce = null;
+      document.addEventListener('input', function (e) {
+        var inp = e.target.closest('.nso-cat-filter'); if (!inp) return;
+        var pager = inp.closest('.nso-cat-pager'); if (!pager) return;
+        clearTimeout(debounce);
+        var v = inp.value.trim();
+        debounce = setTimeout(function () { load(pager, v, curState(pager), 1); }, 350);
+      });
+      document.addEventListener('click', function (e) {
+        var st = e.target.closest('.nso-cat-state');
+        if (st) {
+          var sp = st.closest('.nso-cat-pager'); if (!sp) return;
+          e.preventDefault();
+          load(sp, sp.dataset.q || '', st.dataset.catState, 1);
+          return;
+        }
+        var pg = e.target.closest('.nso-cat-page'); if (!pg) return;
+        var pager = pg.closest('.nso-cat-pager'); if (!pager) return;
+        e.preventDefault();
+        load(pager, pager.dataset.q || '', curState(pager), pg.dataset.page);
+      });
+      document.addEventListener('submit', function (e) {
+        var form = e.target.closest('.nso-cat-pager .nso-row-form'); if (!form) return;
+        var pager = form.closest('.nso-cat-pager');
+        e.preventDefault();
+        form.querySelectorAll('button').forEach(function (b) { b.disabled = true; });
+        fetch(form.action, {
+          method: 'POST',
+          headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-CSRFToken': csrf(), 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams(new FormData(form)),
+        }).then(function (r) {
+          return r.json().catch(function () { return {}; }).then(function (d) { return { ok: r.ok, data: d }; });
+        }).then(function (res) {
+          if (!res.ok || (res.data && res.data.status === 'error')) {
+            flash(pager, 'Action failed: ' + esc((res.data && res.data.message) || 'server error'), 'danger');
+          } else {
+            flash(pager, '', '');
+            document.dispatchEvent(new CustomEvent('nso:refresh-categories'));
+          }
+          return load(pager, pager.dataset.q || '', curState(pager), pager.dataset.page || 1);
+        });
+      });
+    })();
+    </script>
+  {% elif not adapter_error %}
+    <div class="alert alert-secondary mt-3">
+      No managed scopes for this device.
+      <a href="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_edit' mgmt.pk %}?return_url={% url 'dcim:device_nso' pk=object.pk %}">Edit scope</a>.
+    </div>
+  {% endif %}
+
+{% else %}
+  <div class="alert alert-info" role="alert">
+    <span class="mdi mdi-information-outline me-1"></span>
+    This device is not NSO-managed.
+    <a href="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_add' %}?device={{ object.pk }}&amp;return_url={% url 'dcim:device_nso' pk=object.pk %}">
+      Enable NSO management
+    </a>
+  </div>
+{% endif %}
+{% endblock content %}

@@ -1,0 +1,20 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
+{# Lazy fragment: per-interface BFD, as a client-side grid (nso-grid-bfd.js). Accept = #}
+{# NetBox owns the BFD timers; pushed to the device on Apply via the bfd-reconciler. #}
+{# BFD owns the whole ROW (one status, one accept_url), so Accept is a trailing #}
+{# column rather than the per-cell Accept the Interfaces grid uses. #}
+{% include "netbox_nso_plugin/categories/_adapter_error.html" %}
+
+{% if grid_payload.rows %}
+  <p class="text-muted small mb-2">BFD is an interface property; protocols (BGP/IS-IS/OSPF) just enable it. Edit the BFD config or Accept to make NetBox the source of truth; Apply writes it to the device.</p>
+  {{ grid_payload|json_script:"nso-bfd-data" }}
+  {% url 'plugins:netbox_nso_plugin:device_nso_category' pk=object.pk key='bfd' as cat_url %}
+  {% include "netbox_nso_plugin/categories/_grid.html" with cls="nso-bfd" json_url=cat_url|add:"?format=json" counts=grid_payload.counts %}
+
+  <script>
+  window.NSOGridBfd && window.NSOGridBfd.mount(document.querySelector('.nso-bfd'));
+  </script>
+{% else %}
+  <p class="text-muted mb-0">No BFD-configured interfaces found on this device.</p>
+{% endif %}
