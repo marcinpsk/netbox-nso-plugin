@@ -354,7 +354,7 @@ class TestNSODeviceManagementListView(ViewTestBase):
     @patch("netbox_nso_plugin.adapter_client._resolve_config")
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_list_polls_and_refreshes_last_sync(self, mock_session_cls, mock_cfg):
-        """List view refreshes cached last_sync_* via a per-row get_device poll."""
+        """List view refreshes cached last_sync_* via one bulk list_devices poll."""
         mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
         mgmt.adapter_device_id = 16
         mgmt.last_sync_at = None
@@ -375,11 +375,16 @@ class TestNSODeviceManagementListView(ViewTestBase):
             calls.append(url)
             return make_response(
                 200,
-                json_data={
-                    "id": 16,
-                    "last_sync_at": "2025-06-01T10:00:00+00:00",
-                    "last_sync_status": "succeeded",
-                },
+                json_data=[
+                    {
+                        "id": 16,
+                        "nso_instance": "view-nso-id",
+                        "nso_device_name": "view-router-01",
+                        "netbox_device_id": None,
+                        "last_sync_at": "2025-06-01T10:00:00+00:00",
+                        "last_sync_status": "succeeded",
+                    }
+                ],
             )
 
         session = make_session()
@@ -390,8 +395,8 @@ class TestNSODeviceManagementListView(ViewTestBase):
         response = self.client.get(url)
         self.assertEqual(response.status_code, 200)
 
-        # Poll hit get_device (not /interfaces or /state — list is lightweight).
-        self.assertTrue(any(u.endswith("/devices/16") for u in calls), calls)
+        # Poll hit the bulk device list (not /interfaces or /state — list is lightweight).
+        self.assertTrue(any(u.endswith("/api/v1/devices") for u in calls), calls)
         self.assertFalse(any("/state" in u or "/interfaces" in u for u in calls), calls)
 
         mgmt.refresh_from_db()
@@ -403,12 +408,14 @@ class TestNSODeviceManagementListView(ViewTestBase):
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config")
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
-    def test_successful_poll_clears_stale_adapter_link_error(self, mock_session_cls, mock_cfg):
-        """A poll that finds the device synced 'succeeded' retires a sticky adapter_link_error.
+    def test_successful_poll_keeps_adapter_link_error(self, mock_session_cls, mock_cfg):
+        """A poll finding the device synced 'succeeded' must NOT retire an adapter_link_error.
 
-        The error is set by a failed scope-sync (post_save handler) and was previously only
-        cleared by the *next successful save* — a transient adapter outage left the tab banner
-        claiming "last adapter sync failed" forever, alongside "Last sync: succeeded"."""
+        The two live on different clocks: the error is a failed plugin→adapter scope push, the
+        status is the adapter→NSO device sync, stamped whenever the adapter last synced. A
+        'succeeded' that predates the failure would clear the banner (and its "Retry adapter
+        link" button) for a scope that never landed. Only the successful push or the retry
+        action clears it."""
         mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
         mgmt.adapter_device_id = 16
         mgmt.save(update_fields=["adapter_device_id"])
@@ -429,11 +436,16 @@ class TestNSODeviceManagementListView(ViewTestBase):
         def make_resp(method, url, **kwargs):
             return make_response(
                 200,
-                json_data={
-                    "id": 16,
-                    "last_sync_at": "2025-06-01T10:00:00+00:00",
-                    "last_sync_status": "succeeded",
-                },
+                json_data=[
+                    {
+                        "id": 16,
+                        "nso_instance": "view-nso-id",
+                        "nso_device_name": "view-router-01",
+                        "netbox_device_id": None,
+                        "last_sync_at": "2025-06-01T10:00:00+00:00",
+                        "last_sync_status": "succeeded",
+                    }
+                ],
             )
 
         session = make_session()
@@ -445,8 +457,8 @@ class TestNSODeviceManagementListView(ViewTestBase):
         self.assertEqual(response.status_code, 200)
 
         mgmt.refresh_from_db()
-        self.assertEqual(mgmt.last_sync_status, "succeeded")
-        self.assertEqual(mgmt.adapter_link_error, "")
+        self.assertEqual(mgmt.last_sync_status, "succeeded")  # the poll did run
+        self.assertEqual(mgmt.adapter_link_error, "Internal Server Error")
 
         mgmt.adapter_device_id = None
         mgmt.save(update_fields=["adapter_device_id"])
@@ -473,11 +485,16 @@ class TestNSODeviceManagementListView(ViewTestBase):
         def make_resp(method, url, **kwargs):
             return make_response(
                 200,
-                json_data={
-                    "id": 16,
-                    "last_sync_at": "2025-06-01T10:00:00+00:00",
-                    "last_sync_status": "failed",
-                },
+                json_data=[
+                    {
+                        "id": 16,
+                        "nso_instance": "view-nso-id",
+                        "nso_device_name": "view-router-01",
+                        "netbox_device_id": None,
+                        "last_sync_at": "2025-06-01T10:00:00+00:00",
+                        "last_sync_status": "failed",
+                    }
+                ],
             )
 
         session = make_session()
@@ -516,12 +533,17 @@ class TestNSODeviceManagementListView(ViewTestBase):
         def make_resp(method, url, **kwargs):
             return make_response(
                 200,
-                json_data={
-                    "id": 17,
-                    "last_sync_at": "2025-06-01T10:00:00+00:00",
-                    "last_sync_status": "partial",
-                    "degraded_surfaces": ["bgp", "ospf"],
-                },
+                json_data=[
+                    {
+                        "id": 17,
+                        "nso_instance": "view-nso-id",
+                        "nso_device_name": "view-router-01",
+                        "netbox_device_id": None,
+                        "last_sync_at": "2025-06-01T10:00:00+00:00",
+                        "last_sync_status": "partial",
+                        "degraded_surfaces": ["bgp", "ospf"],
+                    }
+                ],
             )
 
         session = make_session()
@@ -2249,8 +2271,13 @@ class TestDeviceNSOTabView(ViewTestBase):
         mgmt.save()
 
         stack, mocks = self._patch_all_getters()
+        # The identity fields are load-bearing: the tab mirrors this payload onto the row, and
+        # that mirror now fails closed unless the payload really is this device's.
         mocks["get_device"].return_value = {
             "id": 15,
+            "nso_instance": self.nso_instance.adapter_instance_id,
+            "nso_device_name": mgmt.nso_device_name,
+            "netbox_device_id": self.device.pk,
             "last_sync_at": "2025-06-01T10:00:00+00:00",
             "last_sync_status": "partial",
             "degraded_surfaces": ["bgp", "ospf"],
@@ -5041,6 +5068,61 @@ class TestNSOAdapterLinkRetryView(ViewTestBase):
         self.mgmt.refresh_from_db()
         self.assertEqual(self.mgmt.adapter_link_error, "")  # cleared on success
         self.assertEqual(self.mgmt.adapter_device_id, 321)  # now linked
+
+    def test_retry_relinks_a_device_the_adapter_no_longer_knows(self):
+        """A dead adapter_device_id is re-onboarded by the retry, not just re-reported.
+
+        The adapter's device row can vanish under a live management row (a provision that
+        rolled back, a manual delete, a restored DB). The link path then skips onboarding —
+        the id is set, so ``created or adapter_device_id is None`` is False — and every scope
+        push 404s against the dead id, so the banner's own Retry button could never heal it.
+        """
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(
+            adapter_device_id=196, adapter_link_error="Device not found", onboard_status=""
+        )
+        scope_calls = []
+
+        def fake_set_scope(adapter_device_id, *args, **kwargs):
+            scope_calls.append(adapter_device_id)
+            if adapter_device_id == 196:
+                raise AdapterError("Device not found", code="not_found")
+            return {}
+
+        with (
+            patch(f"{self._MOD}.onboard_device", return_value={"id": 700}),
+            patch(f"{self._MOD}.set_scope", side_effect=fake_set_scope),
+            patch(f"{self._MOD}.sync_notify", return_value=None),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            resp = self.client.post(self._url())
+
+        self.assertEqual(resp.status_code, 302)
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_device_id, 700)  # re-onboarded onto a live row
+        self.assertEqual(self.mgmt.adapter_link_error, "")  # healed, banner goes away
+        self.assertEqual(scope_calls, [196, 700])  # dead id tried, then the fresh one
+
+    def test_retry_does_not_reonboard_on_a_transient_scope_failure(self):
+        """Only a not-found scope push means the id is dead — an outage must not re-onboard.
+
+        Re-onboarding on any error would mint a second adapter device row for a device that
+        already has a live one every time the adapter was briefly unreachable.
+        """
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(
+            adapter_device_id=196, adapter_link_error="", onboard_status=""
+        )
+        with (
+            patch(f"{self._MOD}.onboard_device") as onboard,
+            patch(f"{self._MOD}.set_scope", side_effect=AdapterError("adapter down", code="nso_unreachable")),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            resp = self.client.post(self._url())
+
+        self.assertEqual(resp.status_code, 302)
+        onboard.assert_not_called()
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_device_id, 196)  # mapping left alone
+        self.assertIn("adapter down", self.mgmt.adapter_link_error)
 
     def test_retry_failure_refreshes_error(self):
         NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(

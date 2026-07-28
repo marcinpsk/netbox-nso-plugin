@@ -327,6 +327,11 @@ def get_device(adapter_device_id):
     return _request("GET", f"/api/v1/devices/{adapter_device_id}")
 
 
+def list_devices():
+    """GET /api/v1/devices — every device the adapter knows, across all NSO instances."""
+    return _request("GET", "/api/v1/devices")
+
+
 def get_interfaces(adapter_device_id):
     """GET /api/v1/devices/{id}/interfaces."""
     return _request("GET", f"/api/v1/devices/{adapter_device_id}/interfaces")

@@ -450,11 +450,34 @@ def _sync_source_change(instance, client) -> bool:
             management_model.objects.filter(pk=current.pk).update(source_rekey_pending=True)
             current.source_rekey_pending = True
 
-        result = client.patch_device(
-            adapter_device_id=current.adapter_device_id,
-            nso_instance=current.nso_instance.adapter_instance_id,
-            nso_device_name=current.nso_device_name,
-        )
+        from .adapter_client import AdapterError
+
+        try:
+            result = client.patch_device(
+                adapter_device_id=current.adapter_device_id,
+                nso_instance=current.nso_instance.adapter_instance_id,
+                nso_device_name=current.nso_device_name,
+            )
+        except AdapterError as exc:
+            # The mapping this rekey retargets is gone, so the PATCH can never land and both the
+            # periodic repair and the Retry button would re-enter here forever. Re-onboard under
+            # the NEW identity — which is what the rekey was expressing — then fall through to
+            # the same completion below, so the epoch fence and the reset-pending marker are
+            # recorded exactly as on the normal path. Handling it HERE rather than at the caller
+            # is what keeps ``invalidated`` in scope: admissions were already blanked above, and
+            # dropping that marker would leave every family fenced while the UI read all-clear.
+            if exc.code != "not_found":
+                raise
+            logger.warning(
+                "Rekey target %s is gone for NetBox device %s — re-onboarding under the new source",
+                current.adapter_device_id,
+                current.device_id,
+            )
+            _onboard_into_adapter(current, client)
+            # ``current`` is a separate instance from the caller's ``instance``; without this
+            # the scope push below would still target the dead id.
+            instance.adapter_device_id = current.adapter_device_id
+            result = {"source_epoch": current.adapter_source_epoch}
         if result.get("source_epoch") is None:
             raise RuntimeError("adapter rekey response omitted source_epoch; publication remains fenced")
         with transaction.atomic():
@@ -473,6 +496,26 @@ def _sync_source_change(instance, client) -> bool:
     instance.source_epoch_aware = source_aware
     instance.source_rekey_pending = False
     return True
+
+
+def _onboard_into_adapter(instance, client):
+    """Register the device with the adapter and store the returned mapping on the row.
+
+    ``.update()`` (not ``.save()``) so storing the mapping doesn't re-enter this handler.
+    """
+    result = client.onboard_device(
+        nso_instance=instance.nso_instance.adapter_instance_id,
+        nso_device_name=instance.nso_device_name,
+        netbox_device_id=instance.device_id,
+    )
+    type(instance).objects.filter(pk=instance.pk).update(
+        adapter_device_id=result["id"],
+        adapter_source_epoch=result.get("source_epoch"),
+        source_epoch_aware=result.get("source_epoch") is not None,
+    )
+    instance.adapter_device_id = result["id"]
+    instance.adapter_source_epoch = result.get("source_epoch")
+    instance.source_epoch_aware = result.get("source_epoch") is not None
 
 
 @receiver(post_save, sender="netbox_nso_plugin.NSODeviceManagement")
@@ -504,23 +547,13 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
         return
 
     from . import adapter_client as client
+    from .adapter_client import AdapterError
 
     try:
         if created or instance.adapter_device_id is None:
-            result = client.onboard_device(
-                nso_instance=instance.nso_instance.adapter_instance_id,
-                nso_device_name=instance.nso_device_name,
-                netbox_device_id=instance.device_id,
-            )
-            type(instance).objects.filter(pk=instance.pk).update(
-                adapter_device_id=result["id"],
-                adapter_source_epoch=result.get("source_epoch"),
-                source_epoch_aware=result.get("source_epoch") is not None,
-            )
-            instance.adapter_device_id = result["id"]
-            instance.adapter_source_epoch = result.get("source_epoch")
-            instance.source_epoch_aware = result.get("source_epoch") is not None
+            _onboard_into_adapter(instance, client)
         elif instance.source_rekey_pending:
+            # _sync_source_change recovers a dead mapping itself — it owns the fencing state.
             if not _sync_source_change(instance, client):
                 return
 
@@ -532,14 +565,34 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
         from .onboarding import device_mgmt_addresses
 
         primary_ip, oob_ip = device_mgmt_addresses(instance.device)
-        client.set_scope(
-            instance.adapter_device_id,
-            instance.managed_attributes,
-            auto_apply=instance.auto_apply,
-            sync_before_apply=instance.sync_before_apply,
-            primary_ip=primary_ip,
-            oob_ip=oob_ip,
-        )
+
+        def push_scope():
+            client.set_scope(
+                instance.adapter_device_id,
+                instance.managed_attributes,
+                auto_apply=instance.auto_apply,
+                sync_before_apply=instance.sync_before_apply,
+                primary_ip=primary_ip,
+                oob_ip=oob_ip,
+            )
+
+        try:
+            push_scope()
+        except AdapterError as exc:
+            # The stored id points at an adapter device row that no longer exists (a provision
+            # that rolled back, a manual delete, a restored DB). Without this the branch above
+            # never re-onboards — the id is set — so every push 404s forever and even the tab's
+            # "Retry adapter link" can't heal it. Only 'not_found' proves the id is dead; any
+            # other error is an outage and must not mint a second device row.
+            if exc.code != "not_found":
+                raise
+            logger.warning(
+                "Adapter no longer has device %s for NetBox device %s — re-onboarding",
+                instance.adapter_device_id,
+                instance.device_id,
+            )
+            _onboard_into_adapter(instance, client)
+            push_scope()
 
         notify_result = client.sync_notify(instance.adapter_device_id)
         if notify_result and notify_result.get("job_id"):
@@ -572,15 +625,29 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
 
 @receiver(post_delete, sender="netbox_nso_plugin.NSODeviceManagement")
 def offboard_device_from_adapter(sender, instance, **kwargs):
-    """Remove device from adapter when the management record is deleted."""
+    """Remove the device from the adapter once the management row's deletion COMMITS.
+
+    Deferred to on_commit for two reasons. A rolled-back delete must not have already
+    offboarded the device adapter-side; and while the deleting transaction is open the row is
+    still visible to other connections, so a concurrent save (or the periodic link repair)
+    could see the mapping, get a 404 from the just-deleted adapter device, and re-onboard a
+    fresh row that nothing then owns — this handler has already fired against the old id.
+    """
     if instance.adapter_device_id is None:
         return
+    from django.db import transaction
+
     from . import adapter_client as client
 
-    try:
-        client.delete_device(instance.adapter_device_id)
-    except Exception as exc:
-        logger.warning("Failed to offboard device %s from adapter: %s", instance.adapter_device_id, exc)
+    adapter_device_id = instance.adapter_device_id
+
+    def _offboard():
+        try:
+            client.delete_device(adapter_device_id)
+        except Exception as exc:  # noqa: BLE001 — best-effort; never block the NetBox delete
+            logger.warning("Failed to offboard device %s from adapter: %s", adapter_device_id, exc)
+
+    transaction.on_commit(_offboard)
 
 
 @receiver(post_save, sender="netbox_nso_plugin.NSOFailoverSettings")

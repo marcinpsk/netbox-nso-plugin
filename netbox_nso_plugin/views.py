@@ -99,45 +99,6 @@ def _device_capabilities_url(device_pk):
     return reverse("plugins:netbox_nso_plugin:route_policy_capabilities", kwargs={"device_pk": device_pk})
 
 
-def _refresh_sync_cache(mgmt, adapter_device):
-    """Update an NSODeviceManagement row's cached last_sync_* from an adapter device dict.
-
-    Writes only changed fields via a targeted .update() (no full save / no signals),
-    so it is cheap enough to call per-row on the list view. Returns the list of
-    fields actually changed (empty if already current).
-    """
-    update_fields = []
-    raw_ts = adapter_device.get("last_sync_at")
-    if raw_ts:
-        from dateutil.parser import parse as parse_dt
-
-        last_sync_at = parse_dt(raw_ts) if isinstance(raw_ts, str) else raw_ts
-        if mgmt.last_sync_at != last_sync_at:
-            mgmt.last_sync_at = last_sync_at
-            update_fields.append("last_sync_at")
-    last_sync_status = adapter_device.get("last_sync_status") or ""
-    if mgmt.last_sync_status != last_sync_status:
-        mgmt.last_sync_status = last_sync_status
-        update_fields.append("last_sync_status")
-    # Which routing surfaces went stale on a "partial" sync (e.g. ["bgp", "ospf"]),
-    # normalized to None when nothing degraded so the display branches on truthiness.
-    degraded_surfaces = adapter_device.get("degraded_surfaces") or None
-    if mgmt.degraded_surfaces != degraded_surfaces:
-        mgmt.degraded_surfaces = degraded_surfaces
-        update_fields.append("degraded_surfaces")
-    # A successful device-level sync proves the adapter link works and the mirror is
-    # current — retire a sticky adapter_link_error left by an earlier failed scope-sync
-    # (otherwise it is only cleared by the next successful *save* of the row, so a
-    # transient adapter outage kept the tab's red "sync failed" banner up forever,
-    # directly above the "Last sync: succeeded" strip).
-    if mgmt.adapter_link_error and last_sync_status == "succeeded":
-        mgmt.adapter_link_error = ""
-        update_fields.append("adapter_link_error")
-    if update_fields:
-        NSODeviceManagement.objects.filter(pk=mgmt.pk).update(**{f: getattr(mgmt, f) for f in update_fields})
-    return update_fields
-
-
 def _observe_live_read_state(device, mgmt):
     """READSEM S4 (D8b): fetch + observe the live per-family read-state on tab render.
 
@@ -262,10 +223,11 @@ class DeviceNSOTabView(generic.ObjectView):
         if mgmt is not None and mgmt.adapter_device_id is not None:
             from . import adapter_client as client
             from .intent_drift import compute_intent_drift
+            from .sync_cache import refresh_sync_cache
 
             try:
                 adapter_device = client.get_device(mgmt.adapter_device_id)
-                _refresh_sync_cache(mgmt, adapter_device)
+                refresh_sync_cache(mgmt, adapter_device)
                 # Mgmt-IP failover status (active address / last probe / OOB health) — None when
                 # the device has no failover row (no primary/OOB IPs pushed yet). Parse the ISO
                 # timestamps to datetimes so the template's |date filter can format them.
@@ -2106,6 +2068,16 @@ class NSOOnboardingDashboardView(LoginRequiredMixin, View):
         else:
             data = build_onboarding_dashboard(instance)
             managed = list(NSODeviceManagement.objects.filter(nso_instance=instance).select_related("device"))
+            # Mirror the adapter's current last-sync state onto the rows before rendering.
+            # The periodic job keeps them fresh with nobody watching; this makes the page
+            # the operator is actually looking at current to the second. Best-effort: the
+            # last-sync columns are a display nicety, never worth 500ing the dashboard.
+            from .sync_cache import refresh_sync_caches
+
+            try:
+                refresh_sync_caches(managed)
+            except Exception:  # noqa: BLE001 — see above
+                logger.debug("Dashboard last-sync refresh failed", exc_info=True)
             # Annotate each managed row with the NED it actually runs on (live NSO
             # inventory), so the Managed tab shows it without a second page.
             ned_by_name = data.get("ned_by_nso_name") or {}
@@ -2331,12 +2303,10 @@ class NSODevicesReturnMixin:
 class NSODeviceManagementListView(generic.ObjectListView):
     """List view for managed NSO devices.
 
-    Refreshes the cached ``last_sync_*`` columns on each render via a cheap
-    per-row ``get_device`` call, so the list reflects current sync state without
-    the operator first having to open each device's NSO tab. Compliance and
-    per-protocol reconcile are NOT run here (those stay on the tab) — only the
-    two lightweight last-sync fields are polled. Adapter errors are swallowed
-    per row so one unreachable device never breaks the list.
+    Refreshes the cached ``last_sync_*`` columns on each render via one bulk adapter
+    call, so the list reflects current sync state without the operator first having to
+    open each device's NSO tab. Compliance and per-protocol reconcile are NOT run here
+    (those stay on the tab) — only the lightweight last-sync fields are polled.
     """
 
     queryset = NSODeviceManagement.objects.select_related("device", "nso_instance")
@@ -2347,15 +2317,9 @@ class NSODeviceManagementListView(generic.ObjectListView):
     def get_queryset(self, request):
         """Poll the adapter for last-sync state before the table is built."""
         qs = super().get_queryset(request)
-        from . import adapter_client as client
+        from .sync_cache import refresh_sync_caches
 
-        for mgmt in qs:
-            if mgmt.adapter_device_id is None:
-                continue
-            try:
-                _refresh_sync_cache(mgmt, client.get_device(mgmt.adapter_device_id))
-            except AdapterError as exc:
-                logger.debug("List last-sync poll failed for device %s: %s", mgmt.pk, exc)
+        refresh_sync_caches(qs)
         return qs
 
 
