@@ -605,6 +605,63 @@ class TestRoutePolicyApplySettle(APITestCase):
             push.assert_called_once_with(mgmt.device_id, mgmt.adapter_device_id, force=True)
 
 
+class TestSnmpApplyForcePush(APITestCase):
+    """SNMP intent is mirrored reactively on accept, and _push_changed swallows a failed PUT —
+    so a device whose accept-time push failed has no adapter intent at all. Apply is the only
+    recovery, exactly as for logging hosts, and must force-push the owned SNMP snapshot.
+
+    The refresh must be STORE-ONLY: a plain put_snmp_intent enqueues the shrink-removal job
+    (and auto-apply on auto_apply devices), and _prepare_apply runs before trigger_apply —
+    whose _trigger 409s while any job is active, so the recovery would kill the Apply it serves.
+    """
+
+    def test_prepare_apply_force_pushes_snmp_snapshot(self):
+        from netbox_nso_plugin import adapter_client
+        from netbox_nso_plugin.models import NSOSnmpHostState
+        from netbox_nso_plugin.views import _prepare_apply
+
+        device = _make_device("snmp-apply")
+        inst, _ = NSOInstance.objects.get_or_create(
+            name="snmp-apply-inst", defaults={"adapter_instance_id": "snmp-apply-inst"}
+        )
+        mgmt = NSODeviceManagement.objects.create(
+            device=device, nso_instance=inst, nso_device_name="snmp-apply", adapter_device_id=91
+        )
+        NSOSnmpHostState.objects.create(
+            management=mgmt,
+            address="198.18.0.40",
+            version="v2c",
+            notify_type="trap",
+            community_hash="abcd1234abcd1234",
+            status="accepted",
+        )
+        seen = {}
+
+        def _record_store_only(*args, **kwargs):
+            seen["store_only"] = adapter_client._store_only_push.get()
+
+        with (
+            patch("netbox_nso_plugin.signals._push_interface_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_lacp_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_switchport_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_vlan_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_svi_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_subinterface_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_bfd_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_interface_mtu_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_route_policy_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_static_route_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_l2_sap_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_logging_intent_for_device"),
+            patch("netbox_nso_plugin.adapter_client.put_snmp_intent", side_effect=_record_store_only) as put_snmp,
+        ):
+            _prepare_apply(mgmt)
+        put_snmp.assert_called_once()
+        self.assertEqual(put_snmp.call_args.args[0], mgmt.adapter_device_id)
+        self.assertEqual([h["address"] for h in put_snmp.call_args.args[3]], ["198.18.0.40"])
+        self.assertTrue(seen.get("store_only"))
+
+
 class TestApplyRollbackOnAdapterError(APITestCase):
     """A failed Apply (adapter unreachable / 500 — no job enqueued) must roll the rows
     _prepare_apply moved accepted→deploying back to accepted. Otherwise they are stuck

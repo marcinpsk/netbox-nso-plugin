@@ -2422,6 +2422,7 @@ def _prepare_apply(mgmt):
         _push_lacp_intent_for_device,
         _push_logging_intent_for_device,
         _push_route_policy_intent_for_device,
+        _push_snmp_intent_for_device,
         _push_static_route_intent_for_device,
         _push_subinterface_intent_for_device,
         _push_svi_intent_for_device,
@@ -2445,6 +2446,8 @@ def _prepare_apply(mgmt):
     #     force-push the owned snapshot too — otherwise Apply applies nothing and the row
     #     sticks 'deploying' forever (observed on rg03 for route-policy: an owned as-path
     #     with no adapter intent row; SVI/subinterface/BFD/MTU share the same failure mode).
+    #   - SNMP: mirrored reactively on accept and a failed push is swallowed, so the adapter
+    #     mirror can be stale or absent. Refreshed store-only below — the Apply commits it.
     for push in (
         _push_interface_intent_for_device,
         _push_lacp_intent_for_device,
@@ -2463,6 +2466,16 @@ def _prepare_apply(mgmt):
             push(mgmt.device_id, mgmt.adapter_device_id, force=True)
         except Exception as exc:  # noqa: BLE001 — one scope's failure must not block the rest
             logger.warning("Apply push failed for device %s: %s", mgmt.device_id, exc)
+
+    # Store-only: a plain put_snmp_intent enqueues the shrink-removal (and auto-apply) job,
+    # which would 409 the trigger_apply this runs just ahead of.
+    try:
+        from . import adapter_client as client
+
+        with client.store_only_pushes():
+            _push_snmp_intent_for_device(mgmt.device_id, mgmt.adapter_device_id, force=True)
+    except Exception as exc:  # noqa: BLE001 — one scope's failure must not block the rest
+        logger.warning("Apply push failed for device %s: %s", mgmt.device_id, exc)
 
     moved: list[tuple] = []  # (model, [pks]) actually moved, for rollback if the Apply fails
     for model in (
