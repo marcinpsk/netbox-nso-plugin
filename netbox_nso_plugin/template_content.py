@@ -1011,13 +1011,16 @@ def _reconcile_static_routes(device, payload: dict) -> list:
             on_device = True
         desired_metric = _static_route_metric(entry, device)
         metric_matches = route.metric == desired_metric
+        # `tag` is compared on the same terms as `metric` (#1381): checking metric alone
+        # left a device tag against an untagged NetBox route reading as fully in sync.
+        tag_matches = route.tag == entry.get("tag")
         # StaticRoute is shared across all associated devices.  A refresh from
-        # one platform must never rewrite its metric to that platform's default:
-        # another device may have a different effective default.  Keep the
-        # shared intent and surface the per-device mismatch through this state.
+        # one platform must never rewrite its metric or tag to that platform's
+        # value: another device may legitimately differ.  Keep the shared intent
+        # and surface the per-device mismatch through this state.
         state.status = sm.on_reconcile(
             state.status,
-            matches=on_device and metric_matches,
+            matches=on_device and metric_matches and tag_matches,
             conflict=not on_device,
             settles_owned=False,
         )
