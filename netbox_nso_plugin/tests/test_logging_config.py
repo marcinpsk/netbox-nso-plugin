@@ -122,6 +122,89 @@ class TestReconcileLoggingConfig(TestCase):
         self.assertEqual(row.facility, "local7")
         self.assertEqual(row.status, "accepted")
 
+    def test_owned_settle_does_not_clobber_concurrent_operator_edit(self):
+        """An operator edit landing between the reconciler's row load and its write must survive
+        WHOLE: its field values AND its 'accepted' status. The settle was computed against the
+        pre-edit values, so writing it would green-light intent the device has never seen."""
+        from django.db.models.signals import post_init
+
+        from netbox_nso_plugin.models import NSOLoggingHostState, NSOPlatformNedMapping
+        from netbox_nso_plugin.template_content import _reconcile_logging_config
+
+        mgmt = self._mgmt()
+        platform = Platform.objects.create(name="Logging Nokia concurrent", slug="logging-nokia-concurrent")
+        NSOPlatformNedMapping.objects.create(platform=platform, ned_id="timos-nc-23.10")
+        self.device.platform = platform
+        self.device.save(update_fields=["platform"])
+        row = NSOLoggingHostState.objects.create(
+            management=mgmt,
+            address="198.18.0.25",
+            port=514,
+            severity="warning",
+            status="accepted",
+        )
+
+        fired = []
+
+        def _concurrent_editor(sender, instance, **kwargs):
+            # post_init = the reconciler has just SELECTed the row, so its in-memory copy is
+            # already stale when the edit lands. .update() writes straight to the DB: no
+            # post_init, hence no recursion.
+            if fired or instance.pk is None:
+                return
+            fired.append(True)
+            NSOLoggingHostState.objects.filter(pk=instance.pk).update(severity="error")
+
+        post_init.connect(_concurrent_editor, sender=NSOLoggingHostState, weak=False)
+        self.addCleanup(post_init.disconnect, _concurrent_editor, sender=NSOLoggingHostState)
+
+        _reconcile_logging_config(self.device, self._payload({"address": row.address, "severity": "warning"}))
+
+        row.refresh_from_db()
+        self.assertEqual(row.severity, "error")
+        self.assertEqual(row.port, 514)
+        self.assertEqual(row.status, "accepted")
+
+    def test_owned_settle_does_not_follow_a_concurrent_address_rename(self):
+        """The CAS must guard the row's IDENTITY, not just its values: a host renamed between
+        the reconciler's SELECT and its write was confirmed at the OLD address only, so the
+        settle belongs to a host this row no longer is."""
+        from django.db.models.signals import post_init
+
+        from netbox_nso_plugin.models import NSOLoggingHostState, NSOPlatformNedMapping
+        from netbox_nso_plugin.template_content import _reconcile_logging_config
+
+        mgmt = self._mgmt()
+        platform = Platform.objects.create(name="Logging Nokia rename", slug="logging-nokia-rename")
+        NSOPlatformNedMapping.objects.create(platform=platform, ned_id="timos-nc-23.10")
+        self.device.platform = platform
+        self.device.save(update_fields=["platform"])
+        row = NSOLoggingHostState.objects.create(
+            management=mgmt,
+            address="198.18.0.26",
+            port=514,
+            severity="warning",
+            status="accepted",
+        )
+
+        fired = []
+
+        def _concurrent_renamer(sender, instance, **kwargs):
+            # Only the row under test: the loop's get_or_create instantiates others too.
+            if fired or instance.pk != row.pk:
+                return
+            fired.append(True)
+            NSOLoggingHostState.objects.filter(pk=instance.pk).update(address="198.18.0.98")
+
+        post_init.connect(_concurrent_renamer, sender=NSOLoggingHostState, weak=False)
+        self.addCleanup(post_init.disconnect, _concurrent_renamer, sender=NSOLoggingHostState)
+
+        _reconcile_logging_config(self.device, self._payload({"address": "198.18.0.26", "severity": "warning"}))
+
+        row.refresh_from_db()
+        self.assertEqual(row.address, "198.18.0.98")
+        self.assertEqual(row.status, "accepted")
+
     def test_timos_writer_and_reader_tokens_settle_to_one_canonical_value(self):
         from netbox_nso_plugin.models import NSOLoggingHostState, NSOPlatformNedMapping
         from netbox_nso_plugin.signals import _push_logging_intent_for_device
