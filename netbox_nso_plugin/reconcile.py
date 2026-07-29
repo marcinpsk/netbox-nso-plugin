@@ -1151,7 +1151,7 @@ def _stuck_deploying_grace():
 
 
 def _parse_adapter_ts(value):
-    """Parse an adapter job timestamp (naive-UTC isoformat + 'Z') to an aware datetime."""
+    """Parse an adapter job timestamp — canonical UTC isoformat + 'Z', optional fraction."""
     from datetime import UTC, datetime
 
     if not value:

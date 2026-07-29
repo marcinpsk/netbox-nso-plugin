@@ -220,7 +220,8 @@ class TestEscalateStuckDeploying(APITestCase):
 
     @staticmethod
     def _job(status="succeeded", minutes_ago=30, job_id=900):
-        # The adapter serializes timestamps as naive-UTC isoformat + "Z" (api/jobs.py).
+        # The adapter serializes every wire timestamp as UTC isoformat + "Z" (api/jobs.py),
+        # fractional seconds included — the shape the escalation's clock has to parse.
         from datetime import timedelta
 
         from django.utils import timezone

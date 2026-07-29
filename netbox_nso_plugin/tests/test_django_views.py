@@ -8,6 +8,7 @@ Adapter calls are mocked so no live adapter is needed.
 
 import json
 import re
+from datetime import UTC, datetime
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
@@ -381,7 +382,7 @@ class TestNSODeviceManagementListView(ViewTestBase):
                         "nso_instance": "view-nso-id",
                         "nso_device_name": "view-router-01",
                         "netbox_device_id": None,
-                        "last_sync_at": "2025-06-01T10:00:00+00:00",
+                        "last_sync_at": "2025-06-01T10:00:00Z",
                         "last_sync_status": "succeeded",
                     }
                 ],
@@ -442,7 +443,7 @@ class TestNSODeviceManagementListView(ViewTestBase):
                         "nso_instance": "view-nso-id",
                         "nso_device_name": "view-router-01",
                         "netbox_device_id": None,
-                        "last_sync_at": "2025-06-01T10:00:00+00:00",
+                        "last_sync_at": "2025-06-01T10:00:00Z",
                         "last_sync_status": "succeeded",
                     }
                 ],
@@ -491,7 +492,7 @@ class TestNSODeviceManagementListView(ViewTestBase):
                         "nso_instance": "view-nso-id",
                         "nso_device_name": "view-router-01",
                         "netbox_device_id": None,
-                        "last_sync_at": "2025-06-01T10:00:00+00:00",
+                        "last_sync_at": "2025-06-01T10:00:00Z",
                         "last_sync_status": "failed",
                     }
                 ],
@@ -539,7 +540,7 @@ class TestNSODeviceManagementListView(ViewTestBase):
                         "nso_instance": "view-nso-id",
                         "nso_device_name": "view-router-01",
                         "netbox_device_id": None,
-                        "last_sync_at": "2025-06-01T10:00:00+00:00",
+                        "last_sync_at": "2025-06-01T10:00:00Z",
                         "last_sync_status": "partial",
                         "degraded_surfaces": ["bgp", "ospf"],
                     }
@@ -2138,6 +2139,59 @@ class TestDeviceNSOTabView(ViewTestBase):
         self.assertIn("cold connect exceeded probe window", body)
         self.assertNotIn(">Unreachable<", body)
 
+    #: The two timestamp shapes the adapter is allowed to emit on the failover block.
+    _FAILOVER_SHAPES = (
+        ("2026-07-18T09:23:48Z", datetime(2026, 7, 18, 9, 23, 48, tzinfo=UTC)),
+        ("2026-07-18T09:23:48.123456Z", datetime(2026, 7, 18, 9, 23, 48, 123456, tzinfo=UTC)),
+    )
+    _FAILOVER_TS_KEYS = ("last_probe_at", "last_switch_at", "oob_health_checked_at")
+
+    def _render_tab_with_failover_ts(self, wire):
+        """Render the real NSO tab with *wire* on every failover timestamp; return its context."""
+        mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+        mgmt.adapter_device_id = 15
+        mgmt.save(update_fields=["adapter_device_id"])
+        stack, mocks = self._patch_all_getters()
+        mocks["get_device"].return_value = {
+            "id": 15,
+            "last_sync_at": None,
+            "last_sync_status": "succeeded",
+            "failover": {
+                "active_address": "primary",
+                "oob_ip": "192.0.2.5",
+                "primary_ip": "10.0.0.1",
+                "oob_healthy": True,
+                "manual_override": False,
+                **dict.fromkeys(self._FAILOVER_TS_KEYS, wire),
+            },
+        }
+        with stack:
+            return self.client.get(reverse("dcim:device_nso", kwargs={"pk": self.device.pk}))
+
+    def test_failover_timestamps_parse_as_aware_utc(self):
+        """The tab parses the failover block's timestamps for the template's ``|date`` filter.
+
+        A host-local tzinfo carries the right instant only while the host runs UTC, so assert
+        the zone, not just equality.
+        """
+        for wire, expected in self._FAILOVER_SHAPES:
+            with self.subTest(wire=wire):
+                response = self._render_tab_with_failover_ts(wire)
+                self.assertEqual(response.status_code, 200)
+                failover = response.context["failover"]
+                for key in self._FAILOVER_TS_KEYS:
+                    self.assertEqual(failover[key], expected, key)
+                    self.assertEqual(failover[key].microsecond, expected.microsecond, key)
+                    self.assertEqual(str(failover[key].tzinfo), "UTC", f"{key} must carry UTC, not a host-local zone")
+
+    def test_unparseable_failover_timestamp_does_not_break_the_tab(self):
+        """The tab's ``try`` only catches AdapterError — a raising parser 500s the whole page."""
+        response = self._render_tab_with_failover_ts("2026-07-18T09:23:48+00:00Z")
+        self.assertEqual(response.status_code, 200)
+        failover = response.context["failover"]
+        for key in self._FAILOVER_TS_KEYS:
+            self.assertIsNone(failover[key], key)
+
     def _patch_all_getters(self):
         """Patch every adapter getter the tab view may call; return the patch context
         and a dict of the mocks keyed by attribute name."""
@@ -2278,7 +2332,7 @@ class TestDeviceNSOTabView(ViewTestBase):
             "nso_instance": self.nso_instance.adapter_instance_id,
             "nso_device_name": mgmt.nso_device_name,
             "netbox_device_id": self.device.pk,
-            "last_sync_at": "2025-06-01T10:00:00+00:00",
+            "last_sync_at": "2025-06-01T10:00:00Z",
             "last_sync_status": "partial",
             "degraded_surfaces": ["bgp", "ospf"],
         }
@@ -2311,7 +2365,7 @@ class TestDeviceNSOTabView(ViewTestBase):
         stack, mocks = self._patch_all_getters()
         mocks["get_device"].return_value = {
             "id": 15,
-            "last_sync_at": "2025-06-01T10:00:00+00:00",
+            "last_sync_at": "2025-06-01T10:00:00Z",
             "last_sync_status": "succeeded",
         }
         with stack:
@@ -3061,7 +3115,7 @@ class TestDeviceNSOTabView(ViewTestBase):
                 200,
                 json_data={
                     "id": 16,
-                    "last_sync_at": "2025-06-01T10:00:00+00:00",
+                    "last_sync_at": "2025-06-01T10:00:00Z",
                     "last_sync_status": "succeeded",
                 },
             )

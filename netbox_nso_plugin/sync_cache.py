@@ -15,7 +15,7 @@ push this row's scope, failover addresses and auto-apply flag onto it.
 
 import logging
 
-from dateutil.parser import parse as parse_dt
+from django.utils.dateparse import parse_datetime
 
 from .models import NSODeviceManagement
 
@@ -33,6 +33,20 @@ _MOVED = "moved"  # our device is there under a different id — adopt it
 _MISSING = "missing"  # our device is not in the adapter at all — re-link it
 
 _BROKEN_LINK_MESSAGE = "This device's adapter mapping is broken; the next sync-cache sweep will repair it."
+
+
+def parse_adapter_timestamp(value, field="timestamp"):
+    """Parse the adapter's canonical wire timestamp — ``<iso>Z``, optional fraction — to aware UTC.
+
+    Anything else degrades to None rather than raising: every caller is on a page render.
+    """
+    try:
+        parsed = parse_datetime(value)
+    except ValueError:  # regex-shaped but not a real datetime (month 13, day 32, …)
+        parsed = None
+    if parsed is None:
+        logger.warning("Adapter %s %r is not a timestamp — treating as absent", field, value)
+    return parsed
 
 
 def refresh_sync_cache(mgmt, adapter_device):
@@ -58,7 +72,7 @@ def refresh_sync_cache(mgmt, adapter_device):
     # A key absent from the payload is a different thing (partial shape) — leave it alone.
     if "last_sync_at" in adapter_device:
         raw_ts = adapter_device["last_sync_at"]
-        last_sync_at = parse_dt(raw_ts) if isinstance(raw_ts, str) else raw_ts
+        last_sync_at = parse_adapter_timestamp(raw_ts, "last_sync_at") if isinstance(raw_ts, str) else raw_ts
         if mgmt.last_sync_at != last_sync_at:
             mgmt.last_sync_at = last_sync_at
             update_fields.append("last_sync_at")

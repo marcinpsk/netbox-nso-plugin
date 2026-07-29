@@ -223,7 +223,7 @@ class DeviceNSOTabView(generic.ObjectView):
         if mgmt is not None and mgmt.adapter_device_id is not None:
             from . import adapter_client as client
             from .intent_drift import compute_intent_drift
-            from .sync_cache import refresh_sync_cache
+            from .sync_cache import parse_adapter_timestamp, refresh_sync_cache
 
             try:
                 adapter_device = client.get_device(mgmt.adapter_device_id)
@@ -233,11 +233,9 @@ class DeviceNSOTabView(generic.ObjectView):
                 # timestamps to datetimes so the template's |date filter can format them.
                 failover = adapter_device.get("failover")
                 if failover:
-                    from dateutil.parser import parse as parse_dt
-
                     for key in ("last_probe_at", "last_switch_at", "oob_health_checked_at"):
                         if failover.get(key):
-                            failover[key] = parse_dt(failover[key])
+                            failover[key] = parse_adapter_timestamp(failover[key], key)
                 # Surface adapter↔NetBox split-brain (orphaned intent) — only renders if any.
                 intent_drift = compute_intent_drift(device, mgmt)
             except AdapterError as exc:
