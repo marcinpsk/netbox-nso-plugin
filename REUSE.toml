@@ -20,6 +20,10 @@ path = [
     ".github/copilot-instructions.md",
     ".github/dependabot.yml",
     ".github/workflows/codeql.yml",
+    # JSON has no comment syntax, and release-please rewrites the manifest on
+    # every release, so these are covered here rather than by a header.
+    "release-please-config.json",
+    ".release-please-manifest.json",
     ".github/ISSUE_TEMPLATE/**",
     ".github/PULL_REQUEST_TEMPLATE/**",
     "CHANGELOG.md",
