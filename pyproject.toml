@@ -44,6 +44,27 @@ include = ["netbox_nso_plugin*"]
 [tool.setuptools.package-data]
 netbox_nso_plugin = ["templates/**/*", "static/**/*"]
 
+[tool.semantic_release]
+allow_zero_version = true
+commit_message = "chore(release): {version} [skip ci]"
+commit_parser = "conventional"
+tag_format = "v{version}"
+version_toml = ["pyproject.toml:project.version"]
+version_variables = ["netbox_nso_plugin/__init__.py:__version__"]
+
+[tool.semantic_release.branches.main]
+match = "^main$"
+prerelease = false
+
+[tool.semantic_release.changelog]
+mode = "update"
+
+[tool.semantic_release.commit_parser_options]
+allowed_tags = ["feat", "fix", "docs", "style", "refactor", "perf", "test", "build", "ci", "chore", "revert"]
+minor_tags = ["feat"]
+patch_tags = ["fix", "perf", "revert"]
+parse_squash_commits = false
+
 [dependency-groups]
 dev = [
     "build",

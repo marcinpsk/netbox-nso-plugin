@@ -1,5 +1,7 @@
 # Changelog
 
+<!-- version list -->
+
 ## [Unreleased]
 
 ### Added — read paths (NSO → NetBox)

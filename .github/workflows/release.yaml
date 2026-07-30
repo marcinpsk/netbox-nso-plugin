@@ -15,30 +15,66 @@ concurrency:
 permissions: {}
 
 jobs:
-  release-please:
-    name: Maintain the release PR
+  release:
+    name: Create the release
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      pull-requests: write
     outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
+      released: ${{ steps.release.outputs.released || 'false' }}
+      tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
     steps:
-      # Every push to main refreshes the pending release PR from the conventional
-      # commits since the last tag; merging that PR is what tags and releases.
-      - name: Run release-please
-        id: release
-        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7  # v5.0.0
+      - name: Check out main with full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          config-file: release-please-config.json
-          manifest-file: .release-please-manifest.json
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+          token: ${{ secrets.SEMANTIC_RELEASE_TOKEN || github.token }}
+
+      # The branch may advance while a queued release waits. Release exactly
+      # the push that started this run; the workflow concurrency lock ensures
+      # the next push is evaluated separately.
+      - name: Reset the release branch to the triggering commit
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+        run: git reset --hard "$RELEASE_SHA"
+
+      # release-please never created a tag in this repository. Establish the
+      # version declared immediately before this push as the baseline; otherwise
+      # semantic-release starts at 0.0.0 and would downgrade the existing 0.1.0.
+      - name: Establish the existing version baseline
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if git tag --list 'v[0-9]*' | grep -q .; then
+            exit 0
+          fi
+          if [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "::error::cannot establish a release baseline without the previous main commit"
+            exit 1
+          fi
+          version="$(git show "${BEFORE_SHA}:pyproject.toml" |
+            python -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["project"]["version"])')"
+          git tag "v${version}" "$BEFORE_SHA"
+          git push origin "v${version}"
+
+      # A repository whose branch rules reject GITHUB_TOKEN pushes can provide a
+      # fine-grained PAT as SEMANTIC_RELEASE_TOKEN. Checkout and semantic-release
+      # must use the same token so the version commit, tag, and release agree.
+      - name: Release from conventional commits
+        id: release
+        uses: python-semantic-release/python-semantic-release@39dd2052f2ce8282a5d932c31d58a2ca06d2550e  # v10.6.1
+        with:
+          github_token: ${{ secrets.SEMANTIC_RELEASE_TOKEN || github.token }}
+          build: false
+          changelog: true
 
   build:
     name: Build sdist and wheel
-    needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
+    needs: release
+    if: needs.release.outputs.released == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -46,7 +82,7 @@ jobs:
       - name: Check out the released tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          ref: ${{ needs.release-please.outputs.tag_name }}
+          ref: ${{ needs.release.outputs.tag }}
           persist-credentials: false
 
       - name: Install uv
@@ -55,14 +91,14 @@ jobs:
       - name: Build the distributions
         run: uv build
 
-      # Guards the whole version chain: release-please has to have bumped both
+      # Guards the whole version chain: semantic-release has to have bumped both
       # pyproject.toml and netbox_nso_plugin/__init__.py (which is what
       # PluginConfig.version reports to NetBox) to exactly the tag it cut.
       # Versions are compared as PEP 440 objects, not strings, because a tag
       # like v1.2.3-rc.1 legitimately normalises to 1.2.3rc1 in a filename.
       - name: Verify the built version matches the release tag
         env:
-          TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
+          TAG_NAME: ${{ needs.release.outputs.tag }}
         run: |
           cat > "${RUNNER_TEMP}/verify_version.py" <<'PY'
           import os, sys, zipfile
@@ -106,7 +142,7 @@ jobs:
 
   publish-pypi:
     name: Publish to PyPI
-    needs: [release-please, build]
+    needs: [release, build]
     runs-on: ubuntu-latest
     environment:
       name: pypi
