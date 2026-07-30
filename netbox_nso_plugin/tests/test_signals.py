@@ -529,6 +529,12 @@ class TestOffboardDeviceFromAdapter(unittest.TestCase):
     boundary and stays patched.
     """
 
+    def setUp(self):
+        """Run callbacks immediately, matching production's outer-autocommit path."""
+        on_commit = patch("django.db.transaction.on_commit", side_effect=lambda callback: callback())
+        on_commit.start()
+        self.addCleanup(on_commit.stop)
+
     def test_offboards_when_adapter_device_id_set(self):
         from netbox_nso_plugin.signals import offboard_device_from_adapter
 

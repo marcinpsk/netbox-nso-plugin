@@ -117,7 +117,40 @@ netbox-shell() {
 }
 
 netbox-test() {
-  cd /opt/netbox/netbox && source /opt/netbox/venv/bin/activate && python manage.py test netbox_nso_plugin --settings=netbox.test_settings "$@"
+  local workers="${NETBOX_TEST_WORKERS:-8}"
+  local target="netbox_nso_plugin/tests"
+  local parallel_args=()
+  if [ "$#" -gt 0 ] && [[ "$1" != -* ]]; then
+    target="$1"
+    shift
+  fi
+  if [ "$workers" -gt 1 ]; then
+    parallel_args=(-n "$workers" --maxschedchunk=1)
+  fi
+  cd "$PLUGIN_DIR" && source /opt/netbox/venv/bin/activate && \
+    TEST_DB_NAME="${TEST_DB_NAME:-test_netbox_nso_plugin}" \
+    pytest "$target" --no-cov -q --disable-warnings "${parallel_args[@]}" "$@"
+}
+
+netbox-test-coverage() {
+  local workers="${NETBOX_TEST_WORKERS:-8}"
+  local target="netbox_nso_plugin/tests"
+  local parallel_args=()
+  if [ "$#" -gt 0 ] && [[ "$1" != -* ]]; then
+    target="$1"
+    shift
+  fi
+  if [ "$workers" -gt 1 ]; then
+    parallel_args=(-n "$workers" --maxschedchunk=1)
+  fi
+  cd "$PLUGIN_DIR" && source /opt/netbox/venv/bin/activate && \
+    TEST_DB_NAME="${TEST_DB_NAME:-test_netbox_nso_plugin}" \
+    pytest "$target" -q --disable-warnings "${parallel_args[@]}" "$@"
+}
+
+netbox-test-django() {
+  cd /opt/netbox/netbox && source /opt/netbox/venv/bin/activate && \
+    python manage.py test netbox_nso_plugin --settings=netbox.test_settings "$@"
 }
 
 netbox-manage() {
@@ -190,7 +223,9 @@ dev-help() {
   echo ""
   echo "🛠️  Development Tools:"
   echo "  netbox-shell        : Open NetBox Django shell"
-  echo "  netbox-test         : Run plugin tests"
+  echo "  netbox-test         : Run plugin tests (8 workers, warm DB reuse)"
+  echo "  netbox-test-coverage: Run plugin tests with coverage"
+  echo "  netbox-test-django  : Diagnose Django-runner-specific behavior"
   echo "  netbox-manage       : Run Django management commands"
   echo "  plugin-install      : Reinstall plugin in development mode"
   echo ""

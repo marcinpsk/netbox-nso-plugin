@@ -53,6 +53,7 @@ dev = [
     "pytest",
     "pytest-django",
     "pytest-cov>=6.0",
+    "pytest-xdist>=3.8",
     "django>=5.1,<7.0",
     "requests-mock",
 ]

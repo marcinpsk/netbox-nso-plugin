@@ -129,38 +129,40 @@ Other useful helpers include `netbox-run-bg`, `netbox-stop`, `netbox-restart`, `
 What `netbox-test` actually does (`.devcontainer/scripts/load-aliases.sh`):
 
 ```bash
-cd /opt/netbox/netbox && source /opt/netbox/venv/bin/activate && python manage.py test netbox_nso_plugin "$@"
+cd "$PLUGIN_DIR" && source /opt/netbox/venv/bin/activate && \
+  TEST_DB_NAME="${TEST_DB_NAME:-test_netbox_nso_plugin}" \
+  pytest netbox_nso_plugin/tests --no-cov -q --disable-warnings \
+  -n "${NETBOX_TEST_WORKERS:-8}" --maxschedchunk=1
 ```
 
 Why this is the only path you should take:
 
-- It activates the NetBox venv, where `pytest`, `pytest-django`, `pytest-cov`, `ruff`, `django`, and all plugin runtime deps are already present (`.devcontainer/scripts/setup.sh` does this on container build). `pip install pytest-cov` from your shell will install into the *wrong* environment and confuse the next agent.
-- It runs from `/opt/netbox/netbox` with `DJANGO_SETTINGS_MODULE=netbox.settings` implicit — required for the plugin to load. Running `pytest` from the plugin checkout root without this setup will trip on Django setup errors.
-- It uses Django's test runner against `netbox_nso_plugin.tests`, which is what NetBox itself uses for its plugin test suite. Test discovery matches the rest of the NetBox ecosystem.
+- It activates the NetBox venv, where `pytest`, `pytest-django`, `pytest-cov`, `pytest-xdist`, `ruff`, Django, and all plugin runtime deps are already present (`.devcontainer/scripts/setup.sh` does this on container build).
+- It runs pytest from the plugin checkout so `pyproject.toml` and both conftest files are loaded. The session guard blocks every unmocked adapter request; Django's runner does not load that guard and can otherwise call the live adapter during tests.
+- It reuses the isolated PostgreSQL databases and gives every xdist worker its own suffixed database. Eight workers are the default; set `NETBOX_TEST_WORKERS=1` for a serial run.
 
 Common variants:
 
 ```bash
-netbox-test                                                # full plugin suite
-netbox-test netbox_nso_plugin.tests.test_models            # one module
-netbox-test netbox_nso_plugin.tests.test_models.TestX      # one class
-netbox-test netbox_nso_plugin.tests.test_models.TestX.test_y  # one test
-netbox-test -v 2                                           # verbose
-netbox-test --keepdb                                       # skip test-DB rebuild between runs (much faster on re-runs)
+netbox-test                                                        # full suite, eight workers
+netbox-test netbox_nso_plugin/tests/test_models.py                 # one module
+netbox-test netbox_nso_plugin/tests/test_models.py::TestX          # one class
+netbox-test netbox_nso_plugin/tests/test_models.py::TestX::test_y  # one test
+NETBOX_TEST_WORKERS=1 netbox-test                                  # serial override
+TEST_DB_NAME=test_nso_task netbox-test                             # separate DB family
 ```
 
 If `netbox-test` is not found, you are not inside the devcontainer — `source ~/.zshrc` (or open a new terminal) to load the aliases, or fall back to the explicit form above. Do not invent a new command.
 
 ### Coverage reports
 
-Coverage runs come from pytest (the pyproject `addopts` carries `--cov=netbox_nso_plugin --cov-report=term-missing`). `pytest-cov`, `requests-mock`, and `reuse` are installed by `.devcontainer/scripts/setup.sh` alongside `pytest pytest-django ruff pre-commit`, so a clean devcontainer build has everything the test suite needs. If you rebuilt the container before 2026-05-25, run `/opt/netbox/venv/bin/pip install pytest-cov requests-mock reuse` once or rebuild — do not silently `pip install` per-package every time; if something's missing, that's a `setup.sh` bug to fix, not a workaround to repeat.
+Coverage runs come from `netbox-test-coverage`; the pyproject `addopts` carries `--cov=netbox_nso_plugin --cov-report=term-missing`. `pytest-cov`, `pytest-xdist`, `requests-mock`, and `reuse` are installed by `.devcontainer/scripts/setup.sh`, so a clean devcontainer build has everything the suite needs. Rebuild the devcontainer after changing that dependency set rather than installing into an unrelated host environment.
 
 ```bash
-source /opt/netbox/venv/bin/activate && cd /opt/netbox/netbox && \
-  pytest /workspaces/nso/netbox-nso-plugin/netbox_nso_plugin/tests
+netbox-test-coverage
 ```
 
-For the **iterative edit-test loop, use `netbox-test`** (Django runner, no coverage, fast). Coverage is a periodic check, not a per-edit signal.
+For the **iterative edit-test loop, use `netbox-test`** (no coverage, parallel, warm DB reuse). Coverage is a periodic check, not a per-edit signal. `netbox-test-django` remains available for diagnosing Django-runner-specific behavior.
 
 ## Linting and quality gates
 

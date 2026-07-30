@@ -2,6 +2,7 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Pytest configuration: mock the netbox package so unit tests run without a full NetBox install."""
 
+import os
 import sys
 import types
 from unittest.mock import patch
@@ -67,6 +68,12 @@ def _make_netbox_stubs():
 _make_netbox_stubs()
 
 
+def _isolated_test_db_name(base_name: str, worker_id: str | None) -> str:
+    """Return a PostgreSQL-safe private database name for one pytest worker."""
+    suffix = f"_{worker_id}" if worker_id else ""
+    return f"{base_name[: 63 - len(suffix)]}{suffix}"
+
+
 @pytest.fixture(scope="session")
 def django_db_modify_db_settings(django_db_modify_db_settings):
     """Give the plugin suite its OWN test database name.
@@ -81,7 +88,8 @@ def django_db_modify_db_settings(django_db_modify_db_settings):
     from django.conf import settings
 
     test_cfg = dict(settings.DATABASES["default"].get("TEST") or {})
-    test_cfg["NAME"] = "test_netbox_nso_plugin"
+    base_name = os.environ.get("TEST_DB_NAME", "test_netbox_nso_plugin")
+    test_cfg["NAME"] = _isolated_test_db_name(base_name, os.environ.get("PYTEST_XDIST_WORKER"))
     settings.DATABASES["default"]["TEST"] = test_cfg
 
 
