@@ -122,6 +122,36 @@ class TestReconcileLoggingConfig(TestCase):
         self.assertEqual(row.facility, "local7")
         self.assertEqual(row.status, "accepted")
 
+    def test_nx_device_default_facility_settles_and_pushes_explicit_intent(self):
+        from netbox_nso_plugin.models import NSOLoggingHostState, NSOPlatformNedMapping
+        from netbox_nso_plugin.signals import _push_logging_intent_for_device
+        from netbox_nso_plugin.template_content import _reconcile_logging_config
+
+        mgmt = self._mgmt()
+        platform = Platform.objects.create(name="Logging NX default facility", slug="logging-nx-default-facility")
+        NSOPlatformNedMapping.objects.create(platform=platform, ned_id="cisco-nx-cli-5.32")
+        self.device.platform = platform
+        self.device.save(update_fields=["platform"])
+        row = NSOLoggingHostState.objects.create(
+            management=mgmt,
+            address="198.18.0.22",
+            facility="local7",
+            status="accepted",
+        )
+
+        with patch("netbox_nso_plugin.adapter_client.put_logging_intent") as put:
+            _push_logging_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+        # Keep the explicit semantic intent on the write path: the NSO
+        # reconciler needs local7 to retract a brownfield non-default facility.
+        # Only observed-state comparison canonicalizes local7 to omission.
+        self.assertEqual(put.call_args.args[1][0]["facility"], "local7")
+
+        _reconcile_logging_config(self.device, self._payload({"address": row.address}))
+
+        row.refresh_from_db()
+        self.assertEqual(row.facility, "local7")
+        self.assertEqual(row.status, "in_sync")
+
     def test_owned_settle_does_not_clobber_concurrent_operator_edit(self):
         """An operator edit landing between the reconciler's row load and its write must survive
         WHOLE: its field values AND its 'accepted' status. The settle was computed against the

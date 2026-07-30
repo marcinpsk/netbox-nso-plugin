@@ -1196,7 +1196,7 @@ def _push_logging_intent_for_device(device_id, adapter_device_id, force=False):
     """
     from . import adapter_client as client
     from .models import NSOLoggingHostState, NSOLoggingLevelState
-    from .template_content import _canonical_logging_field
+    from .template_content import _canonical_logging_intent_field
 
     ned_id = _ned_id_for_device(device_id)
     hosts = []
@@ -1206,8 +1206,8 @@ def _push_logging_intent_for_device(device_id, adapter_device_id, force=False):
     ):
         host = {
             "address": row.address,
-            "severity": _canonical_logging_field(ned_id, "severity", row.severity or ""),
-            "facility": _canonical_logging_field(ned_id, "facility", row.facility or ""),
+            "severity": _canonical_logging_intent_field(ned_id, "severity", row.severity or ""),
+            "facility": _canonical_logging_intent_field(ned_id, "facility", row.facility or ""),
             "transport": row.transport or "",
             "vrf": row.vrf or "",
             "source": row.source or "",

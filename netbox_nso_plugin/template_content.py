@@ -814,8 +814,23 @@ def _canonical_logging_field(ned_id: str, field: str, value):
     if field == "facility":
         if ned_id.startswith("arcos-"):
             return "ALL" if token == "any" else token.upper()
+        if ned_id.startswith("cisco-nx-cli") and token == "local7":
+            # NX accepts explicit local7 but normalizes it out of running config.
+            # Treat the operator token and the reader's omission as one value so
+            # apply settles and the next push does not materialize permanent drift.
+            return ""
         return token
     return value
+
+
+def _canonical_logging_intent_field(ned_id: str, field: str, value):
+    """Canonicalize a logging token without erasing explicit write semantics."""
+    token = str(value).lower() if value not in (None, "") else value
+    if field == "facility" and ned_id.startswith("cisco-nx-cli") and token == "local7":
+        # The reader omits NX's local7 device default, but the writer needs the
+        # explicit token to retract an adopted non-default facility.
+        return token
+    return _canonical_logging_field(ned_id, field, value)
 
 
 def _reconcile_logging_config(device, payload: dict) -> dict:
