@@ -129,10 +129,15 @@ Other useful helpers include `netbox-run-bg`, `netbox-stop`, `netbox-restart`, `
 What `netbox-test` actually does (`.devcontainer/scripts/load-aliases.sh`):
 
 ```bash
+workers="${NETBOX_TEST_WORKERS:-8}"
+parallel_args=()
+if [ "$workers" -gt 1 ]; then
+  parallel_args=(-n "$workers" --maxschedchunk=1)
+fi
 cd "$PLUGIN_DIR" && source /opt/netbox/venv/bin/activate && \
   TEST_DB_NAME="${TEST_DB_NAME:-test_netbox_nso_plugin}" \
   pytest netbox_nso_plugin/tests --no-cov -q --disable-warnings \
-  -n "${NETBOX_TEST_WORKERS:-8}" --maxschedchunk=1
+  "${parallel_args[@]}"
 ```
 
 Why this is the only path you should take:

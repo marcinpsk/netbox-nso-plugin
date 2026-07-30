@@ -24,6 +24,21 @@ _BASE_CFG = {
 }
 
 
+class TestClientResetHelpers(unittest.TestCase):
+    """Tests for public reset hooks that do not need a configured database."""
+
+    def test_reset_config_cache_discards_cached_values(self):
+        """The public hook removes both cached settings and their expiry timestamp."""
+        import netbox_nso_plugin.adapter_client as ac
+
+        self.addCleanup(ac.reset_config_cache)
+        ac._cfg_cache.update({"data": {"url": "http://stale.invalid"}, "ts": 123.0})
+
+        ac.reset_config_cache()
+
+        self.assertEqual(ac._cfg_cache, {})
+
+
 def _mock_response(status_code=200, json_data=None, content=None):
     return make_response(status_code, json_data, content)
 
@@ -43,7 +58,7 @@ class TestResolveConfig(TestCase):
         # test's AdapterConnection state is explicit.
         import netbox_nso_plugin.adapter_client as ac
 
-        ac._cfg_cache.clear()
+        ac.reset_config_cache()
         AdapterConnection.objects.all().delete()
 
     @override_settings(

@@ -35,7 +35,7 @@ def test_live_adapter_read_and_auth_contract():
 
     import netbox_nso_plugin.adapter_client as client
 
-    client._cfg_cache.clear()
+    client.reset_config_cache()
     client.reset_session()
     try:
         devices = client.list_devices()
@@ -57,10 +57,10 @@ def test_live_adapter_read_and_auth_contract():
         } == set(failover)
 
         settings.PLUGINS_CONFIG["netbox_nso_plugin"]["adapter_token"] = "intentionally-wrong-test-token"
-        client._cfg_cache.clear()
+        client.reset_config_cache()
         with pytest.raises(client.AdapterError) as exc_info:
             client.list_devices()
         assert exc_info.value.code == "unauthorized"
     finally:
-        client._cfg_cache.clear()
+        client.reset_config_cache()
         client.reset_session()

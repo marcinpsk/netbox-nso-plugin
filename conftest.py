@@ -2,8 +2,14 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Root conftest: inject netbox stubs so tests run without a full NetBox install."""
 
+import os
 import sys
 import types
+
+
+def _should_inject_netbox_stubs():
+    """Return whether this test process needs the lightweight NetBox stubs."""
+    return os.environ.get("NETBOX_NSO_USE_REAL_NETBOX") != "1"
 
 
 def _inject_netbox_stubs():
@@ -91,4 +97,5 @@ def _inject_netbox_stubs():
 
 def pytest_configure(config):
     """Inject netbox stubs before pytest-django loads Django settings."""
-    _inject_netbox_stubs()
+    if _should_inject_netbox_stubs():
+        _inject_netbox_stubs()

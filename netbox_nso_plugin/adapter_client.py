@@ -96,6 +96,11 @@ def reset_session():
     _session_cls = None
 
 
+def reset_config_cache():
+    """Discard cached adapter settings so the next request resolves them again."""
+    _cfg_cache.clear()
+
+
 class AdapterError(Exception):
     """Raised when the nso-adapter returns an error or is unreachable."""
 

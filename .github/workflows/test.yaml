@@ -18,6 +18,9 @@ concurrency:
 jobs:
   test-netbox:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
 
     strategy:
       fail-fast: false
@@ -33,7 +36,7 @@ jobs:
           - 6379:6379
 
       postgres:
-        image: postgres:16
+        image: postgres:16@sha256:33f923b05f64ca54ac4401c01126a6b92afe839a0aa0a52bc5aeb5cc958e5f20
         env:
           POSTGRES_USER: netbox
           POSTGRES_PASSWORD: netbox
@@ -50,6 +53,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
         with:
           path: netbox-nso-plugin
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
@@ -65,6 +69,7 @@ jobs:
           repository: netbox-community/netbox
           path: netbox
           ref: ${{ matrix.netbox-version }}
+          persist-credentials: false
 
       - name: Install NetBox and plugin
         working-directory: netbox-nso-plugin
@@ -114,6 +119,7 @@ jobs:
         working-directory: netbox-nso-plugin
         env:
           NETBOX_CONFIGURATION: netbox.configuration
+          NETBOX_NSO_USE_REAL_NETBOX: "1"
           PYTHONPATH: ${{ github.workspace }}/netbox/netbox
           TEST_DB_NAME: test_netbox_nso_plugin_ci
         # Four workers match the standard public runner's CPU allocation. The
@@ -123,10 +129,13 @@ jobs:
   live-adapter-contract:
     name: Live adapter contract
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
 
     services:
       adapter-postgres:
-        image: postgres:16-alpine
+        image: postgres:16-alpine@sha256:16bc17c64a573ef34162af9298258d1aec548232985b33ed7b1eac33ba35c229
         env:
           POSTGRES_USER: adapter
           POSTGRES_PASSWORD: adapter
@@ -144,6 +153,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
         with:
           path: netbox-nso-plugin
+          persist-credentials: false
 
       # This compatibility job intentionally follows adapter main. A breaking
       # adapter change should fail plugin CI before the two public repositories
@@ -154,6 +164,7 @@ jobs:
           repository: marcinpsk/nso-adapter
           ref: main
           path: nso-adapter
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
