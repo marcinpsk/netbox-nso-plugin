@@ -3677,6 +3677,14 @@ def _save_owned_overlay_edit(obj, key):
             with suppress_intent_push():
                 obj.static_route.save(update_fields=["metric", "permanent", "tag"])
         obj.save()
+        if key == "static_route":
+            from .signals import _transition_static_route_content
+
+            # The native save above ran suppressed and only THIS overlay was saved, but the
+            # fork object is shared by every device the route is on — editing through one
+            # device's row silently changes the others' content. Re-arm them all.
+            _transition_static_route_content(obj.static_route)
+            obj.refresh_from_db()
 
 
 def _route_map_name_errors(state, old_name):
@@ -4510,6 +4518,11 @@ class RoutingStateAcceptMixin(NSOActionPermissionMixin, View):
     """Per-row accept for a routing state model — sets status to 'accepted' and fires push signal."""
 
     model_class = None
+    # Extra columns _arm_accept() writes, saved in the same UPDATE as the status.
+    accept_extra_fields: tuple[str, ...] = ()
+
+    def _arm_accept(self, state) -> None:
+        """Set family-specific state on *state* before the accepted row is saved."""
 
     def post(self, request, pk):  # noqa: D102
         state = get_object_or_404(self.model_class, pk=pk)
@@ -4519,7 +4532,8 @@ class RoutingStateAcceptMixin(NSOActionPermissionMixin, View):
         # FIRST took ownership, so a re-accept must not reset it (#107 staleness badge).
         if state.accepted_at is None:
             state.accepted_at = timezone.now()
-        state.save(update_fields=["status", "accepted_at"])
+        self._arm_accept(state)
+        state.save(update_fields=["status", "accepted_at", *self.accept_extra_fields])
         messages.success(request, f"Accepted routing state {state.pk}.")
         return redirect(_device_nso_tab_url(state.management.device_id))
 
@@ -4887,8 +4901,26 @@ class NSOInterfaceIPStateAcceptView(NSOActionPermissionMixin, View):
         return redirect(_device_nso_tab_url(iface.device_id))
 
 
-class NSOStaticRouteStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
+class NSOStaticRouteStateAcceptView(RoutingStateAcceptMixin):
+    """Accept one static route — and re-arm its generation even when nothing changed.
+
+    A re-accept saves no native object, so no content transition can see it, yet it is a
+    fresh statement of intent: without a new generation the result of the apply the
+    operator is re-accepting away would still name this row and could settle it.
+    """
+
     model_class = NSOStaticRouteState
+    accept_extra_fields = (
+        "intent_generation",
+        "generation_started_at",
+        "last_apply_error",
+        "last_result_advisory",
+    )
+
+    def _arm_accept(self, state):  # noqa: D102
+        from .signals import _arm_static_route_generation
+
+        _arm_static_route_generation(state)
 
 
 class NSOISISInterfaceStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
@@ -5209,8 +5241,12 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
     def _push(self, mgmt):
         """Trigger the appropriate intent push; override in subclasses."""
 
-    def _after_accept(self, mgmt):
-        """Run after the bulk ownership update, before the push (override in subclasses)."""
+    def _after_accept(self, mgmt, accepted_pks):
+        """Run after the bulk ownership update, before the push (override in subclasses).
+
+        *accepted_pks* are the rows this call moved from drift into ownership — the ones
+        that now carry intent the device does not have.
+        """
 
     def post(self, request, device_pk):  # noqa: D102
         try:
@@ -5224,13 +5260,16 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
         # them was a repeatable no-op). Matching (imported) -> in_sync (nothing to
         # push); drift -> accepted (pending apply). _push() sends the snapshot once.
         base = self.model_class.objects.filter(management=mgmt)
+        # Captured before the UPDATE: afterwards the two groups are indistinguishable, and
+        # only the drift group is entering ownership.
+        drift_pks = list(base.filter(status__in=["changed", "conflict"]).values_list("pk", flat=True))
         n_owned = base.filter(status="imported").update(status="in_sync")
-        n_drift = base.filter(status__in=["changed", "conflict"]).update(status="accepted")
+        n_drift = base.filter(pk__in=drift_pks).update(status="accepted")
         count = n_owned + n_drift
 
         if count and mgmt.adapter_device_id is not None:
             try:
-                self._after_accept(mgmt)
+                self._after_accept(mgmt, drift_pks)
                 self._push(mgmt)
             except Exception as exc:
                 logger.warning("Bulk accept push failed for device %s: %s", device_pk, exc)
@@ -5244,6 +5283,21 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
 
 class NSOStaticRouteBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     model_class = NSOStaticRouteState
+
+    def _after_accept(self, mgmt, accepted_pks):
+        """Arm a generation on every row this accept moved from drift into ownership."""
+        from .signals import _arm_static_route_generation
+
+        for state in self.model_class.objects.filter(pk__in=accepted_pks):
+            _arm_static_route_generation(state)
+            state.save(
+                update_fields=[
+                    "intent_generation",
+                    "generation_started_at",
+                    "last_apply_error",
+                    "last_result_advisory",
+                ]
+            )
 
     def _push(self, mgmt):
         from .signals import _push_static_route_intent_for_device
@@ -5281,7 +5335,7 @@ class NSOBGPPeerBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
 class NSORoutePolicyBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     model_class = NSORoutePolicyState
 
-    def _after_accept(self, mgmt):
+    def _after_accept(self, mgmt, accepted_pks):
         from .signals import _own_route_map_contributors
 
         # Owning a route-map owns its contributors — cascade for every now-owned route-map.

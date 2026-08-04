@@ -1885,6 +1885,94 @@ def _on_static_route_state_save(sender, instance, **kwargs):
 # (full-replace). All wired from the plugin against the netbox_routing model — no fork edit.
 
 
+def _static_route_content(static_route) -> tuple:
+    """Return the wire-visible content of *static_route* — what a push would carry.
+
+    A delta here is new intent for every device that owns the route; a delta anywhere
+    else is not. ``name`` and ``interface_next_hop`` never reach the wire for a pushable
+    route, so editing them is not an intent change.
+    """
+    return (
+        static_route.vrf_id,
+        str(static_route.prefix or ""),
+        str(static_route.next_hop or ""),
+        static_route.metric,
+        # The wire sends ``permanent or False``, so None and False are one value there —
+        # treating them as a delta would bump a generation over an identical payload.
+        bool(static_route.permanent),
+        static_route.tag,
+    )
+
+
+def _arm_static_route_generation(state) -> None:
+    """Give *state* a fresh generation in memory — the caller saves it.
+
+    For the accept paths, which never save the native route (so no ``pre_save`` fires and
+    the content transition cannot see them) yet are still a new statement of intent: the
+    result of the apply that already failed must not be able to settle the row the
+    operator has just re-accepted.
+    """
+    from .intent_generation import allocate_intent_generation
+
+    state.intent_generation = allocate_intent_generation()
+    state.generation_started_at = timezone.now()
+    # Both describe the generation just superseded.
+    state.last_apply_error = ""
+    state.last_result_advisory = ""
+
+
+_STATIC_ROUTE_TRANSITION_FIELDS = (
+    "nso_vrf",
+    "nso_prefix",
+    "nso_next_hop",
+    "status",
+    "intent_generation",
+    "generation_started_at",
+    "last_apply_error",
+    "last_result_advisory",
+)
+
+
+def _transition_static_route_content(static_route) -> list:
+    """Re-arm every owned overlay of *static_route* as fresh, unsettled intent.
+
+    Any operator content edit — identity or not — makes every prior apply result stale.
+    The row goes back to ``accepted`` (fail-closed: "pending apply"), takes a generation
+    no in-flight result can name, and drops the error and advisory that described the
+    generation just superseded. Leaving an edited row ``in_sync`` is a green badge over
+    content the device does not have, and leaving it ``deploying`` lets the apply already
+    in flight settle the *new* intent from the *old* result.
+
+    The fan-out is resolved by querying the overlays, never through ``instance.devices``:
+    the fork's form writes the row before ``devices.set()``, so at ``post_save`` the M2M
+    still reads the pre-edit membership. Rows are locked in ascending management-id order
+    so two edits of one shared route touching the same devices in opposite order cannot
+    deadlock. ``accepted_at`` is left alone — it dates first ownership (staged_days).
+    """
+    from django.db import transaction
+
+    from .models import NSOStaticRouteState
+
+    vrf_name = static_route.vrf.name if static_route.vrf else ""
+    prefix = str(static_route.prefix or "")
+    next_hop = str(static_route.next_hop or "")
+    with transaction.atomic():
+        rows = list(
+            NSOStaticRouteState.objects.select_for_update()
+            .filter(static_route=static_route, status__in=_OWNED_PUSH_STATUSES)
+            .order_by("management_id")
+        )
+        for row in rows:
+            row.nso_vrf = vrf_name
+            row.nso_prefix = prefix
+            row.nso_next_hop = next_hop
+            row.status = "accepted"
+            _arm_static_route_generation(row)
+            # → _on_static_route_state_save, which coalesces to one push per device.
+            row.save(update_fields=list(_STATIC_ROUTE_TRANSITION_FIELDS))
+    return rows
+
+
 def _accept_static_route_for_device(static_route, device) -> None:
     """Own a greenfield route for *device* (accepted overlay) → its save pushes intent."""
     from .models import NSODeviceManagement, NSOStaticRouteState
@@ -1902,9 +1990,17 @@ def _accept_static_route_for_device(static_route, device) -> None:
         static_route=static_route,
         defaults={"status": "accepted", "accepted_at": timezone.now()},
     )
-    if not created and state.status not in ("accepted", "deploying", "in_sync", "apply_failed"):
+    was_owned = not created and state.status in _OWNED_PUSH_STATUSES
+    if not created and not was_owned:
         state.status = "accepted"
         state.accepted_at = timezone.now()
+    if not was_owned:
+        # Entering ownership is intent this device did not carry before, so it needs a
+        # generation of its own — an already-owned row keeps the one it is mid-flight on.
+        _arm_static_route_generation(state)
+    # nso_vrf too: the residue key is the (vrf, prefix, next_hop) triple, so a VRF route
+    # adopted with an empty mirror never matches its own device row.
+    state.nso_vrf = static_route.vrf.name if static_route.vrf else ""
     state.nso_prefix = str(static_route.prefix or "")
     state.nso_next_hop = str(static_route.next_hop or "")
     state.last_sync_at = timezone.now()
@@ -1929,27 +2025,37 @@ def _remove_static_route_for_device(static_route, device) -> None:
     )
 
 
-@_skip_on_render
-def _on_routing_static_route_save(sender, instance, **kwargs):
-    """Re-push when an owned greenfield route's fields (prefix/next-hop/…) are edited."""
-    from .models import NSODeviceManagement, NSOStaticRouteState
+def _on_routing_static_route_pre_save(sender, instance, **kwargs):
+    """Stash the committed row's wire-visible content so post_save can see the delta.
 
-    for device in instance.devices.all():
-        try:
-            mgmt = NSODeviceManagement.objects.get(device=device)
-        except NSODeviceManagement.DoesNotExist:
-            continue
-        if mgmt.adapter_device_id is None:
-            continue
-        owned = NSOStaticRouteState.objects.filter(
-            management=mgmt, static_route=instance, status__in=("accepted", "deploying", "in_sync", "apply_failed")
-        ).exists()
-        if owned:
-            device_id, adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
-            _schedule_intent_push(
-                (device_id, "static_route"),
-                lambda d=device_id, a=adapter_device_id: _push_static_route_intent_for_device(d, a),
-            )
+    Not ``@_skip_on_render``: it only reads and stashes on the instance, and post_save's
+    own guard decides whether the transition runs. The stash lives on the instance, so a
+    save of a *different* route on the same thread can never be read as this one's
+    baseline. Re-reading on every save is deliberate: within one transaction a second
+    save sees the transaction's own first write, which is what makes an A→B→A edit two
+    real transitions instead of a silently swallowed one.
+    """
+    instance._nso_static_route_content = None
+    if not instance.pk:
+        return
+    try:
+        instance._nso_static_route_content = _static_route_content(sender.objects.get(pk=instance.pk))
+    except sender.DoesNotExist:
+        return
+
+
+@_skip_on_render
+def _on_routing_static_route_save(sender, instance, created=False, **kwargs):
+    """Re-arm every overlay owning this route when its content changed, and push.
+
+    Delta-gated against the pre-save row: a save that touches nothing the wire carries is
+    not intent and must neither bump a generation nor push. A create is left to the
+    ``post_add`` that assigns the route its first devices — there is no overlay yet.
+    """
+    previous = getattr(instance, "_nso_static_route_content", None)
+    if created or previous is None or previous == _static_route_content(instance):
+        return
+    _transition_static_route_content(instance)
 
 
 @_skip_on_render
@@ -4262,6 +4368,13 @@ def _connect_g_activated():  # pragma: no cover
     try:
         from netbox_routing.models import StaticRoute
 
+        # The pre_save stash is what makes post_save delta-gated; without it every save
+        # (including one that touched only ``name``) would bump a generation and push.
+        pre_save.connect(
+            _on_routing_static_route_pre_save,
+            sender=StaticRoute,
+            dispatch_uid="nso_plugin_routing_static_route_pre_save",
+        )
         post_save.connect(
             _on_routing_static_route_save,
             sender=StaticRoute,
