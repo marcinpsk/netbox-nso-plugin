@@ -5249,6 +5249,8 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
         """
 
     def post(self, request, device_pk):  # noqa: D102
+        from django.db import transaction
+
         try:
             mgmt = NSODeviceManagement.objects.get(device_id=device_pk)
         except NSODeviceManagement.DoesNotExist:
@@ -5260,18 +5262,23 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
         # them was a repeatable no-op). Matching (imported) -> in_sync (nothing to
         # push); drift -> accepted (pending apply). _push() sends the snapshot once.
         base = self.model_class.objects.filter(management=mgmt)
-        # Captured before the UPDATE: afterwards the two groups are indistinguishable, and
-        # only the drift group is entering ownership.
-        drift_pks = list(base.filter(status__in=["changed", "conflict"]).values_list("pk", flat=True))
-        n_owned = base.filter(status="imported").update(status="in_sync")
-        # The pks narrow the update, they do not replace its predicate: a reconcile that
-        # re-classified one of them meanwhile owns that row's status, not this request.
-        n_drift = base.filter(pk__in=drift_pks, status__in=["changed", "conflict"]).update(status="accepted")
-        count = n_owned + n_drift
+        # One transaction: a request is not wrapped in one, so committing the status ahead
+        # of _after_accept() would publish rows that read as owned while still carrying the
+        # state the previous apply named — which a concurrent Apply would then act on.
+        with transaction.atomic():
+            # Captured before the UPDATE: afterwards the two groups are indistinguishable,
+            # and only the drift group is entering ownership.
+            drift_pks = list(base.filter(status__in=["changed", "conflict"]).values_list("pk", flat=True))
+            n_owned = base.filter(status="imported").update(status="in_sync")
+            # The pks narrow the update, they do not replace its predicate: a reconcile that
+            # re-classified one of them meanwhile owns that row's status, not this request.
+            n_drift = base.filter(pk__in=drift_pks, status__in=["changed", "conflict"]).update(status="accepted")
+            count = n_owned + n_drift
+            if count and mgmt.adapter_device_id is not None:
+                self._after_accept(mgmt, drift_pks)
 
         if count and mgmt.adapter_device_id is not None:
             try:
-                self._after_accept(mgmt, drift_pks)
                 self._push(mgmt)
             except Exception as exc:
                 logger.warning("Bulk accept push failed for device %s: %s", device_pk, exc)

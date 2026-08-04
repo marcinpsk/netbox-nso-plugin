@@ -1933,8 +1933,11 @@ _STATIC_ROUTE_TRANSITION_FIELDS = (
 )
 
 
-def _transition_static_route_content(static_route) -> list:
+def _transition_static_route_content(static_route, previous=None) -> list:
     """Re-arm every owned overlay of *static_route* as fresh, unsettled intent.
+
+    *previous* is the pre-save content the delta is judged against; ``None`` means the
+    caller already knows this is a change and wants the transition unconditionally.
 
     Any operator content edit — identity or not — makes every prior apply result stale.
     The row goes back to ``accepted`` (fail-closed: "pending apply"), takes a generation
@@ -1953,10 +1956,19 @@ def _transition_static_route_content(static_route) -> list:
 
     from .models import NSOStaticRouteState
 
-    vrf_name = static_route.vrf.name if static_route.vrf else ""
-    prefix = str(static_route.prefix or "")
-    next_hop = str(static_route.next_hop or "")
     with transaction.atomic():
+        # The committed row, never the instance: a save(update_fields=…) persists only the
+        # named columns, so an unsaved attribute would otherwise be mirrored and bumped as
+        # intent the push — which re-queries the row — could never send.
+        route_rows = type(static_route)._default_manager.filter(pk=static_route.pk).order_by("pk")
+        committed = route_rows.select_for_update().first()
+        if committed is None:
+            return []
+        if previous is not None and previous == _static_route_content(committed):
+            return []  # nothing the wire carries actually changed
+        vrf_name = committed.vrf.name if committed.vrf else ""
+        prefix = str(committed.prefix or "")
+        next_hop = str(committed.next_hop or "")
         rows = list(
             NSOStaticRouteState.objects.select_for_update()
             .filter(static_route=static_route, status__in=_OWNED_PUSH_STATUSES)
@@ -2060,13 +2072,14 @@ def _on_routing_static_route_save(sender, instance, created=False, **kwargs):
     """Re-arm every overlay owning this route when its content changed, and push.
 
     Delta-gated against the pre-save row: a save that touches nothing the wire carries is
-    not intent and must neither bump a generation nor push. A create is left to the
+    not intent and must neither bump a generation nor push. The comparison itself happens
+    inside the transition, against the *committed* row. A create is left to the
     ``post_add`` that assigns the route its first devices — there is no overlay yet.
     """
     previous = getattr(instance, "_nso_static_route_content", None)
-    if created or previous is None or previous == _static_route_content(instance):
+    if created or previous is None:
         return
-    _transition_static_route_content(instance)
+    _transition_static_route_content(instance, previous=previous)
 
 
 @_skip_on_render

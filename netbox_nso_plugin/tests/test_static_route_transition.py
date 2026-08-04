@@ -221,6 +221,26 @@ class TestStaticRouteContentTransition(IntentPushResetMixin, TestCase):
         self.assertEqual(state.intent_generation, before)
         put.assert_not_called()
 
+    def test_a_field_the_save_did_not_persist_is_not_a_content_change(self):
+        """``update_fields`` means the database never saw the other attributes. Reading them
+        off the instance invents a change, mirrors a value the row does not hold, and bumps a
+        generation — while the push builder re-queries the row and sends the old content."""
+        with _fixtures():
+            sr = _route("10.26.5.0/24", "10.0.0.1", devices=[self.device])
+            state = _own(sr, self.mgmt, status="in_sync")
+        before = state.intent_generation
+
+        with patch(PUT) as put, self.captureOnCommitCallbacks(execute=True):
+            sr.next_hop = "10.0.0.99"  # set in memory, never persisted
+            sr.name = "label"
+            sr.save(update_fields=["name"])
+
+        state.refresh_from_db()
+        self.assertEqual(state.status, "in_sync")
+        self.assertEqual(state.intent_generation, before)
+        self.assertEqual(state.nso_next_hop, "10.0.0.1")
+        put.assert_not_called()
+
     def test_a_created_route_carries_no_stash(self):
         """P2.6 — a create has no pre-save row, so nothing may be read as its baseline."""
         from netbox_routing.models import StaticRoute
@@ -383,6 +403,45 @@ class TestStaticRouteBulkAcceptOutsideATransaction(_CascadeFlushMixin, IntentPus
         pushed = put.call_args.args[1]
         self.assertEqual(len(pushed), 3)
         self.assertTrue(all(route["generation"] for route in pushed))
+
+    def test_no_observer_ever_sees_an_accepted_row_still_on_its_old_generation(self):
+        """Committing the status ahead of the generation leaves a window in which a concurrent
+        Apply force-pushes the freshly accepted row on the generation the *last* apply named,
+        and moves it to deploying — after which the arming pass no longer matches it."""
+        from django.db import connections
+        from django.db.models import QuerySet
+
+        from netbox_nso_plugin.models import NSOStaticRouteState
+
+        state = self._drifted(1)[0]
+        stale_generation = state.intent_generation
+        original, observed = QuerySet.update, []
+
+        def _observe(pk):
+            try:
+                row = NSOStaticRouteState.objects.get(pk=pk)
+                observed.append((row.status, row.intent_generation))
+            finally:
+                connections.close_all()
+
+        def _update_then_observe(self, **kwargs):
+            result = original(self, **kwargs)
+            if kwargs.get("status") == "accepted":
+                # A second connection: it sees only what has been COMMITTED so far.
+                watcher = threading.Thread(target=_observe, args=(state.pk,))
+                watcher.start()
+                watcher.join(timeout=30)
+            return result
+
+        with patch(PUT), patch.object(QuerySet, "update", _update_then_observe):
+            response = self._post()
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(len(observed), 1)
+        self.assertNotEqual(observed[0], ("accepted", stale_generation))
+        state.refresh_from_db()
+        self.assertEqual(state.status, "accepted")
+        self.assertGreater(state.intent_generation, stale_generation)
 
     def test_a_row_a_reconcile_moved_on_is_not_clobbered_by_the_captured_pks(self):
         """Selecting by pk alone drops the status predicate the original UPDATE carried, so a
