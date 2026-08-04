@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import threading
+import time
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
@@ -331,37 +332,6 @@ class TestPushRecordSurvivesFullSaves(IntentPushResetMixin, TestCase):
         self.assertEqual(self.mgmt.intent_push_attempts["static_route"], recorded["attempt"])
         self.assertEqual(self.mgmt.nso_device_name, "renamed-by-the-sweep")  # the real edit landed
 
-    def test_a_full_save_racing_a_push_still_cannot_rewind_the_mark(self):
-        """codex P2 — re-reading the columns is not enough on its own: the read and the
-        UPDATE are separate statements, so a push committing between them wins. The read
-        must be taken under the row lock the save holds through its own UPDATE."""
-        from netbox_nso_plugin.models import NSODeviceManagement
-
-        stale = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
-        stale.nso_device_name = "renamed-mid-race"
-
-        # A push commits between the stale instance's load and its save. Injected on the
-        # locked read so it lands in exactly the window the lock has to cover.
-        original = NSODeviceManagement.objects.select_for_update
-        state = {"fired": False}
-
-        def _push_lands_mid_save(*args, **kwargs):
-            queryset = original(*args, **kwargs)
-            if not state["fired"]:
-                state["fired"] = True
-                NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(
-                    intent_push_attempts={"static_route": 9}, intent_push_errors={"static_route": {"code": "late"}}
-                )
-            return queryset
-
-        with patch.object(NSODeviceManagement.objects, "select_for_update", _push_lands_mid_save):
-            stale.save()
-
-        self.mgmt.refresh_from_db()
-        self.assertEqual(self.mgmt.intent_push_attempts, {"static_route": 9})
-        self.assertEqual(self.mgmt.intent_push_errors, {"static_route": {"code": "late"}})
-        self.assertEqual(self.mgmt.nso_device_name, "renamed-mid-race")
-
     def test_an_explicit_update_fields_write_still_works(self):
         """The guard must not make the record unwritable — only the two allocators touch it,
         and both name the field explicitly."""
@@ -413,6 +383,59 @@ class TestIntentPushRejectionConcurrency(_CascadeFlushMixin, IntentPushResetMixi
         self.mgmt.refresh_from_db()
         self.assertEqual(set(self.mgmt.intent_push_errors), {"static_route", "vlan"})
         self.assertEqual(set(self.mgmt.intent_push_attempts), {"static_route", "vlan"})
+
+    def test_a_full_save_holds_the_row_lock_across_its_own_update(self):
+        """codex P2 — re-reading the record is not enough: unless the lock the guard takes
+        is STILL HELD when Django issues the UPDATE, a push committing in that window is
+        overwritten by the copy the guard made a moment earlier.
+
+        Two real connections, coordinated at ``pre_save`` — which Django fires inside the
+        guard's transaction and before the UPDATE, i.e. exactly the window in question. A
+        guard whose ``atomic()`` ended after the SELECT would let the competing writer
+        through, and its value would then be clobbered back.
+        """
+        from django.db.models.signals import pre_save
+
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(intent_push_attempts={"static_route": 1})
+        stale = NSODeviceManagement.objects.get(pk=self.mgmt.pk)  # carries attempt 1
+        stale.nso_device_name = "renamed-mid-race"
+
+        writer_running = threading.Event()
+        released = threading.Event()
+        errors: list[BaseException] = []
+
+        def _let_the_writer_in(sender, instance, **kwargs):
+            if instance.pk != self.mgmt.pk or released.is_set():
+                return
+            released.set()
+            writer_running.wait(timeout=10)
+            time.sleep(0.5)  # the writer is now blocked on our row lock, not merely started
+
+        def _competing_push():
+            try:
+                released.wait(timeout=30)
+                writer_running.set()
+                NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(intent_push_attempts={"static_route": 9})
+            except BaseException as exc:  # noqa: BLE001 — reported, not swallowed
+                errors.append(exc)
+            finally:
+                connection.close()
+
+        writer = threading.Thread(target=_competing_push)
+        pre_save.connect(_let_the_writer_in, sender=NSODeviceManagement)
+        try:
+            writer.start()
+            stale.save()
+        finally:
+            pre_save.disconnect(_let_the_writer_in, sender=NSODeviceManagement)
+        writer.join(timeout=60)
+
+        self.assertEqual(errors, [])
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.intent_push_attempts, {"static_route": 9}, "the full save rewound the mark")
+        self.assertEqual(self.mgmt.nso_device_name, "renamed-mid-race")  # the real edit still landed
 
 
 class TestStaticRouteFailureRender(IntentPushResetMixin, TestCase):
