@@ -17,6 +17,7 @@ from django.test import TestCase, TransactionTestCase, override_settings
 from netbox_nso_plugin.models import AdapterConnection
 
 from ._adapter_http import make_response, make_session
+from .mixins import _CascadeFlushMixin
 
 _BASE_CFG = {
     "url": "http://adapter.local",
@@ -25,27 +26,6 @@ _BASE_CFG = {
     "ca_cert_path": None,
     "timeout": 30,
 }
-
-
-class _CascadeFlushMixin:
-    """Make TransactionTestCase cleanup work with NetBox's cross-app foreign keys."""
-
-    def _fixture_teardown(self):
-        from django.core.management import call_command
-
-        for db_name in self._databases_names(include_mirrors=False):
-            inhibit_post_migrate = self.available_apps is not None or (
-                self.serialized_rollback and hasattr(connections[db_name], "_test_serialized_contents")
-            )
-            call_command(
-                "flush",
-                verbosity=0,
-                interactive=False,
-                database=db_name,
-                reset_sequences=False,
-                allow_cascade=True,
-                inhibit_post_migrate=inhibit_post_migrate,
-            )
 
 
 class TestClientResetHelpers(unittest.TestCase):

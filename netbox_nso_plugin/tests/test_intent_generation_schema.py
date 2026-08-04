@@ -15,7 +15,7 @@ from django.db.migrations.executor import MigrationExecutor
 from django.test import TestCase, TransactionTestCase
 from django.utils import timezone
 
-from .test_bgp_greenfield import _CascadeFlushMixin
+from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 APP = "netbox_nso_plugin"
 BEFORE = "0015_readsem_1332_atomic_publication"
@@ -42,7 +42,7 @@ def _make_mgmt(device, tag: str, adapter_device_id: int):
     )
 
 
-class TestIntentGenerationMigration(TestCase):
+class TestIntentGenerationMigration(IntentPushResetMixin, TestCase):
     """P0b.1 — the schema lands unallocated, and the migration can be unapplied."""
 
     def test_new_overlay_columns_default_to_the_unallocated_sentinel(self):

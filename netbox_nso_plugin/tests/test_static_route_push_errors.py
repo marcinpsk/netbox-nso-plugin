@@ -22,8 +22,7 @@ from django.db import connection
 from django.test import TestCase, TransactionTestCase
 from django.utils import timezone
 
-from .mixins import IntentPushResetMixin
-from .test_bgp_greenfield import _CascadeFlushMixin
+from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 PUT = "netbox_nso_plugin.adapter_client.put_static_route_intent"
 PUT_VLAN = "netbox_nso_plugin.adapter_client.put_vlan_intent"

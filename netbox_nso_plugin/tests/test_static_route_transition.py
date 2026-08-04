@@ -23,8 +23,7 @@ from django.utils import timezone
 
 from netbox_nso_plugin import adapter_client as _adapter_client
 
-from .mixins import IntentPushResetMixin
-from .test_bgp_greenfield import _CascadeFlushMixin
+from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 PUT = "netbox_nso_plugin.adapter_client.put_static_route_intent"
 #: Captured at import, before any test can patch it — see ``_assert_put_patch_did_not_leak``.

@@ -28,7 +28,7 @@ from django.db import IntegrityError
 from django.test import SimpleTestCase, TestCase, TransactionTestCase
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
-from netbox_nso_plugin.tests.test_bgp_greenfield import _CascadeFlushMixin
+from netbox_nso_plugin.tests.mixins import _CascadeFlushMixin
 
 
 def _make_device(name):
