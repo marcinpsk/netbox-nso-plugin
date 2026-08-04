@@ -125,7 +125,9 @@ jobs:
           TEST_DB_NAME: test_netbox_nso_plugin_ci
         # Four workers match the standard public runner's CPU allocation. The
         # plugin conftest gives each worker an isolated PostgreSQL database.
-        run: pytest -n 4 --dist loadscope --disable-warnings
+        # The pythonpath override replaces the ini value (devcontainer netbox +
+        # netbox_stubs): the stubs would shadow the real NetBox checkout here.
+        run: pytest -n 4 --dist loadscope --disable-warnings -o pythonpath=../netbox/netbox
 
   live-adapter-contract:
     name: Live adapter contract
