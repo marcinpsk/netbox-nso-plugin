@@ -402,20 +402,41 @@ class TestIntentPushRejectionConcurrency(_CascadeFlushMixin, IntentPushResetMixi
         stale = NSODeviceManagement.objects.get(pk=self.mgmt.pk)  # carries attempt 1
         stale.nso_device_name = "renamed-mid-race"
 
+        writer_pid: list[int] = []
         writer_running = threading.Event()
         released = threading.Event()
         errors: list[BaseException] = []
+
+        def _writer_is_blocked_on_a_lock():
+            """True once PostgreSQL itself reports the writer's backend waiting on a lock.
+
+            Waiting on the thread — or on a fixed sleep — proves nothing: a descheduled
+            writer whose UPDATE has not reached the server yet would let this save commit
+            first and the test would pass over the very regression it targets.
+            """
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT count(*) FROM pg_stat_activity WHERE pid = %s AND wait_event_type = 'Lock'",
+                    [writer_pid[0]],
+                )
+                return bool(cursor.fetchone()[0])
 
         def _let_the_writer_in(sender, instance, **kwargs):
             if instance.pk != self.mgmt.pk or released.is_set():
                 return
             released.set()
-            writer_running.wait(timeout=10)
-            time.sleep(0.5)  # the writer is now blocked on our row lock, not merely started
+            self.assertTrue(writer_running.wait(timeout=30), "the competing writer never started")
+            deadline = time.monotonic() + 30
+            while not _writer_is_blocked_on_a_lock():
+                self.assertLess(time.monotonic(), deadline, "the competing UPDATE was never blocked by the row lock")
+                time.sleep(0.02)
 
         def _competing_push():
             try:
-                released.wait(timeout=30)
+                self.assertTrue(released.wait(timeout=30), "the save never reached its pre_save")
+                with connection.cursor() as cursor:  # this thread gets its own connection
+                    cursor.execute("SELECT pg_backend_pid()")
+                    writer_pid.append(cursor.fetchone()[0])
                 writer_running.set()
                 NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(intent_push_attempts={"static_route": 9})
             except BaseException as exc:  # noqa: BLE001 — reported, not swallowed
