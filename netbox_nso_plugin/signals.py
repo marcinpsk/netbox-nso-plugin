@@ -428,6 +428,28 @@ def _record_push_outcome(device_id, scope, attempt, exc):
         logger.warning("Could not record the intent-push outcome for device %s/%s: %s", device_id, scope, exc2)
 
 
+@receiver(pre_save, sender="netbox_nso_plugin.NSODeviceManagement")
+def _protect_push_record_on_full_save(sender, instance, **kwargs):
+    """Stop a stale in-memory management row from rewinding the push record.
+
+    A full ``save()`` rewrites every column from whatever the instance held when it was
+    loaded, and several sweeps load a management row, make an adapter call, and only then
+    save it (``sync_cache.reconcile_device_links``). A rejection recorded in the gap would
+    be silently erased — and rewinding ``intent_push_attempts`` is worse than losing the
+    message: the mark is what discards a superseded response, so lowering it lets a late
+    failure resurrect over a newer success, which is the exact failure P6 exists to
+    prevent. Only :func:`_allocate_push_attempt` and :func:`_record_push_outcome` may move
+    these, and both write them with a queryset update under the row lock.
+    """
+    if kwargs.get("update_fields") is not None or not instance.pk:
+        return
+    current = sender.objects.filter(pk=instance.pk).values("intent_push_errors", "intent_push_attempts").first()
+    if current is None:
+        return
+    instance.intent_push_errors = current["intent_push_errors"]
+    instance.intent_push_attempts = current["intent_push_attempts"]
+
+
 def _push_changed(key, payload, do_push, force=False):
     """Run *do_push* only if *payload* differs from the last push for *key*.
 

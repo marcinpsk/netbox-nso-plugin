@@ -470,18 +470,45 @@ _KIND_SEVERITY = ("apply_failed", "drift", "pending", "deploying", "unknown", "i
 _CATEGORY_PUSH_SCOPES = {"static": "static_route"}
 
 
-def _category_push_error(key, mgmt):
-    """Return this category's persisted intent-push rejection, if any.
+# How definite a recorded push failure is. The adapter client mints these codes ITSELF,
+# so they say the request never reached the adapter — except a read timeout, where the PUT
+# may well have committed (and auto-applied) before its response was lost. Reporting any
+# of them as "the adapter rejected this" would state an outcome nobody observed.
+_PUSH_UNSENT_CODES = frozenset({"nso_unreachable", "configuration_error"})
+_PUSH_UNKNOWN_CODES = frozenset({"nso_timeout", ""})
+_PUSH_HEADLINES = {
+    "rejected": "The adapter rejected the last intent push for this category — NetBox holds the edit, the device does not.",
+    "unsent": "The last intent push for this category never reached the adapter — NetBox holds the edit, the device does not.",
+    "unknown": "The last intent push for this category did not complete — whether the adapter stored it is unknown.",
+}
 
-    A rejected push is not an adapter READ error: the operator's edit was saved and the
+
+def _push_error_kind(code):
+    """Classify a recorded push failure as rejected / unsent / unknown."""
+    if code in _PUSH_UNSENT_CODES:
+        return "unsent"
+    if code in _PUSH_UNKNOWN_CODES:
+        return "unknown"
+    return "rejected"
+
+
+def _category_push_error(key, mgmt):
+    """Return this category's persisted intent-push failure, classified for the banner.
+
+    A failed push is not an adapter READ error: the operator's edit was saved and the
     device was never told. Without this the only trace is a log line — the grid would show
-    a green, freshly-accepted row over intent the adapter refused.
+    a green, freshly-accepted row over intent that never landed. The classification is
+    derived here rather than stored, so a record written before this existed still renders
+    honestly.
     """
     scope = _CATEGORY_PUSH_SCOPES.get(key)
     if scope is None or mgmt is None:
         return None
     entry = (mgmt.intent_push_errors or {}).get(scope)
-    return entry if isinstance(entry, dict) else None
+    if not isinstance(entry, dict):
+        return None
+    kind = _push_error_kind(entry.get("code") or "")
+    return {**entry, "kind": kind, "headline": _PUSH_HEADLINES[kind]}
 
 
 def _row_state(kinds) -> str:

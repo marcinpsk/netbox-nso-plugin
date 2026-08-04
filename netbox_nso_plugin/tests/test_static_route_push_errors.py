@@ -296,6 +296,50 @@ class TestIntentPushRejectionIsolation(IntentPushResetMixin, TestCase):
         self.assertIsNotNone(_record(self.mgmt), "a superseded success cleared a newer failure")
 
 
+class TestPushRecordSurvivesFullSaves(IntentPushResetMixin, TestCase):
+    """codex P2 — a stale in-memory management row must not rewind the record.
+
+    Several sweeps load a management row, make an adapter call, and only then ``save()``
+    it. A full save rewrites every column from what the instance held when it was loaded,
+    so a rejection recorded in that gap is erased — and a rewound attempt mark is worse
+    than a lost message, because it is the mark that discards a superseded response.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.device = _make_device("stale")
+        cls.mgmt = _make_mgmt(cls.device, "stale", 9105)
+
+    def test_a_stale_full_save_cannot_erase_or_rewind_the_record(self):
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        stale = NSODeviceManagement.objects.get(pk=self.mgmt.pk)  # loaded BEFORE the failure
+
+        with _fixtures():
+            sr = _route("10.90.0.0/16", "10.0.0.1", devices=[self.device])
+            _own(sr, self.mgmt)
+        with patch(PUT, side_effect=_duplicate_triple(("", "10.90.0.0/16", "10.0.0.1"))):
+            _push(self.device.pk, self.mgmt.adapter_device_id)
+        recorded = _record(self.mgmt)
+        self.assertIsNotNone(recorded)
+
+        stale.nso_device_name = "renamed-by-the-sweep"
+        stale.save()  # a FULL save — every column, from the pre-failure snapshot
+
+        self.assertEqual(_record(self.mgmt), recorded, "a stale full save erased the rejection")
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.intent_push_attempts["static_route"], recorded["attempt"])
+        self.assertEqual(self.mgmt.nso_device_name, "renamed-by-the-sweep")  # the real edit landed
+
+    def test_an_explicit_update_fields_write_still_works(self):
+        """The guard must not make the record unwritable — only the two allocators touch it,
+        and both name the field explicitly."""
+        self.mgmt.intent_push_attempts = {"static_route": 42}
+        self.mgmt.save(update_fields=["intent_push_attempts"])
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.intent_push_attempts, {"static_route": 42})
+
+
 class TestIntentPushRejectionConcurrency(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     """P6.2 — two workers writing DIFFERENT scopes' records at once.
 
@@ -408,6 +452,31 @@ class TestStaticRouteFailureRender(IntentPushResetMixin, TestCase):
         self.mgmt.refresh_from_db()
         payload = self._grid()
         self.assertEqual(payload["push_error"]["detail"]["reason"], "duplicate_triple")
+
+    def test_a_transport_failure_is_not_reported_as_an_adapter_rejection(self):
+        """codex P2 — the adapter never saw an `nso_unreachable` push, and an `nso_timeout`
+        one may have committed before its response was lost. Calling either 'the adapter
+        rejected this' states an outcome nobody observed."""
+        from netbox_nso_plugin.views import _category_push_error
+
+        def _kind(code):
+            self.mgmt.intent_push_errors = {"static_route": {"code": code, "message": "x"}}
+            self.mgmt.save(update_fields=["intent_push_errors"])
+            return _category_push_error("static", self.mgmt)
+
+        self.assertEqual(_kind("validation_error")["kind"], "rejected")
+        self.assertEqual(_kind("conflict")["kind"], "rejected")
+        self.assertEqual(_kind("nso_unreachable")["kind"], "unsent")
+        self.assertEqual(_kind("configuration_error")["kind"], "unsent")
+        self.assertEqual(_kind("nso_timeout")["kind"], "unknown")
+        self.assertEqual(_kind("")["kind"], "unknown")  # a non-AdapterError carries no code
+
+        # The three read differently, and only the definite one claims a rejection.
+        self.assertIn("rejected", _kind("validation_error")["headline"])
+        self.assertNotIn("rejected", _kind("nso_unreachable")["headline"])
+        self.assertNotIn("rejected", _kind("nso_timeout")["headline"])
+        # A timeout must not claim the device lacks the edit — it may well have it.
+        self.assertNotIn("the device does not", _kind("nso_timeout")["headline"])
 
     def test_another_category_never_grows_a_push_banner(self):
         """Only scopes whose rejection is persisted and rendered are mapped; a category with

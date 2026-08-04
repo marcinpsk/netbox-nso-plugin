@@ -1,18 +1,16 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
-{# The adapter's REJECTION of this category's last intent push. Distinct from #}
-{# _adapter_error.html, which reports a failed READ: here the operator's edit was #}
-{# saved and the device was never told. Renders nothing when there is no rejection. #}
-{% if push_error %}
-  <div class="alert alert-danger mb-2">
-    <span class="mdi mdi-cloud-alert-outline me-1"></span>
-    The adapter rejected the last intent push for this category — NetBox holds the edit, the device does not.
-    <div class="small mt-1">
-      {% if push_error.code %}<span class="font-monospace">{{ push_error.code }}</span> — {% endif %}{{ push_error.message }}
-    </div>
-    {% if push_error.detail.reason %}
-      <div class="small">Rule: <span class="font-monospace">{{ push_error.detail.reason }}</span></div>
-    {% endif %}
-    {% if push_error.at %}<div class="small text-muted">Attempt {{ push_error.attempt }} at {{ push_error.at }}</div>{% endif %}
+{# This category's last FAILED intent push. Distinct from _adapter_error.html, which #}
+{# reports a failed READ: here the operator's edit was saved and the device was not #}
+{# told — or, on a timeout, may or may not have been. The wording is the server's #}
+{# (push_error.headline) so the grid's JS refresh cannot invent a second vocabulary. #}
+{# The container renders even when empty: an inline grid edit reloads rows only and #}
+{# never re-renders this include, so nso-grid.js updates it in place. #}
+<div class="alert alert-danger mb-2 nso-push-banner{% if not push_error %} d-none{% endif %}">
+  <span class="mdi mdi-cloud-alert-outline me-1"></span>
+  <span class="nso-push-headline">{{ push_error.headline }}</span>
+  <div class="small mt-1 nso-push-detail">{{ push_error.message }}</div>
+  <div class="small text-muted nso-push-meta">
+    {% if push_error %}{{ push_error.code }}{% if push_error.detail.reason %} / {{ push_error.detail.reason }}{% endif %} — attempt {{ push_error.attempt }} at {{ push_error.at }}{% endif %}
   </div>
-{% endif %}
+</div>

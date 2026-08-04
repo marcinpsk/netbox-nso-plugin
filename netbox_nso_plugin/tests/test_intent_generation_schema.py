@@ -131,7 +131,18 @@ class TestAdoptIncarnationAllowList(TestCase):
         mgmt.intent_push_errors = {"static_route": {"code": "duplicate_triple"}}
         mgmt.intent_push_attempts = {"static_route": 7}
         mgmt.adapter_incarnation = "inc-old"
-        mgmt.save()
+        # Named explicitly: a plain full save cannot write the push record at all — a
+        # pre_save guard restores it from the row, so a stale in-memory instance held by
+        # one of the sweeps cannot rewind the never-cleared attempt mark.
+        mgmt.save(
+            update_fields=[
+                "settle_cursor_seq",
+                "settle_cursor_incarnation",
+                "intent_push_errors",
+                "intent_push_attempts",
+                "adapter_incarnation",
+            ]
+        )
 
         _adopt_incarnation(mgmt, "inc-new", timezone.now())
 

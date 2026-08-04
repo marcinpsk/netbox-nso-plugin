@@ -310,6 +310,34 @@
       });
     });
 
+    /* Keep the category's intent-push banner honest across an in-grid reload.
+     *
+     * An inline edit suppresses the tab-wide refresh, so this fetch is the ONLY thing
+     * that runs afterwards — and it re-renders rows, not the server-rendered include.
+     * Without this a rejection the edit just caused stays invisible, and one it just
+     * cleared stays on screen. All wording comes from the payload (the server owns it);
+     * this only moves text and toggles visibility, never composes markup.
+     *
+     * A payload with no `push_error` KEY is a category that has no banner at all — leave
+     * whatever is there alone. An explicit null means "no failure", which is a clear. */
+    function updatePushBanner(fresh) {
+      if (!fresh || !("push_error" in fresh)) return;
+      var banner = document.querySelector(".nso-push-banner");
+      if (!banner) return;
+      var err = fresh.push_error;
+      banner.classList.toggle("d-none", !err);
+      if (!err) return;
+      var headline = banner.querySelector(".nso-push-headline");
+      var detail = banner.querySelector(".nso-push-detail");
+      var meta = banner.querySelector(".nso-push-meta");
+      if (headline) headline.textContent = err.headline || "";
+      if (detail) detail.textContent = err.message || "";
+      if (meta) {
+        var reason = err.detail && err.detail.reason ? " / " + err.detail.reason : "";
+        meta.textContent = (err.code || "") + reason + " — attempt " + err.attempt + " at " + err.at;
+      }
+    }
+
     function reload() {
       return fetch(opts.jsonUrl, { headers: { "X-Requested-With": "XMLHttpRequest" } })
         .then(function (r) {
@@ -324,6 +352,7 @@
             var el = root.querySelector(".nso-grid-n-" + k);
             if (el) el.textContent = section.counts[k];
           });
+          updatePushBanner(fresh);
         })
         .catch(function (e) {
           flash("Failed to refresh: " + e.message, "danger");
