@@ -331,6 +331,37 @@ class TestPushRecordSurvivesFullSaves(IntentPushResetMixin, TestCase):
         self.assertEqual(self.mgmt.intent_push_attempts["static_route"], recorded["attempt"])
         self.assertEqual(self.mgmt.nso_device_name, "renamed-by-the-sweep")  # the real edit landed
 
+    def test_a_full_save_racing_a_push_still_cannot_rewind_the_mark(self):
+        """codex P2 — re-reading the columns is not enough on its own: the read and the
+        UPDATE are separate statements, so a push committing between them wins. The read
+        must be taken under the row lock the save holds through its own UPDATE."""
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        stale = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+        stale.nso_device_name = "renamed-mid-race"
+
+        # A push commits between the stale instance's load and its save. Injected on the
+        # locked read so it lands in exactly the window the lock has to cover.
+        original = NSODeviceManagement.objects.select_for_update
+        state = {"fired": False}
+
+        def _push_lands_mid_save(*args, **kwargs):
+            queryset = original(*args, **kwargs)
+            if not state["fired"]:
+                state["fired"] = True
+                NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(
+                    intent_push_attempts={"static_route": 9}, intent_push_errors={"static_route": {"code": "late"}}
+                )
+            return queryset
+
+        with patch.object(NSODeviceManagement.objects, "select_for_update", _push_lands_mid_save):
+            stale.save()
+
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.intent_push_attempts, {"static_route": 9})
+        self.assertEqual(self.mgmt.intent_push_errors, {"static_route": {"code": "late"}})
+        self.assertEqual(self.mgmt.nso_device_name, "renamed-mid-race")
+
     def test_an_explicit_update_fields_write_still_works(self):
         """The guard must not make the record unwritable — only the two allocators touch it,
         and both name the field explicitly."""
@@ -466,17 +497,30 @@ class TestStaticRouteFailureRender(IntentPushResetMixin, TestCase):
 
         self.assertEqual(_kind("validation_error")["kind"], "rejected")
         self.assertEqual(_kind("conflict")["kind"], "rejected")
-        self.assertEqual(_kind("nso_unreachable")["kind"], "unsent")
+        # Only configuration_error is raised before a request is ever built, so it is the
+        # ONE code that proves nothing was sent. nso_unreachable is every generic
+        # RequestException — including a socket dropping after the body went out.
         self.assertEqual(_kind("configuration_error")["kind"], "unsent")
+        self.assertEqual(_kind("nso_unreachable")["kind"], "unknown")
         self.assertEqual(_kind("nso_timeout")["kind"], "unknown")
         self.assertEqual(_kind("")["kind"], "unknown")  # a non-AdapterError carries no code
 
-        # The three read differently, and only the definite one claims a rejection.
+        # Only the definite one claims a rejection.
         self.assertIn("rejected", _kind("validation_error")["headline"])
         self.assertNotIn("rejected", _kind("nso_unreachable")["headline"])
         self.assertNotIn("rejected", _kind("nso_timeout")["headline"])
-        # A timeout must not claim the device lacks the edit — it may well have it.
-        self.assertNotIn("the device does not", _kind("nso_timeout")["headline"])
+        # Neither ambiguous code may claim the device lacks the edit — it may well have it,
+        # and auto-apply may already have pushed it on.
+        for code in ("nso_unreachable", "nso_timeout", ""):
+            self.assertNotIn("the device does not", _kind(code)["headline"], code)
+
+    def test_a_category_without_a_banner_omits_the_key_entirely(self):
+        """codex P2 — a null on every category would let another category's own grid reload
+        clear the static banner over a failure that is still live. No key, no clearing."""
+        from netbox_nso_plugin.views import NSOCategoryView
+
+        self.assertNotIn("push_error", NSOCategoryView()._grid_payload("bgp", self.device, self.mgmt))
+        self.assertIn("push_error", NSOCategoryView()._grid_payload("static", self.device, self.mgmt))
 
     def test_another_category_never_grows_a_push_banner(self):
         """Only scopes whose rejection is persisted and rendered are mapped; a category with

@@ -319,10 +319,15 @@
      * this only moves text and toggles visibility, never composes markup.
      *
      * A payload with no `push_error` KEY is a category that has no banner at all — leave
-     * whatever is there alone. An explicit null means "no failure", which is a clear. */
+     * whatever is there alone. An explicit null means "no failure", which is a clear.
+     *
+     * The lookup is scoped to THIS grid's own category card. Several categories can be
+     * expanded at once, and a document-wide lookup would let one category's reload clear
+     * another's banner over a failure that is still live. */
     function updatePushBanner(fresh) {
       if (!fresh || !("push_error" in fresh)) return;
-      var banner = document.querySelector(".nso-push-banner");
+      var scope = (root.closest && root.closest(".nso-category")) || document;
+      var banner = scope.querySelector(".nso-push-banner");
       if (!banner) return;
       var err = fresh.push_error;
       banner.classList.toggle("d-none", !err);

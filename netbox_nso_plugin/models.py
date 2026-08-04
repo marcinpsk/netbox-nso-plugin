@@ -4,7 +4,7 @@ from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import NON_FIELD_ERRORS, ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
-from django.db import models
+from django.db import models, transaction
 from django.urls import reverse
 from netbox.models import NetBoxModel
 
@@ -592,8 +592,40 @@ class NSODeviceManagement(NetBoxModel):
         verbose_name = "NSO Device Management"
         verbose_name_plural = "NSO Device Management"
 
+    # Columns a save that does not name them must never carry — see save().
+    _PUSH_RECORD_FIELDS = ("intent_push_errors", "intent_push_attempts")
+
     def __str__(self):
         return f"{self.device} → {self.nso_instance.name}/{self.nso_device_name}"
+
+    def save(self, *args, **kwargs):
+        """Keep a full save from rewinding the intent-push record.
+
+        A full ``save()`` rewrites every column from whatever this instance held when it
+        was loaded, and several sweeps load a row, make an adapter call, and only then
+        save it (``sync_cache.reconcile_device_links``). A rejection recorded in that gap
+        would be erased — and rewinding ``intent_push_attempts`` is worse than losing the
+        message: the mark is what discards a superseded response, so lowering it lets a
+        late failure resurrect over a newer success.
+
+        Re-reading the two columns is not enough on its own — the read and the UPDATE are
+        separate statements, so a push committing between them still wins. The read is
+        therefore taken under ``select_for_update`` in a transaction that stays open
+        across ``super().save()``, which is what makes the concurrent writer wait.
+
+        A save that NAMES its fields is untouched: the two allocators write the record
+        deliberately, holding this same row lock.
+        """
+        if kwargs.get("update_fields") is not None or not self.pk:
+            return super().save(*args, **kwargs)
+        with transaction.atomic():
+            current = (
+                type(self).objects.select_for_update().filter(pk=self.pk).values(*self._PUSH_RECORD_FIELDS).first()
+            )
+            if current is not None:
+                for field in self._PUSH_RECORD_FIELDS:
+                    setattr(self, field, current[field])
+            return super().save(*args, **kwargs)
 
     def get_absolute_url(self):
         """Return the detail URL for this management record."""

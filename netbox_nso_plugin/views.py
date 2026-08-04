@@ -470,12 +470,14 @@ _KIND_SEVERITY = ("apply_failed", "drift", "pending", "deploying", "unknown", "i
 _CATEGORY_PUSH_SCOPES = {"static": "static_route"}
 
 
-# How definite a recorded push failure is. The adapter client mints these codes ITSELF,
-# so they say the request never reached the adapter — except a read timeout, where the PUT
-# may well have committed (and auto-applied) before its response was lost. Reporting any
-# of them as "the adapter rejected this" would state an outcome nobody observed.
-_PUSH_UNSENT_CODES = frozenset({"nso_unreachable", "configuration_error"})
-_PUSH_UNKNOWN_CODES = frozenset({"nso_timeout", ""})
+# How definite a recorded push failure is. Only `configuration_error` is raised before a
+# request is ever built, so it is the only code that PROVES nothing was sent.
+# `nso_unreachable` does not: the client maps every generic RequestException to it,
+# including a socket that drops after the body went out, and `nso_timeout` likewise leaves
+# a PUT that may have committed and auto-applied. Both are unknown, not unsent — claiming
+# either way would state an outcome nobody observed.
+_PUSH_UNSENT_CODES = frozenset({"configuration_error"})
+_PUSH_UNKNOWN_CODES = frozenset({"nso_unreachable", "nso_timeout", ""})
 _PUSH_HEADLINES = {
     "rejected": "The adapter rejected the last intent push for this category — NetBox holds the edit, the device does not.",
     "unsent": "The last intent push for this category never reached the adapter — NetBox holds the edit, the device does not.",
@@ -1550,7 +1552,12 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 ctx[path] = states[name]
         _annotate_residue_rows(ctx, key, mgmt)
 
-        payload: dict = {"adapter_error": adapter_error, "push_error": _category_push_error(key, mgmt)}
+        # The key is emitted ONLY for a category that owns a banner. A null on every other
+        # category would let that category's own grid reload hide an active failure
+        # belonging to a different, still-expanded one.
+        payload: dict = {"adapter_error": adapter_error}
+        if key in _CATEGORY_PUSH_SCOPES:
+            payload["push_error"] = _category_push_error(key, mgmt)
         for name, section in spec["sections"].items():
             built = self._grid_section(
                 states[name],

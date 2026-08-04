@@ -233,12 +233,12 @@ describe("reload", () => {
   /* An inline edit suppresses the tab-wide refresh, so this fetch is the only thing that
    * runs after it. It re-renders rows, never the server-rendered banner include — so
    * without this the rejection the edit just caused stays invisible. */
-  function banner() {
+  function banner(host) {
     const el = document.createElement("div");
     el.className = "alert nso-push-banner d-none";
     el.innerHTML =
       '<span class="nso-push-headline"></span><div class="nso-push-detail"></div><div class="nso-push-meta"></div>';
-    document.body.append(el);
+    (host || document.body).append(el);
     return el;
   }
 
@@ -285,6 +285,31 @@ describe("reload", () => {
     const api = mountWith(gridRoot());
     await api.reload();
     expect(el.classList.contains("d-none")).toBe(false);
+  });
+
+  /* Several categories can be expanded at once. A document-wide lookup would let one
+   * category's reload clear another's banner over a failure that is still live. */
+  it("never touches a banner belonging to a different category card", async () => {
+    const otherCard = document.createElement("div");
+    otherCard.className = "nso-category";
+    document.body.append(otherCard);
+    const otherBanner = banner(otherCard);
+    otherBanner.classList.remove("d-none");
+
+    const myCard = document.createElement("div");
+    myCard.className = "nso-category";
+    document.body.append(myCard);
+    const root = gridRoot();
+    myCard.append(root);
+    const myBanner = banner(myCard);
+    myBanner.classList.remove("d-none");
+
+    stubFetch({ json: () => Promise.resolve({ rows: [], counts: {}, push_error: null }) });
+    const api = mountWith(root);
+    await api.reload();
+
+    expect(myBanner.classList.contains("d-none")).toBe(true);
+    expect(otherBanner.classList.contains("d-none")).toBe(false);
   });
 });
 
