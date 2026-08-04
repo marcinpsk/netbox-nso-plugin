@@ -84,7 +84,7 @@ jobs:
           # 0039_bgprouter_router_id (BGPRouter.router_id, BGPPeer.source/local_as/ttl,
           # IS-IS FRR + SRv6 prefix-SID), and the static-route form/serializer refusals
           # test_static_route_refusals.py exercises.
-          uv pip install --system "netbox-routing @ git+https://github.com/marcinpsk/netbox-routing.git@a68bcaf605899122a0384f58deeca0d4e786a416"
+          uv pip install --system "netbox-routing @ git+https://github.com/marcinpsk/netbox-routing.git@dca9ed1a4a972e9dfeba95dbed10247d46eba405"
           uv pip install --system -e .
 
       - name: Set up NetBox configuration
