@@ -151,7 +151,9 @@ class TestStaticRouteFleetResync(IntentPushResetMixin, TestCase):
             with self.assertRaises(CommandError) as raised:
                 call_command(COMMAND, stdout=out, stderr=StringIO())
 
-        assert "fleet-cmdbad" in str(raised.exception) or "fleet-cmdbad" in out.getvalue()
+        assert "fleet-cmdbad" in str(raised.exception)
+        assert "fleet-cmdbad" in out.getvalue()
+        assert "fleet-cmdgood" in out.getvalue()  # the device that did land is still reported stored
 
     def test_command_reports_success_for_a_clean_fleet(self):
         _, mgmt = self._managed_device("cmdok", 8007)
@@ -168,7 +170,55 @@ class TestStaticRouteFleetResync(IntentPushResetMixin, TestCase):
         ):
             call_command(COMMAND, stdout=out, stderr=StringIO())
 
-        assert "fleet-cmdok" in out.getvalue()
+        output = out.getvalue()
+        assert "fleet-cmdok" in output
+        assert "1 route(s) stored" in output
+        assert "Re-synced 1 device(s)" in output
+
+    def test_a_device_that_raises_does_not_abort_the_rest_of_the_pass(self):
+        """The push swallows *adapter* failures, but the echo recorder runs outside that
+        wrapper. An answer it cannot read would otherwise raise out of the loop, leaving every
+        later device unattempted and unreported."""
+        from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet
+
+        _, first = self._managed_device("raiser", 8008)
+        _, second = self._managed_device("after", 8009)
+        self._own_route(first, "10.67.0.0/16", "10.0.0.68")
+        self._own_route(second, "10.68.0.0/16", "10.0.0.69")
+
+        def _malformed_echo(adapter_device_id, routes):
+            if adapter_device_id == 8008:
+                return {"device_id": adapter_device_id, "count": len(routes), "routes": 1}  # not a list
+            return {"device_id": adapter_device_id, "count": len(routes), "routes": []}
+
+        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", side_effect=_malformed_echo):
+            results = resync_static_route_intent_fleet()
+
+        by_device = {r["device_id"]: r for r in results}
+        assert by_device[first.device_id]["ok"] is False
+        assert by_device[first.device_id]["count"] is None
+        assert by_device[second.device_id]["ok"] is True  # the pass carried on
+
+    def test_command_fails_when_a_requested_device_id_matched_nothing(self):
+        """``--device`` filters the queryset, so a mistyped id simply yields no result row —
+        and an unrepaired fleet must never print a clean ``Re-synced 0 device(s)``."""
+        device, mgmt = self._managed_device("cmdsel", 8010)
+        self._own_route(mgmt, "10.69.0.0/16", "10.0.0.70")
+
+        out = StringIO()
+        with patch(
+            "netbox_nso_plugin.adapter_client.put_static_route_intent",
+            side_effect=lambda adapter_device_id, routes: {
+                "device_id": adapter_device_id,
+                "count": len(routes),
+                "routes": [],
+            },
+        ):
+            with self.assertRaises(CommandError) as raised:
+                call_command(COMMAND, "--device", str(device.pk), "--device", "424242", stdout=out, stderr=StringIO())
+
+        assert "424242" in str(raised.exception)
+        assert "fleet-cmdsel" in out.getvalue()  # the id that did match was still re-synced
 
     def test_unlinked_devices_are_skipped(self):
         """A management row with no ``adapter_device_id`` has nothing to push to."""

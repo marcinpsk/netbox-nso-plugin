@@ -322,7 +322,15 @@ def resync_static_route_intent_fleet(device_ids: list[int] | None = None) -> lis
     results: list[dict] = []
     with client.store_only_pushes():
         for mgmt in rows.order_by("device_id"):
-            response = signals._push_static_route_intent_for_device(mgmt.device_id, mgmt.adapter_device_id, force=True)
+            try:
+                response = signals._push_static_route_intent_for_device(
+                    mgmt.device_id, mgmt.adapter_device_id, force=True
+                )
+            except Exception:  # noqa: BLE001 — the push already swallows adapter failures, so this
+                # is a row-building or echo-recording error; letting it out would strand every later
+                # device unattempted and unreported, breaking the one-result-row-per-device contract.
+                logger.exception("Static-route intent re-sync raised for device %s", mgmt.device_id)
+                response = None
             count = response.get("count") if isinstance(response, dict) else None
             if count is None:
                 logger.warning("Static-route intent re-sync was not acknowledged for device %s", mgmt.device_id)

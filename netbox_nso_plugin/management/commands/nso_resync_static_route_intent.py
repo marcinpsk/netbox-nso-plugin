@@ -24,16 +24,25 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
-        results = resync_static_route_intent_fleet(device_ids=options.get("device_ids"))
+        requested = options.get("device_ids")
+        results = resync_static_route_intent_fleet(device_ids=requested)
         for row in results:
             if row["ok"]:
                 self.stdout.write(f"{row['device']} (device {row['device_id']}): {row['count']} route(s) stored")
             else:
                 self.stdout.write(self.style.ERROR(f"{row['device']} (device {row['device_id']}): NOT acknowledged"))
 
+        problems = []
         failed = [row for row in results if not row["ok"]]
         if failed:
-            # A partial pass leaves those devices' fences shut, so it must not read as success.
             names = ", ".join(f"{row['device']} ({row['device_id']})" for row in failed)
-            raise CommandError(f"Static-route intent re-sync failed for {len(failed)} device(s): {names}")
+            problems.append(f"failed for {len(failed)} device(s): {names}")
+        # ``--device`` filters the queryset, so an id that is unknown or unlinked yields no
+        # result row at all and would otherwise print a clean "Re-synced 0 device(s)".
+        missing = sorted(set(requested or []) - {row["device_id"] for row in results})
+        if missing:
+            problems.append("found no linked NSO-managed device for id(s): " + ", ".join(str(i) for i in missing))
+        if problems:
+            # A partial pass leaves those devices' fences shut, so it must not read as success.
+            raise CommandError("Static-route intent re-sync " + "; ".join(problems))
         self.stdout.write(self.style.SUCCESS(f"Re-synced {len(results)} device(s)"))
