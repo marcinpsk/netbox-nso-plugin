@@ -5264,7 +5264,9 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
         # only the drift group is entering ownership.
         drift_pks = list(base.filter(status__in=["changed", "conflict"]).values_list("pk", flat=True))
         n_owned = base.filter(status="imported").update(status="in_sync")
-        n_drift = base.filter(pk__in=drift_pks).update(status="accepted")
+        # The pks narrow the update, they do not replace its predicate: a reconcile that
+        # re-classified one of them meanwhile owns that row's status, not this request.
+        n_drift = base.filter(pk__in=drift_pks, status__in=["changed", "conflict"]).update(status="accepted")
         count = n_owned + n_drift
 
         if count and mgmt.adapter_device_id is not None:
@@ -5285,19 +5287,25 @@ class NSOStaticRouteBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     model_class = NSOStaticRouteState
 
     def _after_accept(self, mgmt, accepted_pks):
-        """Arm a generation on every row this accept moved from drift into ownership."""
-        from .signals import _arm_static_route_generation
+        """Arm a generation on every row this accept moved from drift into ownership.
 
-        for state in self.model_class.objects.filter(pk__in=accepted_pks):
-            _arm_static_route_generation(state)
-            state.save(
-                update_fields=[
-                    "intent_generation",
-                    "generation_started_at",
-                    "last_apply_error",
-                    "last_result_advisory",
-                ]
-            )
+        Suppressed: a request is not wrapped in a transaction, so each unsuppressed save
+        would PUT the full snapshot on the spot — N adapter calls carrying half-armed
+        intent. ``_push()`` sends the finished snapshot once, immediately after.
+        """
+        from .signals import _arm_static_route_generation, suppress_intent_push
+
+        with suppress_intent_push():
+            for state in self.model_class.objects.filter(pk__in=accepted_pks, status="accepted"):
+                _arm_static_route_generation(state)
+                state.save(
+                    update_fields=[
+                        "intent_generation",
+                        "generation_started_at",
+                        "last_apply_error",
+                        "last_result_advisory",
+                    ]
+                )
 
     def _push(self, mgmt):
         from .signals import _push_static_route_intent_for_device

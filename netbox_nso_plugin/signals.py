@@ -2028,20 +2028,31 @@ def _remove_static_route_for_device(static_route, device) -> None:
 def _on_routing_static_route_pre_save(sender, instance, **kwargs):
     """Stash the committed row's wire-visible content so post_save can see the delta.
 
-    Not ``@_skip_on_render``: it only reads and stashes on the instance, and post_save's
-    own guard decides whether the transition runs. The stash lives on the instance, so a
-    save of a *different* route on the same thread can never be read as this one's
-    baseline. Re-reading on every save is deliberate: within one transaction a second
-    save sees the transaction's own first write, which is what makes an A→B→A edit two
-    real transitions instead of a silently swallowed one.
+    The stash lives on the instance, so a save of a *different* route on the same thread
+    can never be read as this one's baseline. Re-reading on every save is deliberate:
+    within one transaction a second save sees the transaction's own first write, which is
+    what makes an A→B→A edit two real transitions instead of a silently swallowed one.
+
+    The baseline is read under the row's own lock, held to COMMIT. Two concurrent edits
+    would otherwise both load A; the one that lands second — writing A back over the
+    first's B — would compare A against A, transition nothing and push nothing, leaving
+    the adapter holding B while NetBox reads A.
     """
+    from django.db import connection
+
     instance._nso_static_route_content = None
-    if not instance.pk:
+    # Same guard as post_save's @_skip_on_render: with no transition to feed there is no
+    # baseline to read, and reconcile writes must not take a route lock.
+    if _is_intent_push_suppressed() or _is_render_request() or not instance.pk:
         return
-    try:
-        instance._nso_static_route_content = _static_route_content(sender.objects.get(pk=instance.pk))
-    except sender.DoesNotExist:
-        return
+    # order_by(pk): the model's Meta ordering starts at the nullable ``vrf``, whose LEFT
+    # JOIN PostgreSQL refuses to lock ("FOR UPDATE cannot be applied to the nullable side").
+    rows = sender.objects.filter(pk=instance.pk).order_by("pk")
+    if connection.in_atomic_block:
+        rows = rows.select_for_update()  # outside a transaction there is nothing to hold it to
+    previous = rows.first()
+    if previous is not None:
+        instance._nso_static_route_content = _static_route_content(previous)
 
 
 @_skip_on_render

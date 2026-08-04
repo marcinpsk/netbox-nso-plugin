@@ -336,6 +336,79 @@ class TestStaticRouteReAcceptBumps(IntentPushResetMixin, TestCase):
         self.assertIsNotNone(state.generation_started_at)
 
 
+class TestStaticRouteBulkAcceptOutsideATransaction(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    """Bulk accept runs in a real request, which NetBox does not wrap in a transaction."""
+
+    def setUp(self):
+        super().setUp()
+        self.device = _make_device("blk")
+        self.mgmt = _make_mgmt(self.device, "blk", 8821)
+        user = get_user_model().objects.create_superuser(username="tr-blk-admin", password="x", email="b@example.com")
+        self.client.force_login(user)
+
+    def _drifted(self, count):
+        states = []
+        with _fixtures():
+            for index in range(count):
+                sr = _route(f"10.39.{index}.0/24", "10.0.0.1", devices=[self.device])
+                state = _own(sr, self.mgmt, status="in_sync")
+                state.status = "changed"
+                state.save(update_fields=["status"])
+                states.append(state)
+        return states
+
+    def _post(self):
+        return self.client.post(
+            reverse(
+                "plugins:netbox_nso_plugin:routing_bulk_accept_static_routes",
+                kwargs={"device_pk": self.device.pk},
+            )
+        )
+
+    def test_arming_the_accepted_rows_does_not_multiply_the_adapter_calls(self):
+        """Without ATOMIC_REQUESTS each overlay save pushes the FULL snapshot immediately, so
+        arming N rows one by one turns one bulk accept into N+1 adapter PUTs, each carrying a
+        half-armed snapshot."""
+        states = self._drifted(3)
+
+        with patch(PUT) as put:
+            response = self._post()
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(put.call_count, 1)
+        for state in states:
+            state.refresh_from_db()
+            self.assertEqual(state.status, "accepted")
+            self.assertGreater(state.intent_generation, 0)
+        pushed = put.call_args.args[1]
+        self.assertEqual(len(pushed), 3)
+        self.assertTrue(all(route["generation"] for route in pushed))
+
+    def test_a_row_a_reconcile_moved_on_is_not_clobbered_by_the_captured_pks(self):
+        """Selecting by pk alone drops the status predicate the original UPDATE carried, so a
+        row a background reconcile has already re-classified is overwritten with `accepted`."""
+        from django.db.models import QuerySet
+
+        from netbox_nso_plugin.models import NSOStaticRouteState
+
+        state = self._drifted(1)[0]
+        original, injected = QuerySet.update, []
+
+        def _reclassify_then_update(self, **kwargs):
+            if not injected:
+                injected.append(True)
+                original(NSOStaticRouteState.objects.filter(pk=state.pk), status="imported")
+            return original(self, **kwargs)
+
+        with patch(PUT), patch.object(QuerySet, "update", _reclassify_then_update):
+            response = self._post()
+
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(injected)
+        state.refresh_from_db()
+        self.assertNotEqual(state.status, "accepted")
+
+
 class TestStaticRouteTransitionFanOut(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     """P2.8, P2.9, P2.12 — the arms that only exist across a real transaction boundary."""
 
@@ -492,6 +565,54 @@ class TestStaticRouteTransitionFanOut(_CascadeFlushMixin, IntentPushResetMixin, 
         s2 = NSOStaticRouteState.objects.get(management=self.mgmt2, static_route=sr)
         self.assertEqual(s2.status, "accepted")
         self.assertGreater(s2.intent_generation, 0)
+
+    def test_an_edit_that_restores_the_value_a_concurrent_edit_replaced_still_transitions(self):
+        """The baseline must be read under the same lock as the write. Two edits that both
+        load content A cannot both keep A as their baseline: the one that lands second writes
+        A back over the first's B, sees "no delta", and pushes nothing — so the adapter is
+        left holding B while NetBox reads A."""
+        from netbox_routing.models import StaticRoute
+
+        with _fixtures():
+            sr = _route("10.38.0.0/16", "10.0.0.1", devices=[self.d1])
+            state = _own(sr, self.mgmt1, status="in_sync")
+
+        first_wrote = threading.Event()
+        release = threading.Event()
+        errors: list[BaseException] = []
+
+        def _write(next_hop, before=None, after=None):
+            try:
+                with patch(PUT):
+                    with transaction.atomic():
+                        row = StaticRoute.objects.get(pk=sr.pk)
+                        row.next_hop = next_hop
+                        if before is not None:
+                            before.set()
+                        row.save(update_fields=["next_hop"])
+                        if after is not None:
+                            after.wait(timeout=30)
+            except BaseException as exc:  # noqa: BLE001 — reported, not swallowed
+                errors.append(exc)
+            finally:
+                connection.close()
+
+        # T1 writes B and holds its transaction open; T2 then writes A (the value T1 replaced).
+        t1 = threading.Thread(target=_write, args=("10.0.0.2",), kwargs={"before": first_wrote, "after": release})
+        t1.start()
+        first_wrote.wait(timeout=30)
+        t2 = threading.Thread(target=_write, args=("10.0.0.1",))
+        t2.start()
+        t2.join(timeout=5)  # blocks on T1's row lock until it commits
+        release.set()
+        t1.join(timeout=60)
+        t2.join(timeout=60)
+
+        self.assertEqual(errors, [])
+        state.refresh_from_db()
+        sr.refresh_from_db()
+        self.assertEqual(str(sr.next_hop), "10.0.0.1")
+        self.assertEqual(state.nso_next_hop, "10.0.0.1")
 
     def test_the_overlay_lock_is_taken_in_ascending_management_id_order(self):
         """P2.9(c) — a fan-out over an unordered queryset can take the same two rows in
