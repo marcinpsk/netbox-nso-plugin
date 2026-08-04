@@ -21,10 +21,14 @@ from django.test import TestCase, TransactionTestCase
 from django.urls import reverse
 from django.utils import timezone
 
+from netbox_nso_plugin import adapter_client as _adapter_client
+
 from .mixins import IntentPushResetMixin
 from .test_bgp_greenfield import _CascadeFlushMixin
 
 PUT = "netbox_nso_plugin.adapter_client.put_static_route_intent"
+#: Captured at import, before any test can patch it — see ``_assert_put_patch_did_not_leak``.
+_REAL_PUT = _adapter_client.put_static_route_intent
 
 
 def _make_device(tag: str, index: int = 1):
@@ -480,6 +484,13 @@ class TestStaticRouteTransitionFanOut(_CascadeFlushMixin, IntentPushResetMixin, 
         user = get_user_model().objects.create_superuser(username="tr-fan-admin", password="x", email="f@example.com")
         self.client.force_login(user)
 
+    def _assert_put_patch_did_not_leak(self):
+        """``mock.patch`` is not thread-safe. Two overlapping patches of one target make the
+        second record the first's ``MagicMock`` as the original, so the last ``__exit__``
+        reinstalls that mock for the rest of the process and a later test silently calls it.
+        """
+        self.assertIs(_adapter_client.put_static_route_intent, _REAL_PUT)
+
     def test_an_inline_overlay_edit_fans_out_to_every_owning_device(self):
         """P2.8 — the inline edit saves the SHARED fork object under suppression and then only
         the selected overlay, so D2's content changes with no demotion, bump or push."""
@@ -552,31 +563,32 @@ class TestStaticRouteTransitionFanOut(_CascadeFlushMixin, IntentPushResetMixin, 
 
             try:
                 start.wait()
-                with patch(PUT):
-                    with transaction.atomic():
-                        row = StaticRoute.objects.get(pk=sr.pk)
-                        row.metric = metric
-                        row.save(update_fields=["metric"])
-                        seen.extend(
-                            NSOStaticRouteState.objects.filter(static_route=sr).values_list(
-                                "intent_generation", flat=True
-                            )
-                        )
+                with transaction.atomic():
+                    row = StaticRoute.objects.get(pk=sr.pk)
+                    row.metric = metric
+                    row.save(update_fields=["metric"])
+                    seen.extend(
+                        NSOStaticRouteState.objects.filter(static_route=sr).values_list("intent_generation", flat=True)
+                    )
             except BaseException as exc:  # noqa: BLE001 — reported, not swallowed
                 errors.append(exc)
             finally:
                 connection.close()
 
         threads = [threading.Thread(target=_edit, args=(m,)) for m in (21, 22)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=60)
+        # One patch, taken in the main thread: `mock.patch` is not thread-safe, so entering it
+        # per worker leaves a MagicMock installed on the module for the rest of the process.
+        with patch(PUT):
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=60)
 
         self.assertEqual(errors, [])
         self.assertEqual(len(seen), 4)
         self.assertEqual(len(set(seen)), 4)  # no generation is ever issued twice
         self.assertTrue(all(value > highest for value in seen))
+        self._assert_put_patch_did_not_leak()
 
     def test_a_re_added_overlay_outruns_every_generation_ever_issued(self):
         """P2.9(b) — reusing a value an unconsumed result still carries would false-green the
@@ -642,36 +654,39 @@ class TestStaticRouteTransitionFanOut(_CascadeFlushMixin, IntentPushResetMixin, 
 
         def _write(next_hop, before=None, after=None):
             try:
-                with patch(PUT):
-                    with transaction.atomic():
-                        row = StaticRoute.objects.get(pk=sr.pk)
-                        row.next_hop = next_hop
-                        if before is not None:
-                            before.set()
-                        row.save(update_fields=["next_hop"])
-                        if after is not None:
-                            after.wait(timeout=30)
+                with transaction.atomic():
+                    row = StaticRoute.objects.get(pk=sr.pk)
+                    row.next_hop = next_hop
+                    if before is not None:
+                        before.set()
+                    row.save(update_fields=["next_hop"])
+                    if after is not None:
+                        after.wait(timeout=30)
             except BaseException as exc:  # noqa: BLE001 — reported, not swallowed
                 errors.append(exc)
             finally:
                 connection.close()
 
         # T1 writes B and holds its transaction open; T2 then writes A (the value T1 replaced).
-        t1 = threading.Thread(target=_write, args=("10.0.0.2",), kwargs={"before": first_wrote, "after": release})
-        t1.start()
-        first_wrote.wait(timeout=30)
-        t2 = threading.Thread(target=_write, args=("10.0.0.1",))
-        t2.start()
-        t2.join(timeout=5)  # blocks on T1's row lock until it commits
-        release.set()
-        t1.join(timeout=60)
-        t2.join(timeout=60)
+        # One patch, taken in the main thread: `mock.patch` is not thread-safe, so entering it
+        # per worker leaves a MagicMock installed on the module for the rest of the process.
+        with patch(PUT):
+            t1 = threading.Thread(target=_write, args=("10.0.0.2",), kwargs={"before": first_wrote, "after": release})
+            t1.start()
+            first_wrote.wait(timeout=30)
+            t2 = threading.Thread(target=_write, args=("10.0.0.1",))
+            t2.start()
+            t2.join(timeout=5)  # blocks on T1's row lock until it commits
+            release.set()
+            t1.join(timeout=60)
+            t2.join(timeout=60)
 
         self.assertEqual(errors, [])
         state.refresh_from_db()
         sr.refresh_from_db()
         self.assertEqual(str(sr.next_hop), "10.0.0.1")
         self.assertEqual(state.nso_next_hop, "10.0.0.1")
+        self._assert_put_patch_did_not_leak()
 
     def test_the_overlay_lock_is_taken_in_ascending_management_id_order(self):
         """P2.9(c) — a fan-out over an unordered queryset can take the same two rows in
