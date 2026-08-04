@@ -1773,12 +1773,24 @@ def _on_ip_address_delete(sender, instance, **kwargs):
 
 
 def _push_static_route_intent_for_device(device_id, adapter_device_id, force=False):
-    """Build and push the full static route intent snapshot for a device."""
+    """Build and push the full static route intent snapshot for a device.
+
+    Each route names the NetBox ``StaticRoute`` pk and the generation of the intent it
+    carries: the pk is what lets the adapter tell a *replacement* from an unrelated
+    delete-plus-insert, and the generation is the token an apply result is correlated
+    against. ``intent_generation`` 0 is the unallocated sentinel and goes on the wire as
+    NULL — the adapter adopts a generation only when non-null, so a sentinel row simply has
+    nothing to correlate with instead of correlating with everything at 0.
+
+    Returns the adapter's response, so a caller passing ``force=True`` can tell a failure
+    (``None``) from a skipped-unchanged push, and records the echoed fingerprints as this
+    device's settlement expectations.
+    """
     from . import adapter_client as client
     from .models import NSOStaticRouteState
 
-    ned_id = _ned_id_for_device(device_id)
     routes = []
+    generations: dict[int, int] = {}
     for row in NSOStaticRouteState.objects.filter(
         management__device_id=device_id,
         status__in=_OWNED_PUSH_STATUSES,
@@ -1787,24 +1799,60 @@ def _push_static_route_intent_for_device(device_id, adapter_device_id, force=Fal
         if sr.next_hop is None:
             continue  # interface-only next-hop not supported by static-route-reconciler v1
         vrf_name = sr.vrf.name if sr.vrf else ""
+        generation = row.intent_generation or None
         route = {
+            "route_id": sr.pk,
+            "generation": generation,
             "vrf": vrf_name,
             "prefix": str(sr.prefix),
             "next_hop": str(sr.next_hop),
             "permanent": sr.permanent or False,
             "tag": sr.tag,
         }
-        # Nokia preference 5 is value-default-suppressed by the export contract.
-        if sr.metric is not None and not (ned_id.startswith("timos") and sr.metric == 5):
+        # Always sent: an omitted optional field is a CLEAR to the adapter, NED-agnostically.
+        # Nokia's default preference 5 used to be suppressed here, which turned an edit
+        # 3 → 5 into a clear plus a networked retract job for a value the SR OS writer
+        # treats identically to None and the exporter suppresses on the way back.
+        if sr.metric is not None:
             route["metric"] = sr.metric
         routes.append(route)
+        if generation is not None:
+            generations[sr.pk] = generation
 
-    _push_changed(
+    response = _push_changed(
         (device_id, "static_route"),
         routes,
         lambda: client.put_static_route_intent(adapter_device_id, routes),
         force=force,
     )
+    if isinstance(response, dict):
+        _record_static_route_expectations(device_id, generations, response.get("routes") or [])
+    return response
+
+
+def _record_static_route_expectations(device_id, generations: dict, echoes) -> None:
+    """Store each echoed ``{route_id, generation, fingerprint}`` as the row's expectation.
+
+    Written under a compare-and-set on the overlay's *current* ``intent_generation``. The
+    adapter commits its store write before it answers, so an operator edit can bump the
+    generation while the response is in flight; recording the stale echo would then let the
+    next apply result settle content that has already been superseded.
+    """
+    from .models import NSOStaticRouteState
+
+    for echo in echoes:
+        if not isinstance(echo, dict):
+            continue
+        route_id, generation, fingerprint = echo.get("route_id"), echo.get("generation"), echo.get("fingerprint")
+        if route_id is None or not fingerprint:
+            continue
+        if generation is None or generations.get(route_id) != generation:
+            continue  # never pushed by us at this generation — not an expectation we may record
+        NSOStaticRouteState.objects.filter(
+            management__device_id=device_id,
+            static_route_id=route_id,
+            intent_generation=generation,
+        ).update(expected_generation=generation, expected_fingerprint=fingerprint)
 
 
 @_skip_on_render

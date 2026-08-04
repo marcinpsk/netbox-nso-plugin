@@ -291,3 +291,48 @@ def resync_intent(device, mgmt, keys: list[str] | None = None) -> list[str]:
             sc["push"](mgmt.device_id, mgmt.adapter_device_id, force=True)
             done.append(key)
     return done
+
+
+def resync_static_route_intent_fleet(device_ids: list[int] | None = None) -> list[dict]:
+    """Push every managed device's static-route intent once, so the adapter backfills ``route_id``.
+
+    The adapter keeps its replacement fence shut while any stored row has a NULL ``route_id``
+    and evaluates the fence on the pre-mutation row set, so this pass fills the ids and the
+    *next* ordinary push is the first one that can plan a replacement.
+
+    Deliberately not routed through :func:`resync_intent`: with the default ``keys`` that only
+    re-syncs scopes that already look drifted — a device whose counts agree looks clean while
+    every one of its rows is still id-less — and it appends each key unconditionally, so it
+    cannot tell a rejected push from a skipped one. Here each device is acknowledged from the
+    ``count`` the adapter answers with, and ``force=True`` makes a ``None`` return
+    unambiguously a failure rather than a change-detection skip.
+
+    Store-only throughout: this repairs the adapter's intent MIRROR, so it must not enqueue an
+    apply or write a tombstone. A clear the resync happens to detect parks the row instead of
+    being authorized.
+    """
+    from . import adapter_client as client
+    from . import signals
+    from .models import NSODeviceManagement
+
+    rows = NSODeviceManagement.objects.filter(adapter_device_id__isnull=False).select_related("device")
+    if device_ids is not None:
+        rows = rows.filter(device_id__in=device_ids)
+
+    results: list[dict] = []
+    with client.store_only_pushes():
+        for mgmt in rows.order_by("device_id"):
+            response = signals._push_static_route_intent_for_device(mgmt.device_id, mgmt.adapter_device_id, force=True)
+            count = response.get("count") if isinstance(response, dict) else None
+            if count is None:
+                logger.warning("Static-route intent re-sync was not acknowledged for device %s", mgmt.device_id)
+            results.append(
+                {
+                    "device_id": mgmt.device_id,
+                    "device": str(mgmt.device),
+                    "adapter_device_id": mgmt.adapter_device_id,
+                    "ok": count is not None,
+                    "count": count,
+                }
+            )
+    return results
