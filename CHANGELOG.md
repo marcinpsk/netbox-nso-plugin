@@ -42,6 +42,14 @@
   the owned snapshot and never touches the device.
 - Drift banner + re-sync for orphaned adapter intent; value-aware drift
   display comparing live NetBox values against the device.
+- **Intent-push rejections are recorded and shown.** A push the adapter refuses
+  is still swallowed — an unreachable adapter must not raise into the operator's
+  save — but the reason is now persisted per (device, scope) on
+  `NSODeviceManagement` and rendered as a category banner, instead of living only
+  in a log line under a green row. Static-route rows additionally show the apply's
+  own per-route error or its `unproven` advisory, and an owned `apply_failed`
+  static route no longer renders as "pending apply". Recording only: durable
+  retry over the record is tracked separately.
 
 ### Added — operations
 
