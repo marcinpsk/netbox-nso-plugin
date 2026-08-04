@@ -76,6 +76,7 @@ from .models import (
     NSOVaultSettings,
     NSOVLANState,
 )
+from .signals import _STATIC_ROUTE_ARMED_FIELDS
 from .tables import (
     NSODerivedIntentTemplateTable,
     NSODeviceManagementTable,
@@ -4980,12 +4981,7 @@ class NSOStaticRouteStateAcceptView(RoutingStateAcceptMixin):
     """
 
     model_class = NSOStaticRouteState
-    accept_extra_fields = (
-        "intent_generation",
-        "generation_started_at",
-        "last_apply_error",
-        "last_result_advisory",
-    )
+    accept_extra_fields = _STATIC_ROUTE_ARMED_FIELDS
 
     def _arm_accept(self, state):  # noqa: D102
         from .signals import _arm_static_route_generation
@@ -5375,14 +5371,7 @@ class NSOStaticRouteBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
         with suppress_intent_push():
             for state in self.model_class.objects.filter(pk__in=accepted_pks, status="accepted"):
                 _arm_static_route_generation(state)
-                state.save(
-                    update_fields=[
-                        "intent_generation",
-                        "generation_started_at",
-                        "last_apply_error",
-                        "last_result_advisory",
-                    ]
-                )
+                state.save(update_fields=list(_STATIC_ROUTE_ARMED_FIELDS))
 
     def _push(self, mgmt):
         from .signals import _push_static_route_intent_for_device

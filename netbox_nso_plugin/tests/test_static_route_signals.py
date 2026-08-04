@@ -383,10 +383,10 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
     @classmethod
     def setUpTestData(cls):
         mfg = Manufacturer.objects.create(name="SrGenMfg", slug="srgenmfg")
-        dt = DeviceType.objects.create(manufacturer=mfg, model="SrGenDev", slug="srgendev")
-        role = DeviceRole.objects.create(name="SrGenRole", slug="srgenrole")
-        site = Site.objects.create(name="SrGenSite", slug="srgensite")
-        cls.device = Device.objects.create(name="sr-gen-router", device_type=dt, role=role, site=site)
+        cls.dt = DeviceType.objects.create(manufacturer=mfg, model="SrGenDev", slug="srgendev")
+        cls.role = DeviceRole.objects.create(name="SrGenRole", slug="srgenrole")
+        cls.site = Site.objects.create(name="SrGenSite", slug="srgensite")
+        cls.device = Device.objects.create(name="sr-gen-router", device_type=cls.dt, role=cls.role, site=cls.site)
 
     def _mgmt(self):
         from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
@@ -563,3 +563,60 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
         state.refresh_from_db()
         assert state.expected_generation is None
         assert state.expected_fingerprint == ""
+
+    def test_the_echo_only_reaches_the_device_that_was_pushed(self):
+        """A ``StaticRoute`` is shared across devices by M2M, so two overlays can carry the same
+        ``route_id`` at the same generation. Without the device predicate, A's echo would write
+        B's expectation and B could settle green on A's apply result."""
+        from netbox_nso_plugin.intent_generation import allocate_intent_generation
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOStaticRouteState
+        from netbox_nso_plugin.signals import _push_static_route_intent_for_device, suppress_intent_push
+
+        mgmt = self._mgmt()
+        generation = allocate_intent_generation()
+        state = self._state(mgmt, "10.48.0.0/16", "10.0.0.48", generation=generation)
+
+        other = Device.objects.create(name="sr-gen-router-2", device_type=self.dt, role=self.role, site=self.site)
+        inst = NSOInstance.objects.get(name="sr-gen-inst")
+        other_mgmt = NSODeviceManagement.objects.create(
+            device=other, nso_instance=inst, nso_device_name="nso-sr-gen-2", adapter_device_id=4243
+        )
+        with suppress_intent_push():
+            state.static_route.devices.add(other)
+        other_state, _ = NSOStaticRouteState.objects.update_or_create(
+            management=other_mgmt,
+            static_route=state.static_route,
+            defaults={"status": "accepted", "intent_generation": generation},
+        )
+
+        response = {
+            "device_id": 4242,
+            "count": 1,
+            "routes": [{"route_id": state.static_route.pk, "generation": generation, "fingerprint": "f00d"}],
+        }
+        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", return_value=response):
+            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id, force=True)
+
+        state.refresh_from_db()
+        other_state.refresh_from_db()
+        assert state.expected_generation == generation
+        assert state.expected_fingerprint == "f00d"
+        assert other_state.expected_generation is None
+        assert other_state.expected_fingerprint == ""
+
+    def test_the_armed_field_list_names_every_field_the_arming_helper_writes(self):
+        """The accept views persist the armed generation with an explicit field list. A field the
+        helper gains that the list does not name is armed in memory and dropped on save, so the
+        list has to be derived from one exported constant instead of restated per call site."""
+        from netbox_nso_plugin.signals import _STATIC_ROUTE_ARMED_FIELDS, _arm_static_route_generation
+
+        mgmt = self._mgmt()
+        state = self._state(mgmt, "10.49.0.0/16", "10.0.0.49", generation=0)
+        state.last_apply_error = "boom"
+        state.last_result_advisory = "advice"
+        before = {field.name: getattr(state, field.name) for field in state._meta.concrete_fields}
+
+        _arm_static_route_generation(state)
+
+        changed = {name for name, value in before.items() if getattr(state, name) != value}
+        assert changed == set(_STATIC_ROUTE_ARMED_FIELDS)

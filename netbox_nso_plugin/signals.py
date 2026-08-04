@@ -2052,6 +2052,17 @@ def _static_route_content(static_route) -> tuple:
     )
 
 
+#: Every field :func:`_arm_static_route_generation` writes. The accept paths save the row
+#: with an explicit ``update_fields``, so they read this list rather than restate it — a
+#: field the helper gains and a call site does not name is armed in memory and dropped.
+_STATIC_ROUTE_ARMED_FIELDS = (
+    "intent_generation",
+    "generation_started_at",
+    "last_apply_error",
+    "last_result_advisory",
+)
+
+
 def _arm_static_route_generation(state) -> None:
     """Give *state* a fresh generation in memory — the caller saves it.
 
@@ -2074,10 +2085,7 @@ _STATIC_ROUTE_TRANSITION_FIELDS = (
     "nso_prefix",
     "nso_next_hop",
     "status",
-    "intent_generation",
-    "generation_started_at",
-    "last_apply_error",
-    "last_result_advisory",
+    *_STATIC_ROUTE_ARMED_FIELDS,
 )
 
 
