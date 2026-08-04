@@ -413,12 +413,14 @@ class TestIntentPushRejectionConcurrency(_CascadeFlushMixin, IntentPushResetMixi
             Waiting on the thread — or on a fixed sleep — proves nothing: a descheduled
             writer whose UPDATE has not reached the server yet would let this save commit
             first and the test would pass over the very regression it targets.
+
+            Read from ``pg_locks``, not ``pg_stat_activity``: this poll runs inside the
+            save's own transaction, and the activity view is snapshot-cached per
+            transaction, so it could keep serving the pre-lock state and time out against
+            a correct implementation. ``pg_locks`` is live.
             """
             with connection.cursor() as cursor:
-                cursor.execute(
-                    "SELECT count(*) FROM pg_stat_activity WHERE pid = %s AND wait_event_type = 'Lock'",
-                    [writer_pid[0]],
-                )
+                cursor.execute("SELECT count(*) FROM pg_locks WHERE pid = %s AND NOT granted", [writer_pid[0]])
                 return bool(cursor.fetchone()[0])
 
         def _let_the_writer_in(sender, instance, **kwargs):
