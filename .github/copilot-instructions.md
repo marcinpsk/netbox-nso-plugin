@@ -130,14 +130,19 @@ What `netbox-test` actually does (`.devcontainer/scripts/load-aliases.sh`):
 
 ```bash
 workers="${NETBOX_TEST_WORKERS:-8}"
+target="netbox_nso_plugin/tests"
 parallel_args=()
+if [ "$#" -gt 0 ] && [[ "$1" != -* ]]; then
+  target="$1"          # a leading non-flag argument selects the module/class/test
+  shift
+fi
 if [ "$workers" -gt 1 ]; then
   parallel_args=(-n "$workers" --maxschedchunk=1)
 fi
 cd "$PLUGIN_DIR" && source /opt/netbox/venv/bin/activate && \
   TEST_DB_NAME="${TEST_DB_NAME:-test_netbox_nso_plugin}" \
-  pytest netbox_nso_plugin/tests --no-cov -q --disable-warnings \
-  "${parallel_args[@]}"
+  pytest "$target" --no-cov -q --disable-warnings \
+  "${parallel_args[@]}" "$@"     # remaining arguments go straight to pytest
 ```
 
 Why this is the only path you should take:
@@ -158,6 +163,12 @@ TEST_DB_NAME=test_nso_task netbox-test                             # separate DB
 ```
 
 If `netbox-test` is not found, enter the devcontainer and `source ~/.zshrc` (or open a new terminal) to load the aliases. If it is still missing, repair or rebuild the devcontainer; never bypass the helper with a raw pytest command.
+
+**This rule is scoped to the devcontainer.** `netbox-test` is a shell function from
+`.devcontainer/scripts/load-aliases.sh` and needs `$PLUGIN_DIR` and the venv at
+`/opt/netbox/venv`, neither of which exists on a CI runner. `.github/workflows/test.yaml`
+therefore calls `pytest` directly, with the same isolated `TEST_DB_NAME`, xdist workers and
+warning suppression, plus a `pythonpath` override the helper has no way to express.
 
 ### Coverage reports
 
