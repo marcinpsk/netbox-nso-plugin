@@ -506,6 +506,20 @@ class NSODeviceManagement(NetBoxModel):
     reset_pending_incarnation = models.CharField(max_length=64, blank=True, default="")
     reset_pending_born = models.DateTimeField(null=True, blank=True)
     reset_conflict_born = models.DateTimeField(null=True, blank=True)
+    # ── #1396 R3: settlement cursor + intent-push rejection record ──────────────
+    # The cursor is per-device and only meaningful within one adapter store
+    # incarnation: a rebuilt store restarts its job identifiers, so the consumer
+    # compares ``settle_cursor_incarnation`` against ``adapter_incarnation`` and
+    # resets on mismatch. Replaying an old result after a reset is harmless because
+    # intent generations are allocated from a database-global sequence.
+    settle_cursor_seq = models.BigIntegerField(null=True, blank=True)
+    settle_cursor_incarnation = models.CharField(max_length=64, blank=True, default="")
+    # Per-scope record of what an intent push was rejected with. ``intent_push_attempts``
+    # is the never-cleared per-scope high-water mark: clearing the error entry on success
+    # would take the attempt token with it, and a delayed failure from an earlier attempt
+    # would then resurrect over the newer success.
+    intent_push_errors = models.JSONField(default=dict, blank=True)
+    intent_push_attempts = models.JSONField(default=dict, blank=True)
     last_sync_at = models.DateTimeField(null=True, blank=True)
     last_sync_status = models.CharField(max_length=50, blank=True, default="")
     degraded_surfaces = models.JSONField(
@@ -1267,6 +1281,21 @@ class NSOStaticRouteState(_NSODeviceTabURLMixin, NetBoxModel):
     accepted_at = models.DateTimeField(null=True, blank=True)
     last_apply_at = models.DateTimeField(null=True, blank=True)
     last_apply_error = models.TextField(blank=True, default="")
+    # ── #1396 R3: intent generation + the settlement expectation ────────────────
+    # ``intent_generation`` is allocated from a database-global sequence
+    # (:func:`~netbox_nso_plugin.intent_generation.allocate_intent_generation`) on every
+    # content change, so no result can outlive the generation it names — not even across a
+    # delete/recreate of the management row, which the adapter's job history survives. ``0``
+    # is the unallocated sentinel: it is never put on the wire and never correlates.
+    # ``expected_*`` is what the intent PUT echoed back for the generation actually pushed;
+    # an apply result settles this row only when it matches both.
+    intent_generation = models.BigIntegerField(default=0)
+    generation_started_at = models.DateTimeField(null=True, blank=True)
+    expected_generation = models.BigIntegerField(null=True, blank=True)
+    expected_fingerprint = models.CharField(max_length=128, blank=True, default="")
+    # Why a result did not settle green (an ``unproven`` verdict's reason) — a statement
+    # about evidence, not about ownership, so it qualifies the status instead of being one.
+    last_result_advisory = models.TextField(blank=True, default="")
 
     class Meta:
         ordering = ["management", "static_route"]
