@@ -218,6 +218,44 @@ class TestReconcileSnmpConfig(TestCase):
         row = NSOSnmpCommunityState.objects.get(community_hash="abcd1234abcd1234")
         self.assertEqual(row.status, "accepted")
 
+    def test_system_info_deleted_after_load_returns_none(self):
+        """A concurrent singleton deletion must not crash the read reconciliation."""
+        from django.db.models.signals import post_init
+
+        from netbox_nso_plugin.models import NSOSnmpSystemInfoState
+        from netbox_nso_plugin.template_content import _reconcile_snmp_config
+
+        mgmt = self._create_mgmt()
+        row = NSOSnmpSystemInfoState.objects.create(
+            management=mgmt,
+            location="Test rack",
+            contact="noc@example.invalid",
+            status="accepted",
+        )
+        deleted = []
+
+        def delete_after_load(sender, instance, **kwargs):
+            if deleted or instance.pk != row.pk:
+                return
+            deleted.append(True)
+            NSOSnmpSystemInfoState.objects.filter(pk=instance.pk).delete()
+
+        post_init.connect(delete_after_load, sender=NSOSnmpSystemInfoState, weak=False)
+        self.addCleanup(post_init.disconnect, delete_after_load, sender=NSOSnmpSystemInfoState)
+
+        result = _reconcile_snmp_config(
+            self.device,
+            {
+                "communities": [],
+                "v3_users": [],
+                "hosts": [],
+                "system_info": {"location": "Test rack", "contact": "noc@example.invalid"},
+            },
+        )
+
+        self.assertEqual(deleted, [True])
+        self.assertIsNone(result["system_info"])
+
     def test_omitted_default_trap_port_matches_owned_intent(self):
         from netbox_nso_plugin.models import NSOSnmpHostState
         from netbox_nso_plugin.template_content import _reconcile_snmp_config

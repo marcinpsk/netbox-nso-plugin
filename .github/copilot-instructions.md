@@ -157,7 +157,7 @@ NETBOX_TEST_WORKERS=1 netbox-test                                  # serial over
 TEST_DB_NAME=test_nso_task netbox-test                             # separate DB family
 ```
 
-If `netbox-test` is not found, you are not inside the devcontainer — `source ~/.zshrc` (or open a new terminal) to load the aliases, or fall back to the explicit form above. Do not invent a new command.
+If `netbox-test` is not found, enter the devcontainer and `source ~/.zshrc` (or open a new terminal) to load the aliases. If it is still missing, repair or rebuild the devcontainer; never bypass the helper with a raw pytest command.
 
 ### Coverage reports
 

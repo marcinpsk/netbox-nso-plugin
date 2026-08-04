@@ -550,7 +550,10 @@ def _reconcile_snmp_system_info(mgmt, sys_data: dict, now):
         NSOSnmpSystemInfoState.objects.filter(
             pk=state.pk, status=state.status, location=state.location, contact=state.contact
         ).update(status=sm.on_reconcile(state.status, matches=matches), last_sync_at=now)
-        state.refresh_from_db()
+        try:
+            state.refresh_from_db()
+        except NSOSnmpSystemInfoState.DoesNotExist:
+            return None
     else:
         state.last_sync_at = now
         state.location = dev_location

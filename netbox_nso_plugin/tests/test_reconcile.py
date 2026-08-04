@@ -2,6 +2,7 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for the off-request reconcile job and the sync-complete callback endpoint."""
 
+import os
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
@@ -838,7 +839,7 @@ class TestEnqueueDeviceReconcileWiring(TestCase):
     """
 
     _DEV = 987654  # won't collide with any real nso-reconcile-<id> job hash
-    _QUEUE = "nso-test-reconcile-wiring"
+    _QUEUE = f"nso-test-reconcile-wiring-{os.environ.get('NETBOX_NSO_REDIS_KEY_NAMESPACE', 'local')}"
 
     def _queue(self):
         import django_rq
@@ -849,6 +850,7 @@ class TestEnqueueDeviceReconcileWiring(TestCase):
 
     def setUp(self):
         super().setUp()
+        self._detached_jobs = []
         self._clear()
 
     def tearDown(self):
@@ -859,9 +861,10 @@ class TestEnqueueDeviceReconcileWiring(TestCase):
         from netbox_nso_plugin.read_gate import carrier_key, marker_key
 
         q = self._queue()
-        for job in q.jobs:
+        q.delete(delete_jobs=True)
+        for job in self._detached_jobs:
             job.delete()
-        q.empty()
+        self._detached_jobs.clear()
         q.connection.delete(carrier_key(self._DEV))
         q.connection.delete(marker_key(self._DEV))
 
@@ -895,6 +898,7 @@ class TestEnqueueDeviceReconcileWiring(TestCase):
         q = self._queue()
         with patch("django_rq.get_queue", return_value=q):
             first = enqueue_device_reconcile(self._DEV)
+            self._detached_jobs.append(first)
             q.remove(first.id)  # worker popped it; pointer still references it
             second = enqueue_device_reconcile(self._DEV)
         self.assertNotEqual(first.id, second.id)
@@ -909,11 +913,29 @@ class TestEnqueueDeviceReconcileWiring(TestCase):
         q = self._queue()
         with patch("django_rq.get_queue", return_value=q):
             first = enqueue_device_reconcile(self._DEV)
+            self._detached_jobs.append(first)
             q.remove(first.id)
             RqJob.fetch(first.id, connection=q.connection).set_status("finished")
             second = enqueue_device_reconcile(self._DEV)
         self.assertIsNotNone(second)
         self.assertIn(second.id, q.get_job_ids())
+
+    def test_clear_deletes_queue_registry_and_detached_job(self):
+        """Per-run queues and jobs already popped from them must not accumulate in Redis."""
+        from netbox_nso_plugin.reconcile import enqueue_device_reconcile
+
+        q = self._queue()
+        with patch("django_rq.get_queue", return_value=q):
+            detached = enqueue_device_reconcile(self._DEV)
+        q.remove(detached.id)
+        self._detached_jobs = [detached]
+        self.assertTrue(q.connection.sismember(q.redis_queues_keys, q.key))
+        self.assertTrue(q.connection.exists(detached.key))
+
+        self._clear()
+
+        self.assertFalse(q.connection.sismember(q.redis_queues_keys, q.key))
+        self.assertFalse(q.connection.exists(detached.key))
 
 
 class TestNotifyClassLeaseBudget(TestCase):
