@@ -464,6 +464,25 @@ _PENDING_KINDS = {"pending", "apply_failed"}
 # into the single row-level state the grid sorts and quick-filters on.
 _KIND_SEVERITY = ("apply_failed", "drift", "pending", "deploying", "unknown", "in_sync")
 
+# Grid category → the intent-push scope whose rejection record belongs on its banner.
+# Only the scopes whose push failures are persisted appear here (see
+# signals._record_push_outcome); a category with no entry simply renders no banner.
+_CATEGORY_PUSH_SCOPES = {"static": "static_route"}
+
+
+def _category_push_error(key, mgmt):
+    """Return this category's persisted intent-push rejection, if any.
+
+    A rejected push is not an adapter READ error: the operator's edit was saved and the
+    device was never told. Without this the only trace is a log line — the grid would show
+    a green, freshly-accepted row over intent the adapter refused.
+    """
+    scope = _CATEGORY_PUSH_SCOPES.get(key)
+    if scope is None or mgmt is None:
+        return None
+    entry = (mgmt.intent_push_errors or {}).get(scope)
+    return entry if isinstance(entry, dict) else None
+
 
 def _row_state(kinds) -> str:
     """Collapse one interface's cell kinds to the single worst-first row state.
@@ -1342,6 +1361,11 @@ class NSOCategoryView(LoginRequiredMixin, View):
                         ctx="static_routes",
                         qs=lambda d: by_device(NSOStaticRouteState, d, "static_route").order_by("nso_prefix"),
                         accept=r + "routing_accept_static_route",
+                        # Static routes are the one family that settles per route with a
+                        # per-route reason, so an owned apply_failed here renders as its
+                        # own red state carrying the message instead of a blue
+                        # "pending apply" chip promising an Apply that already lost.
+                        distinguish_failed=True,
                         fields={
                             "vrf": lambda st: st.nso_vrf or "global",
                             "prefix": lambda st: st.nso_prefix,
@@ -1350,6 +1374,10 @@ class NSOCategoryView(LoginRequiredMixin, View):
                             "permanent": lambda st: st.static_route.permanent if st.static_route else None,
                             "tag": lambda st: st.static_route.tag if st.static_route else None,
                             "route": lambda st: linked(st.static_route),
+                            "error": lambda st: st.last_apply_error or None,
+                            # An `unproven` verdict's reason: the apply landed and nothing
+                            # proves it. Not a status — a qualifier on one.
+                            "advisory": lambda st: st.last_result_advisory or None,
                             "edit_url": lambda st: (
                                 reverse(r + "overlay_field_edit", args=["static_route", st.pk])
                                 if st.static_route_id
@@ -1427,7 +1455,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
             },
         }
 
-    def _grid_section(self, states, accept_route, fields, related=None):
+    def _grid_section(self, states, accept_route, fields, related=None, distinguish_failed=False):
         """Serialize one grid sub-table: its rows plus the quick-filter counts.
 
         kind/label come from summary.display_state — the same helper the server-rendered
@@ -1445,7 +1473,10 @@ class NSOCategoryView(LoginRequiredMixin, View):
         counts = {"all": 0, "drift": 0, "pending": 0}
         for st in states:
             status_rows = [st, *(list(related(st)) if related else [])]
-            displayed = [display_state(row.status, row.status in OWNED_STATES) for row in status_rows]
+            displayed = [
+                display_state(row.status, row.status in OWNED_STATES, distinguish_failed=distinguish_failed)
+                for row in status_rows
+            ]
             kind = _row_state({item[0] for item in displayed})
             label = next(item[1] for item in displayed if item[0] == kind)
             counts["all"] += 1
@@ -1492,10 +1523,14 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 ctx[path] = states[name]
         _annotate_residue_rows(ctx, key, mgmt)
 
-        payload: dict = {"adapter_error": adapter_error}
+        payload: dict = {"adapter_error": adapter_error, "push_error": _category_push_error(key, mgmt)}
         for name, section in spec["sections"].items():
             built = self._grid_section(
-                states[name], section["accept"], section["fields"], related=section.get("related")
+                states[name],
+                section["accept"],
+                section["fields"],
+                related=section.get("related"),
+                distinguish_failed=section.get("distinguish_failed", False),
             )
             if name is None:
                 payload.update(built)
@@ -1541,6 +1576,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 "grid_payload": payload,
                 "counts": payload.get("counts"),
                 "adapter_error": adapter_error,
+                "push_error": payload.get("push_error"),
                 "category_has_unowned": has_unowned,
             },
         )

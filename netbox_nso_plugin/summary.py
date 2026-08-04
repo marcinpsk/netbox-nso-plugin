@@ -32,15 +32,25 @@ _MATCH_STATUSES = ("imported", "in_sync")
 _DIFFER_STATUSES = ("changed", "conflict", "accepted", "apply_failed")
 
 
-def display_state(status: str, owned: bool):
+def display_state(status: str, owned: bool, *, distinguish_failed: bool = False):
     """Return (kind, label) for a row from its sync *status* and *owned* flag.
 
-    kind ∈ in_sync | drift | pending | deploying | unknown — drives badge colour.
+    kind ∈ in_sync | drift | pending | apply_failed | deploying | unknown — drives badge
+    colour.
+
+    ``distinguish_failed`` splits an OWNED ``apply_failed`` out of the "pending apply"
+    bucket. It is off by default because folding it in is what every other family still
+    does, and flipping it fleet-wide would change nine panels at once; a caller opts in
+    for a family that can also show WHY the apply failed, so the operator gets a red chip
+    and the message together rather than a blue chip promising an Apply that already ran
+    and lost. Not owned means the device changed out of band, which is drift either way.
     """
     if status == "deploying":
         return ("deploying", "deploying")
     if status in _MATCH_STATUSES:
         return ("in_sync", "in sync")
+    if distinguish_failed and owned and status == "apply_failed":
+        return ("apply_failed", "apply failed")
     if status in _DIFFER_STATUSES:
         return ("pending", "pending apply") if owned else ("drift", "drift")
     return ("unknown", status or "unknown")

@@ -288,6 +288,146 @@ def _drain_intent_pushes() -> None:
             logger.warning("Coalesced intent push failed: %s", exc)
 
 
+def _allocate_push_attempt(device_id, scope):
+    """Bump and return this scope's attempt high-water mark, or ``None`` if unmanaged.
+
+    Allocated BEFORE the request and never cleared. The mark is what tells a delayed
+    response from a current one: a success clears the visible error entry but leaves the
+    mark standing, so an attempt-1 failure that arrives after attempt 2 already succeeded
+    is discarded instead of resurrecting over it.
+    """
+    from django.db import transaction
+
+    from .models import NSODeviceManagement
+
+    try:
+        with transaction.atomic():
+            mgmt = NSODeviceManagement.objects.select_for_update().filter(device_id=device_id).first()
+            if mgmt is None:
+                return None
+            attempts = dict(mgmt.intent_push_attempts or {})
+            attempt = int(attempts.get(scope) or 0) + 1
+            attempts[scope] = attempt
+            # Queryset update, not save(): the mark is bookkeeping and must not re-date
+            # last_updated or wake a management post_save.
+            NSODeviceManagement.objects.filter(pk=mgmt.pk).update(intent_push_attempts=attempts)
+            return attempt
+    except Exception as exc:  # noqa: BLE001 — bookkeeping must never block the push itself
+        logger.warning("Could not allocate an intent-push attempt for device %s/%s: %s", device_id, scope, exc)
+        return None
+
+
+def _push_error_entry(exc, attempt):
+    """Render an exception as the persisted per-scope rejection record."""
+    from django.utils import timezone
+
+    from .adapter_client import AdapterError
+
+    if isinstance(exc, AdapterError):
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        return {
+            "code": exc.code or "",
+            "message": str(exc),
+            "detail": detail,
+            "at": timezone.now().isoformat(),
+            "attempt": attempt,
+        }
+    # Not an AdapterError — no structured code or detail exists, so say so rather than
+    # inventing one. repr() keeps the exception type, which is the whole diagnostic.
+    return {
+        "code": "",
+        "message": repr(exc),
+        "detail": {},
+        "at": timezone.now().isoformat(),
+        "attempt": attempt,
+    }
+
+
+def _attribute_static_route_error(device_id, detail):
+    """Which owned routes an adapter static-route rejection names.
+
+    ``duplicate_route_id`` names one pk, so it resolves to exactly one overlay.
+    ``duplicate_triple`` does NOT: it fires because two *payload entries* share a triple,
+    so every owned route holding that triple is a candidate and all of them are named.
+    An unresolvable detail yields ``[]`` — device-scoped, which is honest rather than a
+    guess at one row.
+    """
+    from .models import NSOStaticRouteState
+
+    reason = (detail or {}).get("reason")
+    if reason == "duplicate_route_id":
+        route_id = detail.get("route_id")
+        return [route_id] if isinstance(route_id, int) else []
+    if reason != "duplicate_triple":
+        return []
+    triple = detail.get("triple")
+    if not (isinstance(triple, list) and len(triple) == 3):
+        return []
+    vrf, prefix, next_hop = (str(part) for part in triple)
+    matched = []
+    for row in NSOStaticRouteState.objects.filter(
+        management__device_id=device_id,
+        status__in=_OWNED_PUSH_STATUSES,
+    ).select_related("static_route", "static_route__vrf"):
+        sr = row.static_route
+        if sr is None or sr.next_hop is None:
+            continue
+        row_vrf = sr.vrf.name if sr.vrf else ""
+        if (row_vrf, str(sr.prefix), str(sr.next_hop)) == (vrf, prefix, next_hop):
+            matched.append(sr.pk)
+    return sorted(matched)
+
+
+# Scope → the attribution that turns an adapter rejection into the objects it names.
+# Only static routes carry per-object identity on the wire today.
+_PUSH_ERROR_ATTRIBUTION = {"static_route": _attribute_static_route_error}
+
+
+def _record_push_outcome(device_id, scope, attempt, exc):
+    """Persist (or clear) this scope's rejection record, discarding a superseded response.
+
+    Per ``(device, scope)`` under ``select_for_update``: the record is a JSONField shared
+    by every scope, so a plain read-modify-write from two workers loses one of them, and a
+    device-wide record would let one scope's failure erase another's.
+    """
+    from django.db import transaction
+
+    from .models import NSODeviceManagement
+
+    if attempt is None:
+        return
+    try:
+        with transaction.atomic():
+            mgmt = NSODeviceManagement.objects.select_for_update().filter(device_id=device_id).first()
+            if mgmt is None:
+                return
+            high_water = int((mgmt.intent_push_attempts or {}).get(scope) or 0)
+            if attempt < high_water:
+                # A newer attempt has since been made; this response describes a
+                # superseded request and must not overwrite what that attempt recorded.
+                logger.info(
+                    "Discarding a superseded intent-push outcome for device %s/%s (attempt %s < %s)",
+                    device_id,
+                    scope,
+                    attempt,
+                    high_water,
+                )
+                return
+            errors = dict(mgmt.intent_push_errors or {})
+            if exc is None:
+                if errors.pop(scope, None) is None:
+                    return
+            else:
+                entry = _push_error_entry(exc, attempt)
+                attribute = _PUSH_ERROR_ATTRIBUTION.get(scope)
+                if attribute is not None:
+                    entry["route_ids"] = attribute(device_id, entry["detail"])
+                errors[scope] = entry
+            NSODeviceManagement.objects.filter(pk=mgmt.pk).update(intent_push_errors=errors)
+    except Exception as exc2:  # noqa: BLE001 — surfacing must never turn a swallowed push into a raise
+        logger.warning("Could not record the intent-push outcome for device %s/%s: %s", device_id, scope, exc2)
+
+
 def _push_changed(key, payload, do_push, force=False):
     """Run *do_push* only if *payload* differs from the last push for *key*.
 
@@ -295,6 +435,10 @@ def _push_changed(key, payload, do_push, force=False):
     (matching the adapter-unreachable tolerance elsewhere) and the cache is left
     unchanged on failure so the next attempt retries. ``force`` bypasses the
     unchanged-skip (used by the explicit device Apply, which must always commit).
+
+    A failure is now also PERSISTED per ``(device, scope)`` so the operator can see what
+    the adapter refused instead of only a log line. R3 records; #1474 owns any retry —
+    nothing here re-sends, times out or queues.
 
     Returns the ``do_push()`` result on a push that ran (so a caller can read the
     adapter's response, e.g. the route-policy ``unsupported_members`` map), or ``None``
@@ -304,11 +448,15 @@ def _push_changed(key, payload, do_push, force=False):
     if not force and _last_pushed_hashes.get(key) == digest:
         logger.debug("Intent push skipped (unchanged) for %s", key)
         return None
+    device_id, scope = key
+    attempt = _allocate_push_attempt(device_id, scope)
     try:
         result = do_push()
     except Exception as exc:  # noqa: BLE001 — adapter may be down; log and retry next time
         logger.warning("Intent push failed for %s: %s", key, exc)
+        _record_push_outcome(device_id, scope, attempt, exc)
         return None
+    _record_push_outcome(device_id, scope, attempt, None)
     _last_pushed_hashes[key] = digest
     return result
 
