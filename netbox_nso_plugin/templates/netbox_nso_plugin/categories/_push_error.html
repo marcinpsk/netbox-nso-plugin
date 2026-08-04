@@ -6,7 +6,7 @@
 {# (push_error.headline) so the grid's JS refresh cannot invent a second vocabulary. #}
 {# The container renders even when empty: an inline grid edit reloads rows only and #}
 {# never re-renders this include, so nso-grid.js updates it in place. #}
-<div class="alert alert-danger mb-2 nso-push-banner{% if not push_error %} d-none{% endif %}">
+<div class="alert alert-danger mb-2 nso-push-banner{% if not push_error %} d-none{% endif %}" role="alert">
   <span class="mdi mdi-cloud-alert-outline me-1"></span>
   <span class="nso-push-headline">{{ push_error.headline }}</span>
   <div class="small mt-1 nso-push-detail">{{ push_error.message }}</div>

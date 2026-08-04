@@ -529,6 +529,18 @@ class TestStaticRouteFailureRender(IntentPushResetMixin, TestCase):
         payload = self._grid()
         self.assertEqual(payload["push_error"]["detail"]["reason"], "duplicate_triple")
 
+    def test_the_banner_is_a_live_region(self):
+        """nso-grid.js un-hides the container after an in-grid reload, with no page render, so
+        the rejection only reaches assistive technology if the container is an alert region."""
+        from django.template.loader import render_to_string
+
+        html = render_to_string(
+            "netbox_nso_plugin/categories/_push_error.html",
+            {"push_error": {"headline": "The adapter refused this push", "code": "duplicate_triple"}},
+        )
+        self.assertIn('role="alert"', html)
+        self.assertIn("The adapter refused this push", html)
+
     def test_a_transport_failure_is_not_reported_as_an_adapter_rejection(self):
         """codex P2 — the adapter never saw an `nso_unreachable` push, and an `nso_timeout`
         one may have committed before its response was lost. Calling either 'the adapter
