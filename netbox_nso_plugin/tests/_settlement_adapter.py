@@ -52,6 +52,11 @@ class SettlementStore:
         self.devices: dict[int, dict] = {}
         #: status the read-back GET answers with; anything but 200 makes it unresolvable
         self.intent_status = 200
+        #: status ``GET /api/v1/devices`` answers with — the maintenance tick's shared snapshot
+        self.devices_status = 200
+        #: called (on the server thread) while the read-back is in flight, so a test can
+        #: commit a concurrent operator edit inside the consumer's real HTTP window
+        self.on_readback = None
         #: adapter device ids whose ASCENDING (settlement) feed answers 503. Scoped to the
         #: ascending page on purpose: the coarse per-scope settle reads the same collection
         #: descending, and a knob that broke both could not tell the two channels apart.
@@ -125,6 +130,15 @@ class SettlementStore:
         self.routes.setdefault(device_id, []).append(
             {"route_id": route_id, "generation": generation, "fingerprint": fingerprint}
         )
+
+    def recent(self, device_id: int, limit: int) -> list[dict]:
+        """The DEFAULT descending page: every job of the device, newest first.
+
+        Unsequenced rows are invisible only to the ascending cursor page — the plain
+        collection is what tells a caller an apply is queued or running right now.
+        """
+        rows = [job for job in self.jobs if job["device_id"] == device_id]
+        return list(reversed(rows))[:limit]
 
     def feed(self, device_id: int, after: int, limit: int) -> list[dict]:
         """The adapter's ascending page: sequenced rows only, in commit order."""
@@ -210,6 +224,9 @@ class _Handler(BaseHTTPRequestHandler):
         store = self._store
 
         if parsed.path == "/api/v1/devices":
+            if store.devices_status != 200:
+                self._send(store.devices_status, {"error": {"code": "nso_error", "message": "the adapter is hung"}})
+                return
             self._send(200, list(store.devices.values()))
             return
 
@@ -225,16 +242,17 @@ class _Handler(BaseHTTPRequestHandler):
                 if int(device_id) in store.feed_error_devices:
                     self._send(503, {"error": {"code": "nso_error", "message": "the settlement feed is down"}})
                     return
-            self._send(
-                200,
-                store.feed(int(device_id), after, limit),
-                headers={STORE_INCARNATION_HEADER: store.incarnation},
-            )
+                rows = store.feed(int(device_id), after, limit)
+            else:
+                rows = store.recent(int(device_id), limit)
+            self._send(200, rows, headers={STORE_INCARNATION_HEADER: store.incarnation})
             return
 
         if parsed.path.startswith("/api/v1/devices/") and parsed.path.endswith("/static-route-intent"):
             device_id = int(parsed.path.split("/")[4])
             store.readback_requests.append(device_id)
+            if store.on_readback is not None:
+                store.on_readback()
             if store.intent_status != 200:
                 self._send(
                     store.intent_status,

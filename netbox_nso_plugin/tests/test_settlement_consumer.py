@@ -304,3 +304,65 @@ class TestMembershipRemoval(_SettlementCase):
         assert not NSOStaticRouteState.objects.filter(management=gone).exists()
         assert not gone_outcome.stalled, "the removed device's feed head blocked its cursor"
         assert self._cursor(gone).settle_cursor_seq == 1
+
+
+class TestAVerdictCannotLandOnNewerIntent(_SettlementCase):
+    """Codex S5 P1 — the consumer locks the MANAGEMENT row, not the overlay.
+
+    One job can carry a route whose expectation is missing beside one whose expectation is
+    recorded. Recovering the first costs a real HTTP round trip, and the second's overlay
+    was loaded before it: an operator Accept or content edit in that window allocates a new
+    generation and resets the status, and an unguarded save then puts an old result's
+    verdict on intent the device has not been asked for yet.
+    """
+
+    def test_an_edit_during_the_read_back_cannot_be_overwritten_by_the_old_verdict(self):
+        import threading
+
+        from django.db import connections
+        from django.utils import timezone
+
+        from netbox_nso_plugin.models import NSOStaticRouteState
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        device = _make_device("cas")
+        mgmt = _make_mgmt(device, "cas", 10)
+        # `recovered` needs a read-back; `edited` is the row the operator moves during it.
+        recovered = _route("10.50.0.0/16", "10.50.0.1", devices=[device])
+        edited = _route("10.51.0.0/16", "10.51.0.1", devices=[device])
+        recovered_state = _own(recovered, mgmt, generation=301, expected=False)
+        edited_state = _own(edited, mgmt, generation=301)
+        self.adapter.store.echo(10, recovered.pk, 301, FINGERPRINT)
+        self.adapter.store.terminal_job(10, results=[_result(recovered.pk, 301), _result(edited.pk, 301)])
+
+        def operator_edit_mid_flight():
+            """A real second connection: the consumer holds the management row, not this one."""
+
+            def commit():
+                try:
+                    NSOStaticRouteState.objects.filter(pk=edited_state.pk).update(
+                        intent_generation=302,
+                        generation_started_at=timezone.now(),
+                        status="accepted",
+                        expected_generation=None,
+                        expected_fingerprint="",
+                    )
+                finally:
+                    connections.close_all()
+
+            thread = threading.Thread(target=commit)
+            thread.start()
+            thread.join(timeout=30)
+
+        self.adapter.store.on_readback = operator_edit_mid_flight
+
+        consume_static_route_settlements(mgmt)
+
+        recovered_state.refresh_from_db()
+        edited_state.refresh_from_db()
+        assert recovered_state.status == "in_sync", "the read-back arm stopped working"
+        assert edited_state.intent_generation == 302
+        assert edited_state.status == "accepted", (
+            "a verdict computed for generation 301 landed on generation 302 — a green badge "
+            "for content the device has not been asked for"
+        )

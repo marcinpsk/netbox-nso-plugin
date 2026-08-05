@@ -19,6 +19,7 @@ from __future__ import annotations
 from unittest.mock import patch
 
 from ._settlement_case import _CarrierCase, _make_device, _make_mgmt, _own, _result, _route, _SettlementCase
+from .test_settlement_carrier import _stale_clock
 
 
 class TestTheScheduledTickIsAnIndependentClock(_CarrierCase):
@@ -229,3 +230,74 @@ class TestTheRepairCapRotates(_SettlementCase):
         self._tick()
         tail_mgmt.refresh_from_db()
         assert tail_mgmt.adapter_link_attempted_at is not None, "convergence is slower than ceil(B / C) ticks"
+
+
+class TestTheClockAlsoEscalates(_CarrierCase):
+    """Codex S5 P1 — a clock that only consumes is half a clock.
+
+    With the callback channel dead, the tick is the only thing left running. It walks the
+    feed, bounds an unresolvable result and advances past it on the fifth attempt — and then
+    every later page is empty. If the timeout backstop rides only the carrier, that row is
+    ``deploying`` for good: the same shared-failure-domain trap the tick exists to break,
+    one level down.
+    """
+
+    def test_the_tick_escalates_a_row_whose_result_never_resolved(self):
+        from netbox_nso_plugin.settlement import SETTLE_STALL_MAX_ATTEMPTS
+
+        device = _make_device("noresolve")
+        mgmt = _make_mgmt(device, "noresolve", 15)
+        self.adapter.store.add_device(
+            nso_instance="se-noresolve-inst",
+            nso_device_name="nso-se-noresolve",
+            netbox_device_id=device.pk,
+            device_id=15,
+        )
+        sr = _route("10.46.0.0/16", "10.46.0.1", devices=[device])
+        state = _own(sr, mgmt, generation=207, expected=False)
+        _stale_clock(state)
+        self.adapter.store.terminal_job(15, results=[_result(sr.pk, 207)])
+        self.adapter.store.intent_status = 503  # this result can never be correlated
+
+        # No callback of any kind: the tick is the only clock running.
+        with patch(
+            "netbox_nso_plugin.reconcile.enqueue_device_reconcile",
+            side_effect=AssertionError("the pin fired a callback — the very channel this removes"),
+        ):
+            for tick in range(SETTLE_STALL_MAX_ATTEMPTS):
+                self._tick()
+                state.refresh_from_db()
+                if tick < SETTLE_STALL_MAX_ATTEMPTS - 1:
+                    assert state.status == "deploying", "the bound was short-circuited before attempt five"
+
+        state.refresh_from_db()
+        assert self._cursor(mgmt).settle_cursor_seq == 1, "the stall bound never released the cursor"
+        assert state.status == "apply_failed", (
+            "the row is stranded deploying forever: the independent clock consumed but never escalated"
+        )
+
+    def test_the_tick_does_not_escalate_while_an_apply_is_in_flight(self):
+        """The clock the carrier had, which the tick must not be missing.
+
+        ``_prepare_apply`` promotes a row to ``deploying`` without re-stamping its generation
+        clock, so a route staged long before its Apply looks stuck the instant that Apply
+        starts. Failing it there is unrecoverable: the apply's own ``in_sync`` cannot lift a
+        row back out of ``apply_failed``.
+        """
+        device = _make_device("inflighttick")
+        mgmt = _make_mgmt(device, "inflighttick", 17)
+        self.adapter.store.add_device(
+            nso_instance="se-inflighttick-inst",
+            nso_device_name="nso-se-inflighttick",
+            netbox_device_id=device.pk,
+            device_id=17,
+        )
+        sr = _route("10.48.0.0/16", "10.48.0.1", devices=[device])
+        state = _own(sr, mgmt, generation=209)
+        _stale_clock(state)
+        self.adapter.store.queued_job(17)  # the Apply that just re-marked this row
+
+        self._tick()
+
+        state.refresh_from_db()
+        assert state.status == "deploying", "the clock failed a row the running apply is about to settle"

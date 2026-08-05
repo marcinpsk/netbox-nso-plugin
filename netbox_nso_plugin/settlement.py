@@ -77,6 +77,10 @@ class ConsumeResult:
     #: the epoch changed, so the cursor and the stall triple were reset and the page re-requested
     epoch_reset: bool
     cursor: int | None
+    #: the walk reached the END of the feed: nothing is stalled and no further page is owed.
+    #: The ONLY state in which the timeout backstop may judge a row — see
+    #: :func:`settle_static_routes`.
+    drained: bool = False
 
 
 def consume_static_route_settlements(mgmt) -> ConsumeResult:
@@ -92,6 +96,35 @@ def consume_static_route_settlements(mgmt) -> ConsumeResult:
     with transaction.atomic():
         row = NSODeviceManagement.objects.select_for_update().get(pk=pk)
         return _consume_locked(row)
+
+
+def settle_static_routes(mgmt, *, escalate: bool = True) -> ConsumeResult:
+    """Walk the feed, then let the timeout backstop judge — but only a **drained** feed.
+
+    The one implementation both clocks call, so the post-apply carrier and the five-minute
+    maintenance tick cannot drift on either half. Two properties live here rather than at
+    the call sites, because getting them wrong is silent in both directions:
+
+    * **The backstop runs only on a drained, unstalled feed.** A walk that stopped on an
+      unresolved head, or that filled its page and owes another, has not proven anything
+      about a row still ``deploying`` — its result may be the very sequence the walk did not
+      reach. Escalating there fails a healthy row on the first read-back outage and bypasses
+      the durable stall bound that exists to make one unresolvable result survivable.
+    * **The escalation belongs to BOTH clocks.** A dead callback channel is exactly the case
+      the tick exists for; a tick that consumed but never escalated would advance past an
+      unresolvable result on attempt five and then leave the row ``deploying`` forever,
+      because every later page is empty and only the carrier judged. That is the same
+      shared-failure-domain trap one level down.
+
+    The remaining precondition — no apply in flight — is the backstop's own, so that both
+    clocks get it without either restating it.
+    """
+    from .reconcile import _escalate_stuck_static_routes
+
+    outcome = consume_static_route_settlements(mgmt)
+    if escalate and outcome.drained and outcome.adapter_device_id is not None:
+        _escalate_stuck_static_routes(mgmt, adapter_device_id=outcome.adapter_device_id)
+    return outcome
 
 
 def sweep_static_route_settlements() -> tuple[int, int]:
@@ -124,7 +157,7 @@ def sweep_static_route_settlements() -> tuple[int, int]:
     failed = 0
     for pk in candidates:
         try:
-            consume_static_route_settlements(pk)
+            settle_static_routes(pk)
         except Exception:  # noqa: BLE001 — one device's adapter must not abort the fleet sweep
             logger.exception("static-route settlement sweep failed for management row %s", pk)
             failed += 1
@@ -209,7 +242,10 @@ def _consume_locked(row) -> ConsumeResult:
         break
 
     _persist(row, cursor, device_id, incarnation)
-    return ConsumeResult(device_id, consumed, stalled, advanced_past_stall, epoch_reset, cursor)
+    # A full page means the adapter may be holding more. Only a SHORT page proves the walk
+    # reached the end, which is what the timeout backstop needs before it may judge.
+    drained = not stalled and len(jobs) < SETTLE_FEED_PAGE
+    return ConsumeResult(device_id, consumed, stalled, advanced_past_stall, epoch_reset, cursor, drained)
 
 
 def _clear_stall(row) -> None:
@@ -353,33 +389,61 @@ def _apply_verdict(device_id: int, job: dict, entry: dict, state) -> None:
         )
 
 
+def _write_verdict(state, **fields) -> bool:
+    """Write *fields* under a compare-and-set on everything the verdict was computed from.
+
+    The consumer locks the **management** row, not the overlay, and it makes an HTTP
+    read-back call while holding a copy of it — so an operator Accept or content edit can
+    allocate a new generation and reset the status in that window. A plain save would then
+    put an old result's verdict on new intent: a green badge for content the device has not
+    been asked for yet. The CAS is the same shape ``_record_static_route_expectations``
+    already uses on this table, and ``.update()`` also keeps the write from re-firing the
+    row's intent push, which a settlement must never do.
+
+    Returns whether the row still matched. Zero rows means a newer writer won, and the next
+    pass recomputes from a fresh read.
+    """
+    from .models import NSOStaticRouteState
+
+    matched = NSOStaticRouteState.objects.filter(
+        pk=state.pk,
+        status=state.status,
+        intent_generation=state.intent_generation,
+        expected_generation=state.expected_generation,
+        expected_fingerprint=state.expected_fingerprint,
+    ).update(**fields)
+    if not matched:
+        logger.debug(
+            "settlement verdict for overlay %s skipped: the row moved under the read (generation %s)",
+            state.pk,
+            state.intent_generation,
+        )
+    return bool(matched)
+
+
 def _settle(state, *, ok: bool, error: str = "") -> None:
     """Write the settled status, or leave the row alone when the result concerns no in-flight one."""
     from . import status_machine as sm
-    from .signals import suppress_intent_push
 
     new_status = sm.on_apply_result(state.status, ok=ok, settle_accepted=True)
     if new_status == state.status:
         # Already settled (or never owned): re-applying the same verdict would only rewrite
         # an error the row has since recovered from.
         return
-    state.status = new_status
-    state.last_apply_at = timezone.now()
-    state.last_apply_error = error
-    state.last_result_advisory = ""
-    with suppress_intent_push():
-        state.save(update_fields=["status", "last_apply_at", "last_apply_error", "last_result_advisory"])
+    _write_verdict(
+        state,
+        status=new_status,
+        last_apply_at=timezone.now(),
+        last_apply_error=error,
+        last_result_advisory="",
+    )
 
 
 def _advise(state, reason: str) -> None:
     """Record why a correlated result did not settle. Non-settling, so the status is untouched."""
-    from .signals import suppress_intent_push
-
     if state.last_result_advisory == reason:
         return
-    state.last_result_advisory = reason
-    with suppress_intent_push():
-        state.save(update_fields=["last_result_advisory"])
+    _write_verdict(state, last_result_advisory=reason)
 
 
 def _result_error(entry: dict) -> str:
