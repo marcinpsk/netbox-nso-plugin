@@ -301,3 +301,27 @@ class TestTheClockAlsoEscalates(_CarrierCase):
 
         state.refresh_from_db()
         assert state.status == "deploying", "the clock failed a row the running apply is about to settle"
+
+
+class TestTheSweepStandsDownOnAGlobalOutage(_SettlementCase):
+    """Codex S5 P2 — per-device isolation is the wrong tool for a hung adapter.
+
+    The tick's shared snapshot already proves whether the adapter answers at all. When it
+    does not, polling every candidate in turn buys nothing and each one waits out the full
+    read timeout, so a fleet can hold a five-minute job for the best part of an hour.
+    """
+
+    def test_a_failed_snapshot_skips_the_per_device_polling(self):
+        device = _make_device("hung")
+        mgmt = _make_mgmt(device, "hung", 16)
+        sr = _route("10.47.0.0/16", "10.47.0.1", devices=[device])
+        _own(sr, mgmt, generation=208)
+        self.adapter.store.terminal_job(16, results=[_result(sr.pk, 208)])
+        self.adapter.store.devices_status = 503  # the shared snapshot proves a global outage
+
+        self._tick()
+
+        assert self.adapter.store.feed_requests == [], (
+            "the sweep polled every candidate after the adapter had already been proven hung: "
+            f"{self.adapter.store.feed_requests}"
+        )

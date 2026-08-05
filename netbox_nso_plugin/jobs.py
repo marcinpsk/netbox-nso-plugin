@@ -79,7 +79,18 @@ class RefreshDeviceSyncCacheJob(JobRunner):
         # LAST, and on its own candidate query: the repair above wrote the database while
         # leaving `rows` stale in two of its three branches, so reusing that list here would
         # skip a device repaired this tick or poll it on an id that no longer exists.
-        polled, settle_failed = sweep_static_route_settlements()
+        #
+        # The one thing the fresh query must NOT re-litigate is a proven global outage. The
+        # snapshot's `by_id is None` means the adapter did not answer at all, and per-device
+        # isolation is the wrong tool there: every candidate would wait out the full read
+        # timeout in turn, so a hundred of them can hold a five-minute job for the best part
+        # of an hour. Skip the pass; the next tick is five minutes away.
+        _mapped, by_id, _by_identity = snapshot
+        if by_id is None:
+            logger.warning("RefreshDeviceSyncCacheJob: adapter snapshot unavailable — settlement sweep skipped")
+            polled, settle_failed = 0, 0
+        else:
+            polled, settle_failed = sweep_static_route_settlements()
         logger.info(
             "RefreshDeviceSyncCacheJob: %d checked, %d updated, %d broken, %d repair attempted, "
             "%d settlement polled, %d settlement failed",
