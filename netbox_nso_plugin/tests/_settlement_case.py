@@ -89,10 +89,16 @@ def _result(route_id, generation, *, outcome="in_sync", fingerprint=FINGERPRINT,
     }
 
 
-class _SettlementCase(IntentPushResetMixin, _CascadeFlushMixin, TransactionTestCase):
-    """Point the plugin at a live adapter double for the duration of one test."""
+class _AdapterDoubleMixin:
+    """Point the plugin at a live adapter double for the duration of one test.
 
-    serialized_rollback = False
+    A mixin rather than a base class because the e2e chunk needs the same wiring under
+    ``LiveServerTestCase`` — the adapter has to reach the plugin's own HTTP endpoint there,
+    which a plain ``TransactionTestCase`` does not serve.
+    """
+
+    #: overridden by a suite whose double needs to answer more than the feed
+    adapter_factory = FakeAdapter
 
     def setUp(self):
         super().setUp()
@@ -104,7 +110,7 @@ class _SettlementCase(IntentPushResetMixin, _CascadeFlushMixin, TransactionTestC
         adapter_client.reset_session()
         self.addCleanup(adapter_client.reset_session)
 
-        self.adapter = FakeAdapter()
+        self.adapter = self.adapter_factory()
         self.addCleanup(self.adapter.stop)
         self.addCleanup(self._reset_adapter_config)
         self._point_at(self.adapter)
@@ -142,7 +148,13 @@ class _SettlementCase(IntentPushResetMixin, _CascadeFlushMixin, TransactionTestC
         RefreshDeviceSyncCacheJob(job).run()
 
 
-class _CarrierCase(_SettlementCase):
+class _SettlementCase(IntentPushResetMixin, _CascadeFlushMixin, _AdapterDoubleMixin, TransactionTestCase):
+    """The settlement suites' base: a live adapter double and a real transaction boundary."""
+
+    serialized_rollback = False
+
+
+class _CarrierMixin:
     """Drive Step 4 the way production does: notify endpoint → arbiter → queue → RQ worker.
 
     The queue is a throwaway **async** one on the configured Redis, and the worker is drained
@@ -211,3 +223,7 @@ class _CarrierCase(_SettlementCase):
         worker.work(burst=True, with_scheduler=False)
         failed = self.queue.failed_job_registry.get_job_ids()
         assert not failed, f"the carrier job failed: {failed}"
+
+
+class _CarrierCase(_CarrierMixin, _SettlementCase):
+    """A settlement case whose Step 4 is reached through the real queued carrier."""

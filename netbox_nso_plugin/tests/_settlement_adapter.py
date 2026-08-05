@@ -135,6 +135,15 @@ class SettlementStore:
             {"route_id": route_id, "generation": generation, "fingerprint": fingerprint}
         )
 
+    def put_static_route_intent(self, device_id: int, routes: list[dict]) -> dict:
+        """Accept a static-route intent push and echo nothing.
+
+        The settlement suites record their expectations directly, so the default store only
+        has to answer 200. A suite that drives the push itself overrides this — it is the
+        one seam where the double has to behave like the adapter rather than serve fixtures.
+        """
+        return {"device_id": device_id, "count": len(routes), "routes": []}
+
     def recent(self, device_id: int, limit: int) -> list[dict]:
         """The DEFAULT descending page: every job of the device, newest first.
 
@@ -206,7 +215,7 @@ class _Handler(BaseHTTPRequestHandler):
     def do_PUT(self):  # noqa: N802 — BaseHTTPRequestHandler's dispatch name
         parsed = urlparse(self.path)
         store = self._store
-        self._body()
+        body = self._body()
 
         if parsed.path.endswith("/scope"):
             device_id = self._device_id_from_path(parsed)
@@ -217,7 +226,8 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         if parsed.path.endswith("/static-route-intent"):
-            self._send(200, {"device_id": self._device_id_from_path(parsed), "routes": []})
+            device_id = self._device_id_from_path(parsed)
+            self._send(200, store.put_static_route_intent(device_id, body.get("routes") or []))
             return
 
         self._send(404, {"error": {"code": "not_found", "message": f"unexpected request {self.path}"}})
