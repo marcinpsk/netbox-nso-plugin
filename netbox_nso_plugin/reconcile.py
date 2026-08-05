@@ -1230,6 +1230,13 @@ _STUCK_STATIC_ROUTE_ERROR = (
     "or its result never correlated — re-apply; the value is still safe in NetBox."
 )
 
+_UNCLOCKED_STATIC_ROUTE_ERROR = (
+    "This route is applying with no generation clock, which is the state an upgrade leaves "
+    "a row in that was already applying before generation-correlated settlement existed. No "
+    "apply result can ever name its generation, so it can never settle — re-apply; the value "
+    "is still safe in NetBox. (Running the static-route intent re-sync arms every such row.)"
+)
+
 
 def _escalate_stuck_static_routes(mgmt, *, adapter_device_id) -> None:
     """Static-route rows left 'deploying' past the grace with no correlated result → apply_failed.
@@ -1244,14 +1251,17 @@ def _escalate_stuck_static_routes(mgmt, *, adapter_device_id) -> None:
     owns the precondition — a feed walked to its end with nothing stalled — and a row judged
     on an unwalked page is a false red on a device the adapter already reported ``in_sync``.
 
-    Two rows are excluded even then:
+    One row is excluded even then: a row carrying a ``last_result_advisory``, which means a
+    result **did** correlate to this generation and deliberately did not settle it
+    (``unproven``, or a fingerprint the row is not waiting for). The clock says nothing there
+    that the advisory has not said better, and an edit clears the advisory with the
+    generation, so it can never go stale.
 
-    * a row carrying a ``last_result_advisory``, which means a result **did** correlate to
-      this generation and deliberately did not settle it (``unproven``, or a fingerprint the
-      row is not waiting for). The clock says nothing there that the advisory has not said
-      better, and an edit clears the advisory with the generation, so it can never go stale;
-    * a row whose ``generation_started_at`` is NULL — an impossible state after the rollout
-      backfill, and the backfill owns escalating what it leaves behind.
+    A ``deploying`` row whose ``generation_started_at`` is NULL escalates with a **distinct**
+    reason rather than waiting on a clock it has not got. It is an impossible state once the
+    rollout backfill has run, and the timestamp comparison is NULL-false — so skipping it is
+    how a pre-upgrade row stays ``deploying`` forever, which is exactly what #1502 exists to
+    end. Fail loudly on the state the backfill did not reach.
 
     And nothing is judged at all while an apply is in flight: ``_prepare_apply`` re-marks
     rows ``deploying`` without re-stamping the generation clock, so a route staged long
@@ -1260,6 +1270,7 @@ def _escalate_stuck_static_routes(mgmt, *, adapter_device_id) -> None:
     That lookup is deliberately made only when there is something to escalate, so a quiet
     device costs no adapter call.
     """
+    from django.db.models import Q
     from django.utils import timezone
 
     from . import models
@@ -1268,9 +1279,9 @@ def _escalate_stuck_static_routes(mgmt, *, adapter_device_id) -> None:
     cutoff = timezone.now() - _stuck_deploying_grace()
     rows = list(
         models.NSOStaticRouteState.objects.filter(
+            Q(generation_started_at__lt=cutoff) | Q(generation_started_at__isnull=True),
             management=mgmt,
             status="deploying",
-            generation_started_at__lt=cutoff,
             last_result_advisory="",
         )
     )
@@ -1291,11 +1302,24 @@ def _escalate_stuck_static_routes(mgmt, *, adapter_device_id) -> None:
         # flow and with the settlement consumer, and a save() here would fire the row's
         # intent push on an RQ worker with a cold cache — a full static-route PUT that, under
         # adapter auto-apply, starts another apply for the row just declared failed.
+        unclocked = row.generation_started_at is None
         matched = models.NSOStaticRouteState.objects.filter(pk=row.pk, status=row.status).update(
             status=new_status,
-            last_apply_error=_STUCK_STATIC_ROUTE_ERROR.format(generation=row.intent_generation),
+            last_apply_error=(
+                _UNCLOCKED_STATIC_ROUTE_ERROR
+                if unclocked
+                else _STUCK_STATIC_ROUTE_ERROR.format(generation=row.intent_generation)
+            ),
         )
         if not matched:
+            continue
+        if unclocked:
+            logger.error(
+                "nso reconcile: NSOStaticRouteState %s is deploying with no generation clock — "
+                "an upgrade left it uncorrelatable and the rollout backfill did not reach it; "
+                "escalated to apply_failed",
+                row.pk,
+            )
             continue
         logger.warning(
             "nso reconcile: NSOStaticRouteState %s stuck deploying at generation %s past the "
