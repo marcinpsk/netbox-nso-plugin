@@ -189,6 +189,40 @@ class TestTheStuckDeployingBackstop(_SettlementCase):
             "the impossible state is reported as an ordinary timeout"
         )
 
+    def test_an_unreadable_jobs_probe_stands_the_escalation_down(self):
+        """Codex S6 P2 — a probe that failed did not answer "is an Apply running".
+
+        The feed can drain while the separate jobs request times out, and a NULL-clock row
+        has no grace to absorb that: reading the failure as "nothing is running" fails a row
+        whose Apply is in flight, and no ``in_sync`` can lift a row back out of
+        ``apply_failed``. Standing down costs one tick.
+        """
+        from netbox_nso_plugin.models import NSOStaticRouteState
+
+        device, mgmt = self._device("probefail", 63)
+        sr = _route("10.53.0.0/16", "10.53.0.1", devices=[device])
+        state = _own(sr, mgmt, generation=0, expected=False)
+        NSOStaticRouteState.objects.filter(pk=state.pk).update(generation_started_at=None)
+        # The Apply IS running; the probe that would have said so is what breaks.
+        self.adapter.store.queued_job(63)
+        self.adapter.store.jobs_error_devices.add(63)
+
+        self._tick()
+
+        state.refresh_from_db()
+        assert state.status == "deploying", (
+            "an unreadable jobs list was read as 'no apply is active', so the backstop failed "
+            "a row whose Apply is in flight — unrecoverable without an operator"
+        )
+
+        # And it is a stand-down, not a refusal: the row still escalates once the probe answers.
+        self.adapter.store.jobs_error_devices.discard(63)
+        self.adapter.store.jobs.clear()
+        self._tick()
+
+        state.refresh_from_db()
+        assert state.status == "apply_failed"
+
     def test_a_null_clock_still_stands_down_while_an_apply_is_in_flight(self):
         """The escalation is new, its preconditions are not: an in-flight Apply still wins."""
         from netbox_nso_plugin.models import NSOStaticRouteState

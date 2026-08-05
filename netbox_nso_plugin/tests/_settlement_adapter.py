@@ -61,6 +61,10 @@ class SettlementStore:
         #: ascending page on purpose: the coarse per-scope settle reads the same collection
         #: descending, and a knob that broke both could not tell the two channels apart.
         self.feed_error_devices: set[int] = set()
+        #: adapter device ids whose DESCENDING (plain collection) jobs page answers 503.
+        #: That page is the apply-activity probe, and it fails independently of the feed:
+        #: a walk can drain while the probe times out.
+        self.jobs_error_devices: set[int] = set()
         #: every feed request the consumer made, as ``(device_id, after_settle_seq, limit)``
         self.feed_requests: list[tuple[int, int, int]] = []
         self.readback_requests: list[int] = []
@@ -244,6 +248,9 @@ class _Handler(BaseHTTPRequestHandler):
                     return
                 rows = store.feed(int(device_id), after, limit)
             else:
+                if int(device_id) in store.jobs_error_devices:
+                    self._send(503, {"error": {"code": "nso_error", "message": "the jobs list is unavailable"}})
+                    return
                 rows = store.recent(int(device_id), limit)
             self._send(200, rows, headers={STORE_INCARNATION_HEADER: store.incarnation})
             return

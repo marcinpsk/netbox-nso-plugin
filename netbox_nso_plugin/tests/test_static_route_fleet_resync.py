@@ -296,6 +296,86 @@ class TestStaticRouteFleetResync(IntentPushResetMixin, TestCase):
         assert second_pass[second.device_id]["armed"] == 0
         assert second_pass[rejected.device_id]["armed"] == 1, "the rejected device was never retried"
 
+    def test_a_route_the_push_cannot_carry_is_never_armed(self):
+        """Codex S6 P2 — the arm set must equal the set the pusher serializes.
+
+        An interface-only next hop has no place in the static-route snapshot, so the push
+        drops that row. Arming it anyway mints a generation the adapter never receives:
+        nothing can correlate it, no later run finds a sentinel row to retry it with, and
+        an Apply is then free to promote a row only the backstop can end.
+        """
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet
+        from netbox_nso_plugin.intent_generation import UNALLOCATED
+        from netbox_nso_plugin.models import NSOStaticRouteState
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        _, mgmt = self._managed_device("ifacenh", 8105)
+        carried = self._own_route(mgmt, "10.77.0.0/16", "10.0.0.78")
+        iface_route = StaticRoute.objects.create(
+            prefix="10.78.0.0/16", next_hop=None, interface_next_hop="Ethernet1/1", metric=1
+        )
+        with suppress_intent_push():
+            iface_route.devices.add(mgmt.device)
+        skipped = NSOStaticRouteState.objects.create(
+            management=mgmt,
+            static_route=iface_route,
+            status="accepted",
+            nso_prefix="10.78.0.0/16",
+        )
+        sent = {}
+
+        def _ack(adapter_device_id, routes):
+            sent["routes"] = routes
+            return {"device_id": adapter_device_id, "count": len(routes), "routes": []}
+
+        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", side_effect=_ack):
+            results = resync_static_route_intent_fleet()
+
+        carried.refresh_from_db()
+        skipped.refresh_from_db()
+        assert [r["route_id"] for r in sent["routes"]] == [carried.static_route_id]
+        assert carried.intent_generation > UNALLOCATED
+        assert skipped.intent_generation == UNALLOCATED, (
+            "a row the push never carries was armed: the adapter has never seen that generation, "
+            "so no result can name it and no later pass would re-arm it"
+        )
+        assert skipped.generation_started_at is None
+        assert results[0]["armed"] == 1
+
+    def test_a_rejected_push_keeps_its_reason_on_the_device(self):
+        """Codex S6 P2 — the rollback undoes the arming, and must not undo the diagnosis.
+
+        The push persists the adapter's rejection on the management row, which is what the
+        device tab shows and what the operator acts on. Rolling the arming back inside the
+        same transaction took that record with it, leaving a bare "NOT acknowledged".
+        """
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet
+
+        _, mgmt = self._managed_device("keepreason", 8106)
+        row = self._own_route(mgmt, "10.79.0.0/16", "10.0.0.80")
+
+        def _reject(adapter_device_id, routes):
+            raise AdapterError(
+                "422 duplicate_triple", code="duplicate_triple", detail={"route_ids": [row.static_route_id]}
+            )
+
+        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", side_effect=_reject):
+            results = resync_static_route_intent_fleet()
+
+        mgmt.refresh_from_db()
+        row.refresh_from_db()
+        assert results[0]["ok"] is False
+        assert row.intent_generation == 0, "the arming outlived the push the adapter refused"
+        recorded = (mgmt.intent_push_errors or {}).get("static_route") or {}
+        assert recorded.get("code") == "duplicate_triple", (
+            "the rollback discarded the adapter's rejection: the device tab can only say "
+            f"'not acknowledged' — {mgmt.intent_push_errors!r}"
+        )
+        assert (mgmt.intent_push_attempts or {}).get("static_route") == 1, "the attempt mark was rewound"
+
     def test_backfill_demotes_deploying_and_leaves_other_statuses(self):
         """S6.2 — a row already ``deploying`` cannot wait on a generation it has just replaced."""
         from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet

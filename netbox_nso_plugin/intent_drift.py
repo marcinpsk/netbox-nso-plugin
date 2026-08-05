@@ -294,7 +294,14 @@ def resync_intent(device, mgmt, keys: list[str] | None = None) -> list[str]:
 
 
 class _PushNotAcknowledged(Exception):
-    """The adapter did not answer this device's push with a stored count."""
+    """The adapter did not answer this device's push with a stored count.
+
+    Carries the push record the rollback is about to discard, as ``(attempt, entry)``.
+    """
+
+    def __init__(self, record=(None, None)):
+        super().__init__("the adapter did not acknowledge the static-route intent push")
+        self.record = record
 
 
 def _backfill_static_route_generations(mgmt) -> int:
@@ -313,6 +320,13 @@ def _backfill_static_route_generations(mgmt) -> int:
     their status and only change generation, so the *next* result correlates and no badge
     flickers. ``accepted_at`` is untouched — it dates first ownership.
 
+    The candidate set is the pusher's own (``signals.PUSHED_STATIC_ROUTE_FILTER``), not a
+    broader "owned" one: a route with an interface-only next hop is owned but has no place
+    in the snapshot, so arming it would mint a generation the adapter never receives — and
+    a later run would find no sentinel row to retry, leaving an Apply free to promote a row
+    nothing can settle. Only ``self`` is locked, so the join the filter adds cannot take
+    ``static_route`` locks against the content transition's own order.
+
     Rows are locked in the same order the content transition takes them (``management_id``,
     then pk), and the pushes the arming saves would fire are suppressed: the caller's own
     forced push is the one that carries these generations to the adapter.
@@ -320,11 +334,11 @@ def _backfill_static_route_generations(mgmt) -> int:
     from . import signals
     from .intent_generation import UNALLOCATED
     from .models import NSOStaticRouteState
-    from .status_machine import DEPLOYING, OWNED_STATES
+    from .status_machine import DEPLOYING
 
     rows = list(
-        NSOStaticRouteState.objects.select_for_update()
-        .filter(management=mgmt, status__in=OWNED_STATES, intent_generation=UNALLOCATED)
+        NSOStaticRouteState.objects.select_for_update(of=("self",))
+        .filter(signals.PUSHED_STATIC_ROUTE_FILTER, management=mgmt, intent_generation=UNALLOCATED)
         .order_by("management_id", "pk")
     )
     if not rows:
@@ -389,9 +403,14 @@ def resync_static_route_intent_fleet(device_ids: list[int] | None = None) -> lis
                     )
                     count = response.get("count") if isinstance(response, dict) else None
                     if count is None:
-                        raise _PushNotAcknowledged
-            except _PushNotAcknowledged:
+                        # Read the rejection the push just persisted, because rolling the
+                        # arming back would take that record with it.
+                        raise _PushNotAcknowledged(signals.read_push_record(mgmt.device_id, "static_route"))
+            except _PushNotAcknowledged as rejected:
                 logger.warning("Static-route intent re-sync was not acknowledged for device %s", mgmt.device_id)
+                # Outside the rolled-back transaction: the reason the adapter gave is what
+                # the operator acts on, and it is not part of what the rollback undoes.
+                signals.restore_push_record(mgmt.device_id, "static_route", *rejected.record)
                 armed, count = 0, None
             # Not an adapter rejection (the push returns None for those), so letting it out
             # would strand every later device unattempted and unreported.

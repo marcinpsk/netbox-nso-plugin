@@ -1330,18 +1330,30 @@ def _escalate_stuck_static_routes(mgmt, *, adapter_device_id) -> None:
 
 
 def _apply_job_state(adapter_device_id) -> tuple[dict | None, bool]:
-    """Best-effort: (most recent terminal apply job, is an apply queued/running now).
+    """Best-effort: (most recent terminal apply job, may an apply be in flight now).
 
     One jobs fetch serves both the failure-settle (which needs the last terminal
     apply's result) and the stuck-deploying escalation (which must stand down while
     a new apply is in flight).
+
+    A probe that FAILED answers the second question with **True**, because it did not
+    answer it at all. Its only consumer is a fail-closed gate, and the two directions are
+    not symmetric: standing down costs one tick, while escalating a row whose Apply is
+    running is unrecoverable — the apply's own ``in_sync`` cannot lift a row back out of
+    ``apply_failed``. Reading an unreadable jobs list as "nothing is running" is the same
+    shape as trusting a drained feed the adapter never served.
     """
     from . import adapter_client as client
 
     try:
         jobs = client.list_jobs(adapter_device_id)  # most-recent-first
-    except Exception:  # noqa: BLE001 — adapter transient; settling is best-effort
-        return None, False
+    except Exception as exc:  # noqa: BLE001 — adapter transient; settling is best-effort
+        logger.warning(
+            "nso reconcile: could not read adapter device %s's jobs (%s) — treating apply activity as unknown",
+            adapter_device_id,
+            exc,
+        )
+        return None, True
     last, active = None, False
     for job in jobs or []:
         if job.get("type") != "apply":
