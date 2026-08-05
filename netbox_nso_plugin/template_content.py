@@ -1066,11 +1066,17 @@ def _reconcile_static_routes(device, payload: dict) -> list:
         # one platform must never rewrite its metric or tag to that platform's
         # value: another device may legitimately differ.  Keep the shared intent
         # and surface the per-device mismatch through this state.
+        # A 'deploying' static route settles ONLY on a generation-correlated apply result
+        # (#1502 Appendix S). Re-reading the route says nothing about which generation the
+        # device is reflecting, so a reconcile settle here was a green badge over content
+        # the device may never have received — a metric edit still in flight read as
+        # in_sync the moment the OLD route came back on a sync.
         state.status = sm.on_reconcile(
             state.status,
             matches=on_device and metric_matches and tag_matches,
             conflict=not on_device,
             settles_owned=False,
+            settles_deploying=False,
         )
         state.save()
 

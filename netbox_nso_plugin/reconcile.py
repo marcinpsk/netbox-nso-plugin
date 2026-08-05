@@ -1058,7 +1058,12 @@ _APPLY_DEPLOYING_SCOPES = {
     "bfd": "NSOBFDInterfaceState",
     "interface_mtu": "NSOInterfaceMtuState",
     "route_policy": "NSORoutePolicyState",
-    "static_route": "NSOStaticRouteState",
+    # "static_route" deliberately absent (#1502 Appendix S): a static-route row is settled
+    # by the generation-correlated settlement consumer, which knows WHICH intent the result
+    # is about. The two coarse channels here do not — a scope counter says the apply
+    # succeeded, not that it carried this row's generation — so both were writing verdicts
+    # on evidence they did not have. `_escalate_stuck_static_routes` is the backstop half's
+    # replacement, and it runs only after the consumer has walked the feed.
     "l2_sap": "NSOL2SapState",
     # Levels only — NSOLoggingHostState still settles via reconcile-matching alone
     # (the pre-existing family behavior). The levels singleton needs the failure leg:
@@ -1219,6 +1224,50 @@ def _escalate_stuck_deploying(mgmt, job: dict | None) -> None:
                 )
 
 
+_STUCK_STATIC_ROUTE_ERROR = (
+    "This route's intent was pushed as generation {generation} and the adapter has still "
+    "reported no result naming that generation. The apply either never carried this route "
+    "or its result never correlated — re-apply; the value is still safe in NetBox."
+)
+
+
+def _escalate_stuck_static_routes(mgmt) -> None:
+    """Static-route rows left 'deploying' past the grace with no correlated result → apply_failed.
+
+    Static routes left :data:`_APPLY_DEPLOYING_SCOPES`, so :func:`_escalate_stuck_deploying`
+    no longer judges them; this is that half's replacement. It is anchored on
+    ``generation_started_at`` — the moment the generation this row is waiting for was armed
+    — because every other overlay timestamp is rewritten by reconcile and so cannot date a
+    generation.
+
+    Callers must run the settlement consumer first and skip this when it failed: a row whose
+    settlement is sitting one unwalked page away has not failed, and judging it here would
+    turn an adapter's own ``in_sync`` into a false red.
+    """
+    from django.utils import timezone
+
+    from . import models
+    from . import status_machine as sm
+
+    cutoff = timezone.now() - _stuck_deploying_grace()
+    rows = models.NSOStaticRouteState.objects.filter(
+        management=mgmt, status="deploying", generation_started_at__lt=cutoff
+    )
+    for row in rows:
+        new_status = sm.on_apply_result(row.status, ok=False)
+        if new_status == row.status:
+            continue
+        row.status = new_status
+        row.last_apply_error = _STUCK_STATIC_ROUTE_ERROR.format(generation=row.intent_generation)
+        row.save(update_fields=["status", "last_apply_error"])
+        logger.warning(
+            "nso reconcile: NSOStaticRouteState %s stuck deploying at generation %s past the "
+            "grace with no correlated settlement — escalated to apply_failed",
+            row.pk,
+            row.intent_generation,
+        )
+
+
 def _apply_job_state(adapter_device_id) -> tuple[dict | None, bool]:
     """Best-effort: (most recent terminal apply job, is an apply queued/running now).
 
@@ -1357,6 +1406,7 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
     from dcim.models import Device
 
     from .adapter_client import AdapterError
+    from .settlement import consume_static_route_settlements
 
     try:
         device = Device.objects.get(pk=device_id)
@@ -1382,7 +1432,8 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
     if ctx.get("_lock_unavailable"):
         return {"device_id": device_id, "skipped": "lock_unavailable"}
 
-    # Step 4: after the post-sync reconcile, settle any rows left 'deploying' whose
+    # Step 4: after the post-sync reconcile, walk this device's settlement feed (the
+    # production carrier for #1502's consumer), settle any rows left 'deploying' whose
     # scope's last apply reported a failure → apply_failed (no longer stuck), escalate
     # rows a SUCCEEDED apply left 'deploying' past the grace (silent drop, #26), and
     # record the route-policy apply outcome in the netbox-routing journals (idempotent).
@@ -1390,9 +1441,29 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
         mgmt = device.nso_management
         if mgmt is not None and mgmt.adapter_device_id is not None:
             job, apply_active = _apply_job_state(mgmt.adapter_device_id)
+            # BEFORE both backstops, in the same invocation. `_escalate_stuck_deploying`'s
+            # own justification is that the settling step "runs right before this"; static
+            # routes no longer settle by reconcile, so without this walk the static backstop
+            # would fail rows the adapter has already reported in_sync.
+            settlement_ok = True
+            try:
+                consume_static_route_settlements(mgmt)
+            except Exception as exc:  # noqa: BLE001 — narrow: only the static backstop stands down
+                settlement_ok = False
+                logger.warning(
+                    "nso reconcile: static-route settlement failed for device %s: %s — "
+                    "the static backstop stands down for this invocation",
+                    device_id,
+                    exc,
+                )
             _settle_apply_failures(mgmt, job.get("result") if job else None, job)
             if not apply_active:
                 _escalate_stuck_deploying(mgmt, job)
+                if settlement_ok:
+                    # Fail closed: an unconsumed feed is exactly the state in which this may
+                    # not judge. The five-minute maintenance tick is what retries it — the
+                    # next notify rides the same channel that just failed.
+                    _escalate_stuck_static_routes(mgmt)
             _journal_route_policy_apply(mgmt, job)
     except Exception as exc:  # noqa: BLE001 — settling is best-effort, never crash the worker
         logger.warning("nso reconcile: apply-failure settle skipped for device %s: %s", device_id, exc)

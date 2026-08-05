@@ -334,8 +334,15 @@ class TestReconcileStaticRoutes(TestCase):
 
     def test_tag_drift_preserves_operator_owned_statuses_exactly_like_metric(self):
         """The binding control: `settles_owned=False` means an owned row is never pulled
-        back by a value mismatch. accepted/in_sync are preserved and deploying still
-        settles — identical to what a metric mismatch does today, for the same status set.
+        back by a value mismatch, and (#1502 P5.1) `settles_deploying=False` means a
+        reconcile never settles one either — identical to what a metric mismatch does, for
+        the same status set.
+
+        ``deploying`` used to land ``in_sync`` here. That was the live false green this
+        appendix exists to remove: re-reading a route says nothing about WHICH generation
+        the device is reflecting, so a metric edit still in flight settled green the moment
+        the OLD route came back on a sync. Only a generation-correlated apply result may
+        settle this family now.
         """
         from netbox_nso_plugin.template_content import _reconcile_static_routes
 
@@ -344,7 +351,7 @@ class TestReconcileStaticRoutes(TestCase):
             (
                 ("accepted", "accepted"),
                 ("in_sync", "in_sync"),
-                ("deploying", "in_sync"),
+                ("deploying", "deploying"),
                 ("apply_failed", "apply_failed"),
             )
         ):

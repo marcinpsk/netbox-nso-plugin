@@ -1,12 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""#1502 Appendix S — the durable settlement consumer: cursor epoch, feed walk, stall bound.
+"""#1502 Appendix S — the settlement consumer: cursor epoch, feed walk, stall bound, verdicts.
 
-This module owns the *transport* of settlement, not its verdicts. It walks one device's
-ordered settlement feed, decides for each terminal job whether that job's per-route
-results can be correlated at all, advances a durable cursor over the ones that can, and
-bounds the ones that cannot so a single unresolvable result never blocks a device forever.
-Turning a correlated result into an overlay status is the next layer's job.
+This module walks one device's ordered settlement feed, decides for each terminal job
+whether that job's per-route results can be correlated at all, applies the per-route
+verdict to the overlay, advances a durable cursor over the jobs it decided, and bounds the
+ones it cannot decide so a single unresolvable result never blocks a device forever.
+
+It is the **only** writer of a static-route overlay's apply status. ``"static_route"`` left
+``reconcile._APPLY_DEPLOYING_SCOPES`` and the static reconciler passes
+``settles_deploying=False``, because neither of those channels can say *which* generation
+the device is reflecting: both settled a row green for content the device may never have
+received. Two clocks drive this one implementation — the adapter's post-apply notification
+through ``run_device_reconcile``'s Step 4, and the plugin's own five-minute maintenance
+tick (:func:`sweep_static_route_settlements`), which survives a dead callback channel.
 
 Three properties are load-bearing and each cost a review round to establish:
 
@@ -48,6 +55,9 @@ SETTLE_STALL_MAX_ATTEMPTS = 5
 # consecutive passes instead of holding the management row locked for an unbounded walk.
 SETTLE_FEED_PAGE = 100
 
+# Used only when the adapter reported a per-route failure with no message of its own.
+_GENERIC_RESULT_ERROR = "The apply reported a failure for this route (see adapter apply job #{job_id})."
+
 
 class SettlementFeedError(Exception):
     """The adapter served a settlement page that breaks the feed contract."""
@@ -82,6 +92,45 @@ def consume_static_route_settlements(mgmt) -> ConsumeResult:
     with transaction.atomic():
         row = NSODeviceManagement.objects.select_for_update().get(pk=pk)
         return _consume_locked(row)
+
+
+def sweep_static_route_settlements() -> tuple[int, int]:
+    """Consume settlements for every device that is still owed one. Returns ``(polled, failed)``.
+
+    The plugin's own clock, and the reason a dead adapter-to-NetBox callback channel cannot
+    strand a device: this pass runs plugin-to-adapter, the direction that survives an
+    invalid callback token. It is the **last** pass of the maintenance tick, after the link
+    repair, and it issues its **own** candidate query rather than reusing the row objects
+    that tick materialized — the repair writes the database while leaving the caller's
+    object holding ``None`` or a dead adapter id in two of its three branches, so a reused
+    list would skip a repaired device or poll it on an id that no longer exists.
+
+    Bounded and isolated: a device with no owned static-route overlay still in flight is
+    never polled, and one device's settlement error aborts neither the rest of the sweep
+    nor anything that ran before it.
+    """
+    from . import status_machine as sm
+    from .models import NSODeviceManagement
+
+    candidates = list(
+        NSODeviceManagement.objects.filter(
+            adapter_device_id__isnull=False,
+            static_route_states__status__in=(sm.ACCEPTED, sm.DEPLOYING),
+        )
+        .distinct()
+        .values_list("pk", flat=True)
+    )
+    polled = 0
+    failed = 0
+    for pk in candidates:
+        try:
+            consume_static_route_settlements(pk)
+        except Exception:  # noqa: BLE001 — one device's adapter must not abort the fleet sweep
+            logger.exception("static-route settlement sweep failed for management row %s", pk)
+            failed += 1
+            continue
+        polled += 1
+    return polled, failed
 
 
 def _consume_locked(row) -> ConsumeResult:
@@ -126,7 +175,7 @@ def _consume_locked(row) -> ConsumeResult:
             raise SettlementFeedError(
                 f"job {job.get('id')} appeared in the ascending settlement feed with no settle_seq"
             )
-        if _resolve_job(row, device_id, job):
+        if _settle_job(row, device_id, job):
             cursor = max(cursor, seq)
             _clear_stall(row)
             consumed += 1
@@ -188,8 +237,8 @@ def _persist(row, cursor: int, device_id: int, incarnation: str) -> None:
     )
 
 
-def _resolve_job(row, device_id: int, job: dict) -> bool:
-    """Can this job's per-route results be correlated? False means "not yet" — a stall.
+def _settle_job(row, device_id: int, job: dict) -> bool:
+    """Apply this job's per-route verdicts. False means "undecided yet" — a stall.
 
     An overlay that recorded no expectation cannot judge a result: the adapter commits its
     intent write before answering the PUT, so a response lost in flight leaves a committed
@@ -202,60 +251,145 @@ def _resolve_job(row, device_id: int, job: dict) -> bool:
 
     results = (job.get("result") or {}).get("static_route_results")
     if not results:
-        # Nothing correlatable rides this job (a removal job carries no route ids at all).
+        # Absence is not "all failed": a removal job carries no route ids at all, and an
+        # apply that touched no static route says nothing about this device's routes.
         return True
 
     states = {s.static_route_id: s for s in NSOStaticRouteState.objects.filter(management=row)}
+    correlated: list[tuple[dict, object]] = []
     pending = []
     for entry in results:
         if not isinstance(entry, dict):
             continue
-        state = states.get(entry.get("route_id"))
+        route_id = entry.get("route_id")
+        if route_id is None:
+            # This row is uncorrelated, and only this row: a null id is not a device-wide
+            # fence signal, and falling back to the (vrf, prefix, next-hop) triple would
+            # settle whatever route happens to match it.
+            continue
+        state = states.get(route_id)
         if state is None:
             # The overlay is gone (the device left the route's membership), so nothing
             # waits on this result.
             continue
-        if state.expected_generation is not None:
+        generation = entry.get("generation")
+        if generation is None or generation == UNALLOCATED or generation != state.intent_generation:
+            # Superseded, or never ours: the overlay has moved on to a newer generation, or
+            # this result names intent that was never put on the wire under one.
             continue
-        if state.intent_generation == UNALLOCATED:
-            # Never put on the wire, so no result can ever name it. The fleet backfill is
-            # the repair; blocking the device on it would be a stall with no exit.
-            continue
-        pending.append(state)
+        correlated.append((entry, state))
+        if state.expected_generation != generation:
+            pending.append(state)
 
-    if not pending:
-        return True
+    if pending:
+        try:
+            echoed = adapter_client.get_static_route_intent(device_id)
+        except adapter_client.AdapterError as exc:
+            logger.warning(
+                "settlement read-back failed for adapter device %s (job %s): %s — sequence %s undecided",
+                device_id,
+                job.get("id"),
+                exc,
+                job.get("settle_seq"),
+            )
+            return False
+        _record_readback_expectations(row, pending, echoed)
+        recovered = {s.pk: s for s in NSOStaticRouteState.objects.filter(pk__in=[s.pk for s in pending])}
+        correlated = [(entry, recovered.get(state.pk, state)) for entry, state in correlated]
 
-    try:
-        echoed = adapter_client.get_static_route_intent(device_id)
-    except adapter_client.AdapterError as exc:
-        logger.warning(
-            "settlement read-back failed for adapter device %s (job %s): %s — sequence %s undecided",
-            device_id,
-            job.get("id"),
-            exc,
-            job.get("settle_seq"),
-        )
-        return False
-
-    _record_readback_expectations(row, pending, echoed)
-    recovered = set(
-        NSOStaticRouteState.objects.filter(
-            pk__in=[state.pk for state in pending], expected_generation__isnull=False
-        ).values_list("static_route_id", flat=True)
-    )
-    unrecoverable = sorted({state.static_route_id for state in pending} - recovered)
-    if unrecoverable:
-        # The store no longer holds what this result is about, so no later poll can decide
-        # it either. Advancing is correct; doing it silently is not.
-        logger.warning(
-            "the adapter's intent read-back names no expectation for route(s) %s on device %s, "
-            "so sequence %s can never correlate — advancing past it",
-            unrecoverable,
-            device_id,
-            job.get("settle_seq"),
-        )
+    for entry, state in correlated:
+        _apply_verdict(device_id, job, entry, state)
     return True
+
+
+def _apply_verdict(device_id: int, job: dict, entry: dict, state) -> None:
+    """Turn one correlated per-route result into this overlay's status, or say why not."""
+    generation = entry.get("generation")
+    if state.expected_generation != generation:
+        # The read-back could not recover an expectation, so no later poll can decide this
+        # result either. Advancing is correct; doing it silently is not.
+        logger.warning(
+            "the adapter's intent read-back names no expectation for route %s on device %s, "
+            "so sequence %s can never correlate — advancing past it",
+            state.static_route_id,
+            device_id,
+            job.get("settle_seq"),
+        )
+        return
+
+    fingerprint = entry.get("fingerprint") or ""
+    if fingerprint != state.expected_fingerprint:
+        logger.warning(
+            "settlement fingerprint mismatch for route %s on device %s at generation %s: "
+            "the apply reported %r, this device expected %r — not settled",
+            state.static_route_id,
+            device_id,
+            generation,
+            fingerprint,
+            state.expected_fingerprint,
+        )
+        _advise(
+            state,
+            f"The apply reported fingerprint {fingerprint!r} for generation {generation}, but this "
+            f"device's intent expects {state.expected_fingerprint!r}. The result describes content "
+            f"this row is not waiting for, so it did not settle.",
+        )
+        return
+
+    outcome = entry.get("outcome")
+    if outcome == "in_sync":
+        _settle(state, ok=True)
+    elif outcome == "apply_failed":
+        _settle(state, ok=False, error=_result_error(entry) or _GENERIC_RESULT_ERROR.format(job_id=job.get("id")))
+    else:
+        # `unproven` (and anything the adapter adds later) is evidence the apply could not
+        # prove the value landed. It is not a failure and it is emphatically not a settle;
+        # the scope-level counter may still say in_sync and must not be believed here.
+        reason = _result_error(entry)
+        _advise(
+            state,
+            f"The adapter reported {outcome!r} for generation {generation} on apply job "
+            f"#{job.get('id')}, so this row did not settle." + (f" {reason}" if reason else ""),
+        )
+
+
+def _settle(state, *, ok: bool, error: str = "") -> None:
+    """Write the settled status, or leave the row alone when the result concerns no in-flight one."""
+    from . import status_machine as sm
+    from .signals import suppress_intent_push
+
+    new_status = sm.on_apply_result(state.status, ok=ok, settle_accepted=True)
+    if new_status == state.status:
+        # Already settled (or never owned): re-applying the same verdict would only rewrite
+        # an error the row has since recovered from.
+        return
+    state.status = new_status
+    state.last_apply_at = timezone.now()
+    state.last_apply_error = error
+    state.last_result_advisory = ""
+    with suppress_intent_push():
+        state.save(update_fields=["status", "last_apply_at", "last_apply_error", "last_result_advisory"])
+
+
+def _advise(state, reason: str) -> None:
+    """Record why a correlated result did not settle. Non-settling, so the status is untouched."""
+    from .signals import suppress_intent_push
+
+    if state.last_result_advisory == reason:
+        return
+    state.last_result_advisory = reason
+    with suppress_intent_push():
+        state.save(update_fields=["last_result_advisory"])
+
+
+def _result_error(entry: dict) -> str:
+    """Render the row-level ``{code, message, detail}`` the adapter computed as one line."""
+    err = entry.get("error")
+    if isinstance(err, dict):
+        code = str(err.get("code") or "").strip()
+        message = str(err.get("message") or err.get("detail") or "").strip()
+        return f"{code}: {message}" if code and message else (message or code)
+    return str(err or "").strip()
 
 
 def _record_readback_expectations(row, pending, echoed) -> None:

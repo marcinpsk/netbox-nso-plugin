@@ -375,14 +375,23 @@ class TestStaticRouteApplySettle(APITestCase):
         )
         return mgmt, row
 
-    def test_failed_static_route_scope_marks_apply_failed(self):
-        from netbox_nso_plugin.reconcile import _settle_apply_failures
+    def test_the_coarse_scope_settle_no_longer_judges_static_routes(self):
+        """#1502 S5 handover: the scope counter is not evidence about any particular row.
+
+        It says the apply reported N failures for the scope, not that this device's route
+        was one of them, and not which generation the result is about. The generation-
+        correlated consumer is the only writer of a static-route apply verdict now, so the
+        coarse settle must leave the row exactly as it found it — the alternative is a red
+        badge on a route that applied cleanly beside a sibling that did not.
+        """
+        from netbox_nso_plugin.reconcile import _APPLY_DEPLOYING_SCOPES, _settle_apply_failures
 
         mgmt, row = self._setup()
         _settle_apply_failures(mgmt, {"static_route_count_by_outcome": {"in_sync": 0, "apply_failed": 1}})
         row.refresh_from_db()
-        self.assertEqual(row.status, "apply_failed")
-        self.assertTrue(row.last_apply_error)
+        self.assertEqual(row.status, "deploying")
+        self.assertFalse(row.last_apply_error)
+        self.assertNotIn("static_route", _APPLY_DEPLOYING_SCOPES)
 
     def test_prepare_apply_marks_accepted_static_route_deploying(self):
         from netbox_nso_plugin.views import _prepare_apply

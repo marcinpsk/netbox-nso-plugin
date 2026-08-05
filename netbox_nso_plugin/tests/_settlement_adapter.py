@@ -52,6 +52,10 @@ class SettlementStore:
         self.devices: dict[int, dict] = {}
         #: status the read-back GET answers with; anything but 200 makes it unresolvable
         self.intent_status = 200
+        #: adapter device ids whose ASCENDING (settlement) feed answers 503. Scoped to the
+        #: ascending page on purpose: the coarse per-scope settle reads the same collection
+        #: descending, and a knob that broke both could not tell the two channels apart.
+        self.feed_error_devices: set[int] = set()
         #: every feed request the consumer made, as ``(device_id, after_settle_seq, limit)``
         self.feed_requests: list[tuple[int, int, int]] = []
         self.readback_requests: list[int] = []
@@ -78,14 +82,17 @@ class SettlementStore:
         self.devices[device_id] = row
         return row
 
-    def _job(self, device_id: int, *, settle_seq, status, results, job_type):
+    def _job(self, device_id: int, *, settle_seq, status, results, job_type, extra=None):
         self._next_id += 1
+        result = None if results is None else {"static_route_results": results}
+        if extra:
+            result = {**(result or {}), **extra}
         return {
             "id": f"job-{self._next_id}",
             "type": job_type,
             "device_id": device_id,
             "status": status,
-            "result": None if results is None else {"static_route_results": results},
+            "result": result,
             "error": None,
             "context": None,
             "created_at": "2026-01-01T00:00:00Z",
@@ -95,11 +102,15 @@ class SettlementStore:
             "settle_seq": settle_seq,
         }
 
-    def terminal_job(self, device_id: int, *, results=None, status="succeeded", job_type="apply") -> dict:
-        """Add a terminal job, allocating this device's next settlement sequence."""
+    def terminal_job(self, device_id: int, *, results=None, status="succeeded", job_type="apply", extra=None) -> dict:
+        """Add a terminal job, allocating this device's next settlement sequence.
+
+        *extra* merges into ``result`` — the per-scope ``<scope>_count_by_outcome`` counters
+        the coarse settle reads, so one job can carry both channels' evidence.
+        """
         seq = self._next_seq.get(device_id, 0) + 1
         self._next_seq[device_id] = seq
-        job = self._job(device_id, settle_seq=seq, status=status, results=results, job_type=job_type)
+        job = self._job(device_id, settle_seq=seq, status=status, results=results, job_type=job_type, extra=extra)
         self.jobs.append(job)
         return job
 
@@ -209,7 +220,11 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             after = int(query.get("after_settle_seq") or 0)
             limit = int(query.get("limit") or 100)
-            store.feed_requests.append((int(device_id), after, limit))
+            if query.get("order") == "asc":
+                store.feed_requests.append((int(device_id), after, limit))
+                if int(device_id) in store.feed_error_devices:
+                    self._send(503, {"error": {"code": "nso_error", "message": "the settlement feed is down"}})
+                    return
             self._send(
                 200,
                 store.feed(int(device_id), after, limit),
