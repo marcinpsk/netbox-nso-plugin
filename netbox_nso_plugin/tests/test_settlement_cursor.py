@@ -504,6 +504,109 @@ class TestStallBound(_SettlementCase):
         assert self._cursor(mgmt).settle_cursor_seq == 2
 
 
+class TestStaleFullSaveCannotRewindTheCursor(_SettlementCase):
+    """A holder of a pre-advance instance may not carry the cursor or the bound backwards.
+
+    ``.update()`` protects the consumer's write from being *clobbered on the way out*; it
+    does nothing about a full ``save()`` that lands afterwards from an instance loaded
+    before it. Several sweeps load a management row, make an adapter call, and only then
+    save — the window is real and it is where the row's other durable records already had
+    to be protected. Monotonicity and the five-attempt bound are worth exactly as much as
+    that protection covers them.
+    """
+
+    def _advanced(self, tag, adapter_device_id):
+        """A device whose cursor has been advanced by the consumer, plus a stale holder."""
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        device = _make_device(tag)
+        mgmt = _make_mgmt(device, tag, adapter_device_id)
+        sr = _route(f"10.12.{adapter_device_id % 250}.0/24", "10.12.0.1", devices=[device])
+        _own(sr, mgmt, generation=80)
+        self.adapter.store.terminal_job(adapter_device_id, results=[_result(sr.pk, 80)])
+
+        # The holder loads the row BEFORE the consumer runs, exactly as a sweep does.
+        stale = NSODeviceManagement.objects.get(pk=mgmt.pk)
+        assert stale.settle_cursor_seq is None
+
+        result = consume_static_route_settlements(mgmt)
+        assert result.consumed == 1
+        return mgmt, stale, sr
+
+    def test_a_stale_full_save_cannot_rewind_the_cursor(self):
+        mgmt, stale, _sr = self._advanced("rewind", 110)
+        incarnation = self._cursor(mgmt).settle_cursor_incarnation
+
+        stale.save()
+
+        row = self._cursor(mgmt)
+        assert row.settle_cursor_seq == 1, "a stale full save rewound the cursor"
+        assert row.settle_cursor_incarnation == incarnation, "a stale full save rewound the epoch"
+        assert row.settle_cursor_device_id == 110
+
+    def test_a_stale_full_save_cannot_reset_the_stall_bound(self):
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        device = _make_device("bound2")
+        mgmt = _make_mgmt(device, "bound2", 111)
+        sr = _route("10.13.0.0/16", "10.13.0.1", devices=[device])
+        _own(sr, mgmt, generation=81, expected=False)
+        self.adapter.store.terminal_job(111, results=[_result(sr.pk, 81)])
+        self.adapter.store.intent_status = 503
+
+        stale = NSODeviceManagement.objects.get(pk=mgmt.pk)
+        for _ in range(3):
+            consume_static_route_settlements(mgmt)
+        assert self._cursor(mgmt).settle_stall_attempts == 3
+
+        stale.save()
+
+        row = self._cursor(mgmt)
+        assert row.settle_stall_attempts == 3, "a stale full save reset the stall bound"
+        assert row.settle_stall_seq == 1
+        assert row.settle_stall_first_seen_at is not None
+
+    def test_the_link_repairs_save_cannot_rewind_the_cursor(self):
+        """The named production holder: load the row, call the adapter, then save it."""
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+        from netbox_nso_plugin.sync_cache import reconcile_device_links
+
+        device = _make_device("repairsave")
+        mgmt = _make_mgmt(device, "repairsave", 112)
+        sr = _route("10.14.0.0/16", "10.14.0.1", devices=[device])
+        _own(sr, mgmt, generation=82)
+        self.adapter.store.terminal_job(112, results=[_result(sr.pk, 82)])
+
+        # The sweep materializes its candidate list first; the adapter has no device 112,
+        # so this row is broken and will be re-saved once the snapshot comes back.
+        rows = list(NSODeviceManagement.objects.filter(pk=mgmt.pk))
+
+        assert consume_static_route_settlements(mgmt).consumed == 1
+        assert self._cursor(mgmt).settle_cursor_seq == 1
+
+        reconcile_device_links(rows)
+
+        assert self._cursor(mgmt).settle_cursor_seq == 1, "the link repair's save rewound the cursor"
+
+    def test_the_refresh_covers_every_field_the_consumer_writes(self):
+        """Asserted explicitly: a settlement column added later cannot miss the refresh."""
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        written = {
+            "settle_cursor_seq",
+            "settle_cursor_incarnation",
+            "settle_cursor_device_id",
+            "settle_stall_seq",
+            "settle_stall_attempts",
+            "settle_stall_first_seen_at",
+            "adapter_link_attempted_at",
+        }
+        assert written <= set(NSODeviceManagement._STALE_SAVE_PROTECTED_FIELDS)
+
+
 class TestDurableStallAcrossProcesses(_SettlementCase):
     """S4.3 (P5.11) — the bound survives a real process boundary, or it is not durable."""
 
