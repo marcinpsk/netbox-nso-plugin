@@ -66,6 +66,9 @@ _UNSET = object()
 # unreachable adapter fails fast, while a connected-but-slow adapter still gets
 # the full read window before we conclude it is hung.
 _CONNECT_TIMEOUT = 5  # seconds
+# The live store incarnation, served on the job collection's 200s. Named once here so the
+# consumer and the adapter cannot drift on the spelling.
+STORE_INCARNATION_HEADER = "X-Store-Incarnation"
 
 # Process-wide pooled session, reused across calls so connections to the (internal)
 # adapter are kept alive instead of a fresh TCP+TLS handshake per request. Keyed by the
@@ -168,6 +171,12 @@ def _resolve_config() -> dict:
 
 
 def _request(method, path, **kwargs):
+    resp = _request_response(method, path, **kwargs)
+    return resp.json() if resp.content else None
+
+
+def _request_response(method, path, **kwargs):
+    """Send one adapter request and return the raw response, for callers that read a header."""
     cfg = _resolve_config()
 
     if not cfg["url"]:
@@ -237,7 +246,7 @@ def _request(method, path, **kwargs):
             code=err.get("code", str(resp.status_code)),
             detail=err.get("detail"),
         )
-    return resp.json() if resp.content else None
+    return resp
 
 
 def onboard_device(nso_instance, nso_device_name, netbox_device_id):
@@ -683,6 +692,48 @@ def get_job(job_id):
 def list_jobs(adapter_device_id):
     """GET /api/v1/jobs?device_id={id} — the device's jobs, most-recent-first."""
     return _request("GET", "/api/v1/jobs", params={"device_id": adapter_device_id})
+
+
+def get_settlement_feed(adapter_device_id, *, after_settle_seq, limit):
+    """GET the device's ordered settlement feed → ``(jobs, store_incarnation)``.
+
+    Ascending by ``settle_seq``, which the adapter allocates under a per-device lock held
+    to COMMIT, so the page is in commit order. Queued and running jobs carry no sequence
+    and the ``> cursor`` predicate is NULL-false, so they are invisible until terminal.
+
+    The incarnation rides a header rather than the body because the page that proves a
+    store is gone is an EMPTY one: a cursor past the end of a restarted sequence returns
+    no rows at all, and a per-row field would say nothing in exactly that state.
+    """
+    resp = _request_response(
+        "GET",
+        "/api/v1/jobs",
+        params={
+            "device_id": adapter_device_id,
+            "order": "asc",
+            "after_settle_seq": after_settle_seq,
+            "limit": limit,
+        },
+    )
+    incarnation = resp.headers.get(STORE_INCARNATION_HEADER)
+    if not incarnation:
+        # Without it the cursor epoch cannot be compared, and applying a cursor whose
+        # store may be dead is the silent-skip this header exists to prevent.
+        raise AdapterError(
+            f"Adapter served the settlement feed without a {STORE_INCARNATION_HEADER} header.",
+            code="missing_store_incarnation",
+        )
+    return (resp.json() if resp.content else []), incarnation
+
+
+def get_static_route_intent(adapter_device_id):
+    """GET /api/v1/devices/{id}/static-route-intent — re-serve what the last PUT echoed.
+
+    The lost-response recovery path: the adapter commits its store write before it
+    answers, so a response lost in flight leaves the pusher holding a committed intent it
+    recorded no expectation for, and this is the only other way to obtain one.
+    """
+    return _request("GET", f"/api/v1/devices/{adapter_device_id}/static-route-intent")
 
 
 def put_intent(adapter_device_id, attributes):

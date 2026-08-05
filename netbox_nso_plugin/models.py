@@ -489,6 +489,11 @@ class NSODeviceManagement(NetBoxModel):
             "while silently unlinked. Cleared once linking succeeds. Surfaced on the NSO tab."
         ),
     )
+    # When the link repair last TRIED this row, whether or not the repair worked. The
+    # repair is capped per run, so an unordered traversal lets a persistently failing head
+    # hold the cap on every run and starve a repairable tail row; ordering the broken list
+    # least-recently-attempted first bounds every broken row at ceil(B / C) ticks.
+    adapter_link_attempted_at = models.DateTimeField(null=True, blank=True)
     # ── READSEM S4 (D5): adopted store incarnation + durable reset markers ──────
     # The adapter store mints an (incarnation UUID, born) pair on every DB rebuild;
     # the gated reconcile ADOPTS the newest born (resetting per-family read state),
@@ -506,14 +511,25 @@ class NSODeviceManagement(NetBoxModel):
     reset_pending_incarnation = models.CharField(max_length=64, blank=True, default="")
     reset_pending_born = models.DateTimeField(null=True, blank=True)
     reset_conflict_born = models.DateTimeField(null=True, blank=True)
-    # ── #1396 R3: settlement cursor + intent-push rejection record ──────────────
-    # The cursor is per-device and only meaningful within one adapter store
-    # incarnation: a rebuilt store restarts its job identifiers, so the consumer
-    # compares ``settle_cursor_incarnation`` against ``adapter_incarnation`` and
-    # resets on mismatch. Replaying an old result after a reset is harmless because
-    # intent generations are allocated from a database-global sequence.
+    # ── #1396 R3 / Appendix S: settlement cursor + intent-push rejection record ──
+    # The cursor names how far the consumer has walked this device's ordered settlement
+    # feed, under the epoch ``(store incarnation, adapter device id)``. Neither half may
+    # be read from a cache: ``adapter_incarnation`` is written only when a read-state
+    # publication is adopted, so the incarnation is taken from the feed response's
+    # ``X-Store-Incarnation`` header, and the device half from ``adapter_device_id`` on
+    # the row the consumer locks. A rebuilt store and a device remap both restart the
+    # adapter's per-device counter at 1, so either mismatch resets the cursor AND the
+    # stall triple. Replaying an old result after a reset is harmless because intent
+    # generations are allocated from a database-global sequence.
     settle_cursor_seq = models.BigIntegerField(null=True, blank=True)
     settle_cursor_incarnation = models.CharField(max_length=64, blank=True, default="")
+    settle_cursor_device_id = models.BigIntegerField(null=True, blank=True)
+    # One unresolvable settlement may not block the device forever, and the bound has to
+    # survive a worker restart — so the triple lives on the row, not in a module global.
+    # It describes exactly one sequence: any advance clears it, as does an epoch change.
+    settle_stall_seq = models.BigIntegerField(null=True, blank=True)
+    settle_stall_attempts = models.PositiveIntegerField(default=0)
+    settle_stall_first_seen_at = models.DateTimeField(null=True, blank=True)
     # Per-scope record of what an intent push was rejected with. ``intent_push_attempts``
     # is the never-cleared per-scope high-water mark: clearing the error entry on success
     # would take the attempt token with it, and a delayed failure from an earlier attempt
