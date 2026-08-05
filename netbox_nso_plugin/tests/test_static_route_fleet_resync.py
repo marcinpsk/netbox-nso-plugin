@@ -47,7 +47,9 @@ class TestStaticRouteFleetResync(IntentPushResetMixin, TestCase):
         )
         return device, mgmt
 
-    def _own_route(self, mgmt, prefix: str, next_hop: str):
+    def _own_route(self, mgmt, prefix: str, next_hop: str, status: str = "accepted"):
+        """A pre-P2 owned overlay: owned, pushed, and still on the generation sentinel."""
+        from django.utils import timezone
         from netbox_routing.models import StaticRoute
 
         from netbox_nso_plugin.models import NSOStaticRouteState
@@ -57,7 +59,12 @@ class TestStaticRouteFleetResync(IntentPushResetMixin, TestCase):
         with suppress_intent_push():
             sr.devices.add(mgmt.device)
         return NSOStaticRouteState.objects.create(
-            management=mgmt, static_route=sr, status="accepted", nso_prefix=prefix, nso_next_hop=next_hop
+            management=mgmt,
+            static_route=sr,
+            status=status,
+            nso_prefix=prefix,
+            nso_next_hop=next_hop,
+            accepted_at=timezone.now(),
         )
 
     def test_backfills_a_device_with_no_detected_drift(self):
@@ -219,6 +226,109 @@ class TestStaticRouteFleetResync(IntentPushResetMixin, TestCase):
 
         assert "424242" in str(raised.exception)
         assert "fleet-cmdsel" in out.getvalue()  # the id that did match was still re-synced
+
+    def test_the_pass_backfills_generations_not_only_route_ids(self):
+        """S6.1 (#1502) — a pre-P2 owned row keeps ``intent_generation = 0`` through the pass.
+
+        Zero is the unallocated sentinel: it goes on the wire as null, the adapter adopts
+        nothing, and every result the row ever produces is non-settling. A pass that fills
+        ``route_id`` and reports success leaves exactly that state behind, fleet-wide.
+        """
+        from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet
+        from netbox_nso_plugin.intent_generation import UNALLOCATED
+
+        _, first = self._managed_device("genone", 8101)
+        _, second = self._managed_device("gentwo", 8102)
+        _, rejected = self._managed_device("genbad", 8103)
+        rows = [
+            self._own_route(first, "10.70.0.0/16", "10.0.0.71"),
+            self._own_route(second, "10.71.0.0/16", "10.0.0.72"),
+            self._own_route(rejected, "10.72.0.0/16", "10.0.0.73"),
+        ]
+        assert {row.intent_generation for row in rows} == {UNALLOCATED}
+        sent: dict[int, list] = {}
+
+        def _ack_but_one(adapter_device_id, routes):
+            sent[adapter_device_id] = routes
+            if adapter_device_id == 8103:
+                return None  # the adapter refused this device's intent
+            return {"device_id": adapter_device_id, "count": len(routes), "routes": []}
+
+        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", side_effect=_ack_but_one):
+            results = resync_static_route_intent_fleet()
+
+        by_device = {r["device_id"]: r for r in results}
+        for mgmt, row in ((first, rows[0]), (second, rows[1])):
+            row.refresh_from_db()
+            assert by_device[mgmt.device_id]["armed"] == 1
+            assert row.intent_generation > UNALLOCATED, "the row is still on the sentinel: no result can settle it"
+            assert row.generation_started_at is not None, "an armed row with no clock cannot be timed out either"
+            assert sent[mgmt.adapter_device_id][0]["generation"] == row.intent_generation, (
+                "the generation was armed in NetBox but never put on the wire"
+            )
+        rows[2].refresh_from_db()
+        assert by_device[rejected.device_id]["ok"] is False
+        assert by_device[rejected.device_id]["armed"] == 0
+        assert rows[2].intent_generation == UNALLOCATED, (
+            "the arming outlived the push the adapter refused: nothing is holding that generation, "
+            "and no later pass would find a sentinel row to retry"
+        )
+
+        # The operator has to see the partial pass, and a re-run must arm nothing twice.
+        out = StringIO()
+        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", side_effect=_ack_but_one):
+            with self.assertRaises(CommandError) as raised:
+                call_command(COMMAND, stdout=out, stderr=StringIO())
+        assert "fleet-genbad" in str(raised.exception)
+        assert "0 generation(s) armed" in out.getvalue()
+
+        with patch(
+            "netbox_nso_plugin.adapter_client.put_static_route_intent",
+            side_effect=lambda adapter_device_id, routes: {
+                "device_id": adapter_device_id,
+                "count": len(routes),
+                "routes": [],
+            },
+        ):
+            second_pass = {r["device_id"]: r for r in resync_static_route_intent_fleet()}
+
+        assert second_pass[first.device_id]["armed"] == 0, "an armed row was re-armed, so its expectation went stale"
+        assert second_pass[second.device_id]["armed"] == 0
+        assert second_pass[rejected.device_id]["armed"] == 1, "the rejected device was never retried"
+
+    def test_backfill_demotes_deploying_and_leaves_other_statuses(self):
+        """S6.2 — a row already ``deploying`` cannot wait on a generation it has just replaced."""
+        from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet
+        from netbox_nso_plugin.intent_generation import UNALLOCATED
+
+        _, mgmt = self._managed_device("demote", 8104)
+        deploying = self._own_route(mgmt, "10.73.0.0/16", "10.0.0.74", status="deploying")
+        in_sync = self._own_route(mgmt, "10.74.0.0/16", "10.0.0.75", status="in_sync")
+        failed = self._own_route(mgmt, "10.75.0.0/16", "10.0.0.76", status="apply_failed")
+        accepted = self._own_route(mgmt, "10.76.0.0/16", "10.0.0.77")
+        owned_since = deploying.accepted_at
+
+        with patch(
+            "netbox_nso_plugin.adapter_client.put_static_route_intent",
+            side_effect=lambda adapter_device_id, routes: {
+                "device_id": adapter_device_id,
+                "count": len(routes),
+                "routes": [],
+            },
+        ):
+            resync_static_route_intent_fleet()
+
+        for row in (deploying, in_sync, failed, accepted):
+            row.refresh_from_db()
+            assert row.intent_generation > UNALLOCATED
+        assert deploying.status == "accepted", (
+            "the row is left deploying under a generation no in-flight result can name — "
+            "stranded until the backstop calls it failed"
+        )
+        assert deploying.accepted_at == owned_since, "the demotion re-dated first ownership"
+        assert in_sync.status == "in_sync", "a settled row's badge flickered on a pass that changed no content"
+        assert failed.status == "apply_failed"
+        assert accepted.status == "accepted"
 
     def test_unlinked_devices_are_skipped(self):
         """A management row with no ``adapter_device_id`` has nothing to push to."""
