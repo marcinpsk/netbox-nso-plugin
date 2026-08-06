@@ -241,6 +241,132 @@ class TestReconcileStaticRoutes(TestCase):
         state = route.nso_states.get(management__device=self.device)
         self.assertNotEqual(state.status, "in_sync")
 
+    # ── tag drift (#1381 codex F1) ─────────────────────────────────────────────
+
+    def _tagged_route(self, prefix, next_hop, *, tag):
+        """A StaticRoute already in NetBox and already linked to self.device."""
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        route = StaticRoute.objects.create(prefix=prefix, next_hop=next_hop, metric=1, tag=tag)
+        with suppress_intent_push():
+            route.devices.add(self.device)
+        return route
+
+    def test_new_route_carries_the_payload_tag(self):
+        """Control for the create half: a newly-created route already lands the tag."""
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.template_content import _reconcile_static_routes
+
+        self._make_mgmt(self.device, nso_device_name="sr-tag-create")
+        entry = self._route_entry("198.18.50.0/24", "198.18.0.1")
+        entry["tag"] = 42
+        with self._auto_create_ctx(True):
+            _reconcile_static_routes(self.device, self._route_payload(entry))
+
+        self.assertEqual(StaticRoute.objects.get(prefix="198.18.50.0/24").tag, 42)
+
+    def test_tag_drift_on_an_existing_route_surfaces_as_changed(self):
+        """The reconcile compare used to check ONLY metric, so an existing row with no tag
+        against a device carrying tag 42 stayed `imported`/`in_sync` — the mirror was
+        silently wrong and the drift invisible. `tag` now joins the same conjunction as
+        `metric`: compare every read, surface the mismatch through the per-device state.
+        """
+        from netbox_nso_plugin.template_content import _reconcile_static_routes
+
+        self._make_mgmt(self.device, nso_device_name="sr-tag-drift")
+        route = self._tagged_route("198.18.51.0/24", "198.18.0.2", tag=None)
+        entry = self._route_entry(str(route.prefix), str(route.next_hop))
+        entry["tag"] = 42
+
+        _reconcile_static_routes(self.device, self._route_payload(entry))
+
+        state = route.nso_states.get(management__device=self.device)
+        self.assertEqual(state.status, "changed")
+
+    def test_tag_drift_never_clobbers_the_shared_route(self):
+        """The metric precedent exactly (test_nokia_omitted_preference_does_not_rewrite_
+        shared_metric): StaticRoute is shared across every associated device, so a refresh
+        from one device must never rewrite its tag — the mismatch is surfaced, not applied.
+        """
+        from netbox_nso_plugin.template_content import _reconcile_static_routes
+
+        self._make_mgmt(self.device, nso_device_name="sr-tag-noclobber")
+        route = self._tagged_route("198.18.52.0/24", "198.18.0.3", tag=7)
+        entry = self._route_entry(str(route.prefix), str(route.next_hop))
+        entry["tag"] = 42
+
+        _reconcile_static_routes(self.device, self._route_payload(entry))
+
+        route.refresh_from_db()
+        self.assertEqual(route.tag, 7)
+        self.assertEqual(route.nso_states.get(management__device=self.device).status, "changed")
+
+    def test_tag_absent_from_the_payload_against_a_tagged_route_is_drift(self):
+        """The other direction: NetBox carries a tag the device no longer reports."""
+        from netbox_nso_plugin.template_content import _reconcile_static_routes
+
+        self._make_mgmt(self.device, nso_device_name="sr-tag-gone")
+        route = self._tagged_route("198.18.53.0/24", "198.18.0.4", tag=9)
+        entry = self._route_entry(str(route.prefix), str(route.next_hop))  # no tag key at all
+
+        _reconcile_static_routes(self.device, self._route_payload(entry))
+
+        self.assertEqual(route.nso_states.get(management__device=self.device).status, "changed")
+
+    def test_matching_tag_still_imports_clean(self):
+        """Control: an agreeing tag (and an agreeing absent tag) must not manufacture drift."""
+        from netbox_nso_plugin.template_content import _reconcile_static_routes
+
+        self._make_mgmt(self.device, nso_device_name="sr-tag-match")
+        tagged = self._tagged_route("198.18.54.0/24", "198.18.0.5", tag=42)
+        untagged = self._tagged_route("198.18.55.0/24", "198.18.0.6", tag=None)
+        e1 = self._route_entry(str(tagged.prefix), str(tagged.next_hop))
+        e1["tag"] = 42
+        e2 = self._route_entry(str(untagged.prefix), str(untagged.next_hop))
+
+        _reconcile_static_routes(self.device, self._route_payload(e1, e2))
+
+        self.assertEqual(tagged.nso_states.get(management__device=self.device).status, "imported")
+        self.assertEqual(untagged.nso_states.get(management__device=self.device).status, "imported")
+
+    def test_tag_drift_preserves_operator_owned_statuses_exactly_like_metric(self):
+        """The binding control: `settles_owned=False` means an owned row is never pulled
+        back by a value mismatch. accepted/in_sync are preserved and deploying still
+        settles — identical to what a metric mismatch does today, for the same status set.
+        """
+        from netbox_nso_plugin.template_content import _reconcile_static_routes
+
+        mgmt = self._make_mgmt(self.device, nso_device_name="sr-tag-owned")
+        for i, (owned, expected) in enumerate(
+            (
+                ("accepted", "accepted"),
+                ("in_sync", "in_sync"),
+                ("deploying", "in_sync"),
+                ("apply_failed", "apply_failed"),
+            )
+        ):
+            with self.subTest(status=owned):
+                route = self._tagged_route(f"198.18.6{i}.0/24", f"198.18.1.{i + 1}", tag=None)
+                state = route.nso_states.create(management=mgmt, status=owned)
+                entry = self._route_entry(str(route.prefix), str(route.next_hop))
+
+                entry_tag = dict(entry, tag=42)
+                _reconcile_static_routes(self.device, self._route_payload(entry_tag))
+                state.refresh_from_db()
+                tag_result = state.status
+
+                # the same row driven by a METRIC mismatch instead — must land identically
+                state.status = owned
+                state.save(update_fields=["status"])
+                _reconcile_static_routes(self.device, self._route_payload(dict(entry, metric=99)))
+                state.refresh_from_db()
+
+                self.assertEqual(tag_result, expected)
+                self.assertEqual(tag_result, state.status)
+
     def test_idempotent_second_reconcile_same_result(self):
         """Second reconcile with same payload → same state rows, no duplicates."""
         from netbox_routing.models import StaticRoute

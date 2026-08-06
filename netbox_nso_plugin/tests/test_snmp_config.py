@@ -218,6 +218,44 @@ class TestReconcileSnmpConfig(TestCase):
         row = NSOSnmpCommunityState.objects.get(community_hash="abcd1234abcd1234")
         self.assertEqual(row.status, "accepted")
 
+    def test_system_info_deleted_after_load_returns_none(self):
+        """A concurrent singleton deletion must not crash the read reconciliation."""
+        from django.db.models.signals import post_init
+
+        from netbox_nso_plugin.models import NSOSnmpSystemInfoState
+        from netbox_nso_plugin.template_content import _reconcile_snmp_config
+
+        mgmt = self._create_mgmt()
+        row = NSOSnmpSystemInfoState.objects.create(
+            management=mgmt,
+            location="Test rack",
+            contact="noc@example.invalid",
+            status="accepted",
+        )
+        deleted = []
+
+        def delete_after_load(sender, instance, **kwargs):
+            if deleted or instance.pk != row.pk:
+                return
+            deleted.append(True)
+            NSOSnmpSystemInfoState.objects.filter(pk=instance.pk).delete()
+
+        post_init.connect(delete_after_load, sender=NSOSnmpSystemInfoState, weak=False)
+        self.addCleanup(post_init.disconnect, delete_after_load, sender=NSOSnmpSystemInfoState)
+
+        result = _reconcile_snmp_config(
+            self.device,
+            {
+                "communities": [],
+                "v3_users": [],
+                "hosts": [],
+                "system_info": {"location": "Test rack", "contact": "noc@example.invalid"},
+            },
+        )
+
+        self.assertEqual(deleted, [True])
+        self.assertIsNone(result["system_info"])
+
     def test_omitted_default_trap_port_matches_owned_intent(self):
         from netbox_nso_plugin.models import NSOSnmpHostState
         from netbox_nso_plugin.template_content import _reconcile_snmp_config
@@ -250,6 +288,147 @@ class TestReconcileSnmpConfig(TestCase):
         row.refresh_from_db()
         self.assertEqual(row.port, 162)
         self.assertEqual(row.status, "in_sync")
+
+    def test_present_null_trap_port_matches_owned_intent(self):
+        """The adapter emits the host port as present-null, not as an absent key
+        (nso_adapter/api/snmp.py) — the owned-intent port must survive that shape too."""
+        from netbox_nso_plugin.models import NSOSnmpHostState
+        from netbox_nso_plugin.template_content import _reconcile_snmp_config
+
+        self._set_ned("arcos-v8.1.2X-nc-1.0")
+        mgmt = self._create_mgmt()
+        row = NSOSnmpHostState.objects.create(
+            management=mgmt,
+            address="198.18.0.32",
+            version="v2c",
+            notify_type="trap",
+            port=162,
+            status="accepted",
+        )
+        _reconcile_snmp_config(
+            self.device,
+            {
+                "communities": [],
+                "v3_users": [],
+                "hosts": [
+                    {
+                        "address": row.address,
+                        "version": "v2c",
+                        "notify_type": "trap",
+                        "port": None,
+                    }
+                ],
+            },
+        )
+
+        row.refresh_from_db()
+        self.assertEqual(row.port, 162)
+        self.assertEqual(row.status, "in_sync")
+
+    def test_owned_settle_does_not_clobber_concurrent_operator_edit(self):
+        """An operator edit landing between the reconciler's row load and its write must survive
+        WHOLE: its field values AND its 'accepted' status. The settle was computed against the
+        pre-edit values, so writing it would green-light intent the device has never seen."""
+        from django.db.models.signals import post_init
+
+        from netbox_nso_plugin.models import NSOSnmpHostState
+        from netbox_nso_plugin.template_content import _reconcile_snmp_config
+
+        self._set_ned("arcos-v8.1.2X-nc-1.0")
+        mgmt = self._create_mgmt()
+        row = NSOSnmpHostState.objects.create(
+            management=mgmt,
+            address="198.18.0.33",
+            version="v2c",
+            notify_type="trap",
+            port=162,
+            status="accepted",
+        )
+
+        fired = []
+
+        def _concurrent_editor(sender, instance, **kwargs):
+            # post_init = the reconciler has just SELECTed the row, so its in-memory copy is
+            # already stale when the edit lands. .update() writes straight to the DB: no
+            # post_init, hence no recursion.
+            if fired or instance.pk is None:
+                return
+            fired.append(True)
+            NSOSnmpHostState.objects.filter(pk=instance.pk).update(notify_type="inform")
+
+        post_init.connect(_concurrent_editor, sender=NSOSnmpHostState, weak=False)
+        self.addCleanup(post_init.disconnect, _concurrent_editor, sender=NSOSnmpHostState)
+
+        _reconcile_snmp_config(
+            self.device,
+            {
+                "communities": [],
+                "v3_users": [],
+                "hosts": [
+                    {
+                        "address": row.address,
+                        "version": "v2c",
+                        "notify_type": "trap",
+                    }
+                ],
+            },
+        )
+
+        row.refresh_from_db()
+        self.assertEqual(row.notify_type, "inform")
+        self.assertEqual(row.port, 162)
+        self.assertEqual(row.status, "accepted")
+
+    def test_owned_settle_does_not_follow_a_concurrent_address_rename(self):
+        """The CAS must guard the row's IDENTITY, not just its values: a host renamed between
+        the reconciler's SELECT and its write was confirmed at the OLD address only, so the
+        settle belongs to a host this row no longer is."""
+        from django.db.models.signals import post_init
+
+        from netbox_nso_plugin.models import NSOSnmpHostState
+        from netbox_nso_plugin.template_content import _reconcile_snmp_config
+
+        self._set_ned("arcos-v8.1.2X-nc-1.0")
+        mgmt = self._create_mgmt()
+        row = NSOSnmpHostState.objects.create(
+            management=mgmt,
+            address="198.18.0.35",
+            version="v2c",
+            notify_type="trap",
+            port=162,
+            status="accepted",
+        )
+
+        fired = []
+
+        def _concurrent_renamer(sender, instance, **kwargs):
+            # Only the row under test: the loop's get_or_create instantiates others too.
+            if fired or instance.pk != row.pk:
+                return
+            fired.append(True)
+            NSOSnmpHostState.objects.filter(pk=instance.pk).update(address="198.18.0.99")
+
+        post_init.connect(_concurrent_renamer, sender=NSOSnmpHostState, weak=False)
+        self.addCleanup(post_init.disconnect, _concurrent_renamer, sender=NSOSnmpHostState)
+
+        _reconcile_snmp_config(
+            self.device,
+            {
+                "communities": [],
+                "v3_users": [],
+                "hosts": [
+                    {
+                        "address": "198.18.0.35",
+                        "version": "v2c",
+                        "notify_type": "trap",
+                    }
+                ],
+            },
+        )
+
+        row.refresh_from_db()
+        self.assertEqual(row.address, "198.18.0.99")
+        self.assertEqual(row.status, "accepted")
 
     def test_package_canonical_2c_settles_owned_v2c_alias(self):
         from netbox_nso_plugin.models import NSOSnmpHostState

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 name: Release
 
 "on":
@@ -7,41 +7,163 @@ name: Release
     branches:
       - main
 
+# Never cancel a run that may already be uploading to PyPI.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
 jobs:
-  semantic-release:
-    name: Semantic Release
+  release:
+    name: Create the release
     runs-on: ubuntu-latest
+    # semantic-release needs to push its version commit and tag, then create the GitHub release.
     permissions:
       contents: write
-      issues: write
-      pull-requests: write
+    outputs:
+      released: ${{ steps.release.outputs.released || 'false' }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - name: Check out main with full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
+          ref: ${{ github.ref_name }}
           fetch-depth: 0
-          token: ${{ secrets.RELEASE_TOKEN }}
+          token: ${{ secrets.SEMANTIC_RELEASE_TOKEN || github.token }}
 
-      # actions/checkout uses --no-tags internally, which can prevent
-      # annotated tag objects from being fetched even with fetch-tags.
-      # Re-fetch explicitly so gitpython (used by semantic-release) can
-      # dereference annotated tags to their target commits.
-      # See: https://github.com/actions/checkout/issues/2309
-      - name: Fetch tags
-        run: git fetch --tags --force
+      # The branch may advance while a queued release waits. Release exactly
+      # the push that started this run; the workflow concurrency lock ensures
+      # the next push is evaluated separately.
+      - name: Reset the release branch to the triggering commit
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+        run: git reset --hard "$RELEASE_SHA"
 
-      - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
-          python-version: '3.12'
+          python-version: "3.12"
+
+      # release-please never created a tag in this repository. Establish the
+      # version declared immediately before this push as the baseline; otherwise
+      # semantic-release starts at 0.0.0 and would downgrade the existing 0.1.0.
+      - name: Establish the existing version baseline
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if git tag --list 'v[0-9]*' | grep -q .; then
+            exit 0
+          fi
+          if [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "::error::cannot establish a release baseline without the previous main commit"
+            exit 1
+          fi
+          version="$(git show "${BEFORE_SHA}:pyproject.toml" |
+            python -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["project"]["version"])')"
+          git tag "v${version}" "$BEFORE_SHA"
+          git push origin "v${version}"
+
+      # A repository whose branch rules reject GITHUB_TOKEN pushes can provide a
+      # fine-grained PAT as SEMANTIC_RELEASE_TOKEN. Checkout and semantic-release
+      # must use the same token so the version commit, tag, and release agree.
+      - name: Release from conventional commits
+        id: release
+        uses: python-semantic-release/python-semantic-release@39dd2052f2ce8282a5d932c31d58a2ca06d2550e  # v10.6.1
+        with:
+          github_token: ${{ secrets.SEMANTIC_RELEASE_TOKEN || github.token }}
+          build: false
+          changelog: true
+
+  build:
+    name: Build sdist and wheel
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the released tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+          persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
 
-      - name: Install dependencies
-        run: uv sync --group dev
+      - name: Build the distributions
+        run: uv build
 
-      - name: Run semantic-release
+      # Guards the whole version chain: semantic-release has to have bumped both
+      # pyproject.toml and netbox_nso_plugin/__init__.py (which is what
+      # PluginConfig.version reports to NetBox) to exactly the tag it cut.
+      # Versions are compared as PEP 440 objects, not strings, because a tag
+      # like v1.2.3-rc.1 legitimately normalises to 1.2.3rc1 in a filename.
+      - name: Verify the built version matches the release tag
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-        run: uv run semantic-release version --changelog --push --vcs-release
+          TAG_NAME: ${{ needs.release.outputs.tag }}
+        run: |
+          cat > "${RUNNER_TEMP}/verify_version.py" <<'PY'
+          import os, sys, zipfile
+          from pathlib import Path
+          from packaging.utils import parse_sdist_filename, parse_wheel_filename
+          from packaging.version import Version
+
+          tag = os.environ["TAG_NAME"]
+          expected = Version(tag.removeprefix("v"))
+          wheels = sorted(Path("dist").glob("*.whl"))
+          sdists = sorted(Path("dist").glob("*.tar.gz"))
+          if len(wheels) != 1 or len(sdists) != 1:
+              sys.exit(f"::error::expected one wheel and one sdist, got {[p.name for p in wheels + sdists]}")
+
+          found = {
+              wheels[0].name: parse_wheel_filename(wheels[0].name)[1],
+              sdists[0].name: parse_sdist_filename(sdists[0].name)[1],
+          }
+          with zipfile.ZipFile(wheels[0]) as whl:
+              source = whl.read("netbox_nso_plugin/__init__.py").decode()
+          declared = [ln for ln in source.splitlines() if ln.startswith("__version__")]
+          if len(declared) != 1:
+              sys.exit(f"::error::expected one __version__ line in the packaged __init__.py, got {len(declared)}")
+          found["__version__"] = Version(declared[0].split("=", 1)[1].strip().strip("\"'"))
+
+          for where, version in found.items():
+              if version != expected:
+                  sys.exit(f"::error::{where} declares {version}, but tag {tag} expects {expected}")
+              print(f"{where}: {version}")
+          PY
+          uv run --no-project --with packaging -- python "${RUNNER_TEMP}/verify_version.py"
+
+      # Hidden files are excluded by default, which keeps uv's dist/.gitignore
+      # out of the artifact and therefore out of what is uploaded to PyPI.
+      - name: Upload the distributions
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: python-package-distributions
+          path: dist/
+          if-no-files-found: error
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [release, build]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/netbox-nso-plugin
+    # Trusted Publishing: PyPI verifies this short-lived OIDC token against the
+    # publisher registered for repo + workflow file + environment. No API token.
+    # id-token: write is the only permission needed to request that OIDC token.
+    permissions:
+      id-token: write
+    steps:
+      - name: Download the distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2

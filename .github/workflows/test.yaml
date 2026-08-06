@@ -17,10 +17,10 @@ concurrency:
 
 jobs:
   test-netbox:
-    # Temporarily disabled by operator request. Keep the job/check name in place
-    # so branch-protection configuration does not need to change.
-    if: ${{ false }}
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
 
     strategy:
       fail-fast: false
@@ -36,7 +36,7 @@ jobs:
           - 6379:6379
 
       postgres:
-        image: postgres:16
+        image: postgres:16@sha256:33f923b05f64ca54ac4401c01126a6b92afe839a0aa0a52bc5aeb5cc958e5f20
         env:
           POSTGRES_USER: netbox
           POSTGRES_PASSWORD: netbox
@@ -50,38 +50,41 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           path: netbox-nso-plugin
+          persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Checkout NetBox
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: netbox-community/netbox
           path: netbox
           ref: ${{ matrix.netbox-version }}
+          persist-credentials: false
 
       - name: Install NetBox and plugin
         working-directory: netbox-nso-plugin
         run: |
           uv pip install --system -r ../netbox/requirements.txt
-          uv pip install --system pytest pytest-django tblib coverage
+          uv pip install --system pytest pytest-django pytest-cov pytest-xdist requests-mock tblib
           # netbox_routing fork: the plugin has hard FKs to its ISIS/OSPF/BGP/StaticRoute models.
           # Pinned to a commit SHA (not the mutable feature/integration branch) so CI is
           # reproducible and a fork push cannot silently change what this repo tests against.
           # This SHA is feature/integration's tip and provides the netbox_routing.helpers.isis
-          # module (NET_RE, auth_pair_errors) that views.py imports, plus migration
+          # module (NET_RE, auth_pair_errors) that views.py imports, migration
           # 0039_bgprouter_router_id (BGPRouter.router_id, BGPPeer.source/local_as/ttl,
-          # IS-IS FRR + SRv6 prefix-SID).
-          uv pip install --system "netbox-routing @ git+https://github.com/marcinpsk/netbox-routing.git@fef7d918b7949ecfa97cb6b550e65f98e578113a"
+          # IS-IS FRR + SRv6 prefix-SID), and the static-route form/serializer refusals
+          # test_static_route_refusals.py exercises.
+          uv pip install --system "netbox-routing @ git+https://github.com/marcinpsk/netbox-routing.git@dca9ed1a4a972e9dfeba95dbed10247d46eba405"
           uv pip install --system -e .
 
       - name: Set up NetBox configuration
@@ -113,13 +116,130 @@ jobs:
           }
           EOF
 
-      - name: Run tests with coverage
-        working-directory: netbox/netbox
+      - name: Run the hermetic test suite with coverage
+        working-directory: netbox-nso-plugin
         env:
           NETBOX_CONFIGURATION: netbox.configuration
-          COVERAGE_RCFILE: ../../netbox-nso-plugin/pyproject.toml
+          NETBOX_NSO_USE_REAL_NETBOX: "1"
+          PYTHONPATH: ${{ github.workspace }}/netbox/netbox
+          TEST_DB_NAME: test_netbox_nso_plugin_ci
+        # Four workers match the standard public runner's CPU allocation. The
+        # plugin conftest gives each worker an isolated PostgreSQL database.
+        # The pythonpath override replaces the ini value (devcontainer netbox +
+        # netbox_stubs): the stubs would shadow the real NetBox checkout here.
+        run: pytest -n 4 --dist loadscope --disable-warnings -o pythonpath=../netbox/netbox
+
+  live-adapter-contract:
+    name: Live adapter contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    services:
+      adapter-postgres:
+        image: postgres:16-alpine@sha256:16bc17c64a573ef34162af9298258d1aec548232985b33ed7b1eac33ba35c229
+        env:
+          POSTGRES_USER: adapter
+          POSTGRES_PASSWORD: adapter
+          POSTGRES_DB: adapter
+        options: >-
+          --health-cmd "pg_isready -U adapter -d adapter"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+        ports:
+          - 55432:5432
+
+    steps:
+      - name: Check out the plugin
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          path: netbox-nso-plugin
+          persist-credentials: false
+
+      # This compatibility job intentionally follows adapter main. A breaking
+      # adapter change should fail plugin CI before the two public repositories
+      # silently diverge.
+      - name: Check out the live adapter
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: marcinpsk/nso-adapter
+          ref: main
+          path: nso-adapter
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Build the adapter image
+        working-directory: nso-adapter
+        run: docker build --tag nso-adapter-contract:ci .
+
+      - name: Start the adapter with a real PostgreSQL store
+        env:
+          ADAPTER_DATABASE_URL: postgresql+asyncpg://adapter:adapter@127.0.0.1:55432/adapter
+          ADAPTER_TOKEN: contract-adapter-token
+          NETBOX_TOKEN: contract-netbox-token
         run: |
-          # --noinput: never block on the "destroy the old test database?" prompt
-          # (a leftover test DB would otherwise hang the job with EOFError).
-          coverage run manage.py test netbox_nso_plugin --verbosity=2 --noinput
-          coverage report
+          cat > "${RUNNER_TEMP}/adapter-contract.yaml" <<'EOF'
+          secrets:
+            provider: local
+          nso_instances: []
+          netbox:
+            base_url: http://127.0.0.1:9
+            api_token_ref: CONTRACT_NETBOX_TOKEN
+          api:
+            adapter_token_ref: CONTRACT_ADAPTER_TOKEN
+          database_url: postgresql+asyncpg://adapter:adapter@127.0.0.1:55432/adapter
+          log_level: WARNING
+          log_format: json
+          scheduler:
+            enable_nso_streams: false
+          EOF
+          docker run --detach --name nso-adapter-contract --network host \
+            --env CONFIG_FILE=/app/config.contract.yaml \
+            --env DATABASE_URL="$ADAPTER_DATABASE_URL" \
+            --env CONTRACT_ADAPTER_TOKEN="$ADAPTER_TOKEN" \
+            --env CONTRACT_NETBOX_TOKEN="$NETBOX_TOKEN" \
+            --volume "${RUNNER_TEMP}/adapter-contract.yaml:/app/config.contract.yaml:ro" \
+            nso-adapter-contract:ci \
+            uvicorn nso_adapter.main:app --host 127.0.0.1 --port 18000
+
+          ready=0
+          for _ in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:18000/healthz >/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then
+            docker logs nso-adapter-contract
+            exit 1
+          fi
+
+      - name: Install plugin contract-test dependencies
+        working-directory: netbox-nso-plugin
+        run: uv sync --group dev
+
+      - name: Exercise the real plugin-to-adapter HTTP contract
+        working-directory: netbox-nso-plugin
+        env:
+          NSO_LIVE_ADAPTER_TEST: "1"
+          NSO_LIVE_ADAPTER_URL: http://127.0.0.1:18000
+          NSO_LIVE_ADAPTER_TOKEN: contract-adapter-token
+        run: >-
+          uv run --native-tls -- pytest
+          -c /dev/null --rootdir=.
+          contract_tests/test_live_adapter_contract.py
+          --quiet
+
+      - name: Show adapter logs on failure
+        if: failure()
+        run: docker logs nso-adapter-contract

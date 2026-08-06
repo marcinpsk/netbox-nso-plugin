@@ -4,7 +4,7 @@ from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import NON_FIELD_ERRORS, ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
-from django.db import models
+from django.db import models, transaction
 from django.urls import reverse
 from netbox.models import NetBoxModel
 
@@ -506,6 +506,20 @@ class NSODeviceManagement(NetBoxModel):
     reset_pending_incarnation = models.CharField(max_length=64, blank=True, default="")
     reset_pending_born = models.DateTimeField(null=True, blank=True)
     reset_conflict_born = models.DateTimeField(null=True, blank=True)
+    # ── #1396 R3: settlement cursor + intent-push rejection record ──────────────
+    # The cursor is per-device and only meaningful within one adapter store
+    # incarnation: a rebuilt store restarts its job identifiers, so the consumer
+    # compares ``settle_cursor_incarnation`` against ``adapter_incarnation`` and
+    # resets on mismatch. Replaying an old result after a reset is harmless because
+    # intent generations are allocated from a database-global sequence.
+    settle_cursor_seq = models.BigIntegerField(null=True, blank=True)
+    settle_cursor_incarnation = models.CharField(max_length=64, blank=True, default="")
+    # Per-scope record of what an intent push was rejected with. ``intent_push_attempts``
+    # is the never-cleared per-scope high-water mark: clearing the error entry on success
+    # would take the attempt token with it, and a delayed failure from an earlier attempt
+    # would then resurrect over the newer success.
+    intent_push_errors = models.JSONField(default=dict, blank=True)
+    intent_push_attempts = models.JSONField(default=dict, blank=True)
     last_sync_at = models.DateTimeField(null=True, blank=True)
     last_sync_status = models.CharField(max_length=50, blank=True, default="")
     degraded_surfaces = models.JSONField(
@@ -578,8 +592,40 @@ class NSODeviceManagement(NetBoxModel):
         verbose_name = "NSO Device Management"
         verbose_name_plural = "NSO Device Management"
 
+    # Columns a save that does not name them must never carry — see save().
+    _PUSH_RECORD_FIELDS = ("intent_push_errors", "intent_push_attempts")
+
     def __str__(self):
         return f"{self.device} → {self.nso_instance.name}/{self.nso_device_name}"
+
+    def save(self, *args, **kwargs):
+        """Keep a full save from rewinding the intent-push record.
+
+        A full ``save()`` rewrites every column from whatever this instance held when it
+        was loaded, and several sweeps load a row, make an adapter call, and only then
+        save it (``sync_cache.reconcile_device_links``). A rejection recorded in that gap
+        would be erased — and rewinding ``intent_push_attempts`` is worse than losing the
+        message: the mark is what discards a superseded response, so lowering it lets a
+        late failure resurrect over a newer success.
+
+        Re-reading the two columns is not enough on its own — the read and the UPDATE are
+        separate statements, so a push committing between them still wins. The read is
+        therefore taken under ``select_for_update`` in a transaction that stays open
+        across ``super().save()``, which is what makes the concurrent writer wait.
+
+        A save that NAMES its fields is untouched: the two allocators write the record
+        deliberately, holding this same row lock.
+        """
+        if kwargs.get("update_fields") is not None or not self.pk:
+            return super().save(*args, **kwargs)
+        with transaction.atomic():
+            current = (
+                type(self).objects.select_for_update().filter(pk=self.pk).values(*self._PUSH_RECORD_FIELDS).first()
+            )
+            if current is not None:
+                for field in self._PUSH_RECORD_FIELDS:
+                    setattr(self, field, current[field])
+            return super().save(*args, **kwargs)
 
     def get_absolute_url(self):
         """Return the detail URL for this management record."""
@@ -1267,6 +1313,21 @@ class NSOStaticRouteState(_NSODeviceTabURLMixin, NetBoxModel):
     accepted_at = models.DateTimeField(null=True, blank=True)
     last_apply_at = models.DateTimeField(null=True, blank=True)
     last_apply_error = models.TextField(blank=True, default="")
+    # ── #1396 R3: intent generation + the settlement expectation ────────────────
+    # ``intent_generation`` is allocated from a database-global sequence
+    # (:func:`~netbox_nso_plugin.intent_generation.allocate_intent_generation`) on every
+    # content change, so no result can outlive the generation it names — not even across a
+    # delete/recreate of the management row, which the adapter's job history survives. ``0``
+    # is the unallocated sentinel: it is never put on the wire and never correlates.
+    # ``expected_*`` is what the intent PUT echoed back for the generation actually pushed;
+    # an apply result settles this row only when it matches both.
+    intent_generation = models.BigIntegerField(default=0)
+    generation_started_at = models.DateTimeField(null=True, blank=True)
+    expected_generation = models.BigIntegerField(null=True, blank=True)
+    expected_fingerprint = models.CharField(max_length=128, blank=True, default="")
+    # Why a result did not settle green (an ``unproven`` verdict's reason) — a statement
+    # about evidence, not about ownership, so it qualifies the status instead of being one.
+    last_result_advisory = models.TextField(blank=True, default="")
 
     class Meta:
         ordering = ["management", "static_route"]

@@ -5,15 +5,19 @@ and the remaining API call functions not covered by test_models.py.
 """
 
 import sys
+import threading
 import unittest
 from unittest.mock import patch
 
 import requests
-from django.test import TestCase, override_settings
+from django.db import connections
+from django.db.models.signals import post_init
+from django.test import TestCase, TransactionTestCase, override_settings
 
 from netbox_nso_plugin.models import AdapterConnection
 
 from ._adapter_http import make_response, make_session
+from .mixins import _CascadeFlushMixin
 
 _BASE_CFG = {
     "url": "http://adapter.local",
@@ -22,6 +26,76 @@ _BASE_CFG = {
     "ca_cert_path": None,
     "timeout": 30,
 }
+
+
+class TestClientResetHelpers(unittest.TestCase):
+    """Tests for public reset hooks that do not need a configured database."""
+
+    def test_reset_config_cache_discards_cached_values(self):
+        """The public hook removes both cached settings and their expiry timestamp."""
+        import netbox_nso_plugin.adapter_client as ac
+
+        self.addCleanup(ac.reset_config_cache)
+        ac._cfg_cache.update({"data": {"url": "http://stale.invalid"}, "ts": 123.0})
+
+        ac.reset_config_cache()
+
+        self.assertEqual(ac._cfg_cache, {})
+
+
+class TestResolveConfigCacheConcurrency(_CascadeFlushMixin, TransactionTestCase):
+    """Database-backed concurrency coverage for adapter config invalidation."""
+
+    @override_settings(
+        PLUGINS_CONFIG={"netbox_nso_plugin": {"adapter_token": "test-token", "adapter_url": "http://fallback.invalid"}}
+    )
+    def test_reset_during_resolve_cannot_repopulate_stale_config(self):
+        """A resolver already holding the old row must not refill the cleared cache."""
+        import netbox_nso_plugin.adapter_client as ac
+
+        ac.reset_config_cache()
+        self.addCleanup(ac.reset_config_cache)
+        AdapterConnection.objects.all().delete()
+        conn = AdapterConnection.objects.create(url="http://old-adapter.invalid", enabled=True)
+        row_loaded = threading.Event()
+        resume_resolve = threading.Event()
+        paused_once = threading.Event()
+
+        def pause_after_old_row_load(sender, instance, **kwargs):
+            if instance.pk != conn.pk or paused_once.is_set():
+                return
+            paused_once.set()
+            row_loaded.set()
+            resume_resolve.wait(timeout=10)
+
+        post_init.connect(pause_after_old_row_load, sender=AdapterConnection, weak=False)
+        self.addCleanup(post_init.disconnect, pause_after_old_row_load, sender=AdapterConnection)
+        self.addCleanup(resume_resolve.set)
+
+        results = []
+        errors = []
+
+        def resolve_config():
+            try:
+                results.append(ac._resolve_config())
+            except Exception as exc:  # noqa: BLE001 — surfaced by the main test thread
+                errors.append(exc)
+            finally:
+                connections.close_all()
+
+        resolver = threading.Thread(target=resolve_config, daemon=True)
+        resolver.start()
+        self.assertTrue(row_loaded.wait(timeout=10), "resolver never loaded the old AdapterConnection row")
+
+        AdapterConnection.objects.filter(pk=conn.pk).update(url="http://new-adapter.invalid")
+        ac.reset_config_cache()
+        resume_resolve.set()
+        resolver.join(timeout=10)
+
+        self.assertFalse(resolver.is_alive(), "resolver did not finish")
+        self.assertEqual(errors, [])
+        self.assertEqual(results[0]["url"], "http://new-adapter.invalid")
+        self.assertEqual(ac._cfg_cache["data"]["url"], "http://new-adapter.invalid")
 
 
 def _mock_response(status_code=200, json_data=None, content=None):
@@ -43,7 +117,7 @@ class TestResolveConfig(TestCase):
         # test's AdapterConnection state is explicit.
         import netbox_nso_plugin.adapter_client as ac
 
-        ac._cfg_cache.clear()
+        ac.reset_config_cache()
         AdapterConnection.objects.all().delete()
 
     @override_settings(

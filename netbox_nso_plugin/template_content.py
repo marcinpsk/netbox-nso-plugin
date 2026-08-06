@@ -542,17 +542,24 @@ def _reconcile_snmp_system_info(mgmt, sys_data: dict, now):
     state, _ = NSOSnmpSystemInfoState.objects.get_or_create(management=mgmt)
     dev_location = sys_data.get("location") or ""
     dev_contact = sys_data.get("contact") or ""
-    state.last_sync_at = now
     if sm.is_owned(state.status):
         # Owned: location/contact are operator intent — never clobber with the
         # device read; settle accepted → in_sync only when the device matches.
         matches = state.location == dev_location and state.contact == dev_contact
-        state.status = sm.on_reconcile(state.status, matches=matches)
+        # CAS: settle only if the row still holds the values `matches` saw — a concurrent edit wins wholesale
+        NSOSnmpSystemInfoState.objects.filter(
+            pk=state.pk, status=state.status, location=state.location, contact=state.contact
+        ).update(status=sm.on_reconcile(state.status, matches=matches), last_sync_at=now)
+        try:
+            state.refresh_from_db()
+        except NSOSnmpSystemInfoState.DoesNotExist:
+            return None
     else:
+        state.last_sync_at = now
         state.location = dev_location
         state.contact = dev_contact
         state.status = sm.on_reconcile(state.status, matches=None)
-    state.save()
+        state.save()
     return state
 
 
@@ -595,8 +602,7 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
         state, _ = NSOSnmpCommunityState.objects.get_or_create(management=mgmt, community_hash=h)
         dev_access = entry.get("access") or "RO"
         dev_acl = entry.get("acl") or ""
-        state.has_secret = bool(entry.get("has_secret", True))
-        state.last_sync_at = now
+        dev_has_secret = bool(entry.get("has_secret", True))
         if sm.is_owned(state.status):
             # Owned: access/acl are operator intent — never clobber them with the
             # device read (the next snapshot push would silently revert the edit).
@@ -607,12 +613,27 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
             matches = None
             if value_compare and state.vault_secret_hash:
                 matches = state.vault_secret_hash == h and state.access == dev_access and state.acl == dev_acl
-            state.status = sm.on_reconcile(state.status, matches=matches)
+            # CAS: settle only if the row still holds the identity + values `matches` saw —
+            # a concurrent edit (a rekey included) wins wholesale
+            NSOSnmpCommunityState.objects.filter(
+                pk=state.pk,
+                community_hash=h,
+                status=state.status,
+                access=state.access,
+                acl=state.acl,
+                vault_secret_hash=state.vault_secret_hash,
+            ).update(
+                status=sm.on_reconcile(state.status, matches=matches),
+                last_sync_at=now,
+                has_secret=dev_has_secret,
+            )
         else:
+            state.has_secret = dev_has_secret
+            state.last_sync_at = now
             state.access = dev_access
             state.acl = dev_acl
             state.status = sm.on_reconcile(state.status, matches=None)
-        state.save()
+            state.save()
     # Owned rows absent from the payload must SURVIVE (an operator-created or
     # just-rotated row would otherwise lose its vault_ref/status mid-flight
     # between Accept and the device reporting the new value) — but they must DRIFT,
@@ -631,7 +652,7 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
         state.has_priv_secret = bool(entry.get("has_priv_secret", False))
         state.last_sync_at = now
         state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
-        state.save()
+        state.save(update_fields=["has_auth_secret", "has_priv_secret", "last_sync_at", "status"])
     _retire_absent_snmp_rows(NSOSnmpV3UserState, mgmt, "username", incoming_usernames)
 
     # ── Hosts ──────────────────────────────────────────────────────────────────
@@ -653,7 +674,6 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
             # host pushable at all: both NSO writers key the receiver on the user name.
             "username": entry.get("username") or "",
         }
-        state.last_sync_at = now
         if sm.is_owned(state.status):
             # Owned: attributes are operator intent — settle only when the device
             # reports exactly the intent values, never overwrite them.
@@ -663,12 +683,17 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
                 or getattr(state, f) == v
                 for f, v in dev.items()
             )
-            state.status = sm.on_reconcile(state.status, matches=matches)
+            # CAS: settle only if the row still holds the identity + values `matches` saw —
+            # a concurrent edit (a rename included) wins wholesale
+            NSOSnmpHostState.objects.filter(
+                pk=state.pk, address=address, status=state.status, **{f: getattr(state, f) for f in dev}
+            ).update(status=sm.on_reconcile(state.status, matches=matches), last_sync_at=now)
         else:
+            state.last_sync_at = now
             for f, v in dev.items():
                 setattr(state, f, v)
             state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
-        state.save()
+            state.save()
     _retire_absent_snmp_rows(NSOSnmpHostState, mgmt, "address", incoming_addresses)
 
     system_info_state = _reconcile_snmp_system_info(mgmt, payload.get("system_info") or {}, now)
@@ -724,17 +749,21 @@ def _reconcile_logging_levels(mgmt, levels_data: dict, now):
 
     state, _ = NSOLoggingLevelState.objects.get_or_create(management=mgmt)
     dev = {f: (levels_data.get(f) or "") for f in NSOLoggingLevelState.SEVERITY_FIELDS}
-    state.last_sync_at = now
     if sm.is_owned(state.status):
         # Owned: severities are operator intent — never clobber with the device
         # read; settle accepted → in_sync only when the device matches exactly.
         matches = all(getattr(state, f) == v for f, v in dev.items())
-        state.status = sm.on_reconcile(state.status, matches=matches)
+        # CAS: settle only if the row still holds the values `matches` saw — a concurrent edit wins wholesale
+        NSOLoggingLevelState.objects.filter(
+            pk=state.pk, status=state.status, **{f: getattr(state, f) for f in dev}
+        ).update(status=sm.on_reconcile(state.status, matches=matches), last_sync_at=now)
+        state.refresh_from_db()
     else:
+        state.last_sync_at = now
         for f, v in dev.items():
             setattr(state, f, v)
         state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
-    state.save()
+        state.save()
     return state
 
 
@@ -788,8 +817,23 @@ def _canonical_logging_field(ned_id: str, field: str, value):
     if field == "facility":
         if ned_id.startswith("arcos-"):
             return "ALL" if token == "any" else token.upper()
+        if ned_id.startswith("cisco-nx-cli") and token == "local7":
+            # NX accepts explicit local7 but normalizes it out of running config.
+            # Treat the operator token and the reader's omission as one value so
+            # apply settles and the next push does not materialize permanent drift.
+            return ""
         return token
     return value
+
+
+def _canonical_logging_intent_field(ned_id: str, field: str, value):
+    """Canonicalize a logging token without erasing explicit write semantics."""
+    token = str(value).lower() if value not in (None, "") else value
+    if field == "facility" and ned_id.startswith("cisco-nx-cli") and token == "local7":
+        # The reader omits NX's local7 device default, but the writer needs the
+        # explicit token to retract an adopted non-default facility.
+        return token
+    return _canonical_logging_field(ned_id, field, value)
 
 
 def _reconcile_logging_config(device, payload: dict) -> dict:
@@ -837,7 +881,6 @@ def _reconcile_logging_config(device, payload: dict) -> dict:
             "vrf": h.get("vrf") or "",
             "source": h.get("source") or "",
         }
-        state.last_sync_at = now
         if sm.is_owned(state.status):
             # Owned: field values are operator intent — never clobber with the
             # device read; settle only when the device reports the intent exactly.
@@ -846,12 +889,17 @@ def _reconcile_logging_config(device, payload: dict) -> dict:
                 or _canonical_logging_field(ned_id, f, getattr(state, f)) == v
                 for f, v in dev.items()
             )
-            state.status = sm.on_reconcile(state.status, matches=matches)
+            # CAS: settle only if the row still holds the identity + values `matches` saw —
+            # a concurrent edit (a rename included) wins wholesale
+            NSOLoggingHostState.objects.filter(
+                pk=state.pk, address=addr, status=state.status, **{f: getattr(state, f) for f in dev}
+            ).update(status=sm.on_reconcile(state.status, matches=matches), last_sync_at=now)
         else:
+            state.last_sync_at = now
             for f, v in dev.items():
                 setattr(state, f, v)
             state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
-        state.save()
+            state.save()
 
     levels_state = _reconcile_logging_levels(mgmt, payload.get("local_levels") or {}, now)
 
@@ -1011,13 +1059,16 @@ def _reconcile_static_routes(device, payload: dict) -> list:
             on_device = True
         desired_metric = _static_route_metric(entry, device)
         metric_matches = route.metric == desired_metric
+        # `tag` is compared on the same terms as `metric` (#1381): checking metric alone
+        # left a device tag against an untagged NetBox route reading as fully in sync.
+        tag_matches = route.tag == entry.get("tag")
         # StaticRoute is shared across all associated devices.  A refresh from
-        # one platform must never rewrite its metric to that platform's default:
-        # another device may have a different effective default.  Keep the
-        # shared intent and surface the per-device mismatch through this state.
+        # one platform must never rewrite its metric or tag to that platform's
+        # value: another device may legitimately differ.  Keep the shared intent
+        # and surface the per-device mismatch through this state.
         state.status = sm.on_reconcile(
             state.status,
-            matches=on_device and metric_matches,
+            matches=on_device and metric_matches and tag_matches,
             conflict=not on_device,
             settles_owned=False,
         )

@@ -72,6 +72,7 @@ describe("static route grid", () => {
       "_destination",
       "next_hop",
       "_policy",
+      "_result",
       "state",
       "last_sync",
       "accept_url",
@@ -107,5 +108,70 @@ describe("static route grid", () => {
     expect(destination.querySelector("a")).toBeNull();
     expect(destination.textContent).toContain("203.0.113.0/24");
     expect(policy.querySelector(".nso-popedit")).toBeNull();
+  });
+
+  /* P6.6 — an owned row the apply failed must not read as an ordinary pending row with no
+   * words. The server already gives it the apply_failed state; the grid owes the reason. */
+  it("renders a failed route's own error message, not a bare state chip", () => {
+    const row = {
+      vrf: "global",
+      prefix: "203.0.113.0/24",
+      next_hop: "192.0.2.2",
+      metric: 1,
+      route: null,
+      edit_url: null,
+      state: "apply_failed",
+      error: "static_route_send_failed: NED rejected the route",
+      advisory: null,
+    };
+    const table = mount(row);
+    const result = table.config.columns.find((column) => column.field === "_result").formatter(cell(row));
+
+    expect(result.textContent).toContain("apply failed");
+    expect(result.textContent).toContain("NED rejected the route");
+    expect(result.querySelector(".badge").className).toContain("text-bg-danger");
+  });
+
+  /* P6.7 — `unproven` is a statement about EVIDENCE, not about ownership: it may render
+   * neither green nor failed, and it must carry its reason rather than pass silently. */
+  it("qualifies an unproven verdict with its advisory instead of a green or failed badge", () => {
+    const row = {
+      vrf: "global",
+      prefix: "203.0.113.0/24",
+      next_hop: "192.0.2.2",
+      metric: 1,
+      route: null,
+      edit_url: null,
+      state: "pending",
+      error: null,
+      advisory: "verification disabled — nothing proves this route landed",
+    };
+    const table = mount(row);
+    const result = table.config.columns.find((column) => column.field === "_result").formatter(cell(row));
+    const badgeClass = result.querySelector(".badge").className;
+
+    expect(result.textContent).toContain("unproven");
+    expect(result.textContent).toContain("nothing proves this route landed");
+    expect(badgeClass).not.toContain("text-bg-success");
+    expect(badgeClass).not.toContain("text-bg-danger");
+  });
+
+  it("leaves the result column empty for a route with no verdict to report", () => {
+    const row = {
+      vrf: "global",
+      prefix: "203.0.113.0/24",
+      next_hop: "192.0.2.2",
+      metric: 1,
+      route: null,
+      edit_url: null,
+      state: "in_sync",
+      error: null,
+      advisory: null,
+    };
+    const table = mount(row);
+    const result = table.config.columns.find((column) => column.field === "_result").formatter(cell(row));
+
+    expect(result.querySelector(".badge")).toBeNull();
+    expect(result.textContent.trim()).toBe("—");
   });
 });

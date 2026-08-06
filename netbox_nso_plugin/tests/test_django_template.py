@@ -231,7 +231,7 @@ class TestUpsertInterfaceStates(TestCase):
                         "description": {
                             "nso_value": "desc",
                             "status": "in_sync",
-                            "last_apply_at": "2025-01-01T12:00:00+00:00",
+                            "last_apply_at": "2025-01-01T12:00:00Z",
                         }
                     },
                 }

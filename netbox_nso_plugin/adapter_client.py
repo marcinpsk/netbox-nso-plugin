@@ -9,6 +9,7 @@ Config resolution (per call, ~30 s in-process cache):
 
 import contextvars
 import logging
+import threading
 import time
 from contextlib import contextmanager
 
@@ -56,6 +57,8 @@ def delete_origin_pushes():
 
 _CACHE_TTL = 30  # seconds
 _cfg_cache: dict = {}
+_cfg_cache_lock = threading.Lock()
+_cfg_cache_generation = 0
 # Distinguishes "caller did not supply this field" (omit → adapter preserves it) from an
 # explicit ``None`` (send null → adapter clears it). Used by set_scope's failover IPs.
 _UNSET = object()
@@ -96,6 +99,14 @@ def reset_session():
     _session_cls = None
 
 
+def reset_config_cache():
+    """Discard cached adapter settings so the next request resolves them again."""
+    global _cfg_cache_generation
+    with _cfg_cache_lock:
+        _cfg_cache_generation += 1
+        _cfg_cache.clear()
+
+
 class AdapterError(Exception):
     """Raised when the nso-adapter returns an error or is unreachable."""
 
@@ -107,47 +118,53 @@ class AdapterError(Exception):
 
 def _resolve_config() -> dict:
     """Return resolved config dict, using a short in-process cache."""
-    now = time.monotonic()
-    cached = _cfg_cache.get("data")
-    if cached and (_cfg_cache.get("ts", 0) + _CACHE_TTL > now):
-        return cached
+    while True:
+        now = time.monotonic()
+        with _cfg_cache_lock:
+            cached = _cfg_cache.get("data")
+            if cached and (_cfg_cache.get("ts", 0) + _CACHE_TTL > now):
+                return cached
+            generation = _cfg_cache_generation
 
-    plugin_cfg = settings.PLUGINS_CONFIG.get("netbox_nso_plugin", {})
-    # Token is ALWAYS from env/PLUGINS_CONFIG — never the DB.
-    token = plugin_cfg.get("adapter_token", "")
+        plugin_cfg = settings.PLUGINS_CONFIG.get("netbox_nso_plugin", {})
+        # Token is ALWAYS from env/PLUGINS_CONFIG — never the DB.
+        token = plugin_cfg.get("adapter_token", "")
 
-    # Try AdapterConnection singleton for URL and non-secret settings.
-    conn = None
-    try:
-        from .models import AdapterConnection  # noqa: PLC0415
+        # Try AdapterConnection singleton for URL and non-secret settings.
+        conn = None
+        try:
+            from .models import AdapterConnection  # noqa: PLC0415
 
-        conn = AdapterConnection.objects.filter(enabled=True).first()
-    except Exception as exc:  # noqa: BLE001 — DB may be mid-migration; fall back to PLUGINS_CONFIG
-        # Log so a real DB error isn't silently masked as a config fallback (which would surface
-        # later as a misleading "Adapter URL is not configured").
-        logger.debug("AdapterConnection lookup failed, falling back to PLUGINS_CONFIG: %s", exc)
+            conn = AdapterConnection.objects.filter(enabled=True).first()
+        except Exception as exc:  # noqa: BLE001 — DB may be mid-migration; fall back to PLUGINS_CONFIG
+            # Log so a real DB error isn't silently masked as a config fallback (which would surface
+            # later as a misleading "Adapter URL is not configured").
+            logger.debug("AdapterConnection lookup failed, falling back to PLUGINS_CONFIG: %s", exc)
 
-    if conn:
-        url = conn.url or plugin_cfg.get("adapter_url", "")
-        verify_tls = conn.verify_tls
-        ca_cert_path = conn.ca_cert_path or None
-        timeout = conn.timeout_seconds
-    else:
-        url = plugin_cfg.get("adapter_url", "")
-        verify_tls = True
-        ca_cert_path = None
-        timeout = 30
+        if conn:
+            url = conn.url or plugin_cfg.get("adapter_url", "")
+            verify_tls = conn.verify_tls
+            ca_cert_path = conn.ca_cert_path or None
+            timeout = conn.timeout_seconds
+        else:
+            url = plugin_cfg.get("adapter_url", "")
+            verify_tls = True
+            ca_cert_path = None
+            timeout = 30
 
-    data = {
-        "url": url.rstrip("/") if url else "",
-        "token": token,
-        "verify_tls": verify_tls,
-        "ca_cert_path": ca_cert_path,
-        "timeout": timeout,
-    }
-    _cfg_cache["data"] = data
-    _cfg_cache["ts"] = now
-    return data
+        data = {
+            "url": url.rstrip("/") if url else "",
+            "token": token,
+            "verify_tls": verify_tls,
+            "ca_cert_path": ca_cert_path,
+            "timeout": timeout,
+        }
+        with _cfg_cache_lock:
+            if generation != _cfg_cache_generation:
+                continue
+            _cfg_cache["data"] = data
+            _cfg_cache["ts"] = now
+            return data
 
 
 def _request(method, path, **kwargs):
@@ -325,6 +342,11 @@ def delete_device(adapter_device_id):
 def get_device(adapter_device_id):
     """GET /api/v1/devices/{id}."""
     return _request("GET", f"/api/v1/devices/{adapter_device_id}")
+
+
+def list_devices():
+    """GET /api/v1/devices — every device the adapter knows, across all NSO instances."""
+    return _request("GET", "/api/v1/devices")
 
 
 def get_interfaces(adapter_device_id):

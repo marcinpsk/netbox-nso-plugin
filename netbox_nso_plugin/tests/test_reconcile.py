@@ -2,6 +2,7 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for the off-request reconcile job and the sync-complete callback endpoint."""
 
+import os
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
@@ -220,7 +221,8 @@ class TestEscalateStuckDeploying(APITestCase):
 
     @staticmethod
     def _job(status="succeeded", minutes_ago=30, job_id=900):
-        # The adapter serializes timestamps as naive-UTC isoformat + "Z" (api/jobs.py).
+        # The adapter serializes every wire timestamp as UTC isoformat + "Z" (api/jobs.py),
+        # fractional seconds included — the shape the escalation's clock has to parse.
         from datetime import timedelta
 
         from django.utils import timezone
@@ -605,6 +607,63 @@ class TestRoutePolicyApplySettle(APITestCase):
             push.assert_called_once_with(mgmt.device_id, mgmt.adapter_device_id, force=True)
 
 
+class TestSnmpApplyForcePush(APITestCase):
+    """SNMP intent is mirrored reactively on accept, and _push_changed swallows a failed PUT —
+    so a device whose accept-time push failed has no adapter intent at all. Apply is the only
+    recovery, exactly as for logging hosts, and must force-push the owned SNMP snapshot.
+
+    The refresh must be STORE-ONLY: a plain put_snmp_intent enqueues the shrink-removal job
+    (and auto-apply on auto_apply devices), and _prepare_apply runs before trigger_apply —
+    whose _trigger 409s while any job is active, so the recovery would kill the Apply it serves.
+    """
+
+    def test_prepare_apply_force_pushes_snmp_snapshot(self):
+        from netbox_nso_plugin import adapter_client
+        from netbox_nso_plugin.models import NSOSnmpHostState
+        from netbox_nso_plugin.views import _prepare_apply
+
+        device = _make_device("snmp-apply")
+        inst, _ = NSOInstance.objects.get_or_create(
+            name="snmp-apply-inst", defaults={"adapter_instance_id": "snmp-apply-inst"}
+        )
+        mgmt = NSODeviceManagement.objects.create(
+            device=device, nso_instance=inst, nso_device_name="snmp-apply", adapter_device_id=91
+        )
+        NSOSnmpHostState.objects.create(
+            management=mgmt,
+            address="198.18.0.40",
+            version="v2c",
+            notify_type="trap",
+            community_hash="abcd1234abcd1234",
+            status="accepted",
+        )
+        seen = {}
+
+        def _record_store_only(*args, **kwargs):
+            seen["store_only"] = adapter_client._store_only_push.get()
+
+        with (
+            patch("netbox_nso_plugin.signals._push_interface_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_lacp_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_switchport_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_vlan_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_svi_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_subinterface_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_bfd_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_interface_mtu_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_route_policy_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_static_route_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_l2_sap_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_logging_intent_for_device"),
+            patch("netbox_nso_plugin.adapter_client.put_snmp_intent", side_effect=_record_store_only) as put_snmp,
+        ):
+            _prepare_apply(mgmt)
+        put_snmp.assert_called_once()
+        self.assertEqual(put_snmp.call_args.args[0], mgmt.adapter_device_id)
+        self.assertEqual([h["address"] for h in put_snmp.call_args.args[3]], ["198.18.0.40"])
+        self.assertTrue(seen.get("store_only"))
+
+
 class TestApplyRollbackOnAdapterError(APITestCase):
     """A failed Apply (adapter unreachable / 500 — no job enqueued) must roll the rows
     _prepare_apply moved accepted→deploying back to accepted. Otherwise they are stuck
@@ -780,7 +839,7 @@ class TestEnqueueDeviceReconcileWiring(TestCase):
     """
 
     _DEV = 987654  # won't collide with any real nso-reconcile-<id> job hash
-    _QUEUE = "nso-test-reconcile-wiring"
+    _QUEUE = f"nso-test-reconcile-wiring-{os.environ.get('NETBOX_NSO_REDIS_KEY_NAMESPACE', 'local')}"
 
     def _queue(self):
         import django_rq
@@ -791,6 +850,7 @@ class TestEnqueueDeviceReconcileWiring(TestCase):
 
     def setUp(self):
         super().setUp()
+        self._detached_jobs = []
         self._clear()
 
     def tearDown(self):
@@ -801,9 +861,10 @@ class TestEnqueueDeviceReconcileWiring(TestCase):
         from netbox_nso_plugin.read_gate import carrier_key, marker_key
 
         q = self._queue()
-        for job in q.jobs:
+        q.delete(delete_jobs=True)
+        for job in self._detached_jobs:
             job.delete()
-        q.empty()
+        self._detached_jobs.clear()
         q.connection.delete(carrier_key(self._DEV))
         q.connection.delete(marker_key(self._DEV))
 
@@ -837,6 +898,7 @@ class TestEnqueueDeviceReconcileWiring(TestCase):
         q = self._queue()
         with patch("django_rq.get_queue", return_value=q):
             first = enqueue_device_reconcile(self._DEV)
+            self._detached_jobs.append(first)
             q.remove(first.id)  # worker popped it; pointer still references it
             second = enqueue_device_reconcile(self._DEV)
         self.assertNotEqual(first.id, second.id)
@@ -851,11 +913,29 @@ class TestEnqueueDeviceReconcileWiring(TestCase):
         q = self._queue()
         with patch("django_rq.get_queue", return_value=q):
             first = enqueue_device_reconcile(self._DEV)
+            self._detached_jobs.append(first)
             q.remove(first.id)
             RqJob.fetch(first.id, connection=q.connection).set_status("finished")
             second = enqueue_device_reconcile(self._DEV)
         self.assertIsNotNone(second)
         self.assertIn(second.id, q.get_job_ids())
+
+    def test_clear_deletes_queue_registry_and_detached_job(self):
+        """Per-run queues and jobs already popped from them must not accumulate in Redis."""
+        from netbox_nso_plugin.reconcile import enqueue_device_reconcile
+
+        q = self._queue()
+        with patch("django_rq.get_queue", return_value=q):
+            detached = enqueue_device_reconcile(self._DEV)
+        q.remove(detached.id)
+        self._detached_jobs = [detached]
+        self.assertTrue(q.connection.sismember(q.redis_queues_keys, q.key))
+        self.assertTrue(q.connection.exists(detached.key))
+
+        self._clear()
+
+        self.assertFalse(q.connection.sismember(q.redis_queues_keys, q.key))
+        self.assertFalse(q.connection.exists(detached.key))
 
 
 class TestNotifyClassLeaseBudget(TestCase):
