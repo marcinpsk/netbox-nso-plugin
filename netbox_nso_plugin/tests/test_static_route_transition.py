@@ -10,94 +10,21 @@ through P2.12 (P2.7's (b)/(c) provenance arms ship with Appendix O).
 
 from __future__ import annotations
 
-import contextlib
 import threading
 from unittest.mock import patch
 
-from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.contrib.auth import get_user_model
 from django.db import connection, transaction
 from django.test import TestCase, TransactionTestCase
 from django.urls import reverse
-from django.utils import timezone
 
 from netbox_nso_plugin import adapter_client as _adapter_client
 
+from ._static_route_case import PUT, _fixtures, _make_device, _make_mgmt, _own, _route
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
-PUT = "netbox_nso_plugin.adapter_client.put_static_route_intent"
 #: Captured at import, before any test can patch it — see ``_assert_put_patch_did_not_leak``.
 _REAL_PUT = _adapter_client.put_static_route_intent
-
-
-def _make_device(tag: str, index: int = 1):
-    mfg, _ = Manufacturer.objects.get_or_create(name=f"Tr{tag}Mfg", slug=f"tr{tag}mfg")
-    dt, _ = DeviceType.objects.get_or_create(manufacturer=mfg, model=f"Tr{tag}Dev", slug=f"tr{tag}dev")
-    role, _ = DeviceRole.objects.get_or_create(name=f"Tr{tag}Role", slug=f"tr{tag}role")
-    site, _ = Site.objects.get_or_create(name=f"Tr{tag}Site", slug=f"tr{tag}site")
-    return Device.objects.create(name=f"tr-{tag}-rtr-{index}", device_type=dt, role=role, site=site)
-
-
-def _make_mgmt(device, tag: str, adapter_device_id: int):
-    from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
-
-    inst, _ = NSOInstance.objects.get_or_create(
-        name=f"tr-{tag}-inst", defaults={"adapter_instance_id": f"tr-{tag}-inst"}
-    )
-    return NSODeviceManagement.objects.create(
-        device=device,
-        nso_instance=inst,
-        nso_device_name=f"nso-tr-{tag}-{device.pk}",
-        adapter_device_id=adapter_device_id,
-    )
-
-
-@contextlib.contextmanager
-def _fixtures():
-    """Build fixtures with the adapter patched out, then clear the coalescer.
-
-    Creating an overlay fires its own push, which inside a ``TestCase``'s ambient atomic
-    block lands in the thread-local pending map that only an ``on_commit`` drain clears.
-    That drain is registered outside the assertion's ``captureOnCommitCallbacks()``, so it
-    never runs there — and the still-populated map then suppresses the registration the
-    transition's own push needs (the pre-existing rollback leak; Appendix O owns the fix).
-    """
-    from netbox_nso_plugin.signals import reset_intent_push_state
-
-    with patch(PUT):
-        yield
-    reset_intent_push_state()
-
-
-def _route(prefix, next_hop, *, vrf=None, metric=1, devices=()):
-    """Create a route already assigned to *devices*, without owning it (brownfield shape)."""
-    from netbox_routing.models import StaticRoute
-
-    from netbox_nso_plugin.signals import suppress_intent_push
-
-    sr = StaticRoute.objects.create(prefix=prefix, next_hop=next_hop, vrf=vrf, metric=metric)
-    if devices:
-        with suppress_intent_push():
-            sr.devices.add(*devices)
-    return sr
-
-
-def _own(sr, mgmt, *, status="in_sync", mirror_vrf=None):
-    """Create the overlay the reconciler would have, already carrying a generation."""
-    from netbox_nso_plugin.intent_generation import allocate_intent_generation
-    from netbox_nso_plugin.models import NSOStaticRouteState
-
-    return NSOStaticRouteState.objects.create(
-        management=mgmt,
-        static_route=sr,
-        status=status,
-        nso_vrf=mirror_vrf if mirror_vrf is not None else (sr.vrf.name if sr.vrf else ""),
-        nso_prefix=str(sr.prefix or ""),
-        nso_next_hop=str(sr.next_hop or ""),
-        accepted_at=timezone.now(),
-        intent_generation=allocate_intent_generation(),
-        generation_started_at=timezone.now(),
-    )
 
 
 class TestStaticRouteContentTransition(IntentPushResetMixin, TestCase):
