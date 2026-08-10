@@ -565,7 +565,7 @@ def abandon(claim: Claim) -> str:
 # ── The drain ─────────────────────────────────────────────────────────────────
 
 
-def drain_key(device_id, scope, *, mode=delivery.MODE_NORMAL, force=False, chain=DRAIN_CHAIN_MAX) -> str:
+def drain_key(device_id, scope, *, mode=delivery.MODE_NORMAL, force=False, chain=DRAIN_CHAIN_MAX, reform=1) -> str:
     """Claim, send and settle one key, then chain a bounded number of further drains."""
     _refuse_in_transaction("drain")
     claimed = _claim_or_wait(device_id, scope, mode=mode, force=force)
@@ -576,6 +576,11 @@ def drain_key(device_id, scope, *, mode=delivery.MODE_NORMAL, force=False, chain
     except Exception as exc:  # noqa: BLE001 (the operation is replayed, so the failure is data)
         logger.warning("push_seq %s failed for %s/%s: %s", claimed.push_seq, device_id, scope, exc)
         return record_failure(claimed, exc)
+    if answer == ABANDONED and reform > 0:
+        # A fixed revocation resolves in ONE re-form: the re-form folds the revoking entry
+        # with everything else, so the authority no longer names that route. A revocation
+        # committing during the re-form is the accepted OQ-O-7 residual, not a loop.
+        return drain_key(device_id, scope, mode=mode, force=force, chain=chain, reform=reform - 1)
     if answer in (PARKED, ABANDONED):
         return answer
     outcome = settle(claimed, answer)
