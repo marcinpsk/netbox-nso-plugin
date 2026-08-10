@@ -2197,7 +2197,8 @@ class NSOOnboardView(NSOActionPermissionMixin, View):
         try:
             result = onboard_candidate(device, instance, ned_id=ned_id)
         except Exception as exc:  # never 500 the action
-            messages.error(request, f"Onboarding {device} failed: {exc}")
+            logger.exception("onboard action failed for device %s", device.pk)
+            messages.error(request, f"Onboarding {device} failed ({type(exc).__name__}); see the server log.")
             return redirect(f"{redirect_url}?instance={instance.adapter_instance_id}")
 
         if result["ok"]:
@@ -2242,7 +2243,8 @@ class NSOQuickManageView(NSOActionPermissionMixin, View):
         try:
             result = manage_existing(device, instance, nso_name)
         except Exception as exc:  # never 500 the action
-            messages.error(request, f"Managing {device} failed: {exc}")
+            logger.exception("manage action failed for device %s", device.pk)
+            messages.error(request, f"Managing {device} failed ({type(exc).__name__}); see the server log.")
             return redirect(f"{redirect_url}?instance={instance.adapter_instance_id}")
 
         if result["ok"]:
