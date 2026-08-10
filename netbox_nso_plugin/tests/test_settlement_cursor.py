@@ -12,6 +12,7 @@ and a module global are indistinguishable from inside one process.
 from __future__ import annotations
 
 import os
+import pathlib
 import subprocess
 import sys
 import threading
@@ -501,16 +502,22 @@ class TestStaleFullSaveCannotRewindTheCursor(_SettlementCase):
         """Asserted explicitly: a settlement column added later cannot miss the refresh."""
         from netbox_nso_plugin.models import NSODeviceManagement
 
-        written = {
-            "settle_cursor_seq",
-            "settle_cursor_incarnation",
-            "settle_cursor_device_id",
-            "settle_stall_seq",
-            "settle_stall_attempts",
-            "settle_stall_first_seen_at",
-            "adapter_link_attempted_at",
-        }
-        assert written <= set(NSODeviceManagement._STALE_SAVE_PROTECTED_FIELDS)
+        # Derived from the model, not written out: a hand-written list is exactly what a new
+        # settle_* column would be left out of.
+        written = {f.name for f in NSODeviceManagement._meta.concrete_fields if f.name.startswith("settle_")}
+        written.add("adapter_link_attempted_at")
+        protected = set(NSODeviceManagement._STALE_SAVE_PROTECTED_FIELDS)
+        assert written <= protected, f"unprotected against a stale full save: {sorted(written - protected)}"
+
+
+def _manage_py_dir():
+    """The directory the NetBox ``manage.py`` lives in, taken from the installed package."""
+    import netbox
+
+    root = pathlib.Path(netbox.__file__).resolve().parents[1]
+    # No skip on absence: this pin is the only durable-stall evidence, so it must fail loud.
+    assert (root / "manage.py").is_file(), f"no manage.py under {root} — the durable-stall pin cannot run"
+    return root
 
 
 class TestDurableStallAcrossProcesses(_SettlementCase):
@@ -530,7 +537,7 @@ class TestDurableStallAcrossProcesses(_SettlementCase):
                 "--passes",
                 str(passes),
             ],
-            cwd="/opt/netbox/netbox",
+            cwd=_manage_py_dir(),
             env=env,
             capture_output=True,
             text=True,
