@@ -384,7 +384,9 @@ class TestStaticRouteBulkAcceptOutsideATransaction(_CascadeFlushMixin, IntentPus
         original, injected = QuerySet.update, []
 
         def _reclassify_then_update(self, **kwargs):
-            if not injected:
+            # The accept UPDATE only: the imported -> in_sync pass runs first, and injecting
+            # there lands outside the window this pin is about.
+            if not injected and kwargs.get("status") == "accepted":
                 injected.append(True)
                 original(NSOStaticRouteState.objects.filter(pk=state.pk), status="imported")
             return original(self, **kwargs)
