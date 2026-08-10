@@ -74,7 +74,7 @@ class ConsumeResult:
     stalled: bool
     #: the stall bound was reached, so the cursor advanced past a sequence that never resolved
     advanced_past_stall: bool
-    #: the epoch changed, so the cursor and the stall triple were reset and the page re-requested
+    #: the epoch changed, so the cursor and the stall triple were reset
     epoch_reset: bool
     cursor: int | None
     #: the walk reached the END of the feed: nothing is stalled and no further page is owed.
@@ -188,14 +188,16 @@ def _consume_locked(row) -> ConsumeResult:
             device_id,
             cursor,
         )
-        cursor = 0
         _clear_stall(row)
-        # Re-request from the start rather than applying a cursor that belongs to a store
-        # or a device this page is not about. The header of the page actually consumed is
-        # the one recorded, so a store that changes again mid-pass is recorded correctly.
-        jobs, incarnation = adapter_client.get_settlement_feed(
-            device_id, after_settle_seq=cursor, limit=SETTLE_FEED_PAGE
-        )
+        if cursor:
+            # The page in hand was requested from a cursor that belongs to a store or a
+            # device it is not about, so ask again from the start. Only the header of the
+            # page actually consumed is recorded, so a store that changes again mid-pass
+            # is recorded correctly. A cursor already at 0 asked for that page already.
+            cursor = 0
+            jobs, incarnation = adapter_client.get_settlement_feed(
+                device_id, after_settle_seq=cursor, limit=SETTLE_FEED_PAGE
+            )
 
     consumed = 0
     stalled = False
@@ -291,7 +293,14 @@ def _settle_job(row, device_id: int, job: dict) -> bool:
         # apply that touched no static route says nothing about this device's routes.
         return True
 
-    states = {s.static_route_id: s for s in NSOStaticRouteState.objects.filter(management=row)}
+    # Re-read (the verdicts are written through ``.update()``), but only the routes this
+    # job's results name — the rest of the device's overlay is not evidence about them.
+    named = {
+        entry["route_id"] for entry in results if isinstance(entry, dict) and isinstance(entry.get("route_id"), int)
+    }
+    states = {
+        s.static_route_id: s for s in NSOStaticRouteState.objects.filter(management=row, static_route_id__in=named)
+    }
     correlated: list[tuple[dict, object]] = []
     pending = []
     for entry in results:

@@ -124,8 +124,7 @@ class TestTheSameTickSettlesARepairedDevice(_SettlementCase):
         state.refresh_from_db()
         assert mgmt.adapter_device_id == expected_id, "the link repair did not run"
         assert self.adapter.store.feed_requests, "the sweep skipped the repaired device entirely"
-        # Every request, not just the last: the first pass re-requests page one after the
-        # epoch reset, and a stale id anywhere in that pair is the defect.
+        # Every request, not just the last: a stale id anywhere in the pass is the defect.
         assert {r[0] for r in self.adapter.store.feed_requests} == {expected_id}, (
             f"the feed was requested with a stale id: {self.adapter.store.feed_requests}"
         )

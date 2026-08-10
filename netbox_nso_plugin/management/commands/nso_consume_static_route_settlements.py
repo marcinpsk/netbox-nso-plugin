@@ -46,7 +46,7 @@ class Command(BaseCommand):
             raise CommandError("--passes must be at least 1")
 
         requested = options.get("device_ids")
-        rows = NSODeviceManagement.objects.filter(adapter_device_id__isnull=False)
+        rows = NSODeviceManagement.objects.filter(adapter_device_id__isnull=False).select_related("device")
         if requested:
             rows = rows.filter(device_id__in=requested)
         rows = list(rows.order_by("pk"))

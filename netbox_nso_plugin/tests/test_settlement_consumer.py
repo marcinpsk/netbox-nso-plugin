@@ -231,6 +231,38 @@ class TestPerRouteVerdicts(_SettlementCase):
         assert bad_state.status == "apply_failed"
         assert "next-hop 10.19.0.1 is not reachable" in bad_state.last_apply_error
 
+    def test_the_overlay_read_is_scoped_to_the_routes_the_job_names(self):
+        """A job decides its own results, so the device's whole overlay table is not read."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        device = _make_device("scoped")
+        mgmt = _make_mgmt(device, "scoped", 60)
+        named = _route("10.24.0.0/16", "10.24.0.1", devices=[device])
+        unnamed = _route("10.25.0.0/16", "10.25.0.1", devices=[device])
+        named_state = _own(named, mgmt, generation=85)
+        unnamed_state = _own(unnamed, mgmt, generation=85)
+        self.adapter.store.terminal_job(60, results=[_result(named.pk, 85)])
+
+        with CaptureQueriesContext(connection) as queries:
+            consume_static_route_settlements(mgmt)
+
+        named_state.refresh_from_db()
+        unnamed_state.refresh_from_db()
+        assert named_state.status == "in_sync"
+        assert unnamed_state.status == "deploying", "a route this job never named was settled"
+        predicates = [
+            sql.split(" WHERE ", 1)[1]
+            for sql in (query["sql"] for query in queries.captured_queries)
+            if sql.startswith("SELECT") and "nsostaticroutestate" in sql and " WHERE " in sql
+        ]
+        assert predicates, "the settle pass read no overlay row at all"
+        assert all("static_route_id" in predicate for predicate in predicates), (
+            f"the settle pass re-read every overlay row of the device: {predicates}"
+        )
+
     def test_a_newer_running_apply_does_not_gate_an_older_result(self):
         """P5.7: consumption is ordered by the feed and decided by generation, never gated."""
         from netbox_nso_plugin.settlement import consume_static_route_settlements

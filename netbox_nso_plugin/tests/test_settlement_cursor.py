@@ -149,6 +149,26 @@ class TestCursorEpoch(_SettlementCase):
         row = self._cursor(mgmt)
         assert row.settle_cursor_seq == 1
         assert row.settle_cursor_incarnation == self.adapter.store.incarnation
+        # The first page was fetched from the dead cursor, so it had to be re-requested.
+        assert [request[1] for request in self.adapter.store.feed_requests] == [100, 0]
+
+    def test_a_first_consumption_asks_for_the_page_once(self):
+        """The epoch resets on a cursor that is already 0, so the page just fetched stands."""
+        from netbox_nso_plugin.settlement import SETTLE_FEED_PAGE, consume_static_route_settlements
+
+        device = _make_device("firstpass")
+        mgmt = _make_mgmt(device, "firstpass", 42)
+        sr = _route("10.42.0.0/16", "10.42.0.1", devices=[device])
+        _own(sr, mgmt, generation=52)
+        self.adapter.store.terminal_job(42, results=[_result(sr.pk, 52)])
+
+        result = consume_static_route_settlements(mgmt)
+
+        assert result.epoch_reset is True
+        assert result.consumed == 1
+        assert self.adapter.store.feed_requests == [(42, 0, SETTLE_FEED_PAGE)], (
+            f"the identical page was requested twice: {self.adapter.store.feed_requests}"
+        )
 
     def test_a_recreated_management_row_starts_from_the_beginning(self):
         """P29 — a delete/recreate leaves no epoch, so the feed is walked from the start."""
@@ -542,3 +562,29 @@ class TestDurableStallAcrossProcesses(_SettlementCase):
         assert row.settle_cursor_seq == 1, "the bound was not reached, so the attempts did not survive"
         assert row.settle_stall_seq is None
         assert row.settle_stall_attempts == 0
+
+
+class TestTheConsumeCommandReportsTheFleet(_SettlementCase):
+    """The operator's drain tool names every device it walked, on one candidate query."""
+
+    def test_the_command_names_each_device_without_a_query_per_row(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+        from django.test.utils import CaptureQueriesContext
+
+        for index, adapter_device_id in enumerate((120, 121, 122)):
+            tag = f"cmd{index}"
+            device = _make_device(tag)
+            mgmt = _make_mgmt(device, tag, adapter_device_id)
+            sr = _route(f"10.16.{index}.0/24", f"10.16.{index}.1", devices=[device])
+            _own(sr, mgmt, generation=90 + index)
+            self.adapter.store.terminal_job(adapter_device_id, results=[_result(sr.pk, 90 + index)])
+
+        out = StringIO()
+        with CaptureQueriesContext(connection) as queries:
+            call_command("nso_consume_static_route_settlements", stdout=out)
+
+        assert out.getvalue().count("consumed 1") == 3, out.getvalue()
+        per_row = [query["sql"] for query in queries.captured_queries if 'FROM "dcim_device"' in query["sql"]]
+        assert per_row == [], f"the command read each row's device one at a time: {per_row}"
