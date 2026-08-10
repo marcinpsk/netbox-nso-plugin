@@ -2265,6 +2265,16 @@ class TestDeviceNSOTabView(ViewTestBase):
         for key in self._FAILOVER_TS_KEYS:
             self.assertIsNone(failover[key], key)
 
+    def test_non_string_failover_timestamp_does_not_break_the_tab(self):
+        """The key guard is truthiness only, so a number or an object reaches the parser."""
+        for wire in (1717236000, {"at": "2026-07-18T09:23:48Z"}):
+            with self.subTest(wire=wire):
+                response = self._render_tab_with_failover_ts(wire)
+                self.assertEqual(response.status_code, 200)
+                failover = response.context["failover"]
+                for key in self._FAILOVER_TS_KEYS:
+                    self.assertIsNone(failover[key], key)
+
     def _patch_all_getters(self):
         """Patch every adapter getter the tab view may call; return the patch context
         and a dict of the mocks keyed by attribute name."""
