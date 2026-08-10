@@ -401,7 +401,7 @@ def resync_static_route_intent_fleet(device_ids: list[int] | None = None) -> lis
                     response = signals._push_static_route_intent_for_device(
                         mgmt.device_id, mgmt.adapter_device_id, force=True
                     )
-                    count = response.get("count") if isinstance(response, dict) else None
+                    count = signals.stored_static_route_count(response)
                     if count is None:
                         # Read the rejection the push just persisted, because rolling the
                         # arming back would take that record with it.

@@ -1979,6 +1979,16 @@ def _on_ip_address_delete(sender, instance, **kwargs):
 PUSHED_STATIC_ROUTE_FILTER = Q(status__in=_OWNED_PUSH_STATUSES, static_route__next_hop__isnull=False)
 
 
+def stored_static_route_count(response):
+    """How many routes the adapter says it stored, or ``None`` when it did not say.
+
+    One definition for every reader of a static-route push answer: the Apply promotion gate
+    and the fleet re-sync both decide "acknowledged" from this, so a malformed answer cannot
+    mean stored to one of them and refused to the other.
+    """
+    return response.get("count") if isinstance(response, dict) else None
+
+
 def _push_static_route_intent_for_device(device_id, adapter_device_id, force=False):
     """Build and push the full static route intent snapshot for a device.
 

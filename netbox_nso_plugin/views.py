@@ -2497,6 +2497,7 @@ def _prepare_apply(mgmt):
         _push_svi_intent_for_device,
         _push_switchport_intent_for_device,
         _push_vlan_intent_for_device,
+        stored_static_route_count,
     )
 
     # Force-push (bypass change-detection) the owned snapshots so Apply re-ships the
@@ -2538,11 +2539,11 @@ def _prepare_apply(mgmt):
             logger.warning("Apply push failed for device %s: %s", mgmt.device_id, exc)
             response = None
         if push is _push_static_route_intent_for_device:
-            # A forced push returns None only on a real rejection (change-detection is
+            # A forced push is only skipped on a real rejection (change-detection is
             # bypassed), and a static route settles on a generation the adapter has to be
             # holding. Promoting on a push the adapter refused would create a 'deploying'
             # row no result can ever name — stuck until the backstop calls it failed.
-            static_route_stored = response is not None
+            static_route_stored = stored_static_route_count(response) is not None
 
     # Store-only: a plain put_snmp_intent enqueues the shrink-removal (and auto-apply) job,
     # which would 409 the trigger_apply this runs just ahead of.
