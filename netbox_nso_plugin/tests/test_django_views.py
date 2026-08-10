@@ -128,6 +128,79 @@ class TestOnboardingDashboardView(ViewTestBase):
         self.assertIn("partial", html)
         self.assertIn("bgp, ospf", html)
 
+    @patch("netbox_nso_plugin.adapter_client.get_neds", return_value=[])
+    @patch("netbox_nso_plugin.adapter_client.list_instance_devices", return_value=[])
+    @patch("netbox_nso_plugin.adapter_client.list_devices")
+    def test_dashboard_refresh_costs_no_query_per_managed_row(self, mock_devices, _list, _neds):
+        """The pre-render mirror refresh classifies every row through its ``NSOInstance``.
+
+        Without that join on the dashboard queryset each row costs one more NSOInstance
+        query, so the page grows with the fleet. Counting only that table isolates the join
+        from whatever else a longer row list renders.
+        """
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_device_id=901)
+        self.addCleanup(NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update, adapter_device_id=None)
+
+        def _snapshot():
+            # Every row matched and already current, so the refresh mirrors nothing and
+            # writes nothing: what is counted is the classification, not an update.
+            return [
+                {
+                    "id": m.adapter_device_id,
+                    "nso_instance": self.nso_instance.adapter_instance_id,
+                    "nso_device_name": m.nso_device_name,
+                    "netbox_device_id": m.device_id,
+                    "last_sync_at": None,
+                    "last_sync_status": "",
+                    "degraded_surfaces": None,
+                }
+                for m in NSODeviceManagement.objects.filter(nso_instance=self.nso_instance)
+            ]
+
+        mock_devices.side_effect = lambda: _snapshot()
+        url = reverse("plugins:netbox_nso_plugin:onboarding_dashboard")
+        params = {"instance": self.nso_instance.adapter_instance_id}
+        table = NSODeviceManagement._meta.get_field("nso_instance").related_model._meta.db_table
+
+        def _instance_queries():
+            with CaptureQueriesContext(connection) as captured:
+                self.assertEqual(self.client.get(url, params).status_code, 200)
+            return [q["sql"] for q in captured.captured_queries if table in q["sql"]]
+
+        _instance_queries()  # warm the per-request caches the count must not measure
+        one_row = _instance_queries()
+
+        extra = []
+        for n in (2, 3):
+            dev = Device.objects.create(
+                name=f"dash-count-{n}",
+                device_type=self.device.device_type,
+                role=self.device.role,
+                site=self.device.site,
+            )
+            extra.append(
+                NSODeviceManagement.objects.create(
+                    device=dev,
+                    nso_instance=self.nso_instance,
+                    nso_device_name=f"dash-count-{n}",
+                    adapter_device_id=900 + n,
+                )
+            )
+        three_rows = _instance_queries()
+
+        self.assertEqual(
+            len(three_rows),
+            len(one_row),
+            f"the dashboard reads NSOInstance once per managed row: {three_rows}",
+        )
+        for mgmt in extra:
+            mgmt.device.delete()
+
     def test_quick_manage_creates_management(self):
         """POST to quick_manage creates the management record for an external device.
 
