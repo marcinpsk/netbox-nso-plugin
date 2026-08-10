@@ -26,8 +26,11 @@ jobs:
       fail-fast: false
       max-parallel: 4
       matrix:
-        python-version: ["3.12", "3.13"]
-        netbox-version: ["v4.6.1"]
+        include:
+          - python-version: "3.12"
+            netbox-version: "v4.6.1"
+          - python-version: "3.13"
+            netbox-version: "v4.6.7"
 
     services:
       redis:
@@ -91,9 +94,13 @@ jobs:
         working-directory: netbox
         run: |
           cat > netbox/netbox/configuration.py << 'EOF'
+          import os
+
           ALLOWED_HOSTS = ['*']
           DATABASE = {
-              'NAME': 'netbox',
+              # Honored by the tests that re-enter manage.py in a subprocess: they forward the
+              # parent's real test-database name, which a hardcoded name would send to the wrong DB.
+              'NAME': os.environ.get('DB_NAME', 'netbox'),
               'USER': 'netbox',
               'PASSWORD': 'netbox',
               'HOST': 'localhost',
