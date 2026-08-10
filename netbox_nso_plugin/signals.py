@@ -238,7 +238,46 @@ def _device_is_managed(device_id) -> bool:
     return NSODeviceManagement.objects.filter(device_id=device_id, adapter_device_id__isnull=False).exists()
 
 
-def _schedule_intent_push(key, fn) -> None:
+# ── Teardown: a device on its way out records nothing ──────────────────────────
+#
+# Deleting a Device (or unmanaging it) cascades every overlay away, and each of those
+# post_deletes schedules a push the drain then drops (see _device_is_managed). The outbox
+# must drop it EARLIER, at the append: the cascade is NetBox-side bookkeeping and carries no
+# operator intent, and a row appended after Django's collector took its snapshot would fail
+# the deferred foreign key at COMMIT. Every pre_delete fires before any post_delete, so the
+# mark is up before the first overlay handler runs, and the Device's own mark outlives the
+# management row's.
+
+
+@receiver(pre_delete, sender="dcim.Device")
+def _mark_device_teardown(sender, instance, **kwargs):
+    from . import outbox
+
+    outbox.mark_device_teardown(instance.pk, outbox.current_txid())
+
+
+@receiver(post_delete, sender="dcim.Device")
+def _clear_device_teardown(sender, instance, **kwargs):
+    from . import outbox
+
+    outbox.clear_device_teardown(instance.pk, outbox.current_txid())
+
+
+@receiver(pre_delete, sender="netbox_nso_plugin.NSODeviceManagement")
+def _mark_management_teardown(sender, instance, **kwargs):
+    from . import outbox
+
+    outbox.mark_device_teardown(instance.device_id, outbox.current_txid())
+
+
+@receiver(post_delete, sender="netbox_nso_plugin.NSODeviceManagement")
+def _clear_management_teardown(sender, instance, **kwargs):
+    from . import outbox
+
+    outbox.clear_device_teardown(instance.device_id, outbox.current_txid())
+
+
+def _schedule_intent_push(key, fn, transitions=()) -> None:
     """Coalesce *fn* under *key*, flushing once when the current transaction commits.
 
     Deduped by key, so N saves of the same (device, category) collapse to one push.
@@ -247,10 +286,18 @@ def _schedule_intent_push(key, fn) -> None:
     The delete-origin mark survives coalescing only when EVERY contributor for the key
     was a deletion (AND): if an un-own coalesces with a delete, the single shrink push
     stays unmarked and the adapter detaches — erring toward never touching the device.
+
+    This is also where the durable record is appended (#1503 Appendix O): the outbox entry
+    carries *transitions*, the provenance of what this transaction did to the key, and the
+    dispatch mark it did it under. The entry is the operator transaction's own row, so a
+    rollback discards it where the coalescing map above keeps it.
     """
     from django.db import connection, transaction
 
+    from . import outbox
+
     delete_origin = _DELETE_DISPATCH.get()
+    outbox.enqueue(key[0], key[1], transitions=transitions, delete_origin=delete_origin)
     if not connection.in_atomic_block:
         if _device_is_managed(key[0]):
             _run_intent_push(fn, delete_origin)
@@ -2245,6 +2292,34 @@ def _accept_static_route_for_device(static_route, device) -> None:
     state.nso_next_hop = str(static_route.next_hop or "")
     state.last_sync_at = timezone.now()
     state.save()  # → _on_static_route_state_save schedules the push
+    if not was_owned:
+        from . import outbox
+
+        # Re-ownership withdraws whatever deletion authority is pending for this pk: without
+        # the record, a delete/re-own/re-delete sequence would ship the deletion of a route
+        # NetBox owns again.
+        device_id, adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
+        _schedule_intent_push(
+            (device_id, "static_route"),
+            lambda: _push_static_route_intent_for_device(device_id, adapter_device_id),
+            transitions=[outbox.revoke_transition(static_route.pk)],
+        )
+
+
+def _static_route_delete_transition(row, static_route):
+    """Record what is leaving, from the overlay that still mirrors it.
+
+    The lineage leads with the triple the adapter last ACKNOWLEDGED, because a content edit
+    whose push never landed leaves the adapter holding the older one; an id plus the current
+    triple alone would match nothing there, be classified moot and detach the route silently.
+    """
+    from . import outbox
+
+    return outbox.delete_transition(
+        static_route.pk,
+        last_acked=row.last_acked_triple,
+        current=outbox.triple_of(row.nso_vrf, row.nso_prefix, row.nso_next_hop),
+    )
 
 
 def _remove_static_route_for_device(static_route, device) -> None:
@@ -2257,11 +2332,16 @@ def _remove_static_route_for_device(static_route, device) -> None:
         return
     if mgmt.adapter_device_id is None:
         return
-    NSOStaticRouteState.objects.filter(management=mgmt, static_route=static_route).delete()
+    rows = NSOStaticRouteState.objects.filter(management=mgmt, static_route=static_route)
+    # Captured here because this is the last moment the mirror is alive: the next statement
+    # deletes it, and a removed route's content cannot be re-rendered from anything else.
+    transitions = [_static_route_delete_transition(row, static_route) for row in rows]
+    rows.delete()
     device_id, adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
     _schedule_intent_push(
         (device_id, "static_route"),
         lambda: _push_static_route_intent_for_device(device_id, adapter_device_id),
+        transitions=transitions,
     )
 
 
