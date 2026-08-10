@@ -408,7 +408,7 @@ class TestTheReadBackIsFetchedOncePerPass(_SettlementCase):
     ``_settle_job`` needs it for every job that carries a result whose expectation the pusher
     never recorded. Fetching per job issues up to ``SETTLE_FEED_PAGE`` identical HTTP calls
     while the pass holds ``SELECT … FOR UPDATE`` on the management row, and every other writer
-    of that row — the push recorder, the link repair, reconcile — waits for the sum of them.
+    of that row (the push recorder, the link repair, reconcile) waits for the sum of them.
     """
 
     def test_one_read_back_serves_every_job_on_the_page(self):
@@ -437,7 +437,7 @@ class TestTheReadBackIsFetchedOncePerPass(_SettlementCase):
 class TestStep4ReadsTheJobStateOnce(_SettlementCase):
     """Step 4 already fetched the apply-job state, so the escalation must not fetch it again.
 
-    Both reads answer the same question — may an apply be in flight — from the same
+    Both reads answer the same question (may an apply be in flight) from the same
     descending jobs page. Two fetches per reconcile is one wasted adapter round trip per
     device per pass, and the two answers can disagree.
     """
@@ -457,7 +457,7 @@ class TestStep4ReadsTheJobStateOnce(_SettlementCase):
         sr = _route("10.61.0.0/16", "10.61.0.1", devices=[device])
         state = _own(sr, mgmt, generation=320)
         _stale_clock(state)
-        # Terminal, and about no static route: the feed drains, so the backstop may judge —
+        # Terminal, and about no static route: the feed drains, so the backstop may judge,
         # which is the path that fetched the job state a second time.
         self.adapter.store.terminal_job(97)
 

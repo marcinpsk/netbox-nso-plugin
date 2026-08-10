@@ -65,7 +65,7 @@ class SettlementStore:
         #: That page is the apply-activity probe, and it fails independently of the feed:
         #: a walk can drain while the probe times out.
         self.jobs_error_devices: set[int] = set()
-        #: ids of jobs the ASCENDING page serves even though they hold no sequence — the
+        #: ids of jobs the ASCENDING page serves even though they hold no sequence: the
         #: feed contract broken the way only the adapter itself can break it
         self.unsequenced_in_feed: set[str] = set()
         #: every feed request the consumer made, as ``(device_id, after_settle_seq, limit)``
@@ -136,7 +136,7 @@ class SettlementStore:
         """Add a TERMINAL job that the ascending feed serves with no sequence.
 
         The page's predicate is NULL-false by construction, so this is the adapter breaking
-        its own feed contract — a state nothing but the server can produce, and the one the
+        its own feed contract, a state nothing but the server can produce, and the one the
         consumer's durable bound has to survive. Served at the head, where it blocks.
         """
         job = self._job(device_id, settle_seq=None, status="succeeded", results=results, job_type=job_type)

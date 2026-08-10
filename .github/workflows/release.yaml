@@ -35,7 +35,7 @@ jobs:
 
       # The branch may advance while a queued release waits: concurrency serializes the
       # runs, it does not stop the pushes. A run whose commit is no longer the tip has
-      # nothing left to release — the later push runs its own release from the newer tip —
+      # nothing left to release (the later push runs its own release from the newer tip),
       # and resetting back to it would only build a version commit that cannot fast-forward.
       - name: Skip a stale release trigger
         id: trigger
@@ -47,7 +47,7 @@ jobs:
           git fetch --quiet origin "refs/heads/${RELEASE_REF}"
           tip="$(git rev-parse FETCH_HEAD)"
           if [ "$tip" != "$RELEASE_SHA" ]; then
-            echo "::notice::${RELEASE_REF} is at ${tip}, not ${RELEASE_SHA} — this run releases nothing"
+            echo "::notice::${RELEASE_REF} is at ${tip}, not ${RELEASE_SHA}: this run releases nothing"
             echo "stale=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
