@@ -2136,7 +2136,11 @@ class NSOOnboardingDashboardView(LoginRequiredMixin, View):
             managed = []
         else:
             data = build_onboarding_dashboard(instance)
-            managed = list(NSODeviceManagement.objects.filter(nso_instance=instance).select_related("device"))
+            # nso_instance: the refresh below classifies every row through it, so without the
+            # join the page costs one more query per managed device.
+            managed = list(
+                NSODeviceManagement.objects.filter(nso_instance=instance).select_related("device", "nso_instance")
+            )
             # Mirror the adapter's current last-sync state onto the rows before rendering.
             # The periodic job keeps them fresh with nobody watching; this makes the page
             # the operator is actually looking at current to the second. Best-effort: the
