@@ -121,7 +121,7 @@ class TestDeliverySuccessHooks(IntentPushResetMixin, TestCase):
         echo = {"count": 1, "routes": [{"route_id": route.pk, "generation": generation, "fingerprint": "fp-1"}]}
 
         with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", return_value=echo):
-            deliver("static_route", device.pk, 7301, force=True)
+            deliver("static_route", device.pk, 7301)
 
         state.refresh_from_db()
         assert (state.expected_generation, state.expected_fingerprint) == (generation, "fp-1")
@@ -142,7 +142,7 @@ class TestDeliverySuccessHooks(IntentPushResetMixin, TestCase):
         response = {"unsupported_members": {"dr-cl-1": ["large:1:2:3"]}}
 
         with patch("netbox_nso_plugin.adapter_client.put_route_policy_intent", return_value=response):
-            deliver("route_policy", device.pk, 7302, force=True)
+            deliver("route_policy", device.pk, 7302)
 
         row.refresh_from_db()
         assert row.unsupported_members == ["large:1:2:3"]
@@ -159,7 +159,7 @@ class TestDeliverySuccessHooks(IntentPushResetMixin, TestCase):
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=self._CFG),
             patch("netbox_nso_plugin.adapter_client.requests.Session", return_value=session),
         ):
-            deliver("lacp", device.pk, 7303, force=True)
+            deliver("lacp", device.pk, 7303)
 
         for call in session.request.call_args_list:
             assert "X-Push-Seq" not in (call.kwargs.get("headers") or {})

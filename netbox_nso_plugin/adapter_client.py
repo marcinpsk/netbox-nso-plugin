@@ -55,6 +55,23 @@ def delete_origin_pushes():
         _delete_origin_push.reset(token)
 
 
+# The logical operation a request belongs to (#1503 Appendix O, §4.4). It rides in a header
+# rather than in every mirrored-scope body model, so one emitter covers every in-protocol
+# delivery key and no call site can forget it. The adapter admits it against its own
+# ``(device_id, scope)`` receipt, which is what makes a lost response resolvable by replay.
+_push_seq = contextvars.ContextVar("nso_push_seq", default=None)
+
+
+@contextmanager
+def push_seq(seq: int):
+    """Carry *seq* as ``X-Push-Seq`` on every adapter request made in this context."""
+    token = _push_seq.set(int(seq))
+    try:
+        yield
+    finally:
+        _push_seq.reset(token)
+
+
 _CACHE_TTL = 30  # seconds
 _cfg_cache: dict = {}
 _cfg_cache_lock = threading.Lock()
@@ -186,6 +203,10 @@ def _request_response(method, path, **kwargs):
 
     url = f"{cfg['url']}{path}"
     headers = {"Authorization": f"Bearer {cfg['token']}", "Content-Type": "application/json"}
+
+    seq = _push_seq.get()
+    if seq is not None:
+        headers["X-Push-Seq"] = str(seq)
 
     if _store_only_push.get():
         params = dict(kwargs.pop("params", None) or {})

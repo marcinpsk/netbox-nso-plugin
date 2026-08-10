@@ -21,6 +21,8 @@ resync, and static routes likewise.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import dataclasses
 from collections.abc import Callable
 
@@ -92,16 +94,73 @@ def delivery_keys() -> dict[str, DeliveryKey]:
     return _REGISTRY
 
 
-def deliver(key: str, device_id, adapter_device_id, *, mode: str = MODE_NORMAL, force: bool = False):
-    """Deliver *key* for one device under *mode*, and return the adapter's answer.
+# ── Rendering and sending, which the claim protocol must be able to separate ───
+#
+# A claim renders inside its own repeatable-read transaction and sends outside every
+# transaction (§4.2), so the two halves of a push have to come apart. The push functions are
+# the only renderers there are and each reaches exactly one choke point, ``_push_changed``,
+# so the render is that function run with the send captured instead of made.
 
-    The mode rides on the request as a query flag, so it is applied here rather than being
-    baked into a key: the same scope is delivered normally and store-only.
-    """
+_CAPTURE: contextvars.ContextVar[list | None] = contextvars.ContextVar("nso_render_capture", default=None)
+
+
+@dataclasses.dataclass
+class Rendered:
+    """One key's rendered request: the body, the call that sends a body, the success hook."""
+
+    key: tuple
+    payload: object
+    #: Takes the body to send, so a replay can send the claim's stored body rather than
+    #: whatever the re-render produced. The sequence must carry the digest it was admitted at.
+    do_push: Callable
+    #: The scope's own success side effect, run on the response the send returned.
+    on_response: Callable | None = None
+
+
+def capture(rendered: Rendered) -> bool:
+    """Record *rendered* when a render is in progress, and answer whether it was recorded."""
+    sink = _CAPTURE.get()
+    if sink is None:
+        return False
+    sink.append(rendered)
+    return True
+
+
+def render(key: str, device_id, adapter_device_id) -> Rendered:
+    """Build the key's request body for one device without sending anything."""
     entry = delivery_keys()[key]
-    if mode == MODE_STORE_ONLY:
-        from . import adapter_client
+    sink: list = []
+    token = _CAPTURE.set(sink)
+    try:
+        entry.push(device_id, adapter_device_id)
+    finally:
+        _CAPTURE.reset(token)
+    if len(sink) != 1:
+        raise RuntimeError(f"the {key} push rendered {len(sink)} bodies, expected exactly one")
+    return sink[0]
 
-        with adapter_client.store_only_pushes():
-            return entry.push(device_id, adapter_device_id, force=force)
-    return entry.push(device_id, adapter_device_id, force=force)
+
+def send(rendered: Rendered, body, *, mode: str = MODE_NORMAL, mark: bool = False, push_seq: int | None = None):
+    """Send *body* for an already-rendered key, and return the adapter's answer.
+
+    The mode and the deletion mark ride on the request as query flags, so they are applied
+    here rather than being baked into a key: the same scope is delivered normally and
+    store-only. The sequence is a header, and only an in-protocol key carries one.
+    """
+    from . import adapter_client, signals
+
+    entry = delivery_keys()[rendered.key[1]]
+    with contextlib.ExitStack() as stack:
+        if mode == MODE_STORE_ONLY:
+            stack.enter_context(adapter_client.store_only_pushes())
+        if mark:
+            stack.enter_context(adapter_client.delete_origin_pushes())
+        if push_seq is not None and entry.in_protocol:
+            stack.enter_context(adapter_client.push_seq(push_seq))
+        return signals._send_rendered(rendered, body)
+
+
+def deliver(key: str, device_id, adapter_device_id, *, mode: str = MODE_NORMAL, mark: bool = False):
+    """Render *key* for one device and send it straight away, outside the claim protocol."""
+    rendered = render(key, device_id, adapter_device_id)
+    return send(rendered, rendered.payload, mode=mode, mark=mark)

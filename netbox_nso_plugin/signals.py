@@ -526,36 +526,63 @@ def restore_push_record(device_id, scope, attempt, entry) -> None:
         logger.warning("Could not restore the intent-push record for device %s/%s: %s", device_id, scope, exc)
 
 
-def _push_changed(key, payload, do_push, force=False):
+def _push_changed(key, payload, do_push, force=False, on_response=None):
     """Run *do_push* only if *payload* differs from the last push for *key*.
 
-    ``do_push`` performs the actual ``client.put_*`` call. Errors are swallowed
-    (matching the adapter-unreachable tolerance elsewhere) and the cache is left
-    unchanged on failure so the next attempt retries. ``force`` bypasses the
+    ``do_push`` takes the body to send and performs the actual ``client.put_*`` call;
+    ``on_response`` is the scope's own success side effect, run on the adapter's answer.
+    Errors are swallowed (matching the adapter-unreachable tolerance elsewhere) and the
+    cache is left unchanged on failure so the next attempt retries. ``force`` bypasses the
     unchanged-skip (used by the explicit device Apply, which must always commit).
 
     A failure is now also PERSISTED per ``(device, scope)`` so the operator can see what
     the adapter refused instead of only a log line. R3 records; #1474 owns any retry —
     nothing here re-sends, times out or queues.
 
+    This is also the render/send choke point the claim protocol needs (#1503 Appendix O,
+    §4.2): under a render the body is captured here and nothing is sent, so the claim can
+    render inside its transaction and send outside it.
+
     Returns the ``do_push()`` result on a push that ran (so a caller can read the
     adapter's response, e.g. the route-policy ``unsupported_members`` map), or ``None``
-    when the push was skipped-unchanged or failed. Most callers ignore the return.
+    when the push was captured, skipped-unchanged or failed. Most callers ignore the return.
     """
+    from .delivery import Rendered, capture
+
+    rendered = Rendered(key=key, payload=payload, do_push=do_push, on_response=on_response)
+    if capture(rendered):
+        return None
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
     if not force and _last_pushed_hashes.get(key) == digest:
         logger.debug("Intent push skipped (unchanged) for %s", key)
         return None
-    device_id, scope = key
-    attempt = _allocate_push_attempt(device_id, scope)
     try:
-        result = do_push()
+        result = _send_rendered(rendered, payload)
     except Exception as exc:  # noqa: BLE001 — adapter may be down; log and retry next time
         logger.warning("Intent push failed for %s: %s", key, exc)
-        _record_push_outcome(device_id, scope, attempt, exc)
         return None
-    _record_push_outcome(device_id, scope, attempt, None)
     _last_pushed_hashes[key] = digest
+    return result
+
+
+def _send_rendered(rendered, body):
+    """Send one rendered body: the attempt mark, the call, the outcome record, the side effect.
+
+    The coalescer and the claim protocol share this, so a push made either way is marked,
+    recorded and settled identically. It RAISES on a failed call, because the claim has to
+    tell a failure from a success; :func:`_push_changed` is what swallows it for the
+    coalescer.
+    """
+    device_id, scope = rendered.key
+    attempt = _allocate_push_attempt(device_id, scope)
+    try:
+        result = rendered.do_push(body)
+    except Exception as exc:
+        _record_push_outcome(device_id, scope, attempt, exc)
+        raise
+    _record_push_outcome(device_id, scope, attempt, None)
+    if rendered.on_response is not None and isinstance(result, dict):
+        rendered.on_response(result)
     return result
 
 
@@ -604,7 +631,7 @@ def _push_interface_intent_for_device(device_id, adapter_device_id, force=False)
     _push_changed(
         (device_id, "interface"),
         attributes,
-        lambda: client.put_intent(adapter_device_id, attributes),
+        lambda body: client.put_intent(adapter_device_id, body),
         force=force,
     )
 
@@ -1212,7 +1239,7 @@ def _push_ip_intent_for_device(device_id, adapter_device_id, force=False):
         entry.update(_nokia_routed_binding(ip_state.interface))
         addresses.append(entry)
 
-    _push_changed((device_id, "ip"), addresses, lambda: client.put_ip_intent(adapter_device_id, addresses), force=force)
+    _push_changed((device_id, "ip"), addresses, lambda body: client.put_ip_intent(adapter_device_id, body), force=force)
 
 
 def _nokia_routed_binding(interface) -> dict:
@@ -1404,7 +1431,7 @@ def _push_snmp_intent_for_device(device_id, adapter_device_id, force=False):
     _push_changed(
         (device_id, "snmp"),
         [communities, v3_users, hosts, system_info],
-        lambda: client.put_snmp_intent(adapter_device_id, communities, v3_users, hosts, system_info),
+        lambda body: client.put_snmp_intent(adapter_device_id, *body),
         force=force,
     )
 
@@ -1473,7 +1500,7 @@ def _push_logging_intent_for_device(device_id, adapter_device_id, force=False):
     _push_changed(
         (device_id, "logging"),
         [hosts, local_levels],
-        lambda: client.put_logging_intent(adapter_device_id, hosts, local_levels),
+        lambda body: client.put_logging_intent(adapter_device_id, *body),
         force=force,
     )
 
@@ -1534,7 +1561,7 @@ def _push_svi_intent_for_device(device_id, adapter_device_id, force=False):
     _push_changed(
         (device_id, "svi"),
         interfaces,
-        lambda: client.put_svi_intent(adapter_device_id, interfaces),
+        lambda body: client.put_svi_intent(adapter_device_id, body),
         force=force,
     )
 
@@ -1596,7 +1623,7 @@ def _push_subinterface_intent_for_device(device_id, adapter_device_id, force=Fal
     _push_changed(
         (device_id, "subinterface"),
         interfaces,
-        lambda: client.put_subinterface_intent(adapter_device_id, interfaces),
+        lambda body: client.put_subinterface_intent(adapter_device_id, body),
         force=force,
     )
 
@@ -1656,7 +1683,7 @@ def _push_interface_mtu_intent_for_device(device_id, adapter_device_id, force=Fa
     _push_changed(
         (device_id, "interface_mtu"),
         interfaces,
-        lambda: client.put_interface_mtu_intent(adapter_device_id, interfaces),
+        lambda body: client.put_interface_mtu_intent(adapter_device_id, body),
         force=force,
     )
 
@@ -1713,7 +1740,7 @@ def _push_vlan_intent_for_device(device_id, adapter_device_id, force=False):
     _push_changed(
         (device_id, "vlan"),
         vlans,
-        lambda: client.put_vlan_intent(adapter_device_id, vlans),
+        lambda body: client.put_vlan_intent(adapter_device_id, body),
         force=force,
     )
 
@@ -1819,7 +1846,7 @@ def _push_bfd_intent_for_device(device_id, adapter_device_id, force=False):
     _push_changed(
         (device_id, "bfd"),
         interfaces,
-        lambda: client.put_bfd_intent(adapter_device_id, interfaces),
+        lambda body: client.put_bfd_intent(adapter_device_id, body),
         force=force,
     )
 
@@ -2086,15 +2113,13 @@ def _push_static_route_intent_for_device(device_id, adapter_device_id, force=Fal
         if generation is not None:
             generations[sr.pk] = generation
 
-    response = _push_changed(
+    return _push_changed(
         (device_id, "static_route"),
         routes,
-        lambda: client.put_static_route_intent(adapter_device_id, routes),
+        lambda body: client.put_static_route_intent(adapter_device_id, body),
         force=force,
+        on_response=lambda resp: _record_static_route_expectations(device_id, generations, resp.get("routes") or []),
     )
-    if isinstance(response, dict):
-        _record_static_route_expectations(device_id, generations, response.get("routes") or [])
-    return response
 
 
 def _record_static_route_expectations(device_id, generations: dict, echoes) -> None:
@@ -2464,7 +2489,7 @@ def _push_isis_flex_algo_intent_for_device(device_id, adapter_device_id, force=F
     _push_changed(
         (device_id, "isis_flex_algo"),
         flex_algos,
-        lambda: client.put_isis_flex_algo_intent(adapter_device_id, flex_algos),
+        lambda body: client.put_isis_flex_algo_intent(adapter_device_id, body),
         force=force,
     )
 
@@ -2597,7 +2622,7 @@ def _push_l2_sap_intent_for_device(device_id, adapter_device_id, force=False):
     _push_changed(
         (device_id, "l2_sap"),
         saps,
-        lambda: client.put_l2_sap_intent(adapter_device_id, saps),
+        lambda body: client.put_l2_sap_intent(adapter_device_id, body),
         force=force,
     )
 
@@ -2664,7 +2689,7 @@ def _push_lacp_intent_for_device(device_id, adapter_device_id, force=False):
     _push_changed(
         (device_id, "lacp"),
         bundles,
-        lambda: client.apply_lag_config(adapter_device_id, bundles),
+        lambda body: client.apply_lag_config(adapter_device_id, body),
         force=force,
     )
 
@@ -2723,7 +2748,7 @@ def _push_switchport_intent_for_device(device_id, adapter_device_id, force=False
     _push_changed(
         (device_id, "switchport"),
         interfaces,
-        lambda: client.apply_switchport_config(adapter_device_id, interfaces),
+        lambda body: client.apply_switchport_config(adapter_device_id, body),
         force=force,
     )
 
@@ -2845,7 +2870,7 @@ def _push_isis_intent_for_device(device_id, adapter_device_id, force=False):
     _push_changed(
         (device_id, "isis"),
         [interfaces, processes],
-        lambda: client.put_isis_interface_intent(adapter_device_id, interfaces, processes=processes),
+        lambda body: client.put_isis_interface_intent(adapter_device_id, body[0], processes=body[1]),
         force=force,
     )
 
@@ -3096,7 +3121,7 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id, force=False):
     _push_changed(
         (device_id, "bgp"),
         router_list,
-        lambda: client.put_bgp_intent(adapter_device_id, router_list),
+        lambda body: client.put_bgp_intent(adapter_device_id, body),
         force=force,
     )
 
@@ -3300,13 +3325,13 @@ def _push_route_policy_intent_for_device(device_id, adapter_device_id, force=Fal
             }
         )
 
-    resp = _push_changed(
+    return _push_changed(
         (device_id, "route_policy"),
         objects,
-        lambda: client.put_route_policy_intent(adapter_device_id, objects),
+        lambda body: client.put_route_policy_intent(adapter_device_id, body),
         force=force,
+        on_response=lambda resp: _store_unsupported_members(owned_rows, resp),
     )
-    _store_unsupported_members(owned_rows, resp)
 
 
 def _store_unsupported_members(owned_rows, resp) -> None:
@@ -3917,7 +3942,9 @@ def _push_ospf_intent_for_device(device_id, adapter_device_id, force=False):
         interfaces.append(entry)
 
     payload = {"instances": instances, "interfaces": interfaces}
-    _push_changed((device_id, "ospf"), payload, lambda: client.put_ospf_intent(adapter_device_id, payload), force=force)
+    _push_changed(
+        (device_id, "ospf"), payload, lambda body: client.put_ospf_intent(adapter_device_id, body), force=force
+    )
 
 
 @_skip_on_render
