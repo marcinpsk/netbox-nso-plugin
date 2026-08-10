@@ -399,3 +399,35 @@ class TestAVerdictCannotLandOnNewerIntent(_SettlementCase):
             "a verdict computed for generation 301 landed on generation 302 — a green badge "
             "for content the device has not been asked for"
         )
+
+
+class TestTheReadBackIsFetchedOncePerPass(_SettlementCase):
+    """The intent read-back is keyed by device alone, so one pass may fetch it once.
+
+    ``_settle_job`` needs it for every job that carries a result whose expectation the pusher
+    never recorded. Fetching per job issues up to ``SETTLE_FEED_PAGE`` identical HTTP calls
+    while the pass holds ``SELECT … FOR UPDATE`` on the management row, and every other writer
+    of that row — the push recorder, the link repair, reconcile — waits for the sum of them.
+    """
+
+    def test_one_read_back_serves_every_job_on_the_page(self):
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        device = _make_device("readback")
+        mgmt = _make_mgmt(device, "readback", 96)
+        routes = [_route(f"10.60.{n}.0/24", f"10.60.{n}.1", devices=[device]) for n in range(3)]
+        states = [_own(sr, mgmt, generation=310, expected=False) for sr in routes]
+        for sr in routes:
+            # Committed intent whose PUT response never arrived: the read-back is the recovery.
+            self.adapter.store.echo(96, sr.pk, 310, FINGERPRINT)
+            self.adapter.store.terminal_job(96, results=[_result(sr.pk, 310)])
+
+        outcome = consume_static_route_settlements(mgmt)
+
+        assert outcome.consumed == 3
+        assert self.adapter.store.readback_requests == [96], (
+            "the device-wide read-back was re-fetched per job, under the row lock"
+        )
+        for state in states:
+            state.refresh_from_db()
+            assert state.status == "in_sync"

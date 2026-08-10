@@ -411,6 +411,56 @@ class TestStallBound(_SettlementCase):
         assert self._cursor(mgmt).settle_cursor_seq == 2
 
 
+class TestAFeedRowWithNoSequenceIsBounded(_SettlementCase):
+    """S4.6 — a page that breaks the feed contract gets the same durable bound as any stall.
+
+    An unsequenced row carries no position, so the cursor can never move past it. Failing the
+    pass instead rolls the consuming transaction back — the cursor, the verdicts already
+    written for that page and the stall record go with it — so the next pass meets the same
+    row with the same count, forever, and every ``deploying`` overlay on the device stays
+    ``deploying``. That is precisely the failure the bound exists to prevent.
+    """
+
+    def _broken_feed(self, tag, adapter_device_id):
+        """A device whose feed head is an unsequenced row, with a real settlement behind it."""
+        device = _make_device(tag)
+        mgmt = _make_mgmt(device, tag, adapter_device_id)
+        sr = _route(f"10.12.{adapter_device_id % 250}.0/24", "10.12.0.1", devices=[device])
+        state = _own(sr, mgmt, generation=74)
+        self.adapter.store.unsequenced_job(adapter_device_id, results=[_result(sr.pk, 74)])
+        self.adapter.store.terminal_job(adapter_device_id, results=[_result(sr.pk, 74)])
+        return mgmt, state
+
+    def test_an_unsequenced_row_stalls_durably_then_is_skipped(self):
+        from netbox_nso_plugin.settlement import SETTLE_STALL_MAX_ATTEMPTS, consume_static_route_settlements
+
+        mgmt, state = self._broken_feed("nosequence", 91)
+
+        for attempt in range(1, SETTLE_STALL_MAX_ATTEMPTS):
+            result = consume_static_route_settlements(mgmt)
+            assert result.stalled is True
+            assert result.advanced_past_stall is False, f"skipped early, on attempt {attempt}"
+            row = self._cursor(mgmt)
+            # Durable, so the pass has to COMMIT: a rollback would leave this at zero forever.
+            assert row.settle_stall_attempts == attempt
+            assert row.settle_stall_seq == 0, "the stall was keyed off the position it blocks"
+            assert row.settle_cursor_seq == 0, "the cursor moved past a row it cannot position"
+            state.refresh_from_db()
+            assert state.status == "deploying"
+
+        final = consume_static_route_settlements(mgmt)
+
+        assert final.advanced_past_stall is True
+        assert final.consumed == 1, "the sequenced job behind the broken row never drained"
+        assert final.drained is True, "a bounded device must reach the backstop's precondition"
+        row = self._cursor(mgmt)
+        assert row.settle_cursor_seq == 1
+        assert row.settle_stall_seq is None
+        assert row.settle_stall_attempts == 0
+        state.refresh_from_db()
+        assert state.status == "in_sync"
+
+
 class TestStaleFullSaveCannotRewindTheCursor(_SettlementCase):
     """A holder of a pre-advance instance may not carry the cursor or the bound backwards.
 

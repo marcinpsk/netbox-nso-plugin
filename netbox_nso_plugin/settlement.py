@@ -59,10 +59,6 @@ SETTLE_FEED_PAGE = 100
 _GENERIC_RESULT_ERROR = "The apply reported a failure for this route (see adapter apply job #{job_id})."
 
 
-class SettlementFeedError(Exception):
-    """The adapter served a settlement page that breaks the feed contract."""
-
-
 @dataclass(frozen=True)
 class ConsumeResult:
     """What one pass over one device's feed did."""
@@ -72,7 +68,7 @@ class ConsumeResult:
     consumed: int
     #: the walk stopped on an unresolved head; the cursor did not move past it
     stalled: bool
-    #: the stall bound was reached, so the cursor advanced past a sequence that never resolved
+    #: the stall bound was reached, so this pass abandoned an entry it could never resolve
     advanced_past_stall: bool
     #: the epoch changed, so the cursor and the stall triple were reset
     epoch_reset: bool
@@ -98,7 +94,7 @@ def consume_static_route_settlements(mgmt) -> ConsumeResult:
         return _consume_locked(row)
 
 
-def settle_static_routes(mgmt, *, escalate: bool = True) -> ConsumeResult:
+def settle_static_routes(mgmt, *, escalate: bool = True, apply_active: bool | None = None) -> ConsumeResult:
     """Walk the feed, then let the timeout backstop judge — but only a **drained** feed.
 
     The one implementation both clocks call, so the post-apply carrier and the five-minute
@@ -202,28 +198,42 @@ def _consume_locked(row) -> ConsumeResult:
     consumed = 0
     stalled = False
     advanced_past_stall = False
+    readback = _Readback(device_id)
     for job in jobs:
         seq = job.get("settle_seq")
         if seq is None:
             # The ascending page's predicate is NULL-false by construction, so an
-            # unsequenced row in it means the feed contract broke. Never guess a position.
-            raise SettlementFeedError(
-                f"job {job.get('id')} appeared in the ascending settlement feed with no settle_seq"
+            # unsequenced row in it means the feed contract broke. Never guess a position:
+            # bound it on the cursor it sits behind — the position it blocks — and abandon it
+            # there, the way an unresolvable sequence is abandoned. Raising instead would roll
+            # this transaction back, taking the cursor, the verdicts already written and the
+            # stall record with it, so every later pass would meet the same row unbounded.
+            logger.error(
+                "job %s appeared in the ascending settlement feed for adapter device %s with no "
+                "settle_seq: the feed contract is broken",
+                job.get("id"),
+                device_id,
             )
-        if _settle_job(row, device_id, job):
+            if not _record_stall(row, cursor):
+                stalled = True
+                break
+            logger.error(
+                "the settlement feed for adapter device %s served an unsequenced job %s times, "
+                "first seen %s — skipping that entry; its result is abandoned",
+                device_id,
+                row.settle_stall_attempts,
+                row.settle_stall_first_seen_at,
+            )
+            _clear_stall(row)
+            advanced_past_stall = True
+            continue
+        if _settle_job(row, device_id, job, readback):
             cursor = max(cursor, seq)
             _clear_stall(row)
             consumed += 1
             continue
 
-        if row.settle_stall_seq != seq:
-            row.settle_stall_seq = seq
-            row.settle_stall_attempts = 1
-            row.settle_stall_first_seen_at = timezone.now()
-        else:
-            row.settle_stall_attempts += 1
-
-        if row.settle_stall_attempts >= SETTLE_STALL_MAX_ATTEMPTS:
+        if _record_stall(row, seq):
             logger.error(
                 "settlement stalled %s times on sequence %s for device %s (adapter device %s), "
                 "first seen %s — advancing the cursor past it; that result is abandoned",
@@ -248,6 +258,22 @@ def _consume_locked(row) -> ConsumeResult:
     # reached the end, which is what the timeout backstop needs before it may judge.
     drained = not stalled and len(jobs) < SETTLE_FEED_PAGE
     return ConsumeResult(device_id, consumed, stalled, advanced_past_stall, epoch_reset, cursor, drained)
+
+
+def _record_stall(row, seq) -> bool:
+    """Count one failed resolution of *seq* on *row*. True once the durable bound is reached.
+
+    *seq* keys the triple. For a job the feed served with no sequence there is none, so the
+    key is the cursor that entry blocks: a stall key equal to the cursor is exactly that
+    case, since a real undecided sequence is always ahead of it.
+    """
+    if row.settle_stall_seq != seq:
+        row.settle_stall_seq = seq
+        row.settle_stall_attempts = 1
+        row.settle_stall_first_seen_at = timezone.now()
+    else:
+        row.settle_stall_attempts += 1
+    return row.settle_stall_attempts >= SETTLE_STALL_MAX_ATTEMPTS
 
 
 def _clear_stall(row) -> None:
@@ -275,7 +301,33 @@ def _persist(row, cursor: int, device_id: int, incarnation: str) -> None:
     )
 
 
-def _settle_job(row, device_id: int, job: dict) -> bool:
+class _Readback:
+    """One device's intent read-back, fetched at most once per pass — the failure too.
+
+    ``get_static_route_intent`` is keyed by device alone, so every job on a page that needs
+    it gets the same answer. Fetching per job would issue up to ``SETTLE_FEED_PAGE`` identical
+    HTTP calls while this pass holds the management row's ``SELECT … FOR UPDATE``, blocking
+    the push recorder, the link repair and reconcile for the sum of them.
+    """
+
+    def __init__(self, device_id: int):
+        self._device_id = device_id
+        self._fetched = False
+        self._echoed = None
+        self._error = None
+
+    def fetch(self):
+        """Return ``(echoed, error)`` — exactly one of the two is set."""
+        if not self._fetched:
+            self._fetched = True
+            try:
+                self._echoed = adapter_client.get_static_route_intent(self._device_id)
+            except adapter_client.AdapterError as exc:
+                self._error = exc
+        return self._echoed, self._error
+
+
+def _settle_job(row, device_id: int, job: dict, readback: _Readback) -> bool:
     """Apply this job's per-route verdicts. False means "undecided yet" — a stall.
 
     An overlay that recorded no expectation cannot judge a result: the adapter commits its
@@ -327,14 +379,13 @@ def _settle_job(row, device_id: int, job: dict) -> bool:
             pending.append(state)
 
     if pending:
-        try:
-            echoed = adapter_client.get_static_route_intent(device_id)
-        except adapter_client.AdapterError as exc:
+        echoed, error = readback.fetch()
+        if error is not None:
             logger.warning(
                 "settlement read-back failed for adapter device %s (job %s): %s — sequence %s undecided",
                 device_id,
                 job.get("id"),
-                exc,
+                error,
                 job.get("settle_seq"),
             )
             return False
