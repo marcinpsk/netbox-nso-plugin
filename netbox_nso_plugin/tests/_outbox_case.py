@@ -12,8 +12,11 @@ an already-accepted sequence returns the stored response and applies nothing, ex
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
 import hashlib
 import json
+import re
 from unittest.mock import MagicMock, patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
@@ -118,6 +121,77 @@ def enqueue(device, scope, *, transitions=(), delete_origin=False):
     outbox.enqueue(device.pk, scope, transitions=transitions, delete_origin=delete_origin)
 
 
+def in_thread(work, timeout=30):
+    """Run *work* on its own database connection, and re-raise whatever it raised.
+
+    A pin that needs a second committed transaction needs a second connection: the test's
+    own connection is the one under test, and a nested ``atomic()`` on it is a savepoint.
+    """
+    import threading
+
+    from django.db import connection
+
+    errors: list[BaseException] = []
+
+    def _run():
+        try:
+            work()
+        except BaseException as exc:  # noqa: BLE001 (re-raised on the caller's thread)
+            errors.append(exc)
+        finally:
+            connection.close()
+
+    worker = threading.Thread(target=_run)
+    worker.start()
+    worker.join(timeout=timeout)
+    assert not worker.is_alive(), "the worker transaction never finished"
+    if errors:
+        raise errors[0]
+
+
+@contextlib.contextmanager
+def as_per_object(scope):
+    """Run the block with *scope* in ``per_object`` marking mode, which O3 makes permanent.
+
+    O1.20 records the ids in both modes and gates only emission on the mode, so a pin over
+    the per-object acknowledgement can flip the registry entry and change nothing else.
+    """
+    from netbox_nso_plugin import delivery
+
+    registry = delivery.delivery_keys()
+    original = registry[scope]
+    registry[scope] = dataclasses.replace(original, marking_mode=delivery.MARKING_PER_OBJECT)
+    try:
+        yield
+    finally:
+        registry[scope] = original
+
+
+_DEVICE_IN_URL = re.compile(r"/devices/(\d+)/")
+#: What a body entry is called on each scope's wire, so one device model serves both.
+_BODY_KEYS = ("route_id", "vlan_id")
+
+
+def _body_members(body) -> set:
+    """The objects a full-replace body claims for the device.
+
+    Every mirrored scope wraps its list under one key of its own (``vlans``, ``routes``),
+    so the wrapper is walked rather than named: the pin is about membership, not spelling.
+    """
+    if isinstance(body, dict):
+        entries_ = [entry for value in body.values() if isinstance(value, list) for entry in value]
+    else:
+        entries_ = list(body or [])
+    members = set()
+    for entry in entries_:
+        if not isinstance(entry, dict):
+            continue
+        for name in _BODY_KEYS:
+            if name in entry:
+                members.add((name, entry[name]))
+    return members
+
+
 class ReceiptAdapter:
     """The far side of a push, keeping §4.4's receipt per endpoint.
 
@@ -126,6 +200,10 @@ class ReceiptAdapter:
     request whose sequence and digest match the stored receipt is a REPLAY: the stored
     response comes back and nothing is applied a second time, which is what makes a lost
     outcome resolvable.
+
+    It also keeps the DEVICE, because the pins over marking are about what the device ends
+    up carrying, not about which request went out: a full-replace push RETRACTS what it
+    omits when it is marked and DETACHES it when it is not, which is X9's ratified rule.
     """
 
     def __init__(self, respond=None):
@@ -136,11 +214,36 @@ class ReceiptAdapter:
         self.fail_with: Exception | None = None
         #: Adapter device ids whose every request fails, for the replayably failing key.
         self.fail_devices: set[int] = set()
+        #: Per adapter device id: what the device carries, and what it no longer owns.
+        self.on_device: dict[int, set] = {}
+        self.detached: dict[int, set] = {}
+        self._owned: dict[int, set] = {}
         self._respond = respond or (lambda body: {"count": len(next(iter(body.values()), []) or [])})
 
     @property
     def sequences(self) -> list[int | None]:
         return [request["push_seq"] for request in self.requests]
+
+    def _apply_to_device(self, url, body, params) -> None:
+        """Move the device to what this request authorizes, and nothing further."""
+        found = _DEVICE_IN_URL.search(url)
+        if found is None:
+            return
+        device_id = int(found.group(1))
+        members = _body_members(body)
+        on_device = self.on_device.setdefault(device_id, set())
+        detached = self.detached.setdefault(device_id, set())
+        dropped = self._owned.setdefault(device_id, set()) - members
+        if params.get("store_only") == "true":
+            self._owned[device_id] = members
+            return
+        if params.get("delete_origin") == "true":
+            on_device -= dropped  # authorized retraction: the object leaves the device
+        else:
+            detached |= dropped & on_device  # an unmarked shrink un-owns, it never removes
+        on_device |= members
+        detached -= members
+        self._owned[device_id] = members
 
     def session(self):
         """A ``spec=requests.Session`` stand-in whose ``request`` runs the admission."""
@@ -164,8 +267,9 @@ class ReceiptAdapter:
         raw_seq = headers.get("X-Push-Seq")
         seq = int(raw_seq) if raw_seq is not None else None
         body = kwargs.get("json")
+        params = kwargs.get("params") or {}
         digest = hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
-        self.requests.append({"url": url, "push_seq": seq, "body": body, "params": kwargs.get("params") or {}})
+        self.requests.append({"url": url, "push_seq": seq, "body": body, "params": params})
 
         receipt = self.receipts.get(url)
         if receipt is not None and seq is not None and seq <= receipt["push_seq"]:
@@ -178,6 +282,12 @@ class ReceiptAdapter:
 
         response = self._respond(body)
         self.applied.append((url, body))
+        self._apply_to_device(url, body, params)
         if seq is not None:
             self.receipts[url] = {"push_seq": seq, "digest": digest, "response": response}
         return make_response(200, response)
+
+    def place(self, adapter_device_id: int, *members) -> None:
+        """Seed what the device already carries, which a push may only narrow when marked."""
+        self.on_device.setdefault(adapter_device_id, set()).update(members)
+        self._owned.setdefault(adapter_device_id, set()).update(members)
