@@ -7,6 +7,9 @@ transport exception into an ``AdapterError`` that carries the exception TYPE onl
 blanket ``except`` guards in ``onboarding`` follow the same rule. The full text goes to the
 server log. These tests drive the real views through the real ``adapter_client`` (only the
 network ``requests.Session`` is replaced) and assert the leaked text is gone from the body.
+
+Also covers the sibling reflection bug: an unknown category key is a raw URL segment echoed
+into an HTML body, so it must come back escaped.
 """
 
 from unittest.mock import patch
@@ -271,3 +274,22 @@ class TestOnboardActionEnvelope(_UnreachableAdapterMixin, ViewTestBase):
         self.assertNotIn(_LEAK, body)
         self.assertIn("RuntimeError", body)
         self.assertTrue(any(_LEAK in line for line in logs.output))
+
+
+class TestUnknownCategoryKeyIsEscaped(ViewTestBase):
+    """The unknown-category 400 echoes a raw URL segment, so it must escape it."""
+
+    _PAYLOAD = "<img src=x onerror=alert(1)>"
+
+    def test_script_payload_in_the_category_key_comes_back_escaped(self):
+        url = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category",
+            kwargs={"pk": self.device.pk, "key": self._PAYLOAD},
+        )
+
+        resp = self.client.get(url)
+
+        self.assertEqual(resp.status_code, 400)
+        body = resp.content.decode()
+        self.assertNotIn(self._PAYLOAD, body)
+        self.assertIn("&lt;img src=x onerror=alert(1)&gt;", body)

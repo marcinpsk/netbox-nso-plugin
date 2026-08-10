@@ -10,6 +10,7 @@ from django.http import HttpResponseBadRequest, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils import timezone
+from django.utils.html import escape
 from django.views import View
 from netbox.object_actions import AddObject, BulkDelete, BulkExport
 from netbox.views import generic
@@ -779,7 +780,8 @@ class NSOCategoryView(LoginRequiredMixin, View):
 
         partial = self._PARTIALS.get(key)
         if partial is None:
-            return HttpResponseBadRequest(f"unknown category: {key}")
+            # ``key`` is a raw URL segment reflected into an HTML body: escape it.
+            return HttpResponseBadRequest(f"unknown category: {escape(key)}")
 
         ctx = {"object": device, "mgmt": mgmt, "status_badge": _STATUS_BADGE}
         if mgmt is not None and mgmt.adapter_device_id is not None:
