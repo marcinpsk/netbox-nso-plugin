@@ -366,13 +366,13 @@ def _attribute_static_route_error(device_id, detail):
         return []
     vrf, prefix, next_hop = (str(part) for part in triple)
     matched = []
+    # The same predicate the push serializes by: the rejection names payload entries, so a
+    # row the push never sent may never be attributed one.
     for row in NSOStaticRouteState.objects.filter(
+        PUSHED_STATIC_ROUTE_FILTER,
         management__device_id=device_id,
-        status__in=_OWNED_PUSH_STATUSES,
     ).select_related("static_route", "static_route__vrf"):
         sr = row.static_route
-        if sr is None or sr.next_hop is None:
-            continue
         row_vrf = sr.vrf.name if sr.vrf else ""
         if (row_vrf, str(sr.prefix), str(sr.next_hop)) == (vrf, prefix, next_hop):
             matched.append(sr.pk)
