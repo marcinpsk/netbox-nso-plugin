@@ -299,6 +299,10 @@ class TestStaticRouteFleetResync(IntentPushResetMixin, TestCase):
         rows[2].refresh_from_db()
         assert by_device[rejected.device_id]["ok"] is False
         assert by_device[rejected.device_id]["armed"] == 0
+        # armed == 0 is the rolled-back arming, not "nothing needed arming"; only the second
+        # key tells the two apart, and a partial pass has to be visible without a re-run.
+        assert by_device[rejected.device_id]["armed_rolled_back"] == 1
+        assert by_device[first.device_id]["armed_rolled_back"] == 0
         assert rows[2].intent_generation == UNALLOCATED, (
             "the arming outlived the push the adapter refused: nothing is holding that generation, "
             "and no later pass would find a sentinel row to retry"
@@ -311,6 +315,7 @@ class TestStaticRouteFleetResync(IntentPushResetMixin, TestCase):
                 call_command(COMMAND, stdout=out, stderr=StringIO())
         assert "fleet-genbad" in str(raised.exception)
         assert "0 generation(s) armed" in out.getvalue()
+        assert "1 generation(s) rolled back" in out.getvalue()
 
         with patch(
             "netbox_nso_plugin.adapter_client.put_static_route_intent",
