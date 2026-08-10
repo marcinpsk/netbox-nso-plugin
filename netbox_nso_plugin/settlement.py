@@ -46,8 +46,8 @@ from . import adapter_client
 
 logger = logging.getLogger(__name__)
 
-# The bound is attempts only: on the fifth failed resolution of one sequence the cursor
-# advances past it with a loud log. Elapsed time is recorded and logged but is deliberately
+# The bound is attempts only: on the fifth failed resolution of one feed entry the walk
+# abandons it with a loud log. Elapsed time is recorded and logged but is deliberately
 # not a second settlement policy.
 SETTLE_STALL_MAX_ATTEMPTS = 5
 
