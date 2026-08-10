@@ -412,11 +412,11 @@ class TestStallBound(_SettlementCase):
 
 
 class TestAFeedRowWithNoSequenceIsBounded(_SettlementCase):
-    """S4.6 — a page that breaks the feed contract gets the same durable bound as any stall.
+    """S4.6: a page that breaks the feed contract gets the same durable bound as any stall.
 
     An unsequenced row carries no position, so the cursor can never move past it. Failing the
-    pass instead rolls the consuming transaction back — the cursor, the verdicts already
-    written for that page and the stall record go with it — so the next pass meets the same
+    pass instead rolls the consuming transaction back, taking the cursor, the verdicts already
+    written for that page and the stall record with it, so the next pass meets the same
     row with the same count, forever, and every ``deploying`` overlay on the device stays
     ``deploying``. That is precisely the failure the bound exists to prevent.
     """

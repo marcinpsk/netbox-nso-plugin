@@ -206,7 +206,7 @@ def _consume_locked(row) -> ConsumeResult:
         if seq is None:
             # The ascending page's predicate is NULL-false by construction, so an
             # unsequenced row in it means the feed contract broke. Never guess a position:
-            # bound it on the cursor it sits behind — the position it blocks — and abandon it
+            # bound it on the cursor it sits behind (the position it blocks) and abandon it
             # there, the way an unresolvable sequence is abandoned. Raising instead would roll
             # this transaction back, taking the cursor, the verdicts already written and the
             # stall record with it, so every later pass would meet the same row unbounded.
@@ -221,7 +221,7 @@ def _consume_locked(row) -> ConsumeResult:
                 break
             logger.error(
                 "the settlement feed for adapter device %s served an unsequenced job %s times, "
-                "first seen %s — skipping that entry; its result is abandoned",
+                "first seen %s: skipping that entry, its result is abandoned",
                 device_id,
                 row.settle_stall_attempts,
                 row.settle_stall_first_seen_at,
@@ -304,7 +304,7 @@ def _persist(row, cursor: int, device_id: int, incarnation: str) -> None:
 
 
 class _Readback:
-    """One device's intent read-back, fetched at most once per pass — the failure too.
+    """One device's intent read-back, fetched at most once per pass, the failure too.
 
     ``get_static_route_intent`` is keyed by device alone, so every job on a page that needs
     it gets the same answer. Fetching per job would issue up to ``SETTLE_FEED_PAGE`` identical
@@ -319,7 +319,7 @@ class _Readback:
         self._error = None
 
     def fetch(self):
-        """Return ``(echoed, error)`` — exactly one of the two is set."""
+        """Return ``(echoed, error)``: exactly one of the two is set."""
         if not self._fetched:
             self._fetched = True
             try:
