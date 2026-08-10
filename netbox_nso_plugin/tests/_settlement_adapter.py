@@ -246,7 +246,8 @@ class _Handler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/v1/jobs":
             device_id = query.get("device_id")
-            if query.get("order") == "asc" and device_id is None:
+            # Both orders: a missing id raised inside the descending branch and dropped the connection.
+            if device_id is None:
                 self._send(422, {"error": {"code": "validation_error", "message": "device_id is required"}})
                 return
             after = int(query.get("after_settle_seq") or 0)
