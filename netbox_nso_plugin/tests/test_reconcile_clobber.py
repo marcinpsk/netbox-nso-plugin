@@ -145,6 +145,7 @@ class _ClobberBarrierCase(IntentPushResetMixin, _CascadeFlushMixin, TransactionT
         armed = self._backfill()
         release.set()
         thread.join(timeout=30)
+        assert not thread.is_alive(), "the reconciler never returned, so its writes are still in flight"
         assert not failure, failure
         self.state.refresh_from_db()
         assert self.state.last_sync_at is not None, (

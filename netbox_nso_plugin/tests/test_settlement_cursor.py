@@ -74,6 +74,7 @@ class TestConsumptionIsOnceAndMonotone(_SettlementCase):
         for thread in threads:
             thread.join(timeout=30)
 
+        assert not any(thread.is_alive() for thread in threads), "a consumer never returned"
         assert not errors, errors
         assert sorted(r.consumed for r in results) == [0, 1], "the one settlement was consumed twice"
         assert self._cursor(mgmt).settle_cursor_seq == 1

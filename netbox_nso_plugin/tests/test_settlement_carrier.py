@@ -129,6 +129,7 @@ class TestTheConsumerReadsTheLockedRow(_CarrierCase):
                 thread = threading.Thread(target=other_connection)
                 thread.start()
                 thread.join(timeout=30)
+                assert not thread.is_alive(), "the repair never committed, so the barrier proves nothing"
             return real_apply_job_state(adapter_device_id)
 
         with patch.object(reconcile, "_apply_job_state", commit_the_repair_between_materialize_and_lock):

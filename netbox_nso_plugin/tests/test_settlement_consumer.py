@@ -385,6 +385,7 @@ class TestAVerdictCannotLandOnNewerIntent(_SettlementCase):
             thread = threading.Thread(target=commit)
             thread.start()
             thread.join(timeout=30)
+            assert not thread.is_alive(), "the operator edit never committed, so the window was never opened"
 
         self.adapter.store.on_readback = operator_edit_mid_flight
 
