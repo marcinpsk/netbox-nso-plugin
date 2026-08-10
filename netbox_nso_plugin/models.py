@@ -5,6 +5,7 @@ from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import NON_FIELD_ERRORS, ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models, transaction
+from django.db.models.functions import Now
 from django.urls import reverse
 from netbox.models import NetBoxModel
 
@@ -1362,6 +1363,13 @@ class NSOStaticRouteState(_NSODeviceTabURLMixin, NetBoxModel):
     # Why a result did not settle green (an ``unproven`` verdict's reason) — a statement
     # about evidence, not about ownership, so it qualifies the status instead of being one.
     last_result_advisory = models.TextField(blank=True, default="")
+    # ── #1503 Appendix O: the triple the adapter last ACKNOWLEDGED for this route ──
+    # ``{vrf, prefix, next_hop}``, written only when a push carrying this route is
+    # acknowledged, so a deletion's lineage names a triple the adapter can actually match.
+    # NULL is never fabricated: it IS the wire's ``unverified`` flag. Stamping a live mirror
+    # here would label content the adapter never accepted as acknowledged, and the first
+    # deletion after that would match nothing and silently detach the route.
+    last_acked_triple = models.JSONField(null=True, blank=True, default=None)
 
     class Meta:
         ordering = ["management", "static_route"]
@@ -2718,3 +2726,98 @@ class NSOLinkRoleAssignment(NetBoxModel):
                 raise ValidationError({"cable": "A point-to-point role must be assigned to a cable."})
             if self.role.link_type == "single" and not has_iface:
                 raise ValidationError({"interface": "A single-ended role must be assigned to an interface."})
+
+
+# ── #1503 Appendix O: the durable push outbox ─────────────────────────────────
+#
+# Plain Django models, deliberately not NetBoxModel: these are machinery rows written by
+# every operator transaction that touches intent, so change logging, journaling and custom
+# fields would multiply the write cost of a bulk edit for records no operator browses.
+
+
+class NSOIntentOutboxEntry(models.Model):
+    """One operator transaction's contribution to a delivery key.
+
+    Appended inside the operator's own transaction, so a rollback — whole or savepoint —
+    takes the contribution with it, which the in-memory coalescer cannot do. Rewritten by
+    compaction and deleted when the claim that consumed it is acknowledged.
+    """
+
+    device = models.ForeignKey(to="dcim.Device", on_delete=models.CASCADE, related_name="nso_intent_outbox_entries")
+    scope = models.CharField(max_length=32)
+    # ``txid_current()`` — provenance only: the fold is transaction-blind (OQ-O-9), so no
+    # rule reads this. It groups the rows one transaction wrote, for an operator reading them.
+    batch_id = models.BigIntegerField()
+    # Ordered, in the order the operator's transaction applied them: two histories that
+    # differ only in order must not reduce to the same authority.
+    transitions = models.JSONField(default=list, blank=True)
+    # The AND and the OR of this row's contributors' legacy delete-origin marks. There is no
+    # per-entry ``delete_origin``: a compacted row would inherit it as true and send marked.
+    mark_and = models.BooleanField(default=False)
+    mark_any = models.BooleanField(default=False)
+    consumed_by_push_seq = models.BigIntegerField(null=True, blank=True, db_index=True)
+    created_at = models.DateTimeField(db_default=Now())
+
+    class Meta:
+        ordering = ["id"]
+        # No unique constraint, by design: two transactions appending to one key must never
+        # collide, and compaction is what collapses them.
+        indexes = [
+            models.Index(
+                fields=["device", "scope"],
+                condition=models.Q(consumed_by_push_seq__isnull=True),
+                name="nso_outbox_unconsumed",
+            ),
+        ]
+        verbose_name = "NSO Intent Outbox Entry"
+        verbose_name_plural = "NSO Intent Outbox Entries"
+
+    def __str__(self):
+        return f"{self.device_id}/{self.scope} #{self.pk}"
+
+
+class NSOIntentOutboxState(models.Model):
+    """The drain's state for one ``(device, scope)``, and the lock every drain-side operation takes.
+
+    Created on demand by the first drain-side operation, never by an enqueue: an operator
+    transaction that took this row would serialize with every other writer of the key.
+    """
+
+    device = models.ForeignKey(to="dcim.Device", on_delete=models.CASCADE, related_name="nso_intent_outbox_states")
+    scope = models.CharField(max_length=32)
+    # Authority folded out of consumed entries, before a claim exists. Deletions are whole
+    # triple-bearing records; a revocation needs no triple, so those stay bare ids.
+    queued_deletions = models.JSONField(default=list, blank=True)
+    revoked_ids = models.JSONField(default=list, blank=True)
+    # The logical operation id, replayed on takeover and never reallocated.
+    push_seq = models.BigIntegerField(null=True, blank=True)
+    claimed_at = models.DateTimeField(null=True, blank=True)
+    claim_payload = models.JSONField(null=True, blank=True)
+    claim_deletions = models.JSONField(default=list, blank=True)
+    claim_flags = models.JSONField(default=dict, blank=True)
+    claim_digest = models.CharField(max_length=64, blank=True, default="")
+    # The legacy flag actually sent (``query_flag`` scopes), the AND of the folded
+    # contributors' ``mark_and`` values. Not a run identifier: there are no runs.
+    claim_mark = models.BooleanField(null=True, blank=True)
+    # ``{route_id: last_acked_triple}`` — one triple per pk, carried across a revoked
+    # deletion so a re-ownership of that pk inherits the only history that can matter.
+    lineage_carry = models.JSONField(default=dict, blank=True)
+    last_success_digest = models.CharField(max_length=64, blank=True, default="")
+    last_success_at = models.DateTimeField(null=True, blank=True)
+    attempts = models.IntegerField(default=0)
+    # Stamped on EVERY drain attempt, success or failure: the fair-selection cursor.
+    last_drain_attempted_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    last_error_code = models.CharField(max_length=64, blank=True, default="")
+    last_error_at = models.DateTimeField(null=True, blank=True)
+    # Never cleared by a push outcome — only by an explicit operator acknowledgement.
+    degraded_deletions = models.JSONField(default=list, blank=True)
+    fence_withheld_since = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["device", "scope"]
+        unique_together = [("device", "scope")]
+        verbose_name = "NSO Intent Outbox State"
+        verbose_name_plural = "NSO Intent Outbox States"
+
+    def __str__(self):
+        return f"{self.device_id}/{self.scope}"
