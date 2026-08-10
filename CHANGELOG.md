@@ -2,6 +2,77 @@
 
 <!-- version list -->
 
+## v0.2.0 (2026-08-10)
+
+### Bug Fixes
+
+- **apply**: Promote static routes only on an acknowledged stored count
+  ([`4e80f37`](https://github.com/marcinpsk/netbox-nso-plugin/commit/4e80f372962840409d0fa6bc03c1228c253c100d))
+
+- **reconcile**: Read nso_management defensively in the settle step
+  ([`509fa10`](https://github.com/marcinpsk/netbox-nso-plugin/commit/509fa106bf7aef56c96e66d4c16f5fc48641dbe1))
+
+- **static-route**: Accept only a real route count as a stored acknowledgement
+  ([`4990b6d`](https://github.com/marcinpsk/netbox-nso-plugin/commit/4990b6d2baca70dad65dffc9f0c14e29bd260762))
+
+### Chores
+
+- **deps**: Watch the JS test harness with dependabot
+  ([`166f7af`](https://github.com/marcinpsk/netbox-nso-plugin/commit/166f7afa7350bffb141a2e33e2189bc22c9a4f69))
+
+### Continuous Integration
+
+- **test**: Pin the matrix diagonally and honor DB_NAME in the CI configuration
+  ([`8041a05`](https://github.com/marcinpsk/netbox-nso-plugin/commit/8041a057ed220536beab0cf5faf353ed2a847199))
+
+### Features
+
+- **jobs**: Report the settlement sweep's elapsed time in the tick summary
+  ([`29b4714`](https://github.com/marcinpsk/netbox-nso-plugin/commit/29b4714c0252f3b0c515f422f8182450d1d7a89e))
+
+### Performance Improvements
+
+- **settlement**: Drop the redundant feed request and the unbounded reads
+  ([`ac7b8c4`](https://github.com/marcinpsk/netbox-nso-plugin/commit/ac7b8c4b4b50d52b72de393307fd59f3663b68f3))
+
+### Refactoring
+
+- **signals**: Attribute a static-route rejection with the push filter
+  ([`ab6014f`](https://github.com/marcinpsk/netbox-nso-plugin/commit/ab6014f419e673d8eb03c3ee648860355b83dffb))
+
+### Testing
+
+- **apply**: Stop each patch on its own cleanup, and pin the stuck-row message
+  ([`2e9f58e`](https://github.com/marcinpsk/netbox-nso-plugin/commit/2e9f58ea3d9b3daa8e43f4aa99ffb3ed1aacf365))
+
+- **contract**: Restore all three settings entry states, not just the value
+  ([`7cda4b5`](https://github.com/marcinpsk/netbox-nso-plugin/commit/7cda4b5a2a559788552839688d5c2a5c65bc8b7e))
+
+- **contract**: Restore the process plugin config the live client replaces
+  ([`72aa7c8`](https://github.com/marcinpsk/netbox-nso-plugin/commit/72aa7c89be5cbca1b4af71f991b87ee7bdfa7001))
+
+- **migrations**: Report the pending migration instead of a raw SystemExit
+  ([`f1ecdf3`](https://github.com/marcinpsk/netbox-nso-plugin/commit/f1ecdf3e7182e569c21b2bb64c43f81ea06ef212))
+
+- **settlement**: 422 a jobs request with no device_id on either order
+  ([`7a7dcc4`](https://github.com/marcinpsk/netbox-nso-plugin/commit/7a7dcc49d2a3de5fd471903242f0cca54d6a0905))
+
+- **settlement**: Define the generation-clock helper once, in the shared base
+  ([`1d72354`](https://github.com/marcinpsk/netbox-nso-plugin/commit/1d7235436bc3f0941fdc2008cb1d3211ed993661))
+
+- **settlement**: Derive the protected settlement columns, and locate manage.py
+  ([`fc35978`](https://github.com/marcinpsk/netbox-nso-plugin/commit/fc35978664552f07f2fd96f1634908d839594353))
+
+- **settlement**: Fail a bounded thread join on its own terms
+  ([`6006505`](https://github.com/marcinpsk/netbox-nso-plugin/commit/60065050194060735a76c1ffa7733bc5cc26ace5))
+
+- **settlement**: Judge the adapter's callback on the test thread
+  ([`c43c9bd`](https://github.com/marcinpsk/netbox-nso-plugin/commit/c43c9bd9f175a5441bfef6ad676f028a32aee790))
+
+- **settlement**: Prove the mirror pass reached the failed-settlement row
+  ([`45e4cd1`](https://github.com/marcinpsk/netbox-nso-plugin/commit/45e4cd1ad561262fce4f1bda867adea97c2c2648))
+
+
 ## [Unreleased]
 
 ### Added — read paths (NSO → NetBox)
