@@ -101,7 +101,7 @@ class TestTheConsumerReadsTheLockedRow(_CarrierCase):
 
     def test_the_consumer_reads_its_device_id_from_the_locked_row(self):
         """The FIRST feed request must carry the id on the row, not the id on the argument."""
-        from netbox_nso_plugin import reconcile
+        from netbox_nso_plugin import settlement
         from netbox_nso_plugin.models import NSODeviceManagement
 
         device = _make_device("stale")
@@ -112,11 +112,13 @@ class TestTheConsumerReadsTheLockedRow(_CarrierCase):
         # end-state assertion alone could pass for the wrong reason — hence the outbound one.
         self.adapter.store.terminal_job(11, results=[_result(sr.pk, 104)])
 
-        real_apply_job_state = reconcile._apply_job_state
+        # Anchored on the consumer's entry point, which is the contract Step 4 calls: Step 4
+        # has handed over its `mgmt` object and the consumer has not taken its lock yet, in
+        # whatever order Step 4 does the rest of its work.
+        real_settle = settlement.settle_static_routes
         barrier_done = []
 
-        def commit_the_repair_between_materialize_and_lock(adapter_device_id):
-            """Step 4 has its `mgmt` object; the consumer has not taken its lock yet."""
+        def commit_the_repair_before_the_consumer_locks(passed_mgmt, **kwargs):
             if not barrier_done:
                 barrier_done.append(True)
 
@@ -130,13 +132,13 @@ class TestTheConsumerReadsTheLockedRow(_CarrierCase):
                 thread.start()
                 thread.join(timeout=30)
                 assert not thread.is_alive(), "the repair never committed, so the barrier proves nothing"
-            return real_apply_job_state(adapter_device_id)
+            return real_settle(passed_mgmt, **kwargs)
 
-        with patch.object(reconcile, "_apply_job_state", commit_the_repair_between_materialize_and_lock):
+        with patch.object(settlement, "settle_static_routes", commit_the_repair_before_the_consumer_locks):
             self._notify(device.pk)
             self._drain()
 
-        assert barrier_done, "the barrier never ran — Step 4 did not materialize its row"
+        assert barrier_done, "the barrier never ran — Step 4 never reached the consumer"
         assert self.adapter.store.feed_requests, "the consumer was never reached"
         assert self.adapter.store.feed_requests[0][0] == 11, (
             "the first feed request used the caller's cached adapter device id, "
@@ -206,6 +208,7 @@ class TestTheBackstopPushesNoIntent(_CarrierCase):
     """
 
     def test_escalating_a_stuck_row_sends_no_static_route_intent(self):
+        from netbox_nso_plugin import adapter_client
         from netbox_nso_plugin.signals import reset_intent_push_state
 
         device = _make_device("nopush")
@@ -225,8 +228,21 @@ class TestTheBackstopPushesNoIntent(_CarrierCase):
 
         state.refresh_from_db()
         assert state.status == "apply_failed", "the backstop did not fire, so this proves nothing"
-        pushes = [r for r in self.adapter.store.requests if r == ("PUT", "/api/v1/devices/42/static-route-intent")]
+        pushes = self._intent_puts()
         assert pushes == [], f"escalating re-pushed this device's static-route intent: {pushes}"
+        # Positive control: the same filter DOES see a push issued through the client the
+        # production path uses, so the empty list above is evidence and not a URL template
+        # the filter stopped matching.
+        adapter_client.put_static_route_intent(42, [])
+        assert self._intent_puts(), "the filter cannot see a static-route push at all"
+
+    def _intent_puts(self):
+        """Every recorded static-route intent PUT, however the client spells the path."""
+        return [
+            (method, path)
+            for method, path in self.adapter.store.requests
+            if method == "PUT" and path.endswith("/static-route-intent")
+        ]
 
 
 class TestAnUnprovenResultIsNotAFailure(_CarrierCase):
