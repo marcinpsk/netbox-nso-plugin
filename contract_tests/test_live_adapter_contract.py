@@ -14,6 +14,7 @@ from uuid import uuid4
 
 import pytest
 from django.conf import settings
+from django.utils.functional import empty
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("NSO_LIVE_ADAPTER_TEST") != "1",
@@ -28,8 +29,10 @@ _UNSET = object()
 def _live_client():
     """Point the real plugin HTTP client at the live adapter for the block.
 
-    ``PLUGINS_CONFIG`` is process-global and the auth arm below poisons the token in it, so
-    the previous value is restored on the way out — a later test must not inherit either.
+    ``PLUGINS_CONFIG`` is process-global and the auth arm below poisons the token in it, so the
+    process state is put back on the way out — a later test must not inherit either. Three entry
+    states, each with its own way back: unconfigured settings (this job runs with no settings
+    module), configured without the key, and configured with a value to keep.
     """
     plugin_config = {
         "netbox_nso_plugin": {
@@ -37,11 +40,12 @@ def _live_client():
             "adapter_token": os.environ["NSO_LIVE_ADAPTER_TOKEN"],
         }
     }
-    previous = getattr(settings, "PLUGINS_CONFIG", _UNSET) if settings.configured else _UNSET
-    if settings.configured:
-        settings.PLUGINS_CONFIG = plugin_config
-    else:
+    configured_here = not settings.configured
+    previous = _UNSET if configured_here else getattr(settings, "PLUGINS_CONFIG", _UNSET)
+    if configured_here:
         settings.configure(PLUGINS_CONFIG=plugin_config)
+    else:
+        settings.PLUGINS_CONFIG = plugin_config
 
     import netbox_nso_plugin.adapter_client as client
 
@@ -50,28 +54,48 @@ def _live_client():
     try:
         yield client
     finally:
-        if previous is not _UNSET:
+        if configured_here:
+            settings._wrapped = empty  # settings.configure() has no public undo
+        elif previous is _UNSET:
+            delattr(settings, "PLUGINS_CONFIG")
+        else:
             settings.PLUGINS_CONFIG = previous
         client.reset_config_cache()
         client.reset_session()
 
 
-def test_the_live_client_restores_the_process_plugin_config():
+def test_the_live_client_restores_every_process_settings_state():
     """The one pin here that needs no adapter: the context owns process-global state.
 
     The auth arm points ``adapter_token`` at a deliberately wrong value, so a context that
-    exits without restoring hands every later test a client that cannot authenticate.
+    exits without restoring hands every later test a client that cannot authenticate. All
+    three entry states have to come back to themselves, and the two absent ones are the trap:
+    a context that only ever assigns leaves its replacement installed, which is then the
+    "previous" value the next entry keeps.
     """
-    with _live_client():
-        pass  # the first entry configures settings, so there is a previous value to keep
 
-    before = settings.PLUGINS_CONFIG
-    with pytest.raises(RuntimeError), _live_client():
-        settings.PLUGINS_CONFIG["netbox_nso_plugin"]["adapter_token"] = "intentionally-wrong-test-token"
-        raise RuntimeError("the block failed with the config replaced and its token poisoned")
+    def poison_and_fail():
+        """Enter, replace the config, poison its token, and leave by an exception."""
+        with pytest.raises(RuntimeError), _live_client():
+            settings.PLUGINS_CONFIG["netbox_nso_plugin"]["adapter_token"] = "intentionally-wrong-test-token"
+            raise RuntimeError("the block failed with the config replaced and its token poisoned")
 
-    assert settings.PLUGINS_CONFIG is before, "the live-client context leaked its PLUGINS_CONFIG"
-    assert settings.PLUGINS_CONFIG["netbox_nso_plugin"]["adapter_token"] == os.environ["NSO_LIVE_ADAPTER_TOKEN"]
+    settings._wrapped = empty  # this job's own entry state: no settings module at all
+    poison_and_fail()
+    assert not settings.configured, "the live-client context left the process settings configured"
+
+    settings._wrapped = empty
+    settings.configure()  # configured, but holding no PLUGINS_CONFIG of its own
+    poison_and_fail()
+    assert not hasattr(settings, "PLUGINS_CONFIG"), "the live-client context leaked its PLUGINS_CONFIG"
+
+    kept = {"netbox_nso_plugin": {"adapter_url": "https://kept.invalid", "adapter_token": "kept-token"}}
+    settings.PLUGINS_CONFIG = kept
+    poison_and_fail()
+    assert settings.PLUGINS_CONFIG is kept, "the live-client context did not put the previous config back"
+    assert kept["netbox_nso_plugin"]["adapter_token"] == "kept-token", "the poisoned token reached the kept config"
+
+    settings._wrapped = empty  # and back to the unconfigured state this job starts in
 
 
 def _entry(route_id, generation, **overrides):
