@@ -23,7 +23,7 @@ keywords = [
     "networking",
 ]
 dependencies = [
-    "requests>=2.32",
+    "requests>=2.34.2",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
