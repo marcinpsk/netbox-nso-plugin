@@ -210,11 +210,14 @@ class TestSyncScopeToAdapter(_SignalDBBase):
             patch(f"{_MOD}.patch_device", side_effect=AdapterError("adapter down", code="nso_unreachable")),
             patch(f"{_MOD}.onboard_device") as mock_onboard,
             patch(f"{_MOD}.set_scope") as mock_scope,
+            # A regression past the fail-closed guard would otherwise reach the live adapter.
+            patch(f"{_MOD}.sync_notify") as mock_notify,
         ):
             self._sync_scope(mgmt, created=False)
 
         mock_onboard.assert_not_called()
         mock_scope.assert_not_called()
+        mock_notify.assert_not_called()
         mgmt.refresh_from_db()
         self.assertEqual(mgmt.adapter_device_id, 7)  # mapping untouched
         self.assertTrue(mgmt.source_rekey_pending)  # still pending, retried next save
