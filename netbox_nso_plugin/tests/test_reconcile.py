@@ -50,6 +50,22 @@ class TestRunDeviceReconcile(APITestCase):
         self.assertIn("error", result)
         self.assertEqual(result["device_id"], device.pk)
 
+    def test_an_unmanaged_device_is_not_reported_as_a_settle_failure(self):
+        """Step 4 has nothing to settle for a device with no management row, and says nothing.
+
+        ``device.nso_management`` is a reverse one-to-one: reading it on an unmanaged device
+        raises, so the guard below it never runs and the step's own handler logs a warning
+        that names a failure which did not happen.
+        """
+        from netbox_nso_plugin import reconcile
+
+        device = _make_device("rec-unmanaged")
+        with (
+            patch.object(reconcile, "reconcile_device", return_value={}),
+            self.assertNoLogs("netbox_nso_plugin.reconcile", level="WARNING"),
+        ):
+            reconcile.run_device_reconcile(device.pk)
+
 
 class TestSyncCompleteEndpoint(APITestCase):
     """POST /api/plugins/nso/sync-complete/ — the adapter's sync-done callback."""

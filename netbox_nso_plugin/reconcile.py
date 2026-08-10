@@ -1511,7 +1511,8 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
     # rows a SUCCEEDED apply left 'deploying' past the grace (silent drop, #26), and
     # record the route-policy apply outcome in the netbox-routing journals (idempotent).
     try:
-        mgmt = device.nso_management
+        # Reverse one-to-one: a plain attribute read raises for an unmanaged device.
+        mgmt = getattr(device, "nso_management", None)
         if mgmt is not None and mgmt.adapter_device_id is not None:
             job, apply_active = _apply_job_state(mgmt.adapter_device_id)
             # BEFORE the coarse settle and both backstops, in the same invocation.
