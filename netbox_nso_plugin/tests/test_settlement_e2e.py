@@ -173,6 +173,8 @@ class TestTheIdentityEditSettlesEndToEnd(
         from netbox_nso_plugin.models import NSOStaticRouteState
 
         self.states = NSOStaticRouteState.objects
+        #: what each adapter-side callback answered, as ``(status_code, body)``
+        self.notify_responses: list[tuple[int, str]] = []
         self.device = _make_device("e2e")
         self.mgmt = _make_mgmt(self.device, "e2e", ADAPTER_DEVICE_ID)
         self.store = self.adapter.store
@@ -194,6 +196,10 @@ class TestTheIdentityEditSettlesEndToEnd(
         token — but sent by the double, so what is proven is that the plugin's endpoint
         carries it, not that the adapter's client constructs it. The client itself is the
         adapter suite's to pin.
+
+        The response is recorded rather than asserted: this runs on the double's handler
+        thread, inside the PUT the plugin is still waiting on, so an assertion here would
+        abort that request and report a rejected callback as a transport error.
         """
         netbox_device_id = self.store.devices[adapter_device_id]["netbox_device_id"]
         self._notified = {*getattr(self, "_notified", set()), netbox_device_id}
@@ -205,7 +211,13 @@ class TestTheIdentityEditSettlesEndToEnd(
             proxies={"http": None, "https": None},
             timeout=30,
         )
-        assert response.status_code == 202, (response.status_code, response.text[:400])
+        self.notify_responses.append((response.status_code, response.text[:400]))
+
+    def _drain(self):
+        """Judge the callbacks on the test thread, then run the queued carrier."""
+        rejected = [row for row in self.notify_responses if row[0] != 202]
+        assert not rejected, f"the plugin's notify endpoint rejected the adapter's callback: {rejected}"
+        super()._drain()
 
     def _bearer(self) -> dict:
         return {"Authorization": self.header["HTTP_AUTHORIZATION"]}
