@@ -229,6 +229,88 @@ describe("reload", () => {
     await settle();
     expect(fetchFn).toHaveBeenCalledWith("/json", expect.anything());
   });
+
+  /* An inline edit suppresses the tab-wide refresh, so this fetch is the only thing that
+   * runs after it. It re-renders rows, never the server-rendered banner include — so
+   * without this the rejection the edit just caused stays invisible. */
+  function banner(host) {
+    const el = document.createElement("div");
+    el.className = "alert nso-push-banner d-none";
+    el.innerHTML =
+      '<span class="nso-push-headline"></span><div class="nso-push-detail"></div><div class="nso-push-meta"></div>';
+    (host || document.body).append(el);
+    return el;
+  }
+
+  it("shows an intent-push rejection that appeared since the page was rendered", async () => {
+    const el = banner();
+    stubFetch({
+      json: () =>
+        Promise.resolve({
+          rows: [],
+          counts: {},
+          push_error: {
+            headline: "The adapter rejected the last intent push for this category.",
+            message: "Two routes in the payload carry the same triple",
+            code: "validation_error",
+            detail: { reason: "duplicate_triple" },
+            attempt: 2,
+            at: "2026-08-04T10:00:00Z",
+          },
+        }),
+    });
+    const api = mountWith(gridRoot());
+    await api.reload();
+
+    expect(el.classList.contains("d-none")).toBe(false);
+    expect(el.querySelector(".nso-push-headline").textContent).toContain("rejected");
+    expect(el.querySelector(".nso-push-detail").textContent).toContain("same triple");
+    expect(el.querySelector(".nso-push-meta").textContent).toContain("duplicate_triple");
+    expect(el.querySelector(".nso-push-meta").textContent).toContain("attempt 2");
+  });
+
+  it("hides a rejection the reload shows has cleared", async () => {
+    const el = banner();
+    el.classList.remove("d-none");
+    stubFetch({ json: () => Promise.resolve({ rows: [], counts: {}, push_error: null }) });
+    const api = mountWith(gridRoot());
+    await api.reload();
+    expect(el.classList.contains("d-none")).toBe(true);
+  });
+
+  it("leaves the banner alone for a category whose payload has no push_error key", async () => {
+    const el = banner();
+    el.classList.remove("d-none");
+    stubFetch({ json: () => Promise.resolve({ rows: [], counts: {} }) });
+    const api = mountWith(gridRoot());
+    await api.reload();
+    expect(el.classList.contains("d-none")).toBe(false);
+  });
+
+  /* Several categories can be expanded at once. A document-wide lookup would let one
+   * category's reload clear another's banner over a failure that is still live. */
+  it("never touches a banner belonging to a different category card", async () => {
+    const otherCard = document.createElement("div");
+    otherCard.className = "nso-category";
+    document.body.append(otherCard);
+    const otherBanner = banner(otherCard);
+    otherBanner.classList.remove("d-none");
+
+    const myCard = document.createElement("div");
+    myCard.className = "nso-category";
+    document.body.append(myCard);
+    const root = gridRoot();
+    myCard.append(root);
+    const myBanner = banner(myCard);
+    myBanner.classList.remove("d-none");
+
+    stubFetch({ json: () => Promise.resolve({ rows: [], counts: {}, push_error: null }) });
+    const api = mountWith(root);
+    await api.reload();
+
+    expect(myBanner.classList.contains("d-none")).toBe(true);
+    expect(otherBanner.classList.contains("d-none")).toBe(false);
+  });
 });
 
 describe("per-cell Accept (delegated click)", () => {

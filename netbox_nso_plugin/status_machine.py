@@ -186,6 +186,13 @@ TRANSITIONS: tuple[Transition, ...] = (
     Transition(APPLY, ACCEPTED, DEPLOYING, True, "_prepare_apply marks owned accepted→deploying"),
     Transition(APPLY_OK, DEPLOYING, IN_SYNC, True, "apply worker reported success"),
     Transition(APPLY_ERR, DEPLOYING, APPLY_FAILED, True, "apply worker reported a per-intent failure"),
+    # A correlated settlement may settle a row that never passed through ``deploying``:
+    # an auto-applied route is pushed and applied without an operator Apply, so it sits
+    # ``accepted`` with a real generation and a real result. Only the settlement consumer
+    # takes these edges (``on_apply_result(settle_accepted=True)``); the coarse per-scope
+    # settle keeps its ``deploying``-only behavior.
+    Transition(APPLY_OK, ACCEPTED, IN_SYNC, True, "settlement: a correlated result on a never-deploying row"),
+    Transition(APPLY_ERR, ACCEPTED, APPLY_FAILED, True, "settlement: a correlated failure on a never-deploying row"),
     # -- automatic: an unexpected exception while reconciling a row ----------
     # Only the unowned/observable states flip to error; an operator-owned row is
     # preserved by ``on_reconcile_error`` (a crash in the read path must never
@@ -331,6 +338,7 @@ def on_reconcile(
     matches: bool | None = None,
     conflict: bool = False,
     settles_owned: bool = True,
+    settles_deploying: bool = True,
 ) -> str:
     """Apply the single reconcile transition shared by EVERY overlay (no read/write split).
 
@@ -355,6 +363,12 @@ def on_reconcile(
       the Apply in flight; merely re-reporting the row is not confirmation that the
       intended values landed. Pure mirrors (``matches=None``) still settle on presence.
 
+    - ``settles_deploying`` — whether a reconcile may settle ``deploying`` at all. Pass
+      ``False`` for a family whose in-flight rows are settled by a **correlated** apply
+      result instead (static routes, #1502 Appendix S): re-reading the row says nothing
+      about *which* generation the device is reflecting, so settling on it is a green
+      badge for content the device may never have received.
+
     Ownership is preserved: an owned row is never pulled back to ``imported``.
     """
     if not present:
@@ -367,6 +381,8 @@ def on_reconcile(
         return advance(current, DRIFT, to=CHANGED)
     if is_owned(current):
         if current == DEPLOYING:
+            if not settles_deploying:
+                return current  # only a correlated apply result may settle this family
             if matches is False and settles_owned:
                 return current
             return advance(current, RECONCILE, to=IN_SYNC)
@@ -380,7 +396,7 @@ def on_reconcile(
     return advance(current, RECONCILE, to=IMPORTED if matches else CHANGED)
 
 
-def on_apply_result(current: str, *, ok: bool) -> str:
+def on_apply_result(current: str, *, ok: bool, settle_accepted: bool = False) -> str:
     """Settle a ``deploying`` row from the adapter apply outcome.
 
     ``ok`` → ``deploying → in_sync`` (the apply committed); not ok → ``deploying →
@@ -388,10 +404,16 @@ def on_apply_result(current: str, *, ok: bool) -> str:
     ``last_apply_error`` carries the detail, and the next reconcile recovers it to
     in_sync once the device catches up, or re-pends to accepted to retry). Rows not in
     ``deploying`` are returned unchanged (the apply outcome only concerns in-flight rows).
+
+    ``settle_accepted`` additionally settles ``accepted``. Pass it only from a
+    **generation-correlated** consumer: an auto-applied row is pushed and applied with no
+    operator Apply, so it never passes through ``deploying`` and would otherwise sit
+    ``accepted`` forever with a real result naming it. The coarse per-scope settle has no
+    such correlation and must keep its ``deploying``-only behavior.
     """
-    if current != DEPLOYING:
-        return current
-    return advance(current, APPLY_OK if ok else APPLY_ERR, to=IN_SYNC if ok else APPLY_FAILED)
+    if current == DEPLOYING or (settle_accepted and current == ACCEPTED):
+        return advance(current, APPLY_OK if ok else APPLY_ERR, to=IN_SYNC if ok else APPLY_FAILED)
+    return current
 
 
 def on_reconcile_error(current: str) -> str:

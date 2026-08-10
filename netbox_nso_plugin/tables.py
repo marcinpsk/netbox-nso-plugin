@@ -96,6 +96,14 @@ class NSODeviceManagementTable(NetBoxTable):
         For 'partial', list the stale surfaces in a tooltip so the operator sees what
         went stale without opening the tab.
         """
+        # A broken adapter link outranks the status: last_sync_status is the adapter's record
+        # of an EARLIER sync, so rendering it for an unreachable/unmapped device shows a green
+        # badge for a device the plugin can no longer reach.
+        if record.adapter_link_error:
+            return format_html(
+                '<span class="badge text-bg-danger" title="{}">Adapter link failed</span>',
+                record.adapter_link_error,
+            )
         if not value:
             return "—"
         css = "badge text-bg-" + _SYNC_STATUS_COLOR.get(value, "info")

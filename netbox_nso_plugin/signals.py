@@ -11,6 +11,7 @@ import logging
 import threading
 from collections import namedtuple
 
+from django.db.models import Q
 from django.db.models.signals import m2m_changed, post_delete, post_save, pre_delete, pre_save
 from django.dispatch import receiver
 from django.utils import timezone
@@ -288,6 +289,196 @@ def _drain_intent_pushes() -> None:
             logger.warning("Coalesced intent push failed: %s", exc)
 
 
+def _allocate_push_attempt(device_id, scope):
+    """Bump and return this scope's attempt high-water mark, or ``None`` if unmanaged.
+
+    Allocated BEFORE the request and never cleared. The mark is what tells a delayed
+    response from a current one: a success clears the visible error entry but leaves the
+    mark standing, so an attempt-1 failure that arrives after attempt 2 already succeeded
+    is discarded instead of resurrecting over it.
+    """
+    from django.db import transaction
+
+    from .models import NSODeviceManagement
+
+    try:
+        with transaction.atomic():
+            mgmt = NSODeviceManagement.objects.select_for_update().filter(device_id=device_id).first()
+            if mgmt is None:
+                return None
+            attempts = dict(mgmt.intent_push_attempts or {})
+            attempt = int(attempts.get(scope) or 0) + 1
+            attempts[scope] = attempt
+            # Queryset update, not save(): the mark is bookkeeping and must not re-date
+            # last_updated or wake a management post_save.
+            NSODeviceManagement.objects.filter(pk=mgmt.pk).update(intent_push_attempts=attempts)
+            return attempt
+    except Exception as exc:  # noqa: BLE001 — bookkeeping must never block the push itself
+        logger.warning("Could not allocate an intent-push attempt for device %s/%s: %s", device_id, scope, exc)
+        return None
+
+
+def _push_error_entry(exc, attempt):
+    """Render an exception as the persisted per-scope rejection record."""
+    from django.utils import timezone
+
+    from .adapter_client import AdapterError
+
+    if isinstance(exc, AdapterError):
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        return {
+            "code": exc.code or "",
+            "message": str(exc),
+            "detail": detail,
+            "at": timezone.now().isoformat(),
+            "attempt": attempt,
+        }
+    # Not an AdapterError — no structured code or detail exists, so say so rather than
+    # inventing one. repr() keeps the exception type, which is the whole diagnostic.
+    return {
+        "code": "",
+        "message": repr(exc),
+        "detail": {},
+        "at": timezone.now().isoformat(),
+        "attempt": attempt,
+    }
+
+
+def _attribute_static_route_error(device_id, detail):
+    """Which owned routes an adapter static-route rejection names.
+
+    ``duplicate_route_id`` names one pk, so it resolves to exactly one overlay.
+    ``duplicate_triple`` does NOT: it fires because two *payload entries* share a triple,
+    so every owned route holding that triple is a candidate and all of them are named.
+    An unresolvable detail yields ``[]`` — device-scoped, which is honest rather than a
+    guess at one row.
+    """
+    from .models import NSOStaticRouteState
+
+    reason = (detail or {}).get("reason")
+    if reason == "duplicate_route_id":
+        route_id = detail.get("route_id")
+        return [route_id] if isinstance(route_id, int) else []
+    if reason != "duplicate_triple":
+        return []
+    triple = detail.get("triple")
+    if not (isinstance(triple, list) and len(triple) == 3):
+        return []
+    vrf, prefix, next_hop = (str(part) for part in triple)
+    matched = []
+    # The same predicate the push serializes by: the rejection names payload entries, so a
+    # row the push never sent may never be attributed one.
+    for row in NSOStaticRouteState.objects.filter(
+        PUSHED_STATIC_ROUTE_FILTER,
+        management__device_id=device_id,
+    ).select_related("static_route", "static_route__vrf"):
+        sr = row.static_route
+        row_vrf = sr.vrf.name if sr.vrf else ""
+        if (row_vrf, str(sr.prefix), str(sr.next_hop)) == (vrf, prefix, next_hop):
+            matched.append(sr.pk)
+    return sorted(matched)
+
+
+# Scope → the attribution that turns an adapter rejection into the objects it names.
+# Only static routes carry per-object identity on the wire today.
+_PUSH_ERROR_ATTRIBUTION = {"static_route": _attribute_static_route_error}
+
+
+def _record_push_outcome(device_id, scope, attempt, exc):
+    """Persist (or clear) this scope's rejection record, discarding a superseded response.
+
+    Per ``(device, scope)`` under ``select_for_update``: the record is a JSONField shared
+    by every scope, so a plain read-modify-write from two workers loses one of them, and a
+    device-wide record would let one scope's failure erase another's.
+    """
+    from django.db import transaction
+
+    from .models import NSODeviceManagement
+
+    if attempt is None:
+        return
+    try:
+        with transaction.atomic():
+            mgmt = NSODeviceManagement.objects.select_for_update().filter(device_id=device_id).first()
+            if mgmt is None:
+                return
+            high_water = int((mgmt.intent_push_attempts or {}).get(scope) or 0)
+            if attempt < high_water:
+                # A newer attempt has since been made; this response describes a
+                # superseded request and must not overwrite what that attempt recorded.
+                logger.info(
+                    "Discarding a superseded intent-push outcome for device %s/%s (attempt %s < %s)",
+                    device_id,
+                    scope,
+                    attempt,
+                    high_water,
+                )
+                return
+            errors = dict(mgmt.intent_push_errors or {})
+            if exc is None:
+                if errors.pop(scope, None) is None:
+                    return
+            else:
+                entry = _push_error_entry(exc, attempt)
+                attribute = _PUSH_ERROR_ATTRIBUTION.get(scope)
+                if attribute is not None:
+                    entry["route_ids"] = attribute(device_id, entry["detail"])
+                errors[scope] = entry
+            NSODeviceManagement.objects.filter(pk=mgmt.pk).update(intent_push_errors=errors)
+    except Exception as exc2:  # noqa: BLE001 — surfacing must never turn a swallowed push into a raise
+        logger.warning("Could not record the intent-push outcome for device %s/%s: %s", device_id, scope, exc2)
+
+
+def read_push_record(device_id, scope) -> tuple:
+    """Return this scope's persisted ``(attempt, rejection entry)`` as it stands right now."""
+    from .models import NSODeviceManagement
+
+    row = (
+        NSODeviceManagement.objects.filter(device_id=device_id)
+        .values("intent_push_attempts", "intent_push_errors")
+        .first()
+    )
+    if row is None:
+        return None, None
+    attempt = (row["intent_push_attempts"] or {}).get(scope)
+    return (int(attempt) if attempt is not None else None), (row["intent_push_errors"] or {}).get(scope)
+
+
+def restore_push_record(device_id, scope, attempt, entry) -> None:
+    """Re-apply a rejection record a caller's own rollback discarded.
+
+    :func:`_push_changed` persists the attempt mark and the adapter's rejection through
+    :func:`_record_push_outcome`, which is what puts the reason on the device tab. A caller
+    that runs its push inside a transaction it then rolls back (the static-route rollout
+    pass, which cannot keep a generation the adapter refused) takes those writes down with
+    it, leaving the operator a bare "not acknowledged". This puts them back, in its own
+    transaction, under the same per-scope merge — so no other scope's record is touched and
+    a newer attempt recorded meanwhile still wins.
+    """
+    from django.db import transaction
+
+    from .models import NSODeviceManagement
+
+    if attempt is None or entry is None:
+        return
+    try:
+        with transaction.atomic():
+            mgmt = NSODeviceManagement.objects.select_for_update().filter(device_id=device_id).first()
+            if mgmt is None:
+                return
+            attempts = dict(mgmt.intent_push_attempts or {})
+            if int(attempts.get(scope) or 0) > attempt:
+                return  # a later attempt has reported since; its record is the current one
+            errors = dict(mgmt.intent_push_errors or {})
+            attempts[scope] = attempt
+            errors[scope] = entry
+            NSODeviceManagement.objects.filter(pk=mgmt.pk).update(
+                intent_push_attempts=attempts, intent_push_errors=errors
+            )
+    except Exception as exc:  # noqa: BLE001 — surfacing must never turn a swallowed push into a raise
+        logger.warning("Could not restore the intent-push record for device %s/%s: %s", device_id, scope, exc)
+
+
 def _push_changed(key, payload, do_push, force=False):
     """Run *do_push* only if *payload* differs from the last push for *key*.
 
@@ -295,6 +486,10 @@ def _push_changed(key, payload, do_push, force=False):
     (matching the adapter-unreachable tolerance elsewhere) and the cache is left
     unchanged on failure so the next attempt retries. ``force`` bypasses the
     unchanged-skip (used by the explicit device Apply, which must always commit).
+
+    A failure is now also PERSISTED per ``(device, scope)`` so the operator can see what
+    the adapter refused instead of only a log line. R3 records; #1474 owns any retry —
+    nothing here re-sends, times out or queues.
 
     Returns the ``do_push()`` result on a push that ran (so a caller can read the
     adapter's response, e.g. the route-policy ``unsupported_members`` map), or ``None``
@@ -304,11 +499,15 @@ def _push_changed(key, payload, do_push, force=False):
     if not force and _last_pushed_hashes.get(key) == digest:
         logger.debug("Intent push skipped (unchanged) for %s", key)
         return None
+    device_id, scope = key
+    attempt = _allocate_push_attempt(device_id, scope)
     try:
         result = do_push()
     except Exception as exc:  # noqa: BLE001 — adapter may be down; log and retry next time
         logger.warning("Intent push failed for %s: %s", key, exc)
+        _record_push_outcome(device_id, scope, attempt, exc)
         return None
+    _record_push_outcome(device_id, scope, attempt, None)
     _last_pushed_hashes[key] = digest
     return result
 
@@ -450,11 +649,34 @@ def _sync_source_change(instance, client) -> bool:
             management_model.objects.filter(pk=current.pk).update(source_rekey_pending=True)
             current.source_rekey_pending = True
 
-        result = client.patch_device(
-            adapter_device_id=current.adapter_device_id,
-            nso_instance=current.nso_instance.adapter_instance_id,
-            nso_device_name=current.nso_device_name,
-        )
+        from .adapter_client import AdapterError
+
+        try:
+            result = client.patch_device(
+                adapter_device_id=current.adapter_device_id,
+                nso_instance=current.nso_instance.adapter_instance_id,
+                nso_device_name=current.nso_device_name,
+            )
+        except AdapterError as exc:
+            # The mapping this rekey retargets is gone, so the PATCH can never land and both the
+            # periodic repair and the Retry button would re-enter here forever. Re-onboard under
+            # the NEW identity — which is what the rekey was expressing — then fall through to
+            # the same completion below, so the epoch fence and the reset-pending marker are
+            # recorded exactly as on the normal path. Handling it HERE rather than at the caller
+            # is what keeps ``invalidated`` in scope: admissions were already blanked above, and
+            # dropping that marker would leave every family fenced while the UI read all-clear.
+            if exc.code != "not_found":
+                raise
+            logger.warning(
+                "Rekey target %s is gone for NetBox device %s — re-onboarding under the new source",
+                current.adapter_device_id,
+                current.device_id,
+            )
+            _onboard_into_adapter(current, client)
+            # ``current`` is a separate instance from the caller's ``instance``; without this
+            # the scope push below would still target the dead id.
+            instance.adapter_device_id = current.adapter_device_id
+            result = {"source_epoch": current.adapter_source_epoch}
         if result.get("source_epoch") is None:
             raise RuntimeError("adapter rekey response omitted source_epoch; publication remains fenced")
         with transaction.atomic():
@@ -473,6 +695,26 @@ def _sync_source_change(instance, client) -> bool:
     instance.source_epoch_aware = source_aware
     instance.source_rekey_pending = False
     return True
+
+
+def _onboard_into_adapter(instance, client):
+    """Register the device with the adapter and store the returned mapping on the row.
+
+    ``.update()`` (not ``.save()``) so storing the mapping doesn't re-enter this handler.
+    """
+    result = client.onboard_device(
+        nso_instance=instance.nso_instance.adapter_instance_id,
+        nso_device_name=instance.nso_device_name,
+        netbox_device_id=instance.device_id,
+    )
+    type(instance).objects.filter(pk=instance.pk).update(
+        adapter_device_id=result["id"],
+        adapter_source_epoch=result.get("source_epoch"),
+        source_epoch_aware=result.get("source_epoch") is not None,
+    )
+    instance.adapter_device_id = result["id"]
+    instance.adapter_source_epoch = result.get("source_epoch")
+    instance.source_epoch_aware = result.get("source_epoch") is not None
 
 
 @receiver(post_save, sender="netbox_nso_plugin.NSODeviceManagement")
@@ -504,23 +746,13 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
         return
 
     from . import adapter_client as client
+    from .adapter_client import AdapterError
 
     try:
         if created or instance.adapter_device_id is None:
-            result = client.onboard_device(
-                nso_instance=instance.nso_instance.adapter_instance_id,
-                nso_device_name=instance.nso_device_name,
-                netbox_device_id=instance.device_id,
-            )
-            type(instance).objects.filter(pk=instance.pk).update(
-                adapter_device_id=result["id"],
-                adapter_source_epoch=result.get("source_epoch"),
-                source_epoch_aware=result.get("source_epoch") is not None,
-            )
-            instance.adapter_device_id = result["id"]
-            instance.adapter_source_epoch = result.get("source_epoch")
-            instance.source_epoch_aware = result.get("source_epoch") is not None
+            _onboard_into_adapter(instance, client)
         elif instance.source_rekey_pending:
+            # _sync_source_change recovers a dead mapping itself — it owns the fencing state.
             if not _sync_source_change(instance, client):
                 return
 
@@ -532,14 +764,34 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
         from .onboarding import device_mgmt_addresses
 
         primary_ip, oob_ip = device_mgmt_addresses(instance.device)
-        client.set_scope(
-            instance.adapter_device_id,
-            instance.managed_attributes,
-            auto_apply=instance.auto_apply,
-            sync_before_apply=instance.sync_before_apply,
-            primary_ip=primary_ip,
-            oob_ip=oob_ip,
-        )
+
+        def push_scope():
+            client.set_scope(
+                instance.adapter_device_id,
+                instance.managed_attributes,
+                auto_apply=instance.auto_apply,
+                sync_before_apply=instance.sync_before_apply,
+                primary_ip=primary_ip,
+                oob_ip=oob_ip,
+            )
+
+        try:
+            push_scope()
+        except AdapterError as exc:
+            # The stored id points at an adapter device row that no longer exists (a provision
+            # that rolled back, a manual delete, a restored DB). Without this the branch above
+            # never re-onboards — the id is set — so every push 404s forever and even the tab's
+            # "Retry adapter link" can't heal it. Only 'not_found' proves the id is dead; any
+            # other error is an outage and must not mint a second device row.
+            if exc.code != "not_found":
+                raise
+            logger.warning(
+                "Adapter no longer has device %s for NetBox device %s — re-onboarding",
+                instance.adapter_device_id,
+                instance.device_id,
+            )
+            _onboard_into_adapter(instance, client)
+            push_scope()
 
         notify_result = client.sync_notify(instance.adapter_device_id)
         if notify_result and notify_result.get("job_id"):
@@ -572,15 +824,29 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
 
 @receiver(post_delete, sender="netbox_nso_plugin.NSODeviceManagement")
 def offboard_device_from_adapter(sender, instance, **kwargs):
-    """Remove device from adapter when the management record is deleted."""
+    """Remove the device from the adapter once the management row's deletion COMMITS.
+
+    Deferred to on_commit for two reasons. A rolled-back delete must not have already
+    offboarded the device adapter-side; and while the deleting transaction is open the row is
+    still visible to other connections, so a concurrent save (or the periodic link repair)
+    could see the mapping, get a 404 from the just-deleted adapter device, and re-onboard a
+    fresh row that nothing then owns — this handler has already fired against the old id.
+    """
     if instance.adapter_device_id is None:
         return
+    from django.db import transaction
+
     from . import adapter_client as client
 
-    try:
-        client.delete_device(instance.adapter_device_id)
-    except Exception as exc:
-        logger.warning("Failed to offboard device %s from adapter: %s", instance.adapter_device_id, exc)
+    adapter_device_id = instance.adapter_device_id
+
+    def _offboard():
+        try:
+            client.delete_device(adapter_device_id)
+        except Exception as exc:  # noqa: BLE001 — best-effort; never block the NetBox delete
+            logger.warning("Failed to offboard device %s from adapter: %s", adapter_device_id, exc)
+
+    transaction.on_commit(_offboard)
 
 
 @receiver(post_save, sender="netbox_nso_plugin.NSOFailoverSettings")
@@ -1129,7 +1395,7 @@ def _push_logging_intent_for_device(device_id, adapter_device_id, force=False):
     """
     from . import adapter_client as client
     from .models import NSOLoggingHostState, NSOLoggingLevelState
-    from .template_content import _canonical_logging_field
+    from .template_content import _canonical_logging_intent_field
 
     ned_id = _ned_id_for_device(device_id)
     hosts = []
@@ -1139,8 +1405,8 @@ def _push_logging_intent_for_device(device_id, adapter_device_id, force=False):
     ):
         host = {
             "address": row.address,
-            "severity": _canonical_logging_field(ned_id, "severity", row.severity or ""),
-            "facility": _canonical_logging_field(ned_id, "facility", row.facility or ""),
+            "severity": _canonical_logging_intent_field(ned_id, "severity", row.severity or ""),
+            "facility": _canonical_logging_intent_field(ned_id, "facility", row.facility or ""),
             "transport": row.transport or "",
             "vrf": row.vrf or "",
             "source": row.source or "",
@@ -1705,39 +1971,108 @@ def _on_ip_address_delete(sender, instance, **kwargs):
     )
 
 
+#: The overlays a static-route push actually serializes: owned, and carrying an IP next
+#: hop (an interface-only next hop is not supported by static-route-reconciler v1, so the
+#: snapshot has no way to express it). Read by the rollout backfill too — a row it armed
+#: but the push never sent would hold a generation the adapter has never seen, which no
+#: apply result can name and no later pass would re-arm (#1502 Appendix S).
+PUSHED_STATIC_ROUTE_FILTER = Q(status__in=_OWNED_PUSH_STATUSES, static_route__next_hop__isnull=False)
+
+
+def stored_static_route_count(response):
+    """How many routes the adapter says it stored, or ``None`` when it did not say.
+
+    One definition for every reader of a static-route push answer: the Apply promotion gate
+    and the fleet re-sync both decide "acknowledged" from this, so a malformed answer cannot
+    mean stored to one of them and refused to the other. Only a real row count answers —
+    ``True`` is an ``int`` in Python, and no push stores a negative number of routes.
+    """
+    if not isinstance(response, dict):
+        return None
+    count = response.get("count")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        return None
+    return count
+
+
 def _push_static_route_intent_for_device(device_id, adapter_device_id, force=False):
-    """Build and push the full static route intent snapshot for a device."""
+    """Build and push the full static route intent snapshot for a device.
+
+    Each route names the NetBox ``StaticRoute`` pk and the generation of the intent it
+    carries: the pk is what lets the adapter tell a *replacement* from an unrelated
+    delete-plus-insert, and the generation is the token an apply result is correlated
+    against. ``intent_generation`` 0 is the unallocated sentinel and goes on the wire as
+    NULL — the adapter adopts a generation only when non-null, so a sentinel row simply has
+    nothing to correlate with instead of correlating with everything at 0.
+
+    Returns the adapter's response, so a caller passing ``force=True`` can tell a failure
+    (``None``) from a skipped-unchanged push, and records the echoed fingerprints as this
+    device's settlement expectations.
+    """
     from . import adapter_client as client
     from .models import NSOStaticRouteState
 
-    ned_id = _ned_id_for_device(device_id)
     routes = []
+    generations: dict[int, int] = {}
     for row in NSOStaticRouteState.objects.filter(
-        management__device_id=device_id,
-        status__in=_OWNED_PUSH_STATUSES,
+        PUSHED_STATIC_ROUTE_FILTER, management__device_id=device_id
     ).select_related("static_route", "static_route__vrf"):
         sr = row.static_route
-        if sr.next_hop is None:
-            continue  # interface-only next-hop not supported by static-route-reconciler v1
         vrf_name = sr.vrf.name if sr.vrf else ""
+        generation = row.intent_generation or None
         route = {
+            "route_id": sr.pk,
+            "generation": generation,
             "vrf": vrf_name,
             "prefix": str(sr.prefix),
             "next_hop": str(sr.next_hop),
             "permanent": sr.permanent or False,
             "tag": sr.tag,
         }
-        # Nokia preference 5 is value-default-suppressed by the export contract.
-        if sr.metric is not None and not (ned_id.startswith("timos") and sr.metric == 5):
+        # Always sent: an omitted optional field is a CLEAR to the adapter, NED-agnostically.
+        # Nokia's default preference 5 used to be suppressed here, which turned an edit
+        # 3 → 5 into a clear plus a networked retract job for a value the SR OS writer
+        # treats identically to None and the exporter suppresses on the way back.
+        if sr.metric is not None:
             route["metric"] = sr.metric
         routes.append(route)
+        if generation is not None:
+            generations[sr.pk] = generation
 
-    _push_changed(
+    response = _push_changed(
         (device_id, "static_route"),
         routes,
         lambda: client.put_static_route_intent(adapter_device_id, routes),
         force=force,
     )
+    if isinstance(response, dict):
+        _record_static_route_expectations(device_id, generations, response.get("routes") or [])
+    return response
+
+
+def _record_static_route_expectations(device_id, generations: dict, echoes) -> None:
+    """Store each echoed ``{route_id, generation, fingerprint}`` as the row's expectation.
+
+    Written under a compare-and-set on the overlay's *current* ``intent_generation``. The
+    adapter commits its store write before it answers, so an operator edit can bump the
+    generation while the response is in flight; recording the stale echo would then let the
+    next apply result settle content that has already been superseded.
+    """
+    from .models import NSOStaticRouteState
+
+    for echo in echoes:
+        if not isinstance(echo, dict):
+            continue
+        route_id, generation, fingerprint = echo.get("route_id"), echo.get("generation"), echo.get("fingerprint")
+        if route_id is None or not fingerprint:
+            continue
+        if generation is None or generations.get(route_id) != generation:
+            continue  # never pushed by us at this generation — not an expectation we may record
+        NSOStaticRouteState.objects.filter(
+            management__device_id=device_id,
+            static_route_id=route_id,
+            intent_generation=generation,
+        ).update(expected_generation=generation, expected_fingerprint=fingerprint)
 
 
 @_skip_on_render
@@ -1770,6 +2105,114 @@ def _on_static_route_state_save(sender, instance, **kwargs):
 # (full-replace). All wired from the plugin against the netbox_routing model — no fork edit.
 
 
+def _static_route_content(static_route) -> tuple:
+    """Return the wire-visible content of *static_route* — what a push would carry.
+
+    A delta here is new intent for every device that owns the route; a delta anywhere
+    else is not. ``name`` and ``interface_next_hop`` never reach the wire for a pushable
+    route, so editing them is not an intent change.
+    """
+    return (
+        static_route.vrf_id,
+        str(static_route.prefix or ""),
+        str(static_route.next_hop or ""),
+        static_route.metric,
+        # The wire sends ``permanent or False``, so None and False are one value there —
+        # treating them as a delta would bump a generation over an identical payload.
+        bool(static_route.permanent),
+        static_route.tag,
+    )
+
+
+#: Every field :func:`_arm_static_route_generation` writes. The accept paths save the row
+#: with an explicit ``update_fields``, so they read this list rather than restate it — a
+#: field the helper gains and a call site does not name is armed in memory and dropped.
+_STATIC_ROUTE_ARMED_FIELDS = (
+    "intent_generation",
+    "generation_started_at",
+    "last_apply_error",
+    "last_result_advisory",
+)
+
+
+def _arm_static_route_generation(state) -> None:
+    """Give *state* a fresh generation in memory — the caller saves it.
+
+    For the accept paths, which never save the native route (so no ``pre_save`` fires and
+    the content transition cannot see them) yet are still a new statement of intent: the
+    result of the apply that already failed must not be able to settle the row the
+    operator has just re-accepted.
+    """
+    from .intent_generation import allocate_intent_generation
+
+    state.intent_generation = allocate_intent_generation()
+    state.generation_started_at = timezone.now()
+    # Both describe the generation just superseded.
+    state.last_apply_error = ""
+    state.last_result_advisory = ""
+
+
+_STATIC_ROUTE_TRANSITION_FIELDS = (
+    "nso_vrf",
+    "nso_prefix",
+    "nso_next_hop",
+    "status",
+    *_STATIC_ROUTE_ARMED_FIELDS,
+)
+
+
+def _transition_static_route_content(static_route, previous=None) -> list:
+    """Re-arm every owned overlay of *static_route* as fresh, unsettled intent.
+
+    *previous* is the pre-save content the delta is judged against; ``None`` means the
+    caller already knows this is a change and wants the transition unconditionally.
+
+    Any operator content edit — identity or not — makes every prior apply result stale.
+    The row goes back to ``accepted`` (fail-closed: "pending apply"), takes a generation
+    no in-flight result can name, and drops the error and advisory that described the
+    generation just superseded. Leaving an edited row ``in_sync`` is a green badge over
+    content the device does not have, and leaving it ``deploying`` lets the apply already
+    in flight settle the *new* intent from the *old* result.
+
+    The fan-out is resolved by querying the overlays, never through ``instance.devices``:
+    the fork's form writes the row before ``devices.set()``, so at ``post_save`` the M2M
+    still reads the pre-edit membership. Rows are locked in ascending management-id order
+    so two edits of one shared route touching the same devices in opposite order cannot
+    deadlock. ``accepted_at`` is left alone — it dates first ownership (staged_days).
+    """
+    from django.db import transaction
+
+    from .models import NSOStaticRouteState
+
+    with transaction.atomic():
+        # The committed row, never the instance: a save(update_fields=…) persists only the
+        # named columns, so an unsaved attribute would otherwise be mirrored and bumped as
+        # intent the push — which re-queries the row — could never send.
+        route_rows = type(static_route)._default_manager.filter(pk=static_route.pk).order_by("pk")
+        committed = route_rows.select_for_update().first()
+        if committed is None:
+            return []
+        if previous is not None and previous == _static_route_content(committed):
+            return []  # nothing the wire carries actually changed
+        vrf_name = committed.vrf.name if committed.vrf else ""
+        prefix = str(committed.prefix or "")
+        next_hop = str(committed.next_hop or "")
+        rows = list(
+            NSOStaticRouteState.objects.select_for_update()
+            .filter(static_route=static_route, status__in=_OWNED_PUSH_STATUSES)
+            .order_by("management_id")
+        )
+        for row in rows:
+            row.nso_vrf = vrf_name
+            row.nso_prefix = prefix
+            row.nso_next_hop = next_hop
+            row.status = "accepted"
+            _arm_static_route_generation(row)
+            # → _on_static_route_state_save, which coalesces to one push per device.
+            row.save(update_fields=list(_STATIC_ROUTE_TRANSITION_FIELDS))
+    return rows
+
+
 def _accept_static_route_for_device(static_route, device) -> None:
     """Own a greenfield route for *device* (accepted overlay) → its save pushes intent."""
     from .models import NSODeviceManagement, NSOStaticRouteState
@@ -1787,9 +2230,17 @@ def _accept_static_route_for_device(static_route, device) -> None:
         static_route=static_route,
         defaults={"status": "accepted", "accepted_at": timezone.now()},
     )
-    if not created and state.status not in ("accepted", "deploying", "in_sync", "apply_failed"):
+    was_owned = not created and state.status in _OWNED_PUSH_STATUSES
+    if not created and not was_owned:
         state.status = "accepted"
         state.accepted_at = timezone.now()
+    if not was_owned:
+        # Entering ownership is intent this device did not carry before, so it needs a
+        # generation of its own — an already-owned row keeps the one it is mid-flight on.
+        _arm_static_route_generation(state)
+    # nso_vrf too: the residue key is the (vrf, prefix, next_hop) triple, so a VRF route
+    # adopted with an empty mirror never matches its own device row.
+    state.nso_vrf = static_route.vrf.name if static_route.vrf else ""
     state.nso_prefix = str(static_route.prefix or "")
     state.nso_next_hop = str(static_route.next_hop or "")
     state.last_sync_at = timezone.now()
@@ -1814,27 +2265,49 @@ def _remove_static_route_for_device(static_route, device) -> None:
     )
 
 
-@_skip_on_render
-def _on_routing_static_route_save(sender, instance, **kwargs):
-    """Re-push when an owned greenfield route's fields (prefix/next-hop/…) are edited."""
-    from .models import NSODeviceManagement, NSOStaticRouteState
+def _on_routing_static_route_pre_save(sender, instance, **kwargs):
+    """Stash the committed row's wire-visible content so post_save can see the delta.
 
-    for device in instance.devices.all():
-        try:
-            mgmt = NSODeviceManagement.objects.get(device=device)
-        except NSODeviceManagement.DoesNotExist:
-            continue
-        if mgmt.adapter_device_id is None:
-            continue
-        owned = NSOStaticRouteState.objects.filter(
-            management=mgmt, static_route=instance, status__in=("accepted", "deploying", "in_sync", "apply_failed")
-        ).exists()
-        if owned:
-            device_id, adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
-            _schedule_intent_push(
-                (device_id, "static_route"),
-                lambda d=device_id, a=adapter_device_id: _push_static_route_intent_for_device(d, a),
-            )
+    The stash lives on the instance, so a save of a *different* route on the same thread
+    can never be read as this one's baseline. Re-reading on every save is deliberate:
+    within one transaction a second save sees the transaction's own first write, which is
+    what makes an A→B→A edit two real transitions instead of a silently swallowed one.
+
+    The baseline is read under the row's own lock, held to COMMIT. Two concurrent edits
+    would otherwise both load A; the one that lands second — writing A back over the
+    first's B — would compare A against A, transition nothing and push nothing, leaving
+    the adapter holding B while NetBox reads A.
+    """
+    from django.db import connection
+
+    instance._nso_static_route_content = None
+    # Same guard as post_save's @_skip_on_render: with no transition to feed there is no
+    # baseline to read, and reconcile writes must not take a route lock.
+    if _is_intent_push_suppressed() or _is_render_request() or not instance.pk:
+        return
+    # order_by(pk): the model's Meta ordering starts at the nullable ``vrf``, whose LEFT
+    # JOIN PostgreSQL refuses to lock ("FOR UPDATE cannot be applied to the nullable side").
+    rows = sender.objects.filter(pk=instance.pk).order_by("pk")
+    if connection.in_atomic_block:
+        rows = rows.select_for_update()  # outside a transaction there is nothing to hold it to
+    previous = rows.first()
+    if previous is not None:
+        instance._nso_static_route_content = _static_route_content(previous)
+
+
+@_skip_on_render
+def _on_routing_static_route_save(sender, instance, created=False, **kwargs):
+    """Re-arm every overlay owning this route when its content changed, and push.
+
+    Delta-gated against the pre-save row: a save that touches nothing the wire carries is
+    not intent and must neither bump a generation nor push. The comparison itself happens
+    inside the transition, against the *committed* row. A create is left to the
+    ``post_add`` that assigns the route its first devices — there is no overlay yet.
+    """
+    previous = getattr(instance, "_nso_static_route_content", None)
+    if created or previous is None:
+        return
+    _transition_static_route_content(instance, previous=previous)
 
 
 @_skip_on_render
@@ -4147,6 +4620,13 @@ def _connect_g_activated():  # pragma: no cover
     try:
         from netbox_routing.models import StaticRoute
 
+        # The pre_save stash is what makes post_save delta-gated; without it every save
+        # (including one that touched only ``name``) would bump a generation and push.
+        pre_save.connect(
+            _on_routing_static_route_pre_save,
+            sender=StaticRoute,
+            dispatch_uid="nso_plugin_routing_static_route_pre_save",
+        )
         post_save.connect(
             _on_routing_static_route_save,
             sender=StaticRoute,

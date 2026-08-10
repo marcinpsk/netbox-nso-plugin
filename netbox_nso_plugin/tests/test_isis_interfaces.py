@@ -880,6 +880,45 @@ class TestReconcileIsisProcess(TestCase):
         self.assertEqual(state.is_type, "level-1-2")
         self.assertEqual(state.status, "accepted")
 
+    def test_junos_operator_edited_is_type_survives_omission_after_blank_import(self):
+        """The producer-faithful lifecycle: the corrected Junos reader never emits process
+        is-type while both levels are enabled, so an owned is_type can only arrive by operator
+        edit on top of a BLANK import — and a later omitting read must not erase it."""
+        from netbox_nso_plugin.models import NSOPlatformNedMapping
+        from netbox_nso_plugin.template_content import _reconcile_isis_process
+
+        platform = Platform.objects.create(
+            name="Junos IS-IS edited",
+            slug="junos-isis-edited",
+            manufacturer=self.device.device_type.manufacturer,
+        )
+        NSOPlatformNedMapping.objects.create(platform=platform, ned_id="juniper-junos-nc-4.19")
+        self.device.platform = platform
+        self.device.save(update_fields=["platform"])
+        self._make_mgmt()
+
+        # 1. Import from the corrected reader: is_type is OMITTED, never blank-explicit.
+        state = _reconcile_isis_process(self.device, [{"process_tag": ""}])[0]
+        self.assertEqual(state.status, "imported")
+        self.assertEqual(state.is_type, "")
+        self.assertEqual(state.isis_instance.is_type, "")
+
+        # 2. Operator edits the linked instance inline, then accepts the overlay.
+        inst = state.isis_instance
+        inst.is_type = "level-1-2"
+        inst.save(update_fields=["is_type"])
+        state.is_type = "level-1-2"
+        state.status = "accepted"
+        state.save(update_fields=["is_type", "status"])
+
+        # 3. The device still omits is-type — absence is not confirmation, nor permission to erase.
+        state = _reconcile_isis_process(self.device, [{"process_tag": ""}])[0]
+
+        state.isis_instance.refresh_from_db()
+        self.assertEqual(state.is_type, "level-1-2")
+        self.assertEqual(state.isis_instance.is_type, "level-1-2")
+        self.assertEqual(state.status, "accepted")
+
     def test_nokia_omitted_defaults_do_not_confirm_owned_nondefaults(self):
         from netbox_routing.models import ISISSegmentRouting
 

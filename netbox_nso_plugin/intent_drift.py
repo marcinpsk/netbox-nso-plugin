@@ -291,3 +291,140 @@ def resync_intent(device, mgmt, keys: list[str] | None = None) -> list[str]:
             sc["push"](mgmt.device_id, mgmt.adapter_device_id, force=True)
             done.append(key)
     return done
+
+
+class _PushNotAcknowledged(Exception):
+    """The adapter did not answer this device's push with a stored count.
+
+    Carries the push record the rollback is about to discard, as ``(attempt, entry)``.
+    """
+
+    def __init__(self, record=(None, None)):
+        super().__init__("the adapter did not acknowledge the static-route intent push")
+        self.record = record
+
+
+def _backfill_static_route_generations(mgmt) -> int:
+    """Arm every owned overlay of *mgmt* still on the unallocated sentinel. Returns how many.
+
+    Pre-P2 owned rows keep ``intent_generation = 0``: the push sends that as null, the
+    adapter adopts nothing, and every result the row ever produces is non-settling. The
+    fleet pass is where they get a generation, because "one pass that leaves every owned
+    overlay correlatable" is one concern — splitting it across two commands invites an
+    operator to run one and not the other.
+
+    A row already ``deploying`` is **demoted to accepted**. Its new generation makes any
+    in-flight result uncorrelatable, so leaving it ``deploying`` would strand it until the
+    backstop fires; a new generation means unsettled intent, and ``accepted`` is what
+    unsettled intent reads as. ``in_sync``, ``accepted`` and ``apply_failed`` rows keep
+    their status and only change generation, so the *next* result correlates and no badge
+    flickers. ``accepted_at`` is untouched — it dates first ownership.
+
+    The candidate set is the pusher's own (``signals.PUSHED_STATIC_ROUTE_FILTER``), not a
+    broader "owned" one: a route with an interface-only next hop is owned but has no place
+    in the snapshot, so arming it would mint a generation the adapter never receives — and
+    a later run would find no sentinel row to retry, leaving an Apply free to promote a row
+    nothing can settle. Only ``self`` is locked, so the join the filter adds cannot take
+    ``static_route`` locks against the content transition's own order.
+
+    Rows are locked in the same order the content transition takes them (``management_id``,
+    then pk), and the pushes the arming saves would fire are suppressed: the caller's own
+    forced push is the one that carries these generations to the adapter.
+    """
+    from . import signals
+    from .intent_generation import UNALLOCATED
+    from .models import NSOStaticRouteState
+    from .status_machine import DEPLOYING
+
+    rows = list(
+        NSOStaticRouteState.objects.select_for_update(of=("self",))
+        .filter(signals.PUSHED_STATIC_ROUTE_FILTER, management=mgmt, intent_generation=UNALLOCATED)
+        .order_by("management_id", "pk")
+    )
+    if not rows:
+        return 0
+    demote = [row.pk for row in rows if row.status == DEPLOYING]
+    with signals.suppress_intent_push():
+        for row in rows:
+            signals._arm_static_route_generation(row)
+            row.save(update_fields=list(signals._STATIC_ROUTE_ARMED_FIELDS))
+    if demote:
+        # .update(): a status save would re-fire the row's intent push, and this is
+        # bookkeeping about intent that has not moved.
+        NSOStaticRouteState.objects.filter(pk__in=demote).update(status="accepted")
+    logger.info("Armed %s static-route overlay(s) of device %s from the generation sentinel", len(rows), mgmt.device_id)
+    return len(rows)
+
+
+def resync_static_route_intent_fleet(device_ids: list[int] | None = None) -> list[dict]:
+    """Push every managed device's static-route intent once, so the adapter backfills ``route_id``.
+
+    The adapter keeps its replacement fence shut while any stored row has a NULL ``route_id``
+    and evaluates the fence on the pre-mutation row set, so this pass fills the ids and the
+    *next* ordinary push is the first one that can plan a replacement.
+
+    Deliberately not routed through :func:`resync_intent`: with the default ``keys`` that only
+    re-syncs scopes that already look drifted — a device whose counts agree looks clean while
+    every one of its rows is still id-less — and it appends each key unconditionally, so it
+    cannot tell a rejected push from a skipped one. Here each device is acknowledged from the
+    ``count`` the adapter answers with, and ``force=True`` makes a ``None`` return
+    unambiguously a failure rather than a change-detection skip.
+
+    Store-only throughout: this repairs the adapter's intent MIRROR, so it must not enqueue an
+    apply or write a tombstone. A clear the resync happens to detect parks the row instead of
+    being authorized.
+
+    It is also the rollout pass for #1502 Appendix S: per device, in **one** transaction, it
+    arms every owned overlay still on the generation sentinel and then pushes it. Arming and
+    pushing cannot be separated — a generation the adapter never stored correlates with
+    nothing, and a later run would find no sentinel row left to retry it with, so a push the
+    adapter did not acknowledge rolls the arming back with it. Idempotent: a second run finds
+    no sentinel rows, arms nothing and pushes an unchanged snapshot.
+    """
+    from django.db import transaction
+
+    from . import adapter_client as client
+    from . import signals
+    from .models import NSODeviceManagement
+
+    rows = NSODeviceManagement.objects.filter(adapter_device_id__isnull=False).select_related("device")
+    if device_ids is not None:
+        rows = rows.filter(device_id__in=device_ids)
+
+    results: list[dict] = []
+    with client.store_only_pushes():
+        for mgmt in rows.order_by("device_id"):
+            armed = 0
+            try:
+                with transaction.atomic():
+                    armed = _backfill_static_route_generations(mgmt)
+                    response = signals._push_static_route_intent_for_device(
+                        mgmt.device_id, mgmt.adapter_device_id, force=True
+                    )
+                    count = signals.stored_static_route_count(response)
+                    if count is None:
+                        # Read the rejection the push just persisted, because rolling the
+                        # arming back would take that record with it.
+                        raise _PushNotAcknowledged(signals.read_push_record(mgmt.device_id, "static_route"))
+            except _PushNotAcknowledged as rejected:
+                logger.warning("Static-route intent re-sync was not acknowledged for device %s", mgmt.device_id)
+                # Outside the rolled-back transaction: the reason the adapter gave is what
+                # the operator acts on, and it is not part of what the rollback undoes.
+                signals.restore_push_record(mgmt.device_id, "static_route", *rejected.record)
+                armed, count = 0, None
+            # Not an adapter rejection (the push returns None for those), so letting it out
+            # would strand every later device unattempted and unreported.
+            except Exception:  # noqa: BLE001
+                logger.exception("Static-route intent re-sync raised for device %s", mgmt.device_id)
+                armed, count = 0, None
+            results.append(
+                {
+                    "device_id": mgmt.device_id,
+                    "device": str(mgmt.device),
+                    "adapter_device_id": mgmt.adapter_device_id,
+                    "ok": count is not None,
+                    "count": count,
+                    "armed": armed,
+                }
+            )
+    return results

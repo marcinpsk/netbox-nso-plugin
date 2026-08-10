@@ -76,6 +76,7 @@ from .models import (
     NSOVaultSettings,
     NSOVLANState,
 )
+from .signals import _STATIC_ROUTE_ARMED_FIELDS
 from .tables import (
     NSODerivedIntentTemplateTable,
     NSODeviceManagementTable,
@@ -97,45 +98,6 @@ def _device_nso_tab_url(device_pk):
 def _device_capabilities_url(device_pk):
     """Return the URL for a device's route-policy capabilities page."""
     return reverse("plugins:netbox_nso_plugin:route_policy_capabilities", kwargs={"device_pk": device_pk})
-
-
-def _refresh_sync_cache(mgmt, adapter_device):
-    """Update an NSODeviceManagement row's cached last_sync_* from an adapter device dict.
-
-    Writes only changed fields via a targeted .update() (no full save / no signals),
-    so it is cheap enough to call per-row on the list view. Returns the list of
-    fields actually changed (empty if already current).
-    """
-    update_fields = []
-    raw_ts = adapter_device.get("last_sync_at")
-    if raw_ts:
-        from dateutil.parser import parse as parse_dt
-
-        last_sync_at = parse_dt(raw_ts) if isinstance(raw_ts, str) else raw_ts
-        if mgmt.last_sync_at != last_sync_at:
-            mgmt.last_sync_at = last_sync_at
-            update_fields.append("last_sync_at")
-    last_sync_status = adapter_device.get("last_sync_status") or ""
-    if mgmt.last_sync_status != last_sync_status:
-        mgmt.last_sync_status = last_sync_status
-        update_fields.append("last_sync_status")
-    # Which routing surfaces went stale on a "partial" sync (e.g. ["bgp", "ospf"]),
-    # normalized to None when nothing degraded so the display branches on truthiness.
-    degraded_surfaces = adapter_device.get("degraded_surfaces") or None
-    if mgmt.degraded_surfaces != degraded_surfaces:
-        mgmt.degraded_surfaces = degraded_surfaces
-        update_fields.append("degraded_surfaces")
-    # A successful device-level sync proves the adapter link works and the mirror is
-    # current — retire a sticky adapter_link_error left by an earlier failed scope-sync
-    # (otherwise it is only cleared by the next successful *save* of the row, so a
-    # transient adapter outage kept the tab's red "sync failed" banner up forever,
-    # directly above the "Last sync: succeeded" strip).
-    if mgmt.adapter_link_error and last_sync_status == "succeeded":
-        mgmt.adapter_link_error = ""
-        update_fields.append("adapter_link_error")
-    if update_fields:
-        NSODeviceManagement.objects.filter(pk=mgmt.pk).update(**{f: getattr(mgmt, f) for f in update_fields})
-    return update_fields
 
 
 def _observe_live_read_state(device, mgmt):
@@ -262,20 +224,19 @@ class DeviceNSOTabView(generic.ObjectView):
         if mgmt is not None and mgmt.adapter_device_id is not None:
             from . import adapter_client as client
             from .intent_drift import compute_intent_drift
+            from .sync_cache import parse_adapter_timestamp, refresh_sync_cache
 
             try:
                 adapter_device = client.get_device(mgmt.adapter_device_id)
-                _refresh_sync_cache(mgmt, adapter_device)
+                refresh_sync_cache(mgmt, adapter_device)
                 # Mgmt-IP failover status (active address / last probe / OOB health) — None when
                 # the device has no failover row (no primary/OOB IPs pushed yet). Parse the ISO
                 # timestamps to datetimes so the template's |date filter can format them.
                 failover = adapter_device.get("failover")
                 if failover:
-                    from dateutil.parser import parse as parse_dt
-
                     for key in ("last_probe_at", "last_switch_at", "oob_health_checked_at"):
                         if failover.get(key):
-                            failover[key] = parse_dt(failover[key])
+                            failover[key] = parse_adapter_timestamp(failover[key], key)
                 # Surface adapter↔NetBox split-brain (orphaned intent) — only renders if any.
                 intent_drift = compute_intent_drift(device, mgmt)
             except AdapterError as exc:
@@ -503,6 +464,54 @@ _PENDING_KINDS = {"pending", "apply_failed"}
 # Worst-first ordering of per-cell state kinds, for rolling an interface's cells up
 # into the single row-level state the grid sorts and quick-filters on.
 _KIND_SEVERITY = ("apply_failed", "drift", "pending", "deploying", "unknown", "in_sync")
+
+# Grid category → the intent-push scope whose rejection record belongs on its banner.
+# Only the scopes whose push failures are persisted appear here (see
+# signals._record_push_outcome); a category with no entry simply renders no banner.
+_CATEGORY_PUSH_SCOPES = {"static": "static_route"}
+
+
+# How definite a recorded push failure is. Only `configuration_error` is raised before a
+# request is ever built, so it is the only code that PROVES nothing was sent.
+# `nso_unreachable` does not: the client maps every generic RequestException to it,
+# including a socket that drops after the body went out, and `nso_timeout` likewise leaves
+# a PUT that may have committed and auto-applied. Both are unknown, not unsent — claiming
+# either way would state an outcome nobody observed.
+_PUSH_UNSENT_CODES = frozenset({"configuration_error"})
+_PUSH_UNKNOWN_CODES = frozenset({"nso_unreachable", "nso_timeout", ""})
+_PUSH_HEADLINES = {
+    "rejected": "The adapter rejected the last intent push for this category — NetBox holds the edit, the device does not.",
+    "unsent": "The last intent push for this category never reached the adapter — NetBox holds the edit, the device does not.",
+    "unknown": "The last intent push for this category did not complete — whether the adapter stored it is unknown.",
+}
+
+
+def _push_error_kind(code):
+    """Classify a recorded push failure as rejected / unsent / unknown."""
+    if code in _PUSH_UNSENT_CODES:
+        return "unsent"
+    if code in _PUSH_UNKNOWN_CODES:
+        return "unknown"
+    return "rejected"
+
+
+def _category_push_error(key, mgmt):
+    """Return this category's persisted intent-push failure, classified for the banner.
+
+    A failed push is not an adapter READ error: the operator's edit was saved and the
+    device was never told. Without this the only trace is a log line — the grid would show
+    a green, freshly-accepted row over intent that never landed. The classification is
+    derived here rather than stored, so a record written before this existed still renders
+    honestly.
+    """
+    scope = _CATEGORY_PUSH_SCOPES.get(key)
+    if scope is None or mgmt is None:
+        return None
+    entry = (mgmt.intent_push_errors or {}).get(scope)
+    if not isinstance(entry, dict):
+        return None
+    kind = _push_error_kind(entry.get("code") or "")
+    return {**entry, "kind": kind, "headline": _PUSH_HEADLINES[kind]}
 
 
 def _row_state(kinds) -> str:
@@ -1382,6 +1391,11 @@ class NSOCategoryView(LoginRequiredMixin, View):
                         ctx="static_routes",
                         qs=lambda d: by_device(NSOStaticRouteState, d, "static_route").order_by("nso_prefix"),
                         accept=r + "routing_accept_static_route",
+                        # Static routes are the one family that settles per route with a
+                        # per-route reason, so an owned apply_failed here renders as its
+                        # own red state carrying the message instead of a blue
+                        # "pending apply" chip promising an Apply that already lost.
+                        distinguish_failed=True,
                         fields={
                             "vrf": lambda st: st.nso_vrf or "global",
                             "prefix": lambda st: st.nso_prefix,
@@ -1390,6 +1404,10 @@ class NSOCategoryView(LoginRequiredMixin, View):
                             "permanent": lambda st: st.static_route.permanent if st.static_route else None,
                             "tag": lambda st: st.static_route.tag if st.static_route else None,
                             "route": lambda st: linked(st.static_route),
+                            "error": lambda st: st.last_apply_error or None,
+                            # An `unproven` verdict's reason: the apply landed and nothing
+                            # proves it. Not a status — a qualifier on one.
+                            "advisory": lambda st: st.last_result_advisory or None,
                             "edit_url": lambda st: (
                                 reverse(r + "overlay_field_edit", args=["static_route", st.pk])
                                 if st.static_route_id
@@ -1467,7 +1485,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
             },
         }
 
-    def _grid_section(self, states, accept_route, fields, related=None):
+    def _grid_section(self, states, accept_route, fields, related=None, distinguish_failed=False):
         """Serialize one grid sub-table: its rows plus the quick-filter counts.
 
         kind/label come from summary.display_state — the same helper the server-rendered
@@ -1485,7 +1503,10 @@ class NSOCategoryView(LoginRequiredMixin, View):
         counts = {"all": 0, "drift": 0, "pending": 0}
         for st in states:
             status_rows = [st, *(list(related(st)) if related else [])]
-            displayed = [display_state(row.status, row.status in OWNED_STATES) for row in status_rows]
+            displayed = [
+                display_state(row.status, row.status in OWNED_STATES, distinguish_failed=distinguish_failed)
+                for row in status_rows
+            ]
             kind = _row_state({item[0] for item in displayed})
             label = next(item[1] for item in displayed if item[0] == kind)
             counts["all"] += 1
@@ -1532,10 +1553,19 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 ctx[path] = states[name]
         _annotate_residue_rows(ctx, key, mgmt)
 
+        # The key is emitted ONLY for a category that owns a banner. A null on every other
+        # category would let that category's own grid reload hide an active failure
+        # belonging to a different, still-expanded one.
         payload: dict = {"adapter_error": adapter_error}
+        if key in _CATEGORY_PUSH_SCOPES:
+            payload["push_error"] = _category_push_error(key, mgmt)
         for name, section in spec["sections"].items():
             built = self._grid_section(
-                states[name], section["accept"], section["fields"], related=section.get("related")
+                states[name],
+                section["accept"],
+                section["fields"],
+                related=section.get("related"),
+                distinguish_failed=section.get("distinguish_failed", False),
             )
             if name is None:
                 payload.update(built)
@@ -1581,6 +1611,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 "grid_payload": payload,
                 "counts": payload.get("counts"),
                 "adapter_error": adapter_error,
+                "push_error": payload.get("push_error"),
                 "category_has_unowned": has_unowned,
             },
         )
@@ -2106,6 +2137,16 @@ class NSOOnboardingDashboardView(LoginRequiredMixin, View):
         else:
             data = build_onboarding_dashboard(instance)
             managed = list(NSODeviceManagement.objects.filter(nso_instance=instance).select_related("device"))
+            # Mirror the adapter's current last-sync state onto the rows before rendering.
+            # The periodic job keeps them fresh with nobody watching; this makes the page
+            # the operator is actually looking at current to the second. Best-effort: the
+            # last-sync columns are a display nicety, never worth 500ing the dashboard.
+            from .sync_cache import refresh_sync_caches
+
+            try:
+                refresh_sync_caches(managed)
+            except Exception:  # noqa: BLE001 — see above
+                logger.debug("Dashboard last-sync refresh failed", exc_info=True)
             # Annotate each managed row with the NED it actually runs on (live NSO
             # inventory), so the Managed tab shows it without a second page.
             ned_by_name = data.get("ned_by_nso_name") or {}
@@ -2331,12 +2372,10 @@ class NSODevicesReturnMixin:
 class NSODeviceManagementListView(generic.ObjectListView):
     """List view for managed NSO devices.
 
-    Refreshes the cached ``last_sync_*`` columns on each render via a cheap
-    per-row ``get_device`` call, so the list reflects current sync state without
-    the operator first having to open each device's NSO tab. Compliance and
-    per-protocol reconcile are NOT run here (those stay on the tab) — only the
-    two lightweight last-sync fields are polled. Adapter errors are swallowed
-    per row so one unreachable device never breaks the list.
+    Refreshes the cached ``last_sync_*`` columns on each render via one bulk adapter
+    call, so the list reflects current sync state without the operator first having to
+    open each device's NSO tab. Compliance and per-protocol reconcile are NOT run here
+    (those stay on the tab) — only the lightweight last-sync fields are polled.
     """
 
     queryset = NSODeviceManagement.objects.select_related("device", "nso_instance")
@@ -2347,15 +2386,9 @@ class NSODeviceManagementListView(generic.ObjectListView):
     def get_queryset(self, request):
         """Poll the adapter for last-sync state before the table is built."""
         qs = super().get_queryset(request)
-        from . import adapter_client as client
+        from .sync_cache import refresh_sync_caches
 
-        for mgmt in qs:
-            if mgmt.adapter_device_id is None:
-                continue
-            try:
-                _refresh_sync_cache(mgmt, client.get_device(mgmt.adapter_device_id))
-            except AdapterError as exc:
-                logger.debug("List last-sync poll failed for device %s: %s", mgmt.pk, exc)
+        refresh_sync_caches(qs)
         return qs
 
 
@@ -2458,11 +2491,13 @@ def _prepare_apply(mgmt):
         _push_lacp_intent_for_device,
         _push_logging_intent_for_device,
         _push_route_policy_intent_for_device,
+        _push_snmp_intent_for_device,
         _push_static_route_intent_for_device,
         _push_subinterface_intent_for_device,
         _push_svi_intent_for_device,
         _push_switchport_intent_for_device,
         _push_vlan_intent_for_device,
+        stored_static_route_count,
     )
 
     # Force-push (bypass change-detection) the owned snapshots so Apply re-ships the
@@ -2481,6 +2516,9 @@ def _prepare_apply(mgmt):
     #     force-push the owned snapshot too — otherwise Apply applies nothing and the row
     #     sticks 'deploying' forever (observed on rg03 for route-policy: an owned as-path
     #     with no adapter intent row; SVI/subinterface/BFD/MTU share the same failure mode).
+    #   - SNMP: mirrored reactively on accept and a failed push is swallowed, so the adapter
+    #     mirror can be stale or absent. Refreshed store-only below — the Apply commits it.
+    static_route_stored = False
     for push in (
         _push_interface_intent_for_device,
         _push_lacp_intent_for_device,
@@ -2496,9 +2534,26 @@ def _prepare_apply(mgmt):
         _push_vlan_intent_for_device,
     ):
         try:
-            push(mgmt.device_id, mgmt.adapter_device_id, force=True)
+            response = push(mgmt.device_id, mgmt.adapter_device_id, force=True)
         except Exception as exc:  # noqa: BLE001 — one scope's failure must not block the rest
             logger.warning("Apply push failed for device %s: %s", mgmt.device_id, exc)
+            response = None
+        if push is _push_static_route_intent_for_device:
+            # A forced push is only skipped on a real rejection (change-detection is
+            # bypassed), and a static route settles on a generation the adapter has to be
+            # holding. Promoting on a push the adapter refused would create a 'deploying'
+            # row no result can ever name — stuck until the backstop calls it failed.
+            static_route_stored = stored_static_route_count(response) is not None
+
+    # Store-only: a plain put_snmp_intent enqueues the shrink-removal (and auto-apply) job,
+    # which would 409 the trigger_apply this runs just ahead of.
+    try:
+        from . import adapter_client as client
+
+        with client.store_only_pushes():
+            _push_snmp_intent_for_device(mgmt.device_id, mgmt.adapter_device_id, force=True)
+    except Exception as exc:  # noqa: BLE001 — one scope's failure must not block the rest
+        logger.warning("Apply push failed for device %s: %s", mgmt.device_id, exc)
 
     moved: list[tuple] = []  # (model, [pks]) actually moved, for rollback if the Apply fails
     for model in (
@@ -2512,6 +2567,13 @@ def _prepare_apply(mgmt):
         NSOL2SapState,
         NSOLoggingLevelState,
     ):
+        if model is NSOStaticRouteState and not static_route_stored:
+            logger.warning(
+                "Apply: the static-route intent push was not acknowledged for device %s — "
+                "leaving those rows 'accepted' rather than deploying against intent the adapter is not holding",
+                mgmt.device_id,
+            )
+            continue
         try:
             pks = list(model.objects.filter(management=mgmt, status="accepted").values_list("pk", flat=True))
             if pks:
@@ -3702,6 +3764,14 @@ def _save_owned_overlay_edit(obj, key):
             with suppress_intent_push():
                 obj.static_route.save(update_fields=["metric", "permanent", "tag"])
         obj.save()
+        if key == "static_route":
+            from .signals import _transition_static_route_content
+
+            # The native save above ran suppressed and only THIS overlay was saved, but the
+            # fork object is shared by every device the route is on — editing through one
+            # device's row silently changes the others' content. Re-arm them all.
+            _transition_static_route_content(obj.static_route)
+            obj.refresh_from_db()
 
 
 def _route_map_name_errors(state, old_name):
@@ -4535,6 +4605,11 @@ class RoutingStateAcceptMixin(NSOActionPermissionMixin, View):
     """Per-row accept for a routing state model — sets status to 'accepted' and fires push signal."""
 
     model_class = None
+    # Extra columns _arm_accept() writes, saved in the same UPDATE as the status.
+    accept_extra_fields: tuple[str, ...] = ()
+
+    def _arm_accept(self, state) -> None:
+        """Set family-specific state on *state* before the accepted row is saved."""
 
     def post(self, request, pk):  # noqa: D102
         state = get_object_or_404(self.model_class, pk=pk)
@@ -4544,7 +4619,8 @@ class RoutingStateAcceptMixin(NSOActionPermissionMixin, View):
         # FIRST took ownership, so a re-accept must not reset it (#107 staleness badge).
         if state.accepted_at is None:
             state.accepted_at = timezone.now()
-        state.save(update_fields=["status", "accepted_at"])
+        self._arm_accept(state)
+        state.save(update_fields=["status", "accepted_at", *self.accept_extra_fields])
         messages.success(request, f"Accepted routing state {state.pk}.")
         return redirect(_device_nso_tab_url(state.management.device_id))
 
@@ -4912,8 +4988,21 @@ class NSOInterfaceIPStateAcceptView(NSOActionPermissionMixin, View):
         return redirect(_device_nso_tab_url(iface.device_id))
 
 
-class NSOStaticRouteStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
+class NSOStaticRouteStateAcceptView(RoutingStateAcceptMixin):
+    """Accept one static route — and re-arm its generation even when nothing changed.
+
+    A re-accept saves no native object, so no content transition can see it, yet it is a
+    fresh statement of intent: without a new generation the result of the apply the
+    operator is re-accepting away would still name this row and could settle it.
+    """
+
     model_class = NSOStaticRouteState
+    accept_extra_fields = _STATIC_ROUTE_ARMED_FIELDS
+
+    def _arm_accept(self, state):  # noqa: D102
+        from .signals import _arm_static_route_generation
+
+        _arm_static_route_generation(state)
 
 
 class NSOISISInterfaceStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
@@ -5234,10 +5323,16 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
     def _push(self, mgmt):
         """Trigger the appropriate intent push; override in subclasses."""
 
-    def _after_accept(self, mgmt):
-        """Run after the bulk ownership update, before the push (override in subclasses)."""
+    def _after_accept(self, mgmt, accepted_pks):
+        """Run after the bulk ownership update, before the push (override in subclasses).
+
+        *accepted_pks* are the rows this call moved from drift into ownership — the ones
+        that now carry intent the device does not have.
+        """
 
     def post(self, request, device_pk):  # noqa: D102
+        from django.db import transaction
+
         try:
             mgmt = NSODeviceManagement.objects.get(device_id=device_pk)
         except NSODeviceManagement.DoesNotExist:
@@ -5249,13 +5344,23 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
         # them was a repeatable no-op). Matching (imported) -> in_sync (nothing to
         # push); drift -> accepted (pending apply). _push() sends the snapshot once.
         base = self.model_class.objects.filter(management=mgmt)
-        n_owned = base.filter(status="imported").update(status="in_sync")
-        n_drift = base.filter(status__in=["changed", "conflict"]).update(status="accepted")
-        count = n_owned + n_drift
+        # One transaction: a request is not wrapped in one, so committing the status ahead
+        # of _after_accept() would publish rows that read as owned while still carrying the
+        # state the previous apply named — which a concurrent Apply would then act on.
+        with transaction.atomic():
+            # Captured before the UPDATE: afterwards the two groups are indistinguishable,
+            # and only the drift group is entering ownership.
+            drift_pks = list(base.filter(status__in=["changed", "conflict"]).values_list("pk", flat=True))
+            n_owned = base.filter(status="imported").update(status="in_sync")
+            # The pks narrow the update, they do not replace its predicate: a reconcile that
+            # re-classified one of them meanwhile owns that row's status, not this request.
+            n_drift = base.filter(pk__in=drift_pks, status__in=["changed", "conflict"]).update(status="accepted")
+            count = n_owned + n_drift
+            if count and mgmt.adapter_device_id is not None:
+                self._after_accept(mgmt, drift_pks)
 
         if count and mgmt.adapter_device_id is not None:
             try:
-                self._after_accept(mgmt)
                 self._push(mgmt)
             except Exception as exc:
                 logger.warning("Bulk accept push failed for device %s: %s", device_pk, exc)
@@ -5269,6 +5374,20 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
 
 class NSOStaticRouteBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     model_class = NSOStaticRouteState
+
+    def _after_accept(self, mgmt, accepted_pks):
+        """Arm a generation on every row this accept moved from drift into ownership.
+
+        Suppressed: a request is not wrapped in a transaction, so each unsuppressed save
+        would PUT the full snapshot on the spot — N adapter calls carrying half-armed
+        intent. ``_push()`` sends the finished snapshot once, immediately after.
+        """
+        from .signals import _arm_static_route_generation, suppress_intent_push
+
+        with suppress_intent_push():
+            for state in self.model_class.objects.filter(pk__in=accepted_pks, status="accepted"):
+                _arm_static_route_generation(state)
+                state.save(update_fields=list(_STATIC_ROUTE_ARMED_FIELDS))
 
     def _push(self, mgmt):
         from .signals import _push_static_route_intent_for_device
@@ -5306,7 +5425,7 @@ class NSOBGPPeerBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
 class NSORoutePolicyBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     model_class = NSORoutePolicyState
 
-    def _after_accept(self, mgmt):
+    def _after_accept(self, mgmt, accepted_pks):
         from .signals import _own_route_map_contributors
 
         # Owning a route-map owns its contributors — cascade for every now-owned route-map.

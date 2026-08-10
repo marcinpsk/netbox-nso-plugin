@@ -1,5 +1,7 @@
 # Changelog
 
+<!-- version list -->
+
 ## [Unreleased]
 
 ### Added — read paths (NSO → NetBox)
@@ -40,6 +42,53 @@
   the owned snapshot and never touches the device.
 - Drift banner + re-sync for orphaned adapter intent; value-aware drift
   display comparing live NetBox values against the device.
+- **Intent-push rejections are recorded and shown.** A push the adapter refuses
+  is still swallowed — an unreachable adapter must not raise into the operator's
+  save — but the reason is now persisted per (device, scope) on
+  `NSODeviceManagement` and rendered as a category banner, instead of living only
+  in a log line under a green row. Static-route rows additionally show the apply's
+  own per-route error or its `unproven` advisory, and an owned `apply_failed`
+  static route no longer renders as "pending apply". Recording only: durable
+  retry over the record is tracked separately.
+- **Generation-correlated settlement for static routes.** A static-route overlay
+  no longer settles on a scope-wide apply counter. Each push stamps the route with
+  a plugin-global `intent_generation` and records the fingerprint the adapter
+  echoes for it, and the overlay settles only when a per-route apply result names
+  **both**. A result naming a generation the overlay has already moved past is
+  simply not this row's result: it is skipped and the cursor advances. A result
+  naming the **current** generation but a fingerprint this device is not waiting
+  for is a disagreement about content, so it does not settle and it records why.
+  `unproven` is neither a settle nor a failure: it is kept as an advisory on the row.
+  - Results arrive over the adapter's **ordered settlement feed**
+    (`GET /api/v1/jobs?order=asc&after_settle_seq=…`), walked under a durable
+    per-device cursor on `NSODeviceManagement`. The cursor is keyed on
+    *(store incarnation, adapter device id)* and both halves are compared on every
+    read — the incarnation against the feed response's `X-Store-Incarnation` header,
+    never against a cached mirror — so an adapter store rebuild or a device remap
+    resets the cursor instead of silently skipping every settlement below it.
+  - A result that cannot be decided (a lost PUT response whose expectation the
+    adapter's read-back also fails to re-serve) stalls the device rather than being
+    burned. The stall is bounded at **five** attempts, counted per stuck sequence
+    and persisted on the row, so the count survives a worker restart; on the fifth
+    the cursor advances past it with an error-level log.
+  - Two independent clocks consume the feed: the device reconcile (the carrier,
+    running ahead of the stuck-`deploying` backstop in the same invocation) and the
+    five-minute `RefreshDeviceSyncCacheJob` maintenance tick. The tick runs
+    plugin → adapter, so consumption survives a dead adapter → NetBox callback
+    channel. A consumer failure stands the static-route backstop down for that
+    invocation only, leaving the other scopes' settlement untouched.
+  - `manage.py nso_consume_static_route_settlements` walks the feed by hand — the
+    operator's drain tool, not the production path.
+  - Rows owned before generations existed carry the sentinel `0` and can correlate
+    with nothing. `manage.py nso_resync_static_route_intent` arms them in the same
+    pass that backfills `route_id` into the adapter's store, and demotes a
+    pre-existing `deploying` row to `accepted` so no result is owed for a
+    generation that was never sent.
+  - **Not included: deletion semantics.** The removed-device arm — a push that lists
+    the dropped route in `deleted_route_ids` and an adapter tombstone marked
+    `delete_origin` — ships with the intent-outbox work and is still open. Until it
+    lands, a combined identity-plus-membership edit settles only the **retained**
+    device.
 
 ### Added — operations
 
@@ -62,5 +111,10 @@
 - Reconcile no longer clobbers owned OSPF/IS-IS interface intent; stale
   overlay rows pruned across all FK reconcilers instead of raising false
   drift.
+- Reconcile no longer restores a static route's superseded generation state.
+  Its mirror refresh saves an explicit field allow-list, and it writes the
+  overlay status only as a compare-and-set against the status it observed, so a
+  reconcile that began before a concurrent writer's lock can no longer put back
+  the generation, the expectation or the status that writer had just replaced.
 - Route-policy Accept crash, VLAN rename surfacing as drift, switchport
   3-way merge seeding, per-scope apply-failure surfacing.

@@ -163,6 +163,62 @@ class TestSyncScopeToAdapter(_SignalDBBase):
         self.assertEqual(mgmt.adapter_source_epoch, 2)
         self.assertFalse(mgmt.source_rekey_pending)
 
+    def test_rekey_of_a_dead_mapping_reonboards_and_keeps_the_reset_marker(self):
+        """A rekey whose target mapping is gone re-onboards, and still records the reset fence.
+
+        The rekey PATCHes the stored adapter id, so a dead mapping fails BEFORE the scope push
+        and would loop forever otherwise. Recovery has to happen inside _sync_source_change:
+        admissions are blanked before the PATCH, so completing without
+        ``reset_pending_source_epoch`` would leave every family fenced while the UI (summary.py
+        reads exactly these three markers) reported all-clear.
+        """
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.models import NSOFamilyReadState
+
+        mgmt = self._make_mgmt(adapter_device_id=7)
+        NSOFamilyReadState.objects.create(management=mgmt, family="bfd", observed_outcome="ok")
+        type(mgmt).objects.filter(pk=mgmt.pk).update(source_rekey_pending=True)
+        mgmt.source_rekey_pending = True
+
+        with (
+            patch(f"{_MOD}.patch_device", side_effect=AdapterError("Device not found", code="not_found")),
+            patch(f"{_MOD}.onboard_device", return_value={"id": 71, "source_epoch": 5}) as mock_onboard,
+            patch(f"{_MOD}.set_scope", return_value={}) as mock_scope,
+            patch(f"{_MOD}.sync_notify", return_value=None),
+        ):
+            self._sync_scope(mgmt, created=False)
+
+        mock_onboard.assert_called_once()
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.adapter_device_id, 71)  # re-onboarded
+        self.assertFalse(mgmt.source_rekey_pending)  # the rekey is satisfied
+        self.assertEqual(mgmt.adapter_source_epoch, 5)
+        # The fence survives: families were blanked, so the reset stays pending until they
+        # re-observe at the new epoch.
+        self.assertEqual(mgmt.reset_pending_source_epoch, 5)
+        self.assertEqual(mock_scope.call_args[0][0], 71)  # scope pushed to the fresh id
+
+    def test_rekey_does_not_reonboard_on_a_transient_patch_failure(self):
+        """Only a not-found rekey means the mapping is dead — an outage must not re-onboard."""
+        from netbox_nso_plugin.adapter_client import AdapterError
+
+        mgmt = self._make_mgmt(adapter_device_id=7)
+        type(mgmt).objects.filter(pk=mgmt.pk).update(source_rekey_pending=True)
+        mgmt.source_rekey_pending = True
+
+        with (
+            patch(f"{_MOD}.patch_device", side_effect=AdapterError("adapter down", code="nso_unreachable")),
+            patch(f"{_MOD}.onboard_device") as mock_onboard,
+            patch(f"{_MOD}.set_scope") as mock_scope,
+        ):
+            self._sync_scope(mgmt, created=False)
+
+        mock_onboard.assert_not_called()
+        mock_scope.assert_not_called()
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.adapter_device_id, 7)  # mapping untouched
+        self.assertTrue(mgmt.source_rekey_pending)  # still pending, retried next save
+
     def test_source_save_is_fail_closed_before_its_on_commit_callback(self):
         from netbox_nso_plugin.read_gate import SKIPPED_UNAVAILABLE, gated_family_run
 
@@ -472,6 +528,12 @@ class TestOffboardDeviceFromAdapter(unittest.TestCase):
     would silently fabricate any attribute. ``delete_device`` is the real external
     boundary and stays patched.
     """
+
+    def setUp(self):
+        """Run callbacks immediately, matching production's outer-autocommit path."""
+        on_commit = patch("django.db.transaction.on_commit", side_effect=lambda callback: callback())
+        on_commit.start()
+        self.addCleanup(on_commit.stop)
 
     def test_offboards_when_adapter_device_id_set(self):
         from netbox_nso_plugin.signals import offboard_device_from_adapter

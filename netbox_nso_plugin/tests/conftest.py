@@ -2,6 +2,8 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Pytest configuration: mock the netbox package so unit tests run without a full NetBox install."""
 
+import hashlib
+import os
 import sys
 import types
 from unittest.mock import patch
@@ -67,6 +69,28 @@ def _make_netbox_stubs():
 _make_netbox_stubs()
 
 
+def _isolated_test_db_name(base_name: str, worker_id: str | None) -> str:
+    """Return a PostgreSQL-safe private database name for one pytest worker."""
+    suffix = f"_{worker_id}" if worker_id else ""
+    return f"{base_name[: 63 - len(suffix)]}{suffix}"
+
+
+def _isolated_redis_namespace(base_name: str, worker_id: str | None, run_uid: str | None) -> str:
+    """Return a Redis-safe namespace private to one pytest run and xdist worker."""
+    identity = f"{base_name}:{run_uid or f'pid-{os.getpid()}'}:{worker_id or 'main'}"
+    digest = hashlib.blake2s(identity.encode(), digest_size=8).hexdigest()
+    return f"nso-test-{digest}"
+
+
+_TEST_DB_BASE_NAME = os.environ.get("TEST_DB_NAME", "test_netbox_nso_plugin")
+_TEST_REDIS_NAMESPACE = _isolated_redis_namespace(
+    _TEST_DB_BASE_NAME,
+    os.environ.get("PYTEST_XDIST_WORKER"),
+    os.environ.get("PYTEST_XDIST_TESTRUNUID"),
+)
+os.environ["NETBOX_NSO_REDIS_KEY_NAMESPACE"] = _TEST_REDIS_NAMESPACE
+
+
 @pytest.fixture(scope="session")
 def django_db_modify_db_settings(django_db_modify_db_settings):
     """Give the plugin suite its OWN test database name.
@@ -81,7 +105,7 @@ def django_db_modify_db_settings(django_db_modify_db_settings):
     from django.conf import settings
 
     test_cfg = dict(settings.DATABASES["default"].get("TEST") or {})
-    test_cfg["NAME"] = "test_netbox_nso_plugin"
+    test_cfg["NAME"] = _isolated_test_db_name(_TEST_DB_BASE_NAME, os.environ.get("PYTEST_XDIST_WORKER"))
     settings.DATABASES["default"]["TEST"] = test_cfg
 
 

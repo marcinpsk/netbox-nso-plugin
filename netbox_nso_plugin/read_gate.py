@@ -31,6 +31,7 @@ Three cooperating pieces, consumed by the reconcile paths in Slice B3:
 from __future__ import annotations
 
 import logging
+import os
 import random
 import threading
 import time
@@ -89,6 +90,7 @@ MARKER_TTL_S = 900
 
 _AUTHORITATIVE_OUTCOMES = frozenset({"present", "absent_authoritative"})
 _ADMIT_RESULTS = frozenset({"replaced", "cleared"})
+_REDIS_KEY_NAMESPACE_ENV = "NETBOX_NSO_REDIS_KEY_NAMESPACE"
 
 #: extend only if the stored token is ours (KEYS[1]=lease, ARGV=token, ttl_s)
 _EXTEND_LUA = """
@@ -107,14 +109,20 @@ return 0
 """
 
 
+def _coordination_key(key: str) -> str:
+    """Apply the optional process namespace used by isolated test workers."""
+    namespace = os.environ.get(_REDIS_KEY_NAMESPACE_ENV, "").strip()
+    return f"{namespace}:{key}" if namespace else key
+
+
 def lease_key(mgmt_pk) -> str:
     """Return the device-wide mutex key for one NSODeviceManagement."""
-    return f"nso-read-lease:{mgmt_pk}"
+    return _coordination_key(f"nso-read-lease:{mgmt_pk}")
 
 
 def marker_key(device_id) -> str:
     """Return the per-device pending-reconcile marker key (holds the handoff nonce)."""
-    return f"nso-reconcile-pending:{device_id}"
+    return _coordination_key(f"nso-reconcile-pending:{device_id}")
 
 
 def carrier_key(device_id) -> str:
@@ -125,7 +133,7 @@ def carrier_key(device_id) -> str:
     pointer is safe because every producer validates + overwrites it. Deliberately NOT
     :func:`marker_key` — that namespace holds lease-handoff nonces (codex r7-3 namespace hygiene).
     """
-    return f"nso-reconcile-carrier:{device_id}"
+    return _coordination_key(f"nso-reconcile-carrier:{device_id}")
 
 
 def fresh_carrier_id(device_id) -> str:

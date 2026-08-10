@@ -17,6 +17,7 @@ suite): the CONFIGURED redis connection, but uuid-isolated keys/queues no worker
 consumes, cleaned up in tearDown.
 """
 
+import os
 import threading
 import time
 import uuid
@@ -24,10 +25,10 @@ from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.db import IntegrityError
-from django.test import TestCase, TransactionTestCase
+from django.test import SimpleTestCase, TestCase, TransactionTestCase
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
-from netbox_nso_plugin.tests.test_bgp_greenfield import _CascadeFlushMixin
+from netbox_nso_plugin.tests.mixins import _CascadeFlushMixin
 
 
 def _make_device(name):
@@ -894,6 +895,27 @@ class TestAggregateObservation(TestCase):
 # ---------------------------------------------------------------------------
 # The device-wide redis lease (R6-4 lifecycle, Lua atomicity)
 # ---------------------------------------------------------------------------
+
+
+class TestRedisCoordinationKeyNamespace(SimpleTestCase):
+    def test_workers_with_identical_database_ids_get_distinct_keys(self):
+        from netbox_nso_plugin.read_gate import carrier_key, lease_key, marker_key
+
+        with patch.dict(os.environ, {"NETBOX_NSO_REDIS_KEY_NAMESPACE": "test-run:gw0"}):
+            worker_zero = (lease_key(7), marker_key(11), carrier_key(11))
+        with patch.dict(os.environ, {"NETBOX_NSO_REDIS_KEY_NAMESPACE": "test-run:gw1"}):
+            worker_one = (lease_key(7), marker_key(11), carrier_key(11))
+
+        for zero_key, one_key in zip(worker_zero, worker_one, strict=True):
+            self.assertNotEqual(zero_key, one_key)
+
+    def test_empty_namespace_preserves_production_key_names(self):
+        from netbox_nso_plugin.read_gate import carrier_key, lease_key, marker_key
+
+        with patch.dict(os.environ, {"NETBOX_NSO_REDIS_KEY_NAMESPACE": ""}):
+            self.assertEqual(lease_key(7), "nso-read-lease:7")
+            self.assertEqual(marker_key(11), "nso-reconcile-pending:11")
+            self.assertEqual(carrier_key(11), "nso-reconcile-carrier:11")
 
 
 class TestDeviceReadLease(TestCase):
