@@ -64,8 +64,6 @@ class TestTheScheduledTickIsAnIndependentClock(_CarrierCase):
 
     def test_the_sweep_is_bounded_and_isolated(self):
         """A quiet device is never polled, and one device's adapter cannot abort the tick."""
-        from netbox_nso_plugin.models import NSODeviceManagement
-
         busy = _make_device("busy")
         quiet = _make_device("quiet")
         broken = _make_device("brokenfeed")
@@ -77,12 +75,14 @@ class TestTheScheduledTickIsAnIndependentClock(_CarrierCase):
             (quiet_mgmt, quiet, "quiet", 12),
             (broken_mgmt, broken, "brokenfeed", 13),
         ):
-            self.adapter.store.add_device(
+            row = self.adapter.store.add_device(
                 nso_instance=f"se-{tag}-inst",
                 nso_device_name=f"nso-se-{tag}",
                 netbox_device_id=device.pk,
                 device_id=adapter_id,
             )
+            # A status only the mirror pass can put on the management row.
+            row["last_sync_status"] = "succeeded"
 
         busy_route = _route("10.41.0.0/16", "10.41.0.1", devices=[busy])
         busy_state = _own(busy_route, busy_mgmt, generation=202)
@@ -103,7 +103,11 @@ class TestTheScheduledTickIsAnIndependentClock(_CarrierCase):
         busy_state.refresh_from_db()
         assert busy_state.status == "in_sync", "one device's adapter error aborted another's sweep"
         # The mirror pass ran for every row, including the one whose settlement failed.
-        assert NSODeviceManagement.objects.filter(pk=broken_mgmt.pk).exists()
+        broken_mgmt.refresh_from_db()
+        assert broken_mgmt.last_sync_status == "succeeded", (
+            "the mirror never reached the device whose settlement failed, so the tick's first "
+            "pass is hostage to its last"
+        )
 
 
 class TestTheSameTickSettlesARepairedDevice(_SettlementCase):
