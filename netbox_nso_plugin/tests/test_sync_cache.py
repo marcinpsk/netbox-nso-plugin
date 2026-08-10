@@ -640,6 +640,20 @@ class TestRefreshSyncCacheJob(_SyncCacheTestBase):
         self.assertEqual(mgmt.last_sync_at, _SYNCED_AT)
         self.assertEqual(mgmt.last_sync_status, "succeeded")
 
+    def test_the_summary_reports_how_long_the_settlement_sweep_took(self):
+        """The sweep is the one pass whose cost grows with the fleet, so the tick times it."""
+        mgmt = self._mgmt("cache-job-timed", 621)
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value=[_adapter_row(mgmt)]),
+            self.assertLogs("netbox_nso_plugin.jobs", level="INFO") as logs,
+        ):
+            self._job().run()
+
+        summary = [line for line in logs.output if "settlement polled" in line]
+        self.assertEqual(len(summary), 1, logs.output)
+        self.assertRegex(summary[0], r"settlement sweep \d+\.\d+s")
+
     def test_job_run_repairs_a_broken_mapping(self):
         """The same periodic job that refreshes the mirror also heals a broken mapping."""
         mgmt = self._mgmt("cache-job-dangling", 196)

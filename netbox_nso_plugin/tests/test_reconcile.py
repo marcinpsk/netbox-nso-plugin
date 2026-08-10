@@ -50,6 +50,22 @@ class TestRunDeviceReconcile(APITestCase):
         self.assertIn("error", result)
         self.assertEqual(result["device_id"], device.pk)
 
+    def test_an_unmanaged_device_is_not_reported_as_a_settle_failure(self):
+        """Step 4 has nothing to settle for a device with no management row, and says nothing.
+
+        ``device.nso_management`` is a reverse one-to-one: reading it on an unmanaged device
+        raises, so the guard below it never runs and the step's own handler logs a warning
+        that names a failure which did not happen.
+        """
+        from netbox_nso_plugin import reconcile
+
+        device = _make_device("rec-unmanaged")
+        with (
+            patch.object(reconcile, "reconcile_device", return_value={}),
+            self.assertNoLogs("netbox_nso_plugin.reconcile", level="WARNING"),
+        ):
+            reconcile.run_device_reconcile(device.pk)
+
 
 class TestSyncCompleteEndpoint(APITestCase):
     """POST /api/plugins/nso/sync-complete/ — the adapter's sync-done callback."""
@@ -351,17 +367,15 @@ class TestStaticRouteApplySettle(APITestCase):
     live on rg03: a successfully applied static route stayed 'pending apply' forever —
     _prepare_apply never marked it deploying and never force-pushed its snapshot."""
 
-    def _setup(self, status_="deploying"):
+    def _setup(self, status_="deploying", tag="sr-settle"):
         from netbox_routing.models import StaticRoute
 
         from netbox_nso_plugin.models import NSOStaticRouteState
 
-        device = _make_device("sr-settle")
-        inst, _ = NSOInstance.objects.get_or_create(
-            name="sr-settle-inst", defaults={"adapter_instance_id": "sr-settle-inst"}
-        )
+        device = _make_device(tag)
+        inst, _ = NSOInstance.objects.get_or_create(name=f"{tag}-inst", defaults={"adapter_instance_id": f"{tag}-inst"})
         mgmt = NSODeviceManagement.objects.create(
-            device=device, nso_instance=inst, nso_device_name="sr-settle", adapter_device_id=89
+            device=device, nso_instance=inst, nso_device_name=tag, adapter_device_id=89
         )
         # No device M2M on the route — the greenfield-accept signal must not fire here;
         # the overlay row is created directly in the state under test.
@@ -375,14 +389,23 @@ class TestStaticRouteApplySettle(APITestCase):
         )
         return mgmt, row
 
-    def test_failed_static_route_scope_marks_apply_failed(self):
-        from netbox_nso_plugin.reconcile import _settle_apply_failures
+    def test_the_coarse_scope_settle_no_longer_judges_static_routes(self):
+        """#1502 S5 handover: the scope counter is not evidence about any particular row.
+
+        It says the apply reported N failures for the scope, not that this device's route
+        was one of them, and not which generation the result is about. The generation-
+        correlated consumer is the only writer of a static-route apply verdict now, so the
+        coarse settle must leave the row exactly as it found it — the alternative is a red
+        badge on a route that applied cleanly beside a sibling that did not.
+        """
+        from netbox_nso_plugin.reconcile import _APPLY_DEPLOYING_SCOPES, _settle_apply_failures
 
         mgmt, row = self._setup()
         _settle_apply_failures(mgmt, {"static_route_count_by_outcome": {"in_sync": 0, "apply_failed": 1}})
         row.refresh_from_db()
-        self.assertEqual(row.status, "apply_failed")
-        self.assertTrue(row.last_apply_error)
+        self.assertEqual(row.status, "deploying")
+        self.assertFalse(row.last_apply_error)
+        self.assertNotIn("static_route", _APPLY_DEPLOYING_SCOPES)
 
     def test_prepare_apply_marks_accepted_static_route_deploying(self):
         from netbox_nso_plugin.views import _prepare_apply
@@ -398,7 +421,11 @@ class TestStaticRouteApplySettle(APITestCase):
             patch("netbox_nso_plugin.signals._push_bfd_intent_for_device"),
             patch("netbox_nso_plugin.signals._push_interface_mtu_intent_for_device"),
             patch("netbox_nso_plugin.signals._push_route_policy_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_static_route_intent_for_device") as push_static,
+            # A stored count, not a bare mock: the promotion gate reads the count.
+            patch(
+                "netbox_nso_plugin.signals._push_static_route_intent_for_device",
+                return_value={"device_id": 89, "count": 1, "routes": []},
+            ) as push_static,
         ):
             _prepare_apply(mgmt)
         row.refresh_from_db()
@@ -406,6 +433,38 @@ class TestStaticRouteApplySettle(APITestCase):
         # And the owned snapshot is force-re-pushed so a stale adapter intent still applies.
         push_static.assert_called_once()
         self.assertTrue(push_static.call_args.kwargs.get("force"))
+
+    def test_a_push_answer_with_no_stored_count_does_not_promote(self):
+        """An acknowledgement is a stored count, not a truthy answer.
+
+        The fleet re-sync already reads it that way. Promoting on anything truthy puts the
+        row in 'deploying' against intent the adapter may not be holding, and no apply
+        result can then name it.
+        """
+        from netbox_nso_plugin.views import _prepare_apply
+
+        for tag, answer in (("sr-nondict", "stored"), ("sr-nocount", {"device_id": 89, "routes": []})):
+            with self.subTest(answer=answer):
+                mgmt, row = self._setup(status_="accepted", tag=tag)
+                with (
+                    patch("netbox_nso_plugin.signals._push_interface_intent_for_device"),
+                    patch("netbox_nso_plugin.signals._push_lacp_intent_for_device"),
+                    patch("netbox_nso_plugin.signals._push_switchport_intent_for_device"),
+                    patch("netbox_nso_plugin.signals._push_vlan_intent_for_device"),
+                    patch("netbox_nso_plugin.signals._push_svi_intent_for_device"),
+                    patch("netbox_nso_plugin.signals._push_subinterface_intent_for_device"),
+                    patch("netbox_nso_plugin.signals._push_bfd_intent_for_device"),
+                    patch("netbox_nso_plugin.signals._push_interface_mtu_intent_for_device"),
+                    patch("netbox_nso_plugin.signals._push_route_policy_intent_for_device"),
+                    patch("netbox_nso_plugin.signals._push_logging_intent_for_device"),
+                    patch("netbox_nso_plugin.signals._push_l2_sap_intent_for_device"),
+                    patch("netbox_nso_plugin.signals._push_snmp_intent_for_device"),
+                    # The static-route push itself runs for real; only its transport is doubled.
+                    patch("netbox_nso_plugin.adapter_client.put_static_route_intent", return_value=answer),
+                ):
+                    _prepare_apply(mgmt)
+                row.refresh_from_db()
+                self.assertEqual(row.status, "accepted")
 
 
 class TestL2SapApplySettle(APITestCase):

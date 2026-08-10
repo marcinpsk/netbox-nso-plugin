@@ -180,6 +180,25 @@ class TestIntentPushRejectionRecord(IntentPushResetMixin, TestCase):
             _push(self.device.pk, self.mgmt.adapter_device_id)
         self.assertEqual(_record(self.mgmt)["route_ids"], [])
 
+    def test_attribution_names_only_routes_the_push_serialized(self):
+        """A rejection names PAYLOAD entries, so both predicates must select the same rows."""
+        with _fixtures():
+            pushed = _route("10.66.0.0/16", "10.0.0.1", devices=[self.device])
+            unowned = _route("10.66.0.0/16", "10.0.0.1", devices=[self.device])
+            interface_only = _route("10.66.0.0/16", None, devices=[self.device])
+            _own(pushed, self.mgmt)
+            _own(unowned, self.mgmt, status="imported")
+            _own(interface_only, self.mgmt)
+
+        with patch(PUT, side_effect=_duplicate_triple(("", "10.66.0.0/16", "10.0.0.1"))) as put:
+            _push(self.device.pk, self.mgmt.adapter_device_id)
+
+        serialized = {route["route_id"] for route in put.call_args.args[1]}
+        self.assertEqual(serialized, {pushed.pk})
+        attributed = _record(self.mgmt)["route_ids"]
+        self.assertEqual(attributed, [pushed.pk])
+        self.assertLessEqual(set(attributed), serialized)
+
     def test_a_device_claimed_409_is_recorded_and_never_retried(self):
         """P6.4 — the retry substrate is #1474's; R3 adding one here would double-apply."""
         with _fixtures():

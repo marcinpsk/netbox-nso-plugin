@@ -489,6 +489,11 @@ class NSODeviceManagement(NetBoxModel):
             "while silently unlinked. Cleared once linking succeeds. Surfaced on the NSO tab."
         ),
     )
+    # When the link repair last TRIED this row, whether or not the repair worked. The
+    # repair is capped per run, so an unordered traversal lets a persistently failing head
+    # hold the cap on every run and starve a repairable tail row; ordering the broken list
+    # least-recently-attempted first bounds every broken row at ceil(B / C) ticks.
+    adapter_link_attempted_at = models.DateTimeField(null=True, blank=True)
     # ── READSEM S4 (D5): adopted store incarnation + durable reset markers ──────
     # The adapter store mints an (incarnation UUID, born) pair on every DB rebuild;
     # the gated reconcile ADOPTS the newest born (resetting per-family read state),
@@ -506,14 +511,25 @@ class NSODeviceManagement(NetBoxModel):
     reset_pending_incarnation = models.CharField(max_length=64, blank=True, default="")
     reset_pending_born = models.DateTimeField(null=True, blank=True)
     reset_conflict_born = models.DateTimeField(null=True, blank=True)
-    # ── #1396 R3: settlement cursor + intent-push rejection record ──────────────
-    # The cursor is per-device and only meaningful within one adapter store
-    # incarnation: a rebuilt store restarts its job identifiers, so the consumer
-    # compares ``settle_cursor_incarnation`` against ``adapter_incarnation`` and
-    # resets on mismatch. Replaying an old result after a reset is harmless because
-    # intent generations are allocated from a database-global sequence.
+    # ── #1396 R3 / Appendix S: settlement cursor + intent-push rejection record ──
+    # The cursor names how far the consumer has walked this device's ordered settlement
+    # feed, under the epoch ``(store incarnation, adapter device id)``. Neither half may
+    # be read from a cache: ``adapter_incarnation`` is written only when a read-state
+    # publication is adopted, so the incarnation is taken from the feed response's
+    # ``X-Store-Incarnation`` header, and the device half from ``adapter_device_id`` on
+    # the row the consumer locks. A rebuilt store and a device remap both restart the
+    # adapter's per-device counter at 1, so either mismatch resets the cursor AND the
+    # stall triple. Replaying an old result after a reset is harmless because intent
+    # generations are allocated from a database-global sequence.
     settle_cursor_seq = models.BigIntegerField(null=True, blank=True)
     settle_cursor_incarnation = models.CharField(max_length=64, blank=True, default="")
+    settle_cursor_device_id = models.BigIntegerField(null=True, blank=True)
+    # One unresolvable settlement may not block the device forever, and the bound has to
+    # survive a worker restart — so the triple lives on the row, not in a module global.
+    # It describes exactly one sequence: any advance clears it, as does an epoch change.
+    settle_stall_seq = models.BigIntegerField(null=True, blank=True)
+    settle_stall_attempts = models.PositiveIntegerField(default=0)
+    settle_stall_first_seen_at = models.DateTimeField(null=True, blank=True)
     # Per-scope record of what an intent push was rejected with. ``intent_push_attempts``
     # is the never-cleared per-scope high-water mark: clearing the error entry on success
     # would take the attempt token with it, and a delayed failure from an earlier attempt
@@ -594,36 +610,54 @@ class NSODeviceManagement(NetBoxModel):
 
     # Columns a save that does not name them must never carry — see save().
     _PUSH_RECORD_FIELDS = ("intent_push_errors", "intent_push_attempts")
+    # The settlement cursor, its epoch, the stall triple and the link-repair clock. All are
+    # written by a sweep through ``.update()`` while it holds this row's lock, and all lose
+    # their meaning when rewound: a cursor that moves backwards re-consumes settled results,
+    # and a stall count that resets never reaches its bound, so one unresolvable result
+    # blocks the device forever — the exact failure the durable counter exists to prevent.
+    _SETTLEMENT_RECORD_FIELDS = (
+        "settle_cursor_seq",
+        "settle_cursor_incarnation",
+        "settle_cursor_device_id",
+        "settle_stall_seq",
+        "settle_stall_attempts",
+        "settle_stall_first_seen_at",
+        "adapter_link_attempted_at",
+    )
+    # One authority for the refresh, so a column protected in one group cannot be missed.
+    _STALE_SAVE_PROTECTED_FIELDS = _PUSH_RECORD_FIELDS + _SETTLEMENT_RECORD_FIELDS
 
     def __str__(self):
         return f"{self.device} → {self.nso_instance.name}/{self.nso_device_name}"
 
     def save(self, *args, **kwargs):
-        """Keep a full save from rewinding the intent-push record.
+        """Keep a full save from rewinding the row's durable records.
 
         A full ``save()`` rewrites every column from whatever this instance held when it
         was loaded, and several sweeps load a row, make an adapter call, and only then
-        save it (``sync_cache.reconcile_device_links``). A rejection recorded in that gap
-        would be erased — and rewinding ``intent_push_attempts`` is worse than losing the
-        message: the mark is what discards a superseded response, so lowering it lets a
-        late failure resurrect over a newer success.
+        save it (``sync_cache.reconcile_device_links``). Anything recorded in that gap
+        would be erased — and for these columns erasure is not the worst of it, because
+        each one is a high-water mark whose whole job is to move in one direction.
+        Rewinding ``intent_push_attempts`` lets a late failure resurrect over a newer
+        success; rewinding the settlement cursor re-consumes results that already
+        settled; resetting ``settle_stall_attempts`` means the bound is never reached and
+        one unresolvable result blocks the device forever.
 
-        Re-reading the two columns is not enough on its own — the read and the UPDATE are
-        separate statements, so a push committing between them still wins. The read is
+        Re-reading the columns is not enough on its own — the read and the UPDATE are
+        separate statements, so a writer committing between them still wins. The read is
         therefore taken under ``select_for_update`` in a transaction that stays open
         across ``super().save()``, which is what makes the concurrent writer wait.
 
-        A save that NAMES its fields is untouched: the two allocators write the record
-        deliberately, holding this same row lock.
+        A save that NAMES its fields is untouched: every writer of these columns names
+        them deliberately, holding this same row lock.
         """
         if kwargs.get("update_fields") is not None or not self.pk:
             return super().save(*args, **kwargs)
+        protected = self._STALE_SAVE_PROTECTED_FIELDS
         with transaction.atomic():
-            current = (
-                type(self).objects.select_for_update().filter(pk=self.pk).values(*self._PUSH_RECORD_FIELDS).first()
-            )
+            current = type(self).objects.select_for_update().filter(pk=self.pk).values(*protected).first()
             if current is not None:
-                for field in self._PUSH_RECORD_FIELDS:
+                for field in protected:
                     setattr(self, field, current[field])
             return super().save(*args, **kwargs)
 

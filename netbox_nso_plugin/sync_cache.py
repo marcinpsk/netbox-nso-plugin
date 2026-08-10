@@ -14,12 +14,17 @@ push this row's scope, failover addresses and auto-apply flag onto it.
 """
 
 import logging
+from datetime import UTC, datetime
 
+from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
 from .models import NSODeviceManagement
 
 logger = logging.getLogger(__name__)
+
+# Sort key for a row the link repair has never tried, so it goes to the front of the queue.
+_NEVER_ATTEMPTED = datetime.min.replace(tzinfo=UTC)
 
 # Most link repairs to attempt per sweep. A genuine fleet-wide loss then heals over several
 # ticks instead of firing one onboard+sync burst at the adapter, and — unlike a "suppress
@@ -209,7 +214,12 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
     * *missing* — our device is absent → re-save; the not-found scope push re-onboards it.
 
     Returns ``(broken, attempted)``. Attempts are capped at :data:`MAX_RELINKS_PER_RUN`; rows
-    over the cap keep an ``adapter_link_error`` so nothing is silently deferred.
+    over the cap keep an ``adapter_link_error`` so nothing is silently deferred, and the
+    broken list is walked **least-recently-attempted first** so the cap rotates. Without that
+    order a permanently broken head starves a repairable tail forever: the re-onboard an
+    attempt triggers runs in an ``on_commit`` callback that swallows its own failure, so a
+    row that repaired nothing still spends the cap, on every run. With ``B`` broken rows and
+    cap ``C`` every one of them is attempted within ``ceil(B / C)`` ticks — five minutes each.
     """
     mapped, by_id, by_identity = snapshot if snapshot is not None else _snapshot(rows)
     if by_id is None:
@@ -231,11 +241,23 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
     if not broken:
         return 0, 0
 
+    # Least-recently-attempted first (never-attempted first, pk to break ties deterministically).
+    broken.sort(key=lambda item: (item[0].adapter_link_attempted_at or _NEVER_ATTEMPTED, item[0].pk))
+
     attempted = 0
+    now = timezone.now()
     for mgmt, state, adapter_device in broken:
         if attempted >= MAX_RELINKS_PER_RUN:
             _flag_link_error(mgmt, "Adapter mapping is broken; repair deferred to the next sweep.")
             continue
+        # Stamp for being TRIED, not for succeeding, and before the try: whether the
+        # re-onboard worked is not observable here (it happens in an on_commit callback that
+        # logs and returns), so a stamp conditional on success would never move a
+        # permanently broken row to the back of the queue. Through .update(), which does not
+        # re-fire the row's push handler.
+        attempted += 1
+        mgmt.adapter_link_attempted_at = now
+        NSODeviceManagement.objects.filter(pk=mgmt.pk).update(adapter_link_attempted_at=now)
         try:
             if state is _MOVED:
                 logger.warning(
@@ -258,6 +280,5 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
         except Exception:  # noqa: BLE001 — one bad row must not abort the sweep
             logger.exception("Link reconcile failed for management row %s", mgmt.pk)
             continue
-        attempted += 1
     logger.info("Link reconcile: %d broken, %d repair attempted", len(broken), attempted)
     return len(broken), attempted

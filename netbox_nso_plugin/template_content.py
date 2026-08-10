@@ -988,6 +988,41 @@ def _resolve_static_route(entry, StaticRoute, VRF, auto_create, vrf_auto_create,
         return None, False
 
 
+#: The only columns the static-route reconciler may write from device truth. Named in
+#: every ``save()`` it makes, as a module constant mirroring
+#: ``signals._STATIC_ROUTE_ARMED_FIELDS``, so the two sides of the overlay cannot drift.
+#: An unrestricted save writes every column it read, and this reconciler reads the row
+#: without a lock — so it would restore the generation, the generation clock and the
+#: settlement expectations of any writer that committed after that read (#1502 Appendix S).
+#: These four are pure device mirrors: a stale write of them is corrected by the next pass.
+_STATIC_ROUTE_MIRROR_FIELDS = ("nso_vrf", "nso_prefix", "nso_next_hop", "last_sync_at")
+
+
+def _write_static_route_status(state, observed: str, new_status: str) -> None:
+    """Write the reconciled status under a compare-and-set on the status that was observed.
+
+    ``status`` cannot be protected by the allow-list, because the reconciler legitimately
+    owns it. A stale instance therefore has to lose on the value instead: zero rows matched
+    means the row moved under the unlocked read, so this pass writes no status at all and
+    the next one recomputes from a fresh read. Same shape as
+    ``signals._record_static_route_expectations``'s CAS, and ``.update()`` also keeps the
+    write from re-firing the row's intent push.
+    """
+    from .models import NSOStaticRouteState
+
+    if new_status == observed:
+        return
+    matched = NSOStaticRouteState.objects.filter(pk=state.pk, status=observed).update(status=new_status)
+    if matched:
+        state.status = new_status
+        return
+    logger.debug(
+        "static-route reconcile skipped the status write for overlay %s: the row moved from %r under the read",
+        state.pk,
+        observed,
+    )
+
+
 def _reconcile_static_routes(device, payload: dict) -> list:
     """Reconcile static routes from the adapter payload into NetBox routing.
 
@@ -1066,13 +1101,21 @@ def _reconcile_static_routes(device, payload: dict) -> list:
         # one platform must never rewrite its metric or tag to that platform's
         # value: another device may legitimately differ.  Keep the shared intent
         # and surface the per-device mismatch through this state.
-        state.status = sm.on_reconcile(
-            state.status,
+        # A 'deploying' static route settles ONLY on a generation-correlated apply result
+        # (#1502 Appendix S). Re-reading the route says nothing about which generation the
+        # device is reflecting, so a reconcile settle here was a green badge over content
+        # the device may never have received — a metric edit still in flight read as
+        # in_sync the moment the OLD route came back on a sync.
+        observed = state.status
+        new_status = sm.on_reconcile(
+            observed,
             matches=on_device and metric_matches and tag_matches,
             conflict=not on_device,
             settles_owned=False,
+            settles_deploying=False,
         )
-        state.save()
+        state.save(update_fields=list(_STATIC_ROUTE_MIRROR_FIELDS))
+        _write_static_route_status(state, observed, new_status)
 
     stale_qs = NSOStaticRouteState.objects.filter(management=mgmt).exclude(static_route_id__in=seen_route_ids)
     for stale in stale_qs:
@@ -1080,10 +1123,9 @@ def _reconcile_static_routes(device, payload: dict) -> list:
             # Operator-owned (greenfield) route the device stopped reporting → genuine
             # removal drift. KEEP the device↔route association + overlay so the operator
             # can resolve it; removing it from the M2M would silently discard their intent.
-            new_status = sm.on_reconcile(stale.status, present=False)
-            if new_status != stale.status:
-                stale.status = new_status
-                stale.save()
+            # A pure status write, so it is only the CAS: an unrestricted save here would
+            # restore every settlement column this row was read with.
+            _write_static_route_status(stale, stale.status, sm.on_reconcile(stale.status, present=False))
         else:
             # Brownfield mirror: the route is gone from the device → un-materialise it.
             # Drop the device↔route association AND the overlay. (The old code removed the

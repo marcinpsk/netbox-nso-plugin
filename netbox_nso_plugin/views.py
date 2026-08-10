@@ -2497,6 +2497,7 @@ def _prepare_apply(mgmt):
         _push_svi_intent_for_device,
         _push_switchport_intent_for_device,
         _push_vlan_intent_for_device,
+        stored_static_route_count,
     )
 
     # Force-push (bypass change-detection) the owned snapshots so Apply re-ships the
@@ -2517,6 +2518,7 @@ def _prepare_apply(mgmt):
     #     with no adapter intent row; SVI/subinterface/BFD/MTU share the same failure mode).
     #   - SNMP: mirrored reactively on accept and a failed push is swallowed, so the adapter
     #     mirror can be stale or absent. Refreshed store-only below — the Apply commits it.
+    static_route_stored = False
     for push in (
         _push_interface_intent_for_device,
         _push_lacp_intent_for_device,
@@ -2532,9 +2534,16 @@ def _prepare_apply(mgmt):
         _push_vlan_intent_for_device,
     ):
         try:
-            push(mgmt.device_id, mgmt.adapter_device_id, force=True)
+            response = push(mgmt.device_id, mgmt.adapter_device_id, force=True)
         except Exception as exc:  # noqa: BLE001 — one scope's failure must not block the rest
             logger.warning("Apply push failed for device %s: %s", mgmt.device_id, exc)
+            response = None
+        if push is _push_static_route_intent_for_device:
+            # A forced push is only skipped on a real rejection (change-detection is
+            # bypassed), and a static route settles on a generation the adapter has to be
+            # holding. Promoting on a push the adapter refused would create a 'deploying'
+            # row no result can ever name — stuck until the backstop calls it failed.
+            static_route_stored = stored_static_route_count(response) is not None
 
     # Store-only: a plain put_snmp_intent enqueues the shrink-removal (and auto-apply) job,
     # which would 409 the trigger_apply this runs just ahead of.
@@ -2558,6 +2567,13 @@ def _prepare_apply(mgmt):
         NSOL2SapState,
         NSOLoggingLevelState,
     ):
+        if model is NSOStaticRouteState and not static_route_stored:
+            logger.warning(
+                "Apply: the static-route intent push was not acknowledged for device %s — "
+                "leaving those rows 'accepted' rather than deploying against intent the adapter is not holding",
+                mgmt.device_id,
+            )
+            continue
         try:
             pks = list(model.objects.filter(management=mgmt, status="accepted").values_list("pk", flat=True))
             if pks:

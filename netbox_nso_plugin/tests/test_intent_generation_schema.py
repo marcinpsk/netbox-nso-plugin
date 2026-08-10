@@ -112,7 +112,10 @@ class TestIntentGenerationMigrationRoundTrip(_CascadeFlushMixin, TransactionTest
         finally:
             executor = MigrationExecutor(connection)
             executor.loader.build_graph()
-            executor.migrate([(APP, AFTER)])
+            # Forward to the app's LEAF, not to a fixed name: re-applying only as far as
+            # AFTER leaves every later migration unapplied on this worker's database, and
+            # every test that runs after it on that worker fails on a missing column.
+            executor.migrate([executor.loader.graph.leaf_nodes(APP)[0]])
 
         assert "intent_generation" in _columns()
         assert _sequence_exists()

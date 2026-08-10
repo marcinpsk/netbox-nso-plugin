@@ -26,8 +26,11 @@ jobs:
       fail-fast: false
       max-parallel: 4
       matrix:
-        python-version: ["3.12", "3.13"]
-        netbox-version: ["v4.6.1"]
+        include:
+          - python-version: "3.12"
+            netbox-version: "v4.6.1"
+          - python-version: "3.13"
+            netbox-version: "v4.6.7"
 
     services:
       redis:
@@ -91,9 +94,13 @@ jobs:
         working-directory: netbox
         run: |
           cat > netbox/netbox/configuration.py << 'EOF'
+          import os
+
           ALLOWED_HOSTS = ['*']
           DATABASE = {
-              'NAME': 'netbox',
+              # Honored by the tests that re-enter manage.py in a subprocess: they forward the
+              # parent's real test-database name, which a hardcoded name would send to the wrong DB.
+              'NAME': os.environ.get('DB_NAME', 'netbox'),
               'USER': 'netbox',
               'PASSWORD': 'netbox',
               'HOST': 'localhost',
@@ -186,11 +193,19 @@ jobs:
           ADAPTER_DATABASE_URL: postgresql+asyncpg://adapter:adapter@127.0.0.1:55432/adapter
           ADAPTER_TOKEN: contract-adapter-token
           NETBOX_TOKEN: contract-netbox-token
+        # The instance entry is a name the store validates onboarding against, nothing more:
+        # it points at a closed port and the streams and both scheduler ticks are off, so no
+        # request ever leaves for it. Without it the store-side contract checks cannot create
+        # the throwaway devices they push intent to.
         run: |
           cat > "${RUNNER_TEMP}/adapter-contract.yaml" <<'EOF'
           secrets:
             provider: local
-          nso_instances: []
+          nso_instances:
+            - name: contract
+              base_url: http://127.0.0.1:9
+              username_ref: CONTRACT_NSO_USERNAME
+              password_ref: CONTRACT_NSO_PASSWORD
           netbox:
             base_url: http://127.0.0.1:9
             api_token_ref: CONTRACT_NETBOX_TOKEN
@@ -201,12 +216,16 @@ jobs:
           log_format: json
           scheduler:
             enable_nso_streams: false
+            poll_interval: 1440
+            scope_reconcile_interval: 1440
           EOF
           docker run --detach --name nso-adapter-contract --network host \
             --env CONFIG_FILE=/app/config.contract.yaml \
             --env DATABASE_URL="$ADAPTER_DATABASE_URL" \
             --env CONTRACT_ADAPTER_TOKEN="$ADAPTER_TOKEN" \
             --env CONTRACT_NETBOX_TOKEN="$NETBOX_TOKEN" \
+            --env CONTRACT_NSO_USERNAME=contract \
+            --env CONTRACT_NSO_PASSWORD=contract \
             --volume "${RUNNER_TEMP}/adapter-contract.yaml:/app/config.contract.yaml:ro" \
             nso-adapter-contract:ci \
             uvicorn nso_adapter.main:app --host 127.0.0.1 --port 18000

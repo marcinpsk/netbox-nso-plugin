@@ -11,6 +11,7 @@ import logging
 import threading
 from collections import namedtuple
 
+from django.db.models import Q
 from django.db.models.signals import m2m_changed, post_delete, post_save, pre_delete, pre_save
 from django.dispatch import receiver
 from django.utils import timezone
@@ -365,13 +366,13 @@ def _attribute_static_route_error(device_id, detail):
         return []
     vrf, prefix, next_hop = (str(part) for part in triple)
     matched = []
+    # The same predicate the push serializes by: the rejection names payload entries, so a
+    # row the push never sent may never be attributed one.
     for row in NSOStaticRouteState.objects.filter(
+        PUSHED_STATIC_ROUTE_FILTER,
         management__device_id=device_id,
-        status__in=_OWNED_PUSH_STATUSES,
     ).select_related("static_route", "static_route__vrf"):
         sr = row.static_route
-        if sr is None or sr.next_hop is None:
-            continue
         row_vrf = sr.vrf.name if sr.vrf else ""
         if (row_vrf, str(sr.prefix), str(sr.next_hop)) == (vrf, prefix, next_hop):
             matched.append(sr.pk)
@@ -426,6 +427,56 @@ def _record_push_outcome(device_id, scope, attempt, exc):
             NSODeviceManagement.objects.filter(pk=mgmt.pk).update(intent_push_errors=errors)
     except Exception as exc2:  # noqa: BLE001 — surfacing must never turn a swallowed push into a raise
         logger.warning("Could not record the intent-push outcome for device %s/%s: %s", device_id, scope, exc2)
+
+
+def read_push_record(device_id, scope) -> tuple:
+    """Return this scope's persisted ``(attempt, rejection entry)`` as it stands right now."""
+    from .models import NSODeviceManagement
+
+    row = (
+        NSODeviceManagement.objects.filter(device_id=device_id)
+        .values("intent_push_attempts", "intent_push_errors")
+        .first()
+    )
+    if row is None:
+        return None, None
+    attempt = (row["intent_push_attempts"] or {}).get(scope)
+    return (int(attempt) if attempt is not None else None), (row["intent_push_errors"] or {}).get(scope)
+
+
+def restore_push_record(device_id, scope, attempt, entry) -> None:
+    """Re-apply a rejection record a caller's own rollback discarded.
+
+    :func:`_push_changed` persists the attempt mark and the adapter's rejection through
+    :func:`_record_push_outcome`, which is what puts the reason on the device tab. A caller
+    that runs its push inside a transaction it then rolls back (the static-route rollout
+    pass, which cannot keep a generation the adapter refused) takes those writes down with
+    it, leaving the operator a bare "not acknowledged". This puts them back, in its own
+    transaction, under the same per-scope merge — so no other scope's record is touched and
+    a newer attempt recorded meanwhile still wins.
+    """
+    from django.db import transaction
+
+    from .models import NSODeviceManagement
+
+    if attempt is None or entry is None:
+        return
+    try:
+        with transaction.atomic():
+            mgmt = NSODeviceManagement.objects.select_for_update().filter(device_id=device_id).first()
+            if mgmt is None:
+                return
+            attempts = dict(mgmt.intent_push_attempts or {})
+            if int(attempts.get(scope) or 0) > attempt:
+                return  # a later attempt has reported since; its record is the current one
+            errors = dict(mgmt.intent_push_errors or {})
+            attempts[scope] = attempt
+            errors[scope] = entry
+            NSODeviceManagement.objects.filter(pk=mgmt.pk).update(
+                intent_push_attempts=attempts, intent_push_errors=errors
+            )
+    except Exception as exc:  # noqa: BLE001 — surfacing must never turn a swallowed push into a raise
+        logger.warning("Could not restore the intent-push record for device %s/%s: %s", device_id, scope, exc)
 
 
 def _push_changed(key, payload, do_push, force=False):
@@ -1920,6 +1971,30 @@ def _on_ip_address_delete(sender, instance, **kwargs):
     )
 
 
+#: The overlays a static-route push actually serializes: owned, and carrying an IP next
+#: hop (an interface-only next hop is not supported by static-route-reconciler v1, so the
+#: snapshot has no way to express it). Read by the rollout backfill too — a row it armed
+#: but the push never sent would hold a generation the adapter has never seen, which no
+#: apply result can name and no later pass would re-arm (#1502 Appendix S).
+PUSHED_STATIC_ROUTE_FILTER = Q(status__in=_OWNED_PUSH_STATUSES, static_route__next_hop__isnull=False)
+
+
+def stored_static_route_count(response):
+    """How many routes the adapter says it stored, or ``None`` when it did not say.
+
+    One definition for every reader of a static-route push answer: the Apply promotion gate
+    and the fleet re-sync both decide "acknowledged" from this, so a malformed answer cannot
+    mean stored to one of them and refused to the other. Only a real row count answers —
+    ``True`` is an ``int`` in Python, and no push stores a negative number of routes.
+    """
+    if not isinstance(response, dict):
+        return None
+    count = response.get("count")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        return None
+    return count
+
+
 def _push_static_route_intent_for_device(device_id, adapter_device_id, force=False):
     """Build and push the full static route intent snapshot for a device.
 
@@ -1940,12 +2015,9 @@ def _push_static_route_intent_for_device(device_id, adapter_device_id, force=Fal
     routes = []
     generations: dict[int, int] = {}
     for row in NSOStaticRouteState.objects.filter(
-        management__device_id=device_id,
-        status__in=_OWNED_PUSH_STATUSES,
+        PUSHED_STATIC_ROUTE_FILTER, management__device_id=device_id
     ).select_related("static_route", "static_route__vrf"):
         sr = row.static_route
-        if sr.next_hop is None:
-            continue  # interface-only next-hop not supported by static-route-reconciler v1
         vrf_name = sr.vrf.name if sr.vrf else ""
         generation = row.intent_generation or None
         route = {

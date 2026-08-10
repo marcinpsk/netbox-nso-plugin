@@ -10,7 +10,9 @@ from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet
 class Command(BaseCommand):
     help = (
         "Re-push every NSO-managed device's static-route intent store-only, so the adapter "
-        "backfills route_id on its stored rows and its replacement fence can open."
+        "backfills route_id on its stored rows and its replacement fence can open. Owned "
+        "overlays still on the generation sentinel are armed in the same pass, so their "
+        "apply results can correlate."
     )
 
     def add_arguments(self, parser):
@@ -28,7 +30,10 @@ class Command(BaseCommand):
         results = resync_static_route_intent_fleet(device_ids=requested)
         for row in results:
             if row["ok"]:
-                self.stdout.write(f"{row['device']} (device {row['device_id']}): {row['count']} route(s) stored")
+                self.stdout.write(
+                    f"{row['device']} (device {row['device_id']}): {row['count']} route(s) stored, "
+                    f"{row['armed']} generation(s) armed"
+                )
             else:
                 self.stdout.write(self.style.ERROR(f"{row['device']} (device {row['device_id']}): NOT acknowledged"))
 
