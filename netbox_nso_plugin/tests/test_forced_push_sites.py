@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""#1503 Appendix O (O1) — pin O1.16: the forced-push sites, enumerated by the compiler.
+"""#1503 Appendix O (O1), pin O1.16: the forced-push sites, enumerated by the compiler.
 
 A forced call is its own logical operation: it does not enqueue, does not coalesce and is
 never dropped as unchanged. There are six of them, and the enumeration is taken with the AST
@@ -70,7 +70,7 @@ def _forced_calls() -> set[tuple[str, str, str]]:
 
 
 class TestForcedPushSitesAreEnumerated(SimpleTestCase):
-    """O1.16 — six sites, found by the AST, and a scan that fails when a seventh appears."""
+    """O1.16: six sites, found by the AST, and a scan that fails when a seventh appears."""
 
     def test_every_forced_site_is_still_where_the_enumeration_says(self):
         found = _forced_calls()
@@ -100,7 +100,7 @@ class TestForcedPushSitesAreEnumerated(SimpleTestCase):
 
 
 class TestAForcedCallInsideATransactionRaises(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
-    """O1.16 — silently deferring inside a caller's block is what this refuses to do."""
+    """O1.16: silently deferring inside a caller's block is what this refuses to do."""
 
     def setUp(self):
         super().setUp()

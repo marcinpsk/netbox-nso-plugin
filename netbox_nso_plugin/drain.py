@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""#1503 Appendix O — the claim protocol and the drain pass over the durable outbox.
+"""#1503 Appendix O: the claim protocol and the drain pass over the durable outbox.
 
 The outbox records what an operator transaction did; this is what turns those records into
 one request and settles it. A claim is one short REPEATABLE READ transaction: it locks the
@@ -148,8 +148,8 @@ def _repeatable_read(work):
 def _lock_state(device_id, scope):
     """Take the key's state row FOR UPDATE, creating it on demand.
 
-    This row is the mutual-exclusion point of every drain-side operation — claim, outcome,
-    abandon and compaction alike — so "never touches a row carrying a push_seq" is a lock
+    This row is the mutual-exclusion point of every drain-side operation (claim, outcome,
+    abandon and compaction alike), so "never touches a row carrying a push_seq" is a lock
     rather than a predicate two readers can both satisfy.
     """
     from .models import NSOIntentOutboxState
@@ -374,10 +374,10 @@ def send_claim(claim: Claim):
     from . import signals
 
     if not signals._device_is_managed(claim.device_id):
-        logger.info("device %s is no longer NSO-managed — parking push_seq %s", claim.device_id, claim.push_seq)
+        logger.info("device %s is no longer NSO-managed, parking push_seq %s", claim.device_id, claim.push_seq)
         return PARKED
     if revocation_hit(claim):
-        logger.info("a revocation withdrew authority from push_seq %s — abandoning it", claim.push_seq)
+        logger.info("a revocation withdrew authority from push_seq %s, abandoning it", claim.push_seq)
         abandon(claim)
         return ABANDONED
     return delivery.send(
@@ -566,7 +566,7 @@ def drain_key(device_id, scope, *, mode=delivery.MODE_NORMAL, force=False, chain
         return NOTHING
     try:
         answer = send_claim(claimed)
-    except Exception as exc:  # noqa: BLE001 — the operation is replayed, so the failure is data
+    except Exception as exc:  # noqa: BLE001 (the operation is replayed, so the failure is data)
         logger.warning("push_seq %s failed for %s/%s: %s", claimed.push_seq, device_id, scope, exc)
         return record_failure(claimed, exc)
     if answer in (PARKED, ABANDONED):
@@ -653,7 +653,7 @@ def drain_intent_outbox(limit=None) -> tuple[int, int]:
     for device_id, scope in drain_candidates(limit):
         try:
             outcome = drain_key(device_id, scope)
-        except Exception:  # noqa: BLE001 — one key's adapter must not abort the fleet pass
+        except Exception:  # noqa: BLE001 (one key's adapter must not abort the fleet pass)
             logger.exception("intent outbox drain failed for %s/%s", device_id, scope)
             failed += 1
             continue

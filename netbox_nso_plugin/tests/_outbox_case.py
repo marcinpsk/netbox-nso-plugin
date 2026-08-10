@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""#1503 Appendix O (O1) — shared fixtures for the claim protocol and the drain pass.
+"""#1503 Appendix O (O1): shared fixtures for the claim protocol and the drain pass.
 
 The claim renders inside its own transaction and sends outside it, so its pins cross
 transaction boundaries and run as ``TransactionTestCase``. That means no wrapping test
@@ -121,7 +121,7 @@ def enqueue(device, scope, *, transitions=(), delete_origin=False):
 class ReceiptAdapter:
     """The far side of a push, keeping §4.4's receipt per endpoint.
 
-    Stands in at the transport boundary only — the one place a double is warranted — so the
+    Stands in at the transport boundary only (the one place a double is warranted), so the
     sequence header, the query flags and the body all travel through the real client. A
     request whose sequence and digest match the stored receipt is a REPLAY: the stored
     response comes back and nothing is applied a second time, which is what makes a lost

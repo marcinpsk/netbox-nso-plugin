@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""#1503 Appendix O (O1) — the drain pass: the tick's third call, and what it may see.
+"""#1503 Appendix O (O1), the drain pass: the tick's third call, and what it may see.
 
 O1.23 pins the pass itself: it is the tick's third call, it re-queries its own candidates
 after the link repair, it is bounded and candidate-filtered, and one key's failure isolates.
-O1.24 pins commit visibility with a real second connection — an entry allocated first and
+O1.24 pins commit visibility with a real second connection: an entry allocated first and
 committed last is simply unconsumed, which is Appendix S's r3-B1 re-derived on this side.
 O1.33 pins fairness: the attempt stamp goes on before anything can refuse, so a replayably
 failing head rotates to the back instead of occupying every pass.
@@ -53,7 +53,7 @@ class _DrainCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
 
 
 class TestTheTickDrainsTheTail(_DrainCase):
-    """O1.23 (R4-B3, R5-M3) — the pass the synchronous chain leaves its tail to."""
+    """O1.23 (R4-B3, R5-M3): the pass the synchronous chain leaves its tail to."""
 
     def test_the_drain_is_the_tick_s_third_call(self):
         from netbox_nso_plugin import jobs
@@ -171,7 +171,7 @@ class TestTheTickDrainsTheTail(_DrainCase):
 
 
 class TestOutOfOrderCommitVisibility(_DrainCase):
-    """O1.24 — an entry allocated first and committed last is simply unconsumed."""
+    """O1.24: an entry allocated first and committed last is simply unconsumed."""
 
     def test_the_late_commit_is_seen_by_the_next_claim_the_scan_and_the_tick(self):
         from netbox_nso_plugin import drain, outbox
@@ -197,7 +197,7 @@ class TestOutOfOrderCommitVisibility(_DrainCase):
                     outbox.enqueue(device.pk, "static_route", transitions=[outbox.revoke_transition(leaving.pk)])
                     inserted.set()
                     assert release.wait(timeout=30)
-            except BaseException as exc:  # noqa: BLE001 — reported, not swallowed
+            except BaseException as exc:  # noqa: BLE001 (reported, not swallowed)
                 errors.append(exc)
             finally:
                 connection.close()
@@ -237,7 +237,7 @@ class TestOutOfOrderCommitVisibility(_DrainCase):
 
 
 class TestFairSelectionRotatesAFailingHead(_DrainCase):
-    """O1.33 (R9-B1) — isolation is not fairness; the stamp is what rotates the head."""
+    """O1.33 (R9-B1): isolation is not fairness; the stamp is what rotates the head."""
 
     def test_a_healthy_key_behind_failing_ones_is_claimed_within_the_bound(self):
         from netbox_nso_plugin import drain

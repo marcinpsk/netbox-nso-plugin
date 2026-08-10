@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""#1503 Appendix O (O1) — the claim protocol: one fold, one render, one send.
+"""#1503 Appendix O (O1), the claim protocol: one fold, one render, one send.
 
 Every pin here crosses a transaction boundary, so every case is a ``TransactionTestCase``:
 the claim renders inside its own repeatable-read transaction and sends outside every
@@ -58,7 +58,7 @@ class _ClaimCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
 
 
 class TestClaimFoldsEveryEntryOnce(_ClaimCase):
-    """O1.6 (R8-B1) — N saves cost one claim, and a batched pass truncates keys, not folds."""
+    """O1.6 (R8-B1): N saves cost one claim, and a batched pass truncates keys, not folds."""
 
     tag = "fold"
     adapter_device_id = 7502
@@ -131,7 +131,7 @@ class TestClaimFoldsEveryEntryOnce(_ClaimCase):
 
 
 class TestDigestEqualClaimRetiresItsRows(_ClaimCase):
-    """O1.7 (R13-M1) — the dropped claim has no outcome transaction, so it retires its own."""
+    """O1.7 (R13-M1): the dropped claim has no outcome transaction, so it retires its own."""
 
     tag = "dig"
     adapter_device_id = 7503
@@ -169,7 +169,7 @@ class TestDigestEqualClaimRetiresItsRows(_ClaimCase):
 
 
 class TestFailureKeepsTheWorkAndTheBaseline(_ClaimCase):
-    """O1.8 — a failed attempt moves neither the authority nor the acknowledged baseline."""
+    """O1.8: a failed attempt moves neither the authority nor the acknowledged baseline."""
 
     tag = "fail"
     adapter_device_id = 7504
@@ -213,7 +213,7 @@ class TestFailureKeepsTheWorkAndTheBaseline(_ClaimCase):
 
 
 class TestCrashedAttemptsReplayAtTheirOwnSequence(_ClaimCase):
-    """O1.9, O1.10 — the sequence names the operation, so a crash is resolvable either side."""
+    """O1.9, O1.10: the sequence names the operation, so a crash is resolvable either side."""
 
     tag = "crash"
     adapter_device_id = 7505
@@ -258,7 +258,7 @@ class TestCrashedAttemptsReplayAtTheirOwnSequence(_ClaimCase):
 
 
 class TestOutcomeCasRefusesASupersededAttempt(_ClaimCase):
-    """O1.11 — an outcome may only settle the operation the key is still on."""
+    """O1.11: an outcome may only settle the operation the key is still on."""
 
     tag = "cas"
     adapter_device_id = 7506
@@ -282,7 +282,7 @@ class TestOutcomeCasRefusesASupersededAttempt(_ClaimCase):
 
 
 class TestUnmanagedClaimIsParked(_ClaimCase):
-    """O1.13 (R11-m1) — unmanaging is not a third abandon cause; the claim simply waits."""
+    """O1.13 (R11-m1): unmanaging is not a third abandon cause; the claim simply waits."""
 
     tag = "park"
     adapter_device_id = 7507
