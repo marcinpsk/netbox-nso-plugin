@@ -1238,7 +1238,7 @@ _UNCLOCKED_STATIC_ROUTE_ERROR = (
 )
 
 
-def _escalate_stuck_static_routes(mgmt, *, adapter_device_id) -> None:
+def _escalate_stuck_static_routes(mgmt, *, adapter_device_id, apply_active: bool | None = None) -> None:
     """Static-route rows left 'deploying' past the grace with no correlated result → apply_failed.
 
     Static routes left :data:`_APPLY_DEPLOYING_SCOPES`, so :func:`_escalate_stuck_deploying`
@@ -1267,8 +1267,9 @@ def _escalate_stuck_static_routes(mgmt, *, adapter_device_id) -> None:
     rows ``deploying`` without re-stamping the generation clock, so a route staged long
     before its Apply looks stuck the moment that Apply starts. Failing it there is
     unrecoverable — the apply's own ``in_sync`` cannot lift a row out of ``apply_failed``.
-    That lookup is deliberately made only when there is something to escalate, so a quiet
-    device costs no adapter call.
+    A caller that already fetched the job state passes it as *apply_active*; otherwise the
+    lookup is made here, and only when there is something to escalate, so a quiet device on
+    the maintenance tick costs no adapter call.
     """
     from django.db.models import Q
     from django.utils import timezone
@@ -1287,7 +1288,8 @@ def _escalate_stuck_static_routes(mgmt, *, adapter_device_id) -> None:
     )
     if not rows:
         return
-    _job, apply_active = _apply_job_state(adapter_device_id)
+    if apply_active is None:
+        _job, apply_active = _apply_job_state(adapter_device_id)
     if apply_active:
         logger.debug(
             "nso reconcile: static-route escalation stands down for adapter device %s — an apply is in flight",
@@ -1523,7 +1525,8 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
             # including the apply-in-flight check — an error here therefore stands the static
             # backstop down and touches nothing else.
             try:
-                settle_static_routes(mgmt)
+                # apply_active is already known here, so the escalation must not re-fetch it.
+                settle_static_routes(mgmt, apply_active=apply_active)
             except Exception as exc:  # noqa: BLE001 — narrow: only the static backstop stands down
                 logger.warning(
                     "nso reconcile: static-route settlement failed for device %s: %s — "

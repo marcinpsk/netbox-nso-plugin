@@ -23,6 +23,7 @@ from ._settlement_case import (
     _result,
     _route,
     _SettlementCase,
+    _stale_clock,
 )
 
 
@@ -431,3 +432,38 @@ class TestTheReadBackIsFetchedOncePerPass(_SettlementCase):
         for state in states:
             state.refresh_from_db()
             assert state.status == "in_sync"
+
+
+class TestStep4ReadsTheJobStateOnce(_SettlementCase):
+    """Step 4 already fetched the apply-job state, so the escalation must not fetch it again.
+
+    Both reads answer the same question — may an apply be in flight — from the same
+    descending jobs page. Two fetches per reconcile is one wasted adapter round trip per
+    device per pass, and the two answers can disagree.
+    """
+
+    def _jobs_page_reads(self):
+        """Reads of the DESCENDING jobs page: the apply-activity probe, not the feed."""
+        store = self.adapter.store
+        return len([path for _method, path in store.requests if path == "/api/v1/jobs"]) - len(store.feed_requests)
+
+    def test_the_escalation_reuses_step_4_s_job_state(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin.reconcile import run_device_reconcile
+
+        device = _make_device("step4")
+        mgmt = _make_mgmt(device, "step4", 97)
+        sr = _route("10.61.0.0/16", "10.61.0.1", devices=[device])
+        state = _own(sr, mgmt, generation=320)
+        _stale_clock(state)
+        # Terminal, and about no static route: the feed drains, so the backstop may judge —
+        # which is the path that fetched the job state a second time.
+        self.adapter.store.terminal_job(97)
+
+        with patch("netbox_nso_plugin.reconcile.reconcile_device", return_value={}):
+            run_device_reconcile(device.pk)
+
+        state.refresh_from_db()
+        assert state.status == "apply_failed", "the backstop never ran, so nothing proves the reuse"
+        assert self._jobs_page_reads() == 1, "the escalation re-fetched the job state Step 4 already had"
