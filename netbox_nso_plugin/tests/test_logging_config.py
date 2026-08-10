@@ -180,7 +180,8 @@ class TestReconcileLoggingConfig(TestCase):
             # post_init = the reconciler has just SELECTed the row, so its in-memory copy is
             # already stale when the edit lands. .update() writes straight to the DB: no
             # post_init, hence no recursion.
-            if fired or instance.pk is None:
+            # Only the row under test: the loop's get_or_create instantiates others too.
+            if fired or instance.pk != row.pk:
                 return
             fired.append(True)
             NSOLoggingHostState.objects.filter(pk=instance.pk).update(severity="error")
