@@ -134,6 +134,8 @@ class ReceiptAdapter:
         self.requests: list[dict] = []
         self.replays = 0
         self.fail_with: Exception | None = None
+        #: Adapter device ids whose every request fails, for the replayably failing key.
+        self.fail_devices: set[int] = set()
         self._respond = respond or (lambda body: {"count": len(next(iter(body.values()), []) or [])})
 
     @property
@@ -156,6 +158,8 @@ class ReceiptAdapter:
     def _handle(self, method, url, **kwargs):
         if self.fail_with is not None:
             raise self.fail_with
+        if any(f"/devices/{device_id}/" in url for device_id in self.fail_devices):
+            raise ConnectionError(f"the far side refuses {url}")
         headers = kwargs.get("headers") or {}
         raw_seq = headers.get("X-Push-Seq")
         seq = int(raw_seq) if raw_seq is not None else None
