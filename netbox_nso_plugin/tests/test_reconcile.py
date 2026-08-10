@@ -421,6 +421,9 @@ class TestStaticRouteApplySettle(APITestCase):
             patch("netbox_nso_plugin.signals._push_bfd_intent_for_device"),
             patch("netbox_nso_plugin.signals._push_interface_mtu_intent_for_device"),
             patch("netbox_nso_plugin.signals._push_route_policy_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_logging_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_l2_sap_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_snmp_intent_for_device"),
             # A stored count, not a bare mock: the promotion gate reads the count.
             patch(
                 "netbox_nso_plugin.signals._push_static_route_intent_for_device",
