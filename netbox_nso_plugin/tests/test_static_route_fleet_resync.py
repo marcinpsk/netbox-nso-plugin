@@ -206,6 +206,36 @@ class TestStaticRouteFleetResync(IntentPushResetMixin, TestCase):
         assert by_device[first.device_id]["count"] is None
         assert by_device[second.device_id]["ok"] is True  # the pass carried on
 
+    def test_only_a_real_route_count_acknowledges_a_push(self):
+        """The count IS the acknowledgement, so an answer that carries no honest one must arm
+        nothing: a device reported stored holds a generation the adapter has never seen. ``True``
+        is an ``int`` in Python and no push stores a negative number of rows. An honest zero still
+        acknowledges — a device with nothing to push really does store zero routes."""
+        from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet
+
+        _, boolean = self._managed_device("boolcount", 8021)
+        _, text = self._managed_device("textcount", 8022)
+        _, negative = self._managed_device("negcount", 8023)
+        _, no_routes = self._managed_device("zerocount", 8024)  # owns no route, so zero is the truth
+        for mgmt, prefix in ((boolean, "10.70.0.0/16"), (text, "10.71.0.0/16"), (negative, "10.72.0.0/16")):
+            self._own_route(mgmt, prefix, "10.0.0.71")
+
+        answers = {8021: True, 8022: "1", 8023: -1, 8024: 0}
+
+        def _answer(adapter_device_id, routes):
+            return {"device_id": adapter_device_id, "count": answers[adapter_device_id], "routes": []}
+
+        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", side_effect=_answer):
+            results = resync_static_route_intent_fleet()
+
+        by_device = {r["device_id"]: r for r in results}
+        for mgmt in (boolean, text, negative):
+            assert by_device[mgmt.device_id]["ok"] is False, by_device[mgmt.device_id]
+            assert by_device[mgmt.device_id]["count"] is None
+            assert by_device[mgmt.device_id]["armed"] == 0, "a refused push kept its arming"
+        assert by_device[no_routes.device_id]["ok"] is True
+        assert by_device[no_routes.device_id]["count"] == 0
+
     def test_command_fails_when_a_requested_device_id_matched_nothing(self):
         """``--device`` filters the queryset, so a mistyped id simply yields no result row —
         and an unrepaired fleet must never print a clean ``Re-synced 0 device(s)``."""

@@ -1984,9 +1984,15 @@ def stored_static_route_count(response):
 
     One definition for every reader of a static-route push answer: the Apply promotion gate
     and the fleet re-sync both decide "acknowledged" from this, so a malformed answer cannot
-    mean stored to one of them and refused to the other.
+    mean stored to one of them and refused to the other. Only a real row count answers —
+    ``True`` is an ``int`` in Python, and no push stores a negative number of routes.
     """
-    return response.get("count") if isinstance(response, dict) else None
+    if not isinstance(response, dict):
+        return None
+    count = response.get("count")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        return None
+    return count
 
 
 def _push_static_route_intent_for_device(device_id, adapter_device_id, force=False):
