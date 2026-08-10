@@ -113,13 +113,15 @@ def settle_static_routes(mgmt, *, escalate: bool = True, apply_active: bool | No
       shared-failure-domain trap one level down.
 
     The remaining precondition — no apply in flight — is the backstop's own, so that both
-    clocks get it without either restating it.
+    clocks get it without either restating it. A caller that already read the job state hands
+    it over as *apply_active* rather than paying for a second jobs fetch; the maintenance
+    tick, which has read nothing, leaves it None and the backstop looks it up itself.
     """
     from .reconcile import _escalate_stuck_static_routes
 
     outcome = consume_static_route_settlements(mgmt)
     if escalate and outcome.drained and outcome.adapter_device_id is not None:
-        _escalate_stuck_static_routes(mgmt, adapter_device_id=outcome.adapter_device_id)
+        _escalate_stuck_static_routes(mgmt, adapter_device_id=outcome.adapter_device_id, apply_active=apply_active)
     return outcome
 
 
