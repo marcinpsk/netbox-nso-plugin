@@ -757,7 +757,10 @@ def _reconcile_logging_levels(mgmt, levels_data: dict, now):
         NSOLoggingLevelState.objects.filter(
             pk=state.pk, status=state.status, **{f: getattr(state, f) for f in dev}
         ).update(status=sm.on_reconcile(state.status, matches=matches), last_sync_at=now)
-        state.refresh_from_db()
+        try:
+            state.refresh_from_db()
+        except NSOLoggingLevelState.DoesNotExist:
+            return None
     else:
         state.last_sync_at = now
         for f, v in dev.items():
