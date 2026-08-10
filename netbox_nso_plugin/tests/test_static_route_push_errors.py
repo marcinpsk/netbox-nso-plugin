@@ -205,9 +205,9 @@ class TestIntentPushRejectionIsolation(IntentPushResetMixin, TestCase):
         self.assertIsNotNone(_record(self.mgmt))
 
         # Another scope fails, then succeeds. Neither may reach static_route.
-        _push_changed((self.device.pk, "vlan"), [{"a": 1}], lambda: (_ for _ in ()).throw(ValueError("vlan down")))
+        _push_changed((self.device.pk, "vlan"), [{"a": 1}], lambda body: (_ for _ in ()).throw(ValueError("vlan down")))
         self.assertIsNotNone(_record(self.mgmt, "vlan"))
-        _push_changed((self.device.pk, "vlan"), [{"a": 2}], lambda: {"ok": True})
+        _push_changed((self.device.pk, "vlan"), [{"a": 2}], lambda body: {"ok": True})
         self.assertIsNone(_record(self.mgmt, "vlan"))
 
         self.assertIsNotNone(_record(self.mgmt), "another scope's success cleared the static record")
@@ -320,7 +320,7 @@ class TestIntentPushRejectionConcurrency(_CascadeFlushMixin, IntentPushResetMixi
                 _push_changed(
                     (self.device.pk, scope),
                     [{"scope": scope}],
-                    lambda: (_ for _ in ()).throw(ValueError(f"{scope} down")),
+                    lambda body: (_ for _ in ()).throw(ValueError(f"{scope} down")),
                 )
             except BaseException as exc:  # noqa: BLE001 — reported, not swallowed
                 errors.append(exc)

@@ -92,27 +92,28 @@ class RefreshDeviceSyncCacheJob(JobRunner):
         # timeout in turn, so a hundred of them can hold a five-minute job for the best part
         # of an hour. Skip the pass; the next tick is five minutes away.
         _mapped, by_id, _by_identity = snapshot
-        started = time.monotonic()
+        drained = drain_failed = polled = settle_failed = 0
+        drain_started = settle_started = time.monotonic()
         if by_id is None:
             logger.warning("RefreshDeviceSyncCacheJob: adapter snapshot unavailable — drain and sweep skipped")
-            drained, drain_failed = 0, 0
-            polled, settle_failed = 0, 0
         else:
-            # Same rule as the sweep below, and for the same reason: a proven global outage
-            # is not a per-key failure, and every candidate would wait out its own timeout.
+            # Same rule as the sweep, and for the same reason: a proven global outage is not
+            # a per-key failure, and every candidate would wait out its own read timeout.
             drained, drain_failed = drain_intent_outbox()
+            settle_started = time.monotonic()
             polled, settle_failed = sweep_static_route_settlements()
         logger.info(
             "RefreshDeviceSyncCacheJob: %d checked, %d updated, %d broken, %d repair attempted, "
-            "%d outbox drained, %d outbox failed, %d settlement polled, %d settlement failed, "
-            "drain and sweep %.3fs",
+            "%d outbox drained, %d outbox failed, outbox drain %.3fs, "
+            "%d settlement polled, %d settlement failed, settlement sweep %.3fs",
             checked,
             updated,
             broken,
             attempted,
             drained,
             drain_failed,
+            settle_started - drain_started,
             polled,
             settle_failed,
-            time.monotonic() - started,
+            time.monotonic() - settle_started,
         )

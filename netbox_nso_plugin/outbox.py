@@ -84,7 +84,7 @@ class FoldedAuthority:
     lineage_carry: dict = dataclasses.field(default_factory=dict)
 
 
-def fold_transitions(transitions, *, claim_deletions=(), queued=(), revoked=()) -> FoldedAuthority:
+def fold_transitions(transitions, *, claim_deletions=(), queued=(), revoked=(), lineage_carry=None) -> FoldedAuthority:
     """Apply the authority algebra to *transitions*, in entry-id order.
 
     ``claim_deletions`` are the ids an in-flight claim already carries: a deletion of one of
@@ -93,14 +93,16 @@ def fold_transitions(transitions, *, claim_deletions=(), queued=(), revoked=()) 
     the route's own locks, so entry-id order is commit order for a route and the fold needs
     no transaction identity.
 
-    ``queued`` and ``revoked`` seed the fold with the authority the state row already holds,
-    because the algebra is over both homes: a re-ownership must discard a deletion queued by
-    an earlier fold exactly as it discards one from this batch.
+    ``queued``, ``revoked`` and ``lineage_carry`` seed the fold with what the state row
+    already holds, because the algebra is over both homes: a re-ownership must discard a
+    deletion queued by an earlier fold exactly as it discards one from this batch, and a
+    carried triple is cleared by an acknowledged success alone.
     """
     held = set(claim_deletions)
     folded = FoldedAuthority(
         queued={int(record["route_id"]): record for record in queued},
         revoked={int(route_id) for route_id in revoked},
+        lineage_carry=dict(lineage_carry or {}),
     )
     for record in transitions:
         route_id = record.get("route_id")

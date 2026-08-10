@@ -270,6 +270,7 @@ def _form(state, mgmt, now, mode, force) -> Claim | None:
         claim_deletions=[int(record["route_id"]) for record in state.claim_deletions or []],
         queued=state.queued_deletions,
         revoked=state.revoked_ids,
+        lineage_carry=state.lineage_carry,
     )
     deletions = list(folded.queued.values())
 
