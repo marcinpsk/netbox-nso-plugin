@@ -90,8 +90,11 @@ class TestApplyPromotion(TestCase):
                 return_value=static_response,
             )
         )
-        started = [p.start() for p in patches]
-        self.addCleanup(lambda: [p.stop() for p in patches])
+        started = []
+        for p in patches:
+            # One cleanup each: a later start() that raises must not strand the earlier patches.
+            started.append(p.start())
+            self.addCleanup(p.stop)
         _prepare_apply(mgmt)
         state.refresh_from_db()
         other.refresh_from_db()
@@ -132,6 +135,7 @@ class TestTheStuckDeployingBackstop(_SettlementCase):
 
     def test_a_stuck_deploying_row_escalates_on_its_generation_clock(self):
         """S6.4 — promoted the normal way, then no result ever names its generation."""
+        from netbox_nso_plugin.reconcile import _STUCK_STATIC_ROUTE_ERROR
         from netbox_nso_plugin.views import _prepare_apply
 
         device, mgmt = self._device("stuckclock", 60)
@@ -139,10 +143,9 @@ class TestTheStuckDeployingBackstop(_SettlementCase):
         state = _own(sr, mgmt, generation=401, status="accepted")
         _stale_clock(state)  # armed long before this Apply, which is what dates the wait
 
-        patches = _patch_other_pushes()
-        for p in patches:
+        for p in _patch_other_pushes():
             p.start()
-        self.addCleanup(lambda: [p.stop() for p in patches])
+            self.addCleanup(p.stop)
         _prepare_apply(mgmt)
 
         state.refresh_from_db()
@@ -153,7 +156,7 @@ class TestTheStuckDeployingBackstop(_SettlementCase):
 
         state.refresh_from_db()
         assert state.status == "apply_failed", "the row is stranded 'applying' forever"
-        assert "401" in state.last_apply_error, state.last_apply_error
+        assert state.last_apply_error == _STUCK_STATIC_ROUTE_ERROR.format(generation=401), state.last_apply_error
         assert self.adapter.store.feed_requests, "the backstop judged without walking the feed"
 
     def test_a_null_generation_clock_escalates_explicitly(self):
