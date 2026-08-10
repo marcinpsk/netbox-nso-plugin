@@ -151,10 +151,16 @@ def _lock_state(device_id, scope):
     This row is the mutual-exclusion point of every drain-side operation (claim, outcome,
     abandon and compaction alike), so "never touches a row carrying a push_seq" is a lock
     rather than a predicate two readers can both satisfy.
+
+    ``of=("self",)`` and the cleared ordering are load-bearing: ``Meta.ordering`` names the
+    ``device`` FK, which orders by the RELATED model's ordering and so joins ``dcim_device``,
+    and an unqualified ``select_for_update`` locks every joined table. That would take FOR
+    UPDATE on the device row and block every operator transaction inserting anything that
+    references it, the outbox entry included.
     """
     from .models import NSOIntentOutboxState
 
-    rows = NSOIntentOutboxState.objects.select_for_update()
+    rows = NSOIntentOutboxState.objects.select_for_update(of=("self",)).order_by()
     state = rows.filter(device_id=device_id, scope=scope).first()
     if state is None:
         NSOIntentOutboxState.objects.create(device_id=device_id, scope=scope)
@@ -220,7 +226,8 @@ def _claim_locked(device_id, scope, mode, force) -> Claim | None:
         return None
 
     mgmt = (
-        NSODeviceManagement.objects.select_for_update()
+        NSODeviceManagement.objects.select_for_update(of=("self",))
+        .order_by()
         .filter(device_id=device_id, adapter_device_id__isnull=False)
         .first()
     )
