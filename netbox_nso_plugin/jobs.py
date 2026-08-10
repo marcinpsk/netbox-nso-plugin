@@ -3,6 +3,7 @@
 """Periodic system jobs for the NSO plugin."""
 
 import logging
+import time
 
 from core.choices import JobIntervalChoices
 from netbox.jobs import JobRunner, system_job
@@ -86,6 +87,7 @@ class RefreshDeviceSyncCacheJob(JobRunner):
         # timeout in turn, so a hundred of them can hold a five-minute job for the best part
         # of an hour. Skip the pass; the next tick is five minutes away.
         _mapped, by_id, _by_identity = snapshot
+        started = time.monotonic()
         if by_id is None:
             logger.warning("RefreshDeviceSyncCacheJob: adapter snapshot unavailable — settlement sweep skipped")
             polled, settle_failed = 0, 0
@@ -93,11 +95,12 @@ class RefreshDeviceSyncCacheJob(JobRunner):
             polled, settle_failed = sweep_static_route_settlements()
         logger.info(
             "RefreshDeviceSyncCacheJob: %d checked, %d updated, %d broken, %d repair attempted, "
-            "%d settlement polled, %d settlement failed",
+            "%d settlement polled, %d settlement failed, settlement sweep %.3fs",
             checked,
             updated,
             broken,
             attempted,
             polled,
             settle_failed,
+            time.monotonic() - started,
         )
