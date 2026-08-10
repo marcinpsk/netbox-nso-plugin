@@ -33,4 +33,9 @@ class TestMigrationsMatchTheModels(TestCase):
     def test_the_models_need_no_further_migration(self):
         """A field added without its migration is a runtime error, not a review finding."""
         out = StringIO()
-        call_command("makemigrations", APP, check=True, dry_run=True, verbosity=1, stdout=out)
+        try:
+            # --check exits the process on pending changes, so the bare call reports a raw
+            # SystemExit and never says which model moved.
+            call_command("makemigrations", APP, check=True, dry_run=True, verbosity=1, stdout=out)
+        except SystemExit:
+            self.fail(f"{APP} has model changes with no migration:\n{out.getvalue()}")
