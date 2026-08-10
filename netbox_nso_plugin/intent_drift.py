@@ -394,7 +394,7 @@ def resync_static_route_intent_fleet(device_ids: list[int] | None = None) -> lis
     results: list[dict] = []
     with client.store_only_pushes():
         for mgmt in rows.order_by("device_id"):
-            armed = 0
+            armed = rolled_back = 0
             try:
                 with transaction.atomic():
                     armed = _backfill_static_route_generations(mgmt)
@@ -411,12 +411,14 @@ def resync_static_route_intent_fleet(device_ids: list[int] | None = None) -> lis
                 # Outside the rolled-back transaction: the reason the adapter gave is what
                 # the operator acts on, and it is not part of what the rollback undoes.
                 signals.restore_push_record(mgmt.device_id, "static_route", *rejected.record)
-                armed, count = 0, None
+                # `armed` is 0 because the rollback undid the arming, which reads the same as
+                # "nothing needed arming". Report the undone count so a partial pass is visible.
+                armed, rolled_back, count = 0, armed, None
             # Not an adapter rejection (the push returns None for those), so letting it out
             # would strand every later device unattempted and unreported.
             except Exception:  # noqa: BLE001
                 logger.exception("Static-route intent re-sync raised for device %s", mgmt.device_id)
-                armed, count = 0, None
+                armed, rolled_back, count = 0, armed, None
             results.append(
                 {
                     "device_id": mgmt.device_id,
@@ -425,6 +427,7 @@ def resync_static_route_intent_fleet(device_ids: list[int] | None = None) -> lis
                     "ok": count is not None,
                     "count": count,
                     "armed": armed,
+                    "armed_rolled_back": rolled_back,
                 }
             )
     return results

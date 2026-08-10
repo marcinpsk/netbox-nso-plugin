@@ -35,7 +35,13 @@ class Command(BaseCommand):
                     f"{row['armed']} generation(s) armed"
                 )
             else:
-                self.stdout.write(self.style.ERROR(f"{row['device']} (device {row['device_id']}): NOT acknowledged"))
+                undone = row["armed_rolled_back"]
+                self.stdout.write(
+                    self.style.ERROR(
+                        f"{row['device']} (device {row['device_id']}): NOT acknowledged"
+                        + (f", {undone} generation(s) rolled back" if undone else "")
+                    )
+                )
 
         problems = []
         failed = [row for row in results if not row["ok"]]
