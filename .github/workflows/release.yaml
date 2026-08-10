@@ -33,13 +33,26 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.SEMANTIC_RELEASE_TOKEN || github.token }}
 
-      # The branch may advance while a queued release waits. Release exactly
-      # the push that started this run; the workflow concurrency lock ensures
-      # the next push is evaluated separately.
-      - name: Reset the release branch to the triggering commit
+      # The branch may advance while a queued release waits: concurrency serializes the
+      # runs, it does not stop the pushes. A run whose commit is no longer the tip has
+      # nothing left to release — the later push runs its own release from the newer tip —
+      # and resetting back to it would only build a version commit that cannot fast-forward.
+      - name: Skip a stale release trigger
+        id: trigger
         env:
           RELEASE_SHA: ${{ github.sha }}
-        run: git reset --hard "$RELEASE_SHA"
+          RELEASE_REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin "refs/heads/${RELEASE_REF}"
+          tip="$(git rev-parse FETCH_HEAD)"
+          if [ "$tip" != "$RELEASE_SHA" ]; then
+            echo "::notice::${RELEASE_REF} is at ${tip}, not ${RELEASE_SHA} — this run releases nothing"
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # The tip IS this run's commit, so this can only move the checkout forward to it.
+          git reset --hard "$RELEASE_SHA"
 
       - name: Set up Python 3.12
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -50,6 +63,7 @@ jobs:
       # version declared immediately before this push as the baseline; otherwise
       # semantic-release starts at 0.0.0 and would downgrade the existing 0.1.0.
       - name: Establish the existing version baseline
+        if: steps.trigger.outputs.stale != 'true'
         env:
           BEFORE_SHA: ${{ github.event.before }}
         run: |
@@ -71,6 +85,7 @@ jobs:
       # must use the same token so the version commit, tag, and release agree.
       - name: Release from conventional commits
         id: release
+        if: steps.trigger.outputs.stale != 'true'
         uses: python-semantic-release/python-semantic-release@39dd2052f2ce8282a5d932c31d58a2ca06d2550e  # v10.6.1
         with:
           github_token: ${{ secrets.SEMANTIC_RELEASE_TOKEN || github.token }}
