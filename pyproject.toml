@@ -73,7 +73,7 @@ dev = [
     "pre-commit",
     "pytest",
     "pytest-django",
-    "pytest-cov>=6.0",
+    "pytest-cov>=7.1.0",
     "pytest-xdist>=3.8",
     "django>=6.1,<7.0",
     "requests-mock",
