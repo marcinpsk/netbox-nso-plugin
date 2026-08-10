@@ -16,20 +16,8 @@ import threading
 from unittest.mock import patch
 
 from django.db import connections
-from django.utils import timezone
 
-from ._settlement_case import _CarrierCase, _make_device, _make_mgmt, _own, _result, _route
-
-
-def _stale_clock(state, minutes=90):
-    """Age the generation clock past the stuck-deploying grace (default 10 minutes)."""
-    from datetime import timedelta
-
-    from netbox_nso_plugin.models import NSOStaticRouteState
-
-    NSOStaticRouteState.objects.filter(pk=state.pk).update(
-        generation_started_at=timezone.now() - timedelta(minutes=minutes)
-    )
+from ._settlement_case import _CarrierCase, _make_device, _make_mgmt, _own, _result, _route, _stale_clock
 
 
 class TestTheCarrier(_CarrierCase):

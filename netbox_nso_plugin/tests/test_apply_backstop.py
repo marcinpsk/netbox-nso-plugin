@@ -16,13 +16,12 @@ result and by nothing else, which puts two obligations on the ``deploying`` stat
 
 from __future__ import annotations
 
-from datetime import timedelta
 from unittest.mock import patch
 
 from django.test import TestCase
 from django.utils import timezone
 
-from ._settlement_case import _make_device, _make_mgmt, _own, _route, _SettlementCase
+from ._settlement_case import _make_device, _make_mgmt, _own, _route, _SettlementCase, _stale_clock
 
 _OTHER_PUSHES = (
     "_push_interface_intent_for_device",
@@ -43,15 +42,6 @@ _OTHER_PUSHES = (
 def _patch_other_pushes():
     """Silence every scope but static routes: they are a different subsystem here."""
     return [patch(f"netbox_nso_plugin.signals.{name}") for name in _OTHER_PUSHES]
-
-
-def _age_clock(state, minutes=90):
-    """Age the generation clock past the stuck-deploying grace (default 10 minutes)."""
-    from netbox_nso_plugin.models import NSOStaticRouteState
-
-    NSOStaticRouteState.objects.filter(pk=state.pk).update(
-        generation_started_at=timezone.now() - timedelta(minutes=minutes)
-    )
 
 
 class TestApplyPromotion(TestCase):
@@ -147,7 +137,7 @@ class TestTheStuckDeployingBackstop(_SettlementCase):
         device, mgmt = self._device("stuckclock", 60)
         sr = _route("10.50.0.0/16", "10.50.0.1", devices=[device])
         state = _own(sr, mgmt, generation=401, status="accepted")
-        _age_clock(state)  # armed long before this Apply, which is what dates the wait
+        _stale_clock(state)  # armed long before this Apply, which is what dates the wait
 
         patches = _patch_other_pushes()
         for p in patches:

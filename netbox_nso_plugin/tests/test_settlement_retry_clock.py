@@ -18,8 +18,16 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from ._settlement_case import _CarrierCase, _make_device, _make_mgmt, _own, _result, _route, _SettlementCase
-from .test_settlement_carrier import _stale_clock
+from ._settlement_case import (
+    _CarrierCase,
+    _make_device,
+    _make_mgmt,
+    _own,
+    _result,
+    _route,
+    _SettlementCase,
+    _stale_clock,
+)
 
 
 class TestTheScheduledTickIsAnIndependentClock(_CarrierCase):

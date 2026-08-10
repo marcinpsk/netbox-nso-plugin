@@ -9,6 +9,7 @@ double of :mod:`._settlement_adapter`; nothing here mocks the client.
 
 from __future__ import annotations
 
+from datetime import timedelta
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
@@ -74,6 +75,15 @@ def _own(sr, mgmt, *, generation, expected=True, status="deploying"):
             expected_generation=generation if expected else None,
             expected_fingerprint=FINGERPRINT if expected else "",
         )
+
+
+def _stale_clock(state, minutes=90):
+    """Age the generation clock past the stuck-deploying grace (default 10 minutes)."""
+    from netbox_nso_plugin.models import NSOStaticRouteState
+
+    NSOStaticRouteState.objects.filter(pk=state.pk).update(
+        generation_started_at=timezone.now() - timedelta(minutes=minutes)
+    )
 
 
 def _result(route_id, generation, *, outcome="in_sync", fingerprint=FINGERPRINT, error=None):
