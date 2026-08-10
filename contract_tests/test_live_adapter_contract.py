@@ -21,15 +21,23 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+_UNSET = object()
+
+
 @contextmanager
 def _live_client():
-    """Point the real plugin HTTP client at the live adapter for the block."""
+    """Point the real plugin HTTP client at the live adapter for the block.
+
+    ``PLUGINS_CONFIG`` is process-global and the auth arm below poisons the token in it, so
+    the previous value is restored on the way out — a later test must not inherit either.
+    """
     plugin_config = {
         "netbox_nso_plugin": {
             "adapter_url": os.environ["NSO_LIVE_ADAPTER_URL"],
             "adapter_token": os.environ["NSO_LIVE_ADAPTER_TOKEN"],
         }
     }
+    previous = getattr(settings, "PLUGINS_CONFIG", _UNSET) if settings.configured else _UNSET
     if settings.configured:
         settings.PLUGINS_CONFIG = plugin_config
     else:
@@ -42,8 +50,28 @@ def _live_client():
     try:
         yield client
     finally:
+        if previous is not _UNSET:
+            settings.PLUGINS_CONFIG = previous
         client.reset_config_cache()
         client.reset_session()
+
+
+def test_the_live_client_restores_the_process_plugin_config():
+    """The one pin here that needs no adapter: the context owns process-global state.
+
+    The auth arm points ``adapter_token`` at a deliberately wrong value, so a context that
+    exits without restoring hands every later test a client that cannot authenticate.
+    """
+    with _live_client():
+        pass  # the first entry configures settings, so there is a previous value to keep
+
+    before = settings.PLUGINS_CONFIG
+    with pytest.raises(RuntimeError), _live_client():
+        settings.PLUGINS_CONFIG["netbox_nso_plugin"]["adapter_token"] = "intentionally-wrong-test-token"
+        raise RuntimeError("the block failed with the config replaced and its token poisoned")
+
+    assert settings.PLUGINS_CONFIG is before, "the live-client context leaked its PLUGINS_CONFIG"
+    assert settings.PLUGINS_CONFIG["netbox_nso_plugin"]["adapter_token"] == os.environ["NSO_LIVE_ADAPTER_TOKEN"]
 
 
 def _entry(route_id, generation, **overrides):
