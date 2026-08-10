@@ -6,6 +6,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   format-and-lint:
     runs-on: ubuntu-latest
