@@ -190,7 +190,7 @@ class TestFailureKeepsTheWorkAndTheBaseline(_ClaimCase):
         assert row.push_seq is None and row.attempts == 0
         rendered = delivery.render("vlan", self.device.pk, self.adapter_device_id)
         assert row.last_success_identity == drain.request_identity(
-            rendered.payload, mode="normal", deletions=[], mark=None
+            rendered.payload, mode="normal", deletions=[], mark=None, epoch=drain.mapping_epoch(self.mgmt)
         )
         assert self.adapter.sequences[0] == failed_seq, "the failed operation is replayed, never reallocated"
 
@@ -376,3 +376,52 @@ class TestUnmanagedClaimIsParked(_ClaimCase):
         row = state_of(self.device, "static_route")
         assert (row.push_seq, row.claim_deletions, row.queued_deletions) == (None, [], [])
         assert entries(self.device, "static_route") == []
+
+
+class TestTheBaselineIsBoundToTheAdapterMapping(_ClaimCase):
+    """codex O1 r5 F3 (O-P22): a repaired link points the same body at a device that never got it.
+
+    ``last_success_identity`` names a body the adapter acknowledged, and the link repair can
+    move the management row from one adapter device to another (``_MOVED`` adopts the id it
+    found, ``_MISSING`` re-onboards onto a fresh one). An identity blind to that mapping
+    reads the next unchanged edit as already delivered and retires it without a request, so
+    the device the plugin now points at never receives the intent it owns.
+    """
+
+    tag = "remap"
+    adapter_device_id = 7505
+    moved_device_id = 7506
+
+    def test_an_unchanged_edit_sends_to_the_device_the_repair_moved_the_row_to(self):
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        overlay = own_vlan(self.mgmt, 860, self.tag)
+        assert self.drain() == drain.SUCCEEDED
+        assert f"/devices/{self.adapter_device_id}/" in self.adapter.requests[-1]["url"]
+
+        # The link repair's own write: our node turned up under a different adapter id.
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_device_id=self.moved_device_id)
+        with without_commit_drain(), transaction.atomic():
+            overlay.save()
+
+        assert self.drain() == drain.SUCCEEDED, "the moved device has never been sent this intent"
+
+        assert f"/devices/{self.moved_device_id}/" in self.adapter.requests[-1]["url"]
+        assert entries(self.device, "vlan") == []
+
+    def test_a_rebuilt_adapter_store_under_the_same_id_sends_too(self):
+        """The mapping is the pair: the same id can name a store that holds nothing of ours."""
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        overlay = own_vlan(self.mgmt, 861, self.tag)
+        assert self.drain() == drain.SUCCEEDED
+        sent = len(self.adapter.requests)
+
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_incarnation="cl-remap-rebuilt")
+        with without_commit_drain(), transaction.atomic():
+            overlay.save()
+
+        assert self.drain() == drain.SUCCEEDED
+        assert len(self.adapter.requests) == sent + 1

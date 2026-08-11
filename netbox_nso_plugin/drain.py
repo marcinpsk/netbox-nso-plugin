@@ -236,7 +236,7 @@ def _work_pending(state) -> bool:
     )
 
 
-def request_identity(payload, *, mode, deletions, mark) -> str:
+def request_identity(payload, *, mode, deletions, mark, epoch) -> str:
     """Return the identity of one request: its body, its mode, its authority, its legacy flag.
 
     Two claims with the same identity are the same operation, which is what lets an unchanged
@@ -244,6 +244,11 @@ def request_identity(payload, *, mode, deletions, mark) -> str:
     fact and never leaves the plugin: the mode and the mark ride as query flags, so a body
     delivered store-only and the same body delivered normally are one wire digest and two
     identities, and dropping the second against the first would lose the delivery.
+
+    *epoch* is the adapter mapping the body is delivered under (:func:`mapping_epoch`), and it
+    is part of the identity for the same reason: a repaired link points the same body at a
+    device that never received it, so an identity blind to the mapping would drop the delivery
+    that mapping needs. Binding it here covers every writer of ``adapter_device_id`` at once.
     """
     material = {
         "payload": payload,
@@ -252,8 +257,19 @@ def request_identity(payload, *, mode, deletions, mark) -> str:
         # The flag as the wire carries it: no contributors and unmarked contributors are one
         # request, so they must be one identity or an unchanged save re-sends forever.
         "mark": bool(mark),
+        "epoch": list(epoch),
     }
     return _sha256(material)
+
+
+def mapping_epoch(mgmt) -> tuple:
+    """Return the adapter a body is delivered to: its device row, and the store holding it.
+
+    Appendix S's own epoch (``models.py``: the settlement cursor), for the same two events: a
+    remapped device id and a rebuilt store both leave the far side holding nothing the
+    acknowledged baseline can speak for.
+    """
+    return (mgmt.adapter_device_id, mgmt.adapter_incarnation or "")
 
 
 def wire_digest(body) -> str:
@@ -371,7 +387,7 @@ def _form(state, mgmt, now, mode, force) -> Claim | None:
         return _form_store_only(state, mgmt, now, deletions, untracked, force)
 
     rendered = delivery.render(scope, device_id, mgmt.adapter_device_id)
-    identity = request_identity(rendered.payload, mode=mode, deletions=deletions, mark=mark)
+    identity = request_identity(rendered.payload, mode=mode, deletions=deletions, mark=mark, epoch=mapping_epoch(mgmt))
 
     state.revoked_ids = sorted(folded.revoked)
     state.lineage_carry = folded.lineage_carry
@@ -438,7 +454,9 @@ def _form_store_only(state, mgmt, now, deletions, untracked_mark, force) -> Clai
     state.push_seq = push_seq
     state.claimed_at = now
     state.claim_payload = rendered.payload
-    state.claim_identity = request_identity(rendered.payload, mode=delivery.MODE_STORE_ONLY, deletions=[], mark=None)
+    state.claim_identity = request_identity(
+        rendered.payload, mode=delivery.MODE_STORE_ONLY, deletions=[], mark=None, epoch=mapping_epoch(mgmt)
+    )
     state.claim_deletions = []
     state.claim_mark = None
     state.claim_flags = {"mode": delivery.MODE_STORE_ONLY, "mark_any": False, "force": bool(force)}
@@ -471,7 +489,9 @@ def _form_backfill(state, mgmt, now) -> Claim:
     state.push_seq = push_seq
     state.claimed_at = now
     state.claim_payload = rendered.payload
-    state.claim_identity = request_identity(rendered.payload, mode=delivery.MODE_BACKFILL_ONLY, deletions=[], mark=None)
+    state.claim_identity = request_identity(
+        rendered.payload, mode=delivery.MODE_BACKFILL_ONLY, deletions=[], mark=None, epoch=mapping_epoch(mgmt)
+    )
     state.claim_deletions = []
     state.claim_mark = None
     state.claim_flags = {"mode": delivery.MODE_BACKFILL_ONLY, "mark_any": False, "force": True}
