@@ -2690,10 +2690,18 @@ class NSOIntentResyncView(NSOActionPermissionMixin, View):
             messages.warning(request, "Device is not yet onboarded to the adapter.")
             return redirect(_device_nso_tab_url(mgmt.device.pk))
         try:
-            done = resync_intent(mgmt.device, mgmt)
+            done, failed = resync_intent(mgmt.device, mgmt)
             if done:
                 messages.success(request, f"Re-synced adapter intent — cleared orphaned: {', '.join(done)}.")
-            else:
+            if failed:
+                # A refused or unanswered push cleared nothing, so it is reported as the
+                # failure it is; the NSO tab renders the per-scope cause the claim recorded.
+                messages.error(
+                    request,
+                    f"The adapter did not acknowledge: {', '.join(failed)} — that intent is still "
+                    "orphaned. See the per-scope push error on this tab, then retry.",
+                )
+            if not done and not failed:
                 messages.info(request, "No orphaned adapter intent to clear.")
         except Exception as exc:  # noqa: BLE001
             logger.warning("Intent re-sync failed for device %s: %s", mgmt.device_id, exc)

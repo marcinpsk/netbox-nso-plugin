@@ -156,8 +156,8 @@ class TestIntentDrift(IntentPushResetMixin, TestCase):
     def test_resync_calls_push_for_scope(self, mock_push):
         from netbox_nso_plugin.delivery import MODE_STORE_ONLY
 
-        done = intent_drift.resync_intent(self.device, self.mgmt, ["interface_ip"])
-        self.assertEqual(done, ["interface_ip"])
+        done, failed = intent_drift.resync_intent(self.device, self.mgmt, ["interface_ip"])
+        self.assertEqual((done, failed), (["interface_ip"], []))
         # The drift registry calls the scope interface_ip and the delivery registry calls it
         # ip, so the key is resolved through the one registry that enumerates the pushes.
         # force=True: the split-brain re-sync must not be dropped against the acknowledged
@@ -166,7 +166,7 @@ class TestIntentDrift(IntentPushResetMixin, TestCase):
 
     def test_resync_no_adapter_id_noop(self):
         self.mgmt.adapter_device_id = None
-        self.assertEqual(intent_drift.resync_intent(self.device, self.mgmt, ["interface_ip"]), [])
+        self.assertEqual(intent_drift.resync_intent(self.device, self.mgmt, ["interface_ip"]), ([], []))
 
     @patch("netbox_nso_plugin.drain.push_now")
     @patch("netbox_nso_plugin.adapter_client.get_intent_summary")
@@ -177,8 +177,9 @@ class TestIntentDrift(IntentPushResetMixin, TestCase):
         NSOInterfaceIPState.objects.create(
             interface=self.iface, address="10.0.0.1/32", vrf="", family="ipv4", status="accepted"
         )
-        done = intent_drift.resync_intent(self.device, self.mgmt)
+        done, failed = intent_drift.resync_intent(self.device, self.mgmt)
         self.assertIn("interface_ip", done)
+        self.assertEqual(failed, [])
         mock_push.assert_called_once_with(self.mgmt.device_id, "ip", mode=MODE_STORE_ONLY, force=True)
 
 
@@ -262,3 +263,21 @@ class TestResyncStoreOnly(_CascadeFlushMixin, IntentPushResetMixin, TransactionT
         self.assertEqual(len(first), 1)
         self.assertEqual(len(repeated), 1, "the re-sync was dropped against the baseline it had just set")
         self.assertEqual((repeated[0].kwargs.get("params") or {}).get("store_only"), "true")
+
+    def test_a_refused_push_is_reported_rather_than_reported_cleared(self):
+        """codex O1 r4 F5 (board #1557): a key nothing was sent for is not a key that cleared.
+
+        The deletion of an owned row is authority a store-only request can never carry
+        (§4.3(d)), so the claim refuses and the wire stays empty. Appending the key anyway
+        told the operator the orphaned intent was gone while the drift was untouched.
+        """
+        with without_commit_drain(), transaction.atomic():
+            NSOLoggingHostState.objects.filter(management=self.mgmt).delete()
+
+        returned: list = []
+        calls = self._recorded_requests(
+            lambda: returned.append(intent_drift.resync_intent(self.device, self.mgmt, ["logging"]))
+        )
+
+        self.assertEqual(len(calls), 0, "a store-only request writes no removal, so it may not carry one")
+        self.assertEqual(returned, [([], ["logging"])], "the refused key is reported, never counted as cleared")

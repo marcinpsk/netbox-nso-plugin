@@ -248,12 +248,14 @@ def compute_intent_drift(device, mgmt) -> list[dict]:
     return drift
 
 
-def resync_intent(device, mgmt, keys: list[str] | None = None) -> list[str]:
+def resync_intent(device, mgmt, keys: list[str] | None = None) -> tuple[list[str], list[str]]:
     """Re-push the owned intent for *keys* (default: all orphaned/partial scopes) → clears them.
 
-    Returns the scope keys re-synced. The push is the plugin's normal full-snapshot push, so
-    for a scope NetBox owns nothing in, it sends an empty snapshot and the adapter full-replace
-    removes the orphaned rows.
+    Returns ``(done, failed)``: the scope keys the adapter acknowledged, and the keys whose
+    push it refused or never answered. A refusal clears no orphaned row, so reporting it as
+    done told the operator the split-brain was repaired while the drift stood (#1557). The
+    push is the plugin's normal full-snapshot push, so for a scope NetBox owns nothing in, it
+    sends an empty snapshot and the adapter full-replace removes the orphaned rows.
 
     The pushes run under ``store_only_pushes()`` (→ ``?store_only=true``): re-sync repairs the
     adapter's intent STORE only, so the adapter must skip its shrink-removal and auto-apply
@@ -262,13 +264,14 @@ def resync_intent(device, mgmt, keys: list[str] | None = None) -> list[str]:
     the banner's "does not touch the device" promise (tracker #103, ra1.lab).
     """
     if mgmt is None or mgmt.adapter_device_id is None:
-        return []
+        return [], []
     from . import delivery, drain
 
     if keys is None:
         keys = [d["key"] for d in compute_intent_drift(device, mgmt)]
     by_key = {sc["key"]: sc for sc in _scopes()}
     done: list[str] = []
+    failed: list[str] = []
     for key in keys:
         sc = by_key.get(key)
         if sc is None:
@@ -277,9 +280,15 @@ def resync_intent(device, mgmt, keys: list[str] | None = None) -> list[str]:
         # split-brain where the ADAPTER lost the intent while the plugin's acknowledged
         # baseline still names that body — which is what the claim reads as "unchanged,
         # drop". The re-sync would then silently no-op while the view reported success.
-        drain.push_now(mgmt.device_id, _delivery_key(sc), mode=delivery.MODE_STORE_ONLY, force=True)
-        done.append(key)
-    return done
+        try:
+            response = drain.push_now(mgmt.device_id, _delivery_key(sc), mode=delivery.MODE_STORE_ONLY, force=True)
+        except Exception:  # noqa: BLE001 — one scope's refusal must not strand the rest unattempted
+            logger.exception("Intent re-sync raised for device %s scope %s", mgmt.device_id, key)
+            response = None
+        # Forced, so None is unambiguously a refusal or a failure and never a digest-equal
+        # drop. The claim has already recorded the cause where the device tab renders it.
+        (done if response is not None else failed).append(key)
+    return done, failed
 
 
 class _PushNotAcknowledged(Exception):
@@ -382,9 +391,8 @@ def resync_static_route_intent_fleet(device_ids: list[int] | None = None) -> lis
     *next* ordinary push is the first one that can plan a replacement.
 
     Deliberately not routed through :func:`resync_intent`: with the default ``keys`` that only
-    re-syncs scopes that already look drifted — a device whose counts agree looks clean while
-    every one of its rows is still id-less — and it appends each key unconditionally, so it
-    cannot tell a rejected push from a skipped one. Here each device is acknowledged from the
+    re-syncs scopes that already look drifted, and a device whose counts agree looks clean
+    while every one of its rows is still id-less. Here each device is acknowledged from the
     ``count`` the adapter answers with, and the forced claim makes a ``None`` return
     unambiguously a failure rather than a drop against the acknowledged baseline.
 
