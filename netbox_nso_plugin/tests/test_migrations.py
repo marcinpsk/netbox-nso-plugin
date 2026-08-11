@@ -20,6 +20,23 @@ APP = "netbox_nso_plugin"
 
 
 class TestMigrationGraph(SimpleTestCase):
+    def test_cross_app_dependencies_stay_on_the_0001_floor(self):
+        """makemigrations pins the GENERATING environment's app heads; a pin newer than
+        the 0001 floor breaks DB setup on the oldest supported NetBox (CI matrix floor)."""
+        loader = MigrationLoader(None, ignore_no_migrations=True)
+        ours = {name: mig for (app, name), mig in loader.disk_migrations.items() if app == APP}
+        floor = {app: name for app, name in ours["0001_initial"].dependencies if app != APP}
+        stray = sorted(
+            (name, dep_app, dep_name)
+            for name, mig in ours.items()
+            for dep_app, dep_name in mig.dependencies
+            if dep_app != APP and floor.get(dep_app) != dep_name
+        )
+        assert not stray, (
+            f"cross-app pins off the 0001 floor {floor} — repin to the floor, "
+            f"or move the floor deliberately in 0001's successor and here: {stray}"
+        )
+
     def test_the_migration_graph_has_a_single_leaf(self):
         # Built from disk with no connection: two leaves make Django refuse to migrate at
         # all, so a graph check that needs a migrated database cannot report the defect.

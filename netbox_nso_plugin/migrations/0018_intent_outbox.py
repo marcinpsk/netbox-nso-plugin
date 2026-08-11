@@ -30,7 +30,8 @@ from netbox_nso_plugin.outbox import PUSH_SEQ_SEQUENCE
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("dcim", "0241_nullify_empty_cable_end"),
+        # The 0001 floor, NOT the generating environment's dcim head (test_migrations pins this).
+        ("dcim", "0234_cablepath_nodes_index"),
         ("netbox_nso_plugin", "0017_settlement_cursor_epoch"),
     ]
 
