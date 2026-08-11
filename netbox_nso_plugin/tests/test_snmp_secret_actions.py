@@ -16,7 +16,7 @@ from django.test import TestCase
 from netbox_nso_plugin.vault_refs import secret_fingerprint
 
 from ._adapter_http import make_session
-from .mixins import IntentPushResetMixin
+from .mixins import IntentPushDeliveryMixin
 
 _BASE_CFG = {
     "url": "http://adapter.local",
@@ -32,7 +32,7 @@ def _superuser():
     return User.objects.create_superuser(username="vault-admin", password="pw", email="vault@test.x")  # noqa: S106
 
 
-class _SecretBase(IntentPushResetMixin, TestCase):
+class _SecretBase(IntentPushDeliveryMixin, TestCase):
     @classmethod
     def setUpTestData(cls):
         mfg = Manufacturer.objects.create(name="VaultMfg", slug="vaultmfg")

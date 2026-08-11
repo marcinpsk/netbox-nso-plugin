@@ -7,7 +7,9 @@ from unittest.mock import patch
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Platform, Site
 from django.test import TestCase
 
-from .mixins import IntentPushResetMixin
+from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin
+
+PUT = "netbox_nso_plugin.adapter_client.put_static_route_intent"
 
 
 class TestPushStaticRouteIntentForDevice(IntentPushResetMixin, TestCase):
@@ -68,7 +70,7 @@ class TestPushStaticRouteIntentForDevice(IntentPushResetMixin, TestCase):
         mgmt = self._make_mgmt()
         self._make_state(mgmt, status="accepted")  # create before patch to avoid signal double-call
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent") as mock_push:
+        with patch(PUT) as mock_push:
             _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
 
             mock_push.assert_called_once()
@@ -102,15 +104,15 @@ class TestPushStaticRouteIntentForDevice(IntentPushResetMixin, TestCase):
         state.static_route.metric = 3
         state.static_route.save(update_fields=["metric"])
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent") as put:
+        with patch(PUT) as put:
             _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
         assert put.call_args.args[1][0]["metric"] == 3
 
         state.static_route.metric = 5
         state.static_route.save(update_fields=["metric"])
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent") as put:
-            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id, force=True)
+        with patch(PUT) as put:
+            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
 
         route = put.call_args.args[1][0]
         assert route["metric"] == 5
@@ -123,7 +125,7 @@ class TestPushStaticRouteIntentForDevice(IntentPushResetMixin, TestCase):
         mgmt = self._make_mgmt()
         self._make_state(mgmt, status="apply_failed")
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent") as mock_push:
+        with patch(PUT) as mock_push:
             _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
 
             mock_push.assert_called_once()
@@ -138,7 +140,7 @@ class TestPushStaticRouteIntentForDevice(IntentPushResetMixin, TestCase):
         mgmt = self._make_mgmt()
         self._make_state(mgmt, prefix="172.16.0.0/12", next_hop="10.0.0.1", status="imported")
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent") as mock_push:
+        with patch(PUT) as mock_push:
             _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
 
             mock_push.assert_called_once()
@@ -167,7 +169,7 @@ class TestPushStaticRouteIntentForDevice(IntentPushResetMixin, TestCase):
             nso_prefix="192.168.50.0/24",
         )
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent") as mock_push:
+        with patch(PUT) as mock_push:
             _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
 
             mock_push.assert_called_once()
@@ -181,12 +183,12 @@ class TestPushStaticRouteIntentForDevice(IntentPushResetMixin, TestCase):
         mgmt = self._make_mgmt()
         self._make_state(mgmt, prefix="10.1.0.0/16", next_hop="10.0.0.2", status="accepted")
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", side_effect=Exception("boom")):
+        with patch(PUT, side_effect=Exception("boom")):
             # Should not raise
             _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
 
 
-class TestOnStaticRouteStateSave(IntentPushResetMixin, TestCase):
+class TestOnStaticRouteStateSave(IntentPushDeliveryMixin, TestCase):
     """Tests for _on_static_route_state_save signal handler."""
 
     @classmethod
@@ -235,7 +237,7 @@ class TestOnStaticRouteStateSave(IntentPushResetMixin, TestCase):
         mgmt = self._make_mgmt()
         sr = self._make_route()
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent") as mock_push:
+        with patch(PUT) as mock_push:
             state = NSOStaticRouteState(
                 management=mgmt,
                 static_route=sr,
@@ -272,14 +274,14 @@ class TestOnStaticRouteStateSave(IntentPushResetMixin, TestCase):
         sr = self._make_route(prefix="10.30.0.0/16", next_hop="10.0.0.3")
         state = NSOStaticRouteState(management=mgmt, static_route=sr, status="accepted")
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent") as mock_push:
+        with patch(PUT) as mock_push:
             from netbox_nso_plugin.signals import _on_static_route_state_save
 
             _on_static_route_state_save(sender=NSOStaticRouteState, instance=state)
             mock_push.assert_not_called()
 
 
-class TestGreenfieldStaticRoute(IntentPushResetMixin, TestCase):
+class TestGreenfieldStaticRoute(IntentPushDeliveryMixin, TestCase):
     """Greenfield write path: an operator-created route assigned to a managed device
     becomes accepted intent + pushes; removing/deleting it pushes the removal."""
 
@@ -308,7 +310,7 @@ class TestGreenfieldStaticRoute(IntentPushResetMixin, TestCase):
         mgmt = self._mgmt()
         sr = StaticRoute.objects.create(prefix="10.9.9.0/24", next_hop="10.0.0.9", metric=1)
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent") as mock_push:
+        with patch(PUT) as mock_push:
             with self.captureOnCommitCallbacks(execute=True):
                 sr.devices.add(self.device)  # operator assignment (not suppressed)
             state = NSOStaticRouteState.objects.get(management=mgmt, static_route=sr)
@@ -324,11 +326,11 @@ class TestGreenfieldStaticRoute(IntentPushResetMixin, TestCase):
 
         mgmt = self._mgmt()
         sr = StaticRoute.objects.create(prefix="10.9.10.0/24", next_hop="10.0.0.10", metric=1)
-        with self.captureOnCommitCallbacks(execute=True):
+        with patch(PUT), self.captureOnCommitCallbacks(execute=True):
             sr.devices.add(self.device)
         self.assertTrue(NSOStaticRouteState.objects.filter(management=mgmt, static_route=sr).exists())
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent") as mock_push:
+        with patch(PUT) as mock_push:
             with self.captureOnCommitCallbacks(execute=True):
                 sr.devices.remove(self.device)
             self.assertFalse(NSOStaticRouteState.objects.filter(management=mgmt, static_route=sr).exists())
@@ -346,11 +348,11 @@ class TestGreenfieldStaticRoute(IntentPushResetMixin, TestCase):
 
         mgmt = self._mgmt()
         sr = StaticRoute.objects.create(prefix="10.9.12.0/24", next_hop="10.0.0.12", metric=1)
-        with self.captureOnCommitCallbacks(execute=True):
+        with patch(PUT), self.captureOnCommitCallbacks(execute=True):
             sr.devices.add(self.device)
         self.assertTrue(NSOStaticRouteState.objects.filter(management=mgmt, static_route=sr).exists())
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent") as mock_push:
+        with patch(PUT) as mock_push:
             with self.captureOnCommitCallbacks(execute=True):
                 sr.devices.clear()  # pk_set=None on post_clear
             self.assertFalse(NSOStaticRouteState.objects.filter(management=mgmt, static_route=sr).exists())
@@ -365,10 +367,10 @@ class TestGreenfieldStaticRoute(IntentPushResetMixin, TestCase):
 
         mgmt = self._mgmt()
         sr = StaticRoute.objects.create(prefix="10.9.11.0/24", next_hop="10.0.0.11", metric=1)
-        with self.captureOnCommitCallbacks(execute=True):
+        with patch(PUT), self.captureOnCommitCallbacks(execute=True):
             sr.devices.add(self.device)
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent") as mock_push:
+        with patch(PUT) as mock_push:
             with self.captureOnCommitCallbacks(execute=True):
                 sr.delete()
             self.assertFalse(NSOStaticRouteState.objects.filter(management=mgmt, static_route__isnull=False).exists())
@@ -429,8 +431,8 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
         generation = allocate_intent_generation()
         state = self._state(mgmt, "10.40.0.0/16", "10.0.0.40", generation=generation)
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent") as put:
-            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id, force=True)
+        with patch(PUT) as put:
+            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
 
         route = put.call_args.args[1][0]
         assert route["route_id"] == state.static_route.pk
@@ -447,8 +449,8 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
         mgmt = self._mgmt()
         self._state(mgmt, "10.41.0.0/16", "10.0.0.41", generation=0)
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent") as put:
-            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id, force=True)
+        with patch(PUT) as put:
+            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
 
         route = put.call_args.args[1][0]
         assert route["generation"] is None
@@ -461,26 +463,13 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
         mgmt = self._mgmt()
         self._state(mgmt, "10.42.0.0/16", None, next_hop_is_none=True)
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent") as put:
-            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id, force=True)
+        with patch(PUT) as put:
+            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
 
         assert put.call_args.args[1] == []
 
-    def test_an_unchanged_snapshot_is_pushed_once(self):
-        """P1.4 — the added keys are part of the digest, not a permanent cache-buster."""
-        from netbox_nso_plugin.signals import _push_static_route_intent_for_device
-
-        mgmt = self._mgmt()
-        self._state(mgmt, "10.43.0.0/16", "10.0.0.43")
-
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent") as put:
-            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
-            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
-
-        put.assert_called_once()
-
     def test_the_push_returns_the_adapter_response(self):
-        """A forced push must be able to say *failed* rather than *skipped* — the fleet driver
+        """A push must be able to say *failed* rather than *acknowledged* — the fleet driver
         and every settlement expectation are built on that distinction."""
         from netbox_nso_plugin.signals import _push_static_route_intent_for_device
 
@@ -488,11 +477,11 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
         self._state(mgmt, "10.44.0.0/16", "10.0.0.44")
         response = {"device_id": 4242, "count": 1, "routes": []}
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", return_value=response):
-            assert _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id, force=True) == response
+        with patch(PUT, return_value=response):
+            assert _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id) == response
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", side_effect=Exception("boom")):
-            assert _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id, force=True) is None
+        with patch(PUT, side_effect=Exception("boom")):
+            assert _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id) is None
 
     def test_the_echo_records_the_expectation_for_the_generation_pushed(self):
         from netbox_nso_plugin.intent_generation import allocate_intent_generation
@@ -507,8 +496,8 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
             "routes": [{"route_id": state.static_route.pk, "generation": generation, "fingerprint": "f00d"}],
         }
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", return_value=response):
-            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id, force=True)
+        with patch(PUT, return_value=response):
+            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
 
         state.refresh_from_db()
         assert state.expected_generation == generation
@@ -536,8 +525,8 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
                 "routes": [{"route_id": state.static_route.pk, "generation": pushed, "fingerprint": "stale"}],
             }
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", side_effect=_bump_then_answer):
-            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id, force=True)
+        with patch(PUT, side_effect=_bump_then_answer):
+            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
 
         state.refresh_from_db()
         assert state.intent_generation == newer
@@ -557,8 +546,8 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
             "routes": [{"route_id": state.static_route.pk, "generation": None, "fingerprint": "nope"}],
         }
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", return_value=response):
-            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id, force=True)
+        with patch(PUT, return_value=response):
+            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
 
         state.refresh_from_db()
         assert state.expected_generation is None
@@ -594,8 +583,8 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
             "count": 1,
             "routes": [{"route_id": state.static_route.pk, "generation": generation, "fingerprint": "f00d"}],
         }
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", return_value=response):
-            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id, force=True)
+        with patch(PUT, return_value=response):
+            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
 
         state.refresh_from_db()
         other_state.refresh_from_db()

@@ -7,7 +7,7 @@ from unittest.mock import patch
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.test import TestCase
 
-from .mixins import IntentPushResetMixin
+from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin
 
 
 class TestPushL2SapIntentForDevice(IntentPushResetMixin, TestCase):
@@ -95,7 +95,7 @@ class TestPushL2SapIntentForDevice(IntentPushResetMixin, TestCase):
             _push_l2_sap_intent_for_device(self.device.pk, mgmt.adapter_device_id)
 
 
-class TestOnL2SapStateSave(IntentPushResetMixin, TestCase):
+class TestOnL2SapStateSave(IntentPushDeliveryMixin, TestCase):
     """Tests for _on_l2_sap_state_save signal handler."""
 
     @classmethod

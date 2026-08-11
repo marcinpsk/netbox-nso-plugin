@@ -15,12 +15,13 @@ from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import TestCase, TransactionTestCase
 from django.urls import reverse
 from django.utils import timezone
 
 from ._adapter_http import make_session
-from .mixins import IntentPushResetMixin
+from ._outbox_case import without_commit_drain
+from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 User = get_user_model()
 TEST_PASSWORD = "levelstestpass123"  # noqa: S105
@@ -44,7 +45,7 @@ def _make_device(suffix):
     return Device.objects.create(name=f"lvl-rtr-{suffix}", device_type=dt, role=role, site=site)
 
 
-class LevelsTestBase(IntentPushResetMixin, TestCase):
+class LevelsTestBase(IntentPushDeliveryMixin, TestCase):
     """Device + management fixtures shared by the levels tests."""
 
     @classmethod
@@ -436,22 +437,6 @@ class TestLoggingLevelsApplyLifecycle(LevelsTestBase):
     failure (`logging_count_by_outcome.apply_failed`) never reaches the row.
     """
 
-    def test_prepare_apply_force_pushes_logging_and_marks_deploying(self):
-        from netbox_nso_plugin.views import _prepare_apply
-
-        row = self._row(console_severity="CRITICAL", status="accepted", accepted_at=timezone.now())
-        # Prime the change-detection digest the way a successful accept-time push would —
-        # the Apply-time push must bypass it (force=True), not read "unchanged, skip".
-        with patch("netbox_nso_plugin.adapter_client.put_logging_intent"), self.captureOnCommitCallbacks(execute=True):
-            row.save()
-        with patch("netbox_nso_plugin.adapter_client.put_logging_intent") as mock_put:
-            moved = _prepare_apply(self.mgmt)
-        mock_put.assert_called_once()
-        self.assertEqual(mock_put.call_args.args[2], {"console_severity": "CRITICAL"})
-        row.refresh_from_db()
-        self.assertEqual(row.status, "deploying")
-        self.assertIn(row.pk, [pk for model, pks in moved for pk in pks if model.__name__ == "NSOLoggingLevelState"])
-
     def test_settle_apply_failures_marks_levels_apply_failed(self):
         from netbox_nso_plugin.reconcile import _settle_apply_failures
 
@@ -530,3 +515,54 @@ class TestLoggingLevelsWiring(LevelsTestBase):
         self.assertEqual(row.get_absolute_url(), reverse("dcim:device_nso", kwargs={"pk": self.device.pk}))
         data = serialize_for_event(row)
         self.assertEqual(data["id"], row.pk)
+
+
+class TestLoggingLevelsApplyPush(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    """The Apply's forced logging push, which needs a committed transaction to take.
+
+    ``drain.push_now`` refuses to run nested in a caller's block (#1503 Appendix O), so this
+    half of the Apply lifecycle cannot be pinned from a ``TestCase``. It runs here against
+    the real claim, which is also what makes the force meaningful: the acknowledged baseline
+    below already names this body, and only ``force`` gets it sent a second time.
+    """
+
+    def setUp(self):
+        super().setUp()
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOLoggingLevelState
+
+        with without_commit_drain():
+            self.device = _make_device("applypush")
+            inst, _ = NSOInstance.objects.get_or_create(
+                name="lvl-apply-inst", defaults={"adapter_instance_id": "lvl-apply-inst"}
+            )
+            self.mgmt = NSODeviceManagement.objects.create(
+                device=self.device,
+                nso_instance=inst,
+                nso_device_name="lvl-dev-applypush",
+                adapter_device_id=self.device.pk,
+                manage_logging=True,
+            )
+            self.row = NSOLoggingLevelState.objects.create(
+                management=self.mgmt, console_severity="CRITICAL", status="accepted", accepted_at=timezone.now()
+            )
+
+    def test_prepare_apply_force_pushes_logging_and_marks_deploying(self):
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.views import _prepare_apply
+
+        # The acknowledged baseline an accept-time push leaves behind, which the Apply overrides.
+        with patch("netbox_nso_plugin.adapter_client.put_logging_intent", return_value={}):
+            drain.drain_key(self.device.pk, "logging")
+        with patch("netbox_nso_plugin.adapter_client.put_logging_intent", return_value={}) as unforced:
+            drain.drain_key(self.device.pk, "logging")
+        unforced.assert_not_called()
+
+        with patch("netbox_nso_plugin.adapter_client.put_logging_intent", return_value={}) as mock_put:
+            moved = _prepare_apply(self.mgmt)
+
+        mock_put.assert_called_once()
+        self.assertEqual(mock_put.call_args.args[2], {"console_severity": "CRITICAL"})
+        self.row.refresh_from_db()
+        self.assertEqual(self.row.status, "deploying")
+        moved_pks = [pk for model, pks in moved for pk in pks if model.__name__ == "NSOLoggingLevelState"]
+        self.assertIn(self.row.pk, moved_pks)

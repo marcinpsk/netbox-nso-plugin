@@ -7,10 +7,10 @@ from unittest.mock import patch
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.test import TestCase
 
-from .mixins import IntentPushResetMixin
+from .mixins import IntentPushDeliveryMixin
 
 
-class _FlexAlgoBase(IntentPushResetMixin, TestCase):
+class _FlexAlgoBase(IntentPushDeliveryMixin, TestCase):
     @classmethod
     def setUpTestData(cls):
         mfg = Manufacturer.objects.create(name="FaMfg", slug="famfg")

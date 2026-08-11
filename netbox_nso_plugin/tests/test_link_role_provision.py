@@ -4,10 +4,10 @@
 
 Real ORM end-to-end across all three consumers (IP + description + IGP) on both
 ends of a real cable, with atomic rollback verified against actual DB state. The
-only patches are the four adapter intent pushes (true external boundaries).
+only patch is the forced claim provisioning takes per scope, which is where the
+push leaves the process.
 """
 
-from contextlib import ExitStack
 from unittest.mock import patch
 
 from core.models import ObjectType
@@ -22,7 +22,7 @@ from dcim.models import (
     Site,
 )
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import TestCase, TransactionTestCase
 from ipam.models import Prefix, Role
 from users.models import ObjectPermission
 
@@ -37,12 +37,10 @@ from netbox_nso_plugin.models import (
     NSOLinkRoleAssignment,
 )
 
-_PUSH_TARGETS = (
-    "netbox_nso_plugin.signals._push_ip_intent_for_device",
-    "netbox_nso_plugin.signals._push_interface_intent_for_device",
-    "netbox_nso_plugin.signals._push_isis_intent_for_device",
-    "netbox_nso_plugin.signals._push_ospf_intent_for_device",
-)
+from ._outbox_case import without_commit_drain
+from .mixins import IntentPushResetMixin, _CascadeFlushMixin
+
+_PUSH = "netbox_nso_plugin.drain.push_now"
 
 
 def _make_cable(iface_a, iface_b):
@@ -52,16 +50,21 @@ def _make_cable(iface_a, iface_b):
     return cable
 
 
+def _make_fixtures(case):
+    """The two devices, their site and their NSO instance, on *case*."""
+    mfg = Manufacturer.objects.create(name="LpMfg", slug="lpmfg")
+    dt = DeviceType.objects.create(manufacturer=mfg, model="LpDev", slug="lpdev")
+    drole = DeviceRole.objects.create(name="LpRole", slug="lprole")
+    case.site = Site.objects.create(name="LpSite", slug="lpsite")
+    case.inst = NSOInstance.objects.create(name="lp-nso", adapter_instance_id="lp-nso")
+    case.dev_a = Device.objects.create(name="lp-a", device_type=dt, role=drole, site=case.site)
+    case.dev_b = Device.objects.create(name="lp-b", device_type=dt, role=drole, site=case.site)
+
+
 class _Base(TestCase):
     @classmethod
     def setUpTestData(cls):
-        mfg = Manufacturer.objects.create(name="LpMfg", slug="lpmfg")
-        dt = DeviceType.objects.create(manufacturer=mfg, model="LpDev", slug="lpdev")
-        drole = DeviceRole.objects.create(name="LpRole", slug="lprole")
-        cls.site = Site.objects.create(name="LpSite", slug="lpsite")
-        cls.inst = NSOInstance.objects.create(name="lp-nso", adapter_instance_id="lp-nso")
-        cls.dev_a = Device.objects.create(name="lp-a", device_type=dt, role=drole, site=cls.site)
-        cls.dev_b = Device.objects.create(name="lp-b", device_type=dt, role=drole, site=cls.site)
+        _make_fixtures(cls)
 
     def _manage(self, device):
         return NSODeviceManagement.objects.create(
@@ -69,10 +72,9 @@ class _Base(TestCase):
         )
 
     def _provision(self, iface):
-        with ExitStack() as stack:
-            pushes = [stack.enter_context(patch(t)) for t in _PUSH_TARGETS]
+        with patch(_PUSH) as push:
             summary = provision_link_role(iface)
-        return summary, pushes
+        return summary, push
 
 
 class TestProvisionP2P(_Base):
@@ -104,7 +106,7 @@ class TestProvisionP2P(_Base):
     def test_happy_path_all_three_both_ends(self):
         role = self._p2p_role()
         NSOLinkRoleAssignment.objects.create(role=role, cable=self.cable)
-        summary, _pushes = self._provision(self.if_a)
+        summary, _push = self._provision(self.if_a)
         self.assertTrue(summary["provisioned"], summary)
         self.assertFalse(summary["rolled_back"])
         # IP: both ends
@@ -124,18 +126,22 @@ class TestProvisionP2P(_Base):
         """The summary lists both interface pks (the batch view dedups a link on it)."""
         role = self._p2p_role()
         NSOLinkRoleAssignment.objects.create(role=role, cable=self.cable)
-        summary, _pushes = self._provision(self.if_a)
+        summary, _push = self._provision(self.if_a)
         self.assertEqual(set(summary["ends"]), {self.if_a.pk, self.if_b.pk})
 
     def test_pushes_each_affected_device(self):
         role = self._p2p_role()
         NSOLinkRoleAssignment.objects.create(role=role, cable=self.cable)
-        _summary, pushes = self._provision(self.if_a)
-        ip_push, iface_push, isis_push, _ospf_push = pushes
-        # Both device ids pushed for ip / interface / isis.
-        for push in (ip_push, iface_push, isis_push):
-            pushed_devices = {call.args[0] for call in push.call_args_list}
-            self.assertEqual(pushed_devices, {self.dev_a.pk, self.dev_b.pk}, push)
+        _summary, push = self._provision(self.if_a)
+        # Both device ids claimed for ip / interface / isis, and each claim is forced.
+        forced = {(call.args[0], call.args[1]) for call in push.call_args_list if call.kwargs.get("force")}
+        for scope in ("ip", "interface", "isis"):
+            self.assertEqual(
+                {device_id for device_id, pushed in forced if pushed == scope},
+                {self.dev_a.pk, self.dev_b.pk},
+                scope,
+            )
+        self.assertNotIn("ospf", {scope for _device_id, scope in forced}, "an IS-IS role pushed OSPF intent")
 
     def test_partial_failure_rolls_back_everything(self):
         # IPv4 pool role does not exist → IP consumer errors → whole txn rolls back,
@@ -144,7 +150,7 @@ class TestProvisionP2P(_Base):
         NSOLinkRoleAssignment.objects.create(role=role, cable=self.cable)
         self.if_a.description = "original"
         self.if_a.save()
-        summary, _pushes = self._provision(self.if_a)
+        summary, _push = self._provision(self.if_a)
         self.assertFalse(summary["provisioned"])
         self.assertTrue(summary["rolled_back"])
         self.assertTrue(summary["errors"])
@@ -157,21 +163,21 @@ class TestProvisionP2P(_Base):
         self.mgmt_b.delete()  # far end no longer NSO-managed
         role = self._p2p_role()
         NSOLinkRoleAssignment.objects.create(role=role, cable=self.cable)
-        summary, _pushes = self._provision(self.if_a)
+        summary, _push = self._provision(self.if_a)
         self.assertFalse(summary["provisioned"])
         self.assertIsNotNone(summary["skipped"])
         self.assertFalse(NSOInterfaceIPState.objects.filter(interface=self.if_a).exists())
         self.assertFalse(NSOISISInterfaceState.objects.filter(interface=self.if_a).exists())
 
     def test_no_role_skips(self):
-        summary, _pushes = self._provision(self.if_a)
+        summary, _push = self._provision(self.if_a)
         self.assertFalse(summary["provisioned"])
         self.assertEqual(summary["skipped"], "no link role assigned")
 
     def test_disabled_role_skips(self):
         role = self._p2p_role(enabled=False)
         NSOLinkRoleAssignment.objects.create(role=role, cable=self.cable)
-        summary, _pushes = self._provision(self.if_a)
+        summary, _push = self._provision(self.if_a)
         self.assertFalse(summary["provisioned"])
         self.assertEqual(summary["skipped"], "link role is disabled")
 
@@ -205,9 +211,7 @@ class TestProvisionSingle(_Base):
             isis_passive=True,
         )
         NSOLinkRoleAssignment.objects.create(role=role, interface=self.lo_a)
-        with ExitStack() as stack:
-            for t in _PUSH_TARGETS:
-                stack.enter_context(patch(t))
+        with patch(_PUSH):
             summary = provision_link_role(self.lo_a)
         self.assertTrue(summary["provisioned"], summary)
         self.assertTrue(NSOInterfaceIPState.objects.filter(interface=self.lo_a, family="ipv4").exists())
@@ -217,24 +221,38 @@ class TestProvisionSingle(_Base):
         self.assertTrue(state.passive)
 
 
-class TestProvisionForcePush(_Base):
-    """Re-provisioning must always re-push each affected scope even when the in-process
-    change-detection cache already holds an identical snapshot (intent-integrity: no silent
-    drop). Regression: _push_provisioned invoked the scope pushers without force=True, so a
-    warm cache silently skipped the push while the local overlay still flipped to accepted."""
+class TestProvisionForcePush(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    """Re-provisioning must always re-send each affected scope even when the acknowledged
+    baseline already names that snapshot (intent-integrity: no silent drop). Regression:
+    _push_provisioned invoked the scope pushers without force=True, so an unchanged snapshot
+    was dropped while the local overlay still flipped to accepted.
+
+    It runs the real claim, which is why there is no test transaction: the drop this is about
+    is the claim's own, against ``last_success_digest``, and a forced call refuses to nest.
+    """
 
     def setUp(self):
-        self.mgmt = self._manage(self.dev_a)
-        self.iface = Interface.objects.create(device=self.dev_a, name="Gi1/1", type="1000base-t", description="to-peer")
-        NSOInterfaceState.objects.update_or_create(
-            interface=self.iface,
-            attribute="description",
-            defaults={"status": "accepted", "nso_value": ""},
-        )
+        super().setUp()
+        with patch("netbox_nso_plugin.signals._sync_committed_scope_to_adapter"), without_commit_drain():
+            _make_fixtures(self)
+            self.mgmt = NSODeviceManagement.objects.create(
+                device=self.dev_a,
+                nso_instance=self.inst,
+                nso_device_name=self.dev_a.name,
+                adapter_device_id=self.dev_a.pk,
+            )
+            self.iface = Interface.objects.create(
+                device=self.dev_a, name="Gi1/1", type="1000base-t", description="to-peer"
+            )
+            NSOInterfaceState.objects.update_or_create(
+                interface=self.iface,
+                attribute="description",
+                defaults={"status": "accepted", "nso_value": ""},
+            )
 
-    def test_reprovision_forces_push_despite_warm_cache(self):
+    def test_reprovision_pushes_despite_the_acknowledged_baseline(self):
+        from netbox_nso_plugin import drain, outbox
         from netbox_nso_plugin.link_role import _push_provisioned
-        from netbox_nso_plugin.signals import _push_interface_intent_for_device, reset_intent_push_state
 
         role = NSOLinkRole.objects.create(
             name="lp-desc",
@@ -244,11 +262,14 @@ class TestProvisionForcePush(_Base):
             description_template="{self_host}",
             igp="none",
         )
-        reset_intent_push_state()
         with patch("netbox_nso_plugin.adapter_client.put_intent") as mock_put:
-            _push_interface_intent_for_device(self.dev_a.pk, self.mgmt.adapter_device_id)  # warm the cache
+            outbox.enqueue(self.dev_a.pk, "interface")
+            drain.drain_key(self.dev_a.pk, "interface")  # the baseline the claim dedupes against
             self.assertEqual(mock_put.call_count, 1)
-            _push_provisioned(role, [self.dev_a.pk])  # re-provision must push AGAIN (force), not skip
+            outbox.enqueue(self.dev_a.pk, "interface")
+            drain.drain_key(self.dev_a.pk, "interface")  # the control: unchanged, so dropped
+            self.assertEqual(mock_put.call_count, 1)
+            _push_provisioned(role, [self.dev_a.pk])  # re-provision must send AGAIN (forced)
             self.assertEqual(mock_put.call_count, 2)
 
 
@@ -277,9 +298,7 @@ class TestProvisionActionView(_Base):
         perm.users.add(user)
         self.client.force_login(user)
         url = reverse("plugins:netbox_nso_plugin:device_provision_link_role", args=[self.dev_a.pk])
-        with ExitStack() as stack:
-            for t in _PUSH_TARGETS:
-                stack.enter_context(patch(t))
+        with patch(_PUSH):
             resp = self.client.post(url, {"interface_pks": str(self.if_a.pk)})
         self.assertEqual(resp.status_code, 302)
         self.assertTrue(NSOInterfaceIPState.objects.filter(interface=self.if_a, family="ipv4").exists())

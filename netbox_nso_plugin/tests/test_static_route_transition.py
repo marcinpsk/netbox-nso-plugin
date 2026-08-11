@@ -21,13 +21,13 @@ from django.urls import reverse
 from netbox_nso_plugin import adapter_client as _adapter_client
 
 from ._static_route_case import PUT, _fixtures, _make_device, _make_mgmt, _own, _route
-from .mixins import IntentPushResetMixin, _CascadeFlushMixin
+from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 #: Captured at import, before any test can patch it — see ``_assert_put_patch_did_not_leak``.
 _REAL_PUT = _adapter_client.put_static_route_intent
 
 
-class TestStaticRouteContentTransition(IntentPushResetMixin, TestCase):
+class TestStaticRouteContentTransition(IntentPushDeliveryMixin, TestCase):
     """P2.1–P2.7(a), P2.10, P2.11 — the transition itself."""
 
     @classmethod

@@ -10,41 +10,57 @@ fleet is what gets every device there.
 Pins P1.5 (drift detection must not gate the backfill), P1.6 (a rejected device is reported
 failed and the command exits non-zero), P1.7/P1.8 (store-only, so the reduced-or-changed
 snapshot writes no tombstone and enqueues no job).
+
+Every case is a ``TransactionTestCase``: the pass now arms in one committed transaction and
+then takes a forced claim, which refuses to run inside a caller's block (§4.2). A wrapping
+test transaction would make every device report the refusal as a rejection.
 """
 
 from __future__ import annotations
 
+import contextlib
 from io import StringIO
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.core.management import CommandError, call_command
-from django.test import TestCase
+from django.test import TransactionTestCase
 
-from .mixins import IntentPushResetMixin
+from ._outbox_case import without_commit_drain
+from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 COMMAND = "nso_resync_static_route_intent"
 
 
-class TestStaticRouteFleetResync(IntentPushResetMixin, TestCase):
-    @classmethod
-    def setUpTestData(cls):
+@contextlib.contextmanager
+def _quiet_fixture():
+    """Build a fixture without its own commit callbacks reaching the adapter."""
+    with patch("netbox_nso_plugin.signals._sync_committed_scope_to_adapter"), without_commit_drain():
+        yield
+
+
+class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
         mfg = Manufacturer.objects.create(name="FleetMfg", slug="fleetmfg")
-        cls.dt = DeviceType.objects.create(manufacturer=mfg, model="FleetDev", slug="fleetdev")
-        cls.role = DeviceRole.objects.create(name="FleetRole", slug="fleetrole")
-        cls.site = Site.objects.create(name="FleetSite", slug="fleetsite")
+        self.dt = DeviceType.objects.create(manufacturer=mfg, model="FleetDev", slug="fleetdev")
+        self.role = DeviceRole.objects.create(name="FleetRole", slug="fleetrole")
+        self.site = Site.objects.create(name="FleetSite", slug="fleetsite")
 
     def _managed_device(self, tag: str, adapter_device_id: int):
         from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
 
-        device = Device.objects.create(name=f"fleet-{tag}", device_type=self.dt, role=self.role, site=self.site)
-        inst, _ = NSOInstance.objects.get_or_create(name="fleet-inst", defaults={"adapter_instance_id": "fleet-inst"})
-        mgmt = NSODeviceManagement.objects.create(
-            device=device,
-            nso_instance=inst,
-            nso_device_name=f"nso-fleet-{tag}",
-            adapter_device_id=adapter_device_id,
-        )
+        with _quiet_fixture():
+            device = Device.objects.create(name=f"fleet-{tag}", device_type=self.dt, role=self.role, site=self.site)
+            inst, _ = NSOInstance.objects.get_or_create(
+                name="fleet-inst", defaults={"adapter_instance_id": "fleet-inst"}
+            )
+            mgmt = NSODeviceManagement.objects.create(
+                device=device,
+                nso_instance=inst,
+                nso_device_name=f"nso-fleet-{tag}",
+                adapter_device_id=adapter_device_id,
+            )
         return device, mgmt
 
     def _own_route(self, mgmt, prefix: str, next_hop: str, status: str = "accepted"):
@@ -55,17 +71,18 @@ class TestStaticRouteFleetResync(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.models import NSOStaticRouteState
         from netbox_nso_plugin.signals import suppress_intent_push
 
-        sr = StaticRoute.objects.create(prefix=prefix, next_hop=next_hop, metric=1)
-        with suppress_intent_push():
-            sr.devices.add(mgmt.device)
-        return NSOStaticRouteState.objects.create(
-            management=mgmt,
-            static_route=sr,
-            status=status,
-            nso_prefix=prefix,
-            nso_next_hop=next_hop,
-            accepted_at=timezone.now(),
-        )
+        with _quiet_fixture():
+            sr = StaticRoute.objects.create(prefix=prefix, next_hop=next_hop, metric=1)
+            with suppress_intent_push():
+                sr.devices.add(mgmt.device)
+            return NSOStaticRouteState.objects.create(
+                management=mgmt,
+                static_route=sr,
+                status=status,
+                nso_prefix=prefix,
+                nso_next_hop=next_hop,
+                accepted_at=timezone.now(),
+            )
 
     def test_backfills_a_device_with_no_detected_drift(self):
         """P1.5 — ``resync_intent``'s default ``keys`` re-syncs only scopes that already LOOK
@@ -117,7 +134,7 @@ class TestStaticRouteFleetResync(IntentPushResetMixin, TestCase):
         }
 
     def test_a_rejected_device_is_reported_failed(self):
-        """P1.6 — the push swallows its exception and returns ``None``; with ``force=True`` that
+        """P1.6 — the claim records the rejection and answers ``None``; with ``force=True`` that
         ``None`` is unambiguously a failure, and reporting it done would leave the operator
         believing a device is backfilled when its fence is still shut."""
         from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet
@@ -183,9 +200,9 @@ class TestStaticRouteFleetResync(IntentPushResetMixin, TestCase):
         assert "Re-synced 1 device(s)" in output
 
     def test_a_device_that_raises_does_not_abort_the_rest_of_the_pass(self):
-        """The push swallows *adapter* failures, but the echo recorder runs outside that
-        wrapper. An answer it cannot read would otherwise raise out of the loop, leaving every
-        later device unattempted and unreported."""
+        """The claim records *adapter* failures and answers ``None``, but the echo recorder
+        runs on the send's own thread. An answer it cannot read would otherwise raise out of
+        the loop, leaving every later device unattempted and unreported."""
         from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet
 
         _, first = self._managed_device("raiser", 8008)
@@ -348,17 +365,18 @@ class TestStaticRouteFleetResync(IntentPushResetMixin, TestCase):
 
         _, mgmt = self._managed_device("ifacenh", 8105)
         carried = self._own_route(mgmt, "10.77.0.0/16", "10.0.0.78")
-        iface_route = StaticRoute.objects.create(
-            prefix="10.78.0.0/16", next_hop=None, interface_next_hop="Ethernet1/1", metric=1
-        )
-        with suppress_intent_push():
-            iface_route.devices.add(mgmt.device)
-        skipped = NSOStaticRouteState.objects.create(
-            management=mgmt,
-            static_route=iface_route,
-            status="accepted",
-            nso_prefix="10.78.0.0/16",
-        )
+        with _quiet_fixture():
+            iface_route = StaticRoute.objects.create(
+                prefix="10.78.0.0/16", next_hop=None, interface_next_hop="Ethernet1/1", metric=1
+            )
+            with suppress_intent_push():
+                iface_route.devices.add(mgmt.device)
+            skipped = NSOStaticRouteState.objects.create(
+                management=mgmt,
+                static_route=iface_route,
+                status="accepted",
+                nso_prefix="10.78.0.0/16",
+            )
         sent = {}
 
         def _ack(adapter_device_id, routes):
@@ -383,8 +401,8 @@ class TestStaticRouteFleetResync(IntentPushResetMixin, TestCase):
         """Codex S6 P2 — the rollback undoes the arming, and must not undo the diagnosis.
 
         The push persists the adapter's rejection on the management row, which is what the
-        device tab shows and what the operator acts on. Rolling the arming back inside the
-        same transaction took that record with it, leaving a bare "NOT acknowledged".
+        device tab shows and what the operator acts on. The arming is undone by an explicit
+        inverse now, so the two are independent, and this is what keeps them so.
         """
         from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet
@@ -450,11 +468,14 @@ class TestStaticRouteFleetResync(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet
         from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
 
-        device = Device.objects.create(name="fleet-unlinked", device_type=self.dt, role=self.role, site=self.site)
-        inst, _ = NSOInstance.objects.get_or_create(name="fleet-inst", defaults={"adapter_instance_id": "fleet-inst"})
-        NSODeviceManagement.objects.create(
-            device=device, nso_instance=inst, nso_device_name="nso-fleet-unlinked", adapter_device_id=None
-        )
+        with _quiet_fixture():
+            device = Device.objects.create(name="fleet-unlinked", device_type=self.dt, role=self.role, site=self.site)
+            inst, _ = NSOInstance.objects.get_or_create(
+                name="fleet-inst", defaults={"adapter_instance_id": "fleet-inst"}
+            )
+            NSODeviceManagement.objects.create(
+                device=device, nso_instance=inst, nso_device_name="nso-fleet-unlinked", adapter_device_id=None
+            )
 
         with patch("netbox_nso_plugin.adapter_client.put_static_route_intent") as put:
             results = resync_static_route_intent_fleet()

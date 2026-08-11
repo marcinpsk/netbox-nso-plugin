@@ -8,7 +8,7 @@ from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 
-from .mixins import IntentPushResetMixin
+from .mixins import IntentPushDeliveryMixin
 
 
 def _superuser():
@@ -16,7 +16,7 @@ def _superuser():
     return User.objects.create_superuser(username="snmp-admin", password="pw", email="snmp@test.x")  # noqa: S106
 
 
-class _SnmpBase(IntentPushResetMixin, TestCase):
+class _SnmpBase(IntentPushDeliveryMixin, TestCase):
     @classmethod
     def setUpTestData(cls):
         mfg = Manufacturer.objects.create(name="SnmpAccMfg", slug="snmpaccmfg")

@@ -26,7 +26,7 @@ from netbox_nso_plugin.models import (
 )
 
 from ._adapter_http import make_response, make_session
-from .mixins import IntentPushResetMixin
+from .mixins import IntentPushDeliveryMixin
 
 User = get_user_model()
 TEST_PASSWORD = "testpass789"  # noqa: S105
@@ -56,8 +56,13 @@ def _make_fixtures():
     }
 
 
-class ViewTestBase(IntentPushResetMixin, TestCase):
-    """Base class: creates superuser and logs in, creates fixtures."""
+class ViewTestBase(IntentPushDeliveryMixin, TestCase):
+    """Base class: creates superuser and logs in, creates fixtures.
+
+    The view cases assert that an edit reached the adapter, and a ``TestCase`` cannot drain:
+    its transaction never commits and the drain refuses to run inside one. The mixin delivers
+    what the transaction scheduled instead, through the same choke point the claim uses.
+    """
 
     @classmethod
     def setUpTestData(cls):

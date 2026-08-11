@@ -330,33 +330,6 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
         assert [i["interface_name"] for i in ifaces] == ["Port-channel1"]
         assert ifaces[0]["min_tx"] == 300 and ifaces[0]["multiplier"] == 3 and ifaces[0]["micro_bfd"] is True
 
-    def test_force_repush_bypasses_change_detection(self):
-        """force=True (the device Apply) re-ships an owned snapshot even when it is UNCHANGED from
-        the last push. Without it, an owned BFD whose adapter intent went stale/empty (a failed
-        reactive push, an out-of-band adapter reset) is silently skipped by the change-detection
-        cache, so Apply applies 0 items and the accepted->deploying row sticks 'deploying' forever."""
-        from unittest.mock import patch
-
-        from netbox_nso_plugin.models import NSOBFDInterfaceState
-        from netbox_nso_plugin.signals import _push_bfd_intent_for_device, reset_intent_push_state
-
-        NSOBFDInterfaceState.objects.create(
-            management=self.management, interface=self.iface, min_tx=300, min_rx=300, multiplier=3, status="accepted"
-        )
-        reset_intent_push_state()
-        # 1) First reactive push warms the change-detection cache.
-        with patch("netbox_nso_plugin.adapter_client.put_bfd_intent") as first:
-            _push_bfd_intent_for_device(self.device.pk, 88)
-        assert first.call_count == 1
-        # 2) Re-pushing the SAME snapshot without force is skipped (cache hit) — this is the trap.
-        with patch("netbox_nso_plugin.adapter_client.put_bfd_intent") as unchanged:
-            _push_bfd_intent_for_device(self.device.pk, 88)
-        assert unchanged.call_count == 0
-        # 3) force=True bypasses the skip so a stale adapter is corrected on Apply.
-        with patch("netbox_nso_plugin.adapter_client.put_bfd_intent") as forced:
-            _push_bfd_intent_for_device(self.device.pk, 88, force=True)
-        assert forced.call_count == 1
-
     def test_accept_marks_owned(self):
         from unittest.mock import patch
 

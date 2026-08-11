@@ -5,7 +5,7 @@
 Real ORM + real interface-ownership path (NSOInterfaceState): renders the M8
 template on both ends, owns + would-push via the existing interface intent pipe,
 is idempotent, and validates template placeholders at save time. The only patch is
-the adapter interface-intent push (a true external boundary).
+the forced claim the consumer takes, which is where the push leaves the process.
 """
 
 from unittest.mock import patch
@@ -26,7 +26,7 @@ from django.test import TestCase
 from netbox_nso_plugin.link_role import apply_description_for_role
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOInterfaceState, NSOLinkRole
 
-_PUSH = "netbox_nso_plugin.signals._push_interface_intent_for_device"
+_PUSH = "netbox_nso_plugin.drain.push_now"
 
 
 def _make_cable(iface_a, iface_b):
@@ -121,7 +121,7 @@ class TestApplyDescriptionForRole(TestCase):
         role = self._role("to {peer_host}")
         with patch(_PUSH) as push:
             apply_description_for_role(self.if_a, role, other_end=self.if_b)
-        push.assert_called_once_with(self.mgmt_a.device_id, self.mgmt_a.adapter_device_id, force=True)
+        push.assert_called_once_with(self.mgmt_a.device_id, "interface", force=True)
 
 
 class TestDescriptionTemplateValidation(TestCase):

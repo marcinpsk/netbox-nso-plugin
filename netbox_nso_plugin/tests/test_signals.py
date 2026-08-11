@@ -17,12 +17,12 @@ from unittest.mock import patch
 from django.test import RequestFactory, TestCase
 from django.utils import timezone
 
-from .mixins import IntentPushResetMixin
+from .mixins import IntentPushDeliveryMixin
 
 _MOD = "netbox_nso_plugin.adapter_client"
 
 
-class _SignalDBBase(IntentPushResetMixin, TestCase):
+class _SignalDBBase(IntentPushDeliveryMixin, TestCase):
     """Shared real-DB fixture for the signal-handler tests.
 
     These handlers read and update the real overlay models (NSODeviceManagement /
@@ -677,7 +677,7 @@ class TestPushIntentOnAccept(_SignalDBBase):
         )
 
         with patch(f"{_MOD}.put_intent") as mock_put:
-            _push_interface_intent_for_device(self.device.id, 42, force=True)
+            _push_interface_intent_for_device(self.device.id, 42)
 
         mock_put.assert_called_once()
         attrs = mock_put.call_args[0][1]
@@ -791,7 +791,7 @@ class TestSkipOnRenderGuard(_SignalDBBase):
 try:
     from django.test import TestCase as DjangoTestCase
 
-    class TestIPAddressSignals(IntentPushResetMixin, DjangoTestCase):
+    class TestIPAddressSignals(IntentPushDeliveryMixin, DjangoTestCase):
         """Django-DB integration tests for the IPAddress signal → put_ip_intent path."""
 
         @classmethod
@@ -998,7 +998,7 @@ try:
                     address="10.1.3.1/28", assigned_object_type=self._ct(), assigned_object_id=self.iface.pk
                 )
 
-    class TestGActivatedInterfaceIntentOrigin(IntentPushResetMixin, DjangoTestCase):
+    class TestGActivatedInterfaceIntentOrigin(IntentPushDeliveryMixin, DjangoTestCase):
         """Decision-G intent signal discriminates operator edits from adapter imports."""
 
         @classmethod
@@ -1107,7 +1107,7 @@ try:
             # the changed attribute (description) IS promoted
             self.assertEqual(self._state().status, "accepted")
 
-    class TestGreenfieldOspfSignals(IntentPushResetMixin, DjangoTestCase):
+    class TestGreenfieldOspfSignals(IntentPushDeliveryMixin, DjangoTestCase):
         """Operator-created netbox_routing OSPF → accepted overlays + OSPF intent push."""
 
         @classmethod
@@ -1645,16 +1645,27 @@ class TestDeleteOriginMarking(_SignalDBBase):
         """Run *act* with the adapter HTTP transport recorded → list of params dicts."""
         return [params for _method, _url, params in self._recorded_calls(act)]
 
+    @staticmethod
+    def _arranged():
+        """Own the fixture row the way an ALREADY-DRAINED transaction left it.
+
+        The mark survives the fold only when every unconsumed contributor carried it (AND),
+        and in production the transaction that owned the row drained and retired its own
+        entry long before the deletion under test appends one. A ``TestCase`` cannot drain,
+        so an un-suppressed fixture would leave its unmarked entry standing and AND the
+        deletion's mark away — a harness artifact, not the behaviour these pins are about.
+        """
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        return suppress_intent_push()
+
     def _owned_svi(self, mgmt):
         from ipam.models import VLAN
 
         from netbox_nso_plugin.models import NSOSVIState
 
         vlan = VLAN.objects.create(vid=444, name="do-v444")
-        with (
-            patch("netbox_nso_plugin.adapter_client.put_svi_intent"),
-            self.captureOnCommitCallbacks(execute=True),
-        ):
+        with self._arranged():
             return NSOSVIState.objects.create(
                 management=mgmt, interface=self.iface, vlan=vlan, svi_type="irb", status="accepted"
             )
@@ -1693,10 +1704,7 @@ class TestDeleteOriginMarking(_SignalDBBase):
 
         mgmt = self._mgmt()
         route = StaticRoute.objects.create(prefix="198.18.77.0/24", next_hop="198.18.0.1", name="do-sr", metric=1)
-        with (
-            patch("netbox_nso_plugin.adapter_client.put_static_route_intent"),
-            self.captureOnCommitCallbacks(execute=True),
-        ):
+        with self._arranged():
             NSOStaticRouteState.objects.create(
                 management=mgmt, static_route=route, nso_prefix="198.18.77.0/24", status="accepted"
             )
@@ -1729,13 +1737,14 @@ class TestDeleteOriginMarking(_SignalDBBase):
         """post_remove IS a deletion — the reduced snapshot must still carry the mark."""
         from netbox_routing.models import StaticRoute
 
+        from netbox_nso_plugin.signals import _accept_static_route_for_device
+
         mgmt = self._mgmt()
         route = StaticRoute.objects.create(prefix="198.18.88.0/24", next_hop="198.18.0.1", name="do-rm", metric=1)
-        with (
-            patch("netbox_nso_plugin.adapter_client.put_static_route_intent"),
-            self.captureOnCommitCallbacks(execute=True),
-        ):
+        with self._arranged():
+            # The assignment handler is suppressed too, so the overlay is owned explicitly.
             route.devices.add(mgmt.device)
+            _accept_static_route_for_device(route, mgmt.device)
 
         params = self._recorded_params(lambda: route.devices.remove(mgmt.device))
         self.assertTrue(params, "un-assigning the device must push the reduced snapshot")

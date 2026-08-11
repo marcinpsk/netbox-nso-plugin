@@ -47,10 +47,10 @@ def _duplicate_route_id(route_id):
     )
 
 
-def _push(device_id, adapter_device_id, *, force=True):
+def _push(device_id, adapter_device_id):
     from netbox_nso_plugin.signals import _push_static_route_intent_for_device
 
-    return _push_static_route_intent_for_device(device_id, adapter_device_id, force=force)
+    return _push_static_route_intent_for_device(device_id, adapter_device_id)
 
 
 def _record(mgmt, scope="static_route"):
@@ -164,21 +164,6 @@ class TestIntentPushRejectionRecord(IntentPushResetMixin, TestCase):
         self.assertEqual(entry["detail"], {})
         self.assertIn("ValueError", entry["message"])
         self.assertIn("boom", entry["message"])
-
-    def test_a_skipped_unchanged_push_allocates_no_attempt(self):
-        """No request was made, so there is nothing to record and no mark to burn."""
-        with _fixtures():
-            sr = _route("10.65.0.0/16", "10.0.0.1", devices=[self.device])
-            _own(sr, self.mgmt)
-
-        with patch(PUT, return_value={"device_id": 1, "count": 1, "routes": []}):
-            _push(self.device.pk, self.mgmt.adapter_device_id, force=False)
-            self.mgmt.refresh_from_db()
-            self.assertEqual(self.mgmt.intent_push_attempts.get("static_route"), 1)
-            _push(self.device.pk, self.mgmt.adapter_device_id, force=False)
-
-        self.mgmt.refresh_from_db()
-        self.assertEqual(self.mgmt.intent_push_attempts.get("static_route"), 1)
 
 
 class TestIntentPushRejectionIsolation(IntentPushResetMixin, TestCase):

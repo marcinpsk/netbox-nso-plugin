@@ -12,10 +12,10 @@ from unittest.mock import patch
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.test import TestCase
 
-from .mixins import IntentPushResetMixin
+from .mixins import IntentPushDeliveryMixin
 
 
-class _RPBase(IntentPushResetMixin, TestCase):
+class _RPBase(IntentPushDeliveryMixin, TestCase):
     @classmethod
     def setUpTestData(cls):
         mfg = Manufacturer.objects.create(name="RpMfg", slug="rpmfg")
@@ -83,8 +83,7 @@ class TestRoutePolicyIntentAcceptedFlag(_RPBase):
             "netbox_nso_plugin.adapter_client.put_route_policy_intent",
             side_effect=lambda adapter_id, objects: pushed.append(objects),
         ):
-            # force bypasses change-detection (the device Apply path)
-            _push_route_policy_intent_for_device(mgmt.device_id, mgmt.adapter_device_id, force=True)
+            _push_route_policy_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
         return pushed[-1] if pushed else []
 
     def test_deploying_row_pushed_accepted_true(self):
@@ -722,7 +721,7 @@ class TestUnsupportedMembersStorage(_RPBase):
         from netbox_nso_plugin.signals import _push_route_policy_intent_for_device
 
         with patch("netbox_nso_plugin.adapter_client.put_route_policy_intent", side_effect=lambda a, o: resp):
-            _push_route_policy_intent_for_device(mgmt.device_id, mgmt.adapter_device_id, force=True)
+            _push_route_policy_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
 
     def test_unsupported_members_stored_from_adapter_response(self):
         mgmt, state = self._community_overlay()
@@ -739,21 +738,3 @@ class TestUnsupportedMembersStorage(_RPBase):
         self._push(mgmt, {"objects": [], "unsupported_members": {}})
         state.refresh_from_db()
         assert state.unsupported_members == []
-
-    def test_skipped_unchanged_push_preserves_recorded_members(self):
-        # force=False + unchanged payload → the adapter PUT is skipped (resp=None); the
-        # last-recorded unsupported set (deterministic per member+ned) must be kept.
-        from netbox_nso_plugin.signals import _push_route_policy_intent_for_device
-
-        mgmt, state = self._community_overlay()
-        state.unsupported_members = ["color:0:12."]
-        state.save(update_fields=["unsupported_members"])
-        # Prime the change-detection cache so the next non-force push is skipped-unchanged.
-        self._push(mgmt, {"objects": [], "unsupported_members": {"example-comm": ["color:0:12."]}})
-        with patch(
-            "netbox_nso_plugin.adapter_client.put_route_policy_intent",
-            side_effect=AssertionError("PUT must not run when unchanged"),
-        ):
-            _push_route_policy_intent_for_device(mgmt.device_id, mgmt.adapter_device_id, force=False)
-        state.refresh_from_db()
-        assert state.unsupported_members == ["color:0:12."]

@@ -156,30 +156,6 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
         self.assertEqual([i["interface_name"] for i in ifaces], ["Port-channel1"])
         self.assertEqual(ifaces[0]["mtu"], 9216)
 
-    def test_force_repush_bypasses_change_detection(self):
-        """force=True (the device Apply) re-ships an owned snapshot even when it is UNCHANGED from
-        the last push. Without it, an owned MTU whose adapter intent went stale/empty (a failed
-        reactive push, an out-of-band adapter reset) is silently skipped by the change-detection
-        cache, so Apply applies 0 items and the accepted->deploying row sticks 'deploying' forever."""
-        from unittest.mock import patch
-
-        from netbox_nso_plugin.signals import _push_interface_mtu_intent_for_device, reset_intent_push_state
-
-        self._state(l2_mtu=9216, status="accepted")
-        reset_intent_push_state()
-        # 1) First reactive push warms the change-detection cache.
-        with patch("netbox_nso_plugin.adapter_client.put_interface_mtu_intent") as first:
-            _push_interface_mtu_intent_for_device(self.device.pk, 77)
-        self.assertEqual(first.call_count, 1)
-        # 2) Re-pushing the SAME snapshot without force is skipped (cache hit) — this is the trap.
-        with patch("netbox_nso_plugin.adapter_client.put_interface_mtu_intent") as unchanged:
-            _push_interface_mtu_intent_for_device(self.device.pk, 77)
-        self.assertEqual(unchanged.call_count, 0)
-        # 3) force=True bypasses the skip so a stale adapter is corrected on Apply.
-        with patch("netbox_nso_plugin.adapter_client.put_interface_mtu_intent") as forced:
-            _push_interface_mtu_intent_for_device(self.device.pk, 77, force=True)
-        self.assertEqual(forced.call_count, 1)
-
     def test_accept_marks_owned_and_writes_native_mtu(self):
         from unittest.mock import patch
 

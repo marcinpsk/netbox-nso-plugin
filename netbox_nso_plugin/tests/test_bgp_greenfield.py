@@ -23,7 +23,7 @@ from netbox_routing.models import BGPPeer, BGPRouter, BGPScope
 
 from netbox_nso_plugin.models import NSOBGPPeerState, NSODeviceManagement, NSOInstance
 
-from .mixins import IntentPushResetMixin, _CascadeFlushMixin
+from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 
 def _find_pushed_peer(router_list, addr):
@@ -46,7 +46,7 @@ def _make_device(suffix="gf"):
     return Device.objects.create(name=f"bgp-gf-{suffix}", device_type=dt, role=role, site=site)
 
 
-class BgpGreenfieldBase(IntentPushResetMixin, TestCase):
+class BgpGreenfieldBase(IntentPushDeliveryMixin, TestCase):
     @classmethod
     def setUpTestData(cls):
         cls.device = _make_device("main")
