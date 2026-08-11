@@ -330,9 +330,11 @@ class ReceiptAdapter:
         receipt = self.receipts.get(url)
         if receipt is not None and seq is not None and seq <= receipt["push_seq"]:
             if seq < receipt["push_seq"]:
-                return make_response(409, {"detail": {"code": "stale"}})
+                return make_response(409, {"error": {"code": "stale", "message": "sequence is stale"}})
             if digest != receipt["digest"]:
-                return make_response(409, {"detail": {"code": "sequence_reuse"}})
+                return make_response(
+                    409, {"error": {"code": "sequence_reuse", "message": "sequence reused with a different body"}}
+                )
             self.replays += 1
             return make_response(200, receipt["response"])
 
