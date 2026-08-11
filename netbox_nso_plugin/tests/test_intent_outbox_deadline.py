@@ -26,6 +26,7 @@ from unittest.mock import patch
 from django.test import TransactionTestCase
 
 from ._outbox_case import make_managed, own_vlan, state_of
+from ._settlement_adapter import LoopbackOnlySession
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -76,6 +77,15 @@ class _DripCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
 
     def setUp(self):
         super().setUp()
+        from netbox_nso_plugin import adapter_client
+
+        # The suite-wide hermetic guard fails EVERY request; these pins need a real socket
+        # to the in-test far side, so narrow the guard to loopback instead of lifting it.
+        unblocked = patch("netbox_nso_plugin.adapter_client.requests.Session", LoopbackOnlySession)
+        unblocked.start()
+        self.addCleanup(unblocked.stop)
+        adapter_client.reset_session()
+        self.addCleanup(adapter_client.reset_session)
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), _Drip)
         self.server.daemon_threads = True
         self.server.streaming = threading.Event()
