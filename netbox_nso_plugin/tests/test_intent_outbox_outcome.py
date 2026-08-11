@@ -12,6 +12,8 @@ every later success, so only an operator clears it.
 
 from __future__ import annotations
 
+import threading
+
 from django.db import transaction
 from django.test import TransactionTestCase
 
@@ -445,7 +447,9 @@ class TestTheDegradationRecordOutlivesEverySuccess(_OutcomeCase):
 
         assert state_of(self.device, "static_route").degraded_deletions == recorded, "still named"
 
-        assert drain.acknowledge_degraded_deletions(self.device.pk, "static_route") == 1
+        assert drain.acknowledge_degraded_deletions(self.device.pk, "static_route") == [
+            (self.device.pk, "static_route", recorded)
+        ]
         assert state_of(self.device, "static_route").degraded_deletions == []
 
     def test_a_push_outcome_never_clears_it(self):
@@ -465,6 +469,79 @@ class TestTheDegradationRecordOutlivesEverySuccess(_OutcomeCase):
 
         assert self.drain("vlan") == drain.SUCCEEDED
         assert state_of(self.device, "vlan").degraded_deletions != []
+
+
+class TestTheAcknowledgementClearsOnlyWhatItReported(_OutcomeCase):
+    """O1.27, codex O1 r3 F5: the operator clears the records they were shown, and no others."""
+
+    tag = "ackn"
+    adapter_device_id = 7710
+
+    def _record(self, route_id):
+        from netbox_nso_plugin import drain
+
+        return {
+            "route_ids": [route_id],
+            "triples": [],
+            "at": "2026-08-11T00:00:00+00:00",
+            "reason": drain.LEGACY_MARK_DOWNGRADED,
+            "device": self.device.pk,
+        }
+
+    def _appender(self, record, done):
+        """Record one degradation exactly as an outcome does: under the key's own lock."""
+        from django.db import connection
+
+        from netbox_nso_plugin import drain
+
+        def work():
+            try:
+                with transaction.atomic():
+                    state = drain._lock_state(self.device.pk, "vlan")
+                    state.degraded_deletions = [*state.degraded_deletions, record]
+                    state.save(update_fields=["degraded_deletions"])
+                done.set()
+            finally:
+                connection.close()
+
+        return threading.Thread(target=work)
+
+    def test_a_degradation_recorded_while_the_acknowledgement_runs_is_not_cleared(self):
+        from django.core.management import call_command
+
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        first, second = self._record(11), self._record(12)
+        NSOIntentOutboxState.objects.create(device=self.device, scope="vlan", degraded_deletions=[first])
+
+        recorded = threading.Event()
+        appender = self._appender(second, recorded)
+
+        class _Reporter:
+            """Records the second degradation the moment the command reports the first."""
+
+            def __init__(self):
+                self.lines: list[str] = []
+
+            def write(self, text):
+                self.lines.append(text)
+                if not appender.is_alive() and not recorded.is_set():
+                    appender.start()
+                    recorded.wait(timeout=10)
+
+            def flush(self):
+                """Django's OutputWrapper flushes what it wrote."""
+
+        reporter = _Reporter()
+        call_command("nso_acknowledge_degraded_deletions", device_id=self.device.pk, stdout=reporter)
+        appender.join(timeout=30)
+        assert recorded.is_set(), "the concurrent degradation never landed, so this pin proves nothing"
+
+        assert any("route(s) [11]" in line for line in reporter.lines), reporter.lines
+        assert not any("route(s) [12]" in line for line in reporter.lines), "it was never reported"
+        assert state_of(self.device, "vlan").degraded_deletions == [second], (
+            "a record the operator never saw may not be cleared by their acknowledgement"
+        )
 
 
 class TestStoreOnlyCarriesNoAuthority(_OutcomeCase):

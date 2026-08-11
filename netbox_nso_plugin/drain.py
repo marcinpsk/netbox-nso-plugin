@@ -1175,21 +1175,33 @@ def _withhold(claim: Claim, exc) -> str:
     return WITHHELD
 
 
-def acknowledge_degraded_deletions(device_id=None, scope=None) -> int:
-    """Clear the durable degradation records, and return how many keys were cleared.
+def acknowledge_degraded_deletions(device_id=None, scope=None) -> list[tuple[int, str, list]]:
+    """Clear the durable degradation records, and return exactly the ones cleared, per key.
 
     The ONLY thing that clears them. A push outcome never does: the transient per-scope
     error entry is popped by the very next success (`signals.py`), so a degradation
     recorded there would be erased before an operator could read it.
+
+    Reading and clearing under the key's own state-row lock is what makes the returned set
+    the whole set: every write of the field takes that lock, so a degradation recorded
+    while the acknowledgement runs waits behind it and survives, uncleared and unreported.
+    Reporting the return value is therefore reporting exactly what was cleared, which a
+    caller that listed the records itself and then cleared blindly could not promise.
     """
     from .models import NSOIntentOutboxState
 
-    rows = NSOIntentOutboxState.objects.exclude(degraded_deletions=[])
-    if device_id is not None:
-        rows = rows.filter(device_id=device_id)
-    if scope is not None:
-        rows = rows.filter(scope=scope)
-    return rows.update(degraded_deletions=[])
+    acknowledged = []
+    with transaction.atomic():
+        rows = NSOIntentOutboxState.objects.select_for_update(of=("self",)).order_by().exclude(degraded_deletions=[])
+        if device_id is not None:
+            rows = rows.filter(device_id=device_id)
+        if scope is not None:
+            rows = rows.filter(scope=scope)
+        for state in rows:
+            acknowledged.append((state.device_id, state.scope, list(state.degraded_deletions)))
+            state.degraded_deletions = []
+            state.save(update_fields=["degraded_deletions"])
+    return acknowledged
 
 
 def _claim_or_wait(device_id, scope, *, mode, force) -> Claim | None:

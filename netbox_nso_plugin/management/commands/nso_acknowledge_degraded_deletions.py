@@ -19,19 +19,13 @@ class Command(BaseCommand):
         parser.add_argument("--scope", dest="scope", metavar="KEY", help="Limit to one delivery key.")
 
     def handle(self, *args, **options):
-        from netbox_nso_plugin.models import NSOIntentOutboxState
-
-        rows = NSOIntentOutboxState.objects.exclude(degraded_deletions=[])
-        if options.get("device_id"):
-            rows = rows.filter(device_id=options["device_id"])
-        if options.get("scope"):
-            rows = rows.filter(scope=options["scope"])
-        for state in rows:
-            for record in state.degraded_deletions:
+        # Reported FROM what was cleared, never listed separately and cleared afterwards: a
+        # degradation recorded between the two would otherwise go unseen and be wiped.
+        acknowledged = acknowledge_degraded_deletions(options.get("device_id"), options.get("scope"))
+        for device_id, scope, records in acknowledged:
+            for record in records:
                 self.stdout.write(
-                    f"{state.device_id}/{state.scope}: {record.get('reason')} "
+                    f"{device_id}/{scope}: {record.get('reason')} "
                     f"route(s) {record.get('route_ids')} at {record.get('at')}"
                 )
-
-        cleared = acknowledge_degraded_deletions(options.get("device_id"), options.get("scope"))
-        self.stdout.write(self.style.SUCCESS(f"Acknowledged {cleared} key(s)"))
+        self.stdout.write(self.style.SUCCESS(f"Acknowledged {len(acknowledged)} key(s)"))
