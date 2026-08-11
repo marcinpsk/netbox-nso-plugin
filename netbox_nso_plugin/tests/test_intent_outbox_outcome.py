@@ -385,6 +385,34 @@ class TestAnAcknowledgedSuccessRetiresItsRows(_OutcomeCase):
         assert drain.gate_blockers(self.device.pk) == []
 
 
+class TestTheGateRefusesAnUnacknowledgedOperation(_OutcomeCase):
+    """§4.6, codex O1 r3 F4: a bare push_seq is an operation the far side may still hold."""
+
+    tag = "gate"
+    adapter_device_id = 7709
+
+    def test_a_failed_claim_that_consumed_nothing_still_blocks_the_gate(self):
+        from netbox_nso_plugin import delivery, drain
+
+        own_vlan(self.mgmt, 908, self.tag)
+        assert self.drain("vlan") == drain.SUCCEEDED
+        assert entries(self.device, "vlan") == [], "the success retired every row it consumed"
+
+        # A forced store-only claim consumes nothing, so its failure leaves the key with a
+        # sequence to replay and not one other trace of the operation.
+        self.adapter.fail_with = ConnectionError("adapter down")
+        config, session = self.adapter.patches()
+        with config, session:
+            assert drain.push_now(self.device.pk, "vlan", mode=delivery.MODE_STORE_ONLY, force=True) is None
+
+        state = state_of(self.device, "vlan")
+        assert state.push_seq is not None and state.claimed_at is None
+        assert (state.claim_deletions, state.queued_deletions, state.revoked_ids) == ([], [], [])
+        assert entries(self.device, "vlan") == []
+
+        assert drain.gate_blockers(self.device.pk) == [f"{self.device.pk}/vlan: an unacknowledged operation"]
+
+
 class TestTheDegradationRecordOutlivesEverySuccess(_OutcomeCase):
     """O1.27 (R5-M1): the transient error entry is popped by the next success; this is not."""
 

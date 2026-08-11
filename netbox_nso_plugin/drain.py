@@ -1403,6 +1403,11 @@ def gate_blockers(device_id=None) -> list[str]:
         blockers.append(f"{entry_device}/{scope}: a row carrying a push_seq")
     for state in states:
         key = f"{state.device_id}/{state.scope}"
+        if state.push_seq is not None:
+            # A claim that consumed no row leaves nothing else behind, and a forced or
+            # store-only one never consumes any: the sequence alone says the far side may
+            # still hold an operation this key has not resolved.
+            blockers.append(f"{key}: an unacknowledged operation")
         if state.queued_deletions:
             blockers.append(f"{key}: queued deletions")
         if state.revoked_ids:
