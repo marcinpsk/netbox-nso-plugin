@@ -38,6 +38,19 @@ from ._outbox_case import (
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
+def _senders() -> set:
+    """The send workers alive right now, so a pin can speak about the ones IT started."""
+    return {worker for worker in threading.enumerate() if worker.name == "nso-intent-push"}
+
+
+def _senders_ended(before: set, timeout: float) -> bool:
+    """Whether every sender started since *before* has ended, within *timeout* seconds."""
+    deadline = time.monotonic() + timeout
+    while _senders() - before and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return not (_senders() - before)
+
+
 class _ConcurrencyCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     tag = "conc"
     adapter_device_id = 7800
@@ -151,6 +164,38 @@ class TestTheSendCarriesItsOwnDeadline(_ConcurrencyCase):
         row = state_of(self.device, "vlan")
         assert row.claimed_at is None and row.attempts == 1
         assert row.push_seq is not None, "the operation is replayed, so it stays unacknowledged"
+
+    def test_the_expired_deadline_closes_the_transport_it_owns(self):
+        """codex O1 r2 F3: the abandoned sender kept its thread and its socket, per retry."""
+        from netbox_nso_plugin import drain
+
+        own_vlan(self.mgmt, 873, self.tag)
+        self.adapter.delay = 10
+        running = _senders()
+
+        with patch.object(drain, "SEND_DEADLINE", datetime.timedelta(seconds=1)):
+            assert self.drain() == drain.FAILED
+
+        assert _senders_ended(running, 5), "the abandoned sender outlived the deadline that abandoned it"
+        assert self.adapter.closed, "and closing the transport it owns is what ends it"
+
+    def test_a_completion_arriving_after_the_deadline_is_discarded(self):
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        own_vlan(self.mgmt, 874, self.tag)
+        self.adapter.delay = 2
+        self.adapter.ignores_close = True  # already on the wire when the transport went
+        running = _senders()
+
+        with patch.object(drain, "SEND_DEADLINE", datetime.timedelta(seconds=1)):
+            assert self.drain() == drain.FAILED
+        assert _senders_ended(running, 10), "the late sender ran to completion, as this pin needs"
+
+        row = state_of(self.device, "vlan")
+        assert (row.attempts, row.last_error_code) == (1, "nso_send_deadline")
+        errors = NSODeviceManagement.objects.get(pk=self.mgmt.pk).intent_push_errors or {}
+        assert "vlan" in errors, "the waiter's verdict stands: a late answer never pops the failure"
 
 
 class TestTheFoldAndTheRenderShareOneSnapshot(_ConcurrencyCase):

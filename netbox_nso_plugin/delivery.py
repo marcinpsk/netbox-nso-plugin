@@ -155,29 +155,47 @@ def _under_deadline(do_push: Callable, seconds: float) -> Callable:
     """Bound one transport call by wall clock, which the client's timeouts cannot do.
 
     ``(connect, read)`` measures the gap between bytes, so a response dripping one byte at
-    a time resets it forever. The call therefore runs on its own thread and is abandoned
-    when the budget runs out; the budget is well under the lease, so an abandoned call is
-    long finished before a scavenger may take the operation over.
+    a time resets it forever. The call therefore runs on its own thread, on a session of its
+    OWN: an expired deadline closes that session, urllib3 aborts the request under the worker
+    and the thread and its socket go with it. Abandoning the thread instead leaked one thread
+    and one connection per retry, for as long as the far side felt like dripping.
+
+    The waiter's verdict is final. A completion that arrives after the budget ran out is
+    discarded, never applied: the attempt has been recorded failed and the operation is
+    already being replayed under its own sequence.
     """
 
     def _call(body):
-        context = contextvars.copy_context()
+        from . import adapter_client
+
+        session = adapter_client.new_session()
+        with adapter_client.bound_session(session):
+            # Copied while the session is bound, so the worker sends on the transport the
+            # waiter can close under it.
+            context = contextvars.copy_context()
         answer: dict = {}
         done = threading.Event()
+        expired = threading.Event()
 
         def _run():
             from django.db import connections
 
             try:
-                answer["result"] = context.run(do_push, body)
+                result = context.run(do_push, body)
+                if not expired.is_set():
+                    answer["result"] = result
             except BaseException as exc:  # noqa: BLE001 (re-raised on the sender's thread)
-                answer["error"] = exc
+                if not expired.is_set():
+                    answer["error"] = exc
             finally:
                 connections.close_all()  # this thread's own connections, nobody else's
+                session.close()
                 done.set()
 
         threading.Thread(target=_run, name="nso-intent-push", daemon=True).start()
         if not done.wait(seconds):
+            expired.set()
+            session.close()
             raise SendDeadlineExceeded(f"the adapter did not answer within {seconds}s")
         if "error" in answer:
             raise answer["error"]

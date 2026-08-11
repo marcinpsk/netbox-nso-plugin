@@ -115,13 +115,38 @@ STORE_INCARNATION_HEADER = "X-Store-Incarnation"
 _session = None
 _session_cls = None
 
+# A caller that must be able to ABORT its own request cannot use the pooled session: closing
+# it would cut off every other request in the process. So a send under a wall-clock deadline
+# builds its own (#1503 §4.2, O-P16) and binds it here for the duration of that one call.
+_bound_session = contextvars.ContextVar("nso_bound_session", default=None)
+
+
+def new_session():
+    """Build one session configured like the pooled one, for a caller that owns its lifetime."""
+    session = requests.Session()
+    session.trust_env = False  # Adapter is always internal — never route through system proxy.
+    return session
+
+
+@contextmanager
+def bound_session(session):
+    """Send every adapter request made in this context on *session*, not on the pool."""
+    token = _bound_session.set(session)
+    try:
+        yield
+    finally:
+        _bound_session.reset(token)
+
 
 def _get_session():
-    """Return the process-wide pooled requests session, (re)creating it when needed."""
+    """Return this context's bound session, or the process-wide pooled one."""
     global _session, _session_cls
+
+    bound = _bound_session.get()
+    if bound is not None:
+        return bound
     if _session is None or _session_cls is not requests.Session:
-        _session = requests.Session()
-        _session.trust_env = False  # Adapter is always internal — never route through system proxy.
+        _session = new_session()
         _session_cls = requests.Session
     return _session
 
