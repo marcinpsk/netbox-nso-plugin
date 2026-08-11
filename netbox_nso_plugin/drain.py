@@ -995,6 +995,21 @@ def _stamp_attempt(device_id, scope) -> None:
         state.save()
 
 
+def _restamp_attempt(device_id, scope) -> None:
+    """Stamp a key whose drain RAISED, in a transaction of its own (O1.33).
+
+    The claim stamps itself before anything can refuse, but that write rolls back with the
+    transaction it belongs to, so a key raising inside the claim (a render that blows up, a
+    fold that hits a non-retryable error) leaves no stamp at all and stays at the head of
+    every bounded pass, starving the keys behind it. The compact-retry path already
+    re-stamps for the same reason.
+    """
+    try:
+        _stamp_attempt(device_id, scope)
+    except Exception:  # noqa: BLE001 (a key that cannot even be stamped must not abort the pass)
+        logger.exception("intent outbox attempt stamp failed for %s/%s", device_id, scope)
+
+
 def _claim_or_compact(device_id, scope, *, mode, force):
     """Take the claim, compacting once if the fold outgrew the statement budget.
 
@@ -1253,6 +1268,7 @@ def drain_intent_outbox(limit=None) -> tuple[int, int]:
             outcome = drain_key(device_id, scope)
         except Exception:  # noqa: BLE001 (one key's adapter must not abort the fleet pass)
             logger.exception("intent outbox drain failed for %s/%s", device_id, scope)
+            _restamp_attempt(device_id, scope)
             failed += 1
             continue
         if outcome == SUCCEEDED:

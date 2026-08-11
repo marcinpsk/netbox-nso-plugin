@@ -266,6 +266,36 @@ class TestFairSelectionRotatesAFailingHead(_DrainCase):
         assert entries(healthy, "vlan", unconsumed=True) == []
         assert all(state_of(device, "vlan").last_drain_attempted_at is not None for device, _mgmt in failing)
 
+    def test_a_key_whose_claim_raises_before_it_commits_still_rotates(self):
+        """codex O1 r2 F4: the in-transaction stamp rolls back with the claim that raised."""
+        from netbox_nso_plugin import delivery, drain
+
+        failing = [self.managed(f"rz{index}", 7670 + index, index=index, vid=970 + index) for index in range(2)]
+        healthy, healthy_mgmt = self.managed("rzok", 7679, index=9, vid=979)
+        for _device, mgmt in failing:
+            self.edit(mgmt)
+        self.edit(healthy_mgmt)
+
+        real_render = delivery.render
+        broken = {device.pk for device, _mgmt in failing}
+
+        def render(key, device_id, adapter_device_id):
+            if device_id in broken:
+                raise RuntimeError(f"the {key} push rendered 0 bodies, expected exactly one")
+            return real_render(key, device_id, adapter_device_id)
+
+        with (
+            patch.object(drain, "DRAIN_BATCH", len(failing)),
+            patch("netbox_nso_plugin.delivery.render", side_effect=render),
+        ):
+            assert self.run_drain() == (0, 2)
+            assert entries(healthy, "vlan", unconsumed=True), "the raising head took the whole first pass"
+            second = self.run_drain()
+
+        assert second[0] == 1, "the healthy key is claimed within the O1.33 bound"
+        assert entries(healthy, "vlan", unconsumed=True) == []
+        assert all(state_of(device, "vlan").last_drain_attempted_at is not None for device, _mgmt in failing)
+
     def test_a_never_attempted_key_is_ordered_ahead_of_a_stamped_one(self):
         from netbox_nso_plugin import drain
         from netbox_nso_plugin.models import NSOIntentOutboxState
