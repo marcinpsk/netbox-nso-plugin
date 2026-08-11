@@ -33,6 +33,28 @@ def allocate_push_seq() -> int:
         return int(cursor.fetchone()[0])
 
 
+def advance_push_seq(watermark: int) -> int:
+    """Move the sequence past *watermark* and return the value the next allocation exceeds.
+
+    A restored database brings the sequence back rewound with it, so the far side can already
+    hold operations above it. ``GREATEST`` in the statement itself is what makes the move
+    monotonic: a later key's lower watermark can never pull the sequence back, and several
+    keys restored in one pass leave it above the highest of them.
+
+    Sequences are not transactional, so this survives a rollback of the caller's transaction.
+    That is the safe direction: the values it skips are burned, never reissued.
+    """
+    from django.db import connection
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f"SELECT setval('{PUSH_SEQ_SEQUENCE}', GREATEST(last_value, %s), true) "  # noqa: S608 — a module constant
+            f"FROM {PUSH_SEQ_SEQUENCE}",
+            [int(watermark)],
+        )
+        return int(cursor.fetchone()[0])
+
+
 # ── Transition records: the provenance an entry carries ───────────────────────
 
 

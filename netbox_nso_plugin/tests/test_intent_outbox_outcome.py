@@ -827,3 +827,90 @@ class TestARestoredClaimSettlesAgainstTheReceiptsOwnDigest(_OutcomeCase):
 
         assert drain.resolve_restored_claim(self.device.pk, "vlan", receipt) == drain.RESTORE_FAILED_CLOSED
         assert state_of(self.device, "vlan").push_seq == claimed.push_seq
+
+
+class TestARestoreRebaseClearsTheAdaptersWatermark(_OutcomeCase):
+    """codex O1 r5 F1 (§4.6): a rebased key must allocate ABOVE the adapter's watermark.
+
+    A restored database can hold a claim the far side has long since moved past, and the
+    sequence comes back rewound with it. The rebase requeues the work, so the next claim
+    allocates from that rewound sequence: unless the rebase advances it past the accepted
+    watermark, every allocation the key makes is stale, the adapter refuses it, and a
+    replayed failure keeps that sequence forever.
+    """
+
+    tag = "rebase"
+    adapter_device_id = 7712
+
+    _SNAPSHOT_FIELDS = (
+        "push_seq",
+        "claimed_at",
+        "claim_payload",
+        "claim_identity",
+        "claim_flags",
+        "claim_deletions",
+        "claim_mark",
+        "last_success_identity",
+    )
+
+    def _rewind_sequence(self, value):
+        """Put the sequence back where the snapshot was taken, which is what a restore does."""
+        from django.db import connection
+
+        from netbox_nso_plugin.outbox import PUSH_SEQ_SEQUENCE
+
+        with connection.cursor() as cursor:
+            cursor.execute(f"SELECT setval('{PUSH_SEQ_SEQUENCE}', %s, true)", [value])
+
+    def _rename(self, overlay, name):
+        """One operator edit, left unconsumed so the drain under test is the one that folds it."""
+        with without_commit_drain(), transaction.atomic():
+            overlay.vlan.name = name
+            overlay.vlan.save()
+            overlay.save()
+
+    def test_the_rebase_advances_the_sequence_past_the_accepted_watermark(self):
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentOutboxState
+
+        rows = NSOIntentOutboxState.objects.filter(device=self.device, scope="vlan")
+        overlay = own_vlan(self.mgmt, 920, self.tag)
+        assert self.drain("vlan") == drain.SUCCEEDED
+
+        # The snapshot: an unresolved claim, the row it left, and the sequence behind it.
+        self._rename(overlay, "cl-rebase-snapshot")
+        claimed = drain.claim(self.device.pk, "vlan")
+        held = claimed.push_seq
+        snapshot = rows.values(*self._SNAPSHOT_FIELDS)[0]
+
+        # The world the restored database never saw: the same key, pushing on.
+        assert drain.settle(claimed, {"count": 1}) == drain.SUCCEEDED
+        for name in ("cl-rebase-later-a", "cl-rebase-later-b"):
+            self._rename(overlay, name)
+            assert self.drain("vlan") == drain.SUCCEEDED
+        accepted = self.adapter.sequences[-1]
+        assert accepted > held
+
+        # The restore: the snapshot's row, the entry its claim consumed, and its sequence.
+        rows.update(**snapshot)
+        NSOIntentOutboxEntry.objects.create(
+            device=self.device, scope="vlan", batch_id=1, transitions=[], consumed_by_push_seq=held
+        )
+        self._rewind_sequence(held)
+
+        outcome = drain.resolve_restored_claim(self.device.pk, "vlan", {"accepted_push_seq": accepted})
+
+        assert outcome == drain.RESTORE_REBASED
+        assert [row.consumed_by_push_seq for row in entries(self.device, "vlan")] == [None], "the rows refold"
+        assert self.drain("vlan") == drain.SUCCEEDED, "a rebased key allocates above the watermark, or never sends"
+        assert self.adapter.sequences[-1] > accepted
+
+    def test_the_advance_never_moves_the_sequence_backwards(self):
+        """A restore rebases every key it holds, and their watermarks are not in order."""
+        from netbox_nso_plugin.outbox import advance_push_seq, allocate_push_seq
+
+        highest = allocate_push_seq() + 500
+
+        assert advance_push_seq(highest) == highest
+        assert advance_push_seq(highest - 100) == highest, "a later key's lower watermark cannot pull it back"
+        assert allocate_push_seq() == highest + 1

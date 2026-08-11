@@ -36,7 +36,14 @@ import time
 from django.db import IntegrityError, OperationalError, connection, transaction
 
 from . import delivery
-from .outbox import OP_REVOKE, allocate_push_seq, fold_transitions, reduce_transitions, triple_of
+from .outbox import (
+    OP_REVOKE,
+    advance_push_seq,
+    allocate_push_seq,
+    fold_transitions,
+    reduce_transitions,
+    triple_of,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1431,6 +1438,9 @@ def resolve_restored_claim(device_id, scope, receipt) -> str:
             # The restored database is behind the adapter: preserve the authority, return
             # the rows to unconsumed so a later claim refolds them, and allocate above the
             # watermark. Revoked ids stay revoked — a re-ownership outlives the snapshot.
+            # The sequence moves FIRST: a rebase that requeued the work under a rewound
+            # sequence would hand the next claim a stale id the adapter refuses forever.
+            advance_push_seq(int(accepted))
             revoked = {int(route_id) for route_id in state.revoked_ids or []}
             queued = {int(record["route_id"]): record for record in state.queued_deletions}
             for record in state.claim_deletions or []:
