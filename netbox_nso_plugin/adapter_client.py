@@ -9,6 +9,7 @@ Config resolution (per call, ~30 s in-process cache):
 
 import contextvars
 import logging
+import socket
 import threading
 import time
 from contextlib import contextmanager
@@ -121,10 +122,73 @@ _session_cls = None
 _bound_session = contextvars.ContextVar("nso_bound_session", default=None)
 
 
-def new_session():
-    """Build one session configured like the pooled one, for a caller that owns its lifetime."""
+class AbortableTransport(requests.adapters.HTTPAdapter):
+    """An HTTP transport that can end the requests it has in flight (#1503 O-P16).
+
+    ``Session.close()`` empties the connection pool and nothing else: a connection a worker
+    already borrowed is not in the pool, so a thread blocked on a dripping response never
+    notices. Only the socket ends that read, so this remembers the connection each request
+    checked out and shuts its socket down on demand.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._lock = threading.Lock()
+        self._live: set = set()
+        self._instrumented: set = set()
+        super().__init__(*args, **kwargs)
+
+    def get_connection_with_tls_context(self, request, verify, proxies=None, cert=None):
+        """Return the pool this request will use, instrumented to record its connections."""
+        pool = super().get_connection_with_tls_context(request, verify, proxies=proxies, cert=cert)
+        with self._lock:
+            fresh = id(pool) not in self._instrumented
+            self._instrumented.add(id(pool))
+        return self._instrument(pool) if fresh else pool
+
+    def _instrument(self, pool):
+        """Wrap the pool's checkout and release, which is where a connection is identifiable."""
+        checkout, release = pool._get_conn, pool._put_conn
+
+        def _get_conn(timeout=None):
+            conn = checkout(timeout)
+            with self._lock:
+                self._live.add(conn)
+            return conn
+
+        def _put_conn(conn):
+            with self._lock:
+                self._live.discard(conn)
+            return release(conn)
+
+        pool._get_conn, pool._put_conn = _get_conn, _put_conn
+        return pool
+
+    def abort(self) -> None:
+        """Shut down the socket of every request in flight, so its reader comes back."""
+        with self._lock:
+            live = list(self._live)
+        for conn in live:
+            sock = conn.sock
+            if sock is None:
+                continue
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:  # already gone: the request finished or the far side closed first
+                pass
+            sock.close()
+
+
+def new_session(transport=None):
+    """Build one session configured like the pooled one, for a caller that owns its lifetime.
+
+    *transport* is mounted for both schemes when given, which is how a caller that must be
+    able to abort its own request gets a handle on the connection it is using.
+    """
     session = requests.Session()
     session.trust_env = False  # Adapter is always internal — never route through system proxy.
+    if transport is not None:
+        session.mount("http://", transport)
+        session.mount("https://", transport)
     return session
 
 

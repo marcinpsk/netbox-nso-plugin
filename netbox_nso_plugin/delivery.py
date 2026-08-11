@@ -156,9 +156,10 @@ def _under_deadline(do_push: Callable, seconds: float) -> Callable:
 
     ``(connect, read)`` measures the gap between bytes, so a response dripping one byte at
     a time resets it forever. The call therefore runs on its own thread, on a session of its
-    OWN: an expired deadline closes that session, urllib3 aborts the request under the worker
-    and the thread and its socket go with it. Abandoning the thread instead leaked one thread
-    and one connection per retry, for as long as the far side felt like dripping.
+    OWN, over a transport it can ABORT: an expired deadline shuts the in-flight socket down,
+    the worker's read comes back and the thread goes with it. Closing the session is not
+    enough — that empties the pool and leaves the borrowed connection exactly where it was,
+    so the thread and the socket outlived every retry against a far side that kept dripping.
 
     The waiter's verdict is final. A completion that arrives after the budget ran out is
     discarded, never applied: the attempt has been recorded failed and the operation is
@@ -168,7 +169,8 @@ def _under_deadline(do_push: Callable, seconds: float) -> Callable:
     def _call(body):
         from . import adapter_client
 
-        session = adapter_client.new_session()
+        transport = adapter_client.AbortableTransport()
+        session = adapter_client.new_session(transport=transport)
         with adapter_client.bound_session(session):
             # Copied while the session is bound, so the worker sends on the transport the
             # waiter can close under it.
@@ -195,6 +197,7 @@ def _under_deadline(do_push: Callable, seconds: float) -> Callable:
         threading.Thread(target=_run, name="nso-intent-push", daemon=True).start()
         if not done.wait(seconds):
             expired.set()
+            transport.abort()
             session.close()
             raise SendDeadlineExceeded(f"the adapter did not answer within {seconds}s")
         if "error" in answer:

@@ -17,11 +17,8 @@ import dataclasses
 import hashlib
 import json
 import re
-import threading
-import time
 from unittest.mock import MagicMock, patch
 
-import requests
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 
 from ._adapter_http import _REAL_SESSION, make_response
@@ -261,15 +258,6 @@ class ReceiptAdapter:
         self.fail_with: Exception | None = None
         #: Adapter device ids whose every request fails, for the replayably failing key.
         self.fail_devices: set[int] = set()
-        #: Seconds a response takes to arrive. It models a DRIPPING response: the client's
-        #: read window measures the gap between bytes, so it never fires on one.
-        self.delay = 0.0
-        #: Sessions whose ``close()`` was called, in call order.
-        self.closed: list[object] = []
-        #: When set, a delayed response IGNORES the close and answers anyway: the completion
-        #: that was already on the wire when the transport went, which the waiter's verdict
-        #: has to discard rather than apply.
-        self.ignores_close = False
         #: Per adapter device id: what the device carries, and what it no longer owns.
         self.on_device: dict[int, set] = {}
         self.detached: dict[int, set] = {}
@@ -304,19 +292,13 @@ class ReceiptAdapter:
     def session(self):
         """A ``spec=requests.Session`` stand-in whose ``request`` runs the admission.
 
-        ``close()`` ABORTS a request in flight, which is what urllib3 does when the socket
-        goes out from under it: the deadline needs a transport it can cut off, so a double
-        that slept through the close would prove the opposite of what it was asked.
+        It models admission and nothing about the transport. In particular ``close()`` does
+        NOT abort a request in flight, because the real one does not either: it empties the
+        connection pool and leaves a borrowed connection alone. The deadline's abort is
+        pinned against a real socket instead (``test_intent_outbox_deadline``).
         """
         session = MagicMock(spec=_REAL_SESSION)
-        closed = threading.Event()
-
-        def _close():
-            self.closed.append(session)
-            closed.set()
-
-        session.close.side_effect = _close
-        session.request.side_effect = lambda *args, **kwargs: self._handle(*args, closed=closed, **kwargs)
+        session.request.side_effect = self._handle
         return session
 
     def patches(self):
@@ -330,13 +312,7 @@ class ReceiptAdapter:
             patch("netbox_nso_plugin.adapter_client.requests.Session", side_effect=self.session),
         )
 
-    def _handle(self, method, url, closed=None, **kwargs):
-        if self.delay:
-            aborted = closed is not None and closed.wait(self.delay)
-            if aborted and not self.ignores_close:
-                raise requests.exceptions.ConnectionError(f"the transport closed under {url}")
-            if not aborted and closed is None:
-                time.sleep(self.delay)
+    def _handle(self, method, url, **kwargs):
         if self.fail_with is not None:
             raise self.fail_with
         if any(f"/devices/{device_id}/" in url for device_id in self.fail_devices):
