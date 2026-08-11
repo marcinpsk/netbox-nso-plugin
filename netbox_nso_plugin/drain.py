@@ -910,13 +910,28 @@ def _drain_once(device_id, scope, *, mode, force, chain=DRAIN_CHAIN_MAX, reform=
     if answer in (PARKED, ABANDONED):
         return answer, None
     outcome = settle(claimed, answer)
-    chainable = chain > 0 and mode != delivery.MODE_BACKFILL_ONLY
-    if outcome == SUCCEEDED and chainable and _pending(device_id, scope):
-        # Level-triggered, and terminating: each successful pass retires at least one row or
-        # clears authority. A backfill consumes nothing, so a caller who asked for one gets
-        # one; the cap is for latency, and the tick guarantees the rest.
-        _drain_once(device_id, scope, mode=mode, force=False, chain=chain - 1)
+    if outcome == SUCCEEDED and chain > 0:
+        if _answered_other_work(claimed, mode, force):
+            # §4.2: the takeover resolved the OUTSTANDING operation, at the body and mode it
+            # was admitted under. This call's own mode and force are still owed, so it forms
+            # its own claim now that the key is free to allocate one.
+            return _drain_once(device_id, scope, mode=mode, force=force, chain=chain - 1)
+        if mode != delivery.MODE_BACKFILL_ONLY and _pending(device_id, scope):
+            # Level-triggered, and terminating: each successful pass retires at least one row
+            # or clears authority. A backfill consumes nothing, so a caller who asked for one
+            # gets one; the cap is for latency, and the tick guarantees the rest.
+            _drain_once(device_id, scope, mode=mode, force=False, chain=chain - 1)
     return outcome, answer
+
+
+def _answered_other_work(claim: Claim, mode, force) -> bool:
+    """Whether the settled claim was a replay of an operation this call did not ask for.
+
+    A takeover replays the unacknowledged operation with the body, the authority and the
+    mode it was admitted under, so it can never be the answer to a call that asked for a
+    different mode or forced an operation of its own (§4.2, request mode is per call).
+    """
+    return claim.replayed and (force or claim.mode != mode)
 
 
 def _withheld_mode(device_id, scope, mode) -> str:

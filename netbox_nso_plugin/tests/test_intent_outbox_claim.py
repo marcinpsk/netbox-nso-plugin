@@ -262,6 +262,67 @@ class TestOutcomeCasRefusesASupersededAttempt(_ClaimCase):
         assert [e.consumed_by_push_seq for e in entries(self.device, "vlan")] == [second.push_seq]
 
 
+class TestAForcedCallFormsItsOwnClaim(_ClaimCase):
+    """Codex O1 F2 (§4.2): outstanding work resolves first, then THIS call's mode is owed."""
+
+    tag = "mode"
+    adapter_device_id = 7508
+
+    def _stale_unacknowledged_claim(self, scope="vlan"):
+        """Leave the key holding an operation the adapter never answered."""
+        from netbox_nso_plugin import drain
+
+        self.adapter.fail_with = ConnectionError("adapter down")
+        assert self.drain(scope) == drain.FAILED
+        self.adapter.fail_with = None
+        return state_of(self.device, scope).push_seq
+
+    def test_a_store_only_call_is_never_answered_by_a_normal_replay(self):
+        from netbox_nso_plugin import delivery, drain
+
+        own_vlan(self.mgmt, 875, self.tag)
+        stale = self._stale_unacknowledged_claim()
+
+        config, session = self.adapter.patches()
+        with config, session:
+            answer = drain.push_now(self.device.pk, "vlan", mode=delivery.MODE_STORE_ONLY, force=True)
+
+        assert answer is not None
+        assert self.adapter.requests[-1]["params"].get("store_only") == "true", (
+            "the store-only request went out as a normal push, so the adapter enqueued the shrink removal"
+        )
+        assert self.adapter.sequences[0] == stale, "the outstanding operation is replayed at its own sequence"
+        assert self.adapter.sequences[-1] > stale, "and this call then takes one of its own"
+
+    def test_a_forced_call_sends_what_it_renders_now_not_the_stale_body(self):
+        from netbox_nso_plugin import drain
+
+        state = own_vlan(self.mgmt, 876, self.tag)
+        self._stale_unacknowledged_claim()
+
+        with without_commit_drain(), transaction.atomic():
+            state.vlan.name = "cl-mode-renamed"
+            state.vlan.save()
+
+        config, session = self.adapter.patches()
+        with config, session:
+            assert drain.push_now(self.device.pk, "vlan", force=True) is not None
+
+        assert "cl-mode-renamed" in str(self.adapter.requests[-1]["body"]), self.adapter.requests[-1]["body"]
+        assert state_of(self.device, "vlan").push_seq is None, "both operations are resolved"
+
+    def test_an_ordinary_drain_is_still_answered_by_the_replay_alone(self):
+        """The re-entry belongs to a call whose mode differs; it must not fire on every takeover."""
+        from netbox_nso_plugin import drain
+
+        own_vlan(self.mgmt, 877, self.tag)
+        stale = self._stale_unacknowledged_claim()
+
+        assert self.drain() == drain.SUCCEEDED
+
+        assert self.adapter.sequences == [stale]
+
+
 class TestUnmanagedClaimIsParked(_ClaimCase):
     """O1.13 (R11-m1): unmanaging is not a third abandon cause; the claim simply waits."""
 

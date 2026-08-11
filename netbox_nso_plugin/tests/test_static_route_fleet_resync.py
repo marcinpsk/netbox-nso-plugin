@@ -429,6 +429,38 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         )
         assert (mgmt.intent_push_attempts or {}).get("static_route") == 1, "the attempt mark was rewound"
 
+    def test_a_stale_unacknowledged_claim_does_not_answer_the_resync(self):
+        """Codex O1 F2 (§4.2) — the forced call forms its own claim, with its own body.
+
+        A takeover replays the operation the adapter never answered, at ITS body and ITS
+        mode. Answering the resync with that replay reports a device backfilled while the
+        generations this pass armed were never on the wire and no result can settle them.
+        """
+        from netbox_nso_plugin import adapter_client, drain
+        from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet
+        from netbox_nso_plugin.intent_generation import UNALLOCATED
+
+        _, mgmt = self._managed_device("staleclaim", 8108)
+        row = self._own_route(mgmt, "10.81.0.0/16", "10.0.0.82")
+        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", side_effect=ConnectionError("down")):
+            assert drain.drain_key(mgmt.device_id, "static_route") == drain.FAILED
+        sent: list[dict] = []
+
+        def _record(adapter_device_id, routes):
+            sent.append({"routes": routes, "store_only": adapter_client._store_only_push.get()})
+            return {"device_id": adapter_device_id, "count": len(routes), "routes": []}
+
+        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", side_effect=_record):
+            results = resync_static_route_intent_fleet()
+
+        row.refresh_from_db()
+        assert results[0]["ok"] is True
+        assert row.intent_generation > UNALLOCATED
+        assert sent[-1]["store_only"] is True, "the resync repairs the mirror, so it may never enqueue a job"
+        assert sent[-1]["routes"][0]["generation"] == row.intent_generation, (
+            "the resync was answered by the replay of the stale claim, so the armed generation never went out"
+        )
+
     def test_a_concurrent_edit_during_the_push_survives_the_restore(self):
         """Codex O1 F4 — the restore is a compare-and-set on the generation this pass armed.
 
