@@ -425,3 +425,105 @@ class TestTheBaselineIsBoundToTheAdapterMapping(_ClaimCase):
 
         assert self.drain() == drain.SUCCEEDED
         assert len(self.adapter.requests) == sent + 1
+
+
+def _read_state(incarnation, born):
+    """One wire ``read_state`` block (D3 shape), carrying no source epoch.
+
+    A source epoch would fence the observation on its own ratchet and return before the
+    incarnation pair is read at all, which is not the transition these pins are about.
+    """
+    return {
+        "outcome": "present",
+        "reason": None,
+        "freshness": "fresh",
+        "result": "replaced",
+        "succeeded": True,
+        "read_at": "2026-07-21T10:00:00Z",
+        "attempt_id": 1,
+        "incarnation": incarnation,
+        "incarnation_born": born,
+        "source_epoch": None,
+        "payload_revision": 1,
+    }
+
+
+class TestTheBaselineSeesARebuiltStoreBeforeAnythingAdoptsIt(_ClaimCase):
+    """codex O1 gate (O-P22, second arm): the epoch may not wait for the read gate to adopt.
+
+    ``adapter_incarnation`` is written only where a gated read publication ADOPTS the new
+    pair, and a store rebuilt under the same numeric device id changes nothing else the
+    management row carries. An epoch read from the adopted field alone is therefore the dead
+    store's for the whole adoption window: an unchanged save draining in it matches the
+    acknowledged baseline, is retired without a request, and nothing re-enqueues it, so the
+    new store never receives the intent it owns. The row already records the observed pair,
+    and that record moves first.
+    """
+
+    tag = "window"
+    adapter_device_id = 7507
+
+    inc_a = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+    born_a = "2026-07-01T00:00:10Z"
+    inc_b = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"
+    born_b = "2026-07-01T00:00:20Z"
+
+    def setUp(self):
+        super().setUp()
+        from django.utils.dateparse import parse_datetime
+
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        # An adopted store to be rebuilt from: the tab observes nothing without one.
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(
+            adapter_incarnation=self.inc_a, adapter_incarnation_born=parse_datetime(self.born_a)
+        )
+        self.mgmt.refresh_from_db()
+
+    def _observe(self, incarnation, born):
+        """Record the tab's own observation of a store the read gate has not adopted."""
+        from netbox_nso_plugin.read_gate import observe_aggregate
+
+        observe_aggregate(self.mgmt, {"vlan": _read_state(incarnation, born)}, epoch=self.adapter_device_id)
+        self.mgmt.refresh_from_db()
+
+    def test_an_unchanged_save_sends_to_the_store_the_tab_has_only_observed(self):
+        from netbox_nso_plugin import drain
+
+        overlay = own_vlan(self.mgmt, 862, self.tag)
+        assert self.drain() == drain.SUCCEEDED
+        sent = len(self.adapter.requests)
+
+        self._observe(self.inc_b, self.born_b)
+        assert self.mgmt.adapter_incarnation == self.inc_a, "the publication has not adopted the rebuilt store"
+        assert self.mgmt.reset_pending_incarnation == self.inc_b
+
+        with without_commit_drain(), transaction.atomic():
+            overlay.save()
+
+        assert self.drain() == drain.SUCCEEDED, "the rebuilt store has never been sent this intent"
+        assert len(self.adapter.requests) == sent + 1
+        assert entries(self.device, "vlan") == []
+
+    def test_a_pair_the_gate_may_never_adopt_still_moves_the_epoch(self):
+        """Equal born, different UUID: a durable conflict the gate refuses to adopt, for good.
+
+        This is the case an adoption-gated epoch can never reach — the store is provably not
+        the one that acknowledged the baseline, and the field that would say so never moves.
+        """
+        from netbox_nso_plugin import drain
+
+        overlay = own_vlan(self.mgmt, 863, self.tag)
+        assert self.drain() == drain.SUCCEEDED
+        sent = len(self.adapter.requests)
+
+        self._observe(self.inc_b, self.born_a)
+        assert self.mgmt.adapter_incarnation == self.inc_a, "an ambiguous pair is never adopted"
+        assert self.mgmt.reset_conflict_born is not None
+        assert self.mgmt.reset_pending_incarnation == self.inc_b
+
+        with without_commit_drain(), transaction.atomic():
+            overlay.save()
+
+        assert self.drain() == drain.SUCCEEDED
+        assert len(self.adapter.requests) == sent + 1

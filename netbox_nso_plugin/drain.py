@@ -268,8 +268,16 @@ def mapping_epoch(mgmt) -> tuple:
     Appendix S's own epoch (``models.py``: the settlement cursor), for the same two events: a
     remapped device id and a rebuilt store both leave the far side holding nothing the
     acknowledged baseline can speak for.
+
+    The OBSERVED incarnation is read ahead of the adopted one, because ``adapter_incarnation``
+    is written only where a gated read publication adopts the new pair. A store rebuilt under
+    the same numeric device id changes nothing else the row carries, so an epoch taken from the
+    adopted field alone stays the dead store's for the whole adoption window: an unchanged save
+    draining there matches the baseline, is retired with no request, and nothing re-enqueues
+    it. The observed marker is the same fact recorded earlier — and it is the only one recorded
+    at all for a pair the gate refuses to adopt, which an equal-born rebuild leaves forever.
     """
-    return (mgmt.adapter_device_id, mgmt.adapter_incarnation or "")
+    return (mgmt.adapter_device_id, mgmt.reset_pending_incarnation or mgmt.adapter_incarnation or "")
 
 
 def wire_digest(body) -> str:
