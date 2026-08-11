@@ -12,6 +12,8 @@ from utilities.testing import APITestCase
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
 
+from ._settlement_case import _AdapterDoubleMixin, _make_mgmt
+
 
 def _make_device(name="rec-dev"):
     mfg = Manufacturer.objects.create(name=f"{name}-mfg", slug=f"{name}-mfg")
@@ -359,6 +361,129 @@ class TestEscalateStuckDeploying(APITestCase):
             reconcile.run_device_reconcile(mgmt.device_id)
         row.refresh_from_db()
         self.assertEqual(row.status, "deploying")
+
+
+def _repair_link_during_settlement(mgmt_pk: int, new_adapter_device_id: int | None):
+    """Commit a link repair inside Step 4's ``settle_static_routes`` call.
+
+    That call locks the management row and resolves its **own** adapter device id, so the
+    repair is what it consumes — while Step 4 read its job state before the call.
+    """
+    from netbox_nso_plugin import settlement
+
+    real_settle = settlement.settle_static_routes
+
+    def repair_then_settle(mgmt, **kwargs):
+        NSODeviceManagement.objects.filter(pk=mgmt_pk).update(adapter_device_id=new_adapter_device_id)
+        return real_settle(mgmt, **kwargs)
+
+    return patch.object(settlement, "settle_static_routes", repair_then_settle)
+
+
+class TestStepFourRereadsTheRepairedDevice(_AdapterDoubleMixin, TestCase):
+    """Step 4's later helpers must judge the adapter device the settlement consumed.
+
+    ``settle_static_routes`` resolves its adapter device id from the row it LOCKS, so a link
+    repair that commits in that window is what it settles for. The failure settle, the
+    stuck-deploying escalation and the apply journal run after it — handed the job state read
+    BEFORE it, they judge this device's rows by another device's apply.
+    """
+
+    def _setup(self, tag, adapter_device_id):
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
+
+        device = _make_device(tag)
+        mgmt = _make_mgmt(device, tag, adapter_device_id)
+        vlan = VLAN.objects.create(group=_device_vlan_group(device), vid=303, name="V303")
+        row = NSOVLANState.objects.create(management=mgmt, vlan=vlan, device_name="V303", status="deploying")
+        return mgmt, row
+
+    @staticmethod
+    def _aged(job, minutes=30):
+        """Age one of the double's jobs past the stuck-deploying grace, in the adapter's wire format."""
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        job["updated_at"] = (timezone.now() - timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+        return job
+
+    def _reconcile(self, mgmt, new_adapter_device_id):
+        from netbox_nso_plugin import reconcile
+
+        with (
+            patch.object(reconcile, "reconcile_device", return_value={}),
+            _repair_link_during_settlement(mgmt.pk, new_adapter_device_id),
+        ):
+            reconcile.run_device_reconcile(mgmt.device_id)
+
+    def test_the_escalation_stands_down_when_the_repaired_device_is_mid_apply(self):
+        """Escalating a row whose device is mid-apply is unrecoverable: that apply's own
+        in_sync cannot lift a row back out of apply_failed."""
+        mgmt, row = self._setup("rec-repair-active", 70)
+        # 70's last apply succeeded long ago, which is an escalation verdict; 71 is mid-apply.
+        self._aged(
+            self.adapter.store.terminal_job(70, extra={"vlan_count_by_outcome": {"in_sync": 1, "apply_failed": 0}})
+        )
+        self.adapter.store.queued_job(71)
+
+        self._reconcile(mgmt, 71)
+
+        self.assertEqual(self.adapter.store.feed_requests[0][0], 71, "the settlement did not consume the repair")
+        row.refresh_from_db()
+        self.assertEqual(
+            row.status,
+            "deploying",
+            "the escalation stood on adapter device 70's job and failed a row that now belongs "
+            "to 71, where an apply is in flight",
+        )
+
+    def test_the_failure_settle_and_the_journal_read_the_repaired_devices_job(self):
+        mgmt, row = self._setup("rec-repair-job", 72)
+        # 72's apply failed the VLAN scope; 73's succeeded and carried route-policy only.
+        self._aged(
+            self.adapter.store.terminal_job(
+                72, status="failed", extra={"vlan_count_by_outcome": {"in_sync": 0, "apply_failed": 1}}
+            )
+        )
+        repaired = self._aged(
+            self.adapter.store.terminal_job(
+                73, extra={"route_policy_count_by_outcome": {"in_sync": 2, "apply_failed": 0}}
+            )
+        )
+
+        self._reconcile(mgmt, 73)
+
+        self.assertEqual(self.adapter.store.feed_requests[0][0], 73, "the settlement did not consume the repair")
+        row.refresh_from_db()
+        mgmt.refresh_from_db()
+        self.assertEqual(
+            row.status, "deploying", "adapter device 72's failed apply settled a row that now belongs to 73"
+        )
+        self.assertEqual(
+            mgmt.last_journaled_apply_job,
+            repaired["id"],
+            "the apply journal recorded adapter device 72's job for a device that now holds 73",
+        )
+
+    def test_an_unlinked_device_is_not_judged_by_the_id_it_held(self):
+        """The repair's other branch: the row loses its adapter device id entirely. There is
+        no apply to judge it by, so the helpers must skip it exactly as the outer guard does."""
+        mgmt, row = self._setup("rec-repair-unlinked", 74)
+        self._aged(
+            self.adapter.store.terminal_job(74, extra={"vlan_count_by_outcome": {"in_sync": 1, "apply_failed": 0}})
+        )
+
+        self._reconcile(mgmt, None)
+
+        row.refresh_from_db()
+        mgmt.refresh_from_db()
+        self.assertIsNone(mgmt.adapter_device_id, "the repair did not land, so this proves nothing")
+        self.assertEqual(row.status, "deploying", "an unlinked device was judged by adapter device 74's job")
+        self.assertFalse(mgmt.last_journaled_apply_job, "and its apply was journaled onto the unlinked device")
 
 
 class TestStaticRouteApplySettle(APITestCase):
