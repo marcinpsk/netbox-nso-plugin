@@ -2795,14 +2795,19 @@ class NSOIntentOutboxState(models.Model):
     claim_payload = models.JSONField(null=True, blank=True)
     claim_deletions = models.JSONField(default=list, blank=True)
     claim_flags = models.JSONField(default=dict, blank=True)
-    claim_digest = models.CharField(max_length=64, blank=True, default="")
+    # Two digests, two jobs. The wire one is of the exact body sent and is the only value the
+    # adapter's receipt digest can be compared against; the identity also carries the mode,
+    # the authority and the legacy flag, which no body does, and is what an unchanged claim
+    # drops against.
+    claim_wire_digest = models.CharField(max_length=64, blank=True, default="")
+    claim_identity = models.CharField(max_length=64, blank=True, default="")
     # The legacy flag actually sent (``query_flag`` scopes), the AND of the folded
     # contributors' ``mark_and`` values. Not a run identifier: there are no runs.
     claim_mark = models.BooleanField(null=True, blank=True)
     # ``{route_id: last_acked_triple}`` — one triple per pk, carried across a revoked
     # deletion so a re-ownership of that pk inherits the only history that can matter.
     lineage_carry = models.JSONField(default=dict, blank=True)
-    last_success_digest = models.CharField(max_length=64, blank=True, default="")
+    last_success_identity = models.CharField(max_length=64, blank=True, default="")
     last_success_at = models.DateTimeField(null=True, blank=True)
     attempts = models.IntegerField(default=0)
     # Stamped on EVERY drain attempt, success or failure: the fair-selection cursor.

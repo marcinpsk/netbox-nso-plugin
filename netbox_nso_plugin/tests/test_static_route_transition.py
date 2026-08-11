@@ -353,7 +353,7 @@ class TestStaticRouteBulkAcceptOutsideATransaction(_CascadeFlushMixin, IntentPus
         mine = [request for request in adapter.requests if "/devices/8821/" in request["url"]]
         assert len(mine) == 1, mine
         assert mine[0]["push_seq"] is not None, "the bulk accept reached the adapter outside the protocol"
-        assert state_of(self.device, "static_route").last_success_digest != ""
+        assert state_of(self.device, "static_route").last_success_identity != ""
         assert entries(self.device, "static_route") == []
 
     def test_no_observer_ever_sees_an_accepted_row_still_on_its_old_generation(self):

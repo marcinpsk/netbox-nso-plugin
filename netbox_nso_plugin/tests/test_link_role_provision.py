@@ -229,7 +229,7 @@ class TestProvisionForcePush(_CascadeFlushMixin, IntentPushResetMixin, Transacti
     was dropped while the local overlay still flipped to accepted.
 
     It runs the real claim, which is why there is no test transaction: the drop this is about
-    is the claim's own, against ``last_success_digest``, and a forced call refuses to nest.
+    is the claim's own, against ``last_success_identity``, and a forced call refuses to nest.
     """
 
     def setUp(self):

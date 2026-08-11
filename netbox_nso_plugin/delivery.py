@@ -145,6 +145,23 @@ def render(key: str, device_id, adapter_device_id) -> Rendered:
     return sink[0]
 
 
+def wire_body(rendered: Rendered, body):
+    """Return the exact JSON body the client would send for *body*, without sending it.
+
+    The identity the adapter's receipt carries is over the body it received (§4.4), and the
+    envelope each endpoint wraps a payload in (``{"vlans": …}``, ``{"routes": …}``) belongs
+    to the client. So the body is taken by running the same call under a capture rather than
+    by re-deriving the envelope here, where the two definitions could drift apart.
+    """
+    from . import adapter_client
+
+    with adapter_client.capture_wire_body() as captured:
+        rendered.do_push(body)
+    if len(captured) != 1:
+        raise RuntimeError(f"the {rendered.key[1]} push made {len(captured)} requests, expected exactly one")
+    return captured[0]
+
+
 class SendDeadlineExceeded(Exception):
     """One send outlived its total wall-clock budget (O-P16)."""
 

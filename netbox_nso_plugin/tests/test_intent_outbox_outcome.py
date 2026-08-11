@@ -200,7 +200,7 @@ class TestAResponseMustPartitionTheClaim(_OutcomeCase):
                     state = state_of(self.device, "static_route")
                     assert state.push_seq == claimed.push_seq, "the operation is unresolved, not settled"
                     assert state.last_error_code == "ack_not_exact"
-                    assert state.last_success_digest == ""
+                    assert state.last_success_identity == ""
 
     def test_the_restore_same_sequence_arm_runs_the_identical_check(self):
         from netbox_nso_plugin import drain
@@ -210,7 +210,7 @@ class TestAResponseMustPartitionTheClaim(_OutcomeCase):
         contradiction = partition(executed=[first.pk], degraded=[first.pk], moot=[second.pk])
         receipt = {
             "accepted_push_seq": claimed.push_seq,
-            "request_digest": state.claim_digest,
+            "request_digest": state.claim_wire_digest,
             "stored_response": contradiction,
         }
         with as_per_object("static_route"):
@@ -767,3 +767,64 @@ class TestTheFenceWithholdsEverySendButTheBackfill(_OutcomeCase):
         )
         assert recorded[0]["triples"] == [residue]
         assert recorded[0]["reason"] == drain.PRE_FENCE_DETACH
+
+
+class TestARestoredClaimSettlesAgainstTheReceiptsOwnDigest(_OutcomeCase):
+    """codex O1 r4 F4 (§4.4): the receipt digests the BODY the adapter received, nothing else.
+
+    A restored database holds an operation whose response was lost, and the same-sequence
+    arm is the only thing that can resolve it without re-sending. It compares the receipt's
+    digest against the one the claim persisted, so the two must be the same function of the
+    same bytes: an identity over plugin-internal material could never match, and the restore
+    failed closed for every key it was asked about.
+    """
+
+    tag = "rest"
+    adapter_device_id = 7711
+
+    def _lost_response(self, scope="vlan"):
+        """Send one claim and drop its answer, which is the state a restore inherits."""
+        from netbox_nso_plugin import drain
+
+        claimed = drain.claim(self.device.pk, scope)
+        config, session = self.adapter.patches()
+        with config, session:
+            drain.send_claim(claimed)
+        return claimed
+
+    def _receipt(self) -> dict:
+        """What ``GET /api/v1/intent-receipts`` returns, built from the far side's own record."""
+        [stored] = self.adapter.receipts.values()
+        return {
+            "accepted_push_seq": stored["push_seq"],
+            "request_digest": stored["digest"],
+            "stored_response": stored["response"],
+        }
+
+    def test_a_same_sequence_receipt_settles_the_restored_claim(self):
+        from netbox_nso_plugin import drain
+
+        own_vlan(self.mgmt, 910, self.tag)
+        claimed = self._lost_response()
+        receipt = self._receipt()
+        assert receipt["accepted_push_seq"] == claimed.push_seq
+
+        assert drain.resolve_restored_claim(self.device.pk, "vlan", receipt) == drain.RESTORE_SETTLED, (
+            "the restore compared the adapter's body digest against plugin-internal material, "
+            "so a matching receipt could never match and every restore failed closed"
+        )
+
+        state = state_of(self.device, "vlan")
+        assert state.push_seq is None, "the operation is resolved, so the key can allocate again"
+        assert entries(self.device, "vlan") == []
+
+    def test_a_receipt_naming_another_body_still_fails_closed(self):
+        """The arm is a real check: only the body the adapter accepted settles the claim."""
+        from netbox_nso_plugin import drain
+
+        own_vlan(self.mgmt, 911, self.tag)
+        claimed = self._lost_response()
+        receipt = {**self._receipt(), "request_digest": "f" * 64}
+
+        assert drain.resolve_restored_claim(self.device.pk, "vlan", receipt) == drain.RESTORE_FAILED_CLOSED
+        assert state_of(self.device, "vlan").push_seq == claimed.push_seq

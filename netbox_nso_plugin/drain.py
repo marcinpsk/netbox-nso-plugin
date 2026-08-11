@@ -117,7 +117,10 @@ class Claim:
     adapter_device_id: int
     push_seq: int
     payload: object
-    digest: str
+    #: Of the exact body sent: the only value an adapter receipt's digest can answer.
+    wire_digest: str
+    #: Plugin-side, mode-bearing: the acknowledged baseline an unchanged claim drops against.
+    identity: str
     deletions: list
     mark: bool | None
     mark_any: bool
@@ -217,20 +220,38 @@ def _work_pending(state) -> bool:
     )
 
 
-def request_digest(payload, *, mode, deletions, mark) -> str:
+def request_identity(payload, *, mode, deletions, mark) -> str:
     """Return the identity of one request: its body, its mode, its authority, its legacy flag.
 
-    Two claims with the same digest are the same operation, which is what lets an unchanged
-    save be dropped against the acknowledged baseline instead of re-sent.
+    Two claims with the same identity are the same operation, which is what lets an unchanged
+    save be dropped against the acknowledged baseline instead of re-sent. It is a PLUGIN-side
+    fact and never leaves the plugin: the mode and the mark ride as query flags, so a body
+    delivered store-only and the same body delivered normally are one wire digest and two
+    identities, and dropping the second against the first would lose the delivery.
     """
     material = {
         "payload": payload,
         "mode": mode,
         "deletions": sorted(int(record["route_id"]) for record in deletions),
         # The flag as the wire carries it: no contributors and unmarked contributors are one
-        # request, so they must be one digest or an unchanged save re-sends forever.
+        # request, so they must be one identity or an unchanged save re-sends forever.
         "mark": bool(mark),
     }
+    return _sha256(material)
+
+
+def wire_digest(body) -> str:
+    """Return the digest of the exact JSON body sent, which is what the receipt names (§4.4).
+
+    The adapter computes its ``request_digest`` from the raw body it received, so this is
+    the only value a receipt's digest can be compared against. The claim persists it, because
+    a restore resolves an operation whose response was lost and has nothing to re-render it
+    from that the far side would agree with.
+    """
+    return _sha256(body)
+
+
+def _sha256(material) -> str:
     return hashlib.sha256(json.dumps(material, sort_keys=True, default=str).encode()).hexdigest()
 
 
@@ -296,7 +317,8 @@ def _takeover(state, mgmt, now) -> Claim:
         adapter_device_id=mgmt.adapter_device_id,
         push_seq=state.push_seq,
         payload=state.claim_payload,
-        digest=state.claim_digest,
+        wire_digest=state.claim_wire_digest,
+        identity=state.claim_identity,
         deletions=list(state.claim_deletions or []),
         mark=state.claim_mark,
         mark_any=bool(flags.get("mark_any")),
@@ -333,11 +355,11 @@ def _form(state, mgmt, now, mode, force) -> Claim | None:
         return _form_store_only(state, mgmt, now, deletions, untracked, force)
 
     rendered = delivery.render(scope, device_id, mgmt.adapter_device_id)
-    digest = request_digest(rendered.payload, mode=mode, deletions=deletions, mark=mark)
+    identity = request_identity(rendered.payload, mode=mode, deletions=deletions, mark=mark)
 
     state.revoked_ids = sorted(folded.revoked)
     state.lineage_carry = folded.lineage_carry
-    if not force and not deletions and digest == state.last_success_digest:
+    if not force and not deletions and identity == state.last_success_identity:
         # Nothing changed and nothing is owed. The rows are retired here because this path
         # has no outcome transaction, and rows nobody retires would hold the deployment gate
         # shut forever while no-op history grew.
@@ -352,7 +374,8 @@ def _form(state, mgmt, now, mode, force) -> Claim | None:
     state.push_seq = push_seq
     state.claimed_at = now
     state.claim_payload = rendered.payload
-    state.claim_digest = digest
+    state.claim_wire_digest = wire_digest(delivery.wire_body(rendered, rendered.payload))
+    state.claim_identity = identity
     state.claim_deletions = deletions
     state.claim_mark = mark
     state.claim_flags = {"mode": mode, "mark_any": mark_any, "force": bool(force)}
@@ -364,7 +387,8 @@ def _form(state, mgmt, now, mode, force) -> Claim | None:
         adapter_device_id=mgmt.adapter_device_id,
         push_seq=push_seq,
         payload=rendered.payload,
-        digest=digest,
+        wire_digest=state.claim_wire_digest,
+        identity=identity,
         deletions=deletions,
         mark=mark,
         mark_any=mark_any,
@@ -400,7 +424,8 @@ def _form_store_only(state, mgmt, now, deletions, untracked_mark, force) -> Clai
     state.push_seq = push_seq
     state.claimed_at = now
     state.claim_payload = rendered.payload
-    state.claim_digest = request_digest(rendered.payload, mode=delivery.MODE_STORE_ONLY, deletions=[], mark=None)
+    state.claim_wire_digest = wire_digest(delivery.wire_body(rendered, rendered.payload))
+    state.claim_identity = request_identity(rendered.payload, mode=delivery.MODE_STORE_ONLY, deletions=[], mark=None)
     state.claim_deletions = []
     state.claim_mark = None
     state.claim_flags = {"mode": delivery.MODE_STORE_ONLY, "mark_any": False, "force": bool(force)}
@@ -411,7 +436,8 @@ def _form_store_only(state, mgmt, now, deletions, untracked_mark, force) -> Clai
         adapter_device_id=mgmt.adapter_device_id,
         push_seq=push_seq,
         payload=rendered.payload,
-        digest=state.claim_digest,
+        wire_digest=state.claim_wire_digest,
+        identity=state.claim_identity,
         deletions=[],
         mark=None,
         mark_any=False,
@@ -433,7 +459,8 @@ def _form_backfill(state, mgmt, now) -> Claim:
     state.push_seq = push_seq
     state.claimed_at = now
     state.claim_payload = rendered.payload
-    state.claim_digest = request_digest(rendered.payload, mode=delivery.MODE_BACKFILL_ONLY, deletions=[], mark=None)
+    state.claim_wire_digest = wire_digest(delivery.wire_body(rendered, rendered.payload))
+    state.claim_identity = request_identity(rendered.payload, mode=delivery.MODE_BACKFILL_ONLY, deletions=[], mark=None)
     state.claim_deletions = []
     state.claim_mark = None
     state.claim_flags = {"mode": delivery.MODE_BACKFILL_ONLY, "mark_any": False, "force": True}
@@ -444,7 +471,8 @@ def _form_backfill(state, mgmt, now) -> Claim:
         adapter_device_id=mgmt.adapter_device_id,
         push_seq=push_seq,
         payload=rendered.payload,
-        digest=state.claim_digest,
+        wire_digest=state.claim_wire_digest,
+        identity=state.claim_identity,
         deletions=[],
         mark=None,
         mark_any=False,
@@ -863,7 +891,7 @@ def settle(claim: Claim, response) -> str:
         }
         _clear_claim(state)
         state.attempts = 0
-        state.last_success_digest = claim.digest
+        state.last_success_identity = claim.identity
         state.last_success_at = now
         state.save()
         _stamp_last_acked(claim)
@@ -1371,7 +1399,7 @@ def resolve_restored_claim(device_id, scope, receipt) -> str:
             _clear_claim(state)
             state.save()
             return RESTORE_REBASED
-        if (receipt or {}).get("request_digest") != state.claim_digest:
+        if (receipt or {}).get("request_digest") != state.claim_wire_digest:
             logger.error(
                 "%s/%s holds push_seq %s at a digest the receipt does not name", device_id, scope, state.push_seq
             )
@@ -1384,7 +1412,8 @@ def resolve_restored_claim(device_id, scope, receipt) -> str:
         adapter_device_id=0,
         push_seq=state.push_seq,
         payload=state.claim_payload,
-        digest=state.claim_digest,
+        wire_digest=state.claim_wire_digest,
+        identity=state.claim_identity,
         deletions=list(state.claim_deletions or []),
         mark=state.claim_mark,
         mark_any=bool((state.claim_flags or {}).get("mark_any")),
@@ -1416,7 +1445,8 @@ def _clear_claim(state) -> None:
     state.push_seq = None
     state.claimed_at = None
     state.claim_payload = None
-    state.claim_digest = ""
+    state.claim_wire_digest = ""
+    state.claim_identity = ""
     state.claim_flags = {}
     state.claim_mark = None
 

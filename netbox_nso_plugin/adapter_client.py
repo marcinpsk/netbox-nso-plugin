@@ -295,7 +295,30 @@ def _resolve_config() -> dict:
             return data
 
 
+# When set, a request is not made at all: its JSON body is recorded and ``None`` comes back.
+# The claim needs the EXACT body the client would send, because that is what the adapter
+# digests into its receipt (#1503 Appendix O, §4.4), and the wrapper each endpoint puts
+# around a payload lives in this module. Capturing through the real call is what keeps the
+# two sides on one definition instead of a second table of scope-to-envelope names.
+_capture_body: contextvars.ContextVar[list | None] = contextvars.ContextVar("nso_capture_body", default=None)
+
+
+@contextmanager
+def capture_wire_body():
+    """Record the JSON body of every request made in this context, and send none of them."""
+    sink: list = []
+    token = _capture_body.set(sink)
+    try:
+        yield sink
+    finally:
+        _capture_body.reset(token)
+
+
 def _request(method, path, **kwargs):
+    sink = _capture_body.get()
+    if sink is not None:
+        sink.append(kwargs.get("json"))
+        return None
     resp = _request_response(method, path, **kwargs)
     return resp.json() if resp.content else None
 

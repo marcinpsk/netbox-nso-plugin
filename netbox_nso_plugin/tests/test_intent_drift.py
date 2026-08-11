@@ -241,7 +241,7 @@ class TestResyncStoreOnly(_CascadeFlushMixin, IntentPushResetMixin, TransactionT
 
     def test_resync_pushes_even_when_the_acknowledged_baseline_names_that_body(self):
         """The split-brain re-sync exists for: the ADAPTER lost the intent while the plugin's
-        ``last_success_digest`` still names the body it last acknowledged. That is exactly
+        ``last_success_identity`` still names the body it last acknowledged. That is exactly
         what the claim drops as unchanged — so without force=True the re-sync would send
         NOTHING while the view reported success, and the split-brain was never repaired.
         """

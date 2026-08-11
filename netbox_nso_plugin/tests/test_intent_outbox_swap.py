@@ -8,7 +8,7 @@ worker never knew about (§8.3), so neither symbol survives the swap.
 
 What replaces them is the outbox itself: the operator's transaction appends a row, the commit
 callback drains the key through the claim protocol, and change detection becomes the durable
-``last_success_digest`` on the state row. O1.2's send half and O1.6's O(1) tail are asserted
+``last_success_identity`` on the state row. O1.2's send half and O1.6's O(1) tail are asserted
 HERE against the production trigger, not against a test that calls the drain itself.
 """
 
@@ -137,7 +137,7 @@ class TestTheCommitCallbackDrainsTheOutbox(_SwapCase):
         assert len(self.mine()) == 1, self.adapter.requests
         assert self.mine()[0]["push_seq"] is not None, "the production send carries the sequence"
         assert entries(self.device, "vlan") == []
-        assert state_of(self.device, "vlan").last_success_digest != ""
+        assert state_of(self.device, "vlan").last_success_identity != ""
         assert drain.gate_blockers(self.device.pk) == []
 
     def test_a_rolled_back_transaction_leaves_no_entry_and_the_next_edit_drains(self):

@@ -150,7 +150,7 @@ def _skip_on_render(handler):
 # send. The two in-memory carriers this replaced are gone for cause — a thread-local map of
 # pending pushes survived the rollback that discarded its reason (§2), and a process-global
 # last-pushed digest authorized deleting routes a stale worker never knew about (§8.3).
-# Change detection is now the state row's own ``last_success_digest``, which names a body
+# Change detection is now the state row's own ``last_success_identity``, which names a body
 # the adapter ACKNOWLEDGED rather than one this process happened to send.
 #
 # The cell below is thread-local and holds only keys. Registration is unconditional and the
@@ -484,7 +484,7 @@ def _push_changed(key, payload, do_push, on_response=None):
     The name is history: change detection used to live here, against a process-global digest
     of the last body this worker sent. Appendix O deleted that too, because a stale worker's
     cache authorized deleting routes it never knew about (§8.3); the claim now dedupes
-    against the state row's ``last_success_digest``, which names a body the adapter
+    against the state row's ``last_success_identity``, which names a body the adapter
     acknowledged.
     """
     from .delivery import Rendered, capture

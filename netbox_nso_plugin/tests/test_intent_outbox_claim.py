@@ -139,12 +139,12 @@ class TestDigestEqualClaimRetiresItsRows(_ClaimCase):
 
         own_vlan(self.mgmt, 841, self.tag)
         assert self.drain() == drain.SUCCEEDED
-        first = state_of(self.device, "vlan").last_success_digest
+        first = state_of(self.device, "vlan").last_success_identity
 
         assert self.drain(force=True) == drain.SUCCEEDED
 
         state = state_of(self.device, "vlan")
-        assert state.last_success_digest == first
+        assert state.last_success_identity == first
         assert len(self.adapter.requests) == 2
         assert self.adapter.sequences[1] > self.adapter.sequences[0]
 
@@ -167,7 +167,7 @@ class TestFailureKeepsTheWorkAndTheBaseline(_ClaimCase):
         assert state.push_seq is not None, "the operation is replayed, so it stays unacknowledged"
         assert state.claimed_at is None, "the lease is released so the next tick may take it over"
         assert state.attempts == 1
-        assert state.last_success_digest == ""
+        assert state.last_success_identity == ""
         assert [e.consumed_by_push_seq for e in entries(self.device, "vlan")] == [state.push_seq]
 
     def test_the_baseline_names_the_last_acknowledged_body(self):
@@ -189,7 +189,9 @@ class TestFailureKeepsTheWorkAndTheBaseline(_ClaimCase):
         row = state_of(self.device, "vlan")
         assert row.push_seq is None and row.attempts == 0
         rendered = delivery.render("vlan", self.device.pk, self.adapter_device_id)
-        assert row.last_success_digest == drain.request_digest(rendered.payload, mode="normal", deletions=[], mark=None)
+        assert row.last_success_identity == drain.request_identity(
+            rendered.payload, mode="normal", deletions=[], mark=None
+        )
         assert self.adapter.sequences[0] == failed_seq, "the failed operation is replayed, never reallocated"
 
 
@@ -258,7 +260,7 @@ class TestOutcomeCasRefusesASupersededAttempt(_ClaimCase):
 
         row = state_of(self.device, "vlan")
         assert row.push_seq == second.push_seq
-        assert row.attempts == 0 and row.last_success_digest == ""
+        assert row.attempts == 0 and row.last_success_identity == ""
         assert [e.consumed_by_push_seq for e in entries(self.device, "vlan")] == [second.push_seq]
 
 
