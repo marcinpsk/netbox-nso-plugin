@@ -651,26 +651,35 @@ def _stamp_attempt(device_id, scope) -> None:
         state.save()
 
 
-def drain_key(device_id, scope, *, mode=delivery.MODE_NORMAL, force=False, chain=DRAIN_CHAIN_MAX, reform=1) -> str:
-    """Claim, send and settle one key, then chain a bounded number of further drains."""
-    _refuse_in_transaction("drain")
+def _claim_or_compact(device_id, scope, *, mode, force):
+    """Take the claim, compacting once if the fold outgrew the statement budget.
+
+    Returns ``(claim_or_None, timed_out)``. A key that times out even after compaction keeps
+    its work and is left STAMPED, so it rotates to the back of the next pass rather than
+    spinning at the head of every one.
+    """
     try:
-        claimed = _claim_or_wait(device_id, scope, mode=mode, force=force)
+        return _claim_or_wait(device_id, scope, mode=mode, force=force), False
     except OperationalError as exc:
         if not _timed_out(exc):
             raise
-        # An oversized fold is the one failure compaction can actually fix, so it is tried
-        # once. A key that still times out keeps its work and is left STAMPED, so it rotates
-        # to the back of the next pass instead of spinning at the head of every one.
-        logger.warning("the %s/%s fold timed out; compacting and retrying it once", device_id, scope)
-        compact(device_id, scope)
-        try:
-            claimed = _claim_or_wait(device_id, scope, mode=mode, force=force)
-        except OperationalError as retried:
-            if not _timed_out(retried):
-                raise
-            _stamp_attempt(device_id, scope)
-            return FAILED
+    logger.warning("the %s/%s fold timed out; compacting and retrying it once", device_id, scope)
+    compact(device_id, scope)
+    try:
+        return _claim_or_wait(device_id, scope, mode=mode, force=force), False
+    except OperationalError as retried:
+        if not _timed_out(retried):
+            raise
+    _stamp_attempt(device_id, scope)
+    return None, True
+
+
+def drain_key(device_id, scope, *, mode=delivery.MODE_NORMAL, force=False, chain=DRAIN_CHAIN_MAX, reform=1) -> str:
+    """Claim, send and settle one key, then chain a bounded number of further drains."""
+    _refuse_in_transaction("drain")
+    claimed, timed_out = _claim_or_compact(device_id, scope, mode=mode, force=force)
+    if timed_out:
+        return FAILED
     if claimed is None:
         return NOTHING
     try:

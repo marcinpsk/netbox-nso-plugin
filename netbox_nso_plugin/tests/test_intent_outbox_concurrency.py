@@ -195,13 +195,15 @@ class TestTheFoldAndTheRenderShareOneSnapshot(_ConcurrencyCase):
         )
 
     def _remove_in_another_connection(self, route):
+        """Commit the operator's removal on its own connection, patching only from here."""
         from ._outbox_case import in_thread, without_legacy_coalescer
 
         def remove():
-            with patch(PUT_STATIC), without_legacy_coalescer(), transaction.atomic():
+            with transaction.atomic():
                 route.devices.remove(self.device)
 
-        in_thread(remove)
+        with patch(PUT_STATIC), without_legacy_coalescer():
+            in_thread(remove)
 
 
 class _SerializationCause(Exception):
@@ -283,10 +285,14 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
         return found, outbox.OP_DELETE, outbox.OP_REVOKE
 
     def _transaction(self, body, *, before=None, after=None, hold=None, committed=None):
-        """One operator transaction: open, wait, work, announce it, hold, announce the commit."""
+        """One operator transaction: open, wait, work, announce it, hold, announce the commit.
+
+        It patches nothing itself: ``mock.patch`` restores whatever it found on entry, so two
+        threads entering the same patch concurrently leave the mock installed for good.
+        """
 
         def work():
-            with patch(PUT_STATIC), transaction.atomic():
+            with transaction.atomic():
                 if before is not None:
                     assert before.wait(timeout=30)
                 body()
@@ -312,8 +318,12 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
         return self._transaction(own, **barriers)
 
     def _run(self, *works):
-        """Run every transaction concurrently and re-raise whatever any of them raised."""
-        from ._outbox_case import in_thread
+        """Run every transaction concurrently and re-raise whatever any of them raised.
+
+        Every patch these transactions need is entered HERE, once, on this thread, and held
+        for the whole run: entering one from two threads at a time leaks it permanently.
+        """
+        from ._outbox_case import in_thread, without_legacy_coalescer
 
         errors: list[BaseException] = []
 
@@ -323,12 +333,13 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
             except BaseException as exc:  # noqa: BLE001 (reported on the caller's thread)
                 errors.append(exc)
 
-        threads = [threading.Thread(target=guarded, args=(work,)) for work in works]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=90)
-        assert not any(thread.is_alive() for thread in threads), "a transaction never finished"
+        with patch(PUT_STATIC), without_legacy_coalescer():
+            threads = [threading.Thread(target=guarded, args=(work,)) for work in works]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=90)
+            assert not any(thread.is_alive() for thread in threads), "a transaction never finished"
         assert errors == [], errors
 
     def test_a_second_writer_of_one_route_waits_on_the_first(self):

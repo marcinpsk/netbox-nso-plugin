@@ -167,11 +167,15 @@ class TestCompactionAndTheClaimAreMutuallyExclusive(_CompactionCase):
             drain.compact(self.device.pk, "static_route")
 
         written = [q["sql"] for q in queries.captured_queries if "outboxentry" in q["sql"].lower()]
+        selects = [sql for sql in written if sql.startswith("SELECT")]
+        assert any("FOR UPDATE" in sql for sql in selects), selects
         deletes = [sql for sql in written if sql.startswith("DELETE")]
         assert deletes, written
         for pk in selected[:-1]:
             assert any(str(pk) in sql for sql in deletes), f"the delete did not name entry {pk}"
         assert all("IN (" in sql or "= " in sql for sql in deletes)
+        updates = [sql for sql in written if sql.startswith("UPDATE")]
+        assert updates and all(str(selected[-1]) in sql for sql in updates), updates
 
     def test_a_write_touching_a_different_number_of_rows_aborts(self):
         from netbox_nso_plugin import drain
@@ -264,6 +268,24 @@ class TestTheTwoClassesOfGrowth(_CompactionCase):
 
         assert len(self.rows()) == 1
         assert sorted(record["route_id"] for record in self.transitions()) == list(range(4210, 4215))
+
+    def test_the_tick_pass_compacts_a_key_no_claim_can_reach(self):
+        from netbox_nso_plugin import drain
+
+        route = own_route(self.mgmt, "198.51.100.48/28", "198.51.100.4")
+        with patch(PUT_STATIC):
+            route.devices.remove(self.device)
+        held = drain.claim(self.device.pk, "static_route")
+        assert held.deletions, "the key now carries a live claim, so no drain may take it"
+        self.clear_entries()
+        for index in range(5):
+            self.append(self.delete_of(4220 + index))
+
+        config, session = self.adapter.patches()
+        with config, session:
+            drain.drain_intent_outbox()
+
+        assert len(self.rows()) == 1, "the tick's compaction pass never reached the stuck key"
 
 
 class TestTheReductionAppliesTheAlgebra(_CompactionCase):
