@@ -562,3 +562,35 @@ class TestTheFenceWithholdsEverySendButTheBackfill(_OutcomeCase):
         assert (state.queued_deletions, state.claim_deletions) == ([], [])
         seqs = [r["push_seq"] for r in self.adapter.requests]
         assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs), "no sequence is reused"
+
+    def test_the_backfill_never_answers_for_the_push_the_caller_asked_for(self):
+        """codex O1 r2 F2: the fence substitutes a backfill, and its success was the answer."""
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.adapter_client import AdapterError
+
+        route = own_route(self.mgmt, "198.51.100.32/28", "198.51.100.16")
+        self.clear_entries()
+        self.unown(route)
+        self.adapter.fail_with = AdapterError("fence shut", code="conflict", detail={"reason": "fence_shut"})
+
+        with as_per_object("static_route"):
+            assert self.drain() == drain.WITHHELD
+
+            def open_the_fence_then_break(body):
+                """The backfill lands; the push the caller actually asked for does not."""
+                self.adapter.fail_with = ConnectionError("the adapter went away")
+                return partition()
+
+            self.adapter.fail_with = None
+            self.adapter._respond = open_the_fence_then_break
+            config, session = self.adapter.patches()
+            with config, session:
+                answer = drain.push_now(self.device.pk, "static_route", force=True)
+
+        assert answer is None, "the backfill is preparatory: the answer is the requested push's"
+        state = state_of(self.device, "static_route")
+        assert state.fence_withheld_since is None, "the backfill did open the fence"
+        assert state.push_seq is not None and state.last_error_code == "ConnectionError", (
+            "the deletion the caller asked to push is unacknowledged and replayed"
+        )
+        assert [int(r["route_id"]) for r in state.claim_deletions] == [route.pk]

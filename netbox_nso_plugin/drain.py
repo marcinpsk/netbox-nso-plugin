@@ -1070,9 +1070,10 @@ def _drain_once(device_id, scope, *, mode, force, chain=DRAIN_CHAIN_MAX, reform=
     outcome = settle(claimed, answer)
     if outcome == SUCCEEDED and chain > 0:
         if _answered_other_work(claimed, mode, force):
-            # §4.2: the takeover resolved the OUTSTANDING operation, at the body and mode it
-            # was admitted under. This call's own mode and force are still owed, so it forms
-            # its own claim now that the key is free to allocate one.
+            # §4.2: what settled was somebody else's operation, at the body and mode it was
+            # admitted under. This call's own mode and force are still owed, so it forms its
+            # own claim now that the key is free to allocate one, and THAT outcome is the
+            # answer: a preparatory pass may never be reported as the caller's own result.
             return _drain_once(device_id, scope, mode=mode, force=force, chain=chain - 1)
         if mode == delivery.MODE_NORMAL and _pending(device_id, scope):
             # Level-triggered, and terminating: each successful NORMAL pass retires at least
@@ -1084,13 +1085,17 @@ def _drain_once(device_id, scope, *, mode, force, chain=DRAIN_CHAIN_MAX, reform=
 
 
 def _answered_other_work(claim: Claim, mode, force) -> bool:
-    """Whether the settled claim was a replay of an operation this call did not ask for.
+    """Whether the settled claim was not the operation this call asked for (§4.2).
 
-    A takeover replays the unacknowledged operation with the body, the authority and the
-    mode it was admitted under, so it can never be the answer to a call that asked for a
-    different mode or forced an operation of its own (§4.2, request mode is per call).
+    Request mode is per call, so two passes settle something else and both are preparatory.
+    A TAKEOVER replays the unacknowledged operation with the body, the authority and the mode
+    it was admitted under, so it can never answer a call that asked for a different mode or
+    forced an operation of its own. A fence-withheld key SUBSTITUTES the backfill-only claim
+    that opens the fence (§4.3(c)), which by definition delivers nothing: reporting its
+    success as the caller's would promote static routes to ``deploying`` on a pass that
+    carried no intent at all.
     """
-    return claim.replayed and (force or claim.mode != mode)
+    return claim.mode != mode or (claim.replayed and force)
 
 
 def _withheld_mode(device_id, scope, mode) -> str:
