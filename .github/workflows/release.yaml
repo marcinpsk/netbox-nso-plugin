@@ -18,6 +18,7 @@ jobs:
   release:
     name: Create the release
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     # semantic-release needs to push its version commit and tag, then create the GitHub release.
     permissions:
       contents: write
@@ -97,6 +98,7 @@ jobs:
     needs: release
     if: needs.release.outputs.released == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -165,6 +167,7 @@ jobs:
     name: Publish to PyPI
     needs: [release, build]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment:
       name: pypi
       url: https://pypi.org/p/netbox-nso-plugin
