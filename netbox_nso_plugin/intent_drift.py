@@ -338,6 +338,9 @@ def _backfill_static_route_generations(mgmt) -> list[dict]:
         for row in rows:
             signals._arm_static_route_generation(row)
             row.save(update_fields=list(signals._STATIC_ROUTE_ARMED_FIELDS))
+    for snapshot, row in zip(before, rows, strict=True):
+        # What the restore compares against: it may only undo the generation it wrote.
+        snapshot["armed_generation"] = row.intent_generation
     if demote:
         # .update(): a status save would re-fire the row's intent push, and this is
         # bookkeeping about intent that has not moved.
@@ -347,7 +350,7 @@ def _backfill_static_route_generations(mgmt) -> list[dict]:
 
 
 def _restore_static_route_generations(before: list[dict]) -> int:
-    """Put every armed row back the way it was, and return how many.
+    """Put back every armed row this pass still owns, and return how many.
 
     The send cannot run inside the arming transaction any more: a claim sets its own
     isolation level, which PostgreSQL accepts only before a transaction's first statement,
@@ -355,13 +358,20 @@ def _restore_static_route_generations(before: list[dict]) -> int:
     transaction becomes an explicit inverse, restoring the sentinel and the demoted status
     so a later run finds these rows and retries them. Without it a generation the adapter
     never stored would correlate with nothing forever.
+
+    Outside a transaction the inverse needs a compare-and-set, which is what the armed
+    generation is: an operator re-accepting a row while the push is on the wire gives it a
+    new one, and restoring over that would put the sentinel back on intent the operator has
+    just stated. A row that moved is left alone, and is not counted as rolled back.
     """
     from .models import NSOStaticRouteState
 
+    restored = 0
     for snapshot in before:
         fields = dict(snapshot)
-        NSOStaticRouteState.objects.filter(pk=fields.pop("pk")).update(**fields)
-    return len(before)
+        pk, armed = fields.pop("pk"), fields.pop("armed_generation")
+        restored += NSOStaticRouteState.objects.filter(pk=pk, intent_generation=armed).update(**fields)
+    return restored
 
 
 def resync_static_route_intent_fleet(device_ids: list[int] | None = None) -> list[dict]:

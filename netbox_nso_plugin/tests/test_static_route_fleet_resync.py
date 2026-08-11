@@ -429,6 +429,44 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         )
         assert (mgmt.intent_push_attempts or {}).get("static_route") == 1, "the attempt mark was rewound"
 
+    def test_a_concurrent_edit_during_the_push_survives_the_restore(self):
+        """Codex O1 F4 — the restore is a compare-and-set on the generation this pass armed.
+
+        An operator re-accepting the row while the resync push is on the wire gives it a new
+        generation. An unconditional restore puts the sentinel back over that edit, so intent
+        the operator has just stated reads as never-armed and no result can ever settle it.
+        """
+        from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet
+        from netbox_nso_plugin.intent_generation import UNALLOCATED
+        from netbox_nso_plugin.models import NSOStaticRouteState
+
+        _, mgmt = self._managed_device("concurrent", 8107)
+        row = self._own_route(mgmt, "10.80.0.0/16", "10.0.0.81")
+        edited: dict = {}
+
+        def _edit_then_refuse(adapter_device_id, routes):
+            """Re-accept the row on the sender's own connection, then answer unacknowledged."""
+            from netbox_nso_plugin.signals import (
+                _STATIC_ROUTE_ARMED_FIELDS,
+                _arm_static_route_generation,
+                suppress_intent_push,
+            )
+
+            live = NSOStaticRouteState.objects.get(pk=row.pk)
+            with suppress_intent_push():
+                _arm_static_route_generation(live)
+                live.save(update_fields=list(_STATIC_ROUTE_ARMED_FIELDS))
+            edited["generation"] = live.intent_generation
+
+        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", side_effect=_edit_then_refuse):
+            results = resync_static_route_intent_fleet()
+
+        row.refresh_from_db()
+        assert results[0]["ok"] is False
+        assert edited["generation"] > UNALLOCATED
+        assert row.intent_generation == edited["generation"], "the restore clobbered a concurrent operator edit"
+        assert results[0]["armed_rolled_back"] == 0, "a row that moved is left alone, and reported as left alone"
+
     def test_backfill_demotes_deploying_and_leaves_other_statuses(self):
         """S6.2 — a row already ``deploying`` cannot wait on a generation it has just replaced."""
         from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet
