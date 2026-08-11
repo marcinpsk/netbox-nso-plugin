@@ -46,7 +46,7 @@ def advance_push_seq(watermark: int) -> int:
     atomic and strictly forward, so a concurrent allocation can only carry the sequence
     further and can never be undone by this one. ``setval`` cannot promise that. It reads
     ``last_value`` and writes without holding the sequence across the two, so a ``nextval``
-    landing between them is erased and its value is handed out a SECOND time — which the far
+    landing between them is erased and its value is handed out a SECOND time, which the far
     side refuses as a reused sequence for the life of the key, past every retry.
 
     The values walked past are burned, never reissued, and the sequence is BIGINT NO CYCLE,
@@ -60,7 +60,7 @@ def advance_push_seq(watermark: int) -> int:
     watermark = int(watermark)
     with connection.cursor() as cursor:
         while True:
-            cursor.execute(f"SELECT last_value, is_called FROM {PUSH_SEQ_SEQUENCE}")  # noqa: S608 — a module constant
+            cursor.execute(f"SELECT last_value, is_called FROM {PUSH_SEQ_SEQUENCE}")  # noqa: S608 (a constant)
             last_value, is_called = cursor.fetchone()
             # A sequence not yet called has handed out nothing: last_value is the NEXT value.
             issued = int(last_value) if is_called else int(last_value) - 1

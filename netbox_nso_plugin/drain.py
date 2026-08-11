@@ -274,7 +274,7 @@ def mapping_epoch(mgmt) -> tuple:
     the same numeric device id changes nothing else the row carries, so an epoch taken from the
     adopted field alone stays the dead store's for the whole adoption window: an unchanged save
     draining there matches the baseline, is retired with no request, and nothing re-enqueues
-    it. The observed marker is the same fact recorded earlier — and it is the only one recorded
+    it. The observed marker is the same fact recorded earlier, and it is the only one recorded
     at all for a pair the gate refuses to adopt, which an equal-born rebuild leaves forever.
     """
     return (mgmt.adapter_device_id, mgmt.reset_pending_incarnation or mgmt.adapter_incarnation or "")

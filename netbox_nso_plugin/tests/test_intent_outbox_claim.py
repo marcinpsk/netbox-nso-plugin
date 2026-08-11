@@ -508,7 +508,7 @@ class TestTheBaselineSeesARebuiltStoreBeforeAnythingAdoptsIt(_ClaimCase):
     def test_a_pair_the_gate_may_never_adopt_still_moves_the_epoch(self):
         """Equal born, different UUID: a durable conflict the gate refuses to adopt, for good.
 
-        This is the case an adoption-gated epoch can never reach — the store is provably not
+        This is the case an adoption-gated epoch can never reach: the store is provably not
         the one that acknowledged the baseline, and the field that would say so never moves.
         """
         from netbox_nso_plugin import drain
