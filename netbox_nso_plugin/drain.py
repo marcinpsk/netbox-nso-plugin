@@ -123,8 +123,6 @@ class Claim:
     adapter_device_id: int
     push_seq: int
     payload: object
-    #: Of the exact body sent: the only value an adapter receipt's digest can answer.
-    wire_digest: str
     #: Plugin-side, mode-bearing: the acknowledged baseline an unchanged claim drops against.
     identity: str
     deletions: list
@@ -250,9 +248,10 @@ def wire_digest(body) -> str:
     """Return the digest of the exact JSON body sent, which is what the receipt names (§4.4).
 
     The adapter computes its ``request_digest`` from the raw body it received, so this is
-    the only value a receipt's digest can be compared against. The claim persists it, because
-    a restore resolves an operation whose response was lost and has nothing to re-render it
-    from that the far side would agree with.
+    the only value a receipt's digest can be compared against. It is DERIVED rather than
+    stored: the claim already persists the payload it sent, and the envelope around it
+    belongs to the scope's endpoint, so storing a digest of the two would be storing a
+    value the row already determines.
     """
     return _sha256(body)
 
@@ -323,7 +322,6 @@ def _takeover(state, mgmt, now) -> Claim:
         adapter_device_id=mgmt.adapter_device_id,
         push_seq=state.push_seq,
         payload=state.claim_payload,
-        wire_digest=state.claim_wire_digest,
         identity=state.claim_identity,
         deletions=list(state.claim_deletions or []),
         mark=state.claim_mark,
@@ -380,7 +378,6 @@ def _form(state, mgmt, now, mode, force) -> Claim | None:
     state.push_seq = push_seq
     state.claimed_at = now
     state.claim_payload = rendered.payload
-    state.claim_wire_digest = wire_digest(delivery.wire_body(rendered, rendered.payload))
     state.claim_identity = identity
     state.claim_deletions = deletions
     state.claim_mark = mark
@@ -393,7 +390,6 @@ def _form(state, mgmt, now, mode, force) -> Claim | None:
         adapter_device_id=mgmt.adapter_device_id,
         push_seq=push_seq,
         payload=rendered.payload,
-        wire_digest=state.claim_wire_digest,
         identity=identity,
         deletions=deletions,
         mark=mark,
@@ -430,7 +426,6 @@ def _form_store_only(state, mgmt, now, deletions, untracked_mark, force) -> Clai
     state.push_seq = push_seq
     state.claimed_at = now
     state.claim_payload = rendered.payload
-    state.claim_wire_digest = wire_digest(delivery.wire_body(rendered, rendered.payload))
     state.claim_identity = request_identity(rendered.payload, mode=delivery.MODE_STORE_ONLY, deletions=[], mark=None)
     state.claim_deletions = []
     state.claim_mark = None
@@ -442,7 +437,6 @@ def _form_store_only(state, mgmt, now, deletions, untracked_mark, force) -> Clai
         adapter_device_id=mgmt.adapter_device_id,
         push_seq=push_seq,
         payload=rendered.payload,
-        wire_digest=state.claim_wire_digest,
         identity=state.claim_identity,
         deletions=[],
         mark=None,
@@ -465,7 +459,6 @@ def _form_backfill(state, mgmt, now) -> Claim:
     state.push_seq = push_seq
     state.claimed_at = now
     state.claim_payload = rendered.payload
-    state.claim_wire_digest = wire_digest(delivery.wire_body(rendered, rendered.payload))
     state.claim_identity = request_identity(rendered.payload, mode=delivery.MODE_BACKFILL_ONLY, deletions=[], mark=None)
     state.claim_deletions = []
     state.claim_mark = None
@@ -477,7 +470,6 @@ def _form_backfill(state, mgmt, now) -> Claim:
         adapter_device_id=mgmt.adapter_device_id,
         push_seq=push_seq,
         payload=rendered.payload,
-        wire_digest=state.claim_wire_digest,
         identity=state.claim_identity,
         deletions=[],
         mark=None,
@@ -1403,6 +1395,18 @@ RESTORE_FAILED_CLOSED = "failed_closed"
 RESTORE_REPLAY = "replay"
 
 
+def _sent_wire_digest(state) -> str:
+    """Digest the body the unresolved claim put on the wire, from the row that recorded it.
+
+    The claim persists the payload it sent, and the envelope around it (``{"routes": …}``)
+    belongs to the scope's endpoint, so the two together reproduce the exact body the adapter
+    digested into its receipt. The render is for the endpoint's own call, never for its
+    payload: this hashes what was sent, not what the device would render now.
+    """
+    rendered = delivery.render(state.scope, state.device_id, 0)
+    return wire_digest(delivery.wire_body(rendered, state.claim_payload))
+
+
 def resolve_restored_claim(device_id, scope, receipt) -> str:
     """Resolve one restored claim against the adapter's receipt for its key (§4.6).
 
@@ -1439,7 +1443,7 @@ def resolve_restored_claim(device_id, scope, receipt) -> str:
             _clear_claim(state)
             state.save()
             return RESTORE_REBASED
-        if (receipt or {}).get("request_digest") != state.claim_wire_digest:
+        if (receipt or {}).get("request_digest") != _sent_wire_digest(state):
             logger.error(
                 "%s/%s holds push_seq %s at a digest the receipt does not name", device_id, scope, state.push_seq
             )
@@ -1452,7 +1456,6 @@ def resolve_restored_claim(device_id, scope, receipt) -> str:
         adapter_device_id=0,
         push_seq=state.push_seq,
         payload=state.claim_payload,
-        wire_digest=state.claim_wire_digest,
         identity=state.claim_identity,
         deletions=list(state.claim_deletions or []),
         mark=state.claim_mark,
@@ -1485,7 +1488,6 @@ def _clear_claim(state) -> None:
     state.push_seq = None
     state.claimed_at = None
     state.claim_payload = None
-    state.claim_wire_digest = ""
     state.claim_identity = ""
     state.claim_flags = {}
     state.claim_mark = None

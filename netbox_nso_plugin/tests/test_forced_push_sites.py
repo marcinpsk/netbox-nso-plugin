@@ -29,14 +29,17 @@ from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 PLUGIN = Path(__file__).resolve().parent.parent
 
 #: (module, enclosing function, callee) → how many forced calls that site makes. Counted, not
-#: set-collected: the Apply forces twelve scopes and then SNMP store-only through the same
-#: callee in the same function, and a set would report five sites where there are six calls.
+#: set-collected: the Apply forces twelve scopes through one callee in one function, and a
+#: set would report one site where there are twelve calls.
 FORCED_PUSH_SITES = {
     ("intent_drift.py", "resync_intent", "drain.push_now"): 1,
     ("intent_drift.py", "resync_static_route_intent_fleet", "drain.push_now"): 1,
     ("link_role.py", "apply_description_for_role", "drain.push_now"): 1,
     ("link_role.py", "_push_provisioned", "drain.push_now"): 1,
-    ("views.py", "_prepare_apply", "drain.push_now"): 2,
+    ("views.py", "_prepare_apply", "drain.push_now"): 1,
+    # The Apply's SNMP refresh reads the OUTCOME rather than the answer: it aborts on a
+    # refusal alone, which ``push_now`` reports as the same ``None`` as a failure.
+    ("views.py", "_prepare_apply", "drain.drain_key"): 1,
 }
 #: The claim a forced push routes through is itself forced. It is not a push site, and it is
 #: named here so the exclusion cannot quietly widen to a module that is one.
@@ -87,9 +90,14 @@ class TestForcedPushSitesAreEnumerated(SimpleTestCase):
         assert sum(FORCED_PUSH_SITES.values()) == 6
 
     def test_every_forced_site_routes_through_the_claim(self):
-        """A forced call is a claim with those flags, never a push around it (§4.2)."""
+        """A forced call is a claim with those flags, never a push around it (§4.2).
+
+        Both entry points ARE the claim: ``push_now`` is ``drain_key`` returning the answer
+        instead of the outcome, so a site needing the outcome takes the other one and still
+        sends nothing around the protocol.
+        """
         callees = {site[2] for site in FORCED_PUSH_SITES}
-        assert callees == {"drain.push_now"}
+        assert callees == {"drain.push_now", "drain.drain_key"}
 
     def test_the_scan_reads_calls_a_single_line_search_cannot(self):
         """The named trap: a wrapped call is invisible to a grep and plain to the compiler.

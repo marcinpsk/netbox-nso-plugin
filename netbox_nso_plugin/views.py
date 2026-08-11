@@ -2561,20 +2561,22 @@ def _prepare_apply(mgmt):
 
     # Store-only: a plain put_snmp_intent enqueues the shrink-removal (and auto-apply) job,
     # which would 409 the trigger_apply this runs just ahead of.
+    # The OUTCOME, not the answer: a refusal is a proven precondition failure, where a
+    # transport failure leaves the Apply to fail at the trigger as it always has.
     try:
-        refreshed = drain.push_now(mgmt.device_id, "snmp", mode=MODE_STORE_ONLY, force=True)
-    except Exception as exc:  # noqa: BLE001 (the cause of the abort below, never swallowed)
+        outcome = drain.drain_key(mgmt.device_id, "snmp", mode=MODE_STORE_ONLY, force=True)
+    except Exception as exc:  # noqa: BLE001 (one scope's failure must not block the rest)
         logger.warning("Apply push failed for device %s: %s", mgmt.device_id, exc)
-        refreshed = None
-    if refreshed is None:
-        # A store-only claim carrying deletion authority is refused (§4.3(d)), and the Apply
-        # would then commit the SNMP intent the adapter still holds. Delivering that
-        # authority takes a NORMAL claim, whose removal and auto-apply jobs are exactly what
-        # this store-only push exists to avoid ahead of trigger_apply and would 409 this
-        # Apply anyway, so the precondition is reported rather than worked around: the tick
-        # drains the pending claim and the operator re-applies.
+        outcome = None
+    if outcome == drain.REFUSED:
+        # A store-only claim may not carry deletion authority (§4.3(d)), so the adapter still
+        # holds the SNMP intent the operator deleted and this Apply would commit it.
+        # Delivering that authority takes a NORMAL claim, whose removal and auto-apply jobs
+        # are exactly what the store-only push exists to avoid ahead of trigger_apply and
+        # would 409 this Apply anyway. So the precondition is reported rather than worked
+        # around: the tick drains the pending claim and the operator re-applies.
         raise ApplyRefused(
-            f"Apply stopped: this device's SNMP intent refresh was not acknowledged "
+            f"Apply stopped: this device's SNMP intent refresh was refused "
             f"({_push_error_message(mgmt, 'snmp')}), so applying now would commit the SNMP intent the "
             "adapter still holds. Nothing was applied and no row was promoted."
         )

@@ -2795,11 +2795,9 @@ class NSOIntentOutboxState(models.Model):
     claim_payload = models.JSONField(null=True, blank=True)
     claim_deletions = models.JSONField(default=list, blank=True)
     claim_flags = models.JSONField(default=dict, blank=True)
-    # Two digests, two jobs. The wire one is of the exact body sent and is the only value the
-    # adapter's receipt digest can be compared against; the identity also carries the mode,
-    # the authority and the legacy flag, which no body does, and is what an unchanged claim
-    # drops against.
-    claim_wire_digest = models.CharField(max_length=64, blank=True, default="")
+    # Not the receipt's digest: that one is over the wire body, and is derived from
+    # ``claim_payload`` when a restore needs it. This also carries the mode, the authority
+    # and the legacy flag, which no body carries, and is what an unchanged claim drops against.
     claim_identity = models.CharField(max_length=64, blank=True, default="")
     # The legacy flag actually sent (``query_flag`` scopes), the AND of the folded
     # contributors' ``mark_and`` values. Not a run identifier: there are no runs.

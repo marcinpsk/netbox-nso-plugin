@@ -206,11 +206,10 @@ class TestAResponseMustPartitionTheClaim(_OutcomeCase):
         from netbox_nso_plugin import drain
 
         claimed, first, second = self._claim_two()
-        state = state_of(self.device, "static_route")
         contradiction = partition(executed=[first.pk], degraded=[first.pk], moot=[second.pk])
         receipt = {
             "accepted_push_seq": claimed.push_seq,
-            "request_digest": state.claim_wire_digest,
+            "request_digest": drain._sent_wire_digest(state_of(self.device, "static_route")),
             "stored_response": contradiction,
         }
         with as_per_object("static_route"):
