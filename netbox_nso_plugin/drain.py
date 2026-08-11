@@ -326,7 +326,11 @@ def _form(state, mgmt, now, mode, force) -> Claim | None:
     )
     deletions = list(folded.queued.values())
     if mode == delivery.MODE_STORE_ONLY:
-        return _form_store_only(state, mgmt, now, deletions, force)
+        # A deletion mark on a key whose pending rows recorded no provenance at all is
+        # authority the FOLD cannot see: the request flag is the whole of it. Where a row
+        # DID record its transitions the fold decides, so a revocation withdraws it as usual.
+        untracked = mark_any and not any(row.transitions for row in rows)
+        return _form_store_only(state, mgmt, now, deletions, untracked, force)
 
     rendered = delivery.render(scope, device_id, mgmt.adapter_device_id)
     digest = request_digest(rendered.payload, mode=mode, deletions=deletions, mark=mark)
@@ -369,7 +373,7 @@ def _form(state, mgmt, now, mode, force) -> Claim | None:
     )
 
 
-def _form_store_only(state, mgmt, now, deletions, force) -> Claim:
+def _form_store_only(state, mgmt, now, deletions, untracked_mark, force) -> Claim:
     """Take a claim that carries the owned snapshot and consumes nothing (§4.3(d)).
 
     Store-only carries no ids and clears none, so the fold above is a READ: it decides the
@@ -381,9 +385,15 @@ def _form_store_only(state, mgmt, now, deletions, force) -> Claim:
     The refusal is the same rule at its authority end: the adapter writes no tombstone for a
     store-only request (O-A3), so a deletion carried here would be acknowledged with the
     device untouched. Rolling the whole claim back leaves that authority where it was.
+
+    Authority is read at BOTH ends, because a ``query_flag`` scope carries it in the request
+    flag rather than in ids: a marked deletion folds to no ids at all, so a refusal reading
+    only the folded ids would let the resync replace the adapter's stored rows while the
+    removal job is suppressed, and the ordinary claim behind it would then render a body
+    that no longer names the object and retract nothing.
     """
     device_id, scope = state.device_id, state.scope
-    if deletions:
+    if deletions or untracked_mark:
         raise AuthorityPending(f"{device_id}/{scope} holds deletion authority a store-only request cannot carry")
     rendered = delivery.render(scope, device_id, mgmt.adapter_device_id)
     push_seq = allocate_push_seq()

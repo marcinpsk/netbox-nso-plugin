@@ -508,6 +508,39 @@ class TestStoreOnlyCarriesNoAuthority(_OutcomeCase):
         assert entries(self.device, "vlan", unconsumed=True) == []
         assert self.adapter.requests[-1]["params"].get("store_only") is None, "the delivery the resync did not make"
 
+    def test_a_store_only_claim_is_refused_while_a_marked_deletion_is_pending(self):
+        """codex O1 r3 F1: a query_flag deletion is authority, though its fold yields no ids."""
+        from netbox_nso_plugin import delivery, drain
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        own_vlan(self.mgmt, 906, self.tag)
+        leaving = own_vlan(self.mgmt, 907, self.tag)
+        assert self.drain("vlan") == drain.SUCCEEDED
+        on_device = self.adapter.on_device[self.adapter_device_id]
+        assert on_device == {("vlan_id", 906), ("vlan_id", 907)}
+        self.clear_entries()
+
+        with without_commit_drain(), transaction.atomic():
+            leaving.delete()
+        pending = [row.pk for row in entries(self.device, "vlan", unconsumed=True)]
+        assert pending, "the marked deletion is recorded and nothing has folded it yet"
+        sent = len(self.adapter.requests)
+
+        config, session = self.adapter.patches()
+        with config, session:
+            answer = drain.push_now(self.device.pk, "vlan", mode=delivery.MODE_STORE_ONLY, force=True)
+
+        assert answer is None, "refused: a store-only request writes no removal, so it may not carry one"
+        assert len(self.adapter.requests) == sent, "and it never reached the wire"
+        assert [row.pk for row in entries(self.device, "vlan", unconsumed=True)] == pending
+        errors = NSODeviceManagement.objects.get(pk=self.mgmt.pk).intent_push_errors or {}
+        assert "vlan" in errors, errors
+
+        assert self.drain("vlan") == drain.SUCCEEDED
+        assert self.adapter.requests[-1]["params"].get("delete_origin") == "true", "the marked retract still goes"
+        assert self.adapter.on_device[self.adapter_device_id] == {("vlan_id", 906)}
+        assert self.adapter.detached[self.adapter_device_id] == set()
+
 
 class TestTheFenceWithholdsEverySendButTheBackfill(_OutcomeCase):
     """§4.3(c): a proven-no-effect 409 abandons, and only the backfill pass may send after it."""
