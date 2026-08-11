@@ -208,30 +208,16 @@ def _consume_locked(row) -> ConsumeResult:
     for job in jobs:
         seq = job.get("settle_seq")
         if seq is None:
-            # The ascending page's predicate is NULL-false by construction, so an
-            # unsequenced row in it means the feed contract broke. Never guess a position:
-            # bound it on the cursor it sits behind (the position it blocks) and abandon it
-            # there, the way an unresolvable sequence is abandoned. Raising instead would roll
-            # this transaction back, taking the cursor, the verdicts already written and the
-            # stall record with it, so every later pass would meet the same row unbounded.
+            # The ascending page's predicate is NULL-false by construction, so an unsequenced
+            # row in it means the feed contract broke. It holds no position, so it blocks none:
+            # skip it and keep the stall bound for the sequences that have one. Nothing is
+            # lost, a job that later takes a sequence takes one above this cursor.
             logger.error(
                 "job %s appeared in the ascending settlement feed for adapter device %s with no "
-                "settle_seq: the feed contract is broken",
+                "settle_seq: the feed contract is broken, skipping that entry",
                 job.get("id"),
                 device_id,
             )
-            if not _record_stall(row, cursor):
-                stalled = True
-                break
-            logger.error(
-                "the settlement feed for adapter device %s served an unsequenced job %s times, "
-                "first seen %s: skipping that entry, its result is abandoned",
-                device_id,
-                row.settle_stall_attempts,
-                row.settle_stall_first_seen_at,
-            )
-            _clear_stall(row)
-            advanced_past_stall = True
             continue
         if _settle_job(row, device_id, job, readback):
             cursor = max(cursor, seq)
@@ -269,9 +255,8 @@ def _consume_locked(row) -> ConsumeResult:
 def _record_stall(row, seq) -> bool:
     """Count one failed resolution of *seq* on *row*. True once the durable bound is reached.
 
-    *seq* keys the triple. For a job the feed served with no sequence there is none, so the
-    key is the cursor that entry blocks: a stall key equal to the cursor is exactly that
-    case, since a real undecided sequence is always ahead of it.
+    *seq* keys the triple, and only a real sequence may key it: an entry the feed serves on
+    every pass would reset the count of the one entry this bound is about.
     """
     if row.settle_stall_seq != seq:
         row.settle_stall_seq = seq
