@@ -130,6 +130,42 @@ def _last_acked_of(record) -> dict | None:
     return triples[0] if triples else None
 
 
+def _carried_by(record) -> dict | None:
+    """Read the acknowledged triple *record* hands to a revocation folded on top of it."""
+    if record is None:
+        return None
+    if record.get("op") == OP_REVOKE:
+        return record.get("carried_triple")
+    return _last_acked_of(record)
+
+
+def reduce_transitions(transitions) -> list:
+    """Reduce *transitions* to at most one per route, applying the algebra rather than dropping it.
+
+    A route's contribution is determined by its LAST transition plus one fold-time constant
+    (whether an active claim holds it), so everything earlier for that route is dead —
+    everything except the lineage a revocation carries. Reducing ``delete R(record A),
+    revoke R`` to a bare revoke would discard A, and the ``[A, C]`` lineage a later deletion
+    of a re-owned pk needs could never form, so the surviving revoke carries A forward.
+
+    Transitions for different routes commute, so their relative order is not preserved and
+    does not need to be. A record naming no route is kept verbatim: a rewrite may reduce, it
+    may not lose.
+    """
+    survivors: dict = {}
+    unkeyed: list = []
+    for record in transitions:
+        route_id = record.get("route_id")
+        if route_id is None:
+            unkeyed.append(record)
+            continue
+        if record.get("op") == OP_REVOKE:
+            carried = record.get("carried_triple") or _carried_by(survivors.get(route_id))
+            record = {**record, "carried_triple": carried} if carried else record
+        survivors[route_id] = record
+    return [*survivors.values(), *unkeyed]
+
+
 # ── The write path ────────────────────────────────────────────────────────────
 #
 # A device being torn down must not be given new entries. The rows would be inserted after

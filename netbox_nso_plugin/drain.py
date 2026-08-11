@@ -33,7 +33,7 @@ import time
 from django.db import IntegrityError, OperationalError, connection, transaction
 
 from . import delivery
-from .outbox import OP_REVOKE, allocate_push_seq, fold_transitions, triple_of
+from .outbox import OP_REVOKE, allocate_push_seq, fold_transitions, reduce_transitions, triple_of
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +55,8 @@ _RETRIES = 3
 # serialization_failure, deadlock_detected, unique_violation: all mean "retry the whole
 # transaction", because a retry resumes on a snapshot the fold agrees with.
 _RETRYABLE_SQLSTATES = {"40001", "40P01", "23505"}
+# query_canceled: the fold outgrew the statement budget, which compaction is what fixes.
+_STATEMENT_TIMEOUT = "57014"
 
 NOTHING = "nothing"
 PARKED = "parked"
@@ -347,6 +349,73 @@ def _retire(queryset, expected_ids) -> None:
         raise ClaimConflict(f"retired {deleted} of {len(expected_ids)} rows")
 
 
+# ── Compaction ────────────────────────────────────────────────────────────────
+
+
+def compact(device_id, scope) -> int:
+    """Collapse the key's compactable unconsumed entries into one. Returns rows removed.
+
+    It runs whatever the claim is doing: a claim stuck on a replayable failure holds its
+    lease for the whole lease, and a burst arriving behind it would otherwise accumulate
+    one row per operator transaction with nothing to merge them.
+    """
+    _refuse_in_transaction("compaction")
+    return _repeatable_read(lambda: _compact_locked(device_id, scope))
+
+
+def _compact_locked(device_id, scope) -> int:
+    from .models import NSOIntentOutboxEntry
+
+    state = _lock_state(device_id, scope)
+    held = {int(record["route_id"]) for record in state.claim_deletions or []}
+    rows = list(_unconsumed(device_id, scope).select_for_update().order_by("id"))
+    inputs = [row for row in rows if _compactable(row, held)]
+    if len(inputs) < 2:
+        return 0
+
+    # The HIGHEST-id input, updated in place. A minted row would take an id above anything
+    # that committed while this ran, so the later fold would apply that entry's transition
+    # before the compacted one and reverse the real order.
+    survivor, retired = inputs[-1], [row.pk for row in inputs[:-1]]
+    updated = NSOIntentOutboxEntry.objects.filter(pk=survivor.pk, consumed_by_push_seq__isnull=True).update(
+        transitions=reduce_transitions([record for row in inputs for record in row.transitions]),
+        mark_and=all(row.mark_and for row in inputs),
+        mark_any=any(row.mark_any for row in inputs),
+    )
+    if updated != 1:
+        raise ClaimConflict(f"compaction rewrote {updated} rows for entry {survivor.pk}")
+    _retire(NSOIntentOutboxEntry.objects.filter(pk__in=retired), retired)
+    logger.debug("compacted %s rows into entry %s for %s/%s", len(inputs), survivor.pk, device_id, scope)
+    return len(retired)
+
+
+def _compactable(row, held) -> bool:
+    """Whether a row may be merged: it names no route an active claim already holds.
+
+    The exactness proof needs the fold-time constant to hold from compaction until the later
+    fold, and that interval spans the claim's success or abandon. Excluding the routes it
+    holds makes the interval real; those rows compact on a later pass.
+    """
+    return not any(record.get("route_id") in held for record in row.transitions)
+
+
+def compaction_candidates(limit=None) -> list[tuple[int, str]]:
+    """Return the keys carrying more than one unconsumed entry, which are the only merge-able ones."""
+    from django.db.models import Count
+
+    from .models import NSOIntentOutboxEntry
+
+    limit = DRAIN_BATCH if limit is None else limit
+    grouped = (
+        NSOIntentOutboxEntry.objects.filter(consumed_by_push_seq__isnull=True)
+        .values_list("device_id", "scope")
+        .annotate(rows=Count("id"))
+        .filter(rows__gt=1)
+        .order_by("device_id", "scope")
+    )
+    return [(device_id, scope) for device_id, scope, _rows in grouped[:limit]]
+
+
 # ── The send ──────────────────────────────────────────────────────────────────
 
 
@@ -569,10 +638,39 @@ def abandon(claim: Claim) -> str:
 # ── The drain ─────────────────────────────────────────────────────────────────
 
 
+def _timed_out(exc) -> bool:
+    """Whether the database cancelled the statement, which is the fold outgrowing its budget."""
+    return getattr(exc.__cause__, "sqlstate", None) == _STATEMENT_TIMEOUT
+
+
+def _stamp_attempt(device_id, scope) -> None:
+    """Record that the key was tried, so a key that cannot be claimed still rotates."""
+    with transaction.atomic():
+        state = _lock_state(device_id, scope)
+        state.last_drain_attempted_at = _db_now()
+        state.save()
+
+
 def drain_key(device_id, scope, *, mode=delivery.MODE_NORMAL, force=False, chain=DRAIN_CHAIN_MAX, reform=1) -> str:
     """Claim, send and settle one key, then chain a bounded number of further drains."""
     _refuse_in_transaction("drain")
-    claimed = _claim_or_wait(device_id, scope, mode=mode, force=force)
+    try:
+        claimed = _claim_or_wait(device_id, scope, mode=mode, force=force)
+    except OperationalError as exc:
+        if not _timed_out(exc):
+            raise
+        # An oversized fold is the one failure compaction can actually fix, so it is tried
+        # once. A key that still times out keeps its work and is left STAMPED, so it rotates
+        # to the back of the next pass instead of spinning at the head of every one.
+        logger.warning("the %s/%s fold timed out; compacting and retrying it once", device_id, scope)
+        compact(device_id, scope)
+        try:
+            claimed = _claim_or_wait(device_id, scope, mode=mode, force=force)
+        except OperationalError as retried:
+            if not _timed_out(retried):
+                raise
+            _stamp_attempt(device_id, scope)
+            return FAILED
     if claimed is None:
         return NOTHING
     try:
@@ -664,7 +762,17 @@ def drain_intent_outbox(limit=None) -> tuple[int, int]:
     Bounded, candidate-filtered and starvation-free: a key is attempted only when it owes a
     send, the stamp on every attempt rotates a replayably failing key to the back, and one
     key's failure aborts neither the pass nor the tick.
+
+    Compaction runs first, over its OWN candidates: a key whose claim is stuck on a
+    replayable failure is not drainable and would never be compacted otherwise, which is
+    exactly the case where a burst accumulates.
     """
+    for device_id, scope in compaction_candidates(limit):
+        try:
+            compact(device_id, scope)
+        except Exception:  # noqa: BLE001 (one key's compaction must not abort the fleet pass)
+            logger.exception("intent outbox compaction failed for %s/%s", device_id, scope)
+
     drained = failed = 0
     for device_id, scope in drain_candidates(limit):
         try:
