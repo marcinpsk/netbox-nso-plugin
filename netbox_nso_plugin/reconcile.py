@@ -1481,6 +1481,7 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
     from dcim.models import Device
 
     from .adapter_client import AdapterError
+    from .models import NSODeviceManagement
     from .settlement import settle_static_routes
 
     try:
@@ -1535,10 +1536,16 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
                     device_id,
                     exc,
                 )
-            _settle_apply_failures(mgmt, job.get("result") if job else None, job)
-            if not apply_active:
-                _escalate_stuck_deploying(mgmt, job)
-            _journal_route_policy_apply(mgmt, job)
+            # settle_static_routes locks the row and consumes the id IT reads, so a link repair
+            # committing in that window leaves the state read above about another adapter device.
+            # A fresh fetch, not refresh_from_db: an unmanaged device must skip here, not raise.
+            mgmt = NSODeviceManagement.objects.filter(pk=mgmt.pk).first()
+            if mgmt is not None and mgmt.adapter_device_id is not None:
+                job, apply_active = _apply_job_state(mgmt.adapter_device_id)
+                _settle_apply_failures(mgmt, job.get("result") if job else None, job)
+                if not apply_active:
+                    _escalate_stuck_deploying(mgmt, job)
+                _journal_route_policy_apply(mgmt, job)
     except Exception as exc:  # noqa: BLE001 — settling is best-effort, never crash the worker
         logger.warning("nso reconcile: apply-failure settle skipped for device %s: %s", device_id, exc)
 

@@ -434,12 +434,16 @@ class TestTheReadBackIsFetchedOncePerPass(_SettlementCase):
             assert state.status == "in_sync"
 
 
-class TestStep4ReadsTheJobStateOnce(_SettlementCase):
-    """Step 4 already fetched the apply-job state, so the escalation must not fetch it again.
+class TestTheEscalationReusesStep4sJobState(_SettlementCase):
+    """The static backstop must not re-read the apply-job state Step 4 handed it.
 
-    Both reads answer the same question (may an apply be in flight) from the same
-    descending jobs page. Two fetches per reconcile is one wasted adapter round trip per
-    device per pass, and the two answers can disagree.
+    Both reads answer the same question (may an apply be in flight) from the same descending
+    jobs page, for the same adapter device id, so the second one is a wasted round trip whose
+    answer can disagree with the first.
+
+    Step 4 itself probes twice, once on each side of the settlement, and those two are about
+    DIFFERENT devices whenever a link repair commits in between: the settlement resolves the
+    id from the row it locks, and everything after it judges by the id the row holds then.
     """
 
     def _jobs_page_reads(self):
@@ -466,4 +470,7 @@ class TestStep4ReadsTheJobStateOnce(_SettlementCase):
 
         state.refresh_from_db()
         assert state.status == "apply_failed", "the backstop never ran, so nothing proves the reuse"
-        assert self._jobs_page_reads() == 1, "the escalation re-fetched the job state Step 4 already had"
+        assert self._jobs_page_reads() == 2, (
+            "Step 4 probes once before the settlement and once after it; a third read is the "
+            "escalation re-fetching the state it was handed"
+        )
