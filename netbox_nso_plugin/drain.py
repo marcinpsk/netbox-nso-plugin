@@ -533,11 +533,45 @@ def send_claim(claim: Claim):
 _ACK_LISTS = ("deleted_executed_ids", "deleted_degraded_ids", "deleted_moot_ids")
 
 
-def _named_ids(response) -> list[int]:
-    """Every route id *response* names in any acknowledgement list."""
+def _named_ids(response) -> list:
+    """Every value *response* names in any acknowledgement list, verbatim."""
     if not isinstance(response, dict):
         return []
-    return sorted({int(value) for name in _ACK_LISTS for value in (response.get(name) or [])})
+    return [value for name in _ACK_LISTS for value in (response.get(name) or [])]
+
+
+def _route_ids(values) -> tuple[set[int] | None, object]:
+    """Return the route ids *values* names, or ``(None, the offender)`` when one is not an id."""
+    ids: set[int] = set()
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, int | str):
+            return None, value
+        try:
+            ids.add(int(value))
+        except ValueError:
+            return None, value
+    return ids, None
+
+
+def _malformed_list(response) -> str:
+    """Why *response*'s acknowledgement lists are not id lists at all, or "" (§4.4).
+
+    Checked at the boundary, before any rule reads them: an id coerced downstream raised
+    out of the outcome, which left the claim active and made the stored response poisonous
+    for every replay of it.
+    """
+    if not isinstance(response, dict):
+        return ""
+    for name in _ACK_LISTS:
+        values = response.get(name)
+        if values is None:
+            continue
+        if not isinstance(values, list):
+            return f"{name} is not a list"
+        _ids, offender = _route_ids(values)
+        if offender is not None:
+            return f"{name} names {offender!r}, which is not a route id"
+    return ""
 
 
 def acknowledgement(claim: Claim, response) -> Acknowledgement:
@@ -551,12 +585,19 @@ def acknowledgement(claim: Claim, response) -> Acknowledgement:
     A claim carrying NO authority is the same rule at its boundary: a store-only or
     backfill-only request, and every request of a key with nothing queued, must be answered
     with no ids at all. A response naming one is naming an id the claim never requested.
+
+    An id that is not an id at all is refused here too, before any rule reads the lists: it
+    is a protocol violation like every other, never an exception out of the outcome.
     """
+    malformed = _malformed_list(response)
+    if malformed:
+        return Acknowledgement(False, reason=malformed)
     requested = {int(record["route_id"]) for record in claim.deletions}
     if not requested:
         named = _named_ids(response)
         if named:
-            return Acknowledgement(False, reason=f"the acknowledgement names unrequested ids {named}")
+            ids = sorted(int(value) for value in named)
+            return Acknowledgement(False, reason=f"the acknowledgement names unrequested ids {ids}")
         return Acknowledgement(True)
     if delivery.delivery_keys()[claim.scope].marking_mode != delivery.MARKING_PER_OBJECT:
         return Acknowledgement(True, frozenset(requested))
@@ -567,7 +608,7 @@ def acknowledgement(claim: Claim, response) -> Acknowledgement:
         values = response.get(name)
         if not isinstance(values, list):
             return Acknowledgement(False, reason=f"{name} is missing")
-        ids = {int(value) for value in values}
+        ids, _offender = _route_ids(values)
         if len(ids) != len(values):
             return Acknowledgement(False, reason=f"{name} repeats an id")
         if ids & seen:

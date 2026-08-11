@@ -232,6 +232,34 @@ class TestAResponseMustPartitionTheClaim(_OutcomeCase):
         assert "static_route" in errors, errors
         assert "overlap" in errors["static_route"]["message"], errors["static_route"]
 
+    def test_a_malformed_id_is_a_violation_rather_than_an_exception(self):
+        """§4.4: coercing it raised out of the outcome, leaving the claim active forever."""
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        claimed, first, second = self._claim_two()
+        malformed = partition(executed=[first.pk, "not-an-id"], moot=[second.pk])
+        with as_per_object("static_route"):
+            assert drain.settle(claimed, malformed) == drain.UNACKNOWLEDGED
+
+        state = state_of(self.device, "static_route")
+        assert state.push_seq == claimed.push_seq, "the operation is unresolved, not settled"
+        assert state.claimed_at is None, "the lease is released, so the claim is recoverable"
+        assert state.last_error_code == "ack_not_exact"
+        errors = NSODeviceManagement.objects.get(pk=self.mgmt.pk).intent_push_errors or {}
+        assert "not-an-id" in errors["static_route"]["message"], errors["static_route"]
+
+    def test_a_claim_carrying_no_authority_refuses_a_malformed_id_too(self):
+        """The boundary is the response, not the claim: a VLAN claim requests no id at all."""
+        from netbox_nso_plugin import drain
+
+        own_vlan(self.mgmt, 903, self.tag)
+        claimed = drain.claim(self.device.pk, "vlan")
+        assert claimed is not None and claimed.deletions == []
+
+        assert drain.settle(claimed, {"count": 1, "deleted_executed_ids": ["oops"]}) == drain.UNACKNOWLEDGED
+        assert state_of(self.device, "vlan").last_error_code == "ack_not_exact"
+
 
 class TestStampingFollowsTheAcknowledgedBody(_OutcomeCase):
     """O1.32 (R8-M3, R11-M1): seven shapes, and only the ones the adapter accepted stamp."""
