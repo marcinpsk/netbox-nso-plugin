@@ -94,7 +94,7 @@ def consume_static_route_settlements(mgmt) -> ConsumeResult:
         return _consume_locked(row)
 
 
-def settle_static_routes(mgmt, *, escalate: bool = True, apply_active: bool | None = None) -> ConsumeResult:
+def settle_static_routes(mgmt, *, escalate: bool = True, apply_state: tuple[int, bool] | None = None) -> ConsumeResult:
     """Walk the feed, then let the timeout backstop judge — but only a **drained** feed.
 
     The one implementation both clocks call, so the post-apply carrier and the five-minute
@@ -112,15 +112,19 @@ def settle_static_routes(mgmt, *, escalate: bool = True, apply_active: bool | No
       because every later page is empty and only the carrier judged. That is the same
       shared-failure-domain trap one level down.
 
-    The remaining precondition — no apply in flight — is the backstop's own, so that both
-    clocks get it without either restating it. A caller that already read the job state hands
-    it over as *apply_active* rather than paying for a second jobs fetch; the maintenance
-    tick, which has read nothing, leaves it None and the backstop looks it up itself.
+    The remaining precondition, no apply in flight, is the backstop's own, so that both clocks
+    get it without either restating it. A caller that already read the job state hands over the
+    ``(adapter device id, active)`` pair rather than paying for a second jobs fetch, and the id
+    travels with the verdict because the consumer resolves its own: a probe of the device this
+    row held before a link repair says nothing about an apply in flight on the one it holds
+    now. A pair that names another device is dropped and the backstop looks the state up for
+    the id it locked; the maintenance tick, which has read nothing, passes none.
     """
     from .reconcile import _escalate_stuck_static_routes
 
     outcome = consume_static_route_settlements(mgmt)
     if escalate and outcome.drained and outcome.adapter_device_id is not None:
+        apply_active = apply_state[1] if apply_state and apply_state[0] == outcome.adapter_device_id else None
         _escalate_stuck_static_routes(mgmt, adapter_device_id=outcome.adapter_device_id, apply_active=apply_active)
     return outcome
 
