@@ -17,6 +17,7 @@ import dataclasses
 import hashlib
 import json
 import re
+import time
 from unittest.mock import MagicMock, patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
@@ -150,6 +151,18 @@ def in_thread(work, timeout=30):
 
 
 @contextlib.contextmanager
+def without_legacy_coalescer():
+    """Silence the interim commit-time coalescer, which the O1.19 swap deletes.
+
+    It still sends alongside the drain, and its own send takes the management row FOR
+    UPDATE before any client call, so a pin holding a claim open would measure the
+    coalescer waiting on the claim rather than the outbox's own behaviour.
+    """
+    with patch("netbox_nso_plugin.signals._drain_intent_pushes"):
+        yield
+
+
+@contextlib.contextmanager
 def as_per_object(scope):
     """Run the block with *scope* in ``per_object`` marking mode, which O3 makes permanent.
 
@@ -214,6 +227,9 @@ class ReceiptAdapter:
         self.fail_with: Exception | None = None
         #: Adapter device ids whose every request fails, for the replayably failing key.
         self.fail_devices: set[int] = set()
+        #: Seconds a response takes to arrive. It models a DRIPPING response: the client's
+        #: read window measures the gap between bytes, so it never fires on one.
+        self.delay = 0.0
         #: Per adapter device id: what the device carries, and what it no longer owns.
         self.on_device: dict[int, set] = {}
         self.detached: dict[int, set] = {}
@@ -259,6 +275,8 @@ class ReceiptAdapter:
         )
 
     def _handle(self, method, url, **kwargs):
+        if self.delay:
+            time.sleep(self.delay)
         if self.fail_with is not None:
             raise self.fail_with
         if any(f"/devices/{device_id}/" in url for device_id in self.fail_devices):
