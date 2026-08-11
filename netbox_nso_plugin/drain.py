@@ -740,10 +740,37 @@ def _degradations(state, claim: Claim, response, now) -> list[dict]:
     if degraded_ids:
         records.append(_degradation(degraded_ids, removed or _lineages(claim.deletions, degraded_ids), now, claim))
     if removed:
-        pending = [record for record in state.queued_deletions if _uncorrelated_hit(record, removed)]
+        pending = [record for record in _pending_deletions(state, claim) if _uncorrelated_hit(record, removed)]
         if pending:
             records.append(_degradation(sorted(int(r["route_id"]) for r in pending), removed, now, claim))
     return records
+
+
+def _pending_deletions(state, claim: Claim) -> list[dict]:
+    """Every deletion this key still owes, read from BOTH homes and from its unconsumed entries.
+
+    A backfill claim skips the fold and the ``queued_deletions`` move entirely (§4.4), so a
+    deletion committing after the fence shut is in an entry and in neither home. Reading the
+    state row alone left that one unattributed while the same pass pruned its NULL-``route_id``
+    row, and the next ordinary claim then folded it after the row was gone: the adapter moots
+    it and the detach is silent.
+
+    The fold is the authority algebra's own answer, not a second one, so a revocation
+    committed behind the deletion withdraws it here exactly as it would in a claim. Ids an
+    in-flight claim already carries are excluded: the response classifies those.
+    """
+    transitions = [
+        record
+        for row in _unconsumed(state.device_id, state.scope).only("transitions").order_by("id")
+        for record in row.transitions
+    ]
+    folded = fold_transitions(
+        transitions,
+        claim_deletions=[int(record["route_id"]) for record in claim.deletions],
+        queued=state.queued_deletions,
+        revoked=state.revoked_ids,
+    )
+    return list(folded.queued.values())
 
 
 def _degradation(route_ids, triples, now, claim: Claim) -> dict:

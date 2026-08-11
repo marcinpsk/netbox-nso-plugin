@@ -732,3 +732,38 @@ class TestTheFenceWithholdsEverySendButTheBackfill(_OutcomeCase):
             "the deletion the caller asked to push is unacknowledged and replayed"
         )
         assert [int(r["route_id"]) for r in state.claim_deletions] == [route.pk]
+
+    def test_a_deletion_committed_after_the_fence_shut_is_attributed_too(self):
+        """codex O1 r4 F1: a backfill folds nothing, so that deletion lives only in an entry."""
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.adapter_client import AdapterError
+
+        withheld = own_route(self.mgmt, "198.51.100.240/28", "198.51.100.17")
+        later = own_route(self.mgmt, "203.0.113.16/28", "198.51.100.18")
+        self.clear_entries()
+        self.unown(withheld)
+        residue = triple("203.0.113.32/28", "203.0.113.2")
+        self.adapter.fail_with = AdapterError("fence shut", code="conflict", detail={"reason": "fence_shut"})
+
+        with as_per_object("static_route"):
+            assert self.drain() == drain.WITHHELD
+
+            # The operator un-owns a second route while the key is withheld. The backfill
+            # claim consumes nothing and moves nothing, so this authority is in an
+            # unconsumed entry and in neither home of the state row.
+            self.unown(later)
+            state = state_of(self.device, "static_route")
+            assert [int(r["route_id"]) for r in state.queued_deletions] == [withheld.pk]
+            assert entries(self.device, "static_route", unconsumed=True)
+
+            self.adapter.fail_with = None
+            self.adapter._respond = lambda body: partition(removed=[residue])
+            assert self.drain(chain=0) == drain.SUCCEEDED
+
+        recorded = state_of(self.device, "static_route").degraded_deletions
+        assert [r["route_ids"] for r in recorded] == [sorted([withheld.pk, later.pk])], (
+            "the backfill pruned the row behind the later deletion and recorded nothing, so the next "
+            "ordinary claim folds it after its row is gone and the adapter moots it silently"
+        )
+        assert recorded[0]["triples"] == [residue]
+        assert recorded[0]["reason"] == drain.PRE_FENCE_DETACH
