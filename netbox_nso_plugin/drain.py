@@ -355,9 +355,9 @@ def _retire(queryset, expected_ids) -> None:
 def compact(device_id, scope) -> int:
     """Collapse the key's compactable unconsumed entries into one. Returns rows removed.
 
-    It runs whatever the claim is doing: a claim stuck on a replayable failure holds its
-    lease for the whole lease, and a burst arriving behind it would otherwise accumulate
-    one row per operator transaction with nothing to merge them.
+    It runs whatever the claim is doing. A claim stuck on a replayable failure keeps the key
+    undrainable until its lease runs out, and a burst arriving behind it would otherwise
+    accumulate one row per operator transaction with nothing to merge them.
     """
     _refuse_in_transaction("compaction")
     return _repeatable_read(lambda: _compact_locked(device_id, scope))
