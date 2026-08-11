@@ -267,6 +267,12 @@ class TestTheLineageIsBoundedAndCleared(_LineageCase):
                 assert lineage[0] == acked, "the acknowledged triple always leads"
 
     def test_the_success_algebra_clears_the_carry_for_every_request_mode(self):
+        """The clearing lives in the success algebra, never in one mode's own branch.
+
+        A store-only claim reaches it carrying nothing (§4.3(d)), so it is refused while the
+        deletion is pending and the ordinary claim behind it is what clears the carry. The
+        carry survives that refusal, which is the point of refusing rather than folding.
+        """
         from netbox_nso_plugin import delivery, drain
 
         for index, mode in enumerate((delivery.MODE_NORMAL, delivery.MODE_STORE_ONLY)):
@@ -283,7 +289,10 @@ class TestTheLineageIsBoundedAndCleared(_LineageCase):
                 self.unown(route)
                 with as_per_object("static_route"):
                     self.adapter._respond = lambda body, pk=route.pk: partition(executed=[pk])
-                    assert self.drain(mode=mode) == drain.SUCCEEDED
+                    if mode == delivery.MODE_STORE_ONLY:
+                        assert self.drain(mode=mode) == drain.REFUSED
+                        assert state_of(self.device, "static_route").lineage_carry, "still owed"
+                    assert self.drain() == drain.SUCCEEDED
 
                 state = state_of(self.device, "static_route")
                 assert state.lineage_carry == {}, state.lineage_carry
