@@ -82,15 +82,17 @@ class TestApplyPromotion(TestCase):
         """Run the Apply with the static-route claim answering *static_response*.
 
         The Apply routes every scope through ``drain.push_now``, so that is the boundary the
-        promotion gate reads: the other scopes are a different subsystem here and answer
-        ``None``, which the gate consults for none of them.
+        promotion gate reads. The other scopes are a different subsystem here and answer
+        ``None``, which the gate consults for none of them — bar SNMP, whose refusal stops
+        the whole Apply (codex O1 r4 F2), so it answers acknowledged.
         """
         from netbox_nso_plugin.views import _prepare_apply
 
         mgmt, state, other = self._setup()
+        answers = {"static_route": static_response, "snmp": {"device_id": 95}}
         patcher = patch(
             "netbox_nso_plugin.drain.push_now",
-            side_effect=lambda device_id, scope, **kwargs: static_response if scope == "static_route" else None,
+            side_effect=lambda device_id, scope, **kwargs: answers.get(scope),
         )
         push = patcher.start()
         self.addCleanup(patcher.stop)
@@ -116,6 +118,22 @@ class TestApplyPromotion(TestCase):
 
         assert state.status == "deploying"
         assert other.status == "deploying"
+
+    def test_a_refused_snmp_refresh_stops_the_apply_before_any_promotion(self):
+        """codex O1 r4 F2: an Apply against a stale SNMP store re-applies what was deleted."""
+        from netbox_nso_plugin.views import ApplyRefused, _prepare_apply
+
+        mgmt, state, other = self._setup()
+        patcher = patch("netbox_nso_plugin.drain.push_now", side_effect=lambda device_id, scope, **kwargs: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        with self.assertRaises(ApplyRefused):
+            _prepare_apply(mgmt)
+
+        state.refresh_from_db()
+        other.refresh_from_db()
+        assert (state.status, other.status) == ("accepted", "accepted"), "the abort promotes nothing"
 
 
 class TestTheStuckDeployingBackstop(_SettlementCase):

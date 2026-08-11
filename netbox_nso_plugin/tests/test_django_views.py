@@ -13,7 +13,8 @@ from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
 from django.contrib.auth import get_user_model
-from django.test import SimpleTestCase, TestCase
+from django.db import transaction
+from django.test import SimpleTestCase, TestCase, TransactionTestCase
 from django.urls import reverse
 
 from netbox_nso_plugin.adapter_client import AdapterError
@@ -26,7 +27,8 @@ from netbox_nso_plugin.models import (
 )
 
 from ._adapter_http import make_response, make_session
-from .mixins import IntentPushDeliveryMixin
+from ._outbox_case import ReceiptAdapter, make_managed, without_commit_drain
+from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 User = get_user_model()
 TEST_PASSWORD = "testpass789"  # noqa: S105
@@ -5691,3 +5693,58 @@ class TestRoutePolicyGrid(ViewTestBase):
         self.assertIsNone(self.mgmt.adapter_device_id)
         data = json.loads(self.client.get(self._url(), {"format": "json"}).content)
         self.assertEqual(len(data["rows"]), 3)
+
+
+class TestApplyRefusesAStaleSnmpStore(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    """codex O1 r4 F2: the Apply may not commit an SNMP store a refused push left stale.
+
+    The Apply refreshes SNMP store-only ahead of ``trigger_apply`` so the adapter commits
+    what NetBox owns now. That push is refused while the key holds deletion authority
+    (§4.3(d)), and the refusal was discarded: the Apply then committed the adapter's stored
+    SNMP intent, which still carries the community the operator deleted.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.user = User.objects.create_superuser(
+            username="applysnmpadmin", password=TEST_PASSWORD, email="applysnmp@test.example"
+        )
+        self.client.force_login(self.user)
+        self.adapter = ReceiptAdapter(respond=lambda body: {"job_id": 7712, "count": 0})
+        self.device, self.mgmt = make_managed("apsnmp", 7790)
+
+    def _apply(self):
+        from django.contrib.messages import get_messages
+
+        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[self.mgmt.pk, "apply"])
+        config, session = self.adapter.patches()
+        with config, session:
+            response = self.client.post(url)
+        applied = [request for request in self.adapter.requests if "/actions/apply" in request["url"]]
+        return applied, [str(message) for message in get_messages(response.wsgi_request)]
+
+    def _own_then_delete_a_community(self):
+        from netbox_nso_plugin.models import NSOSnmpCommunityState
+
+        with without_commit_drain(), transaction.atomic():
+            community = NSOSnmpCommunityState.objects.create(
+                management=self.mgmt, community_hash="ab12cd34ef56ab78", access="RO", status="accepted"
+            )
+        with without_commit_drain(), transaction.atomic():
+            community.delete()
+
+    def test_a_pending_snmp_deletion_stops_the_apply(self):
+        self._own_then_delete_a_community()
+
+        applied, messages_shown = self._apply()
+
+        assert applied == [], (
+            "the Apply committed the adapter's stored SNMP intent, which still holds the community the operator deleted"
+        )
+        assert any("SNMP" in message for message in messages_shown), messages_shown
+
+    def test_an_acknowledged_refresh_still_applies(self):
+        """The guard is a precondition, not a new refusal: the normal path is unchanged."""
+        applied, _messages_shown = self._apply()
+
+        assert len(applied) == 1

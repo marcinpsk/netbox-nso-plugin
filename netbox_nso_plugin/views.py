@@ -2480,6 +2480,16 @@ _ACTION_LABELS = {
 }
 
 
+class ApplyRefused(Exception):
+    """A precondition of the Apply is unmet, so no job is triggered and no row is promoted."""
+
+
+def _push_error_message(mgmt, scope) -> str:
+    """Read back the cause the claim recorded for *scope*, which the NSO tab also renders."""
+    mgmt.refresh_from_db(fields=["intent_push_errors"])
+    return (mgmt.intent_push_errors or {}).get(scope, {}).get("message") or "no cause was recorded"
+
+
 def _prepare_apply(mgmt):
     """Pre-Apply bookkeeping for one device's single Apply.
 
@@ -2491,6 +2501,8 @@ def _prepare_apply(mgmt):
 
     Returns the rows moved to 'deploying' as ``[(model, [pks]), …]`` so the caller can
     roll them back via :func:`_rollback_prepare_apply` if the Apply fails to enqueue a job.
+    Raises :class:`ApplyRefused` when the SNMP refresh below is not acknowledged: that runs
+    before any promotion, so an abort there leaves nothing to roll back.
     """
     from . import drain
     from .delivery import MODE_STORE_ONLY
@@ -2544,9 +2556,22 @@ def _prepare_apply(mgmt):
     # Store-only: a plain put_snmp_intent enqueues the shrink-removal (and auto-apply) job,
     # which would 409 the trigger_apply this runs just ahead of.
     try:
-        drain.push_now(mgmt.device_id, "snmp", mode=MODE_STORE_ONLY, force=True)
-    except Exception as exc:  # noqa: BLE001 — one scope's failure must not block the rest
+        refreshed = drain.push_now(mgmt.device_id, "snmp", mode=MODE_STORE_ONLY, force=True)
+    except Exception as exc:  # noqa: BLE001 — the cause of the abort below, never swallowed
         logger.warning("Apply push failed for device %s: %s", mgmt.device_id, exc)
+        refreshed = None
+    if refreshed is None:
+        # A store-only claim carrying deletion authority is refused (§4.3(d)), and the Apply
+        # would then commit the SNMP intent the adapter still holds. Delivering that
+        # authority takes a NORMAL claim, whose removal and auto-apply jobs are exactly what
+        # this store-only push exists to avoid ahead of trigger_apply and would 409 this
+        # Apply anyway, so the precondition is reported rather than worked around: the tick
+        # drains the pending claim and the operator re-applies.
+        raise ApplyRefused(
+            f"Apply stopped: this device's SNMP intent refresh was not acknowledged "
+            f"({_push_error_message(mgmt, 'snmp')}), so applying now would commit the SNMP intent the "
+            "adapter still holds. Nothing was applied and no row was promoted."
+        )
 
     moved: list[tuple] = []  # (model, [pks]) actually moved, for rollback if the Apply fails
     for model in (
@@ -2595,6 +2620,34 @@ def _rollback_prepare_apply(moved) -> None:
 class NSODeviceActionView(NSOActionPermissionMixin, View):
     """Trigger an adapter action (sync / detect-drift / connect) via POST."""
 
+    def _incumbent_job(self, request, mgmt, exc, *, is_ajax):
+        """Report a 409 under the name of the job that HOLDS the device (S5a C, codex R1-F7).
+
+        Without the incumbent's type the UI polls the running job under the CLICKED action's
+        label ("Sync from NSO running…" while an Apply runs). Best-effort: a failed lookup
+        degrades to the generic wording rather than losing the conflict.
+        """
+        from . import adapter_client as client
+
+        job_id = (exc.detail or {}).get("job_id")
+        incumbent_type = None
+        if job_id:
+            try:
+                incumbent_type = (client.get_job(job_id) or {}).get("type")
+            except AdapterError:
+                incumbent_type = None
+        if is_ajax:
+            return JsonResponse({"status": "conflict", "job_id": job_id, "job_type": incumbent_type})
+        msg = (
+            f"Another job is already running: {incumbent_type}."
+            if incumbent_type
+            else "A job is already running for this device."
+        )
+        if job_id:
+            msg += f" (Job ID: {job_id})"
+        messages.warning(request, msg)
+        return redirect(_device_nso_tab_url(mgmt.device.pk))
+
     def post(self, request, pk, action):
         """Fire the requested action against the nso-adapter and redirect back."""
         from . import adapter_client as client
@@ -2628,7 +2681,14 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
         # scopes (attrs/IP/SNMP/routing/L2), and here we force-commit the LACP +
         # switchport snapshots, which are owned in NetBox rather than mirrored in the
         # adapter. Accept itself only marks rows owned (no immediate device write).
-        prepared = _prepare_apply(mgmt) if action == "apply" else None
+        try:
+            prepared = _prepare_apply(mgmt) if action == "apply" else None
+        except ApplyRefused as exc:
+            logger.warning("Apply refused for device %s: %s", mgmt.device_id, exc)
+            if is_ajax:
+                return JsonResponse({"status": "error", "message": str(exc)}, status=409)
+            messages.error(request, str(exc))
+            return redirect(_device_nso_tab_url(mgmt.device.pk))
 
         try:
             result = action_fn(mgmt.adapter_device_id)
@@ -2646,27 +2706,7 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
             if prepared:
                 _rollback_prepare_apply(prepared)
             if exc.code == "conflict":
-                job_id = (exc.detail or {}).get("job_id")
-                # S5a C (codex R1-F7): name the INCUMBENT job — without it the UI polls the
-                # running job under the CLICKED action's label ("Sync from NSO running…"
-                # while an Apply runs). Best-effort: a failed lookup degrades to generic.
-                incumbent_type = None
-                if job_id:
-                    try:
-                        incumbent_type = (client.get_job(job_id) or {}).get("type")
-                    except AdapterError:
-                        incumbent_type = None
-                if is_ajax:
-                    return JsonResponse({"status": "conflict", "job_id": job_id, "job_type": incumbent_type})
-                msg = (
-                    f"Another job is already running: {incumbent_type}."
-                    if incumbent_type
-                    else "A job is already running for this device."
-                )
-                if job_id:
-                    msg += f" (Job ID: {job_id})"
-                messages.warning(request, msg)
-                return redirect(_device_nso_tab_url(mgmt.device.pk))
+                return self._incumbent_job(request, mgmt, exc, is_ajax=is_ajax)
             if is_ajax:
                 return JsonResponse({"status": "error", "message": str(exc)}, status=502)
             messages.error(request, f"Adapter error triggering {label}: {exc}")
