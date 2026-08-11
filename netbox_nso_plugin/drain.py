@@ -76,6 +76,7 @@ SUCCEEDED = "succeeded"
 FAILED = "failed"
 SUPERSEDED = "superseded"
 UNACKNOWLEDGED = "unacknowledged"
+REJECTED = "rejected"
 
 WITHHELD = "withheld"
 
@@ -93,6 +94,10 @@ DEGRADED_REASONS = {
 #: Adapter rejections PROVEN to have had no effect: the request unwound through the claim
 #: guard's rollback before its single commit (O-A5). Only these may abandon a sent claim.
 PROVEN_NO_EFFECT = ("fence_shut", "store_only_deletion")
+
+#: The adapter's refusal of the BODY, at the boundary: every raise site precedes the first
+#: statement of the request's own transaction, so it is proven no-effect by the same rule.
+BOUNDARY_REJECTION = "validation_error"
 
 
 class ClaimBusy(Exception):
@@ -1144,6 +1149,8 @@ def _drain_once(device_id, scope, *, mode, force, chain=DRAIN_CHAIN_MAX, reform=
         logger.warning("push_seq %s failed for %s/%s: %s", claimed.push_seq, device_id, scope, exc)
         if _proven_no_effect(exc):
             return _withhold(claimed, exc), None
+        if _rejected_at_boundary(exc):
+            return _dissolve(claimed, exc), None
         return record_failure(claimed, exc), None
     if answer == ABANDONED and reform > 0:
         # A fixed revocation resolves in ONE re-form: the re-form folds the revoking entry
@@ -1213,6 +1220,33 @@ def _proven_no_effect(exc) -> bool:
     detail = getattr(exc, "detail", None)
     detail = detail if isinstance(detail, dict) else {}
     return bool({getattr(exc, "code", None), detail.get("code"), detail.get("reason")} & set(PROVEN_NO_EFFECT))
+
+
+def _rejected_at_boundary(exc) -> bool:
+    """Whether the adapter refused the BODY, which is deterministic and had no effect.
+
+    The refusal is raised before the request's first statement and repeats for the same
+    bytes, so replaying it is not a retry: it is the same rejection, forever.
+    """
+    return getattr(exc, "code", None) == BOUNDARY_REJECTION
+
+
+def _dissolve(claim: Claim, exc) -> str:
+    """Abandon a refused body so the next claim folds the operator's correction.
+
+    §4.2's proven-no-effect abandon, without the withholding the fence adds: a shut fence is
+    a condition of the DEVICE that one backfill lifts, while an invalid body is a condition
+    of the request that only an operator edit changes. Replaying it would take that edit over
+    at the burned body on every later drain, so the correction could never reach the wire.
+    """
+    abandon(claim)
+    with transaction.atomic():
+        state = _lock_state(claim.device_id, claim.scope)
+        state.last_error_code = str(getattr(exc, "code", "") or type(exc).__name__)[:64]
+        state.last_error_at = _db_now()
+        state.save()
+    logger.warning("%s/%s refused push_seq %s at the boundary: %s", claim.device_id, claim.scope, claim.push_seq, exc)
+    return REJECTED
 
 
 def _withhold(claim: Claim, exc) -> str:

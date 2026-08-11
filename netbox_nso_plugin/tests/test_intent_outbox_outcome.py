@@ -914,3 +914,60 @@ class TestARestoreRebaseClearsTheAdaptersWatermark(_OutcomeCase):
         assert advance_push_seq(highest) == highest
         assert advance_push_seq(highest - 100) == highest, "a later key's lower watermark cannot pull it back"
         assert allocate_push_seq() == highest + 1
+
+
+class TestABoundaryRejectionDissolvesTheClaim(_OutcomeCase):
+    """codex O1 r5 F2 (§4.2): a deterministic 422 is proven no-effect, so the claim abandons.
+
+    The adapter refuses a duplicate triple or a duplicate route id at its boundary, before
+    it takes its claim guard and therefore before any statement of its own transaction. The
+    body is invalid and will stay invalid, so replaying it takes over the operator's
+    correcting edit on every later drain and the correction never reaches the wire.
+    """
+
+    tag = "reject"
+    adapter_device_id = 7713
+
+    def _rejects(self, body):
+        from netbox_nso_plugin.adapter_client import AdapterError
+
+        raise AdapterError(
+            "Two routes in the payload carry the same (vrf, prefix, next_hop)",
+            code="validation_error",
+            detail={"reason": "duplicate_triple"},
+        )
+
+    def _move(self, route, next_hop):
+        """The operator's edit, left unconsumed for the drain under test to fold."""
+        with without_commit_drain(), transaction.atomic():
+            route.next_hop = next_hop
+            route.save()
+
+    def test_a_rejected_body_abandons_and_the_correction_sends_at_a_fresh_sequence(self):
+        from netbox_nso_plugin import drain
+
+        route = own_route(self.mgmt, "198.51.100.128/28", "198.51.100.20")
+        assert self.drain() == drain.SUCCEEDED
+        accepted = self.adapter._respond
+        self._move(route, "198.51.100.21")
+        self.adapter._respond = self._rejects
+
+        assert self.drain() == drain.REJECTED
+
+        state = state_of(self.device, "static_route")
+        assert state.push_seq is None, "the rejection is proven no-effect, so the claim dissolves"
+        assert state.claimed_at is None and state.last_error_code == "validation_error"
+        assert state.fence_withheld_since is None, "a rejected body is not a shut fence"
+        assert entries(self.device, "static_route", unconsumed=True), "the work came back"
+        burned = self.adapter.sequences[-1]
+
+        self.adapter._respond = accepted
+        self._move(route, "198.51.100.22")
+        assert self.drain() == drain.SUCCEEDED
+
+        sent = self.adapter.requests[-1]
+        assert [entry["next_hop"] for entry in sent["body"]["routes"]] == ["198.51.100.22"], (
+            "a replayed claim ships the rejected body forever and the correction never lands"
+        )
+        assert sent["push_seq"] > burned, "the rejected sequence is burned, never reissued"
+        assert entries(self.device, "static_route") == []
