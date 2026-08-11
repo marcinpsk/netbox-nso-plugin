@@ -83,7 +83,7 @@ class TestApplyPromotion(TestCase):
 
         The Apply routes every scope through ``drain.push_now``, so that is the boundary the
         promotion gate reads. The other scopes are a different subsystem here and answer
-        ``None``, which the gate consults for none of them — bar SNMP, whose refusal stops
+        ``None``, which the gate consults for none of them, bar SNMP, whose refusal stops
         the whole Apply (codex O1 r4 F2), so it answers acknowledged.
         """
         from netbox_nso_plugin.views import _prepare_apply

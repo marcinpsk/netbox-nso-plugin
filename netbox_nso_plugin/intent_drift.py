@@ -282,7 +282,7 @@ def resync_intent(device, mgmt, keys: list[str] | None = None) -> tuple[list[str
         # drop". The re-sync would then silently no-op while the view reported success.
         try:
             response = drain.push_now(mgmt.device_id, _delivery_key(sc), mode=delivery.MODE_STORE_ONLY, force=True)
-        except Exception:  # noqa: BLE001 — one scope's refusal must not strand the rest unattempted
+        except Exception:  # noqa: BLE001 (one scope's refusal must not strand the rest unattempted)
             logger.exception("Intent re-sync raised for device %s scope %s", mgmt.device_id, key)
             response = None
         # Forced, so None is unambiguously a refusal or a failure and never a digest-equal

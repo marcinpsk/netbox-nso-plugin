@@ -2563,7 +2563,7 @@ def _prepare_apply(mgmt):
     # which would 409 the trigger_apply this runs just ahead of.
     try:
         refreshed = drain.push_now(mgmt.device_id, "snmp", mode=MODE_STORE_ONLY, force=True)
-    except Exception as exc:  # noqa: BLE001 — the cause of the abort below, never swallowed
+    except Exception as exc:  # noqa: BLE001 (the cause of the abort below, never swallowed)
         logger.warning("Apply push failed for device %s: %s", mgmt.device_id, exc)
         refreshed = None
     if refreshed is None:
@@ -2744,7 +2744,7 @@ class NSOIntentResyncView(NSOActionPermissionMixin, View):
                 # failure it is; the NSO tab renders the per-scope cause the claim recorded.
                 messages.error(
                     request,
-                    f"The adapter did not acknowledge: {', '.join(failed)} — that intent is still "
+                    f"The adapter did not acknowledge: {', '.join(failed)}. That intent is still "
                     "orphaned. See the per-scope push error on this tab, then retry.",
                 )
             if not done and not failed:

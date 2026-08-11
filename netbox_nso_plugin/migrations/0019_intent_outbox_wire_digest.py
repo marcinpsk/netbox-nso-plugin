@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""#1503 Appendix O (O1) — two digests on the outbox state row, named for their two jobs.
+"""#1503 Appendix O (O1): two digests on the outbox state row, named for their two jobs.
 
 One value cannot answer both questions. The adapter's receipt digests the raw body it
 received (§4.4), so a restore comparing it against a plugin-internal structure could never
