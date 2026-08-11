@@ -439,6 +439,51 @@ class TestTheDegradationRecordOutlivesEverySuccess(_OutcomeCase):
         assert state_of(self.device, "vlan").degraded_deletions != []
 
 
+class TestStoreOnlyCarriesNoAuthority(_OutcomeCase):
+    """§4.3(d), codex O1 F3: a store-only claim carries nothing and clears nothing."""
+
+    tag = "store"
+    adapter_device_id = 7708
+
+    def test_a_store_only_claim_is_refused_while_a_deletion_is_pending(self):
+        from netbox_nso_plugin import delivery, drain
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        route = own_route(self.mgmt, "198.51.100.240/28", "198.51.100.15")
+        self.clear_entries()
+        self.unown(route)
+        pending = [row.pk for row in entries(self.device, "static_route", unconsumed=True)]
+        assert pending, "the deletion is recorded and nothing has folded it yet"
+
+        config, session = self.adapter.patches()
+        with config, session:
+            answer = drain.push_now(self.device.pk, "static_route", mode=delivery.MODE_STORE_ONLY, force=True)
+
+        assert answer is None, "refused, so the caller reports it instead of believing it landed"
+        assert self.adapter.requests == [], "a store-only request writes no tombstone, so it may not carry one"
+        assert [row.pk for row in entries(self.device, "static_route", unconsumed=True)] == pending
+        state = state_of(self.device, "static_route")
+        assert state is None or (state.push_seq, state.claim_deletions, state.queued_deletions) == (None, [], [])
+
+        errors = NSODeviceManagement.objects.get(pk=self.mgmt.pk).intent_push_errors or {}
+        assert "static_route" in errors, errors
+
+        claimed = drain.claim(self.device.pk, "static_route")
+        assert [int(record["route_id"]) for record in claimed.deletions] == [route.pk], (
+            "the store-only claim consumed the authority the ordinary claim has to deliver"
+        )
+
+    def test_a_store_only_claim_with_nothing_queued_still_sends(self):
+        from netbox_nso_plugin import delivery, drain
+
+        own_vlan(self.mgmt, 904, self.tag)
+        config, session = self.adapter.patches()
+        with config, session:
+            assert drain.push_now(self.device.pk, "vlan", mode=delivery.MODE_STORE_ONLY, force=True) is not None
+
+        assert self.adapter.requests[-1]["params"].get("store_only") == "true"
+
+
 class TestTheFenceWithholdsEverySendButTheBackfill(_OutcomeCase):
     """§4.3(c): a proven-no-effect 409 abandons, and only the backfill pass may send after it."""
 

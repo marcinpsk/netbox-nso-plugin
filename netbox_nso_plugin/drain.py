@@ -59,6 +59,7 @@ _RETRYABLE_SQLSTATES = {"40001", "40P01", "23505"}
 _STATEMENT_TIMEOUT = "57014"
 
 NOTHING = "nothing"
+REFUSED = "refused"
 PARKED = "parked"
 ABANDONED = "abandoned"
 SUCCEEDED = "succeeded"
@@ -90,6 +91,12 @@ class ProtocolViolation(Exception):
 
 class ClaimConflict(Exception):
     """The world changed under a claim: its exact-primary-key write hit a different count."""
+
+
+class AuthorityPending(Exception):
+    """A store-only claim was asked to carry deletion authority it can never deliver (§4.3(d))."""
+
+    code = "nso_store_only_authority_pending"
 
 
 @dataclasses.dataclass
@@ -309,6 +316,13 @@ def _form(state, mgmt, now, mode, force) -> Claim | None:
         lineage_carry=state.lineage_carry,
     )
     deletions = list(folded.queued.values())
+    if mode == delivery.MODE_STORE_ONLY and deletions:
+        # §4.3(d): a store-only claim carries nothing and clears nothing. Folding this
+        # authority would consume its entries and let the outcome retire it, while the
+        # adapter writes no tombstone for a store-only request (O-A3): the deletion would be
+        # gone with the device untouched. The refusal rolls the whole claim back, so the
+        # entries stay unconsumed for the ordinary claim that can deliver them.
+        raise AuthorityPending(f"{device_id}/{scope} holds deletion authority a store-only request cannot carry")
 
     rendered = delivery.render(scope, device_id, mgmt.adapter_device_id)
     digest = request_digest(rendered.payload, mode=mode, deletions=deletions, mark=mark)
@@ -636,6 +650,18 @@ def _report_protocol_violation(claim: Claim, reason: str) -> None:
     )
 
 
+def _report_refusal(device_id, scope, exc) -> None:
+    """Surface a claim the key may not take, where an operator reads its other refusals.
+
+    A refusal is not a silent drop: the caller reads ``None`` and reports the key as not
+    acknowledged, and the per-scope rejection entry is what the device tab renders.
+    """
+    from . import signals
+
+    logger.warning("refusing the %s/%s claim: %s", device_id, scope, exc)
+    signals._record_push_outcome(device_id, scope, (signals.read_push_attempt(device_id, scope) or 0), exc)
+
+
 def _degradations(state, claim: Claim, response, now) -> list[dict]:
     """Return the §4.3(c) records this response owes, most attributable first.
 
@@ -890,7 +916,11 @@ def _drain_once(device_id, scope, *, mode, force, chain=DRAIN_CHAIN_MAX, reform=
     # The mode THIS attempt may send in. The caller's own mode is what a re-form or a chain
     # resumes with, so a fence that opens mid-chain goes back to delivering, not backfilling.
     send_mode = _withheld_mode(device_id, scope, mode)
-    claimed, timed_out = _claim_or_compact(device_id, scope, mode=send_mode, force=force)
+    try:
+        claimed, timed_out = _claim_or_compact(device_id, scope, mode=send_mode, force=force)
+    except AuthorityPending as refusal:
+        _report_refusal(device_id, scope, refusal)
+        return REFUSED, None
     if timed_out:
         return FAILED, None
     if claimed is None:
