@@ -971,3 +971,46 @@ class TestABoundaryRejectionDissolvesTheClaim(_OutcomeCase):
         )
         assert sent["push_seq"] > burned, "the rejected sequence is burned, never reissued"
         assert entries(self.device, "static_route") == []
+
+
+class TestTheDowngradeRecordNamesWhatLeftTheDevice(_OutcomeCase):
+    """codex O1 r5 F4 (§4.3(c)): the banner renders the record, so the record has to be readable.
+
+    A route id alone tells an operator nothing about what left the service, which is why the
+    record carries the triples. Each deletion holds a LINEAGE of them, so a record built from
+    the lists themselves nests one level deeper than every reader of it expects.
+    """
+
+    tag = "downg"
+    adapter_device_id = 7714
+
+    def _touch(self, route):
+        """An unmarked contributor: the operator saves an overlay the deletion folds with."""
+        from netbox_nso_plugin.models import NSOStaticRouteState
+
+        with without_commit_drain(), transaction.atomic():
+            NSOStaticRouteState.objects.get(management=self.mgmt, static_route=route).save()
+
+    def test_a_downgraded_fold_records_the_triples_the_banner_renders(self):
+        from netbox_nso_plugin import drain
+
+        going = own_route(self.mgmt, "198.51.100.160/28", "198.51.100.30")
+        staying = own_route(self.mgmt, "198.51.100.176/28", "198.51.100.31")
+        assert self.drain() == drain.SUCCEEDED
+        self.clear_entries()
+
+        # One marked contributor and one unmarked one, folded into a single unmarked send.
+        self.unown(going)
+        self._touch(staying)
+
+        assert self.drain(chain=0) == drain.SUCCEEDED
+
+        [record] = state_of(self.device, "static_route").degraded_deletions
+        assert record["reason"] == drain.LEGACY_MARK_DOWNGRADED
+        assert record["route_ids"] == [going.pk]
+
+        [banner] = drain.degraded_deletions(self.device.pk)
+        assert banner["triples"] == [triple("198.51.100.160/28", "198.51.100.30")], (
+            "the record nested the lineages, so the banner and the ack command name no route at all"
+        )
+        assert drain.acknowledge_degraded_deletions(self.device.pk)[0][2] == [record]

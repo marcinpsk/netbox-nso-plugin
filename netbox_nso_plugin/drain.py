@@ -897,7 +897,9 @@ def settle(claim: Claim, response) -> str:
                 *state.degraded_deletions,
                 {
                     "route_ids": sorted(ack.acknowledged),
-                    "triples": [record.get("triples") for record in claim.deletions],
+                    # Each deletion holds a LINEAGE, and every reader of the record wants the
+                    # triples themselves: a list of lists renders as no route at all.
+                    "triples": _lineages(claim.deletions, ack.acknowledged),
                     "at": now.isoformat(),
                     "reason": LEGACY_MARK_DOWNGRADED,
                     "device": claim.device_id,
