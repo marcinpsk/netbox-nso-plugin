@@ -20,6 +20,7 @@ from __future__ import annotations
 import datetime
 import threading
 import time
+from collections import Counter
 from unittest.mock import patch
 
 from django.db import OperationalError, transaction
@@ -421,11 +422,9 @@ class TestTheSequenceAdvanceNeverPullsBackALiveAllocator(_CascadeFlushMixin, Tra
 
     def _run(self, work, count):
         """Run *count* copies of *work* on their own connections, released together."""
-        import threading as _threading
-
         from django.db import connection
 
-        start = _threading.Barrier(count, timeout=60)
+        start = threading.Barrier(count, timeout=60)
         errors: list[BaseException] = []
 
         def guarded(index):
@@ -437,7 +436,7 @@ class TestTheSequenceAdvanceNeverPullsBackALiveAllocator(_CascadeFlushMixin, Tra
             finally:
                 connection.close()
 
-        threads = [_threading.Thread(target=guarded, args=(index,)) for index in range(count)]
+        threads = [threading.Thread(target=guarded, args=(index,)) for index in range(count)]
         for thread in threads:
             thread.start()
         for thread in threads:
@@ -464,8 +463,8 @@ class TestTheSequenceAdvanceNeverPullsBackALiveAllocator(_CascadeFlushMixin, Tra
 
         self._run(work, self.ALLOCATORS + 1)
 
-        issued = [value for mine in taken for value in mine]
-        duplicated = sorted({value for value in issued if issued.count(value) > 1})
+        issued = Counter(value for mine in taken for value in mine)
+        duplicated = sorted(value for value, seen in issued.items() if seen > 1)
         assert duplicated == [], f"the advance pulled the sequence back under a live allocator: {duplicated[:10]}"
 
     def test_an_advance_walks_the_gap_it_is_given_and_no_further(self):
@@ -481,8 +480,6 @@ class TestTheSequenceAdvanceNeverPullsBackALiveAllocator(_CascadeFlushMixin, Tra
 
     def test_an_advance_across_a_gap_shares_the_sequence_with_a_live_allocator(self):
         """The gap is walked in batches, and an allocation inside one is never repeated."""
-        from unittest.mock import patch as _patch
-
         from netbox_nso_plugin import outbox
 
         base = outbox.allocate_push_seq()
@@ -492,15 +489,16 @@ class TestTheSequenceAdvanceNeverPullsBackALiveAllocator(_CascadeFlushMixin, Tra
 
         def work(index):
             if index == 2:
-                # A batch far below the gap, so the walk is a loop and not one statement.
-                with _patch.object(outbox, "_ADVANCE_BATCH", 7):
-                    reached.append(outbox.advance_push_seq(watermark))
+                reached.append(outbox.advance_push_seq(watermark))
                 return
             mine = taken[index]
             for _ in range(120):
                 mine.append(outbox.allocate_push_seq())
 
-        self._run(work, 3)
+        # A batch far below the gap, so the walk is a loop and not one statement. Entered
+        # here, on this thread: a patch entered from a worker leaks whatever it found.
+        with patch.object(outbox, "_ADVANCE_BATCH", 7):
+            self._run(work, 3)
 
         issued = [value for mine in taken for value in mine]
         assert sorted(set(issued)) == sorted(issued), "an allocation inside the walk was repeated"
