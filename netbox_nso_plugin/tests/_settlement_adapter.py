@@ -137,7 +137,7 @@ class SettlementStore:
 
         The page's predicate is NULL-false by construction, so this is the adapter breaking
         its own feed contract, a state nothing but the server can produce, and the one the
-        consumer's durable bound has to survive. Served at the head, where it blocks.
+        consumer must skip rather than stall on. Served at the head, where it would block.
         """
         job = self._job(device_id, settle_seq=None, status="succeeded", results=results, job_type=job_type)
         self.jobs.append(job)
