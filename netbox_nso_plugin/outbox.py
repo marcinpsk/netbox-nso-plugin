@@ -33,26 +33,46 @@ def allocate_push_seq() -> int:
         return int(cursor.fetchone()[0])
 
 
+#: Values one advance takes per round trip. A restore's gap is a handful of statements at
+#: this size, and the loop re-reads between batches, so a larger gap costs round trips only.
+_ADVANCE_BATCH = 10_000
+
+
 def advance_push_seq(watermark: int) -> int:
-    """Move the sequence past *watermark* and return the value the next allocation exceeds.
+    """Move the sequence past *watermark*, and return the highest value it proved issued.
 
     A restored database brings the sequence back rewound with it, so the far side can already
-    hold operations above it. ``GREATEST`` in the statement itself is what makes the move
-    monotonic: a later key's lower watermark can never pull the sequence back, and several
-    keys restored in one pass leave it above the highest of them.
+    hold operations above it. The move is made by ``nextval`` and nothing else: each call is
+    atomic and strictly forward, so a concurrent allocation can only carry the sequence
+    further and can never be undone by this one. ``setval`` cannot promise that. It reads
+    ``last_value`` and writes without holding the sequence across the two, so a ``nextval``
+    landing between them is erased and its value is handed out a SECOND time — which the far
+    side refuses as a reused sequence for the life of the key, past every retry.
 
-    Sequences are not transactional, so this survives a rollback of the caller's transaction.
-    That is the safe direction: the values it skips are burned, never reissued.
+    The values walked past are burned, never reissued, and the sequence is BIGINT NO CYCLE,
+    so a rare restore may overshoot for free. A watermark the sequence has already passed
+    takes nothing at all: the sequence only moves forward, so having observed it once past
+    the watermark is proof enough. Sequences are not transactional, so this survives a
+    rollback of the caller's transaction, which is the safe direction.
     """
     from django.db import connection
 
+    watermark = int(watermark)
     with connection.cursor() as cursor:
-        cursor.execute(
-            f"SELECT setval('{PUSH_SEQ_SEQUENCE}', GREATEST(last_value, %s), true) "  # noqa: S608 — a module constant
-            f"FROM {PUSH_SEQ_SEQUENCE}",
-            [int(watermark)],
-        )
-        return int(cursor.fetchone()[0])
+        while True:
+            cursor.execute(f"SELECT last_value, is_called FROM {PUSH_SEQ_SEQUENCE}")  # noqa: S608 — a module constant
+            last_value, is_called = cursor.fetchone()
+            # A sequence not yet called has handed out nothing: last_value is the NEXT value.
+            issued = int(last_value) if is_called else int(last_value) - 1
+            if issued >= watermark:
+                return issued
+            cursor.execute(
+                f"SELECT max(nextval('{PUSH_SEQ_SEQUENCE}')) FROM generate_series(1, %s)",  # noqa: S608
+                [min(watermark - issued, _ADVANCE_BATCH)],
+            )
+            issued = int(cursor.fetchone()[0])
+            if issued >= watermark:
+                return issued
 
 
 # ── Transition records: the provenance an entry carries ───────────────────────

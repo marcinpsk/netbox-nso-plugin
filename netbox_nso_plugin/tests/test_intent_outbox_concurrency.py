@@ -399,3 +399,110 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
         )
         assert sorted(folded.queued) == [leaving.pk]
         assert returning.pk not in folded.queued
+
+
+class TestTheSequenceAdvanceNeverPullsBackALiveAllocator(_CascadeFlushMixin, TransactionTestCase):
+    """codex O1 gate P1 (``outbox.advance_push_seq``): a read-then-write advance loses a race.
+
+    ``setval(seq, GREATEST(last_value, w), true)`` reads ``last_value`` and writes it in one
+    statement but not atomically with it: a ``nextval`` landing between the two is erased when
+    the write commits, and the value it already handed out is issued a SECOND time. The far
+    side admits a sequence exactly once, so the reissued operation is refused as a reused
+    sequence for as long as the key exists, and no retry can ever clear it.
+
+    The sequence may therefore only be moved by ``nextval``, which is atomic and strictly
+    forward: a concurrent allocator can only carry it further, never undo it.
+    """
+
+    #: Enough passes for the window to be hit, and small enough to stay a second of runtime.
+    ADVANCES = 800
+    ALLOCATORS = 3
+    ALLOCATIONS = 800
+
+    def _run(self, work, count):
+        """Run *count* copies of *work* on their own connections, released together."""
+        import threading as _threading
+
+        from django.db import connection
+
+        start = _threading.Barrier(count, timeout=60)
+        errors: list[BaseException] = []
+
+        def guarded(index):
+            try:
+                start.wait()
+                work(index)
+            except BaseException as exc:  # noqa: BLE001 (reported on the caller's thread)
+                errors.append(exc)
+            finally:
+                connection.close()
+
+        threads = [_threading.Thread(target=guarded, args=(index,)) for index in range(count)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=120)
+        assert not any(thread.is_alive() for thread in threads), "a worker never finished"
+        assert errors == [], errors
+
+    def test_a_stale_advance_never_reissues_a_value_an_allocation_already_took(self):
+        from netbox_nso_plugin.outbox import advance_push_seq, allocate_push_seq
+
+        # Every advance below asks for a watermark the sequence has already passed, which is
+        # what a restore's later keys hand it: the move is a no-op and must stay one.
+        stale = allocate_push_seq()
+        taken: list[list[int]] = [[] for _ in range(self.ALLOCATORS)]
+
+        def work(index):
+            if index == self.ALLOCATORS:
+                for _ in range(self.ADVANCES):
+                    advance_push_seq(stale)
+                return
+            mine = taken[index]
+            for _ in range(self.ALLOCATIONS):
+                mine.append(allocate_push_seq())
+
+        self._run(work, self.ALLOCATORS + 1)
+
+        issued = [value for mine in taken for value in mine]
+        duplicated = sorted({value for value in issued if issued.count(value) > 1})
+        assert duplicated == [], f"the advance pulled the sequence back under a live allocator: {duplicated[:10]}"
+
+    def test_an_advance_walks_the_gap_it_is_given_and_no_further(self):
+        """The single-writer arithmetic: forward to the watermark, and never back off it."""
+        from netbox_nso_plugin.outbox import advance_push_seq, allocate_push_seq
+
+        base = allocate_push_seq()
+
+        assert advance_push_seq(base + 500) == base + 500
+        assert allocate_push_seq() == base + 501, "the advance leaves the next allocation just above it"
+        assert advance_push_seq(base + 100) == base + 501, "a later key's lower watermark cannot pull it back"
+        assert allocate_push_seq() == base + 502, "an advance already past its watermark issues nothing"
+
+    def test_an_advance_across_a_gap_shares_the_sequence_with_a_live_allocator(self):
+        """The gap is walked in batches, and an allocation inside one is never repeated."""
+        from unittest.mock import patch as _patch
+
+        from netbox_nso_plugin import outbox
+
+        base = outbox.allocate_push_seq()
+        watermark = base + 200
+        taken: list[list[int]] = [[] for _ in range(2)]
+        reached: list[int] = []
+
+        def work(index):
+            if index == 2:
+                # A batch far below the gap, so the walk is a loop and not one statement.
+                with _patch.object(outbox, "_ADVANCE_BATCH", 7):
+                    reached.append(outbox.advance_push_seq(watermark))
+                return
+            mine = taken[index]
+            for _ in range(120):
+                mine.append(outbox.allocate_push_seq())
+
+        self._run(work, 3)
+
+        issued = [value for mine in taken for value in mine]
+        assert sorted(set(issued)) == sorted(issued), "an allocation inside the walk was repeated"
+        assert reached and reached[0] >= watermark
+        assert outbox.allocate_push_seq() > watermark
