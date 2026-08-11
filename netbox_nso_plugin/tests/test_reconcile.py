@@ -8,7 +8,7 @@ from contextlib import ExitStack
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
-from django.db import connections
+from django.db import connections, transaction
 from django.test import TestCase, TransactionTestCase
 from rest_framework import status
 from utilities.testing import APITestCase
@@ -831,7 +831,11 @@ class TestSnmpApplyForcePush(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         from netbox_nso_plugin.models import NSOSnmpHostState
         from netbox_nso_plugin.views import _prepare_apply
 
-        with patch("netbox_nso_plugin.signals._sync_committed_scope_to_adapter"), without_commit_drain():
+        with (
+            patch("netbox_nso_plugin.signals._sync_committed_scope_to_adapter"),
+            without_commit_drain(),
+            transaction.atomic(),
+        ):
             device = _make_device("snmp-apply")
             inst, _ = NSOInstance.objects.get_or_create(
                 name="snmp-apply-inst", defaults={"adapter_instance_id": "snmp-apply-inst"}

@@ -71,7 +71,8 @@ class _CompactionCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestC
         """One operator transaction's contribution, appended the way the choke point does."""
         from netbox_nso_plugin import outbox
 
-        outbox.enqueue(self.device.pk, scope, transitions=list(transitions), delete_origin=delete_origin)
+        with transaction.atomic():
+            outbox.enqueue(self.device.pk, scope, transitions=list(transitions), delete_origin=delete_origin)
 
     def delete_of(self, route_id, *, last_acked=TRIPLE_A, current=TRIPLE_C):
         from netbox_nso_plugin import outbox

@@ -69,14 +69,12 @@ def _own_route(mgmt, prefix, next_hop, *, device=None):
     """A route assigned to the device and owned by it, exactly as the accept path leaves it."""
     from netbox_routing.models import StaticRoute
 
-    from netbox_nso_plugin.signals import suppress_intent_push
+    from netbox_nso_plugin.signals import _accept_static_route_for_device, suppress_intent_push
 
-    route = StaticRoute.objects.create(prefix=prefix, next_hop=next_hop, metric=1)
-    with suppress_intent_push():
-        route.devices.add(device or mgmt.device)
-    with without_commit_drain():
-        from netbox_nso_plugin.signals import _accept_static_route_for_device
-
+    with without_commit_drain(), transaction.atomic():
+        route = StaticRoute.objects.create(prefix=prefix, next_hop=next_hop, metric=1)
+        with suppress_intent_push():
+            route.devices.add(device or mgmt.device)
         _accept_static_route_for_device(route, device or mgmt.device)
     return route
 
@@ -239,8 +237,8 @@ class TestOutboxMarkingModes(_CascadeFlushMixin, IntentPushResetMixin, Transacti
 
         from netbox_nso_plugin.models import NSOVLANState
 
-        vlan = VLAN.objects.create(vid=vid, name=f"ob-mk-v{vid}")
-        with without_commit_drain():
+        with without_commit_drain(), transaction.atomic():
+            vlan = VLAN.objects.create(vid=vid, name=f"ob-mk-v{vid}")
             return NSOVLANState.objects.create(management=self.mgmt, vlan=vlan, status="accepted")
 
     def test_a_committed_vlan_deletion_still_ships_the_query_flag(self):

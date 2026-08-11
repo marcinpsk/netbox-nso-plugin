@@ -62,7 +62,7 @@ class _LineageCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase
     def reown(self, route):
         from netbox_nso_plugin.signals import _accept_static_route_for_device
 
-        with without_commit_drain():
+        with without_commit_drain(), transaction.atomic():
             _accept_static_route_for_device(route, self.device)
 
     def retriple(self, route, prefix, next_hop):

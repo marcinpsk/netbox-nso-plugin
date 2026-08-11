@@ -485,20 +485,16 @@ def _assign_one_p2p_family(
             state_a.save(update_fields=["peer_state"])
             state_b.peer_state = state_a
             state_b.save(update_fields=["peer_state"])
+            if push:
+                # Appended inside the allocation's own transaction: an in-protocol send is
+                # a claimed, sequenced operation, and the drain runs on this commit.
+                for dev_id in (mgmt.device_id, peer_mgmt.device_id):
+                    _schedule_intent_push((dev_id, "ip"))
     except Exception as exc:
         result["errors"].append(
             {"interface": str(interface), "family": family, "reason": f"P2P allocation failed: {exc}"}
         )
         return
-
-    if push:
-        # Appended, never pushed around the outbox: an in-protocol send is a claimed,
-        # sequenced operation, and outside a transaction the drain runs inline anyway.
-        for dev_id in (mgmt.device_id, peer_mgmt.device_id):
-            try:
-                _schedule_intent_push((dev_id, "ip"))
-            except Exception as exc:
-                logger.warning("ip_autoassign.p2p: failed to push intent for device %s: %s", dev_id, exc)
 
     result["allocated"].extend(
         [
@@ -568,6 +564,7 @@ def _reserve_single(interface, mgmt, family: str, pool, result, push=True) -> No
     the link-role single-ended path. *push* False skips the immediate adapter push
     (the link-role orchestrator defers pushes to after an atomic commit).
     """
+    from django.db import transaction
     from django.utils import timezone
     from ipam.models import IPAddress
 
@@ -585,55 +582,54 @@ def _reserve_single(interface, mgmt, family: str, pool, result, push=True) -> No
         )
         return
 
-    # Reserve the IPAddress in IPAM so concurrent allocations don't collide. It carries the
-    # pool's VRF so a VRF-scoped pool lands the address in the right table (and rollback, which
-    # filters by VRF, can find it).
-    try:
-        ip_obj = IPAddress(address=available_str, vrf=pool.vrf, status="reserved")
-        ip_obj.assigned_object = interface
-        ip_obj.save()
-    except Exception as exc:
-        result["errors"].append(
-            {"interface": str(interface), "family": family, "reason": f"Failed to create IPAddress: {exc}"}
-        )
-        return
-
-    vrf_name = pool.vrf.name if pool.vrf else ""
-
-    # Create (or update the signal-created) NSOInterfaceIPState as 'accepted'.
-    try:
-        state, _ = NSOInterfaceIPState.objects.update_or_create(
-            interface=interface,
-            address=available_str,
-            vrf=vrf_name,
-            defaults={
-                "family": family,
-                "status": "accepted",
-                "auto_assigned": True,
-                "source_pool": pool,
-                "accepted_at": timezone.now(),
-            },
-        )
-    except Exception as exc:
+    # One transaction, so the reservation, the overlay and the outbox entry they schedule
+    # commit together. The link-role orchestrator's own atomic block nests as a savepoint.
+    with transaction.atomic():
+        # Reserve the IPAddress in IPAM so concurrent allocations don't collide. It carries the
+        # pool's VRF so a VRF-scoped pool lands the address in the right table (and rollback, which
+        # filters by VRF, can find it).
         try:
-            ip_obj.delete()
-        except Exception:
-            pass
-        result["errors"].append(
-            {"interface": str(interface), "family": family, "reason": f"Failed to create NSOInterfaceIPState: {exc}"}
-        )
-        return
-
-    if push:
-        try:
-            _schedule_intent_push((mgmt.device_id, "ip"))
+            ip_obj = IPAddress(address=available_str, vrf=pool.vrf, status="reserved")
+            ip_obj.assigned_object = interface
+            ip_obj.save()
         except Exception as exc:
-            logger.warning(
-                "ip_autoassign: failed to push IP intent for device %s after allocating %s: %s",
-                mgmt.device_id,
-                available_str,
-                exc,
+            result["errors"].append(
+                {"interface": str(interface), "family": family, "reason": f"Failed to create IPAddress: {exc}"}
             )
+            return
+
+        vrf_name = pool.vrf.name if pool.vrf else ""
+
+        # Create (or update the signal-created) NSOInterfaceIPState as 'accepted'.
+        try:
+            state, _ = NSOInterfaceIPState.objects.update_or_create(
+                interface=interface,
+                address=available_str,
+                vrf=vrf_name,
+                defaults={
+                    "family": family,
+                    "status": "accepted",
+                    "auto_assigned": True,
+                    "source_pool": pool,
+                    "accepted_at": timezone.now(),
+                },
+            )
+        except Exception as exc:
+            try:
+                ip_obj.delete()
+            except Exception:
+                pass
+            result["errors"].append(
+                {
+                    "interface": str(interface),
+                    "family": family,
+                    "reason": f"Failed to create NSOInterfaceIPState: {exc}",
+                }
+            )
+            return
+
+        if push:
+            _schedule_intent_push((mgmt.device_id, "ip"))
 
     result["allocated"].append(
         {

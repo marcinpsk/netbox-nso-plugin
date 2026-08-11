@@ -195,19 +195,22 @@ class TestTheCommitTailIsConstant(_SwapCase):
         assert signals._pending_intent_keys() == set(), "the first callback clears the cell"
 
 
-class TestALoneSaveOutsideATransactionDrainsNow(_SwapCase):
-    """O1.2: with nothing to coalesce, the drain runs inline exactly as the push used to."""
+class TestALoneSaveDrainsOnItsOwnCommit(_SwapCase):
+    """O1.2: one write with nothing to coalesce still sends once, on its own commit."""
 
     tag = "lone"
     adapter_device_id = 7603
 
-    def test_a_save_with_no_open_transaction_sends_immediately(self):
+    def test_a_save_in_its_own_transaction_sends_on_the_commit(self):
         state = own_vlan(self.mgmt, 895, self.tag)
         config, session = self.live()
         with config, session:
-            state.vlan.name = "cl-lone-renamed"
-            state.vlan.save()
-            state.save()
+            assert self.mine() == [], "nothing goes out while the transaction is open"
+            with transaction.atomic():
+                state.vlan.name = "cl-lone-renamed"
+                state.vlan.save()
+                state.save()
+                assert self.mine() == []
 
         assert len(self.mine()) == 1
         assert entries(self.device, "vlan") == []

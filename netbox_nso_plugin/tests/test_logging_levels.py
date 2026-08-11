@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.contrib.auth import get_user_model
+from django.db import transaction
 from django.test import TestCase, TransactionTestCase
 from django.urls import reverse
 from django.utils import timezone
@@ -528,7 +529,7 @@ class TestLoggingLevelsApplyPush(_CascadeFlushMixin, IntentPushResetMixin, Trans
         super().setUp()
         from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOLoggingLevelState
 
-        with without_commit_drain():
+        with without_commit_drain(), transaction.atomic():
             self.device = _make_device("applypush")
             inst, _ = NSOInstance.objects.get_or_create(
                 name="lvl-apply-inst", defaults={"adapter_instance_id": "lvl-apply-inst"}

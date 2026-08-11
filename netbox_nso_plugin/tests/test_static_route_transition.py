@@ -298,7 +298,7 @@ class TestStaticRouteBulkAcceptOutsideATransaction(_CascadeFlushMixin, IntentPus
 
     def _drifted(self, count):
         states = []
-        with _fixtures():
+        with _fixtures(), transaction.atomic():
             for index in range(count):
                 sr = _route(f"10.39.{index}.0/24", "10.0.0.1", devices=[self.device])
                 state = _own(sr, self.mgmt, status="in_sync")

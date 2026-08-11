@@ -20,6 +20,7 @@ import re
 from unittest.mock import MagicMock, patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
+from django.db import transaction
 
 from ._adapter_http import _REAL_SESSION, make_response
 
@@ -53,7 +54,7 @@ def make_mgmt(device, tag: str, adapter_device_id: int):
 
 def make_managed(tag: str, adapter_device_id: int, index: int = 1):
     """A managed device, with the fixture's own drain silenced."""
-    with without_commit_drain():
+    with without_commit_drain(), transaction.atomic():
         device = make_device(tag, index)
         return device, make_mgmt(device, tag, adapter_device_id)
 
@@ -64,7 +65,7 @@ def own_vlan(mgmt, vid: int, tag: str):
 
     from netbox_nso_plugin.models import NSOVLANState
 
-    with without_commit_drain():
+    with without_commit_drain(), transaction.atomic():
         vlan = VLAN.objects.create(vid=vid, name=f"cl-{tag}-v{vid}")
         return NSOVLANState.objects.create(management=mgmt, vlan=vlan, status="accepted")
 
@@ -75,10 +76,10 @@ def own_route(mgmt, prefix: str, next_hop: str, *, device=None):
 
     from netbox_nso_plugin.signals import _accept_static_route_for_device, suppress_intent_push
 
-    route = StaticRoute.objects.create(prefix=prefix, next_hop=next_hop, metric=1)
-    with suppress_intent_push():
-        route.devices.add(device or mgmt.device)
-    with without_commit_drain():
+    with without_commit_drain(), transaction.atomic():
+        route = StaticRoute.objects.create(prefix=prefix, next_hop=next_hop, metric=1)
+        with suppress_intent_push():
+            route.devices.add(device or mgmt.device)
         _accept_static_route_for_device(route, device or mgmt.device)
     return route
 
@@ -118,7 +119,8 @@ def enqueue(device, scope, *, transitions=(), delete_origin=False):
     """Append one entry the way an operator transaction does, without a render."""
     from netbox_nso_plugin import outbox
 
-    outbox.enqueue(device.pk, scope, transitions=transitions, delete_origin=delete_origin)
+    with transaction.atomic():
+        outbox.enqueue(device.pk, scope, transitions=transitions, delete_origin=delete_origin)
 
 
 def in_thread(work, timeout=30):

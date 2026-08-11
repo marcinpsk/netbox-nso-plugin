@@ -194,6 +194,7 @@ def enable_igp_for_role(interface, role, push=True, *, mgmt=None) -> dict:
     ``{interface, igp, enabled, skipped, error}``. One end only; the orchestrator
     runs it on both.
     """
+    from django.db import transaction
     from django.utils import timezone
 
     from .ip_autoassign import _resolve_managed_mgmt
@@ -213,46 +214,46 @@ def enable_igp_for_role(interface, role, push=True, *, mgmt=None) -> dict:
             return result
 
     now = timezone.now()
-    if role.igp == "isis":
-        with suppress_intent_push():
-            NSOISISInterfaceState.objects.update_or_create(
-                management=mgmt,
-                interface=interface,
-                af="ipv4",
-                defaults={
-                    "process_tag": role.isis_process_tag,
-                    "circuit_type": role.isis_circuit_type,
-                    "metric": role.isis_metric,
-                    "passive": role.isis_passive,
-                    "status": "accepted",
-                    "accepted_at": now,
-                },
-            )
-        scope = "isis"
-    else:  # ospf
-        with suppress_intent_push():
-            NSOOSPFInterfaceState.objects.update_or_create(
-                management=mgmt,
-                interface=interface,
-                defaults={
-                    "process_id": role.ospf_process_id or None,
-                    "area_id": role.ospf_area,
-                    "network_type": role.ospf_network_type,
-                    "passive": role.ospf_passive,
-                    "cost": role.ospf_cost,
-                    "status": "accepted",
-                    "accepted_at": now,
-                },
-            )
-        scope = "ospf"
+    # One transaction, so the ownership and the outbox entry it schedules commit together.
+    # The orchestrator's own atomic block nests here as a savepoint.
+    with transaction.atomic():
+        if role.igp == "isis":
+            with suppress_intent_push():
+                NSOISISInterfaceState.objects.update_or_create(
+                    management=mgmt,
+                    interface=interface,
+                    af="ipv4",
+                    defaults={
+                        "process_tag": role.isis_process_tag,
+                        "circuit_type": role.isis_circuit_type,
+                        "metric": role.isis_metric,
+                        "passive": role.isis_passive,
+                        "status": "accepted",
+                        "accepted_at": now,
+                    },
+                )
+            scope = "isis"
+        else:  # ospf
+            with suppress_intent_push():
+                NSOOSPFInterfaceState.objects.update_or_create(
+                    management=mgmt,
+                    interface=interface,
+                    defaults={
+                        "process_id": role.ospf_process_id or None,
+                        "area_id": role.ospf_area,
+                        "network_type": role.ospf_network_type,
+                        "passive": role.ospf_passive,
+                        "cost": role.ospf_cost,
+                        "status": "accepted",
+                        "accepted_at": now,
+                    },
+                )
+            scope = "ospf"
 
-    if push:
-        # Appended, never pushed around the outbox: an in-protocol send is a claimed,
-        # sequenced operation, and outside a transaction the drain runs inline anyway.
-        try:
+        if push:
+            # Appended, never pushed around the outbox: an in-protocol send is a claimed,
+            # sequenced operation, and the drain runs on this transaction's commit.
             _schedule_intent_push((mgmt.device_id, scope))
-        except Exception as exc:  # noqa: BLE001 — adapter may be down; ownership already recorded
-            logger.warning("enable_igp_for_role: push failed for %s: %s", interface, exc)
 
     result["enabled"] = True
     return result

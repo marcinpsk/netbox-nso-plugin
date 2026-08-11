@@ -22,6 +22,7 @@ from dcim.models import (
     Site,
 )
 from django.contrib.auth import get_user_model
+from django.db import transaction
 from django.test import TestCase, TransactionTestCase
 from ipam.models import Prefix, Role
 from users.models import ObjectPermission
@@ -263,10 +264,12 @@ class TestProvisionForcePush(_CascadeFlushMixin, IntentPushResetMixin, Transacti
             igp="none",
         )
         with patch("netbox_nso_plugin.adapter_client.put_intent") as mock_put:
-            outbox.enqueue(self.dev_a.pk, "interface")
+            with transaction.atomic():
+                outbox.enqueue(self.dev_a.pk, "interface")
             drain.drain_key(self.dev_a.pk, "interface")  # the baseline the claim dedupes against
             self.assertEqual(mock_put.call_count, 1)
-            outbox.enqueue(self.dev_a.pk, "interface")
+            with transaction.atomic():
+                outbox.enqueue(self.dev_a.pk, "interface")
             drain.drain_key(self.dev_a.pk, "interface")  # the control: unchanged, so dropped
             self.assertEqual(mock_put.call_count, 1)
             _push_provisioned(role, [self.dev_a.pk])  # re-provision must send AGAIN (forced)

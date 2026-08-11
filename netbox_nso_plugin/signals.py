@@ -277,8 +277,12 @@ def _schedule_intent_push(key, transitions=()) -> None:
     sends it once. The delete-origin mark survives that fold only when EVERY contributor
     was a deletion (AND), so an un-own folded with a delete leaves the shrink unmarked and
     the adapter detaches, erring toward never touching the device.
+
+    The drain always runs on commit, never inline: the append refuses to run outside the
+    writer's transaction (O1.2), so by the time there is anything to drain there is a
+    commit to wait for.
     """
-    from django.db import connection, transaction
+    from django.db import transaction
 
     from . import outbox
 
@@ -286,10 +290,7 @@ def _schedule_intent_push(key, transitions=()) -> None:
         return  # a reconcile or render write mirrors the adapter; it is not operator intent
     outbox.enqueue(key[0], key[1], transitions=transitions, delete_origin=_DELETE_DISPATCH.get())
     _pending_intent_keys().add(tuple(key))
-    if connection.in_atomic_block:
-        transaction.on_commit(_drain_intent_pushes)
-    else:
-        _drain_intent_pushes()
+    transaction.on_commit(_drain_intent_pushes)
 
 
 def _drain_intent_pushes() -> None:

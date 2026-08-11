@@ -238,6 +238,21 @@ def current_txid() -> int:
         return int(cursor.fetchone()[0])
 
 
+def _refuse_outside_a_transaction() -> None:
+    """Refuse an append that would commit on its own (O1.2).
+
+    The entry survives a rollback, a savepoint rollback and a crash because it is the
+    operator transaction's OWN row. A caller in autocommit gets two transactions instead of
+    one, so its write commits and a failure between the two leaves owned intent with no
+    durable record and nothing for the drain to find. That loss is silent, so this is a
+    refusal rather than a warning: the writer opens the transaction, or it writes nothing.
+    """
+    from django.db import connection
+
+    if not connection.in_atomic_block:
+        raise RuntimeError("an intent outbox entry must be appended inside the writer's own transaction")
+
+
 def enqueue(device_id, scope: str, *, transitions=(), delete_origin: bool = False) -> None:
     """Append this transaction's contribution to ``(device_id, scope)``.
 
@@ -250,6 +265,7 @@ def enqueue(device_id, scope: str, *, transitions=(), delete_origin: bool = Fals
 
     if _is_intent_push_suppressed() or _is_render_request():
         return
+    _refuse_outside_a_transaction()
     txid = current_txid()
     if _device_is_tearing_down(device_id, txid):
         return

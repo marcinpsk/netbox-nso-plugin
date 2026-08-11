@@ -39,6 +39,14 @@ def vlan_member(vid):
     return ("vlan_id", vid)
 
 
+def _append_in_its_own_transaction(device_id):
+    """One writer's contribution, committed the way an operator transaction commits it."""
+    from netbox_nso_plugin import outbox
+
+    with transaction.atomic():
+        outbox.enqueue(device_id, "vlan", transitions=[])
+
+
 class _MarkCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     """A managed device whose VLAN intent is already on the recorded device."""
 
@@ -239,7 +247,7 @@ class TestALateEntryNeverAbandonsTheClaim(_MarkCase):
         assert len(entries(self.device, "static_route", unconsumed=True)) == 1
 
     def test_a_sustained_writer_never_stops_the_claim_from_sending(self):
-        from netbox_nso_plugin import delivery, drain, outbox
+        from netbox_nso_plugin import delivery, drain
 
         states = self.own(851, 852)
         self.unown(states[852])
@@ -248,7 +256,7 @@ class TestALateEntryNeverAbandonsTheClaim(_MarkCase):
         def render_then_commit(*args, **kwargs):
             """A writer that commits one more entry before every attempt's render."""
             rendered = real_render(*args, **kwargs)
-            in_thread(lambda: outbox.enqueue(self.device.pk, "vlan", transitions=[]))
+            in_thread(lambda: _append_in_its_own_transaction(self.device.pk))
             return rendered
 
         with patch("netbox_nso_plugin.delivery.render", side_effect=render_then_commit):
@@ -278,11 +286,15 @@ class TestACommittedRevocationAbandonsAndReformsOnce(_MarkCase):
         real_scan = drain.revocation_hit
         scanned: list[bool] = []
 
+        def reown_in_its_own_transaction():
+            with transaction.atomic():
+                _accept_static_route_for_device(route, self.device)
+
         def scan_after_a_committed_re_own(claim):
             """The re-ownership commits while the claim is formed, before this scan runs."""
             if not scanned:
                 with without_commit_drain():
-                    in_thread(lambda: _accept_static_route_for_device(route, self.device))
+                    in_thread(reown_in_its_own_transaction)
             hit = real_scan(claim)
             scanned.append(hit)
             return hit

@@ -24,6 +24,7 @@ from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.core.management import CommandError, call_command
+from django.db import transaction
 from django.test import TransactionTestCase
 
 from ._outbox_case import without_commit_drain
@@ -71,7 +72,7 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         from netbox_nso_plugin.models import NSOStaticRouteState
         from netbox_nso_plugin.signals import suppress_intent_push
 
-        with _quiet_fixture():
+        with _quiet_fixture(), transaction.atomic():
             sr = StaticRoute.objects.create(prefix=prefix, next_hop=next_hop, metric=1)
             with suppress_intent_push():
                 sr.devices.add(mgmt.device)
@@ -365,7 +366,7 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
 
         _, mgmt = self._managed_device("ifacenh", 8105)
         carried = self._own_route(mgmt, "10.77.0.0/16", "10.0.0.78")
-        with _quiet_fixture():
+        with _quiet_fixture(), transaction.atomic():
             iface_route = StaticRoute.objects.create(
                 prefix="10.78.0.0/16", next_hop=None, interface_next_hop="Ethernet1/1", metric=1
             )

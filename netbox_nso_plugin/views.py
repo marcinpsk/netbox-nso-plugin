@@ -6,6 +6,7 @@ from dcim.models import Device
 from django.contrib import messages
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.core.exceptions import PermissionDenied
+from django.db import transaction
 from django.http import HttpResponseBadRequest, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
@@ -3217,7 +3218,8 @@ class NSOAcceptAttributeView(NSOActionPermissionMixin, View):
         state = get_object_or_404(NSOInterfaceState, pk=pk)
         state.status = _status_after_accept(state.status)
         state.accepted_at = timezone.now()
-        state.save(update_fields=["status", "accepted_at"])
+        with transaction.atomic():
+            state.save(update_fields=["status", "accepted_at"])
 
         msg = f"Accepted {state.attribute} on {state.interface}."
         if request.headers.get("X-Requested-With") == "XMLHttpRequest":
@@ -3286,7 +3288,8 @@ class NSOInterfaceEditFieldView(NSOActionPermissionMixin, View):
             iface.description = raw.strip()
         else:  # enabled
             iface.enabled = raw.strip().lower() in self._TRUE
-        iface.save(update_fields=[attribute])
+        with transaction.atomic():
+            iface.save(update_fields=[attribute])
 
         return JsonResponse({"status": "ok", "message": f"Updated {attribute} on {iface.name}."})
 
@@ -3868,14 +3871,12 @@ def _save_route_map_name_edit(state, old_name):
         route_map.name = new_name
         route_map.save(update_fields=["name"])
         bgp_targets, redistribution_targets = _route_map_dependent_pushes(route_map, old_name)
-
-        def push_dependents():
-            for device_id in bgp_targets:
-                signals._schedule_intent_push((device_id, "bgp"))
-            for device_id, dest_protocol in redistribution_targets:
-                signals._schedule_redistribution_push(device_id, dest_protocol)
-
-        transaction.on_commit(push_dependents)
+        # Appended here, not on commit: the entry belongs to the transaction that renamed
+        # the map, and the drain it schedules still runs after that transaction commits.
+        for device_id in bgp_targets:
+            signals._schedule_intent_push((device_id, "bgp"))
+        for device_id, dest_protocol in redistribution_targets:
+            signals._schedule_redistribution_push(device_id, dest_protocol)
 
 
 def _save_lacp_edit(obj, key):
@@ -4167,15 +4168,18 @@ class NSOBulkAcceptView(NSOActionPermissionMixin, View):
         device = get_object_or_404(Device, pk=device_pk)  # 404 a bad pk BEFORE mutating anything
         now = timezone.now()
         base = NSOInterfaceState.objects.filter(interface__device_id=device_pk)
-        settled = base.filter(status="imported").update(status="in_sync", accepted_at=now)
-        pending = base.filter(status="changed").update(status="accepted", accepted_at=now)
-        updated = settled + pending
+        # One transaction for the ownership and the entry that records it: appended after
+        # the commit, the entry could be lost while the rows read as owned.
+        with transaction.atomic():
+            settled = base.filter(status="imported").update(status="in_sync", accepted_at=now)
+            pending = base.filter(status="changed").update(status="accepted", accepted_at=now)
+            updated = settled + pending
 
-        # Push whenever anything became owned — the snapshot is by status (OWNED_STATES),
-        # and matching rows settle to in_sync (an owned status), so even owned-but-matching
-        # rows are recorded in the adapter to persist ownership.
-        if updated:
-            _push_intent_for_device(device_pk)
+            # Push whenever anything became owned — the snapshot is by status (OWNED_STATES),
+            # and matching rows settle to in_sync (an owned status), so even owned-but-matching
+            # rows are recorded in the adapter to persist ownership.
+            if updated:
+                _push_intent_for_device(device_pk)
         if updated:
             messages.success(request, f"Accepted {updated} interface attribute(s).")
         else:
@@ -4608,7 +4612,9 @@ class RoutingStateAcceptMixin(NSOActionPermissionMixin, View):
         if state.accepted_at is None:
             state.accepted_at = timezone.now()
         self._arm_accept(state)
-        state.save(update_fields=["status", "accepted_at", *self.accept_extra_fields])
+        # One transaction, so the row and the outbox entry it schedules commit together.
+        with transaction.atomic():
+            state.save(update_fields=["status", "accepted_at", *self.accept_extra_fields])
         messages.success(request, f"Accepted routing state {state.pk}.")
         return redirect(_device_nso_tab_url(state.management.device_id))
 
@@ -4632,7 +4638,8 @@ class NSOL2SapStateAcceptView(NSOActionPermissionMixin, View):
         state.status = _status_after_accept(state.status)
         if state.accepted_at is None:
             state.accepted_at = timezone.now()
-        state.save(update_fields=["status", "accepted_at"])
+        with transaction.atomic():
+            state.save(update_fields=["status", "accepted_at"])
         messages.success(request, f"Accepted L2 SAP {state.service_name}:{state.sap_id}.")
         return redirect(_device_nso_tab_url(state.management.device_id))
 
@@ -5346,12 +5353,9 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
             count = n_owned + n_drift
             if count and mgmt.adapter_device_id is not None:
                 self._after_accept(mgmt, drift_pks)
-
-        if count and mgmt.adapter_device_id is not None:
-            try:
+                # Inside the same transaction as the ownership it records: appended after
+                # the commit, the entry could be lost while the rows read as owned.
                 self._push(mgmt)
-            except Exception as exc:
-                logger.warning("Bulk accept push failed for device %s: %s", device_pk, exc)
 
         if count:
             messages.success(request, f"Accepted {count} routing state(s).")
@@ -5470,7 +5474,9 @@ class OverlayStateAcceptMixin(NSOActionPermissionMixin, View):
             return redirect(_device_nso_tab_url(state.management.device_id))
         state.status = _status_after_accept(state.status)
         state.accepted_at = timezone.now()
-        state.save(update_fields=["status", "accepted_at"])
+        # One transaction, so the row and the outbox entry it schedules commit together.
+        with transaction.atomic():
+            state.save(update_fields=["status", "accepted_at"])
         messages.success(request, f"Accepted {state}.")
         return redirect(_device_nso_tab_url(state.management.device_id))
 
@@ -5535,7 +5541,8 @@ class NSOSnmpCommunityStateVerifyView(NSOActionPermissionMixin, View):
         if result.get("exists") and key in hashes:
             state.vault_secret_hash = hashes[key]
             state.vault_secret_version = result.get("version")
-            state.save(update_fields=["vault_secret_hash", "vault_secret_version"])
+            with transaction.atomic():
+                state.save(update_fields=["vault_secret_hash", "vault_secret_version"])
             verdict = (
                 "matches the device value"
                 if state.vault_secret_hash == state.community_hash
@@ -5567,7 +5574,8 @@ class NSOSnmpV3UserStateVerifyView(NSOActionPermissionMixin, View):
         fields = set(result.get("fields") or [])
         state.vault_has_auth = "auth" in fields
         state.vault_has_priv = "priv" in fields
-        state.save(update_fields=["vault_has_auth", "vault_has_priv"])
+        with transaction.atomic():
+            state.save(update_fields=["vault_has_auth", "vault_has_priv"])
         if fields:
             messages.success(request, f"Vault holds: {', '.join(sorted(fields))} (v{result.get('version')}).")
         else:
@@ -5612,7 +5620,8 @@ class NSOSnmpCommunityStateHarvestView(NSOActionPermissionMixin, View):
         state.vault_ref = result.get("vault_ref") or ref
         state.vault_secret_hash = result.get("secret_hash") or ""
         state.vault_secret_version = result.get("version")
-        state.save(update_fields=["vault_ref", "vault_secret_hash", "vault_secret_version"])
+        with transaction.atomic():
+            state.save(update_fields=["vault_ref", "vault_secret_hash", "vault_secret_version"])
         messages.success(
             request,
             f"Community harvested into Vault at {state.vault_ref!r} (v{result.get('version')}).",
@@ -5659,7 +5668,8 @@ class NSOLoggingLevelStateUnacceptView(NSOActionPermissionMixin, View):
             return redirect(_device_nso_tab_url(device_id))
         state.status = sm.advance(state.status, sm.REVERT, to=sm.IMPORTED)
         state.accepted_at = None
-        state.save(update_fields=["status", "accepted_at"])
+        with transaction.atomic():
+            state.save(update_fields=["status", "accepted_at"])
         messages.warning(
             request,
             f"Un-accepted {state}: the managed levels are being retracted from the device — "
@@ -5696,15 +5706,18 @@ class NSOInterfaceMtuStateAcceptView(OverlayStateAcceptMixin):
 
     def post(self, request, pk):  # noqa: D102
         state = get_object_or_404(self.model_class, pk=pk)
-        if state.l2_mtu is not None:
-            iface = state.interface
-            clamped = min(int(state.l2_mtu), self._NETBOX_MTU_MAX)
-            if iface.mtu != clamped:
-                iface.mtu = clamped
-                iface.save(update_fields=["mtu"])
         state.status = _status_after_accept(state.status)
         state.accepted_at = timezone.now()
-        state.save(update_fields=["status", "accepted_at"])
+        # One transaction, so the native adoption, the row and the outbox entry it
+        # schedules commit together.
+        with transaction.atomic():
+            if state.l2_mtu is not None:
+                iface = state.interface
+                clamped = min(int(state.l2_mtu), self._NETBOX_MTU_MAX)
+                if iface.mtu != clamped:
+                    iface.mtu = clamped
+                    iface.save(update_fields=["mtu"])
+            state.save(update_fields=["status", "accepted_at"])
         messages.success(request, f"Accepted {state}.")
         return redirect(_device_nso_tab_url(state.management.device_id))
 
@@ -5830,29 +5843,32 @@ class NSORoutePolicyAttachView(NSOActionPermissionMixin, View):
                 },
             )
 
-        state, created = NSORoutePolicyState.objects.get_or_create(
-            management=mgmt,
-            family=family,
-            object_name=obj.name,
-            defaults={
-                "content_type": ct,
-                "object_id": obj.pk,
-                "status": "accepted",
-                "accepted_at": timezone.now(),
-            },
-        )
-        if not created and state.status not in ("accepted", "deploying", "in_sync", "apply_failed"):
-            state.status = "accepted"
-            state.accepted_at = timezone.now()
-        state.content_type = ct
-        state.object_id = obj.pk
-        state.last_sync_at = timezone.now()
-        state.save()  # → _on_route_policy_state_save schedules the push
-        if family == "route_map":
-            # Owning a route-map owns its contributors too (else dangling device references).
-            from .signals import _own_route_map_contributors
+        with transaction.atomic():
+            state, created = NSORoutePolicyState.objects.get_or_create(
+                management=mgmt,
+                family=family,
+                object_name=obj.name,
+                defaults={
+                    "content_type": ct,
+                    "object_id": obj.pk,
+                    "status": "accepted",
+                    "accepted_at": timezone.now(),
+                },
+            )
+            if not created and state.status not in ("accepted", "deploying", "in_sync", "apply_failed"):
+                state.status = "accepted"
+                state.accepted_at = timezone.now()
+            state.content_type = ct
+            state.object_id = obj.pk
+            state.last_sync_at = timezone.now()
+            state.save()  # → _on_route_policy_state_save schedules the push
+            cascade = None
+            if family == "route_map":
+                # Owning a route-map owns its contributors too (else dangling device references).
+                from .signals import _own_route_map_contributors
 
-            cascade = _own_route_map_contributors(mgmt, obj)
+                cascade = _own_route_map_contributors(mgmt, obj)
+        if cascade is not None:
             if cascade.drifted:
                 # A referenced object the device already has but that diverges from NetBox was
                 # NOT overwritten — tell the operator so they can resolve it explicitly.
@@ -6102,16 +6118,17 @@ class NSOVLANAttachView(NSOActionPermissionMixin, View):
 
         mgmt = get_object_or_404(NSODeviceManagement, device_id=device_pk)
         vlan = get_object_or_404(VLAN, pk=request.POST.get("vlan"))
-        state, created = NSOVLANState.objects.get_or_create(
-            management=mgmt,
-            vlan=vlan,
-            defaults={"status": "accepted", "accepted_at": timezone.now()},
-        )
-        if not created and state.status not in ("accepted", "deploying", "in_sync", "apply_failed"):
-            state.status = "accepted"
-            state.accepted_at = timezone.now()
-        state.last_sync_at = timezone.now()
-        state.save()  # → _on_vlan_state_save schedules the owned-VLAN intent push
+        with transaction.atomic():
+            state, created = NSOVLANState.objects.get_or_create(
+                management=mgmt,
+                vlan=vlan,
+                defaults={"status": "accepted", "accepted_at": timezone.now()},
+            )
+            if not created and state.status not in ("accepted", "deploying", "in_sync", "apply_failed"):
+                state.status = "accepted"
+                state.accepted_at = timezone.now()
+            state.last_sync_at = timezone.now()
+            state.save()  # → _on_vlan_state_save schedules the owned-VLAN intent push
         messages.success(
             request, f"Attached VLAN {vlan.vid} ({vlan.name or '—'}) to {mgmt.device.name} — Apply to write it."
         )

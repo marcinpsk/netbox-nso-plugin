@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
+from django.db import transaction
 from django.test import TestCase, TransactionTestCase
 from ipam.models import VLAN, VLANGroup
 
@@ -479,7 +480,7 @@ class TestVlanApplyPush(_CascadeFlushMixin, IntentPushResetMixin, TransactionTes
 
     def setUp(self):
         super().setUp()
-        with without_commit_drain():
+        with without_commit_drain(), transaction.atomic():
             self.device = _make_device("vap")
             instance = NSOInstance.objects.create(name="nso-vap", adapter_instance_id="nso-vap")
             self.management = NSODeviceManagement.objects.create(

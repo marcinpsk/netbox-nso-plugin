@@ -7,6 +7,7 @@ from __future__ import annotations
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
+from django.db import transaction
 from django.test import TestCase, TransactionTestCase
 from django.utils import timezone
 
@@ -195,7 +196,11 @@ class TestResyncStoreOnly(_CascadeFlushMixin, IntentPushResetMixin, TransactionT
 
     def setUp(self):
         super().setUp()
-        with patch("netbox_nso_plugin.signals._sync_committed_scope_to_adapter"), without_commit_drain():
+        with (
+            patch("netbox_nso_plugin.signals._sync_committed_scope_to_adapter"),
+            without_commit_drain(),
+            transaction.atomic(),
+        ):
             mfg = Manufacturer.objects.create(name="SoMfg", slug="somfg")
             dt = DeviceType.objects.create(manufacturer=mfg, model="SoDev", slug="sodev")
             role = DeviceRole.objects.create(name="SoRole", slug="sorole")
@@ -242,10 +247,12 @@ class TestResyncStoreOnly(_CascadeFlushMixin, IntentPushResetMixin, TransactionT
         from netbox_nso_plugin import drain, outbox
 
         # The control: an ordinary claim IS dropped once the baseline names its body.
-        outbox.enqueue(self.device.pk, "logging")
+        with transaction.atomic():
+            outbox.enqueue(self.device.pk, "logging")
         primed = self._recorded_requests(lambda: drain.drain_key(self.device.pk, "logging"))
         self.assertEqual(len(primed), 1)
-        outbox.enqueue(self.device.pk, "logging")
+        with transaction.atomic():
+            outbox.enqueue(self.device.pk, "logging")
         again = self._recorded_requests(lambda: drain.drain_key(self.device.pk, "logging"))
         self.assertEqual(len(again), 0, "an unchanged ordinary claim is still dropped")
 

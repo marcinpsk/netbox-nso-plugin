@@ -144,7 +144,7 @@ class TestTheBurstStillCoalesces(_DirectApplyCase):
     def _owned_bundle(self):
         from netbox_nso_plugin.models import NSOLACPBundleState
 
-        with without_commit_drain():
+        with without_commit_drain(), transaction.atomic():
             # Committing LACP is a device write, so only auto-apply pushes it on save.
             self.mgmt.auto_apply = True
             self.mgmt.save(update_fields=["auto_apply"])
