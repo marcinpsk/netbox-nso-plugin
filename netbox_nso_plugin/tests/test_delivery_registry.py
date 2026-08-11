@@ -72,6 +72,20 @@ class TestDeliveryRegistry(SimpleTestCase):
         assert fields == {"key", "label", "in_protocol", "marking_mode", "push"}
         assert "mode" in inspect.signature(deliver).parameters
 
+    def test_every_drift_scope_names_a_registered_delivery_key(self):
+        """The two registries name one scope differently, so the mapping is checked, not trusted.
+
+        ``intent_drift`` declares which delivery key it re-syncs through (``interface_ip``
+        there is ``ip`` here, O-P12). A scope naming a key this registry does not hold would
+        make the re-sync raise at the one moment an operator is repairing a split brain.
+        """
+        from netbox_nso_plugin.delivery import delivery_keys
+        from netbox_nso_plugin.intent_drift import _delivery_key, _scopes
+
+        registry = delivery_keys()
+        unknown = {scope["key"]: _delivery_key(scope) for scope in _scopes() if _delivery_key(scope) not in registry}
+        assert unknown == {}
+
     def test_marking_mode_is_declared_per_key(self):
         """O1 records ids in both modes; static routes only leave ``query_flag`` at O3."""
         from netbox_nso_plugin.delivery import delivery_keys

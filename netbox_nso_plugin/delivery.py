@@ -29,6 +29,10 @@ from collections.abc import Callable
 
 MODE_NORMAL = "normal"
 MODE_STORE_ONLY = "store_only"
+#: Adopt the ids of the rows the body still names and prune the uncorrelated residue; accept
+#: no content, carry no authority, spawn no job. It exists to open a fence a pending genuine
+#: deletion cannot open for itself (§4.4, OQ-O-8), and it is never a way to deliver anything.
+MODE_BACKFILL_ONLY = "backfill_only"
 
 MARKING_QUERY_FLAG = "query_flag"
 MARKING_PER_OBJECT = "per_object"
@@ -205,6 +209,8 @@ def send(
     with contextlib.ExitStack() as stack:
         if mode == MODE_STORE_ONLY:
             stack.enter_context(adapter_client.store_only_pushes())
+        if mode == MODE_BACKFILL_ONLY:
+            stack.enter_context(adapter_client.backfill_only_pushes())
         if mark:
             stack.enter_context(adapter_client.delete_origin_pushes())
         if push_seq is not None and entry.in_protocol:

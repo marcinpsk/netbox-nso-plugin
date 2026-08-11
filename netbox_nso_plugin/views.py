@@ -2491,75 +2491,59 @@ def _prepare_apply(mgmt):
     Returns the rows moved to 'deploying' as ``[(model, [pks]), …]`` so the caller can
     roll them back via :func:`_rollback_prepare_apply` if the Apply fails to enqueue a job.
     """
-    from .signals import (
-        _push_bfd_intent_for_device,
-        _push_interface_intent_for_device,
-        _push_interface_mtu_intent_for_device,
-        _push_l2_sap_intent_for_device,
-        _push_lacp_intent_for_device,
-        _push_logging_intent_for_device,
-        _push_route_policy_intent_for_device,
-        _push_snmp_intent_for_device,
-        _push_static_route_intent_for_device,
-        _push_subinterface_intent_for_device,
-        _push_svi_intent_for_device,
-        _push_switchport_intent_for_device,
-        _push_vlan_intent_for_device,
-        stored_static_route_count,
-    )
+    from . import drain
+    from .delivery import MODE_STORE_ONLY
+    from .signals import stored_static_route_count
 
-    # Force-push (bypass change-detection) the owned snapshots so Apply re-ships the
-    # operator's intent even when the adapter's stored intent went stale:
+    # Each of these takes its OWN forced claim, so Apply re-ships the operator's intent
+    # whatever the acknowledged baseline says and whatever a queued claim was carrying:
     #   - LACP / switchport: owned in NetBox, never mirrored as adapter intent.
     #   - VLAN: the name lives on ipam.VLAN; renaming it fires no plugin signal, so a
     #     post-accept rename would otherwise be stranded in NetBox (the row stays
     #     'in_sync' and the stale old name is what gets applied).
     #   - interface description/enabled: an owned attribute (status in OWNED_STATES)
-    #     whose adapter intent went stale is force-pushed so Apply actually re-applies
-    #     it. Ownership is status-based and kept durable by the reconciler's owned-guard,
+    #     whose adapter intent went stale is re-sent so Apply actually re-applies it.
+    #     Ownership is status-based and kept durable by the reconciler's owned-guard,
     #     so this no longer re-pushes a row that genuinely drifted back to 'imported'.
     #   - route-policy / SVI / subinterface / BFD / MTU: mirrored as adapter intent (reactive
     #     push on accept/edit), but that mirror can go stale/empty (a failed push, an
     #     out-of-band adapter reset). These are all marked accepted->deploying below, so
-    #     force-push the owned snapshot too — otherwise Apply applies nothing and the row
+    #     re-send the owned snapshot too — otherwise Apply applies nothing and the row
     #     sticks 'deploying' forever (observed on rg03 for route-policy: an owned as-path
     #     with no adapter intent row; SVI/subinterface/BFD/MTU share the same failure mode).
     #   - SNMP: mirrored reactively on accept and a failed push is swallowed, so the adapter
     #     mirror can be stale or absent. Refreshed store-only below — the Apply commits it.
     static_route_stored = False
-    for push in (
-        _push_interface_intent_for_device,
-        _push_lacp_intent_for_device,
-        _push_logging_intent_for_device,
-        _push_route_policy_intent_for_device,
-        _push_static_route_intent_for_device,
-        _push_svi_intent_for_device,
-        _push_subinterface_intent_for_device,
-        _push_bfd_intent_for_device,
-        _push_interface_mtu_intent_for_device,
-        _push_l2_sap_intent_for_device,
-        _push_switchport_intent_for_device,
-        _push_vlan_intent_for_device,
+    for scope in (
+        "interface",
+        "lacp",
+        "logging",
+        "route_policy",
+        "static_route",
+        "svi",
+        "subinterface",
+        "bfd",
+        "interface_mtu",
+        "l2_sap",
+        "switchport",
+        "vlan",
     ):
         try:
-            response = push(mgmt.device_id, mgmt.adapter_device_id, force=True)
+            response = drain.push_now(mgmt.device_id, scope, force=True)
         except Exception as exc:  # noqa: BLE001 — one scope's failure must not block the rest
             logger.warning("Apply push failed for device %s: %s", mgmt.device_id, exc)
             response = None
-        if push is _push_static_route_intent_for_device:
-            # A forced push is only skipped on a real rejection (change-detection is
-            # bypassed), and a static route settles on a generation the adapter has to be
-            # holding. Promoting on a push the adapter refused would create a 'deploying'
-            # row no result can ever name — stuck until the backstop calls it failed.
+        if scope == "static_route":
+            # A forced claim is dropped only on a real rejection, and a static route settles
+            # on a generation the adapter has to be holding. Promoting on a push the adapter
+            # refused would create a 'deploying' row no result can ever name — stuck until
+            # the backstop calls it failed.
             static_route_stored = stored_static_route_count(response) is not None
 
     # Store-only: a plain put_snmp_intent enqueues the shrink-removal (and auto-apply) job,
     # which would 409 the trigger_apply this runs just ahead of.
     try:
-        from . import adapter_client as client
-
-        with client.store_only_pushes():
-            _push_snmp_intent_for_device(mgmt.device_id, mgmt.adapter_device_id, force=True)
+        drain.push_now(mgmt.device_id, "snmp", mode=MODE_STORE_ONLY, force=True)
     except Exception as exc:  # noqa: BLE001 — one scope's failure must not block the rest
         logger.warning("Apply push failed for device %s: %s", mgmt.device_id, exc)
 
@@ -3840,7 +3824,7 @@ def _route_map_dependent_pushes(route_map, old_name):
             | Q(bgp_peer__address_families__routemap_out=route_map),
             status__in=owned,
             management__adapter_device_id__isnull=False,
-        ).values_list("management__device_id", "management__adapter_device_id")
+        ).values_list("management__device_id", flat=True)
     )
 
     redistribution = NSORedistributionState.objects.filter(
@@ -3849,7 +3833,7 @@ def _route_map_dependent_pushes(route_map, old_name):
     )
     redistribution_targets = set(
         redistribution.filter(management__adapter_device_id__isnull=False).values_list(
-            "management__device_id", "management__adapter_device_id", "dest_protocol"
+            "management__device_id", "dest_protocol"
         )
     )
     redistribution.filter(redistribution__isnull=True, route_map__iexact=old_name).update(route_map=route_map.name)
@@ -3887,13 +3871,10 @@ def _save_route_map_name_edit(state, old_name):
         bgp_targets, redistribution_targets = _route_map_dependent_pushes(route_map, old_name)
 
         def push_dependents():
-            for device_id, adapter_device_id in bgp_targets:
-                signals._schedule_intent_push(
-                    (device_id, "bgp"),
-                    lambda d=device_id, a=adapter_device_id: signals._push_bgp_intent_for_device(d, a),
-                )
-            for device_id, adapter_device_id, dest_protocol in redistribution_targets:
-                signals._schedule_redistribution_push(device_id, adapter_device_id, dest_protocol)
+            for device_id in bgp_targets:
+                signals._schedule_intent_push((device_id, "bgp"))
+            for device_id, dest_protocol in redistribution_targets:
+                signals._schedule_redistribution_push(device_id, dest_protocol)
 
         transaction.on_commit(push_dependents)
 
@@ -4881,7 +4862,7 @@ class NSOInterfaceIPStateEditView(NSOActionPermissionMixin, View):
         from django.db import IntegrityError, transaction
 
         from .models import NSODeviceManagement, NSOInterfaceIPState
-        from .signals import _push_ip_intent_for_device, _schedule_intent_push, suppress_intent_push
+        from .signals import _schedule_intent_push, suppress_intent_push
 
         state = get_object_or_404(
             NSOInterfaceIPState.objects.select_related("interface", "interface__device"),
@@ -4931,13 +4912,7 @@ class NSOInterfaceIPStateEditView(NSOActionPermissionMixin, View):
                     adapter_device_id__isnull=False,
                 ):
                     device_id = mgmt.device_id
-                    adapter_device_id = mgmt.adapter_device_id
-                    _schedule_intent_push(
-                        (device_id, "ip"),
-                        lambda device_id=device_id, adapter_device_id=adapter_device_id: _push_ip_intent_for_device(
-                            device_id, adapter_device_id
-                        ),
-                    )
+                    _schedule_intent_push((device_id, "ip"))
         except (ValidationError, IntegrityError) as exc:
             messages_list = getattr(exc, "messages", None) or ["The address conflicts with an existing object."]
             return JsonResponse(

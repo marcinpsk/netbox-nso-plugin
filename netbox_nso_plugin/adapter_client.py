@@ -55,6 +55,25 @@ def delete_origin_pushes():
         _delete_origin_push.reset(token)
 
 
+# When set, every adapter request carries ``?backfill_only=true``: the adapter adopts the
+# ``route_id`` of every row the payload still names, prunes the uncorrelated NULL-id rows
+# that hold its replacement fence shut, and does nothing else — no removal, no tombstone, no
+# job. It is what opens a fence a pending genuine deletion cannot open for itself, because
+# any ordinary push omitting that route would destroy its before-image (#1503 §4.4, OQ-O-8).
+# It is expressly NOT a delivery mechanism: it accepts no content and carries no authority.
+_backfill_only_push = contextvars.ContextVar("nso_backfill_only_push", default=False)
+
+
+@contextmanager
+def backfill_only_pushes():
+    """Mark every adapter request in this context as an id backfill (no content, no jobs)."""
+    token = _backfill_only_push.set(True)
+    try:
+        yield
+    finally:
+        _backfill_only_push.reset(token)
+
+
 # The logical operation a request belongs to (#1503 Appendix O, §4.4). It rides in a header
 # rather than in every mirrored-scope body model, so one emitter covers every in-protocol
 # delivery key and no call site can forget it. The adapter admits it against its own
@@ -216,6 +235,11 @@ def _request_response(method, path, **kwargs):
     if _delete_origin_push.get():
         params = dict(kwargs.pop("params", None) or {})
         params["delete_origin"] = "true"
+        kwargs["params"] = params
+
+    if _backfill_only_push.get():
+        params = dict(kwargs.pop("params", None) or {})
+        params["backfill_only"] = "true"
         kwargs["params"] = params
 
     if not cfg["verify_tls"]:

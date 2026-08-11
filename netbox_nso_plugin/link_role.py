@@ -138,7 +138,7 @@ def apply_description_for_role(interface, role, other_end=None, push=True, *, mg
     from .derived_intent import render_template
     from .ip_autoassign import _resolve_managed_mgmt
     from .models import NSOInterfaceState
-    from .signals import _push_interface_intent_for_device, suppress_intent_push
+    from .signals import suppress_intent_push
 
     result = {"interface": str(interface), "changed": False, "description": None, "skipped": None, "error": None}
 
@@ -167,8 +167,10 @@ def apply_description_for_role(interface, role, other_end=None, push=True, *, mg
         )
 
     if push:
+        from . import drain
+
         try:
-            _push_interface_intent_for_device(mgmt.device_id, mgmt.adapter_device_id, force=True)
+            drain.push_now(mgmt.device_id, "interface", force=True)
         except Exception as exc:  # noqa: BLE001 — adapter may be down; ownership already recorded
             logger.warning("apply_description_for_role: push failed for %s: %s", interface, exc)
 
@@ -263,34 +265,28 @@ class _ProvisionRollback(Exception):
 
 def _push_provisioned(role, device_ids) -> None:
     """After a successful commit, push each affected (device, category) intent once."""
+    from . import drain
     from .models import NSODeviceManagement
-    from .signals import (
-        _push_interface_intent_for_device,
-        _push_ip_intent_for_device,
-        _push_isis_intent_for_device,
-        _push_ospf_intent_for_device,
-    )
 
     for device_id in device_ids:
         mgmt = NSODeviceManagement.objects.filter(device_id=device_id).first()
         if mgmt is None or mgmt.adapter_device_id is None:
             continue
-        aid = mgmt.adapter_device_id
-        push_fns = []
+        scopes = []
         if role.assign_ipv4 or role.assign_ipv6:
-            push_fns.append(_push_ip_intent_for_device)
+            scopes.append("ip")
         if role.description_template:
-            push_fns.append(_push_interface_intent_for_device)
+            scopes.append("interface")
         if role.igp == "isis":
-            push_fns.append(_push_isis_intent_for_device)
+            scopes.append("isis")
         elif role.igp == "ospf":
-            push_fns.append(_push_ospf_intent_for_device)
-        for fn in push_fns:
+            scopes.append("ospf")
+        for scope in scopes:
             try:
-                # force=True: provisioning must always land its computed intent — the
-                # in-process change-detection cache can otherwise silently skip a re-provision
-                # whose snapshot matches an earlier push (intent-integrity: no silent drop).
-                fn(device_id, aid, force=True)
+                # A forced claim: provisioning must always land its computed intent, and an
+                # acknowledged baseline matching this snapshot would otherwise drop the
+                # re-provision silently (intent-integrity: no silent drop).
+                drain.push_now(device_id, scope, force=True)
             except Exception as exc:  # noqa: BLE001 — adapter may be down; state already owned
                 logger.warning("provision_link_role: push failed for device %s: %s", device_id, exc)
 

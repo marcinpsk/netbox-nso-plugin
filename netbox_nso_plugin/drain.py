@@ -66,11 +66,26 @@ FAILED = "failed"
 SUPERSEDED = "superseded"
 UNACKNOWLEDGED = "unacknowledged"
 
+WITHHELD = "withheld"
+
+#: Why a durable ``degraded_deletions`` record was written. Never cleared by a push outcome:
+#: only the explicit operator acknowledgement clears either of them.
 LEGACY_MARK_DOWNGRADED = "legacy_mark_downgraded"
+PRE_FENCE_DETACH = "pre_fence_detach"
+
+#: Adapter rejections PROVEN to have had no effect: the request unwound through the claim
+#: guard's rollback before its single commit (O-A5). Only these may abandon a sent claim.
+PROVEN_NO_EFFECT = ("fence_shut", "store_only_deletion")
 
 
 class ClaimBusy(Exception):
     """A forced call found an active claim and would not queue behind it."""
+
+
+class ProtocolViolation(Exception):
+    """A response that is not a partition of the claim it answers (§4.4)."""
+
+    code = "nso_ack_not_a_partition"
 
 
 class ClaimConflict(Exception):
@@ -229,6 +244,13 @@ def _claim_locked(device_id, scope, mode, force) -> Claim | None:
     if not (force or state.push_seq is not None or _work_pending(state)):
         state.save()
         return None
+    if state.fence_withheld_since is not None and mode != delivery.MODE_BACKFILL_ONLY:
+        # While the fence is withheld the ONLY send permitted for the key is the
+        # backfill-only claim that opens it: any ordinary or store-only push omits the
+        # withheld route and would destroy its before-image (O-A4).
+        state.save()
+        logger.info("%s/%s is fence-withheld; only the backfill claim may send", device_id, scope)
+        return None
 
     mgmt = (
         NSODeviceManagement.objects.select_for_update(of=("self",))
@@ -273,6 +295,8 @@ def _form(state, mgmt, now, mode, force) -> Claim | None:
     from .models import NSOIntentOutboxEntry
 
     device_id, scope = state.device_id, state.scope
+    if mode == delivery.MODE_BACKFILL_ONLY:
+        return _form_backfill(state, mgmt, now)
     rows = list(_unconsumed(device_id, scope).select_for_update().order_by("id"))
     entry_ids = [row.pk for row in rows]
     mark = all(row.mark_and for row in rows) if rows else None
@@ -323,6 +347,39 @@ def _form(state, mgmt, now, mode, force) -> Claim | None:
         mark=mark,
         mark_any=mark_any,
         mode=mode,
+        rendered=rendered,
+    )
+
+
+def _form_backfill(state, mgmt, now) -> Claim:
+    """Take a claim that carries the owned snapshot and nothing else (§4.4).
+
+    An explicit branch, never an implication of the mode: a backfill claim that ran the
+    generic steps would fold the key's entries, move ``queued_deletions`` into
+    ``claim_deletions`` and then take the adapter's 422 for carrying authority the mode
+    forbids. It consumes no entry, so the real work is still owed after it succeeds.
+    """
+    rendered = delivery.render(state.scope, state.device_id, mgmt.adapter_device_id)
+    push_seq = allocate_push_seq()
+    state.push_seq = push_seq
+    state.claimed_at = now
+    state.claim_payload = rendered.payload
+    state.claim_digest = request_digest(rendered.payload, mode=delivery.MODE_BACKFILL_ONLY, deletions=[], mark=None)
+    state.claim_deletions = []
+    state.claim_mark = None
+    state.claim_flags = {"mode": delivery.MODE_BACKFILL_ONLY, "mark_any": False, "force": True}
+    state.save()
+    return Claim(
+        device_id=state.device_id,
+        scope=state.scope,
+        adapter_device_id=mgmt.adapter_device_id,
+        push_seq=push_seq,
+        payload=rendered.payload,
+        digest=state.claim_digest,
+        deletions=[],
+        mark=None,
+        mark_any=False,
+        mode=delivery.MODE_BACKFILL_ONLY,
         rendered=rendered,
     )
 
@@ -472,6 +529,17 @@ def send_claim(claim: Claim):
 # ── The outcome ───────────────────────────────────────────────────────────────
 
 
+#: The three lists that must partition a claim's requested set exactly (§4.4).
+_ACK_LISTS = ("deleted_executed_ids", "deleted_degraded_ids", "deleted_moot_ids")
+
+
+def _named_ids(response) -> list[int]:
+    """Every route id *response* names in any acknowledgement list."""
+    if not isinstance(response, dict):
+        return []
+    return sorted({int(value) for name in _ACK_LISTS for value in (response.get(name) or [])})
+
+
 def acknowledgement(claim: Claim, response) -> Acknowledgement:
     """Whether *response* acknowledges the claim's authority exactly (§4.4).
 
@@ -479,16 +547,23 @@ def acknowledgement(claim: Claim, response) -> Acknowledgement:
     a successful marked full-replace IS the deletion and acknowledges everything it claimed.
     A ``per_object`` scope must answer with three lists that partition the requested set:
     unique within each, pairwise disjoint, no id the claim did not request, exact coverage.
+
+    A claim carrying NO authority is the same rule at its boundary: a store-only or
+    backfill-only request, and every request of a key with nothing queued, must be answered
+    with no ids at all. A response naming one is naming an id the claim never requested.
     """
     requested = {int(record["route_id"]) for record in claim.deletions}
     if not requested:
+        named = _named_ids(response)
+        if named:
+            return Acknowledgement(False, reason=f"the acknowledgement names unrequested ids {named}")
         return Acknowledgement(True)
     if delivery.delivery_keys()[claim.scope].marking_mode != delivery.MARKING_PER_OBJECT:
         return Acknowledgement(True, frozenset(requested))
     if not isinstance(response, dict):
         return Acknowledgement(False, reason="the response carries no acknowledgement lists")
     seen: set[int] = set()
-    for name in ("deleted_executed_ids", "deleted_degraded_ids", "deleted_moot_ids"):
+    for name in _ACK_LISTS:
         values = response.get(name)
         if not isinstance(values, list):
             return Acknowledgement(False, reason=f"{name} is missing")
@@ -501,6 +576,81 @@ def acknowledgement(claim: Claim, response) -> Acknowledgement:
     if seen != requested:
         return Acknowledgement(False, reason="the acknowledgement does not cover the claim exactly")
     return Acknowledgement(True, frozenset(seen))
+
+
+def _report_protocol_violation(claim: Claim, reason: str) -> None:
+    """Surface a response that is not a partition of the claim, where an operator sees it.
+
+    The state row already RECORDS it as ``ack_not_exact``. This is the reporting half: the
+    per-scope rejection entry is what the device tab renders, and a response the plugin
+    cannot validate has to read as a refusal rather than as silence.
+    """
+    from . import signals
+
+    signals._record_push_outcome(
+        claim.device_id,
+        claim.scope,
+        (signals.read_push_attempt(claim.device_id, claim.scope) or 0),
+        ProtocolViolation(f"push_seq {claim.push_seq}: {reason}"),
+    )
+
+
+def _degradations(state, claim: Claim, response, now) -> list[dict]:
+    """Return the §4.3(c) records this response owes, most attributable first.
+
+    Two sources, one shape. The adapter's ``deleted_degraded_ids`` names the ids it dropped
+    to a detach under the ratified class. ``removed_uncorrelated`` names the triples of the
+    NULL-``route_id`` rows the request removed that no requested id claimed, and those drive
+    the request-wide conservative rule: a deletion still PENDING for this key whose lineage
+    contains one of them, or whose lineage is ``unverified`` and matched nothing, is
+    attributed to that removal rather than left to be mooted silently later.
+
+    The triples of the rows actually removed are part of the record: a route id alone tells
+    an operator nothing about what left the service.
+    """
+    if not isinstance(response, dict):
+        return []
+    removed = [triple for triple in (response.get("removed_uncorrelated") or []) if isinstance(triple, dict)]
+    records = []
+    degraded_ids = sorted({int(value) for value in (response.get("deleted_degraded_ids") or [])})
+    if degraded_ids:
+        records.append(_degradation(degraded_ids, removed or _lineages(claim.deletions, degraded_ids), now, claim))
+    if removed:
+        pending = [record for record in state.queued_deletions if _uncorrelated_hit(record, removed)]
+        if pending:
+            records.append(_degradation(sorted(int(r["route_id"]) for r in pending), removed, now, claim))
+    return records
+
+
+def _degradation(route_ids, triples, now, claim: Claim) -> dict:
+    return {
+        "route_ids": route_ids,
+        "triples": triples,
+        "at": now.isoformat(),
+        "reason": PRE_FENCE_DETACH,
+        "device": claim.device_id,
+    }
+
+
+def _lineages(deletions, route_ids) -> list[dict]:
+    """Return the triples the claim carried for *route_ids*, when the response reported none."""
+    wanted = set(route_ids)
+    return [
+        triple for record in deletions if int(record["route_id"]) in wanted for triple in (record.get("triples") or [])
+    ]
+
+
+def _uncorrelated_hit(record, removed) -> bool:
+    """Whether a pending deletion is attributable to one of the rows this request removed.
+
+    An exact lineage match is `authority:399`'s ratified class. So is an ``unverified``
+    record that matches nothing, because the pass removed a row no id claimed and the
+    conservative direction is to attribute the detach rather than to keep it silent.
+    """
+    triples = record.get("triples") or []
+    if any(triple in removed for triple in triples):
+        return True
+    return bool(record.get("unverified"))
 
 
 def settle(claim: Claim, response) -> str:
@@ -528,6 +678,7 @@ def settle(claim: Claim, response) -> str:
             state.last_error_code = "ack_not_exact"
             state.last_error_at = now
             state.save()
+            _report_protocol_violation(claim, ack.reason)
             return UNACKNOWLEDGED
 
         if claim.mark is False and claim.mark_any:
@@ -543,23 +694,23 @@ def settle(claim: Claim, response) -> str:
                     "device": claim.device_id,
                 },
             ]
+        state.degraded_deletions = [*state.degraded_deletions, *_degradations(state, claim, response, now)]
+        if claim.mode == delivery.MODE_BACKFILL_ONLY and state.fence_withheld_since is not None:
+            # The one thing that lifts the withholding: the fence is open, so the deletion
+            # the key is holding can be re-claimed at a NEW sequence and executed.
+            logger.info("the fence opened for %s/%s; ordinary sends resume", claim.device_id, claim.scope)
+            state.fence_withheld_since = None
         retired = NSOIntentOutboxEntry.objects.filter(
             device_id=claim.device_id, scope=claim.scope, consumed_by_push_seq=claim.push_seq
         )
         _retire(retired, list(retired.values_list("pk", flat=True)))
-        state.claim_deletions = []
         state.revoked_ids = [int(route_id) for route_id in state.revoked_ids if int(route_id) not in ack.acknowledged]
         state.lineage_carry = {
             route_id: triple
             for route_id, triple in (state.lineage_carry or {}).items()
             if int(route_id) not in ack.acknowledged
         }
-        state.push_seq = None
-        state.claimed_at = None
-        state.claim_payload = None
-        state.claim_digest = ""
-        state.claim_flags = {}
-        state.claim_mark = None
+        _clear_claim(state)
         state.attempts = 0
         state.last_success_digest = claim.digest
         state.last_success_at = now
@@ -571,11 +722,17 @@ def settle(claim: Claim, response) -> str:
 def _stamp_last_acked(claim: Claim) -> None:
     """Record the triple the adapter accepted, which is the only one a deletion can match.
 
+    Stamped from the acknowledged claim's OWN payload, on a normal or store-only success,
+    a receipt replay included, and on an exact acknowledgement that named degraded ids: the
+    body was still what the adapter accepted. A BACKFILL-ONLY success never stamps — it
+    adopts ids and generations and accepts no content, so stamping it would record an
+    acknowledgement the adapter never gave.
+
     Not filtered on the overlay's current generation: a late acknowledgement whose overlay
     has since advanced still acknowledged the intermediate triple, and that is exactly the
     one the lineage exists to remember.
     """
-    if claim.scope != "static_route":
+    if claim.scope != "static_route" or claim.mode == delivery.MODE_BACKFILL_ONLY:
         return
     from .models import NSOStaticRouteState
 
@@ -624,13 +781,7 @@ def abandon(claim: Claim) -> str:
         for record in state.claim_deletions or []:
             queued.setdefault(int(record["route_id"]), record)
         state.queued_deletions = list(queued.values())
-        state.claim_deletions = []
-        state.push_seq = None
-        state.claimed_at = None
-        state.claim_payload = None
-        state.claim_digest = ""
-        state.claim_flags = {}
-        state.claim_mark = None
+        _clear_claim(state)
         state.save()
     return ABANDONED
 
@@ -676,30 +827,124 @@ def _claim_or_compact(device_id, scope, *, mode, force):
 
 def drain_key(device_id, scope, *, mode=delivery.MODE_NORMAL, force=False, chain=DRAIN_CHAIN_MAX, reform=1) -> str:
     """Claim, send and settle one key, then chain a bounded number of further drains."""
+    outcome, _answer = _drain_once(device_id, scope, mode=mode, force=force, chain=chain, reform=reform)
+    return outcome
+
+
+def push_now(device_id, scope, *, mode=delivery.MODE_NORMAL, force=False):
+    """Drain one key synchronously and return the adapter's answer, or ``None``.
+
+    The forced-push sites use this: a forced call is its own logical operation, never
+    coalesced with a queued claim and never dropped as digest-equal, and several of them
+    read the answer (the Apply's promotion gate, the fleet resync's stored count). ``None``
+    means the operation was not acknowledged, which is what those callers act on.
+    """
+    outcome, answer = _drain_once(device_id, scope, mode=mode, force=force)
+    return answer if outcome == SUCCEEDED else None
+
+
+def _drain_once(device_id, scope, *, mode, force, chain=DRAIN_CHAIN_MAX, reform=1) -> tuple[str, object]:
+    """Run one claim/send/outcome cycle, returning ``(outcome, the adapter's answer)``."""
     _refuse_in_transaction("drain")
-    claimed, timed_out = _claim_or_compact(device_id, scope, mode=mode, force=force)
+    # The mode THIS attempt may send in. The caller's own mode is what a re-form or a chain
+    # resumes with, so a fence that opens mid-chain goes back to delivering, not backfilling.
+    send_mode = _withheld_mode(device_id, scope, mode)
+    claimed, timed_out = _claim_or_compact(device_id, scope, mode=send_mode, force=force)
     if timed_out:
-        return FAILED
+        return FAILED, None
     if claimed is None:
-        return NOTHING
+        return NOTHING, None
     try:
         answer = send_claim(claimed)
     except Exception as exc:  # noqa: BLE001 (the operation is replayed, so the failure is data)
         logger.warning("push_seq %s failed for %s/%s: %s", claimed.push_seq, device_id, scope, exc)
-        return record_failure(claimed, exc)
+        if _proven_no_effect(exc):
+            return _withhold(claimed, exc), None
+        return record_failure(claimed, exc), None
     if answer == ABANDONED and reform > 0:
         # A fixed revocation resolves in ONE re-form: the re-form folds the revoking entry
         # with everything else, so the authority no longer names that route. A revocation
         # committing during the re-form is the accepted OQ-O-7 residual, not a loop.
-        return drain_key(device_id, scope, mode=mode, force=force, chain=chain, reform=reform - 1)
+        return _drain_once(device_id, scope, mode=mode, force=force, chain=chain, reform=reform - 1)
     if answer in (PARKED, ABANDONED):
-        return answer
+        return answer, None
     outcome = settle(claimed, answer)
-    if outcome == SUCCEEDED and chain > 0 and _pending(device_id, scope):
+    chainable = chain > 0 and mode != delivery.MODE_BACKFILL_ONLY
+    if outcome == SUCCEEDED and chainable and _pending(device_id, scope):
         # Level-triggered, and terminating: each successful pass retires at least one row or
-        # clears authority. The cap is for latency; the tick guarantees the rest.
-        drain_key(device_id, scope, mode=mode, chain=chain - 1)
-    return outcome
+        # clears authority. A backfill consumes nothing, so a caller who asked for one gets
+        # one; the cap is for latency, and the tick guarantees the rest.
+        _drain_once(device_id, scope, mode=mode, force=False, chain=chain - 1)
+    return outcome, answer
+
+
+def _withheld_mode(device_id, scope, mode) -> str:
+    """Return the mode this key may actually send in, which a shut fence overrides (§4.3(c)).
+
+    A fence-withheld key owes exactly one send: the backfill-only pass that opens the fence.
+    Scheduling it is what bounds the withheld state, so the drain runs it in place of the
+    ordinary claim rather than leaving the key stalled until an operator intervenes.
+    """
+    from .models import NSOIntentOutboxState
+
+    if mode == delivery.MODE_BACKFILL_ONLY:
+        return mode
+    withheld = NSOIntentOutboxState.objects.filter(
+        device_id=device_id, scope=scope, fence_withheld_since__isnull=False
+    ).exists()
+    if not withheld:
+        return mode
+    logger.info("%s/%s is fence-withheld; draining the backfill-only claim instead", device_id, scope)
+    return delivery.MODE_BACKFILL_ONLY
+
+
+def _proven_no_effect(exc) -> bool:
+    """Whether the adapter rejected the request BEFORE any effect, which lets it be abandoned.
+
+    Post-send abandonment is otherwise forbidden: only the receipt can say whether the far
+    side applied the operation. These codes are the exception the adapter proves, by
+    unwinding through its claim guard's rollback ahead of its single commit.
+    """
+    detail = getattr(exc, "detail", None)
+    detail = detail if isinstance(detail, dict) else {}
+    return bool({getattr(exc, "code", None), detail.get("code"), detail.get("reason")} & set(PROVEN_NO_EFFECT))
+
+
+def _withhold(claim: Claim, exc) -> str:
+    """Abandon a proven-no-effect rejection and withhold the key's ordinary sends.
+
+    The sequence is burned and the authority returns WHOLE to ``queued_deletions``, so the
+    deletion survives and the ids can still be cross-checked against what a later pass
+    reports removing. Only the backfill-only claim's acknowledged success lifts this.
+    """
+    abandon(claim)
+    with transaction.atomic():
+        state = _lock_state(claim.device_id, claim.scope)
+        now = _db_now()
+        if state.fence_withheld_since is None:
+            state.fence_withheld_since = now
+        state.last_error_code = str(getattr(exc, "code", "") or type(exc).__name__)[:64]
+        state.last_error_at = now
+        state.save()
+    logger.warning("%s/%s is fence-withheld: %s", claim.device_id, claim.scope, exc)
+    return WITHHELD
+
+
+def acknowledge_degraded_deletions(device_id=None, scope=None) -> int:
+    """Clear the durable degradation records, and return how many keys were cleared.
+
+    The ONLY thing that clears them. A push outcome never does: the transient per-scope
+    error entry is popped by the very next success (`signals.py`), so a degradation
+    recorded there would be erased before an operator could read it.
+    """
+    from .models import NSOIntentOutboxState
+
+    rows = NSOIntentOutboxState.objects.exclude(degraded_deletions=[])
+    if device_id is not None:
+        rows = rows.filter(device_id=device_id)
+    if scope is not None:
+        rows = rows.filter(scope=scope)
+    return rows.update(degraded_deletions=[])
 
 
 def _claim_or_wait(device_id, scope, *, mode, force) -> Claim | None:
@@ -795,6 +1040,100 @@ def drain_intent_outbox(limit=None) -> tuple[int, int]:
         elif outcome in (FAILED, UNACKNOWLEDGED):
             failed += 1
     return drained, failed
+
+
+# ── The restore ───────────────────────────────────────────────────────────────
+
+RESTORE_SETTLED = "settled"
+RESTORE_REBASED = "rebased"
+RESTORE_FAILED_CLOSED = "failed_closed"
+RESTORE_REPLAY = "replay"
+
+
+def resolve_restored_claim(device_id, scope, receipt) -> str:
+    """Resolve one restored claim against the adapter's receipt for its key (§4.6).
+
+    *receipt* is what ``GET /api/v1/intent-receipts`` returned for this key, or ``None``.
+    Four cases, and the first is why this exists rather than being folded into the outcome
+    path: a same-sequence, same-digest receipt is settled only if its stored response is a
+    real PARTITION of the claim, validated by the SAME check the outcome path runs. A union
+    test would settle a response in which one id is both executed and degraded, and that
+    contradiction then drives both the degradation record and this decision.
+    """
+    _refuse_in_transaction("restore")
+    from .models import NSOIntentOutboxEntry
+
+    with transaction.atomic():
+        state = _lock_state(device_id, scope)
+        if state.push_seq is None:
+            return RESTORE_REPLAY
+        accepted = (receipt or {}).get("accepted_push_seq")
+        if accepted is None or int(accepted) < state.push_seq:
+            return RESTORE_REPLAY  # the far side never saw it; the ordinary replay carries it
+        if int(accepted) > state.push_seq:
+            # The restored database is behind the adapter: preserve the authority, return
+            # the rows to unconsumed so a later claim refolds them, and allocate above the
+            # watermark. Revoked ids stay revoked — a re-ownership outlives the snapshot.
+            revoked = {int(route_id) for route_id in state.revoked_ids or []}
+            queued = {int(record["route_id"]): record for record in state.queued_deletions}
+            for record in state.claim_deletions or []:
+                if int(record["route_id"]) not in revoked:
+                    queued.setdefault(int(record["route_id"]), record)
+            NSOIntentOutboxEntry.objects.filter(
+                device_id=device_id, scope=scope, consumed_by_push_seq=state.push_seq
+            ).update(consumed_by_push_seq=None)
+            state.queued_deletions = list(queued.values())
+            _clear_claim(state)
+            state.save()
+            return RESTORE_REBASED
+        if (receipt or {}).get("request_digest") != state.claim_digest:
+            logger.error(
+                "%s/%s holds push_seq %s at a digest the receipt does not name", device_id, scope, state.push_seq
+            )
+            return RESTORE_FAILED_CLOSED
+
+    # Rebuilt from the row alone: nothing is sent, so the claim needs no adapter id.
+    restored = Claim(
+        device_id=device_id,
+        scope=scope,
+        adapter_device_id=0,
+        push_seq=state.push_seq,
+        payload=state.claim_payload,
+        digest=state.claim_digest,
+        deletions=list(state.claim_deletions or []),
+        mark=state.claim_mark,
+        mark_any=bool((state.claim_flags or {}).get("mark_any")),
+        mode=(state.claim_flags or {}).get("mode", delivery.MODE_NORMAL),
+        rendered=None,
+        replayed=True,
+    )
+    if settle(restored, (receipt or {}).get("stored_response")) != SUCCEEDED:
+        return RESTORE_FAILED_CLOSED
+    return RESTORE_SETTLED
+
+
+def clear_acknowledged_lineage() -> int:
+    """Forget every acknowledged triple, which a restored database has no right to claim.
+
+    A plugin-only restore can believe it holds ``{A, A}`` while the adapter is at C, so the
+    lineage theorem's scope (tracked-era, non-restored rows) stops holding for every overlay
+    at once. NULL is not a gap here: it IS the wire's ``unverified`` flag, and saying so is
+    what keeps a later deletion attributable instead of silently moot.
+    """
+    from .models import NSOStaticRouteState
+
+    return NSOStaticRouteState.objects.exclude(last_acked_triple=None).update(last_acked_triple=None)
+
+
+def _clear_claim(state) -> None:
+    """Drop the claim fields. The sequence is burned; it is never reissued."""
+    state.claim_deletions = []
+    state.push_seq = None
+    state.claimed_at = None
+    state.claim_payload = None
+    state.claim_digest = ""
+    state.claim_flags = {}
+    state.claim_mark = None
 
 
 def gate_blockers(device_id=None) -> list[str]:

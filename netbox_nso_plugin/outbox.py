@@ -122,6 +122,27 @@ def fold_transitions(transitions, *, claim_deletions=(), queued=(), revoked=(), 
     return folded
 
 
+def carried_triple(route_id, *, transitions=(), queued=(), claim_deletions=(), lineage_carry=None) -> dict | None:
+    """Return the acknowledged triple a re-ownership of *route_id* inherits (§4.3(b)).
+
+    Removal deletes the overlay and re-ownership creates a fresh one, so the pending
+    deletion record is the only history there is. Reading it here is what makes a
+    delete/re-own/re-delete cycle carry ``[A, C]`` instead of ``[C]``, which is the
+    difference between the adapter matching the row it holds and calling the id moot while
+    silently detaching it.
+
+    A pure read: it applies the algebra to a synthetic revocation and takes the carry that
+    transition would produce, so the answer is the fold's answer rather than a second one.
+    Both authority homes are read, because the record may sit in either.
+    """
+    folded = fold_transitions(
+        [*transitions, revoke_transition(route_id)],
+        queued=[*queued, *claim_deletions],
+        lineage_carry=lineage_carry,
+    )
+    return folded.lineage_carry.get(route_id)
+
+
 def _last_acked_of(record) -> dict | None:
     """Read the acknowledged triple a deletion record carries, or ``None`` when unverified."""
     if not record or record.get("unverified"):
