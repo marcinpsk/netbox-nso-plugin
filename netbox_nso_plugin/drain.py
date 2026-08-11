@@ -99,6 +99,12 @@ class AuthorityPending(Exception):
     code = "nso_store_only_authority_pending"
 
 
+class DirectApplyFailed(Exception):
+    """A direct-apply endpoint answered HTTP 200 with an error envelope (§7.1)."""
+
+    code = "nso_direct_apply_failed"
+
+
 @dataclasses.dataclass
 class Claim:
     """One logical operation: the request, its authority, and the id it is admitted under."""
@@ -651,14 +657,16 @@ def _report_protocol_violation(claim: Claim, reason: str) -> None:
 
 
 def _report_refusal(device_id, scope, exc) -> None:
-    """Surface a claim the key may not take, where an operator reads its other refusals.
+    """Surface a push this key may not conclude, where an operator reads its other refusals.
 
-    A refusal is not a silent drop: the caller reads ``None`` and reports the key as not
-    acknowledged, and the per-scope rejection entry is what the device tab renders.
+    Two callers, one rule: the store-only claim that may not carry authority (§4.3(d)) and
+    the direct-apply answer that reports a failed device write under HTTP 200 (§7.1). Neither
+    is a silent drop: the caller reads a non-success, and the per-scope rejection entry is
+    what the device tab renders.
     """
     from . import signals
 
-    logger.warning("refusing the %s/%s claim: %s", device_id, scope, exc)
+    logger.warning("the %s/%s push was refused: %s", device_id, scope, exc)
     signals._record_push_outcome(device_id, scope, (signals.read_push_attempt(device_id, scope) or 0), exc)
 
 
@@ -853,6 +861,85 @@ def abandon(claim: Claim) -> str:
     return ABANDONED
 
 
+# ── The direct-apply keys, which are out of protocol (Rev 15 split, §7.1) ─────
+
+#: The entries were consumed and the body is rendered: this attempt owes a send.
+_SENDING = "sending"
+
+
+def _deliver_direct(device_id, scope, *, mode, force) -> tuple[str, object]:
+    """Deliver an out-of-protocol key: coalesced like every other, and claim-less (O-P12c).
+
+    ``lacp`` and ``switchport`` write to NSO synchronously inside the request, so no receipt
+    can be atomic with their effect and no sequence may name their operation: a takeover
+    would replay the body into a SECOND device write. They take no sequence, no lease and no
+    takeover, and nothing here retires authority on their behalf.
+
+    What survives is the coalescing: one fold, one send per burst. The entries are consumed
+    on the attempt, so the retry semantics are today's rather than the claim's, and a failure
+    lands in the push journal exactly as today's direct call leaves it. §7.1's card owns
+    joining these two to the protocol.
+    """
+    outcome, prepared = _repeatable_read(lambda: _take_direct_entries(device_id, scope, force))
+    if prepared is None:
+        return outcome, None
+    rendered, mark = prepared
+    try:
+        answer = delivery.send(
+            rendered, rendered.payload, mode=mode, mark=bool(mark), deadline=SEND_DEADLINE.total_seconds()
+        )
+    except Exception as exc:  # noqa: BLE001 (the send records it; nothing replays a device write)
+        logger.warning("the %s/%s apply failed: %s", device_id, scope, exc)
+        return FAILED, None
+    refusal = _apply_envelope_error(answer)
+    if refusal:
+        _report_refusal(device_id, scope, DirectApplyFailed(refusal))
+        return FAILED, None
+    return SUCCEEDED, answer
+
+
+def _take_direct_entries(device_id, scope, force) -> tuple[str, tuple | None]:
+    """Consume the key's unconsumed entries and render its body, under the state-row lock.
+
+    The lock is what makes two workers' bursts one send, and the entries are retired here
+    rather than in an outcome: an operation nothing can replay has no outcome transaction to
+    retire them in, and a row left behind would be re-sent to the device by the next pass.
+    """
+    from .models import NSODeviceManagement, NSOIntentOutboxEntry
+
+    state = _lock_state(device_id, scope)
+    state.last_drain_attempted_at = _db_now()
+    state.save()
+    mgmt = (
+        NSODeviceManagement.objects.select_for_update(of=("self",))
+        .order_by()
+        .filter(device_id=device_id, adapter_device_id__isnull=False)
+        .first()
+    )
+    if mgmt is None:
+        return PARKED, None  # unmanaged or unlinked: the entries keep, as the claim path parks
+    rows = list(_unconsumed(device_id, scope).select_for_update().order_by("id"))
+    if not rows and not force:
+        return NOTHING, None
+    rendered = delivery.render(scope, device_id, mgmt.adapter_device_id)
+    entry_ids = [row.pk for row in rows]
+    _retire(NSOIntentOutboxEntry.objects.filter(id__in=entry_ids), entry_ids)
+    return _SENDING, (rendered, all(row.mark_and for row in rows) if rows else None)
+
+
+def _apply_envelope_error(answer) -> str:
+    """Why a direct-apply answer reports a failed device write, or "" when it does not.
+
+    Both endpoints answer a failed apply with HTTP 200 and a ``{"status": "error"}`` envelope
+    (§7.1), so the transport cannot tell it from a success. The status codes and the rest of
+    the taxonomy belong to the split card; what belongs here is that such an answer is
+    recorded as the failure it is.
+    """
+    if isinstance(answer, dict) and answer.get("status") == "error":
+        return str(answer.get("message") or answer.get("detail") or "the adapter reported a failed apply")
+    return ""
+
+
 # ── The drain ─────────────────────────────────────────────────────────────────
 
 
@@ -913,6 +1000,8 @@ def push_now(device_id, scope, *, mode=delivery.MODE_NORMAL, force=False):
 def _drain_once(device_id, scope, *, mode, force, chain=DRAIN_CHAIN_MAX, reform=1) -> tuple[str, object]:
     """Run one claim/send/outcome cycle, returning ``(outcome, the adapter's answer)``."""
     _refuse_in_transaction("drain")
+    if not delivery.delivery_keys()[scope].in_protocol:
+        return _deliver_direct(device_id, scope, mode=mode, force=force)
     # The mode THIS attempt may send in. The caller's own mode is what a re-form or a chain
     # resumes with, so a fence that opens mid-chain goes back to delivering, not backfilling.
     send_mode = _withheld_mode(device_id, scope, mode)
