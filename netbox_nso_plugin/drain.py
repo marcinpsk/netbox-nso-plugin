@@ -77,6 +77,12 @@ WITHHELD = "withheld"
 LEGACY_MARK_DOWNGRADED = "legacy_mark_downgraded"
 PRE_FENCE_DETACH = "pre_fence_detach"
 
+#: What each reason means to an operator, who reads a banner rather than a constant.
+DEGRADED_REASONS = {
+    LEGACY_MARK_DOWNGRADED: "sent unmarked: an unmarked contributor folded in with the deletion",
+    PRE_FENCE_DETACH: "detached before the fence opened: the adapter dropped the row it could not remove",
+}
+
 #: Adapter rejections PROVEN to have had no effect: the request unwound through the claim
 #: guard's rollback before its single commit (O-A5). Only these may abandon a sent claim.
 PROVEN_NO_EFFECT = ("fence_shut", "store_only_deletion")
@@ -1228,6 +1234,40 @@ def _withhold(claim: Claim, exc) -> str:
         state.save()
     logger.warning("%s/%s is fence-withheld: %s", claim.device_id, claim.scope, exc)
     return WITHHELD
+
+
+def degraded_deletions(device_id) -> list[dict]:
+    """Return one rendered record per degradation recorded for *device_id*, newest first.
+
+    The operator surface of §4.3(c). The record is durable and no push outcome clears it, so
+    the device tab renders it as its own banner until the acknowledgement command clears it.
+    A pure read of the state rows: it takes no lock and never touches the adapter, so it
+    renders on a tab whose adapter is down exactly as on one whose adapter is up.
+    """
+    from django.utils.dateparse import parse_datetime
+
+    from .models import NSOIntentOutboxState
+
+    labels = delivery.delivery_keys()
+    rendered = []
+    rows = NSOIntentOutboxState.objects.filter(device_id=device_id).exclude(degraded_deletions=[])
+    for state in rows:
+        entry = labels.get(state.scope)
+        for record in state.degraded_deletions:
+            at = record.get("at") or ""
+            rendered.append(
+                {
+                    "scope": state.scope,
+                    "label": entry.label if entry else state.scope,
+                    "route_ids": record.get("route_ids") or [],
+                    "triples": [triple for triple in (record.get("triples") or []) if isinstance(triple, dict)],
+                    "reason": DEGRADED_REASONS.get(record.get("reason"), record.get("reason") or "unknown"),
+                    "at": parse_datetime(at) if at else None,
+                    "sort_key": at,
+                }
+            )
+    rendered.sort(key=lambda row: row["sort_key"], reverse=True)
+    return rendered
 
 
 def acknowledge_degraded_deletions(device_id=None, scope=None) -> list[tuple[int, str, list]]:

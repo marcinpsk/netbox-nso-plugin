@@ -5748,3 +5748,68 @@ class TestApplyRefusesAStaleSnmpStore(_CascadeFlushMixin, IntentPushResetMixin, 
         applied, _messages_shown = self._apply()
 
         assert len(applied) == 1
+
+
+class TestDeviceNSOTabDegradedDeletions(ViewTestBase):
+    """codex O1 r4 F3 (§4.3(c)): the durable degradation record needs an operator surface.
+
+    ``degraded_deletions`` had exactly one production reader, the acknowledgement command,
+    so a deletion that left the device configured was recorded where nobody looked. The tab
+    renders it as its own banner, from the database alone, until the command clears it.
+    """
+
+    def _url(self):
+        return reverse("dcim:device_nso", kwargs={"pk": self.device.pk})
+
+    def _record(self):
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        return NSOIntentOutboxState.objects.create(
+            device=self.device,
+            scope="static_route",
+            degraded_deletions=[
+                {
+                    "route_ids": [424242],
+                    "triples": [{"vrf": "BLUEVRF", "prefix": "198.51.100.0/28", "next_hop": "198.51.100.9"}],
+                    "at": "2026-08-11T05:00:00+00:00",
+                    "reason": "pre_fence_detach",
+                    "device": self.device.pk,
+                }
+            ],
+        )
+
+    def test_the_record_renders_as_its_own_banner(self):
+        self._record()
+
+        response = self.client.get(self._url())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "mdi-delete-alert-outline")
+        self.assertContains(response, "Static route")  # the delivery key's label
+        self.assertContains(response, "424242")
+        self.assertContains(response, "198.51.100.0/28")  # the triple actually removed
+        self.assertContains(response, "198.51.100.9")
+        self.assertContains(response, "BLUEVRF")
+        self.assertContains(response, "detached before the fence opened")
+        self.assertContains(response, "nso_acknowledge_degraded_deletions")
+        self.assertNotContains(response, "{#")
+
+    def test_a_device_with_no_record_renders_no_banner(self):
+        response = self.client.get(self._url())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, "mdi-delete-alert-outline")
+
+    def test_only_the_acknowledgement_clears_the_banner(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        self._record()
+        self.assertContains(self.client.get(self._url()), "424242")
+
+        out = StringIO()
+        call_command("nso_acknowledge_degraded_deletions", device_id=self.device.pk, stdout=out)
+
+        assert "198.51.100.0/28 via 198.51.100.9 (vrf BLUEVRF)" in out.getvalue(), out.getvalue()
+        self.assertNotContains(self.client.get(self._url()), "mdi-delete-alert-outline")

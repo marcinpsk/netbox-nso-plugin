@@ -28,4 +28,11 @@ class Command(BaseCommand):
                     f"{device_id}/{scope}: {record.get('reason')} "
                     f"route(s) {record.get('route_ids')} at {record.get('at')}"
                 )
+                # The triples of the rows actually removed: a route id alone tells an
+                # operator nothing about what left the service (R10-B1).
+                for triple in record.get("triples") or []:
+                    if not isinstance(triple, dict):
+                        continue
+                    vrf = triple.get("vrf") or "-"
+                    self.stdout.write(f"    {triple.get('prefix')} via {triple.get('next_hop')} (vrf {vrf})")
         self.stdout.write(self.style.SUCCESS(f"Acknowledged {len(acknowledged)} key(s)"))

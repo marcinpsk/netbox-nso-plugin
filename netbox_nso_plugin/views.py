@@ -271,12 +271,18 @@ class DeviceNSOTabView(generic.ObjectView):
                             "gaps": gaps,
                         }
 
+        from .drain import degraded_deletions
+
         return {
             "mgmt": mgmt,
             "nso_categories": category_summaries(device, mgmt),
             "adapter_error": adapter_error,
             "adapter_error_code": adapter_error_code,
             "intent_drift": intent_drift,
+            # §4.3(c): a deletion that left the device configured. Durable, adapter-free and
+            # cleared by the acknowledgement command alone, so it renders on every tab load
+            # until an operator answers for it.
+            "degraded_deletions": degraded_deletions(device.pk),
             "failover": failover,
             "device_capability": device_capability,
             # READSEM S4 (D8/D10): honored by EVERY render path — including the
