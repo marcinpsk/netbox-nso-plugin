@@ -40,6 +40,9 @@ logger = logging.getLogger(__name__)
 #: How long a claim's lease runs before a scavenger may take it over. Longer than any
 #: sender's total deadline, so a live sender is never robbed of its own operation.
 LEASE = datetime.timedelta(minutes=10)
+#: Total wall clock one send may take. The client's ``(connect, read)`` tuple is not a
+#: deadline: it measures the gap between bytes, so a dripping response resets it forever.
+SEND_DEADLINE = datetime.timedelta(minutes=2)
 #: Keys one drain pass may claim. It bounds KEYS, never a fold: a truncated fold would ship
 #: a body without the authority for what the body already omits.
 DRAIN_BATCH = 20
@@ -393,6 +396,7 @@ def send_claim(claim: Claim):
         mode=claim.mode,
         mark=bool(claim.mark),
         push_seq=claim.push_seq,
+        deadline=SEND_DEADLINE.total_seconds(),
     )
 
 

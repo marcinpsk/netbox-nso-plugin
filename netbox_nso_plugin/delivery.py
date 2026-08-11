@@ -24,6 +24,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import dataclasses
+import threading
 from collections.abc import Callable
 
 MODE_NORMAL = "normal"
@@ -140,7 +141,56 @@ def render(key: str, device_id, adapter_device_id) -> Rendered:
     return sink[0]
 
 
-def send(rendered: Rendered, body, *, mode: str = MODE_NORMAL, mark: bool = False, push_seq: int | None = None):
+class SendDeadlineExceeded(Exception):
+    """One send outlived its total wall-clock budget (O-P16)."""
+
+    code = "nso_send_deadline"
+
+
+def _under_deadline(do_push: Callable, seconds: float) -> Callable:
+    """Bound one transport call by wall clock, which the client's timeouts cannot do.
+
+    ``(connect, read)`` measures the gap between bytes, so a response dripping one byte at
+    a time resets it forever. The call therefore runs on its own thread and is abandoned
+    when the budget runs out; the budget is well under the lease, so an abandoned call is
+    long finished before a scavenger may take the operation over.
+    """
+
+    def _call(body):
+        context = contextvars.copy_context()
+        answer: dict = {}
+        done = threading.Event()
+
+        def _run():
+            from django.db import connections
+
+            try:
+                answer["result"] = context.run(do_push, body)
+            except BaseException as exc:  # noqa: BLE001 (re-raised on the sender's thread)
+                answer["error"] = exc
+            finally:
+                connections.close_all()  # this thread's own connections, nobody else's
+                done.set()
+
+        threading.Thread(target=_run, name="nso-intent-push", daemon=True).start()
+        if not done.wait(seconds):
+            raise SendDeadlineExceeded(f"the adapter did not answer within {seconds}s")
+        if "error" in answer:
+            raise answer["error"]
+        return answer["result"]
+
+    return _call
+
+
+def send(
+    rendered: Rendered,
+    body,
+    *,
+    mode: str = MODE_NORMAL,
+    mark: bool = False,
+    push_seq: int | None = None,
+    deadline: float | None = None,
+):
     """Send *body* for an already-rendered key, and return the adapter's answer.
 
     The mode and the deletion mark ride on the request as query flags, so they are applied
@@ -150,6 +200,8 @@ def send(rendered: Rendered, body, *, mode: str = MODE_NORMAL, mark: bool = Fals
     from . import adapter_client, signals
 
     entry = delivery_keys()[rendered.key[1]]
+    if deadline is not None:
+        rendered = dataclasses.replace(rendered, do_push=_under_deadline(rendered.do_push, deadline))
     with contextlib.ExitStack() as stack:
         if mode == MODE_STORE_ONLY:
             stack.enter_context(adapter_client.store_only_pushes())
