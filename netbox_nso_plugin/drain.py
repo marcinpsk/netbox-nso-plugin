@@ -325,13 +325,8 @@ def _form(state, mgmt, now, mode, force) -> Claim | None:
         lineage_carry=state.lineage_carry,
     )
     deletions = list(folded.queued.values())
-    if mode == delivery.MODE_STORE_ONLY and deletions:
-        # §4.3(d): a store-only claim carries nothing and clears nothing. Folding this
-        # authority would consume its entries and let the outcome retire it, while the
-        # adapter writes no tombstone for a store-only request (O-A3): the deletion would be
-        # gone with the device untouched. The refusal rolls the whole claim back, so the
-        # entries stay unconsumed for the ordinary claim that can deliver them.
-        raise AuthorityPending(f"{device_id}/{scope} holds deletion authority a store-only request cannot carry")
+    if mode == delivery.MODE_STORE_ONLY:
+        return _form_store_only(state, mgmt, now, deletions, force)
 
     rendered = delivery.render(scope, device_id, mgmt.adapter_device_id)
     digest = request_digest(rendered.payload, mode=mode, deletions=deletions, mark=mark)
@@ -370,6 +365,47 @@ def _form(state, mgmt, now, mode, force) -> Claim | None:
         mark=mark,
         mark_any=mark_any,
         mode=mode,
+        rendered=rendered,
+    )
+
+
+def _form_store_only(state, mgmt, now, deletions, force) -> Claim:
+    """Take a claim that carries the owned snapshot and consumes nothing (§4.3(d)).
+
+    Store-only carries no ids and clears none, so the fold above is a READ: it decides the
+    refusal and nothing else. Consuming the key's entries would let the outcome retire them
+    (O1.36) on a request that delivered none of what they stand for, so the ordinary
+    delivery would be gone with nothing on the wire that ever carried it. They stay
+    unconsumed for the ordinary claim, which the tick supplies.
+
+    The refusal is the same rule at its authority end: the adapter writes no tombstone for a
+    store-only request (O-A3), so a deletion carried here would be acknowledged with the
+    device untouched. Rolling the whole claim back leaves that authority where it was.
+    """
+    device_id, scope = state.device_id, state.scope
+    if deletions:
+        raise AuthorityPending(f"{device_id}/{scope} holds deletion authority a store-only request cannot carry")
+    rendered = delivery.render(scope, device_id, mgmt.adapter_device_id)
+    push_seq = allocate_push_seq()
+    state.push_seq = push_seq
+    state.claimed_at = now
+    state.claim_payload = rendered.payload
+    state.claim_digest = request_digest(rendered.payload, mode=delivery.MODE_STORE_ONLY, deletions=[], mark=None)
+    state.claim_deletions = []
+    state.claim_mark = None
+    state.claim_flags = {"mode": delivery.MODE_STORE_ONLY, "mark_any": False, "force": bool(force)}
+    state.save()
+    return Claim(
+        device_id=device_id,
+        scope=scope,
+        adapter_device_id=mgmt.adapter_device_id,
+        push_seq=push_seq,
+        payload=rendered.payload,
+        digest=state.claim_digest,
+        deletions=[],
+        mark=None,
+        mark_any=False,
+        mode=delivery.MODE_STORE_ONLY,
         rendered=rendered,
     )
 
@@ -1038,10 +1074,11 @@ def _drain_once(device_id, scope, *, mode, force, chain=DRAIN_CHAIN_MAX, reform=
             # was admitted under. This call's own mode and force are still owed, so it forms
             # its own claim now that the key is free to allocate one.
             return _drain_once(device_id, scope, mode=mode, force=force, chain=chain - 1)
-        if mode != delivery.MODE_BACKFILL_ONLY and _pending(device_id, scope):
-            # Level-triggered, and terminating: each successful pass retires at least one row
-            # or clears authority. A backfill consumes nothing, so a caller who asked for one
-            # gets one; the cap is for latency, and the tick guarantees the rest.
+        if mode == delivery.MODE_NORMAL and _pending(device_id, scope):
+            # Level-triggered, and terminating: each successful NORMAL pass retires at least
+            # one row or clears authority. Neither other mode consumes anything, so a caller
+            # who asked for one gets exactly one; the cap is for latency, and the tick
+            # guarantees the rest.
             _drain_once(device_id, scope, mode=mode, force=False, chain=chain - 1)
     return outcome, answer
 

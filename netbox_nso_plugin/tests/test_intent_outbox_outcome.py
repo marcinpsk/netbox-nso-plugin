@@ -483,6 +483,31 @@ class TestStoreOnlyCarriesNoAuthority(_OutcomeCase):
 
         assert self.adapter.requests[-1]["params"].get("store_only") == "true"
 
+    def test_an_ordinary_entry_outlives_a_store_only_send_and_is_delivered_after_it(self):
+        """codex O1 r2 F1: a settled store-only success retired the delivery it never made."""
+        from netbox_nso_plugin import delivery, drain
+
+        own_vlan(self.mgmt, 905, self.tag)
+        pending = [row.pk for row in entries(self.device, "vlan", unconsumed=True)]
+        assert pending, "the edit is recorded and nothing has folded it yet"
+
+        config, session = self.adapter.patches()
+        with config, session:
+            assert drain.push_now(self.device.pk, "vlan", mode=delivery.MODE_STORE_ONLY, force=True) is not None
+
+        assert [request["params"].get("store_only") for request in self.adapter.requests] == ["true"], (
+            "one store-only send: a pass that retires nothing may not redrain either"
+        )
+        assert [row.pk for row in entries(self.device, "vlan", unconsumed=True)] == pending, (
+            "store-only clears nothing, the ordinary entries included"
+        )
+
+        # The digest names the request MODE, so the store-only baseline can never drop the
+        # ordinary claim behind it as digest-equal.
+        assert self.drain("vlan") == drain.SUCCEEDED
+        assert entries(self.device, "vlan", unconsumed=True) == []
+        assert self.adapter.requests[-1]["params"].get("store_only") is None, "the delivery the resync did not make"
+
 
 class TestTheFenceWithholdsEverySendButTheBackfill(_OutcomeCase):
     """§4.3(c): a proven-no-effect 409 abandons, and only the backfill pass may send after it."""

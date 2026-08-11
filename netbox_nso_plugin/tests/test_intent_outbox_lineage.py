@@ -269,9 +269,10 @@ class TestTheLineageIsBoundedAndCleared(_LineageCase):
     def test_the_success_algebra_clears_the_carry_for_every_request_mode(self):
         """The clearing lives in the success algebra, never in one mode's own branch.
 
-        A store-only claim reaches it carrying nothing (§4.3(d)), so it is refused while the
-        deletion is pending and the ordinary claim behind it is what clears the carry. The
-        carry survives that refusal, which is the point of refusing rather than folding.
+        A store-only claim reaches it carrying nothing (§4.3(d)), so it folds nothing, it is
+        refused while the deletion is pending, and the ordinary claim behind it is what
+        writes the carry and later clears it. The carry survives that refusal, which is the
+        point of refusing rather than folding.
         """
         from netbox_nso_plugin import delivery, drain
 
@@ -284,6 +285,9 @@ class TestTheLineageIsBoundedAndCleared(_LineageCase):
                 self.reown(route)
                 self.adapter._respond = lambda body: partition()
                 assert self.drain(mode=mode) == drain.SUCCEEDED, "the fold is what writes the carry"
+                if mode == delivery.MODE_STORE_ONLY:
+                    assert entries(self.device, "static_route", unconsumed=True), "store-only consumed nothing"
+                    assert self.drain() == drain.SUCCEEDED, "so the ordinary claim behind it does the fold"
                 assert state_of(self.device, "static_route").lineage_carry
 
                 self.unown(route)
