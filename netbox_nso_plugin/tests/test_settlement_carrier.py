@@ -20,6 +20,37 @@ from django.db import connections
 from ._settlement_case import _CarrierCase, _make_device, _make_mgmt, _own, _result, _route, _stale_clock
 
 
+def _repair_before_the_lock(mgmt_pk: int, new_id: int):
+    """Commit a link repair to *new_id* in the window Step 4 leaves open.
+
+    Anchored on the consumer's entry point: Step 4 has handed over its cached ``mgmt`` object
+    and read whatever it reads, and the consumer has not taken its lock yet.
+    """
+    from netbox_nso_plugin import settlement
+    from netbox_nso_plugin.models import NSODeviceManagement
+
+    real_settle = settlement.settle_static_routes
+    repaired = []
+
+    def barrier(passed_mgmt, **kwargs):
+        if not repaired:
+            repaired.append(True)
+
+            def other_connection():
+                try:
+                    NSODeviceManagement.objects.filter(pk=mgmt_pk).update(adapter_device_id=new_id)
+                finally:
+                    connections.close_all()
+
+            thread = threading.Thread(target=other_connection)
+            thread.start()
+            thread.join(timeout=30)
+            assert not thread.is_alive(), "the repair never committed, so the barrier proves nothing"
+        return real_settle(passed_mgmt, **kwargs)
+
+    return patch.object(settlement, "settle_static_routes", barrier)
+
+
 class TestTheCarrier(_CarrierCase):
     """S5.4 — the adapter's notification reaches the consumer, through production wiring only."""
 
@@ -146,6 +177,53 @@ class TestTheConsumerReadsTheLockedRow(_CarrierCase):
         )
         state.refresh_from_db()
         assert state.status == "in_sync"
+
+
+class TestTheApplyProbeNamesTheLockedDevice(_CarrierCase):
+    """The apply-in-flight probe must be about the adapter device the consumer locked.
+
+    Step 4 reads the job state for the id on its cached row and hands the verdict down to the
+    escalation. A link repair that commits in that window moves the row to another adapter
+    device, and a probe of the OLD one says nothing about an apply in flight on the NEW one.
+    Reusing it fails every deploying static route on a device that is mid-apply, and an
+    apply's own ``in_sync`` cannot lift a row back out of ``apply_failed``.
+    """
+
+    def test_a_probe_read_for_another_device_does_not_fail_routes_mid_apply(self):
+        device = _make_device("probe")
+        mgmt = _make_mgmt(device, "probe", 60)
+        sr = _route("10.38.0.0/16", "10.38.0.1", devices=[device])
+        state = _own(sr, mgmt, generation=120)
+        _stale_clock(state)
+        # Device 60 is idle; the repaired device 61 has an apply in flight.
+        self.adapter.store.queued_job(61)
+
+        with _repair_before_the_lock(mgmt.pk, 61):
+            self._notify(device.pk)
+            self._drain()
+
+        assert self.adapter.store.feed_requests[0][0] == 61, "the repair did not land before the lock"
+        state.refresh_from_db()
+        assert state.status == "deploying", (
+            "the backstop stood on an apply probe read for adapter device 60 and failed a route "
+            "on 61, where an apply is in flight"
+        )
+
+    def test_the_backstop_still_judges_when_the_repaired_device_is_idle(self):
+        """The control: standing down is the probe's verdict, not a disabled backstop."""
+        device = _make_device("idle")
+        mgmt = _make_mgmt(device, "idle", 62)
+        sr = _route("10.39.0.0/16", "10.39.0.1", devices=[device])
+        state = _own(sr, mgmt, generation=121)
+        _stale_clock(state)
+
+        with _repair_before_the_lock(mgmt.pk, 63):
+            self._notify(device.pk)
+            self._drain()
+
+        assert self.adapter.store.feed_requests[0][0] == 63, "the repair did not land before the lock"
+        state.refresh_from_db()
+        assert state.status == "apply_failed"
 
 
 class TestTheBackstopNeedsADrainedFeed(_CarrierCase):
