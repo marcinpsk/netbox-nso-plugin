@@ -19,7 +19,15 @@ from django.db import connection, transaction
 from django.test import TransactionTestCase
 from django.utils import timezone
 
-from ._outbox_case import PUT_STATIC, PUT_VLAN, ReceiptAdapter, entries, make_managed, own_route, own_vlan, state_of
+from ._outbox_case import (
+    ReceiptAdapter,
+    entries,
+    make_managed,
+    own_route,
+    own_vlan,
+    state_of,
+    without_commit_drain,
+)
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -36,7 +44,7 @@ class _DrainCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
 
     def edit(self, mgmt):
         """One operator edit of the device's VLAN intent, which leaves one entry."""
-        with patch(PUT_VLAN), transaction.atomic():
+        with without_commit_drain(), transaction.atomic():
             mgmt.vlan_states.first().save()
 
     def run_drain(self, **kwargs):
@@ -181,7 +189,7 @@ class TestOutOfOrderCommitVisibility(_DrainCase):
         keeper = own_route(mgmt, "198.51.100.48/28", "198.51.100.4")
         leaving = own_route(mgmt, "198.51.100.64/28", "198.51.100.5")
         self.clear_entries()
-        with patch(PUT_STATIC):
+        with without_commit_drain():
             leaving.devices.remove(device)
         removal_ids = [row.pk for row in entries(device, "static_route")]
         assert removal_ids, "the removal recorded the deletion this claim will carry"
@@ -209,7 +217,7 @@ class TestOutOfOrderCommitVisibility(_DrainCase):
         # Two transactions that start later commit first, so their entries take higher ids
         # and are the only ones the claim's snapshot can see.
         for _ in range(2):
-            with patch(PUT_STATIC), transaction.atomic():
+            with without_commit_drain(), transaction.atomic():
                 mgmt.static_route_states.get(static_route=keeper).save()
         later_ids = [row.pk for row in entries(device, "static_route") if row.pk not in removal_ids]
         assert len(later_ids) == 2

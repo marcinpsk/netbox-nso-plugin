@@ -20,6 +20,7 @@ from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.db import connection, transaction
 from django.test import RequestFactory, TestCase, TransactionTestCase
 
+from ._outbox_case import without_commit_drain
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 PUT_STATIC = "netbox_nso_plugin.adapter_client.put_static_route_intent"
@@ -73,7 +74,7 @@ def _own_route(mgmt, prefix, next_hop, *, device=None):
     route = StaticRoute.objects.create(prefix=prefix, next_hop=next_hop, metric=1)
     with suppress_intent_push():
         route.devices.add(device or mgmt.device)
-    with patch(PUT_STATIC):
+    with without_commit_drain():
         from netbox_nso_plugin.signals import _accept_static_route_for_device
 
         _accept_static_route_for_device(route, device or mgmt.device)
@@ -172,7 +173,7 @@ class TestOutboxRollback(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         from netbox_nso_plugin.signals import _accept_static_route_for_device
 
         route = StaticRoute.objects.create(prefix="203.0.113.0/24", next_hop="203.0.113.1", metric=1)
-        with patch(PUT_STATIC):
+        with without_commit_drain():
             try:
                 with transaction.atomic():
                     route.devices.add(self.device)
@@ -182,7 +183,7 @@ class TestOutboxRollback(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
 
         assert _entries(self.device, "static_route") == []
 
-        with patch(PUT_STATIC), transaction.atomic():
+        with without_commit_drain(), transaction.atomic():
             route.devices.add(self.device)
             _accept_static_route_for_device(route, self.device)
 
@@ -193,15 +194,14 @@ class TestOutboxRollback(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         """O1.3 — provenance, not content: the folded authority is exactly ``{S}``."""
         from netbox_nso_plugin.outbox import fold_transitions
 
-        with patch(PUT_STATIC):
-            route_r = _own_route(self.mgmt, "203.0.113.16/28", "203.0.113.2")
-            route_s = _own_route(self.mgmt, "203.0.113.32/28", "203.0.113.3")
+        route_r = _own_route(self.mgmt, "203.0.113.16/28", "203.0.113.2")
+        route_s = _own_route(self.mgmt, "203.0.113.32/28", "203.0.113.3")
 
         from netbox_nso_plugin.models import NSOIntentOutboxEntry
 
         NSOIntentOutboxEntry.objects.all().delete()
 
-        with patch(PUT_STATIC), transaction.atomic():
+        with without_commit_drain(), transaction.atomic():
             try:
                 with transaction.atomic():  # a savepoint Django rolls back on its own
                     route_r.devices.remove(self.device)
@@ -240,7 +240,7 @@ class TestOutboxMarkingModes(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         from netbox_nso_plugin.models import NSOVLANState
 
         vlan = VLAN.objects.create(vid=vid, name=f"ob-mk-v{vid}")
-        with patch(PUT_VLAN):
+        with without_commit_drain():
             return NSOVLANState.objects.create(management=self.mgmt, vlan=vlan, status="accepted")
 
     def test_a_committed_vlan_deletion_still_ships_the_query_flag(self):
@@ -249,12 +249,16 @@ class TestOutboxMarkingModes(_CascadeFlushMixin, IntentPushResetMixin, Transacti
 
         state = self._owned_vlan_state(711)
         NSOIntentOutboxEntry.objects.all().delete()
+        with without_commit_drain():
+            state.delete()
+        assert [(e.mark_and, e.mark_any) for e in _entries(self.device, "vlan")] == [(True, True)]
 
-        params = self._recorded_params(state.delete)
-
+        # The drain that ships the mark also retires the row that carried it, so the wire is
+        # asserted on a second deletion rather than on the record above.
+        other = self._owned_vlan_state(713)
+        NSOIntentOutboxEntry.objects.all().delete()
+        params = self._recorded_params(other.delete)
         assert any(p.get("delete_origin") == "true" for p in params), f"saw {params}"
-        entries = _entries(self.device, "vlan")
-        assert [(e.mark_and, e.mark_any) for e in entries] == [(True, True)]
 
     def test_a_rolled_back_vlan_deletion_contributes_no_mark(self):
         """O1.4 — the rolled-back deletion leaves neither an entry nor a mark to AND in."""
@@ -263,7 +267,7 @@ class TestOutboxMarkingModes(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         state = self._owned_vlan_state(712)
         NSOIntentOutboxEntry.objects.all().delete()
 
-        with patch(PUT_VLAN):
+        with without_commit_drain():
             try:
                 with transaction.atomic():
                     state.delete()
@@ -275,7 +279,7 @@ class TestOutboxMarkingModes(_CascadeFlushMixin, IntentPushResetMixin, Transacti
 
         # ``delete()`` clears the in-memory pk; the row itself came back with the rollback.
         survivor = NSOVLANState.objects.get(management=self.mgmt, vlan__vid=712)
-        with patch(PUT_VLAN), transaction.atomic():
+        with without_commit_drain(), transaction.atomic():
             survivor.save()
 
         assert [e.mark_and for e in _entries(self.device, "vlan")] == [False]
@@ -293,13 +297,12 @@ class TestOutboxMarkingModes(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         prefixes = {"query_flag": "203.0.113.64/28", "per_object": "203.0.113.96/28"}
         for mode, prefix in prefixes.items():
             NSOIntentOutboxEntry.objects.all().delete()
-            with patch(PUT_STATIC):
-                route = _own_route(self.mgmt, prefix, "203.0.113.4")
+            route = _own_route(self.mgmt, prefix, "203.0.113.4")
             NSOIntentOutboxEntry.objects.all().delete()
 
             registry["static_route"] = dataclasses.replace(original, marking_mode=mode)
             try:
-                with patch(PUT_STATIC):
+                with without_commit_drain():
                     route.devices.remove(self.device)
             finally:
                 registry["static_route"] = original
@@ -309,8 +312,12 @@ class TestOutboxMarkingModes(_CascadeFlushMixin, IntentPushResetMixin, Transacti
 
     def test_only_the_emission_is_mode_gated(self):
         """O1.20 — while the scope is ``query_flag`` the wire still carries the query flag."""
-        with patch(PUT_STATIC):
-            route = _own_route(self.mgmt, "203.0.113.128/28", "203.0.113.5")
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry
+
+        route = _own_route(self.mgmt, "203.0.113.128/28", "203.0.113.5")
+        # The accept's own entry is unmarked, and the fold ANDs it in; the pin is about the
+        # deletion's flag, so it is the only contributor left.
+        NSOIntentOutboxEntry.objects.all().delete()
 
         params = self._recorded_params(lambda: route.devices.remove(self.device))
 
@@ -334,9 +341,9 @@ class TestOutboxEnqueueTakesNoSharedLock(_CascadeFlushMixin, IntentPushResetMixi
 
             try:
                 with transaction.atomic():
-                    _schedule_intent_push((device_id, scopes[0]), lambda: None)
+                    _schedule_intent_push((device_id, scopes[0]))
                     barrier.wait()
-                    _schedule_intent_push((device_id, scopes[1]), lambda: None)
+                    _schedule_intent_push((device_id, scopes[1]))
             except BaseException as exc:  # noqa: BLE001 — reported, not swallowed
                 errors.append(exc)
             finally:
@@ -346,10 +353,11 @@ class TestOutboxEnqueueTakesNoSharedLock(_CascadeFlushMixin, IntentPushResetMixi
             threading.Thread(target=_append, args=(("vlan", "interface"),)),
             threading.Thread(target=_append, args=(("interface", "vlan"),)),
         ]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=60)
+        with without_commit_drain():
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=60)
 
         assert errors == []
         assert NSOIntentOutboxEntry.objects.filter(device_id=device_id).count() == 4
@@ -376,10 +384,9 @@ class TestOutboxTeardown(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
     def _pending_entry(self):
         from netbox_nso_plugin.models import NSOIntentOutboxEntry
 
-        with patch(PUT_STATIC):
-            route = _own_route(self.mgmt, "203.0.113.192/28", "203.0.113.6")
+        route = _own_route(self.mgmt, "203.0.113.192/28", "203.0.113.6")
         NSOIntentOutboxEntry.objects.all().delete()
-        with patch(PUT_STATIC):
+        with without_commit_drain():
             route.devices.remove(self.device)
         assert _entries(self.device, "static_route"), "the deletion must have been recorded"
         return route

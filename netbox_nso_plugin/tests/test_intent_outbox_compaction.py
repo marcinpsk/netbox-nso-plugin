@@ -26,8 +26,6 @@ from django.test import TransactionTestCase
 from django.test.utils import CaptureQueriesContext
 
 from ._outbox_case import (
-    PUT_STATIC,
-    PUT_VLAN,
     ReceiptAdapter,
     as_per_object,
     entries,
@@ -36,6 +34,7 @@ from ._outbox_case import (
     own_route,
     own_vlan,
     state_of,
+    without_commit_drain,
 )
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
@@ -221,7 +220,7 @@ class TestTheTwoClassesOfGrowth(_CompactionCase):
         from netbox_nso_plugin import drain
 
         route = own_route(self.mgmt, "198.51.100.0/28", "198.51.100.1")
-        with patch(PUT_STATIC):
+        with without_commit_drain():
             route.devices.remove(self.device)
         held = drain.claim(self.device.pk, "static_route")
         assert [record["route_id"] for record in held.deletions] == [route.pk]
@@ -240,7 +239,7 @@ class TestTheTwoClassesOfGrowth(_CompactionCase):
         from netbox_nso_plugin import drain
 
         route = own_route(self.mgmt, "198.51.100.16/28", "198.51.100.2")
-        with patch(PUT_STATIC):
+        with without_commit_drain():
             route.devices.remove(self.device)
         held = drain.claim(self.device.pk, "static_route")
         assert held.deletions
@@ -273,7 +272,7 @@ class TestTheTwoClassesOfGrowth(_CompactionCase):
         from netbox_nso_plugin import drain
 
         route = own_route(self.mgmt, "198.51.100.48/28", "198.51.100.4")
-        with patch(PUT_STATIC):
+        with without_commit_drain():
             route.devices.remove(self.device)
         held = drain.claim(self.device.pk, "static_route")
         assert held.deletions, "the key now carries a live claim, so no drain may take it"
@@ -354,10 +353,10 @@ class TestACompactedRowSendsWhatItsContributorsAuthorized(_CompactionCase):
         self.clear_entries()
         self.adapter.requests.clear()
 
-        with patch(PUT_VLAN), transaction.atomic():
+        with without_commit_drain(), transaction.atomic():
             kept.status = "imported"  # an unmarked shrink: the operator un-owns it
             kept.save()
-        with patch(PUT_VLAN), transaction.atomic():
+        with without_commit_drain(), transaction.atomic():
             going.delete()  # a marked shrink: the object is destroyed in NetBox
         assert len(self.rows("vlan")) == 2
 
@@ -493,7 +492,7 @@ class TestCompactionRewritesInPlace(_CompactionCase):
         from netbox_nso_plugin import drain
 
         route = own_route(self.mgmt, "198.51.100.32/28", "198.51.100.3")
-        with patch(PUT_STATIC):
+        with without_commit_drain():
             route.devices.remove(self.device)
         held = drain.claim(self.device.pk, "static_route")
         assert [record["route_id"] for record in held.deletions] == [route.pk]

@@ -26,7 +26,6 @@ from django.db import OperationalError, transaction
 from django.test import TransactionTestCase
 
 from ._outbox_case import (
-    PUT_STATIC,
     ReceiptAdapter,
     entries,
     expire_claim,
@@ -34,6 +33,7 @@ from ._outbox_case import (
     own_route,
     own_vlan,
     state_of,
+    without_commit_drain,
 )
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
@@ -196,13 +196,13 @@ class TestTheFoldAndTheRenderShareOneSnapshot(_ConcurrencyCase):
 
     def _remove_in_another_connection(self, route):
         """Commit the operator's removal on its own connection, patching only from here."""
-        from ._outbox_case import in_thread, without_legacy_coalescer
+        from ._outbox_case import in_thread, without_commit_drain
 
         def remove():
             with transaction.atomic():
                 route.devices.remove(self.device)
 
-        with patch(PUT_STATIC), without_legacy_coalescer():
+        with without_commit_drain():
             in_thread(remove)
 
 
@@ -323,7 +323,7 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
         Every patch these transactions need is entered HERE, once, on this thread, and held
         for the whole run: entering one from two threads at a time leaks it permanently.
         """
-        from ._outbox_case import in_thread, without_legacy_coalescer
+        from ._outbox_case import in_thread, without_commit_drain
 
         errors: list[BaseException] = []
 
@@ -333,7 +333,7 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
             except BaseException as exc:  # noqa: BLE001 (reported on the caller's thread)
                 errors.append(exc)
 
-        with patch(PUT_STATIC), without_legacy_coalescer():
+        with without_commit_drain():
             threads = [threading.Thread(target=guarded, args=(work,)) for work in works]
             for thread in threads:
                 thread.start()
@@ -382,7 +382,7 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
 
     def test_a_re_ownership_committing_first_takes_the_lower_entry_id(self):
         route = own_route(self.mgmt, "198.51.100.160/28", "198.51.100.11")
-        with patch(PUT_STATIC):
+        with without_commit_drain():
             route.devices.remove(self.device)  # un-owned, so the re-ownership is a real one
         self.clear_entries()
         owned = threading.Event()
@@ -402,7 +402,7 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
 
         leaving = own_route(self.mgmt, "198.51.100.176/28", "198.51.100.12")
         returning = own_route(self.mgmt, "198.51.100.192/28", "198.51.100.13")
-        with patch(PUT_STATIC):
+        with without_commit_drain():
             returning.devices.remove(self.device)
         self.clear_entries()
         held = threading.Event()

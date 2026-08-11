@@ -165,9 +165,9 @@ class TestOneClaimerAcrossTwoProcesses(_CascadeFlushMixin, IntentPushResetMixin,
         """One operator edit, recorded as an entry and sent by nobody but the drain."""
         from django.db import transaction
 
-        from ._outbox_case import without_legacy_coalescer
+        from ._outbox_case import without_commit_drain
 
-        with without_legacy_coalescer(), transaction.atomic():
+        with without_commit_drain(), transaction.atomic():
             state.vlan.name = "proc-renamed"
             state.vlan.save()
             state.save()

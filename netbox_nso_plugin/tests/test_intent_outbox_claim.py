@@ -20,7 +20,6 @@ from django.db import transaction
 from django.test import TransactionTestCase
 
 from ._outbox_case import (
-    PUT_VLAN,
     ReceiptAdapter,
     entries,
     expire_claim,
@@ -28,6 +27,7 @@ from ._outbox_case import (
     own_route,
     own_vlan,
     state_of,
+    without_commit_drain,
 )
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
@@ -68,7 +68,7 @@ class TestClaimFoldsEveryEntryOnce(_ClaimCase):
 
         states = [own_vlan(self.mgmt, 800 + index, self.tag) for index in range(3)]
         self.clear_entries()
-        with patch(PUT_VLAN), transaction.atomic():
+        with without_commit_drain(), transaction.atomic():
             for state in states:
                 state.save()
 
@@ -82,25 +82,6 @@ class TestClaimFoldsEveryEntryOnce(_ClaimCase):
         assert len(self.adapter.requests) == 1
         assert entries(self.device, "vlan") == []
 
-    def test_callbacks_two_to_n_register_no_further_work(self):
-        """The commit cell is registered once: later saves only touch the thread-local."""
-        states = [own_vlan(self.mgmt, 810 + index, self.tag) for index in range(4)]
-
-        with (
-            patch("django.db.transaction.on_commit", wraps=transaction.on_commit) as registered,
-            patch(PUT_VLAN),
-            transaction.atomic(),
-        ):
-            for state in states:
-                state.save()
-
-        drains = [
-            call
-            for call in registered.call_args_list
-            if getattr(call.args[0], "__name__", "") == "_drain_intent_pushes"
-        ]
-        assert len(drains) == 1, registered.call_args_list
-
     def test_a_pass_truncates_keys_never_a_fold(self):
         from netbox_nso_plugin import drain
 
@@ -110,7 +91,7 @@ class TestClaimFoldsEveryEntryOnce(_ClaimCase):
         own_vlan(self.mgmt, 830, self.tag)
         self.clear_entries()
 
-        with patch(PUT_VLAN), transaction.atomic():
+        with without_commit_drain(), transaction.atomic():
             for _device, mgmt in others:
                 mgmt.vlan_states.first().save()
             # One key carrying more entries than the whole pass may claim keys: the cap is
@@ -143,7 +124,7 @@ class TestDigestEqualClaimRetiresItsRows(_ClaimCase):
         assert self.drain() == drain.SUCCEEDED
         sent = len(self.adapter.requests)
 
-        with patch(PUT_VLAN), transaction.atomic():
+        with without_commit_drain(), transaction.atomic():
             state.save()
         assert len(entries(self.device, "vlan", unconsumed=True)) == 1
 
@@ -198,7 +179,7 @@ class TestFailureKeepsTheWorkAndTheBaseline(_ClaimCase):
         failed_seq = state_of(self.device, "vlan").push_seq
 
         self.adapter.fail_with = None
-        with patch(PUT_VLAN), transaction.atomic():
+        with without_commit_drain(), transaction.atomic():
             state.vlan.name = "cl-dig-renamed"
             state.vlan.save()
             state.save()
@@ -236,7 +217,7 @@ class TestCrashedAttemptsReplayAtTheirOwnSequence(_ClaimCase):
         from netbox_nso_plugin import drain
 
         route = own_route(self.mgmt, "198.51.100.0/28", "198.51.100.1")
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent"):
+        with without_commit_drain():
             route.devices.remove(self.device)
 
         claimed = drain.claim(self.device.pk, "static_route")
@@ -291,7 +272,7 @@ class TestUnmanagedClaimIsParked(_ClaimCase):
         from netbox_nso_plugin import drain
 
         route = own_route(self.mgmt, "198.51.100.16/28", "198.51.100.2")
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent"):
+        with without_commit_drain():
             route.devices.remove(self.device)
         claimed = drain.claim(self.device.pk, "static_route")
         assert claimed.deletions

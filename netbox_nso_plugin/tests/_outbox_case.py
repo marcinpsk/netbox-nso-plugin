@@ -53,8 +53,8 @@ def make_mgmt(device, tag: str, adapter_device_id: int):
 
 
 def make_managed(tag: str, adapter_device_id: int, index: int = 1):
-    """A managed device, with the fixture's own pushes silenced."""
-    with patch(PUT_STATIC), patch(PUT_VLAN):
+    """A managed device, with the fixture's own drain silenced."""
+    with without_commit_drain():
         device = make_device(tag, index)
         return device, make_mgmt(device, tag, adapter_device_id)
 
@@ -65,7 +65,7 @@ def own_vlan(mgmt, vid: int, tag: str):
 
     from netbox_nso_plugin.models import NSOVLANState
 
-    with patch(PUT_VLAN):
+    with without_commit_drain():
         vlan = VLAN.objects.create(vid=vid, name=f"cl-{tag}-v{vid}")
         return NSOVLANState.objects.create(management=mgmt, vlan=vlan, status="accepted")
 
@@ -79,7 +79,7 @@ def own_route(mgmt, prefix: str, next_hop: str, *, device=None):
     route = StaticRoute.objects.create(prefix=prefix, next_hop=next_hop, metric=1)
     with suppress_intent_push():
         route.devices.add(device or mgmt.device)
-    with patch(PUT_STATIC):
+    with without_commit_drain():
         _accept_static_route_for_device(route, device or mgmt.device)
     return route
 
@@ -151,15 +151,47 @@ def in_thread(work, timeout=30):
 
 
 @contextlib.contextmanager
-def without_legacy_coalescer():
-    """Silence the interim commit-time coalescer, which the O1.19 swap deletes.
+def without_commit_drain():
+    """Leave the key's entries unconsumed by silencing the commit callback.
 
-    It still sends alongside the drain, and its own send takes the management row FOR
-    UPDATE before any client call, so a pin holding a claim open would measure the
-    coalescer waiting on the claim rather than the outbox's own behaviour.
+    Since the O1.19 swap the commit callback IS the drain, so an edit that commits sends
+    for real and retires its rows. A pin that has to construct a specific outbox state —
+    an unconsumed tail, a stuck claim, a barrier between two operations — cannot let that
+    happen mid-fixture. The production trigger has pins of its own
+    (``test_intent_outbox_swap``); silencing it here is about arranging the world, never
+    about what the drain does with it.
     """
     with patch("netbox_nso_plugin.signals._drain_intent_pushes"):
         yield
+
+
+def partition(*, executed=(), degraded=(), moot=(), removed=()) -> dict:
+    """One adapter answer in §4.4's shape: three id lists plus the rows it removed uncorrelated.
+
+    The three lists must partition the requested set exactly, which is what the plugin
+    validates. ``removed`` carries the triples of the ``route_id IS NULL`` rows the request
+    removed that no requested id claimed, reported on every request mode.
+    """
+    return {
+        "count": 0,
+        "deleted_executed_ids": list(executed),
+        "deleted_degraded_ids": list(degraded),
+        "deleted_moot_ids": list(moot),
+        "removed_uncorrelated": list(removed),
+    }
+
+
+def triple(prefix, next_hop, vrf=""):
+    from netbox_nso_plugin.outbox import triple_of
+
+    return triple_of(vrf, prefix, next_hop)
+
+
+def last_acked(mgmt, route):
+    from netbox_nso_plugin.models import NSOStaticRouteState
+
+    row = NSOStaticRouteState.objects.filter(management=mgmt, static_route=route).first()
+    return row.last_acked_triple if row else None
 
 
 @contextlib.contextmanager

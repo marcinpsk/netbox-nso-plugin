@@ -21,8 +21,6 @@ from django.db import transaction
 from django.test import TransactionTestCase
 
 from ._outbox_case import (
-    PUT_STATIC,
-    PUT_VLAN,
     ReceiptAdapter,
     as_per_object,
     entries,
@@ -31,6 +29,7 @@ from ._outbox_case import (
     own_route,
     own_vlan,
     state_of,
+    without_commit_drain,
 )
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
@@ -75,13 +74,13 @@ class _MarkCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
 
     def unown(self, state):
         """An unmarked shrink: the operator hands the object back, the device keeps it."""
-        with patch(PUT_VLAN), transaction.atomic():
+        with without_commit_drain(), transaction.atomic():
             state.status = "imported"
             state.save()
 
     def delete_overlay(self, state):
         """A marked shrink: the object is destroyed in NetBox, so the device may lose it."""
-        with patch(PUT_VLAN), transaction.atomic():
+        with without_commit_drain(), transaction.atomic():
             state.delete()
 
     def sent(self):
@@ -102,7 +101,7 @@ class TestOneTransactionOneMarkedPush(_MarkCase):
         from netbox_nso_plugin import drain
 
         states = self.own(801, 802, 803)
-        with patch(PUT_VLAN), transaction.atomic():
+        with without_commit_drain(), transaction.atomic():
             states[801].delete()
             states[802].delete()
 
@@ -221,7 +220,7 @@ class TestALateEntryNeverAbandonsTheClaim(_MarkCase):
         worker.start()
         assert started.wait(timeout=30)
 
-        with patch(PUT_STATIC), transaction.atomic():
+        with without_commit_drain(), transaction.atomic():
             self.mgmt.static_route_states.get(static_route=route).save()
         with as_per_object("static_route"):
             claimed = drain.claim(self.device.pk, "static_route")
@@ -272,7 +271,7 @@ class TestACommittedRevocationAbandonsAndReformsOnce(_MarkCase):
         from netbox_nso_plugin.signals import _accept_static_route_for_device
 
         route = own_route(self.mgmt, "198.51.100.96/28", "198.51.100.7")
-        with patch(PUT_STATIC):
+        with without_commit_drain():
             route.devices.remove(self.device)
         self.adapter.place(self.adapter_device_id, ("route_id", route.pk))
 
@@ -282,7 +281,7 @@ class TestACommittedRevocationAbandonsAndReformsOnce(_MarkCase):
         def scan_after_a_committed_re_own(claim):
             """The re-ownership commits while the claim is formed, before this scan runs."""
             if not scanned:
-                with patch(PUT_STATIC):
+                with without_commit_drain():
                     in_thread(lambda: _accept_static_route_for_device(route, self.device))
             hit = real_scan(claim)
             scanned.append(hit)
