@@ -271,13 +271,14 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
     def test_push_builds_owned_snapshot(self):
         from unittest.mock import patch
 
-        from netbox_nso_plugin.signals import _push_subinterface_intent_for_device, reset_intent_push_state
+        from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.signals import reset_intent_push_state
 
         self._state(name="ge-0/0/0.100", dot1q=100, status="accepted")
         self._state(name="ge-0/0/0.200", dot1q=200, status="imported")  # not owned → excluded
         reset_intent_push_state()
         with patch("netbox_nso_plugin.adapter_client.put_subinterface_intent") as mock_put:
-            _push_subinterface_intent_for_device(self.device.pk, 42)
+            deliver("subinterface", self.device.pk, 42)
         mock_put.assert_called_once()
         ifaces = mock_put.call_args[0][1]
         assert [i["interface_name"] for i in ifaces] == ["ge-0/0/0.100"]
@@ -288,14 +289,15 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
     def test_push_skips_rows_without_dot1q(self):
         from unittest.mock import patch
 
-        from netbox_nso_plugin.signals import _push_subinterface_intent_for_device, reset_intent_push_state
+        from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.signals import reset_intent_push_state
 
         self._state(name="ge-0/0/0.100", dot1q=100, status="accepted")
         # Owned but no dot1q tag → the reconciler can't key it; must be excluded.
         self._state(name="ge-0/0/0.110", dot1q=None, status="accepted")
         reset_intent_push_state()
         with patch("netbox_nso_plugin.adapter_client.put_subinterface_intent") as mock_put:
-            _push_subinterface_intent_for_device(self.device.pk, 42)
+            deliver("subinterface", self.device.pk, 42)
         ifaces = mock_put.call_args[0][1]
         assert [i["interface_name"] for i in ifaces] == ["ge-0/0/0.100"]
 

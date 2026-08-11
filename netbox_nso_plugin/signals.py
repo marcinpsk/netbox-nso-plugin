@@ -466,37 +466,31 @@ def read_push_attempt(device_id, scope):
 
 
 def _push_changed(key, payload, do_push, on_response=None):
-    """Offer *payload* for *key*: captured under a render, otherwise sent straight away.
+    """Offer *payload* for *key* to the render in progress, and send nothing.
 
     This is the render/send choke point the claim protocol needs (#1503 Appendix O, §4.2):
-    under a render the body is captured here and nothing is sent, so the claim can render
-    inside its transaction and send outside it. Every push function reaches exactly one of
-    these, which is what makes the delivery registry an enumeration rather than a promise.
+    the body is captured here and the send happens later, outside every transaction, so a
+    claim can render inside its own one. Every push function reaches exactly one of these,
+    which is what makes the delivery registry an enumeration rather than a promise.
+
+    The direct send this used to fall back to is GONE with its callers (§4.2): it sent with
+    no claim and no ``X-Push-Seq``, and it swallowed the failure of a push that had already
+    published ownership, leaving nothing durable for the tick to carry. Reaching this
+    outside a render is therefore a programming error and says so, rather than delivering
+    intent by a route the protocol cannot see. :func:`delivery.deliver` is the supported way
+    to render and send a key on the spot.
 
     The name is history: change detection used to live here, against a process-global digest
-    of the last body this worker sent. Appendix O deleted it, because a stale worker's cache
-    authorized deleting routes it never knew about (§8.3); the claim now dedupes against the
-    state row's ``last_success_digest``, which names a body the adapter acknowledged.
-
-    ``do_push`` takes the body to send and performs the actual ``client.put_*`` call;
-    ``on_response`` is the scope's own success side effect, run on the adapter's answer. A
-    failure is swallowed here and PERSISTED per ``(device, scope)`` so the operator sees
-    what the adapter refused; #1474 owns any retry.
-
-    Returns the ``do_push()`` result on a push that ran (so a caller can read the adapter's
-    response, e.g. the route-policy ``unsupported_members`` map), or ``None`` when the push
-    was captured or failed. Most callers ignore the return.
+    of the last body this worker sent. Appendix O deleted that too, because a stale worker's
+    cache authorized deleting routes it never knew about (§8.3); the claim now dedupes
+    against the state row's ``last_success_digest``, which names a body the adapter
+    acknowledged.
     """
     from .delivery import Rendered, capture
 
     rendered = Rendered(key=key, payload=payload, do_push=do_push, on_response=on_response)
-    if capture(rendered):
-        return None
-    try:
-        return _send_rendered(rendered, payload)
-    except Exception as exc:  # noqa: BLE001 — adapter may be down; log and retry next time
-        logger.warning("Intent push failed for %s: %s", key, exc)
-        return None
+    if not capture(rendered):
+        raise RuntimeError(f"the {key} push ran outside a render: every send goes through the outbox")
 
 
 def _send_rendered(rendered, body):

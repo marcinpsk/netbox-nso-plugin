@@ -3287,8 +3287,8 @@ class TestPushIntentForDevice(ViewTestBase):
     @patch("netbox_nso_plugin.adapter_client._resolve_config")
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_pushes_accepted_states(self, mock_session_cls, mock_cfg):
-        """_push_intent_for_device pushes all accepted interface states."""
-        from netbox_nso_plugin.views import _push_intent_for_device
+        """The interface render carries every accepted state (#1503 Appendix O: rendered, then sent)."""
+        from netbox_nso_plugin.delivery import deliver
 
         NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="accepted")
         mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
@@ -3305,7 +3305,7 @@ class TestPushIntentForDevice(ViewTestBase):
         session = make_session(response=make_response(200, json_data={}))
         mock_session_cls.return_value = session
 
-        _push_intent_for_device(self.device.pk)
+        deliver("interface", self.device.pk, mgmt.adapter_device_id)
 
         mgmt.adapter_device_id = None
         mgmt.save(update_fields=["adapter_device_id"])
@@ -3314,8 +3314,8 @@ class TestPushIntentForDevice(ViewTestBase):
     @patch("netbox_nso_plugin.adapter_client._resolve_config")
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_pushes_enabled_attribute(self, mock_session_cls, mock_cfg):
-        """_push_intent_for_device includes 'enabled' attribute states in push."""
-        from netbox_nso_plugin.views import _push_intent_for_device
+        """The interface render includes 'enabled' attribute states."""
+        from netbox_nso_plugin.delivery import deliver
 
         # Create an 'enabled' interface state in accepted status
         enabled_state = NSOInterfaceState.objects.create(
@@ -3338,7 +3338,7 @@ class TestPushIntentForDevice(ViewTestBase):
         session = make_session(response=make_response(200, json_data={}))
         mock_session_cls.return_value = session
 
-        _push_intent_for_device(self.device.pk)
+        deliver("interface", self.device.pk, mgmt.adapter_device_id)
 
         mgmt.adapter_device_id = None
         mgmt.save(update_fields=["adapter_device_id"])
@@ -3347,8 +3347,8 @@ class TestPushIntentForDevice(ViewTestBase):
     @patch("netbox_nso_plugin.adapter_client._resolve_config")
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_skips_unknown_attribute(self, mock_session_cls, mock_cfg):
-        """_push_intent_for_device skips accepted states with unknown attribute."""
-        from netbox_nso_plugin.views import _push_intent_for_device
+        """The interface render skips accepted states with an unknown attribute."""
+        from netbox_nso_plugin.delivery import deliver
 
         # Create a state with an unknown attribute — should be skipped
         unknown_state = NSOInterfaceState.objects.create(
@@ -3371,16 +3371,19 @@ class TestPushIntentForDevice(ViewTestBase):
         session = make_session(response=make_response(200, json_data={}))
         mock_session_cls.return_value = session
 
-        _push_intent_for_device(self.device.pk)
+        deliver("interface", self.device.pk, mgmt.adapter_device_id)
 
         mgmt.adapter_device_id = None
         mgmt.save(update_fields=["adapter_device_id"])
         unknown_state.delete()
 
-    @patch("netbox_nso_plugin.adapter_client._resolve_config")
-    @patch("netbox_nso_plugin.adapter_client.requests.Session")
-    def test_put_intent_exception_is_swallowed(self, mock_session_cls, mock_cfg):
-        """_push_intent_for_device logs and swallows exceptions from put_intent."""
+    def test_the_intent_is_recorded_even_when_the_adapter_is_down(self):
+        """The accept records the key; the drain owns the send, and the tick owns the retry.
+
+        The direct push this replaced swallowed the failure of a request that had already
+        published ownership, leaving nothing durable behind (#1503 Appendix O, §2).
+        """
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry
         from netbox_nso_plugin.views import _push_intent_for_device
 
         NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="accepted")
@@ -3388,21 +3391,9 @@ class TestPushIntentForDevice(ViewTestBase):
         mgmt.adapter_device_id = 23
         mgmt.save(update_fields=["adapter_device_id"])
 
-        mock_cfg.return_value = {
-            "url": "http://adapter",
-            "token": "tok",
-            "verify_tls": True,
-            "ca_cert_path": None,
-            "timeout": 30,
-        }
-        session = make_session()
-        # Simulate a connection error to make put_intent raise
-        session.request.side_effect = OSError("connection refused")
-        mock_session_cls.return_value = session
-
-        # Should not raise — exception is swallowed with a warning log
         _push_intent_for_device(self.device.pk)
 
+        assert NSOIntentOutboxEntry.objects.filter(device=self.device, scope="interface").exists()
         mgmt.adapter_device_id = None
         mgmt.save(update_fields=["adapter_device_id"])
         NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="changed")

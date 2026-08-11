@@ -198,7 +198,7 @@ def enable_igp_for_role(interface, role, push=True, *, mgmt=None) -> dict:
 
     from .ip_autoassign import _resolve_managed_mgmt
     from .models import NSOISISInterfaceState, NSOOSPFInterfaceState
-    from .signals import _push_isis_intent_for_device, _push_ospf_intent_for_device, suppress_intent_push
+    from .signals import _schedule_intent_push, suppress_intent_push
 
     result = {"interface": str(interface), "igp": role.igp, "enabled": False, "skipped": None, "error": None}
 
@@ -228,7 +228,7 @@ def enable_igp_for_role(interface, role, push=True, *, mgmt=None) -> dict:
                     "accepted_at": now,
                 },
             )
-        push_fn = _push_isis_intent_for_device
+        scope = "isis"
     else:  # ospf
         with suppress_intent_push():
             NSOOSPFInterfaceState.objects.update_or_create(
@@ -244,11 +244,13 @@ def enable_igp_for_role(interface, role, push=True, *, mgmt=None) -> dict:
                     "accepted_at": now,
                 },
             )
-        push_fn = _push_ospf_intent_for_device
+        scope = "ospf"
 
     if push:
+        # Appended, never pushed around the outbox: an in-protocol send is a claimed,
+        # sequenced operation, and outside a transaction the drain runs inline anyway.
         try:
-            push_fn(mgmt.device_id, mgmt.adapter_device_id)
+            _schedule_intent_push((mgmt.device_id, scope))
         except Exception as exc:  # noqa: BLE001 — adapter may be down; ownership already recorded
             logger.warning("enable_igp_for_role: push failed for %s: %s", interface, exc)
 

@@ -74,7 +74,7 @@ class TestVlanReconciler(TestCase):
         """
         from unittest.mock import patch
 
-        from netbox_nso_plugin.signals import _push_vlan_intent_for_device
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
 
         self.management.adapter_device_id = 42
@@ -87,7 +87,7 @@ class TestVlanReconciler(TestCase):
             row.save()
 
         with patch("netbox_nso_plugin.adapter_client.put_vlan_intent") as mock_put:
-            _push_vlan_intent_for_device(self.device.pk, 42)
+            deliver("vlan", self.device.pk, 42)
 
         pushed = {v["vlan_id"]: v["name"] for v in mock_put.call_args[0][1]}
         self.assertEqual(pushed[5], "", "the fabricated placeholder must not be pushed as a device VLAN name")
@@ -97,7 +97,7 @@ class TestVlanReconciler(TestCase):
         """The suppression keys on the name being UNTOUCHED — a rename is real intent."""
         from unittest.mock import patch
 
-        from netbox_nso_plugin.signals import _push_vlan_intent_for_device
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
 
         self.management.adapter_device_id = 42
@@ -109,7 +109,7 @@ class TestVlanReconciler(TestCase):
         row.save()
 
         with patch("netbox_nso_plugin.adapter_client.put_vlan_intent") as mock_put:
-            _push_vlan_intent_for_device(self.device.pk, 42)
+            deliver("vlan", self.device.pk, 42)
 
         self.assertEqual(mock_put.call_args[0][1], [{"vlan_id": 5, "name": "STORAGE"}])
 
@@ -423,13 +423,14 @@ class TestVlanWritePath(IntentPushResetMixin, TestCase):
     def test_push_builds_owned_snapshot_with_live_name(self):
         from unittest.mock import patch
 
-        from netbox_nso_plugin.signals import _push_vlan_intent_for_device, reset_intent_push_state
+        from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.signals import reset_intent_push_state
 
         owned = self._state(vid=2213, name="RENAMED", status="accepted", device_name="OLD")
         self._state(vid=10, name="MGMT", status="imported")  # not owned → excluded
         reset_intent_push_state()
         with patch("netbox_nso_plugin.adapter_client.put_vlan_intent") as mock_put:
-            _push_vlan_intent_for_device(self.device.pk, 77)
+            deliver("vlan", self.device.pk, 77)
         mock_put.assert_called_once()
         vlans = mock_put.call_args[0][1]
         assert vlans == [{"vlan_id": 2213, "name": "RENAMED"}]  # live NetBox name, owned only

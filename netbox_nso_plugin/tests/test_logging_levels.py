@@ -204,11 +204,9 @@ class TestLoggingLevelsPush(LevelsTestBase):
         return session.request.call_args_list
 
     def _push(self):
-        from netbox_nso_plugin.signals import _push_logging_intent_for_device
+        from netbox_nso_plugin.delivery import deliver
 
-        return self._recorded_requests(
-            lambda: _push_logging_intent_for_device(self.device.pk, self.mgmt.adapter_device_id)
-        )
+        return self._recorded_requests(lambda: deliver("logging", self.device.pk, self.mgmt.adapter_device_id))
 
     def test_owned_row_pushes_set_severities_only(self):
         self._row(console_severity="CRITICAL", monitor_severity="", status="accepted", accepted_at=timezone.now())

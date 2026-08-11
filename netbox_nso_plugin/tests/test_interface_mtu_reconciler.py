@@ -142,7 +142,8 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
     def test_push_builds_owned_snapshot(self):
         from unittest.mock import patch
 
-        from netbox_nso_plugin.signals import _push_interface_mtu_intent_for_device, reset_intent_push_state
+        from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.signals import reset_intent_push_state
 
         self._state(l2_mtu=9216, status="accepted")
         # An unowned mirror row must be excluded from the pushed intent.
@@ -150,7 +151,7 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
         NSOInterfaceMtuState.objects.create(management=self.management, interface=other, l2_mtu=1500, status="imported")
         reset_intent_push_state()
         with patch("netbox_nso_plugin.adapter_client.put_interface_mtu_intent") as mock_put:
-            _push_interface_mtu_intent_for_device(self.device.pk, 77)
+            deliver("interface_mtu", self.device.pk, 77)
         mock_put.assert_called_once()
         ifaces = mock_put.call_args[0][1]
         self.assertEqual([i["interface_name"] for i in ifaces], ["Port-channel1"])

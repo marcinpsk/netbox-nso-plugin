@@ -201,7 +201,7 @@ class TestReconcileBgpConfig(TestCase):
         from ipam.models import IPAddress
 
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
-        from netbox_nso_plugin.signals import _push_bgp_intent_for_device
+        from netbox_nso_plugin.delivery import deliver
 
         mgmt = self._make_mgmt()
         IPAddress.objects.create(address="198.18.255.1/32")
@@ -222,7 +222,7 @@ class TestReconcileBgpConfig(TestCase):
             return {"device_id": adapter_device_id, "router_count": len(routers)}
 
         with patch("netbox_nso_plugin.adapter_client.put_bgp_intent", side_effect=_capture):
-            _push_bgp_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("bgp", self.device.pk, mgmt.adapter_device_id)
 
         peers = captured["routers"][0]["scopes"][0]["peers"]
         self.assertEqual(peers[0]["source"], "198.18.255.1")
@@ -239,7 +239,7 @@ class TestReconcileBgpConfig(TestCase):
         from unittest.mock import patch
 
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
-        from netbox_nso_plugin.signals import _push_bgp_intent_for_device
+        from netbox_nso_plugin.delivery import deliver
 
         mgmt = self._make_mgmt()
         result = _reconcile_bgp_config(
@@ -274,7 +274,7 @@ class TestReconcileBgpConfig(TestCase):
             return {"device_id": adapter_device_id, "router_count": len(routers)}
 
         with patch("netbox_nso_plugin.adapter_client.put_bgp_intent", side_effect=_capture):
-            _push_bgp_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("bgp", self.device.pk, mgmt.adapter_device_id)
 
         peer = captured["routers"][0]["scopes"][0]["peers"][0]
         self.assertEqual(peer["local_as"], "65199")
@@ -329,7 +329,7 @@ class TestReconcileBgpConfig(TestCase):
         from unittest.mock import patch
 
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
-        from netbox_nso_plugin.signals import _push_bgp_intent_for_device
+        from netbox_nso_plugin.delivery import deliver
 
         mgmt = self._make_mgmt()
         result = _reconcile_bgp_config(
@@ -347,7 +347,7 @@ class TestReconcileBgpConfig(TestCase):
             return {"device_id": adapter_device_id, "router_count": len(routers)}
 
         with patch("netbox_nso_plugin.adapter_client.put_bgp_intent", side_effect=_capture):
-            _push_bgp_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("bgp", self.device.pk, mgmt.adapter_device_id)
 
         self.assertEqual(captured["routers"][0]["router_id"], "10.255.0.1")
 
@@ -542,7 +542,7 @@ class TestReconcileBgpConfig(TestCase):
         from dcim.models import Interface
 
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
-        from netbox_nso_plugin.signals import _push_bgp_intent_for_device
+        from netbox_nso_plugin.delivery import deliver
 
         mgmt = self._make_mgmt()
         Interface.objects.create(device=self.device, name="Loopback0", type="virtual")
@@ -564,7 +564,7 @@ class TestReconcileBgpConfig(TestCase):
             return {"device_id": adapter_device_id, "router_count": len(routers)}
 
         with patch("netbox_nso_plugin.adapter_client.put_bgp_intent", side_effect=_capture):
-            _push_bgp_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("bgp", self.device.pk, mgmt.adapter_device_id)
 
         peers = captured["routers"][0]["scopes"][0]["peers"]
         self.assertEqual(peers[0]["source"], "Loopback0")

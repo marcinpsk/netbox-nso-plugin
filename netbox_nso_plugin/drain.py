@@ -19,6 +19,9 @@ A failed attempt is REPLAYED, never reallocated: the sequence names the operatio
 attempt, so the far side can admit a retry against its receipt and answer a lost response
 with the stored one. Only two things return a consumed row to unconsumed, and both are
 here: :func:`abandon` and the restore rebase Appendix O's later chunk owns.
+
+Two of the eighteen delivery keys hold no receipt and so may never be replayed at all. They
+take the claim-less path of :func:`_deliver_direct` (the Rev 15 split, §7.1).
 """
 
 from __future__ import annotations

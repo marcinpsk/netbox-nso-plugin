@@ -401,7 +401,7 @@ def _assign_one_p2p_family(
     from ipam.models import IPAddress, Prefix
 
     from .models import NSOInterfaceIPState
-    from .signals import _push_ip_intent_for_device
+    from .signals import _schedule_intent_push
 
     _OCCUPIED = ("reserved", "accepted", "deploying", "in_sync")
     now = timezone.now()
@@ -492,12 +492,11 @@ def _assign_one_p2p_family(
         return
 
     if push:
-        for dev_id, adapter_id in [
-            (mgmt.device_id, mgmt.adapter_device_id),
-            (peer_mgmt.device_id, peer_mgmt.adapter_device_id),
-        ]:
+        # Appended, never pushed around the outbox: an in-protocol send is a claimed,
+        # sequenced operation, and outside a transaction the drain runs inline anyway.
+        for dev_id in (mgmt.device_id, peer_mgmt.device_id):
             try:
-                _push_ip_intent_for_device(dev_id, adapter_id)
+                _schedule_intent_push((dev_id, "ip"))
             except Exception as exc:
                 logger.warning("ip_autoassign.p2p: failed to push intent for device %s: %s", dev_id, exc)
 
@@ -573,7 +572,7 @@ def _reserve_single(interface, mgmt, family: str, pool, result, push=True) -> No
     from ipam.models import IPAddress
 
     from .models import NSOInterfaceIPState
-    from .signals import _push_ip_intent_for_device
+    from .signals import _schedule_intent_push
 
     available_str = pool.get_first_available_ip()
     if available_str is None:
@@ -627,7 +626,7 @@ def _reserve_single(interface, mgmt, family: str, pool, result, push=True) -> No
 
     if push:
         try:
-            _push_ip_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+            _schedule_intent_push((mgmt.device_id, "ip"))
         except Exception as exc:
             logger.warning(
                 "ip_autoassign: failed to push IP intent for device %s after allocating %s: %s",

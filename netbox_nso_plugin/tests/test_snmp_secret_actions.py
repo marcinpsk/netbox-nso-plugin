@@ -390,8 +390,9 @@ class TestDeletePropagation(_SecretBase):
 
 class TestV3PushDerivation(_SecretBase):
     def test_push_derives_auth_priv_refs_from_protocols_and_skips_v3_hosts(self):
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.models import NSOSnmpHostState, NSOSnmpV3UserState
-        from netbox_nso_plugin.signals import _push_snmp_intent_for_device, reset_intent_push_state
+        from netbox_nso_plugin.signals import reset_intent_push_state
 
         mgmt = self._make_mgmt()
         NSOSnmpV3UserState.objects.create(
@@ -417,7 +418,7 @@ class TestV3PushDerivation(_SecretBase):
         )
         reset_intent_push_state()
         with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
-            _push_snmp_intent_for_device(self.device.pk, 42)
+            deliver("snmp", self.device.pk, 42)
         mock_put.assert_called_once()
         _, communities, v3_users, hosts, _ = mock_put.call_args[0]
         self.assertEqual(

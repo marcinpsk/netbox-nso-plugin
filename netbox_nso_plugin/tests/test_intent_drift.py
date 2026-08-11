@@ -226,9 +226,9 @@ class TestResyncStoreOnly(_CascadeFlushMixin, IntentPushResetMixin, TransactionT
         self.assertEqual(params.get("store_only"), "true")
 
     def test_normal_signal_push_has_no_store_only_flag(self):
-        from netbox_nso_plugin.signals import _push_logging_intent_for_device
+        from netbox_nso_plugin.delivery import deliver
 
-        calls = self._recorded_requests(lambda: _push_logging_intent_for_device(self.device.pk, 91))
+        calls = self._recorded_requests(lambda: deliver("logging", self.device.pk, 91))
         self.assertEqual(len(calls), 1)
         params = calls[0].kwargs.get("params") or {}
         self.assertNotIn("store_only", params)

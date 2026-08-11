@@ -334,6 +334,28 @@ class TestStaticRouteBulkAcceptOutsideATransaction(_CascadeFlushMixin, IntentPus
         self.assertEqual(len(pushed), 3)
         self.assertTrue(all(route["generation"] for route in pushed))
 
+    def test_the_bulk_accept_push_is_claimed_and_sequenced(self):
+        """Codex O1 F5 — a bulk accept called the builder directly, so it sent with no claim.
+
+        No sequence, no entry, no durable record: the swallowed failure of a push that
+        published ownership left nothing for the tick to carry, which is the one thing the
+        outbox exists to prevent.
+        """
+        from ._outbox_case import ReceiptAdapter, entries, state_of
+
+        self._drifted(2)
+        adapter = ReceiptAdapter()
+        config, session = adapter.patches()
+        with config, session:
+            response = self._post()
+
+        assert response.status_code == 302
+        mine = [request for request in adapter.requests if "/devices/8821/" in request["url"]]
+        assert len(mine) == 1, mine
+        assert mine[0]["push_seq"] is not None, "the bulk accept reached the adapter outside the protocol"
+        assert state_of(self.device, "static_route").last_success_digest != ""
+        assert entries(self.device, "static_route") == []
+
     def test_no_observer_ever_sees_an_accepted_row_still_on_its_old_generation(self):
         """Committing the status ahead of the generation leaves a window in which a concurrent
         Apply force-pushes the freshly accepted row on the generation the *last* apply named,

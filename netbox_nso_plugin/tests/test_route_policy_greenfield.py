@@ -76,14 +76,14 @@ class TestRoutePolicyIntentAcceptedFlag(_RPBase):
         return mgmt
 
     def _push_and_capture(self, mgmt):
-        from netbox_nso_plugin.signals import _push_route_policy_intent_for_device
+        from netbox_nso_plugin.delivery import deliver
 
         pushed = []
         with patch(
             "netbox_nso_plugin.adapter_client.put_route_policy_intent",
             side_effect=lambda adapter_id, objects: pushed.append(objects),
         ):
-            _push_route_policy_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+            deliver("route_policy", mgmt.device_id, mgmt.adapter_device_id)
         return pushed[-1] if pushed else []
 
     def test_deploying_row_pushed_accepted_true(self):
@@ -718,10 +718,10 @@ class TestUnsupportedMembersStorage(_RPBase):
         return mgmt, state
 
     def _push(self, mgmt, resp):
-        from netbox_nso_plugin.signals import _push_route_policy_intent_for_device
+        from netbox_nso_plugin.delivery import deliver
 
         with patch("netbox_nso_plugin.adapter_client.put_route_policy_intent", side_effect=lambda a, o: resp):
-            _push_route_policy_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+            deliver("route_policy", mgmt.device_id, mgmt.adapter_device_id)
 
     def test_unsupported_members_stored_from_adapter_response(self):
         mgmt, state = self._community_overlay()

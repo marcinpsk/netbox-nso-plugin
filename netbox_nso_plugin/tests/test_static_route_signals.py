@@ -65,13 +65,13 @@ class TestPushStaticRouteIntentForDevice(IntentPushResetMixin, TestCase):
 
     def test_pushes_accepted_routes(self):
         """Accepted routes are included in the intent push payload."""
-        from netbox_nso_plugin.signals import _push_static_route_intent_for_device
+        from netbox_nso_plugin.delivery import deliver
 
         mgmt = self._make_mgmt()
         self._make_state(mgmt, status="accepted")  # create before patch to avoid signal double-call
 
         with patch(PUT) as mock_push:
-            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("static_route", self.device.pk, mgmt.adapter_device_id)
 
             mock_push.assert_called_once()
             args = mock_push.call_args[0]
@@ -92,8 +92,8 @@ class TestPushStaticRouteIntentForDevice(IntentPushResetMixin, TestCase):
         (``static_route_reconciler/main.py:1493-1498``) and the exporter suppresses the
         default on the way back (``network_state_export/static_route.py:486-488``).
         """
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.models import NSOPlatformNedMapping
-        from netbox_nso_plugin.signals import _push_static_route_intent_for_device
 
         platform = Platform.objects.create(name="Static push Nokia", slug="static-push-nokia")
         NSOPlatformNedMapping.objects.create(platform=platform, ned_id="timos-nc-23.10")
@@ -105,14 +105,14 @@ class TestPushStaticRouteIntentForDevice(IntentPushResetMixin, TestCase):
         state.static_route.save(update_fields=["metric"])
 
         with patch(PUT) as put:
-            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("static_route", self.device.pk, mgmt.adapter_device_id)
         assert put.call_args.args[1][0]["metric"] == 3
 
         state.static_route.metric = 5
         state.static_route.save(update_fields=["metric"])
 
         with patch(PUT) as put:
-            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("static_route", self.device.pk, mgmt.adapter_device_id)
 
         route = put.call_args.args[1][0]
         assert route["metric"] == 5
@@ -120,13 +120,13 @@ class TestPushStaticRouteIntentForDevice(IntentPushResetMixin, TestCase):
     def test_pushes_apply_failed_routes(self):
         """apply_failed rows stay in the push: intent is still owned (retry-eligible), and
         the adapter PUT is full-replace — skipping them would drop their mirror rows."""
-        from netbox_nso_plugin.signals import _push_static_route_intent_for_device
+        from netbox_nso_plugin.delivery import deliver
 
         mgmt = self._make_mgmt()
         self._make_state(mgmt, status="apply_failed")
 
         with patch(PUT) as mock_push:
-            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("static_route", self.device.pk, mgmt.adapter_device_id)
 
             mock_push.assert_called_once()
             routes = mock_push.call_args[0][1]
@@ -135,13 +135,13 @@ class TestPushStaticRouteIntentForDevice(IntentPushResetMixin, TestCase):
 
     def test_excludes_non_accepted_routes(self):
         """Routes with status=imported are excluded from the intent push."""
-        from netbox_nso_plugin.signals import _push_static_route_intent_for_device
+        from netbox_nso_plugin.delivery import deliver
 
         mgmt = self._make_mgmt()
         self._make_state(mgmt, prefix="172.16.0.0/12", next_hop="10.0.0.1", status="imported")
 
         with patch(PUT) as mock_push:
-            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("static_route", self.device.pk, mgmt.adapter_device_id)
 
             mock_push.assert_called_once()
             routes = mock_push.call_args[0][1]
@@ -151,8 +151,8 @@ class TestPushStaticRouteIntentForDevice(IntentPushResetMixin, TestCase):
         """Routes with no IP next-hop (interface-only) are skipped."""
         from netbox_routing.models import StaticRoute
 
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.models import NSOStaticRouteState
-        from netbox_nso_plugin.signals import _push_static_route_intent_for_device
 
         mgmt = self._make_mgmt()
         sr, _ = StaticRoute.objects.get_or_create(
@@ -170,22 +170,25 @@ class TestPushStaticRouteIntentForDevice(IntentPushResetMixin, TestCase):
         )
 
         with patch(PUT) as mock_push:
-            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("static_route", self.device.pk, mgmt.adapter_device_id)
 
             mock_push.assert_called_once()
             routes = mock_push.call_args[0][1]
             assert routes == []
 
-    def test_adapter_error_is_swallowed(self):
-        """AdapterError during push is logged but does not propagate."""
-        from netbox_nso_plugin.signals import _push_static_route_intent_for_device
+    def test_an_adapter_failure_is_recorded_and_left_for_the_drain_to_isolate(self):
+        """The swallow moved to the drain (#1503 Appendix O): the send itself fails fast."""
+        from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.models import NSODeviceManagement
 
         mgmt = self._make_mgmt()
         self._make_state(mgmt, prefix="10.1.0.0/16", next_hop="10.0.0.2", status="accepted")
 
-        with patch(PUT, side_effect=Exception("boom")):
-            # Should not raise
-            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+        with patch(PUT, side_effect=ConnectionError("boom")):
+            with self.assertRaises(ConnectionError):
+                deliver("static_route", self.device.pk, mgmt.adapter_device_id)
+
+        assert "static_route" in (NSODeviceManagement.objects.get(pk=mgmt.pk).intent_push_errors or {})
 
 
 class TestOnStaticRouteStateSave(IntentPushDeliveryMixin, TestCase):
@@ -424,15 +427,15 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
 
     def test_push_names_the_netbox_pk_and_the_allocated_generation(self):
         """P1.1 — the pk is what opens the fence; the generation is what a result correlates on."""
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.intent_generation import allocate_intent_generation
-        from netbox_nso_plugin.signals import _push_static_route_intent_for_device
 
         mgmt = self._mgmt()
         generation = allocate_intent_generation()
         state = self._state(mgmt, "10.40.0.0/16", "10.0.0.40", generation=generation)
 
         with patch(PUT) as put:
-            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("static_route", self.device.pk, mgmt.adapter_device_id)
 
         route = put.call_args.args[1][0]
         assert route["route_id"] == state.static_route.pk
@@ -444,13 +447,13 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
         """``0`` means "never allocated" — putting it on the wire would let a result correlate
         with a generation that names nothing, which is exactly what the sentinel exists to
         prevent."""
-        from netbox_nso_plugin.signals import _push_static_route_intent_for_device
+        from netbox_nso_plugin.delivery import deliver
 
         mgmt = self._mgmt()
         self._state(mgmt, "10.41.0.0/16", "10.0.0.41", generation=0)
 
         with patch(PUT) as put:
-            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("static_route", self.device.pk, mgmt.adapter_device_id)
 
         route = put.call_args.args[1][0]
         assert route["generation"] is None
@@ -458,34 +461,35 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
 
     def test_interface_only_route_is_still_skipped(self):
         """P1.2 — having a pk does not make an unsupported route pushable."""
-        from netbox_nso_plugin.signals import _push_static_route_intent_for_device
+        from netbox_nso_plugin.delivery import deliver
 
         mgmt = self._mgmt()
         self._state(mgmt, "10.42.0.0/16", None, next_hop_is_none=True)
 
         with patch(PUT) as put:
-            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("static_route", self.device.pk, mgmt.adapter_device_id)
 
         assert put.call_args.args[1] == []
 
     def test_the_push_returns_the_adapter_response(self):
         """A push must be able to say *failed* rather than *acknowledged* — the fleet driver
         and every settlement expectation are built on that distinction."""
-        from netbox_nso_plugin.signals import _push_static_route_intent_for_device
+        from netbox_nso_plugin.delivery import deliver
 
         mgmt = self._mgmt()
         self._state(mgmt, "10.44.0.0/16", "10.0.0.44")
         response = {"device_id": 4242, "count": 1, "routes": []}
 
         with patch(PUT, return_value=response):
-            assert _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id) == response
+            assert deliver("static_route", self.device.pk, mgmt.adapter_device_id) == response
 
-        with patch(PUT, side_effect=Exception("boom")):
-            assert _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id) is None
+        # A failure is an exception now, which is how the claim tells the two apart (§4.2).
+        with patch(PUT, side_effect=ConnectionError("boom")), self.assertRaises(ConnectionError):
+            deliver("static_route", self.device.pk, mgmt.adapter_device_id)
 
     def test_the_echo_records_the_expectation_for_the_generation_pushed(self):
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.intent_generation import allocate_intent_generation
-        from netbox_nso_plugin.signals import _push_static_route_intent_for_device
 
         mgmt = self._mgmt()
         generation = allocate_intent_generation()
@@ -497,7 +501,7 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
         }
 
         with patch(PUT, return_value=response):
-            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("static_route", self.device.pk, mgmt.adapter_device_id)
 
         state.refresh_from_db()
         assert state.expected_generation == generation
@@ -507,9 +511,9 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
         """P1.9 — the PUT commits before it answers, so an edit can bump the generation between
         the request and the response. Writing the stale echo would make the *next* result settle
         content the operator has already replaced."""
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.intent_generation import allocate_intent_generation
         from netbox_nso_plugin.models import NSOStaticRouteState
-        from netbox_nso_plugin.signals import _push_static_route_intent_for_device
 
         mgmt = self._mgmt()
         pushed = allocate_intent_generation()
@@ -526,7 +530,7 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
             }
 
         with patch(PUT, side_effect=_bump_then_answer):
-            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("static_route", self.device.pk, mgmt.adapter_device_id)
 
         state.refresh_from_db()
         assert state.intent_generation == newer
@@ -536,7 +540,7 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
     def test_an_echo_for_an_unallocated_row_records_nothing(self):
         """A row still on the sentinel has no generation to correlate — recording a fingerprint
         for it would create an expectation nothing can legitimately match."""
-        from netbox_nso_plugin.signals import _push_static_route_intent_for_device
+        from netbox_nso_plugin.delivery import deliver
 
         mgmt = self._mgmt()
         state = self._state(mgmt, "10.47.0.0/16", "10.0.0.47", generation=0)
@@ -547,7 +551,7 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
         }
 
         with patch(PUT, return_value=response):
-            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("static_route", self.device.pk, mgmt.adapter_device_id)
 
         state.refresh_from_db()
         assert state.expected_generation is None
@@ -557,9 +561,10 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
         """A ``StaticRoute`` is shared across devices by M2M, so two overlays can carry the same
         ``route_id`` at the same generation. Without the device predicate, A's echo would write
         B's expectation and B could settle green on A's apply result."""
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.intent_generation import allocate_intent_generation
         from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOStaticRouteState
-        from netbox_nso_plugin.signals import _push_static_route_intent_for_device, suppress_intent_push
+        from netbox_nso_plugin.signals import suppress_intent_push
 
         mgmt = self._mgmt()
         generation = allocate_intent_generation()
@@ -584,7 +589,7 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
             "routes": [{"route_id": state.static_route.pk, "generation": generation, "fingerprint": "f00d"}],
         }
         with patch(PUT, return_value=response):
-            _push_static_route_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("static_route", self.device.pk, mgmt.adapter_device_id)
 
         state.refresh_from_db()
         other_state.refresh_from_db()

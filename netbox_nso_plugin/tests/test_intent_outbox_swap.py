@@ -28,6 +28,51 @@ class _Abort(Exception):
     """Roll the operator's transaction back the way a failing form save does."""
 
 
+def _production_modules():
+    """Every module a request runs, which is where an unclaimed send would hide."""
+    from pathlib import Path
+
+    plugin = Path(__file__).resolve().parent.parent
+    for path in sorted(plugin.rglob("*.py")):
+        if "tests" not in path.parts and "migrations" not in path.parts:
+            yield path
+
+
+class TestEveryProductionSendGoesThroughTheOutbox(SimpleTestCase):
+    """Codex O1 F5: the push builders are the delivery registry's to call, and nobody else's."""
+
+    def test_only_the_delivery_registry_names_a_push_builder(self):
+        """A direct call sends with no claim and no ``X-Push-Seq``; the compiler can see it."""
+        import ast
+        import re
+
+        pattern = re.compile(r"_push_[a-z0-9_]+_intent_for_device")
+        named = set()
+        for path in _production_modules():
+            if path.name == "delivery.py":
+                continue  # the registry, which is the one place that may hold them
+            for node in ast.walk(ast.parse(path.read_text())):
+                # A call, an attribute access and an import all name it, and all three count.
+                if isinstance(node, ast.Name):
+                    named_here = node.id
+                elif isinstance(node, ast.Attribute):
+                    named_here = node.attr
+                elif isinstance(node, ast.alias):
+                    named_here = node.name
+                else:
+                    continue
+                if pattern.fullmatch(named_here):
+                    named.add(f"{path.name}:{node.lineno}")
+        assert named == set()
+
+    def test_a_push_outside_a_render_refuses_rather_than_sending(self):
+        """The fallback is gone with its callers: nothing may deliver intent around the claim."""
+        from netbox_nso_plugin import signals
+
+        with self.assertRaises(RuntimeError):
+            signals._push_changed((1, "vlan"), [], lambda body: None)
+
+
 class TestTheCoalescerSymbolsAreGone(SimpleTestCase):
     """O1.19: neither in-memory carrier may still be defined."""
 

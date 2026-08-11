@@ -25,8 +25,9 @@ class TestIsisIntentPush(IntentPushResetMixin, TestCase):
 
     def _push_and_capture(self, **state_kwargs):
         from netbox_nso_plugin import adapter_client
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOISISInstanceState
-        from netbox_nso_plugin.signals import _push_isis_intent_for_device, suppress_intent_push
+        from netbox_nso_plugin.signals import suppress_intent_push
 
         inst, _ = NSOInstance.objects.get_or_create(name="ii-inst", defaults={"adapter_instance_id": "ii-inst"})
         mgmt = NSODeviceManagement.objects.get_or_create(
@@ -51,7 +52,7 @@ class TestIsisIntentPush(IntentPushResetMixin, TestCase):
         # inspects a mock here, so assign it directly (no MagicMock wrapper needed).
         adapter_client.put_isis_interface_intent = _fake_put
         try:
-            _push_isis_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+            deliver("isis", mgmt.device_id, mgmt.adapter_device_id)
         finally:
             adapter_client.put_isis_interface_intent = orig
         assert "processes" in captured and len(captured["processes"]) == 1

@@ -53,13 +53,13 @@ class TestPushL2SapIntentForDevice(IntentPushResetMixin, TestCase):
 
     def test_pushes_accepted_saps(self):
         """Accepted SAPs are included in the intent push payload."""
-        from netbox_nso_plugin.signals import _push_l2_sap_intent_for_device
+        from netbox_nso_plugin.delivery import deliver
 
         mgmt = self._make_mgmt()
         self._make_state(mgmt, status="accepted")
 
         with patch("netbox_nso_plugin.adapter_client.put_l2_sap_intent") as mock_push:
-            _push_l2_sap_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("l2_sap", self.device.pk, mgmt.adapter_device_id)
 
             mock_push.assert_called_once()
             args = mock_push.call_args[0]
@@ -73,26 +73,30 @@ class TestPushL2SapIntentForDevice(IntentPushResetMixin, TestCase):
 
     def test_excludes_non_accepted_saps(self):
         """SAPs with status=imported are excluded from the intent push."""
-        from netbox_nso_plugin.signals import _push_l2_sap_intent_for_device
+        from netbox_nso_plugin.delivery import deliver
 
         mgmt = self._make_mgmt()
         self._make_state(mgmt, sap_id="lag-60:1", status="imported")
 
         with patch("netbox_nso_plugin.adapter_client.put_l2_sap_intent") as mock_push:
-            _push_l2_sap_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("l2_sap", self.device.pk, mgmt.adapter_device_id)
 
             mock_push.assert_called_once()
             assert mock_push.call_args[0][1] == []
 
-    def test_adapter_error_is_swallowed(self):
-        """AdapterError during push is logged but does not propagate."""
-        from netbox_nso_plugin.signals import _push_l2_sap_intent_for_device
+    def test_an_adapter_failure_is_recorded_and_left_for_the_drain_to_isolate(self):
+        """The swallow moved to the drain (#1503 Appendix O): the send itself fails fast."""
+        from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.models import NSODeviceManagement
 
         mgmt = self._make_mgmt()
         self._make_state(mgmt, status="accepted")
 
-        with patch("netbox_nso_plugin.adapter_client.put_l2_sap_intent", side_effect=Exception("boom")):
-            _push_l2_sap_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+        with patch("netbox_nso_plugin.adapter_client.put_l2_sap_intent", side_effect=ConnectionError("boom")):
+            with self.assertRaises(ConnectionError):
+                deliver("l2_sap", self.device.pk, mgmt.adapter_device_id)
+
+        assert "l2_sap" in (NSODeviceManagement.objects.get(pk=mgmt.pk).intent_push_errors or {})
 
 
 class TestOnL2SapStateSave(IntentPushDeliveryMixin, TestCase):

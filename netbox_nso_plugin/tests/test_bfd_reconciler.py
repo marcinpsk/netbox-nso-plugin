@@ -304,8 +304,9 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
     def test_push_builds_owned_snapshot(self):
         from unittest.mock import patch
 
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.models import NSOBFDInterfaceState
-        from netbox_nso_plugin.signals import _push_bfd_intent_for_device, reset_intent_push_state
+        from netbox_nso_plugin.signals import reset_intent_push_state
 
         NSOBFDInterfaceState.objects.create(
             management=self.management,
@@ -325,7 +326,7 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
         )
         reset_intent_push_state()
         with patch("netbox_nso_plugin.adapter_client.put_bfd_intent") as mock_put:
-            _push_bfd_intent_for_device(self.device.pk, 88)
+            deliver("bfd", self.device.pk, 88)
         ifaces = mock_put.call_args[0][1]
         assert [i["interface_name"] for i in ifaces] == ["Port-channel1"]
         assert ifaces[0]["min_tx"] == 300 and ifaces[0]["multiplier"] == 3 and ifaces[0]["micro_bfd"] is True

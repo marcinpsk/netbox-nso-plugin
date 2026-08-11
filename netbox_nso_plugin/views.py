@@ -77,7 +77,7 @@ from .models import (
     NSOVaultSettings,
     NSOVLANState,
 )
-from .signals import _STATIC_ROUTE_ARMED_FIELDS
+from .signals import _STATIC_ROUTE_ARMED_FIELDS, _schedule_intent_push
 from .tables import (
     NSODerivedIntentTemplateTable,
     NSODeviceManagementTable,
@@ -3170,14 +3170,13 @@ class NSOInterfaceStateDeleteView(generic.ObjectDeleteView):
 
 
 def _push_intent_for_device(device_id: int) -> None:
-    """Push the full OWNED interface intent snapshot for a device to the adapter.
+    """Record the device's interface intent in the outbox, which drains it once.
 
-    Delegates to the single shared builder in ``signals`` so the view-level bulk
-    accept, the accept signal, and the Decision-G edit signal all push the same
-    snapshot and share the change-detection cache.
+    Appends rather than pushes (#1503 Appendix O): every in-protocol send is a claimed,
+    sequenced logical operation, so the view-level bulk accept goes through the same outbox
+    as the accept signal and the Decision-G edit signal rather than calling the builder
+    around it. With no transaction open the drain runs inline, exactly as the push did.
     """
-    from .signals import _push_interface_intent_for_device
-
     try:
         mgmt = NSODeviceManagement.objects.select_related("nso_instance").get(device_id=device_id)
     except NSODeviceManagement.DoesNotExist:
@@ -3187,7 +3186,7 @@ def _push_intent_for_device(device_id: int) -> None:
     if mgmt.adapter_device_id is None:
         return
 
-    _push_interface_intent_for_device(device_id, mgmt.adapter_device_id)
+    _schedule_intent_push((device_id, "interface"))
 
 
 # Statuses where the NetBox value already matches the device — accepting them
@@ -5304,7 +5303,13 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
     model_class = None
 
     def _push(self, mgmt):
-        """Trigger the appropriate intent push; override in subclasses."""
+        """Record the accepted rows in the outbox; override in subclasses.
+
+        The bulk update writes with ``QuerySet.update()``, which fires no signal, so the
+        subclass names the key its rows belong to. Appending is what makes the send a
+        claimed, sequenced operation (#1503 Appendix O, §4.2) rather than a bare PUT whose
+        failure the view would swallow with nothing left to retry.
+        """
 
     def _after_accept(self, mgmt, accepted_pks):
         """Run after the bulk ownership update, before the push (override in subclasses).
@@ -5373,36 +5378,28 @@ class NSOStaticRouteBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
                 state.save(update_fields=list(_STATIC_ROUTE_ARMED_FIELDS))
 
     def _push(self, mgmt):
-        from .signals import _push_static_route_intent_for_device
-
-        _push_static_route_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+        _schedule_intent_push((mgmt.device_id, "static_route"))
 
 
 class NSOISISInterfaceBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     model_class = NSOISISInterfaceState
 
     def _push(self, mgmt):
-        from .signals import _push_isis_intent_for_device
-
-        _push_isis_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+        _schedule_intent_push((mgmt.device_id, "isis"))
 
 
 class NSOISISInstanceBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     model_class = NSOISISInstanceState
 
     def _push(self, mgmt):
-        from .signals import _push_isis_intent_for_device
-
-        _push_isis_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+        _schedule_intent_push((mgmt.device_id, "isis"))
 
 
 class NSOBGPPeerBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     model_class = NSOBGPPeerState
 
     def _push(self, mgmt):
-        from .signals import _push_bgp_intent_for_device
-
-        _push_bgp_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+        _schedule_intent_push((mgmt.device_id, "bgp"))
 
 
 class NSORoutePolicyBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
@@ -5419,38 +5416,30 @@ class NSORoutePolicyBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
                 _own_route_map_contributors(mgmt, obj)
 
     def _push(self, mgmt):
-        from .signals import _push_route_policy_intent_for_device
-
-        _push_route_policy_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+        _schedule_intent_push((mgmt.device_id, "route_policy"))
 
 
 class NSOOSPFInstanceBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     model_class = NSOOSPFInstanceState
 
     def _push(self, mgmt):
-        from .signals import _push_ospf_intent_for_device
-
-        _push_ospf_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+        _schedule_intent_push((mgmt.device_id, "ospf"))
 
 
 class NSOOSPFInterfaceBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     model_class = NSOOSPFInterfaceState
 
     def _push(self, mgmt):
-        from .signals import _push_ospf_intent_for_device
-
-        _push_ospf_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+        _schedule_intent_push((mgmt.device_id, "ospf"))
 
 
 class NSORedistributionBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     model_class = NSORedistributionState
 
     def _push(self, mgmt):
-        from .signals import _push_bgp_intent_for_device, _push_isis_intent_for_device, _push_ospf_intent_for_device
-
         # Redistribution is distributed across destination protocols; push all three.
-        for fn in (_push_ospf_intent_for_device, _push_isis_intent_for_device, _push_bgp_intent_for_device):
-            fn(mgmt.device_id, mgmt.adapter_device_id)
+        for scope in ("ospf", "isis", "bgp"):
+            _schedule_intent_push((mgmt.device_id, scope))
 
 
 # ── SNMP / Logging overlay accept + edit (operator modify → accept → push) ─────

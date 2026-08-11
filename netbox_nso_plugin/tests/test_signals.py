@@ -658,8 +658,8 @@ class TestPushIntentOnAccept(_SignalDBBase):
         from dcim.models import Interface
         from django.utils import timezone
 
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.models import NSOInterfaceState
-        from netbox_nso_plugin.signals import _push_interface_intent_for_device
 
         self._make_mgmt(adapter_device_id=42)
         # Owned: accepted status, real NetBox value to push.
@@ -677,7 +677,7 @@ class TestPushIntentOnAccept(_SignalDBBase):
         )
 
         with patch(f"{_MOD}.put_intent") as mock_put:
-            _push_interface_intent_for_device(self.device.id, 42)
+            deliver("interface", self.device.id, 42)
 
         mock_put.assert_called_once()
         attrs = mock_put.call_args[0][1]

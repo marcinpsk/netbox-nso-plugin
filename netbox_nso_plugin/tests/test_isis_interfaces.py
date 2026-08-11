@@ -469,8 +469,8 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
         from netbox_routing.models import ISISInstance, ISISInterface
 
         from netbox_nso_plugin import adapter_client
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.models import NSOISISInterfaceState
-        from netbox_nso_plugin.signals import _push_isis_intent_for_device
 
         mgmt = self._make_mgmt()
         inst = ISISInstance.objects.create(device=self.device, process_tag="")
@@ -491,7 +491,7 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
         orig = adapter_client.put_isis_interface_intent
         adapter_client.put_isis_interface_intent = _fake_put
         try:
-            _push_isis_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+            deliver("isis", mgmt.device_id, mgmt.adapter_device_id)
         finally:
             adapter_client.put_isis_interface_intent = orig
         entry = next(i for i in captured["interfaces"] if i["interface_name"] == "GigabitEthernet0/1")

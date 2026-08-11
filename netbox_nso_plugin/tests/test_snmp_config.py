@@ -500,8 +500,8 @@ class TestReconcileSnmpConfig(TestCase):
         self.assertEqual(row.status, "in_sync")
 
     def test_value_suppressed_default_trap_port_stays_absent_in_push_payload(self):
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.models import NSOSnmpHostState
-        from netbox_nso_plugin.signals import _push_snmp_intent_for_device
 
         self._set_ned("arcos-v8.1.2X-nc-1.0")
         mgmt = self._create_mgmt()
@@ -515,14 +515,14 @@ class TestReconcileSnmpConfig(TestCase):
         )
 
         with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as put:
-            _push_snmp_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("snmp", self.device.pk, mgmt.adapter_device_id)
 
         host = put.call_args.args[3][0]
         self.assertNotIn("port", host)
 
     def test_iosxe_default_trap_port_uses_ios_omission_semantics(self):
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.models import NSOSnmpHostState
-        from netbox_nso_plugin.signals import _push_snmp_intent_for_device
         from netbox_nso_plugin.template_content import _reconcile_snmp_config
 
         self._set_ned("cisco-iosxe-cli-6.114")
@@ -537,7 +537,7 @@ class TestReconcileSnmpConfig(TestCase):
         )
 
         with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as put:
-            _push_snmp_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("snmp", self.device.pk, mgmt.adapter_device_id)
         self.assertNotIn("port", put.call_args.args[3][0])
 
         _reconcile_snmp_config(
@@ -558,8 +558,8 @@ class TestReconcileSnmpConfig(TestCase):
         self.assertEqual(row.status, "in_sync")
 
     def test_default_free_family_preserves_explicit_conventional_port(self):
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.models import NSOSnmpHostState
-        from netbox_nso_plugin.signals import _push_snmp_intent_for_device
 
         self._set_ned("juniper-junos-nc-4.19")
         mgmt = self._create_mgmt()
@@ -573,7 +573,7 @@ class TestReconcileSnmpConfig(TestCase):
         )
 
         with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as put:
-            _push_snmp_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("snmp", self.device.pk, mgmt.adapter_device_id)
 
         self.assertEqual(put.call_args.args[3][0]["port"], 162)
 
