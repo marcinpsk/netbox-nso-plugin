@@ -290,7 +290,7 @@ class TestOutboxMarkingModes(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         from netbox_nso_plugin.models import NSOIntentOutboxEntry
 
         registry = delivery_keys()
-        assert registry["static_route"].marking_mode == MARKING_QUERY_FLAG
+        assert registry["static_route"].marking_mode == MARKING_PER_OBJECT
         original = registry["static_route"]
         prefixes = {MARKING_QUERY_FLAG: "203.0.113.64/28", MARKING_PER_OBJECT: "203.0.113.96/28"}
         for mode, prefix in prefixes.items():
@@ -309,7 +309,10 @@ class TestOutboxMarkingModes(_CascadeFlushMixin, IntentPushResetMixin, Transacti
             assert [(t["op"], t["route_id"]) for t in recorded] == [("delete", route.pk)], f"{mode}: {recorded}"
 
     def test_only_the_emission_is_mode_gated(self):
-        """O1.20 — while the scope is ``query_flag`` the wire still carries the query flag."""
+        """O1.20: a query-flag configuration still emits only the legacy query flag."""
+        import dataclasses
+
+        from netbox_nso_plugin.delivery import MARKING_QUERY_FLAG, delivery_keys
         from netbox_nso_plugin.models import NSOIntentOutboxEntry
 
         route = _own_route(self.mgmt, "203.0.113.128/28", "203.0.113.5")
@@ -317,7 +320,13 @@ class TestOutboxMarkingModes(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         # deletion's flag, so it is the only contributor left.
         NSOIntentOutboxEntry.objects.all().delete()
 
-        params = self._recorded_params(lambda: route.devices.remove(self.device))
+        registry = delivery_keys()
+        original = registry["static_route"]
+        registry["static_route"] = dataclasses.replace(original, marking_mode=MARKING_QUERY_FLAG)
+        try:
+            params = self._recorded_params(lambda: route.devices.remove(self.device))
+        finally:
+            registry["static_route"] = original
 
         assert any(p.get("delete_origin") == "true" for p in params), f"saw {params}"
 

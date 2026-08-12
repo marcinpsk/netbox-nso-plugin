@@ -66,6 +66,10 @@ def delete_origin_pushes():
 # It is expressly NOT a delivery mechanism: it accepts no content and carries no authority.
 _backfill_only_push = contextvars.ContextVar("nso_backfill_only_push", default=False)
 
+# Static-route per-object deletion authority. The default is the required empty list, so
+# direct client users and claims with no deletion both send the activated body shape.
+_static_route_deletions = contextvars.ContextVar("nso_static_route_deletions", default=())
+
 
 @contextmanager
 def backfill_only_pushes():
@@ -75,6 +79,16 @@ def backfill_only_pushes():
         yield
     finally:
         _backfill_only_push.reset(token)
+
+
+@contextmanager
+def static_route_deletions(records):
+    """Put one claim's folded static-route deletion records on its request body."""
+    token = _static_route_deletions.set(tuple(records))
+    try:
+        yield
+    finally:
+        _static_route_deletions.reset(token)
 
 
 # The logical operation a request belongs to (#1503 Appendix O, §4.4). It rides in a header
@@ -1142,13 +1156,15 @@ def put_static_route_intent(adapter_device_id, routes):
       [{"vrf": "", "prefix": "10.0.0.0/8", "next_hop": "192.168.1.1",
         "metric": None, "permanent": None, "tag": None,
         "accepted_at": "...Z"}, ...]
+    ``deleted_routes`` comes from the active claim's deletion context. It is always present,
+    including as an empty list for direct callers and store-only or backfill-only pushes.
     An empty ``routes`` list clears all static route intent for the device.
     Returns {"device_id": ..., "count": N}.
     """
     return _request(
         "PUT",
         f"/api/v1/devices/{adapter_device_id}/static-route-intent",
-        json={"routes": routes},
+        json={"routes": routes, "deleted_routes": list(_static_route_deletions.get())},
     )
 
 
