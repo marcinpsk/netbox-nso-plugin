@@ -1607,10 +1607,10 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
 
 
 class TestDeleteOriginMarking(_SignalDBBase):
-    """#106: only pushes born from a DELETION may let the adapter retract from the
-    device. The adapter treats every UNMARKED intent shrink as an un-own and DETACHES
-    (no-networking + sync-from, device untouched) — so deletion-driven pushes must
-    carry ``?delete_origin=true``, and un-own pushes must not.
+    """#106/#1503: only proven deletion authority may let the adapter retract.
+
+    Query-mode scopes carry ``?delete_origin=true``. Activated static-route pushes carry
+    per-object authority in ``deleted_routes`` and never send that query parameter.
     """
 
     _CFG = {
@@ -1695,9 +1695,9 @@ class TestDeleteOriginMarking(_SignalDBBase):
             f"an un-own push must stay unmarked (detach-safe); saw params {params}",
         )
 
-    def test_native_static_route_delete_is_marked(self):
-        """The native pre_delete safety-net path (routing.StaticRoute) is a deletion —
-        its reduced push must carry the mark too."""
+    def test_native_static_route_delete_uses_no_query_flag(self):
+        """The native pre_delete safety-net path (routing.StaticRoute) is a deletion, so
+        its activated push must leave the legacy query flag off."""
         from netbox_routing.models import StaticRoute
 
         from netbox_nso_plugin.models import NSOStaticRouteState
@@ -1710,9 +1710,9 @@ class TestDeleteOriginMarking(_SignalDBBase):
             )
         params = self._recorded_params(route.delete)
         self.assertTrue(params, "the native delete must push")
-        self.assertTrue(
-            any(p.get("delete_origin") == "true" for p in params),
-            f"native-delete push must be marked delete_origin; saw params {params}",
+        self.assertFalse(
+            any("delete_origin" in item for item in params),
+            f"activated static-route pushes must not use the query flag; saw params {params}",
         )
 
     def test_assigning_a_device_to_a_static_route_is_unmarked(self):
@@ -1733,8 +1733,8 @@ class TestDeleteOriginMarking(_SignalDBBase):
             f"an ADD is not a deletion — its push must stay unmarked; saw params {params}",
         )
 
-    def test_unassigning_a_device_from_a_static_route_is_marked(self):
-        """post_remove IS a deletion — the reduced snapshot must still carry the mark."""
+    def test_unassigning_a_device_from_a_static_route_uses_no_query_flag(self):
+        """post_remove is a deletion, but its activated push uses no legacy query flag."""
         from netbox_routing.models import StaticRoute
 
         from netbox_nso_plugin.signals import _accept_static_route_for_device
@@ -1748,9 +1748,9 @@ class TestDeleteOriginMarking(_SignalDBBase):
 
         params = self._recorded_params(lambda: route.devices.remove(mgmt.device))
         self.assertTrue(params, "un-assigning the device must push the reduced snapshot")
-        self.assertTrue(
-            any(p.get("delete_origin") == "true" for p in params),
-            f"un-assigning is a deletion — its push must be marked; saw params {params}",
+        self.assertFalse(
+            any("delete_origin" in item for item in params),
+            f"activated static-route pushes must not use the query flag; saw params {params}",
         )
 
     # ── teardown must never be read as a retraction ───────────────────────────

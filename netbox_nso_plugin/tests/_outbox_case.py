@@ -231,7 +231,12 @@ def _body_members(body) -> set:
     so the wrapper is walked rather than named: the pin is about membership, not spelling.
     """
     if isinstance(body, dict):
-        entries_ = [entry for value in body.values() if isinstance(value, list) for entry in value]
+        entries_ = [
+            entry
+            for name, value in body.items()
+            if name != "deleted_routes" and isinstance(value, list)
+            for entry in value
+        ]
     else:
         entries_ = list(body or [])
     members = set()
@@ -273,8 +278,23 @@ class ReceiptAdapter:
         #: Per adapter device id: what the device carries, and what it no longer owns.
         self.on_device: dict[int, set] = {}
         self.detached: dict[int, set] = {}
+        #: The jobs one full-replace would execute, in request order. Each names the
+        #: per-object marking that decides retract versus detach.
+        self.jobs: list[dict] = []
         self._owned: dict[int, set] = {}
-        self._respond = respond or (lambda body: {"count": len(next(iter(body.values()), []) or [])})
+        self._respond = respond or self._default_response
+
+    @staticmethod
+    def _default_response(body):
+        """Answer static routes in the landed adapter shape and other scopes by count."""
+        if isinstance(body, dict) and "deleted_routes" in body:
+            return {
+                **partition(executed=[record["route_id"] for record in body["deleted_routes"]]),
+                "count": len(body.get("routes") or []),
+                "routes": [],
+            }
+        values = next(iter(body.values()), []) if isinstance(body, dict) else body
+        return {"count": len(values or [])}
 
     @property
     def sequences(self) -> list[int | None]:
@@ -293,7 +313,19 @@ class ReceiptAdapter:
         if params.get("store_only") == "true":
             self._owned[device_id] = members
             return
-        if params.get("delete_origin") == "true":
+        if params.get("backfill_only") == "true":
+            return
+        deleted_routes = body.get("deleted_routes") if isinstance(body, dict) else None
+        if deleted_routes is not None:
+            marked = {("route_id", int(record["route_id"])) for record in deleted_routes}
+            for member in sorted(dropped):
+                marking = "delete_origin" if member in marked else "detach"
+                self.jobs.append({"device_id": device_id, "member": member, "marking": marking})
+                if marking == "delete_origin":
+                    on_device.discard(member)
+                elif member in on_device:
+                    detached.add(member)
+        elif params.get("delete_origin") == "true":
             on_device -= dropped  # authorized retraction: the object leaves the device
         else:
             detached |= dropped & on_device  # an unmarked shrink un-owns, it never removes
