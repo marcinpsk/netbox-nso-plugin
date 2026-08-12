@@ -690,6 +690,7 @@ def send_claim(claim: Claim, *, deadline=None):
         claim.payload,
         mode=claim.mode,
         mark=bool(claim.mark),
+        deletions=claim.deletions,
         push_seq=claim.push_seq,
         deadline=SEND_DEADLINE.total_seconds() if deadline is None else deadline,
     )
@@ -947,9 +948,14 @@ def settle(claim: Claim, response) -> str:
             _report_protocol_violation(claim, ack.reason)
             return UNACKNOWLEDGED
 
-        if claim.mark is False and claim.mark_any:
-            # The fold downgraded a marked contributor, which is today's cross-transaction
-            # AND. It is recorded because the success path pops the transient error entry.
+        if (
+            claim.mark is False
+            and claim.mark_any
+            and delivery.delivery_keys()[claim.scope].marking_mode == delivery.MARKING_QUERY_FLAG
+        ):
+            # The fold downgraded a marked contributor, which is the query-flag AND. A
+            # per-object scope delivers the deletion itself, so its AND has no wire effect.
+            # It is recorded because the success path pops the transient error entry.
             state.degraded_deletions = [
                 *state.degraded_deletions,
                 {
@@ -1653,7 +1659,7 @@ def _sent_wire_digest(state) -> str:
     payload: this hashes what was sent, not what the device would render now.
     """
     rendered = delivery.render(state.scope, state.device_id, 0)
-    return wire_digest(delivery.wire_body(rendered, state.claim_payload))
+    return wire_digest(delivery.wire_body(rendered, state.claim_payload, deletions=state.claim_deletions or []))
 
 
 def resolve_restored_claim(device_id, scope, receipt) -> str:

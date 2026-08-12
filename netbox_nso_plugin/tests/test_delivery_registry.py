@@ -87,10 +87,14 @@ class TestDeliveryRegistry(SimpleTestCase):
         assert unknown == {}
 
     def test_marking_mode_is_declared_per_key(self):
-        """O1 records ids in both modes; static routes only leave ``query_flag`` at O3."""
-        from netbox_nso_plugin.delivery import delivery_keys
+        """O3.4: only static routes activate; every other key keeps its query flag."""
+        from netbox_nso_plugin.delivery import MARKING_PER_OBJECT, MARKING_QUERY_FLAG, delivery_keys
 
-        assert {entry.marking_mode for entry in delivery_keys().values()} == {"query_flag"}
+        registry = delivery_keys()
+        assert registry["static_route"].marking_mode == MARKING_PER_OBJECT
+        assert {key: entry.marking_mode for key, entry in registry.items() if key != "static_route"} == {
+            key: MARKING_QUERY_FLAG for key in registry if key != "static_route"
+        }
 
     def test_every_entry_names_a_push_that_exists(self):
         """The registry holds names, so a typo has to fail here rather than at push time."""

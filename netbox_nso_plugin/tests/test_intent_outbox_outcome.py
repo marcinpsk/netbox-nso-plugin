@@ -1197,7 +1197,10 @@ class TestTheDowngradeRecordNamesWhatLeftTheDevice(_OutcomeCase):
             NSOStaticRouteState.objects.get(management=self.mgmt, static_route=route).save()
 
     def test_a_downgraded_fold_records_the_triples_the_banner_renders(self):
+        import dataclasses
+
         from netbox_nso_plugin import drain
+        from netbox_nso_plugin.delivery import MARKING_QUERY_FLAG, delivery_keys
 
         going = own_route(self.mgmt, "198.51.100.160/28", "198.51.100.30")
         staying = own_route(self.mgmt, "198.51.100.176/28", "198.51.100.31")
@@ -1205,10 +1208,18 @@ class TestTheDowngradeRecordNamesWhatLeftTheDevice(_OutcomeCase):
         self.clear_entries()
 
         # One marked contributor and one unmarked one, folded into a single unmarked send.
+        # The record is written only under the query flag (O3a); pre-activation records
+        # still render, so the legacy write path is driven under a swapped registry.
         self.unown(going)
         self._touch(staying)
 
-        assert self.drain(chain=0) == drain.SUCCEEDED
+        registry = delivery_keys()
+        original = registry["static_route"]
+        registry["static_route"] = dataclasses.replace(original, marking_mode=MARKING_QUERY_FLAG)
+        try:
+            assert self.drain(chain=0) == drain.SUCCEEDED
+        finally:
+            registry["static_route"] = original
 
         [record] = state_of(self.device, "static_route").degraded_deletions
         assert record["reason"] == drain.LEGACY_MARK_DOWNGRADED
