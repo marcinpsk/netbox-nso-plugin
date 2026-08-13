@@ -82,6 +82,52 @@ def _removal_job(job_id, scope, status, updated="2026-07-10T07:00:00Z", context=
     }
 
 
+def _device_generations():
+    # Copied from ../nso-adapter/docs/api-contract.md, GET devices/{id}/generations,
+    # and ../nso-adapter/tests/api/test_device_generations.py, complete emit-null shape.
+    return [
+        {
+            "generation_id": 81,
+            "seq": 4,
+            "status": "settled",
+            "job_id": 501,
+            "mode": "detach",
+            "settlement_cohort": 73,
+            "digest": "a" * 64,
+            "stream_revisions": {"vlan": 11},
+            "source_push_seq": {"vlan": 501},
+            "created_at": "2026-08-12T09:15:00Z",
+            "updated_at": "2026-08-12T09:30:00Z",
+        },
+        {
+            "generation_id": 82,
+            "seq": 5,
+            "status": "pending",
+            "job_id": None,
+            "mode": "networked",
+            "settlement_cohort": 73,
+            "digest": "b" * 64,
+            "stream_revisions": {"vlan": 12},
+            "source_push_seq": {"vlan": 502},
+            "created_at": "2026-08-12T09:30:00Z",
+            "updated_at": "2026-08-12T09:30:00Z",
+        },
+        {
+            "generation_id": 90,
+            "seq": 9,
+            "status": "running",
+            "job_id": 510,
+            "mode": "networked",
+            "settlement_cohort": None,
+            "digest": "c" * 64,
+            "stream_revisions": {"logging": 3},
+            "source_push_seq": {"logging": None},
+            "created_at": "2026-08-13T10:45:00Z",
+            "updated_at": "2026-08-13T11:00:00Z",
+        },
+    ]
+
+
 class BlockedRemovalTestBase(TestCase):
     """Superuser + onboarded managed device."""
 
@@ -104,15 +150,23 @@ class BlockedRemovalTestBase(TestCase):
         super().setUp()
         self.client.force_login(self.superuser)
 
-    def _get_jobs(self, jobs):
+    def _get_jobs(self, jobs, *, generations=None, generation_ids=()):
         """Hit device_nso_jobs with the adapter's job list canned at the transport."""
         with (
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_ADAPTER_CFG),
             patch("netbox_nso_plugin.adapter_client.requests.Session") as mock_session_cls,
         ):
-            mock_session_cls.return_value = make_session(response=make_response(200, json_data=jobs))
+            session = make_session()
+
+            def request(_method, url, **_kwargs):
+                if url.endswith("/generations"):
+                    return make_response(200, json_data=generations)
+                return make_response(200, json_data=jobs)
+
+            session.request.side_effect = request
+            mock_session_cls.return_value = session
             url = reverse("plugins:netbox_nso_plugin:device_nso_jobs", args=[self.device.pk])
-            response = self.client.get(url)
+            response = self.client.get(url, {"generation_id": generation_ids})
         self.assertEqual(response.status_code, 200)
         return json.loads(response.content)
 
@@ -122,7 +176,9 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
 
     def test_blocked_removal_surfaced_with_detail(self):
         """A failed removal with removal_blocked_collateral yields a blocked_removals entry."""
-        data = self._get_jobs([_blocked_job()])
+        job = _blocked_job()
+        data = self._get_jobs([job])
+        self.assertEqual(data["jobs"], [job])
         self.assertEqual(len(data["blocked_removals"]), 1)
         entry = data["blocked_removals"][0]
         self.assertEqual(entry["scope"], "isis")
@@ -133,6 +189,19 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
         )
         self.assertIn("would delete lo0", entry["preview"])
         self.assertEqual(entry["blocked_at"], "2026-07-10T06:00:00Z")
+
+    def test_requested_apply_generations_are_wired_on_the_first_poll(self):
+        generations = _device_generations()
+        # Job fields come from JobOut in ../nso-adapter/tests/api/openapi_snapshot.json.
+        jobs = [
+            _removal_job(510, "logging", "running"),
+            _removal_job(501, "vlan", "succeeded"),
+        ]
+
+        data = self._get_jobs(jobs, generations=generations, generation_ids=(81, 82))
+
+        self.assertEqual(data["generations"], generations[:2])
+        self.assertEqual(data["jobs"], [jobs[1]])
 
     def test_ordinary_failed_removal_not_blocked(self):
         """A removal that failed for another reason does not raise the banner."""

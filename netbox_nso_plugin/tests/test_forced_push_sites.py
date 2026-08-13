@@ -3,9 +3,9 @@
 """#1503 Appendix O (O1), pin O1.16: the forced-push sites, enumerated by the compiler.
 
 A forced call is its own logical operation: it does not enqueue, does not coalesce and is
-never dropped as unchanged. There are five of them, and the enumeration is taken with the AST
-rather than with a text search, because a wrapped call can span several lines. The scan fails
-when an unowned site appears, so a new site is triaged before its outbox omission causes harm.
+never dropped as unchanged. The enumeration is taken with the AST rather than with a text
+search, because a wrapped call can span several lines. The scan fails when an unowned site
+appears, so a new site is triaged before its outbox omission causes harm.
 
 A forced call inside an open transaction raises: the claim sets its own isolation level,
 which PostgreSQL accepts only before a transaction's first statement, and the send must hold
@@ -35,6 +35,9 @@ FORCED_PUSH_SITES = {
     ("intent_drift.py", "resync_static_route_intent_fleet", "drain.push_now"): 1,
     ("link_role.py", "_push_provisioned", "drain.push_now"): 1,
     ("views.py", "_prepare_apply", "drain.push_now"): 1,
+    # The direct lacp/switchport snapshots push after every store-only push succeeded,
+    # from their own helper so a failure can name what already reached the device.
+    ("views.py", "_push_direct_snapshots", "drain.push_now"): 1,
     # The Apply's SNMP refresh reads the OUTCOME rather than the answer: it aborts on a
     # refusal alone, which ``push_now`` reports as the same ``None`` as a failure.
     ("views.py", "_prepare_apply", "drain.drain_key"): 1,
@@ -94,7 +97,7 @@ class TestForcedPushSitesAreEnumerated(SimpleTestCase):
         expected[FORCED_CLAIM_SITE] += 1
         expected[DEPLOYMENT_VERIFICATION_CLAIM_SITE] += 1
         assert _forced_calls() == expected
-        assert sum(FORCED_PUSH_SITES.values()) == 5
+        assert sum(FORCED_PUSH_SITES.values()) == 6
 
     def test_every_forced_site_routes_through_the_claim(self):
         """A forced call is a claim with those flags, never a push around it (§4.2).

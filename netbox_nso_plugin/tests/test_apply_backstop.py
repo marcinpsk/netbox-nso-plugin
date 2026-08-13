@@ -61,7 +61,7 @@ class TestApplyPromotion(TestCase):
         other = NSOLoggingLevelState.objects.create(management=mgmt, console_severity="warning", status="accepted")
         return mgmt, state, other
 
-    def _prepare(self, static_response):
+    def _prepare(self, static_response, *, expect_refused=False):
         """Run the Apply with the static-route claim answering *static_response*.
 
         The Apply routes SNMP through ``drain.drain_key`` and every other scope through
@@ -74,29 +74,33 @@ class TestApplyPromotion(TestCase):
         mgmt, state, other = self._setup()
         patcher = patch(
             "netbox_nso_plugin.drain.push_now",
-            side_effect=lambda device_id, scope, **kwargs: static_response if scope == "static_route" else None,
+            side_effect=lambda device_id, scope, **kwargs: (
+                static_response if scope == "static_route" else {"status": "deployed"}
+            ),
         )
         push = patcher.start()
         self.addCleanup(patcher.stop)
         snmp_patcher = patch("netbox_nso_plugin.drain.drain_key", return_value=drain.SUCCEEDED)
         snmp = snmp_patcher.start()
         self.addCleanup(snmp_patcher.stop)
-        _prepare_apply(mgmt)
+        if expect_refused:
+            from netbox_nso_plugin.views import ApplyRefused
+
+            with self.assertRaises(ApplyRefused):
+                _prepare_apply(mgmt)
+        else:
+            _prepare_apply(mgmt)
         state.refresh_from_db()
         other.refresh_from_db()
         return state, other, push, snmp
 
-    def test_a_failed_force_push_skips_promotion(self):
-        """A forced claim answers ``None`` only on a real rejection: the adapter stored nothing."""
-        state, other, push, snmp = self._prepare(static_response=None)
+    def test_a_failed_force_push_aborts_before_any_promotion(self):
+        """A forced claim answers ``None`` only when the adapter did not acknowledge it."""
+        state, other, push, snmp = self._prepare(static_response=None, expect_refused=True)
 
         assert [call.args[1] for call in push.call_args_list].count("static_route") == 1
         snmp.assert_called_once()
-        assert state.status == "accepted", (
-            "the Apply promoted a route whose intent the adapter refused: nothing can ever "
-            "settle that row, so it waits for the backstop to call it failed"
-        )
-        assert other.status == "deploying", "one scope's rejection blocked every other scope's Apply"
+        assert (state.status, other.status) == ("accepted", "accepted"), "the abort promoted rows"
 
     def test_an_acknowledged_push_still_promotes(self):
         """The guard is a precondition, not a new refusal: the normal path is unchanged."""
@@ -300,6 +304,48 @@ class TestTheStuckDeployingBackstop(_SettlementCase):
 
         state.refresh_from_db()
         assert state.status == "deploying", "the clock failed a row the running apply is about to settle"
+
+    def test_an_unattached_pending_successor_keeps_the_apply_active(self):
+        """A settled head does not finish its chain before the pending successor gets a job."""
+        from netbox_nso_plugin.reconcile import _apply_job_state
+
+        device, mgmt = self._device("pendinggeneration", 64)
+        sr = _route("10.54.0.0/16", "10.54.0.1", devices=[device])
+        state = _own(sr, mgmt, generation=402, expected=False)
+        _stale_clock(state)
+        self.adapter.store.terminal_job(64, results=[])
+        self.adapter.store.add_generation(
+            64,
+            generation_id=81,
+            seq=4,
+            status="settled",
+            job_id=501,
+            mode="networked",
+            settlement_cohort=73,
+            digest="a" * 64,
+            stream_revisions={"static_route": 11},
+            source_push_seq={"static_route": 501},
+        )
+        self.adapter.store.add_generation(
+            64,
+            generation_id=82,
+            seq=5,
+            status="pending",
+            job_id=None,
+            mode="detach",
+            settlement_cohort=73,
+            digest="b" * 64,
+            stream_revisions={"static_route": 12},
+            source_push_seq={"static_route": 502},
+        )
+
+        _last_apply, active = _apply_job_state(64)
+        self.assertTrue(active)
+        self._tick()
+
+        state.refresh_from_db()
+        self.assertEqual(state.status, "deploying")
+        self.assertEqual(state.last_apply_error, "")
 
 
 # ── CodeQL py/stack-trace-exposure — the refusal wording is rebuilt, never serialized ────

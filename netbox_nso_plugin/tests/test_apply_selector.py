@@ -1,0 +1,499 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
+"""The manual Apply selector contract and its operator-visible outcomes."""
+
+from __future__ import annotations
+
+from dcim.models import Interface
+from django.contrib.auth import get_user_model
+from django.db import transaction
+from django.test import SimpleTestCase, TransactionTestCase
+from django.urls import reverse
+from requests.exceptions import ConnectionError
+
+from ._adapter_http import make_response
+from ._outbox_case import ReceiptAdapter, make_managed, own_vlan, without_commit_drain
+from .mixins import IntentPushResetMixin, _CascadeFlushMixin
+
+_ADAPTER_STREAMS = {
+    "bfd",
+    "bgp",
+    "interface_config",
+    "interface_mtu",
+    "ip",
+    "isis",
+    "isis_flex_algo",
+    "l2_sap",
+    "logging",
+    "ospf",
+    "route_policy",
+    "snmp",
+    "static_route",
+    "subinterface",
+    "svi",
+    "vlan",
+}
+
+
+def _promoted(selected):
+    # Copied from ../nso-adapter/docs/api-contract.md, actions/apply 202 response,
+    # with the fields pinned by ActionApplyGenerationOut in openapi_snapshot.json.
+    return {
+        "device_id": 1558,
+        "outcome": "promoted",
+        "selected": selected,
+        "skipped": {},
+        "generations": [
+            {
+                "generation_id": 81,
+                "seq": 4,
+                "job_id": 501,
+                "mode": "networked",
+                "source_push_seq": selected,
+                "stream_revisions": {stream: 7 for stream in selected},
+                "digest": "a" * 64,
+            },
+            {
+                "generation_id": 82,
+                "seq": 5,
+                "job_id": None,
+                "mode": "detach",
+                "source_push_seq": selected,
+                "stream_revisions": {stream: 7 for stream in selected},
+                "digest": "b" * 64,
+            },
+        ],
+    }
+
+
+def _no_op(selected):
+    # Copied from ../nso-adapter/docs/api-contract.md, actions/apply no-op response.
+    # The skipped enum is copied from ActionApplyOut in openapi_snapshot.json.
+    return {
+        "device_id": 1558,
+        "outcome": "no_op",
+        "selected": selected,
+        "skipped": {
+            stream: ("superseded", "already_applied", "already_authorized", "no_receipt")[index % 4]
+            for index, stream in enumerate(sorted(selected))
+        },
+        "generations": [],
+    }
+
+
+class _ApplyContractAdapter(ReceiptAdapter):
+    """A strict actions/apply boundary backed by the landed §4.4 receipt shape.
+
+    ReceiptAdapter copies ../nso-adapter/docs/api-contract.md, ``X-Push-Seq`` and
+    ``GET /api/v1/intent-receipts``. Each Apply response supplied to this double states
+    its contract-source provenance at its definition below.
+    """
+
+    def __init__(
+        self,
+        apply_response,
+        *,
+        accepted_intent_suffixes=("-intent", "/intent"),
+        failed_intent_suffix=None,
+        failed_direct_suffix=None,
+    ):
+        super().__init__()
+        self.apply_response = apply_response
+        self.accepted_intent_suffixes = accepted_intent_suffixes
+        self.failed_intent_suffix = failed_intent_suffix
+        self.failed_direct_suffix = failed_direct_suffix
+        self.apply_requests: list[dict] = []
+        self.direct_requests: list[str] = []
+
+    def _handle(self, method, url, **kwargs):
+        if method == "POST" and url.endswith("/actions/apply"):
+            body = kwargs.get("json")
+            self.apply_requests.append(body)
+            if not isinstance(body, dict) or set(body) != {"selected"} or not isinstance(body["selected"], dict):
+                # Copied from ../nso-adapter/tests/api/openapi_snapshot.json,
+                # actions/apply 422 ErrorEnvelope response.
+                return make_response(
+                    422,
+                    {
+                        "error": {
+                            "code": "validation_error",
+                            "message": "Request validation failed",
+                            "detail": {"errors": [{"loc": ["body", "selected"], "type": "missing"}]},
+                        }
+                    },
+                )
+            status, payload = self.apply_response(dict(body["selected"]))
+            return make_response(status, payload) if payload is not None else make_response(status, content=b"")
+        if method == "POST" and url.endswith(("/lag-config/apply", "/switchport/apply")):
+            self.direct_requests.append(url)
+            if self.failed_direct_suffix and url.endswith(self.failed_direct_suffix):
+                # Copied from ../nso-adapter/docs/api-contract.md, direct apply error response.
+                return make_response(
+                    200,
+                    {
+                        "status": "error",
+                        "message": "Direct configuration failed",
+                        "detail": "NSO rejected the snapshot",
+                    },
+                )
+            if url.endswith("/lag-config/apply"):
+                # Copied from ../nso-adapter/docs/api-contract.md, lag-config/apply response.
+                return make_response(200, {"status": "deployed", "device": "lab-device", "bundle_count": 0})
+            # Copied from ../nso-adapter/docs/api-contract.md, switchport/apply response.
+            return make_response(200, {"status": "deployed", "device": "lab-device", "interface_count": 0})
+        if method == "GET" and url.endswith("/api/v1/jobs/900"):
+            # Copied from JobOut in ../nso-adapter/tests/api/openapi_snapshot.json.
+            return make_response(
+                200,
+                {
+                    "id": 900,
+                    "type": "apply",
+                    "device_id": 1558,
+                    "status": "running",
+                    "result": None,
+                    "error": None,
+                    "context": None,
+                    "created_at": "2026-08-13T10:00:00Z",
+                    "updated_at": "2026-08-13T10:00:00Z",
+                    "started_at": "2026-08-13T10:00:00Z",
+                    "heartbeat_at": "2026-08-13T10:00:00Z",
+                    "settle_seq": None,
+                },
+            )
+        if method == "PUT" and self.failed_intent_suffix and url.endswith(self.failed_intent_suffix):
+            # Copied from ErrorEnvelope in ../nso-adapter/tests/api/openapi_snapshot.json.
+            return make_response(
+                500,
+                {
+                    "error": {
+                        "code": "nso_error",
+                        "message": "Intent preparation failed",
+                        "detail": {},
+                    }
+                },
+            )
+        if method == "PUT":
+            if not url.endswith(self.accepted_intent_suffixes):
+                raise ConnectionError(f"this contract case does not serve {url}")
+        return super()._handle(method, url, **kwargs)
+
+
+class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    """Drive Apply through its URL and the real claim, client, and rollback paths."""
+
+    reset_sequences = True
+
+    def setUp(self):
+        super().setUp()
+        self.user = get_user_model().objects.create_superuser(
+            username="apply-selector-admin",
+            password="test-password-1558",
+            email="apply-selector@test.example",
+        )
+        self.client.force_login(self.user)
+        self.device, self.mgmt = make_managed("apply-selector", 1558)
+        self.vlan_state = own_vlan(self.mgmt, 1558, "apply-selector")
+
+    def _post(self, adapter):
+        config, session = adapter.patches()
+        url = reverse(
+            "plugins:netbox_nso_plugin:nsodevicemanagement_action",
+            args=[self.mgmt.pk, "apply"],
+        )
+        with config, session:
+            return self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+
+    def test_promoted_apply_selects_the_store_only_receipt_and_returns_the_whole_chain(self):
+        adapter = _ApplyContractAdapter(lambda selected: (202, _promoted(selected)))
+
+        response = self._post(adapter)
+
+        self.assertEqual(response.status_code, 200)
+        result = response.json()
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["job_id"], 501)
+        self.assertEqual(result["generations"], _promoted(adapter.apply_requests[0]["selected"])["generations"])
+        vlan_url, receipt = next(
+            (url, receipt) for url, receipt in adapter.receipts.items() if url.endswith("/vlan-intent")
+        )
+        self.assertEqual(set(adapter.apply_requests[0]["selected"]), _ADAPTER_STREAMS)
+        self.assertEqual(adapter.apply_requests[0]["selected"]["vlan"], receipt["push_seq"])
+        self.assertEqual(receipt["params"], {"store_only": "true"})
+        pushed = next(request for request in adapter.requests if request["url"] == vlan_url)
+        self.assertEqual(pushed["push_seq"], receipt["push_seq"])
+        self.assertRegex(receipt["digest"], r"^[0-9a-f]{64}$")
+        self.assertEqual([link["digest"] for link in result["generations"]], ["a" * 64, "b" * 64])
+        self.vlan_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "deploying")
+
+    def test_apply_selects_the_stored_isis_receipt_from_the_delivery_registry(self):
+        from netbox_nso_plugin.models import NSOISISInterfaceState
+
+        with without_commit_drain(), transaction.atomic():
+            interface = Interface.objects.create(device=self.device, name="Ethernet1", type="1000base-t")
+            NSOISISInterfaceState.objects.create(
+                management=self.mgmt,
+                interface=interface,
+                af="ipv4",
+                process_tag="CORE",
+                status="accepted",
+            )
+        adapter = _ApplyContractAdapter(lambda selected: (202, _promoted(selected)))
+
+        response = self._post(adapter)
+
+        self.assertEqual(response.status_code, 200)
+        isis_receipt = next(
+            receipt for url, receipt in adapter.receipts.items() if url.endswith("/isis-interface-intent")
+        )
+        self.assertEqual(adapter.apply_requests[0]["selected"]["isis"], isis_receipt["push_seq"])
+        self.assertEqual(isis_receipt["params"], {"store_only": "true"})
+
+    def test_a_raised_preparation_push_aborts_apply_after_a_sibling_succeeds(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import drain
+
+        adapter = _ApplyContractAdapter(
+            lambda selected: (202, _promoted(selected)),
+            accepted_intent_suffixes=("-intent", "/intent"),
+        )
+        real_push_now = drain.push_now
+
+        def push_now(device_id, scope, **kwargs):
+            if scope == "isis":
+                raise RuntimeError("IS-IS preparation failed")
+            return real_push_now(device_id, scope, **kwargs)
+
+        with patch("netbox_nso_plugin.drain.push_now", side_effect=push_now):
+            response = self._post(adapter)
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["status"], "error")
+        self.assertIn("IS-IS", response.json()["message"])
+        self.assertTrue(any(url.endswith("/vlan-intent") for url in adapter.receipts))
+        self.assertEqual(adapter.apply_requests, [])
+        self.vlan_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "accepted")
+
+    def test_a_terminally_failed_preparation_push_aborts_apply_after_a_sibling_succeeds(self):
+        adapter = _ApplyContractAdapter(
+            lambda selected: (202, _promoted(selected)),
+            accepted_intent_suffixes=("-intent", "/intent"),
+            failed_intent_suffix="/isis-interface-intent",
+        )
+
+        response = self._post(adapter)
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["status"], "error")
+        self.assertIn("IS-IS", response.json()["message"])
+        self.assertTrue(any(url.endswith("/vlan-intent") for url in adapter.receipts))
+        self.assertEqual(adapter.apply_requests, [])
+        self.vlan_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "accepted")
+
+    def test_a_terminal_snmp_preparation_failure_happens_before_any_direct_push(self):
+        adapter = _ApplyContractAdapter(
+            lambda selected: (202, _promoted(selected)),
+            failed_intent_suffix="/snmp-intent",
+        )
+
+        response = self._post(adapter)
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["status"], "error")
+        self.assertIn("Nothing was applied", response.json()["message"])
+        self.assertEqual(adapter.direct_requests, [])
+        self.assertEqual(adapter.apply_requests, [])
+        self.vlan_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "accepted")
+
+    def test_a_direct_push_failure_names_the_snapshot_already_applied(self):
+        adapter = _ApplyContractAdapter(
+            lambda selected: (202, _promoted(selected)),
+            failed_direct_suffix="/switchport/apply",
+        )
+
+        response = self._post(adapter)
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["status"], "error")
+        self.assertNotIn("Nothing was applied", response.json()["message"])
+        self.assertIn("LACP", response.json()["message"])
+        self.assertEqual(
+            [url.rsplit("/devices/1558/", 1)[-1] for url in adapter.direct_requests],
+            ["lag-config/apply", "switchport/apply"],
+        )
+        self.assertEqual(adapter.apply_requests, [])
+        self.vlan_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "accepted")
+
+    def test_no_op_surfaces_every_skipped_reason_and_rolls_back_prepared_rows(self):
+        adapter = _ApplyContractAdapter(lambda selected: (202, _no_op(selected)))
+
+        response = self._post(adapter)
+
+        self.assertEqual(response.status_code, 200)
+        result = response.json()
+        self.assertEqual(result["status"], "no_op")
+        self.assertEqual(set(adapter.apply_requests[0]["selected"]), _ADAPTER_STREAMS)
+        for stream, reason in _no_op(adapter.apply_requests[0]["selected"])["skipped"].items():
+            self.assertIn(stream, result["message"])
+            self.assertIn(reason, result["message"])
+        selected_receipts = list(adapter.receipts.values())
+        self.assertEqual(len(selected_receipts), len(adapter.apply_requests[0]["selected"]))
+        self.assertTrue(all(receipt["params"] == {"store_only": "true"} for receipt in selected_receipts))
+        self.vlan_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "accepted")
+
+    def test_promoted_apply_rolls_back_a_skipped_stream_without_rolling_back_its_generation(self):
+        from netbox_nso_plugin.models import NSOLoggingLevelState
+
+        with without_commit_drain(), transaction.atomic():
+            logging_state = NSOLoggingLevelState.objects.create(
+                management=self.mgmt,
+                console_severity="warning",
+                status="accepted",
+            )
+
+        def promoted_with_skipped(selected):
+            # Copied from ../nso-adapter/docs/api-contract.md, actions/apply 202 response.
+            # The mixed skipped/promoted case uses ActionApplyOut and
+            # ActionApplyGenerationOut from openapi_snapshot.json.
+            return {
+                "device_id": 1558,
+                "outcome": "promoted",
+                "selected": selected,
+                "skipped": {
+                    stream: "superseded" if stream == "vlan" else "no_receipt"
+                    for stream in selected
+                    if stream != "logging"
+                },
+                "generations": [
+                    {
+                        "generation_id": 81,
+                        "seq": 4,
+                        "job_id": 501,
+                        "mode": "networked",
+                        "source_push_seq": {"logging": selected["logging"]},
+                        "stream_revisions": {"logging": 7},
+                        "digest": "a" * 64,
+                    }
+                ],
+            }
+
+        adapter = _ApplyContractAdapter(lambda selected: (202, promoted_with_skipped(selected)))
+
+        response = self._post(adapter)
+
+        self.assertEqual(response.status_code, 200)
+        result = response.json()
+        skipped = promoted_with_skipped(adapter.apply_requests[0]["selected"])["skipped"]
+        self.assertEqual(result["skipped"], skipped)
+        for stream, reason in skipped.items():
+            self.assertIn(stream, result["message"])
+            self.assertIn(reason, result["message"])
+        self.vlan_state.refresh_from_db()
+        logging_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "accepted")
+        self.assertEqual(logging_state.status, "deploying")
+
+    def test_apply_unexecutable_surfaces_each_stream_reason_and_rolls_back(self):
+        def refused(_selected):
+            # Copied from ../nso-adapter/docs/api-contract.md, actions/apply
+            # 409 apply_unexecutable, using the ErrorEnvelope from openapi_snapshot.json.
+            return (
+                409,
+                {
+                    "error": {
+                        "code": "apply_unexecutable",
+                        "message": "Selected streams cannot be applied faithfully",
+                        "detail": {
+                            "streams": {
+                                "interface_config": "live_read_execution",
+                                "static_route": "outstanding_deletion_provenance",
+                            }
+                        },
+                    }
+                },
+            )
+
+        adapter = _ApplyContractAdapter(refused)
+
+        response = self._post(adapter)
+
+        self.assertEqual(response.status_code, 409)
+        result = response.json()
+        self.assertEqual(result["status"], "error")
+        self.assertIn("interface_config", result["message"])
+        self.assertIn("live_read_execution", result["message"])
+        self.assertIn("static_route", result["message"])
+        self.assertIn("outstanding_deletion_provenance", result["message"])
+        self.vlan_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "accepted")
+
+    def test_conflict_keeps_the_existing_incumbent_job_semantics_and_rolls_back(self):
+        def conflict(_selected):
+            # Copied from ../nso-adapter/docs/api-contract.md, actions/apply 409 conflict,
+            # using the ErrorEnvelope from openapi_snapshot.json.
+            return (
+                409,
+                {
+                    "error": {
+                        "code": "conflict",
+                        "message": "A job is already running for this device",
+                        "detail": {"job_id": 900},
+                    }
+                },
+            )
+
+        response = self._post(_ApplyContractAdapter(conflict))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "conflict", "job_id": 900, "job_type": "apply"})
+        self.vlan_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "accepted")
+
+    def test_deployment_gate_503_is_deliberate_and_rolls_back_without_retry(self):
+        calls = []
+
+        def quiesced(selected):
+            calls.append(selected)
+            # Copied from the 503 quiesce-middleware behavior named in
+            # .handoff/1558-slice2c-brief.md. It has no JSON error envelope.
+            return 503, None
+
+        response = self._post(_ApplyContractAdapter(quiesced))
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["status"], "error")
+        self.assertIn("deployment gate active", response.json()["message"])
+        self.assertEqual(len(calls), 1)
+        self.vlan_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "accepted")
+
+
+class TestApplyChainSettlement(SimpleTestCase):
+    """Apply remains active until every device-writing link in its chain settles."""
+
+    def test_a_running_removal_successor_keeps_apply_active(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin.reconcile import _apply_job_state
+
+        jobs = [
+            # Copied from JobOut in ../nso-adapter/tests/api/openapi_snapshot.json.
+            {"id": 502, "type": "removal", "status": "running", "result": None},
+            {"id": 501, "type": "apply", "status": "succeeded", "result": {}},
+        ]
+
+        # Empty list is the landed GET devices/{id}/generations list shape before any promotion.
+        with (
+            patch("netbox_nso_plugin.adapter_client.list_jobs", return_value=jobs),
+            patch("netbox_nso_plugin.adapter_client.list_device_generations", return_value=[]),
+        ):
+            last_apply, active = _apply_job_state(1558)
+
+        self.assertEqual(last_apply["id"], 501)
+        self.assertTrue(active)
