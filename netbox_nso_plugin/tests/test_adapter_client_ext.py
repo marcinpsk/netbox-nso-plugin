@@ -7,6 +7,7 @@ and the remaining API call functions not covered by test_models.py.
 import sys
 import threading
 import unittest
+from types import MappingProxyType
 from unittest.mock import patch
 
 import requests
@@ -801,15 +802,69 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
-    def test_trigger_apply(self, mock_s, _cfg):
+    def test_trigger_apply_sends_the_frozen_selector_and_returns_the_generation_chain(self, mock_s, _cfg):
         from netbox_nso_plugin.adapter_client import trigger_apply
 
-        session = self._make_session(202, {"job_id": 20})
+        # Copied from ../nso-adapter/docs/api-contract.md, actions/apply 202 response,
+        # with the fields pinned by ActionApplyGenerationOut in openapi_snapshot.json.
+        promoted = {
+            "device_id": 5,
+            "outcome": "promoted",
+            "selected": {"vlan": 4711},
+            "skipped": {},
+            "generations": [
+                {
+                    "generation_id": 81,
+                    "seq": 4,
+                    "job_id": 501,
+                    "mode": "networked",
+                    "source_push_seq": {"vlan": 4711},
+                    "stream_revisions": {"vlan": 7},
+                    "digest": "a" * 64,
+                },
+                {
+                    "generation_id": 82,
+                    "seq": 5,
+                    "job_id": None,
+                    "mode": "detach",
+                    "source_push_seq": {"vlan": 4711},
+                    "stream_revisions": {"vlan": 7},
+                    "digest": "b" * 64,
+                },
+            ],
+        }
+        session = self._make_session(202, promoted)
         mock_s.return_value = session
-        result = trigger_apply(5)
-        self.assertEqual(result["job_id"], 20)
+        selector = MappingProxyType({"vlan": 4711})
+
+        result = trigger_apply(5, selector)
+
+        self.assertEqual(result, promoted)
         _, kwargs = session.request.call_args
-        self.assertTrue(kwargs["json"]["force"])
+        self.assertEqual(kwargs["json"], {"selected": {"vlan": 4711}})
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_trigger_apply_propagates_the_adapters_bad_selector_response(self, mock_s, _cfg):
+        from netbox_nso_plugin.adapter_client import AdapterError, trigger_apply
+
+        # Copied from ../nso-adapter/tests/api/openapi_snapshot.json,
+        # actions/apply 422 ErrorEnvelope response.
+        bad_selector = {
+            "error": {
+                "code": "validation_error",
+                "message": "Request validation failed",
+                "detail": {"errors": [{"loc": ["body", "selected", "unknown"], "type": "value_error"}]},
+            }
+        }
+        session = self._make_session(422, bad_selector)
+        mock_s.return_value = session
+
+        with self.assertRaises(AdapterError) as raised:
+            trigger_apply(5, MappingProxyType({"unknown": 9}))
+
+        self.assertEqual(raised.exception.status_code, 422)
+        self.assertEqual(raised.exception.code, "validation_error")
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")

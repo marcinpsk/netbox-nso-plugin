@@ -32,6 +32,8 @@ import hashlib
 import json
 import logging
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 from django.db import IntegrityError, OperationalError, connection, transaction
 
@@ -90,6 +92,8 @@ REJECTED = "rejected"
 
 WITHHELD = "withheld"
 
+_SUCCESSFUL_PUSHES: ContextVar[dict[str, int] | None] = ContextVar("nso_successful_pushes", default=None)
+
 #: Why a durable ``degraded_deletions`` record was written. Never cleared by a push outcome:
 #: only the explicit operator acknowledgement clears either of them.
 LEGACY_MARK_DOWNGRADED = "legacy_mark_downgraded"
@@ -137,6 +141,17 @@ class DirectApplyFailed(Exception):
     """A direct-apply endpoint answered HTTP 200 with an error envelope (§7.1)."""
 
     code = "nso_direct_apply_failed"
+
+
+@contextmanager
+def capture_successful_pushes():
+    """Collect each caller-owned claim that settles successfully inside this block."""
+    pushed: dict[str, int] = {}
+    token = _SUCCESSFUL_PUSHES.set(pushed)
+    try:
+        yield pushed
+    finally:
+        _SUCCESSFUL_PUSHES.reset(token)
 
 
 @dataclasses.dataclass
@@ -1333,7 +1348,12 @@ def _drain_once(
 def _after_success(claimed, *, mode, force, chain, deadline, deadline_at):
     """Resolve any operation still owed after a successful preparatory pass."""
     device_id, scope = claimed.device_id, claimed.scope
-    if _answered_other_work(claimed, mode, force):
+    answered_other_work = _answered_other_work(claimed, mode, force)
+    if not answered_other_work:
+        pushed = _SUCCESSFUL_PUSHES.get()
+        if pushed is not None:
+            pushed[scope] = claimed.push_seq
+    if answered_other_work:
         if chain <= 0:
             logger.info(
                 "%s/%s settled a preparatory operation after the chain budget expired",

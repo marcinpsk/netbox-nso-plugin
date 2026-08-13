@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 import logging
+from types import MappingProxyType
 
 from dcim.models import Device
 from django.contrib import messages
@@ -2523,22 +2524,66 @@ def _snmp_refusal_message(mgmt) -> str:
     )
 
 
+def _direct_prepare_failure_message(entry, applied_labels, failure) -> str:
+    """Describe a direct preparation failure without hiding completed device writes."""
+    if applied_labels:
+        completed = f"Direct-config snapshots already applied to the device: {', '.join(applied_labels)}."
+    else:
+        completed = "No direct-config snapshot completed before this failure."
+    return (
+        f"Apply stopped: {entry.label} direct configuration {failure}. {completed} "
+        "No Apply job was enqueued and no row was promoted."
+    )
+
+
+def _push_direct_snapshots(mgmt, registry) -> None:
+    """Force-push the out-of-protocol device snapshots, last, and abort truthfully.
+
+    These are synchronous device writes with no rollback, so they run only after every
+    store-only push succeeded, and a failure names the snapshots already applied.
+    """
+    from . import delivery, drain
+
+    applied_direct_labels = []
+    for entry in (candidate for candidate in registry.values() if not candidate.in_protocol):
+        try:
+            response = drain.push_now(
+                mgmt.device_id,
+                entry.key,
+                mode=delivery.MODE_NORMAL,
+                force=True,
+            )
+        except Exception as exc:  # noqa: BLE001 (the direct write may already have happened)
+            logger.warning("Apply direct push failed for device %s: %s", mgmt.device_id, exc)
+            raise ApplyRefused(_direct_prepare_failure_message(entry, applied_direct_labels, "failed")) from exc
+        if response is None:
+            raise ApplyRefused(
+                _direct_prepare_failure_message(
+                    entry,
+                    applied_direct_labels,
+                    "did not settle successfully",
+                )
+            )
+        applied_direct_labels.append(entry.label)
+
+
 def _prepare_apply(mgmt):
     """Pre-Apply bookkeeping for one device's single Apply.
 
-    LACP + switchport are owned in NetBox (not mirrored as adapter intent), so
-    force-push their snapshots now. Then move owned 'accepted' overlays →
+    Refresh every adapter intent mirror with store-only pushes first. LACP and
+    switchport are owned in NetBox, so push their device snapshots only after
+    every store-only push succeeds. Then move owned 'accepted' overlays →
     'deploying' so they read as "applying" and settle to 'in_sync' on the next
     reconcile once the device reflects them (VLAN value-aware; SVI/subif/BFD when
     re-reported). ``.update()`` avoids firing the per-row push signal.
 
-    Returns the rows moved to 'deploying' as ``[(model, [pks]), …]`` so the caller can
-    roll them back via :func:`_rollback_prepare_apply` if the Apply fails to enqueue a job.
-    Raises :class:`ApplyRefused` when the SNMP refresh below is not acknowledged: that runs
-    before any promotion, so an abort there leaves nothing to roll back.
+    Returns the rows moved to 'deploying' and an immutable adapter-stream selector. The
+    caller can roll the rows back via :func:`_rollback_prepare_apply` if no job is enqueued.
+    Raises :class:`ApplyRefused` when a preparation call escapes or the SNMP refresh is
+    refused. Preparation completes before promotion, so an abort leaves no rows to roll back.
+    Completed direct writes cannot be rolled back.
     """
-    from . import drain
-    from .delivery import MODE_STORE_ONLY
+    from . import delivery, drain
     from .signals import stored_static_route_count
 
     prepare_deadline = drain._send_clock() + drain.SEND_DEADLINE.total_seconds()
@@ -2567,64 +2612,84 @@ def _prepare_apply(mgmt):
     #     with no adapter intent row; SVI/subinterface/BFD/MTU share the same failure mode).
     #   - SNMP: mirrored reactively on accept and a failed push is swallowed, so the adapter
     #     mirror can be stale or absent. Refreshed store-only below — the Apply commits it.
+    registry = delivery.delivery_keys()
     static_route_stored = False
-    for scope in (
-        "interface",
-        "lacp",
-        "logging",
-        "route_policy",
-        "static_route",
-        "svi",
-        "subinterface",
-        "bfd",
-        "interface_mtu",
-        "l2_sap",
-        "switchport",
-        "vlan",
-    ):
+    with drain.capture_successful_pushes() as pushed:
+        for entry in (candidate for candidate in registry.values() if candidate.in_protocol):
+            if entry.key == "snmp":
+                continue
+            deadline = remaining_budget()
+            try:
+                response = drain.push_now(
+                    mgmt.device_id,
+                    entry.key,
+                    mode=delivery.MODE_STORE_ONLY,
+                    force=True,
+                    deadline=deadline,
+                )
+            except Exception as exc:  # noqa: BLE001 (a partial selector must never be applied)
+                logger.warning("Apply push failed for device %s: %s", mgmt.device_id, exc)
+                raise ApplyRefused(
+                    f"Apply stopped: {entry.label} intent preparation failed. "
+                    "Nothing was applied and no row was promoted."
+                ) from exc
+            if response is None:
+                raise ApplyRefused(
+                    f"Apply stopped: {entry.label} intent preparation did not settle successfully. "
+                    "Nothing was applied and no row was promoted."
+                )
+            if entry.key == "static_route":
+                # A forced claim is dropped only on a real rejection, and a static route settles
+                # on a generation the adapter has to be holding. Promoting on a push the adapter
+                # refused would create a 'deploying' row no result can ever name, stuck until
+                # the backstop calls it failed.
+                static_route_stored = stored_static_route_count(response) is not None
+
+        # A normal SNMP push can enqueue a shrink-removal job before this Apply. Store the
+        # snapshot without executing it, then select that exact receipt for promotion below.
         deadline = remaining_budget()
         try:
-            response = drain.push_now(mgmt.device_id, scope, force=True, deadline=deadline)
-        except Exception as exc:  # noqa: BLE001 — one scope's failure must not block the rest
+            outcome = drain.drain_key(
+                mgmt.device_id,
+                "snmp",
+                mode=delivery.MODE_STORE_ONLY,
+                force=True,
+                deadline=deadline,
+            )
+        except Exception as exc:  # noqa: BLE001 (a partial selector must never be applied)
             logger.warning("Apply push failed for device %s: %s", mgmt.device_id, exc)
-            response = None
-        if scope == "static_route":
-            # A forced claim is dropped only on a real rejection, and a static route settles
-            # on a generation the adapter has to be holding. Promoting on a push the adapter
-            # refused would create a 'deploying' row no result can ever name — stuck until
-            # the backstop calls it failed.
-            static_route_stored = stored_static_route_count(response) is not None
+            raise ApplyRefused(
+                "Apply stopped: SNMP intent preparation failed. Nothing was applied and no row was promoted."
+            ) from exc
+        if outcome == drain.REFUSED:
+            # A store-only claim may not carry deletion authority (§4.3(d)), so the adapter still
+            # holds the SNMP intent the operator deleted and this Apply would commit it.
+            # Delivering that authority takes a NORMAL claim, whose removal and auto-apply jobs
+            # are exactly what the store-only push exists to avoid ahead of trigger_apply and
+            # would 409 this Apply anyway. So the precondition is reported rather than worked
+            # around: the tick drains the pending claim and the operator re-applies.
+            raise ApplySnmpRefused(_snmp_refusal_message(mgmt))
+        if outcome != drain.SUCCEEDED:
+            raise ApplyRefused(
+                "Apply stopped: SNMP intent preparation did not settle successfully. "
+                "Nothing was applied and no row was promoted."
+            )
 
-    # Store-only: a plain put_snmp_intent enqueues the shrink-removal (and auto-apply) job,
-    # which would 409 the trigger_apply this runs just ahead of.
-    # The OUTCOME, not the answer: a refusal is a proven precondition failure, where a
-    # transport failure leaves the Apply to fail at the trigger as it always has.
-    deadline = remaining_budget()
-    try:
-        outcome = drain.drain_key(mgmt.device_id, "snmp", mode=MODE_STORE_ONLY, force=True, deadline=deadline)
-    except Exception as exc:  # noqa: BLE001 (one scope's failure must not block the rest)
-        logger.warning("Apply push failed for device %s: %s", mgmt.device_id, exc)
-        outcome = None
-    if outcome == drain.REFUSED:
-        # A store-only claim may not carry deletion authority (§4.3(d)), so the adapter still
-        # holds the SNMP intent the operator deleted and this Apply would commit it.
-        # Delivering that authority takes a NORMAL claim, whose removal and auto-apply jobs
-        # are exactly what the store-only push exists to avoid ahead of trigger_apply and
-        # would 409 this Apply anyway. So the precondition is reported rather than worked
-        # around: the tick drains the pending claim and the operator re-applies.
-        raise ApplySnmpRefused(_snmp_refusal_message(mgmt))
+        _push_direct_snapshots(mgmt, registry)
 
-    moved: list[tuple] = []  # (model, [pks]) actually moved, for rollback if the Apply fails
-    for model in (
-        NSOVLANState,
-        NSOSVIState,
-        NSOSubinterfaceState,
-        NSOBFDInterfaceState,
-        NSOInterfaceMtuState,
-        NSORoutePolicyState,
-        NSOStaticRouteState,
-        NSOL2SapState,
-        NSOLoggingLevelState,
+    selected = MappingProxyType({registry[scope].section: push_seq for scope, push_seq in pushed.items()})
+
+    moved: list[tuple] = []  # (stream, model, [pks]) actually moved, for selective rollback
+    for stream, model in (
+        ("vlan", NSOVLANState),
+        ("svi", NSOSVIState),
+        ("subinterface", NSOSubinterfaceState),
+        ("bfd", NSOBFDInterfaceState),
+        ("interface_mtu", NSOInterfaceMtuState),
+        ("route_policy", NSORoutePolicyState),
+        ("static_route", NSOStaticRouteState),
+        ("l2_sap", NSOL2SapState),
+        ("logging", NSOLoggingLevelState),
     ):
         if model is NSOStaticRouteState and not static_route_stored:
             logger.warning(
@@ -2637,25 +2702,36 @@ def _prepare_apply(mgmt):
             pks = list(model.objects.filter(management=mgmt, status="accepted").values_list("pk", flat=True))
             if pks:
                 model.objects.filter(pk__in=pks).update(status="deploying")
-                moved.append((model, pks))
+                moved.append((stream, model, pks))
         except Exception as exc:  # noqa: BLE001
             logger.warning("Apply deploying-mark failed for device %s: %s", mgmt.device_id, exc)
-    return moved
+    return moved, selected
 
 
-def _rollback_prepare_apply(moved) -> None:
-    """Revert the accepted→deploying marks when the Apply never enqueued a job.
+def _rollback_prepare_apply(moved, *, keep_streams=()) -> None:
+    """Revert accepted→deploying marks for streams without an enqueued generation.
 
     Only the rows THIS Apply moved are reverted (by pk), so a genuinely in-flight 'deploying'
     row from a prior Apply is left untouched. Reverting to 'accepted' is safe — an accepted row
     still settles to in_sync on the next reconcile once the device matches; leaving it 'deploying'
     with no apply job would strand it as 'applying' forever (nothing settles it).
     """
-    for model, pks in moved or []:
+    keep_streams = set(keep_streams)
+    for stream, model, pks in moved or []:
+        if stream in keep_streams:
+            continue
         try:
             model.objects.filter(pk__in=pks, status="deploying").update(status="accepted")
         except Exception as exc:  # noqa: BLE001 — best-effort rollback; log and move on
             logger.warning("Apply rollback failed: %s", exc)
+
+
+def _stream_reason_message(prefix, reasons) -> str:
+    """Format adapter stream reasons for an operator-visible Apply message."""
+    if not isinstance(reasons, dict) or not reasons:
+        return prefix
+    detail = ", ".join(f"{stream} ({reason})" for stream, reason in sorted(reasons.items()))
+    return f"{prefix}: {detail}."
 
 
 class NSODeviceActionView(NSOActionPermissionMixin, View):
@@ -2692,6 +2768,82 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
         messages.warning(request, msg)
         return redirect(_device_nso_tab_url(mgmt.device.pk))
 
+    def _apply_result(self, request, mgmt, result, prepared, *, label, is_ajax):
+        """Surface one successful Apply response and its complete generation chain."""
+        if not isinstance(result, dict):
+            raise AdapterError("Adapter returned an invalid Apply response.", code="invalid_response")
+        outcome = result.get("outcome")
+        if outcome == "no_op":
+            _rollback_prepare_apply(prepared)
+            msg = _stream_reason_message("Apply did not enqueue a job. Skipped streams", result.get("skipped"))
+            if is_ajax:
+                return JsonResponse(
+                    {
+                        "status": "no_op",
+                        "message": msg,
+                        "skipped": result.get("skipped") or {},
+                        "generations": [],
+                    }
+                )
+            messages.info(request, msg)
+            return redirect(_device_nso_tab_url(mgmt.device.pk))
+        if outcome != "promoted":
+            raise AdapterError("Adapter returned an invalid Apply outcome.", code="invalid_response")
+        generations = result.get("generations")
+        if not isinstance(generations, list) or not generations:
+            raise AdapterError("Adapter promoted Apply without a generation chain.", code="invalid_response")
+        promoted_streams = set()
+        for link in generations:
+            if not isinstance(link, dict) or not isinstance(link.get("stream_revisions"), dict):
+                raise AdapterError("Adapter returned an invalid Apply generation.", code="invalid_response")
+            promoted_streams.update(link["stream_revisions"])
+        _rollback_prepare_apply(prepared, keep_streams=promoted_streams)
+        job_id = next((link.get("job_id") for link in generations if link.get("job_id") is not None), None)
+        if job_id is None:
+            raise AdapterError("Adapter promoted Apply without a queued head job.", code="invalid_response")
+        skipped = result.get("skipped") or {}
+        msg = f"{label} triggered. Tracking {len(generations)} generation(s) from Job ID {job_id}."
+        if skipped:
+            msg = f"{msg} {_stream_reason_message('Skipped streams', skipped)}"
+        if is_ajax:
+            return JsonResponse(
+                {
+                    "status": "ok",
+                    "message": msg,
+                    "job_id": job_id,
+                    "skipped": skipped,
+                    "generations": generations,
+                }
+            )
+        messages.success(request, msg)
+        return redirect(_device_nso_tab_url(mgmt.device.pk))
+
+    def _adapter_error(self, request, mgmt, exc, prepared, *, action, label, is_ajax):
+        """Roll back an unenqueued Apply and surface the adapter's failure."""
+        if prepared is not None:
+            _rollback_prepare_apply(prepared)
+        if exc.code == "conflict":
+            return self._incumbent_job(request, mgmt, exc, is_ajax=is_ajax)
+        if action == "apply" and exc.code == "apply_unexecutable":
+            msg = _stream_reason_message(
+                "Apply cannot execute the selected streams",
+                (exc.detail or {}).get("streams"),
+            )
+            if is_ajax:
+                return JsonResponse({"status": "error", "message": msg}, status=409)
+            messages.error(request, msg)
+            return redirect(_device_nso_tab_url(mgmt.device.pk))
+        if action == "apply" and exc.status_code == 503:
+            msg = "Apply stopped: deployment gate active. Nothing was applied."
+            if is_ajax:
+                return JsonResponse({"status": "error", "message": msg}, status=503)
+            messages.error(request, msg)
+            return redirect(_device_nso_tab_url(mgmt.device.pk))
+        if is_ajax:
+            return JsonResponse({"status": "error", "message": str(exc)}, status=502)
+        messages.error(request, f"Adapter error triggering {label}: {exc}")
+        return redirect(_device_nso_tab_url(mgmt.device.pk))
+
     def post(self, request, pk, action):
         """Fire the requested action against the nso-adapter and redirect back."""
         from . import adapter_client as client
@@ -2725,8 +2877,11 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
         # scopes (attrs/IP/SNMP/routing/L2), and here we force-commit the LACP +
         # switchport snapshots, which are owned in NetBox rather than mirrored in the
         # adapter. Accept itself only marks rows owned (no immediate device write).
+        prepared = None
+        selected = None
         try:
-            prepared = _prepare_apply(mgmt) if action == "apply" else None
+            if action == "apply":
+                prepared, selected = _prepare_apply(mgmt)
         except ApplyRefused as exc:
             logger.warning("Apply refused for device %s: %s", mgmt.device_id, exc)
             # CodeQL py/stack-trace-exposure: rebuild the wording from the refusal type, never
@@ -2738,7 +2893,12 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
             return redirect(_device_nso_tab_url(mgmt.device.pk))
 
         try:
-            result = action_fn(mgmt.adapter_device_id)
+            result = (
+                action_fn(mgmt.adapter_device_id, selected) if action == "apply" else action_fn(mgmt.adapter_device_id)
+            )
+            if action == "apply":
+                return self._apply_result(request, mgmt, result, prepared, label=label, is_ajax=is_ajax)
+
             job_id = result.get("job_id") if result else None
             if is_ajax:
                 return JsonResponse({"status": "ok", "job_id": job_id})
@@ -2750,13 +2910,15 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
             # The Apply never enqueued a job (adapter unreachable/500, or a conflict rejected
             # ours), so roll back the deploying marks THIS Apply made — otherwise the rows are
             # stuck 'applying' with nothing to ever settle them.
-            if prepared:
-                _rollback_prepare_apply(prepared)
-            if exc.code == "conflict":
-                return self._incumbent_job(request, mgmt, exc, is_ajax=is_ajax)
-            if is_ajax:
-                return JsonResponse({"status": "error", "message": str(exc)}, status=502)
-            messages.error(request, f"Adapter error triggering {label}: {exc}")
+            return self._adapter_error(
+                request,
+                mgmt,
+                exc,
+                prepared,
+                action=action,
+                label=label,
+                is_ajax=is_ajax,
+            )
 
         return redirect(_device_nso_tab_url(mgmt.device.pk))
 
@@ -3129,7 +3291,7 @@ class NSODeviceJobsView(LoginRequiredMixin, View):
     _TERMINAL = ("succeeded", "failed")
 
     def get(self, request, pk):
-        """Return {onboarded, running, last, blocked_removals} for the device's adapter jobs."""
+        """Return the device's adapter jobs and the requested Apply generation chain."""
         device = get_object_or_404(Device, pk=pk)
         mgmt = getattr(device, "nso_management", None)
         if mgmt is None or mgmt.adapter_device_id is None:
@@ -3138,6 +3300,8 @@ class NSODeviceJobsView(LoginRequiredMixin, View):
                     "onboarded": False,
                     "running": None,
                     "last": None,
+                    "jobs": [],
+                    "generations": [],
                     "blocked_removals": [],
                     "residue_removals": [],
                 }
@@ -3146,9 +3310,19 @@ class NSODeviceJobsView(LoginRequiredMixin, View):
         from . import adapter_client as client
 
         try:
+            generation_ids = {int(value) for value in request.GET.getlist("generation_id")}
+        except ValueError:
+            return JsonResponse({"error": "generation_id must be an integer"}, status=400)
+        try:
             jobs = client.list_jobs(mgmt.adapter_device_id)
+            generations = client.list_device_generations(mgmt.adapter_device_id) if generation_ids else []
         except AdapterError as exc:
             return JsonResponse({"error": str(exc)}, status=502)
+        generations = [row for row in generations if row.get("generation_id") in generation_ids]
+        serialized_jobs = jobs
+        if generation_ids:
+            generation_job_ids = {row.get("job_id") for row in generations if row.get("job_id") is not None}
+            serialized_jobs = [job for job in jobs if job.get("id") in generation_job_ids]
 
         # list_jobs is most-recent-first, so the first match in each bucket is newest.
         running = next((j for j in jobs if j.get("status") in self._ACTIVE), None)
@@ -3158,6 +3332,8 @@ class NSODeviceJobsView(LoginRequiredMixin, View):
                 "onboarded": True,
                 "running": running,
                 "last": last,
+                "jobs": serialized_jobs,
+                "generations": generations,
                 "blocked_removals": _blocked_removals(jobs),
                 "residue_removals": _residue_removals(jobs),
             }

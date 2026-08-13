@@ -1016,6 +1016,11 @@ def list_jobs(adapter_device_id):
     return _validated_jobs(_request("GET", "/api/v1/jobs", params={"device_id": adapter_device_id}), "jobs listing")
 
 
+def list_device_generations(adapter_device_id):
+    """GET /api/v1/devices/{id}/generations in ascending sequence order."""
+    return _request("GET", f"/api/v1/devices/{adapter_device_id}/generations")
+
+
 def get_settlement_feed(adapter_device_id, *, after_settle_seq, limit):
     """GET the device's ordered settlement feed → ``(jobs, store_incarnation)``.
 
@@ -1393,16 +1398,12 @@ def preflight_route_policy(
         return {"known": False, "fully_supported": True, "unsupported": [], "coverage_unknown": False}
 
 
-def trigger_apply(adapter_device_id, force=True):
-    """POST /api/v1/devices/{id}/actions/apply → job_id.
-
-    ``force=True`` (default) pushes all eligible attributes including in_sync.
-    Returns the job dict, or raises AdapterError on conflict (existing job running).
-    """
+def trigger_apply(adapter_device_id, selected):
+    """Promote the exact stored intent receipts named by a frozen selector."""
     return _request(
         "POST",
         f"/api/v1/devices/{adapter_device_id}/actions/apply",
-        json={"force": force},
+        json={"selected": dict(selected)},
     )
 
 
