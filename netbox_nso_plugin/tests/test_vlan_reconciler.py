@@ -506,10 +506,19 @@ class TestVlanApplyPush(_CascadeFlushMixin, IntentPushResetMixin, TransactionTes
             drain.drain_key(self.device.pk, "vlan")
         unforced.assert_not_called()
 
+        real_push_now = drain.push_now
+
+        def prepare_push(device_id, scope, **kwargs):
+            if scope == "vlan":
+                return real_push_now(device_id, scope, **kwargs)
+            return {"status": "deployed"}
+
         # Every other scope is isolated from the registry, so this asserts on the VLAN push
         # alone instead of relying on _prepare_apply swallowing the others' adapter failures.
         with (
             isolate_other_scopes("vlan"),
+            patch("netbox_nso_plugin.drain.push_now", side_effect=prepare_push),
+            patch("netbox_nso_plugin.drain.drain_key", return_value=drain.SUCCEEDED),
             patch("netbox_nso_plugin.adapter_client.put_vlan_intent", return_value={}) as mock_vlan,
         ):
             _prepare_apply(self.management)

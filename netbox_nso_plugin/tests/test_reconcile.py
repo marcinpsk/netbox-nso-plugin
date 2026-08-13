@@ -2,9 +2,9 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for the off-request reconcile job and the sync-complete callback endpoint."""
 
-import contextlib
 import os
 import threading
+from contextlib import contextmanager
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
@@ -28,21 +28,21 @@ def _make_device(name="rec-dev"):
     return Device.objects.create(name=name, device_type=dt, role=role, site=site)
 
 
-@contextlib.contextmanager
+@contextmanager
 def _patch_apply_pushes(answers=None):
-    """Double the forced claims the Apply takes, keyed by delivery scope.
+    """Double the forced preparation claims, keyed by delivery scope.
 
-    Apply routes SNMP through ``drain_key`` and every other scope through ``push_now``.
-    *answers* maps a scope to its answer. Every other scope answers ``None``.
+    Apply routes every scope except SNMP through ``drain.push_now``. SNMP uses
+    ``drain_key`` because its acknowledgement is an outcome. *answers* maps a scope to
+    the answer from ``push_now``. Every other required scope succeeds.
     """
     answers = answers or {}
-
-    def side_effect(device_id, scope, **kwargs):
-        return answers.get(scope)
-
     with (
-        patch("netbox_nso_plugin.drain.push_now", side_effect=side_effect) as push,
-        patch("netbox_nso_plugin.drain.drain_key", side_effect=side_effect),
+        patch(
+            "netbox_nso_plugin.drain.push_now",
+            side_effect=lambda device_id, scope, **kwargs: answers.get(scope, {"status": "deployed"}),
+        ) as push,
+        patch("netbox_nso_plugin.drain.drain_key", return_value="succeeded"),
     ):
         yield push
 
@@ -406,9 +406,11 @@ class TestEscalateStuckDeploying(APITestCase):
 
         mgmt, row = self._setup()
         jobs = [self._job(minutes_ago=30)]
+        # Empty list is the landed GET devices/{id}/generations list shape before any promotion.
         with (
             patch.object(reconcile, "reconcile_device", return_value={}),
             patch("netbox_nso_plugin.adapter_client.list_jobs", return_value=jobs),
+            patch("netbox_nso_plugin.adapter_client.list_device_generations", return_value=[]),
         ):
             reconcile.run_device_reconcile(mgmt.device_id)
         row.refresh_from_db()
@@ -424,9 +426,11 @@ class TestEscalateStuckDeploying(APITestCase):
             {"id": 901, "type": "apply", "status": "running", "updated_at": None, "result": None},
             self._job(minutes_ago=30),
         ]
+        # Empty list is the landed GET devices/{id}/generations list shape before any promotion.
         with (
             patch.object(reconcile, "reconcile_device", return_value={}),
             patch("netbox_nso_plugin.adapter_client.list_jobs", return_value=jobs),
+            patch("netbox_nso_plugin.adapter_client.list_device_generations", return_value=[]),
         ):
             reconcile.run_device_reconcile(mgmt.device_id)
         row.refresh_from_db()
