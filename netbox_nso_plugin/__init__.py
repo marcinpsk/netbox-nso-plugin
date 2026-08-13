@@ -15,6 +15,7 @@ class NSOPluginConfig(PluginConfig):
     base_url = "nso"
     min_version = "4.6.0"
     required_settings = []
+    middleware = ["netbox_nso_plugin.middleware.IntentDeploymentMiddleware"]
     default_settings = {
         "adapter_url": "",
         "adapter_token": "",
