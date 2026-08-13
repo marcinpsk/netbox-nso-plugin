@@ -545,11 +545,11 @@
     pass that backfills `route_id` into the adapter's store, and demotes a
     pre-existing `deploying` row to `accepted` so no result is owed for a
     generation that was never sent.
-  - **Not included: deletion semantics.** The removed-device arm — a push that lists
-    the dropped route in `deleted_route_ids` and an adapter tombstone marked
-    `delete_origin` — ships with the intent-outbox work and is still open. Until it
-    lands, a combined identity-plus-membership edit settles only the **retained**
-    device.
+  - **Per-object static-route deletion authority is active end to end.** The intent
+    outbox retains each removed route and its acknowledged identity until delivery.
+    Static-route pushes carry the authority in `deleted_routes`, the adapter records a
+    `delete_origin` tombstone, and its removal worker executes the networked retraction.
+    A combined identity and membership edit settles only the retained device.
 
 ### Added — operations
 
@@ -559,6 +559,13 @@
   connection, Apply — with client-side job polling and status strip.
 - REST API at `/api/plugins/nso/device-management/` consumed by the
   adapter's reconcile loop.
+- Deployment-window tooling for adapter store restores:
+  `nso_intent_deployment_gate` (`--prepare`/`--verify`/`--abort`) quiesces
+  plugin-side writes behind a durable gate while a restore runs, with mutating
+  HTTP requests answering 503 until the gate lifts, and `nso_intent_restore`
+  rebuilds the outbox from the adapter's replayed receipts: it advances the
+  push-seq and static-route pk namespaces past everything the store
+  acknowledged, clears delivery lineage, and resolves open claims.
 
 ### Changed
 
