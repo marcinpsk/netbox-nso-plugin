@@ -20,6 +20,7 @@ from django.test import SimpleTestCase, TestCase
 from .mixins import IntentPushResetMixin
 
 APP = "netbox_nso_plugin"
+PLUGIN = Path(__file__).resolve().parent.parent
 
 
 def _delivery_keys_at_the_push_sites() -> set[str]:
@@ -69,7 +70,7 @@ class TestDeliveryRegistry(SimpleTestCase):
         from netbox_nso_plugin.delivery import DeliveryKey, deliver
 
         fields = {f.name for f in dataclasses.fields(DeliveryKey)}
-        assert fields == {"key", "label", "in_protocol", "marking_mode", "push_name"}
+        assert fields == {"key", "section", "label", "in_protocol", "marking_mode", "push_name"}
         assert "mode" in inspect.signature(deliver).parameters
 
     def test_every_drift_scope_names_a_registered_delivery_key(self):
@@ -103,6 +104,29 @@ class TestDeliveryRegistry(SimpleTestCase):
 
         missing = [entry.push_name for entry in delivery_keys().values() if not hasattr(signals, entry.push_name)]
         assert missing == []
+
+    def test_receipt_sections_are_a_registry_fact(self):
+        from netbox_nso_plugin.delivery import delivery_keys
+
+        registry = delivery_keys()
+        assert registry["interface"].section == "interface_config"
+        assert {key: entry.section for key, entry in registry.items() if key != "interface"} == {
+            key: key for key in registry if key != "interface"
+        }
+
+    def test_no_production_reader_repeats_the_interface_receipt_literal(self):
+        offenders = []
+        for path in PLUGIN.rglob("*.py"):
+            if path.name == "delivery.py" or "tests" in path.parts or "migrations" in path.parts:
+                continue
+            literals = {
+                node.value
+                for node in ast.walk(ast.parse(path.read_text()))
+                if isinstance(node, ast.Constant) and isinstance(node.value, str)
+            }
+            if "interface_config" in literals:
+                offenders.append(path.relative_to(PLUGIN).as_posix())
+        assert offenders == [], f"receipt-section literals outside delivery.py: {offenders}"
 
 
 def _fixture(tag: str, adapter_device_id: int):

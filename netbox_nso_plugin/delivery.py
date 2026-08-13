@@ -44,6 +44,8 @@ class DeliveryKey:
     """One ``(device, scope)`` delivery key: how it is pushed, and under which contract."""
 
     key: str
+    #: The adapter receipt's section vocabulary. Only ``interface`` differs.
+    section: str
     label: str
     #: In protocol: carries ``X-Push-Seq``, is admitted against a receipt and can be replayed.
     in_protocol: bool
@@ -87,6 +89,7 @@ def _build() -> dict[str, DeliveryKey]:
     return {
         key: DeliveryKey(
             key=key,
+            section="interface_config" if key == "interface" else key,
             label=label,
             in_protocol=in_protocol,
             marking_mode=MARKING_PER_OBJECT if key == "static_route" else MARKING_QUERY_FLAG,

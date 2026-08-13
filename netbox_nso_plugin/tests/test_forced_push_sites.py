@@ -42,6 +42,13 @@ FORCED_PUSH_SITES = {
 #: The claim a forced push routes through is itself forced. It is not a push site, and it is
 #: named here so the exclusion cannot quietly widen to a module that is one.
 FORCED_CLAIM_SITE = ("drain.py", "_claim_or_wait", "claim")
+#: The deployment gate forms one known no-deletion claim, sends it, and verifies its exact
+#: receipt before it resumes mutation. It is an operator protocol, not a product push site.
+DEPLOYMENT_VERIFICATION_CLAIM_SITE = (
+    "nso_intent_deployment_gate.py",
+    "_verify",
+    "drain.claim",
+)
 
 
 def _forced_calls() -> collections.Counter:
@@ -85,6 +92,7 @@ class TestForcedPushSitesAreEnumerated(SimpleTestCase):
     def test_no_forced_call_exists_outside_the_enumeration(self):
         expected = collections.Counter(FORCED_PUSH_SITES)
         expected[FORCED_CLAIM_SITE] += 1
+        expected[DEPLOYMENT_VERIFICATION_CLAIM_SITE] += 1
         assert _forced_calls() == expected
         assert sum(FORCED_PUSH_SITES.values()) == 5
 

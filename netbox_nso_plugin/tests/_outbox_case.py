@@ -269,6 +269,9 @@ class ReceiptAdapter:
 
     def __init__(self, respond=None):
         self.receipts: dict[str, dict] = {}
+        self.receipt_reads: list[dict] = []
+        self.global_max_route_id: int | None = None
+        self.include_global_max_route_id = True
         self.applied: list[tuple[str, object]] = []
         self.requests: list[dict] = []
         self.replays = 0
@@ -367,6 +370,8 @@ class ReceiptAdapter:
             raise self.fail_with
         if any(f"/devices/{device_id}/" in url for device_id in self.fail_devices):
             raise requests.exceptions.ConnectionError(f"the far side refuses {url}")
+        if method == "GET" and url.endswith("/api/v1/intent-receipts"):
+            return self._serve_receipts(kwargs.get("params") or {})
         headers = kwargs.get("headers") or {}
         raw_seq = headers.get("X-Push-Seq")
         seq = int(raw_seq) if raw_seq is not None else None
@@ -396,8 +401,53 @@ class ReceiptAdapter:
         self.applied.append((url, body))
         self._apply_to_device(url, body, params)
         if seq is not None:
-            self.receipts[url] = {"push_seq": seq, "digest": digest, "response": response}
+            self.receipts[url] = {
+                "push_seq": seq,
+                "digest": digest,
+                "response": response,
+                "params": dict(params),
+            }
         return make_response(200, response)
+
+    def _serve_receipts(self, params):
+        """Serve the adapter's landed receipt JSON, including fleet-wide maxima."""
+        rows = []
+        for url, receipt in self.receipts.items():
+            found = _DEVICE_IN_URL.search(url)
+            if found is None:
+                continue
+            device_id = int(found.group(1))
+            if "/static-route-intent" in url:
+                section = "static_route"
+            elif "/vlan-intent" in url:
+                section = "vlan"
+            else:
+                continue
+            row = {
+                "device_id": device_id,
+                "section": section,
+                "push_seq": receipt["push_seq"],
+                "request_digest": receipt["digest"],
+                "store_only": receipt["params"].get("store_only") == "true",
+                "delete_origin": receipt["params"].get("delete_origin") == "true",
+                "backfill_only": receipt["params"].get("backfill_only") == "true",
+                "status_code": 200,
+                "response": receipt["response"],
+                "generation_id": None,
+                "created_at": "2026-08-12T00:00:00Z",
+                "updated_at": "2026-08-12T00:00:00Z",
+            }
+            if params.get("device_id") is not None and int(params["device_id"]) != device_id:
+                continue
+            if params.get("section") is not None and params["section"] != section:
+                continue
+            rows.append(row)
+        self.receipt_reads.append(dict(params))
+        maximum = max((receipt["push_seq"] for receipt in self.receipts.values()), default=None)
+        document = {"receipts": rows, "global_max_push_seq": maximum}
+        if self.include_global_max_route_id:
+            document["global_max_route_id"] = self.global_max_route_id
+        return make_response(200, document)
 
     def place(self, adapter_device_id: int, *members) -> None:
         """Seed what the device already carries, which a push may only narrow when marked."""

@@ -309,10 +309,11 @@ def reset_config_cache():
 class AdapterError(Exception):
     """Raised when the nso-adapter returns an error or is unreachable."""
 
-    def __init__(self, message, code=None, detail=None):
+    def __init__(self, message, code=None, detail=None, status_code=None):
         super().__init__(message)
         self.code = code
         self.detail = detail
+        self.status_code = status_code
 
 
 def _resolve_config() -> dict:
@@ -523,6 +524,7 @@ def _request_response(method, path, **kwargs):
             err.get("message") or resp.text,
             code=str(err.get("code") or resp.status_code),
             detail=detail if isinstance(detail, dict) else None,
+            status_code=resp.status_code,
         )
     return resp
 
@@ -634,6 +636,16 @@ def get_device(adapter_device_id):
 def list_devices():
     """GET /api/v1/devices — every device the adapter knows, across all NSO instances."""
     return _request("GET", "/api/v1/devices")
+
+
+def get_intent_receipts(*, device_id: int | None = None, section: str | None = None) -> dict:
+    """GET the adapter's per-key receipts and fleet-wide restore watermarks."""
+    params = {}
+    if device_id is not None:
+        params["device_id"] = int(device_id)
+    if section is not None:
+        params["section"] = section
+    return _request("GET", "/api/v1/intent-receipts", params=params)
 
 
 def get_interfaces(adapter_device_id):

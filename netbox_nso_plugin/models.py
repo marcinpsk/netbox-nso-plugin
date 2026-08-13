@@ -2824,3 +2824,14 @@ class NSOIntentOutboxState(models.Model):
 
     def __str__(self):
         return f"{self.device_id}/{self.scope}"
+
+
+class NSOIntentDeploymentControl(models.Model):
+    """The fleet-wide deployment quiescence switch, stored where every process sees it."""
+
+    id = models.PositiveSmallIntegerField(primary_key=True, default=1, editable=False)
+    quiesced_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        verbose_name = "NSO Intent Deployment Control"
+        verbose_name_plural = "NSO Intent Deployment Control"

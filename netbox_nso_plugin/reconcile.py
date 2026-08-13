@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import logging
 
+from .deployment import guarded as _deployment_guarded
+
 logger = logging.getLogger(__name__)
 
 
@@ -409,6 +411,7 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
         )
 
 
+@_deployment_guarded("reconcile")
 def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
     """Fetch adapter state for *device* and reconcile each opted-in scope.
 
@@ -650,6 +653,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
     return ctx
 
 
+@_deployment_guarded("reconcile")
 def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
     """Reconcile a SINGLE category and return its display context (for lazy expand).
 
