@@ -36,6 +36,9 @@ import time
 from django.db import IntegrityError, OperationalError, connection, transaction
 
 from . import delivery
+from .deployment import DeploymentQuiesced
+from .deployment import guarded as _deployment_guarded
+from .deployment import operation as _deployment_operation
 from .outbox import (
     OP_REVOKE,
     advance_push_seq,
@@ -1254,6 +1257,7 @@ def push_now(device_id, scope, *, mode=delivery.MODE_NORMAL, force=False, deadli
     return answer if outcome == SUCCEEDED else None
 
 
+@_deployment_guarded("intent drain")
 def _drain_once(
     device_id,
     scope,
@@ -1624,6 +1628,16 @@ def drain_intent_outbox(limit=None) -> tuple[int, int]:
     replayable failure is not drainable and would never be compacted otherwise, which is
     exactly the case where a burst accumulates.
     """
+    try:
+        with _deployment_operation("intent drain tick"):
+            return _drain_intent_outbox(limit)
+    except DeploymentQuiesced:
+        logger.info("the intent outbox tick is paused for a deployment")
+        return 0, 0
+
+
+def _drain_intent_outbox(limit=None) -> tuple[int, int]:
+    """Run one admitted tick after the deployment guard has accepted it."""
     compact_intent_outbox(limit)
 
     drained = failed = 0
@@ -1749,6 +1763,17 @@ def resolve_restored_claim(device_id, scope, receipt) -> str:
     if settle(restored, receipt.get("stored_response")) != SUCCEEDED:
         return RESTORE_FAILED_CLOSED
     return RESTORE_SETTLED
+
+
+def release_restored_replay(device_id, scope) -> None:
+    """Release the snapshot's stale lease so a replay verdict can run immediately."""
+    _refuse_in_transaction("restore")
+    with transaction.atomic():
+        state = _lock_state(device_id, scope)
+        if state.push_seq is None:
+            return
+        state.claimed_at = None
+        state.save(update_fields=["claimed_at"])
 
 
 def clear_acknowledged_lineage() -> int:
