@@ -14,6 +14,7 @@
 <link rel="stylesheet" href="{% static 'netbox_nso_plugin/nso.css' %}">
 <script src="{% static 'netbox_nso_plugin/nso-popedit.js' %}"></script>
 <script src="{% static 'netbox_nso_plugin/nso-badges.js' %}"></script>
+<script src="{% static 'netbox_nso_plugin/nso-apply-chain.js' %}"></script>
 {# Shared grid harness — badge vocabulary, per-cell Accept, inline-edit-owns, state #}
 {# pills. Must load before any lazy category fragment runs its column definitions. #}
 <script src="{% static 'netbox_nso_plugin/nso-grid.js' %}"></script>
@@ -555,6 +556,8 @@
     var jobUrlTemplate = statusArea.dataset.jobStatusUrl;
     var spinner = document.getElementById('nso-job-spinner');
     var messageEl = document.getElementById('nso-job-message');
+    var jobsArea = document.getElementById('nso-job-activity');
+    var deviceJobsUrl = jobsArea ? jobsArea.dataset.jobsUrl : null;
 
     function jobStatusUrl(jobId) { return jobUrlTemplate.replace('/0/', '/' + jobId + '/'); }
 
@@ -618,6 +621,90 @@
       }, 2000);
     }
 
+    function pollApplyChain(generations, label, notice) {
+      var expected = generations.length;
+      var headJobId = generations[0] && generations[0].job_id;
+      var interval = null;
+      var guard = window.NSOApplyChain && window.NSOApplyChain.createPollGuard
+        ? window.NSOApplyChain.createPollGuard()
+        : null;
+
+      function statusMessage(msg) {
+        return notice ? notice + ' ' + msg : msg;
+      }
+
+      function stop(msg, type, job) {
+        if (guard && !guard.stop()) return;
+        if (interval) clearInterval(interval);
+        setButtons(false);
+        setStatus(statusMessage(msg), type, false);
+        if (job) document.dispatchEvent(new CustomEvent('nso:refresh-categories'));
+      }
+
+      async function checkChain() {
+        if (!guard || !guard.enter()) return;
+        try {
+          var pollUrl = window.NSOApplyChain.pollUrl(deviceJobsUrl, generations);
+          var response = await fetch(pollUrl, { headers: { 'X-Requested-With': 'XMLHttpRequest' } });
+          if (!response.ok) { stop('Could not retrieve the Apply generation chain.', 'danger'); return; }
+          var payload = await response.json();
+          var jobs = payload.jobs || [];
+          if (!Array.isArray(payload.generations)) {
+            stop('Could not correlate the Apply chain: the adapter generation surface is unavailable.', 'warning');
+            return;
+          }
+          var correlation = window.NSOApplyChain.correlate(generations, payload.generations, jobs);
+          if (correlation.outcome === 'surface_gap') {
+            stop(
+              'Could not correlate the Apply chain: the adapter generation surface has a gap for requested generation(s): '
+                + correlation.missingGenerationIds.join(', ') + '.',
+              'warning'
+            );
+            return;
+          }
+          var links = correlation.links;
+          var failed = links.find(function (link) {
+            return link.generationStatus === 'failed' || link.generationStatus === 'outcome_unknown'
+              || (link.job && link.job.status === 'failed');
+          });
+          if (failed) {
+            var failedJob = failed.job;
+            var detail = failedJob ? formatApplyError(failedJob) : ('generation ' + failed.generationStatus);
+            var suffix = failedJob ? ' (Job #' + failedJob.id + ').' : '.';
+            stop(label + ' failed: ' + detail + suffix, 'danger', failedJob);
+            return;
+          }
+          var abandoned = links.find(function (link) { return link.generationStatus === 'abandoned'; });
+          if (abandoned) {
+            stop(label + ' stopped: generation ' + abandoned.generationId + ' was abandoned.', 'warning', abandoned.job);
+            return;
+          }
+          var allSettled = links.every(function (link) { return link.generationStatus === 'settled'; });
+          var jobIds = links.map(function (link) { return link.jobId; }).filter(function (id) { return id != null; });
+          if (allSettled) {
+            var jobText = jobIds.length ? ' (Jobs #' + jobIds.join(', #') + ')' : '';
+            stop(label + ' completed across ' + expected + ' generation(s)' + jobText + '.', 'success', links[links.length - 1].job);
+            return;
+          }
+          var waiting = links.some(function (link) { return link.jobId == null; }) ? ', waiting for the next chain job' : '';
+          if (guard.canWrite()) {
+            setStatus(statusMessage(label + ' running across ' + expected + ' generation(s)' + waiting + '.'), 'info', true);
+          }
+        } catch (error) {
+          stop('Polling error: ' + error.message, 'warning');
+        } finally {
+          guard.leave();
+        }
+      }
+
+      if (!deviceJobsUrl || !guard || headJobId == null) {
+        stop('Could not track the Apply generation chain.', 'danger');
+        return;
+      }
+      checkChain();
+      interval = setInterval(checkChain, 2000);
+    }
+
     async function runAction(form) {
       var label = form.dataset.label;
       setButtons(true); setStatus(label + ' triggered…', 'info', true);
@@ -629,12 +716,18 @@
         });
         var data = await r.json();
         if (data.status === 'error') { setStatus('Error: ' + data.message, 'danger', false); setButtons(false); }
+        else if (data.status === 'no_op') { setStatus(data.message, 'info', false); setButtons(false); }
         else if (data.status === 'conflict') {
           // S5a C (codex R1-F7): poll the INCUMBENT under its own name — never claim the
           // clicked action is running when it was rejected.
           var who = data.job_type ? ('Another job is already running: ' + data.job_type) : 'Another job is already running';
           if (data.job_id) { setStatus(who + ' — tracking it (Job #' + data.job_id + ').', 'warning', true); pollJob(data.job_id, data.job_type || 'Job'); }
           else { setStatus(who + '.', 'warning', false); setButtons(false); }
+        }
+        else if (data.generations && data.generations.length) {
+          var applyNotice = data.skipped && Object.keys(data.skipped).length ? data.message : '';
+          setStatus(applyNotice || (label + ' running across ' + data.generations.length + ' generation(s).'), 'info', true);
+          pollApplyChain(data.generations, label, applyNotice);
         }
         else if (data.job_id) { setStatus(label + ' running… (Job #' + data.job_id + ')', 'info', true); pollJob(data.job_id, label); }
         else { setStatus(label + ' triggered (no job to track).', 'success', false); setButtons(false); }

@@ -558,15 +558,27 @@ class TestLoggingLevelsApplyPush(_CascadeFlushMixin, IntentPushResetMixin, Trans
             drain.drain_key(self.device.pk, "logging")
         unforced.assert_not_called()
 
+        real_push_now = drain.push_now
+
+        def prepare_push(device_id, scope, **kwargs):
+            if scope == "logging":
+                return real_push_now(device_id, scope, **kwargs)
+            return {"status": "deployed"}
+
         with isolate_other_scopes("logging") as stack:
+            stack.enter_context(patch("netbox_nso_plugin.drain.push_now", side_effect=prepare_push))
+            stack.enter_context(patch("netbox_nso_plugin.drain.drain_key", return_value=drain.SUCCEEDED))
             mock_put = stack.enter_context(
                 patch("netbox_nso_plugin.adapter_client.put_logging_intent", return_value={})
             )
-            moved = _prepare_apply(self.mgmt)
+            moved, selected = _prepare_apply(self.mgmt)
 
         mock_put.assert_called_once()
         self.assertEqual(mock_put.call_args.args[2], {"console_severity": "CRITICAL"})
         self.row.refresh_from_db()
         self.assertEqual(self.row.status, "deploying")
-        moved_pks = [pk for model, pks in moved for pk in pks if model.__name__ == "NSOLoggingLevelState"]
+        moved_pks = [pk for stream, _model, pks in moved for pk in pks if stream == "logging"]
         self.assertIn(self.row.pk, moved_pks)
+        self.assertIn("logging", selected)
+        with self.assertRaises(TypeError):
+            selected["logging"] = 0

@@ -1357,19 +1357,19 @@ def _escalate_stuck_static_routes(mgmt, *, adapter_device_id, apply_active: bool
         )
 
 
+_TERMINAL_GENERATION_STATUSES = frozenset({"settled", "failed", "outcome_unknown", "abandoned"})
+
+
 def _apply_job_state(adapter_device_id) -> tuple[dict | None, bool]:
-    """Best-effort: (most recent terminal apply job, may an apply be in flight now).
+    """Best-effort: (most recent terminal apply job, may its generation chain be active).
 
-    One jobs fetch serves both the failure-settle (which needs the last terminal
-    apply's result) and the stuck-deploying escalation (which must stand down while
-    a new apply is in flight).
+    The jobs surface supplies the last apply result and visible queued or running work.
+    The generations surface covers the barrier interval after a head job finishes and
+    before its pending successor gets a job.
 
-    A probe that FAILED answers the second question with **True**, because it did not
-    answer it at all. Its only consumer is a fail-closed gate, and the two directions are
-    not symmetric: standing down costs one tick, while escalating a row whose Apply is
-    running is unrecoverable — the apply's own ``in_sync`` cannot lift a row back out of
-    ``apply_failed``. Reading an unreadable jobs list as "nothing is running" is the same
-    shape as trusting a drained feed the adapter never served.
+    A failed or malformed probe answers the second question with **True**, because it did
+    not answer it at all. Its only consumer is a fail-closed gate. Standing down costs one
+    tick, while escalating a row whose Apply is running is unrecoverable.
     """
     from . import adapter_client as client
 
@@ -1384,12 +1384,32 @@ def _apply_job_state(adapter_device_id) -> tuple[dict | None, bool]:
         return None, True
     last, active = None, False
     for job in jobs or []:
-        if job.get("type") != "apply":
-            continue
+        job_type = job.get("type")
         if job.get("status") in ("queued", "running"):
-            active = True
-        elif last is None and job.get("status") in ("succeeded", "failed"):
+            if job_type in ("apply", "removal"):
+                active = True
+        elif job_type == "apply" and last is None and job.get("status") in ("succeeded", "failed"):
             last = job
+    try:
+        generations = client.list_device_generations(adapter_device_id)
+    except Exception as exc:  # noqa: BLE001 (adapter transient; the gate fails closed)
+        logger.warning(
+            "nso reconcile: could not read adapter device %s's generations (%s), treating apply activity as unknown",
+            adapter_device_id,
+            exc,
+        )
+        return last, True
+    if not isinstance(generations, list):
+        logger.warning(
+            "nso reconcile: adapter device %s returned a malformed generations listing, "
+            "treating apply activity as unknown",
+            adapter_device_id,
+        )
+        return last, True
+    for generation in generations:
+        if not isinstance(generation, dict) or generation.get("status") not in _TERMINAL_GENERATION_STATUSES:
+            active = True
+            break
     return last, active
 
 
