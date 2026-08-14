@@ -13,9 +13,10 @@ failing head rotates to the back instead of occupying every pass.
 from __future__ import annotations
 
 import threading
+import time
 from unittest.mock import patch
 
-from django.db import connection, transaction
+from django.db import close_old_connections, connection, transaction
 from django.test import TransactionTestCase
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
@@ -120,6 +121,158 @@ class TestTheTickDrainsTheTail(_DrainCase):
         guarded_compact.assert_not_called()
         drain_key.assert_called_once_with(1, "vlan")
         restamp.assert_not_called()
+
+    def test_a_queued_exclusive_transition_stops_a_real_drain_between_keys(self):
+        from netbox_nso_plugin import deployment, drain, jobs
+
+        first, first_mgmt = self.managed("gatefirst", 7607, index=1, vid=907)
+        second, second_mgmt = self.managed("gatesecond", 7608, index=2, vid=908)
+        self.edit(first_mgmt)
+        self.edit(second_mgmt)
+
+        waiter_pid = []
+        waiter_errors = []
+        original_send = drain.send_claim
+        started_waiter = False
+
+        def request_quiesce():
+            close_old_connections()
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT pg_backend_pid()")
+                    waiter_pid.append(cursor.fetchone()[0])
+                deployment.quiesce()
+            except BaseException as exc:
+                waiter_errors.append(exc)
+            finally:
+                close_old_connections()
+
+        waiter = threading.Thread(target=request_quiesce)
+
+        def send_after_exclusive_queues(*args, **kwargs):
+            nonlocal started_waiter
+            if not started_waiter:
+                started_waiter = True
+                waiter.start()
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    if waiter_pid:
+                        with connection.cursor() as cursor:
+                            cursor.execute(
+                                "SELECT EXISTS (SELECT 1 FROM pg_locks "
+                                "WHERE pid = %s AND locktype = 'advisory' AND NOT granted)",
+                                [waiter_pid[0]],
+                            )
+                            if cursor.fetchone()[0]:
+                                break
+                    time.sleep(0.01)
+                else:
+                    self.fail("the exclusive transition did not queue during the first key")
+            return original_send(*args, **kwargs)
+
+        config, session = self.adapter.patches()
+        try:
+            with (
+                config,
+                session,
+                patch("netbox_nso_plugin.sync_cache._snapshot", return_value=([], {}, {})),
+                patch("netbox_nso_plugin.sync_cache.refresh_sync_caches", return_value=(0, 0)),
+                patch("netbox_nso_plugin.sync_cache.reconcile_device_links", return_value=(0, 0)),
+                patch("netbox_nso_plugin.settlement.sweep_static_route_settlements", return_value=(0, 0)),
+                patch.object(drain, "send_claim", side_effect=send_after_exclusive_queues),
+            ):
+                jobs.RefreshDeviceSyncCacheJob.run(None)
+            waiter.join(timeout=10)
+
+            self.assertFalse(waiter.is_alive(), "the exclusive transition did not finish")
+            self.assertEqual(waiter_errors, [])
+            self.assertEqual(len(self.adapter.requests), 1)
+            self.assertEqual(
+                sorted(bool(entries(device, "vlan", unconsumed=True)) for device in (first, second)),
+                [False, True],
+            )
+        finally:
+            if waiter.is_alive():
+                waiter.join(timeout=10)
+            if deployment.is_quiesced():
+                deployment.resume()
+
+    def test_the_maintenance_job_holds_the_deployment_lock_for_every_pass(self):
+        from netbox_nso_plugin import deployment, jobs
+
+        snapshot_started = threading.Event()
+        release_snapshot = threading.Event()
+        quiesce_finished = threading.Event()
+        waiter_pid = []
+        errors = []
+
+        def snapshot(rows):
+            snapshot_started.set()
+            release_snapshot.wait(10)
+            return [], {}, {}
+
+        def run_job():
+            close_old_connections()
+            try:
+                jobs.RefreshDeviceSyncCacheJob.run(None)
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                close_old_connections()
+
+        def request_quiesce():
+            close_old_connections()
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT pg_backend_pid()")
+                    waiter_pid.append(cursor.fetchone()[0])
+                deployment.quiesce()
+                quiesce_finished.set()
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                close_old_connections()
+
+        with (
+            patch("netbox_nso_plugin.sync_cache._snapshot", side_effect=snapshot),
+            patch("netbox_nso_plugin.sync_cache.refresh_sync_caches", return_value=(0, 0)),
+            patch("netbox_nso_plugin.sync_cache.reconcile_device_links", return_value=(0, 0)),
+            patch("netbox_nso_plugin.drain.drain_intent_outbox", return_value=(0, 0)),
+            patch("netbox_nso_plugin.settlement.sweep_static_route_settlements", return_value=(0, 0)),
+        ):
+            worker = threading.Thread(target=run_job)
+            waiter = threading.Thread(target=request_quiesce)
+            worker.start()
+            self.assertTrue(snapshot_started.wait(5), "the maintenance job did not reach its snapshot")
+            waiter.start()
+
+            deadline = time.monotonic() + 5
+            queued = False
+            while time.monotonic() < deadline:
+                if waiter_pid:
+                    with connection.cursor() as cursor:
+                        cursor.execute(
+                            "SELECT EXISTS (SELECT 1 FROM pg_locks "
+                            "WHERE pid = %s AND locktype = 'advisory' AND NOT granted)",
+                            [waiter_pid[0]],
+                        )
+                        queued = cursor.fetchone()[0]
+                if queued or quiesce_finished.is_set():
+                    break
+                time.sleep(0.01)
+
+            release_snapshot.set()
+            worker.join(timeout=10)
+            waiter.join(timeout=10)
+
+        try:
+            self.assertTrue(queued, "the maintenance job did not hold the deployment lock")
+            self.assertFalse(worker.is_alive(), "the maintenance job did not finish")
+            self.assertFalse(waiter.is_alive(), "the exclusive transition did not finish")
+            self.assertEqual(errors, [])
+        finally:
+            if deployment.is_quiesced():
+                deployment.resume()
 
     def test_outage_compaction_respects_the_gate_and_the_normal_tick_still_runs(self):
         from netbox_nso_plugin import jobs

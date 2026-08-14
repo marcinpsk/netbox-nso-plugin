@@ -1639,15 +1639,21 @@ def drain_intent_outbox(limit=None) -> tuple[int, int]:
     """
     try:
         with _deployment_operation("intent drain tick"):
-            return _drain_intent_outbox(limit)
+            pass
     except DeploymentQuiesced:
         logger.info("the intent outbox tick is paused for a deployment")
         return 0, 0
+    return _drain_intent_outbox(limit)
 
 
 def _drain_intent_outbox(limit=None) -> tuple[int, int]:
-    """Run one admitted tick after the deployment guard has accepted it."""
-    _compact_intent_outbox(limit)
+    """Run one tick with a new deployment admission for each bounded stage."""
+    try:
+        with _deployment_operation("intent outbox compaction"):
+            _compact_intent_outbox(limit)
+    except DeploymentQuiesced:
+        logger.info("the intent outbox tick stopped because a deployment started")
+        return 0, 0
 
     drained = failed = 0
     for device_id, scope in drain_candidates(limit):
