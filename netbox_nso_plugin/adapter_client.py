@@ -122,6 +122,7 @@ _CONNECT_TIMEOUT = 5  # seconds
 # The live store incarnation, served on the job collection's 200s. Named once here so the
 # consumer and the adapter cannot drift on the spelling.
 STORE_INCARNATION_HEADER = "X-Store-Incarnation"
+_GENERATION_PAGE_LIMIT = 500
 
 # Process-wide pooled session, reused across calls so connections to the (internal)
 # adapter are kept alive instead of a fresh TCP+TLS handshake per request. Keyed by the
@@ -1017,11 +1018,24 @@ def list_jobs(adapter_device_id):
 
 
 def list_device_generations(adapter_device_id):
-    """GET /api/v1/devices/{id}/generations in ascending sequence order."""
-    generations = _request("GET", f"/api/v1/devices/{adapter_device_id}/generations")
-    if not isinstance(generations, list) or any(not isinstance(row, dict) for row in generations):
-        raise AdapterError("Adapter returned a malformed generations listing.", code="invalid_response")
-    return generations
+    """GET every ascending generation page for one device."""
+    generations = []
+    last_seq = None
+    while True:
+        params = {"limit": _GENERATION_PAGE_LIMIT}
+        if last_seq is not None:
+            params["since_seq"] = last_seq
+        page = _request("GET", f"/api/v1/devices/{adapter_device_id}/generations", params=params)
+        if not isinstance(page, list) or any(not isinstance(row, dict) for row in page):
+            raise AdapterError("Adapter returned a malformed generations listing.", code="invalid_response")
+        for row in page:
+            seq = row.get("seq")
+            if type(seq) is not int or (last_seq is not None and seq <= last_seq):
+                raise AdapterError("Adapter returned a malformed generations listing.", code="invalid_response")
+            last_seq = seq
+        generations.extend(page)
+        if len(page) < _GENERATION_PAGE_LIMIT:
+            return generations
 
 
 def get_settlement_feed(adapter_device_id, *, after_settle_seq, limit):

@@ -782,6 +782,28 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_device_generations_reads_every_ascending_page(self, mock_s, _cfg):
+        from netbox_nso_plugin.adapter_client import list_device_generations
+
+        first_page = [{"generation_id": seq, "seq": seq} for seq in range(1, 501)]
+        final_page = [{"generation_id": 501, "seq": 501}]
+        session = make_session()
+        session.request.side_effect = [
+            make_response(200, first_page),
+            make_response(200, final_page),
+        ]
+        mock_s.return_value = session
+
+        generations = list_device_generations(5)
+
+        self.assertEqual([row["seq"] for row in generations], list(range(1, 502)))
+        self.assertEqual(
+            [call.kwargs["params"] for call in session.request.call_args_list],
+            [{"limit": 500}, {"limit": 500, "since_seq": 500}],
+        )
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_put_intent(self, mock_s, _cfg):
         from netbox_nso_plugin.adapter_client import put_intent
 
