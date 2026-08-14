@@ -3423,9 +3423,18 @@ class NSODeviceJobsView(LoginRequiredMixin, View):
             generation_ids = {int(value) for value in request.GET.getlist("generation_id")}
         except ValueError:
             return JsonResponse({"error": "generation_id must be an integer"}, status=400)
+        raw_since_seq = request.GET.get("since_seq")
+        try:
+            since_seq = None if raw_since_seq is None else int(raw_since_seq)
+        except ValueError:
+            return JsonResponse({"error": "since_seq must be an integer"}, status=400)
+        if since_seq is not None and since_seq < 0:
+            return JsonResponse({"error": "since_seq must be non-negative"}, status=400)
         try:
             jobs = client.list_jobs(mgmt.adapter_device_id)
-            generations = client.list_device_generations(mgmt.adapter_device_id) if generation_ids else []
+            generations = (
+                client.list_device_generations(mgmt.adapter_device_id, since_seq=since_seq) if generation_ids else []
+            )
         except AdapterError as exc:
             return JsonResponse({"error": str(exc)}, status=502)
         generations = [row for row in generations if row.get("generation_id") in generation_ids]
