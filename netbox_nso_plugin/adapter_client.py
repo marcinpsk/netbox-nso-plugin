@@ -1018,7 +1018,10 @@ def list_jobs(adapter_device_id):
 
 def list_device_generations(adapter_device_id):
     """GET /api/v1/devices/{id}/generations in ascending sequence order."""
-    return _request("GET", f"/api/v1/devices/{adapter_device_id}/generations")
+    generations = _request("GET", f"/api/v1/devices/{adapter_device_id}/generations")
+    if not isinstance(generations, list) or any(not isinstance(row, dict) for row in generations):
+        raise AdapterError("Adapter returned a malformed generations listing.", code="invalid_response")
+    return generations
 
 
 def get_settlement_feed(adapter_device_id, *, after_settle_seq, limit):

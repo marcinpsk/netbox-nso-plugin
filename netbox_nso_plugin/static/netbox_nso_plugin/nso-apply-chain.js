@@ -74,5 +74,28 @@
     };
   }
 
-  window.NSOApplyChain = { correlate: correlate, pollUrl: pollUrl, createPollGuard: createPollGuard };
+  function createPollTimer(tick, delay, schedule, cancel) {
+    var interval = null;
+    var setTimer = schedule || window.setInterval.bind(window);
+    var clearTimer = cancel || window.clearInterval.bind(window);
+
+    return {
+      start: function () {
+        interval = setTimer(tick, delay);
+        tick();
+      },
+      stop: function () {
+        if (interval == null) return;
+        clearTimer(interval);
+        interval = null;
+      },
+    };
+  }
+
+  window.NSOApplyChain = {
+    correlate: correlate,
+    pollUrl: pollUrl,
+    createPollGuard: createPollGuard,
+    createPollTimer: createPollTimer,
+  };
 })();

@@ -1399,15 +1399,8 @@ def _apply_job_state(adapter_device_id) -> tuple[dict | None, bool]:
             exc,
         )
         return last, True
-    if not isinstance(generations, list):
-        logger.warning(
-            "nso reconcile: adapter device %s returned a malformed generations listing, "
-            "treating apply activity as unknown",
-            adapter_device_id,
-        )
-        return last, True
     for generation in generations:
-        if not isinstance(generation, dict) or generation.get("status") not in _TERMINAL_GENERATION_STATUSES:
+        if generation.get("status") not in _TERMINAL_GENERATION_STATUSES:
             active = True
             break
     return last, active

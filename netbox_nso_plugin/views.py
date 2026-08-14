@@ -2536,7 +2536,7 @@ def _direct_prepare_failure_message(entry, applied_labels, failure) -> str:
     )
 
 
-def _push_direct_snapshots(mgmt, registry) -> None:
+def _push_direct_snapshots(mgmt, registry, remaining_budget) -> None:
     """Force-push the out-of-protocol device snapshots, last, and abort truthfully.
 
     These are synchronous device writes with no rollback, so they run only after every
@@ -2547,11 +2547,22 @@ def _push_direct_snapshots(mgmt, registry) -> None:
     applied_direct_labels = []
     for entry in (candidate for candidate in registry.values() if not candidate.in_protocol):
         try:
+            deadline = remaining_budget()
+        except ApplyRefused as exc:
+            raise ApplyRefused(
+                _direct_prepare_failure_message(
+                    entry,
+                    applied_direct_labels,
+                    "did not start before the preparation deadline expired",
+                )
+            ) from exc
+        try:
             response = drain.push_now(
                 mgmt.device_id,
                 entry.key,
                 mode=delivery.MODE_NORMAL,
                 force=True,
+                deadline=deadline,
             )
         except Exception as exc:  # noqa: BLE001 (the direct write may already have happened)
             logger.warning("Apply direct push failed for device %s: %s", mgmt.device_id, exc)
@@ -2675,12 +2686,12 @@ def _prepare_apply(mgmt):
                 "Nothing was applied and no row was promoted."
             )
 
-        _push_direct_snapshots(mgmt, registry)
+        _push_direct_snapshots(mgmt, registry, remaining_budget)
 
     selected = MappingProxyType({registry[scope].section: push_seq for scope, push_seq in pushed.items()})
 
-    moved: list[tuple] = []  # (stream, model, [pks]) actually moved, for selective rollback
-    for stream, model in (
+    moved: list[tuple] = []  # (adapter section, model, [pks]) actually moved, for selective rollback
+    for scope, model in (
         ("vlan", NSOVLANState),
         ("svi", NSOSVIState),
         ("subinterface", NSOSubinterfaceState),
@@ -2699,10 +2710,11 @@ def _prepare_apply(mgmt):
             )
             continue
         try:
+            section = registry[scope].section
             pks = list(model.objects.filter(management=mgmt, status="accepted").values_list("pk", flat=True))
             if pks:
                 model.objects.filter(pk__in=pks).update(status="deploying")
-                moved.append((stream, model, pks))
+                moved.append((section, model, pks))
         except Exception as exc:  # noqa: BLE001
             logger.warning("Apply deploying-mark failed for device %s: %s", mgmt.device_id, exc)
     return moved, selected
@@ -2717,8 +2729,8 @@ def _rollback_prepare_apply(moved, *, keep_streams=()) -> None:
     with no apply job would strand it as 'applying' forever (nothing settles it).
     """
     keep_streams = set(keep_streams)
-    for stream, model, pks in moved or []:
-        if stream in keep_streams:
+    for section, model, pks in moved or []:
+        if section in keep_streams:
             continue
         try:
             model.objects.filter(pk__in=pks, status="deploying").update(status="accepted")
@@ -2800,7 +2812,17 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
         _rollback_prepare_apply(prepared, keep_streams=promoted_streams)
         job_id = next((link.get("job_id") for link in generations if link.get("job_id") is not None), None)
         if job_id is None:
-            raise AdapterError("Adapter promoted Apply without a queued head job.", code="invalid_response")
+            msg = (
+                f"Apply promoted {len(generations)} generation(s), but the adapter reported no queued head job. "
+                "The promoted rows remain applying until a result settles them."
+            )
+            if is_ajax:
+                return JsonResponse(
+                    {"status": "error", "message": msg, "generations": generations},
+                    status=502,
+                )
+            messages.error(request, msg)
+            return redirect(_device_nso_tab_url(mgmt.device.pk))
         skipped = result.get("skipped") or {}
         msg = f"{label} triggered. Tracking {len(generations)} generation(s) from Job ID {job_id}."
         if skipped:

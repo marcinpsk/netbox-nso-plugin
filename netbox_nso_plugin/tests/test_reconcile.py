@@ -437,6 +437,19 @@ class TestEscalateStuckDeploying(APITestCase):
         self.assertEqual(row.status, "deploying")
 
 
+class TestSettlementAdapterContract(_SettlementCase):
+    """The real-socket settlement double rejects unknown adapter devices."""
+
+    def test_unknown_device_generations_return_not_found(self):
+        from netbox_nso_plugin.adapter_client import AdapterError, list_device_generations
+
+        with self.assertRaises(AdapterError) as raised:
+            list_device_generations(404)
+
+        self.assertEqual(raised.exception.status_code, 404)
+        self.assertEqual(raised.exception.code, "not_found")
+
+
 def _during_settlement(action):
     """Run *action* inside Step 4's ``settle_static_routes`` call, before it locks the row.
 

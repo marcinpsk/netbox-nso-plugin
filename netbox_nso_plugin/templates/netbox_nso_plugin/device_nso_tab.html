@@ -624,10 +624,10 @@
     function pollApplyChain(generations, label, notice) {
       var expected = generations.length;
       var headJobId = generations[0] && generations[0].job_id;
-      var interval = null;
       var guard = window.NSOApplyChain && window.NSOApplyChain.createPollGuard
         ? window.NSOApplyChain.createPollGuard()
         : null;
+      var timer = window.NSOApplyChain.createPollTimer(checkChain, 2000);
 
       function statusMessage(msg) {
         return notice ? notice + ' ' + msg : msg;
@@ -635,7 +635,7 @@
 
       function stop(msg, type, job) {
         if (guard && !guard.stop()) return;
-        if (interval) clearInterval(interval);
+        timer.stop();
         setButtons(false);
         setStatus(statusMessage(msg), type, false);
         if (job) document.dispatchEvent(new CustomEvent('nso:refresh-categories'));
@@ -701,8 +701,7 @@
         stop('Could not track the Apply generation chain.', 'danger');
         return;
       }
-      checkChain();
-      interval = setInterval(checkChain, 2000);
+      timer.start();
     }
 
     async function runAction(form) {

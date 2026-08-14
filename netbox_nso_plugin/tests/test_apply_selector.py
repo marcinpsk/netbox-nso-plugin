@@ -226,6 +226,26 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "deploying")
 
+    def test_promoted_apply_without_a_job_keeps_promoted_rows_deploying(self):
+        def promoted_without_job(selected):
+            result = _promoted(selected)
+            for generation in result["generations"]:
+                generation["job_id"] = None
+            return result
+
+        adapter = _ApplyContractAdapter(lambda selected: (202, promoted_without_job(selected)))
+
+        response = self._post(adapter)
+
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["status"], "error")
+        self.vlan_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "deploying")
+        self.assertEqual(
+            response.json()["generations"],
+            promoted_without_job(adapter.apply_requests[0]["selected"])["generations"],
+        )
+
     def test_apply_selects_the_stored_isis_receipt_from_the_delivery_registry(self):
         from netbox_nso_plugin.models import NSOISISInterfaceState
 
@@ -272,6 +292,24 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertEqual(response.json()["status"], "error")
         self.assertIn("IS-IS", response.json()["message"])
         self.assertTrue(any(url.endswith("/vlan-intent") for url in adapter.receipts))
+        self.assertEqual(adapter.apply_requests, [])
+        self.vlan_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "accepted")
+
+    def test_shared_deadline_expiry_mid_selector_loop_promotes_nothing(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        adapter = _ApplyContractAdapter(lambda selected: (202, _promoted(selected)))
+        clock = SimpleNamespace(monotonic=lambda: 121 if adapter.receipts else 0)
+
+        with patch("netbox_nso_plugin.views.time", clock):
+            response = self._post(adapter)
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("deadline expired", response.json()["message"])
+        self.assertEqual(len(adapter.receipts), 1)
+        self.assertEqual(adapter.direct_requests, [])
         self.assertEqual(adapter.apply_requests, [])
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "accepted")
@@ -324,6 +362,27 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertEqual(
             [url.rsplit("/devices/1558/", 1)[-1] for url in adapter.direct_requests],
             ["lag-config/apply", "switchport/apply"],
+        )
+        self.assertEqual(adapter.apply_requests, [])
+        self.vlan_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "accepted")
+
+    def test_direct_snapshots_share_the_apply_preparation_deadline(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        adapter = _ApplyContractAdapter(lambda selected: (202, _promoted(selected)))
+        clock = SimpleNamespace(monotonic=lambda: 121 if adapter.direct_requests else 0)
+
+        with patch("netbox_nso_plugin.views.time", clock):
+            response = self._post(adapter)
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("LACP", response.json()["message"])
+        self.assertIn("did not start before the preparation deadline expired", response.json()["message"])
+        self.assertEqual(
+            [url.rsplit("/devices/1558/", 1)[-1] for url in adapter.direct_requests],
+            ["lag-config/apply"],
         )
         self.assertEqual(adapter.apply_requests, [])
         self.vlan_state.refresh_from_db()
@@ -394,6 +453,52 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         for stream, reason in skipped.items():
             self.assertIn(stream, result["message"])
             self.assertIn(reason, result["message"])
+        self.vlan_state.refresh_from_db()
+        logging_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "accepted")
+        self.assertEqual(logging_state.status, "deploying")
+
+    def test_selective_rollback_uses_the_registry_section_vocabulary(self):
+        from dataclasses import replace
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOLoggingLevelState
+
+        with without_commit_drain(), transaction.atomic():
+            logging_state = NSOLoggingLevelState.objects.create(
+                management=self.mgmt,
+                console_severity="warning",
+                status="accepted",
+            )
+        registry = delivery.delivery_keys()
+        logging = replace(registry["logging"], section="system_logging")
+
+        def promoted_logging(selected):
+            return {
+                "device_id": 1558,
+                "outcome": "promoted",
+                "selected": selected,
+                "skipped": {stream: "no_receipt" for stream in selected if stream != logging.section},
+                "generations": [
+                    {
+                        "generation_id": 81,
+                        "seq": 4,
+                        "job_id": 501,
+                        "mode": "networked",
+                        "source_push_seq": {logging.section: selected[logging.section]},
+                        "stream_revisions": {logging.section: 7},
+                        "digest": "a" * 64,
+                    }
+                ],
+            }
+
+        adapter = _ApplyContractAdapter(lambda selected: (202, promoted_logging(selected)))
+        with patch.dict(registry, {"logging": logging}):
+            response = self._post(adapter)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(logging.section, adapter.apply_requests[0]["selected"])
         self.vlan_state.refresh_from_db()
         logging_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "accepted")
