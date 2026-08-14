@@ -2763,12 +2763,17 @@ def _apply_stream_partition(result, selected):
     return expected_selected, skipped, None
 
 
+_APPLY_GENERATION_FIELDS = frozenset(
+    {"generation_id", "seq", "job_id", "mode", "source_push_seq", "stream_revisions", "digest"}
+)
+
+
 def _promoted_stream_coverage(generations, expected_selected, skipped):
     """Return the promoted stream union when every generation proves its selector."""
     promoted_streams = set()
     previous_seq = None
     for link in generations:
-        if not isinstance(link, dict):
+        if not isinstance(link, dict) or not _APPLY_GENERATION_FIELDS.issubset(link):
             return None, "Adapter returned an invalid Apply generation."
         generation_id = link.get("generation_id")
         seq = link.get("seq")
@@ -2891,11 +2896,11 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
         promoted_streams, coverage_error = _promoted_stream_coverage(generations, expected_selected, skipped)
         if coverage_error:
             return self._apply_unreadable_response(request, mgmt, coverage_error, is_ajax=is_ajax)
-        _rollback_prepare_apply(prepared, keep_streams=promoted_streams)
-        job_id = next((link.get("job_id") for link in generations if link.get("job_id") is not None), None)
-        if job_id is None:
+        job_id = generations[0]["job_id"]
+        response_job_id = result.get("job_id")
+        if job_id is None or type(response_job_id) is not int or response_job_id != job_id:
             msg = (
-                f"Apply promoted {len(generations)} generation(s), but the adapter reported no queued head job. "
+                f"Apply promoted {len(generations)} generation(s), but the adapter reported an invalid head job. "
                 "The promoted rows remain applying until a result settles them."
             )
             if is_ajax:
@@ -2905,6 +2910,7 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
                 )
             messages.error(request, msg)
             return redirect(_device_nso_tab_url(mgmt.device.pk))
+        _rollback_prepare_apply(prepared, keep_streams=promoted_streams)
         msg = f"{label} triggered. Tracking {len(generations)} generation(s) from Job ID {job_id}."
         if skipped:
             msg = f"{msg} {_stream_reason_message('Skipped streams', skipped)}"

@@ -41,6 +41,7 @@ def _promoted(selected):
     return {
         "device_id": 1558,
         "outcome": "promoted",
+        "job_id": 501,
         "selected": selected,
         "skipped": {},
         "generations": [
@@ -229,6 +230,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
     def test_promoted_apply_without_a_job_keeps_promoted_rows_deploying(self):
         def promoted_without_job(selected):
             result = _promoted(selected)
+            result["job_id"] = None
             for generation in result["generations"]:
                 generation["job_id"] = None
             return result
@@ -245,6 +247,32 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             response.json()["generations"],
             promoted_without_job(adapter.apply_requests[0]["selected"])["generations"],
         )
+
+    def test_malformed_generation_job_chains_keep_prepared_rows_deploying(self):
+        def missing_successor_job(selected):
+            result = _promoted(selected)
+            result["generations"][1].pop("job_id")
+            return result
+
+        def successor_claims_the_head_job(selected):
+            result = _promoted(selected)
+            result["generations"][0]["job_id"] = None
+            result["generations"][1]["job_id"] = 501
+            return result
+
+        def mismatched_response_job(selected):
+            result = _promoted(selected)
+            result["job_id"] = 502
+            return result
+
+        for malformed in (missing_successor_job, successor_claims_the_head_job, mismatched_response_job):
+            with self.subTest(malformed=malformed.__name__):
+                type(self.vlan_state).objects.filter(pk=self.vlan_state.pk).update(status="accepted")
+                response = self._post(_ApplyContractAdapter(lambda selected: (202, malformed(selected))))
+
+                self.assertEqual(response.status_code, 502)
+                self.vlan_state.refresh_from_db()
+                self.assertEqual(self.vlan_state.status, "deploying")
 
     def test_malformed_success_responses_keep_potentially_promoted_rows_deploying(self):
         malformed = (
@@ -499,6 +527,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             return {
                 "device_id": 1558,
                 "outcome": "promoted",
+                "job_id": 501,
                 "selected": selected,
                 "skipped": {
                     stream: "superseded" if stream == "vlan" else "no_receipt"
@@ -554,6 +583,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             return {
                 "device_id": 1558,
                 "outcome": "promoted",
+                "job_id": 501,
                 "selected": selected,
                 "skipped": {stream: "no_receipt" for stream in selected if stream != logging.section},
                 "generations": [
