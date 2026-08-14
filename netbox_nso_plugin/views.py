@@ -2780,10 +2780,22 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
         messages.warning(request, msg)
         return redirect(_device_nso_tab_url(mgmt.device.pk))
 
+    def _apply_unreadable_response(self, request, mgmt, message, *, is_ajax):
+        """Report an unreadable successful Apply response without reverting promoted rows."""
+        logger.error(
+            "Adapter accepted Apply for device %s but returned an unreadable response: %s", mgmt.device_id, message
+        )
+        if is_ajax:
+            return JsonResponse({"status": "error", "message": message}, status=502)
+        messages.error(request, message)
+        return redirect(_device_nso_tab_url(mgmt.device.pk))
+
     def _apply_result(self, request, mgmt, result, prepared, *, label, is_ajax):
         """Surface one successful Apply response and its complete generation chain."""
         if not isinstance(result, dict):
-            raise AdapterError("Adapter returned an invalid Apply response.", code="invalid_response")
+            return self._apply_unreadable_response(
+                request, mgmt, "Adapter returned an invalid Apply response.", is_ajax=is_ajax
+            )
         outcome = result.get("outcome")
         if outcome == "no_op":
             _rollback_prepare_apply(prepared)
@@ -2800,14 +2812,20 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
             messages.info(request, msg)
             return redirect(_device_nso_tab_url(mgmt.device.pk))
         if outcome != "promoted":
-            raise AdapterError("Adapter returned an invalid Apply outcome.", code="invalid_response")
+            return self._apply_unreadable_response(
+                request, mgmt, "Adapter returned an invalid Apply outcome.", is_ajax=is_ajax
+            )
         generations = result.get("generations")
         if not isinstance(generations, list) or not generations:
-            raise AdapterError("Adapter promoted Apply without a generation chain.", code="invalid_response")
+            return self._apply_unreadable_response(
+                request, mgmt, "Adapter promoted Apply without a generation chain.", is_ajax=is_ajax
+            )
         promoted_streams = set()
         for link in generations:
             if not isinstance(link, dict) or not isinstance(link.get("stream_revisions"), dict):
-                raise AdapterError("Adapter returned an invalid Apply generation.", code="invalid_response")
+                return self._apply_unreadable_response(
+                    request, mgmt, "Adapter returned an invalid Apply generation.", is_ajax=is_ajax
+                )
             promoted_streams.update(link["stream_revisions"])
         _rollback_prepare_apply(prepared, keep_streams=promoted_streams)
         job_id = next((link.get("job_id") for link in generations if link.get("job_id") is not None), None)
@@ -2847,9 +2865,10 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
         if exc.code == "conflict":
             return self._incumbent_job(request, mgmt, exc, is_ajax=is_ajax)
         if action == "apply" and exc.code == "apply_unexecutable":
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
             msg = _stream_reason_message(
                 "Apply cannot execute the selected streams",
-                (exc.detail or {}).get("streams"),
+                detail.get("streams"),
             )
             if is_ajax:
                 return JsonResponse({"status": "error", "message": msg}, status=409)

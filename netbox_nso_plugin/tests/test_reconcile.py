@@ -436,6 +436,44 @@ class TestEscalateStuckDeploying(APITestCase):
         row.refresh_from_db()
         self.assertEqual(row.status, "deploying")
 
+    def test_stale_nonterminal_generation_does_not_mask_the_current_terminal_cohort(self):
+        from netbox_nso_plugin import reconcile
+
+        mgmt, row = self._setup()
+        jobs = [self._job(minutes_ago=30)]
+        generations = [
+            {"generation_id": 81, "seq": 4, "status": "pending", "settlement_cohort": 70},
+            {"generation_id": 82, "seq": 5, "status": "settled", "settlement_cohort": 71},
+        ]
+        with (
+            patch.object(reconcile, "reconcile_device", return_value={}),
+            patch("netbox_nso_plugin.adapter_client.list_jobs", return_value=jobs),
+            patch("netbox_nso_plugin.adapter_client.list_device_generations", return_value=generations),
+        ):
+            reconcile.run_device_reconcile(mgmt.device_id)
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, "apply_failed")
+
+    def test_nonterminal_member_of_the_current_cohort_keeps_escalation_stood_down(self):
+        from netbox_nso_plugin import reconcile
+
+        mgmt, row = self._setup()
+        jobs = [self._job(minutes_ago=30)]
+        generations = [
+            {"generation_id": 81, "seq": 4, "status": "running", "settlement_cohort": 71},
+            {"generation_id": 82, "seq": 5, "status": "settled", "settlement_cohort": 71},
+        ]
+        with (
+            patch.object(reconcile, "reconcile_device", return_value={}),
+            patch("netbox_nso_plugin.adapter_client.list_jobs", return_value=jobs),
+            patch("netbox_nso_plugin.adapter_client.list_device_generations", return_value=generations),
+        ):
+            reconcile.run_device_reconcile(mgmt.device_id)
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, "deploying")
+
 
 class TestSettlementAdapterContract(_SettlementCase):
     """The real-socket settlement double rejects unknown adapter devices."""

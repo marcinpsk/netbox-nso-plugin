@@ -246,6 +246,25 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             promoted_without_job(adapter.apply_requests[0]["selected"])["generations"],
         )
 
+    def test_malformed_success_responses_keep_potentially_promoted_rows_deploying(self):
+        malformed = (
+            {"device_id": 1558, "outcome": "unexpected"},
+            {"device_id": 1558, "outcome": "promoted", "generations": []},
+            {
+                "device_id": 1558,
+                "outcome": "promoted",
+                "generations": [{"job_id": 501, "stream_revisions": []}],
+            },
+        )
+        for result in malformed:
+            with self.subTest(result=result):
+                type(self.vlan_state).objects.filter(pk=self.vlan_state.pk).update(status="accepted")
+                response = self._post(_ApplyContractAdapter(lambda _selected, result=result: (202, result)))
+
+                self.assertEqual(response.status_code, 502)
+                self.vlan_state.refresh_from_db()
+                self.assertEqual(self.vlan_state.status, "deploying")
+
     def test_apply_selects_the_stored_isis_receipt_from_the_delivery_registry(self):
         from netbox_nso_plugin.models import NSOISISInterfaceState
 
@@ -535,6 +554,26 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertIn("live_read_execution", result["message"])
         self.assertIn("static_route", result["message"])
         self.assertIn("outstanding_deletion_provenance", result["message"])
+        self.vlan_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "accepted")
+
+    def test_apply_unexecutable_with_non_mapping_detail_still_returns_conflict(self):
+        def refused(_selected):
+            return (
+                409,
+                {
+                    "error": {
+                        "code": "apply_unexecutable",
+                        "message": "Selected streams cannot be applied faithfully",
+                        "detail": ["malformed detail"],
+                    }
+                },
+            )
+
+        response = self._post(_ApplyContractAdapter(refused))
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("Apply cannot execute the selected streams", response.json()["message"])
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "accepted")
 

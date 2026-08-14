@@ -1399,7 +1399,16 @@ def _apply_job_state(adapter_device_id) -> tuple[dict | None, bool]:
             exc,
         )
         return last, True
-    for generation in generations:
+    current_chain = []
+    if generations:
+        latest = generations[-1]
+        cohort = latest.get("settlement_cohort")
+        current_chain = (
+            [latest]
+            if cohort is None
+            else [generation for generation in generations if generation.get("settlement_cohort") == cohort]
+        )
+    for generation in current_chain:
         if generation.get("status") not in _TERMINAL_GENERATION_STATUSES:
             active = True
             break
