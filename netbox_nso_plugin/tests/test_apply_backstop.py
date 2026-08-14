@@ -133,17 +133,26 @@ class TestApplyPromotion(TestCase):
         from netbox_nso_plugin.views import ApplyRefused, _prepare_apply
 
         mgmt, state, other = self._setup()
-        # Every push settles, so the SNMP refusal is the only thing that can abort the Apply.
-        for name, answer in (("push_now", {"count": 0}), ("drain_key", drain.REFUSED)):
-            patcher = patch(f"netbox_nso_plugin.drain.{name}", side_effect=lambda *args, answer=answer, **kw: answer)
-            patcher.start()
-            self.addCleanup(patcher.stop)
+        calls = []
 
-        with self.assertRaisesRegex(ApplyRefused, "SNMP"):
+        def push_now(_device_id, scope, **_kwargs):
+            calls.append(scope)
+            return {"count": 0}
+
+        def drain_key(_device_id, scope, **_kwargs):
+            calls.append(scope)
+            return drain.REFUSED
+
+        with (
+            patch("netbox_nso_plugin.drain.push_now", new=push_now),
+            patch("netbox_nso_plugin.drain.drain_key", new=drain_key),
+            self.assertRaisesRegex(ApplyRefused, "SNMP"),
+        ):
             _prepare_apply(mgmt)
 
         state.refresh_from_db()
         other.refresh_from_db()
+        self.assertIn("snmp", calls)
         assert (state.status, other.status) == ("accepted", "accepted"), "the abort promotes nothing"
 
     def test_apply_uses_one_decreasing_deadline_for_all_preparation_sends(self):

@@ -150,8 +150,9 @@ class BlockedRemovalTestBase(TestCase):
         super().setUp()
         self.client.force_login(self.superuser)
 
-    def _get_jobs(self, jobs, *, generations=None, generation_ids=()):
+    def _get_jobs(self, jobs, *, generations=None, generation_ids=(), since_seq=None):
         """Hit device_nso_jobs with the adapter's job list canned at the transport."""
+        generation_request_params = []
         with (
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_ADAPTER_CFG),
             patch("netbox_nso_plugin.adapter_client.requests.Session") as mock_session_cls,
@@ -161,16 +162,21 @@ class BlockedRemovalTestBase(TestCase):
             def request(_method, url, **kwargs):
                 if url.endswith("/generations"):
                     params = kwargs.get("params") or {}
-                    since_seq = params.get("since_seq", 0)
+                    generation_request_params.append(params)
+                    cursor = params.get("since_seq", 0)
                     limit = params.get("limit", 100)
-                    page = [row for row in generations if row["seq"] > since_seq][:limit]
+                    page = [row for row in generations if row["seq"] > cursor][:limit]
                     return make_response(200, json_data=page)
                 return make_response(200, json_data=jobs)
 
             session.request.side_effect = request
             mock_session_cls.return_value = session
             url = reverse("plugins:netbox_nso_plugin:device_nso_jobs", args=[self.device.pk])
-            response = self.client.get(url, {"generation_id": generation_ids})
+            query = {"generation_id": generation_ids}
+            if since_seq is not None:
+                query["since_seq"] = since_seq
+            response = self.client.get(url, query)
+        self.generation_request_params = generation_request_params
         self.assertEqual(response.status_code, 200)
         return json.loads(response.content)
 
@@ -223,6 +229,23 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
 
         self.assertEqual(data["generations"], [generations[500]])
         self.assertEqual(data["jobs"], jobs)
+
+    def test_requested_apply_generation_starts_after_the_browser_cursor(self):
+        generations = [
+            {
+                "generation_id": seq,
+                "seq": seq,
+                "status": "settled",
+                "job_id": 501 if seq == 501 else None,
+            }
+            for seq in range(1, 502)
+        ]
+        jobs = [_removal_job(501, "vlan", "succeeded")]
+
+        data = self._get_jobs(jobs, generations=generations, generation_ids=(501,), since_seq=500)
+
+        self.assertEqual(data["generations"], [generations[500]])
+        self.assertEqual(self.generation_request_params, [{"limit": 500, "since_seq": 500}])
 
     def test_a_non_integer_generation_id_is_rejected(self):
         url = reverse("plugins:netbox_nso_plugin:device_nso_jobs", args=[self.device.pk])
