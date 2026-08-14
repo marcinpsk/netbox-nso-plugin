@@ -169,6 +169,25 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
                 with self.assertRaises(CommandError):
                     _verification_receipt(claim, {**valid, field: malformed})
 
+    def test_pending_transition_probe_is_scoped_to_the_current_database(self):
+        from netbox_nso_plugin.deployment import _exclusive_transition_pending
+
+        class ProbeCursor:
+            def execute(self, sql, params):
+                self.sql = " ".join(sql.lower().split())
+                self.params = params
+
+            def fetchone(self):
+                return (False,)
+
+        cursor = ProbeCursor()
+
+        self.assertFalse(_exclusive_transition_pending(cursor))
+        self.assertIn(
+            "database = (select oid from pg_database where datname = current_database())",
+            cursor.sql,
+        )
+
     def test_each_dirty_key_shape_refuses_the_gate(self):
         from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentOutboxState
 
