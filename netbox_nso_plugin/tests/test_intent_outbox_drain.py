@@ -102,6 +102,30 @@ class TestTheTickDrainsTheTail(_DrainCase):
         compact.assert_called_once_with()
         drain_all.assert_not_called()
 
+    def test_outage_compaction_respects_the_gate_and_the_normal_tick_still_runs(self):
+        from netbox_nso_plugin import jobs
+        from netbox_nso_plugin.deployment import quiesce, resume
+
+        device, mgmt = self.managed("gatecompact", 7609, vid=909)
+        self.edit(mgmt)
+        before = [row.pk for row in entries(device, "vlan", unconsumed=True)]
+        assert len(before) == 2
+
+        quiesce()
+        try:
+            with (
+                patch("netbox_nso_plugin.sync_cache._snapshot", return_value=([], None, {})),
+                patch("netbox_nso_plugin.sync_cache.refresh_sync_caches", return_value=(0, 0)),
+                patch("netbox_nso_plugin.sync_cache.reconcile_device_links", return_value=(0, 0)),
+            ):
+                jobs.RefreshDeviceSyncCacheJob.run(None)
+            assert [row.pk for row in entries(device, "vlan", unconsumed=True)] == before
+        finally:
+            resume()
+
+        assert self.run_drain() == (1, 0)
+        assert entries(device, "vlan", unconsumed=True) == []
+
     def test_the_tail_left_by_the_chain_drains_within_one_interval(self):
         from netbox_nso_plugin import drain
 

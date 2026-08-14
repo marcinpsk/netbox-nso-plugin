@@ -1482,7 +1482,7 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
 
     Runs in the rqworker (no HTTP request), so suppress_intent_push() — not the
     GET-render guard — is what keeps the NSO*State writes from pushing intent back.
-    AdapterError is swallowed: a transient adapter outage must not crash the worker.
+    Adapter and deployment-gate refusals are returned instead of crashing the worker.
     ``notify_class=True`` marks a unique notify job: its lease acquisition is
     single-attempt + defer-marker (no 90s retry burn on general RQ workers). Under READSEM
     1334 the enqueue plane no longer sets it (all carriers are rq-class), but the param stays
@@ -1491,6 +1491,7 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
     from dcim.models import Device
 
     from .adapter_client import AdapterError
+    from .deployment import DeploymentQuiesced
     from .models import NSODeviceManagement
     from .settlement import settle_static_routes
 
@@ -1502,8 +1503,8 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
 
     try:
         ctx = reconcile_device(device, call_class="notify" if notify_class else "rq")
-    except AdapterError as exc:
-        logger.warning("nso reconcile: adapter error for device %s: %s", device_id, exc)
+    except (AdapterError, DeploymentQuiesced) as exc:
+        logger.warning("nso reconcile deferred for device %s: %s", device_id, exc)
         return {"device_id": device_id, "error": str(exc)}
 
     if ctx.get("_deferred"):

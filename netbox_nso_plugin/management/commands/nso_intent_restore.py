@@ -52,13 +52,17 @@ def _normalize(receipt):
     missing = required - receipt.keys()
     if missing:
         raise CommandError("Adapter key receipt is missing: " + ", ".join(sorted(missing)))
+    mode_fields = ("store_only", "delete_origin", "backfill_only")
+    invalid_modes = [name for name in mode_fields if type(receipt[name]) is not bool]
+    if invalid_modes:
+        raise CommandError("Adapter key receipt has invalid boolean modes: " + ", ".join(invalid_modes))
     return {
         "accepted_push_seq": receipt["push_seq"],
         "request_digest": receipt["request_digest"],
         "stored_response": receipt["response"],
-        "store_only": bool(receipt["store_only"]),
-        "delete_origin": bool(receipt["delete_origin"]),
-        "backfill_only": bool(receipt["backfill_only"]),
+        "store_only": receipt["store_only"],
+        "delete_origin": receipt["delete_origin"],
+        "backfill_only": receipt["backfill_only"],
     }
 
 
@@ -78,7 +82,7 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         from netbox_nso_plugin.models import NSODeviceManagement, NSOIntentOutboxState
 
-        quiesce()
+        created = quiesce()
         with gate_bypass():
             global_document = _document(adapter_client.get_intent_receipts())
             max_push_seq = _watermark(global_document["global_max_push_seq"], "global_max_push_seq")
@@ -134,5 +138,6 @@ class Command(BaseCommand):
                 if verdict == drain.RESTORE_REPLAY:
                     drain.release_restored_replay(state.device_id, state.scope)
                 self.stdout.write(f"{key_name}: {verdict}")
-        resume()
+        if created:
+            resume()
         self.stdout.write(self.style.SUCCESS(f"Restore resolved {len(states)} outstanding claim(s)"))
