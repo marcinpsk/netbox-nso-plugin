@@ -265,6 +265,8 @@ class TestTheLineageIsBoundedAndCleared(_LineageCase):
     adapter_device_id = 7804
 
     def test_repeated_cycles_never_grow_the_emitted_lineage(self):
+        from netbox_nso_plugin import outbox
+
         acked = triple("198.51.100.128/28", "198.51.100.9")
         route = own_route(self.mgmt, "198.51.100.128/28", "198.51.100.9")
         self.stamp(route, acked)
@@ -276,9 +278,12 @@ class TestTheLineageIsBoundedAndCleared(_LineageCase):
             seen.append([r["triples"] for r in self.records()])
             self.retriple(route, "198.51.100.128/28", f"198.51.100.1{index}")
             self.reown(route)
-            state = state_of(self.device, "static_route")
-            assert state is not None, "the re-own's fold must leave the key a state row"
-            assert len(state.lineage_carry) <= 1, state.lineage_carry
+            transitions = [
+                record for row in entries(self.device, "static_route", unconsumed=True) for record in row.transitions
+            ]
+            folded = outbox.fold_transitions(transitions)
+            assert folded.queued == {}
+            assert folded.lineage_carry == {route.pk: acked}
         self.unown(route)
         seen.append([r["triples"] for r in self.records()])
 
