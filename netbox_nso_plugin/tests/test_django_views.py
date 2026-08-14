@@ -5938,6 +5938,12 @@ class TestReviewRegressionPins(ViewTestBase):
             source_protocol="static",
             status="imported",
         )
+        NSORedistributionState.objects.create(
+            management=self.mgmt,
+            dest_protocol="unknown",
+            source_protocol="static",
+            status="accepted",
+        )
 
         with patch("netbox_nso_plugin.views._schedule_intent_push") as schedule:
             NSORedistributionBulkAcceptView()._push(self.mgmt)

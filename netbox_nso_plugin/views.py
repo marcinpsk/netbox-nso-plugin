@@ -5517,10 +5517,16 @@ class NSORedistributionBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     model_class = NSORedistributionState
 
     def _push(self, mgmt):
+        from . import delivery
         from .signals import _OWNED_PUSH_STATUSES
 
+        supported = delivery.delivery_keys()
         destinations = (
-            self.model_class.objects.filter(management=mgmt, status__in=_OWNED_PUSH_STATUSES)
+            self.model_class.objects.filter(
+                management=mgmt,
+                status__in=_OWNED_PUSH_STATUSES,
+                dest_protocol__in=supported,
+            )
             .order_by()
             .values_list("dest_protocol", flat=True)
             .distinct()

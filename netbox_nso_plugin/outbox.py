@@ -270,6 +270,8 @@ def current_txid() -> int:
     outer = connection.atomic_blocks[0] if connection.atomic_blocks else None
     hooks = connection.run_on_commit
     cached = getattr(connection, "_nso_intent_txid", None)
+    # Django 6.1 rollback paths replace this private hook list. Its identity rejects
+    # transaction IDs cached by a transaction or savepoint that rolled back.
     if outer is not None and cached is not None and cached[0] is outer and cached[1] is hooks:
         return cached[2]
 

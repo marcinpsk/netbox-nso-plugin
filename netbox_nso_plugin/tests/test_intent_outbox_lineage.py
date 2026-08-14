@@ -277,8 +277,8 @@ class TestTheLineageIsBoundedAndCleared(_LineageCase):
             self.retriple(route, "198.51.100.128/28", f"198.51.100.1{index}")
             self.reown(route)
             state = state_of(self.device, "static_route")
-            if state is not None:
-                assert len(state.lineage_carry) <= 1, state.lineage_carry
+            assert state is not None, "the re-own's fold must leave the key a state row"
+            assert len(state.lineage_carry) <= 1, state.lineage_carry
         self.unown(route)
         seen.append([r["triples"] for r in self.records()])
 

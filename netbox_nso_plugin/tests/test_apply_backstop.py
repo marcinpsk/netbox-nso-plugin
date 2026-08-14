@@ -17,6 +17,7 @@ result and by nothing else, which puts two obligations on the ``deploying`` stat
 from __future__ import annotations
 
 from contextlib import ExitStack
+from itertools import count
 from unittest.mock import patch
 
 from django.test import TestCase
@@ -146,7 +147,7 @@ class TestApplyPromotion(TestCase):
 
         mgmt, _state, _other = self._setup()
         with (
-            patch("time.monotonic", side_effect=range(20)),
+            patch("time.monotonic", side_effect=count()),
             patch(
                 "netbox_nso_plugin.drain.push_now",
                 side_effect=lambda device_id, scope, **kwargs: {"count": 0} if scope == "static_route" else None,

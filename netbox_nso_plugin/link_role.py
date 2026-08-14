@@ -404,6 +404,6 @@ def provision_link_role(interface) -> dict:
         summary["rolled_back"] = True
         return summary
 
-    _push_provisioned(role, device_ids)
+    transaction.on_commit(lambda role=role, device_ids=tuple(device_ids): _push_provisioned(role, device_ids))
     summary["provisioned"] = True
     return summary

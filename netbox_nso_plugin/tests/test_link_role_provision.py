@@ -74,7 +74,8 @@ class _Base(TestCase):
 
     def _provision(self, iface):
         with patch(_PUSH) as push:
-            summary = provision_link_role(iface)
+            with self.captureOnCommitCallbacks(execute=True):
+                summary = provision_link_role(iface)
         return summary, push
 
 
@@ -143,6 +144,17 @@ class TestProvisionP2P(_Base):
                 scope,
             )
         self.assertNotIn("ospf", {scope for _device_id, scope in forced}, "an IS-IS role pushed OSPF intent")
+
+    def test_an_outer_rollback_suppresses_forced_delivery(self):
+        role = self._p2p_role()
+        NSOLinkRoleAssignment.objects.create(role=role, cable=self.cable)
+
+        with patch(_PUSH) as push, self.captureOnCommitCallbacks(execute=True):
+            with transaction.atomic():
+                provision_link_role(self.if_a)
+                transaction.set_rollback(True)
+
+        push.assert_not_called()
 
     def test_partial_failure_rolls_back_everything(self):
         # IPv4 pool role does not exist → IP consumer errors → whole txn rolls back,

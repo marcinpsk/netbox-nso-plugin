@@ -446,6 +446,13 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         row = self._own_route(mgmt, "10.81.0.0/16", "10.0.0.82")
         with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", side_effect=ConnectionError("down")):
             assert drain.drain_key(mgmt.device_id, "static_route") == drain.FAILED
+        from django.utils import timezone
+
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        NSOIntentOutboxState.objects.filter(device_id=mgmt.device_id, scope="static_route").update(
+            claimed_at=timezone.now() - 2 * drain.LEASE
+        )
         sent: list[dict] = []
 
         def _record(adapter_device_id, routes):
