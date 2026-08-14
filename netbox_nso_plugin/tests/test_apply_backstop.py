@@ -65,8 +65,9 @@ class TestApplyPromotion(TestCase):
         """Run the Apply with the static-route claim answering *static_response*.
 
         The Apply routes SNMP through ``drain.drain_key`` and every other scope through
-        ``drain.push_now``. Isolate both send boundaries so this helper tests only the
-        static-route promotion gate.
+        ``drain.push_now``. The other scopes answer a settled response, so the fail-fast
+        preparation reaches the static-route claim under test. Isolate both send boundaries
+        so this helper tests only that promotion gate.
         """
         from netbox_nso_plugin import drain
         from netbox_nso_plugin.views import _prepare_apply
@@ -146,28 +147,28 @@ class TestApplyPromotion(TestCase):
         assert (state.status, other.status) == ("accepted", "accepted"), "the abort promotes nothing"
 
     def test_apply_uses_one_decreasing_deadline_for_all_preparation_sends(self):
-        from netbox_nso_plugin import drain
+        from netbox_nso_plugin import delivery, drain
         from netbox_nso_plugin.views import _prepare_apply
 
         mgmt, _state, _other = self._setup()
         deadlines = []
 
-        def _push_now(device_id, scope, **kwargs):
+        def push_now(_device_id, _scope, **kwargs):
             deadlines.append(kwargs["deadline"])
-            return {"count": 0} if scope == "static_route" else None
+            return {"count": 0}
 
-        def _drain_key(device_id, scope, **kwargs):
+        def drain_key(_device_id, _scope, **kwargs):
             deadlines.append(kwargs["deadline"])
             return drain.SUCCEEDED
 
         with (
             patch("netbox_nso_plugin.drain._send_clock", side_effect=count()),
-            patch("netbox_nso_plugin.drain.push_now", side_effect=_push_now),
-            patch("netbox_nso_plugin.drain.drain_key", side_effect=_drain_key),
+            patch("netbox_nso_plugin.drain.push_now", side_effect=push_now),
+            patch("netbox_nso_plugin.drain.drain_key", side_effect=drain_key),
         ):
             _prepare_apply(mgmt)
 
-        assert len(deadlines) == 13
+        assert len(deadlines) == len(delivery.delivery_keys())
         assert all(later < earlier for earlier, later in zip(deadlines, deadlines[1:]))
 
     def test_apply_stops_before_the_first_send_when_its_total_budget_is_spent(self):

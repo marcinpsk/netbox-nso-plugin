@@ -1272,6 +1272,16 @@ def push_now(device_id, scope, *, mode=delivery.MODE_NORMAL, force=False, deadli
     return answer if outcome == SUCCEEDED else None
 
 
+def _send_failure_outcome(claimed, exc) -> str:
+    """Triage one send failure into the outcome its evidence supports."""
+    logger.warning("push_seq %s failed for %s/%s: %s", claimed.push_seq, claimed.device_id, claimed.scope, exc)
+    if _proven_no_effect(exc):
+        return _withhold(claimed, exc)
+    if _rejected_at_boundary(exc):
+        return _dissolve(claimed, exc)
+    return record_failure(claimed, exc)
+
+
 @_deployment_guarded("intent drain")
 def _drain_once(
     device_id,
@@ -1306,12 +1316,7 @@ def _drain_once(
     try:
         answer = send_claim(claimed, deadline=_remaining_send_deadline(_deadline_at))
     except Exception as exc:  # noqa: BLE001 (the operation is replayed, so the failure is data)
-        logger.warning("push_seq %s failed for %s/%s: %s", claimed.push_seq, device_id, scope, exc)
-        if _proven_no_effect(exc):
-            return _withhold(claimed, exc), None
-        if _rejected_at_boundary(exc):
-            return _dissolve(claimed, exc), None
-        return record_failure(claimed, exc), None
+        return _send_failure_outcome(claimed, exc), None
     if answer is _ABANDONED_SEND and reform > 0:
         # A fixed revocation resolves in ONE re-form: the re-form folds the revoking entry
         # with everything else, so the authority no longer names that route. A revocation
