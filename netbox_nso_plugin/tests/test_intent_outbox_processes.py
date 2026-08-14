@@ -263,9 +263,10 @@ class TestOneClaimerAcrossTwoProcesses(_CascadeFlushMixin, IntentPushResetMixin,
         while time.monotonic() < deadline:
             if any(request["path"].split("?", 1)[0].endswith(suffix) for request in self.server.received):
                 return
-            if all(process.poll() is not None for process in processes):
-                reports = [process.communicate() for process in processes]
-                raise AssertionError(f"every worker exited before the request landed: {reports!r}")
+            for process in processes:
+                if process.poll() is not None:
+                    out, err = process.communicate()
+                    raise AssertionError(f"a worker exited before the request landed:\n{out}\n{err}")
             time.sleep(0.1)
         raise AssertionError(f"no request ending in {suffix} reached the adapter")
 

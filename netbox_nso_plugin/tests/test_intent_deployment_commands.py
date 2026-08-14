@@ -5,11 +5,13 @@
 from __future__ import annotations
 
 import io
+import threading
+import time
 from unittest.mock import patch
 
 from django.core.management import call_command
 from django.core.management.base import CommandError
-from django.db import transaction
+from django.db import close_old_connections, connection, transaction
 from django.test import TransactionTestCase
 from django.utils import timezone
 
@@ -43,6 +45,129 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
             stdout=io.StringIO(),
             stderr=io.StringIO(),
         )
+
+    def test_a_pending_exclusive_transition_refuses_new_shared_work(self):
+        from netbox_nso_plugin import deployment
+
+        holder_ready = threading.Event()
+        release_holder = threading.Event()
+        waiter_ready = threading.Event()
+        waiter_pid = []
+        errors = []
+
+        def hold_shared_lock():
+            close_old_connections()
+            try:
+                with deployment.operation("test holder"):
+                    holder_ready.set()
+                    release_holder.wait(10)
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                close_old_connections()
+
+        def request_exclusive_lock():
+            close_old_connections()
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT pg_backend_pid()")
+                    waiter_pid.append(cursor.fetchone()[0])
+                waiter_ready.set()
+                deployment.quiesce()
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                close_old_connections()
+
+        holder = threading.Thread(target=hold_shared_lock)
+        waiter = threading.Thread(target=request_exclusive_lock)
+        holder.start()
+        self.assertTrue(holder_ready.wait(5), "the shared lock was not acquired")
+        waiter.start()
+        self.assertTrue(waiter_ready.wait(5), "the exclusive waiter did not start")
+
+        deadline = time.monotonic() + 5
+        queued = False
+        while time.monotonic() < deadline:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = %s AND locktype = 'advisory' AND NOT granted)",
+                    [waiter_pid[0]],
+                )
+                queued = cursor.fetchone()[0]
+            if queued:
+                break
+            time.sleep(0.01)
+
+        outcomes = {}
+
+        def attempt_operation():
+            close_old_connections()
+            try:
+                with deployment.operation("late operation"):
+                    outcomes["operation"] = "admitted"
+            except deployment.DeploymentQuiesced:
+                outcomes["operation"] = "refused"
+            finally:
+                close_old_connections()
+
+        def attempt_mutation():
+            close_old_connections()
+            try:
+                with transaction.atomic():
+                    deployment.lock_mutation()
+                outcomes["mutation"] = "admitted"
+            except deployment.DeploymentQuiesced:
+                outcomes["mutation"] = "refused"
+            finally:
+                close_old_connections()
+
+        late = [threading.Thread(target=attempt_operation), threading.Thread(target=attempt_mutation)]
+        for worker in late:
+            worker.start()
+        for worker in late:
+            worker.join(timeout=1)
+        finished_before_release = [not worker.is_alive() for worker in late]
+
+        release_holder.set()
+        holder.join(timeout=10)
+        waiter.join(timeout=10)
+        for worker in late:
+            worker.join(timeout=10)
+        if deployment.is_quiesced():
+            deployment.resume()
+
+        self.assertTrue(queued, "the exclusive transition never queued behind the shared lock")
+        self.assertEqual(finished_before_release, [True, True], "new shared work blocked behind the transition")
+        self.assertEqual(outcomes, {"operation": "refused", "mutation": "refused"})
+        self.assertEqual(errors, [])
+
+    def test_verification_receipt_rejects_non_canonical_field_types(self):
+        from netbox_nso_plugin import delivery, drain
+        from netbox_nso_plugin.management.commands.nso_intent_deployment_gate import _verification_receipt
+
+        own_route(self.mgmt, "198.18.39.0/24", "198.18.0.1")
+        claim = drain.claim(self.device.pk, "static_route", force=True)
+        wire = delivery.wire_body(claim.rendered, claim.payload, deletions=[])
+        valid = {
+            "push_seq": claim.push_seq,
+            "request_digest": drain.wire_digest(wire),
+            "store_only": False,
+            "delete_origin": False,
+            "backfill_only": False,
+            "status_code": 200,
+            "response": {},
+        }
+        for field, malformed in (
+            ("push_seq", float(claim.push_seq)),
+            ("status_code", 200.0),
+            ("store_only", 0),
+            ("delete_origin", 0),
+            ("backfill_only", 0),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaises(CommandError):
+                    _verification_receipt(claim, {**valid, field: malformed})
 
     def test_each_dirty_key_shape_refuses_the_gate(self):
         from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentOutboxState
@@ -229,7 +354,7 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         from netbox_nso_plugin.onboarding import advance_provisioning, onboard_candidate
         from netbox_nso_plugin.reconcile import reconcile_device
 
-        route = own_route(self.mgmt, "198.18.40.0/24", "198.18.0.1")
+        own_route(self.mgmt, "198.18.40.0/24", "198.18.0.1")
         config, session = self.adapter.patches()
         with config, session:
             assert drain.drain_key(self.device.pk, "static_route") == drain.SUCCEEDED
@@ -251,7 +376,9 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         ):
             with self.assertRaises(DeploymentQuiesced):
                 operation()
-        assert drain.drain_intent_outbox() == (0, 0), "the scheduled drain tick ran while quiesced"
+        with patch("netbox_nso_plugin.drain._drain_intent_outbox") as admitted_tick:
+            assert drain.drain_intent_outbox() == (0, 0), "the scheduled drain tick ran while quiesced"
+        admitted_tick.assert_not_called()
 
         stdout = io.StringIO()
         config, session = self.adapter.patches()
@@ -278,7 +405,6 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         with without_commit_drain(), transaction.atomic():
             outbox.enqueue(self.device.pk, "static_route")
         assert entries(self.device, "static_route", unconsumed=True), "normal operation did not resume"
-        assert route.pk is not None
 
 
 class TestIntentRestoreResolvesEveryReceiptCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
@@ -484,9 +610,9 @@ class TestIntentRestoreProtectsTheRouteIdentityNamespace(
     def test_restore_clears_last_acked_triple_on_every_overlay(self):
         from netbox_nso_plugin.models import NSOStaticRouteState
 
-        device, mgmt = make_managed(self.tag, self.adapter_device_id)
-        first = own_route(mgmt, "198.18.82.0/24", "198.18.0.10")
-        second = own_route(mgmt, "198.18.83.0/24", "198.18.0.11")
+        _device, mgmt = make_managed(self.tag, self.adapter_device_id)
+        own_route(mgmt, "198.18.82.0/24", "198.18.0.10")
+        own_route(mgmt, "198.18.83.0/24", "198.18.0.11")
         NSOStaticRouteState.objects.filter(management=mgmt).update(
             last_acked_triple={"vrf": "", "prefix": "198.18.0.0/15", "next_hop": "198.18.0.1"}
         )
@@ -495,5 +621,3 @@ class TestIntentRestoreProtectsTheRouteIdentityNamespace(
         self._restore()
 
         assert NSOStaticRouteState.objects.filter(last_acked_triple__isnull=False).count() == 0
-        assert {first.pk, second.pk}
-        assert device.pk is not None
