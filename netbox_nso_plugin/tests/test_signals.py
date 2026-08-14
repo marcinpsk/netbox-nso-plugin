@@ -1628,8 +1628,8 @@ class TestDeleteOriginMarking(_SignalDBBase):
             device=self.device, nso_instance=self.nso_instance, nso_device_name="core-rtr-01", adapter_device_id=43
         )
 
-    def _recorded_calls(self, act):
-        """Run *act* with the adapter HTTP transport recorded → [(method, url, params), ...]."""
+    def _recorded_requests(self, act):
+        """Run *act* with the adapter HTTP transport recorded."""
         from ._adapter_http import make_response, make_session
 
         session = make_session(response=make_response(200, json_data={}))
@@ -1639,7 +1639,14 @@ class TestDeleteOriginMarking(_SignalDBBase):
             self.captureOnCommitCallbacks(execute=True),
         ):
             act()
-        return [(c.args[0], c.args[1], c.kwargs.get("params") or {}) for c in session.request.call_args_list]
+        return [
+            (c.args[0], c.args[1], c.kwargs.get("params") or {}, c.kwargs.get("json"))
+            for c in session.request.call_args_list
+        ]
+
+    def _recorded_calls(self, act):
+        """Run *act* and return its adapter method, URL, and query parameters."""
+        return [(method, url, params) for method, url, params, _body in self._recorded_requests(act)]
 
     def _recorded_params(self, act):
         """Run *act* with the adapter HTTP transport recorded → list of params dicts."""
@@ -1705,14 +1712,22 @@ class TestDeleteOriginMarking(_SignalDBBase):
         mgmt = self._mgmt()
         route = StaticRoute.objects.create(prefix="198.18.77.0/24", next_hop="198.18.0.1", name="do-sr", metric=1)
         with self._arranged():
+            route.devices.add(mgmt.device)
             NSOStaticRouteState.objects.create(
                 management=mgmt, static_route=route, nso_prefix="198.18.77.0/24", status="accepted"
             )
-        params = self._recorded_params(route.delete)
+        route_id = route.pk
+        requests = self._recorded_requests(route.delete)
+        params = [params for _method, _url, params, _body in requests]
         self.assertTrue(params, "the native delete must push")
         self.assertFalse(
             any("delete_origin" in item for item in params),
             f"activated static-route pushes must not use the query flag; saw params {params}",
+        )
+        bodies = [body for _method, _url, _params, body in requests]
+        self.assertTrue(
+            any(route_id in [record["route_id"] for record in body["deleted_routes"]] for body in bodies),
+            f"the deleted route must carry per-object authority; saw bodies {bodies}",
         )
 
     def test_assigning_a_device_to_a_static_route_is_unmarked(self):
@@ -1746,11 +1761,17 @@ class TestDeleteOriginMarking(_SignalDBBase):
             route.devices.add(mgmt.device)
             _accept_static_route_for_device(route, mgmt.device)
 
-        params = self._recorded_params(lambda: route.devices.remove(mgmt.device))
+        requests = self._recorded_requests(lambda: route.devices.remove(mgmt.device))
+        params = [params for _method, _url, params, _body in requests]
         self.assertTrue(params, "un-assigning the device must push the reduced snapshot")
         self.assertFalse(
             any("delete_origin" in item for item in params),
             f"activated static-route pushes must not use the query flag; saw params {params}",
+        )
+        bodies = [body for _method, _url, _params, body in requests]
+        self.assertTrue(
+            any(route.pk in [record["route_id"] for record in body["deleted_routes"]] for body in bodies),
+            f"the unassigned route must carry per-object authority; saw bodies {bodies}",
         )
 
     # ── teardown must never be read as a retraction ───────────────────────────
