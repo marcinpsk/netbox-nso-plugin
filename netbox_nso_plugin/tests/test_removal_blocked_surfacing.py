@@ -203,6 +203,33 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
         self.assertEqual(data["generations"], generations[:2])
         self.assertEqual(data["jobs"], [jobs[1]])
 
+    def test_a_non_integer_generation_id_is_rejected(self):
+        url = reverse("plugins:netbox_nso_plugin:device_nso_jobs", args=[self.device.pk])
+
+        response = self.client.get(url, {"generation_id": "abc"})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"], "generation_id must be an integer")
+
+    def test_a_malformed_generation_listing_fails_closed(self):
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_ADAPTER_CFG),
+            patch("netbox_nso_plugin.adapter_client.requests.Session") as mock_session_cls,
+        ):
+            session = make_session()
+            session.request.side_effect = lambda _method, url, **_kwargs: make_response(
+                200,
+                json_data={"generations": []} if url.endswith("/generations") else [],
+            )
+            mock_session_cls.return_value = session
+            url = reverse("plugins:netbox_nso_plugin:device_nso_jobs", args=[self.device.pk])
+            self.client.raise_request_exception = False
+
+            response = self.client.get(url, {"generation_id": 81})
+
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["error"], "Adapter returned a malformed generations listing.")
+
     def test_ordinary_failed_removal_not_blocked(self):
         """A removal that failed for another reason does not raise the banner."""
         job = _removal_job(51, "isis", "failed")
