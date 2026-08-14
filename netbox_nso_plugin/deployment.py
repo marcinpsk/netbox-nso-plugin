@@ -32,6 +32,19 @@ def _refuse(label: str) -> None:
     raise DeploymentQuiesced(f"{label} is blocked because the intent deployment is quiesced")
 
 
+def _exclusive_transition_pending(cursor) -> bool:
+    """Return whether activation is waiting for this advisory-lock key."""
+    cursor.execute(
+        "SELECT EXISTS ("
+        "SELECT 1 FROM pg_locks "
+        "WHERE locktype = 'advisory' AND classid = %s AND objid = %s "
+        "AND objsubid = 1 AND mode = 'ExclusiveLock' AND NOT granted"
+        ")",
+        [_LOCK_KEY >> 32, _LOCK_KEY & 0xFFFFFFFF],
+    )
+    return cursor.fetchone()[0]
+
+
 def lock_mutation() -> None:
     """Join the current transaction to the gate and refuse a new intent mutation."""
     if _bypass.get():
@@ -39,9 +52,15 @@ def lock_mutation() -> None:
     if not connection.in_atomic_block:
         raise RuntimeError("an intent mutation must join the deployment gate inside its transaction")
     with connection.cursor() as cursor:
+        if _exclusive_transition_pending(cursor):
+            _refuse("intent mutation")
         cursor.execute("SELECT pg_try_advisory_xact_lock_shared(%s)", [_LOCK_KEY])
         acquired = cursor.fetchone()[0]
+        transition_pending = acquired and _exclusive_transition_pending(cursor)
     if not acquired:
+        _refuse("intent mutation")
+    if transition_pending:
+        transaction.set_rollback(True)
         _refuse("intent mutation")
     if is_quiesced():
         _refuse("intent mutation")
@@ -56,7 +75,12 @@ def operation(label: str):
     with connection.cursor() as cursor:
         cursor.execute("SELECT pg_try_advisory_lock_shared(%s)", [_LOCK_KEY])
         acquired = cursor.fetchone()[0]
+        transition_pending = acquired and _exclusive_transition_pending(cursor)
+        if transition_pending:
+            cursor.execute("SELECT pg_advisory_unlock_shared(%s)", [_LOCK_KEY])
     if not acquired:
+        _refuse(label)
+    if transition_pending:
         _refuse(label)
     try:
         if is_quiesced():
