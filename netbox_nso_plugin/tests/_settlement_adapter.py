@@ -325,6 +325,9 @@ class _Handler(BaseHTTPRequestHandler):
 
         if parsed.path.startswith("/api/v1/devices/") and parsed.path.endswith("/generations"):
             device_id = self._device_id_from_path(parsed)
+            if device_id not in store.devices:
+                self._send(404, {"error": {"code": "not_found", "message": "Device not found"}})
+                return
             self._send(200, store.generations.get(device_id, []))
             return
 

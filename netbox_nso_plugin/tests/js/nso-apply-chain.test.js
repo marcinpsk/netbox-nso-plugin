@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* SPDX-FileCopyrightText: 2026 Marcin Zieba <marcinpsk@gmail.com> */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import "../../static/netbox_nso_plugin/nso-apply-chain.js";
 
 const C = window.NSOApplyChain;
@@ -83,5 +83,21 @@ describe("createPollGuard", () => {
     expect(guard.stop()).toBe(false);
     guard.leave();
     expect(guard.enter()).toBe(false);
+  });
+});
+
+describe("createPollTimer", () => {
+  it("cancels the assigned interval when the first tick stops synchronously", () => {
+    const schedule = vi.fn(() => 37);
+    const cancel = vi.fn();
+    let timer;
+    const tick = vi.fn(() => timer.stop());
+    timer = C.createPollTimer(tick, 2000, schedule, cancel);
+
+    timer.start();
+
+    expect(schedule).toHaveBeenCalledWith(tick, 2000);
+    expect(tick).toHaveBeenCalledOnce();
+    expect(cancel).toHaveBeenCalledWith(37);
   });
 });

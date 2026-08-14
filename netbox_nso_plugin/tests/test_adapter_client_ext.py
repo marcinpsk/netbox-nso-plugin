@@ -766,6 +766,22 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_device_generations_reject_a_malformed_listing(self, mock_s, _cfg):
+        from netbox_nso_plugin.adapter_client import AdapterError, list_device_generations, reset_session
+
+        self.addCleanup(reset_session)
+        for payload in ({"generations": []}, [None]):
+            with self.subTest(payload=payload):
+                reset_session()
+                mock_s.return_value = self._make_session(200, payload)
+
+                with self.assertRaisesRegex(AdapterError, "malformed generations listing") as raised:
+                    list_device_generations(5)
+
+                self.assertEqual(raised.exception.code, "invalid_response")
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_put_intent(self, mock_s, _cfg):
         from netbox_nso_plugin.adapter_client import put_intent
 
