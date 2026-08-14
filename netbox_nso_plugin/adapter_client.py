@@ -1017,10 +1017,12 @@ def list_jobs(adapter_device_id):
     return _validated_jobs(_request("GET", "/api/v1/jobs", params={"device_id": adapter_device_id}), "jobs listing")
 
 
-def list_device_generations(adapter_device_id):
-    """GET every ascending generation page for one device."""
+def list_device_generations(adapter_device_id, *, since_seq=None):
+    """GET every ascending generation page for one device after ``since_seq``."""
+    if since_seq is not None and (type(since_seq) is not int or since_seq < 0):
+        raise ValueError("since_seq must be a non-negative integer")
     generations = []
-    last_seq = None
+    last_seq = since_seq
     while True:
         params = {"limit": _GENERATION_PAGE_LIMIT}
         if last_seq is not None:

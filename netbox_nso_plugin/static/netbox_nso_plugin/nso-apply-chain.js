@@ -42,12 +42,24 @@
 
   function pollUrl(baseUrl, expectedGenerations) {
     var url = new URL(baseUrl, window.location.href);
-    (expectedGenerations || []).forEach(function (generation) {
+    var expected = expectedGenerations || [];
+    expected.forEach(function (generation) {
       if (generation.generation_id != null) {
         url.searchParams.append("generation_id", String(generation.generation_id));
       }
     });
+    var sequences = expected.map(function (generation) { return generation.seq; });
+    if (sequences.length && sequences.every(function (seq) { return Number.isInteger(seq) && seq > 0; })) {
+      url.searchParams.set("since_seq", String(Math.min.apply(null, sequences) - 1));
+    }
     return url.toString();
+  }
+
+  function pollRequestOptions() {
+    return {
+      headers: { "X-Requested-With": "XMLHttpRequest" },
+      signal: AbortSignal.timeout(10_000),
+    };
   }
 
   function firstJobId(expectedGenerations) {
@@ -103,6 +115,7 @@
   window.NSOApplyChain = {
     correlate: correlate,
     pollUrl: pollUrl,
+    pollRequestOptions: pollRequestOptions,
     firstJobId: firstJobId,
     createPollGuard: createPollGuard,
     createPollTimer: createPollTimer,
