@@ -148,14 +148,13 @@ netbox-test-coverage() {
     pytest "$target" -q --disable-warnings "${parallel_args[@]}" "$@"
 }
 
-# Django's runner loads neither conftest, so the pytest session guard that blocks every
-# unmocked adapter request is absent. Point PLUGINS_CONFIG at a reserved non-resolving name
-# (RFC 2606 .invalid) for this process, so an unmocked request fails fast instead of
-# reaching the configured live adapter and onboarding a test device into its store.
+# Django's runner does not load conftest, so use repository settings that select an
+# isolated database and replace the adapter configuration with test-only values.
 netbox-test-django() {
-  cd /opt/netbox/netbox && source /opt/netbox/venv/bin/activate && \
-    NSO_ADAPTER_URL="http://adapter.mock.invalid" \
-    python manage.py test netbox_nso_plugin --settings=netbox.test_settings "$@"
+  cd "$PLUGIN_DIR" && source /opt/netbox/venv/bin/activate && \
+    PYTHONPATH="$PLUGIN_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+    python /opt/netbox/netbox/manage.py test netbox_nso_plugin \
+      --settings=isolated_test_settings "$@"
 }
 
 netbox-manage() {

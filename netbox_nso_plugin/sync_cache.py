@@ -80,7 +80,7 @@ def refresh_sync_cache(mgmt, adapter_device):
     # A key absent from the payload is a different thing (partial shape) — leave it alone.
     if "last_sync_at" in adapter_device:
         raw_ts = adapter_device["last_sync_at"]
-        last_sync_at = parse_adapter_timestamp(raw_ts, "last_sync_at") if isinstance(raw_ts, str) else raw_ts
+        last_sync_at = parse_adapter_timestamp(raw_ts, "last_sync_at") if raw_ts is not None else None
         if mgmt.last_sync_at != last_sync_at:
             mgmt.last_sync_at = last_sync_at
             update_fields.append("last_sync_at")

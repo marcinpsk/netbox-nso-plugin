@@ -132,9 +132,6 @@ class TestTheConsumerReadsTheLockedRow(_CarrierCase):
 
     def test_the_consumer_reads_its_device_id_from_the_locked_row(self):
         """The FIRST feed request must carry the id on the row, not the id on the argument."""
-        from netbox_nso_plugin import settlement
-        from netbox_nso_plugin.models import NSODeviceManagement
-
         device = _make_device("stale")
         mgmt = _make_mgmt(device, "stale", 10)
         sr = _route("10.33.0.0/16", "10.33.0.1", devices=[device])
@@ -144,32 +141,11 @@ class TestTheConsumerReadsTheLockedRow(_CarrierCase):
         self.adapter.store.terminal_job(11, results=[_result(sr.pk, 104)])
 
         # Anchored on the consumer's entry point, which is the contract Step 4 calls: Step 4
-        # has handed over its `mgmt` object and the consumer has not taken its lock yet, in
-        # whatever order Step 4 does the rest of its work.
-        real_settle = settlement.settle_static_routes
-        barrier_done = []
-
-        def commit_the_repair_before_the_consumer_locks(passed_mgmt, **kwargs):
-            if not barrier_done:
-                barrier_done.append(True)
-
-                def other_connection():
-                    try:
-                        NSODeviceManagement.objects.filter(pk=mgmt.pk).update(adapter_device_id=11)
-                    finally:
-                        connections.close_all()
-
-                thread = threading.Thread(target=other_connection)
-                thread.start()
-                thread.join(timeout=30)
-                assert not thread.is_alive(), "the repair never committed, so the barrier proves nothing"
-            return real_settle(passed_mgmt, **kwargs)
-
-        with patch.object(settlement, "settle_static_routes", commit_the_repair_before_the_consumer_locks):
+        # has handed over its `mgmt` object and the consumer has not taken its lock yet.
+        with _repair_before_the_lock(mgmt.pk, 11):
             self._notify(device.pk)
             self._drain()
 
-        assert barrier_done, "the barrier never ran — Step 4 never reached the consumer"
         assert self.adapter.store.feed_requests, "the consumer was never reached"
         assert self.adapter.store.feed_requests[0][0] == 11, (
             "the first feed request used the caller's cached adapter device id, "

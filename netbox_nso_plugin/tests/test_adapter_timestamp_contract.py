@@ -245,3 +245,17 @@ class TestSyncCacheTimestamp(_AwareUTCMixin, TestCase):
             with self.subTest(value=value):
                 with self.assertLogs("netbox_nso_plugin.sync_cache", level="WARNING"):
                     self.assertIsNone(parse_adapter_timestamp(value, "last_probe_at"))
+
+    def test_refresh_degrades_non_string_timestamps_before_persistence(self):
+        """The refresh boundary must not pass malformed adapter values to the DateTimeField."""
+        from netbox_nso_plugin.sync_cache import refresh_sync_cache
+
+        for value in (1717236000, {"at": "2026-06-01T10:00:00Z"}, ["2026-06-01T10:00:00Z"]):
+            with self.subTest(value=value):
+                with self.assertLogs("netbox_nso_plugin.sync_cache", level="WARNING"):
+                    changed = refresh_sync_cache(self.mgmt, self._adapter_row(value))
+
+                self.assertNotIn("last_sync_at", changed)
+                self.assertIsNone(self.mgmt.last_sync_at)
+                self.mgmt.refresh_from_db()
+                self.assertIsNone(self.mgmt.last_sync_at)

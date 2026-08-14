@@ -178,7 +178,7 @@ Coverage runs come from `netbox-test-coverage`; the pyproject `addopts` carries 
 netbox-test-coverage
 ```
 
-For the **iterative edit-test loop, use `netbox-test`** (no coverage, parallel, warm DB reuse). Coverage is a periodic check, not a per-edit signal. `netbox-test-django` remains available for diagnosing Django-runner-specific behavior; it pins `NSO_ADAPTER_URL` to a non-resolving name, because Django's runner does not load the pytest session guard that blocks unmocked adapter requests. A raw `manage.py test` carries no such pin and can reach the configured adapter.
+For the **iterative edit-test loop, use `netbox-test`** (no coverage, parallel, warm DB reuse). Coverage is a periodic check, not a per-edit signal. `netbox-test-django` remains available for diagnosing Django-runner-specific behavior. It requires a private `TEST_DB_NAME` and loads `isolated_test_settings`, which replaces the adapter configuration because Django's runner does not load the pytest session guard. A raw `manage.py test` has neither guard and can reach the configured adapter.
 
 ## Linting and quality gates
 
