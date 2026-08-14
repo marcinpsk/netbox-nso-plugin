@@ -123,8 +123,8 @@ class TestForcedPushSitesAreEnumerated(SimpleTestCase):
     def test_the_scan_reads_calls_a_single_line_search_cannot(self):
         """The named trap: a wrapped call is invisible to a grep and plain to the compiler.
 
-        Asserted against a source string rather than against the tree, because how many of
-        them the formatter happens to fit on one line is not the property under test.
+        Asserted against a source string rather than against the tree, because whether the
+        formatter puts a forced call on one line is not the property under test.
         """
         source = (
             "def wrapped():\n"

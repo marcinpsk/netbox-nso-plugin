@@ -623,15 +623,25 @@
 
     function pollApplyChain(generations, label, notice) {
       var expected = generations.length;
-      var headJobId = generations[0] && generations[0].job_id;
-      var guard = window.NSOApplyChain && window.NSOApplyChain.createPollGuard
-        ? window.NSOApplyChain.createPollGuard()
-        : null;
-      var timer = window.NSOApplyChain.createPollTimer(checkChain, 2000);
+      var helper = window.NSOApplyChain;
 
       function statusMessage(msg) {
         return notice ? notice + ' ' + msg : msg;
       }
+
+      if (
+        !deviceJobsUrl || !helper || typeof helper.firstJobId !== 'function'
+        || typeof helper.createPollGuard !== 'function' || typeof helper.createPollTimer !== 'function'
+        || typeof helper.pollUrl !== 'function' || typeof helper.correlate !== 'function'
+      ) {
+        setButtons(false);
+        setStatus(statusMessage('Could not track the Apply generation chain.'), 'danger', false);
+        return;
+      }
+
+      var headJobId = helper.firstJobId(generations);
+      var guard = helper.createPollGuard();
+      var timer = helper.createPollTimer(checkChain, 2000);
 
       function stop(msg, type, job) {
         if (guard && !guard.stop()) return;
@@ -644,7 +654,7 @@
       async function checkChain() {
         if (!guard || !guard.enter()) return;
         try {
-          var pollUrl = window.NSOApplyChain.pollUrl(deviceJobsUrl, generations);
+          var pollUrl = helper.pollUrl(deviceJobsUrl, generations);
           var response = await fetch(pollUrl, { headers: { 'X-Requested-With': 'XMLHttpRequest' } });
           if (!response.ok) { stop('Could not retrieve the Apply generation chain.', 'danger'); return; }
           var payload = await response.json();
@@ -653,7 +663,7 @@
             stop('Could not correlate the Apply chain: the adapter generation surface is unavailable.', 'warning');
             return;
           }
-          var correlation = window.NSOApplyChain.correlate(generations, payload.generations, jobs);
+          var correlation = helper.correlate(generations, payload.generations, jobs);
           if (correlation.outcome === 'surface_gap') {
             stop(
               'Could not correlate the Apply chain: the adapter generation surface has a gap for requested generation(s): '
@@ -697,7 +707,7 @@
         }
       }
 
-      if (!deviceJobsUrl || !guard || headJobId == null) {
+      if (headJobId == null) {
         stop('Could not track the Apply generation chain.', 'danger');
         return;
       }
