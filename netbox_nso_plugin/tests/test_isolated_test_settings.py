@@ -19,6 +19,13 @@ class TestIsolatedTestSettings(SimpleTestCase):
             with self.assertRaisesRegex(RuntimeError, r"TEST_DB_NAME.*TEST_DB_NAME=test_nso_<tag>"):
                 runpy.run_path(SETTINGS)
 
+    def test_unsafe_database_names_are_rejected_before_django_can_create_or_drop_them(self):
+        for name in ("netbox", "test_netbox_nso_plugin", "test_nso_"):
+            with self.subTest(name=name):
+                with patch.dict(os.environ, {"TEST_DB_NAME": name}):
+                    with self.assertRaisesRegex(RuntimeError, r"private.*test_nso_<tag>"):
+                        runpy.run_path(SETTINGS)
+
     def test_runner_settings_replace_the_database_and_adapter_configuration(self):
         with patch.dict(os.environ, {"TEST_DB_NAME": "test_nso_settings"}):
             configured = runpy.run_path(SETTINGS)

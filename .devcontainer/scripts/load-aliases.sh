@@ -154,7 +154,7 @@ netbox-test-django() {
   cd "$PLUGIN_DIR" && source /opt/netbox/venv/bin/activate && \
     PYTHONPATH="$PLUGIN_DIR${PYTHONPATH:+:$PYTHONPATH}" \
     python /opt/netbox/netbox/manage.py test netbox_nso_plugin \
-      --settings=isolated_test_settings "$@"
+      --settings=isolated_test_settings --keepdb --noinput "$@"
 }
 
 netbox-manage() {

@@ -14,6 +14,7 @@ placed under ``/opt/netbox/netbox``.
 """
 
 import os
+import re
 
 from netbox.settings import *  # noqa: F403
 
@@ -22,6 +23,9 @@ def _test_database_name() -> str:
     name = os.environ.get("TEST_DB_NAME")
     if not name:
         raise RuntimeError("TEST_DB_NAME is required. Run with TEST_DB_NAME=test_nso_<tag>.")
+    live_name = str(DATABASES["default"].get("NAME") or "")  # noqa: F405
+    if name == live_name or re.fullmatch(r"test_nso_[a-z0-9][a-z0-9_]{0,53}", name) is None:
+        raise RuntimeError("TEST_DB_NAME must name a private test_nso_<tag> database.")
     return name
 
 
