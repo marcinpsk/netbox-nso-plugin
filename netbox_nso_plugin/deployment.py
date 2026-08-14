@@ -75,8 +75,8 @@ def guarded(label: str):
     return _decorate
 
 
-def _set_active(active: bool) -> None:
-    """Change the switch after every operation that started first has left."""
+def _set_active(active: bool) -> bool:
+    """Change the switch and return whether activation created it."""
     from .models import NSOIntentDeploymentControl
 
     with connection.cursor() as cursor:
@@ -84,20 +84,21 @@ def _set_active(active: bool) -> None:
     try:
         with transaction.atomic():
             if active:
-                NSOIntentDeploymentControl.objects.update_or_create(
+                _control, created = NSOIntentDeploymentControl.objects.update_or_create(
                     pk=1,
                     defaults={"quiesced_at": timezone.now()},
                 )
-            else:
-                NSOIntentDeploymentControl.objects.filter(pk=1).delete()
+                return created
+            NSOIntentDeploymentControl.objects.filter(pk=1).delete()
+            return False
     finally:
         with connection.cursor() as cursor:
             cursor.execute("SELECT pg_advisory_unlock(%s)", [_LOCK_KEY])
 
 
-def quiesce() -> None:
-    """Block new intent operations and wait for operations already in progress."""
-    _set_active(True)
+def quiesce() -> bool:
+    """Block new operations and return whether this call activated the gate."""
+    return _set_active(True)
 
 
 def resume() -> None:
