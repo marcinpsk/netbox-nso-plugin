@@ -280,6 +280,21 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "deploying")
 
+    def test_generation_from_an_unselected_receipt_keeps_prepared_rows_deploying(self):
+        def wrong_source(selected):
+            result = _promoted(selected)
+            for generation in result["generations"]:
+                generation["source_push_seq"] = {**selected, "vlan": selected["vlan"] - 1}
+            return result
+
+        adapter = _ApplyContractAdapter(lambda selected: (202, wrong_source(selected)))
+
+        response = self._post(adapter)
+
+        self.assertEqual(response.status_code, 502)
+        self.vlan_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "deploying")
+
     def test_deploying_marks_are_atomic_and_apply_is_not_submitted_after_a_database_failure(self):
         from netbox_nso_plugin.models import NSOLoggingLevelState
 
