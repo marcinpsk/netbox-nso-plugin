@@ -632,7 +632,8 @@
       if (
         !deviceJobsUrl || !helper || typeof helper.firstJobId !== 'function'
         || typeof helper.createPollGuard !== 'function' || typeof helper.createPollTimer !== 'function'
-        || typeof helper.pollUrl !== 'function' || typeof helper.correlate !== 'function'
+        || typeof helper.pollUrl !== 'function' || typeof helper.pollRequestOptions !== 'function'
+        || typeof helper.correlate !== 'function'
       ) {
         setButtons(false);
         setStatus(statusMessage('Could not track the Apply generation chain.'), 'danger', false);
@@ -655,7 +656,7 @@
         if (!guard || !guard.enter()) return;
         try {
           var pollUrl = helper.pollUrl(deviceJobsUrl, generations);
-          var response = await fetch(pollUrl, { headers: { 'X-Requested-With': 'XMLHttpRequest' } });
+          var response = await fetch(pollUrl, helper.pollRequestOptions());
           if (!response.ok) { stop('Could not retrieve the Apply generation chain.', 'danger'); return; }
           var payload = await response.json();
           var jobs = payload.jobs || [];

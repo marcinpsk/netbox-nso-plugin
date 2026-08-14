@@ -62,11 +62,25 @@ describe("correlate", () => {
 describe("pollUrl", () => {
   it("requests the generation ids from the Apply response on the first poll", () => {
     const url = C.pollUrl("https://netbox.example/plugins/nso/devices/10/jobs/", [
-      { generation_id: 81 },
-      { generation_id: 82 },
+      { generation_id: 81, seq: 81 },
+      { generation_id: 82, seq: 82 },
     ]);
 
     expect(new URL(url).searchParams.getAll("generation_id")).toEqual(["81", "82"]);
+    expect(new URL(url).searchParams.get("since_seq")).toBe("80");
+  });
+});
+
+describe("pollRequestOptions", () => {
+  it("bounds each generation-chain request to ten seconds", () => {
+    const signal = {};
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(signal);
+
+    expect(C.pollRequestOptions()).toEqual({
+      headers: { "X-Requested-With": "XMLHttpRequest" },
+      signal,
+    });
+    expect(timeout).toHaveBeenCalledWith(10_000);
   });
 });
 
