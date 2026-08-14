@@ -38,7 +38,8 @@ def _exclusive_transition_pending(cursor) -> bool:
         "SELECT EXISTS ("
         "SELECT 1 FROM pg_locks "
         "WHERE locktype = 'advisory' AND classid = %s AND objid = %s "
-        "AND objsubid = 1 AND mode = 'ExclusiveLock' AND NOT granted"
+        "AND objsubid = 1 AND mode = 'ExclusiveLock' AND NOT granted "
+        "AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
         ")",
         [_LOCK_KEY >> 32, _LOCK_KEY & 0xFFFFFFFF],
     )
