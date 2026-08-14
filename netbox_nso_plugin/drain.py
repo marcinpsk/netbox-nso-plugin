@@ -1647,12 +1647,15 @@ def drain_intent_outbox(limit=None) -> tuple[int, int]:
 
 def _drain_intent_outbox(limit=None) -> tuple[int, int]:
     """Run one admitted tick after the deployment guard has accepted it."""
-    compact_intent_outbox(limit)
+    _compact_intent_outbox(limit)
 
     drained = failed = 0
     for device_id, scope in drain_candidates(limit):
         try:
             outcome = drain_key(device_id, scope)
+        except DeploymentQuiesced:
+            logger.info("the intent outbox tick stopped because a deployment started")
+            break
         except Exception:  # noqa: BLE001 (one key's adapter must not abort the fleet pass)
             logger.exception("intent outbox drain failed for %s/%s", device_id, scope)
             _restamp_attempt(device_id, scope)

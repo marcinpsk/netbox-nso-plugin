@@ -202,21 +202,30 @@ def last_acked(mgmt, route):
 
 
 @contextlib.contextmanager
+def marking_mode(scope, mode):
+    """Temporarily set one delivery key's marking mode and restore it afterward."""
+    from netbox_nso_plugin import delivery
+
+    registry = delivery.delivery_keys()
+    original = registry[scope]
+    registry[scope] = dataclasses.replace(original, marking_mode=mode)
+    try:
+        yield
+    finally:
+        registry[scope] = original
+
+
+@contextlib.contextmanager
 def as_per_object(scope):
     """Run the block with *scope* in ``per_object`` marking mode, which O3 makes permanent.
 
     O1.20 records the ids in both modes and gates only emission on the mode, so a pin over
     the per-object acknowledgement can flip the registry entry and change nothing else.
     """
-    from netbox_nso_plugin import delivery
+    from netbox_nso_plugin.delivery import MARKING_PER_OBJECT
 
-    registry = delivery.delivery_keys()
-    original = registry[scope]
-    registry[scope] = dataclasses.replace(original, marking_mode=delivery.MARKING_PER_OBJECT)
-    try:
+    with marking_mode(scope, MARKING_PER_OBJECT):
         yield
-    finally:
-        registry[scope] = original
 
 
 _DEVICE_IN_URL = re.compile(r"/devices/(\d+)/")

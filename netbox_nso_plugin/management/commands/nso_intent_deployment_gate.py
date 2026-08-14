@@ -49,7 +49,11 @@ def _verification_receipt(claim, receipt):
         "backfill_only": False,
         "status_code": 200,
     }
-    wrong = {name: (receipt.get(name), value) for name, value in expected.items() if receipt.get(name) != value}
+    wrong = {
+        name: (receipt.get(name), value)
+        for name, value in expected.items()
+        if type(receipt.get(name)) is not type(value) or receipt.get(name) != value
+    }
     if wrong:
         raise CommandError(f"Verification receipt does not match the exact push: {wrong}")
     return {
