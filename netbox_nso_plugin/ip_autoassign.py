@@ -585,45 +585,34 @@ def _reserve_single(interface, mgmt, family: str, pool, result, push=True) -> No
     # One transaction, so the reservation, the overlay and the outbox entry they schedule
     # commit together. The link-role orchestrator's own atomic block nests as a savepoint.
     with transaction.atomic():
-        # Reserve the IPAddress in IPAM so concurrent allocations don't collide. It carries the
-        # pool's VRF so a VRF-scoped pool lands the address in the right table (and rollback, which
-        # filters by VRF, can find it).
+        failed_step = "IPAddress"
         try:
-            ip_obj = IPAddress(address=available_str, vrf=pool.vrf, status="reserved")
-            ip_obj.assigned_object = interface
-            ip_obj.save()
-        except Exception as exc:
-            result["errors"].append(
-                {"interface": str(interface), "family": family, "reason": f"Failed to create IPAddress: {exc}"}
-            )
-            return
+            with transaction.atomic():
+                # Reserve the IPAddress so concurrent allocations do not collide.
+                ip_obj = IPAddress(address=available_str, vrf=pool.vrf, status="reserved")
+                ip_obj.assigned_object = interface
+                ip_obj.save()
 
-        vrf_name = pool.vrf.name if pool.vrf else ""
-
-        # Create (or update the signal-created) NSOInterfaceIPState as 'accepted'.
-        try:
-            state, _ = NSOInterfaceIPState.objects.update_or_create(
-                interface=interface,
-                address=available_str,
-                vrf=vrf_name,
-                defaults={
-                    "family": family,
-                    "status": "accepted",
-                    "auto_assigned": True,
-                    "source_pool": pool,
-                    "accepted_at": timezone.now(),
-                },
-            )
+                vrf_name = pool.vrf.name if pool.vrf else ""
+                failed_step = "NSOInterfaceIPState"
+                state, _ = NSOInterfaceIPState.objects.update_or_create(
+                    interface=interface,
+                    address=available_str,
+                    vrf=vrf_name,
+                    defaults={
+                        "family": family,
+                        "status": "accepted",
+                        "auto_assigned": True,
+                        "source_pool": pool,
+                        "accepted_at": timezone.now(),
+                    },
+                )
         except Exception as exc:
-            try:
-                ip_obj.delete()
-            except Exception:
-                pass
             result["errors"].append(
                 {
                     "interface": str(interface),
                     "family": family,
-                    "reason": f"Failed to create NSOInterfaceIPState: {exc}",
+                    "reason": f"Failed to create {failed_step}: {exc}",
                 }
             )
             return

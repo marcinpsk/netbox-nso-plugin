@@ -9,6 +9,7 @@ from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.test import TestCase
 
 from ._adapter_http import make_session
+from .mixins import IntentPushResetMixin
 
 _BASE_CFG = {
     "url": "http://adapter.local",
@@ -99,7 +100,7 @@ def _make_bgp_device(suffix="bgp"):
     return Device.objects.create(name=f"bgp-router-{suffix}", device_type=dt, role=role, site=site)
 
 
-class TestReconcileBgpConfig(TestCase):
+class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
     """Integration tests for _reconcile_bgp_config() — real Django DB."""
 
     @classmethod

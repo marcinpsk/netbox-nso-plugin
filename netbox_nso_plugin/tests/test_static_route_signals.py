@@ -280,7 +280,8 @@ class TestOnStaticRouteStateSave(IntentPushDeliveryMixin, TestCase):
         with patch(PUT) as mock_push:
             from netbox_nso_plugin.signals import _on_static_route_state_save
 
-            _on_static_route_state_save(sender=NSOStaticRouteState, instance=state)
+            with self.captureOnCommitCallbacks(execute=True):
+                _on_static_route_state_save(sender=NSOStaticRouteState, instance=state)
             mock_push.assert_not_called()
 
 

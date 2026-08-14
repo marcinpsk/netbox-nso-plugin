@@ -98,6 +98,7 @@ class TestOneClaimerAcrossTwoProcesses(_CascadeFlushMixin, IntentPushResetMixin,
         self.server.received = []
         self.server.hold = threading.Event()
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
 
     def _adapter_url(self):

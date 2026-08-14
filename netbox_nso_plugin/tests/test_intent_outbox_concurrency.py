@@ -23,8 +23,9 @@ import time
 from collections import Counter
 from unittest.mock import patch
 
-from django.db import OperationalError, transaction
+from django.db import OperationalError, connection, transaction
 from django.test import TransactionTestCase
+from django.test.utils import CaptureQueriesContext
 
 from ._outbox_case import (
     ReceiptAdapter,
@@ -478,8 +479,18 @@ class TestTheSequenceAdvanceNeverPullsBackALiveAllocator(_CascadeFlushMixin, Tra
         assert advance_push_seq(base + 100) == base + 501, "a later key's lower watermark cannot pull it back"
         assert allocate_push_seq() == base + 502, "an advance already past its watermark issues nothing"
 
+    def test_a_large_advance_uses_one_set_based_jump(self):
+        from netbox_nso_plugin.outbox import advance_push_seq, allocate_push_seq
+
+        base = allocate_push_seq()
+        with CaptureQueriesContext(connection) as queries:
+            reached = advance_push_seq(base + 25_001)
+
+        assert reached >= base + 25_001
+        assert len(queries) == 2, [query["sql"] for query in queries]
+
     def test_an_advance_across_a_gap_shares_the_sequence_with_a_live_allocator(self):
-        """The gap is walked in batches, and an allocation inside one is never repeated."""
+        """The set-based jump shares the sequence with a live allocator without reuse."""
         from netbox_nso_plugin import outbox
 
         base = outbox.allocate_push_seq()
@@ -495,10 +506,7 @@ class TestTheSequenceAdvanceNeverPullsBackALiveAllocator(_CascadeFlushMixin, Tra
             for _ in range(120):
                 mine.append(outbox.allocate_push_seq())
 
-        # A batch far below the gap, so the walk is a loop and not one statement. Entered
-        # here, on this thread: a patch entered from a worker leaks whatever it found.
-        with patch.object(outbox, "_ADVANCE_BATCH", 7):
-            self._run(work, 3)
+        self._run(work, 3)
 
         issued = [value for mine in taken for value in mine]
         assert sorted(set(issued)) == sorted(issued), "an allocation inside the walk was repeated"

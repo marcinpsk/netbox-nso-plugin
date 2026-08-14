@@ -133,12 +133,13 @@ def apply_description_for_role(interface, role, other_end=None, push=True, *, mg
     defers pushes to after an atomic commit). Returns ``{interface, changed,
     description, skipped, error}``.
     """
+    from django.db import transaction
     from django.utils import timezone
 
     from .derived_intent import render_template
     from .ip_autoassign import _resolve_managed_mgmt
     from .models import NSOInterfaceState
-    from .signals import suppress_intent_push
+    from .signals import _schedule_intent_push, suppress_intent_push
 
     result = {"interface": str(interface), "changed": False, "description": None, "skipped": None, "error": None}
 
@@ -155,24 +156,18 @@ def apply_description_for_role(interface, role, other_end=None, push=True, *, mg
     new_value = render_template(role.description_template, self_iface=interface, peer_iface=other_end)
     changed = interface.description != new_value
 
-    # Set the value + own it locally under suppression, then push once explicitly.
-    with suppress_intent_push():
-        if changed:
-            interface.description = new_value
-            interface.save(update_fields=["description"])
-        NSOInterfaceState.objects.update_or_create(
-            interface=interface,
-            attribute="description",
-            defaults={"status": "accepted", "accepted_at": timezone.now()},
-        )
-
-    if push:
-        from . import drain
-
-        try:
-            drain.push_now(mgmt.device_id, "interface", force=True)
-        except Exception as exc:  # noqa: BLE001 — adapter may be down; ownership already recorded
-            logger.warning("apply_description_for_role: push failed for %s: %s", interface, exc)
+    with transaction.atomic():
+        with suppress_intent_push():
+            if changed:
+                interface.description = new_value
+                interface.save(update_fields=["description"])
+            NSOInterfaceState.objects.update_or_create(
+                interface=interface,
+                attribute="description",
+                defaults={"status": "accepted", "accepted_at": timezone.now()},
+            )
+        if push:
+            _schedule_intent_push((mgmt.device_id, "interface"))
 
     result["changed"] = changed
     result["description"] = new_value
@@ -266,6 +261,20 @@ class _ProvisionRollback(Exception):
     """Internal signal to roll back the provisioning transaction on any consumer error."""
 
 
+def _provisioned_scopes(role) -> list[str]:
+    """Return the delivery scopes one role provisioning changes."""
+    scopes = []
+    if role.assign_ipv4 or role.assign_ipv6:
+        scopes.append("ip")
+    if role.description_template:
+        scopes.append("interface")
+    if role.igp == "isis":
+        scopes.append("isis")
+    elif role.igp == "ospf":
+        scopes.append("ospf")
+    return scopes
+
+
 def _push_provisioned(role, device_ids) -> None:
     """After a successful commit, push each affected (device, category) intent once."""
     from . import drain
@@ -275,16 +284,7 @@ def _push_provisioned(role, device_ids) -> None:
         mgmt = NSODeviceManagement.objects.filter(device_id=device_id).first()
         if mgmt is None or mgmt.adapter_device_id is None:
             continue
-        scopes = []
-        if role.assign_ipv4 or role.assign_ipv6:
-            scopes.append("ip")
-        if role.description_template:
-            scopes.append("interface")
-        if role.igp == "isis":
-            scopes.append("isis")
-        elif role.igp == "ospf":
-            scopes.append("ospf")
-        for scope in scopes:
+        for scope in _provisioned_scopes(role):
             try:
                 # A forced claim: provisioning must always land its computed intent, and an
                 # acknowledged baseline matching this snapshot would otherwise drop the
@@ -292,6 +292,15 @@ def _push_provisioned(role, device_ids) -> None:
                 drain.push_now(device_id, scope, force=True)
             except Exception as exc:  # noqa: BLE001 — adapter may be down; state already owned
                 logger.warning("provision_link_role: push failed for device %s: %s", device_id, exc)
+
+
+def _enqueue_provisioned(role, device_ids) -> None:
+    """Record each affected delivery scope before the provisioning commit."""
+    from . import outbox
+
+    for device_id in device_ids:
+        for scope in _provisioned_scopes(role):
+            outbox.enqueue(device_id, scope)
 
 
 def provision_link_role(interface) -> dict:
@@ -344,6 +353,7 @@ def provision_link_role(interface) -> dict:
     else:
         pairs = [(interface, None)]
     summary["ends"] = sorted({end.pk for end, _peer in pairs})
+    device_ids = {end.device_id for end, _peer in pairs}
 
     # Pre-flight: every end must be NSO-managed — resolve each device's management
     # row once and thread it to the consumers (they'd otherwise re-query it ~10× per
@@ -367,31 +377,33 @@ def provision_link_role(interface) -> dict:
             summary["errors"].append({"kind": kind, "reason": res["error"], "interface": res.get("interface")})
 
     try:
-        with suppress_intent_push(), transaction.atomic():
-            ip_res = assign_ips_for_role(
-                interface,
-                role,
-                other_end,
-                push=False,
-                mgmt=mgmt_by_device[interface.device_id],
-                peer_mgmt=(mgmt_by_device.get(other_end.device_id) if other_end is not None else None),
-            )
-            summary["ip"] = ip_res
-            _collect(ip_res, "ip")
-            for end, peer in pairs:
-                end_mgmt = mgmt_by_device[end.device_id]
-                d = apply_description_for_role(end, role, peer, push=False, mgmt=end_mgmt)
-                summary["descriptions"].append(d)
-                _collect(d, "description")
-                g = enable_igp_for_role(end, role, push=False, mgmt=end_mgmt)
-                summary["igp"].append(g)
-                _collect(g, "igp")
+        with transaction.atomic():
+            with suppress_intent_push():
+                ip_res = assign_ips_for_role(
+                    interface,
+                    role,
+                    other_end,
+                    push=False,
+                    mgmt=mgmt_by_device[interface.device_id],
+                    peer_mgmt=(mgmt_by_device.get(other_end.device_id) if other_end is not None else None),
+                )
+                summary["ip"] = ip_res
+                _collect(ip_res, "ip")
+                for end, peer in pairs:
+                    end_mgmt = mgmt_by_device[end.device_id]
+                    d = apply_description_for_role(end, role, peer, push=False, mgmt=end_mgmt)
+                    summary["descriptions"].append(d)
+                    _collect(d, "description")
+                    g = enable_igp_for_role(end, role, push=False, mgmt=end_mgmt)
+                    summary["igp"].append(g)
+                    _collect(g, "igp")
             if summary["errors"]:
                 raise _ProvisionRollback()
+            _enqueue_provisioned(role, device_ids)
     except _ProvisionRollback:
         summary["rolled_back"] = True
         return summary
 
-    _push_provisioned(role, {end.device_id for end, _peer in pairs})
+    _push_provisioned(role, device_ids)
     summary["provisioned"] = True
     return summary

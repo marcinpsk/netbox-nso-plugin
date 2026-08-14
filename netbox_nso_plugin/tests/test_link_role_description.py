@@ -3,12 +3,9 @@
 """Phase 4 tests for the link-role description consumer.
 
 Real ORM + real interface-ownership path (NSOInterfaceState): renders the M8
-template on both ends, owns + would-push via the existing interface intent pipe,
-is idempotent, and validates template placeholders at save time. The only patch is
-the forced claim the consumer takes, which is where the push leaves the process.
+template on both ends, records durable interface intent, is idempotent, and validates
+template placeholders at save time.
 """
-
-from unittest.mock import patch
 
 from dcim.models import (
     Cable,
@@ -26,7 +23,8 @@ from django.test import TestCase
 from netbox_nso_plugin.link_role import apply_description_for_role
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOInterfaceState, NSOLinkRole
 
-_PUSH = "netbox_nso_plugin.drain.push_now"
+from ._outbox_case import entries
+from .mixins import IntentPushResetMixin
 
 
 def _make_cable(iface_a, iface_b):
@@ -36,7 +34,7 @@ def _make_cable(iface_a, iface_b):
     return cable
 
 
-class TestApplyDescriptionForRole(TestCase):
+class TestApplyDescriptionForRole(IntentPushResetMixin, TestCase):
     @classmethod
     def setUpTestData(cls):
         mfg = Manufacturer.objects.create(name="LdMfg", slug="ldmfg")
@@ -67,8 +65,7 @@ class TestApplyDescriptionForRole(TestCase):
 
     def test_renders_peer_facts_p2p(self):
         role = self._role("to {peer_host}:{peer_iface}")
-        with patch(_PUSH):
-            result = apply_description_for_role(self.if_a, role, other_end=self.if_b)
+        result = apply_description_for_role(self.if_a, role, other_end=self.if_b)
         self.if_a.refresh_from_db()
         self.assertEqual(self.if_a.description, "to ld-b:Gi1/0")
         self.assertTrue(result["changed"])
@@ -78,8 +75,7 @@ class TestApplyDescriptionForRole(TestCase):
 
     def test_single_ended_blank_peer_placeholders(self):
         role = self._role("{self_host} {self_iface} loopback", link_type="single")
-        with patch(_PUSH):
-            apply_description_for_role(self.lo_a, role)
+        apply_description_for_role(self.lo_a, role)
         self.lo_a.refresh_from_db()
         self.assertEqual(self.lo_a.description, "ld-a Loopback0 loopback")
 
@@ -94,8 +90,7 @@ class TestApplyDescriptionForRole(TestCase):
         )
         self.lo_a.description = "keep me"
         self.lo_a.save()
-        with patch(_PUSH):
-            result = apply_description_for_role(self.lo_a, role)
+        result = apply_description_for_role(self.lo_a, role)
         self.lo_a.refresh_from_db()
         self.assertEqual(self.lo_a.description, "keep me")
         self.assertIsNotNone(result["skipped"])
@@ -103,9 +98,8 @@ class TestApplyDescriptionForRole(TestCase):
 
     def test_idempotent_rerun(self):
         role = self._role("link to {peer_host}")
-        with patch(_PUSH):
-            first = apply_description_for_role(self.if_a, role, other_end=self.if_b)
-            second = apply_description_for_role(self.if_a, role, other_end=self.if_b)
+        first = apply_description_for_role(self.if_a, role, other_end=self.if_b)
+        second = apply_description_for_role(self.if_a, role, other_end=self.if_b)
         self.if_a.refresh_from_db()
         self.assertTrue(first["changed"])
         self.assertFalse(second["changed"])
@@ -113,15 +107,13 @@ class TestApplyDescriptionForRole(TestCase):
 
     def test_unmanaged_device_error(self):
         role = self._role("to {peer_host}", link_type="single")
-        with patch(_PUSH):
-            result = apply_description_for_role(self.if_b, role)  # dev_b is not managed
+        result = apply_description_for_role(self.if_b, role)  # dev_b is not managed
         self.assertIn("not managed", result["error"])
 
-    def test_pushes_when_owned(self):
+    def test_records_durable_work_when_owned(self):
         role = self._role("to {peer_host}")
-        with patch(_PUSH) as push:
-            apply_description_for_role(self.if_a, role, other_end=self.if_b)
-        push.assert_called_once_with(self.mgmt_a.device_id, "interface", force=True)
+        apply_description_for_role(self.if_a, role, other_end=self.if_b)
+        self.assertTrue(entries(self.dev_a, "interface", unconsumed=True))
 
 
 class TestDescriptionTemplateValidation(TestCase):

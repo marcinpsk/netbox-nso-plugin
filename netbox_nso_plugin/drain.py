@@ -73,6 +73,8 @@ REFUSED = "refused"
 PARKED = "parked"
 ABANDONED = "abandoned"
 SUCCEEDED = "succeeded"
+_PARKED_SEND = object()
+_ABANDONED_SEND = object()
 FAILED = "failed"
 SUPERSEDED = "superseded"
 UNACKNOWLEDGED = "unacknowledged"
@@ -346,11 +348,27 @@ def _claim_locked(device_id, scope, mode, force) -> Claim | None:
     return _form(state, mgmt, now, mode, force)
 
 
-def _takeover(state, mgmt, now) -> Claim:
+def _takeover(state, mgmt, now) -> Claim | None:
     """Replay the unacknowledged operation: same sequence, same body, fresh lease."""
+    flags = state.claim_flags or {}
+    current_identity = request_identity(
+        state.claim_payload,
+        mode=flags.get("mode", delivery.MODE_NORMAL),
+        deletions=state.claim_deletions or [],
+        mark=state.claim_mark,
+        epoch=mapping_epoch(mgmt),
+    )
+    if current_identity != state.claim_identity:
+        logger.info(
+            "abandoning push_seq %s for %s/%s after its mapping epoch changed",
+            state.push_seq,
+            state.device_id,
+            state.scope,
+        )
+        _abandon_locked(state)
+        return None
     state.claimed_at = now
     state.save()
-    flags = state.claim_flags or {}
     logger.info("taking over push_seq %s for %s/%s", state.push_seq, state.device_id, state.scope)
     return Claim(
         device_id=state.device_id,
@@ -633,11 +651,11 @@ def revocation_hit(claim: Claim) -> bool:
     return False
 
 
-def send_claim(claim: Claim):
+def send_claim(claim: Claim, *, deadline=None):
     """Make the claim's HTTP call and return the adapter's answer.
 
-    Returns :data:`PARKED` when the device is no longer managed and :data:`ABANDONED` when
-    the pre-send scan found a revocation, in both cases without sending. Parking is not a
+    Returns a private control sentinel when the device is no longer managed or the pre-send
+    scan found a revocation, in both cases without sending. Parking is not a
     third abandon cause: the operation keeps its rows, its authority and its sequence, and
     resumes when the device is managed again.
     """
@@ -646,19 +664,34 @@ def send_claim(claim: Claim):
 
     if not signals._device_is_managed(claim.device_id):
         logger.info("device %s is no longer NSO-managed, parking push_seq %s", claim.device_id, claim.push_seq)
-        return PARKED
+        return _PARKED_SEND
     if revocation_hit(claim):
         logger.info("a revocation withdrew authority from push_seq %s, abandoning it", claim.push_seq)
         abandon(claim)
-        return ABANDONED
+        return _ABANDONED_SEND
     return delivery.send(
         claim.rendered,
         claim.payload,
         mode=claim.mode,
         mark=bool(claim.mark),
         push_seq=claim.push_seq,
-        deadline=SEND_DEADLINE.total_seconds(),
+        deadline=SEND_DEADLINE.total_seconds() if deadline is None else deadline,
     )
+
+
+def _send_clock() -> float:
+    """Return the monotonic clock used for a shared send deadline."""
+    return time.monotonic()
+
+
+def _remaining_send_deadline(deadline_at) -> float:
+    """Return this send's share of one drain deadline."""
+    if deadline_at is None:
+        return SEND_DEADLINE.total_seconds()
+    remaining = deadline_at - _send_clock()
+    if remaining <= 0:
+        raise delivery.SendDeadlineExceeded("the shared send deadline expired before transport")
+    return remaining
 
 
 # ── The outcome ───────────────────────────────────────────────────────────────
@@ -987,22 +1020,30 @@ def abandon(claim: Claim) -> str:
     never reissued.
     """
     _refuse_in_transaction("abandon")
-    from .models import NSOIntentOutboxEntry
-
     with transaction.atomic():
         state = _lock_state(claim.device_id, claim.scope)
         if state.push_seq != claim.push_seq:
             return SUPERSEDED
-        NSOIntentOutboxEntry.objects.filter(
-            device_id=claim.device_id, scope=claim.scope, consumed_by_push_seq=claim.push_seq
-        ).update(consumed_by_push_seq=None)
-        queued = {int(record["route_id"]): record for record in state.queued_deletions}
-        for record in state.claim_deletions or []:
-            queued.setdefault(int(record["route_id"]), record)
-        state.queued_deletions = list(queued.values())
-        _clear_claim(state)
-        state.save()
+        _abandon_locked(state)
     return ABANDONED
+
+
+def _abandon_locked(state) -> None:
+    """Rehome one locked claim without opening another transaction."""
+    from .models import NSOIntentOutboxEntry
+
+    NSOIntentOutboxEntry.objects.filter(
+        device_id=state.device_id, scope=state.scope, consumed_by_push_seq=state.push_seq
+    ).update(consumed_by_push_seq=None)
+    queued = {int(record["route_id"]): record for record in state.queued_deletions}
+    revoked = {int(route_id) for route_id in state.revoked_ids or []}
+    for record in state.claim_deletions or []:
+        route_id = int(record["route_id"])
+        if route_id not in revoked:
+            queued.setdefault(route_id, record)
+    state.queued_deletions = list(queued.values())
+    _clear_claim(state)
+    state.save()
 
 
 # ── The direct-apply keys, which are out of protocol (Rev 15 split, §7.1) ─────
@@ -1011,7 +1052,7 @@ def abandon(claim: Claim) -> str:
 _SENDING = "sending"
 
 
-def _deliver_direct(device_id, scope, *, mode, force) -> tuple[str, object]:
+def _deliver_direct(device_id, scope, *, mode, force, deadline_at) -> tuple[str, object]:
     """Deliver an out-of-protocol key: coalesced like every other, and claim-less (O-P12c).
 
     ``lacp`` and ``switchport`` write to NSO synchronously inside the request, so no receipt
@@ -1030,7 +1071,11 @@ def _deliver_direct(device_id, scope, *, mode, force) -> tuple[str, object]:
     rendered, mark = prepared
     try:
         answer = delivery.send(
-            rendered, rendered.payload, mode=mode, mark=bool(mark), deadline=SEND_DEADLINE.total_seconds()
+            rendered,
+            rendered.payload,
+            mode=mode,
+            mark=bool(mark),
+            deadline=_remaining_send_deadline(deadline_at),
         )
     except Exception as exc:  # noqa: BLE001 (the send records it; nothing replays a device write)
         logger.warning("the %s/%s apply failed: %s", device_id, scope, exc)
@@ -1138,13 +1183,24 @@ def _claim_or_compact(device_id, scope, *, mode, force):
     return None, True
 
 
-def drain_key(device_id, scope, *, mode=delivery.MODE_NORMAL, force=False, chain=DRAIN_CHAIN_MAX, reform=1) -> str:
+def drain_key(
+    device_id,
+    scope,
+    *,
+    mode=delivery.MODE_NORMAL,
+    force=False,
+    chain=DRAIN_CHAIN_MAX,
+    reform=1,
+    deadline=None,
+) -> str:
     """Claim, send and settle one key, then chain a bounded number of further drains."""
-    outcome, _answer = _drain_once(device_id, scope, mode=mode, force=force, chain=chain, reform=reform)
+    outcome, _answer = _drain_once(
+        device_id, scope, mode=mode, force=force, chain=chain, reform=reform, deadline=deadline
+    )
     return outcome
 
 
-def push_now(device_id, scope, *, mode=delivery.MODE_NORMAL, force=False):
+def push_now(device_id, scope, *, mode=delivery.MODE_NORMAL, force=False, deadline=None):
     """Drain one key synchronously and return the adapter's answer, or ``None``.
 
     The forced-push sites use this: a forced call is its own logical operation, never
@@ -1152,21 +1208,34 @@ def push_now(device_id, scope, *, mode=delivery.MODE_NORMAL, force=False):
     read the answer (the Apply's promotion gate, the fleet resync's stored count). ``None``
     means the operation was not acknowledged, which is what those callers act on.
     """
-    outcome, answer = _drain_once(device_id, scope, mode=mode, force=force)
+    outcome, answer = _drain_once(device_id, scope, mode=mode, force=force, deadline=deadline)
     return answer if outcome == SUCCEEDED else None
 
 
-def _drain_once(device_id, scope, *, mode, force, chain=DRAIN_CHAIN_MAX, reform=1) -> tuple[str, object]:
+def _drain_once(
+    device_id,
+    scope,
+    *,
+    mode,
+    force,
+    chain=DRAIN_CHAIN_MAX,
+    reform=1,
+    deadline=None,
+    _deadline_at=None,
+) -> tuple[str, object]:
     """Run one claim/send/outcome cycle, returning ``(outcome, the adapter's answer)``."""
     _refuse_in_transaction("drain")
+    if deadline is not None and _deadline_at is None:
+        _deadline_at = _send_clock() + deadline
     if not delivery.delivery_keys()[scope].in_protocol:
-        return _deliver_direct(device_id, scope, mode=mode, force=force)
+        return _deliver_direct(device_id, scope, mode=mode, force=force, deadline_at=_deadline_at)
     # The mode THIS attempt may send in. The caller's own mode is what a re-form or a chain
     # resumes with, so a fence that opens mid-chain goes back to delivering, not backfilling.
     send_mode = _withheld_mode(device_id, scope, mode)
     try:
         claimed, timed_out = _claim_or_compact(device_id, scope, mode=send_mode, force=force)
     except AuthorityPending as refusal:
+        _record_claim_refusal(device_id, scope, refusal)
         _report_refusal(device_id, scope, refusal)
         return REFUSED, None
     if timed_out:
@@ -1174,7 +1243,7 @@ def _drain_once(device_id, scope, *, mode, force, chain=DRAIN_CHAIN_MAX, reform=
     if claimed is None:
         return NOTHING, None
     try:
-        answer = send_claim(claimed)
+        answer = send_claim(claimed, deadline=_remaining_send_deadline(_deadline_at))
     except Exception as exc:  # noqa: BLE001 (the operation is replayed, so the failure is data)
         logger.warning("push_seq %s failed for %s/%s: %s", claimed.push_seq, device_id, scope, exc)
         if _proven_no_effect(exc):
@@ -1182,13 +1251,24 @@ def _drain_once(device_id, scope, *, mode, force, chain=DRAIN_CHAIN_MAX, reform=
         if _rejected_at_boundary(exc):
             return _dissolve(claimed, exc), None
         return record_failure(claimed, exc), None
-    if answer == ABANDONED and reform > 0:
+    if answer is _ABANDONED_SEND and reform > 0:
         # A fixed revocation resolves in ONE re-form: the re-form folds the revoking entry
         # with everything else, so the authority no longer names that route. A revocation
         # committing during the re-form is the accepted OQ-O-7 residual, not a loop.
-        return _drain_once(device_id, scope, mode=mode, force=force, chain=chain, reform=reform - 1)
-    if answer in (PARKED, ABANDONED):
-        return answer, None
+        return _drain_once(
+            device_id,
+            scope,
+            mode=mode,
+            force=force,
+            chain=chain,
+            reform=reform - 1,
+            deadline=deadline,
+            _deadline_at=_deadline_at,
+        )
+    if answer is _PARKED_SEND:
+        return PARKED, None
+    if answer is _ABANDONED_SEND:
+        return ABANDONED, None
     outcome = settle(claimed, answer)
     if outcome == SUCCEEDED and chain > 0:
         if _answered_other_work(claimed, mode, force):
@@ -1196,13 +1276,29 @@ def _drain_once(device_id, scope, *, mode, force, chain=DRAIN_CHAIN_MAX, reform=
             # admitted under. This call's own mode and force are still owed, so it forms its
             # own claim now that the key is free to allocate one, and THAT outcome is the
             # answer: a preparatory pass may never be reported as the caller's own result.
-            return _drain_once(device_id, scope, mode=mode, force=force, chain=chain - 1)
+            return _drain_once(
+                device_id,
+                scope,
+                mode=mode,
+                force=force,
+                chain=chain - 1,
+                deadline=deadline,
+                _deadline_at=_deadline_at,
+            )
         if mode == delivery.MODE_NORMAL and _pending(device_id, scope):
             # Level-triggered, and terminating: each successful NORMAL pass retires at least
             # one row or clears authority. Neither other mode consumes anything, so a caller
             # who asked for one gets exactly one; the cap is for latency, and the tick
             # guarantees the rest.
-            _drain_once(device_id, scope, mode=mode, force=False, chain=chain - 1)
+            _drain_once(
+                device_id,
+                scope,
+                mode=mode,
+                force=False,
+                chain=chain - 1,
+                deadline=deadline,
+                _deadline_at=_deadline_at,
+            )
     return outcome, answer
 
 
@@ -1277,6 +1373,18 @@ def _dissolve(claim: Claim, exc) -> str:
         state.save()
     logger.warning("%s/%s refused push_seq %s at the boundary: %s", claim.device_id, claim.scope, claim.push_seq, exc)
     return REJECTED
+
+
+def _record_claim_refusal(device_id, scope, exc) -> None:
+    """Record a refusal whose claim transaction rolled back."""
+    with transaction.atomic():
+        state = _lock_state(device_id, scope)
+        now = _db_now()
+        state.attempts += 1
+        state.last_drain_attempted_at = now
+        state.last_error_code = str(getattr(exc, "code", "") or type(exc).__name__)[:64]
+        state.last_error_at = now
+        state.save()
 
 
 def _withhold(claim: Claim, exc) -> str:
@@ -1425,6 +1533,15 @@ def drain_candidates(limit=None) -> list[tuple[int, str]]:
     return [key for _stamped, _at, key in ordered[:limit]]
 
 
+def compact_intent_outbox(limit=None) -> None:
+    """Compact the tick's bounded candidate set without contacting the adapter."""
+    for device_id, scope in compaction_candidates(limit):
+        try:
+            compact(device_id, scope)
+        except Exception:  # noqa: BLE001 (one key's compaction must not abort the fleet pass)
+            logger.exception("intent outbox compaction failed for %s/%s", device_id, scope)
+
+
 def drain_intent_outbox(limit=None) -> tuple[int, int]:
     """Appendix O's tick pass. Returns ``(drained, failed)``.
 
@@ -1436,11 +1553,7 @@ def drain_intent_outbox(limit=None) -> tuple[int, int]:
     replayable failure is not drainable and would never be compacted otherwise, which is
     exactly the case where a burst accumulates.
     """
-    for device_id, scope in compaction_candidates(limit):
-        try:
-            compact(device_id, scope)
-        except Exception:  # noqa: BLE001 (one key's compaction must not abort the fleet pass)
-            logger.exception("intent outbox compaction failed for %s/%s", device_id, scope)
+    compact_intent_outbox(limit)
 
     drained = failed = 0
     for device_id, scope in drain_candidates(limit):
@@ -1582,9 +1695,13 @@ def gate_blockers(device_id=None) -> list[str]:
         states = states.filter(device_id=device_id)
 
     blockers = []
-    for entry_device, scope in rows.filter(consumed_by_push_seq__isnull=True).values_list("device_id", "scope"):
+    for entry_device, scope in (
+        rows.filter(consumed_by_push_seq__isnull=True).order_by().values_list("device_id", "scope").distinct()
+    ):
         blockers.append(f"{entry_device}/{scope}: an unconsumed entry")
-    for entry_device, scope in rows.filter(consumed_by_push_seq__isnull=False).values_list("device_id", "scope"):
+    for entry_device, scope in (
+        rows.filter(consumed_by_push_seq__isnull=False).order_by().values_list("device_id", "scope").distinct()
+    ):
         blockers.append(f"{entry_device}/{scope}: a row carrying a push_seq")
     for state in states:
         key = f"{state.device_id}/{state.scope}"

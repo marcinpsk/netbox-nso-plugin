@@ -72,8 +72,10 @@ class _MarkCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
 
     def own(self, *vids):
         """Own each VLAN and land it on the device, so a later shrink has something to lose."""
+        from netbox_nso_plugin import drain
+
         states = {vid: own_vlan(self.mgmt, vid, self.tag) for vid in vids}
-        assert self.drain() in {"succeeded", "nothing"}
+        assert self.drain() in {drain.SUCCEEDED, drain.NOTHING}
         assert self.adapter.on_device[self.adapter_device_id] == {vlan_member(vid) for vid in vids}
         self.clear_entries()
         self.adapter.requests.clear()
@@ -216,25 +218,33 @@ class TestALateEntryNeverAbandonsTheClaim(_MarkCase):
 
         started = threading.Event()
         release = threading.Event()
+        errors: list[BaseException] = []
 
         def late_writer():
             """Allocates its entry first and commits it last, so its id is the lower one."""
-            with transaction.atomic():
-                outbox.enqueue(self.device.pk, "static_route", transitions=[])
-                started.set()
-                assert release.wait(timeout=30)
+            try:
+                with transaction.atomic():
+                    outbox.enqueue(self.device.pk, "static_route", transitions=[])
+                    started.set()
+                    assert release.wait(timeout=30)
+            except BaseException as exc:  # noqa: BLE001 (the parent reports the failure)
+                errors.append(exc)
 
         worker = threading.Thread(target=lambda: in_thread(late_writer))
         worker.start()
-        assert started.wait(timeout=30)
+        assert started.wait(timeout=30), errors
 
         with without_commit_drain(), transaction.atomic():
             self.mgmt.static_route_states.get(static_route=route).save()
         with as_per_object("static_route"):
-            claimed = drain.claim(self.device.pk, "static_route")
-            assert claimed is not None
-            release.set()
-            worker.join(timeout=30)
+            try:
+                claimed = drain.claim(self.device.pk, "static_route")
+                assert claimed is not None
+            finally:
+                release.set()
+                worker.join(timeout=30)
+            assert not worker.is_alive(), "the writer did not finish"
+            assert errors == []
 
             config, session = self.adapter.patches()
             with config, session:

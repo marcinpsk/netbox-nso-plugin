@@ -411,3 +411,20 @@ class TestOutboxTeardown(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
             self.device.delete()
 
         assert not NSOIntentOutboxEntry.objects.filter(device_id=device_id).exists()
+
+    def test_device_delete_suppresses_a_cascaded_svi_overlay_append(self):
+        from dcim.models import Interface
+
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOSVIState
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        interface = Interface.objects.create(device=self.device, name="Vlan444", type="virtual")
+        with suppress_intent_push():
+            NSOSVIState.objects.create(management=self.mgmt, interface=interface, status="accepted")
+        NSOIntentOutboxEntry.objects.all().delete()
+        device_id = self.device.pk
+
+        with patch("netbox_nso_plugin.adapter_client.delete_device"):
+            self.device.delete()
+
+        assert not NSOIntentOutboxEntry.objects.filter(device_id=device_id).exists()

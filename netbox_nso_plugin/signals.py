@@ -155,8 +155,7 @@ def _skip_on_render(handler):
 #
 # The cell below is thread-local and holds only keys. Registration is unconditional and the
 # first callback clears it, so a cell a rollback left behind costs extra O(1) callbacks and
-# never a missing drain. With no transaction open (a lone programmatic save) the same
-# callback runs inline, because there is nothing to wait for.
+# never a missing drain. The append refuses when no writer transaction is open.
 _intent_keys = threading.local()
 
 
@@ -511,7 +510,10 @@ def _send_rendered(rendered, body):
         raise
     _record_push_outcome(device_id, scope, attempt, None)
     if rendered.on_response is not None and isinstance(result, dict):
-        rendered.on_response(result)
+        try:
+            rendered.on_response(result)
+        except Exception:  # noqa: BLE001 (the adapter already acknowledged the send)
+            logger.exception("Intent push success hook failed for device %s/%s", device_id, scope)
     return result
 
 
@@ -1938,9 +1940,8 @@ def _push_static_route_intent_for_device(device_id, adapter_device_id):
     NULL — the adapter adopts a generation only when non-null, so a sentinel row simply has
     nothing to correlate with instead of correlating with everything at 0.
 
-    Returns the adapter's response, so a forced caller can tell a failure (``None``) from
-    an acknowledged push, and records the echoed fingerprints as this device's settlement
-    expectations.
+    Records echoed fingerprints as this device's settlement expectations. The claim handles
+    the adapter response after this function captures the rendered body.
     """
     from . import adapter_client as client
     from .models import NSOStaticRouteState
@@ -1972,7 +1973,7 @@ def _push_static_route_intent_for_device(device_id, adapter_device_id):
         if generation is not None:
             generations[sr.pk] = generation
 
-    return _push_changed(
+    _push_changed(
         (device_id, "static_route"),
         routes,
         lambda body: client.put_static_route_intent(adapter_device_id, body),
@@ -2184,13 +2185,11 @@ def _accept_static_route_for_device(static_route, device) -> None:
         defaults={
             "status": "accepted",
             "accepted_at": timezone.now(),
-            # The transfer of §4.3(b): removal deleted the overlay that held the history, so
-            # a fresh row inherits the last triple the adapter acknowledged for this pk from
-            # the deletion still pending for it. Without it the next deletion carries only
-            # the new triple, matches nothing and detaches the old row silently.
-            "last_acked_triple": _carried_last_acked(mgmt, static_route.pk),
         },
     )
+    if created:
+        # A fresh row inherits the last acknowledged triple from its pending deletion.
+        state.last_acked_triple = _carried_last_acked(mgmt, static_route.pk)
     was_owned = not created and state.status in _OWNED_PUSH_STATUSES
     if not created and not was_owned:
         state.status = "accepted"
@@ -3161,7 +3160,7 @@ def _push_route_policy_intent_for_device(device_id, adapter_device_id):
             }
         )
 
-    return _push_changed(
+    _push_changed(
         (device_id, "route_policy"),
         objects,
         lambda body: client.put_route_policy_intent(adapter_device_id, body),

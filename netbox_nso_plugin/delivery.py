@@ -33,6 +33,7 @@ MODE_STORE_ONLY = "store_only"
 #: no content, carry no authority, spawn no job. It exists to open a fence a pending genuine
 #: deletion cannot open for itself (§4.4, OQ-O-8), and it is never a way to deliver anything.
 MODE_BACKFILL_ONLY = "backfill_only"
+_MODES = (MODE_NORMAL, MODE_STORE_ONLY, MODE_BACKFILL_ONLY)
 
 MARKING_QUERY_FLAG = "query_flag"
 MARKING_PER_OBJECT = "per_object"
@@ -241,6 +242,8 @@ def send(
     """
     from . import adapter_client, signals
 
+    if mode not in _MODES:
+        raise ValueError(f"unknown delivery mode {mode!r}")
     entry = delivery_keys()[rendered.key[1]]
     if deadline is not None:
         rendered = dataclasses.replace(rendered, do_push=_under_deadline(rendered.do_push, deadline))

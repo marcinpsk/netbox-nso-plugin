@@ -9,6 +9,7 @@ from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Platform, 
 from django.test import TestCase
 
 from ._adapter_http import make_session
+from .mixins import IntentPushResetMixin
 
 _BASE_CFG = {
     "url": "http://adapter.local",
@@ -94,7 +95,7 @@ class TestGetSnmpConfig(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestReconcileSnmpConfig(TestCase):
+class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
     """Django-DB tests for _reconcile_snmp_config in template_content.py."""
 
     @classmethod

@@ -33,11 +33,6 @@ def allocate_push_seq() -> int:
         return int(cursor.fetchone()[0])
 
 
-#: Values one advance takes per round trip. A restore's gap is a handful of statements at
-#: this size, and the loop re-reads between batches, so a larger gap costs round trips only.
-_ADVANCE_BATCH = 10_000
-
-
 def advance_push_seq(watermark: int) -> int:
     """Move the sequence past *watermark*, and return the highest value it proved issued.
 
@@ -59,20 +54,17 @@ def advance_push_seq(watermark: int) -> int:
 
     watermark = int(watermark)
     with connection.cursor() as cursor:
-        while True:
-            cursor.execute(f"SELECT last_value, is_called FROM {PUSH_SEQ_SEQUENCE}")  # noqa: S608 (a constant)
-            last_value, is_called = cursor.fetchone()
-            # A sequence not yet called has handed out nothing: last_value is the NEXT value.
-            issued = int(last_value) if is_called else int(last_value) - 1
-            if issued >= watermark:
-                return issued
-            cursor.execute(
-                f"SELECT max(nextval('{PUSH_SEQ_SEQUENCE}')) FROM generate_series(1, %s)",  # noqa: S608
-                [min(watermark - issued, _ADVANCE_BATCH)],
-            )
-            issued = int(cursor.fetchone()[0])
-            if issued >= watermark:
-                return issued
+        cursor.execute(f"SELECT last_value, is_called FROM {PUSH_SEQ_SEQUENCE}")  # noqa: S608 (a constant)
+        last_value, is_called = cursor.fetchone()
+        # A sequence not yet called has handed out nothing: last_value is the NEXT value.
+        issued = int(last_value) if is_called else int(last_value) - 1
+        if issued >= watermark:
+            return issued
+        cursor.execute(
+            f"SELECT max(nextval('{PUSH_SEQ_SEQUENCE}')) FROM generate_series(1, %s)",  # noqa: S608
+            [watermark - issued],
+        )
+        return int(cursor.fetchone()[0])
 
 
 # ── Transition records: the provenance an entry carries ───────────────────────
@@ -144,7 +136,7 @@ def fold_transitions(transitions, *, claim_deletions=(), queued=(), revoked=(), 
     folded = FoldedAuthority(
         queued={int(record["route_id"]): record for record in queued},
         revoked={int(route_id) for route_id in revoked},
-        lineage_carry=dict(lineage_carry or {}),
+        lineage_carry={int(route_id): triple for route_id, triple in (lineage_carry or {}).items()},
     )
     for record in transitions:
         route_id = record.get("route_id")
@@ -273,11 +265,27 @@ def _device_is_tearing_down(device_id, txid: int) -> bool:
 
 def current_txid() -> int:
     """Read the current transaction's id: the entry's ``batch_id`` and the mark's epoch."""
-    from django.db import connection
+    from django.db import connection, transaction
+
+    outer = connection.atomic_blocks[0] if connection.atomic_blocks else None
+    hooks = connection.run_on_commit
+    cached = getattr(connection, "_nso_intent_txid", None)
+    if outer is not None and cached is not None and cached[0] is outer and cached[1] is hooks:
+        return cached[2]
 
     with connection.cursor() as cursor:
         cursor.execute("SELECT txid_current()")
-        return int(cursor.fetchone()[0])
+        txid = int(cursor.fetchone()[0])
+    if outer is not None:
+        connection._nso_intent_txid = (outer, hooks, txid)
+
+        def clear_cache():
+            cached = getattr(connection, "_nso_intent_txid", None)
+            if cached is not None and cached[0] is outer and cached[1] is hooks:
+                del connection._nso_intent_txid
+
+        transaction.on_commit(clear_cache)
+    return txid
 
 
 def _refuse_outside_a_transaction() -> None:

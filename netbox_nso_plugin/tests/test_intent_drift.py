@@ -152,8 +152,8 @@ class TestIntentDrift(IntentPushResetMixin, TestCase):
         # Must never break the tab render.
         self.assertEqual(intent_drift.compute_intent_drift(self.device, self.mgmt), [])
 
-    @patch("netbox_nso_plugin.drain.push_now")
-    def test_resync_calls_push_for_scope(self, mock_push):
+    @patch("netbox_nso_plugin.drain.drain_key", return_value="succeeded")
+    def test_resync_calls_push_for_scope(self, mock_drain):
         from netbox_nso_plugin.delivery import MODE_STORE_ONLY
 
         done, failed = intent_drift.resync_intent(self.device, self.mgmt, ["interface_ip"])
@@ -162,15 +162,15 @@ class TestIntentDrift(IntentPushResetMixin, TestCase):
         # ip, so the key is resolved through the one registry that enumerates the pushes.
         # force=True: the split-brain re-sync must not be dropped against the acknowledged
         # baseline — that baseline is precisely what is stale here (see TestResyncStoreOnly).
-        mock_push.assert_called_once_with(self.mgmt.device_id, "ip", mode=MODE_STORE_ONLY, force=True)
+        mock_drain.assert_called_once_with(self.mgmt.device_id, "ip", mode=MODE_STORE_ONLY, force=True)
 
     def test_resync_no_adapter_id_noop(self):
         self.mgmt.adapter_device_id = None
         self.assertEqual(intent_drift.resync_intent(self.device, self.mgmt, ["interface_ip"]), ([], []))
 
-    @patch("netbox_nso_plugin.drain.push_now")
+    @patch("netbox_nso_plugin.drain.drain_key", return_value="succeeded")
     @patch("netbox_nso_plugin.adapter_client.get_intent_summary")
-    def test_resync_default_keys_include_partial_scopes(self, mock_sum, mock_push):
+    def test_resync_default_keys_include_partial_scopes(self, mock_sum, mock_drain):
         from netbox_nso_plugin.delivery import MODE_STORE_ONLY
 
         mock_sum.return_value = self._SUMMARY
@@ -180,7 +180,7 @@ class TestIntentDrift(IntentPushResetMixin, TestCase):
         done, failed = intent_drift.resync_intent(self.device, self.mgmt)
         self.assertIn("interface_ip", done)
         self.assertEqual(failed, [])
-        mock_push.assert_called_once_with(self.mgmt.device_id, "ip", mode=MODE_STORE_ONLY, force=True)
+        mock_drain.assert_called_once_with(self.mgmt.device_id, "ip", mode=MODE_STORE_ONLY, force=True)
 
 
 class TestResyncStoreOnly(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
@@ -230,6 +230,16 @@ class TestResyncStoreOnly(_CascadeFlushMixin, IntentPushResetMixin, TransactionT
         self.assertIn("/logging-intent", url)
         params = calls[0].kwargs.get("params") or {}
         self.assertEqual(params.get("store_only"), "true")
+
+    def test_an_empty_success_response_is_reported_as_done(self):
+        session = make_session(content=b"")
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_ADAPTER_CFG),
+            patch("netbox_nso_plugin.adapter_client._get_session", return_value=session),
+        ):
+            result = intent_drift.resync_intent(self.device, self.mgmt, ["logging"])
+
+        self.assertEqual(result, (["logging"], []))
 
     def test_normal_signal_push_has_no_store_only_flag(self):
         from netbox_nso_plugin.delivery import deliver

@@ -140,6 +140,41 @@ class TestApplyPromotion(TestCase):
         other.refresh_from_db()
         assert (state.status, other.status) == ("accepted", "accepted"), "the abort promotes nothing"
 
+    def test_apply_uses_one_decreasing_deadline_for_all_preparation_sends(self):
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.views import _prepare_apply
+
+        mgmt, _state, _other = self._setup()
+        with (
+            patch("time.monotonic", side_effect=range(20)),
+            patch(
+                "netbox_nso_plugin.drain.push_now",
+                side_effect=lambda device_id, scope, **kwargs: {"count": 0} if scope == "static_route" else None,
+            ) as push,
+            patch("netbox_nso_plugin.drain.drain_key", return_value=drain.SUCCEEDED) as snmp,
+        ):
+            _prepare_apply(mgmt)
+
+        deadlines = [call.kwargs["deadline"] for call in [*push.call_args_list, *snmp.call_args_list]]
+        assert len(deadlines) == 13
+        assert all(later < earlier for earlier, later in zip(deadlines, deadlines[1:]))
+
+    def test_apply_stops_before_the_first_send_when_its_total_budget_is_spent(self):
+        from netbox_nso_plugin.views import ApplyRefused, _prepare_apply
+
+        mgmt, state, other = self._setup()
+        with (
+            patch("time.monotonic", side_effect=[0, 121]),
+            patch("netbox_nso_plugin.drain.push_now") as push,
+            self.assertRaisesRegex(ApplyRefused, "preparation deadline"),
+        ):
+            _prepare_apply(mgmt)
+
+        push.assert_not_called()
+        state.refresh_from_db()
+        other.refresh_from_db()
+        assert (state.status, other.status) == ("accepted", "accepted")
+
 
 class TestTheStuckDeployingBackstop(_SettlementCase):
     """S6.4/S6.5 — the two ways a static-route row can be stuck, and their two reasons."""

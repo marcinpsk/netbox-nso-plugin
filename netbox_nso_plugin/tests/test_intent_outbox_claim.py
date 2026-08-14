@@ -239,6 +239,25 @@ class TestCrashedAttemptsReplayAtTheirOwnSequence(_ClaimCase):
         assert (row.claim_deletions, row.queued_deletions, row.push_seq) == ([], [], None)
         assert entries(self.device, "static_route") == []
 
+    def test_a_mapping_change_abandons_the_old_claim_before_any_replay(self):
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        own_vlan(self.mgmt, 861, self.tag)
+        claimed = drain.claim(self.device.pk, "vlan")
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_device_id=7599)
+        expire_claim(self.device, "vlan")
+
+        assert self.drain() == drain.NOTHING
+        assert self.adapter.requests == [], "the old body was sent to a device outside its mapping epoch"
+        row = state_of(self.device, "vlan")
+        assert row.push_seq is None
+        assert [entry.consumed_by_push_seq for entry in entries(self.device, "vlan")] == [None]
+
+        assert self.drain() == drain.SUCCEEDED
+        assert "/devices/7599/" in self.adapter.requests[-1]["url"]
+        assert self.adapter.sequences[-1] > claimed.push_seq
+
 
 class TestOutcomeCasRefusesASupersededAttempt(_ClaimCase):
     """O1.11: an outcome may only settle the operation the key is still on."""
@@ -313,6 +332,27 @@ class TestAForcedCallFormsItsOwnClaim(_ClaimCase):
         assert "cl-mode-renamed" in str(self.adapter.requests[-1]["body"]), self.adapter.requests[-1]["body"]
         assert state_of(self.device, "vlan").push_seq is None, "both operations are resolved"
 
+    def test_a_forced_replay_and_its_new_claim_share_one_send_deadline(self):
+        from netbox_nso_plugin import drain
+
+        own_vlan(self.mgmt, 878, self.tag)
+        self._stale_unacknowledged_claim()
+        deadlines = []
+
+        def answer(_rendered, _payload, **kwargs):
+            deadlines.append(kwargs["deadline"])
+            return {"count": 1}
+
+        ticks = iter((100, 102, 105))
+        with (
+            patch("netbox_nso_plugin.delivery.send", new=answer),
+            patch("netbox_nso_plugin.drain._send_clock", new=lambda: next(ticks), create=True),
+        ):
+            outcome = drain.drain_key(self.device.pk, "vlan", force=True, deadline=10)
+
+        assert outcome == drain.SUCCEEDED
+        assert deadlines == [8, 5]
+
     def test_an_ordinary_drain_is_still_answered_by_the_replay_alone(self):
         """The re-entry belongs to a call whose mode differs; it must not fire on every takeover."""
         from netbox_nso_plugin import drain
@@ -350,7 +390,7 @@ class TestUnmanagedClaimIsParked(_ClaimCase):
 
         config, session = self.adapter.patches()
         with config, session:
-            assert drain.send_claim(claimed) == drain.PARKED
+            assert drain.send_claim(claimed) is drain._PARKED_SEND
 
         assert self.adapter.requests == []
         row = state_of(self.device, "static_route")
@@ -376,6 +416,20 @@ class TestUnmanagedClaimIsParked(_ClaimCase):
         row = state_of(self.device, "static_route")
         assert (row.push_seq, row.claim_deletions, row.queued_deletions) == (None, [], [])
         assert entries(self.device, "static_route") == []
+
+
+class TestControlOutcomesCannotCollideWithAdapterAnswers(_ClaimCase):
+    tag = "answer"
+    adapter_device_id = 7509
+
+    def test_a_bare_parked_answer_is_settled_as_an_adapter_answer(self):
+        from netbox_nso_plugin import drain
+
+        own_vlan(self.mgmt, 862, self.tag)
+        self.adapter._respond = lambda body: drain.PARKED
+
+        assert self.drain() == drain.SUCCEEDED
+        assert state_of(self.device, "vlan").push_seq is None
 
 
 class TestTheBaselineIsBoundToTheAdapterMapping(_ClaimCase):

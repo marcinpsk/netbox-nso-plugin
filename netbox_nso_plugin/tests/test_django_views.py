@@ -1361,6 +1361,31 @@ class TestNSODeviceActionView(ViewTestBase):
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config")
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_post_conflict_with_non_object_detail_still_returns_conflict(self, mock_session_cls, mock_cfg):
+        mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+        mgmt.adapter_device_id = 10
+        mgmt.save(update_fields=["adapter_device_id"])
+        mock_cfg.return_value = {
+            "url": "http://adapter",
+            "token": "tok",
+            "verify_tls": True,
+            "ca_cert_path": None,
+            "timeout": 30,
+        }
+        mock_session_cls.return_value = make_session(
+            response=make_response(
+                409, json_data={"error": {"code": "conflict", "message": "running", "detail": ["busy"]}}
+            )
+        )
+
+        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[mgmt.pk, "sync"])
+        response = self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "conflict", "job_id": None, "job_type": None})
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config")
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_post_sync_success_no_job_id(self, mock_session_cls, mock_cfg):
         """Non-AJAX POST sync with no job_id in response shows generic success message."""
         mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
@@ -2180,6 +2205,18 @@ class TestDeviceNSOTabView(ViewTestBase):
         response = self.client.get(url)
         self.assertIn(response.status_code, [200, 302])  # may redirect if no tab
         device2.delete()
+
+    def test_degraded_deletion_read_failure_does_not_break_the_tab(self):
+        mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+        mgmt.adapter_device_id = None
+        mgmt.save(update_fields=["adapter_device_id"])
+        url = reverse("dcim:device_nso", kwargs={"pk": self.device.pk})
+
+        with patch("netbox_nso_plugin.drain.degraded_deletions", side_effect=ValueError("bad timestamp")):
+            response = self.client.get(url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context["degraded_deletions"], [])
 
     def test_oob_probe_timeout_is_not_rendered_as_unreachable(self):
         """The adapter can still connect after its short health window; preserve that as a
@@ -3308,6 +3345,15 @@ class TestPushIntentForDevice(ViewTestBase):
         mock_session_cls.return_value = session
 
         deliver("interface", self.device.pk, mgmt.adapter_device_id)
+        sent = session.request.call_args.kwargs["json"]["attributes"]
+        assert sent == [
+            {
+                "interface": self.interface.name,
+                "attribute": "description",
+                "intent_value": self.interface.description,
+                "accepted_at": None,
+            }
+        ]
 
         mgmt.adapter_device_id = None
         mgmt.save(update_fields=["adapter_device_id"])
@@ -3341,6 +3387,15 @@ class TestPushIntentForDevice(ViewTestBase):
         mock_session_cls.return_value = session
 
         deliver("interface", self.device.pk, mgmt.adapter_device_id)
+        sent = session.request.call_args.kwargs["json"]["attributes"]
+        assert sent == [
+            {
+                "interface": self.interface.name,
+                "attribute": "enabled",
+                "intent_value": str(self.interface.enabled).lower(),
+                "accepted_at": None,
+            }
+        ]
 
         mgmt.adapter_device_id = None
         mgmt.save(update_fields=["adapter_device_id"])
@@ -3374,6 +3429,8 @@ class TestPushIntentForDevice(ViewTestBase):
         mock_session_cls.return_value = session
 
         deliver("interface", self.device.pk, mgmt.adapter_device_id)
+        sent = session.request.call_args.kwargs["json"]["attributes"]
+        assert "mtu" not in {attribute["attribute"] for attribute in sent}
 
         mgmt.adapter_device_id = None
         mgmt.save(update_fields=["adapter_device_id"])
@@ -3393,9 +3450,30 @@ class TestPushIntentForDevice(ViewTestBase):
         mgmt.adapter_device_id = 23
         mgmt.save(update_fields=["adapter_device_id"])
 
-        _push_intent_for_device(self.device.pk)
+        from requests.exceptions import ConnectionError
+
+        session = make_session()
+        session.request.side_effect = ConnectionError("adapter unavailable")
+        with (
+            patch(
+                "netbox_nso_plugin.adapter_client._resolve_config",
+                return_value={
+                    "url": "http://adapter",
+                    "token": "tok",
+                    "verify_tls": True,
+                    "ca_cert_path": None,
+                    "timeout": 30,
+                },
+            ),
+            patch("netbox_nso_plugin.adapter_client.requests.Session", return_value=session),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            _push_intent_for_device(self.device.pk)
 
         assert NSOIntentOutboxEntry.objects.filter(device=self.device, scope="interface").exists()
+        assert session.request.called, "the test did not reach the transport failure"
+        mgmt.refresh_from_db()
+        assert "interface" in (mgmt.intent_push_errors or {}), "the failed send was recorded as complete"
         mgmt.adapter_device_id = None
         mgmt.save(update_fields=["adapter_device_id"])
         NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="changed")
@@ -5723,13 +5801,16 @@ class TestApplyRefusesAStaleSnmpStore(_CascadeFlushMixin, IntentPushResetMixin, 
         applied = [request for request in self.adapter.requests if "/actions/apply" in request["url"]]
         return applied, [str(message) for message in get_messages(response.wsgi_request)]
 
-    def _own_then_delete_a_community(self):
+    def _own_a_community(self):
         from netbox_nso_plugin.models import NSOSnmpCommunityState
 
         with without_commit_drain(), transaction.atomic():
-            community = NSOSnmpCommunityState.objects.create(
+            return NSOSnmpCommunityState.objects.create(
                 management=self.mgmt, community_hash="ab12cd34ef56ab78", access="RO", status="accepted"
             )
+
+    def _own_then_delete_a_community(self):
+        community = self._own_a_community()
         with without_commit_drain(), transaction.atomic():
             community.delete()
 
@@ -5745,6 +5826,13 @@ class TestApplyRefusesAStaleSnmpStore(_CascadeFlushMixin, IntentPushResetMixin, 
 
     def test_an_acknowledged_refresh_still_applies(self):
         """The guard is a precondition, not a new refusal: the normal path is unchanged."""
+        from netbox_nso_plugin import drain
+
+        self._own_a_community()
+        config, session = self.adapter.patches()
+        with config, session:
+            assert drain.drain_key(self.device.pk, "snmp") == drain.SUCCEEDED
+
         applied, _messages_shown = self._apply()
 
         assert len(applied) == 1
@@ -5813,3 +5901,45 @@ class TestDeviceNSOTabDegradedDeletions(ViewTestBase):
 
         assert "198.51.100.0/28 via 198.51.100.9 (vrf BLUEVRF)" in out.getvalue(), out.getvalue()
         self.assertNotContains(self.client.get(self._url()), "mdi-delete-alert-outline")
+
+
+class TestReviewRegressionPins(ViewTestBase):
+    def test_interface_ip_residue_uses_the_adapter_removal_scope(self):
+        # Residue flows adapter -> plugin under the adapter's removal-scope vocabulary
+        # (nso_adapter/core/removal.py VALID_REMOVAL_SCOPES), where interface-IP residue
+        # is "interface_config". The plugin's outbound delivery key "ip" names a
+        # different direction; #1591 owns unifying the two.
+        from netbox_nso_plugin.views import _residue_matchers
+
+        assert _residue_matchers()["interface_ips"][0] == "interface_config"
+
+    def test_redistribution_bulk_accept_schedules_only_owned_destinations(self):
+        from netbox_nso_plugin.models import NSORedistributionState
+        from netbox_nso_plugin.views import NSORedistributionBulkAcceptView
+
+        NSORedistributionState.objects.create(
+            management=self.mgmt,
+            dest_protocol="bgp",
+            dest_ref="65001",
+            source_protocol="static",
+            status="accepted",
+        )
+        NSORedistributionState.objects.create(
+            management=self.mgmt,
+            dest_protocol="bgp",
+            dest_ref="65001",
+            source_protocol="connected",
+            status="in_sync",
+        )
+        NSORedistributionState.objects.create(
+            management=self.mgmt,
+            dest_protocol="isis",
+            dest_ref="CORE",
+            source_protocol="static",
+            status="imported",
+        )
+
+        with patch("netbox_nso_plugin.views._schedule_intent_push") as schedule:
+            NSORedistributionBulkAcceptView()._push(self.mgmt)
+
+        schedule.assert_called_once_with((self.device.pk, "bgp"))

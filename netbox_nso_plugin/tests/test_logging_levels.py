@@ -546,13 +546,15 @@ class TestLoggingLevelsApplyPush(_CascadeFlushMixin, IntentPushResetMixin, Trans
             )
 
     def test_prepare_apply_force_pushes_logging_and_marks_deploying(self):
-        from netbox_nso_plugin import drain
+        from netbox_nso_plugin import drain, outbox
         from netbox_nso_plugin.views import _prepare_apply
 
         # The acknowledged baseline an accept-time push leaves behind, which the Apply overrides.
         with patch("netbox_nso_plugin.adapter_client.put_logging_intent", return_value={}):
             drain.drain_key(self.device.pk, "logging")
         with patch("netbox_nso_plugin.adapter_client.put_logging_intent", return_value={}) as unforced:
+            with transaction.atomic():
+                outbox.enqueue(self.device.pk, "logging")
             drain.drain_key(self.device.pk, "logging")
         unforced.assert_not_called()
 

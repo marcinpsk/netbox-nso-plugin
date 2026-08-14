@@ -113,6 +113,35 @@ class TestDeliverySuccessHooks(IntentPushResetMixin, TestCase):
 
     _CFG = {"url": "http://adapter", "token": "tok", "verify_tls": True, "ca_cert_path": None, "timeout": 30}
 
+    def test_an_unknown_mode_is_rejected_before_the_send(self):
+        from netbox_nso_plugin.delivery import Rendered, send
+
+        device, _mgmt = _fixture("mode", 7300)
+        sent = []
+        rendered = Rendered(
+            key=(device.pk, "vlan"),
+            payload=[],
+            do_push=lambda body: sent.append(body),
+        )
+
+        with self.assertRaisesRegex(ValueError, "unknown delivery mode"):
+            send(rendered, rendered.payload, mode="store-only")
+
+        assert sent == []
+
+    def test_receipt_adapter_device_failure_uses_the_client_transport_exception(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.delivery import deliver
+
+        from ._outbox_case import ReceiptAdapter
+
+        device, _mgmt = _fixture("transport", 7306)
+        adapter = ReceiptAdapter()
+        adapter.fail_devices = {7306}
+        config, session = adapter.patches()
+        with config, session, self.assertRaises(AdapterError):
+            deliver("vlan", device.pk, 7306)
+
     def test_a_static_route_delivery_records_the_settlement_expectation(self):
         from netbox_routing.models import StaticRoute
 
@@ -161,6 +190,37 @@ class TestDeliverySuccessHooks(IntentPushResetMixin, TestCase):
         row.refresh_from_db()
         assert row.unsupported_members == ["large:1:2:3"]
 
+    def test_render_builders_do_not_claim_to_return_adapter_responses(self):
+        from netbox_nso_plugin import signals
+
+        device, mgmt = _fixture("returns", 7305)
+        marker = object()
+        with patch.object(signals, "_push_changed", return_value=marker):
+            static_result = signals._push_static_route_intent_for_device(device.pk, mgmt.adapter_device_id)
+            policy_result = signals._push_route_policy_intent_for_device(device.pk, mgmt.adapter_device_id)
+
+        assert static_result is None
+        assert policy_result is None
+
+    def test_a_success_hook_failure_does_not_reclassify_the_send(self):
+        from netbox_nso_plugin.delivery import Rendered, send
+
+        device, mgmt = _fixture("hook", 7304)
+        response = {"count": 1}
+        rendered = Rendered(
+            key=(device.pk, "vlan"),
+            payload=[],
+            do_push=lambda body: response,
+            on_response=lambda answer: (_ for _ in ()).throw(RuntimeError("side effect failed")),
+        )
+
+        with self.assertLogs("netbox_nso_plugin.signals", level="ERROR"):
+            answer = send(rendered, rendered.payload)
+
+        assert answer == response
+        mgmt.refresh_from_db()
+        assert "vlan" not in (mgmt.intent_push_errors or {})
+
     def test_an_out_of_protocol_delivery_carries_no_sequence_header(self):
         """``lacp`` and ``switchport`` keep today's direct client calls (Rev 15 split)."""
         from netbox_nso_plugin.delivery import deliver
@@ -175,5 +235,6 @@ class TestDeliverySuccessHooks(IntentPushResetMixin, TestCase):
         ):
             deliver("lacp", device.pk, 7303)
 
+        assert session.request.call_count >= 1
         for call in session.request.call_args_list:
             assert "X-Push-Seq" not in (call.kwargs.get("headers") or {})

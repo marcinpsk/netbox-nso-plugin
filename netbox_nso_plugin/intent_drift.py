@@ -281,13 +281,12 @@ def resync_intent(device, mgmt, keys: list[str] | None = None) -> tuple[list[str
         # baseline still names that body — which is what the claim reads as "unchanged,
         # drop". The re-sync would then silently no-op while the view reported success.
         try:
-            response = drain.push_now(mgmt.device_id, _delivery_key(sc), mode=delivery.MODE_STORE_ONLY, force=True)
+            outcome = drain.drain_key(mgmt.device_id, _delivery_key(sc), mode=delivery.MODE_STORE_ONLY, force=True)
         except Exception:  # noqa: BLE001 (one scope's refusal must not strand the rest unattempted)
             logger.exception("Intent re-sync raised for device %s scope %s", mgmt.device_id, key)
-            response = None
-        # Forced, so None is unambiguously a refusal or a failure and never a digest-equal
-        # drop. The claim has already recorded the cause where the device tab renders it.
-        (done if response is not None else failed).append(key)
+            outcome = None
+        # The outcome is independent of whether the acknowledged response has a body.
+        (done if outcome == drain.SUCCEEDED else failed).append(key)
     return done, failed
 
 

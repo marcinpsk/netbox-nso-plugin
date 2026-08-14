@@ -41,7 +41,7 @@ class AdvanceStaleOnboardingJob(JobRunner):
 class RefreshDeviceSyncCacheJob(JobRunner):
     """The plugin's per-device maintenance tick. The name is kept; it does more than it says.
 
-    Three passes today, in this order and for these reasons:
+    Four passes today, in this order and for these reasons:
 
     1. **the last-sync mirror.** ``NSODeviceManagement.last_sync_at``/``last_sync_status``
        are a cache of the adapter's device row, and page renders used to be the only thing
@@ -69,7 +69,7 @@ class RefreshDeviceSyncCacheJob(JobRunner):
 
     def run(self, *args, **kwargs):
         """Refresh the last-sync mirror, repair mappings, drain the outbox, sweep settlements."""
-        from .drain import drain_intent_outbox
+        from .drain import compact_intent_outbox, drain_intent_outbox
         from .models import NSODeviceManagement
         from .settlement import sweep_static_route_settlements
         from .sync_cache import _snapshot, reconcile_device_links, refresh_sync_caches
@@ -95,7 +95,8 @@ class RefreshDeviceSyncCacheJob(JobRunner):
         drained = drain_failed = polled = settle_failed = 0
         drain_started = settle_started = time.monotonic()
         if by_id is None:
-            logger.warning("RefreshDeviceSyncCacheJob: adapter snapshot unavailable — drain and sweep skipped")
+            compact_intent_outbox()
+            logger.warning("RefreshDeviceSyncCacheJob: adapter snapshot unavailable, sends and sweep skipped")
         else:
             # Same rule as the sweep, and for the same reason: a proven global outage is not
             # a per-key failure, and every candidate would wait out its own read timeout.

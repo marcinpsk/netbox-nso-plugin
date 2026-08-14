@@ -21,7 +21,7 @@ from django.db import transaction
 from django.test import SimpleTestCase, TransactionTestCase
 
 from ._outbox_case import ReceiptAdapter, entries, make_managed, own_vlan, state_of
-from .mixins import IntentPushResetMixin, _CascadeFlushMixin
+from .mixins import IntentPushResetMixin, _CascadeFlushMixin, _deliver_scheduled_keys
 
 
 class _Abort(Exception):
@@ -85,17 +85,53 @@ class TestTheCoalescerSymbolsAreGone(SimpleTestCase):
 
     def test_no_module_still_reads_them(self):
         import ast
-        from pathlib import Path
 
-        plugin = Path(__file__).resolve().parent.parent
+        gone = {"_pending_pushes", "_last_pushed_hashes"}
         read = set()
-        for path in sorted(plugin.rglob("*.py")):
-            if "tests" in path.parts or "migrations" in path.parts:
-                continue
+        for path in _production_modules():
             for node in ast.walk(ast.parse(path.read_text())):
-                if isinstance(node, ast.Name) and node.id in ("_pending_pushes", "_last_pushed_hashes"):
+                if isinstance(node, ast.Name):
+                    named_here = node.id
+                elif isinstance(node, ast.Attribute):
+                    named_here = node.attr
+                elif isinstance(node, ast.alias):
+                    named_here = node.name
+                else:
+                    continue
+                if named_here in gone:
                     read.add(f"{path.name}:{node.lineno}")
         assert read == set()
+
+
+class TestTheTestCaseDeliveryDouble(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    """The TestCase delivery double follows the production drain's empty-key behavior."""
+
+    def setUp(self):
+        super().setUp()
+        self.device, self.mgmt = make_managed("double", 7608)
+
+    def test_a_stale_key_with_no_entry_does_not_send(self):
+        from netbox_nso_plugin import delivery, signals
+
+        signals._pending_intent_keys().add((self.device.pk, "vlan"))
+        with patch.object(delivery, "deliver") as deliver:
+            _deliver_scheduled_keys()
+
+        deliver.assert_not_called()
+
+    def test_a_delivery_failure_is_logged_and_does_not_escape(self):
+        from netbox_nso_plugin import delivery, outbox, signals
+
+        with transaction.atomic():
+            outbox.enqueue(self.device.pk, "vlan")
+        signals._pending_intent_keys().add((self.device.pk, "vlan"))
+        with (
+            patch.object(delivery, "deliver", side_effect=RuntimeError("render failed")),
+            self.assertLogs("netbox_nso_plugin.tests.mixins", level="ERROR") as logs,
+        ):
+            _deliver_scheduled_keys()
+
+        assert any("test delivery failed" in line for line in logs.output)
 
 
 class _SwapCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):

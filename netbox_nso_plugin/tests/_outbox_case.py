@@ -318,6 +318,8 @@ class ReceiptAdapter:
         if self.fail_with is not None:
             raise self.fail_with
         if any(f"/devices/{device_id}/" in url for device_id in self.fail_devices):
+            from requests.exceptions import ConnectionError
+
             raise ConnectionError(f"the far side refuses {url}")
         headers = kwargs.get("headers") or {}
         raw_seq = headers.get("X-Push-Seq")

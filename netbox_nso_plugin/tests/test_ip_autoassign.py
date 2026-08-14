@@ -214,6 +214,26 @@ class TestAutoAssignIP(TestCase):
         self.assertEqual(ip.vrf, vrf)  # was None (global table) before the fix
         mgmt.delete()
 
+    def test_state_failure_rolls_back_the_reservation_without_manual_delete(self):
+        from django.db import IntegrityError
+
+        from netbox_nso_plugin.ip_autoassign import _reserve_single
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        pool = Prefix.objects.get(pk=self.pool_lo4.pk)
+        mgmt = self._make_mgmt()
+        iface = Interface.objects.create(device=self.device, name="Loopback151", type="virtual")
+        result = {"allocated": [], "errors": [], "skipped": []}
+        with (
+            patch.object(NSOInterfaceIPState.objects, "update_or_create", side_effect=IntegrityError("duplicate")),
+            patch.object(IPAddress, "delete", wraps=IPAddress.delete) as delete,
+        ):
+            _reserve_single(iface, mgmt, "ipv4", pool, result, push=False)
+
+        assert result["errors"]
+        assert not IPAddress.objects.filter(assigned_object_id=iface.pk).exists()
+        delete.assert_not_called()
+
     def test_fill_empty_skips_interface_with_managed_ip(self):
         from netbox_nso_plugin.models import NSOInterfaceIPState
 

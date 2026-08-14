@@ -27,7 +27,7 @@ from django.test import TestCase, TransactionTestCase
 from ipam.models import Prefix, Role
 from users.models import ObjectPermission
 
-from netbox_nso_plugin.link_role import provision_link_role
+from netbox_nso_plugin.link_role import apply_description_for_role, provision_link_role
 from netbox_nso_plugin.models import (
     NSODeviceManagement,
     NSOInstance,
@@ -220,6 +220,44 @@ class TestProvisionSingle(_Base):
         self.assertEqual(self.lo_a.description, "lp-a loopback")
         state = NSOISISInterfaceState.objects.get(interface=self.lo_a)
         self.assertTrue(state.passive)
+
+    def test_direct_description_write_leaves_durable_interface_work(self):
+        from netbox_nso_plugin.tests._outbox_case import entries
+
+        role = NSOLinkRole.objects.create(
+            name="lp-description",
+            slug="lp-description",
+            link_type="single",
+            description_template="{self_host} loopback",
+            igp="none",
+        )
+
+        result = apply_description_for_role(self.lo_a, role, mgmt=self.mgmt_a)
+
+        self.assertIsNone(result["error"])
+        self.assertTrue(entries(self.dev_a, "interface", unconsumed=True))
+
+    def test_failed_forced_push_keeps_every_provisioned_scope_in_the_outbox(self):
+        from netbox_nso_plugin.tests._outbox_case import entries
+
+        Prefix.objects.create(prefix="198.18.32.0/24", role=Role.objects.create(name="Lo2", slug="lo2-pool"))
+        role = NSOLinkRole.objects.create(
+            name="lp-durable",
+            slug="lp-durable",
+            link_type="single",
+            assign_ipv4=True,
+            ipv4_pool_role="lo2-pool",
+            description_template="{self_host} loopback",
+            igp="isis",
+        )
+        NSOLinkRoleAssignment.objects.create(role=role, interface=self.lo_a)
+
+        with patch(_PUSH, side_effect=ConnectionError("adapter down")):
+            summary = provision_link_role(self.lo_a)
+
+        self.assertTrue(summary["provisioned"], summary)
+        for scope in ("ip", "interface", "isis"):
+            self.assertTrue(entries(self.dev_a, scope, unconsumed=True), scope)
 
 
 class TestProvisionForcePush(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):

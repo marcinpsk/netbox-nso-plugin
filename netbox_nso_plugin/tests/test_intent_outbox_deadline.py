@@ -92,6 +92,7 @@ class _DripCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
         self.server.stop = threading.Event()
         self.server.broken: list[str] = []
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
         self.addCleanup(self.server.stop.set)
         self.device, self.mgmt = make_managed(self.tag, self.adapter_device_id)
@@ -151,6 +152,37 @@ class TestTheTransportEndsItsOwnSocket(_DripCase):
 
     tag = "sock"
     adapter_device_id = 7813
+
+    def test_abort_continues_when_one_socket_close_fails(self):
+        from netbox_nso_plugin import adapter_client
+
+        class _Socket:
+            def __init__(self, *, close_error=False):
+                self.close_error = close_error
+                self.shutdown_called = False
+                self.close_called = False
+
+            def shutdown(self, how):
+                self.shutdown_called = True
+
+            def close(self):
+                self.close_called = True
+                if self.close_error:
+                    raise OSError("already closed")
+
+        class _Connection:
+            def __init__(self, sock):
+                self.sock = sock
+
+        broken = _Socket(close_error=True)
+        healthy = _Socket()
+        transport = adapter_client.AbortableTransport()
+        transport._live = {_Connection(broken), _Connection(healthy)}
+
+        transport.abort()
+
+        assert broken.close_called
+        assert healthy.shutdown_called and healthy.close_called
 
     def test_closing_the_session_leaves_the_read_running_and_abort_ends_it(self):
         from netbox_nso_plugin import adapter_client

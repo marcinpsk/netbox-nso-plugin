@@ -200,10 +200,8 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         assert "1 route(s) stored" in output
         assert "Re-synced 1 device(s)" in output
 
-    def test_a_device_that_raises_does_not_abort_the_rest_of_the_pass(self):
-        """The claim records *adapter* failures and answers ``None``, but the echo recorder
-        runs on the send's own thread. An answer it cannot read would otherwise raise out of
-        the loop, leaving every later device unattempted and unreported."""
+    def test_a_response_hook_failure_does_not_abort_the_rest_of_the_pass(self):
+        """An acknowledged send stays successful when its response hook rejects malformed data."""
         from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet
 
         _, first = self._managed_device("raiser", 8008)
@@ -216,12 +214,15 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 return {"device_id": adapter_device_id, "count": len(routes), "routes": 1}  # not a list
             return {"device_id": adapter_device_id, "count": len(routes), "routes": []}
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", side_effect=_malformed_echo):
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_static_route_intent", side_effect=_malformed_echo),
+            self.assertLogs("netbox_nso_plugin.signals", level="ERROR"),
+        ):
             results = resync_static_route_intent_fleet()
 
         by_device = {r["device_id"]: r for r in results}
-        assert by_device[first.device_id]["ok"] is False
-        assert by_device[first.device_id]["count"] is None
+        assert by_device[first.device_id]["ok"] is True
+        assert by_device[first.device_id]["count"] == 1
         assert by_device[second.device_id]["ok"] is True  # the pass carried on
 
     def test_only_a_real_route_count_acknowledges_a_push(self):

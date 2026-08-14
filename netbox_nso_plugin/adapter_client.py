@@ -173,9 +173,9 @@ class AbortableTransport(requests.adapters.HTTPAdapter):
                 continue
             try:
                 sock.shutdown(socket.SHUT_RDWR)
+                sock.close()
             except OSError:  # already gone: the request finished or the far side closed first
                 pass
-            sock.close()
 
 
 def new_session(transport=None):
@@ -991,7 +991,7 @@ def put_static_route_intent(adapter_device_id, routes):
       [{"vrf": "", "prefix": "10.0.0.0/8", "next_hop": "192.168.1.1",
         "metric": None, "permanent": None, "tag": None,
         "accepted_at": "...Z"}, ...]
-    Empty list clears all static route intent for the device.
+    An empty ``routes`` list clears all static route intent for the device.
     Returns {"device_id": ..., "count": N}.
     """
     return _request(

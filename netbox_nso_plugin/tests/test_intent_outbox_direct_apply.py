@@ -84,7 +84,7 @@ class TestADirectApplyIsNeverReplayed(_DirectApplyCase):
             self.drain()
         assert len(self.adapter.applied) == 1, "the body reached the device once"
 
-        _expire_any_claim(self.device, "lacp")
+        assert _expire_any_claim(self.device, "lacp") is False, "a direct-apply key took a lease"
         self.drain()  # the scavenger's turn
         config, session = self.adapter.patches()
         with config, session:

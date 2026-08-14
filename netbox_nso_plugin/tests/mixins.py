@@ -2,6 +2,10 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Shared test mixins."""
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class _CascadeFlushMixin:
     """Make TransactionTestCase's post-test flush use ``TRUNCATE ... CASCADE``.
@@ -90,10 +94,12 @@ def _deliver_scheduled_keys():
                 device_id=device_id, scope=scope, consumed_by_push_seq__isnull=True
             ).values_list("mark_and", flat=True)
         )
+        if not marks:
+            continue
         try:
-            delivery.deliver(scope, device_id, adapter_device_id, mark=bool(marks) and all(marks))
-        except Exception:  # noqa: BLE001 — one key's failure must not abort its siblings
-            pass
+            delivery.deliver(scope, device_id, adapter_device_id, mark=all(marks))
+        except Exception:  # noqa: BLE001 (one key's failure must not abort its siblings)
+            logger.exception("test delivery failed for %s/%s", device_id, scope)
 
 
 class IntentPushDeliveryMixin(IntentPushResetMixin):

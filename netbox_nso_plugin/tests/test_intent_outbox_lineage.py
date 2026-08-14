@@ -204,6 +204,12 @@ class TestTheLineageTransfersAcrossReOwnership(_LineageCase):
     tag = "xfer"
     adapter_device_id = 7803
 
+    def test_a_persisted_string_key_is_normalized_before_the_carry_lookup(self):
+        from netbox_nso_plugin import outbox
+
+        carried = triple("198.51.100.88/28", "198.51.100.6")
+        assert outbox.carried_triple(42, lineage_carry={"42": carried}) == carried
+
     def test_a_delete_re_own_re_delete_cycle_still_names_the_adapter_triple(self):
         first = triple("198.51.100.96/28", "198.51.100.7")
         route = own_route(self.mgmt, "198.51.100.96/28", "198.51.100.7")
@@ -221,6 +227,20 @@ class TestTheLineageTransfersAcrossReOwnership(_LineageCase):
         record = self.records()[-1]
         assert record["triples"] == [first, second]
         assert record["unverified"] is False, "A is a real acknowledgement, so this is verified"
+
+    def test_accepting_an_existing_overlay_does_not_scan_the_outbox_carry(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin.signals import _accept_static_route_for_device
+
+        route = own_route(self.mgmt, "198.51.100.128/28", "198.51.100.9")
+        self.clear_entries()
+
+        with patch("netbox_nso_plugin.signals._carried_last_acked") as carried:
+            with without_commit_drain(), transaction.atomic():
+                _accept_static_route_for_device(route, self.device)
+
+        carried.assert_not_called()
 
     def test_the_fold_carries_the_triple_onto_the_state_row(self):
         from netbox_nso_plugin import drain
@@ -256,8 +276,9 @@ class TestTheLineageIsBoundedAndCleared(_LineageCase):
             seen.append([r["triples"] for r in self.records()])
             self.retriple(route, "198.51.100.128/28", f"198.51.100.1{index}")
             self.reown(route)
-            carry = state_of(self.device, "static_route")
-            assert len(carry.lineage_carry) <= 1 if carry else True
+            state = state_of(self.device, "static_route")
+            if state is not None:
+                assert len(state.lineage_carry) <= 1, state.lineage_carry
         self.unown(route)
         seen.append([r["triples"] for r in self.records()])
 

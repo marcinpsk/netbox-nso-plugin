@@ -13,6 +13,10 @@ operation takes, which is what makes a claim and a compaction pass mutually excl
 takeover and burned on abandon, so it must never wrap — a re-issued value would let the
 adapter admit a replay as new work.
 
+Reversing this migration drops the sequence. Re-applying it restarts at 1 and can reuse
+values that the adapter already admitted. Roll back this migration only when you also
+discard the adapter receipts for every key.
+
 ``last_acked_triple`` starts NULL for every existing overlay, and that is not a gap to fill
 later. Stamping the live mirror would record content the adapter never acknowledged; NULL is
 the wire's ``unverified`` flag and the adapter classifies it conservatively.

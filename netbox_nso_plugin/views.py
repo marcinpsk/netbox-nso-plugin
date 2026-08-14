@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 import logging
+import time
 
 from dcim.models import Device
 from django.contrib import messages
@@ -273,6 +274,12 @@ class DeviceNSOTabView(generic.ObjectView):
 
         from .drain import degraded_deletions
 
+        try:
+            deletion_records = degraded_deletions(device.pk)
+        except Exception:  # noqa: BLE001 (optional tab data must not break the render)
+            logger.debug("Degraded deletion read failed for device %s", device.pk, exc_info=True)
+            deletion_records = []
+
         return {
             "mgmt": mgmt,
             "nso_categories": category_summaries(device, mgmt),
@@ -282,7 +289,7 @@ class DeviceNSOTabView(generic.ObjectView):
             # §4.3(c): a deletion that left the device configured. Durable, adapter-free and
             # cleared by the acknowledgement command alone, so it renders on every tab load
             # until an operator answers for it.
-            "degraded_deletions": degraded_deletions(device.pk),
+            "degraded_deletions": deletion_records,
             "failover": failover,
             "device_capability": device_capability,
             # READSEM S4 (D8/D10): honored by EVERY render path — including the
@@ -2514,6 +2521,14 @@ def _prepare_apply(mgmt):
     from .delivery import MODE_STORE_ONLY
     from .signals import stored_static_route_count
 
+    prepare_deadline = time.monotonic() + drain.SEND_DEADLINE.total_seconds()
+
+    def remaining_budget():
+        remaining = prepare_deadline - time.monotonic()
+        if remaining <= 0:
+            raise ApplyRefused("Apply stopped before submission because the intent preparation deadline expired.")
+        return remaining
+
     # Each of these takes its OWN forced claim, so Apply re-ships the operator's intent
     # whatever the acknowledged baseline says and whatever a queued claim was carrying:
     #   - LACP / switchport: owned in NetBox, never mirrored as adapter intent.
@@ -2547,8 +2562,9 @@ def _prepare_apply(mgmt):
         "switchport",
         "vlan",
     ):
+        deadline = remaining_budget()
         try:
-            response = drain.push_now(mgmt.device_id, scope, force=True)
+            response = drain.push_now(mgmt.device_id, scope, force=True, deadline=deadline)
         except Exception as exc:  # noqa: BLE001 — one scope's failure must not block the rest
             logger.warning("Apply push failed for device %s: %s", mgmt.device_id, exc)
             response = None
@@ -2563,8 +2579,9 @@ def _prepare_apply(mgmt):
     # which would 409 the trigger_apply this runs just ahead of.
     # The OUTCOME, not the answer: a refusal is a proven precondition failure, where a
     # transport failure leaves the Apply to fail at the trigger as it always has.
+    deadline = remaining_budget()
     try:
-        outcome = drain.drain_key(mgmt.device_id, "snmp", mode=MODE_STORE_ONLY, force=True)
+        outcome = drain.drain_key(mgmt.device_id, "snmp", mode=MODE_STORE_ONLY, force=True, deadline=deadline)
     except Exception as exc:  # noqa: BLE001 (one scope's failure must not block the rest)
         logger.warning("Apply push failed for device %s: %s", mgmt.device_id, exc)
         outcome = None
@@ -2637,7 +2654,8 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
         """
         from . import adapter_client as client
 
-        job_id = (exc.detail or {}).get("job_id")
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        job_id = detail.get("job_id")
         incumbent_type = None
         if job_id:
             try:
@@ -3012,6 +3030,8 @@ def _residue_matchers():
         ),
         # #104 phase-3: interface_config residue is VALUE-grain — the adapter reports
         # the removed (interface, address, vrf) triples that survived the retraction.
+        # The key is the ADAPTER's removal scope (VALID_REMOVAL_SCOPES), not the plugin's
+        # outbound delivery key "ip"; card #1591 owns unifying the two vocabularies.
         "interface_ips": (
             "interface_config",
             [("interface_ips", "address", lambda r: (r.interface.name, r.address, r.vrf or ""))],
@@ -3232,7 +3252,7 @@ def _push_intent_for_device(device_id: int) -> None:
     Appends rather than pushes (#1503 Appendix O): every in-protocol send is a claimed,
     sequenced logical operation, so the view-level bulk accept goes through the same outbox
     as the accept signal and the Decision-G edit signal rather than calling the builder
-    around it. With no transaction open the drain runs inline, exactly as the push did.
+    around it. The caller must hold a writer transaction, as ``NSOBulkAcceptView.post`` does.
     """
     try:
         mgmt = NSODeviceManagement.objects.select_related("nso_instance").get(device_id=device_id)
@@ -5497,8 +5517,15 @@ class NSORedistributionBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     model_class = NSORedistributionState
 
     def _push(self, mgmt):
-        # Redistribution is distributed across destination protocols; push all three.
-        for scope in ("ospf", "isis", "bgp"):
+        from .signals import _OWNED_PUSH_STATUSES
+
+        destinations = (
+            self.model_class.objects.filter(management=mgmt, status__in=_OWNED_PUSH_STATUSES)
+            .order_by()
+            .values_list("dest_protocol", flat=True)
+            .distinct()
+        )
+        for scope in sorted(destinations):
             _schedule_intent_push((mgmt.device_id, scope))
 
 

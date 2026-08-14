@@ -157,7 +157,12 @@ class TestCompactionAndTheClaimAreMutuallyExclusive(_CompactionCase):
         return drain.claim(self.device.pk, "static_route")
 
     def test_the_writes_name_exact_primary_keys(self):
+        import re
+
         from netbox_nso_plugin import drain
+
+        def named_pks(sql):
+            return {int(value) for value in re.findall(r"\b\d+\b", sql)}
 
         for index in range(3):
             self.append(self.delete_of(4010 + index))
@@ -171,11 +176,12 @@ class TestCompactionAndTheClaimAreMutuallyExclusive(_CompactionCase):
         assert any("FOR UPDATE" in sql for sql in selects), selects
         deletes = [sql for sql in written if sql.startswith("DELETE")]
         assert deletes, written
-        for pk in selected[:-1]:
-            assert any(str(pk) in sql for sql in deletes), f"the delete did not name entry {pk}"
+        deleted = set().union(*(named_pks(sql) for sql in deletes))
+        assert set(selected[:-1]) <= deleted, f"the delete did not name {set(selected[:-1]) - deleted}"
+        assert selected[-1] not in deleted, "the survivor was deleted"
         assert all("IN (" in sql or "= " in sql for sql in deletes)
         updates = [sql for sql in written if sql.startswith("UPDATE")]
-        assert updates and all(str(selected[-1]) in sql for sql in updates), updates
+        assert updates and all(selected[-1] in named_pks(sql) for sql in updates), updates
 
     def test_a_write_touching_a_different_number_of_rows_aborts(self):
         from netbox_nso_plugin import drain

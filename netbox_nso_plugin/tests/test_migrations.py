@@ -10,6 +10,7 @@ isolation. So the property is asserted mechanically here, on the graph itself.
 
 from __future__ import annotations
 
+import importlib
 from io import StringIO
 
 from django.core.management import call_command
@@ -20,6 +21,13 @@ APP = "netbox_nso_plugin"
 
 
 class TestMigrationGraph(SimpleTestCase):
+    def test_sequence_rollback_warning_names_the_reuse_risk(self):
+        migration = importlib.import_module("netbox_nso_plugin.migrations.0018_intent_outbox")
+
+        assert "Re-applying it restarts at 1" in migration.__doc__
+        sequence = migration.Migration.operations[0]
+        assert "DROP SEQUENCE" in sequence.reverse_sql
+
     def test_cross_app_dependencies_stay_on_the_0001_floor(self):
         """makemigrations pins the GENERATING environment's app heads; a pin newer than
         the 0001 floor breaks DB setup on the oldest supported NetBox (CI matrix floor)."""

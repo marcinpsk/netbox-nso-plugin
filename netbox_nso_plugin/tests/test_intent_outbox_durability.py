@@ -15,11 +15,13 @@ than allowed to commit alone.
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.test import TransactionTestCase
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 
 from ._outbox_case import entries, make_managed, without_commit_drain
@@ -87,7 +89,7 @@ class TestAWriteAndItsEntryCommitTogether(_DurabilityCase):
 
 
 class TestABareEnqueueIsRefused(_DurabilityCase):
-    """codex O1 r3 F2(b): a site that never opens a transaction has to fail, not lose."""
+    """Programmatic writers must open transaction.atomic() before managed-model writes."""
 
     def test_appending_outside_a_transaction_raises(self):
         from django.db import connection
@@ -103,3 +105,41 @@ class TestABareEnqueueIsRefused(_DurabilityCase):
             raise AssertionError("the entry committed alone, so the write it stands for could be lost")
 
         assert entries(self.device, "vlan") == []
+
+    def test_public_docs_require_the_writer_transaction(self):
+        root = Path(__file__).resolve().parents[2]
+        readme = (root / "README.md").read_text()
+        signals = (root / "netbox_nso_plugin" / "signals.py").read_text()
+        views = (root / "netbox_nso_plugin" / "views.py").read_text()
+
+        assert "transaction.atomic()" in readme
+        assert "must hold a writer transaction" in views
+        assert "append refuses when no writer transaction" in signals
+        assert "drain runs inline" not in signals + views
+
+
+class TestTransactionIdReuse(_DurabilityCase):
+    def test_one_writer_transaction_reads_its_id_once(self):
+        from django.db import connection
+
+        from netbox_nso_plugin import outbox
+
+        with transaction.atomic(), CaptureQueriesContext(connection) as queries:
+            first = outbox.current_txid()
+            second = outbox.current_txid()
+
+        txid_queries = [query for query in queries if "txid_current" in query["sql"]]
+        assert first == second
+        assert len(txid_queries) == 1
+
+    def test_a_reused_atomic_context_does_not_reuse_a_rolled_back_id(self):
+        from netbox_nso_plugin import outbox
+
+        writer = transaction.atomic()
+        with writer:
+            rolled_back = outbox.current_txid()
+            transaction.set_rollback(True)
+        with writer:
+            committed = outbox.current_txid()
+
+        assert committed != rolled_back

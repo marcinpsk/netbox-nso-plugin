@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import threading
 
-from django.db import transaction
+from django.db import connection, transaction
 from django.test import TransactionTestCase
+from django.test.utils import CaptureQueriesContext
 
 from ._outbox_case import (
     ReceiptAdapter,
@@ -567,7 +568,11 @@ class TestStoreOnlyCarriesNoAuthority(_OutcomeCase):
         assert self.adapter.requests == [], "a store-only request writes no tombstone, so it may not carry one"
         assert [row.pk for row in entries(self.device, "static_route", unconsumed=True)] == pending
         state = state_of(self.device, "static_route")
-        assert state is None or (state.push_seq, state.claim_deletions, state.queued_deletions) == (None, [], [])
+        assert (state.push_seq, state.claim_deletions, state.queued_deletions) == (None, [], [])
+        assert state.attempts == 1
+        assert state.last_error_code == drain.AuthorityPending.code
+        assert state.last_error_at is not None
+        assert state.last_drain_attempted_at is not None
 
         errors = NSODeviceManagement.objects.get(pk=self.mgmt.pk).intent_push_errors or {}
         assert "static_route" in errors, errors
@@ -644,6 +649,47 @@ class TestStoreOnlyCarriesNoAuthority(_OutcomeCase):
         assert self.adapter.requests[-1]["params"].get("delete_origin") == "true", "the marked retract still goes"
         assert self.adapter.on_device[self.adapter_device_id] == {("vlan_id", 906)}
         assert self.adapter.detached[self.adapter_device_id] == set()
+
+
+class TestAbandonHonorsRevocations(_OutcomeCase):
+    tag = "abrev"
+    adapter_device_id = 7716
+
+    def test_abandon_does_not_requeue_a_revoked_claim_deletion(self):
+        from netbox_nso_plugin import drain
+
+        route = own_route(self.mgmt, "198.51.100.176/28", "198.51.100.12")
+        self.clear_entries()
+        self.unown(route)
+        claimed = drain.claim(self.device.pk, "static_route")
+        row = state_of(self.device, "static_route")
+        row.revoked_ids = [route.pk]
+        row.save(update_fields=["revoked_ids"])
+
+        assert drain.abandon(claimed) == drain.ABANDONED
+        row.refresh_from_db()
+        assert row.queued_deletions == []
+
+
+class TestGateBlockerQueriesAreDistinct(_OutcomeCase):
+    tag = "gatequery"
+    adapter_device_id = 7717
+
+    def test_entry_blockers_are_deduplicated_by_the_database(self):
+        from netbox_nso_plugin import drain
+
+        state = own_vlan(self.mgmt, 932, self.tag)
+        with without_commit_drain(), transaction.atomic():
+            state.save()
+            state.save()
+
+        with CaptureQueriesContext(connection) as queries:
+            drain.gate_blockers(self.device.pk)
+
+        entry_queries = [q["sql"] for q in queries if "intentoutboxentry" in q["sql"].lower()]
+        assert len(entry_queries) == 2
+        assert all("SELECT DISTINCT" in query.upper() for query in entry_queries)
+        assert all("ORDER BY" not in query.upper() for query in entry_queries)
 
 
 class TestTheFenceWithholdsEverySendButTheBackfill(_OutcomeCase):

@@ -86,6 +86,21 @@ class TestTheTickDrainsTheTail(_DrainCase):
 
         assert order == ["refresh", "repair", "drain", "settle"]
 
+    def test_an_adapter_outage_still_runs_database_compaction(self):
+        from netbox_nso_plugin import jobs
+
+        with (
+            patch("netbox_nso_plugin.sync_cache._snapshot", return_value=([], None, {})),
+            patch("netbox_nso_plugin.sync_cache.refresh_sync_caches", return_value=(0, 0)),
+            patch("netbox_nso_plugin.sync_cache.reconcile_device_links", return_value=(0, 0)),
+            patch("netbox_nso_plugin.drain.compact_intent_outbox") as compact,
+            patch("netbox_nso_plugin.drain.drain_intent_outbox") as drain_all,
+        ):
+            jobs.RefreshDeviceSyncCacheJob.run(None)
+
+        compact.assert_called_once_with()
+        drain_all.assert_not_called()
+
     def test_the_tail_left_by_the_chain_drains_within_one_interval(self):
         from netbox_nso_plugin import drain
 

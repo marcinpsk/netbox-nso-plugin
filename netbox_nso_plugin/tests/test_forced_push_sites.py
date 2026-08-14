@@ -3,10 +3,9 @@
 """#1503 Appendix O (O1), pin O1.16: the forced-push sites, enumerated by the compiler.
 
 A forced call is its own logical operation: it does not enqueue, does not coalesce and is
-never dropped as unchanged. There are six of them, and the enumeration is taken with the AST
-rather than with a text search, because one of the six spreads its call over three lines and
-a single-line grep reports five. The scan fails when a seventh appears, so a new site is
-triaged rather than discovered later by its absence from the outbox.
+never dropped as unchanged. There are five of them, and the enumeration is taken with the AST
+rather than with a text search, because a wrapped call can span several lines. The scan fails
+when an unowned site appears, so a new site is triaged before its outbox omission causes harm.
 
 A forced call inside an open transaction raises: the claim sets its own isolation level,
 which PostgreSQL accepts only before a transaction's first statement, and the send must hold
@@ -29,12 +28,11 @@ from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 PLUGIN = Path(__file__).resolve().parent.parent
 
 #: (module, enclosing function, callee) → how many forced calls that site makes. Counted, not
-#: set-collected: the Apply forces twelve scopes through one callee in one function, and a
-#: set would report one site where there are twelve calls.
+#: set-collected: the Apply forces several scopes through one call in one function, and a set
+#: would report one site where repeated calls could exist.
 FORCED_PUSH_SITES = {
-    ("intent_drift.py", "resync_intent", "drain.push_now"): 1,
+    ("intent_drift.py", "resync_intent", "drain.drain_key"): 1,
     ("intent_drift.py", "resync_static_route_intent_fleet", "drain.push_now"): 1,
-    ("link_role.py", "apply_description_for_role", "drain.push_now"): 1,
     ("link_role.py", "_push_provisioned", "drain.push_now"): 1,
     ("views.py", "_prepare_apply", "drain.push_now"): 1,
     # The Apply's SNMP refresh reads the OUTCOME rather than the answer: it aborts on a
@@ -75,7 +73,7 @@ def _forced_calls() -> collections.Counter:
 
 
 class TestForcedPushSitesAreEnumerated(SimpleTestCase):
-    """O1.16: six calls, found by the AST, and a scan that fails when a seventh appears."""
+    """O1.16: forced calls found by the AST, with a scan that fails on an unowned site."""
 
     def test_every_forced_site_is_still_where_the_enumeration_says(self):
         found = _forced_calls()
@@ -83,11 +81,11 @@ class TestForcedPushSitesAreEnumerated(SimpleTestCase):
             with self.subTest(site=site):
                 assert found[site] == count
 
-    def test_there_are_six_forced_calls_and_none_outside_the_enumeration(self):
+    def test_no_forced_call_exists_outside_the_enumeration(self):
         expected = collections.Counter(FORCED_PUSH_SITES)
         expected[FORCED_CLAIM_SITE] += 1
         assert _forced_calls() == expected
-        assert sum(FORCED_PUSH_SITES.values()) == 6
+        assert sum(FORCED_PUSH_SITES.values()) == 5
 
     def test_every_forced_site_routes_through_the_claim(self):
         """A forced call is a claim with those flags, never a push around it (§4.2).
@@ -96,8 +94,19 @@ class TestForcedPushSitesAreEnumerated(SimpleTestCase):
         instead of the outcome, so a site needing the outcome takes the other one and still
         sends nothing around the protocol.
         """
+        import inspect
+
+        from netbox_nso_plugin import drain
+
         callees = {site[2] for site in FORCED_PUSH_SITES}
         assert callees == {"drain.push_now", "drain.drain_key"}
+        for entry_point in (drain.push_now, drain.drain_key):
+            calls = {
+                ast.unparse(node.func)
+                for node in ast.walk(ast.parse(inspect.getsource(entry_point)))
+                if isinstance(node, ast.Call)
+            }
+            assert calls == {"_drain_once"}, f"{entry_point.__name__} bypasses the shared drain: {calls}"
 
     def test_the_scan_reads_calls_a_single_line_search_cannot(self):
         """The named trap: a wrapped call is invisible to a grep and plain to the compiler.

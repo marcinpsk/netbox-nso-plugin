@@ -585,6 +585,11 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
         _, kwargs = session.request.call_args
         self.assertEqual(kwargs["json"]["attributes"], attrs)
 
+    def test_static_route_intent_doc_names_the_list_that_clears_the_mirror(self):
+        from netbox_nso_plugin.adapter_client import put_static_route_intent
+
+        self.assertIn("empty ``routes`` list clears", put_static_route_intent.__doc__)
+
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_trigger_apply(self, mock_s, _cfg):
