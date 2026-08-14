@@ -276,7 +276,7 @@ class TestTheTickDrainsTheTail(_DrainCase):
 
     def test_outage_compaction_respects_the_gate_and_the_normal_tick_still_runs(self):
         from netbox_nso_plugin import jobs
-        from netbox_nso_plugin.deployment import quiesce, resume
+        from netbox_nso_plugin.deployment import DeploymentQuiesced, quiesce, resume
 
         device, mgmt = self.managed("gatecompact", 7609, vid=909)
         self.edit(mgmt)
@@ -290,10 +290,19 @@ class TestTheTickDrainsTheTail(_DrainCase):
                 patch("netbox_nso_plugin.sync_cache.refresh_sync_caches", return_value=(0, 0)),
                 patch("netbox_nso_plugin.sync_cache.reconcile_device_links", return_value=(0, 0)),
             ):
-                jobs.RefreshDeviceSyncCacheJob.run(None)
+                with self.assertRaisesRegex(DeploymentQuiesced, "device maintenance tick"):
+                    jobs.RefreshDeviceSyncCacheJob.run(None)
             assert [row.pk for row in entries(device, "vlan", unconsumed=True)] == before
         finally:
             resume()
+
+        with (
+            patch("netbox_nso_plugin.sync_cache._snapshot", return_value=([], None, {})),
+            patch("netbox_nso_plugin.sync_cache.refresh_sync_caches", return_value=(0, 0)),
+            patch("netbox_nso_plugin.sync_cache.reconcile_device_links", return_value=(0, 0)),
+        ):
+            jobs.RefreshDeviceSyncCacheJob.run(None)
+        assert [row.pk for row in entries(device, "vlan", unconsumed=True)] == [before[-1]]
 
         assert self.run_drain() == (1, 0)
         assert entries(device, "vlan", unconsumed=True) == []
