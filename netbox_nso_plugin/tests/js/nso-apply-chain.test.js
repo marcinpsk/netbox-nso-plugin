@@ -70,6 +70,12 @@ describe("pollUrl", () => {
   });
 });
 
+describe("firstJobId", () => {
+  it("uses the first job attached anywhere in the generation chain", () => {
+    expect(C.firstJobId([{ generation_id: 81, job_id: null }, { generation_id: 82, job_id: 503 }])).toBe(503);
+  });
+});
+
 describe("createPollGuard", () => {
   it("prevents overlapping ticks and blocks all work after stop", () => {
     const guard = C.createPollGuard();
@@ -99,5 +105,17 @@ describe("createPollTimer", () => {
     expect(schedule).toHaveBeenCalledWith(tick, 2000);
     expect(tick).toHaveBeenCalledOnce();
     expect(cancel).toHaveBeenCalledWith(37);
+  });
+
+  it("does not schedule or tick again when start is called twice", () => {
+    const schedule = vi.fn(() => 37);
+    const tick = vi.fn();
+    const timer = C.createPollTimer(tick, 2000, schedule, vi.fn());
+
+    timer.start();
+    timer.start();
+
+    expect(schedule).toHaveBeenCalledOnce();
+    expect(tick).toHaveBeenCalledOnce();
   });
 });

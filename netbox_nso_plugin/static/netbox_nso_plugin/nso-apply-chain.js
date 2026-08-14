@@ -50,6 +50,13 @@
     return url.toString();
   }
 
+  function firstJobId(expectedGenerations) {
+    var linked = (expectedGenerations || []).find(function (generation) {
+      return generation && generation.job_id != null;
+    });
+    return linked ? linked.job_id : null;
+  }
+
   function createPollGuard() {
     var stopped = false;
     var inFlight = false;
@@ -81,6 +88,7 @@
 
     return {
       start: function () {
+        if (interval != null) return;
         interval = setTimer(tick, delay);
         tick();
       },
@@ -95,6 +103,7 @@
   window.NSOApplyChain = {
     correlate: correlate,
     pollUrl: pollUrl,
+    firstJobId: firstJobId,
     createPollGuard: createPollGuard,
     createPollTimer: createPollTimer,
   };
