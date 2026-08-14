@@ -151,6 +151,73 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
                 self._prepare()
         assert is_quiesced(), "a failed re-prepare released a gate it did not create"
 
+    def test_prepare_failure_preserves_a_gate_created_before_its_exclusive_transition(self):
+        from netbox_nso_plugin.deployment import is_quiesced, quiesce, resume
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        NSOIntentOutboxState.objects.create(
+            device=self.device,
+            scope="static_route",
+            claimed_at=timezone.now(),
+        )
+
+        def competing_transition():
+            quiesce()
+            return quiesce()
+
+        try:
+            with (
+                patch(
+                    "netbox_nso_plugin.management.commands.nso_intent_deployment_gate.quiesce",
+                    side_effect=competing_transition,
+                ),
+                patch("netbox_nso_plugin.management.commands.nso_intent_deployment_gate.time.sleep"),
+            ):
+                with self.assertRaisesRegex(CommandError, "Deployment gate blocked"):
+                    self._prepare()
+            assert is_quiesced(), "prepare released the competing command's gate"
+        finally:
+            resume()
+
+    def test_verification_abandons_a_claim_that_carries_deletions(self):
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.deployment import quiesce, resume
+
+        route = own_route(self.mgmt, "198.18.43.0/24", "198.18.0.1")
+        config, session = self.adapter.patches()
+        with config, session:
+            assert drain.drain_key(self.device.pk, "static_route") == drain.SUCCEEDED
+        with without_commit_drain():
+            route.devices.remove(self.device)
+        claim = drain.claim(self.device.pk, "static_route")
+        assert claim is not None and [record["route_id"] for record in claim.deletions] == [route.pk]
+
+        quiesce()
+        try:
+            with (
+                patch(
+                    "netbox_nso_plugin.management.commands.nso_intent_deployment_gate.drain.gate_blockers",
+                    return_value=[],
+                ),
+                patch(
+                    "netbox_nso_plugin.management.commands.nso_intent_deployment_gate.drain.claim", return_value=claim
+                ),
+            ):
+                with self.assertRaisesRegex(CommandError, "no-deletion static verification push"):
+                    call_command(
+                        "nso_intent_deployment_gate",
+                        verify=True,
+                        device_id=self.device.pk,
+                        stdout=io.StringIO(),
+                        stderr=io.StringIO(),
+                    )
+            state = state_of(self.device, "static_route")
+            assert state.push_seq is None, "the rejected verification claim remained active"
+            assert state.claim_deletions == []
+            assert [record["route_id"] for record in state.queued_deletions] == [route.pk]
+        finally:
+            resume()
+
     def test_the_full_gate_sequence_quiesces_and_verifies_a_no_deletion_static_push(self):
         from django.http import HttpResponse
         from django.test import RequestFactory
@@ -299,6 +366,37 @@ class TestIntentRestoreResolvesEveryReceiptCase(_CascadeFlushMixin, IntentPushRe
         self._assert_real_reads()
         assert state_of(self.device, "vlan").push_seq == claim.push_seq
         assert is_quiesced(), "a mode-mismatched receipt settled a restored claim"
+
+    def test_non_boolean_receipt_modes_fail_closed(self):
+        from netbox_nso_plugin.management.commands.nso_intent_restore import _normalize
+
+        valid = {
+            "push_seq": 1,
+            "request_digest": "a" * 64,
+            "response": {},
+            "store_only": False,
+            "delete_origin": False,
+            "backfill_only": False,
+        }
+        for field, malformed in (
+            ("store_only", "false"),
+            ("delete_origin", 0),
+            ("backfill_only", None),
+        ):
+            with self.subTest(field=field, malformed=malformed):
+                receipt = {**valid, field: malformed}
+                with self.assertRaises(CommandError):
+                    _normalize(receipt)
+
+    def test_restore_preserves_a_gate_created_by_another_invocation(self):
+        from netbox_nso_plugin.deployment import is_quiesced, quiesce, resume
+
+        quiesce()
+        try:
+            self._restore()
+            assert is_quiesced(), "restore resumed another invocation's deployment gate"
+        finally:
+            resume()
 
     def test_lower_receipt_releases_the_restored_lease_for_normal_replay(self):
         from netbox_nso_plugin import drain

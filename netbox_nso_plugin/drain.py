@@ -1609,7 +1609,16 @@ def drain_candidates(limit=None) -> list[tuple[int, str]]:
 
 
 def compact_intent_outbox(limit=None) -> None:
-    """Compact the tick's bounded candidate set without contacting the adapter."""
+    """Compact the bounded candidate set unless a deployment has paused it."""
+    try:
+        with _deployment_operation("intent outbox compaction"):
+            _compact_intent_outbox(limit)
+    except DeploymentQuiesced:
+        logger.info("intent outbox compaction is paused for a deployment")
+
+
+def _compact_intent_outbox(limit=None) -> None:
+    """Compact an admitted candidate set without contacting the adapter."""
     for device_id, scope in compaction_candidates(limit):
         try:
             compact(device_id, scope)

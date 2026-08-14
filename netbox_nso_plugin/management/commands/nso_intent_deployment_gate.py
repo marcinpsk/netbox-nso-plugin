@@ -84,8 +84,7 @@ class Command(BaseCommand):
     def _prepare(self):
         # Release on failure ONLY a gate this invocation created: a re-prepare over a gate
         # a failed verification left active must keep writes blocked (§4.6).
-        created = not is_quiesced()
-        quiesce()
+        created = quiesce()
         try:
             wait = _old_client_wait()
             self.stdout.write(f"Intent work is quiesced; waiting {wait} seconds for old clients and the lease")
@@ -114,7 +113,10 @@ class Command(BaseCommand):
             raise CommandError(f"No linked NSO-managed device exists for id {device_id}")
         with gate_bypass():
             claim = drain.claim(device_id, "static_route", force=True)
-            if claim is None or claim.deletions:
+            if claim is None:
+                raise CommandError("Could not form the no-deletion static verification push")
+            if claim.deletions:
+                drain.abandon(claim)
                 raise CommandError("Could not form the no-deletion static verification push")
             try:
                 response = drain.send_claim(claim)

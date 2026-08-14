@@ -81,6 +81,21 @@ class TestRunDeviceReconcile(APITestCase):
         self.assertIn("error", result)
         self.assertEqual(result["device_id"], device.pk)
 
+    def test_deployment_quiescence_is_returned_without_failing_the_worker(self):
+        from netbox_nso_plugin import reconcile
+        from netbox_nso_plugin.deployment import quiesce, resume
+
+        device = _make_device("rec-quiesced")
+        quiesce()
+        try:
+            result = reconcile.run_device_reconcile(device.pk)
+        finally:
+            resume()
+
+        self.assertIn("error", result)
+        self.assertEqual(result["device_id"], device.pk)
+        self.assertIn("quiesced", result["error"])
+
     def test_an_unmanaged_device_is_not_reported_as_a_settle_failure(self):
         """Step 4 has nothing to settle for a device with no management row, and says nothing.
 
