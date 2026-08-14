@@ -102,6 +102,25 @@ class TestTheTickDrainsTheTail(_DrainCase):
         compact.assert_called_once_with()
         drain_all.assert_not_called()
 
+    def test_a_mid_tick_quiesce_stops_without_recording_a_key_failure(self):
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.deployment import DeploymentQuiesced
+
+        with (
+            patch.object(drain, "_compact_intent_outbox") as compact,
+            patch.object(drain, "compact_intent_outbox") as guarded_compact,
+            patch.object(drain, "drain_candidates", return_value=[(1, "vlan"), (2, "vlan")]),
+            patch.object(drain, "drain_key", side_effect=DeploymentQuiesced("deployment started")) as drain_key,
+            patch.object(drain, "_restamp_attempt") as restamp,
+        ):
+            result = drain._drain_intent_outbox()
+
+        assert result == (0, 0)
+        compact.assert_called_once_with(None)
+        guarded_compact.assert_not_called()
+        drain_key.assert_called_once_with(1, "vlan")
+        restamp.assert_not_called()
+
     def test_outage_compaction_respects_the_gate_and_the_normal_tick_still_runs(self):
         from netbox_nso_plugin import jobs
         from netbox_nso_plugin.deployment import quiesce, resume

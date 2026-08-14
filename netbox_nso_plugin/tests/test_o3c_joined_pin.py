@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -28,7 +29,21 @@ from ._outbox_case import make_device, own_route, without_commit_drain
 from ._settlement_adapter import LoopbackOnlySession
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
-_ADAPTER_COMMIT = "806c84c994a7843351cfc8b77f0b268a132dea31"
+_WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "test.yaml"
+
+
+def _adapter_commit_from_workflow() -> str:
+    """Read the joined adapter pin from the workflow that checks it out."""
+    match = re.search(
+        r"repository: marcinpsk/nso-adapter\s+ref: ([0-9a-f]{40})",
+        _WORKFLOW.read_text(),
+    )
+    if match is None:
+        raise AssertionError(f"O3c adapter commit is missing or malformed in {_WORKFLOW}")
+    return match.group(1)
+
+
+_ADAPTER_COMMIT = _adapter_commit_from_workflow()
 _ADAPTER_RUNTIME_DIGEST = "148cd7168b1d7ddb7d176d59c409fd42cd4dad326318464e29c766e3e2964a54"
 _ADAPTER_ROOT = Path(__file__).resolve().parents[2].parent / ".o3c-adapter"
 _SR_PATH = "/restconf/data/static-route-reconciler:static-route-config"

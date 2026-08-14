@@ -39,7 +39,10 @@ def lock_mutation() -> None:
     if not connection.in_atomic_block:
         raise RuntimeError("an intent mutation must join the deployment gate inside its transaction")
     with connection.cursor() as cursor:
-        cursor.execute("SELECT pg_advisory_xact_lock_shared(%s)", [_LOCK_KEY])
+        cursor.execute("SELECT pg_try_advisory_xact_lock_shared(%s)", [_LOCK_KEY])
+        acquired = cursor.fetchone()[0]
+    if not acquired:
+        _refuse("intent mutation")
     if is_quiesced():
         _refuse("intent mutation")
 
@@ -51,7 +54,10 @@ def operation(label: str):
         yield
         return
     with connection.cursor() as cursor:
-        cursor.execute("SELECT pg_advisory_lock_shared(%s)", [_LOCK_KEY])
+        cursor.execute("SELECT pg_try_advisory_lock_shared(%s)", [_LOCK_KEY])
+        acquired = cursor.fetchone()[0]
+    if not acquired:
+        _refuse(label)
     try:
         if is_quiesced():
             _refuse(label)
