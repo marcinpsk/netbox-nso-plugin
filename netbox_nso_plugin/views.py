@@ -2764,13 +2764,44 @@ def _apply_stream_partition(result, selected):
 
 
 def _promoted_stream_coverage(generations, expected_selected, skipped):
-    """Return the promoted stream union when every generation has valid coverage."""
+    """Return the promoted stream union when every generation proves its selector."""
     promoted_streams = set()
+    previous_seq = None
     for link in generations:
-        revisions = link.get("stream_revisions") if isinstance(link, dict) else None
-        if not isinstance(revisions, dict) or not revisions or not set(revisions).issubset(expected_selected):
+        if not isinstance(link, dict):
             return None, "Adapter returned an invalid Apply generation."
+        generation_id = link.get("generation_id")
+        seq = link.get("seq")
+        job_id = link.get("job_id")
+        mode = link.get("mode")
+        sources = link.get("source_push_seq")
+        revisions = link.get("stream_revisions")
+        digest = link.get("digest")
+        valid_shape = (
+            type(generation_id) is int
+            and generation_id > 0
+            and type(seq) is int
+            and seq > 0
+            and (previous_seq is None or seq > previous_seq)
+            and (job_id is None or (type(job_id) is int and job_id > 0))
+            and isinstance(mode, str)
+            and mode in {"networked", "detach"}
+            and isinstance(sources, dict)
+            and isinstance(revisions, dict)
+            and bool(revisions)
+            and isinstance(digest, str)
+        )
+        if not valid_shape:
+            return None, "Adapter returned an invalid Apply generation."
+        streams = set(revisions)
+        if streams != set(sources) or not streams.issubset(expected_selected):
+            return None, "Adapter returned an invalid Apply generation."
+        if any(type(revision) is not int for revision in revisions.values()) or any(
+            type(sources[stream]) is not int or sources[stream] != expected_selected[stream] for stream in streams
+        ):
+            return None, "Adapter returned an invalid Apply generation provenance."
         promoted_streams.update(revisions)
+        previous_seq = seq
     if promoted_streams != set(expected_selected) - set(skipped):
         return None, "Adapter returned incomplete Apply generation coverage."
     return promoted_streams, None
