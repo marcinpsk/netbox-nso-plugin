@@ -7,7 +7,7 @@ survives: pins O1.2 (a whole-transaction rollback leaves nothing) and O1.3 (a ne
 savepoint rollback leaves the outer deletion's provenance and only that). O1.15 keeps
 reconcile and render writes out of the outbox altogether, O1.4 keeps an unmigrated
 ``query_flag`` scope's marking intact, O1.20 records a deleted route id in both marking
-modes, and O1.18 proves the enqueue takes no shared lock.
+modes, and O1.18 proves concurrent appends remain compatible under the shared deployment lock.
 """
 
 from __future__ import annotations
@@ -318,8 +318,8 @@ class TestOutboxMarkingModes(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         assert any(p.get("delete_origin") == "true" for p in params), f"saw {params}"
 
 
-class TestOutboxEnqueueTakesNoSharedLock(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
-    """O1.18 — two transactions appending two keys in opposite orders cannot deadlock."""
+class TestOutboxEnqueueSharedLockCompatibility(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    """O1.18 — the shared deployment lock keeps opposite key orders compatible."""
 
     def test_opposite_key_orders_both_commit(self):
         from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentOutboxState
