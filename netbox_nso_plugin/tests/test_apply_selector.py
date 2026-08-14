@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from dcim.models import Interface
 from django.contrib.auth import get_user_model
-from django.db import transaction
+from django.db import DatabaseError, connection, transaction
 from django.test import SimpleTestCase, TransactionTestCase
 from django.urls import reverse
 from requests.exceptions import ConnectionError
@@ -264,6 +264,48 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 self.assertEqual(response.status_code, 502)
                 self.vlan_state.refresh_from_db()
                 self.assertEqual(self.vlan_state.status, "deploying")
+
+    def test_incomplete_promoted_streams_keep_every_prepared_row_deploying(self):
+        def incomplete(selected):
+            result = _promoted(selected)
+            for generation in result["generations"]:
+                generation["stream_revisions"] = {"logging": 7}
+            return result
+
+        adapter = _ApplyContractAdapter(lambda selected: (202, incomplete(selected)))
+
+        response = self._post(adapter)
+
+        self.assertEqual(response.status_code, 502)
+        self.vlan_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "deploying")
+
+    def test_deploying_marks_are_atomic_and_apply_is_not_submitted_after_a_database_failure(self):
+        from netbox_nso_plugin.models import NSOLoggingLevelState
+
+        with without_commit_drain(), transaction.atomic():
+            logging_state = NSOLoggingLevelState.objects.create(
+                management=self.mgmt,
+                console_severity="warning",
+                status="accepted",
+            )
+        logging_table = NSOLoggingLevelState._meta.db_table
+
+        def reject_logging_update(execute, sql, params, many, context):
+            if sql.lstrip().upper().startswith("UPDATE") and f'"{logging_table}"' in sql:
+                raise DatabaseError("forced local promotion failure")
+            return execute(sql, params, many, context)
+
+        adapter = _ApplyContractAdapter(lambda selected: (202, _promoted(selected)))
+        with connection.execute_wrapper(reject_logging_update):
+            response = self._post(adapter)
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(adapter.apply_requests, [])
+        self.vlan_state.refresh_from_db()
+        logging_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "accepted")
+        self.assertEqual(logging_state.status, "accepted")
 
     def test_apply_selects_the_stored_isis_receipt_from_the_delivery_registry(self):
         from netbox_nso_plugin.models import NSOISISInterfaceState
