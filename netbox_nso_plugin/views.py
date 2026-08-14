@@ -2691,32 +2691,37 @@ def _prepare_apply(mgmt):
     selected = MappingProxyType({registry[scope].section: push_seq for scope, push_seq in pushed.items()})
 
     moved: list[tuple] = []  # (adapter section, model, [pks]) actually moved, for selective rollback
-    for scope, model in (
-        ("vlan", NSOVLANState),
-        ("svi", NSOSVIState),
-        ("subinterface", NSOSubinterfaceState),
-        ("bfd", NSOBFDInterfaceState),
-        ("interface_mtu", NSOInterfaceMtuState),
-        ("route_policy", NSORoutePolicyState),
-        ("static_route", NSOStaticRouteState),
-        ("l2_sap", NSOL2SapState),
-        ("logging", NSOLoggingLevelState),
-    ):
-        if model is NSOStaticRouteState and not static_route_stored:
-            logger.warning(
-                "Apply: the static-route intent push was not acknowledged for device %s — "
-                "leaving those rows 'accepted' rather than deploying against intent the adapter is not holding",
-                mgmt.device_id,
-            )
-            continue
-        try:
-            section = registry[scope].section
-            pks = list(model.objects.filter(management=mgmt, status="accepted").values_list("pk", flat=True))
-            if pks:
-                model.objects.filter(pk__in=pks).update(status="deploying")
-                moved.append((section, model, pks))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Apply deploying-mark failed for device %s: %s", mgmt.device_id, exc)
+    try:
+        with transaction.atomic():
+            for scope, model in (
+                ("vlan", NSOVLANState),
+                ("svi", NSOSVIState),
+                ("subinterface", NSOSubinterfaceState),
+                ("bfd", NSOBFDInterfaceState),
+                ("interface_mtu", NSOInterfaceMtuState),
+                ("route_policy", NSORoutePolicyState),
+                ("static_route", NSOStaticRouteState),
+                ("l2_sap", NSOL2SapState),
+                ("logging", NSOLoggingLevelState),
+            ):
+                if model is NSOStaticRouteState and not static_route_stored:
+                    logger.warning(
+                        "Apply: the static-route intent push was not acknowledged for device %s: "
+                        "leaving those rows accepted because the adapter does not hold their intent",
+                        mgmt.device_id,
+                    )
+                    continue
+                section = registry[scope].section
+                pks = list(model.objects.filter(management=mgmt, status="accepted").values_list("pk", flat=True))
+                if pks:
+                    model.objects.filter(pk__in=pks).update(status="deploying")
+                    moved.append((section, model, pks))
+    except Exception as exc:  # noqa: BLE001 (abort before the adapter can promote a partial local state)
+        logger.warning("Apply deploying-mark transaction failed for device %s: %s", mgmt.device_id, exc)
+        raise ApplyRefused(
+            "Apply stopped because NetBox could not mark the selected intent as deploying. "
+            "No Apply job was enqueued and all local promotion marks were rolled back."
+        ) from exc
     return moved, selected
 
 
@@ -2744,6 +2749,31 @@ def _stream_reason_message(prefix, reasons) -> str:
         return prefix
     detail = ", ".join(f"{stream} ({reason})" for stream, reason in sorted(reasons.items()))
     return f"{prefix}: {detail}."
+
+
+def _apply_stream_partition(result, selected):
+    """Validate the selector echo and return its selected and skipped stream sets."""
+    expected_selected = dict(selected)
+    returned_selected = result.get("selected")
+    skipped = result.get("skipped")
+    if not isinstance(returned_selected, dict) or returned_selected != expected_selected:
+        return None, None, "Adapter returned an invalid Apply selector."
+    if not isinstance(skipped, dict) or not set(skipped).issubset(expected_selected):
+        return None, None, "Adapter returned invalid Apply skip results."
+    return expected_selected, skipped, None
+
+
+def _promoted_stream_coverage(generations, expected_selected, skipped):
+    """Return the promoted stream union when every generation has valid coverage."""
+    promoted_streams = set()
+    for link in generations:
+        revisions = link.get("stream_revisions") if isinstance(link, dict) else None
+        if not isinstance(revisions, dict) or not revisions or not set(revisions).issubset(expected_selected):
+            return None, "Adapter returned an invalid Apply generation."
+        promoted_streams.update(revisions)
+    if promoted_streams != set(expected_selected) - set(skipped):
+        return None, "Adapter returned incomplete Apply generation coverage."
+    return promoted_streams, None
 
 
 class NSODeviceActionView(NSOActionPermissionMixin, View):
@@ -2790,22 +2820,29 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
         messages.error(request, message)
         return redirect(_device_nso_tab_url(mgmt.device.pk))
 
-    def _apply_result(self, request, mgmt, result, prepared, *, label, is_ajax):
+    def _apply_result(self, request, mgmt, result, prepared, selected, *, label, is_ajax):
         """Surface one successful Apply response and its complete generation chain."""
         if not isinstance(result, dict):
             return self._apply_unreadable_response(
                 request, mgmt, "Adapter returned an invalid Apply response.", is_ajax=is_ajax
             )
         outcome = result.get("outcome")
+        expected_selected, skipped, partition_error = _apply_stream_partition(result, selected)
+        if partition_error:
+            return self._apply_unreadable_response(request, mgmt, partition_error, is_ajax=is_ajax)
         if outcome == "no_op":
+            if set(skipped) != set(expected_selected) or result.get("generations") != []:
+                return self._apply_unreadable_response(
+                    request, mgmt, "Adapter returned incomplete Apply skip results.", is_ajax=is_ajax
+                )
             _rollback_prepare_apply(prepared)
-            msg = _stream_reason_message("Apply did not enqueue a job. Skipped streams", result.get("skipped"))
+            msg = _stream_reason_message("Apply did not enqueue a job. Skipped streams", skipped)
             if is_ajax:
                 return JsonResponse(
                     {
                         "status": "no_op",
                         "message": msg,
-                        "skipped": result.get("skipped") or {},
+                        "skipped": skipped,
                         "generations": [],
                     }
                 )
@@ -2820,13 +2857,9 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
             return self._apply_unreadable_response(
                 request, mgmt, "Adapter promoted Apply without a generation chain.", is_ajax=is_ajax
             )
-        promoted_streams = set()
-        for link in generations:
-            if not isinstance(link, dict) or not isinstance(link.get("stream_revisions"), dict):
-                return self._apply_unreadable_response(
-                    request, mgmt, "Adapter returned an invalid Apply generation.", is_ajax=is_ajax
-                )
-            promoted_streams.update(link["stream_revisions"])
+        promoted_streams, coverage_error = _promoted_stream_coverage(generations, expected_selected, skipped)
+        if coverage_error:
+            return self._apply_unreadable_response(request, mgmt, coverage_error, is_ajax=is_ajax)
         _rollback_prepare_apply(prepared, keep_streams=promoted_streams)
         job_id = next((link.get("job_id") for link in generations if link.get("job_id") is not None), None)
         if job_id is None:
@@ -2841,7 +2874,6 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
                 )
             messages.error(request, msg)
             return redirect(_device_nso_tab_url(mgmt.device.pk))
-        skipped = result.get("skipped") or {}
         msg = f"{label} triggered. Tracking {len(generations)} generation(s) from Job ID {job_id}."
         if skipped:
             msg = f"{msg} {_stream_reason_message('Skipped streams', skipped)}"
@@ -2938,7 +2970,7 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
                 action_fn(mgmt.adapter_device_id, selected) if action == "apply" else action_fn(mgmt.adapter_device_id)
             )
             if action == "apply":
-                return self._apply_result(request, mgmt, result, prepared, label=label, is_ajax=is_ajax)
+                return self._apply_result(request, mgmt, result, prepared, selected, label=label, is_ajax=is_ajax)
 
             job_id = result.get("job_id") if result else None
             if is_ajax:

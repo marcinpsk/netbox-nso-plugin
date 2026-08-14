@@ -158,9 +158,13 @@ class BlockedRemovalTestBase(TestCase):
         ):
             session = make_session()
 
-            def request(_method, url, **_kwargs):
+            def request(_method, url, **kwargs):
                 if url.endswith("/generations"):
-                    return make_response(200, json_data=generations)
+                    params = kwargs.get("params") or {}
+                    since_seq = params.get("since_seq", 0)
+                    limit = params.get("limit", 100)
+                    page = [row for row in generations if row["seq"] > since_seq][:limit]
+                    return make_response(200, json_data=page)
                 return make_response(200, json_data=jobs)
 
             session.request.side_effect = request
@@ -202,6 +206,23 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
 
         self.assertEqual(data["generations"], generations[:2])
         self.assertEqual(data["jobs"], [jobs[1]])
+
+    def test_requested_apply_generation_is_found_beyond_the_first_page(self):
+        generations = [
+            {
+                "generation_id": seq,
+                "seq": seq,
+                "status": "settled",
+                "job_id": 501 if seq == 501 else None,
+            }
+            for seq in range(1, 502)
+        ]
+        jobs = [_removal_job(501, "vlan", "succeeded")]
+
+        data = self._get_jobs(jobs, generations=generations, generation_ids=(501,))
+
+        self.assertEqual(data["generations"], [generations[500]])
+        self.assertEqual(data["jobs"], jobs)
 
     def test_a_non_integer_generation_id_is_rejected(self):
         url = reverse("plugins:netbox_nso_plugin:device_nso_jobs", args=[self.device.pk])
