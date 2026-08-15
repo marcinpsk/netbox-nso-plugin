@@ -43,7 +43,6 @@ def _adapter_commit_from_workflow() -> str:
     return match.group(1)
 
 
-_ADAPTER_COMMIT = _adapter_commit_from_workflow()
 _ADAPTER_RUNTIME_DIGEST = "148cd7168b1d7ddb7d176d59c409fd42cd4dad326318464e29c766e3e2964a54"
 _ADAPTER_ROOT = Path(__file__).resolve().parents[2].parent / ".o3c-adapter"
 _SR_PATH = "/restconf/data/static-route-reconciler:static-route-config"
@@ -397,8 +396,10 @@ class _O3CEnvironment:
             raise AssertionError(f"O3c adapter worktree is missing at {_ADAPTER_ROOT}")
         digest = self._runtime_digest()
         if digest != _ADAPTER_RUNTIME_DIGEST:
+            expected_commit = _adapter_commit_from_workflow()
             raise AssertionError(
-                f"O3c requires adapter {_ADAPTER_COMMIT}; runtime digest is {digest}, expected {_ADAPTER_RUNTIME_DIGEST}"
+                f"O3c requires adapter {expected_commit}; runtime digest is {digest}, "
+                f"expected {_ADAPTER_RUNTIME_DIGEST}"
             )
         uv = shutil.which("uv")
         if uv is None:
