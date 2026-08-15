@@ -14,7 +14,7 @@ from netbox_nso_plugin.deployment import gate_bypass, is_quiesced, quiesce, resu
 
 
 def _old_client_wait() -> int:
-    """Return connect plus longest read timeout plus the outbox lease margin."""
+    """Return capped connect plus longest read timeout plus the outbox lease margin."""
     from netbox_nso_plugin.models import AdapterConnection
 
     configured = int(settings.PLUGINS_CONFIG.get("netbox_nso_plugin", {}).get("adapter_timeout", 30))

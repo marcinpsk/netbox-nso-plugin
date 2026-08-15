@@ -16,7 +16,9 @@ class TestO3CJoinedPinImport(SimpleTestCase):
         loaded = sys.modules.pop(module_name, None)
         try:
             with patch.object(Path, "read_text", side_effect=FileNotFoundError("workflow missing")):
-                importlib.import_module(module_name)
+                module = importlib.import_module(module_name)
+                with self.assertRaisesRegex(FileNotFoundError, "workflow missing"):
+                    module._adapter_commit_from_workflow()
         finally:
             sys.modules.pop(module_name, None)
             if loaded is not None:
