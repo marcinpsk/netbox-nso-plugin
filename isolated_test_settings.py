@@ -15,8 +15,11 @@ placed under ``/opt/netbox/netbox``.
 
 import os
 import re
+from copy import deepcopy
 
 from netbox.settings import *  # noqa: F403
+
+DATABASES = deepcopy(DATABASES)  # noqa: F405
 
 
 def _test_database_name() -> str:

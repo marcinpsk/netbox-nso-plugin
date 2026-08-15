@@ -4,9 +4,11 @@
 
 import os
 import runpy
+from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
+import netbox.settings as netbox_settings
 from django.test import SimpleTestCase
 
 SETTINGS = Path(__file__).resolve().parents[2] / "isolated_test_settings.py"
@@ -34,3 +36,14 @@ class TestIsolatedTestSettings(SimpleTestCase):
         adapter = configured["PLUGINS_CONFIG"]["netbox_nso_plugin"]
         self.assertEqual(adapter["adapter_url"], "http://adapter.mock.invalid")
         self.assertEqual(adapter["adapter_token"], "test-token")
+
+    def test_runner_settings_do_not_mutate_the_cached_netbox_database_configuration(self):
+        original = deepcopy(netbox_settings.DATABASES)
+        try:
+            with patch.dict(os.environ, {"TEST_DB_NAME": "test_nso_settings"}):
+                runpy.run_path(SETTINGS)
+
+            self.assertEqual(netbox_settings.DATABASES, original)
+        finally:
+            netbox_settings.DATABASES.clear()
+            netbox_settings.DATABASES.update(original)

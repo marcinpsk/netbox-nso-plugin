@@ -250,12 +250,15 @@ class TestSyncCacheTimestamp(_AwareUTCMixin, TestCase):
         """The refresh boundary must not pass malformed adapter values to the DateTimeField."""
         from netbox_nso_plugin.sync_cache import refresh_sync_cache
 
+        previous = datetime(2026, 5, 31, 9, 0, tzinfo=UTC)
+        self.mgmt.last_sync_at = previous
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(last_sync_at=previous)
         for value in (1717236000, {"at": "2026-06-01T10:00:00Z"}, ["2026-06-01T10:00:00Z"]):
             with self.subTest(value=value):
                 with self.assertLogs("netbox_nso_plugin.sync_cache", level="WARNING"):
                     changed = refresh_sync_cache(self.mgmt, self._adapter_row(value))
 
                 self.assertNotIn("last_sync_at", changed)
-                self.assertIsNone(self.mgmt.last_sync_at)
+                self.assertEqual(self.mgmt.last_sync_at, previous)
                 self.mgmt.refresh_from_db()
-                self.assertIsNone(self.mgmt.last_sync_at)
+                self.assertEqual(self.mgmt.last_sync_at, previous)

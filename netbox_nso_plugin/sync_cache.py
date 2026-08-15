@@ -81,7 +81,7 @@ def refresh_sync_cache(mgmt, adapter_device):
     if "last_sync_at" in adapter_device:
         raw_ts = adapter_device["last_sync_at"]
         last_sync_at = parse_adapter_timestamp(raw_ts, "last_sync_at") if raw_ts is not None else None
-        if mgmt.last_sync_at != last_sync_at:
+        if (raw_ts is None or last_sync_at is not None) and mgmt.last_sync_at != last_sync_at:
             mgmt.last_sync_at = last_sync_at
             update_fields.append("last_sync_at")
     last_sync_status = adapter_device.get("last_sync_status") or ""
