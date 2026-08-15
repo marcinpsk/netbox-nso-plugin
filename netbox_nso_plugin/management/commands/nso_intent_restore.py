@@ -88,7 +88,9 @@ class Command(BaseCommand):
             max_push_seq = _watermark(global_document["global_max_push_seq"], "global_max_push_seq")
             max_route_id = _watermark(global_document["global_max_route_id"], "global_max_route_id")
             if max_push_seq is not None:
-                outbox.advance_push_seq(max_push_seq)
+                reached = outbox.advance_push_seq(max_push_seq)
+                while reached < max_push_seq:
+                    reached = outbox.advance_push_seq(max_push_seq)
             if max_route_id is not None:
                 advance_static_route_pk(max_route_id)
             drain.clear_acknowledged_lineage()
