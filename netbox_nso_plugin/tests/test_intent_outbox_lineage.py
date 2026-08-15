@@ -148,16 +148,22 @@ class TestTheRecordIsCapturedAtProvenanceTime(_LineageCase):
             rehomed = state_of(self.device, "static_route").queued_deletions
             assert rehomed[0]["triples"] == [acked], "the WHOLE record, not a bare id"
 
-            # The backfill pass reports removing exactly the row that record names, and the
-            # chained ordinary claim then delivers the deletion at a new sequence.
+            # The backfill pass reports removing exactly the row that record names. The next
+            # tick then delivers the deletion at a new sequence.
             self.adapter.fail_with = None
             self.adapter._respond = lambda body: partition(removed=[acked])
-            assert self.drain(chain=0) == drain.SUCCEEDED
+            assert self.drain(chain=0) == drain.NOTHING
+            assert self.adapter.requests[-1]["params"].get("backfill_only") == "true"
+
+            self.adapter._respond = lambda body: partition(executed=[route.pk])
+            assert self.drain() == drain.SUCCEEDED
 
         recorded = state_of(self.device, "static_route").degraded_deletions
         assert [r["route_ids"] for r in recorded] == [[route.pk]]
         assert recorded[0]["triples"] == [acked]
         assert recorded[0]["reason"] == drain.PRE_FENCE_DETACH
+        seqs = self.adapter.sequences
+        assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs), "no sequence is reused"
 
 
 class TestInitializationIsTruthfulOrAbsent(_LineageCase):
