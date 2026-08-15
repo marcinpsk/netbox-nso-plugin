@@ -3407,6 +3407,7 @@ class TestPushIntentForDevice(ViewTestBase):
         """The interface render skips accepted states with an unknown attribute."""
         from netbox_nso_plugin.delivery import deliver
 
+        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="accepted")
         # Create a state with an unknown attribute — should be skipped
         unknown_state = NSOInterfaceState.objects.create(
             interface=self.interface,
@@ -3430,11 +3431,19 @@ class TestPushIntentForDevice(ViewTestBase):
 
         deliver("interface", self.device.pk, mgmt.adapter_device_id)
         sent = session.request.call_args.kwargs["json"]["attributes"]
-        assert "mtu" not in {attribute["attribute"] for attribute in sent}
+        assert sent == [
+            {
+                "interface": self.interface.name,
+                "attribute": "description",
+                "intent_value": self.interface.description,
+                "accepted_at": None,
+            }
+        ]
 
         mgmt.adapter_device_id = None
         mgmt.save(update_fields=["adapter_device_id"])
         unknown_state.delete()
+        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="changed")
 
     def test_the_intent_is_recorded_even_when_the_adapter_is_down(self):
         """The accept records the key; the drain owns the send, and the tick owns the retry.

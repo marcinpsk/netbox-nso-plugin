@@ -1604,37 +1604,44 @@ def resolve_restored_claim(device_id, scope, receipt) -> str:
     _refuse_in_transaction("restore")
     from .models import NSOIntentOutboxEntry
 
-    with transaction.atomic():
-        state = _lock_state(device_id, scope)
-        if state.push_seq is None:
-            return RESTORE_REPLAY
-        accepted = (receipt or {}).get("accepted_push_seq")
-        if accepted is None or int(accepted) < state.push_seq:
-            return RESTORE_REPLAY  # the far side never saw it; the ordinary replay carries it
-        if int(accepted) > state.push_seq:
-            # The restored database is behind the adapter: preserve the authority, return
-            # the rows to unconsumed so a later claim refolds them, and allocate above the
-            # watermark. Revoked ids stay revoked — a re-ownership outlives the snapshot.
-            # The sequence moves FIRST: a rebase that requeued the work under a rewound
-            # sequence would hand the next claim a stale id the adapter refuses forever.
-            advance_push_seq(int(accepted))
-            revoked = {int(route_id) for route_id in state.revoked_ids or []}
-            queued = {int(record["route_id"]): record for record in state.queued_deletions}
-            for record in state.claim_deletions or []:
-                if int(record["route_id"]) not in revoked:
-                    queued.setdefault(int(record["route_id"]), record)
-            NSOIntentOutboxEntry.objects.filter(
-                device_id=device_id, scope=scope, consumed_by_push_seq=state.push_seq
-            ).update(consumed_by_push_seq=None)
-            state.queued_deletions = list(queued.values())
-            _clear_claim(state)
-            state.save()
-            return RESTORE_REBASED
-        if (receipt or {}).get("request_digest") != _sent_wire_digest(state):
-            logger.error(
-                "%s/%s holds push_seq %s at a digest the receipt does not name", device_id, scope, state.push_seq
-            )
-            return RESTORE_FAILED_CLOSED
+    while True:
+        with transaction.atomic():
+            state = _lock_state(device_id, scope)
+            if state.push_seq is None:
+                return RESTORE_REPLAY
+            accepted = (receipt or {}).get("accepted_push_seq")
+            if accepted is None or int(accepted) < state.push_seq:
+                return RESTORE_REPLAY  # the far side never saw it; the ordinary replay carries it
+            if int(accepted) > state.push_seq:
+                # The sequence moves first. A rebase under a rewound sequence would hand the
+                # next claim a stale id that the adapter refuses forever. End this transaction
+                # after each bounded step so another operation can lock the key between steps.
+                if advance_push_seq(int(accepted)) < int(accepted):
+                    continue
+
+                # Preserve the authority and return the rows to unconsumed so a later claim
+                # refolds them. Revoked ids stay revoked because re-ownership outlives a restore.
+                revoked = {int(route_id) for route_id in state.revoked_ids or []}
+                queued = {int(record["route_id"]): record for record in state.queued_deletions}
+                for record in state.claim_deletions or []:
+                    if int(record["route_id"]) not in revoked:
+                        queued.setdefault(int(record["route_id"]), record)
+                NSOIntentOutboxEntry.objects.filter(
+                    device_id=device_id, scope=scope, consumed_by_push_seq=state.push_seq
+                ).update(consumed_by_push_seq=None)
+                state.queued_deletions = list(queued.values())
+                _clear_claim(state)
+                state.save()
+                return RESTORE_REBASED
+            if (receipt or {}).get("request_digest") != _sent_wire_digest(state):
+                logger.error(
+                    "%s/%s holds push_seq %s at a digest the receipt does not name",
+                    device_id,
+                    scope,
+                    state.push_seq,
+                )
+                return RESTORE_FAILED_CLOSED
+            break
 
     # Rebuilt from the row alone: nothing is sent, so the claim needs no adapter id.
     restored = Claim(

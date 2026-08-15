@@ -479,14 +479,16 @@ class TestTheSequenceAdvanceNeverPullsBackALiveAllocator(_CascadeFlushMixin, Tra
         assert advance_push_seq(base + 100) == base + 501, "a later key's lower watermark cannot pull it back"
         assert allocate_push_seq() == base + 502, "an advance already past its watermark issues nothing"
 
-    def test_a_large_advance_uses_one_set_based_jump(self):
-        from netbox_nso_plugin.outbox import advance_push_seq, allocate_push_seq
+    def test_a_large_advance_bounds_one_set_based_jump(self):
+        from netbox_nso_plugin.outbox import PUSH_SEQ_ADVANCE_BATCH, advance_push_seq, allocate_push_seq
 
         base = allocate_push_seq()
+        watermark = base + PUSH_SEQ_ADVANCE_BATCH + 1
         with CaptureQueriesContext(connection) as queries:
-            reached = advance_push_seq(base + 25_001)
+            reached = advance_push_seq(watermark)
 
-        assert reached >= base + 25_001
+        assert reached < watermark
+        assert reached >= base + PUSH_SEQ_ADVANCE_BATCH
         assert len(queries) == 2, [query["sql"] for query in queries]
 
     def test_an_advance_across_a_gap_shares_the_sequence_with_a_live_allocator(self):

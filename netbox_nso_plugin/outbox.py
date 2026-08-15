@@ -19,6 +19,7 @@ import threading
 #: Plugin-global, created by Appendix O's migration. Names a logical operation, never an
 #: attempt, and never wraps: a re-issued value would let the adapter admit a replay as new.
 PUSH_SEQ_SEQUENCE = "nso_intent_push_seq"
+PUSH_SEQ_ADVANCE_BATCH = 10_000
 
 OP_DELETE = "delete"
 OP_REVOKE = "revoke"
@@ -34,7 +35,7 @@ def allocate_push_seq() -> int:
 
 
 def advance_push_seq(watermark: int) -> int:
-    """Move the sequence past *watermark*, and return the highest value it proved issued.
+    """Move the sequence toward *watermark*, and return the highest value it proved issued.
 
     A restored database brings the sequence back rewound with it, so the far side can already
     hold operations above it. The move is made by ``nextval`` and nothing else: each call is
@@ -44,11 +45,12 @@ def advance_push_seq(watermark: int) -> int:
     landing between them is erased and its value is handed out a SECOND time, which the far
     side refuses as a reused sequence for the life of the key, past every retry.
 
-    The values walked past are burned, never reissued, and the sequence is BIGINT NO CYCLE,
-    so a rare restore may overshoot for free. A watermark the sequence has already passed
-    takes nothing at all: the sequence only moves forward, so having observed it once past
-    the watermark is proof enough. Sequences are not transactional, so this survives a
-    rollback of the caller's transaction, which is the safe direction.
+    Each call burns at most ``PUSH_SEQ_ADVANCE_BATCH`` values. The caller can release its
+    own locks between calls instead of holding them through an attacker-sized watermark
+    gap. The values walked past are never reissued, and the sequence is BIGINT NO CYCLE, so
+    a rare restore may overshoot for free. A watermark the sequence has already passed takes
+    nothing at all. Sequences are not transactional, so this survives a rollback of the
+    caller's transaction, which is the safe direction.
     """
     from django.db import connection
 
@@ -60,9 +62,10 @@ def advance_push_seq(watermark: int) -> int:
         issued = int(last_value) if is_called else int(last_value) - 1
         if issued >= watermark:
             return issued
+        step = min(watermark - issued, PUSH_SEQ_ADVANCE_BATCH)
         cursor.execute(
             f"SELECT max(nextval('{PUSH_SEQ_SEQUENCE}')) FROM generate_series(1, %s)",  # noqa: S608
-            [watermark - issued],
+            [step],
         )
         return int(cursor.fetchone()[0])
 

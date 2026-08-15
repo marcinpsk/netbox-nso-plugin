@@ -62,10 +62,16 @@ def _make_fixtures(case):
     case.dev_b = Device.objects.create(name="lp-b", device_type=dt, role=drole, site=case.site)
 
 
-class _Base(TestCase):
+class _Base(IntentPushResetMixin, TestCase):
     @classmethod
     def setUpTestData(cls):
         _make_fixtures(cls)
+
+    def setUp(self):
+        super().setUp()
+        from netbox_nso_plugin.signals import _pending_intent_keys
+
+        self.assertFalse(_pending_intent_keys(), "the prior test left thread-local delivery state")
 
     def _manage(self, device):
         return NSODeviceManagement.objects.create(
@@ -81,6 +87,7 @@ class _Base(TestCase):
 
 class TestProvisionP2P(_Base):
     def setUp(self):
+        super().setUp()
         self.mgmt_a = self._manage(self.dev_a)
         self.mgmt_b = self._manage(self.dev_b)
         self.if_a = Interface.objects.create(device=self.dev_a, name="Gi0/0", type="1000base-t")
@@ -208,6 +215,7 @@ class TestProvisionP2P(_Base):
 
 class TestProvisionSingle(_Base):
     def setUp(self):
+        super().setUp()
         self.mgmt_a = self._manage(self.dev_a)
         self.lo_a = Interface.objects.create(device=self.dev_a, name="Loopback0", type="virtual")
 
@@ -264,9 +272,14 @@ class TestProvisionSingle(_Base):
         )
         NSOLinkRoleAssignment.objects.create(role=role, interface=self.lo_a)
 
-        with patch(_PUSH, side_effect=ConnectionError("adapter down")):
-            summary = provision_link_role(self.lo_a)
+        with patch(_PUSH, side_effect=ConnectionError("adapter down")) as push:
+            with self.captureOnCommitCallbacks(execute=True):
+                summary = provision_link_role(self.lo_a)
 
+        self.assertEqual(
+            {(call.args[0], call.args[1], call.kwargs.get("force")) for call in push.call_args_list},
+            {(self.dev_a.pk, scope, True) for scope in ("ip", "interface", "isis")},
+        )
         self.assertTrue(summary["provisioned"], summary)
         for scope in ("ip", "interface", "isis"):
             self.assertTrue(entries(self.dev_a, scope, unconsumed=True), scope)
@@ -330,6 +343,7 @@ class TestProvisionActionView(_Base):
     """The device_provision_link_role operator action view."""
 
     def setUp(self):
+        super().setUp()
         self.mgmt_a = self._manage(self.dev_a)
         self.mgmt_b = self._manage(self.dev_b)
         self.if_a = Interface.objects.create(device=self.dev_a, name="Gi0/0", type="1000base-t")

@@ -918,6 +918,7 @@ class TestARestoreRebaseClearsTheAdaptersWatermark(_OutcomeCase):
     def test_the_rebase_advances_the_sequence_past_the_accepted_watermark(self):
         from netbox_nso_plugin import drain
         from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentOutboxState
+        from netbox_nso_plugin.outbox import PUSH_SEQ_ADVANCE_BATCH, advance_push_seq
 
         rows = NSOIntentOutboxState.objects.filter(device=self.device, scope="vlan")
         overlay = own_vlan(self.mgmt, 920, self.tag)
@@ -931,11 +932,13 @@ class TestARestoreRebaseClearsTheAdaptersWatermark(_OutcomeCase):
 
         # The world the restored database never saw: the same key, pushing on.
         assert drain.settle(claimed, {"count": 1}) == drain.SUCCEEDED
-        for name in ("cl-rebase-later-a", "cl-rebase-later-b"):
-            self._rename(overlay, name)
-            assert self.drain("vlan") == drain.SUCCEEDED
+        far_side_watermark = held + PUSH_SEQ_ADVANCE_BATCH + 1
+        while advance_push_seq(far_side_watermark) < far_side_watermark:
+            pass
+        self._rename(overlay, "cl-rebase-later")
+        assert self.drain("vlan") == drain.SUCCEEDED
         accepted = self.adapter.sequences[-1]
-        assert accepted > held
+        assert accepted > far_side_watermark
 
         # The restore: the snapshot's row, the entry its claim consumed, and its sequence.
         rows.update(**snapshot)
@@ -944,9 +947,16 @@ class TestARestoreRebaseClearsTheAdaptersWatermark(_OutcomeCase):
         )
         self._rewind_sequence(held)
 
-        outcome = drain.resolve_restored_claim(self.device.pk, "vlan", {"accepted_push_seq": accepted})
+        with CaptureQueriesContext(connection) as queries:
+            outcome = drain.resolve_restored_claim(self.device.pk, "vlan", {"accepted_push_seq": accepted})
 
         assert outcome == drain.RESTORE_REBASED
+        statements = [query["sql"].strip().upper() for query in queries]
+        jumps = [index for index, statement in enumerate(statements) if "GENERATE_SERIES" in statement]
+        assert len(jumps) >= 2, statements
+        assert any(statement == "COMMIT" for statement in statements[jumps[0] + 1 : jumps[1]]), (
+            "the state row lock remained held between bounded sequence advances"
+        )
         assert [row.consumed_by_push_seq for row in entries(self.device, "vlan")] == [None], "the rows refold"
         assert self.drain("vlan") == drain.SUCCEEDED, "a rebased key allocates above the watermark, or never sends"
         assert self.adapter.sequences[-1] > accepted
