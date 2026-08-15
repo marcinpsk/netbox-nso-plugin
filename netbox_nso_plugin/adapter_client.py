@@ -8,6 +8,7 @@ Config resolution (per call, ~30 s in-process cache):
 """
 
 import contextvars
+import json
 import logging
 import socket
 import threading
@@ -305,7 +306,7 @@ _capture_body: contextvars.ContextVar[list | None] = contextvars.ContextVar("nso
 
 @contextmanager
 def capture_wire_body():
-    """Record the JSON body of every request made in this context, and send none of them."""
+    """Record the serialized JSON bytes of every request, and send none of them."""
     sink: list = []
     token = _capture_body.set(sink)
     try:
@@ -314,10 +315,29 @@ def capture_wire_body():
         _capture_body.reset(token)
 
 
+def _serialize_json_body(body) -> bytes:
+    """Serialize one canonical JSON body once, for both capture and transport.
+
+    Claims persist their payload in JSONB, which does not preserve object key order. Sorting
+    makes the restored value reproduce the bytes the adapter received without storing a
+    second copy of the request.
+    """
+    return json.dumps(body, allow_nan=False, sort_keys=True).encode()
+
+
+def _attach_serialized_json(kwargs) -> None:
+    """Attach the canonical wire bytes while retaining the structured request body."""
+    if "json" not in kwargs:
+        return
+    # Requests sends ``data`` when both are present. Keep ``json`` for transport
+    # instrumentation and tests. The canonical ``data`` value goes on the socket.
+    kwargs["data"] = _serialize_json_body(kwargs["json"])
+
+
 def _request(method, path, **kwargs):
     sink = _capture_body.get()
     if sink is not None:
-        sink.append(kwargs.get("json"))
+        sink.append(_serialize_json_body(kwargs["json"]))
         return None
     resp = _request_response(method, path, **kwargs)
     return resp.json() if resp.content else None
@@ -334,6 +354,7 @@ def _request_response(method, path, **kwargs):
 
     url = f"{cfg['url']}{path}"
     headers = {"Authorization": f"Bearer {cfg['token']}", "Content-Type": "application/json"}
+    _attach_serialized_json(kwargs)
 
     seq = _push_seq.get()
     if seq is not None:

@@ -343,12 +343,32 @@ class TestAForcedCallFormsItsOwnClaim(_ClaimCase):
         ticks = iter((100, 102, 105))
         with (
             patch("netbox_nso_plugin.delivery.send", new=answer),
-            patch("netbox_nso_plugin.drain._send_clock", new=lambda: next(ticks), create=True),
+            patch("netbox_nso_plugin.drain._send_clock", new=lambda: next(ticks)),
         ):
             outcome = drain.drain_key(self.device.pk, "vlan", force=True, deadline=10)
 
         assert outcome == drain.SUCCEEDED
         assert deadlines == [8, 5]
+
+    def test_an_exhausted_chain_never_reports_a_preparatory_replay_as_this_call(self):
+        from netbox_nso_plugin import delivery, drain
+
+        own_vlan(self.mgmt, 879, self.tag)
+        stale = self._stale_unacknowledged_claim()
+
+        config, session = self.adapter.patches()
+        with config, session:
+            outcome, answer = drain._drain_once(
+                self.device.pk,
+                "vlan",
+                mode=delivery.MODE_STORE_ONLY,
+                force=True,
+                chain=0,
+            )
+
+        assert (outcome, answer) == (drain.NOTHING, None)
+        assert self.adapter.sequences == [stale], "only the preparatory replay reached the adapter"
+        assert state_of(self.device, "vlan").push_seq is None
 
     def test_an_ordinary_drain_is_still_answered_by_the_replay_alone(self):
         """The re-entry belongs to a call whose mode differs; it must not fire on every takeover."""
@@ -394,9 +414,9 @@ class TestUnmanagedClaimIsParked(_ClaimCase):
         assert row.push_seq == claimed.push_seq
         assert [d["route_id"] for d in row.claim_deletions] == [d["route_id"] for d in claimed.deletions]
         assert row.queued_deletions == []
-        assert [e.consumed_by_push_seq for e in entries(self.device, "static_route")] == [claimed.push_seq] * len(
-            entries(self.device, "static_route")
-        )
+        parked = entries(self.device, "static_route")
+        assert parked, "the parked claim kept the rows it consumed"
+        assert [e.consumed_by_push_seq for e in parked] == [claimed.push_seq] * len(parked)
 
     def test_unmanaging_between_send_and_outcome_still_records_the_outcome(self):
         from netbox_nso_plugin import drain

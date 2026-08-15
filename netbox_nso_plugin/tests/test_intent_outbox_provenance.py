@@ -428,3 +428,28 @@ class TestOutboxTeardown(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
             self.device.delete()
 
         assert not NSOIntentOutboxEntry.objects.filter(device_id=device_id).exists()
+
+    def test_a_failed_teardown_does_not_suppress_a_later_edit_in_the_outer_transaction(self):
+        from django.db.models.signals import pre_delete
+
+        from netbox_nso_plugin import outbox
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOIntentOutboxEntry
+
+        class AbortTeardown(Exception):
+            pass
+
+        def abort_after_mark(sender, instance, **kwargs):
+            raise AbortTeardown
+
+        pre_delete.connect(abort_after_mark, sender=NSODeviceManagement, weak=False)
+        self.addCleanup(pre_delete.disconnect, abort_after_mark, sender=NSODeviceManagement)
+
+        with transaction.atomic():
+            try:
+                with transaction.atomic():
+                    self.mgmt.delete()
+            except AbortTeardown:
+                pass
+            outbox.enqueue(self.device.pk, "vlan")
+
+        assert NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").exists()

@@ -3477,7 +3477,8 @@ class TestPushIntentForDevice(ViewTestBase):
             patch("netbox_nso_plugin.adapter_client.requests.Session", return_value=session),
             self.captureOnCommitCallbacks(execute=True),
         ):
-            _push_intent_for_device(self.device.pk)
+            with transaction.atomic():
+                _push_intent_for_device(self.device.pk)
 
         assert NSOIntentOutboxEntry.objects.filter(device=self.device, scope="interface").exists()
         assert session.request.called, "the test did not reach the transport failure"

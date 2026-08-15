@@ -117,6 +117,7 @@ class TestOnlyOneScavengerReplaysAnExpiredClaim(_ConcurrencyCase):
             thread.start()
         for thread in scavengers:
             thread.join(timeout=60)
+        assert not any(thread.is_alive() for thread in scavengers), "a scavenger never finished"
 
         assert errors == []
         replayed = [claim for claim in taken if claim is not None]
@@ -496,7 +497,7 @@ class TestTheSequenceAdvanceNeverPullsBackALiveAllocator(_CascadeFlushMixin, Tra
         from netbox_nso_plugin import outbox
 
         base = outbox.allocate_push_seq()
-        watermark = base + 200
+        watermark = base + min(200, outbox.PUSH_SEQ_ADVANCE_BATCH)
         taken: list[list[int]] = [[] for _ in range(2)]
         reached: list[int] = []
 

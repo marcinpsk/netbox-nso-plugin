@@ -68,10 +68,11 @@ class _Base(IntentPushResetMixin, TestCase):
         _make_fixtures(cls)
 
     def setUp(self):
-        super().setUp()
         from netbox_nso_plugin.signals import _pending_intent_keys
 
-        self.assertFalse(_pending_intent_keys(), "the prior test left thread-local delivery state")
+        leaked = set(_pending_intent_keys())
+        super().setUp()
+        self.assertFalse(leaked, "the prior test left thread-local delivery state")
 
     def _manage(self, device):
         return NSODeviceManagement.objects.create(
@@ -242,7 +243,10 @@ class TestProvisionSingle(_Base):
         self.assertTrue(state.passive)
 
     def test_direct_description_write_leaves_durable_interface_work(self):
+        from netbox_nso_plugin.signals import reset_intent_push_state
         from netbox_nso_plugin.tests._outbox_case import entries
+
+        self.addCleanup(reset_intent_push_state)
 
         role = NSOLinkRole.objects.create(
             name="lp-description",
@@ -326,7 +330,7 @@ class TestProvisionForcePush(_CascadeFlushMixin, IntentPushResetMixin, Transacti
             description_template="{self_host}",
             igp="none",
         )
-        with patch("netbox_nso_plugin.adapter_client.put_intent") as mock_put:
+        with patch("netbox_nso_plugin.adapter_client.put_intent", return_value={"count": 1}) as mock_put:
             with transaction.atomic():
                 outbox.enqueue(self.dev_a.pk, "interface")
             drain.drain_key(self.dev_a.pk, "interface")  # the baseline the claim dedupes against

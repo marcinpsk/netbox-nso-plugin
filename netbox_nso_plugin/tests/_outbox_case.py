@@ -324,9 +324,15 @@ class ReceiptAdapter:
         headers = kwargs.get("headers") or {}
         raw_seq = headers.get("X-Push-Seq")
         seq = int(raw_seq) if raw_seq is not None else None
-        body = kwargs.get("json")
+        if "data" in kwargs:
+            wire = kwargs["data"]
+            wire = wire.encode() if isinstance(wire, str) else wire
+            body = json.loads(wire)
+        else:
+            body = kwargs.get("json")
+            wire = json.dumps(body, allow_nan=False).encode()
         params = kwargs.get("params") or {}
-        digest = hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
+        digest = hashlib.sha256(wire).hexdigest()
         self.requests.append({"url": url, "push_seq": seq, "body": body, "params": params})
 
         receipt = self.receipts.get(url)

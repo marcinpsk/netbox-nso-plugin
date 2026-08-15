@@ -34,6 +34,21 @@ def allocate_push_seq() -> int:
         return int(cursor.fetchone()[0])
 
 
+def _issued_push_seq(cursor) -> int:
+    """Read the issued watermark. An uncalled sequence's ``last_value`` is still next."""
+    cursor.execute(f"SELECT last_value, is_called FROM {PUSH_SEQ_SEQUENCE}")  # noqa: S608 (a constant)
+    last_value, is_called = cursor.fetchone()
+    return int(last_value) if is_called else int(last_value) - 1
+
+
+def issued_push_seq() -> int:
+    """Return the highest sequence value already issued, without allocating one."""
+    from django.db import connection
+
+    with connection.cursor() as cursor:
+        return _issued_push_seq(cursor)
+
+
 def advance_push_seq(watermark: int) -> int:
     """Move the sequence toward *watermark*, and return the highest value it proved issued.
 
@@ -56,10 +71,7 @@ def advance_push_seq(watermark: int) -> int:
 
     watermark = int(watermark)
     with connection.cursor() as cursor:
-        cursor.execute(f"SELECT last_value, is_called FROM {PUSH_SEQ_SEQUENCE}")  # noqa: S608 (a constant)
-        last_value, is_called = cursor.fetchone()
-        # A sequence not yet called has handed out nothing: last_value is the NEXT value.
-        issued = int(last_value) if is_called else int(last_value) - 1
+        issued = _issued_push_seq(cursor)
         if issued >= watermark:
             return issued
         step = min(watermark - issued, PUSH_SEQ_ADVANCE_BATCH)
@@ -245,25 +257,38 @@ def _teardown_marks() -> dict:
 def mark_device_teardown(device_id, txid: int) -> None:
     """Count one in-progress deletion of *device_id* (or of its management row)."""
     marks = _teardown_marks()
-    held_txid, count = marks.get(device_id, (txid, 0))
-    marks[device_id] = (txid, count + 1) if held_txid == txid else (txid, 1)
+    scope = _teardown_scope(txid)
+    held_scope, count = marks.get(device_id, (scope, 0))
+    marks[device_id] = (scope, count + 1) if held_scope == scope else (scope, 1)
 
 
 def clear_device_teardown(device_id, txid: int) -> None:
-    """Release one mark. A mark left behind by a failed teardown expires with its txid."""
+    """Release one mark in the transaction scope that created it."""
     marks = _teardown_marks()
-    held_txid, count = marks.get(device_id, (None, 0))
-    if held_txid != txid or count <= 1:
+    scope = _teardown_scope(txid)
+    held_scope, count = marks.get(device_id, (None, 0))
+    if held_scope != scope or count <= 1:
         marks.pop(device_id, None)
     else:
-        marks[device_id] = (held_txid, count - 1)
+        marks[device_id] = (held_scope, count - 1)
 
 
 def _device_is_tearing_down(device_id, txid: int) -> bool:
     marks = getattr(_teardown, "marks", None)
     if not marks or device_id not in marks:
         return False
-    return marks[device_id][0] == txid
+    return marks[device_id][0] == _teardown_scope(txid)
+
+
+def _teardown_scope(txid: int) -> tuple:
+    """Identify the atomic scope whose rollback must expire a teardown mark."""
+    from django.db import connection
+
+    return (
+        txid,
+        tuple(id(block) for block in connection.atomic_blocks),
+        tuple(connection.savepoint_ids),
+    )
 
 
 def current_txid() -> int:

@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 from django.db import connection, transaction
 from django.test import TransactionTestCase
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 from ._outbox_case import (
@@ -192,6 +193,24 @@ class TestTheTickDrainsTheTail(_DrainCase):
         assert (queued.pk, "static_route") in candidates
         assert [key for key in candidates if key[0] == idle.pk] == []
 
+    def test_candidate_queries_apply_the_requested_limit_in_the_database(self):
+        from netbox_nso_plugin import drain
+
+        for index in range(3):
+            _device, mgmt = self.managed(f"bound{index}", 7632 + index, index=index + 3, vid=932 + index)
+            self.edit(mgmt)
+
+        with CaptureQueriesContext(connection) as queries:
+            assert len(drain.drain_candidates(limit=1)) == 1
+
+        candidate_queries = [
+            query["sql"].upper()
+            for query in queries
+            if "NSOINTENTOUTBOXENTRY" in query["sql"].upper() or "NSOINTENTOUTBOXSTATE" in query["sql"].upper()
+        ]
+        assert candidate_queries
+        assert all("LIMIT 1" in query for query in candidate_queries), candidate_queries
+
 
 class TestOutOfOrderCommitVisibility(_DrainCase):
     """O1.24: an entry allocated first and committed last is simply unconsumed."""
@@ -257,6 +276,25 @@ class TestOutOfOrderCommitVisibility(_DrainCase):
         refolded = drain.claim(device.pk, "static_route")
         assert entries(device, "static_route", unconsumed=True) == []
         assert refolded.deletions == [], "the revocation withdrew the authority the earlier fold carried"
+
+    def test_a_null_route_id_in_a_revoke_record_does_not_poison_the_key(self):
+        from netbox_nso_plugin import drain, outbox
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry
+
+        device, mgmt = make_managed("null-revoke", 7641)
+        route = own_route(mgmt, "198.51.100.80/28", "198.51.100.6")
+        self.clear_entries()
+        with without_commit_drain():
+            route.devices.remove(device)
+        claimed = drain.claim(device.pk, "static_route")
+        NSOIntentOutboxEntry.objects.create(
+            device=device,
+            scope="static_route",
+            batch_id=1,
+            transitions=[{"op": outbox.OP_REVOKE, "route_id": None}],
+        )
+
+        assert drain.revocation_hit(claimed) is False
 
 
 class TestFairSelectionRotatesAFailingHead(_DrainCase):

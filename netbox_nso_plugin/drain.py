@@ -41,6 +41,7 @@ from .outbox import (
     advance_push_seq,
     allocate_push_seq,
     fold_transitions,
+    issued_push_seq,
     reduce_transitions,
     triple_of,
 )
@@ -58,6 +59,9 @@ SEND_DEADLINE = datetime.timedelta(minutes=2)
 DRAIN_BATCH = 20
 #: Synchronous redrains after a success, for latency only. The tick guarantees the rest.
 DRAIN_CHAIN_MAX = 4
+#: Largest sequence gap one restore may burn automatically. A larger far-side watermark
+#: needs operator investigation instead of an unbounded walk through a NO CYCLE sequence.
+MAX_RESTORE_GAP = 10_000_000
 #: How long a forced call waits for an active claim before failing fast.
 FORCE_WAIT = datetime.timedelta(seconds=5)
 _FORCE_POLL = 0.2
@@ -291,7 +295,9 @@ def wire_digest(body) -> str:
     belongs to the scope's endpoint, so storing a digest of the two would be storing a
     value the row already determines.
     """
-    return _sha256(body)
+    if not isinstance(body, bytes):
+        raise TypeError("wire_digest requires the serialized request bytes")
+    return hashlib.sha256(body).hexdigest()
 
 
 def _sha256(material) -> str:
@@ -649,7 +655,8 @@ def revocation_hit(claim: Claim) -> bool:
             return True
         for row in _unconsumed(claim.device_id, claim.scope).only("transitions"):
             for record in row.transitions:
-                if record.get("op") == OP_REVOKE and int(record.get("route_id", -1)) in held:
+                route_id = record.get("route_id")
+                if record.get("op") == OP_REVOKE and route_id is not None and int(route_id) in held:
                     return True
     return False
 
@@ -991,13 +998,26 @@ def _stamp_last_acked(claim: Claim) -> None:
         return
     from .models import NSOStaticRouteState
 
+    triples_by_route = {}
     for route in claim.payload or []:
         route_id = route.get("route_id")
         if route_id is None:
             continue
-        NSOStaticRouteState.objects.filter(management__device_id=claim.device_id, static_route_id=route_id).update(
-            last_acked_triple=triple_of(route.get("vrf") or "", route.get("prefix") or "", route.get("next_hop") or "")
+        triples_by_route[route_id] = triple_of(
+            route.get("vrf") or "",
+            route.get("prefix") or "",
+            route.get("next_hop") or "",
         )
+    rows = list(
+        NSOStaticRouteState.objects.filter(
+            management__device_id=claim.device_id,
+            static_route_id__in=triples_by_route,
+        ).only("static_route_id", "last_acked_triple")
+    )
+    for row in rows:
+        row.last_acked_triple = triples_by_route[row.static_route_id]
+    if rows:
+        NSOStaticRouteState.objects.bulk_update(rows, ["last_acked_triple"])
 
 
 def record_failure(claim: Claim, exc: Exception) -> str:
@@ -1273,36 +1293,54 @@ def _drain_once(
     if answer is _ABANDONED_SEND:
         return ABANDONED, None
     outcome = settle(claimed, answer)
-    if outcome == SUCCEEDED and chain > 0:
-        if _answered_other_work(claimed, mode, force):
-            # §4.2: what settled was somebody else's operation, at the body and mode it was
-            # admitted under. This call's own mode and force are still owed, so it forms its
-            # own claim now that the key is free to allocate one, and THAT outcome is the
-            # answer: a preparatory pass may never be reported as the caller's own result.
-            return _drain_once(
-                device_id,
-                scope,
-                mode=mode,
-                force=force,
-                chain=chain - 1,
-                deadline=deadline,
-                _deadline_at=_deadline_at,
-            )
-        if mode == delivery.MODE_NORMAL and _pending(device_id, scope):
-            # Level-triggered, and terminating: each successful NORMAL pass retires at least
-            # one row or clears authority. Neither other mode consumes anything, so a caller
-            # who asked for one gets exactly one; the cap is for latency, and the tick
-            # guarantees the rest.
-            _drain_once(
-                device_id,
-                scope,
-                mode=mode,
-                force=False,
-                chain=chain - 1,
-                deadline=deadline,
-                _deadline_at=_deadline_at,
-            )
+    if outcome == SUCCEEDED:
+        continued = _after_success(
+            claimed,
+            mode=mode,
+            force=force,
+            chain=chain,
+            deadline=deadline,
+            deadline_at=_deadline_at,
+        )
+        if continued is not None:
+            return continued
     return outcome, answer
+
+
+def _after_success(claimed, *, mode, force, chain, deadline, deadline_at):
+    """Resolve any operation still owed after a successful preparatory pass."""
+    device_id, scope = claimed.device_id, claimed.scope
+    if _answered_other_work(claimed, mode, force):
+        if chain <= 0:
+            logger.info(
+                "%s/%s settled a preparatory operation after the chain budget expired",
+                device_id,
+                scope,
+            )
+            return NOTHING, None
+        # What settled was somebody else's operation. This call's own mode and force are
+        # still owed, so only the next claim's result can answer this call.
+        return _drain_once(
+            device_id,
+            scope,
+            mode=mode,
+            force=force,
+            chain=chain - 1,
+            deadline=deadline,
+            _deadline_at=deadline_at,
+        )
+    if chain > 0 and mode == delivery.MODE_NORMAL and _pending(device_id, scope):
+        # This chain is a latency optimization. The tick guarantees any remaining tail.
+        _drain_once(
+            device_id,
+            scope,
+            mode=mode,
+            force=False,
+            chain=chain - 1,
+            deadline=deadline,
+            _deadline_at=deadline_at,
+        )
+    return None
 
 
 def _answered_other_work(claim: Claim, mode, force) -> bool:
@@ -1503,35 +1541,44 @@ def drain_candidates(limit=None) -> list[tuple[int, str]]:
     database while leaving those objects holding ``None`` or a dead adapter id, so a reused
     list would skip a device repaired this tick or push to an id that no longer exists.
     """
-    from .models import NSODeviceManagement, NSOIntentOutboxEntry, NSOIntentOutboxState
+    from django.db.models import F, OuterRef, Q, Subquery
+
+    from .models import NSOIntentOutboxEntry, NSOIntentOutboxState
 
     limit = DRAIN_BATCH if limit is None else limit
-    managed = set(
-        NSODeviceManagement.objects.filter(adapter_device_id__isnull=False).values_list("device_id", flat=True)
-    )
-    if not managed:
-        return []
-    keys = {
-        (device_id, scope)
-        for device_id, scope in NSOIntentOutboxEntry.objects.filter(consumed_by_push_seq__isnull=True)
-        .values_list("device_id", "scope")
-        .distinct()
-        if device_id in managed
-    }
-    states = {}
-    for state in NSOIntentOutboxState.objects.filter(device_id__in=managed):
-        states[(state.device_id, state.scope)] = state
-        if state.push_seq is not None or state.queued_deletions:
-            keys.add((state.device_id, state.scope))
-
     fresh = _db_now() - LEASE
-    ordered = []
-    for key in keys:
-        state = states.get(key)
-        if state is not None and state.claimed_at is not None and state.claimed_at > fresh:
-            continue  # an active claim owns the key; its own lease is what releases it
-        attempted = state.last_drain_attempted_at if state is not None else None
-        ordered.append((attempted is not None, attempted or datetime.datetime.min, key))
+    state_for_entry = NSOIntentOutboxState.objects.filter(
+        device_id=OuterRef("device_id"),
+        scope=OuterRef("scope"),
+    ).order_by()
+    entry_keys = list(
+        NSOIntentOutboxEntry.objects.filter(
+            consumed_by_push_seq__isnull=True,
+            device__nso_management__adapter_device_id__isnull=False,
+        )
+        .order_by()
+        .values("device_id", "scope")
+        .annotate(
+            claimed_at=Subquery(state_for_entry.values("claimed_at")[:1]),
+            attempted_at=Subquery(state_for_entry.values("last_drain_attempted_at")[:1]),
+        )
+        .filter(Q(claimed_at__isnull=True) | Q(claimed_at__lte=fresh))
+        .order_by(F("attempted_at").asc(nulls_first=True), "device_id", "scope")
+        .distinct()[:limit]
+    )
+    state_keys = list(
+        NSOIntentOutboxState.objects.filter(device__nso_management__adapter_device_id__isnull=False)
+        .filter(Q(push_seq__isnull=False) | ~Q(queued_deletions=[]))
+        .filter(Q(claimed_at__isnull=True) | Q(claimed_at__lte=fresh))
+        .order_by(F("last_drain_attempted_at").asc(nulls_first=True), "device_id", "scope")
+        .values("device_id", "scope", attempted_at=F("last_drain_attempted_at"))[:limit]
+    )
+
+    by_key = {}
+    for row in [*entry_keys, *state_keys]:
+        key = (row["device_id"], row["scope"])
+        by_key[key] = row["attempted_at"]
+    ordered = [(attempted is not None, attempted or datetime.datetime.min, key) for key, attempted in by_key.items()]
     ordered.sort(key=lambda item: (item[0], item[1], item[2]))
     return [key for _stamped, _at, key in ordered[:limit]]
 
@@ -1623,6 +1670,16 @@ def resolve_restored_claim(device_id, scope, receipt) -> str:
             if accepted is None or accepted < state.push_seq:
                 return RESTORE_REPLAY  # the far side never saw it; the ordinary replay carries it
             if accepted > state.push_seq:
+                issued = issued_push_seq()
+                if accepted - issued > MAX_RESTORE_GAP:
+                    logger.error(
+                        "%s/%s receipt push_seq %s is %s values ahead of the local sequence",
+                        device_id,
+                        scope,
+                        accepted,
+                        accepted - issued,
+                    )
+                    return RESTORE_FAILED_CLOSED
                 # The sequence moves first. A rebase under a rewound sequence would hand the
                 # next claim a stale id that the adapter refuses forever. End this transaction
                 # after each bounded step so another operation can lock the key between steps.

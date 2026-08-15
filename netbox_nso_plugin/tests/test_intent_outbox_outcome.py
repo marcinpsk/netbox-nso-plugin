@@ -350,6 +350,25 @@ class TestStampingFollowsTheAcknowledgedBody(_OutcomeCase):
         assert drain.settle(claimed, {"count": 1}) == drain.SUCCEEDED
         assert last_acked(self.mgmt, self.route) == self.mirror
 
+    def test_stamping_many_routes_uses_one_update(self):
+        from netbox_nso_plugin import drain
+
+        other = own_route(self.mgmt, "198.51.100.176/28", "198.51.100.11")
+        self._touch()
+        claimed = drain.claim(self.device.pk, "static_route")
+
+        with CaptureQueriesContext(connection) as queries:
+            assert drain.settle(claimed, {"count": 2}) == drain.SUCCEEDED
+
+        updates = [
+            query["sql"]
+            for query in queries
+            if query["sql"].lstrip().upper().startswith("UPDATE") and "NSOSTATICROUTESTATE" in query["sql"].upper()
+        ]
+        assert len(updates) == 1, updates
+        assert last_acked(self.mgmt, self.route) == self.mirror
+        assert last_acked(self.mgmt, other) == triple("198.51.100.176/28", "198.51.100.11")
+
     def test_a_backfill_only_success_never_stamps(self):
         from netbox_nso_plugin import delivery, drain
         from netbox_nso_plugin.models import NSOStaticRouteState
@@ -732,7 +751,9 @@ class TestTheFenceWithholdsEverySendButTheBackfill(_OutcomeCase):
 
             self.adapter.fail_with = None
             self.adapter._respond = lambda body: partition(removed=[residue])
-            assert self.drain(chain=0) == drain.SUCCEEDED, "the withheld key drains its backfill claim"
+            assert self.drain(chain=0) == drain.NOTHING, (
+                "the backfill opened the fence, but the exhausted call did not deliver its own operation"
+            )
             assert self.adapter.requests[-1]["params"].get("backfill_only") == "true"
             assert state_of(self.device, "static_route").fence_withheld_since is None
 
@@ -803,7 +824,7 @@ class TestTheFenceWithholdsEverySendButTheBackfill(_OutcomeCase):
 
             self.adapter.fail_with = None
             self.adapter._respond = lambda body: partition(removed=[residue])
-            assert self.drain(chain=0) == drain.SUCCEEDED
+            assert self.drain(chain=0) == drain.NOTHING
 
         recorded = state_of(self.device, "static_route").degraded_deletions
         assert [r["route_ids"] for r in recorded] == [sorted([withheld.pk, later.pk])], (
@@ -894,6 +915,22 @@ class TestARestoredClaimSettlesAgainstTheReceiptsOwnDigest(_OutcomeCase):
             with self.subTest(receipt=receipt):
                 assert drain.resolve_restored_claim(self.device.pk, "vlan", receipt) == drain.RESTORE_FAILED_CLOSED
                 assert state_of(self.device, "vlan").push_seq == claimed.push_seq
+
+    def test_an_implausibly_distant_receipt_fails_closed_before_advancing(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import drain
+
+        own_vlan(self.mgmt, 913, self.tag)
+        claimed = self._lost_response()
+        receipt = {"accepted_push_seq": 2**63 - 1}
+
+        with patch("netbox_nso_plugin.drain.advance_push_seq") as advance:
+            outcome = drain.resolve_restored_claim(self.device.pk, "vlan", receipt)
+
+        assert outcome == drain.RESTORE_FAILED_CLOSED
+        advance.assert_not_called()
+        assert state_of(self.device, "vlan").push_seq == claimed.push_seq
 
 
 class TestARestoreRebaseClearsTheAdaptersWatermark(_OutcomeCase):
