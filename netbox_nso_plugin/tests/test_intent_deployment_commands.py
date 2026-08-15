@@ -485,6 +485,23 @@ class TestIntentRestoreResolvesEveryReceiptCase(_CascadeFlushMixin, IntentPushRe
         assert [row.consumed_by_push_seq for row in entries(self.device, "vlan")] == [None]
         assert allocate_push_seq() > accepted
 
+    def test_the_global_watermark_is_fully_advanced_without_an_outstanding_claim(self):
+        from django.db import connection
+
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.outbox import PUSH_SEQ_ADVANCE_BATCH, PUSH_SEQ_SEQUENCE, allocate_push_seq
+
+        claim, url = self._lost_vlan_response(935)
+        assert drain.settle(claim, {"count": 1}) == drain.SUCCEEDED
+        accepted = claim.push_seq + PUSH_SEQ_ADVANCE_BATCH + 1
+        self.adapter.receipts[url]["push_seq"] = accepted
+        with connection.cursor() as cursor:
+            cursor.execute(f"SELECT setval('{PUSH_SEQ_SEQUENCE}', %s, true)", [claim.push_seq])
+
+        self._restore()
+
+        assert allocate_push_seq() > accepted
+
     def test_equal_sequence_with_another_digest_fails_closed_and_names_the_key(self):
         from netbox_nso_plugin.deployment import is_quiesced
 

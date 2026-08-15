@@ -8,6 +8,7 @@ import time
 from core.choices import JobIntervalChoices
 from netbox.jobs import JobRunner, system_job
 
+from .deployment import DeploymentQuiesced
 from .deployment import guarded as _deployment_guarded
 
 logger = logging.getLogger(__name__)
@@ -69,8 +70,17 @@ class RefreshDeviceSyncCacheJob(JobRunner):
     class Meta:
         name = "Refresh NSO device sync cache"
 
-    @_deployment_guarded("device maintenance tick")
     def run(self, *args, **kwargs):
+        """Run a scheduled tick, or return normally while a deployment pauses it."""
+        try:
+            return RefreshDeviceSyncCacheJob._run(*args, **kwargs)
+        except DeploymentQuiesced:
+            logger.info("RefreshDeviceSyncCacheJob: paused for an intent deployment")
+            return None
+
+    @staticmethod
+    @_deployment_guarded("device maintenance tick")
+    def _run(*args, **kwargs):
         """Refresh the last-sync mirror, repair mappings, drain the outbox, sweep settlements."""
         from .drain import compact_intent_outbox, drain_intent_outbox
         from .models import NSODeviceManagement

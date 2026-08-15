@@ -103,6 +103,24 @@ class TestTheTickDrainsTheTail(_DrainCase):
         compact.assert_called_once_with()
         drain_all.assert_not_called()
 
+    def test_an_adapter_outage_reports_compaction_and_settlement_durations_separately(self):
+        from netbox_nso_plugin import jobs
+
+        with (
+            patch("netbox_nso_plugin.sync_cache._snapshot", return_value=([], None, {})),
+            patch("netbox_nso_plugin.sync_cache.refresh_sync_caches", return_value=(0, 0)),
+            patch("netbox_nso_plugin.sync_cache.reconcile_device_links", return_value=(0, 0)),
+            patch("netbox_nso_plugin.drain.compact_intent_outbox"),
+            patch.object(jobs, "time") as clock,
+            patch.object(jobs.logger, "info") as log,
+        ):
+            clock.monotonic.side_effect = [10.0, 20.0, 21.0]
+            jobs.RefreshDeviceSyncCacheJob.run(None)
+
+        args = log.call_args.args
+        assert args[7] == 10.0, "the outbox duration omitted outage compaction"
+        assert args[10] == 1.0, "the settlement duration included outage compaction"
+
     def test_a_mid_tick_quiesce_stops_without_recording_a_key_failure(self):
         from netbox_nso_plugin import drain
         from netbox_nso_plugin.deployment import DeploymentQuiesced
@@ -276,7 +294,7 @@ class TestTheTickDrainsTheTail(_DrainCase):
 
     def test_outage_compaction_respects_the_gate_and_the_normal_tick_still_runs(self):
         from netbox_nso_plugin import jobs
-        from netbox_nso_plugin.deployment import DeploymentQuiesced, quiesce, resume
+        from netbox_nso_plugin.deployment import quiesce, resume
 
         device, mgmt = self.managed("gatecompact", 7609, vid=909)
         self.edit(mgmt)
@@ -290,8 +308,9 @@ class TestTheTickDrainsTheTail(_DrainCase):
                 patch("netbox_nso_plugin.sync_cache.refresh_sync_caches", return_value=(0, 0)),
                 patch("netbox_nso_plugin.sync_cache.reconcile_device_links", return_value=(0, 0)),
             ):
-                with self.assertRaisesRegex(DeploymentQuiesced, "device maintenance tick"):
+                with self.assertLogs("netbox_nso_plugin.jobs", level="INFO") as logged:
                     jobs.RefreshDeviceSyncCacheJob.run(None)
+            assert "paused for an intent deployment" in "\n".join(logged.output)
             assert [row.pk for row in entries(device, "vlan", unconsumed=True)] == before
         finally:
             resume()
