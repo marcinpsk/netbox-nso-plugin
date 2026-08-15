@@ -248,14 +248,11 @@ class TestCrashedAttemptsReplayAtTheirOwnSequence(_ClaimCase):
         NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_device_id=7599)
         expire_claim(self.device, "vlan")
 
-        assert self.drain() == drain.NOTHING
-        assert self.adapter.requests == [], "the old body was sent to a device outside its mapping epoch"
+        assert self.drain() == drain.SUCCEEDED
+        assert len(self.adapter.requests) == 1
+        assert "/devices/7599/" in self.adapter.requests[0]["url"]
         row = state_of(self.device, "vlan")
         assert row.push_seq is None
-        assert [entry.consumed_by_push_seq for entry in entries(self.device, "vlan")] == [None]
-
-        assert self.drain() == drain.SUCCEEDED
-        assert "/devices/7599/" in self.adapter.requests[-1]["url"]
         assert self.adapter.sequences[-1] > claimed.push_seq
 
 

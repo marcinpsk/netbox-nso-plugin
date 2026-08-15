@@ -874,6 +874,27 @@ class TestARestoredClaimSettlesAgainstTheReceiptsOwnDigest(_OutcomeCase):
         assert drain.resolve_restored_claim(self.device.pk, "vlan", receipt) == drain.RESTORE_FAILED_CLOSED
         assert state_of(self.device, "vlan").push_seq == claimed.push_seq
 
+    def test_malformed_receipt_sequences_fail_closed_without_mutating_the_claim(self):
+        from netbox_nso_plugin import drain
+
+        own_vlan(self.mgmt, 912, self.tag)
+        claimed = self._lost_response()
+        malformed = (
+            [],
+            "receipt",
+            {},
+            {"accepted_push_seq": None},
+            {"accepted_push_seq": False},
+            {"accepted_push_seq": 1.5},
+            {"accepted_push_seq": "1"},
+            {"accepted_push_seq": 0},
+        )
+
+        for receipt in malformed:
+            with self.subTest(receipt=receipt):
+                assert drain.resolve_restored_claim(self.device.pk, "vlan", receipt) == drain.RESTORE_FAILED_CLOSED
+                assert state_of(self.device, "vlan").push_seq == claimed.push_seq
+
 
 class TestARestoreRebaseClearsTheAdaptersWatermark(_OutcomeCase):
     """codex O1 r5 F1 (§4.6): a rebased key must allocate ABOVE the adapter's watermark.

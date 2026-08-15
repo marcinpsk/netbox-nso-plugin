@@ -344,7 +344,10 @@ def _claim_locked(device_id, scope, mode, force) -> Claim | None:
         return None
 
     if state.push_seq is not None:
-        return _takeover(state, mgmt, now)
+        replay = _takeover(state, mgmt, now)
+        if replay is not None:
+            return replay
+        return _form(state, mgmt, now, mode, force)
     return _form(state, mgmt, now, mode, force)
 
 
@@ -1604,19 +1607,26 @@ def resolve_restored_claim(device_id, scope, receipt) -> str:
     _refuse_in_transaction("restore")
     from .models import NSOIntentOutboxEntry
 
+    accepted = None
+    if receipt is not None:
+        if not isinstance(receipt, dict):
+            return RESTORE_FAILED_CLOSED
+        accepted = receipt.get("accepted_push_seq")
+        if isinstance(accepted, bool) or not isinstance(accepted, int) or accepted < 1:
+            return RESTORE_FAILED_CLOSED
+
     while True:
         with transaction.atomic():
             state = _lock_state(device_id, scope)
             if state.push_seq is None:
                 return RESTORE_REPLAY
-            accepted = (receipt or {}).get("accepted_push_seq")
-            if accepted is None or int(accepted) < state.push_seq:
+            if accepted is None or accepted < state.push_seq:
                 return RESTORE_REPLAY  # the far side never saw it; the ordinary replay carries it
-            if int(accepted) > state.push_seq:
+            if accepted > state.push_seq:
                 # The sequence moves first. A rebase under a rewound sequence would hand the
                 # next claim a stale id that the adapter refuses forever. End this transaction
                 # after each bounded step so another operation can lock the key between steps.
-                if advance_push_seq(int(accepted)) < int(accepted):
+                if advance_push_seq(accepted) < accepted:
                     continue
 
                 # Preserve the authority and return the rows to unconsumed so a later claim
@@ -1633,7 +1643,7 @@ def resolve_restored_claim(device_id, scope, receipt) -> str:
                 _clear_claim(state)
                 state.save()
                 return RESTORE_REBASED
-            if (receipt or {}).get("request_digest") != _sent_wire_digest(state):
+            if receipt.get("request_digest") != _sent_wire_digest(state):
                 logger.error(
                     "%s/%s holds push_seq %s at a digest the receipt does not name",
                     device_id,
@@ -1658,7 +1668,7 @@ def resolve_restored_claim(device_id, scope, receipt) -> str:
         rendered=None,
         replayed=True,
     )
-    if settle(restored, (receipt or {}).get("stored_response")) != SUCCEEDED:
+    if settle(restored, receipt.get("stored_response")) != SUCCEEDED:
         return RESTORE_FAILED_CLOSED
     return RESTORE_SETTLED
 
