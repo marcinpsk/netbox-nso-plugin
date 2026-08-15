@@ -446,7 +446,7 @@ class TestAdapterResponsesSettleTheActivatedScope(_ActivationCase):
 
         self.adapter.fail_with = None
         self.adapter._respond = lambda body: partition(removed=[triple("198.18.1.32/28", "198.18.1.33")])
-        assert self.drain(chain=0) == drain.SUCCEEDED
+        assert self.drain(chain=0) == drain.NOTHING
         assert self.sent()[-1]["params"].get("backfill_only") == "true"
         assert self.sent()[-1]["body"]["deleted_routes"] == []
 
