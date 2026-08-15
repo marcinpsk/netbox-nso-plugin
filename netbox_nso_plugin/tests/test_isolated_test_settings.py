@@ -15,6 +15,14 @@ SETTINGS = Path(__file__).resolve().parents[2] / "isolated_test_settings.py"
 
 
 class TestIsolatedTestSettings(SimpleTestCase):
+    def test_documented_command_uses_a_valid_shell_safe_database_name(self):
+        instructions = SETTINGS.read_text()
+
+        self.assertIn(
+            "TEST_DB_NAME=test_nso_local PYTHONPATH=/workspaces/nso/netbox-nso-plugin",
+            instructions,
+        )
+
     def test_missing_database_name_reports_the_required_command_shape(self):
         with patch.dict(os.environ, {}):
             os.environ.pop("TEST_DB_NAME", None)
@@ -28,14 +36,25 @@ class TestIsolatedTestSettings(SimpleTestCase):
                     with self.assertRaisesRegex(RuntimeError, r"private.*test_nso_<tag>"):
                         runpy.run_path(SETTINGS)
 
-    def test_runner_settings_replace_the_database_and_adapter_configuration(self):
-        with patch.dict(os.environ, {"TEST_DB_NAME": "test_nso_settings"}):
-            configured = runpy.run_path(SETTINGS)
+        with patch.dict(netbox_settings.DATABASES["default"], {"NAME": "test_nso_live"}):
+            with patch.dict(os.environ, {"TEST_DB_NAME": "test_nso_live"}):
+                with self.assertRaisesRegex(RuntimeError, r"private.*test_nso_<tag>"):
+                    runpy.run_path(SETTINGS)
 
-        self.assertEqual(configured["DATABASES"]["default"]["TEST"]["NAME"], "test_nso_settings")
-        adapter = configured["PLUGINS_CONFIG"]["netbox_nso_plugin"]
-        self.assertEqual(adapter["adapter_url"], "http://adapter.mock.invalid")
-        self.assertEqual(adapter["adapter_token"], "test-token")
+    def test_runner_settings_replace_the_database_and_adapter_configuration(self):
+        original_plugins_config = deepcopy(netbox_settings.PLUGINS_CONFIG)
+        try:
+            with patch.dict(os.environ, {"TEST_DB_NAME": "test_nso_settings"}):
+                configured = runpy.run_path(SETTINGS)
+
+            self.assertEqual(configured["DATABASES"]["default"]["TEST"]["NAME"], "test_nso_settings")
+            adapter = configured["PLUGINS_CONFIG"]["netbox_nso_plugin"]
+            self.assertEqual(adapter["adapter_url"], "http://adapter.mock.invalid")
+            self.assertEqual(adapter["adapter_token"], "test-token")
+            self.assertEqual(netbox_settings.PLUGINS_CONFIG, original_plugins_config)
+        finally:
+            netbox_settings.PLUGINS_CONFIG.clear()
+            netbox_settings.PLUGINS_CONFIG.update(original_plugins_config)
 
     def test_runner_settings_do_not_mutate_the_cached_netbox_database_configuration(self):
         original = deepcopy(netbox_settings.DATABASES)

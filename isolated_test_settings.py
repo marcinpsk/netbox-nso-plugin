@@ -4,7 +4,7 @@
 
 Run inside the devcontainer with an isolated database family:
 
-    TEST_DB_NAME=test_<yours> PYTHONPATH=<this repo's checkout> \
+    TEST_DB_NAME=test_nso_local PYTHONPATH=/workspaces/nso/netbox-nso-plugin \
         python /opt/netbox/netbox/manage.py test netbox_nso_plugin --settings=isolated_test_settings \
         --keepdb --noinput
 
