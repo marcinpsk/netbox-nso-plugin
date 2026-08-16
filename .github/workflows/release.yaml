@@ -64,12 +64,14 @@ jobs:
       # version declared immediately before this push as the baseline; otherwise
       # semantic-release starts at 0.0.0 and would downgrade the existing 0.1.0.
       - name: Establish the existing version baseline
+        id: baseline
         if: steps.trigger.outputs.stale != 'true'
         env:
           BEFORE_SHA: ${{ github.event.before }}
         run: |
           set -euo pipefail
           if git tag --list 'v[0-9]*' | grep -q .; then
+            echo "tag=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
@@ -79,11 +81,10 @@ jobs:
           version="$(git show "${BEFORE_SHA}:pyproject.toml" |
             python -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["project"]["version"])')"
           git tag "v${version}" "$BEFORE_SHA"
-          git push origin "v${version}"
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
 
-      # A repository whose branch rules reject GITHUB_TOKEN pushes can provide a
-      # fine-grained PAT as SEMANTIC_RELEASE_TOKEN. Checkout and semantic-release
-      # must use the same token so the version commit, tag, and release agree.
+      # Generate the release commit and tags locally. The ref transaction below owns
+      # every release ref so GitHub can enforce the triggering tip as a lease.
       - name: Release from conventional commits
         id: release
         if: steps.trigger.outputs.stale != 'true'
@@ -92,6 +93,53 @@ jobs:
           github_token: ${{ secrets.SEMANTIC_RELEASE_TOKEN || github.token }}
           build: false
           changelog: true
+          push: false
+          vcs_release: false
+
+      # Revalidate immediately before the first remote mutation. The atomic push
+      # makes the branch, baseline tag, and release tag share one expected-tip lease.
+      - name: Publish release refs with expected-tip lease
+        if: steps.trigger.outputs.stale != 'true'
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+          RELEASE_REF: ${{ github.ref_name }}
+          BASELINE_TAG: ${{ steps.baseline.outputs.tag }}
+          RELEASED: ${{ steps.release.outputs.released || 'false' }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin "refs/heads/${RELEASE_REF}"
+          tip="$(git rev-parse FETCH_HEAD)"
+          if [ "$tip" != "$RELEASE_SHA" ]; then
+            echo "::error::${RELEASE_REF} advanced to ${tip} before release refs could be published"
+            exit 1
+          fi
+
+          refs=()
+          if [ "$RELEASED" = "true" ]; then
+            refs+=("HEAD:refs/heads/${RELEASE_REF}" "$RELEASE_TAG")
+          else
+            refs+=("${RELEASE_SHA}:refs/heads/${RELEASE_REF}")
+          fi
+          if [ -n "$BASELINE_TAG" ]; then
+            refs+=("$BASELINE_TAG")
+          fi
+          git push --atomic \
+            --force-with-lease="refs/heads/${RELEASE_REF}:${RELEASE_SHA}" \
+            origin "${refs[@]}"
+
+      # semantic-release cannot create the GitHub release while its push is disabled.
+      # The verified tag is immutable and points at the leased release commit.
+      - name: Create the GitHub release
+        if: steps.trigger.outputs.stale != 'true' && steps.release.outputs.released == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SEMANTIC_RELEASE_TOKEN || github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_NOTES: ${{ steps.release.outputs.release_notes }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$RELEASE_NOTES" > "$RUNNER_TEMP/release-notes.md"
+          gh release create "$RELEASE_TAG" --verify-tag --notes-file "$RUNNER_TEMP/release-notes.md"
 
   build:
     name: Build sdist and wheel
