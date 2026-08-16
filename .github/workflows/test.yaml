@@ -74,13 +74,13 @@ jobs:
           ref: ${{ matrix.netbox-version }}
           persist-credentials: false
 
-      # The O3c joined pin boots the real adapter from this exact commit; the test
-      # digests the checkout content and refuses to run against anything else.
+      # The joined pin boots the real adapter from this exact commit. It verifies
+      # both O3c execution and the paginated generation-listing contract.
       - name: Checkout the pinned adapter for the joined pin
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: marcinpsk/nso-adapter
-          ref: 806c84c994a7843351cfc8b77f0b268a132dea31
+          ref: 4296309b020884e705b8c0cc9c09eac7d4512fe2
           path: .o3c-adapter
           persist-credentials: false
 
