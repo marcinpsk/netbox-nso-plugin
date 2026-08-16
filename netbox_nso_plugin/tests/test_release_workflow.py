@@ -50,7 +50,7 @@ def test_expected_tip_transaction_rejects_branch_advance_before_tag_push(tmp_pat
     remote = tmp_path / "remote.git"
     first = tmp_path / "first"
     second = tmp_path / "second"
-    _git(tmp_path, "init", "--bare", str(remote))
+    _git(tmp_path, "init", "--bare", "--initial-branch=main", str(remote))
     _git(tmp_path, "init", "--initial-branch=main", str(first))
     _git(first, "config", "user.name", "release-test")
     _git(first, "config", "user.email", "release-test@example.invalid")
