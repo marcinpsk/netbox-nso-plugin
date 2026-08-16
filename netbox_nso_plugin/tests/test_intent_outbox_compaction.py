@@ -223,6 +223,26 @@ class TestTheTwoClassesOfGrowth(_CompactionCase):
         assert len(self.rows()) == 1
         assert sorted(record["route_id"] for record in self.transitions()) == list(range(4100, 4106))
 
+    def test_a_string_route_id_held_by_a_claim_stays_out_of_compaction(self):
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        self.append(self.delete_of("7"))
+        self.append(self.delete_of(8))
+        self.append(self.delete_of(9))
+        NSOIntentOutboxState.objects.create(
+            device=self.device,
+            scope="static_route",
+            claim_deletions=[{"route_id": 7}],
+        )
+
+        drain.compact(self.device.pk, "static_route")
+
+        rows = self.rows()
+        assert len(rows) == 2, "a held route must not be merged into the compacted row"
+        assert [record["route_id"] for record in rows[0].transitions] == ["7"]
+        assert sorted(record["route_id"] for row in rows[1:] for record in row.transitions) == [8, 9]
+
     def test_rows_an_active_claim_holds_stay_one_per_edit(self):
         from netbox_nso_plugin import drain
 
@@ -316,6 +336,19 @@ class TestTheReductionAppliesTheAlgebra(_CompactionCase):
         folded = outbox.fold_transitions(self.transitions())
         assert folded.queued == {}
         assert folded.lineage_carry == {4300: TRIPLE_A}, "O1.30(b)'s [A, C] lineage can no longer form"
+
+    def test_a_string_route_id_reuses_the_integer_route_lineage_when_reducing(self):
+        from netbox_nso_plugin import drain, outbox
+
+        self.append(self.delete_of(7, last_acked=TRIPLE_A, current=TRIPLE_C))
+        self.append(self.revoke_of("7"))
+
+        drain.compact(self.device.pk, "static_route")
+
+        [record] = self.transitions()
+        assert record["op"] == outbox.OP_REVOKE
+        assert int(record["route_id"]) == 7
+        assert record["carried_triple"] == TRIPLE_A
 
     def test_a_revoke_then_delete_pair_reduces_the_other_way(self):
         from netbox_nso_plugin import drain, outbox
