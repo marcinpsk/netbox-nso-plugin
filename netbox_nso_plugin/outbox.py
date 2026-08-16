@@ -147,7 +147,7 @@ def fold_transitions(transitions, *, claim_deletions=(), queued=(), revoked=(), 
     deletion queued by an earlier fold exactly as it discards one from this batch, and a
     carried triple is cleared by an acknowledged success alone.
     """
-    held = set(claim_deletions)
+    held = {int(route_id) for route_id in claim_deletions}
     folded = FoldedAuthority(
         queued={int(record["route_id"]): record for record in queued},
         revoked={int(route_id) for route_id in revoked},
@@ -157,6 +157,7 @@ def fold_transitions(transitions, *, claim_deletions=(), queued=(), revoked=(), 
         route_id = record.get("route_id")
         if route_id is None:
             continue
+        route_id = int(route_id)
         if record.get("op") == OP_DELETE:
             folded.revoked.discard(route_id)
             if route_id not in held:

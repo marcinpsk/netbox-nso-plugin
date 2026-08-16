@@ -1738,9 +1738,11 @@ def clear_acknowledged_lineage() -> int:
     at once. NULL is not a gap here: it IS the wire's ``unverified`` flag, and saying so is
     what keeps a later deletion attributable instead of silently moot.
     """
-    from .models import NSOStaticRouteState
+    from .models import NSOIntentOutboxState, NSOStaticRouteState
 
-    return NSOStaticRouteState.objects.exclude(last_acked_triple=None).update(last_acked_triple=None)
+    cleared = NSOStaticRouteState.objects.exclude(last_acked_triple=None).update(last_acked_triple=None)
+    NSOIntentOutboxState.objects.filter(scope="static_route").update(lineage_carry={})
+    return cleared
 
 
 def _clear_claim(state) -> None:

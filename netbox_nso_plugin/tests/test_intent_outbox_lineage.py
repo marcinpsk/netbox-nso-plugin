@@ -216,6 +216,17 @@ class TestTheLineageTransfersAcrossReOwnership(_LineageCase):
         carried = triple("198.51.100.88/28", "198.51.100.6")
         assert outbox.carried_triple(42, lineage_carry={"42": carried}) == carried
 
+    def test_a_persisted_string_transition_key_uses_the_seeded_route_authority(self):
+        from netbox_nso_plugin import outbox
+
+        carried = triple("198.51.100.90/28", "198.51.100.60")
+        queued = [outbox.delete_transition(7, last_acked=carried, current=carried)]
+
+        folded = outbox.fold_transitions([outbox.revoke_transition("7")], queued=queued)
+
+        assert folded.queued == {}
+        assert folded.lineage_carry == {7: carried}
+
     def test_a_delete_re_own_re_delete_cycle_still_names_the_adapter_triple(self):
         first = triple("198.51.100.96/28", "198.51.100.7")
         route = own_route(self.mgmt, "198.51.100.96/28", "198.51.100.7")
@@ -336,13 +347,20 @@ class TestTheLineageIsBoundedAndCleared(_LineageCase):
 
     def test_a_restored_database_says_unverified_rather_than_guessing(self):
         from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSOIntentOutboxState
 
         acked = triple("198.51.100.208/28", "198.51.100.30")
         route = own_route(self.mgmt, "198.51.100.208/28", "198.51.100.30")
         self.stamp(route, acked)
         self.clear_entries()
+        NSOIntentOutboxState.objects.update_or_create(
+            device=self.device,
+            scope="static_route",
+            defaults={"lineage_carry": {str(route.pk): acked}},
+        )
 
         assert drain.clear_acknowledged_lineage() == 1
+        assert state_of(self.device, "static_route").lineage_carry == {}
         self.unown(route)
 
         [record] = self.records()
