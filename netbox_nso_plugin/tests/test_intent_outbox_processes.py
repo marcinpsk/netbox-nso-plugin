@@ -270,6 +270,78 @@ class TestOneClaimerAcrossTwoProcesses(_CascadeFlushMixin, IntentPushResetMixin,
             time.sleep(0.1)
         raise AssertionError(f"no request ending in {suffix} reached the adapter")
 
+    def test_await_request_ignores_a_successful_loser_until_the_winner_reaches_the_wire(self):
+        loser = subprocess.Popen(  # noqa: S603 — a fixed argv, no shell
+            [sys.executable, "-c", "pass"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        loser.wait(timeout=10)
+        self.assertEqual(loser.returncode, 0)
+        host, port = self.server.server_address[:2]
+        winner_script = (
+            "import time, urllib.request; "
+            "time.sleep(0.3); "
+            f"request=urllib.request.Request({('http://' + host + ':' + str(port) + '/winner')!r}, "
+            "data=b'{}', method='PUT'); urllib.request.urlopen(request).read()"
+        )
+        winner = subprocess.Popen(  # noqa: S603 — a fixed argv, no shell
+            [sys.executable, "-c", winner_script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            self._await_request("/winner", loser, winner)
+        finally:
+            self.server.hold.set()
+            loser_out, loser_err = loser.communicate(timeout=10)
+            winner_out, winner_err = winner.communicate(timeout=10)
+
+        self.assertEqual(loser.returncode, 0, f"{loser_out}\n{loser_err}")
+        self.assertEqual(winner.returncode, 0, f"{winner_out}\n{winner_err}")
+
+    def test_await_request_rejects_a_nonzero_worker_exit(self):
+        loser = subprocess.Popen(  # noqa: S603 — a fixed argv, no shell
+            [sys.executable, "-c", "raise SystemExit(7)"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        winner = subprocess.Popen(  # noqa: S603 — a fixed argv, no shell
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            with self.assertRaisesRegex(AssertionError, "a worker exited before the request landed"):
+                self._await_request("/never", loser, winner)
+        finally:
+            winner.terminate()
+            loser.communicate(timeout=10)
+            winner.communicate(timeout=10)
+
+    def test_await_request_rejects_when_all_workers_exit_without_a_request(self):
+        workers = [
+            subprocess.Popen(  # noqa: S603 — a fixed argv, no shell
+                [sys.executable, "-c", "pass"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for _ in range(2)
+        ]
+        try:
+            with self.assertRaisesRegex(
+                AssertionError, "all workers exited before the request ending in /never landed"
+            ):
+                self._await_request("/never", *workers)
+        finally:
+            for worker in workers:
+                worker.communicate(timeout=10)
+
     def _finish(self, process):
         out, err = process.communicate(timeout=180)
         assert process.returncode == 0, f"{out}\n{err}"
