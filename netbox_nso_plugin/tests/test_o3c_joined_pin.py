@@ -19,7 +19,7 @@ from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import requests
 from django.conf import settings
@@ -620,6 +620,21 @@ class TestO3CJoinedCrossRepositoryPin(_CascadeFlushMixin, IntentPushResetMixin, 
         matches = [job for job in jobs if job.get("type") == job_type]
         terminal = [job for job in matches if job.get("status") in _TERMINAL_JOB_STATUSES]
         return terminal[0] if terminal else None
+
+    def test_pinned_adapter_exposes_the_paginated_generation_listing(self):
+        from netbox_nso_plugin import adapter_client
+        from netbox_nso_plugin.models import NSOInstance
+
+        instance = NSOInstance.objects.create(name="o3c-pin", adapter_instance_id="o3c-pin")
+        management = self._link(make_device("generation-pin"), instance, "generation-pin")
+        _AdapterWireSession.reset(self.environment.adapter_port)
+
+        assert adapter_client.list_device_generations(management.adapter_device_id) == []
+
+        [request] = _AdapterWireSession.snapshot()
+        parsed = urlparse(request["url"])
+        assert parsed.path == f"/api/v1/devices/{management.adapter_device_id}/generations"
+        assert parse_qs(parsed.query) == {"limit": ["500"]}
 
     def test_one_joined_edit_retracts_only_the_removed_device_and_settles_the_retained_device(self):
         from netbox_nso_plugin import drain
