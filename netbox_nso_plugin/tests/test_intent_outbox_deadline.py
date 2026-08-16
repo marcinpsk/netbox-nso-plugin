@@ -153,6 +153,25 @@ class TestTheTransportEndsItsOwnSocket(_DripCase):
     tag = "sock"
     adapter_device_id = 7813
 
+    def test_discarding_a_broken_connection_removes_its_checkout(self):
+        from urllib3.connectionpool import HTTPConnectionPool
+
+        from netbox_nso_plugin import adapter_client
+
+        transport = adapter_client.AbortableTransport()
+        pool = HTTPConnectionPool("127.0.0.1", self.server.server_port)
+        self.addCleanup(pool.close)
+        transport._instrument(pool)
+
+        connection = pool._get_conn()
+        assert connection in transport._live
+
+        # urllib3 closes a broken connection and calls _put_conn(None). The transport must
+        # remove the connection it checked out, not the None sentinel.
+        pool._put_conn(None)
+
+        assert connection not in transport._live
+
     def test_abort_continues_when_one_socket_close_fails(self):
         from netbox_nso_plugin import adapter_client
 

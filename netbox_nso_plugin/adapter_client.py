@@ -149,16 +149,42 @@ class AbortableTransport(requests.adapters.HTTPAdapter):
     def _instrument(self, pool):
         """Wrap the pool's checkout and release, which is where a connection is identifiable."""
         checkout, release = pool._get_conn, pool._put_conn
+        checked_out = threading.local()
+
+        def _checkout_stack() -> list:
+            stack = getattr(checked_out, "stack", None)
+            if stack is None:
+                stack = []
+                checked_out.stack = stack
+            return stack
+
+        def _remove_checkout(conn):
+            stack = getattr(checked_out, "stack", None)
+            if not stack:
+                return None
+            if conn is None:
+                actual = stack.pop()
+            else:
+                actual = None
+                for index in range(len(stack) - 1, -1, -1):
+                    if stack[index] is conn:
+                        actual = stack.pop(index)
+                        break
+            if not stack:
+                del checked_out.stack
+            return actual
 
         def _get_conn(timeout=None):
             conn = checkout(timeout)
             with self._lock:
                 self._live.add(conn)
+                _checkout_stack().append(conn)
             return conn
 
         def _put_conn(conn):
             with self._lock:
-                self._live.discard(conn)
+                actual = _remove_checkout(conn)
+                self._live.discard(actual if actual is not None else conn)
             return release(conn)
 
         pool._get_conn, pool._put_conn = _get_conn, _put_conn
