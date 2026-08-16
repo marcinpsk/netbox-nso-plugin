@@ -25,6 +25,11 @@ OP_DELETE = "delete"
 OP_REVOKE = "revoke"
 
 
+def route_id_of(value) -> int:
+    """Return the canonical integer form of a persisted route id."""
+    return int(value)
+
+
 def allocate_push_seq() -> int:
     """Return the next logical-operation id (strictly increasing, never reused)."""
     from django.db import connection
@@ -147,17 +152,17 @@ def fold_transitions(transitions, *, claim_deletions=(), queued=(), revoked=(), 
     deletion queued by an earlier fold exactly as it discards one from this batch, and a
     carried triple is cleared by an acknowledged success alone.
     """
-    held = {int(route_id) for route_id in claim_deletions}
+    held = {route_id_of(route_id) for route_id in claim_deletions}
     folded = FoldedAuthority(
-        queued={int(record["route_id"]): record for record in queued},
-        revoked={int(route_id) for route_id in revoked},
-        lineage_carry={int(route_id): triple for route_id, triple in (lineage_carry or {}).items()},
+        queued={route_id_of(record["route_id"]): record for record in queued},
+        revoked={route_id_of(route_id) for route_id in revoked},
+        lineage_carry={route_id_of(route_id): triple for route_id, triple in (lineage_carry or {}).items()},
     )
     for record in transitions:
         route_id = record.get("route_id")
         if route_id is None:
             continue
-        route_id = int(route_id)
+        route_id = route_id_of(route_id)
         if record.get("op") == OP_DELETE:
             folded.revoked.discard(route_id)
             if route_id not in held:
@@ -226,10 +231,13 @@ def reduce_transitions(transitions) -> list:
     survivors: dict = {}
     unkeyed: list = []
     for record in transitions:
-        route_id = record.get("route_id")
-        if route_id is None:
+        raw_route_id = record.get("route_id")
+        if raw_route_id is None:
             unkeyed.append(record)
             continue
+        route_id = route_id_of(raw_route_id)
+        if raw_route_id != route_id:
+            record = {**record, "route_id": route_id}
         if record.get("op") == OP_REVOKE:
             carried = record.get("carried_triple") or _carried_by(survivors.get(route_id))
             record = {**record, "carried_triple": carried} if carried else record

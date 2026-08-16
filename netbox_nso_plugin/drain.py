@@ -43,6 +43,7 @@ from .outbox import (
     fold_transitions,
     issued_push_seq,
     reduce_transitions,
+    route_id_of,
     triple_of,
 )
 
@@ -615,7 +616,9 @@ def _compactable(row, held) -> bool:
     fold, and that interval spans the claim's success or abandon. Excluding the routes it
     holds makes the interval real; those rows compact on a later pass.
     """
-    return not any(record.get("route_id") in held for record in row.transitions)
+    return not any(
+        record.get("route_id") is not None and route_id_of(record["route_id"]) in held for record in row.transitions
+    )
 
 
 def compaction_candidates(limit=None) -> list[tuple[int, str]]:
