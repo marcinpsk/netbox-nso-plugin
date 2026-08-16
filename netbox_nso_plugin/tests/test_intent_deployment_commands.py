@@ -170,7 +170,7 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
                     _verification_receipt(claim, {**valid, field: malformed})
 
     def test_pending_transition_probe_is_scoped_to_the_current_database(self):
-        from netbox_nso_plugin.deployment import _exclusive_transition_pending
+        from netbox_nso_plugin import deployment
 
         class ProbeCursor:
             def execute(self, sql, params):
@@ -182,11 +182,34 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
 
         cursor = ProbeCursor()
 
-        self.assertFalse(_exclusive_transition_pending(cursor))
+        self.assertFalse(deployment._exclusive_transition_pending(cursor))
+        self.assertEqual(cursor.params, [deployment._LOCK_KEY >> 32, deployment._LOCK_KEY & 0xFFFFFFFF])
         self.assertIn(
             "database = (select oid from pg_database where datname = current_database())",
             cursor.sql,
         )
+
+    def test_quiescence_middleware_only_blocks_nso_plugin_mutations(self):
+        from django.conf import settings
+        from django.urls import reverse
+
+        from netbox_nso_plugin.deployment import quiesce, resume
+
+        middleware_path = "netbox_nso_plugin.middleware.IntentDeploymentMiddleware"
+        self.assertIn(middleware_path, settings.MIDDLEWARE)
+
+        quiesce()
+        try:
+            plugin_responses = [
+                self.client.post(reverse("plugins:netbox_nso_plugin:onboard")),
+                self.client.post("/api/plugins/nso/onboard/"),
+            ]
+            unrelated_response = self.client.post("/login/", {"username": "not-a-user", "password": "wrong"})
+        finally:
+            resume()
+
+        self.assertEqual([response.status_code for response in plugin_responses], [503, 503])
+        self.assertEqual(unrelated_response.status_code, 200)
 
     def test_each_dirty_key_shape_refuses_the_gate(self):
         from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentOutboxState
@@ -385,7 +408,9 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         with self.assertRaisesRegex(RuntimeError, "deployment is quiesced"):
             with transaction.atomic():
                 outbox.enqueue(self.device.pk, "static_route")
-        blocked = IntentDeploymentMiddleware(lambda _request: HttpResponse("mutated"))(RequestFactory().post("/api/"))
+        blocked = IntentDeploymentMiddleware(lambda _request: HttpResponse("mutated"))(
+            RequestFactory().post("/api/plugins/nso/onboard/")
+        )
         assert blocked.status_code == 503
         for operation in (
             lambda: reconcile_device(None),

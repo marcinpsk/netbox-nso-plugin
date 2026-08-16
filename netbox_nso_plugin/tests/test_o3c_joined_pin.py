@@ -89,6 +89,12 @@ class _AdapterWireSession(LoopbackOnlySession):
         with cls.lock:
             cls.records = []
 
+    @classmethod
+    def snapshot(cls) -> list[dict]:
+        """Return the wire records captured up to this point."""
+        with cls.lock:
+            return list(cls.records)
+
     def send(self, request, **kwargs):
         parsed = urlparse(request.url)
         if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or parsed.port != self.allowed_port:
@@ -615,7 +621,7 @@ class TestO3CJoinedCrossRepositoryPin(_CascadeFlushMixin, IntentPushResetMixin, 
 
         removed_puts = [
             record
-            for record in _AdapterWireSession.records
+            for record in _AdapterWireSession.snapshot()
             if record["method"] == "PUT"
             and f"/devices/{removed.adapter_device_id}/static-route-intent" in record["url"]
         ]
@@ -681,7 +687,7 @@ class TestO3CJoinedCrossRepositoryPin(_CascadeFlushMixin, IntentPushResetMixin, 
 
         retained_pushes = [
             record
-            for record in _AdapterWireSession.records
+            for record in _AdapterWireSession.snapshot()
             if record["method"] == "PUT"
             and f"/devices/{retained.adapter_device_id}/static-route-intent" in record["url"]
         ]
