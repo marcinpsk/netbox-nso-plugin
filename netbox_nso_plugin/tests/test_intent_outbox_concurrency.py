@@ -471,14 +471,20 @@ class TestTheSequenceAdvanceNeverPullsBackALiveAllocator(_CascadeFlushMixin, Tra
 
     def test_an_advance_walks_the_gap_it_is_given_and_no_further(self):
         """The single-writer arithmetic: forward to the watermark, and never back off it."""
-        from netbox_nso_plugin.outbox import advance_push_seq, allocate_push_seq
+        from netbox_nso_plugin.outbox import PUSH_SEQ_ADVANCE_BATCH, advance_push_seq, allocate_push_seq
 
         base = allocate_push_seq()
 
-        assert advance_push_seq(base + 500) == base + 500
-        assert allocate_push_seq() == base + 501, "the advance leaves the next allocation just above it"
-        assert advance_push_seq(base + 100) == base + 501, "a later key's lower watermark cannot pull it back"
-        assert allocate_push_seq() == base + 502, "an advance already past its watermark issues nothing"
+        assert advance_push_seq(base + PUSH_SEQ_ADVANCE_BATCH) == base + PUSH_SEQ_ADVANCE_BATCH
+        assert allocate_push_seq() == base + PUSH_SEQ_ADVANCE_BATCH + 1, (
+            "the advance leaves the next allocation just above it"
+        )
+        assert advance_push_seq(base + 100) == base + PUSH_SEQ_ADVANCE_BATCH + 1, (
+            "a later key's lower watermark cannot pull it back"
+        )
+        assert allocate_push_seq() == base + PUSH_SEQ_ADVANCE_BATCH + 2, (
+            "an advance already past its watermark issues nothing"
+        )
 
     def test_a_large_advance_bounds_one_set_based_jump(self):
         from netbox_nso_plugin.outbox import PUSH_SEQ_ADVANCE_BATCH, advance_push_seq, allocate_push_seq

@@ -1021,9 +1021,9 @@ class TestARestoreRebaseClearsTheAdaptersWatermark(_OutcomeCase):
 
     def test_the_advance_never_moves_the_sequence_backwards(self):
         """A restore rebases every key it holds, and their watermarks are not in order."""
-        from netbox_nso_plugin.outbox import advance_push_seq, allocate_push_seq
+        from netbox_nso_plugin.outbox import PUSH_SEQ_ADVANCE_BATCH, advance_push_seq, allocate_push_seq
 
-        highest = allocate_push_seq() + 500
+        highest = allocate_push_seq() + PUSH_SEQ_ADVANCE_BATCH
 
         assert advance_push_seq(highest) == highest
         assert advance_push_seq(highest - 100) == highest, "a later key's lower watermark cannot pull it back"
