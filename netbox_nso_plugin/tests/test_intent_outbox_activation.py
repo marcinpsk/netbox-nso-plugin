@@ -525,6 +525,8 @@ class TestRevocationRacesDoNotInventAuthority(_ActivationCase):
         self.unown(route)
 
         def revoke_then_fail(body):
+            from requests.exceptions import ConnectionError
+
             self.reown(type(route)._default_manager.get(pk=route.pk))
             raise ConnectionError("response lost")
 
@@ -532,6 +534,7 @@ class TestRevocationRacesDoNotInventAuthority(_ActivationCase):
         assert self.drain(chain=0) == drain.FAILED
         state = state_of(self.device, "static_route")
         assert [record["route_id"] for record in state.claim_deletions] == [route.pk]
+        assert state.last_error_code == "nso_unreachable"
         assert state.queued_deletions == []
         assert [record["route_id"] for record in self.sent()[-1]["body"]["deleted_routes"]] == [route.pk]
 
