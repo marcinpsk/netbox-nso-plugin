@@ -287,7 +287,8 @@ class TestOneClaimerAcrossTwoProcesses(_CascadeFlushMixin, IntentPushResetMixin,
             "import time, urllib.request; "
             "time.sleep(0.3); "
             f"request=urllib.request.Request({('http://' + host + ':' + str(port) + '/winner')!r}, "
-            "data=b'{}', method='PUT'); urllib.request.urlopen(request).read()"
+            "data=b'{}', method='PUT'); "
+            "urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request).read()"
         )
         winner = subprocess.Popen(  # noqa: S603 — a fixed argv, no shell
             [sys.executable, "-c", winner_script],
