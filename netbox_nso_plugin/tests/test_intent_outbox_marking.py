@@ -17,6 +17,7 @@ from __future__ import annotations
 import threading
 from unittest.mock import patch
 
+import requests
 from django.db import transaction
 from django.test import TransactionTestCase
 
@@ -133,7 +134,7 @@ class TestASecondMarkedDeletionIsStillMarked(_MarkCase):
         from netbox_nso_plugin import drain
 
         states = self.own(811, 812, 813)
-        self.adapter.fail_with = ConnectionError("adapter down")
+        self.adapter.fail_with = requests.exceptions.ConnectionError("adapter down")
         self.delete_overlay(states[811])
         assert self.drain() == drain.FAILED
         held = state_of(self.device, "vlan").push_seq

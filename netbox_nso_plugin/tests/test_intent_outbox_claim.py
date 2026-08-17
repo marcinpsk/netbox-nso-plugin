@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import requests
 from django.db import transaction
 from django.test import TransactionTestCase
 
@@ -159,7 +160,7 @@ class TestFailureKeepsTheWorkAndTheBaseline(_ClaimCase):
         from netbox_nso_plugin import drain
 
         own_vlan(self.mgmt, 850, self.tag)
-        self.adapter.fail_with = ConnectionError("adapter down")
+        self.adapter.fail_with = requests.exceptions.ConnectionError("adapter down")
 
         assert self.drain() == drain.FAILED
 
@@ -174,7 +175,7 @@ class TestFailureKeepsTheWorkAndTheBaseline(_ClaimCase):
         from netbox_nso_plugin import delivery, drain
 
         state = own_vlan(self.mgmt, 851, self.tag)
-        self.adapter.fail_with = ConnectionError("adapter down")
+        self.adapter.fail_with = requests.exceptions.ConnectionError("adapter down")
         assert self.drain() == drain.FAILED
         failed_seq = state_of(self.device, "vlan").push_seq
 
@@ -290,7 +291,7 @@ class TestAForcedCallFormsItsOwnClaim(_ClaimCase):
         """Leave the key holding an operation the adapter never answered."""
         from netbox_nso_plugin import drain
 
-        self.adapter.fail_with = ConnectionError("adapter down")
+        self.adapter.fail_with = requests.exceptions.ConnectionError("adapter down")
         assert self.drain(scope) == drain.FAILED
         self.adapter.fail_with = None
         return state_of(self.device, scope).push_seq
