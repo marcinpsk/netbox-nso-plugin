@@ -4,9 +4,10 @@
 
 Every adapter failure is rendered by some view, so ``adapter_client`` converts the
 transport exception into an ``AdapterError`` that carries the exception TYPE only, and the
-blanket ``except`` guards in ``onboarding`` follow the same rule. The full text goes to the
-server log. These tests drive the real views through the real ``adapter_client`` (only the
-network ``requests.Session`` is replaced) and assert the leaked text is gone from the body.
+blanket ``except`` guards in ``onboarding`` follow the same rule. The transport text is
+dropped rather than logged: it echoes the failed request, headers included. These tests
+drive the real views through the real ``adapter_client`` (only the network
+``requests.Session`` is replaced) and assert the leaked text is gone from the body.
 
 Also covers the sibling reflection bug: an unknown category key is a raw URL segment echoed
 into an HTML body, so it must come back escaped.
@@ -28,6 +29,10 @@ from .test_django_views import ViewTestBase
 # Shaped like something that must never be echoed to a client: a requests transport error
 # repeats the request it failed on, and an unexpected internal error can repeat a row value.
 _LEAK = "Bearer nso-adapter-token-abc123 must never leave the server"
+# A token that makes requests' own header validation echo it back (InvalidHeader repeats the
+# value). The secret part is one unbroken word so a repr()'d copy still matches.
+_HEADER_TOKEN_SECRET = "nso-adapter-token-must-never-be-logged"
+_HEADER_BREAKING_TOKEN = f"{_HEADER_TOKEN_SECRET}\nX-Leak: yes"
 _ADAPTER_LOG = "netbox_nso_plugin.adapter_client"
 _ONBOARDING_LOG = "netbox_nso_plugin.onboarding"
 _VIEWS_LOG = "netbox_nso_plugin.views"
@@ -76,7 +81,7 @@ class TestAdapterTransportEnvelope(_UnreachableAdapterMixin, TestCase):
     """adapter_client is where the transport exception is converted, so it is tested there."""
 
     def test_transport_error_text_never_enters_the_adapter_error(self):
-        """The AdapterError names the transport exception type; only the log gets its text."""
+        """The AdapterError names the transport exception type; the text is dropped."""
         from netbox_nso_plugin.adapter_client import _request
 
         with self.assertLogs(_ADAPTER_LOG, level="WARNING") as logs:
@@ -85,7 +90,50 @@ class TestAdapterTransportEnvelope(_UnreachableAdapterMixin, TestCase):
 
         self.assertEqual(ctx.exception.code, "nso_unreachable")
         self.assertEnvelopeOnly(str(ctx.exception))
-        self.assertTrue(any(_LEAK in line for line in logs.output), "the transport text must reach the server log")
+        self.assertTrue(
+            any("ConnectionError" in line for line in logs.output), "the log must name the transport exception type"
+        )
+        self.assertFalse(any(_LEAK in line for line in logs.output), "the transport text must not reach the log")
+
+
+class TestAdapterTransportLogRedaction(TestCase):
+    """The transport text never reaches the SERVER LOG either: it can carry the bearer token.
+
+    ``requests`` validates header values while preparing the request, and ``InvalidHeader``
+    repeats the offending value. A configured token holding a newline therefore raises before
+    any socket is opened, with the whole ``Authorization`` value inside the exception message.
+    """
+
+    def test_invalid_header_never_writes_the_token_to_the_log(self):
+        import netbox_nso_plugin.adapter_client as ac
+
+        cfg = {
+            "url": "http://adapter.invalid",
+            "token": _HEADER_BREAKING_TOKEN,
+            "verify_tls": True,
+            "ca_cert_path": None,
+            "timeout": 5,
+        }
+        ac.reset_session()
+        self.addCleanup(ac.reset_session)
+
+        # The real Session, so requests' own header validation raises: under pytest the
+        # hermetic-network fixture has replaced ``requests.Session``, and
+        # ``requests.sessions.Session`` is the untouched class behind it.
+        with (
+            patch("netbox_nso_plugin.adapter_client.requests.Session", requests.sessions.Session),
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=cfg),
+            self.assertLogs(_ADAPTER_LOG, level="WARNING") as logs,
+            self.assertRaises(AdapterError) as ctx,
+        ):
+            ac._request("GET", "/test")
+
+        self.assertEqual(ctx.exception.code, "nso_unreachable")
+        self.assertIn("InvalidHeader", str(ctx.exception))
+        for line in logs.output:
+            self.assertNotIn(_HEADER_TOKEN_SECRET, line, "the bearer token reached the server log")
+            self.assertNotIn("X-Leak", line, "the injected header reached the server log")
+        self.assertTrue(any("InvalidHeader" in line for line in logs.output), logs.output)
 
 
 class TestAdapterErrorEnvelopeInResponses(_UnreachableAdapterMixin, ViewTestBase):
@@ -126,7 +174,7 @@ class TestAdapterErrorEnvelopeInResponses(_UnreachableAdapterMixin, ViewTestBase
         ]
 
     def test_no_response_carries_the_transport_exception_text(self):
-        """Each site reports the failure by exception type, and logs the text server-side."""
+        """Each site reports the failure by exception type, in the body and in the log alike."""
         for label, url, method, data in self._response_cases():
             with self.subTest(site=label):
                 with self.assertLogs(_ADAPTER_LOG, level="WARNING") as logs:
@@ -135,7 +183,7 @@ class TestAdapterErrorEnvelopeInResponses(_UnreachableAdapterMixin, ViewTestBase
                     else:
                         resp = self.client.post(url, data, **_AJAX)
                 self.assertEnvelopeOnly(resp.content.decode())
-                self.assertTrue(any(_LEAK in line for line in logs.output))
+                self.assertFalse(any(_LEAK in line for line in logs.output))
 
     def test_onboard_status_poll_reports_the_type_not_the_transport_text(self):
         """A transient adapter outage while polling keeps the row provisioning, with no leak."""

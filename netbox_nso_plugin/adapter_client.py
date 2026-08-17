@@ -234,8 +234,9 @@ def _request_response(method, path, **kwargs):
     except requests.exceptions.ConnectTimeout as exc:
         raise AdapterError(f"Adapter connect timed out after {connect_timeout}s.", code="nso_unreachable") from exc
     except requests.RequestException as exc:
-        # Every consumer renders this message, and the transport text echoes the request.
-        logger.warning("nso-adapter request failed for %s %s: %s", method, path, exc)
+        # Never the exception text: requests' InvalidHeader repeats the offending header
+        # value, so a malformed configured token would land in the log verbatim.
+        logger.warning("nso-adapter request failed for %s %s (%s)", method, path, type(exc).__name__)
         raise AdapterError(
             f"Adapter unreachable ({type(exc).__name__}); see the server log.", code="nso_unreachable"
         ) from exc
