@@ -526,10 +526,8 @@ class TestRevocationRacesDoNotInventAuthority(_ActivationCase):
         self.unown(route)
 
         def revoke_then_fail(body):
-            from requests.exceptions import ConnectionError
-
             self.reown(type(route)._default_manager.get(pk=route.pk))
-            raise ConnectionError("response lost")
+            raise requests.exceptions.ConnectionError("response lost")
 
         self.adapter._respond = revoke_then_fail
         assert self.drain(chain=0) == drain.FAILED
