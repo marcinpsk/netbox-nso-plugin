@@ -93,7 +93,7 @@ DJANGO_SETTINGS_MODULE = "netbox.settings"
 # run the same Django TestCase suite, so they report the same number; neither has a
 # private coverage config. (pythonpath here is devcontainer-only, so `pytest` runs
 # locally while CI uses the equivalent `manage.py test` — same tests, same config.)
-addopts = "--cov=netbox_nso_plugin --cov-report=term-missing --reuse-db"
+addopts = "-n auto --cov=netbox_nso_plugin --cov-report=term-missing --reuse-db"
 
 [tool.ruff]
 line-length = 120

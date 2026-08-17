@@ -6,6 +6,17 @@ import os
 import sys
 import types
 
+# Each worker takes a private PostgreSQL test database on the shared dev instance, so the
+# worker count must not follow the core count of the host.
+MAX_PARALLEL_WORKERS = 8
+
+
+def pytest_xdist_auto_num_workers(config):
+    """Cap the `-n auto` worker count from the pyproject addopts."""
+    from xdist.plugin import pytest_xdist_auto_num_workers as detected_num_workers
+
+    return min(detected_num_workers(config), MAX_PARALLEL_WORKERS)
+
 
 def _should_inject_netbox_stubs():
     """Return whether this test process needs the lightweight NetBox stubs."""
