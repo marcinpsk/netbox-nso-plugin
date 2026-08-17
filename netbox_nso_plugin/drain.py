@@ -1006,7 +1006,7 @@ def _stamp_last_acked(claim: Claim) -> None:
         route_id = route.get("route_id")
         if route_id is None:
             continue
-        triples_by_route[route_id] = triple_of(
+        triples_by_route[route_id_of(route_id)] = triple_of(
             route.get("vrf") or "",
             route.get("prefix") or "",
             route.get("next_hop") or "",

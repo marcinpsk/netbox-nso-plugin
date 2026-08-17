@@ -350,6 +350,17 @@ class TestStampingFollowsTheAcknowledgedBody(_OutcomeCase):
         assert drain.settle(claimed, {"count": 1}) == drain.SUCCEEDED
         assert last_acked(self.mgmt, self.route) == self.mirror
 
+    def test_a_string_route_id_in_the_body_stamps_the_row_it_names(self):
+        """The ORM filter matches a string id, so the stamp's own lookup must match it too."""
+        from netbox_nso_plugin import drain
+
+        self._touch()
+        claimed = drain.claim(self.device.pk, "static_route")
+        claimed.payload = [{**route, "route_id": str(route["route_id"])} for route in claimed.payload]
+
+        assert drain.settle(claimed, {"count": 1}) == drain.SUCCEEDED
+        assert last_acked(self.mgmt, self.route) == self.mirror
+
     def test_stamping_many_routes_uses_one_update(self):
         from netbox_nso_plugin import drain
 
