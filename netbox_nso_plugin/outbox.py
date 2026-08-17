@@ -286,7 +286,11 @@ def _device_is_tearing_down(device_id, txid: int) -> bool:
     marks = getattr(_teardown, "marks", None)
     if not marks or device_id not in marks:
         return False
-    return marks[device_id][0] == _teardown_scope(txid)
+    if marks[device_id][0] == _teardown_scope(txid):
+        return True
+    # The scope that took the mark is gone (a rolled-back deletion never cleared it).
+    marks.pop(device_id, None)
+    return False
 
 
 def _teardown_scope(txid: int) -> tuple:

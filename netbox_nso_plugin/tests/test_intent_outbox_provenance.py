@@ -453,3 +453,32 @@ class TestOutboxTeardown(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
             outbox.enqueue(self.device.pk, "vlan")
 
         assert NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").exists()
+
+    def test_a_failed_teardown_leaves_no_mark_behind(self):
+        """No caller clears a rolled-back mark, so the reader that outlives it must prune it."""
+        from django.db.models.signals import pre_delete
+
+        from netbox_nso_plugin import outbox
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        class AbortTeardown(Exception):
+            pass
+
+        def abort_after_mark(sender, instance, **kwargs):
+            raise AbortTeardown
+
+        pre_delete.connect(abort_after_mark, sender=NSODeviceManagement, weak=False)
+        self.addCleanup(pre_delete.disconnect, abort_after_mark, sender=NSODeviceManagement)
+
+        with transaction.atomic():
+            try:
+                with transaction.atomic():
+                    self.mgmt.delete()
+            except AbortTeardown:
+                pass
+            assert self.device.pk in outbox._teardown_marks(), "the aborted deletion never marked the device"
+            outbox.enqueue(self.device.pk, "vlan")
+
+            assert self.device.pk not in outbox._teardown_marks(), (
+                "the mark of a scope that is gone stays for the life of the worker thread"
+            )
