@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import threading
 
+import requests
 from django.core.management import CommandError, call_command
 from django.db import connection, transaction
 from django.test import TransactionTestCase
@@ -341,7 +342,7 @@ class TestFailedDeletionKeepsItsExactAuthority(_ActivationCase):
         route = own_route(self.mgmt, "198.18.0.192/28", "198.18.0.193")
         self.land(route)
         self.unown(route)
-        self.adapter.fail_with = ConnectionError("adapter unavailable")
+        self.adapter.fail_with = requests.exceptions.ConnectionError("adapter unavailable")
 
         assert self.drain(chain=0) == drain.FAILED
         state = state_of(self.device, "static_route")
@@ -504,7 +505,7 @@ class TestRevocationRacesDoNotInventAuthority(_ActivationCase):
         route = own_route(self.mgmt, "198.18.1.48/28", "198.18.1.49")
         self.land(route)
         self.unown(route)
-        self.adapter.fail_with = ConnectionError("adapter unavailable")
+        self.adapter.fail_with = requests.exceptions.ConnectionError("adapter unavailable")
         assert self.drain(chain=0) == drain.FAILED
 
         self.reown(route)
