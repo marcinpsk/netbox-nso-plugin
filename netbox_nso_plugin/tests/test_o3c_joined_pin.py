@@ -324,6 +324,8 @@ class _O3CEnvironment:
         manifest = []
         for path in sorted(files, key=lambda item: item.relative_to(_ADAPTER_ROOT).as_posix()):
             relative = path.relative_to(_ADAPTER_ROOT).as_posix()
+            if not path.is_file():
+                raise AssertionError(f"O3c adapter checkout is missing {relative}")
             manifest.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {relative}\n")
         return hashlib.sha256("".join(manifest).encode()).hexdigest()
 
