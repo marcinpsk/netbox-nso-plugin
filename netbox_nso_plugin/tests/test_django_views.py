@@ -11,6 +11,7 @@ import re
 from datetime import UTC, datetime
 from unittest.mock import patch
 
+import requests
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
 from django.contrib.auth import get_user_model
 from django.db import transaction
@@ -3330,9 +3331,11 @@ class TestPushIntentForDevice(ViewTestBase):
         from netbox_nso_plugin.delivery import deliver
 
         NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="accepted")
+        self.addCleanup(NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update, status="changed")
         mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
         mgmt.adapter_device_id = 20
         mgmt.save(update_fields=["adapter_device_id"])
+        self.addCleanup(NSODeviceManagement.objects.filter(pk=mgmt.pk).update, adapter_device_id=None)
 
         mock_cfg.return_value = {
             "url": "http://adapter",
@@ -3355,10 +3358,6 @@ class TestPushIntentForDevice(ViewTestBase):
             }
         ]
 
-        mgmt.adapter_device_id = None
-        mgmt.save(update_fields=["adapter_device_id"])
-        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="changed")
-
     @patch("netbox_nso_plugin.adapter_client._resolve_config")
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_pushes_enabled_attribute(self, mock_session_cls, mock_cfg):
@@ -3375,6 +3374,7 @@ class TestPushIntentForDevice(ViewTestBase):
         mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
         mgmt.adapter_device_id = 21
         mgmt.save(update_fields=["adapter_device_id"])
+        self.addCleanup(NSODeviceManagement.objects.filter(pk=mgmt.pk).update, adapter_device_id=None)
 
         mock_cfg.return_value = {
             "url": "http://adapter",
@@ -3397,8 +3397,6 @@ class TestPushIntentForDevice(ViewTestBase):
             }
         ]
 
-        mgmt.adapter_device_id = None
-        mgmt.save(update_fields=["adapter_device_id"])
         enabled_state.delete()
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config")
@@ -3408,6 +3406,7 @@ class TestPushIntentForDevice(ViewTestBase):
         from netbox_nso_plugin.delivery import deliver
 
         NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="accepted")
+        self.addCleanup(NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update, status="changed")
         # Create a state with an unknown attribute — should be skipped
         unknown_state = NSOInterfaceState.objects.create(
             interface=self.interface,
@@ -3418,6 +3417,7 @@ class TestPushIntentForDevice(ViewTestBase):
         mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
         mgmt.adapter_device_id = 22
         mgmt.save(update_fields=["adapter_device_id"])
+        self.addCleanup(NSODeviceManagement.objects.filter(pk=mgmt.pk).update, adapter_device_id=None)
 
         mock_cfg.return_value = {
             "url": "http://adapter",
@@ -3440,10 +3440,7 @@ class TestPushIntentForDevice(ViewTestBase):
             }
         ]
 
-        mgmt.adapter_device_id = None
-        mgmt.save(update_fields=["adapter_device_id"])
         unknown_state.delete()
-        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="changed")
 
     def test_the_intent_is_recorded_even_when_the_adapter_is_down(self):
         """The accept records the key; the drain owns the send, and the tick owns the retry.
@@ -3455,14 +3452,14 @@ class TestPushIntentForDevice(ViewTestBase):
         from netbox_nso_plugin.views import _push_intent_for_device
 
         NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="accepted")
+        self.addCleanup(NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update, status="changed")
         mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
         mgmt.adapter_device_id = 23
         mgmt.save(update_fields=["adapter_device_id"])
-
-        from requests.exceptions import ConnectionError
+        self.addCleanup(NSODeviceManagement.objects.filter(pk=mgmt.pk).update, adapter_device_id=None)
 
         session = make_session()
-        session.request.side_effect = ConnectionError("adapter unavailable")
+        session.request.side_effect = requests.exceptions.ConnectionError("adapter unavailable")
         with (
             patch(
                 "netbox_nso_plugin.adapter_client._resolve_config",

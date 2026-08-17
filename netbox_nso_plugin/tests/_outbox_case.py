@@ -19,8 +19,11 @@ import json
 import re
 from unittest.mock import MagicMock, patch
 
+import requests
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.db import transaction
+
+from netbox_nso_plugin.adapter_client import AdapterError
 
 from ._adapter_http import _REAL_SESSION, make_response
 
@@ -252,6 +255,10 @@ class ReceiptAdapter:
     omits when it is marked and DETACHES it when it is not, which is X9's ratified rule.
     """
 
+    #: What a send can raise past the adapter client, and so all ``fail_with`` may carry: a
+    #: builtin injected here would enter the caller through a boundary production never crosses.
+    INJECTABLE = (requests.RequestException, AdapterError)
+
     def __init__(self, respond=None):
         self.receipts: dict[str, dict] = {}
         self.applied: list[tuple[str, object]] = []
@@ -316,11 +323,15 @@ class ReceiptAdapter:
 
     def _handle(self, method, url, **kwargs):
         if self.fail_with is not None:
+            if not isinstance(self.fail_with, self.INJECTABLE):
+                raise AssertionError(
+                    "ReceiptAdapter.fail_with must be a requests.RequestException or an AdapterError, not "
+                    f"{type(self.fail_with).__name__}: the adapter client raises nothing else out of a send, "
+                    "so a builtin here would exercise a path production cannot reach"
+                )
             raise self.fail_with
         if any(f"/devices/{device_id}/" in url for device_id in self.fail_devices):
-            from requests.exceptions import ConnectionError
-
-            raise ConnectionError(f"the far side refuses {url}")
+            raise requests.exceptions.ConnectionError(f"the far side refuses {url}")
         headers = kwargs.get("headers") or {}
         raw_seq = headers.get("X-Push-Seq")
         seq = int(raw_seq) if raw_seq is not None else None

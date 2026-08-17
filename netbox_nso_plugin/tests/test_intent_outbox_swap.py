@@ -17,8 +17,11 @@ from __future__ import annotations
 import contextlib
 from unittest.mock import patch
 
+import requests
 from django.db import transaction
 from django.test import SimpleTestCase, TransactionTestCase
+
+from netbox_nso_plugin.adapter_client import AdapterError
 
 from ._outbox_case import ReceiptAdapter, entries, make_managed, own_vlan, state_of
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin, _deliver_scheduled_keys
@@ -101,6 +104,31 @@ class TestTheCoalescerSymbolsAreGone(SimpleTestCase):
                 if named_here in gone:
                     read.add(f"{path.name}:{node.lineno}")
         assert read == set()
+
+
+class TestTheReceiptAdapterInjectionSeam(SimpleTestCase):
+    """``fail_with`` may only carry what the adapter client can actually raise out of a send."""
+
+    def test_a_builtin_injection_is_refused(self):
+        adapter = ReceiptAdapter()
+        adapter.fail_with = ConnectionError("builtin, not requests")
+
+        with self.assertRaisesRegex(AssertionError, "requests.RequestException or an AdapterError"):
+            adapter._handle("PUT", "http://adapter/devices/1/vlan")
+
+    def test_a_transport_injection_is_raised_unchanged(self):
+        adapter = ReceiptAdapter()
+        adapter.fail_with = requests.exceptions.ConnectionError("adapter down")
+
+        with self.assertRaises(requests.exceptions.ConnectionError):
+            adapter._handle("PUT", "http://adapter/devices/1/vlan")
+
+    def test_an_adapter_error_injection_is_raised_unchanged(self):
+        adapter = ReceiptAdapter()
+        adapter.fail_with = AdapterError("fence shut", code="conflict")
+
+        with self.assertRaises(AdapterError):
+            adapter._handle("PUT", "http://adapter/devices/1/vlan")
 
 
 class TestTheTestCaseDeliveryDouble(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
