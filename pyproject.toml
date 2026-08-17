@@ -86,13 +86,11 @@ docs = [
 [tool.pytest.ini_options]
 pythonpath = ["/opt/netbox/netbox", "netbox_stubs"]
 DJANGO_SETTINGS_MODULE = "netbox.settings"
-# Coverage has ONE source of truth: the [tool.coverage.*] tables below. Both entry
-# points read it and enforce the same fail_under gate — CI/devcontainer via
-# `coverage run manage.py test` + `coverage report`, and local `pytest` via
-# pytest-cov (`--cov`), which honors `[tool.coverage.report] fail_under`. The two
-# run the same Django TestCase suite, so they report the same number; neither has a
-# private coverage config. (pythonpath here is devcontainer-only, so `pytest` runs
-# locally while CI uses the equivalent `manage.py test` — same tests, same config.)
+# Coverage has ONE source of truth: the [tool.coverage.*] tables below. Every entry
+# point is pytest with pytest-cov, and `--cov` honors [tool.coverage.report]
+# fail_under: CI's hermetic lane, the devcontainer's netbox-test-coverage, and a raw
+# `pytest` all report the same number. (pythonpath is devcontainer-only; CI replaces
+# it with `-o pythonpath=../netbox/netbox`.)
 addopts = "-n auto --cov=netbox_nso_plugin --cov-report=term-missing --reuse-db"
 
 [tool.ruff]
