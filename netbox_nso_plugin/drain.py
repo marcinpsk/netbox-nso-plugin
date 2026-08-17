@@ -1581,6 +1581,8 @@ def drain_candidates(limit=None) -> list[tuple[int, str]]:
     for row in [*entry_keys, *state_keys]:
         key = (row["device_id"], row["scope"])
         by_key[key] = row["attempted_at"]
+    # The boolean element keeps the naive sentinel and the aware timestamps in separate
+    # groups: they are never compared with each other, so the sort cannot raise.
     ordered = [(attempted is not None, attempted or datetime.datetime.min, key) for key, attempted in by_key.items()]
     ordered.sort(key=lambda item: (item[0], item[1], item[2]))
     return [key for _stamped, _at, key in ordered[:limit]]
