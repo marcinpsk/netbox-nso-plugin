@@ -286,13 +286,13 @@ class TestOutboxMarkingModes(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         """O1.20 — an O3→O1 rollback must strand no authority, so O1 records the id already."""
         import dataclasses
 
-        from netbox_nso_plugin.delivery import delivery_keys
+        from netbox_nso_plugin.delivery import MARKING_PER_OBJECT, MARKING_QUERY_FLAG, delivery_keys
         from netbox_nso_plugin.models import NSOIntentOutboxEntry
 
         registry = delivery_keys()
-        assert registry["static_route"].marking_mode == "query_flag"
+        assert registry["static_route"].marking_mode == MARKING_QUERY_FLAG
         original = registry["static_route"]
-        prefixes = {"query_flag": "203.0.113.64/28", "per_object": "203.0.113.96/28"}
+        prefixes = {MARKING_QUERY_FLAG: "203.0.113.64/28", MARKING_PER_OBJECT: "203.0.113.96/28"}
         for mode, prefix in prefixes.items():
             NSOIntentOutboxEntry.objects.all().delete()
             route = _own_route(self.mgmt, prefix, "203.0.113.4")

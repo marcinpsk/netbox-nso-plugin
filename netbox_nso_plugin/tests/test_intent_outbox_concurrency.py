@@ -331,7 +331,10 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
             _accept_static_route_for_device(route, self.device)
             waited.append(time.monotonic() - started)
 
-        threading.Timer(2.0, release.set).start()
+        timer = threading.Timer(2.0, release.set)
+        timer.daemon = True
+        timer.start()
+        self.addCleanup(timer.cancel)
         self._run(
             self._remove(route, after=deleted, hold=release),
             self._transaction(own_the_same_route, before=deleted),

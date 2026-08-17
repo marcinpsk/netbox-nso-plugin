@@ -129,12 +129,13 @@ class TestApplyPromotion(TestCase):
         from netbox_nso_plugin.views import ApplyRefused, _prepare_apply
 
         mgmt, state, other = self._setup()
-        for name, answer in (("push_now", None), ("drain_key", drain.REFUSED)):
+        # Every push settles, so the SNMP refusal is the only thing that can abort the Apply.
+        for name, answer in (("push_now", {"count": 0}), ("drain_key", drain.REFUSED)):
             patcher = patch(f"netbox_nso_plugin.drain.{name}", side_effect=lambda *args, answer=answer, **kw: answer)
             patcher.start()
             self.addCleanup(patcher.stop)
 
-        with self.assertRaises(ApplyRefused):
+        with self.assertRaisesRegex(ApplyRefused, "SNMP"):
             _prepare_apply(mgmt)
 
         state.refresh_from_db()

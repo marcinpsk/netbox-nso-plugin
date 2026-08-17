@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import threading
 
+import requests
 from django.db import connection, transaction
 from django.test import TransactionTestCase
 from django.test.utils import CaptureQueriesContext
@@ -85,7 +86,7 @@ class TestTheSingleHomeInvariantHoldsAcrossAReplay(_OutcomeCase):
         # state row is created by the first drain-side operation.
         assert state_of(self.device, "static_route") is None
 
-        self.adapter.fail_with = ConnectionError("adapter down")
+        self.adapter.fail_with = requests.exceptions.ConnectionError("adapter down")
         assert self.drain() == drain.FAILED
         self.assertHome(route, "claim")
         failed_seq = state_of(self.device, "static_route").push_seq
@@ -432,7 +433,7 @@ class TestTheGateRefusesAnUnacknowledgedOperation(_OutcomeCase):
 
         # A forced store-only claim consumes nothing, so its failure leaves the key with a
         # sequence to replay and not one other trace of the operation.
-        self.adapter.fail_with = ConnectionError("adapter down")
+        self.adapter.fail_with = requests.exceptions.ConnectionError("adapter down")
         config, session = self.adapter.patches()
         with config, session:
             assert drain.push_now(self.device.pk, "vlan", mode=delivery.MODE_STORE_ONLY, force=True) is None
@@ -793,7 +794,7 @@ class TestTheFenceWithholdsEverySendButTheBackfill(_OutcomeCase):
 
             def open_the_fence_then_break(body):
                 """The backfill lands; the push the caller actually asked for does not."""
-                self.adapter.fail_with = ConnectionError("the adapter went away")
+                self.adapter.fail_with = requests.exceptions.ConnectionError("the adapter went away")
                 return partition()
 
             self.adapter.fail_with = None
@@ -805,7 +806,7 @@ class TestTheFenceWithholdsEverySendButTheBackfill(_OutcomeCase):
         assert answer is None, "the backfill is preparatory: the answer is the requested push's"
         state = state_of(self.device, "static_route")
         assert state.fence_withheld_since is None, "the backfill did open the fence"
-        assert state.push_seq is not None and state.last_error_code == "ConnectionError", (
+        assert state.push_seq is not None and state.last_error_code == "nso_unreachable", (
             "the deletion the caller asked to push is unacknowledged and replayed"
         )
         assert [int(r["route_id"]) for r in state.claim_deletions] == [route.pk]

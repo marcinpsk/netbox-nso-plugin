@@ -502,6 +502,7 @@ class TestCompactionRewritesInPlace(_CompactionCase):
         with patch("netbox_nso_plugin.drain._unconsumed", side_effect=commit_a_re_own_after_the_selection):
             drain.compact(self.device.pk, "static_route")
 
+        assert late, "the concurrent re-ownership never committed, so this pin proves nothing"
         survivors = [row.pk for row in self.rows()]
         assert survivors == [max(selected), late[0]], f"selected={selected} late={late} left={survivors}"
         assert max(selected) < late[0], "the compacted content must keep an id below the later commit"
