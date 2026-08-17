@@ -600,9 +600,12 @@ class TestDurableStallAcrossProcesses(_SettlementCase):
     """S4.3 (P5.11) — the bound survives a real process boundary, or it is not durable."""
 
     def _run_consumer(self, device_id: int, passes: int):
+        # The child names the test database directly, under the standard settings: the isolated
+        # harness refuses to build a settings module whose live NAME is already the test name.
         env = dict(os.environ)
+        env.pop("TEST_DB_NAME", None)
         env["DB_NAME"] = connection.settings_dict["NAME"]
-        env.setdefault("DJANGO_SETTINGS_MODULE", "netbox.settings")
+        env["DJANGO_SETTINGS_MODULE"] = "netbox.settings"
         return subprocess.run(  # noqa: S603 — a fixed argv, no shell
             [
                 sys.executable,
