@@ -45,6 +45,7 @@ def _adapter_commit_from_workflow() -> str:
 
 _ADAPTER_RUNTIME_DIGEST = "148cd7168b1d7ddb7d176d59c409fd42cd4dad326318464e29c766e3e2964a54"
 _ADAPTER_ROOT = Path(__file__).resolve().parents[2].parent / ".o3c-adapter"
+_DSN_CREDENTIAL = re.compile(r"(?<=://)[^:/@\s]+:[^@/\s]+(?=@)")
 _SR_PATH = "/restconf/data/static-route-reconciler:static-route-config"
 _SR_ROOT = "static-route-reconciler:static-route-config"
 _STATE_READ_PATH = "/restconf/data/network-state-export:device-state-read/run"
@@ -476,7 +477,10 @@ class _O3CEnvironment:
         log_path = path or Path(self.tempdir.name) / "adapter.log"
         if not log_path.exists():
             return ""
-        return log_path.read_text(errors="replace")[-12000:]
+        text = log_path.read_text(errors="replace")[-12000:]
+        # The adapter runs against the store DSN, and a connection failure both logs it
+        # and calls this method, whose output rides into assertion messages.
+        return _DSN_CREDENTIAL.sub("***:***", text)
 
     def stop(self) -> None:
         self.restconf.allow_removal.set()
@@ -705,6 +709,18 @@ class TestO3CEnvironmentFailFast(SimpleTestCase):
     """Prove a failed preflight tears down without hanging the suite."""
 
     databases = {"default"}
+
+    def test_log_text_redacts_the_store_credential(self):
+        environment = _O3CEnvironment()
+        self.addCleanup(environment.stop)
+        log_path = Path(environment.tempdir.name) / "adapter.log"
+        log_path.write_text('connection to "postgresql+asyncpg://nso_user:s3cr3t-pw@db-host:5432/store" failed\n')
+
+        text = environment.log_text(log_path)
+
+        assert "s3cr3t-pw" not in text
+        assert "nso_user" not in text
+        assert "postgresql+asyncpg://***:***@db-host:5432/store" in text
 
     def test_stop_returns_before_the_restconf_thread_ever_served(self):
         environment = _O3CEnvironment()
