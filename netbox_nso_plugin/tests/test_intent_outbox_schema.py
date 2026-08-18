@@ -169,7 +169,9 @@ class TestOutboxMigrationRoundTrip(_CascadeFlushMixin, TransactionTestCase):
             executor.migrate([(APP, parent)])
             assert not _table_exists(ENTRY_TABLE)
             assert not _table_exists(STATE_TABLE)
-            assert not _sequence_exists()
+            # The sequence stays: dropping it would let the re-apply below restart at 1 and
+            # re-issue values the adapter already admitted (the reverse is a noop).
+            assert _sequence_exists()
         finally:
             # Forward to the app's LEAVES, not to a fixed name: this worker's database is
             # reused by every test after this one, and a branched graph would leave the
