@@ -2,6 +2,148 @@
 
 <!-- version list -->
 
+## v0.3.0 (2026-08-18)
+
+### Bug Fixes
+
+- **adapter-client**: Log the transport exception type, never its text
+  ([`23b396f`](https://github.com/marcinpsk/netbox-nso-plugin/commit/23b396f2813cb521d1b35c5b3e2ca81a183a0585))
+
+- **devcontainer**: Pin netbox-test-django at a non-resolving adapter
+  ([`97a298a`](https://github.com/marcinpsk/netbox-nso-plugin/commit/97a298a234ecdf76a921b112a1ed07a263295b44))
+
+- **logging**: Survive a concurrent delete of the levels singleton
+  ([`1cb8290`](https://github.com/marcinpsk/netbox-nso-plugin/commit/1cb829093c0ef787b09a6e102e516e91f6c04ad5))
+
+- **reconcile**: Re-read the apply state after the settlement consumes a repair
+  ([`c155b09`](https://github.com/marcinpsk/netbox-nso-plugin/commit/c155b0942ee5955a62740a30980472cdb196ae65))
+
+- **review**: Harden test and timestamp boundaries
+  ([`0b76e4a`](https://github.com/marcinpsk/netbox-nso-plugin/commit/0b76e4afe3a67cc586de98cd45573972dd7258bb))
+
+- **review**: Preserve valid sync timestamps
+  ([`cad4a34`](https://github.com/marcinpsk/netbox-nso-plugin/commit/cad4a34ce9287294aff812940ba2658218013654))
+
+- **security**: Escape the unknown-category key in the 400 body
+  ([`b7cab70`](https://github.com/marcinpsk/netbox-nso-plugin/commit/b7cab70ce0263191b68b750623d98ef5d1103bdd))
+
+- **security**: Report adapter failures by exception type, not text
+  ([`226f0c2`](https://github.com/marcinpsk/netbox-nso-plugin/commit/226f0c217aae40aeb81a909282dacfa3433d8eab))
+
+- **settlement**: Bind the reused apply probe to the device the consumer locked
+  ([`aa53804`](https://github.com/marcinpsk/netbox-nso-plugin/commit/aa53804ae6567adfe80a2f39ac7b91dcf016a219))
+
+- **settlement**: Bound a feed row with no sequence, and read back once per pass
+  ([`8374d82`](https://github.com/marcinpsk/netbox-nso-plugin/commit/8374d827f7968a93cce080ab84815c0c0256e1b0))
+
+- **settlement**: Skip a feed row with no sequence instead of stalling on it
+  ([`7431567`](https://github.com/marcinpsk/netbox-nso-plugin/commit/743156749b5938e7fc68d1aaea2b3501e0eb1e0b))
+
+- **sync-cache**: Degrade non-string and offset-less adapter timestamps
+  ([`c9b7007`](https://github.com/marcinpsk/netbox-nso-plugin/commit/c9b7007ec6cac883c2590a3452af0cb5addef845))
+
+- **test**: Require a private database name
+  ([`658d3a6`](https://github.com/marcinpsk/netbox-nso-plugin/commit/658d3a605bb4c63f24429011e3293a089174a4c2))
+
+- **test**: Spawn the restart consumer under the standard settings
+  ([`340c878`](https://github.com/marcinpsk/netbox-nso-plugin/commit/340c878e4f3ed3e221ef3e2d2ed150943acce428))
+
+### Chores
+
+- **ci**: Bump astral-sh/setup-uv in the actions group
+  ([`f7a3ed2`](https://github.com/marcinpsk/netbox-nso-plugin/commit/f7a3ed2eaaaedb75b8b163ad6f40ea1173141f9b))
+
+- **deps**: Bump jsdom from 26.1.0 to 30.0.1
+  ([`3b712fd`](https://github.com/marcinpsk/netbox-nso-plugin/commit/3b712fdb8e51bbfd859f40bfccf285c9b2f77f00))
+
+- **deps**: Bump vitest from 3.2.7 to 4.1.10
+  ([`74a5d8a`](https://github.com/marcinpsk/netbox-nso-plugin/commit/74a5d8aba0a8c34336e1c599633c43b150a4dc61))
+
+- **deps**: Update django requirement from <7.0,>=5.1 to >=6.1,<7.0
+  ([`28e0866`](https://github.com/marcinpsk/netbox-nso-plugin/commit/28e0866c6a9299449fdaf5b13184fb1de447d2a9))
+
+- **deps**: Update mkdocs requirement from <2,>=1 to >=1.6.1,<2
+  ([`f3b26f9`](https://github.com/marcinpsk/netbox-nso-plugin/commit/f3b26f9f29d0bac30d623765c0c69249b83424d4))
+
+- **deps**: Update pytest-cov requirement from >=6.0 to >=7.1.0
+  ([`2addffb`](https://github.com/marcinpsk/netbox-nso-plugin/commit/2addffb569b4863d40b4c387733be64a585d3c41))
+
+- **deps**: Update requests requirement from >=2.32 to >=2.34.2
+  ([`0a619ae`](https://github.com/marcinpsk/netbox-nso-plugin/commit/0a619ae2f32b2165f0f59f34e50a824567228d59))
+
+- **test**: Run pytest on capped xdist workers
+  ([`5ed9927`](https://github.com/marcinpsk/netbox-nso-plugin/commit/5ed9927956f50882bb9342b7d5c2711057f1bbc8))
+
+### Code Style
+
+- Drop em-dashes from the text this branch added
+  ([`9f4d5d4`](https://github.com/marcinpsk/netbox-nso-plugin/commit/9f4d5d42e2a52bde62c2efdd2ad7fe6976a997c6))
+
+### Continuous Integration
+
+- Bound the quick workflow jobs with a job timeout
+  ([`69b7fc9`](https://github.com/marcinpsk/netbox-nso-plugin/commit/69b7fc9b236848945263f153ac52482c48e138f4))
+
+- Give lint-format and js-test a read-only GITHUB_TOKEN
+  ([`c87c629`](https://github.com/marcinpsk/netbox-nso-plugin/commit/c87c6296d29bfb1d0b317cc81c8a0361e068b4df))
+
+- **release**: Guard refs with expected tip lease
+  ([`cceca5f`](https://github.com/marcinpsk/netbox-nso-plugin/commit/cceca5f92f753e21dbcfe8cff6ec13f2bd68ea3b))
+
+- **release**: Skip a stale release trigger instead of resetting to it
+  ([`542de23`](https://github.com/marcinpsk/netbox-nso-plugin/commit/542de23892b919f3d32398e23c84ac089ddd3d7f))
+
+### Documentation
+
+- **settlement**: State the stall bound in terms of feed entries
+  ([`65dd1c8`](https://github.com/marcinpsk/netbox-nso-plugin/commit/65dd1c8a702d198fa8b3a539ea26bf59c113134e))
+
+### Features
+
+- **resync**: Report the arming a rejected push rolled back
+  ([`65d5070`](https://github.com/marcinpsk/netbox-nso-plugin/commit/65d5070f8a86a3a12a51e6eba09b13861d447a55))
+
+### Performance Improvements
+
+- **reconcile**: Reuse Step 4's apply-job state in the static-route escalation
+  ([`02dedcd`](https://github.com/marcinpsk/netbox-nso-plugin/commit/02dedcdc4290a17f964671495bff23ea717f7592))
+
+- **views**: Join nso_instance on the onboarding dashboard's managed rows
+  ([`e0eeac0`](https://github.com/marcinpsk/netbox-nso-plugin/commit/e0eeac03f6b3535f424d1d73ba407d45fcab5bb0))
+
+### Testing
+
+- **config**: Scope the concurrent-editor injections to the row under test
+  ([`8308a31`](https://github.com/marcinpsk/netbox-nso-plugin/commit/8308a31f81249518c446003f2b8aa08e3f2132ec))
+
+- **migrations**: Re-apply every leaf, not just the first
+  ([`c2709c0`](https://github.com/marcinpsk/netbox-nso-plugin/commit/c2709c0a101c17841d90bbbd64e8b955fab9c660))
+
+- **reconcile**: Exercise the settlement window on a real transaction boundary
+  ([`ff49962`](https://github.com/marcinpsk/netbox-nso-plugin/commit/ff499621cdfa69008723ae0df4579263ecab85ab))
+
+- **reconcile**: Patch the forced SNMP, logging and L2 SAP pushes in the apply pin
+  ([`081beeb`](https://github.com/marcinpsk/netbox-nso-plugin/commit/081beeba1c702273326696393a6f1d20f8894ff3))
+
+- **release**: Pin bare remote branch
+  ([`3570b5d`](https://github.com/marcinpsk/netbox-nso-plugin/commit/3570b5dc247e042dc8249fc19b4b69fce0ca45d2))
+
+- **review**: Close isolated settings coverage gaps
+  ([`ca7a95e`](https://github.com/marcinpsk/netbox-nso-plugin/commit/ca7a95e277a94d9396115382b8ea76948bafff29))
+
+- **settlement**: Anchor the carrier barrier on the consumer entry point
+  ([`3c33993`](https://github.com/marcinpsk/netbox-nso-plugin/commit/3c3399367864303946d2d3819cefbbcf73d49091))
+
+- **signals**: Pin that a fail-closed rekey never reaches sync_notify
+  ([`2f06b35`](https://github.com/marcinpsk/netbox-nso-plugin/commit/2f06b35bfdbcf0575b76dba619be832a56e8f99f))
+
+- **static-route**: Inject the reclassification on the accept update
+  ([`6cb5dce`](https://github.com/marcinpsk/netbox-nso-plugin/commit/6cb5dcec3b2fc180cdfe2f8738fbcb35e318fbb1))
+
+- **static-route**: Share the P2/P6 fixtures and reset the coalescer in a finally
+  ([`789e058`](https://github.com/marcinpsk/netbox-nso-plugin/commit/789e0581dc15b9f27b2e8505f4ee80d4109c6bbd))
+
+
 ## v0.2.0 (2026-08-10)
 
 ### Bug Fixes
