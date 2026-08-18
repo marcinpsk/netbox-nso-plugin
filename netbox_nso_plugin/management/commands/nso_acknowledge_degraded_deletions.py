@@ -15,8 +15,18 @@ class Command(BaseCommand):
     )
 
     def add_arguments(self, parser):
+        # The registry is the same source `outbox.enqueue` validates against, so a typo here
+        # cannot silently report "0 key(s)" on the only command that clears these records.
+        from netbox_nso_plugin.delivery import delivery_keys
+
         parser.add_argument("--device", type=int, dest="device_id", metavar="ID", help="Limit to one NetBox device id.")
-        parser.add_argument("--scope", dest="scope", metavar="KEY", help="Limit to one delivery key.")
+        parser.add_argument(
+            "--scope",
+            dest="scope",
+            metavar="KEY",
+            choices=sorted(delivery_keys()),
+            help="Limit to one delivery key.",
+        )
 
     def handle(self, *args, **options):
         # Reported FROM what was cleared, never listed separately and cleared afterwards: a

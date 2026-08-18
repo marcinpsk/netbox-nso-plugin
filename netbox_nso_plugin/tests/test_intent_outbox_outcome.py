@@ -13,6 +13,7 @@ every later success, so only an operator clears it.
 from __future__ import annotations
 
 import threading
+from io import StringIO
 
 import requests
 from django.db import connection, transaction
@@ -605,6 +606,36 @@ class TestTheAcknowledgementClearsOnlyWhatItReported(_OutcomeCase):
         assert state_of(self.device, "vlan").degraded_deletions == [second], (
             "a record the operator never saw may not be cleared by their acknowledgement"
         )
+
+    def test_a_scope_that_is_not_a_delivery_key_is_refused(self):
+        """ "0 key(s)" is indistinguishable from an empty record set, on the ONLY command
+        that clears these records, so a typo must not reach the filter at all."""
+        from django.core.management import call_command
+        from django.core.management.base import CommandError
+
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        NSOIntentOutboxState.objects.create(device=self.device, scope="vlan", degraded_deletions=[self._record(21)])
+
+        with self.assertRaises((CommandError, SystemExit)) as raised:
+            call_command("nso_acknowledge_degraded_deletions", "--scope", "vlann", stdout=StringIO())
+
+        assert "vlan" in str(raised.exception), "the refusal never named the valid keys"
+        assert state_of(self.device, "vlan").degraded_deletions, "a refused run cleared records anyway"
+
+    def test_a_real_delivery_key_still_clears_and_reports(self):
+        from django.core.management import call_command
+
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        NSOIntentOutboxState.objects.create(device=self.device, scope="vlan", degraded_deletions=[self._record(22)])
+        out = StringIO()
+
+        call_command("nso_acknowledge_degraded_deletions", "--scope", "vlan", stdout=out)
+
+        assert "route(s) [22]" in out.getvalue()
+        assert "Acknowledged 1 key(s)" in out.getvalue()
+        assert state_of(self.device, "vlan").degraded_deletions == []
 
 
 class TestStoreOnlyCarriesNoAuthority(_OutcomeCase):
