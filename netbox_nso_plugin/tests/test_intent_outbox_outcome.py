@@ -415,6 +415,9 @@ class TestAnAcknowledgedSuccessRetiresItsRows(_OutcomeCase):
             assert self.drain("vlan") == drain.SUCCEEDED
             assert NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").count() == 0
 
+        # The gate passes OVER a settled row, not over an absent one: the state selection
+        # narrows to what the six predicates can name, so a quiescent row must survive it.
+        assert state_of(self.device, "vlan") is not None
         assert drain.gate_blockers(self.device.pk) == []
 
 

@@ -1767,10 +1767,20 @@ def gate_blockers(device_id=None) -> list[str]:
     The command that enforces them is O3's; the predicate lives here because it reads the
     outbox's own invariants and is what a claim's own paths have to leave true.
     """
+    from django.db.models import Q
+
     from .models import NSOIntentOutboxEntry, NSOIntentOutboxState
 
     rows = NSOIntentOutboxEntry.objects.all()
-    states = NSOIntentOutboxState.objects.all()
+    # Only a row one of the six predicates below can name: expressed once, in SQL.
+    states = NSOIntentOutboxState.objects.filter(
+        Q(push_seq__isnull=False)
+        | ~Q(queued_deletions=[])
+        | ~Q(revoked_ids=[])
+        | Q(claimed_at__isnull=False)
+        | ~Q(claim_deletions=[])
+        | Q(fence_withheld_since__isnull=False)
+    )
     if device_id is not None:
         rows = rows.filter(device_id=device_id)
         states = states.filter(device_id=device_id)
