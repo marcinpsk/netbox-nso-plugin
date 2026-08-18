@@ -2993,12 +2993,9 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
                 return JsonResponse({"status": "error", "message": msg}, status=409)
             messages.error(request, msg)
             return redirect(_device_nso_tab_url(mgmt.device.pk))
-        if action == "apply" and exc.status_code == 503:
-            msg = "Apply stopped: deployment gate active. Nothing was applied."
-            if is_ajax:
-                return JsonResponse({"status": "error", "message": msg}, status=503)
-            messages.error(request, msg)
-            return redirect(_device_nso_tab_url(mgmt.device.pk))
+        # No deployment-gate branch here: the gate is the plugin's OWN middleware, which
+        # answers the POST before this view runs. An adapter 503 is an ordinary adapter
+        # failure and keeps the adapter's own message.
         if is_ajax:
             return JsonResponse({"status": "error", "message": str(exc)}, status=502)
         messages.error(request, f"Adapter error triggering {label}: {exc}")
