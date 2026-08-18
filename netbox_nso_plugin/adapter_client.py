@@ -366,7 +366,12 @@ def _request(method, path, **kwargs):
         sink.append(_serialize_json_body(kwargs["json"]))
         return None
     resp = _request_response(method, path, **kwargs)
-    return resp.json() if resp.content else None
+    if not resp.content:
+        return None
+    try:
+        return resp.json()
+    except ValueError as exc:
+        raise AdapterError("Adapter returned a response that is not valid JSON.", code="invalid_response") from exc
 
 
 def _request_response(method, path, **kwargs):
