@@ -644,12 +644,15 @@
       var guard = helper.createPollGuard();
       var timer = helper.createPollTimer(checkChain, 2000);
 
-      function stop(msg, type, job) {
+      // `settled` gates on the CHAIN's outcome, not on the job details: a successor that
+      // attaches between the endpoint's jobs read and its generations read is reported
+      // terminal with no job in that page, and gating on the job left the badges stale.
+      function stop(msg, type, settled) {
         if (guard && !guard.stop()) return;
         timer.stop();
         setButtons(false);
         setStatus(statusMessage(msg), type, false);
-        if (job) document.dispatchEvent(new CustomEvent('nso:refresh-categories'));
+        if (settled) document.dispatchEvent(new CustomEvent('nso:refresh-categories'));
       }
 
       async function checkChain() {
@@ -682,19 +685,19 @@
             var failedJob = failed.job;
             var detail = failedJob ? formatApplyError(failedJob) : ('generation ' + failed.generationStatus);
             var suffix = failedJob ? ' (Job #' + failedJob.id + ').' : '.';
-            stop(label + ' failed: ' + detail + suffix, 'danger', failedJob);
+            stop(label + ' failed: ' + detail + suffix, 'danger', true);
             return;
           }
           var abandoned = links.find(function (link) { return link.generationStatus === 'abandoned'; });
           if (abandoned) {
-            stop(label + ' stopped: generation ' + abandoned.generationId + ' was abandoned.', 'warning', abandoned.job);
+            stop(label + ' stopped: generation ' + abandoned.generationId + ' was abandoned.', 'warning', true);
             return;
           }
           var allSettled = links.every(function (link) { return link.generationStatus === 'settled'; });
           var jobIds = links.map(function (link) { return link.jobId; }).filter(function (id) { return id != null; });
           if (allSettled) {
             var jobText = jobIds.length ? ' (Jobs #' + jobIds.join(', #') + ')' : '';
-            stop(label + ' completed across ' + expected + ' generation(s)' + jobText + '.', 'success', links[links.length - 1].job);
+            stop(label + ' completed across ' + expected + ' generation(s)' + jobText + '.', 'success', true);
             return;
           }
           var waiting = links.some(function (link) { return link.jobId == null; }) ? ', waiting for the next chain job' : '';
