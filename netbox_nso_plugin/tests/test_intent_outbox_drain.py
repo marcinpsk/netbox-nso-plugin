@@ -150,6 +150,9 @@ class TestTheTickDrainsTheTail(_DrainCase):
 
         waiter_pid = []
         waiter_errors = []
+        # The drain catches broad Exception, and `self.failureException` is one: a `self.fail`
+        # inside the patched send is logged and swallowed, and never reaches the runner.
+        send_failures = []
         original_send = drain.send_claim
         started_waiter = False
 
@@ -185,7 +188,7 @@ class TestTheTickDrainsTheTail(_DrainCase):
                                 break
                     time.sleep(0.01)
                 else:
-                    self.fail("the exclusive transition did not queue during the first key")
+                    send_failures.append("the exclusive transition did not queue during the first key")
             return original_send(*args, **kwargs)
 
         config, session = self.adapter.patches()
@@ -202,6 +205,7 @@ class TestTheTickDrainsTheTail(_DrainCase):
                 jobs.RefreshDeviceSyncCacheJob.run(None)
             waiter.join(timeout=10)
 
+            self.assertEqual(send_failures, [], send_failures[0] if send_failures else "")
             self.assertFalse(waiter.is_alive(), "the exclusive transition did not finish")
             self.assertEqual(waiter_errors, [])
             self.assertEqual(len(self.adapter.requests), 1)
