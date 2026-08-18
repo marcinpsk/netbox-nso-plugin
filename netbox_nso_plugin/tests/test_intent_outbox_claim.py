@@ -649,3 +649,38 @@ class TestTheBaselineSeesARebuiltStoreBeforeAnythingAdoptsIt(_ClaimCase):
 
         assert self.drain() == drain.SUCCEEDED
         assert len(self.adapter.requests) == sent + 1
+
+
+class TestTheCapturedSequenceNamesTheCallersOwnClaim(_ClaimCase):
+    """§4.2's selector identifies the claim the caller settled, not a later chained one."""
+
+    def test_a_chained_normal_drain_does_not_overwrite_the_captured_sequence(self):
+        from netbox_nso_plugin import delivery, drain
+
+        own_vlan(self.mgmt, 881, self.tag)
+
+        # A save that lands while the first claim is in flight leaves work pending, which is
+        # what makes the MODE_NORMAL chain run a second successful pass.
+        real_send = delivery.send
+        appended = []
+
+        def send_then_append(*args, **kwargs):
+            answer = real_send(*args, **kwargs)
+            if not appended:
+                appended.append(True)
+                # A real second operation: the render differs, so the chained pass is not
+                # dropped as digest-equal against the acknowledged baseline.
+                with without_commit_drain():
+                    own_vlan(self.mgmt, 882, self.tag)
+            return answer
+
+        config, session = self.adapter.patches()
+        with config, session, patch("netbox_nso_plugin.delivery.send", new=send_then_append):
+            with drain.capture_successful_pushes() as pushed:
+                outcome = drain.drain_key(self.device.pk, "vlan")
+
+        assert outcome == drain.SUCCEEDED
+        assert len(self.adapter.sequences) == 2, "the chain ran a second pass"
+        assert pushed["vlan"] == self.adapter.sequences[0], (
+            "the selector must name the caller's own claim, not the chained one"
+        )
