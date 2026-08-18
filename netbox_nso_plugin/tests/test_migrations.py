@@ -84,14 +84,23 @@ class TestThePushSequenceOutlivesARollback(_CascadeFlushMixin, TransactionTestCa
         executor.loader.build_graph()
         executor.migrate([(APP, target)])
 
+    def _migrate_to_leaves(self):
+        from django.db.migrations.executor import MigrationExecutor
+
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate(executor.loader.graph.leaf_nodes(APP))
+
     def _nextval(self):
         with connection.cursor() as cursor:
             cursor.execute("SELECT nextval('nso_intent_push_seq');")
             return cursor.fetchone()[0]
 
     def test_a_rollback_and_re_apply_never_re_issues_a_burnt_value(self):
-        # However this ends, the worker's database goes back to the graph's leaf.
-        self.addCleanup(self._migrate, OUTBOX)
+        # However this ends, the worker's database goes back to the graph's LEAVES, not to a
+        # fixed name: this worker's database is reused by every test after this one, and a
+        # branch that adds a later migration would stay unapplied for all of them.
+        self.addCleanup(self._migrate_to_leaves)
 
         burnt = max(self._nextval() for _ in range(3))
 
