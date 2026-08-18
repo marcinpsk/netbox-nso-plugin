@@ -1516,6 +1516,7 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
     from .deployment import DeploymentQuiesced
     from .models import NSODeviceManagement
     from .settlement import settle_static_routes
+    from .signals import suppress_intent_push
 
     try:
         device = Device.objects.get(pk=device_id)
@@ -1575,10 +1576,14 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
             mgmt = NSODeviceManagement.objects.filter(pk=mgmt.pk).first()
             if mgmt is not None and mgmt.adapter_device_id is not None:
                 job, apply_active = _apply_job_state(mgmt.adapter_device_id)
-                _settle_apply_failures(mgmt, job.get("result") if job else None, job)
-                if not apply_active:
-                    _escalate_stuck_deploying(mgmt, job)
-                _journal_route_policy_apply(mgmt, job)
+                # These are mirror writes, not operator intent: without the suppression the
+                # first status flip's push-on-save signal refuses (no writer transaction) and
+                # takes the rest of Step 4 with it.
+                with suppress_intent_push():
+                    _settle_apply_failures(mgmt, job.get("result") if job else None, job)
+                    if not apply_active:
+                        _escalate_stuck_deploying(mgmt, job)
+                    _journal_route_policy_apply(mgmt, job)
     except Exception as exc:  # noqa: BLE001 — settling is best-effort, never crash the worker
         logger.warning("nso reconcile: apply-failure settle skipped for device %s: %s", device_id, exc)
 
