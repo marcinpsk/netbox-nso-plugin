@@ -2495,7 +2495,12 @@ _ACTION_LABELS = {
 
 
 class ApplyRefused(Exception):
-    """A precondition of the Apply is unmet, so no job is triggered and no row is promoted."""
+    """A precondition of the Apply is unmet, so no job is triggered and no row is promoted.
+
+    A refusal carries delivery-registry keys and a phrase from the vocabulary below, never
+    text: :func:`_apply_refusal_message` rebuilds the operator wording from those fields at
+    the boundary, so nothing a raise site was told can be serialized into a response.
+    """
 
 
 class ApplyDeadlineExpired(ApplyRefused):
@@ -2506,7 +2511,43 @@ class ApplySnmpRefused(ApplyRefused):
     """The store-only SNMP refresh was refused, so this Apply would commit stale intent."""
 
 
+class ApplyPreparationRefused(ApplyRefused):
+    """One in-protocol scope's store-only preparation did not land."""
+
+    def __init__(self, key, failure):
+        super().__init__()
+        self.key = key
+        self.failure = failure
+
+
+class ApplyDirectRefused(ApplyRefused):
+    """One direct-config snapshot did not land, after *applied* already reached the device."""
+
+    def __init__(self, key, applied, failure):
+        super().__init__()
+        self.key = key
+        self.applied = tuple(applied)
+        self.failure = failure
+
+
+class ApplyPromotionFailed(ApplyRefused):
+    """NetBox could not mark the selected intent as deploying, so nothing was submitted."""
+
+
+#: What a preparation step did, in the operator's words. A closed vocabulary: with the
+#: delivery-registry labels it is everything a refusal may say.
+_PREPARE_FAILED = "failed"
+_PREPARE_NOT_SETTLED = "did not settle successfully"
+_PREPARE_NOT_STARTED = "did not start before the preparation deadline expired"
+
 _APPLY_DEADLINE_MESSAGE = "Apply stopped before submission because the intent preparation deadline expired."
+_APPLY_PROMOTION_MESSAGE = (
+    "Apply stopped because NetBox could not mark the selected intent as deploying. "
+    "No Apply job was enqueued and all local promotion marks were rolled back."
+)
+_APPLY_REFUSED_MESSAGE = (
+    "Apply stopped before submission because a precondition was unmet. Nothing was applied and no row was promoted."
+)
 
 
 def _push_error_message(mgmt, scope) -> str:
@@ -2524,16 +2565,51 @@ def _snmp_refusal_message(mgmt) -> str:
     )
 
 
-def _direct_prepare_failure_message(entry, applied_labels, failure) -> str:
+def _delivery_label(key) -> str:
+    """Return one delivery key's operator label, which only the registry may supply."""
+    from . import delivery
+
+    return delivery.delivery_keys()[key].label
+
+
+def _prepare_failure_message(key, failure) -> str:
+    """Describe an in-protocol preparation failure that promoted nothing."""
+    return (
+        f"Apply stopped: {_delivery_label(key)} intent preparation {failure}. "
+        "Nothing was applied and no row was promoted."
+    )
+
+
+def _direct_prepare_failure_message(key, applied_keys, failure) -> str:
     """Describe a direct preparation failure without hiding completed device writes."""
-    if applied_labels:
-        completed = f"Direct-config snapshots already applied to the device: {', '.join(applied_labels)}."
+    if applied_keys:
+        applied = ", ".join(_delivery_label(applied_key) for applied_key in applied_keys)
+        completed = f"Direct-config snapshots already applied to the device: {applied}."
     else:
         completed = "No direct-config snapshot completed before this failure."
     return (
-        f"Apply stopped: {entry.label} direct configuration {failure}. {completed} "
+        f"Apply stopped: {_delivery_label(key)} direct configuration {failure}. {completed} "
         "No Apply job was enqueued and no row was promoted."
     )
+
+
+def _apply_refusal_message(exc, mgmt) -> str:
+    """Rebuild the operator wording from the refusal's TYPE and its registry-keyed fields.
+
+    CodeQL py/stack-trace-exposure: nothing here reads the exception's own text, and an
+    unrecognised refusal says only that a precondition was unmet.
+    """
+    if isinstance(exc, ApplySnmpRefused):
+        return _snmp_refusal_message(mgmt)
+    if isinstance(exc, ApplyDirectRefused):
+        return _direct_prepare_failure_message(exc.key, exc.applied, exc.failure)
+    if isinstance(exc, ApplyPreparationRefused):
+        return _prepare_failure_message(exc.key, exc.failure)
+    if isinstance(exc, ApplyPromotionFailed):
+        return _APPLY_PROMOTION_MESSAGE
+    if isinstance(exc, ApplyDeadlineExpired):
+        return _APPLY_DEADLINE_MESSAGE
+    return _APPLY_REFUSED_MESSAGE
 
 
 def _push_direct_snapshots(mgmt, registry, remaining_budget) -> None:
@@ -2544,18 +2620,12 @@ def _push_direct_snapshots(mgmt, registry, remaining_budget) -> None:
     """
     from . import delivery, drain
 
-    applied_direct_labels = []
+    applied_direct_keys = []
     for entry in (candidate for candidate in registry.values() if not candidate.in_protocol):
         try:
             deadline = remaining_budget()
-        except ApplyRefused as exc:
-            raise ApplyRefused(
-                _direct_prepare_failure_message(
-                    entry,
-                    applied_direct_labels,
-                    "did not start before the preparation deadline expired",
-                )
-            ) from exc
+        except ApplyDeadlineExpired as exc:
+            raise ApplyDirectRefused(entry.key, applied_direct_keys, _PREPARE_NOT_STARTED) from exc
         try:
             response = drain.push_now(
                 mgmt.device_id,
@@ -2566,16 +2636,10 @@ def _push_direct_snapshots(mgmt, registry, remaining_budget) -> None:
             )
         except Exception as exc:  # noqa: BLE001 (the direct write may already have happened)
             logger.warning("Apply direct push failed for device %s: %s", mgmt.device_id, exc)
-            raise ApplyRefused(_direct_prepare_failure_message(entry, applied_direct_labels, "failed")) from exc
+            raise ApplyDirectRefused(entry.key, applied_direct_keys, _PREPARE_FAILED) from exc
         if response is None:
-            raise ApplyRefused(
-                _direct_prepare_failure_message(
-                    entry,
-                    applied_direct_labels,
-                    "did not settle successfully",
-                )
-            )
-        applied_direct_labels.append(entry.label)
+            raise ApplyDirectRefused(entry.key, applied_direct_keys, _PREPARE_NOT_SETTLED)
+        applied_direct_keys.append(entry.key)
 
 
 def _prepare_apply(mgmt):
@@ -2602,7 +2666,7 @@ def _prepare_apply(mgmt):
     def remaining_budget():
         remaining = prepare_deadline - drain._send_clock()
         if remaining <= 0:
-            raise ApplyDeadlineExpired(_APPLY_DEADLINE_MESSAGE)
+            raise ApplyDeadlineExpired
         return remaining
 
     # Each of these takes its OWN forced claim, so Apply re-ships the operator's intent
@@ -2640,15 +2704,9 @@ def _prepare_apply(mgmt):
                 )
             except Exception as exc:  # noqa: BLE001 (a partial selector must never be applied)
                 logger.warning("Apply push failed for device %s: %s", mgmt.device_id, exc)
-                raise ApplyRefused(
-                    f"Apply stopped: {entry.label} intent preparation failed. "
-                    "Nothing was applied and no row was promoted."
-                ) from exc
+                raise ApplyPreparationRefused(entry.key, _PREPARE_FAILED) from exc
             if response is None:
-                raise ApplyRefused(
-                    f"Apply stopped: {entry.label} intent preparation did not settle successfully. "
-                    "Nothing was applied and no row was promoted."
-                )
+                raise ApplyPreparationRefused(entry.key, _PREPARE_NOT_SETTLED)
             if entry.key == "static_route":
                 # A forced claim is dropped only on a real rejection, and a static route settles
                 # on a generation the adapter has to be holding. Promoting on a push the adapter
@@ -2669,9 +2727,7 @@ def _prepare_apply(mgmt):
             )
         except Exception as exc:  # noqa: BLE001 (a partial selector must never be applied)
             logger.warning("Apply push failed for device %s: %s", mgmt.device_id, exc)
-            raise ApplyRefused(
-                "Apply stopped: SNMP intent preparation failed. Nothing was applied and no row was promoted."
-            ) from exc
+            raise ApplyPreparationRefused("snmp", _PREPARE_FAILED) from exc
         if outcome == drain.REFUSED:
             # A store-only claim may not carry deletion authority (§4.3(d)), so the adapter still
             # holds the SNMP intent the operator deleted and this Apply would commit it.
@@ -2679,12 +2735,9 @@ def _prepare_apply(mgmt):
             # are exactly what the store-only push exists to avoid ahead of trigger_apply and
             # would 409 this Apply anyway. So the precondition is reported rather than worked
             # around: the tick drains the pending claim and the operator re-applies.
-            raise ApplySnmpRefused(_snmp_refusal_message(mgmt))
+            raise ApplySnmpRefused
         if outcome != drain.SUCCEEDED:
-            raise ApplyRefused(
-                "Apply stopped: SNMP intent preparation did not settle successfully. "
-                "Nothing was applied and no row was promoted."
-            )
+            raise ApplyPreparationRefused("snmp", _PREPARE_NOT_SETTLED)
 
         _push_direct_snapshots(mgmt, registry, remaining_budget)
 
@@ -2718,10 +2771,7 @@ def _prepare_apply(mgmt):
                     moved.append((section, model, pks))
     except Exception as exc:  # noqa: BLE001 (abort before the adapter can promote a partial local state)
         logger.warning("Apply deploying-mark transaction failed for device %s: %s", mgmt.device_id, exc)
-        raise ApplyRefused(
-            "Apply stopped because NetBox could not mark the selected intent as deploying. "
-            "No Apply job was enqueued and all local promotion marks were rolled back."
-        ) from exc
+        raise ApplyPromotionFailed from exc
     return moved, selected
 
 
@@ -2993,10 +3043,10 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
             if action == "apply":
                 prepared, selected = _prepare_apply(mgmt)
         except ApplyRefused as exc:
-            logger.warning("Apply refused for device %s: %s", mgmt.device_id, exc)
-            # CodeQL py/stack-trace-exposure: rebuild the wording from the refusal type, never
-            # from the exception object.
-            msg = _snmp_refusal_message(mgmt) if isinstance(exc, ApplySnmpRefused) else _APPLY_DEADLINE_MESSAGE
+            # CodeQL py/stack-trace-exposure: rebuild the wording from the refusal type and
+            # its registry-keyed fields, never from the exception object.
+            msg = _apply_refusal_message(exc, mgmt)
+            logger.warning("Apply refused for device %s (%s): %s", mgmt.device_id, type(exc).__name__, msg)
             if is_ajax:
                 return JsonResponse({"status": "error", "message": msg}, status=409)
             messages.error(request, msg)
