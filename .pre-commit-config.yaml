@@ -26,7 +26,7 @@ repos:
       - id: mixed-line-ending
         args: [--fix=lf]
 
-  # Python code quality
+  # Python code quality. Keep the rev in step with [dependency-groups].dev.
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.4
     hooks:
