@@ -52,6 +52,17 @@ class TestOutboxMigrationShape(SimpleTestCase):
         in_app = [name for app, name in migration.dependencies if app == APP]
         assert in_app == [names[-2]], f"the outbox migration must chain off {names[-2]}; saw {in_app}"
 
+    def test_the_migrations_sequence_name_still_matches_the_running_one(self):
+        """0018 inlines the name so a rename cannot rewrite history; this is the drift alarm."""
+        from importlib import import_module
+
+        from netbox_nso_plugin import outbox
+
+        historical = import_module(f"{APP}.migrations.0018_intent_outbox").PUSH_SEQ_SEQUENCE
+        assert historical == outbox.PUSH_SEQ_SEQUENCE, (
+            "outbox.PUSH_SEQ_SEQUENCE was renamed; add a migration that renames the sequence too"
+        )
+
     def test_every_operation_declares_a_reverse(self):
         """A ``RunSQL`` with no ``reverse_sql`` makes the whole migration irreversible."""
         from importlib import import_module

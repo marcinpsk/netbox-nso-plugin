@@ -29,7 +29,9 @@ import django.db.models.deletion
 import django.db.models.functions.datetime
 from django.db import migrations, models
 
-from netbox_nso_plugin.outbox import PUSH_SEQ_SEQUENCE
+# Inlined on purpose: a migration records a fixed historical change, so it must not follow a
+# later rename of ``outbox.PUSH_SEQ_SEQUENCE``.
+PUSH_SEQ_SEQUENCE = "nso_intent_push_seq"
 
 
 class Migration(migrations.Migration):
