@@ -130,7 +130,7 @@ class TestApplyPromotion(TestCase):
         as it always has.
         """
         from netbox_nso_plugin import drain
-        from netbox_nso_plugin.views import ApplyRefused, _prepare_apply
+        from netbox_nso_plugin.views import ApplySnmpRefused, _prepare_apply
 
         mgmt, state, other = self._setup()
         calls = []
@@ -146,7 +146,8 @@ class TestApplyPromotion(TestCase):
         with (
             patch("netbox_nso_plugin.drain.push_now", new=push_now),
             patch("netbox_nso_plugin.drain.drain_key", new=drain_key),
-            self.assertRaisesRegex(ApplyRefused, "SNMP"),
+            # The TYPE is what selects the SNMP wording, so the type is what this pins.
+            self.assertRaises(ApplySnmpRefused),
         ):
             _prepare_apply(mgmt)
 
@@ -182,7 +183,7 @@ class TestApplyPromotion(TestCase):
 
     def test_apply_stops_before_the_first_send_when_its_total_budget_is_spent(self):
         from netbox_nso_plugin import drain
-        from netbox_nso_plugin.views import ApplyRefused, _prepare_apply
+        from netbox_nso_plugin.views import ApplyDeadlineExpired, _prepare_apply
 
         mgmt, state, other = self._setup()
         # Derived, so raising the deadline cannot turn this into a StopIteration from the
@@ -192,7 +193,7 @@ class TestApplyPromotion(TestCase):
             patch("netbox_nso_plugin.drain._send_clock", side_effect=[0, spent]),
             patch("netbox_nso_plugin.drain.push_now") as push,
             patch("netbox_nso_plugin.drain.drain_key") as snmp,
-            self.assertRaisesRegex(ApplyRefused, "preparation deadline"),
+            self.assertRaises(ApplyDeadlineExpired),
         ):
             _prepare_apply(mgmt)
 
@@ -422,6 +423,63 @@ class TestApplyRefusalSealing(TestCase):
                         f"{target} in the ApplyRefused handler uses the bound exception; "
                         "rebuild the message from the refusal type instead"
                     )
+
+    def test_no_refusal_raise_site_carries_wording(self):
+        """A refusal carries delivery keys and vocabulary constants, and nothing else.
+
+        This is what makes the handler safe by construction: an exception that holds no text
+        cannot serialize any into a response, whichever renderer reads it.
+        """
+        import ast
+        import inspect
+
+        from netbox_nso_plugin import delivery, views
+
+        tree = ast.parse(inspect.getsource(views))
+        refusals = {"ApplyRefused"} | {
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef)
+            and any(isinstance(base, ast.Name) and base.id == "ApplyRefused" for base in node.bases)
+        }
+        keys = set(delivery.delivery_keys())
+
+        raised = [
+            node.exc
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Raise)
+            and isinstance(node.exc, ast.Call)
+            and isinstance(node.exc.func, ast.Name)
+            and node.exc.func.id in refusals
+        ]
+        assert raised, "the apply preparation lost its typed refusals"
+        for call in raised:
+            for node in ast.walk(call):
+                assert not isinstance(node, ast.JoinedStr), (
+                    f"{call.func.id} is raised with interpolated wording; pass typed fields instead"
+                )
+                if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    assert node.value in keys, (
+                        f"{call.func.id} is raised with the literal {node.value!r}; a refusal may "
+                        "carry a delivery key or a vocabulary constant, and the handler says the words"
+                    )
+
+    def test_the_renderer_answers_the_refusals_no_end_to_end_case_reaches(self):
+        """The promotion failure renders its fixed wording, and an untyped refusal stays mute."""
+        from netbox_nso_plugin.views import (
+            _APPLY_PROMOTION_MESSAGE,
+            _APPLY_REFUSED_MESSAGE,
+            ApplyPromotionFailed,
+            ApplyRefused,
+            _apply_refusal_message,
+        )
+
+        mgmt = self._mgmt("seal-render", 99)
+
+        assert _apply_refusal_message(ApplyPromotionFailed(), mgmt) == _APPLY_PROMOTION_MESSAGE
+        assert _apply_refusal_message(ApplyRefused("text a raise site should not carry"), mgmt) == (
+            _APPLY_REFUSED_MESSAGE
+        )
 
     def test_a_refused_snmp_refresh_answers_the_rebuilt_wording(self):
         """End to end: POST → view → 409 whose body carries the recorded cause, not str(exc)."""
