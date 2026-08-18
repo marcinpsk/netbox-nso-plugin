@@ -363,6 +363,12 @@ def _attach_serialized_json(kwargs) -> None:
 def _request(method, path, **kwargs):
     sink = _capture_body.get()
     if sink is not None:
+        if "json" not in kwargs:
+            # Skipping it silently would make the caller's "expected exactly one" count lie.
+            raise AdapterError(
+                f"cannot capture a wire body for {method} {path}: the request carries no JSON body.",
+                code="capture_without_body",
+            )
         sink.append(_serialize_json_body(kwargs["json"]))
         return None
     resp = _request_response(method, path, **kwargs)

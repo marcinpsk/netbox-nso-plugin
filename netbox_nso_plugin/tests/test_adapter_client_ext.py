@@ -655,3 +655,25 @@ class TestGetApplyDiffOutformat(TestCase):
         with patch("netbox_nso_plugin.adapter_client._request", return_value={"diffs": {}}) as req:
             adapter_client.get_apply_diff(5, outformat="cli")
         req.assert_called_once_with("GET", "/api/v1/devices/5/actions/apply-diff", params={"outformat": "cli"})
+
+
+class TestCaptureWireBody(unittest.TestCase):
+    """``delivery.wire_body`` counts the requests one push made, so a skipped one lies."""
+
+    def test_a_request_with_no_json_body_is_refused_by_name(self):
+        from netbox_nso_plugin.adapter_client import AdapterError, _request, capture_wire_body
+
+        with capture_wire_body() as captured, self.assertRaises(AdapterError) as raised:
+            _request("GET", "/api/v1/devices/1/static-routes")
+
+        assert raised.exception.code == "capture_without_body"
+        assert "GET /api/v1/devices/1/static-routes" in str(raised.exception)
+        assert captured == []
+
+    def test_a_json_body_is_captured_as_the_canonical_bytes(self):
+        from netbox_nso_plugin.adapter_client import _request, capture_wire_body
+
+        with capture_wire_body() as captured:
+            assert _request("PUT", "/api/v1/devices/1/vlans", json={"b": 2, "a": 1}) is None
+
+        assert captured == [b'{"a": 1, "b": 2}']
