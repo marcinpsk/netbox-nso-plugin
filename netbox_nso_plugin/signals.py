@@ -566,7 +566,14 @@ def _push_interface_intent_for_device(device_id, adapter_device_id) -> None:
 
 #: The destination protocols a redistribution change can be scheduled against. It is the
 #: delivery key itself, so an unknown value names no renderer and must be refused, not sent.
-_REDISTRIBUTION_DESTINATIONS = ("ospf", "isis", "bgp")
+_REDISTRIBUTION_PROTOCOLS = ("ospf", "isis", "bgp")
+
+
+def redistribution_destinations() -> tuple[str, ...]:
+    """Return the one allow-list both scheduling paths refuse against."""
+    from . import delivery
+
+    return tuple(dest for dest in _REDISTRIBUTION_PROTOCOLS if dest in delivery.delivery_keys())
 
 
 def _schedule_redistribution_push(device_id, dest) -> None:
@@ -575,7 +582,7 @@ def _schedule_redistribution_push(device_id, dest) -> None:
     Keyed by (device, dest_protocol) so redistribution and the protocol's own state
     saves fold into a single push for that protocol.
     """
-    if dest not in _REDISTRIBUTION_DESTINATIONS:
+    if dest not in redistribution_destinations():
         logger.warning(
             "Redistribution: unknown dest_protocol %r for device %s — no push triggered",
             dest,

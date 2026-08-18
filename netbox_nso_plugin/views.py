@@ -5517,10 +5517,9 @@ class NSORedistributionBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     model_class = NSORedistributionState
 
     def _push(self, mgmt):
-        from . import delivery
-        from .signals import _OWNED_PUSH_STATUSES
+        from .signals import _OWNED_PUSH_STATUSES, redistribution_destinations
 
-        supported = delivery.delivery_keys()
+        supported = redistribution_destinations()
         destinations = (
             self.model_class.objects.filter(
                 management=mgmt,
