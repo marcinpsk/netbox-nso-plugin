@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import math
+
 from django.core.management.base import BaseCommand, CommandError
 
 from netbox_nso_plugin import adapter_client, delivery, drain, outbox
@@ -30,6 +32,21 @@ def _watermark(value, name):
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise CommandError(f"Adapter receipt response has an invalid {name}")
     return value
+
+
+def _advance_push_seq_to(watermark: int) -> None:
+    """Walk the sequence up to *watermark*, in a bounded number of steps.
+
+    Each call burns at most one batch, so the gap bounds the attempts. Unbounded, a stalled
+    advance spins for the life of the command instead of naming itself.
+    """
+    reached = outbox.issued_push_seq()
+    attempts = math.ceil(max(watermark - reached, 0) / outbox.PUSH_SEQ_ADVANCE_BATCH) + 1
+    for _ in range(attempts):
+        reached = outbox.advance_push_seq(watermark)
+        if reached >= watermark:
+            return
+    raise CommandError(f"The push sequence advance stalled at {reached}, below the adapter's {watermark}")
 
 
 def _key_receipt(document, *, adapter_device_id, section):
@@ -88,9 +105,7 @@ class Command(BaseCommand):
             max_push_seq = _watermark(global_document["global_max_push_seq"], "global_max_push_seq")
             max_route_id = _watermark(global_document["global_max_route_id"], "global_max_route_id")
             if max_push_seq is not None:
-                reached = outbox.advance_push_seq(max_push_seq)
-                while reached < max_push_seq:
-                    reached = outbox.advance_push_seq(max_push_seq)
+                _advance_push_seq_to(max_push_seq)
             if max_route_id is not None:
                 advance_static_route_pk(max_route_id)
             drain.clear_acknowledged_lineage()
