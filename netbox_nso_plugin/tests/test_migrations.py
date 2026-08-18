@@ -14,19 +14,24 @@ import importlib
 from io import StringIO
 
 from django.core.management import call_command
+from django.db import connection
 from django.db.migrations.loader import MigrationLoader
-from django.test import SimpleTestCase, TestCase
+from django.test import SimpleTestCase, TestCase, TransactionTestCase
+
+from .mixins import _CascadeFlushMixin
 
 APP = "netbox_nso_plugin"
+OUTBOX = "0018_intent_outbox"
+PRE_OUTBOX = "0017_settlement_cursor_epoch"
 
 
 class TestMigrationGraph(SimpleTestCase):
-    def test_sequence_rollback_warning_names_the_reuse_risk(self):
-        migration = importlib.import_module("netbox_nso_plugin.migrations.0018_intent_outbox")
+    def test_the_push_sequence_reverse_is_a_noop(self):
+        from django.db import migrations
 
-        assert "Re-applying it restarts at 1" in migration.__doc__
-        sequence = migration.Migration.operations[0]
-        assert "DROP SEQUENCE" in sequence.reverse_sql
+        migration = importlib.import_module(f"netbox_nso_plugin.migrations.{OUTBOX}")
+
+        assert migration.Migration.operations[0].reverse_sql is migrations.RunSQL.noop
 
     def test_cross_app_dependencies_stay_on_the_0001_floor(self):
         """makemigrations pins the GENERATING environment's app heads; a pin newer than
@@ -64,3 +69,33 @@ class TestMigrationsMatchTheModels(TestCase):
             call_command("makemigrations", APP, check=True, dry_run=True, verbosity=1, stdout=out)
         except SystemExit:
             self.fail(f"{APP} has model changes with no migration:\n{out.getvalue()}")
+
+
+class TestThePushSequenceOutlivesARollback(_CascadeFlushMixin, TransactionTestCase):
+    """``nso_intent_push_seq`` names a logical operation, is replayed on takeover and burned
+    on abandon, so it must never wrap: a re-issued value would let the adapter admit a replay
+    as new work. The forward SQL is ``CREATE SEQUENCE IF NOT EXISTS``, so a reverse that
+    dropped it made a re-apply restart at 1."""
+
+    def _migrate(self, target):
+        from django.db.migrations.executor import MigrationExecutor
+
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate([(APP, target)])
+
+    def _nextval(self):
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT nextval('nso_intent_push_seq');")
+            return cursor.fetchone()[0]
+
+    def test_a_rollback_and_re_apply_never_re_issues_a_burnt_value(self):
+        # However this ends, the worker's database goes back to the graph's leaf.
+        self.addCleanup(self._migrate, OUTBOX)
+
+        burnt = max(self._nextval() for _ in range(3))
+
+        self._migrate(PRE_OUTBOX)
+        self._migrate(OUTBOX)
+
+        assert self._nextval() > burnt, "the re-applied sequence re-issues values the adapter already admitted"

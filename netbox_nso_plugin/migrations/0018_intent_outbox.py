@@ -13,10 +13,6 @@ operation takes, which is what makes a claim and a compaction pass mutually excl
 takeover and burned on abandon, so it must never wrap — a re-issued value would let the
 adapter admit a replay as new work.
 
-Reversing this migration drops the sequence. Re-applying it restarts at 1 and can reuse
-values that the adapter already admitted. Roll back this migration only when you also
-discard the adapter receipts for every key.
-
 ``last_acked_triple`` starts NULL for every existing overlay, and that is not a gap to fill
 later. Stamping the live mirror would record content the adapter never acknowledged; NULL is
 the wire's ``unverified`` flag and the adapter classifies it conservatively.
@@ -44,7 +40,9 @@ class Migration(migrations.Migration):
     operations = [
         migrations.RunSQL(
             sql=f"CREATE SEQUENCE IF NOT EXISTS {PUSH_SEQ_SEQUENCE} AS bigint START WITH 1 INCREMENT BY 1 NO CYCLE;",
-            reverse_sql=f"DROP SEQUENCE IF EXISTS {PUSH_SEQ_SEQUENCE};",
+            # A drop plus the IF NOT EXISTS above would restart at 1 and re-issue values the
+            # adapter has already admitted. An orphan sequence is the cheaper rollback cost.
+            reverse_sql=migrations.RunSQL.noop,
         ),
         migrations.AddField(
             model_name="nsostaticroutestate",
