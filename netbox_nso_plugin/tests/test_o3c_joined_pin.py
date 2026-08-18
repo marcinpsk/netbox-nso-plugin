@@ -74,7 +74,12 @@ def _adapter_database_name() -> str:
     plugin_test_db = str(connection.settings_dict["NAME"])
     if not plugin_test_db.startswith("test_"):
         raise AssertionError(f"O3c refuses to derive an adapter database from {plugin_test_db!r}")
-    return f"{plugin_test_db}_adapter"
+    name = f"{plugin_test_db}_adapter"
+    # PostgreSQL truncates at NAMEDATALEN-1 with only a notice, which would silently map two
+    # base names onto one store and let reset_database() drop a database another worker owns.
+    if len(name.encode()) > 63:
+        raise AssertionError(f"the derived adapter database {name!r} exceeds PostgreSQL's 63 bytes")
+    return name
 
 
 class _AdapterWireSession(LoopbackOnlySession):
@@ -477,10 +482,11 @@ class _O3CEnvironment:
         log_path = path or Path(self.tempdir.name) / "adapter.log"
         if not log_path.exists():
             return ""
-        text = log_path.read_text(errors="replace")[-12000:]
         # The adapter runs against the store DSN, and a connection failure both logs it
-        # and calls this method, whose output rides into assertion messages.
-        return _DSN_CREDENTIAL.sub("***:***", text)
+        # and calls this method, whose output rides into assertion messages. Redact before
+        # truncating: a cut inside the DSN drops the ``://`` the lookbehind matches on.
+        text = _DSN_CREDENTIAL.sub("***:***", log_path.read_text(errors="replace"))
+        return text[-12000:]
 
     def stop(self) -> None:
         self.restconf.allow_removal.set()
@@ -496,11 +502,26 @@ class _O3CEnvironment:
             self.log_handle = None
         if self.serving:
             self.restconf_server.shutdown()
-        self.restconf_server.server_close()
+
+        # Independent releases: one that raises must not strand the socket or the temp
+        # directory for every later attempt. The first failure is re-raised at the end.
+        failure: BaseException | None = None
+        for release in (
+            self.restconf_server.server_close,
+            self._join_restconf_thread,
+            self.drop_database,
+            self.tempdir.cleanup,
+        ):
+            try:
+                release()
+            except BaseException as exc:  # noqa: BLE001 - every release still has to run
+                failure = failure or exc
+        if failure is not None:
+            raise failure
+
+    def _join_restconf_thread(self) -> None:
         if self.restconf_thread.is_alive():
             self.restconf_thread.join(timeout=10)
-        self.drop_database()
-        self.tempdir.cleanup()
 
 
 @tag("o3c", "cross_repository")
@@ -721,6 +742,40 @@ class TestO3CEnvironmentFailFast(SimpleTestCase):
         assert "s3cr3t-pw" not in text
         assert "nso_user" not in text
         assert "postgresql+asyncpg://***:***@db-host:5432/store" in text
+
+    def test_log_text_redacts_a_credential_that_straddles_the_truncation(self):
+        """Truncating first would drop the ``://`` the redaction's lookbehind needs."""
+        environment = _O3CEnvironment()
+        self.addCleanup(environment.stop)
+        log_path = Path(environment.tempdir.name) / "adapter.log"
+        # Place the cut between the scheme and the password: the kept tail is exactly 12000
+        # characters and starts at the password itself.
+        tail = 's3cr3t-pw@db-host:5432/store" failed\n'
+        head = "A" * 5000 + 'connection to "postgresql+asyncpg://nso_user:'
+        log_path.write_text(head + tail + "x" * (12000 - len(tail)))
+
+        text = environment.log_text(log_path)
+
+        assert "s3cr3t-pw" not in text, "the password survived the truncate-then-redact order"
+
+    def test_stop_releases_every_resource_when_an_earlier_step_raises(self):
+        """One failing release must not strand the socket and the temp directory."""
+        environment = _O3CEnvironment()
+        tempdir_name = environment.tempdir.name
+
+        with patch.object(_O3CEnvironment, "drop_database", side_effect=RuntimeError("store still connected")):
+            with self.assertRaises(RuntimeError):
+                environment.stop()
+
+        assert environment.restconf_server.socket.fileno() == -1, "the listening socket leaked"
+        assert not Path(tempdir_name).exists(), "the temp directory leaked"
+
+    def test_the_derived_adapter_database_name_fits_postgresql(self):
+        """PostgreSQL truncates at 63 bytes with only a notice, so two runs could collide."""
+        long_name = "test_" + "n" * 70
+        with patch.dict(connection.settings_dict, {"NAME": long_name}):
+            with self.assertRaisesRegex(AssertionError, "63"):
+                _adapter_database_name()
 
     def test_stop_returns_before_the_restconf_thread_ever_served(self):
         environment = _O3CEnvironment()
