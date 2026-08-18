@@ -117,9 +117,11 @@ class TestTheTickDrainsTheTail(_DrainCase):
             clock.monotonic.side_effect = [10.0, 20.0, 21.0]
             jobs.RefreshDeviceSyncCacheJob.run(None)
 
-        args = log.call_args.args
-        assert args[7] == 10.0, "the outbox duration omitted outage compaction"
-        assert args[10] == 1.0, "the settlement duration included outage compaction"
+        # Rendered, not indexed: a value added to that one `logger.info` shifts every index,
+        # and the test would then assert the wrong duration and still pass.
+        message = log.call_args.args[0] % log.call_args.args[1:]
+        assert "outbox drain 10.000s" in message, f"the outbox duration omitted outage compaction: {message}"
+        assert "settlement sweep 1.000s" in message, f"the settlement duration included outage compaction: {message}"
 
     def test_a_mid_tick_quiesce_stops_without_recording_a_key_failure(self):
         from netbox_nso_plugin import drain
