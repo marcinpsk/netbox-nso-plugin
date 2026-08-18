@@ -13,6 +13,7 @@ from django.test import TestCase, TransactionTestCase
 from rest_framework import status
 from utilities.testing import APITestCase
 
+from netbox_nso_plugin import drain
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
 
 from ._outbox_case import without_commit_drain
@@ -42,7 +43,7 @@ def _patch_apply_pushes(answers=None):
             "netbox_nso_plugin.drain.push_now",
             side_effect=lambda device_id, scope, **kwargs: answers.get(scope, {"status": "deployed"}),
         ) as push,
-        patch("netbox_nso_plugin.drain.drain_key", return_value="succeeded"),
+        patch("netbox_nso_plugin.drain.drain_key", return_value=drain.SUCCEEDED),
     ):
         yield push
 
