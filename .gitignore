@@ -30,8 +30,6 @@ coverage.xml
 # Node (JS test harness)
 node_modules/
 
-# uv
-uv.lock
 
 # IDE
 .vscode/*

@@ -51,6 +51,10 @@ commit_parser = "conventional"
 tag_format = "v{version}"
 version_toml = ["pyproject.toml:project.version"]
 version_variables = ["netbox_nso_plugin/__init__.py:__version__"]
+# The lock records this project's own version, so a bump leaves it stale. semantic-release runs
+# build_command before it stages, and assets is what carries the result into the release commit.
+build_command = "uv lock"
+assets = ["uv.lock"]
 
 [tool.semantic_release.branches.main]
 match = "^main$"

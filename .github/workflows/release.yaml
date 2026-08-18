@@ -60,6 +60,10 @@ jobs:
         with:
           python-version: "3.12"
 
+      # semantic-release's build_command is `uv lock`, so uv has to be on PATH here.
+      - name: Install uv
+        uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d  # v10.0.0
+
       # release-please never created a tag in this repository. Establish the
       # version declared immediately before this push as the baseline; otherwise
       # semantic-release starts at 0.0.0 and would downgrade the existing 0.1.0.
@@ -85,13 +89,16 @@ jobs:
 
       # Generate the release commit and tags locally. The ref transaction below owns
       # every release ref so GitHub can enforce the triggering tip as a lease.
+      # build: true runs build_command, which here is `uv lock`, so the release commit carries
+      # a lock matching the version it just wrote. build: false would pass --skip-build and drop
+      # that refresh. The wheel and sdist are built from the tag by the `build` job, not here.
       - name: Release from conventional commits
         id: release
         if: steps.trigger.outputs.stale != 'true'
         uses: python-semantic-release/python-semantic-release@39dd2052f2ce8282a5d932c31d58a2ca06d2550e  # v10.6.1
         with:
           github_token: ${{ secrets.SEMANTIC_RELEASE_TOKEN || github.token }}
-          build: false
+          build: true
           changelog: true
           push: false
           vcs_release: false
@@ -162,9 +169,10 @@ jobs:
       - name: Build the distributions
         run: uv build
 
-      # Guards the whole version chain: semantic-release has to have bumped both
-      # pyproject.toml and netbox_nso_plugin/__init__.py (which is what
-      # PluginConfig.version reports to NetBox) to exactly the tag it cut.
+      # Guards the whole version chain: semantic-release has to have bumped pyproject.toml,
+      # netbox_nso_plugin/__init__.py (which is what PluginConfig.version reports to NetBox)
+      # and uv.lock (refreshed by build_command) to exactly the tag it cut. The lock is not
+      # inside the wheel, but this job checks out the tag, so it is on disk here.
       # Versions are compared as PEP 440 objects, not strings, because a tag
       # like v1.2.3-rc.1 legitimately normalises to 1.2.3rc1 in a filename.
       - name: Verify the built version matches the release tag
@@ -172,7 +180,7 @@ jobs:
           TAG_NAME: ${{ needs.release.outputs.tag }}
         run: |
           cat > "${RUNNER_TEMP}/verify_version.py" <<'PY'
-          import os, sys, zipfile
+          import os, sys, tomllib, zipfile
           from pathlib import Path
           from packaging.utils import parse_sdist_filename, parse_wheel_filename
           from packaging.version import Version
@@ -195,12 +203,19 @@ jobs:
               sys.exit(f"::error::expected one __version__ line in the packaged __init__.py, got {len(declared)}")
           found["__version__"] = Version(declared[0].split("=", 1)[1].strip().strip("\"'"))
 
+          locked = tomllib.loads(Path("uv.lock").read_text())
+          entries = [pkg for pkg in locked["package"] if pkg["name"] == "netbox-nso-plugin"]
+          if len(entries) != 1:
+              sys.exit(f"::error::expected one netbox-nso-plugin entry in uv.lock, got {len(entries)}")
+          found["uv.lock"] = Version(entries[0]["version"])
+
           for where, version in found.items():
               if version != expected:
                   sys.exit(f"::error::{where} declares {version}, but tag {tag} expects {expected}")
               print(f"{where}: {version}")
           PY
-          uv run --no-project --with packaging -- python "${RUNNER_TEMP}/verify_version.py"
+          # Pinned: the guard reads uv.lock with tomllib, which needs 3.11+.
+          uv run --no-project --python 3.12 --with packaging -- python "${RUNNER_TEMP}/verify_version.py"
 
       # Hidden files are excluded by default, which keeps uv's dist/.gitignore
       # out of the artifact and therefore out of what is uploaded to PyPI.
