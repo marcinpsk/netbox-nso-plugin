@@ -4,13 +4,14 @@
 
 import logging
 
-from django.http import HttpResponse
+from django.http import HttpResponse, JsonResponse
 
 from .deployment import DeploymentQuiesced, operation
 
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE"})
 _PLUGIN_PATH_PREFIXES = ("/plugins/nso/", "/api/plugins/nso/")
 logger = logging.getLogger(__name__)
+_REFUSAL = "Intent deployment gate is active. Nothing was changed."
 
 
 class IntentDeploymentMiddleware:
@@ -29,4 +30,9 @@ class IntentDeploymentMiddleware:
             return self.get_response(request)
         except DeploymentQuiesced:
             logger.info("Refused a mutation during intent deployment: %r", request.path_info)
-            return HttpResponse("Intent deployment is quiesced.", status=503, content_type="text/plain")
+            # The gate answers before the view, so this IS the Apply response the tab's
+            # AJAX caller parses — it reads JSON, and a text/plain body reaches the
+            # operator as a generic parse failure instead of the deliberate refusal.
+            if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+                return JsonResponse({"status": "error", "message": _REFUSAL}, status=503)
+            return HttpResponse(_REFUSAL, status=503, content_type="text/plain")
