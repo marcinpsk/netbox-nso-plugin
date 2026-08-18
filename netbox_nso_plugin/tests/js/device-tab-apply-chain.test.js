@@ -48,34 +48,113 @@ function message() {
   return document.getElementById("nso-job-message").textContent;
 }
 
-/* Copied from ../nso-adapter/docs/api-contract.md, actions/apply 202 response. */
-const generations = [
-  { generation_id: 81, seq: 4, job_id: 501, mode: "networked" },
-  { generation_id: 82, seq: 5, job_id: null, mode: "detach" },
+/* The adapter emits EVERY field of these rows on EVERY row, null when unset (the
+ * receipts-surface emit-null discipline), and views.NSODeviceActionView rejects an Apply
+ * chain that drops one. A fixture that omits a field therefore proves nothing about the
+ * poller, so each builder below is pinned against its response's field list. Copied from
+ * ../nso-adapter/docs/api-contract.md (actions/apply 202, GET devices/{id}/generations)
+ * and ../nso-adapter/tests/api/openapi_snapshot.json (ActionApplyGenerationOut,
+ * DeviceGenerationOut, JobOut). */
+const APPLY_GENERATION_FIELDS = [
+  "generation_id", "seq", "job_id", "mode", "source_push_seq", "stream_revisions", "digest",
 ];
+const DEVICE_GENERATION_FIELDS = [
+  ...APPLY_GENERATION_FIELDS, "status", "settlement_cohort", "created_at", "updated_at",
+];
+const JOB_FIELDS = [
+  "id", "type", "device_id", "status", "result", "error", "context",
+  "created_at", "updated_at", "started_at", "heartbeat_at", "settle_seq",
+];
+
+function pinned(row, fields, what) {
+  const missing = fields.filter((field) => !(field in row));
+  if (missing.length) {
+    throw new Error(`the ${what} fixture dropped required field(s): ${missing.join(", ")}`);
+  }
+  return row;
+}
+
+/* One link of the actions/apply 202 chain. It carries no status and no timestamps; the
+ * poller reads those from the listing instead. */
+function applyGeneration(overrides) {
+  return pinned(
+    {
+      generation_id: 81,
+      seq: 4,
+      job_id: 501,
+      mode: "networked",
+      source_push_seq: { logging: 8801 },
+      stream_revisions: { logging: 12 },
+      digest: "a".repeat(64),
+      ...overrides,
+    },
+    APPLY_GENERATION_FIELDS,
+    "actions/apply generation",
+  );
+}
+
+function deviceGeneration(overrides) {
+  return pinned(
+    {
+      ...applyGeneration({}),
+      status: "settled",
+      settlement_cohort: 73,
+      created_at: "2026-08-12T09:15:00Z",
+      updated_at: "2026-08-12T09:30:00Z",
+      ...overrides,
+    },
+    DEVICE_GENERATION_FIELDS,
+    "device generation",
+  );
+}
+
+function job(overrides) {
+  return pinned(
+    {
+      id: 501,
+      type: "apply",
+      device_id: 1558,
+      status: "succeeded",
+      result: {},
+      error: null,
+      context: null,
+      created_at: "2026-08-12T09:15:00Z",
+      updated_at: "2026-08-12T09:30:00Z",
+      started_at: "2026-08-12T09:15:02Z",
+      heartbeat_at: null,
+      settle_seq: 4,
+      ...overrides,
+    },
+    JOB_FIELDS,
+    "job",
+  );
+}
+
+const generations = [
+  applyGeneration({}),
+  applyGeneration({ generation_id: 82, seq: 5, job_id: null, mode: "detach", digest: "b".repeat(64) }),
+];
+
+const HEAD = deviceGeneration({});
 
 /* views.NSODeviceJobsView reads list_jobs() before list_device_generations(), so a
  * successor that attaches and settles between the two calls is reported terminal by a jobs
- * page that predates its job. Rows copied from DeviceGenerationOut and JobOut in
- * ../nso-adapter/tests/api/openapi_snapshot.json. */
+ * page that predates its job. */
 const RACED = {
   onboarded: true,
   running: null,
-  last: { id: 501, type: "apply", status: "succeeded" },
-  jobs: [{ id: 501, type: "apply", status: "succeeded", result: {} }],
+  last: job({}),
+  jobs: [job({})],
   generations: [
-    { generation_id: 81, seq: 4, status: "settled", job_id: 501, mode: "networked" },
-    { generation_id: 82, seq: 5, status: "settled", job_id: 502, mode: "detach" },
+    HEAD,
+    deviceGeneration({ generation_id: 82, seq: 5, job_id: 502, mode: "detach", digest: "b".repeat(64) }),
   ],
   blocked_removals: [],
   residue_removals: [],
 };
 
 function withChain(chain) {
-  return [
-    { generation_id: 81, seq: 4, status: "settled", job_id: 501, mode: "networked" },
-    chain,
-  ];
+  return [HEAD, chain];
 }
 
 describe("the device tab's Apply generation-chain poller", () => {
@@ -106,6 +185,13 @@ describe("the device tab's Apply generation-chain poller", () => {
     return refreshed;
   }
 
+  it("refuses a fixture row that drops a contract field", () => {
+    const { digest, ...withoutDigest } = deviceGeneration({});
+
+    expect(digest).toBeTruthy();
+    expect(() => pinned(withoutDigest, DEVICE_GENERATION_FIELDS, "device generation")).toThrow(/digest/);
+  });
+
   it("refreshes the categories when the chain settles without its successor's job details", async () => {
     const refreshed = await runApply(RACED);
 
@@ -116,7 +202,16 @@ describe("the device tab's Apply generation-chain poller", () => {
   it("refreshes the categories when a failed link's job is missing from the jobs page", async () => {
     const refreshed = await runApply({
       ...RACED,
-      generations: withChain({ generation_id: 82, seq: 5, status: "failed", job_id: 502, mode: "detach" }),
+      generations: withChain(
+        deviceGeneration({
+          generation_id: 82,
+          seq: 5,
+          status: "failed",
+          job_id: 502,
+          mode: "detach",
+          digest: "b".repeat(64),
+        }),
+      ),
     });
 
     expect(message()).toContain("failed");
@@ -126,7 +221,16 @@ describe("the device tab's Apply generation-chain poller", () => {
   it("refreshes the categories when an abandoned link carries no job at all", async () => {
     const refreshed = await runApply({
       ...RACED,
-      generations: withChain({ generation_id: 82, seq: 5, status: "abandoned", job_id: null, mode: "detach" }),
+      generations: withChain(
+        deviceGeneration({
+          generation_id: 82,
+          seq: 5,
+          status: "abandoned",
+          job_id: null,
+          mode: "detach",
+          digest: "b".repeat(64),
+        }),
+      ),
     });
 
     expect(message()).toContain("was abandoned");
