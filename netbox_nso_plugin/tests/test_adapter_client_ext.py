@@ -602,6 +602,15 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
         _, kwargs = session.request.call_args
         self.assertEqual(kwargs["json"]["attributes"], attrs)
 
+    def test_the_canonical_bytes_are_what_requests_prepares(self):
+        """Both keys go to ``session.request``; requests must put the canonical ``data`` on the wire."""
+        from netbox_nso_plugin.adapter_client import _attach_serialized_json
+
+        kwargs = {"json": {"b": 1, "a": 2}}
+        _attach_serialized_json(kwargs)
+        prepared = requests.Request("PUT", "https://example.invalid/x", **kwargs).prepare()
+        self.assertEqual(prepared.body, b'{"a": 2, "b": 1}')
+
     def test_static_route_intent_doc_names_the_list_that_clears_the_mirror(self):
         from netbox_nso_plugin.adapter_client import put_static_route_intent
 

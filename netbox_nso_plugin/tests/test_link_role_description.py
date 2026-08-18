@@ -46,6 +46,7 @@ class TestApplyDescriptionForRole(IntentPushResetMixin, TestCase):
         cls.dev_b = Device.objects.create(name="ld-b", device_type=dt, role=cls.drole, site=cls.site)
 
     def setUp(self):
+        super().setUp()
         self.mgmt_a = NSODeviceManagement.objects.create(
             device=self.dev_a, nso_instance=self.inst, nso_device_name="ld-a", adapter_device_id=self.dev_a.pk
         )

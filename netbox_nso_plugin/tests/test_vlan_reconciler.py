@@ -427,7 +427,7 @@ class TestVlanWritePath(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.signals import reset_intent_push_state
 
-        owned = self._state(vid=2213, name="RENAMED", status="accepted", device_name="OLD")
+        self._state(vid=2213, name="RENAMED", status="accepted", device_name="OLD")
         self._state(vid=10, name="MGMT", status="imported")  # not owned → excluded
         reset_intent_push_state()
         with patch("netbox_nso_plugin.adapter_client.put_vlan_intent") as mock_put:
@@ -435,7 +435,6 @@ class TestVlanWritePath(IntentPushResetMixin, TestCase):
         mock_put.assert_called_once()
         vlans = mock_put.call_args[0][1]
         assert vlans == [{"vlan_id": 2213, "name": "RENAMED"}]  # live NetBox name, owned only
-        del owned
 
     def test_accept_marks_owned(self):
         from unittest.mock import patch

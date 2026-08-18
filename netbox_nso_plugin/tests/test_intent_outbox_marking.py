@@ -250,7 +250,8 @@ class TestALateEntryNeverAbandonsTheClaim(_MarkCase):
             config, session = self.adapter.patches()
             with config, session:
                 answer = drain.send_claim(claimed)
-            assert answer not in (drain.ABANDONED, drain.PARKED), "no rule invalidates a late entry"
+            assert answer is not drain._ABANDONED_SEND, "no rule invalidates a late entry"
+            assert answer is not drain._PARKED_SEND, "the device is managed, so nothing parks"
             assert drain.settle(claimed, answer) == drain.SUCCEEDED
 
         assert len(self.sent()) == 1

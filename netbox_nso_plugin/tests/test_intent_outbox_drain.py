@@ -246,6 +246,9 @@ class TestOutOfOrderCommitVisibility(_DrainCase):
 
         writer = threading.Thread(target=late_writer)
         writer.start()
+        # LIFO, so the release fires before the join: a failure below never hangs the suite.
+        self.addCleanup(writer.join, 30)
+        self.addCleanup(release.set)
         assert inserted.wait(timeout=30)
 
         # Two transactions that start later commit first, so their entries take higher ids

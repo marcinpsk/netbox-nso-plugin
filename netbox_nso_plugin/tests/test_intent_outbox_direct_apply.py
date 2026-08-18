@@ -17,33 +17,26 @@ leaves it. Joining them to the protocol properly is §7.1's own card.
 from __future__ import annotations
 
 import contextlib
-import datetime
 from unittest.mock import patch
 
 from dcim.models import Interface
 from django.db import transaction
 from django.test import TransactionTestCase
 
-from ._outbox_case import ReceiptAdapter, enqueue, entries, make_managed, state_of, without_commit_drain
+from ._outbox_case import (
+    ReceiptAdapter,
+    enqueue,
+    entries,
+    expire_claim,
+    make_managed,
+    state_of,
+    without_commit_drain,
+)
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
 class _LostOutcome(Exception):
     """The worker died between the send and the outcome, which is O1.10's crash."""
-
-
-def _expire_any_claim(device, scope) -> bool:
-    """Age whatever lease the key holds, and answer whether it held one at all."""
-    from netbox_nso_plugin import drain
-    from netbox_nso_plugin.models import NSOIntentOutboxState
-
-    state = state_of(device, scope)
-    if state is None or state.claimed_at is None:
-        return False
-    NSOIntentOutboxState.objects.filter(pk=state.pk).update(
-        claimed_at=state.claimed_at - drain.LEASE - datetime.timedelta(seconds=1)
-    )
-    return True
 
 
 class _DirectApplyCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
@@ -84,7 +77,7 @@ class TestADirectApplyIsNeverReplayed(_DirectApplyCase):
             self.drain()
         assert len(self.adapter.applied) == 1, "the body reached the device once"
 
-        assert _expire_any_claim(self.device, "lacp") is False, "a direct-apply key took a lease"
+        assert expire_claim(self.device, "lacp") is False, "a direct-apply key took a lease"
         self.drain()  # the scavenger's turn
         config, session = self.adapter.patches()
         with config, session:

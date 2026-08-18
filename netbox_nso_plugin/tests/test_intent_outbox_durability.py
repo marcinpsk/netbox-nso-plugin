@@ -162,3 +162,26 @@ class TestTransactionIdReuse(_DurabilityCase):
             committed = outbox.current_txid()
 
         assert committed != rolled_back
+
+    def test_a_rolled_back_savepoint_forces_a_fresh_transaction_id_read(self):
+        """Django's savepoint rollback rebinds ``run_on_commit``, which drops the cached id."""
+        from django.db import connection
+
+        from netbox_nso_plugin import outbox
+
+        class _Rollback(Exception):
+            pass
+
+        with transaction.atomic():
+            first = outbox.current_txid()
+            try:
+                with transaction.atomic():
+                    raise _Rollback
+            except _Rollback:
+                pass
+            with CaptureQueriesContext(connection) as queries:
+                second = outbox.current_txid()
+
+        txid_queries = [query for query in queries if "txid_current" in query["sql"]]
+        assert len(txid_queries) == 1, "the rolled-back savepoint's cached id was reused"
+        assert second == first, "one PostgreSQL transaction reported two ids"

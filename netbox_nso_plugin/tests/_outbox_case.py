@@ -105,17 +105,20 @@ def state_of(device, scope):
     return NSOIntentOutboxState.objects.filter(device=device, scope=scope).first()
 
 
-def expire_claim(device, scope):
-    """Age the key's lease past ``LEASE``, which is what a crashed sender leaves behind."""
+def expire_claim(device, scope) -> bool:
+    """Age whatever lease the key holds, and answer whether it held one at all."""
     from datetime import timedelta
 
     from netbox_nso_plugin import drain
     from netbox_nso_plugin.models import NSOIntentOutboxState
 
     state = state_of(device, scope)
+    if state is None or state.claimed_at is None:
+        return False
     NSOIntentOutboxState.objects.filter(pk=state.pk).update(
         claimed_at=state.claimed_at - drain.LEASE - timedelta(seconds=1)
     )
+    return True
 
 
 def enqueue(device, scope, *, transitions=(), delete_origin=False):

@@ -134,7 +134,10 @@ class TestOneClaimerAcrossTwoProcesses(_CascadeFlushMixin, IntentPushResetMixin,
         with tempfile.TemporaryDirectory() as raw:
             work = pathlib.Path(raw)
             holder = self._spawn("holder", work, device.pk)
-            racer = self._spawn("racer", work, device.pk)
+            # The racer's clock starts at the ``claimed`` marker but it cannot claim until the
+            # holder settles, which the parent gates behind a 1s send barrier: 8s is too tight
+            # on a loaded worker.
+            racer = self._spawn("racer", work, device.pk, seconds=30)
             self._await(work / "claimed", holder, racer)
 
             # A second edit that really changes the body, so the racer has an operation of
