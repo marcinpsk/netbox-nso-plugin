@@ -486,6 +486,35 @@ class TestTheDegradationRecordOutlivesEverySuccess(_OutcomeCase):
         ]
         assert state_of(self.device, "static_route").degraded_deletions == []
 
+    def test_a_record_that_reaches_the_alert_count_names_its_key_in_the_log(self):
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        route = own_route(self.mgmt, "198.51.100.208/28", "198.51.100.13")
+        self.adapter._respond = lambda body: partition()
+        assert self.drain() == drain.SUCCEEDED, "the first push is what materializes the state row"
+        self.unown(route)
+        seeded = [
+            {"route_ids": [route_id], "reason": drain.PRE_FENCE_DETACH}
+            for route_id in range(drain.DEGRADED_ALERT_COUNT - 1)
+        ]
+        assert (
+            NSOIntentOutboxState.objects.filter(device=self.device, scope="static_route").update(
+                degraded_deletions=seeded
+            )
+            == 1
+        )
+
+        with as_per_object("static_route"):
+            self.adapter._respond = lambda body: partition(degraded=[route.pk])
+            with self.assertLogs("netbox_nso_plugin.drain", level="WARNING") as logs:
+                assert self.drain() == drain.SUCCEEDED
+
+        assert any(
+            f"{self.device.pk}/static_route holds {drain.DEGRADED_ALERT_COUNT} unacknowledged" in line
+            for line in logs.output
+        ), logs.output
+
     def test_a_push_outcome_never_clears_it(self):
         from netbox_nso_plugin import drain
         from netbox_nso_plugin.models import NSOIntentOutboxState

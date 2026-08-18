@@ -92,6 +92,9 @@ WITHHELD = "withheld"
 LEGACY_MARK_DOWNGRADED = "legacy_mark_downgraded"
 PRE_FENCE_DETACH = "pre_fence_detach"
 
+#: When one key's unacknowledged degradation record is large enough to warn an operator about.
+DEGRADED_ALERT_COUNT = 50
+
 #: What each reason means to an operator, who reads a banner rather than a constant.
 DEGRADED_REASONS = {
     LEGACY_MARK_DOWNGRADED: "sent unmarked: an unmarked contributor folded in with the deletion",
@@ -960,6 +963,13 @@ def settle(claim: Claim, response) -> str:
                 },
             ]
         state.degraded_deletions = [*state.degraded_deletions, *_degradations(state, claim, response, now)]
+        if len(state.degraded_deletions) >= DEGRADED_ALERT_COUNT:
+            logger.warning(
+                "%s/%s holds %s unacknowledged degraded deletions; run nso_acknowledge_degraded_deletions",
+                claim.device_id,
+                claim.scope,
+                len(state.degraded_deletions),
+            )
         if claim.mode == delivery.MODE_BACKFILL_ONLY and state.fence_withheld_since is not None:
             # The one thing that lifts the withholding: the fence is open, so the deletion
             # the key is holding can be re-claimed at a NEW sequence and executed.
