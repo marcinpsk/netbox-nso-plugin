@@ -490,23 +490,15 @@ class _O3CEnvironment:
 
     def stop(self) -> None:
         self.restconf.allow_removal.set()
-        if self.process is not None and self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=20)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=10)
-        if self.log_handle is not None:
-            self.log_handle.close()
-            self.log_handle = None
-        if self.serving:
-            self.restconf_server.shutdown()
-
-        # Independent releases: one that raises must not strand the socket or the temp
-        # directory for every later attempt. The first failure is re-raised at the end.
+        # Independent releases, in order: one that raises must not strand the socket, the
+        # database or the temp directory for every later attempt. `setUpClass` calls this on
+        # the preflight-failure path, where a stuck adapter is exactly what is expected.
+        # The first failure is re-raised at the end.
         failure: BaseException | None = None
         for release in (
+            self._stop_process,
+            self._close_log,
+            self._shutdown_restconf,
             self.restconf_server.server_close,
             self._join_restconf_thread,
             self.drop_database,
@@ -518,6 +510,24 @@ class _O3CEnvironment:
                 failure = failure or exc
         if failure is not None:
             raise failure
+
+    def _stop_process(self) -> None:
+        if self.process is not None and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=10)
+
+    def _close_log(self) -> None:
+        if self.log_handle is not None:
+            self.log_handle.close()
+            self.log_handle = None
+
+    def _shutdown_restconf(self) -> None:
+        if self.serving:
+            self.restconf_server.shutdown()
 
     def _join_restconf_thread(self) -> None:
         if self.restconf_thread.is_alive():
@@ -768,6 +778,46 @@ class TestO3CEnvironmentFailFast(SimpleTestCase):
                 environment.stop()
 
         assert environment.restconf_server.socket.fileno() == -1, "the listening socket leaked"
+        assert not Path(tempdir_name).exists(), "the temp directory leaked"
+
+    @staticmethod
+    def _database_exists(name: str) -> bool:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1 FROM pg_database WHERE datname = %s", [name])
+            return cursor.fetchone() is not None
+
+    def test_stop_releases_every_resource_when_the_process_will_not_die(self):
+        """The three process/log/socket steps sat ABOVE the release loop, so a child that
+        outlives both signals stranded the socket, the store database and the temp directory
+        for every later attempt — on the preflight-failure path, where a stuck adapter is
+        exactly what is expected."""
+
+        class _StuckProcess:
+            """A child that answers neither terminate() nor kill()."""
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                """The signal lands and the child ignores it."""
+
+            def kill(self):
+                """So does this one."""
+
+            def wait(self, timeout=None):
+                raise subprocess.TimeoutExpired(cmd="adapter", timeout=timeout)
+
+        environment = _O3CEnvironment()
+        tempdir_name = environment.tempdir.name
+        environment.reset_database()
+        assert self._database_exists(environment.db_name), "the fixture never created the store"
+        environment.process = _StuckProcess()
+
+        with self.assertRaises(subprocess.TimeoutExpired):
+            environment.stop()
+
+        assert environment.restconf_server.socket.fileno() == -1, "the listening socket leaked"
+        assert not self._database_exists(environment.db_name), "the adapter store database leaked"
         assert not Path(tempdir_name).exists(), "the temp directory leaked"
 
     def test_the_derived_adapter_database_name_fits_postgresql(self):
