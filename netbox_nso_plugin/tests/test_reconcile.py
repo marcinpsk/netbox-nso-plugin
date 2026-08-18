@@ -520,6 +520,97 @@ class TestStepFourWritesUnderTheIntentPushSuppression(_SettlementCase):
         self.assertEqual(stamped, 2, "the first stamp's push-on-save took the rest of Step 4 with it")
 
 
+class _LoggingChainCase(_SettlementCase):
+    """One deploying ``NSOLoggingLevelState`` on a device the adapter double serves.
+
+    Both coarse settlers judge such a row by the last *apply* job's per-scope counters, so
+    a case adds the jobs it wants judged and then runs the real Step 4 over them.
+    """
+
+    tag = "logchain"
+
+    def _device(self, adapter_device_id):
+        from netbox_nso_plugin.models import NSOLoggingLevelState
+
+        device = _make_device(f"{self.tag}{adapter_device_id}")
+        mgmt = _make_mgmt(device, f"{self.tag}{adapter_device_id}", adapter_device_id)
+        # The generation probe must find the device, or the chain read stands the settle down.
+        self.adapter.store.add_device(
+            nso_instance=f"se-{self.tag}{adapter_device_id}-inst",
+            nso_device_name=f"nso-se-{self.tag}{adapter_device_id}",
+            device_id=adapter_device_id,
+        )
+        with transaction.atomic():
+            row = NSOLoggingLevelState.objects.create(management=mgmt, console_severity="", status="deploying")
+        return device, row
+
+    def _reconcile(self, device):
+        from netbox_nso_plugin.reconcile import run_device_reconcile
+
+        with patch("netbox_nso_plugin.reconcile.reconcile_device", return_value={}):
+            run_device_reconcile(device.pk)
+
+
+class TestTheCoarseSettlersWriteThroughACompareAndSet(_LoggingChainCase):
+    """Neither coarse channel may overwrite a row the device proved in its write window.
+
+    Both read the deploying rows and write them back in a second statement, and the
+    value-match settle writes the same rows from another reconcile. A row that reached
+    in_sync in between has device truth behind it; a coarse verdict has a job counter.
+    """
+
+    tag = "coarsecas"
+
+    def _settle_on_load(self, row):
+        """Flip *row* to in_sync the moment a settler SELECTs it, once."""
+        from django.db.models.signals import post_init
+
+        from netbox_nso_plugin.models import NSOLoggingLevelState
+
+        settled = []
+
+        def _settle_after_load(sender, instance, **kwargs):
+            # post_init = the settler has just SELECTed the row; the concurrent verdict
+            # lands before its write. Queryset update: no post_init, hence no recursion.
+            if settled or instance.pk != row.pk:
+                return
+            settled.append(True)
+            NSOLoggingLevelState.objects.filter(pk=instance.pk).update(status="in_sync")
+
+        post_init.connect(_settle_after_load, sender=NSOLoggingLevelState, weak=False)
+        self.addCleanup(post_init.disconnect, _settle_after_load, sender=NSOLoggingLevelState)
+        return settled
+
+    def test_a_failed_apply_scope_does_not_overwrite_a_row_that_settled_in_sync(self):
+        """The per-scope counters say the apply failed, not that THIS row never landed."""
+        device, row = self._device(80)
+        self.adapter.store.terminal_job(
+            80, status="failed", extra={"logging_count_by_outcome": {"in_sync": 0, "apply_failed": 1}}
+        )
+        settled = self._settle_on_load(row)
+
+        self._reconcile(device)
+
+        self.assertEqual(settled, [True])
+        row.refresh_from_db()
+        self.assertEqual(row.status, "in_sync", "the failed scope overwrote a row the device had proved")
+        self.assertEqual(row.last_apply_error, "")
+
+    def test_a_silent_drop_escalation_does_not_overwrite_a_row_that_settled_in_sync(self):
+        """The escalation exists because the row never landed, which this row just disproved."""
+        device, row = self._device(81)
+        # A succeeded apply that carried the scope, finished long before the grace.
+        self.adapter.store.terminal_job(81, extra={"logging_count_by_outcome": {"in_sync": 1, "apply_failed": 0}})
+        settled = self._settle_on_load(row)
+
+        self._reconcile(device)
+
+        self.assertEqual(settled, [True])
+        row.refresh_from_db()
+        self.assertEqual(row.status, "in_sync", "the silent-drop backstop overwrote a row the device had proved")
+        self.assertEqual(row.last_apply_error, "")
+
+
 class TestSettlementAdapterContract(_SettlementCase):
     """The real-socket settlement double rejects unknown adapter devices."""
 
