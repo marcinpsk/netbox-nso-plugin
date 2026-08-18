@@ -2497,10 +2497,30 @@ class ApplyRefused(Exception):
     """A precondition of the Apply is unmet, so no job is triggered and no row is promoted."""
 
 
+class ApplyDeadlineExpired(ApplyRefused):
+    """The preparation budget ran out before every scope was shipped."""
+
+
+class ApplySnmpRefused(ApplyRefused):
+    """The store-only SNMP refresh was refused, so this Apply would commit stale intent."""
+
+
+_APPLY_DEADLINE_MESSAGE = "Apply stopped before submission because the intent preparation deadline expired."
+
+
 def _push_error_message(mgmt, scope) -> str:
     """Read back the cause the claim recorded for *scope*, which the NSO tab also renders."""
     mgmt.refresh_from_db(fields=["intent_push_errors"])
     return (mgmt.intent_push_errors or {}).get(scope, {}).get("message") or "no cause was recorded"
+
+
+def _snmp_refusal_message(mgmt) -> str:
+    """Operator wording for the SNMP-refusal stop, rebuilt from the recorded cause."""
+    return (
+        f"Apply stopped: this device's SNMP intent refresh was refused "
+        f"({_push_error_message(mgmt, 'snmp')}), so applying now would commit the SNMP intent the "
+        "adapter still holds. Nothing was applied and no row was promoted."
+    )
 
 
 def _prepare_apply(mgmt):
@@ -2526,7 +2546,7 @@ def _prepare_apply(mgmt):
     def remaining_budget():
         remaining = prepare_deadline - time.monotonic()
         if remaining <= 0:
-            raise ApplyRefused("Apply stopped before submission because the intent preparation deadline expired.")
+            raise ApplyDeadlineExpired(_APPLY_DEADLINE_MESSAGE)
         return remaining
 
     # Each of these takes its OWN forced claim, so Apply re-ships the operator's intent
@@ -2592,11 +2612,7 @@ def _prepare_apply(mgmt):
         # are exactly what the store-only push exists to avoid ahead of trigger_apply and
         # would 409 this Apply anyway. So the precondition is reported rather than worked
         # around: the tick drains the pending claim and the operator re-applies.
-        raise ApplyRefused(
-            f"Apply stopped: this device's SNMP intent refresh was refused "
-            f"({_push_error_message(mgmt, 'snmp')}), so applying now would commit the SNMP intent the "
-            "adapter still holds. Nothing was applied and no row was promoted."
-        )
+        raise ApplySnmpRefused(_snmp_refusal_message(mgmt))
 
     moved: list[tuple] = []  # (model, [pks]) actually moved, for rollback if the Apply fails
     for model in (
@@ -2711,9 +2727,12 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
             prepared = _prepare_apply(mgmt) if action == "apply" else None
         except ApplyRefused as exc:
             logger.warning("Apply refused for device %s: %s", mgmt.device_id, exc)
+            # CodeQL py/stack-trace-exposure: rebuild the wording from the refusal type, never
+            # from the exception object.
+            msg = _snmp_refusal_message(mgmt) if isinstance(exc, ApplySnmpRefused) else _APPLY_DEADLINE_MESSAGE
             if is_ajax:
-                return JsonResponse({"status": "error", "message": str(exc)}, status=409)
-            messages.error(request, str(exc))
+                return JsonResponse({"status": "error", "message": msg}, status=409)
+            messages.error(request, msg)
             return redirect(_device_nso_tab_url(mgmt.device.pk))
 
         try:

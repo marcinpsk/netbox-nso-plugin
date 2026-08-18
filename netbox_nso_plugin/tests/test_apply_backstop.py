@@ -291,3 +291,103 @@ class TestTheStuckDeployingBackstop(_SettlementCase):
 
         state.refresh_from_db()
         assert state.status == "deploying", "the clock failed a row the running apply is about to settle"
+
+
+# ── CodeQL py/stack-trace-exposure — the refusal wording is rebuilt, never serialized ────
+
+
+class TestApplyRefusalSealing(TestCase):
+    """PR #24 CodeQL alert 18: no exception object may flow into an HTTP response."""
+
+    @classmethod
+    def setUpTestData(cls):
+        from django.contrib.auth import get_user_model
+
+        cls.superuser = get_user_model().objects.create_superuser(
+            username="sealtestnsoadmin", password="seal-test-pass", email="seal@test.example"
+        )
+
+    def setUp(self):
+        super().setUp()
+        self.client.force_login(self.superuser)
+
+    def _mgmt(self, tag, adapter_device_id):
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+        device = _make_device(tag)
+        inst, _ = NSOInstance.objects.get_or_create(name=f"{tag}-inst", defaults={"adapter_instance_id": f"{tag}-inst"})
+        with patch("netbox_nso_plugin.signals._sync_committed_scope_to_adapter"):
+            return NSODeviceManagement.objects.create(
+                device=device,
+                nso_instance=inst,
+                nso_device_name=f"nso-{tag}",
+                adapter_device_id=adapter_device_id,
+            )
+
+    def test_the_refusal_handler_never_serializes_the_exception(self):
+        """The ApplyRefused handler rebuilds its wording; the exception reaches only the log."""
+        import ast
+        import inspect
+
+        from netbox_nso_plugin import views
+
+        handlers = [
+            node
+            for node in ast.walk(ast.parse(inspect.getsource(views)))
+            if isinstance(node, ast.ExceptHandler)
+            and isinstance(node.type, ast.Name)
+            and node.type.id == "ApplyRefused"
+        ]
+        assert handlers, "the apply action lost its ApplyRefused handler"
+        for handler in handlers:
+            for call in (node for node in ast.walk(handler) if isinstance(node, ast.Call)):
+                target = ast.unparse(call.func)
+                if target in {"JsonResponse", "messages.error", "messages.warning", "messages.success"}:
+                    names = {n.id for n in ast.walk(call) if isinstance(n, ast.Name)}
+                    assert handler.name not in names, (
+                        f"{target} in the ApplyRefused handler uses the bound exception; "
+                        "rebuild the message from the refusal type instead"
+                    )
+
+    def test_a_refused_snmp_refresh_answers_the_rebuilt_wording(self):
+        """End to end: POST → view → 409 whose body carries the recorded cause, not str(exc)."""
+        from django.urls import reverse
+
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.views import _snmp_refusal_message
+
+        mgmt = self._mgmt("seal-snmp", 97)
+        NSODeviceManagement.objects.filter(pk=mgmt.pk).update(
+            intent_push_errors={"snmp": {"message": "the store refused the shrink"}}
+        )
+        for name, answer in (("push_now", {"count": 0}), ("drain_key", drain.REFUSED)):
+            patcher = patch(f"netbox_nso_plugin.drain.{name}", side_effect=lambda *a, answer=answer, **kw: answer)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[mgmt.pk, "apply"])
+        response = self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+
+        assert response.status_code == 409
+        mgmt.refresh_from_db()
+        assert response.json()["message"] == _snmp_refusal_message(mgmt)
+        assert "the store refused the shrink" in response.json()["message"]
+
+    def test_an_expired_budget_answers_the_deadline_wording(self):
+        """End to end: the deadline refusal serves its fixed wording with a 409."""
+        from itertools import chain, repeat
+
+        from django.urls import reverse
+
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.views import _APPLY_DEADLINE_MESSAGE
+
+        mgmt = self._mgmt("seal-deadline", 98)
+        spent = drain.SEND_DEADLINE.total_seconds() + 1
+        with patch("time.monotonic", side_effect=chain([0, spent], repeat(spent))):
+            url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[mgmt.pk, "apply"])
+            response = self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+
+        assert response.status_code == 409
+        assert response.json()["message"] == _APPLY_DEADLINE_MESSAGE
