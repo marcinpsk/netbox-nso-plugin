@@ -327,6 +327,7 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
         reset_intent_push_state()
         with patch("netbox_nso_plugin.adapter_client.put_bfd_intent") as mock_put:
             deliver("bfd", self.device.pk, 88)
+        mock_put.assert_called_once()
         ifaces = mock_put.call_args[0][1]
         assert [i["interface_name"] for i in ifaces] == ["Port-channel1"]
         assert ifaces[0]["min_tx"] == 300 and ifaces[0]["multiplier"] == 3 and ifaces[0]["micro_bfd"] is True

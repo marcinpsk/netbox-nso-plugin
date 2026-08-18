@@ -16,7 +16,6 @@ leaves it. Joining them to the protocol properly is §7.1's own card.
 
 from __future__ import annotations
 
-import contextlib
 from unittest.mock import patch
 
 from dcim.models import Interface
@@ -70,11 +69,20 @@ class TestADirectApplyIsNeverReplayed(_DirectApplyCase):
     adapter_device_id = 7801
 
     def test_a_lost_outcome_never_applies_the_key_a_second_time(self):
-        from netbox_nso_plugin import drain
+        from netbox_nso_plugin import delivery, drain
 
         enqueue(self.device, "lacp")
-        with contextlib.suppress(_LostOutcome), patch.object(drain, "settle", side_effect=_LostOutcome):
-            self.drain()
+        real_send = delivery.send
+
+        def lose_the_outcome(*args, **kwargs):
+            """The body reaches the device, and nothing records that it did."""
+            real_send(*args, **kwargs)
+            raise _LostOutcome
+
+        # Not `settle`: this path returns its own outcome and never calls it (drain.py
+        # `_deliver_direct`), so patching `settle` here would fire nothing at all.
+        with patch.object(delivery, "send", side_effect=lose_the_outcome):
+            assert self.drain() == drain.FAILED
         assert len(self.adapter.applied) == 1, "the body reached the device once"
 
         assert expire_claim(self.device, "lacp") is False, "a direct-apply key took a lease"

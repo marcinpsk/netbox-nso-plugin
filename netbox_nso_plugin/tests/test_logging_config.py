@@ -7,6 +7,8 @@ from unittest.mock import patch
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Platform, Site
 from django.test import TestCase
 
+from .mixins import IntentPushResetMixin
+
 
 def _make_device(suffix="log"):
     mfg, _ = Manufacturer.objects.get_or_create(name=f"LogMfg{suffix}", slug=f"logmfg{suffix}")
@@ -16,7 +18,7 @@ def _make_device(suffix="log"):
     return Device.objects.create(name=f"log-rtr-{suffix}", device_type=dt, role=role, site=site)
 
 
-class TestReconcileLoggingConfig(TestCase):
+class TestReconcileLoggingConfig(IntentPushResetMixin, TestCase):
     @classmethod
     def setUpTestData(cls):
         cls.device = _make_device("main")

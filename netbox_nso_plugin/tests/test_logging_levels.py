@@ -11,6 +11,7 @@ stale-intent leak), Accept (with the all-blank blocker), the NEW Un-accept flow
 category/summary wiring.
 """
 
+from contextlib import ExitStack
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
@@ -36,6 +37,23 @@ _ADAPTER_CFG = {
 }
 
 _LEVELS_PAYLOAD = {"console_severity": "CRITICAL", "monitor_severity": "NOTICE", "module_severity": "NOTICE"}
+
+#: Every transport an Apply's forced claims reach bar the logging one. A forced claim is
+#: never dropped as unchanged, so without these the other twelve scopes leave the process.
+_OTHER_APPLY_TRANSPORTS = (
+    "apply_lag_config",
+    "apply_switchport_config",
+    "put_bfd_intent",
+    "put_intent",
+    "put_interface_mtu_intent",
+    "put_l2_sap_intent",
+    "put_route_policy_intent",
+    "put_snmp_intent",
+    "put_static_route_intent",
+    "put_subinterface_intent",
+    "put_svi_intent",
+    "put_vlan_intent",
+)
 
 
 def _make_device(suffix):
@@ -558,7 +576,12 @@ class TestLoggingLevelsApplyPush(_CascadeFlushMixin, IntentPushResetMixin, Trans
             drain.drain_key(self.device.pk, "logging")
         unforced.assert_not_called()
 
-        with patch("netbox_nso_plugin.adapter_client.put_logging_intent", return_value={}) as mock_put:
+        with ExitStack() as stack:
+            for name in _OTHER_APPLY_TRANSPORTS:
+                stack.enter_context(patch(f"netbox_nso_plugin.adapter_client.{name}"))
+            mock_put = stack.enter_context(
+                patch("netbox_nso_plugin.adapter_client.put_logging_intent", return_value={})
+            )
             moved = _prepare_apply(self.mgmt)
 
         mock_put.assert_called_once()

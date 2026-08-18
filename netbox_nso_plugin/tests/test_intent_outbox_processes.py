@@ -113,7 +113,7 @@ class TestOneClaimerAcrossTwoProcesses(_CascadeFlushMixin, IntentPushResetMixin,
         env["DB_NAME"] = connection.settings_dict["NAME"]
         env["DJANGO_SETTINGS_MODULE"] = "netbox.settings"
         env.update({"O1_ROLE": role, "O1_DIR": str(work), "O1_DEVICE": str(device_id), "O1_SECONDS": str(seconds)})
-        return subprocess.Popen(  # noqa: S603 — a fixed argv, no shell
+        process = subprocess.Popen(  # noqa: S603 — a fixed argv, no shell
             [sys.executable, "manage.py", "shell", "-c", _SCRIPT],
             cwd=_manage_py_dir(),
             env=env,
@@ -121,6 +121,11 @@ class TestOneClaimerAcrossTwoProcesses(_CascadeFlushMixin, IntentPushResetMixin,
             stderr=subprocess.PIPE,
             text=True,
         )
+        # Cleanups run LIFO, so the kill goes on last and runs first. A child left alive
+        # holds a connection to the test database and the flush blocks on it.
+        self.addCleanup(process.wait, 30)
+        self.addCleanup(process.kill)
+        return process
 
     def test_two_processes_yield_one_claimer_and_increasing_sequences(self):
         from netbox_nso_plugin.models import AdapterConnection

@@ -1066,8 +1066,14 @@ class TestARestoreRebaseClearsTheAdaptersWatermark(_OutcomeCase):
         # The world the restored database never saw: the same key, pushing on.
         assert drain.settle(claimed, {"count": 1}) == drain.SUCCEEDED
         far_side_watermark = held + PUSH_SEQ_ADVANCE_BATCH + 1
-        while advance_push_seq(far_side_watermark) < far_side_watermark:
-            pass
+        # Bounded: the gap is one batch plus one, so two calls suffice. A stalled advance must
+        # name itself here rather than spin to the CI job timeout.
+        reached = 0
+        for _ in range(10):
+            reached = advance_push_seq(far_side_watermark)
+            if reached >= far_side_watermark:
+                break
+        assert reached >= far_side_watermark, f"the sequence advance stalled at {reached}"
         self._rename(overlay, "cl-rebase-later")
         assert self.drain("vlan") == drain.SUCCEEDED
         accepted = self.adapter.sequences[-1]

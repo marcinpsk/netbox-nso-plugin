@@ -162,11 +162,15 @@ class TestApplyPromotion(TestCase):
         assert all(later < earlier for earlier, later in zip(deadlines, deadlines[1:]))
 
     def test_apply_stops_before_the_first_send_when_its_total_budget_is_spent(self):
+        from netbox_nso_plugin import drain
         from netbox_nso_plugin.views import ApplyRefused, _prepare_apply
 
         mgmt, state, other = self._setup()
+        # Derived, so raising the deadline cannot turn this into a StopIteration from the
+        # per-scope loop instead of the refusal it pins.
+        spent = drain.SEND_DEADLINE.total_seconds() + 1
         with (
-            patch("time.monotonic", side_effect=[0, 121]),
+            patch("time.monotonic", side_effect=[0, spent]),
             patch("netbox_nso_plugin.drain.push_now") as push,
             self.assertRaisesRegex(ApplyRefused, "preparation deadline"),
         ):

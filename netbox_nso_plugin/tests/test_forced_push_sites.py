@@ -112,7 +112,7 @@ class TestForcedPushSitesAreEnumerated(SimpleTestCase):
         """The named trap: a wrapped call is invisible to a grep and plain to the compiler.
 
         Asserted against a source string rather than against the tree, because how many of
-        the six the formatter happens to fit on one line is not the property under test.
+        them the formatter happens to fit on one line is not the property under test.
         """
         source = (
             "def wrapped():\n"
@@ -151,7 +151,7 @@ class TestAForcedCallInsideATransactionRaises(_CascadeFlushMixin, IntentPushRese
             drain.drain_key(self.device.pk, "vlan", force=True)
 
     def test_the_forced_sites_own_entry_point_raises_too(self):
-        """``push_now`` is what the six sites call, so it is what the pin must refuse."""
+        """``push_now`` is the other forced entry point, so it is what the pin must refuse too."""
         from netbox_nso_plugin import drain
 
         with transaction.atomic(), self.assertRaises(RuntimeError):
