@@ -20,7 +20,7 @@ import threading
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
-from django.db import connections
+from django.db import connections, transaction
 from django.test import SimpleTestCase, TransactionTestCase
 
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
@@ -56,10 +56,11 @@ class _ClobberBarrierCase(IntentPushResetMixin, _CascadeFlushMixin, TransactionT
                 nso_device_name="nso-clob",
                 adapter_device_id=77,
             )
-        self.route = StaticRoute.objects.create(prefix=PREFIX, next_hop=NEXT_HOP, metric=1)
+        with transaction.atomic():
+            self.route = StaticRoute.objects.create(prefix=PREFIX, next_hop=NEXT_HOP, metric=1)
         with suppress_intent_push():
             self.route.devices.add(self.device)
-        with patch(PUT):
+        with patch(PUT), transaction.atomic():
             self.state = NSOStaticRouteState.objects.create(
                 management=self.mgmt,
                 static_route=self.route,

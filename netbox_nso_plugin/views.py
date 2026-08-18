@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 import logging
+import time
 
 from dcim.models import Device
 from django.contrib import messages
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.core.exceptions import PermissionDenied
+from django.db import transaction
 from django.http import HttpResponseBadRequest, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
@@ -77,7 +79,7 @@ from .models import (
     NSOVaultSettings,
     NSOVLANState,
 )
-from .signals import _STATIC_ROUTE_ARMED_FIELDS
+from .signals import _STATIC_ROUTE_ARMED_FIELDS, _schedule_intent_push
 from .tables import (
     NSODerivedIntentTemplateTable,
     NSODeviceManagementTable,
@@ -270,12 +272,24 @@ class DeviceNSOTabView(generic.ObjectView):
                             "gaps": gaps,
                         }
 
+        from .drain import degraded_deletions
+
+        try:
+            deletion_records = degraded_deletions(device.pk)
+        except Exception:  # noqa: BLE001 (optional tab data must not break the render)
+            logger.debug("Degraded deletion read failed for device %s", device.pk, exc_info=True)
+            deletion_records = []
+
         return {
             "mgmt": mgmt,
             "nso_categories": category_summaries(device, mgmt),
             "adapter_error": adapter_error,
             "adapter_error_code": adapter_error_code,
             "intent_drift": intent_drift,
+            # §4.3(c): a deletion that left the device configured. Durable, adapter-free and
+            # cleared by the acknowledgement command alone, so it renders on every tab load
+            # until an operator answers for it.
+            "degraded_deletions": deletion_records,
             "failover": failover,
             "device_capability": device_capability,
             # READSEM S4 (D8/D10): honored by EVERY render path — including the
@@ -2479,6 +2493,16 @@ _ACTION_LABELS = {
 }
 
 
+class ApplyRefused(Exception):
+    """A precondition of the Apply is unmet, so no job is triggered and no row is promoted."""
+
+
+def _push_error_message(mgmt, scope) -> str:
+    """Read back the cause the claim recorded for *scope*, which the NSO tab also renders."""
+    mgmt.refresh_from_db(fields=["intent_push_errors"])
+    return (mgmt.intent_push_errors or {}).get(scope, {}).get("message") or "no cause was recorded"
+
+
 def _prepare_apply(mgmt):
     """Pre-Apply bookkeeping for one device's single Apply.
 
@@ -2490,78 +2514,89 @@ def _prepare_apply(mgmt):
 
     Returns the rows moved to 'deploying' as ``[(model, [pks]), …]`` so the caller can
     roll them back via :func:`_rollback_prepare_apply` if the Apply fails to enqueue a job.
+    Raises :class:`ApplyRefused` when the SNMP refresh below is not acknowledged: that runs
+    before any promotion, so an abort there leaves nothing to roll back.
     """
-    from .signals import (
-        _push_bfd_intent_for_device,
-        _push_interface_intent_for_device,
-        _push_interface_mtu_intent_for_device,
-        _push_l2_sap_intent_for_device,
-        _push_lacp_intent_for_device,
-        _push_logging_intent_for_device,
-        _push_route_policy_intent_for_device,
-        _push_snmp_intent_for_device,
-        _push_static_route_intent_for_device,
-        _push_subinterface_intent_for_device,
-        _push_svi_intent_for_device,
-        _push_switchport_intent_for_device,
-        _push_vlan_intent_for_device,
-        stored_static_route_count,
-    )
+    from . import drain
+    from .delivery import MODE_STORE_ONLY
+    from .signals import stored_static_route_count
 
-    # Force-push (bypass change-detection) the owned snapshots so Apply re-ships the
-    # operator's intent even when the adapter's stored intent went stale:
+    prepare_deadline = time.monotonic() + drain.SEND_DEADLINE.total_seconds()
+
+    def remaining_budget():
+        remaining = prepare_deadline - time.monotonic()
+        if remaining <= 0:
+            raise ApplyRefused("Apply stopped before submission because the intent preparation deadline expired.")
+        return remaining
+
+    # Each of these takes its OWN forced claim, so Apply re-ships the operator's intent
+    # whatever the acknowledged baseline says and whatever a queued claim was carrying:
     #   - LACP / switchport: owned in NetBox, never mirrored as adapter intent.
     #   - VLAN: the name lives on ipam.VLAN; renaming it fires no plugin signal, so a
     #     post-accept rename would otherwise be stranded in NetBox (the row stays
     #     'in_sync' and the stale old name is what gets applied).
     #   - interface description/enabled: an owned attribute (status in OWNED_STATES)
-    #     whose adapter intent went stale is force-pushed so Apply actually re-applies
-    #     it. Ownership is status-based and kept durable by the reconciler's owned-guard,
+    #     whose adapter intent went stale is re-sent so Apply actually re-applies it.
+    #     Ownership is status-based and kept durable by the reconciler's owned-guard,
     #     so this no longer re-pushes a row that genuinely drifted back to 'imported'.
     #   - route-policy / SVI / subinterface / BFD / MTU: mirrored as adapter intent (reactive
     #     push on accept/edit), but that mirror can go stale/empty (a failed push, an
     #     out-of-band adapter reset). These are all marked accepted->deploying below, so
-    #     force-push the owned snapshot too — otherwise Apply applies nothing and the row
+    #     re-send the owned snapshot too — otherwise Apply applies nothing and the row
     #     sticks 'deploying' forever (observed on rg03 for route-policy: an owned as-path
     #     with no adapter intent row; SVI/subinterface/BFD/MTU share the same failure mode).
     #   - SNMP: mirrored reactively on accept and a failed push is swallowed, so the adapter
     #     mirror can be stale or absent. Refreshed store-only below — the Apply commits it.
     static_route_stored = False
-    for push in (
-        _push_interface_intent_for_device,
-        _push_lacp_intent_for_device,
-        _push_logging_intent_for_device,
-        _push_route_policy_intent_for_device,
-        _push_static_route_intent_for_device,
-        _push_svi_intent_for_device,
-        _push_subinterface_intent_for_device,
-        _push_bfd_intent_for_device,
-        _push_interface_mtu_intent_for_device,
-        _push_l2_sap_intent_for_device,
-        _push_switchport_intent_for_device,
-        _push_vlan_intent_for_device,
+    for scope in (
+        "interface",
+        "lacp",
+        "logging",
+        "route_policy",
+        "static_route",
+        "svi",
+        "subinterface",
+        "bfd",
+        "interface_mtu",
+        "l2_sap",
+        "switchport",
+        "vlan",
     ):
+        deadline = remaining_budget()
         try:
-            response = push(mgmt.device_id, mgmt.adapter_device_id, force=True)
+            response = drain.push_now(mgmt.device_id, scope, force=True, deadline=deadline)
         except Exception as exc:  # noqa: BLE001 — one scope's failure must not block the rest
             logger.warning("Apply push failed for device %s: %s", mgmt.device_id, exc)
             response = None
-        if push is _push_static_route_intent_for_device:
-            # A forced push is only skipped on a real rejection (change-detection is
-            # bypassed), and a static route settles on a generation the adapter has to be
-            # holding. Promoting on a push the adapter refused would create a 'deploying'
-            # row no result can ever name — stuck until the backstop calls it failed.
+        if scope == "static_route":
+            # A forced claim is dropped only on a real rejection, and a static route settles
+            # on a generation the adapter has to be holding. Promoting on a push the adapter
+            # refused would create a 'deploying' row no result can ever name — stuck until
+            # the backstop calls it failed.
             static_route_stored = stored_static_route_count(response) is not None
 
     # Store-only: a plain put_snmp_intent enqueues the shrink-removal (and auto-apply) job,
     # which would 409 the trigger_apply this runs just ahead of.
+    # The OUTCOME, not the answer: a refusal is a proven precondition failure, where a
+    # transport failure leaves the Apply to fail at the trigger as it always has.
+    deadline = remaining_budget()
     try:
-        from . import adapter_client as client
-
-        with client.store_only_pushes():
-            _push_snmp_intent_for_device(mgmt.device_id, mgmt.adapter_device_id, force=True)
-    except Exception as exc:  # noqa: BLE001 — one scope's failure must not block the rest
+        outcome = drain.drain_key(mgmt.device_id, "snmp", mode=MODE_STORE_ONLY, force=True, deadline=deadline)
+    except Exception as exc:  # noqa: BLE001 (one scope's failure must not block the rest)
         logger.warning("Apply push failed for device %s: %s", mgmt.device_id, exc)
+        outcome = None
+    if outcome == drain.REFUSED:
+        # A store-only claim may not carry deletion authority (§4.3(d)), so the adapter still
+        # holds the SNMP intent the operator deleted and this Apply would commit it.
+        # Delivering that authority takes a NORMAL claim, whose removal and auto-apply jobs
+        # are exactly what the store-only push exists to avoid ahead of trigger_apply and
+        # would 409 this Apply anyway. So the precondition is reported rather than worked
+        # around: the tick drains the pending claim and the operator re-applies.
+        raise ApplyRefused(
+            f"Apply stopped: this device's SNMP intent refresh was refused "
+            f"({_push_error_message(mgmt, 'snmp')}), so applying now would commit the SNMP intent the "
+            "adapter still holds. Nothing was applied and no row was promoted."
+        )
 
     moved: list[tuple] = []  # (model, [pks]) actually moved, for rollback if the Apply fails
     for model in (
@@ -2610,6 +2645,35 @@ def _rollback_prepare_apply(moved) -> None:
 class NSODeviceActionView(NSOActionPermissionMixin, View):
     """Trigger an adapter action (sync / detect-drift / connect) via POST."""
 
+    def _incumbent_job(self, request, mgmt, exc, *, is_ajax):
+        """Report a 409 under the name of the job that HOLDS the device (S5a C, codex R1-F7).
+
+        Without the incumbent's type the UI polls the running job under the CLICKED action's
+        label ("Sync from NSO running…" while an Apply runs). Best-effort: a failed lookup
+        degrades to the generic wording rather than losing the conflict.
+        """
+        from . import adapter_client as client
+
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        job_id = detail.get("job_id")
+        incumbent_type = None
+        if job_id:
+            try:
+                incumbent_type = (client.get_job(job_id) or {}).get("type")
+            except AdapterError:
+                incumbent_type = None
+        if is_ajax:
+            return JsonResponse({"status": "conflict", "job_id": job_id, "job_type": incumbent_type})
+        msg = (
+            f"Another job is already running: {incumbent_type}."
+            if incumbent_type
+            else "A job is already running for this device."
+        )
+        if job_id:
+            msg += f" (Job ID: {job_id})"
+        messages.warning(request, msg)
+        return redirect(_device_nso_tab_url(mgmt.device.pk))
+
     def post(self, request, pk, action):
         """Fire the requested action against the nso-adapter and redirect back."""
         from . import adapter_client as client
@@ -2643,7 +2707,14 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
         # scopes (attrs/IP/SNMP/routing/L2), and here we force-commit the LACP +
         # switchport snapshots, which are owned in NetBox rather than mirrored in the
         # adapter. Accept itself only marks rows owned (no immediate device write).
-        prepared = _prepare_apply(mgmt) if action == "apply" else None
+        try:
+            prepared = _prepare_apply(mgmt) if action == "apply" else None
+        except ApplyRefused as exc:
+            logger.warning("Apply refused for device %s: %s", mgmt.device_id, exc)
+            if is_ajax:
+                return JsonResponse({"status": "error", "message": str(exc)}, status=409)
+            messages.error(request, str(exc))
+            return redirect(_device_nso_tab_url(mgmt.device.pk))
 
         try:
             result = action_fn(mgmt.adapter_device_id)
@@ -2661,27 +2732,7 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
             if prepared:
                 _rollback_prepare_apply(prepared)
             if exc.code == "conflict":
-                job_id = (exc.detail or {}).get("job_id")
-                # S5a C (codex R1-F7): name the INCUMBENT job — without it the UI polls the
-                # running job under the CLICKED action's label ("Sync from NSO running…"
-                # while an Apply runs). Best-effort: a failed lookup degrades to generic.
-                incumbent_type = None
-                if job_id:
-                    try:
-                        incumbent_type = (client.get_job(job_id) or {}).get("type")
-                    except AdapterError:
-                        incumbent_type = None
-                if is_ajax:
-                    return JsonResponse({"status": "conflict", "job_id": job_id, "job_type": incumbent_type})
-                msg = (
-                    f"Another job is already running: {incumbent_type}."
-                    if incumbent_type
-                    else "A job is already running for this device."
-                )
-                if job_id:
-                    msg += f" (Job ID: {job_id})"
-                messages.warning(request, msg)
-                return redirect(_device_nso_tab_url(mgmt.device.pk))
+                return self._incumbent_job(request, mgmt, exc, is_ajax=is_ajax)
             if is_ajax:
                 return JsonResponse({"status": "error", "message": str(exc)}, status=502)
             messages.error(request, f"Adapter error triggering {label}: {exc}")
@@ -2705,10 +2756,18 @@ class NSOIntentResyncView(NSOActionPermissionMixin, View):
             messages.warning(request, "Device is not yet onboarded to the adapter.")
             return redirect(_device_nso_tab_url(mgmt.device.pk))
         try:
-            done = resync_intent(mgmt.device, mgmt)
+            done, failed = resync_intent(mgmt.device, mgmt)
             if done:
                 messages.success(request, f"Re-synced adapter intent — cleared orphaned: {', '.join(done)}.")
-            else:
+            if failed:
+                # A refused or unanswered push cleared nothing, so it is reported as the
+                # failure it is; the NSO tab renders the per-scope cause the claim recorded.
+                messages.error(
+                    request,
+                    f"The adapter did not acknowledge: {', '.join(failed)}. That intent is still "
+                    "orphaned. See the per-scope push error on this tab, then retry.",
+                )
+            if not done and not failed:
                 messages.info(request, "No orphaned adapter intent to clear.")
         except Exception as exc:  # noqa: BLE001
             logger.warning("Intent re-sync failed for device %s: %s", mgmt.device_id, exc)
@@ -2971,6 +3030,8 @@ def _residue_matchers():
         ),
         # #104 phase-3: interface_config residue is VALUE-grain — the adapter reports
         # the removed (interface, address, vrf) triples that survived the retraction.
+        # The key is the ADAPTER's removal scope (VALID_REMOVAL_SCOPES), not the plugin's
+        # outbound delivery key "ip"; card #1591 owns unifying the two vocabularies.
         "interface_ips": (
             "interface_config",
             [("interface_ips", "address", lambda r: (r.interface.name, r.address, r.vrf or ""))],
@@ -3186,14 +3247,13 @@ class NSOInterfaceStateDeleteView(generic.ObjectDeleteView):
 
 
 def _push_intent_for_device(device_id: int) -> None:
-    """Push the full OWNED interface intent snapshot for a device to the adapter.
+    """Record the device's interface intent in the outbox, which drains it once.
 
-    Delegates to the single shared builder in ``signals`` so the view-level bulk
-    accept, the accept signal, and the Decision-G edit signal all push the same
-    snapshot and share the change-detection cache.
+    Appends rather than pushes (#1503 Appendix O): every in-protocol send is a claimed,
+    sequenced logical operation, so the view-level bulk accept goes through the same outbox
+    as the accept signal and the Decision-G edit signal rather than calling the builder
+    around it. The caller must hold a writer transaction, as ``NSOBulkAcceptView.post`` does.
     """
-    from .signals import _push_interface_intent_for_device
-
     try:
         mgmt = NSODeviceManagement.objects.select_related("nso_instance").get(device_id=device_id)
     except NSODeviceManagement.DoesNotExist:
@@ -3203,7 +3263,7 @@ def _push_intent_for_device(device_id: int) -> None:
     if mgmt.adapter_device_id is None:
         return
 
-    _push_interface_intent_for_device(device_id, mgmt.adapter_device_id)
+    _schedule_intent_push((device_id, "interface"))
 
 
 # Statuses where the NetBox value already matches the device — accepting them
@@ -3234,7 +3294,8 @@ class NSOAcceptAttributeView(NSOActionPermissionMixin, View):
         state = get_object_or_404(NSOInterfaceState, pk=pk)
         state.status = _status_after_accept(state.status)
         state.accepted_at = timezone.now()
-        state.save(update_fields=["status", "accepted_at"])
+        with transaction.atomic():
+            state.save(update_fields=["status", "accepted_at"])
 
         msg = f"Accepted {state.attribute} on {state.interface}."
         if request.headers.get("X-Requested-With") == "XMLHttpRequest":
@@ -3303,7 +3364,8 @@ class NSOInterfaceEditFieldView(NSOActionPermissionMixin, View):
             iface.description = raw.strip()
         else:  # enabled
             iface.enabled = raw.strip().lower() in self._TRUE
-        iface.save(update_fields=[attribute])
+        with transaction.atomic():
+            iface.save(update_fields=[attribute])
 
         return JsonResponse({"status": "ok", "message": f"Updated {attribute} on {iface.name}."})
 
@@ -3840,7 +3902,7 @@ def _route_map_dependent_pushes(route_map, old_name):
             | Q(bgp_peer__address_families__routemap_out=route_map),
             status__in=owned,
             management__adapter_device_id__isnull=False,
-        ).values_list("management__device_id", "management__adapter_device_id")
+        ).values_list("management__device_id", flat=True)
     )
 
     redistribution = NSORedistributionState.objects.filter(
@@ -3849,7 +3911,7 @@ def _route_map_dependent_pushes(route_map, old_name):
     )
     redistribution_targets = set(
         redistribution.filter(management__adapter_device_id__isnull=False).values_list(
-            "management__device_id", "management__adapter_device_id", "dest_protocol"
+            "management__device_id", "dest_protocol"
         )
     )
     redistribution.filter(redistribution__isnull=True, route_map__iexact=old_name).update(route_map=route_map.name)
@@ -3885,17 +3947,12 @@ def _save_route_map_name_edit(state, old_name):
         route_map.name = new_name
         route_map.save(update_fields=["name"])
         bgp_targets, redistribution_targets = _route_map_dependent_pushes(route_map, old_name)
-
-        def push_dependents():
-            for device_id, adapter_device_id in bgp_targets:
-                signals._schedule_intent_push(
-                    (device_id, "bgp"),
-                    lambda d=device_id, a=adapter_device_id: signals._push_bgp_intent_for_device(d, a),
-                )
-            for device_id, adapter_device_id, dest_protocol in redistribution_targets:
-                signals._schedule_redistribution_push(device_id, adapter_device_id, dest_protocol)
-
-        transaction.on_commit(push_dependents)
+        # Appended here, not on commit: the entry belongs to the transaction that renamed
+        # the map, and the drain it schedules still runs after that transaction commits.
+        for device_id in bgp_targets:
+            signals._schedule_intent_push((device_id, "bgp"))
+        for device_id, dest_protocol in redistribution_targets:
+            signals._schedule_redistribution_push(device_id, dest_protocol)
 
 
 def _save_lacp_edit(obj, key):
@@ -4187,15 +4244,18 @@ class NSOBulkAcceptView(NSOActionPermissionMixin, View):
         device = get_object_or_404(Device, pk=device_pk)  # 404 a bad pk BEFORE mutating anything
         now = timezone.now()
         base = NSOInterfaceState.objects.filter(interface__device_id=device_pk)
-        settled = base.filter(status="imported").update(status="in_sync", accepted_at=now)
-        pending = base.filter(status="changed").update(status="accepted", accepted_at=now)
-        updated = settled + pending
+        # One transaction for the ownership and the entry that records it: appended after
+        # the commit, the entry could be lost while the rows read as owned.
+        with transaction.atomic():
+            settled = base.filter(status="imported").update(status="in_sync", accepted_at=now)
+            pending = base.filter(status="changed").update(status="accepted", accepted_at=now)
+            updated = settled + pending
 
-        # Push whenever anything became owned — the snapshot is by status (OWNED_STATES),
-        # and matching rows settle to in_sync (an owned status), so even owned-but-matching
-        # rows are recorded in the adapter to persist ownership.
-        if updated:
-            _push_intent_for_device(device_pk)
+            # Push whenever anything became owned — the snapshot is by status (OWNED_STATES),
+            # and matching rows settle to in_sync (an owned status), so even owned-but-matching
+            # rows are recorded in the adapter to persist ownership.
+            if updated:
+                _push_intent_for_device(device_pk)
         if updated:
             messages.success(request, f"Accepted {updated} interface attribute(s).")
         else:
@@ -4628,7 +4688,9 @@ class RoutingStateAcceptMixin(NSOActionPermissionMixin, View):
         if state.accepted_at is None:
             state.accepted_at = timezone.now()
         self._arm_accept(state)
-        state.save(update_fields=["status", "accepted_at", *self.accept_extra_fields])
+        # One transaction, so the row and the outbox entry it schedules commit together.
+        with transaction.atomic():
+            state.save(update_fields=["status", "accepted_at", *self.accept_extra_fields])
         messages.success(request, f"Accepted routing state {state.pk}.")
         return redirect(_device_nso_tab_url(state.management.device_id))
 
@@ -4652,7 +4714,8 @@ class NSOL2SapStateAcceptView(NSOActionPermissionMixin, View):
         state.status = _status_after_accept(state.status)
         if state.accepted_at is None:
             state.accepted_at = timezone.now()
-        state.save(update_fields=["status", "accepted_at"])
+        with transaction.atomic():
+            state.save(update_fields=["status", "accepted_at"])
         messages.success(request, f"Accepted L2 SAP {state.service_name}:{state.sap_id}.")
         return redirect(_device_nso_tab_url(state.management.device_id))
 
@@ -4881,7 +4944,7 @@ class NSOInterfaceIPStateEditView(NSOActionPermissionMixin, View):
         from django.db import IntegrityError, transaction
 
         from .models import NSODeviceManagement, NSOInterfaceIPState
-        from .signals import _push_ip_intent_for_device, _schedule_intent_push, suppress_intent_push
+        from .signals import _schedule_intent_push, suppress_intent_push
 
         state = get_object_or_404(
             NSOInterfaceIPState.objects.select_related("interface", "interface__device"),
@@ -4931,13 +4994,7 @@ class NSOInterfaceIPStateEditView(NSOActionPermissionMixin, View):
                     adapter_device_id__isnull=False,
                 ):
                     device_id = mgmt.device_id
-                    adapter_device_id = mgmt.adapter_device_id
-                    _schedule_intent_push(
-                        (device_id, "ip"),
-                        lambda device_id=device_id, adapter_device_id=adapter_device_id: _push_ip_intent_for_device(
-                            device_id, adapter_device_id
-                        ),
-                    )
+                    _schedule_intent_push((device_id, "ip"))
         except (ValidationError, IntegrityError) as exc:
             messages_list = getattr(exc, "messages", None) or ["The address conflicts with an existing object."]
             return JsonResponse(
@@ -5329,7 +5386,13 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
     model_class = None
 
     def _push(self, mgmt):
-        """Trigger the appropriate intent push; override in subclasses."""
+        """Record the accepted rows in the outbox; override in subclasses.
+
+        The bulk update writes with ``QuerySet.update()``, which fires no signal, so the
+        subclass names the key its rows belong to. Appending is what makes the send a
+        claimed, sequenced operation (#1503 Appendix O, §4.2) rather than a bare PUT whose
+        failure the view would swallow with nothing left to retry.
+        """
 
     def _after_accept(self, mgmt, accepted_pks):
         """Run after the bulk ownership update, before the push (override in subclasses).
@@ -5366,12 +5429,9 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
             count = n_owned + n_drift
             if count and mgmt.adapter_device_id is not None:
                 self._after_accept(mgmt, drift_pks)
-
-        if count and mgmt.adapter_device_id is not None:
-            try:
+                # Inside the same transaction as the ownership it records: appended after
+                # the commit, the entry could be lost while the rows read as owned.
                 self._push(mgmt)
-            except Exception as exc:
-                logger.warning("Bulk accept push failed for device %s: %s", device_pk, exc)
 
         if count:
             messages.success(request, f"Accepted {count} routing state(s).")
@@ -5398,36 +5458,28 @@ class NSOStaticRouteBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
                 state.save(update_fields=list(_STATIC_ROUTE_ARMED_FIELDS))
 
     def _push(self, mgmt):
-        from .signals import _push_static_route_intent_for_device
-
-        _push_static_route_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+        _schedule_intent_push((mgmt.device_id, "static_route"))
 
 
 class NSOISISInterfaceBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     model_class = NSOISISInterfaceState
 
     def _push(self, mgmt):
-        from .signals import _push_isis_intent_for_device
-
-        _push_isis_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+        _schedule_intent_push((mgmt.device_id, "isis"))
 
 
 class NSOISISInstanceBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     model_class = NSOISISInstanceState
 
     def _push(self, mgmt):
-        from .signals import _push_isis_intent_for_device
-
-        _push_isis_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+        _schedule_intent_push((mgmt.device_id, "isis"))
 
 
 class NSOBGPPeerBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     model_class = NSOBGPPeerState
 
     def _push(self, mgmt):
-        from .signals import _push_bgp_intent_for_device
-
-        _push_bgp_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+        _schedule_intent_push((mgmt.device_id, "bgp"))
 
 
 class NSORoutePolicyBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
@@ -5444,38 +5496,42 @@ class NSORoutePolicyBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
                 _own_route_map_contributors(mgmt, obj)
 
     def _push(self, mgmt):
-        from .signals import _push_route_policy_intent_for_device
-
-        _push_route_policy_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+        _schedule_intent_push((mgmt.device_id, "route_policy"))
 
 
 class NSOOSPFInstanceBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     model_class = NSOOSPFInstanceState
 
     def _push(self, mgmt):
-        from .signals import _push_ospf_intent_for_device
-
-        _push_ospf_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+        _schedule_intent_push((mgmt.device_id, "ospf"))
 
 
 class NSOOSPFInterfaceBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     model_class = NSOOSPFInterfaceState
 
     def _push(self, mgmt):
-        from .signals import _push_ospf_intent_for_device
-
-        _push_ospf_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+        _schedule_intent_push((mgmt.device_id, "ospf"))
 
 
 class NSORedistributionBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     model_class = NSORedistributionState
 
     def _push(self, mgmt):
-        from .signals import _push_bgp_intent_for_device, _push_isis_intent_for_device, _push_ospf_intent_for_device
+        from .signals import _OWNED_PUSH_STATUSES, redistribution_destinations
 
-        # Redistribution is distributed across destination protocols; push all three.
-        for fn in (_push_ospf_intent_for_device, _push_isis_intent_for_device, _push_bgp_intent_for_device):
-            fn(mgmt.device_id, mgmt.adapter_device_id)
+        supported = redistribution_destinations()
+        destinations = (
+            self.model_class.objects.filter(
+                management=mgmt,
+                status__in=_OWNED_PUSH_STATUSES,
+                dest_protocol__in=supported,
+            )
+            .order_by()
+            .values_list("dest_protocol", flat=True)
+            .distinct()
+        )
+        for scope in sorted(destinations):
+            _schedule_intent_push((mgmt.device_id, scope))
 
 
 # ── SNMP / Logging overlay accept + edit (operator modify → accept → push) ─────
@@ -5506,7 +5562,9 @@ class OverlayStateAcceptMixin(NSOActionPermissionMixin, View):
             return redirect(_device_nso_tab_url(state.management.device_id))
         state.status = _status_after_accept(state.status)
         state.accepted_at = timezone.now()
-        state.save(update_fields=["status", "accepted_at"])
+        # One transaction, so the row and the outbox entry it schedules commit together.
+        with transaction.atomic():
+            state.save(update_fields=["status", "accepted_at"])
         messages.success(request, f"Accepted {state}.")
         return redirect(_device_nso_tab_url(state.management.device_id))
 
@@ -5571,7 +5629,8 @@ class NSOSnmpCommunityStateVerifyView(NSOActionPermissionMixin, View):
         if result.get("exists") and key in hashes:
             state.vault_secret_hash = hashes[key]
             state.vault_secret_version = result.get("version")
-            state.save(update_fields=["vault_secret_hash", "vault_secret_version"])
+            with transaction.atomic():
+                state.save(update_fields=["vault_secret_hash", "vault_secret_version"])
             verdict = (
                 "matches the device value"
                 if state.vault_secret_hash == state.community_hash
@@ -5603,7 +5662,8 @@ class NSOSnmpV3UserStateVerifyView(NSOActionPermissionMixin, View):
         fields = set(result.get("fields") or [])
         state.vault_has_auth = "auth" in fields
         state.vault_has_priv = "priv" in fields
-        state.save(update_fields=["vault_has_auth", "vault_has_priv"])
+        with transaction.atomic():
+            state.save(update_fields=["vault_has_auth", "vault_has_priv"])
         if fields:
             messages.success(request, f"Vault holds: {', '.join(sorted(fields))} (v{result.get('version')}).")
         else:
@@ -5648,7 +5708,8 @@ class NSOSnmpCommunityStateHarvestView(NSOActionPermissionMixin, View):
         state.vault_ref = result.get("vault_ref") or ref
         state.vault_secret_hash = result.get("secret_hash") or ""
         state.vault_secret_version = result.get("version")
-        state.save(update_fields=["vault_ref", "vault_secret_hash", "vault_secret_version"])
+        with transaction.atomic():
+            state.save(update_fields=["vault_ref", "vault_secret_hash", "vault_secret_version"])
         messages.success(
             request,
             f"Community harvested into Vault at {state.vault_ref!r} (v{result.get('version')}).",
@@ -5695,7 +5756,8 @@ class NSOLoggingLevelStateUnacceptView(NSOActionPermissionMixin, View):
             return redirect(_device_nso_tab_url(device_id))
         state.status = sm.advance(state.status, sm.REVERT, to=sm.IMPORTED)
         state.accepted_at = None
-        state.save(update_fields=["status", "accepted_at"])
+        with transaction.atomic():
+            state.save(update_fields=["status", "accepted_at"])
         messages.warning(
             request,
             f"Un-accepted {state}: the managed levels are being retracted from the device — "
@@ -5732,15 +5794,18 @@ class NSOInterfaceMtuStateAcceptView(OverlayStateAcceptMixin):
 
     def post(self, request, pk):  # noqa: D102
         state = get_object_or_404(self.model_class, pk=pk)
-        if state.l2_mtu is not None:
-            iface = state.interface
-            clamped = min(int(state.l2_mtu), self._NETBOX_MTU_MAX)
-            if iface.mtu != clamped:
-                iface.mtu = clamped
-                iface.save(update_fields=["mtu"])
         state.status = _status_after_accept(state.status)
         state.accepted_at = timezone.now()
-        state.save(update_fields=["status", "accepted_at"])
+        # One transaction, so the native adoption, the row and the outbox entry it
+        # schedules commit together.
+        with transaction.atomic():
+            if state.l2_mtu is not None:
+                iface = state.interface
+                clamped = min(int(state.l2_mtu), self._NETBOX_MTU_MAX)
+                if iface.mtu != clamped:
+                    iface.mtu = clamped
+                    iface.save(update_fields=["mtu"])
+            state.save(update_fields=["status", "accepted_at"])
         messages.success(request, f"Accepted {state}.")
         return redirect(_device_nso_tab_url(state.management.device_id))
 
@@ -5866,29 +5931,32 @@ class NSORoutePolicyAttachView(NSOActionPermissionMixin, View):
                 },
             )
 
-        state, created = NSORoutePolicyState.objects.get_or_create(
-            management=mgmt,
-            family=family,
-            object_name=obj.name,
-            defaults={
-                "content_type": ct,
-                "object_id": obj.pk,
-                "status": "accepted",
-                "accepted_at": timezone.now(),
-            },
-        )
-        if not created and state.status not in ("accepted", "deploying", "in_sync", "apply_failed"):
-            state.status = "accepted"
-            state.accepted_at = timezone.now()
-        state.content_type = ct
-        state.object_id = obj.pk
-        state.last_sync_at = timezone.now()
-        state.save()  # → _on_route_policy_state_save schedules the push
-        if family == "route_map":
-            # Owning a route-map owns its contributors too (else dangling device references).
-            from .signals import _own_route_map_contributors
+        with transaction.atomic():
+            state, created = NSORoutePolicyState.objects.get_or_create(
+                management=mgmt,
+                family=family,
+                object_name=obj.name,
+                defaults={
+                    "content_type": ct,
+                    "object_id": obj.pk,
+                    "status": "accepted",
+                    "accepted_at": timezone.now(),
+                },
+            )
+            if not created and state.status not in ("accepted", "deploying", "in_sync", "apply_failed"):
+                state.status = "accepted"
+                state.accepted_at = timezone.now()
+            state.content_type = ct
+            state.object_id = obj.pk
+            state.last_sync_at = timezone.now()
+            state.save()  # → _on_route_policy_state_save schedules the push
+            cascade = None
+            if family == "route_map":
+                # Owning a route-map owns its contributors too (else dangling device references).
+                from .signals import _own_route_map_contributors
 
-            cascade = _own_route_map_contributors(mgmt, obj)
+                cascade = _own_route_map_contributors(mgmt, obj)
+        if cascade is not None:
             if cascade.drifted:
                 # A referenced object the device already has but that diverges from NetBox was
                 # NOT overwritten — tell the operator so they can resolve it explicitly.
@@ -6138,16 +6206,17 @@ class NSOVLANAttachView(NSOActionPermissionMixin, View):
 
         mgmt = get_object_or_404(NSODeviceManagement, device_id=device_pk)
         vlan = get_object_or_404(VLAN, pk=request.POST.get("vlan"))
-        state, created = NSOVLANState.objects.get_or_create(
-            management=mgmt,
-            vlan=vlan,
-            defaults={"status": "accepted", "accepted_at": timezone.now()},
-        )
-        if not created and state.status not in ("accepted", "deploying", "in_sync", "apply_failed"):
-            state.status = "accepted"
-            state.accepted_at = timezone.now()
-        state.last_sync_at = timezone.now()
-        state.save()  # → _on_vlan_state_save schedules the owned-VLAN intent push
+        with transaction.atomic():
+            state, created = NSOVLANState.objects.get_or_create(
+                management=mgmt,
+                vlan=vlan,
+                defaults={"status": "accepted", "accepted_at": timezone.now()},
+            )
+            if not created and state.status not in ("accepted", "deploying", "in_sync", "apply_failed"):
+                state.status = "accepted"
+                state.accepted_at = timezone.now()
+            state.last_sync_at = timezone.now()
+            state.save()  # → _on_vlan_state_save schedules the owned-VLAN intent push
         messages.success(
             request, f"Attached VLAN {vlan.vid} ({vlan.name or '—'}) to {mgmt.device.name} — Apply to write it."
         )

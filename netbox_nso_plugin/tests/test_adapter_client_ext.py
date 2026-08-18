@@ -338,6 +338,23 @@ class TestRequestErrorPaths(unittest.TestCase):
 
         self.assertEqual(ctx.exception.code, "503")
 
+    def test_success_response_non_json_raises_invalid_response(self):
+        """A 2xx whose body is not JSON is an adapter fault, not a plugin crash."""
+        from netbox_nso_plugin.adapter_client import AdapterError, _request
+
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
+            patch("netbox_nso_plugin.adapter_client.requests.Session") as mock_s,
+        ):
+            session = make_session()
+            session.request.return_value = make_response(200, content=b"<html>gateway</html>")
+            mock_s.return_value = session
+
+            with self.assertRaises(AdapterError) as ctx:
+                _request("GET", "/test")
+
+        self.assertEqual(ctx.exception.code, "invalid_response")
+
     def test_read_timeout_surfaces_as_nso_timeout(self):
         """A connected-but-hung adapter (ReadTimeout) → distinct nso_timeout code, not nso_unreachable."""
         from netbox_nso_plugin.adapter_client import AdapterError, _request
@@ -584,6 +601,20 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
         self.assertEqual(result["attribute_count"], 1)
         _, kwargs = session.request.call_args
         self.assertEqual(kwargs["json"]["attributes"], attrs)
+
+    def test_the_canonical_bytes_are_what_requests_prepares(self):
+        """Both keys go to ``session.request``; requests must put the canonical ``data`` on the wire."""
+        from netbox_nso_plugin.adapter_client import _attach_serialized_json
+
+        kwargs = {"json": {"b": 1, "a": 2}}
+        _attach_serialized_json(kwargs)
+        prepared = requests.Request("PUT", "https://example.invalid/x", **kwargs).prepare()
+        self.assertEqual(prepared.body, b'{"a": 2, "b": 1}')
+
+    def test_static_route_intent_doc_names_the_list_that_clears_the_mirror(self):
+        from netbox_nso_plugin.adapter_client import put_static_route_intent
+
+        self.assertIn("empty ``routes`` list clears", put_static_route_intent.__doc__)
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")

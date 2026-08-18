@@ -16,7 +16,7 @@ from django.test import TestCase
 from netbox_nso_plugin.vault_refs import secret_fingerprint
 
 from ._adapter_http import make_session
-from .mixins import IntentPushResetMixin
+from .mixins import IntentPushDeliveryMixin
 
 _BASE_CFG = {
     "url": "http://adapter.local",
@@ -32,7 +32,7 @@ def _superuser():
     return User.objects.create_superuser(username="vault-admin", password="pw", email="vault@test.x")  # noqa: S106
 
 
-class _SecretBase(IntentPushResetMixin, TestCase):
+class _SecretBase(IntentPushDeliveryMixin, TestCase):
     @classmethod
     def setUpTestData(cls):
         mfg = Manufacturer.objects.create(name="VaultMfg", slug="vaultmfg")
@@ -390,8 +390,9 @@ class TestDeletePropagation(_SecretBase):
 
 class TestV3PushDerivation(_SecretBase):
     def test_push_derives_auth_priv_refs_from_protocols_and_skips_v3_hosts(self):
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.models import NSOSnmpHostState, NSOSnmpV3UserState
-        from netbox_nso_plugin.signals import _push_snmp_intent_for_device, reset_intent_push_state
+        from netbox_nso_plugin.signals import reset_intent_push_state
 
         mgmt = self._make_mgmt()
         NSOSnmpV3UserState.objects.create(
@@ -417,7 +418,7 @@ class TestV3PushDerivation(_SecretBase):
         )
         reset_intent_push_state()
         with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
-            _push_snmp_intent_for_device(self.device.pk, 42)
+            deliver("snmp", self.device.pk, 42)
         mock_put.assert_called_once()
         _, communities, v3_users, hosts, _ = mock_put.call_args[0]
         self.assertEqual(

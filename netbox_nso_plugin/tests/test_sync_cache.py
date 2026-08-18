@@ -619,6 +619,7 @@ class TestRefreshSyncCacheJob(_SyncCacheTestBase):
         self.assertIn(RefreshDeviceSyncCacheJob, registry["system_jobs"])
         self.assertEqual(registry["system_jobs"][RefreshDeviceSyncCacheJob]["interval"], 5)
         self.assertEqual(SYNC_CACHE_REFRESH_MINUTES, 5)
+        self.assertIn("Four passes today", RefreshDeviceSyncCacheJob.__doc__)
 
     def _job(self):
         from uuid import uuid4

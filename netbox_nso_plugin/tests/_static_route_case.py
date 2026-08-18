@@ -12,6 +12,7 @@ import contextlib
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
+from django.db import transaction
 from django.utils import timezone
 
 PUT = "netbox_nso_plugin.adapter_client.put_static_route_intent"
@@ -79,14 +80,15 @@ def _own(sr, mgmt, *, status="in_sync", mirror_vrf=None):
     from netbox_nso_plugin.intent_generation import allocate_intent_generation
     from netbox_nso_plugin.models import NSOStaticRouteState
 
-    return NSOStaticRouteState.objects.create(
-        management=mgmt,
-        static_route=sr,
-        status=status,
-        nso_vrf=mirror_vrf if mirror_vrf is not None else (sr.vrf.name if sr.vrf else ""),
-        nso_prefix=str(sr.prefix or ""),
-        nso_next_hop=str(sr.next_hop or ""),
-        accepted_at=timezone.now(),
-        intent_generation=allocate_intent_generation(),
-        generation_started_at=timezone.now(),
-    )
+    with transaction.atomic():
+        return NSOStaticRouteState.objects.create(
+            management=mgmt,
+            static_route=sr,
+            status=status,
+            nso_vrf=mirror_vrf if mirror_vrf is not None else (sr.vrf.name if sr.vrf else ""),
+            nso_prefix=str(sr.prefix or ""),
+            nso_next_hop=str(sr.next_hop or ""),
+            accepted_at=timezone.now(),
+            intent_generation=allocate_intent_generation(),
+            generation_started_at=timezone.now(),
+        )

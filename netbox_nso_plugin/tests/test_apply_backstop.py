@@ -16,6 +16,8 @@ result and by nothing else, which puts two obligations on the ``deploying`` stat
 
 from __future__ import annotations
 
+from contextlib import ExitStack
+from itertools import count
 from unittest.mock import patch
 
 from django.test import TestCase
@@ -23,25 +25,23 @@ from django.utils import timezone
 
 from ._settlement_case import _make_device, _make_mgmt, _own, _route, _SettlementCase, _stale_clock
 
-_OTHER_PUSHES = (
-    "_push_interface_intent_for_device",
-    "_push_lacp_intent_for_device",
-    "_push_logging_intent_for_device",
-    "_push_route_policy_intent_for_device",
-    "_push_svi_intent_for_device",
-    "_push_subinterface_intent_for_device",
-    "_push_bfd_intent_for_device",
-    "_push_interface_mtu_intent_for_device",
-    "_push_l2_sap_intent_for_device",
-    "_push_switchport_intent_for_device",
-    "_push_vlan_intent_for_device",
-    "_push_snmp_intent_for_device",
+#: Every transport an Apply reaches bar the static route's. Doubled where the Apply claims
+#: for real: the adapter double serves the static-route endpoint, and the rest are a
+#: different subsystem here.
+_OTHER_TRANSPORTS = (
+    "apply_lag_config",
+    "apply_switchport_config",
+    "put_bfd_intent",
+    "put_intent",
+    "put_interface_mtu_intent",
+    "put_l2_sap_intent",
+    "put_logging_intent",
+    "put_route_policy_intent",
+    "put_snmp_intent",
+    "put_subinterface_intent",
+    "put_svi_intent",
+    "put_vlan_intent",
 )
-
-
-def _patch_other_pushes():
-    """Silence every scope but static routes: they are a different subsystem here."""
-    return [patch(f"netbox_nso_plugin.signals.{name}") for name in _OTHER_PUSHES]
 
 
 class TestApplyPromotion(TestCase):
@@ -80,31 +80,31 @@ class TestApplyPromotion(TestCase):
         return mgmt, state, other
 
     def _prepare(self, static_response):
+        """Run the Apply with the static-route claim answering *static_response*.
+
+        The Apply routes every scope through ``drain.push_now``, so that is the boundary the
+        promotion gate reads: the other scopes are a different subsystem here and answer
+        ``None``, which the gate consults for none of them.
+        """
         from netbox_nso_plugin.views import _prepare_apply
 
         mgmt, state, other = self._setup()
-        patches = _patch_other_pushes()
-        patches.append(
-            patch(
-                "netbox_nso_plugin.signals._push_static_route_intent_for_device",
-                return_value=static_response,
-            )
+        patcher = patch(
+            "netbox_nso_plugin.drain.push_now",
+            side_effect=lambda device_id, scope, **kwargs: static_response if scope == "static_route" else None,
         )
-        started = []
-        for p in patches:
-            # One cleanup each: a later start() that raises must not strand the earlier patches.
-            started.append(p.start())
-            self.addCleanup(p.stop)
+        push = patcher.start()
+        self.addCleanup(patcher.stop)
         _prepare_apply(mgmt)
         state.refresh_from_db()
         other.refresh_from_db()
-        return state, other, started[-1]
+        return state, other, push
 
     def test_a_failed_force_push_skips_promotion(self):
-        """A forced push returns ``None`` only on a real rejection — the adapter stored nothing."""
+        """A forced claim answers ``None`` only on a real rejection — the adapter stored nothing."""
         state, other, push = self._prepare(static_response=None)
 
-        push.assert_called_once()
+        assert [call.args[1] for call in push.call_args_list].count("static_route") == 1
         assert state.status == "accepted", (
             "the Apply promoted a route whose intent the adapter refused: nothing can ever "
             "settle that row, so it waits for the backstop to call it failed"
@@ -117,6 +117,65 @@ class TestApplyPromotion(TestCase):
 
         assert state.status == "deploying"
         assert other.status == "deploying"
+
+    def test_a_refused_snmp_refresh_stops_the_apply_before_any_promotion(self):
+        """codex O1 r4 F2: an Apply against a stale SNMP store re-applies what was deleted.
+
+        The refusal is the SNMP claim's own outcome, so it is the outcome the Apply reads:
+        a transport failure answers ``None`` too and leaves the Apply to fail at the trigger
+        as it always has.
+        """
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.views import ApplyRefused, _prepare_apply
+
+        mgmt, state, other = self._setup()
+        # Every push settles, so the SNMP refusal is the only thing that can abort the Apply.
+        for name, answer in (("push_now", {"count": 0}), ("drain_key", drain.REFUSED)):
+            patcher = patch(f"netbox_nso_plugin.drain.{name}", side_effect=lambda *args, answer=answer, **kw: answer)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        with self.assertRaisesRegex(ApplyRefused, "SNMP"):
+            _prepare_apply(mgmt)
+
+        state.refresh_from_db()
+        other.refresh_from_db()
+        assert (state.status, other.status) == ("accepted", "accepted"), "the abort promotes nothing"
+
+    def test_apply_uses_one_decreasing_deadline_for_all_preparation_sends(self):
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.views import _prepare_apply
+
+        mgmt, _state, _other = self._setup()
+        with (
+            patch("time.monotonic", side_effect=count()),
+            patch(
+                "netbox_nso_plugin.drain.push_now",
+                side_effect=lambda device_id, scope, **kwargs: {"count": 0} if scope == "static_route" else None,
+            ) as push,
+            patch("netbox_nso_plugin.drain.drain_key", return_value=drain.SUCCEEDED) as snmp,
+        ):
+            _prepare_apply(mgmt)
+
+        deadlines = [call.kwargs["deadline"] for call in [*push.call_args_list, *snmp.call_args_list]]
+        assert len(deadlines) == 13
+        assert all(later < earlier for earlier, later in zip(deadlines, deadlines[1:]))
+
+    def test_apply_stops_before_the_first_send_when_its_total_budget_is_spent(self):
+        from netbox_nso_plugin.views import ApplyRefused, _prepare_apply
+
+        mgmt, state, other = self._setup()
+        with (
+            patch("time.monotonic", side_effect=[0, 121]),
+            patch("netbox_nso_plugin.drain.push_now") as push,
+            self.assertRaisesRegex(ApplyRefused, "preparation deadline"),
+        ):
+            _prepare_apply(mgmt)
+
+        push.assert_not_called()
+        state.refresh_from_db()
+        other.refresh_from_db()
+        assert (state.status, other.status) == ("accepted", "accepted")
 
 
 class TestTheStuckDeployingBackstop(_SettlementCase):
@@ -143,10 +202,12 @@ class TestTheStuckDeployingBackstop(_SettlementCase):
         state = _own(sr, mgmt, generation=401, status="accepted")
         _stale_clock(state)  # armed long before this Apply, which is what dates the wait
 
-        for p in _patch_other_pushes():
-            p.start()
-            self.addCleanup(p.stop)
-        _prepare_apply(mgmt)
+        # The static-route claim runs for real against the adapter double, which is what
+        # promotes the row; the other scopes only have their transports doubled.
+        with ExitStack() as stack:
+            for name in _OTHER_TRANSPORTS:
+                stack.enter_context(patch(f"netbox_nso_plugin.adapter_client.{name}"))
+            _prepare_apply(mgmt)
 
         state.refresh_from_db()
         assert state.status == "deploying", "the setup never reached the state the backstop judges"

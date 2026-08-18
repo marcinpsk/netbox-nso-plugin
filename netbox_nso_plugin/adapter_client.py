@@ -8,7 +8,9 @@ Config resolution (per call, ~30 s in-process cache):
 """
 
 import contextvars
+import json
 import logging
+import socket
 import threading
 import time
 from contextlib import contextmanager
@@ -55,6 +57,42 @@ def delete_origin_pushes():
         _delete_origin_push.reset(token)
 
 
+# When set, every adapter request carries ``?backfill_only=true``: the adapter adopts the
+# ``route_id`` of every row the payload still names, prunes the uncorrelated NULL-id rows
+# that hold its replacement fence shut, and does nothing else — no removal, no tombstone, no
+# job. It is what opens a fence a pending genuine deletion cannot open for itself, because
+# any ordinary push omitting that route would destroy its before-image (#1503 §4.4, OQ-O-8).
+# It is expressly NOT a delivery mechanism: it accepts no content and carries no authority.
+_backfill_only_push = contextvars.ContextVar("nso_backfill_only_push", default=False)
+
+
+@contextmanager
+def backfill_only_pushes():
+    """Mark every adapter request in this context as an id backfill (no content, no jobs)."""
+    token = _backfill_only_push.set(True)
+    try:
+        yield
+    finally:
+        _backfill_only_push.reset(token)
+
+
+# The logical operation a request belongs to (#1503 Appendix O, §4.4). It rides in a header
+# rather than in every mirrored-scope body model, so one emitter covers every in-protocol
+# delivery key and no call site can forget it. The adapter admits it against its own
+# ``(device_id, scope)`` receipt, which is what makes a lost response resolvable by replay.
+_push_seq = contextvars.ContextVar("nso_push_seq", default=None)
+
+
+@contextmanager
+def push_seq(seq: int):
+    """Carry *seq* as ``X-Push-Seq`` on every adapter request made in this context."""
+    token = _push_seq.set(int(seq))
+    try:
+        yield
+    finally:
+        _push_seq.reset(token)
+
+
 _CACHE_TTL = 30  # seconds
 _cfg_cache: dict = {}
 _cfg_cache_lock = threading.Lock()
@@ -79,13 +117,127 @@ STORE_INCARNATION_HEADER = "X-Store-Incarnation"
 _session = None
 _session_cls = None
 
+# A caller that must be able to ABORT its own request cannot use the pooled session: closing
+# it would cut off every other request in the process. So a send under a wall-clock deadline
+# builds its own (#1503 §4.2, O-P16) and binds it here for the duration of that one call.
+_bound_session = contextvars.ContextVar("nso_bound_session", default=None)
+
+
+class AbortableTransport(requests.adapters.HTTPAdapter):
+    """An HTTP transport that can end the requests it has in flight (#1503 O-P16).
+
+    ``Session.close()`` empties the connection pool and nothing else: a connection a worker
+    already borrowed is not in the pool, so a thread blocked on a dripping response never
+    notices. Only the socket ends that read, so this remembers the connection each request
+    checked out and shuts its socket down on demand.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._lock = threading.Lock()
+        self._live: set = set()
+        self._instrumented: set = set()
+        super().__init__(*args, **kwargs)
+
+    def get_connection_with_tls_context(self, request, verify, proxies=None, cert=None):
+        """Return the pool this request will use, instrumented to record its connections."""
+        pool = super().get_connection_with_tls_context(request, verify, proxies=proxies, cert=cert)
+        with self._lock:
+            fresh = id(pool) not in self._instrumented
+            self._instrumented.add(id(pool))
+        return self._instrument(pool) if fresh else pool
+
+    def _instrument(self, pool):
+        """Wrap the pool's checkout and release, which is where a connection is identifiable."""
+        checkout, release = pool._get_conn, pool._put_conn
+        checked_out = threading.local()
+
+        def _checkout_stack() -> list:
+            stack = getattr(checked_out, "stack", None)
+            if stack is None:
+                stack = []
+                checked_out.stack = stack
+            return stack
+
+        def _remove_checkout(conn):
+            stack = getattr(checked_out, "stack", None)
+            if not stack:
+                return None
+            if conn is None:
+                actual = stack.pop()
+            else:
+                actual = None
+                for index in range(len(stack) - 1, -1, -1):
+                    if stack[index] is conn:
+                        actual = stack.pop(index)
+                        break
+            if not stack:
+                del checked_out.stack
+            return actual
+
+        def _get_conn(timeout=None):
+            conn = checkout(timeout)
+            with self._lock:
+                self._live.add(conn)
+                _checkout_stack().append(conn)
+            return conn
+
+        def _put_conn(conn):
+            with self._lock:
+                actual = _remove_checkout(conn)
+                self._live.discard(actual if actual is not None else conn)
+            return release(conn)
+
+        pool._get_conn, pool._put_conn = _get_conn, _put_conn
+        return pool
+
+    def abort(self) -> None:
+        """Shut down the socket of every request in flight, so its reader comes back."""
+        with self._lock:
+            live = list(self._live)
+        for conn in live:
+            sock = conn.sock
+            if sock is None:
+                continue
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+                sock.close()
+            except OSError:  # already gone: the request finished or the far side closed first
+                pass
+
+
+def new_session(transport=None):
+    """Build one session configured like the pooled one, for a caller that owns its lifetime.
+
+    *transport* is mounted for both schemes when given, which is how a caller that must be
+    able to abort its own request gets a handle on the connection it is using.
+    """
+    session = requests.Session()
+    session.trust_env = False  # Adapter is always internal — never route through system proxy.
+    if transport is not None:
+        session.mount("http://", transport)
+        session.mount("https://", transport)
+    return session
+
+
+@contextmanager
+def bound_session(session):
+    """Send every adapter request made in this context on *session*, not on the pool."""
+    token = _bound_session.set(session)
+    try:
+        yield
+    finally:
+        _bound_session.reset(token)
+
 
 def _get_session():
-    """Return the process-wide pooled requests session, (re)creating it when needed."""
+    """Return this context's bound session, or the process-wide pooled one."""
     global _session, _session_cls
+
+    bound = _bound_session.get()
+    if bound is not None:
+        return bound
     if _session is None or _session_cls is not requests.Session:
-        _session = requests.Session()
-        _session.trust_env = False  # Adapter is always internal — never route through system proxy.
+        _session = new_session()
         _session_cls = requests.Session
     return _session
 
@@ -170,9 +322,56 @@ def _resolve_config() -> dict:
             return data
 
 
+# When set, a request is not made at all: its JSON body is recorded and ``None`` comes back.
+# The claim needs the EXACT body the client would send, because that is what the adapter
+# digests into its receipt (#1503 Appendix O, §4.4), and the wrapper each endpoint puts
+# around a payload lives in this module. Capturing through the real call is what keeps the
+# two sides on one definition instead of a second table of scope-to-envelope names.
+_capture_body: contextvars.ContextVar[list | None] = contextvars.ContextVar("nso_capture_body", default=None)
+
+
+@contextmanager
+def capture_wire_body():
+    """Record the serialized JSON bytes of every request, and send none of them."""
+    sink: list = []
+    token = _capture_body.set(sink)
+    try:
+        yield sink
+    finally:
+        _capture_body.reset(token)
+
+
+def _serialize_json_body(body) -> bytes:
+    """Serialize one canonical JSON body once, for both capture and transport.
+
+    Claims persist their payload in JSONB, which does not preserve object key order. Sorting
+    makes the restored value reproduce the bytes the adapter received without storing a
+    second copy of the request.
+    """
+    return json.dumps(body, allow_nan=False, sort_keys=True).encode()
+
+
+def _attach_serialized_json(kwargs) -> None:
+    """Attach the canonical wire bytes while retaining the structured request body."""
+    if "json" not in kwargs:
+        return
+    # Requests sends ``data`` when both are present. Keep ``json`` for transport
+    # instrumentation and tests. The canonical ``data`` value goes on the socket.
+    kwargs["data"] = _serialize_json_body(kwargs["json"])
+
+
 def _request(method, path, **kwargs):
+    sink = _capture_body.get()
+    if sink is not None:
+        sink.append(_serialize_json_body(kwargs["json"]))
+        return None
     resp = _request_response(method, path, **kwargs)
-    return resp.json() if resp.content else None
+    if not resp.content:
+        return None
+    try:
+        return resp.json()
+    except ValueError as exc:
+        raise AdapterError("Adapter returned a response that is not valid JSON.", code="invalid_response") from exc
 
 
 def _request_response(method, path, **kwargs):
@@ -186,6 +385,11 @@ def _request_response(method, path, **kwargs):
 
     url = f"{cfg['url']}{path}"
     headers = {"Authorization": f"Bearer {cfg['token']}", "Content-Type": "application/json"}
+    _attach_serialized_json(kwargs)
+
+    seq = _push_seq.get()
+    if seq is not None:
+        headers["X-Push-Seq"] = str(seq)
 
     if _store_only_push.get():
         params = dict(kwargs.pop("params", None) or {})
@@ -195,6 +399,11 @@ def _request_response(method, path, **kwargs):
     if _delete_origin_push.get():
         params = dict(kwargs.pop("params", None) or {})
         params["delete_origin"] = "true"
+        kwargs["params"] = params
+
+    if _backfill_only_push.get():
+        params = dict(kwargs.pop("params", None) or {})
+        params["backfill_only"] = "true"
         kwargs["params"] = params
 
     if not cfg["verify_tls"]:
@@ -834,7 +1043,7 @@ def put_static_route_intent(adapter_device_id, routes):
       [{"vrf": "", "prefix": "10.0.0.0/8", "next_hop": "192.168.1.1",
         "metric": None, "permanent": None, "tag": None,
         "accepted_at": "...Z"}, ...]
-    Empty list clears all static route intent for the device.
+    An empty ``routes`` list clears all static route intent for the device.
     Returns {"device_id": ..., "count": N}.
     """
     return _request(

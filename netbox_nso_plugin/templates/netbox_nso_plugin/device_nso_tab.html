@@ -74,6 +74,45 @@
     </div>
   {% endif %}
 
+  {# ── Deletions that degraded to a detach; cleared by the acknowledgement alone ── #}
+  {% if degraded_deletions %}
+    <div class="alert alert-danger d-flex align-items-start mb-3" role="alert">
+      <span class="mdi mdi-delete-alert-outline me-2 mt-1"></span>
+      <div class="flex-grow-1">
+        <strong>{{ degraded_deletions|length }} deletion{{ degraded_deletions|length|pluralize }}
+          left the configuration on the device.</strong>
+        NetBox no longer holds this intent, but the adapter detached the row instead of
+        retracting it, so the device still carries what it named. Removing it from the device
+        takes a change of your own.
+        <ul class="mb-2 mt-1">
+          {% for d in degraded_deletions %}
+            <li>
+              <strong>{{ d.label }}</strong>
+              <span class="badge text-bg-danger ms-1">{{ d.reason }}</span>
+              {% if d.route_ids %}
+                <span class="ms-1">object{{ d.route_ids|length|pluralize }} {{ d.route_ids|join:", " }}</span>
+              {% endif %}
+              {% if d.at %}<small class="ms-1">{{ d.at|date:"Y-m-d H:i" }}</small>{% endif %}
+              {% if d.triples %}
+                <ul class="mb-0">
+                  {% for t in d.triples %}
+                    <li>
+                      <code>{{ t.prefix }}</code> via <code>{{ t.next_hop }}</code>
+                      {% if t.vrf %}in VRF <code>{{ t.vrf }}</code>{% endif %}
+                    </li>
+                  {% endfor %}
+                </ul>
+              {% endif %}
+            </li>
+          {% endfor %}
+        </ul>
+        <small>Acknowledge and clear with
+          <code>manage.py nso_acknowledge_degraded_deletions --device {{ mgmt.device_id }}</code>.
+          No push ever clears it: a later success would erase the warning before it was read.</small>
+      </div>
+    </div>
+  {% endif %}
+
   {# ── Adapter intent drift (split-brain) — renders ONLY when there is stale intent ── #}
   {% if intent_drift %}
     <div class="alert alert-warning d-flex align-items-start mb-3" role="alert">

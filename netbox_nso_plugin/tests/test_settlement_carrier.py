@@ -15,7 +15,7 @@ from __future__ import annotations
 import threading
 from unittest.mock import patch
 
-from django.db import connections
+from django.db import connections, transaction
 
 from ._settlement_case import _CarrierCase, _make_device, _make_mgmt, _own, _result, _route, _stale_clock
 
@@ -104,9 +104,10 @@ class TestOrderingAndIsolation(_CarrierCase):
         sr = _route("10.32.0.0/16", "10.32.0.1", devices=[device])
         state = _own(sr, mgmt, generation=103)
         _stale_clock(state)
-        other_scope = NSOLoggingLevelState.objects.create(
-            management=mgmt, console_severity="warning", status="deploying"
-        )
+        with transaction.atomic():
+            other_scope = NSOLoggingLevelState.objects.create(
+                management=mgmt, console_severity="warning", status="deploying"
+            )
         # One job carrying both channels' evidence: the per-route settlement the consumer
         # would read, and the per-scope counter the coarse settle reads.
         self.adapter.store.terminal_job(

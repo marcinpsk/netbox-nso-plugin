@@ -16,6 +16,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d  # v10.0.0
@@ -26,10 +28,14 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: uv pip install --system ruff
+        # Keep zizmor in step with [dependency-groups].dev and .pre-commit-config.yaml.
+        run: uv pip install --system ruff zizmor==1.29.0
 
       - name: Run Ruff linting
         run: ruff check .
 
       - name: Run Ruff formatting check
         run: ruff format --check .
+
+      - name: Audit the GitHub Actions workflows
+        run: zizmor .github/workflows

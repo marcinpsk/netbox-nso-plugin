@@ -5,9 +5,24 @@
 from __future__ import annotations
 
 import subprocess
+import tomllib
 from pathlib import Path
 
 WORKFLOW = Path(__file__).parents[2] / ".github" / "workflows" / "release.yaml"
+PYPROJECT = Path(__file__).parents[2] / "pyproject.toml"
+UV_LOCK = Path(__file__).parents[2] / "uv.lock"
+
+
+def _locked_version(lock_text: str, package: str) -> str:
+    """Return the version ``uv.lock`` records for one package."""
+    for entry in tomllib.loads(lock_text)["package"]:
+        if entry["name"] == package:
+            return entry["version"]
+    raise AssertionError(f"{package} is absent from the lock file")
+
+
+def _uv_lock(cwd: Path) -> None:
+    subprocess.run(["uv", "lock", "--offline"], cwd=cwd, check=True, text=True, capture_output=True)
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -44,6 +59,49 @@ def test_release_refs_use_one_expected_tip_transaction():
     assert 'git push origin "v${version}"' not in workflow
     assert "push: false" in release_action
     assert "vcs_release: false" in release_action
+
+
+def test_the_release_commit_carries_a_regenerated_lock():
+    """The lock records this project's own version, so the release commit has to refresh it."""
+    config = tomllib.loads(PYPROJECT.read_text())["tool"]["semantic_release"]
+    assert config["build_command"] == "uv lock"
+    assert config["assets"] == ["uv.lock"]
+
+    workflow = WORKFLOW.read_text()
+    release_action_start = workflow.index("- name: Release from conventional commits")
+    publish_start = workflow.index("- name: Publish release refs with expected-tip lease")
+    release_action = workflow[release_action_start:publish_start]
+
+    # The action maps build: false to --skip-build, which silently drops build_command.
+    assert "build: true" in release_action
+    assert "astral-sh/setup-uv" in workflow[:release_action_start]
+
+
+def test_uv_lock_records_the_declared_project_version():
+    """The committed lock must not drift from the version a release would cut."""
+    declared = tomllib.loads(PYPROJECT.read_text())["project"]["version"]
+    assert _locked_version(UV_LOCK.read_text(), "netbox-nso-plugin") == declared
+
+
+def test_uv_lock_follows_a_version_bump(tmp_path: Path):
+    """The bump alone leaves the lock stale; ``uv lock`` is what re-pins it."""
+    # No dependencies, so the resolve needs no network.
+    project = tmp_path / "pyproject.toml"
+    project.write_text(
+        '[project]\nname = "demo-pkg"\nversion = "0.2.0"\n'
+        'requires-python = ">=3.9"\ndependencies = []\n\n'
+        '[build-system]\nrequires = ["hatchling"]\nbuild-backend = "hatchling.build"\n'
+    )
+    _uv_lock(tmp_path)
+    assert _locked_version((tmp_path / "uv.lock").read_text(), "demo-pkg") == "0.2.0"
+
+    project.write_text(project.read_text().replace('version = "0.2.0"', 'version = "0.3.0"'))
+    assert _locked_version((tmp_path / "uv.lock").read_text(), "demo-pkg") == "0.2.0", (
+        "the version bump alone must not touch the lock"
+    )
+
+    _uv_lock(tmp_path)
+    assert _locked_version((tmp_path / "uv.lock").read_text(), "demo-pkg") == "0.3.0"
 
 
 def test_expected_tip_transaction_rejects_branch_advance_before_tag_push(tmp_path: Path):

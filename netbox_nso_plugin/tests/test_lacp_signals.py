@@ -7,10 +7,10 @@ from unittest.mock import patch
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
 from django.test import TestCase
 
-from .mixins import IntentPushResetMixin
+from .mixins import IntentPushDeliveryMixin
 
 
-class _LacpBase(IntentPushResetMixin, TestCase):
+class _LacpBase(IntentPushDeliveryMixin, TestCase):
     @classmethod
     def setUpTestData(cls):
         mfg = Manufacturer.objects.create(name="LacpSigMfg", slug="lacpsigmfg")
@@ -69,14 +69,14 @@ class _LacpBase(IntentPushResetMixin, TestCase):
 
 class TestPushLacpIntentForDevice(_LacpBase):
     def test_pushes_accepted_bundle_with_members(self):
-        from netbox_nso_plugin.signals import _push_lacp_intent_for_device
+        from netbox_nso_plugin.delivery import deliver
 
         mgmt = self._make_mgmt()
         self._bundle(mgmt, status="accepted")
         self._member(mgmt, status="accepted")
 
         with patch("netbox_nso_plugin.adapter_client.apply_lag_config") as mock_apply:
-            _push_lacp_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("lacp", self.device.pk, mgmt.adapter_device_id)
 
         mock_apply.assert_called_once()
         dev_id, bundles = mock_apply.call_args[0]
@@ -91,13 +91,13 @@ class TestPushLacpIntentForDevice(_LacpBase):
         assert b["members"][0]["port_priority"] == 128
 
     def test_excludes_non_accepted_bundles(self):
-        from netbox_nso_plugin.signals import _push_lacp_intent_for_device
+        from netbox_nso_plugin.delivery import deliver
 
         mgmt = self._make_mgmt()
         self._bundle(mgmt, status="imported")
 
         with patch("netbox_nso_plugin.adapter_client.apply_lag_config") as mock_apply:
-            _push_lacp_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("lacp", self.device.pk, mgmt.adapter_device_id)
 
         mock_apply.assert_called_once()
         assert mock_apply.call_args[0][1] == []
@@ -106,8 +106,8 @@ class TestPushLacpIntentForDevice(_LacpBase):
         # NX-P2 belt-and-suspenders: an (impossibly-)accepted vPC bundle is excluded from the
         # push — the writer refuses the whole service on ANY vPC bundle, which would block the
         # legitimate bundles too. The Accept view already refuses it; this is defence in depth.
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.models import NSOLACPBundleState
-        from netbox_nso_plugin.signals import _push_lacp_intent_for_device
 
         mgmt = self._make_mgmt()
         NSOLACPBundleState.objects.create(
@@ -115,19 +115,24 @@ class TestPushLacpIntentForDevice(_LacpBase):
         )
 
         with patch("netbox_nso_plugin.adapter_client.apply_lag_config") as mock_apply:
-            _push_lacp_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("lacp", self.device.pk, mgmt.adapter_device_id)
 
         mock_apply.assert_called_once()
         assert mock_apply.call_args[0][1] == []  # the vPC bundle never enters the write intent
 
-    def test_adapter_error_swallowed(self):
-        from netbox_nso_plugin.signals import _push_lacp_intent_for_device
+    def test_an_adapter_failure_is_recorded_and_left_for_the_drain_to_isolate(self):
+        """The swallow moved to the drain (#1503 Appendix O): the send itself fails fast."""
+        from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.models import NSODeviceManagement
 
         mgmt = self._make_mgmt()
         self._bundle(mgmt, status="accepted")
 
-        with patch("netbox_nso_plugin.adapter_client.apply_lag_config", side_effect=Exception("boom")):
-            _push_lacp_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+        with patch("netbox_nso_plugin.adapter_client.apply_lag_config", side_effect=ConnectionError("boom")):
+            with self.assertRaises(ConnectionError):
+                deliver("lacp", self.device.pk, mgmt.adapter_device_id)
+
+        assert "lacp" in (NSODeviceManagement.objects.get(pk=mgmt.pk).intent_push_errors or {})
 
 
 class TestOnLacpStateSave(_LacpBase):

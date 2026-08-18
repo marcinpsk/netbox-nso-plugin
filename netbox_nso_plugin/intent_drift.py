@@ -32,8 +32,13 @@ def _owned_count(model, device, *, via: str = "management__device") -> int:
     return model.objects.filter(**{via: device}, status__in=list(sm.OWNED_STATES)).count()
 
 
+def _delivery_key(scope: dict) -> str:
+    """Return the delivery key a drift scope re-syncs through."""
+    return scope.get("delivery_key", scope["key"])
+
+
 def _scopes() -> list[dict]:
-    """Registry: scope key → label, adapter intent table(s), owned-overlay counter, push fn.
+    """Registry: scope key → label, adapter intent table(s), owned-overlay counter.
 
     Covers the routing + interface families where the split-brain has been observed (the
     migration-reset overlays). Extend by appending an entry; the detector + re-sync pick it
@@ -46,7 +51,6 @@ def _scopes() -> list[dict]:
     orphan-only rule. Push-time row *skips* (dangling FKs, missing vault refs) only ever make
     the adapter hold FEWER rows than NetBox owns, which the partial rule ignores by design.
     """
-    from . import signals
     from .models import (
         NSOBFDInterfaceState,
         NSOBGPPeerState,
@@ -89,21 +93,18 @@ def _scopes() -> list[dict]:
             "label": "IS-IS",
             "tables": ["isis_interface_intent", "isis_process_intent"],
             "owned": lambda d: _owned_count(NSOISISInterfaceState, d) + _owned_count(NSOISISInstanceState, d),
-            "push": signals._push_isis_intent_for_device,
         },
         {
             "key": "isis_flex_algo",
             "label": "IS-IS Flex-Algo",
             "tables": ["isis_flex_algo_intent"],
             "owned": lambda d: _owned_count(NSOISISFlexAlgoState, d),
-            "push": signals._push_isis_flex_algo_intent_for_device,
         },
         {
             "key": "bgp",
             "label": "BGP",
             "tables": ["bgp_router_intent"],
             "owned": lambda d: _owned_count(NSOBGPPeerState, d),
-            "push": signals._push_bgp_intent_for_device,
             # One router intent row covers N owned peer rows — counts can never be
             # compared 1:1, so this scope only gets the orphan (owned == 0) rule.
             "parity": False,
@@ -113,35 +114,33 @@ def _scopes() -> list[dict]:
             "label": "OSPF",
             "tables": ["ospf_instance_intent", "ospf_interface_intent"],
             "owned": lambda d: _owned_count(NSOOSPFInstanceState, d) + _owned_count(NSOOSPFInterfaceState, d),
-            "push": signals._push_ospf_intent_for_device,
         },
         {
             "key": "route_policy",
             "label": "Route policy",
             "tables": ["route_policy_object_intent"],
             "owned": lambda d: _owned_count(NSORoutePolicyState, d),
-            "push": signals._push_route_policy_intent_for_device,
         },
         {
             "key": "static_route",
             "label": "Static routes",
             "tables": ["static_route_intent"],
             "owned": lambda d: _owned_count(NSOStaticRouteState, d),
-            "push": signals._push_static_route_intent_for_device,
         },
         {
             "key": "interface_ip",
             "label": "Interface IPs",
+            # The one scope the two registries name differently (O-P12); every other drift
+            # key IS its delivery key, which ``_delivery_key`` states once and no other way.
+            "delivery_key": "ip",
             "tables": ["interface_ip_intent"],
             "owned": lambda d: _owned_count(NSOInterfaceIPState, d, via="interface__device"),
-            "push": signals._push_ip_intent_for_device,
         },
         {
             "key": "interface_mtu",
             "label": "Interface MTU",
             "tables": ["interface_mtu_intent"],
             "owned": lambda d: _owned_count(NSOInterfaceMtuState, d),
-            "push": signals._push_interface_mtu_intent_for_device,
         },
         {
             "key": "interface",
@@ -152,42 +151,36 @@ def _scopes() -> list[dict]:
             # _push_interface_intent_for_device exactly, or owned rows would read as
             # orphaned/partial.
             "owned": lambda d: _owned_count(NSOInterfaceState, d, via="interface__device"),
-            "push": signals._push_interface_intent_for_device,
         },
         {
             "key": "vlan",
             "label": "VLANs",
             "tables": ["vlan_intent"],
             "owned": lambda d: _owned_count(NSOVLANState, d),
-            "push": signals._push_vlan_intent_for_device,
         },
         {
             "key": "svi",
             "label": "SVIs / IRBs",
             "tables": ["svi_intent"],
             "owned": lambda d: _owned_count(NSOSVIState, d),
-            "push": signals._push_svi_intent_for_device,
         },
         {
             "key": "subinterface",
             "label": "Subinterfaces",
             "tables": ["subinterface_intent"],
             "owned": lambda d: _owned_count(NSOSubinterfaceState, d),
-            "push": signals._push_subinterface_intent_for_device,
         },
         {
             "key": "bfd",
             "label": "BFD",
             "tables": ["bfd_intent"],
             "owned": lambda d: _owned_count(NSOBFDInterfaceState, d),
-            "push": signals._push_bfd_intent_for_device,
         },
         {
             "key": "l2_sap",
             "label": "L2 SAPs",
             "tables": ["l2_sap_intent"],
             "owned": lambda d: _owned_count(NSOL2SapState, d),
-            "push": signals._push_l2_sap_intent_for_device,
         },
         {
             "key": "snmp",
@@ -199,14 +192,12 @@ def _scopes() -> list[dict]:
                 "snmp_v3_user_intent",
             ],
             "owned": _snmp_owned,
-            "push": signals._push_snmp_intent_for_device,
         },
         {
             "key": "logging",
             "label": "Logging",
             "tables": ["logging_host_intent", "logging_levels_intent"],
             "owned": lambda d: _owned_count(NSOLoggingHostState, d) + _owned_count(NSOLoggingLevelState, d),
-            "push": signals._push_logging_intent_for_device,
         },
     ]
 
@@ -257,12 +248,14 @@ def compute_intent_drift(device, mgmt) -> list[dict]:
     return drift
 
 
-def resync_intent(device, mgmt, keys: list[str] | None = None) -> list[str]:
+def resync_intent(device, mgmt, keys: list[str] | None = None) -> tuple[list[str], list[str]]:
     """Re-push the owned intent for *keys* (default: all orphaned/partial scopes) → clears them.
 
-    Returns the scope keys re-synced. The push is the plugin's normal full-snapshot push, so
-    for a scope NetBox owns nothing in, it sends an empty snapshot and the adapter full-replace
-    removes the orphaned rows.
+    Returns ``(done, failed)``: the scope keys the adapter acknowledged, and the keys whose
+    push it refused or never answered. A refusal clears no orphaned row, so reporting it as
+    done told the operator the split-brain was repaired while the drift stood (#1557). The
+    push is the plugin's normal full-snapshot push, so for a scope NetBox owns nothing in, it
+    sends an empty snapshot and the adapter full-replace removes the orphaned rows.
 
     The pushes run under ``store_only_pushes()`` (→ ``?store_only=true``): re-sync repairs the
     adapter's intent STORE only, so the adapter must skip its shrink-removal and auto-apply
@@ -271,41 +264,42 @@ def resync_intent(device, mgmt, keys: list[str] | None = None) -> list[str]:
     the banner's "does not touch the device" promise (tracker #103, ra1.lab).
     """
     if mgmt is None or mgmt.adapter_device_id is None:
-        return []
-    from . import adapter_client as client
+        return [], []
+    from . import delivery, drain
 
     if keys is None:
         keys = [d["key"] for d in compute_intent_drift(device, mgmt)]
     by_key = {sc["key"]: sc for sc in _scopes()}
     done: list[str] = []
-    with client.store_only_pushes():
-        for key in keys:
-            sc = by_key.get(key)
-            if sc is None:
-                continue
-            # force=True is load-bearing, not belt-and-braces. Re-sync exists precisely for
-            # the split-brain where the ADAPTER lost the intent while the plugin's
-            # process-global _last_pushed_hashes still holds the digest of the last push —
-            # which is exactly the condition _push_changed reads as "unchanged, skip". The
-            # re-sync would then silently no-op while the view reported success.
-            sc["push"](mgmt.device_id, mgmt.adapter_device_id, force=True)
-            done.append(key)
-    return done
+    failed: list[str] = []
+    for key in keys:
+        sc = by_key.get(key)
+        if sc is None:
+            continue
+        # force=True is load-bearing, not belt-and-braces. Re-sync exists precisely for the
+        # split-brain where the ADAPTER lost the intent while the plugin's acknowledged
+        # baseline still names that body — which is what the claim reads as "unchanged,
+        # drop". The re-sync would then silently no-op while the view reported success.
+        try:
+            outcome = drain.drain_key(mgmt.device_id, _delivery_key(sc), mode=delivery.MODE_STORE_ONLY, force=True)
+        except Exception:  # noqa: BLE001 (one scope's refusal must not strand the rest unattempted)
+            logger.exception("Intent re-sync raised for device %s scope %s", mgmt.device_id, key)
+            outcome = None
+        # The outcome is independent of whether the acknowledged response has a body.
+        (done if outcome == drain.SUCCEEDED else failed).append(key)
+    return done, failed
 
 
 class _PushNotAcknowledged(Exception):
-    """The adapter did not answer this device's push with a stored count.
-
-    Carries the push record the rollback is about to discard, as ``(attempt, entry)``.
-    """
-
-    def __init__(self, record=(None, None)):
-        super().__init__("the adapter did not acknowledge the static-route intent push")
-        self.record = record
+    """The adapter did not answer this device's push with a stored count."""
 
 
-def _backfill_static_route_generations(mgmt) -> int:
-    """Arm every owned overlay of *mgmt* still on the unallocated sentinel. Returns how many.
+def _backfill_static_route_generations(mgmt) -> list[dict]:
+    """Arm every owned overlay of *mgmt* still on the unallocated sentinel.
+
+    Returns the pre-arm value of every field it wrote, one dict per row, which is what
+    :func:`_restore_static_route_generations` puts back when the push that was supposed to
+    carry these generations is not acknowledged.
 
     Pre-P2 owned rows keep ``intent_generation = 0``: the push sends that as null, the
     adapter adopts nothing, and every result the row ever produces is non-settling. The
@@ -342,18 +336,50 @@ def _backfill_static_route_generations(mgmt) -> int:
         .order_by("management_id", "pk")
     )
     if not rows:
-        return 0
+        return []
+    armed_fields = signals._STATIC_ROUTE_ARMED_FIELDS
+    before = [
+        {"pk": row.pk, "status": row.status, **{field: getattr(row, field) for field in armed_fields}} for row in rows
+    ]
     demote = [row.pk for row in rows if row.status == DEPLOYING]
     with signals.suppress_intent_push():
         for row in rows:
             signals._arm_static_route_generation(row)
             row.save(update_fields=list(signals._STATIC_ROUTE_ARMED_FIELDS))
+    for snapshot, row in zip(before, rows, strict=True):
+        # What the restore compares against: it may only undo the generation it wrote.
+        snapshot["armed_generation"] = row.intent_generation
     if demote:
         # .update(): a status save would re-fire the row's intent push, and this is
         # bookkeeping about intent that has not moved.
         NSOStaticRouteState.objects.filter(pk__in=demote).update(status="accepted")
     logger.info("Armed %s static-route overlay(s) of device %s from the generation sentinel", len(rows), mgmt.device_id)
-    return len(rows)
+    return before
+
+
+def _restore_static_route_generations(before: list[dict]) -> int:
+    """Put back every armed row this pass still owns, and return how many.
+
+    The send cannot run inside the arming transaction any more: a claim sets its own
+    isolation level, which PostgreSQL accepts only before a transaction's first statement,
+    and the send must hold no row lock at all. So the rollback that used to ride the
+    transaction becomes an explicit inverse, restoring the sentinel and the demoted status
+    so a later run finds these rows and retries them. Without it a generation the adapter
+    never stored would correlate with nothing forever.
+
+    Outside a transaction the inverse needs a compare-and-set, which is what the armed
+    generation is: an operator re-accepting a row while the push is on the wire gives it a
+    new one, and restoring over that would put the sentinel back on intent the operator has
+    just stated. A row that moved is left alone, and is not counted as rolled back.
+    """
+    from .models import NSOStaticRouteState
+
+    restored = 0
+    for snapshot in before:
+        fields = dict(snapshot)
+        pk, armed = fields.pop("pk"), fields.pop("armed_generation")
+        restored += NSOStaticRouteState.objects.filter(pk=pk, intent_generation=armed).update(**fields)
+    return restored
 
 
 def resync_static_route_intent_fleet(device_ids: list[int] | None = None) -> list[dict]:
@@ -364,27 +390,27 @@ def resync_static_route_intent_fleet(device_ids: list[int] | None = None) -> lis
     *next* ordinary push is the first one that can plan a replacement.
 
     Deliberately not routed through :func:`resync_intent`: with the default ``keys`` that only
-    re-syncs scopes that already look drifted — a device whose counts agree looks clean while
-    every one of its rows is still id-less — and it appends each key unconditionally, so it
-    cannot tell a rejected push from a skipped one. Here each device is acknowledged from the
-    ``count`` the adapter answers with, and ``force=True`` makes a ``None`` return
-    unambiguously a failure rather than a change-detection skip.
+    re-syncs scopes that already look drifted, and a device whose counts agree looks clean
+    while every one of its rows is still id-less. Here each device is acknowledged from the
+    ``count`` the adapter answers with, and the forced claim makes a ``None`` return
+    unambiguously a failure rather than a drop against the acknowledged baseline.
 
     Store-only throughout: this repairs the adapter's intent MIRROR, so it must not enqueue an
     apply or write a tombstone. A clear the resync happens to detect parks the row instead of
     being authorized.
 
-    It is also the rollout pass for #1502 Appendix S: per device, in **one** transaction, it
-    arms every owned overlay still on the generation sentinel and then pushes it. Arming and
-    pushing cannot be separated — a generation the adapter never stored correlates with
-    nothing, and a later run would find no sentinel row left to retry it with, so a push the
-    adapter did not acknowledge rolls the arming back with it. Idempotent: a second run finds
-    no sentinel rows, arms nothing and pushes an unchanged snapshot.
+    It is also the rollout pass for #1502 Appendix S: per device it arms every owned overlay
+    still on the generation sentinel and then pushes it. The two still stand or fall
+    together — a generation the adapter never stored correlates with nothing, and a later run
+    would find no sentinel row left to retry it with — but they can no longer share one
+    transaction, because the send holds no lock and sets its own isolation level. So the
+    arming commits first and an unacknowledged push RESTORES it, which leaves the same rows
+    for the next run. Idempotent: a second run finds no sentinel rows, arms nothing and
+    pushes an unchanged snapshot.
     """
     from django.db import transaction
 
-    from . import adapter_client as client
-    from . import signals
+    from . import delivery, drain, signals
     from .models import NSODeviceManagement
 
     rows = NSODeviceManagement.objects.filter(adapter_device_id__isnull=False).select_related("device")
@@ -392,42 +418,35 @@ def resync_static_route_intent_fleet(device_ids: list[int] | None = None) -> lis
         rows = rows.filter(device_id__in=device_ids)
 
     results: list[dict] = []
-    with client.store_only_pushes():
-        for mgmt in rows.order_by("device_id"):
-            armed = rolled_back = 0
-            try:
-                with transaction.atomic():
-                    armed = _backfill_static_route_generations(mgmt)
-                    response = signals._push_static_route_intent_for_device(
-                        mgmt.device_id, mgmt.adapter_device_id, force=True
-                    )
-                    count = signals.stored_static_route_count(response)
-                    if count is None:
-                        # Read the rejection the push just persisted, because rolling the
-                        # arming back would take that record with it.
-                        raise _PushNotAcknowledged(signals.read_push_record(mgmt.device_id, "static_route"))
-            except _PushNotAcknowledged as rejected:
-                logger.warning("Static-route intent re-sync was not acknowledged for device %s", mgmt.device_id)
-                # Outside the rolled-back transaction: the reason the adapter gave is what
-                # the operator acts on, and it is not part of what the rollback undoes.
-                signals.restore_push_record(mgmt.device_id, "static_route", *rejected.record)
-                # `armed` is 0 because the rollback undid the arming, which reads the same as
-                # "nothing needed arming". Report the undone count so a partial pass is visible.
-                armed, rolled_back, count = 0, armed, None
-            # Not an adapter rejection (the push returns None for those), so letting it out
-            # would strand every later device unattempted and unreported.
-            except Exception:  # noqa: BLE001
-                logger.exception("Static-route intent re-sync raised for device %s", mgmt.device_id)
-                armed, rolled_back, count = 0, armed, None
-            results.append(
-                {
-                    "device_id": mgmt.device_id,
-                    "device": str(mgmt.device),
-                    "adapter_device_id": mgmt.adapter_device_id,
-                    "ok": count is not None,
-                    "count": count,
-                    "armed": armed,
-                    "armed_rolled_back": rolled_back,
-                }
-            )
+    for mgmt in rows.order_by("device_id"):
+        armed_rows: list[dict] = []
+        rolled_back = 0
+        try:
+            with transaction.atomic():
+                armed_rows = _backfill_static_route_generations(mgmt)
+            response = drain.push_now(mgmt.device_id, "static_route", mode=delivery.MODE_STORE_ONLY, force=True)
+            count = signals.stored_static_route_count(response)
+            if count is None:
+                raise _PushNotAcknowledged
+        except _PushNotAcknowledged:
+            logger.warning("Static-route intent re-sync was not acknowledged for device %s", mgmt.device_id)
+            rolled_back, count = _restore_static_route_generations(armed_rows), None
+            armed_rows = []
+        # Not an adapter rejection (the claim records those and answers None), so letting it
+        # out would strand every later device unattempted and unreported.
+        except Exception:  # noqa: BLE001
+            logger.exception("Static-route intent re-sync raised for device %s", mgmt.device_id)
+            rolled_back, count = _restore_static_route_generations(armed_rows), None
+            armed_rows = []
+        results.append(
+            {
+                "device_id": mgmt.device_id,
+                "device": str(mgmt.device),
+                "adapter_device_id": mgmt.adapter_device_id,
+                "ok": count is not None,
+                "count": count,
+                "armed": len(armed_rows),
+                "armed_rolled_back": rolled_back,
+            }
+        )
     return results

@@ -5,7 +5,6 @@
 import contextlib
 import contextvars
 import functools
-import hashlib
 import json
 import logging
 import threading
@@ -140,38 +139,38 @@ def _skip_on_render(handler):
     return _wrapped
 
 
-# ── Intent-push coalescing + change-detection ──────────────────────────────────
+# ── Intent-push scheduling: the durable outbox ────────────────────────────────
 #
-# A bulk operation (e.g. NetBox's native bulk-edit) saves N rows in one
-# transaction; each save fires a push handler that rebuilds and PUTs the FULL
-# device snapshot. Without coalescing that is O(N^2) work and N HTTP PUTs.
+# A bulk operation (e.g. NetBox's native bulk-edit) saves N rows in one transaction; each
+# save fires a push handler that would rebuild and PUT the FULL device snapshot. Without
+# coalescing that is O(N^2) work and N HTTP PUTs.
 #
-# Two complementary mitigations, mirroring the adapter perf layers:
-#   * Coalescing — collect pushes during a transaction, keyed by (device, category),
-#     and flush each key once at commit (one push reflecting the final state).
-#   * Change-detection — skip the PUT when the snapshot is byte-identical to the
-#     last one pushed for that key. The adapter PUT is an idempotent full-replace,
-#     so this in-process, best-effort cache is safe (a cold-cache redundant push
-#     is harmless).
+# So a save does not push. It APPENDS a row to the outbox (#1503 Appendix O), and the
+# commit callback drains the key once through the claim protocol: one fold, one render, one
+# send. The two in-memory carriers this replaced are gone for cause — a thread-local map of
+# pending pushes survived the rollback that discarded its reason (§2), and a process-global
+# last-pushed digest authorized deleting routes a stale worker never knew about (§8.3).
+# Change detection is now the state row's own ``last_success_identity``, which names a body
+# the adapter ACKNOWLEDGED rather than one this process happened to send.
 #
-# Coalescing only engages inside a transaction; with no active transaction (a
-# lone programmatic save, or the no-DB unit tests) the push runs immediately —
-# this also avoids on_commit's autocommit path forcing a DB connection.
+# The cell below is thread-local and holds only keys. Registration is unconditional and the
+# first callback clears it, so a cell a rollback left behind costs extra O(1) callbacks and
+# never a missing drain. The append refuses when no writer transaction is open.
+_intent_keys = threading.local()
 
-# ``_pending_pushes`` is thread-local: coalescing is per-transaction, so it must not bleed
-# between request threads. ``_last_pushed_hashes`` is deliberately the opposite — a single
-# process-wide dict shared across threads. Two threads racing on the same key can at worst
-# cause one redundant or one un-deduped push, both harmless because the adapter PUT is an
-# idempotent full-replace (and the explicit Apply passes ``force=True``, bypassing it). A
-# per-thread cache would instead miss every cross-thread dedup, so sharing is the right call.
-_pending_pushes = threading.local()
-_last_pushed_hashes: dict[tuple, str] = {}
+
+def _pending_intent_keys() -> set:
+    """Return the keys this thread's current transaction has appended to."""
+    keys = getattr(_intent_keys, "keys", None)
+    if keys is None:
+        keys = set()
+        _intent_keys.keys = keys
+    return keys
 
 
 def reset_intent_push_state() -> None:
-    """Clear coalescing + change-detection state. Intended for use in tests."""
-    _last_pushed_hashes.clear()
-    _pending_pushes.map = {}
+    """Clear the pending-key cell. Intended for use in tests."""
+    _intent_keys.keys = set()
 
 
 # True while a DELETION-signal receiver is dispatching (see _as_delete_origin). Pushes
@@ -211,17 +210,6 @@ def _as_delete_origin(handler):
     return _wrapped
 
 
-def _run_intent_push(fn, delete_origin: bool) -> None:
-    """Run one push, under the delete-origin request mark when the flag survived."""
-    if delete_origin:
-        from . import adapter_client
-
-        with adapter_client.delete_origin_pushes():
-            fn()
-    else:
-        fn()
-
-
 def _device_is_managed(device_id) -> bool:
     """Whether *device_id* still has an adapter-linked NSODeviceManagement row.
 
@@ -238,55 +226,89 @@ def _device_is_managed(device_id) -> bool:
     return NSODeviceManagement.objects.filter(device_id=device_id, adapter_device_id__isnull=False).exists()
 
 
-def _schedule_intent_push(key, fn) -> None:
-    """Coalesce *fn* under *key*, flushing once when the current transaction commits.
+# ── Teardown: a device on its way out records nothing ──────────────────────────
+#
+# Deleting a Device (or unmanaging it) cascades every overlay away, and each of those
+# post_deletes schedules a push the drain then drops (see _device_is_managed). The outbox
+# must drop it EARLIER, at the append: the cascade is NetBox-side bookkeeping and carries no
+# operator intent, and a row appended after Django's collector took its snapshot would fail
+# the deferred foreign key at COMMIT. Every pre_delete fires before any post_delete, so the
+# mark is up before the first overlay handler runs, and the Device's own mark outlives the
+# management row's.
 
-    Deduped by key, so N saves of the same (device, category) collapse to one push.
-    Outside a transaction the push runs immediately (nothing to coalesce).
 
-    The delete-origin mark survives coalescing only when EVERY contributor for the key
-    was a deletion (AND): if an un-own coalesces with a delete, the single shrink push
-    stays unmarked and the adapter detaches — erring toward never touching the device.
+@receiver(pre_delete, sender="dcim.Device")
+def _mark_device_teardown(sender, instance, **kwargs):
+    from . import outbox
+
+    outbox.mark_device_teardown(instance.pk, outbox.current_txid())
+
+
+@receiver(post_delete, sender="dcim.Device")
+def _clear_device_teardown(sender, instance, **kwargs):
+    from . import outbox
+
+    outbox.clear_device_teardown(instance.pk, outbox.current_txid())
+
+
+@receiver(pre_delete, sender="netbox_nso_plugin.NSODeviceManagement")
+def _mark_management_teardown(sender, instance, **kwargs):
+    from . import outbox
+
+    outbox.mark_device_teardown(instance.device_id, outbox.current_txid())
+
+
+@receiver(post_delete, sender="netbox_nso_plugin.NSODeviceManagement")
+def _clear_management_teardown(sender, instance, **kwargs):
+    from . import outbox
+
+    outbox.clear_device_teardown(instance.device_id, outbox.current_txid())
+
+
+def _schedule_intent_push(key, transitions=()) -> None:
+    """Append this transaction's contribution to *key* and arrange for the key to drain.
+
+    *transitions* is the provenance of what this transaction did to the key — which routes
+    it deleted, which it re-owned — recorded alongside the dispatch mark it did it under.
+    The entry is the operator transaction's own row, so a rollback discards it.
+
+    The push itself is the drain's: it folds every unconsumed entry, renders one body and
+    sends it once. The delete-origin mark survives that fold only when EVERY contributor
+    was a deletion (AND), so an un-own folded with a delete leaves the shrink unmarked and
+    the adapter detaches, erring toward never touching the device.
+
+    The drain always runs on commit, never inline: the append refuses to run outside the
+    writer's transaction (O1.2), so by the time there is anything to drain there is a
+    commit to wait for.
     """
-    from django.db import connection, transaction
+    from django.db import transaction
 
-    delete_origin = _DELETE_DISPATCH.get()
-    if not connection.in_atomic_block:
-        if _device_is_managed(key[0]):
-            _run_intent_push(fn, delete_origin)
-        return
+    from . import outbox
 
-    pending = getattr(_pending_pushes, "map", None)
-    if pending is None:
-        pending = {}
-        _pending_pushes.map = pending
-    was_empty = not pending
-    prev = pending.get(key)
-    if prev is not None:
-        delete_origin = delete_origin and prev[1]
-    pending[key] = (fn, delete_origin)  # last fn wins — per-key builders are equivalent
-    if was_empty:
-        transaction.on_commit(_drain_intent_pushes)
+    if _is_intent_push_suppressed() or _is_render_request():
+        return  # a reconcile or render write mirrors the adapter; it is not operator intent
+    outbox.enqueue(key[0], key[1], transitions=transitions, delete_origin=_DELETE_DISPATCH.get())
+    _pending_intent_keys().add(tuple(key))
+    transaction.on_commit(_drain_intent_pushes)
 
 
 def _drain_intent_pushes() -> None:
-    """Run every coalesced push once, isolating failures so one can't abort the rest.
+    """Drain every key this transaction appended to, isolating failures between them.
 
-    Re-checked against the COMMITTED state: a push scheduled by the overlay cascade of a
-    device teardown must be dropped here, not shipped (see _device_is_managed).
+    The first callback takes the whole cell and clears it, so callbacks 2..N of a bulk edit
+    are O(1). A per-key failure is data: the claim keeps its rows and its sequence, and the
+    five-minute tick supplies the next attempt.
     """
-    pending = getattr(_pending_pushes, "map", None)
-    _pending_pushes.map = {}
-    if not pending:
-        return
-    for (device_id, scope), (fn, delete_origin) in pending.items():
-        if not _device_is_managed(device_id):
-            logger.info("Device %s is no longer NSO-managed — dropping the coalesced %s intent push", device_id, scope)
-            continue
+    from . import drain
+
+    keys = _pending_intent_keys()
+    claimed = sorted(keys)
+    keys.clear()
+    for device_id, scope in claimed:
         try:
-            _run_intent_push(fn, delete_origin)
-        except Exception as exc:  # noqa: BLE001 — a failed push must not abort siblings
-            logger.warning("Coalesced intent push failed: %s", exc)
+            drain.drain_key(device_id, scope)
+        except Exception as exc:  # noqa: BLE001 — one key's drain must not abort its siblings
+            logger.warning("Intent outbox drain failed for %s/%s: %s", device_id, scope, exc)
 
 
 def _allocate_push_attempt(device_id, scope):
@@ -429,90 +451,73 @@ def _record_push_outcome(device_id, scope, attempt, exc):
         logger.warning("Could not record the intent-push outcome for device %s/%s: %s", device_id, scope, exc2)
 
 
-def read_push_record(device_id, scope) -> tuple:
-    """Return this scope's persisted ``(attempt, rejection entry)`` as it stands right now."""
+def read_push_attempt(device_id, scope):
+    """Return this scope's attempt high-water mark, or ``None`` when it has none.
+
+    A caller that reports an outcome it did not itself allocate an attempt for — the claim's
+    response validation, which runs after the send returned — names the attempt already
+    standing, so its record cannot be discarded as superseded by the attempt it belongs to.
+    """
     from .models import NSODeviceManagement
 
-    row = (
-        NSODeviceManagement.objects.filter(device_id=device_id)
-        .values("intent_push_attempts", "intent_push_errors")
-        .first()
-    )
-    if row is None:
-        return None, None
-    attempt = (row["intent_push_attempts"] or {}).get(scope)
-    return (int(attempt) if attempt is not None else None), (row["intent_push_errors"] or {}).get(scope)
+    row = NSODeviceManagement.objects.filter(device_id=device_id).values("intent_push_attempts").first()
+    attempt = (row["intent_push_attempts"] or {}).get(scope) if row else None
+    return int(attempt) if attempt is not None else None
 
 
-def restore_push_record(device_id, scope, attempt, entry) -> None:
-    """Re-apply a rejection record a caller's own rollback discarded.
+def _push_changed(key, payload, do_push, on_response=None):
+    """Offer *payload* for *key* to the render in progress, and send nothing.
 
-    :func:`_push_changed` persists the attempt mark and the adapter's rejection through
-    :func:`_record_push_outcome`, which is what puts the reason on the device tab. A caller
-    that runs its push inside a transaction it then rolls back (the static-route rollout
-    pass, which cannot keep a generation the adapter refused) takes those writes down with
-    it, leaving the operator a bare "not acknowledged". This puts them back, in its own
-    transaction, under the same per-scope merge — so no other scope's record is touched and
-    a newer attempt recorded meanwhile still wins.
+    This is the render/send choke point the claim protocol needs (#1503 Appendix O, §4.2):
+    the body is captured here and the send happens later, outside every transaction, so a
+    claim can render inside its own one. Every push function reaches exactly one of these,
+    which is what makes the delivery registry an enumeration rather than a promise.
+
+    The direct send this used to fall back to is GONE with its callers (§4.2): it sent with
+    no claim and no ``X-Push-Seq``, and it swallowed the failure of a push that had already
+    published ownership, leaving nothing durable for the tick to carry. Reaching this
+    outside a render is therefore a programming error and says so, rather than delivering
+    intent by a route the protocol cannot see. :func:`delivery.deliver` is the supported way
+    to render and send a key on the spot.
+
+    The name is history: change detection used to live here, against a process-global digest
+    of the last body this worker sent. Appendix O deleted that too, because a stale worker's
+    cache authorized deleting routes it never knew about (§8.3); the claim now dedupes
+    against the state row's ``last_success_identity``, which names a body the adapter
+    acknowledged.
     """
-    from django.db import transaction
+    from .delivery import Rendered, capture
 
-    from .models import NSODeviceManagement
-
-    if attempt is None or entry is None:
-        return
-    try:
-        with transaction.atomic():
-            mgmt = NSODeviceManagement.objects.select_for_update().filter(device_id=device_id).first()
-            if mgmt is None:
-                return
-            attempts = dict(mgmt.intent_push_attempts or {})
-            if int(attempts.get(scope) or 0) > attempt:
-                return  # a later attempt has reported since; its record is the current one
-            errors = dict(mgmt.intent_push_errors or {})
-            attempts[scope] = attempt
-            errors[scope] = entry
-            NSODeviceManagement.objects.filter(pk=mgmt.pk).update(
-                intent_push_attempts=attempts, intent_push_errors=errors
-            )
-    except Exception as exc:  # noqa: BLE001 — surfacing must never turn a swallowed push into a raise
-        logger.warning("Could not restore the intent-push record for device %s/%s: %s", device_id, scope, exc)
+    rendered = Rendered(key=key, payload=payload, do_push=do_push, on_response=on_response)
+    if not capture(rendered):
+        raise RuntimeError(f"the {key} push ran outside a render: every send goes through the outbox")
 
 
-def _push_changed(key, payload, do_push, force=False):
-    """Run *do_push* only if *payload* differs from the last push for *key*.
+def _send_rendered(rendered, body):
+    """Send one rendered body: the attempt mark, the call, the outcome record, the side effect.
 
-    ``do_push`` performs the actual ``client.put_*`` call. Errors are swallowed
-    (matching the adapter-unreachable tolerance elsewhere) and the cache is left
-    unchanged on failure so the next attempt retries. ``force`` bypasses the
-    unchanged-skip (used by the explicit device Apply, which must always commit).
-
-    A failure is now also PERSISTED per ``(device, scope)`` so the operator can see what
-    the adapter refused instead of only a log line. R3 records; #1474 owns any retry —
-    nothing here re-sends, times out or queues.
-
-    Returns the ``do_push()`` result on a push that ran (so a caller can read the
-    adapter's response, e.g. the route-policy ``unsupported_members`` map), or ``None``
-    when the push was skipped-unchanged or failed. Most callers ignore the return.
+    The coalescer and the claim protocol share this, so a push made either way is marked,
+    recorded and settled identically. It RAISES on a failed call, because the claim has to
+    tell a failure from a success; :func:`_push_changed` is what swallows it for the
+    coalescer.
     """
-    digest = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
-    if not force and _last_pushed_hashes.get(key) == digest:
-        logger.debug("Intent push skipped (unchanged) for %s", key)
-        return None
-    device_id, scope = key
+    device_id, scope = rendered.key
     attempt = _allocate_push_attempt(device_id, scope)
     try:
-        result = do_push()
-    except Exception as exc:  # noqa: BLE001 — adapter may be down; log and retry next time
-        logger.warning("Intent push failed for %s: %s", key, exc)
+        result = rendered.do_push(body)
+    except Exception as exc:
         _record_push_outcome(device_id, scope, attempt, exc)
-        return None
+        raise
     _record_push_outcome(device_id, scope, attempt, None)
-    _last_pushed_hashes[key] = digest
+    if rendered.on_response is not None and isinstance(result, dict):
+        try:
+            rendered.on_response(result)
+        except Exception:  # noqa: BLE001 (the adapter already acknowledged the send)
+            logger.exception("Intent push success hook failed for device %s/%s", device_id, scope)
     return result
 
 
-def _push_interface_intent_for_device(device_id, adapter_device_id, force=False) -> None:
+def _push_interface_intent_for_device(device_id, adapter_device_id) -> None:
     """Build the full OWNED interface intent snapshot and push it (change-detected).
 
     Owned = ``status in OWNED_STATES`` (accepted/deploying/in_sync/apply_failed) — the
@@ -522,11 +527,9 @@ def _push_interface_intent_for_device(device_id, adapter_device_id, force=False)
     ``imported`` carried a stale accepted_at and was force-pushed despite reading as
     drift — the display/push split-brain this fix removes.) Shared by the accept signal,
     the Decision-G edit signal, and the view-level bulk accept so all three agree on
-    what gets pushed. ``force=True`` (the device Apply) bypasses change-detection so an
-    owned interface whose adapter intent went stale is re-pushed and actually applied,
-    instead of being silently skipped — ownership is kept durable by the reconciler's
-    owned-guard (``template_content._upsert_interface_states``), which no longer lets an
-    adapter sync clobber an owned status back to ``imported``.
+    what gets pushed. Ownership is kept durable by the reconciler's owned-guard
+    (``template_content._upsert_interface_states``), which no longer lets an adapter sync
+    clobber an owned status back to ``imported``.
     """
     from . import adapter_client as client
     from .models import NSOInterfaceState
@@ -557,31 +560,36 @@ def _push_interface_intent_for_device(device_id, adapter_device_id, force=False)
     _push_changed(
         (device_id, "interface"),
         attributes,
-        lambda: client.put_intent(adapter_device_id, attributes),
-        force=force,
+        lambda body: client.put_intent(adapter_device_id, body),
     )
 
 
-def _schedule_redistribution_push(device_id, adapter_device_id, dest) -> None:
+#: The destination protocols a redistribution change can be scheduled against. It is the
+#: delivery key itself, so an unknown value names no renderer and must be refused, not sent.
+_REDISTRIBUTION_PROTOCOLS = ("ospf", "isis", "bgp")
+
+
+def redistribution_destinations() -> tuple[str, ...]:
+    """Return the one allow-list both scheduling paths refuse against."""
+    from . import delivery
+
+    return tuple(dest for dest in _REDISTRIBUTION_PROTOCOLS if dest in delivery.delivery_keys())
+
+
+def _schedule_redistribution_push(device_id, dest) -> None:
     """Schedule the destination protocol's intent push for a redistribution change.
 
     Keyed by (device, dest_protocol) so redistribution and the protocol's own state
-    saves coalesce into a single push for that protocol.
+    saves fold into a single push for that protocol.
     """
-    if dest == "ospf":
-        fn = _push_ospf_intent_for_device
-    elif dest == "isis":
-        fn = _push_isis_intent_for_device
-    elif dest == "bgp":
-        fn = _push_bgp_intent_for_device
-    else:
+    if dest not in redistribution_destinations():
         logger.warning(
             "Redistribution: unknown dest_protocol %r for device %s — no push triggered",
             dest,
             device_id,
         )
         return
-    _schedule_intent_push((device_id, dest), lambda: fn(device_id, adapter_device_id))
+    _schedule_intent_push((device_id, dest))
 
 
 @receiver(pre_save, sender="netbox_nso_plugin.NSODeviceManagement")
@@ -912,11 +920,7 @@ def push_intent_on_accept(sender, instance, **kwargs):
     if mgmt.adapter_device_id is None:
         return
 
-    adapter_device_id = mgmt.adapter_device_id
-    _schedule_intent_push(
-        (device_id, "interface"),
-        lambda: _push_interface_intent_for_device(device_id, adapter_device_id),
-    )
+    _schedule_intent_push((device_id, "interface"))
 
 
 def _templates():
@@ -1089,11 +1093,7 @@ def _push_intent_on_interface_edit(sender, instance, created, **kwargs):
         return
 
     device_id = instance.device_id
-    adapter_device_id = mgmt.adapter_device_id
-    _schedule_intent_push(
-        (device_id, "interface"),
-        lambda: _push_interface_intent_for_device(device_id, adapter_device_id),
-    )
+    _schedule_intent_push((device_id, "interface"))
 
 
 def _create_greenfield_subif_state(sender, instance, created, **kwargs):
@@ -1138,11 +1138,11 @@ def _create_greenfield_subif_state(sender, instance, created, **kwargs):
     )
 
 
-def _push_ip_intent_for_device(device_id, adapter_device_id, force=False):
+def _push_ip_intent_for_device(device_id, adapter_device_id):
     """Build and push the full IP intent snapshot for a device.
 
-    ``force=True`` bypasses change-detection (used by provisioning, which must always land
-    its computed intent even if an identical snapshot was pushed earlier this process).
+    A forced claim (provisioning) re-sends this snapshot whatever the acknowledged
+    baseline says, so a computed intent always lands.
     """
     from . import adapter_client as client
     from .models import NSOInterfaceIPState
@@ -1165,7 +1165,7 @@ def _push_ip_intent_for_device(device_id, adapter_device_id, force=False):
         entry.update(_nokia_routed_binding(ip_state.interface))
         addresses.append(entry)
 
-    _push_changed((device_id, "ip"), addresses, lambda: client.put_ip_intent(adapter_device_id, addresses), force=force)
+    _push_changed((device_id, "ip"), addresses, lambda body: client.put_ip_intent(adapter_device_id, body))
 
 
 def _nokia_routed_binding(interface) -> dict:
@@ -1268,7 +1268,7 @@ def _drop_unpushable_snmp_rows(model, rows, blocker):
     return pushable
 
 
-def _push_snmp_intent_for_device(device_id, adapter_device_id, force=False):
+def _push_snmp_intent_for_device(device_id, adapter_device_id):
     """Build and push the full SNMP intent snapshot for a device."""
     from . import adapter_client as client
     from .models import NSOSnmpCommunityState, NSOSnmpHostState, NSOSnmpSystemInfoState, NSOSnmpV3UserState
@@ -1357,8 +1357,7 @@ def _push_snmp_intent_for_device(device_id, adapter_device_id, force=False):
     _push_changed(
         (device_id, "snmp"),
         [communities, v3_users, hosts, system_info],
-        lambda: client.put_snmp_intent(adapter_device_id, communities, v3_users, hosts, system_info),
-        force=force,
+        lambda body: client.put_snmp_intent(adapter_device_id, *body),
     )
 
 
@@ -1376,14 +1375,10 @@ def _on_snmp_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    adapter_device_id = mgmt.adapter_device_id
-    _schedule_intent_push(
-        (device_id, "snmp"),
-        lambda: _push_snmp_intent_for_device(device_id, adapter_device_id),
-    )
+    _schedule_intent_push((device_id, "snmp"))
 
 
-def _push_logging_intent_for_device(device_id, adapter_device_id, force=False):
+def _push_logging_intent_for_device(device_id, adapter_device_id):
     """Build and push the full logging intent snapshot (hosts + local levels) for a device.
 
     Store-only (deferred): the device commit happens on the single device Apply via
@@ -1426,8 +1421,7 @@ def _push_logging_intent_for_device(device_id, adapter_device_id, force=False):
     _push_changed(
         (device_id, "logging"),
         [hosts, local_levels],
-        lambda: client.put_logging_intent(adapter_device_id, hosts, local_levels),
-        force=force,
+        lambda body: client.put_logging_intent(adapter_device_id, *body),
     )
 
 
@@ -1445,24 +1439,17 @@ def _on_logging_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    adapter_device_id = mgmt.adapter_device_id
-    _schedule_intent_push(
-        (device_id, "logging"),
-        lambda: _push_logging_intent_for_device(device_id, adapter_device_id),
-    )
+    _schedule_intent_push((device_id, "logging"))
 
 
-def _push_svi_intent_for_device(device_id, adapter_device_id, force=False):
+def _push_svi_intent_for_device(device_id, adapter_device_id):
     """Build and push the full owned SVI/IRB intent snapshot for a device.
 
     Store-only (deferred): the single device Apply commits via the svi-reconciler.
     Only owned rows (_OWNED_PUSH_STATUSES, incl. apply_failed) are included.
 
-    ``force=True`` (the device Apply) bypasses change-detection so an owned SVI whose
-    adapter intent went stale/empty is re-pushed and actually applied instead of being
-    silently skipped — mirrors the interface/VLAN/route-policy force-push. Without it,
-    Apply marks the row 'deploying', pushes nothing, applies 0 items and the row sticks
-    in 'deploying' forever.
+    A forced Apply claim re-sends this snapshot whatever the acknowledged baseline says,
+    so an owned row whose adapter intent went stale or empty is applied instead of skipped.
     """
     from . import adapter_client as client
     from .models import NSOSVIState
@@ -1487,8 +1474,7 @@ def _push_svi_intent_for_device(device_id, adapter_device_id, force=False):
     _push_changed(
         (device_id, "svi"),
         interfaces,
-        lambda: client.put_svi_intent(adapter_device_id, interfaces),
-        force=force,
+        lambda body: client.put_svi_intent(adapter_device_id, body),
     )
 
 
@@ -1506,23 +1492,17 @@ def _on_svi_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    adapter_device_id = mgmt.adapter_device_id
-    _schedule_intent_push(
-        (device_id, "svi"),
-        lambda: _push_svi_intent_for_device(device_id, adapter_device_id),
-    )
+    _schedule_intent_push((device_id, "svi"))
 
 
-def _push_subinterface_intent_for_device(device_id, adapter_device_id, force=False):
+def _push_subinterface_intent_for_device(device_id, adapter_device_id):
     """Build and push the full owned dot1q subinterface intent snapshot.
 
     Store-only (deferred): the single device Apply commits via the
     subinterface-reconciler. Only owned rows (_OWNED_PUSH_STATUSES, incl. apply_failed) included.
 
-    ``force=True`` (the device Apply) bypasses change-detection so an owned subinterface
-    whose adapter intent went stale/empty is re-pushed and actually applied instead of
-    silently skipped — mirrors the interface/VLAN/route-policy force-push. Without it, Apply
-    marks the row 'deploying', pushes nothing, applies 0 items and it sticks 'deploying'.
+    A forced Apply claim re-sends this snapshot whatever the acknowledged baseline says,
+    so an owned row whose adapter intent went stale or empty is applied instead of skipped.
     """
     from . import adapter_client as client
     from .models import NSOSubinterfaceState
@@ -1549,8 +1529,7 @@ def _push_subinterface_intent_for_device(device_id, adapter_device_id, force=Fal
     _push_changed(
         (device_id, "subinterface"),
         interfaces,
-        lambda: client.put_subinterface_intent(adapter_device_id, interfaces),
-        force=force,
+        lambda body: client.put_subinterface_intent(adapter_device_id, body),
     )
 
 
@@ -1568,23 +1547,17 @@ def _on_subinterface_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    adapter_device_id = mgmt.adapter_device_id
-    _schedule_intent_push(
-        (device_id, "subinterface"),
-        lambda: _push_subinterface_intent_for_device(device_id, adapter_device_id),
-    )
+    _schedule_intent_push((device_id, "subinterface"))
 
 
-def _push_interface_mtu_intent_for_device(device_id, adapter_device_id, force=False):
+def _push_interface_mtu_intent_for_device(device_id, adapter_device_id):
     """Build and push the full owned per-interface MTU intent snapshot (Phase 2b).
 
     Store-only (deferred): the single device Apply commits via the mtu-reconciler.
     Only owned rows (_OWNED_PUSH_STATUSES, incl. apply_failed) are included.
 
-    ``force=True`` (the device Apply) bypasses change-detection so an owned MTU whose
-    adapter intent went stale/empty is re-pushed and actually applied instead of silently
-    skipped — mirrors the interface/VLAN/route-policy force-push. Without it, Apply marks
-    the row 'deploying', pushes nothing, applies 0 items and it sticks 'deploying'.
+    A forced Apply claim re-sends this snapshot whatever the acknowledged baseline says,
+    so an owned row whose adapter intent went stale or empty is applied instead of skipped.
     """
     from . import adapter_client as client
     from .models import NSOInterfaceMtuState
@@ -1609,8 +1582,7 @@ def _push_interface_mtu_intent_for_device(device_id, adapter_device_id, force=Fa
     _push_changed(
         (device_id, "interface_mtu"),
         interfaces,
-        lambda: client.put_interface_mtu_intent(adapter_device_id, interfaces),
-        force=force,
+        lambda body: client.put_interface_mtu_intent(adapter_device_id, body),
     )
 
 
@@ -1628,23 +1600,19 @@ def _on_mtu_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    adapter_device_id = mgmt.adapter_device_id
-    _schedule_intent_push(
-        (device_id, "interface_mtu"),
-        lambda: _push_interface_mtu_intent_for_device(device_id, adapter_device_id),
-    )
+    _schedule_intent_push((device_id, "interface_mtu"))
 
 
-def _push_vlan_intent_for_device(device_id, adapter_device_id, force=False):
+def _push_vlan_intent_for_device(device_id, adapter_device_id):
     """Build and push the full owned VLAN-database intent snapshot for a device (write).
 
     Store-only (deferred): the single device Apply commits via the vlan-reconciler.
     Only owned rows (_OWNED_PUSH_STATUSES, incl. apply_failed) are included; the VLAN name pushed
     is the LIVE NetBox name (operator is the source of truth for it).
 
-    ``force`` re-pushes even if the snapshot looks unchanged — the single Apply calls
-    this with ``force=True`` so a VLAN renamed in NetBox *after* it was accepted (the
-    rename touches ipam.VLAN, which fires no plugin signal) still reaches the device.
+    The single Apply takes a forced claim, so a VLAN renamed in NetBox *after* it was
+    accepted (the rename touches ipam.VLAN, which fires no plugin signal) still reaches
+    the device.
     """
     from . import adapter_client as client
     from .models import NSOVLANState
@@ -1666,8 +1634,7 @@ def _push_vlan_intent_for_device(device_id, adapter_device_id, force=False):
     _push_changed(
         (device_id, "vlan"),
         vlans,
-        lambda: client.put_vlan_intent(adapter_device_id, vlans),
-        force=force,
+        lambda body: client.put_vlan_intent(adapter_device_id, body),
     )
 
 
@@ -1685,11 +1652,7 @@ def _on_vlan_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    adapter_device_id = mgmt.adapter_device_id
-    _schedule_intent_push(
-        (device_id, "vlan"),
-        lambda: _push_vlan_intent_for_device(device_id, adapter_device_id),
-    )
+    _schedule_intent_push((device_id, "vlan"))
 
 
 @_skip_on_render
@@ -1734,22 +1697,17 @@ def _on_ipam_vlan_pre_delete(sender, instance, **kwargs):
         if mgmt.adapter_device_id is not None:
             targets.append((mgmt.device_id, mgmt.adapter_device_id))
     for device_id, adapter_device_id in targets:
-        _schedule_intent_push(
-            (device_id, "vlan"),
-            lambda d=device_id, a=adapter_device_id: _push_vlan_intent_for_device(d, a),
-        )
+        _schedule_intent_push((device_id, "vlan"))
 
 
-def _push_bfd_intent_for_device(device_id, adapter_device_id, force=False):
+def _push_bfd_intent_for_device(device_id, adapter_device_id):
     """Build and push the full owned per-interface BFD intent snapshot for a device.
 
     Store-only (deferred): the single device Apply commits via the bfd-reconciler.
     Only owned rows (_OWNED_PUSH_STATUSES, incl. apply_failed) are included.
 
-    ``force=True`` (the device Apply) bypasses change-detection so an owned BFD whose
-    adapter intent went stale/empty is re-pushed and actually applied instead of silently
-    skipped — mirrors the interface/VLAN/route-policy force-push. Without it, Apply marks
-    the row 'deploying', pushes nothing, applies 0 items and it sticks 'deploying'.
+    A forced Apply claim re-sends this snapshot whatever the acknowledged baseline says,
+    so an owned row whose adapter intent went stale or empty is applied instead of skipped.
     """
     from . import adapter_client as client
     from .models import NSOBFDInterfaceState
@@ -1772,8 +1730,7 @@ def _push_bfd_intent_for_device(device_id, adapter_device_id, force=False):
     _push_changed(
         (device_id, "bfd"),
         interfaces,
-        lambda: client.put_bfd_intent(adapter_device_id, interfaces),
-        force=force,
+        lambda body: client.put_bfd_intent(adapter_device_id, body),
     )
 
 
@@ -1791,11 +1748,7 @@ def _on_bfd_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    adapter_device_id = mgmt.adapter_device_id
-    _schedule_intent_push(
-        (device_id, "bfd"),
-        lambda: _push_bfd_intent_for_device(device_id, adapter_device_id),
-    )
+    _schedule_intent_push((device_id, "bfd"))
 
 
 def _on_ip_address_pre_save(sender, instance, **kwargs):
@@ -1855,11 +1808,8 @@ def _cleanup_reassigned_ip_overlay(instance) -> None:
     deleted, _ = NSOInterfaceIPState.objects.filter(interface=prev_iface, address=prev_addr, vrf=prev_vrf).delete()
     if not deleted:
         return
-    device_id, adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
-    _schedule_intent_push(
-        (device_id, "ip"),
-        lambda: _push_ip_intent_for_device(device_id, adapter_device_id),
-    )
+    device_id, _adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
+    _schedule_intent_push((device_id, "ip"))
 
 
 @_skip_on_render
@@ -1924,11 +1874,7 @@ def _on_ip_address_change(sender, instance, **kwargs):
             ip_state.save(update_fields=["status", "accepted_at"])
 
     if not getattr(_p2p_allocation_active, "active", False):
-        adapter_device_id = mgmt.adapter_device_id
-        _schedule_intent_push(
-            (device_id, "ip"),
-            lambda: _push_ip_intent_for_device(device_id, adapter_device_id),
-        )
+        _schedule_intent_push((device_id, "ip"))
 
 
 @_skip_on_render
@@ -1964,11 +1910,7 @@ def _on_ip_address_delete(sender, instance, **kwargs):
         vrf=vrf_name,
     ).delete()
 
-    adapter_device_id = mgmt.adapter_device_id
-    _schedule_intent_push(
-        (device_id, "ip"),
-        lambda: _push_ip_intent_for_device(device_id, adapter_device_id),
-    )
+    _schedule_intent_push((device_id, "ip"))
 
 
 #: The overlays a static-route push actually serializes: owned, and carrying an IP next
@@ -1995,7 +1937,7 @@ def stored_static_route_count(response):
     return count
 
 
-def _push_static_route_intent_for_device(device_id, adapter_device_id, force=False):
+def _push_static_route_intent_for_device(device_id, adapter_device_id):
     """Build and push the full static route intent snapshot for a device.
 
     Each route names the NetBox ``StaticRoute`` pk and the generation of the intent it
@@ -2005,9 +1947,8 @@ def _push_static_route_intent_for_device(device_id, adapter_device_id, force=Fal
     NULL — the adapter adopts a generation only when non-null, so a sentinel row simply has
     nothing to correlate with instead of correlating with everything at 0.
 
-    Returns the adapter's response, so a caller passing ``force=True`` can tell a failure
-    (``None``) from a skipped-unchanged push, and records the echoed fingerprints as this
-    device's settlement expectations.
+    Records echoed fingerprints as this device's settlement expectations. The claim handles
+    the adapter response after this function captures the rendered body.
     """
     from . import adapter_client as client
     from .models import NSOStaticRouteState
@@ -2039,15 +1980,12 @@ def _push_static_route_intent_for_device(device_id, adapter_device_id, force=Fal
         if generation is not None:
             generations[sr.pk] = generation
 
-    response = _push_changed(
+    _push_changed(
         (device_id, "static_route"),
         routes,
-        lambda: client.put_static_route_intent(adapter_device_id, routes),
-        force=force,
+        lambda body: client.put_static_route_intent(adapter_device_id, body),
+        on_response=lambda resp: _record_static_route_expectations(device_id, generations, resp.get("routes") or []),
     )
-    if isinstance(response, dict):
-        _record_static_route_expectations(device_id, generations, response.get("routes") or [])
-    return response
 
 
 def _record_static_route_expectations(device_id, generations: dict, echoes) -> None:
@@ -2089,11 +2027,7 @@ def _on_static_route_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    adapter_device_id = mgmt.adapter_device_id
-    _schedule_intent_push(
-        (device_id, "static_route"),
-        lambda: _push_static_route_intent_for_device(device_id, adapter_device_id),
-    )
+    _schedule_intent_push((device_id, "static_route"))
 
 
 # ── Greenfield static routes (operator-created in NetBox, not yet on the device) ──
@@ -2213,6 +2147,33 @@ def _transition_static_route_content(static_route, previous=None) -> list:
     return rows
 
 
+def _carried_last_acked(mgmt, route_id):
+    """Read the acknowledged triple a pending deletion of *route_id* hands to a new overlay.
+
+    Both the state row's own homes and the key's unfolded entries are read, because the
+    deletion may not have been folded yet: the codex sequence that needs this — delete,
+    re-own, re-delete, all before the drain — has the record sitting in an entry.
+    """
+    from . import outbox
+    from .models import NSOIntentOutboxEntry, NSOIntentOutboxState
+
+    state = NSOIntentOutboxState.objects.filter(device_id=mgmt.device_id, scope="static_route").first()
+    transitions = [
+        record
+        for row in NSOIntentOutboxEntry.objects.filter(
+            device_id=mgmt.device_id, scope="static_route", consumed_by_push_seq__isnull=True
+        ).order_by("id")
+        for record in row.transitions
+    ]
+    return outbox.carried_triple(
+        route_id,
+        transitions=transitions,
+        queued=(state.queued_deletions if state else ()),
+        claim_deletions=(state.claim_deletions if state else ()),
+        lineage_carry=(state.lineage_carry if state else None),
+    )
+
+
 def _accept_static_route_for_device(static_route, device) -> None:
     """Own a greenfield route for *device* (accepted overlay) → its save pushes intent."""
     from .models import NSODeviceManagement, NSOStaticRouteState
@@ -2228,8 +2189,14 @@ def _accept_static_route_for_device(static_route, device) -> None:
     state, created = NSOStaticRouteState.objects.get_or_create(
         management=mgmt,
         static_route=static_route,
-        defaults={"status": "accepted", "accepted_at": timezone.now()},
+        defaults={
+            "status": "accepted",
+            "accepted_at": timezone.now(),
+        },
     )
+    if created:
+        # A fresh row inherits the last acknowledged triple from its pending deletion.
+        state.last_acked_triple = _carried_last_acked(mgmt, static_route.pk)
     was_owned = not created and state.status in _OWNED_PUSH_STATUSES
     if not created and not was_owned:
         state.status = "accepted"
@@ -2245,6 +2212,30 @@ def _accept_static_route_for_device(static_route, device) -> None:
     state.nso_next_hop = str(static_route.next_hop or "")
     state.last_sync_at = timezone.now()
     state.save()  # → _on_static_route_state_save schedules the push
+    if not was_owned:
+        from . import outbox
+
+        # Re-ownership withdraws whatever deletion authority is pending for this pk: without
+        # the record, a delete/re-own/re-delete sequence would ship the deletion of a route
+        # NetBox owns again.
+        device_id, _adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
+        _schedule_intent_push((device_id, "static_route"), transitions=[outbox.revoke_transition(static_route.pk)])
+
+
+def _static_route_delete_transition(row, static_route):
+    """Record what is leaving, from the overlay that still mirrors it.
+
+    The lineage leads with the triple the adapter last ACKNOWLEDGED, because a content edit
+    whose push never landed leaves the adapter holding the older one; an id plus the current
+    triple alone would match nothing there, be classified moot and detach the route silently.
+    """
+    from . import outbox
+
+    return outbox.delete_transition(
+        static_route.pk,
+        last_acked=row.last_acked_triple,
+        current=outbox.triple_of(row.nso_vrf, row.nso_prefix, row.nso_next_hop),
+    )
 
 
 def _remove_static_route_for_device(static_route, device) -> None:
@@ -2257,12 +2248,12 @@ def _remove_static_route_for_device(static_route, device) -> None:
         return
     if mgmt.adapter_device_id is None:
         return
-    NSOStaticRouteState.objects.filter(management=mgmt, static_route=static_route).delete()
-    device_id, adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
-    _schedule_intent_push(
-        (device_id, "static_route"),
-        lambda: _push_static_route_intent_for_device(device_id, adapter_device_id),
-    )
+    rows = NSOStaticRouteState.objects.filter(management=mgmt, static_route=static_route)
+    # Captured here because this is the last moment the mirror is alive: the next statement
+    # deletes it, and a removed route's content cannot be re-rendered from anything else.
+    transitions = [_static_route_delete_transition(row, static_route) for row in rows]
+    rows.delete()
+    _schedule_intent_push((mgmt.device_id, "static_route"), transitions=transitions)
 
 
 def _on_routing_static_route_pre_save(sender, instance, **kwargs):
@@ -2359,7 +2350,7 @@ def _on_routing_static_route_pre_delete(sender, instance, **kwargs):
 # ── IS-IS Flex-Algorithm intent (process-tag scoped) ────────────────────────
 
 
-def _push_isis_flex_algo_intent_for_device(device_id, adapter_device_id, force=False):
+def _push_isis_flex_algo_intent_for_device(device_id, adapter_device_id):
     """Build and push the full IS-IS Flex-Algo intent snapshot for a device."""
     from . import adapter_client as client
     from .models import NSOISISFlexAlgoState
@@ -2384,8 +2375,7 @@ def _push_isis_flex_algo_intent_for_device(device_id, adapter_device_id, force=F
     _push_changed(
         (device_id, "isis_flex_algo"),
         flex_algos,
-        lambda: client.put_isis_flex_algo_intent(adapter_device_id, flex_algos),
-        force=force,
+        lambda body: client.put_isis_flex_algo_intent(adapter_device_id, body),
     )
 
 
@@ -2400,11 +2390,8 @@ def _on_isis_flex_algo_state_save(sender, instance, **kwargs):
         return
     if mgmt.adapter_device_id is None:
         return
-    device_id, adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
-    _schedule_intent_push(
-        (device_id, "isis_flex_algo"),
-        lambda: _push_isis_flex_algo_intent_for_device(device_id, adapter_device_id),
-    )
+    device_id, _adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
+    _schedule_intent_push((device_id, "isis_flex_algo"))
 
 
 # ── Greenfield Flex-Algo (operator-created in NetBox, not yet on the device) ──
@@ -2468,11 +2455,8 @@ def _remove_isis_flex_algo(flex_algo) -> None:
     NSOISISFlexAlgoState.objects.filter(
         management=mgmt, process_tag=inst.process_tag or "", algo_id=int(flex_algo.algo_id)
     ).delete()
-    device_id, adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
-    _schedule_intent_push(
-        (device_id, "isis_flex_algo"),
-        lambda: _push_isis_flex_algo_intent_for_device(device_id, adapter_device_id),
-    )
+    device_id, _adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
+    _schedule_intent_push((device_id, "isis_flex_algo"))
 
 
 @_skip_on_render
@@ -2487,13 +2471,11 @@ def _on_routing_isis_flex_algo_pre_delete(sender, instance, **kwargs):
     _remove_isis_flex_algo(instance)
 
 
-def _push_l2_sap_intent_for_device(device_id, adapter_device_id, force=False):
+def _push_l2_sap_intent_for_device(device_id, adapter_device_id):
     """Build and push the full Nokia L2 SAP intent snapshot for a device.
 
-    ``force=True`` (the device Apply) bypasses change-detection so an owned SAP whose
-    adapter intent went stale/empty is re-pushed and actually applied — mirrors the
-    SVI/static-route force-push (rows are marked deploying, so a silently skipped push
-    would strand them there forever).
+    A forced Apply claim re-sends this snapshot whatever the acknowledged baseline says,
+    so an owned row whose adapter intent went stale or empty is applied instead of skipped.
     """
     from . import adapter_client as client
     from .models import NSOL2SapState
@@ -2517,8 +2499,7 @@ def _push_l2_sap_intent_for_device(device_id, adapter_device_id, force=False):
     _push_changed(
         (device_id, "l2_sap"),
         saps,
-        lambda: client.put_l2_sap_intent(adapter_device_id, saps),
-        force=force,
+        lambda body: client.put_l2_sap_intent(adapter_device_id, body),
     )
 
 
@@ -2536,19 +2517,15 @@ def _on_l2_sap_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    adapter_device_id = mgmt.adapter_device_id
-    _schedule_intent_push(
-        (device_id, "l2_sap"),
-        lambda: _push_l2_sap_intent_for_device(device_id, adapter_device_id),
-    )
+    _schedule_intent_push((device_id, "l2_sap"))
 
 
-def _push_lacp_intent_for_device(device_id, adapter_device_id, force=False):
+def _push_lacp_intent_for_device(device_id, adapter_device_id):
     """Build and push (apply) the full LACP bundle intent snapshot for a device.
 
     Committing LACP is a device write, so on accept it only fires when the device
-    is in auto-apply mode (see _on_lacp_state_save); the manual device Apply calls
-    this with ``force=True`` to commit the owned snapshot as part of the one Apply.
+    is in auto-apply mode (see _on_lacp_state_save); the manual device Apply forces the
+    owned snapshot out as part of the one Apply.
     """
     from . import adapter_client as client
     from .models import NSOLACPBundleState, NSOLACPMemberState
@@ -2584,8 +2561,7 @@ def _push_lacp_intent_for_device(device_id, adapter_device_id, force=False):
     _push_changed(
         (device_id, "lacp"),
         bundles,
-        lambda: client.apply_lag_config(adapter_device_id, bundles),
-        force=force,
+        lambda body: client.apply_lag_config(adapter_device_id, body),
     )
 
 
@@ -2607,22 +2583,18 @@ def _on_lacp_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    adapter_device_id = mgmt.adapter_device_id
-    _schedule_intent_push(
-        (device_id, "lacp"),
-        lambda: _push_lacp_intent_for_device(device_id, adapter_device_id),
-    )
+    _schedule_intent_push((device_id, "lacp"))
 
 
 # NetBox interface mode -> NSO switchport vocabulary.
 _NETBOX_TO_NSO_MODE = {"access": "access", "tagged": "trunk", "tagged-all": "trunk-all"}
 
 
-def _push_switchport_intent_for_device(device_id, adapter_device_id, force=False):
+def _push_switchport_intent_for_device(device_id, adapter_device_id):
     """Build and push (apply) the device's owned L2 switchport snapshot.
 
     A device write, so on accept it only fires in auto-apply mode; the manual
-    device Apply calls this with ``force=True`` as part of the single Apply.
+    device Apply forces it out as part of the single Apply.
     """
     from . import adapter_client as client
     from .models import NSOSwitchportState
@@ -2643,8 +2615,7 @@ def _push_switchport_intent_for_device(device_id, adapter_device_id, force=False
     _push_changed(
         (device_id, "switchport"),
         interfaces,
-        lambda: client.apply_switchport_config(adapter_device_id, interfaces),
-        force=force,
+        lambda body: client.apply_switchport_config(adapter_device_id, body),
     )
 
 
@@ -2664,11 +2635,7 @@ def _on_switchport_state_save(sender, instance, **kwargs):
     if mgmt.adapter_device_id is None or not mgmt.auto_apply:
         return
     device_id = mgmt.device_id
-    adapter_device_id = mgmt.adapter_device_id
-    _schedule_intent_push(
-        (device_id, "switchport"),
-        lambda: _push_switchport_intent_for_device(device_id, adapter_device_id),
-    )
+    _schedule_intent_push((device_id, "switchport"))
 
 
 def _isis_levels_for_state(state):
@@ -2699,11 +2666,11 @@ def _isis_levels_for_state(state):
     return out
 
 
-def _push_isis_intent_for_device(device_id, adapter_device_id, force=False):
+def _push_isis_intent_for_device(device_id, adapter_device_id):
     """Build and push the full IS-IS intent snapshot (interfaces + processes) for a device.
 
-    ``force=True`` bypasses change-detection (used by provisioning, which must always land
-    its computed intent even if an identical snapshot was pushed earlier this process).
+    A forced claim (provisioning) re-sends this snapshot whatever the acknowledged
+    baseline says, so a computed intent always lands.
     """
     from . import adapter_client as client
     from .models import NSOISISInstanceState, NSOISISInterfaceState
@@ -2765,8 +2732,7 @@ def _push_isis_intent_for_device(device_id, adapter_device_id, force=False):
     _push_changed(
         (device_id, "isis"),
         [interfaces, processes],
-        lambda: client.put_isis_interface_intent(adapter_device_id, interfaces, processes=processes),
-        force=force,
+        lambda body: client.put_isis_interface_intent(adapter_device_id, body[0], processes=body[1]),
     )
 
 
@@ -2784,11 +2750,7 @@ def _on_isis_interface_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    adapter_device_id = mgmt.adapter_device_id
-    _schedule_intent_push(
-        (device_id, "isis"),
-        lambda: _push_isis_intent_for_device(device_id, adapter_device_id),
-    )
+    _schedule_intent_push((device_id, "isis"))
 
 
 @_skip_on_render
@@ -2805,11 +2767,7 @@ def _on_isis_instance_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    adapter_device_id = mgmt.adapter_device_id
-    _schedule_intent_push(
-        (device_id, "isis"),
-        lambda: _push_isis_intent_for_device(device_id, adapter_device_id),
-    )
+    _schedule_intent_push((device_id, "isis"))
 
 
 def _build_bgp_router_list(routers: dict, scope_afs: dict, router_ids: dict | None = None) -> list:
@@ -2942,7 +2900,7 @@ def _bgp_router_id_map(device_id) -> dict:
     return out
 
 
-def _push_bgp_intent_for_device(device_id, adapter_device_id, force=False):
+def _push_bgp_intent_for_device(device_id, adapter_device_id):
     """Build and push the full BGP intent snapshot for a device."""
     from . import adapter_client as client
     from .models import NSOBGPPeerState
@@ -3016,8 +2974,7 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id, force=False):
     _push_changed(
         (device_id, "bgp"),
         router_list,
-        lambda: client.put_bgp_intent(adapter_device_id, router_list),
-        force=force,
+        lambda body: client.put_bgp_intent(adapter_device_id, body),
     )
 
 
@@ -3035,11 +2992,7 @@ def _on_bgp_peer_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    adapter_device_id = mgmt.adapter_device_id
-    _schedule_intent_push(
-        (device_id, "bgp"),
-        lambda: _push_bgp_intent_for_device(device_id, adapter_device_id),
-    )
+    _schedule_intent_push((device_id, "bgp"))
 
 
 # ── Greenfield BGP peers (operator-created in NetBox, not yet on the device) ──
@@ -3151,11 +3104,8 @@ def _on_routing_bgp_peer_pre_delete(sender, instance, **kwargs):
     NSOBGPPeerState.objects.filter(
         management=mgmt, asn_str=asn_str, vrf_name=vrf_name, peer_address_str=peer_address_str
     ).delete()
-    device_id, adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
-    _schedule_intent_push(
-        (device_id, "bgp"),
-        lambda: _push_bgp_intent_for_device(device_id, adapter_device_id),
-    )
+    device_id, _adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
+    _schedule_intent_push((device_id, "bgp"))
 
 
 @_skip_on_render
@@ -3171,17 +3121,14 @@ def _on_redistribution_state_save(sender, instance, **kwargs):
     if mgmt.adapter_device_id is None:
         return
 
-    _schedule_redistribution_push(mgmt.device_id, mgmt.adapter_device_id, instance.dest_protocol)
+    _schedule_redistribution_push(mgmt.device_id, instance.dest_protocol)
 
 
-def _push_route_policy_intent_for_device(device_id, adapter_device_id, force=False):
+def _push_route_policy_intent_for_device(device_id, adapter_device_id):
     """Build and push the full route-policy intent snapshot for a device.
 
-    ``force=True`` (the device Apply) bypasses change-detection so an owned route-policy
-    object whose adapter intent went stale/empty is re-pushed and actually applied, instead
-    of being silently skipped — mirrors the interface/VLAN force-push. Without it, an owned
-    route-policy row whose adapter intent row is missing applies 0 items and sticks in
-    'deploying' forever (the device never gets the definition, so it never settles).
+    A forced Apply claim re-sends this snapshot whatever the acknowledged baseline says,
+    so an owned row whose adapter intent went stale or empty is applied instead of skipped.
     """
     from . import adapter_client as client
     from .models import NSORoutePolicyState
@@ -3220,13 +3167,12 @@ def _push_route_policy_intent_for_device(device_id, adapter_device_id, force=Fal
             }
         )
 
-    resp = _push_changed(
+    _push_changed(
         (device_id, "route_policy"),
         objects,
-        lambda: client.put_route_policy_intent(adapter_device_id, objects),
-        force=force,
+        lambda body: client.put_route_policy_intent(adapter_device_id, body),
+        on_response=lambda resp: _store_unsupported_members(owned_rows, resp),
     )
-    _store_unsupported_members(owned_rows, resp)
 
 
 def _store_unsupported_members(owned_rows, resp) -> None:
@@ -3562,11 +3508,7 @@ def _on_route_policy_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    adapter_device_id = mgmt.adapter_device_id
-    _schedule_intent_push(
-        (device_id, "route_policy"),
-        lambda: _push_route_policy_intent_for_device(device_id, adapter_device_id),
-    )
+    _schedule_intent_push((device_id, "route_policy"))
 
 
 @_skip_on_render
@@ -3593,10 +3535,7 @@ def _on_routing_policy_pre_delete(sender, instance, **kwargs):
             targets.append((mgmt.device_id, mgmt.adapter_device_id))
     NSORoutePolicyState.objects.filter(content_type=ct, object_id=instance.pk).delete()
     for device_id, adapter_device_id in targets:
-        _schedule_intent_push(
-            (device_id, "route_policy"),
-            lambda d=device_id, a=adapter_device_id: _push_route_policy_intent_for_device(d, a),
-        )
+        _schedule_intent_push((device_id, "route_policy"))
 
 
 # ── netbox_routing route-policy edit write path ─────────────────────────────
@@ -3782,11 +3721,11 @@ def _collect_redistribution_by_dest_ref(device_id: int, dest_protocol: str) -> d
     return by_ref
 
 
-def _push_ospf_intent_for_device(device_id, adapter_device_id, force=False):
+def _push_ospf_intent_for_device(device_id, adapter_device_id):
     """Build and push the full OSPF intent snapshot for a device.
 
-    ``force=True`` bypasses change-detection (used by provisioning, which must always land
-    its computed intent even if an identical snapshot was pushed earlier this process).
+    A forced claim (provisioning) re-sends this snapshot whatever the acknowledged
+    baseline says, so a computed intent always lands.
     """
     from . import adapter_client as client
     from .models import NSOOSPFInstanceState, NSOOSPFInterfaceState
@@ -3837,7 +3776,7 @@ def _push_ospf_intent_for_device(device_id, adapter_device_id, force=False):
         interfaces.append(entry)
 
     payload = {"instances": instances, "interfaces": interfaces}
-    _push_changed((device_id, "ospf"), payload, lambda: client.put_ospf_intent(adapter_device_id, payload), force=force)
+    _push_changed((device_id, "ospf"), payload, lambda body: client.put_ospf_intent(adapter_device_id, body))
 
 
 @_skip_on_render
@@ -3854,11 +3793,7 @@ def _on_ospf_instance_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    adapter_device_id = mgmt.adapter_device_id
-    _schedule_intent_push(
-        (device_id, "ospf"),
-        lambda: _push_ospf_intent_for_device(device_id, adapter_device_id),
-    )
+    _schedule_intent_push((device_id, "ospf"))
 
 
 @_skip_on_render
@@ -3875,11 +3810,7 @@ def _on_ospf_interface_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    adapter_device_id = mgmt.adapter_device_id
-    _schedule_intent_push(
-        (device_id, "ospf"),
-        lambda: _push_ospf_intent_for_device(device_id, adapter_device_id),
-    )
+    _schedule_intent_push((device_id, "ospf"))
 
 
 # ── netbox_routing OSPF greenfield write path ───────────────────────────────
@@ -4051,11 +3982,8 @@ def _push_isis_for_routing_level(level) -> None:
         status__in=_OWNED_PUSH_STATUSES,
     ).exists():
         return
-    device_id, adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
-    _schedule_intent_push(
-        (device_id, "isis"),
-        lambda: _push_isis_intent_for_device(device_id, adapter_device_id),
-    )
+    device_id, _adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
+    _schedule_intent_push((device_id, "isis"))
 
 
 @_skip_on_render
@@ -4097,11 +4025,8 @@ def _on_routing_isis_interface_pre_delete(sender, instance, **kwargs):
     if af:
         qs = qs.filter(af=af)  # scope to this ISISInterface's address-family; leave a sibling AF alone
     qs.delete()
-    device_id, adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
-    _schedule_intent_push(
-        (device_id, "isis"),
-        lambda: _push_isis_intent_for_device(device_id, adapter_device_id),
-    )
+    device_id, _adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
+    _schedule_intent_push((device_id, "isis"))
 
 
 @_skip_on_render
@@ -4116,11 +4041,8 @@ def _on_routing_ospf_instance_pre_delete(sender, instance, **kwargs):
     if mgmt.adapter_device_id is None:
         return
     NSOOSPFInstanceState.objects.filter(management=mgmt, process_id=str(instance.process_id)).delete()
-    device_id, adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
-    _schedule_intent_push(
-        (device_id, "ospf"),
-        lambda: _push_ospf_intent_for_device(device_id, adapter_device_id),
-    )
+    device_id, _adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
+    _schedule_intent_push((device_id, "ospf"))
 
 
 @_skip_on_render
@@ -4136,11 +4058,8 @@ def _on_routing_ospf_interface_pre_delete(sender, instance, **kwargs):
     if mgmt.adapter_device_id is None:
         return
     NSOOSPFInterfaceState.objects.filter(management=mgmt, interface=iface).delete()
-    device_id, adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
-    _schedule_intent_push(
-        (device_id, "ospf"),
-        lambda: _push_ospf_intent_for_device(device_id, adapter_device_id),
-    )
+    device_id, _adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
+    _schedule_intent_push((device_id, "ospf"))
 
 
 @_skip_on_render
@@ -4162,7 +4081,7 @@ def _on_redistribution_fork_save(sender, instance, **kwargs):
         if key in seen:
             continue
         seen.add(key)
-        _schedule_redistribution_push(mgmt.device_id, mgmt.adapter_device_id, state.dest_protocol)
+        _schedule_redistribution_push(mgmt.device_id, state.dest_protocol)
 
 
 def _connect_g_activated():  # pragma: no cover

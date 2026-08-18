@@ -7,10 +7,10 @@ from unittest.mock import patch
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.test import TestCase
 
-from .mixins import IntentPushResetMixin
+from .mixins import IntentPushDeliveryMixin
 
 
-class _FlexAlgoBase(IntentPushResetMixin, TestCase):
+class _FlexAlgoBase(IntentPushDeliveryMixin, TestCase):
     @classmethod
     def setUpTestData(cls):
         mfg = Manufacturer.objects.create(name="FaMfg", slug="famfg")
@@ -40,8 +40,8 @@ class _FlexAlgoBase(IntentPushResetMixin, TestCase):
 
 class TestPushIsisFlexAlgoIntent(_FlexAlgoBase):
     def test_push_builds_snapshot_from_accepted_states(self):
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.models import NSOISISFlexAlgoState
-        from netbox_nso_plugin.signals import _push_isis_flex_algo_intent_for_device
 
         mgmt = self._mgmt()
         NSOISISFlexAlgoState.objects.create(
@@ -61,7 +61,7 @@ class TestPushIsisFlexAlgoIntent(_FlexAlgoBase):
         )
 
         with patch("netbox_nso_plugin.adapter_client.put_isis_flex_algo_intent") as mock_put:
-            _push_isis_flex_algo_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+            deliver("isis_flex_algo", mgmt.device_id, mgmt.adapter_device_id)
 
         mock_put.assert_called_once()
         _, flex_algos = mock_put.call_args[0]

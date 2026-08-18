@@ -25,8 +25,9 @@ from unittest.mock import patch
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.test import TestCase
 
+from netbox_nso_plugin.delivery import deliver
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOSnmpHostState
-from netbox_nso_plugin.signals import _push_snmp_intent_for_device, snmp_host_push_blocker
+from netbox_nso_plugin.signals import snmp_host_push_blocker
 
 from .mixins import IntentPushResetMixin
 
@@ -60,7 +61,7 @@ class TestSnmpV3HostPush(IntentPushResetMixin, _HostBase):
 
         reset_intent_push_state()
         with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
-            _push_snmp_intent_for_device(self.device.pk, 42)
+            deliver("snmp", self.device.pk, 42)
         mock_put.assert_called_once()
         return mock_put.call_args[0][3]  # hosts
 
