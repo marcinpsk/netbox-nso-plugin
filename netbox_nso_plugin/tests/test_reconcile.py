@@ -476,6 +476,50 @@ class TestEscalateStuckDeploying(APITestCase):
         self.assertEqual(row.status, "deploying")
 
 
+class TestStepFourWritesUnderTheIntentPushSuppression(_SettlementCase):
+    """Step 4 mirrors adapter results, so none of its writes may re-enter the intent outbox.
+
+    The rqworker runs Step 4 in autocommit and the outbox append refuses outside the
+    writer's own transaction, so the route-policy journal's ``last_apply_at`` stamp raised
+    on its push-on-save and Step 4's best-effort guard swallowed the rest of the step.
+    """
+
+    def test_every_route_policy_row_gets_its_apply_stamp(self):
+        """Two owned rows: the first one's refusal is what strands the second.
+
+        In autocommit the first row's UPDATE has already committed when its post_save
+        raises, so only a SECOND row proves the step ran to the end.
+        """
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import CommunityList
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.reconcile import run_device_reconcile
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        device = _make_device("rec-suppress")
+        mgmt = _make_mgmt(device, "suppress", 82)
+        self.adapter.store.add_device(nso_instance="se-suppress-inst", nso_device_name="nso-se-suppress", device_id=82)
+        self.adapter.store.terminal_job(82, extra={"route_policy_count_by_outcome": {"in_sync": 2, "apply_failed": 0}})
+        with suppress_intent_push(), transaction.atomic():
+            for name in ("SeSuppressCL1", "SeSuppressCL2"):
+                community_list = CommunityList.objects.create(name=name)
+                NSORoutePolicyState.objects.create(
+                    management=mgmt,
+                    content_type=ContentType.objects.get_for_model(community_list),
+                    object_id=community_list.pk,
+                    family="community_list",
+                    object_name=name,
+                    status="accepted",
+                )
+
+        with patch("netbox_nso_plugin.reconcile.reconcile_device", return_value={}):
+            run_device_reconcile(device.pk)
+
+        stamped = NSORoutePolicyState.objects.filter(management=mgmt, last_apply_at__isnull=False).count()
+        self.assertEqual(stamped, 2, "the first stamp's push-on-save took the rest of Step 4 with it")
+
+
 class TestSettlementAdapterContract(_SettlementCase):
     """The real-socket settlement double rejects unknown adapter devices."""
 
