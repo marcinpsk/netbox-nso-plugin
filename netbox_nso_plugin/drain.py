@@ -1755,8 +1755,11 @@ def clear_acknowledged_lineage() -> int:
     """
     from .models import NSOIntentOutboxState, NSOStaticRouteState
 
-    cleared = NSOStaticRouteState.objects.exclude(last_acked_triple=None).update(last_acked_triple=None)
-    NSOIntentOutboxState.objects.filter(scope="static_route").update(lineage_carry={})
+    # One fact, so one transaction: NULL triples beside a surviving carry would let the next
+    # success stamp a triple the adapter never acknowledged.
+    with transaction.atomic():
+        cleared = NSOStaticRouteState.objects.exclude(last_acked_triple=None).update(last_acked_triple=None)
+        NSOIntentOutboxState.objects.filter(scope="static_route").update(lineage_carry={})
     return cleared
 
 

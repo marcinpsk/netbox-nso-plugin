@@ -382,3 +382,34 @@ class TestTheLineageIsBoundedAndCleared(_LineageCase):
         self.unown(route)
         [record] = self.records()
         assert record["unverified"] is True
+
+    def test_a_half_finished_lineage_clear_leaves_nothing_behind(self):
+        """The two writes state one fact. Committed apart, a crash between them leaves every
+        triple NULL while the carry still holds them, and the next successful drain would
+        stamp an acked triple the adapter never acknowledged."""
+        from django.db import connection
+
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        acked = triple("198.51.100.240/28", "198.51.100.32")
+        route = own_route(self.mgmt, "198.51.100.240/28", "198.51.100.32")
+        self.stamp(route, acked)
+        self.clear_entries()
+        NSOIntentOutboxState.objects.update_or_create(
+            device=self.device,
+            scope="static_route",
+            defaults={"lineage_carry": {str(route.pk): acked}},
+        )
+
+        def die_on_the_carry(execute, sql, params, many, context):
+            """Fail the second statement in the database, where a crash would."""
+            if sql.lstrip().upper().startswith("UPDATE") and "lineage_carry" in sql:
+                raise RuntimeError("the process died between the two writes")
+            return execute(sql, params, many, context)
+
+        with connection.execute_wrapper(die_on_the_carry), self.assertRaises(RuntimeError):
+            drain.clear_acknowledged_lineage()
+
+        assert last_acked(self.mgmt, route) == acked, "the first write outlived the second"
+        assert state_of(self.device, "static_route").lineage_carry == {str(route.pk): acked}
