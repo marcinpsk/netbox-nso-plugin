@@ -1357,9 +1357,7 @@ def _after_success(claimed, *, mode, force, chain, deadline, deadline_at):
     if not answered_other_work:
         pushed = _SUCCESSFUL_PUSHES.get()
         if pushed is not None:
-            # First one wins: the chained MODE_NORMAL pass below settles a later claim, and
-            # the selector has to name the sequence this call itself sent.
-            pushed.setdefault(scope, claimed.push_seq)
+            pushed[scope] = claimed.push_seq
     if answered_other_work:
         if chain <= 0:
             logger.info(
