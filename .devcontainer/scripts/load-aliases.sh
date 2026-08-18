@@ -127,7 +127,7 @@ netbox-test() {
   if [ "$workers" -gt 1 ]; then
     parallel_args=(-n "$workers" --maxschedchunk=1)
   else
-    # The pyproject addopts request `-n auto`; -n 0 is what turns a run serial again.
+    # The pyproject addopts request `-n auto`; -n 0 makes it serial.
     parallel_args=(-n 0)
   fi
   cd "$PLUGIN_DIR" && source /opt/netbox/venv/bin/activate && \
