@@ -1153,9 +1153,10 @@ def _settle_apply_failures(mgmt, apply_result: dict | None, job: dict | None = N
         for row in model.objects.filter(management=mgmt, status="deploying"):
             new_status = sm.on_apply_result(row.status, ok=False)
             if new_status != row.status:
-                row.status = new_status
-                row.last_apply_error = detail
-                row.save(update_fields=["status", "last_apply_error"])
+                # Compare-and-set: the value-match settle writes these rows from another
+                # reconcile, and a job counter must not overrule the device truth a row
+                # reached between this read and this write.
+                model.objects.filter(pk=row.pk, status=row.status).update(status=new_status, last_apply_error=detail)
 
 
 _STUCK_DEPLOYING_ERROR = (
@@ -1237,10 +1238,15 @@ def _escalate_stuck_deploying(mgmt, job: dict | None) -> None:
         model = getattr(models, model_name)
         for row in model.objects.filter(management=mgmt, status="deploying"):
             new_status = sm.on_apply_result(row.status, ok=False)
-            if new_status != row.status:
-                row.status = new_status
-                row.last_apply_error = detail
-                row.save(update_fields=["status", "last_apply_error"])
+            if new_status == row.status:
+                continue
+            # Compare-and-set: this judges a row for never landing, so a row the
+            # value-match settle proved in_sync in the write window has already
+            # answered it.
+            matched = model.objects.filter(pk=row.pk, status=row.status).update(
+                status=new_status, last_apply_error=detail
+            )
+            if matched:
                 logger.warning(
                     "nso reconcile: %s %s stuck deploying after successful apply #%s — "
                     "escalated to apply_failed (silent drop)",
