@@ -586,8 +586,11 @@ class TestIntentRestoreResolvesEveryReceiptCase(_CascadeFlushMixin, IntentPushRe
             resume()
 
     def test_lower_receipt_releases_the_restored_lease_for_normal_replay(self):
-        from netbox_nso_plugin import drain
+        from netbox_nso_plugin import drain, outbox
 
+        # Floor the sequence first: on a worker whose database never allocated, the claim
+        # takes seq 1, and the lower receipt would fabricate seq 0, which no adapter serves.
+        outbox.advance_push_seq(1)
         claim, url = self._lost_vlan_response(933)
         self.adapter.receipts[url]["push_seq"] = claim.push_seq - 1
 
