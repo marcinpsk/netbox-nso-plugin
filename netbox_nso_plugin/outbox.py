@@ -358,6 +358,12 @@ def enqueue(device_id, scope: str, *, transitions=(), delete_origin: bool = Fals
 
     if _is_intent_push_suppressed() or _is_render_request():
         return
+    # A scope no delivery key names is a row nothing can ever drain or retire: the drain
+    # raises on the registry lookup every tick and the deployment gate stays shut.
+    from .delivery import delivery_keys
+
+    if scope not in delivery_keys():
+        raise ValueError(f"unknown intent outbox scope {scope!r}")
     _refuse_outside_a_transaction()
     txid = current_txid()
     if _device_is_tearing_down(device_id, txid):

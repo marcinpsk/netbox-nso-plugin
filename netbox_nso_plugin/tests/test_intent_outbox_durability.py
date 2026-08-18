@@ -118,6 +118,25 @@ class TestABareEnqueueIsRefused(_DurabilityCase):
         assert "drain runs inline" not in signals + views
 
 
+class TestAnUnknownScopeIsRefused(_DurabilityCase):
+    """A scope no delivery key names is a row nothing can ever drain or retire."""
+
+    def test_appending_an_unregistered_scope_raises_and_writes_nothing(self):
+        from netbox_nso_plugin import outbox
+
+        unknown = "not-a-delivery-key"
+        with without_commit_drain(), transaction.atomic():
+            try:
+                outbox.enqueue(self.device.pk, unknown)
+            except ValueError:
+                refused = True
+            else:
+                refused = False
+
+        assert refused, "a scope the drain cannot resolve was appended as a durable row"
+        assert entries(self.device, unknown) == [], "the unresolvable row holds the deployment gate shut"
+
+
 class TestTransactionIdReuse(_DurabilityCase):
     def test_one_writer_transaction_reads_its_id_once(self):
         from django.db import connection
