@@ -49,36 +49,40 @@ class DeliveryKey:
     in_protocol: bool
     #: How a deletion is authorized on the wire — a query flag today, per object after O3.
     marking_mode: str
-    #: The full-device push, which owns this scope's own success side effects.
-    push: Callable
+    #: Name of the full-device push in ``signals``, resolved on every call so a test patch
+    #: is honored no matter when the registry was built.
+    push_name: str
+
+    def push(self, device_id, adapter_device_id):
+        from . import signals
+
+        return getattr(signals, self.push_name)(device_id, adapter_device_id)
 
 
 _REGISTRY: dict[str, DeliveryKey] = {}
 
 
 def _build() -> dict[str, DeliveryKey]:
-    from . import signals
-
-    # (key, label, in_protocol, push)
+    # (key, label, in_protocol, push_name)
     keys = [
-        ("interface", "Interface", True, signals._push_interface_intent_for_device),
-        ("ip", "Interface IP", True, signals._push_ip_intent_for_device),
-        ("snmp", "SNMP", True, signals._push_snmp_intent_for_device),
-        ("logging", "Logging", True, signals._push_logging_intent_for_device),
-        ("svi", "SVI", True, signals._push_svi_intent_for_device),
-        ("subinterface", "Subinterface", True, signals._push_subinterface_intent_for_device),
-        ("interface_mtu", "Interface MTU", True, signals._push_interface_mtu_intent_for_device),
-        ("vlan", "VLAN", True, signals._push_vlan_intent_for_device),
-        ("bfd", "BFD", True, signals._push_bfd_intent_for_device),
-        ("static_route", "Static route", True, signals._push_static_route_intent_for_device),
-        ("isis_flex_algo", "IS-IS Flex-Algo", True, signals._push_isis_flex_algo_intent_for_device),
-        ("l2_sap", "L2 SAP", True, signals._push_l2_sap_intent_for_device),
-        ("isis", "IS-IS", True, signals._push_isis_intent_for_device),
-        ("bgp", "BGP", True, signals._push_bgp_intent_for_device),
-        ("route_policy", "Route policy", True, signals._push_route_policy_intent_for_device),
-        ("ospf", "OSPF", True, signals._push_ospf_intent_for_device),
-        ("lacp", "LACP", False, signals._push_lacp_intent_for_device),
-        ("switchport", "Switchport", False, signals._push_switchport_intent_for_device),
+        ("interface", "Interface", True, "_push_interface_intent_for_device"),
+        ("ip", "Interface IP", True, "_push_ip_intent_for_device"),
+        ("snmp", "SNMP", True, "_push_snmp_intent_for_device"),
+        ("logging", "Logging", True, "_push_logging_intent_for_device"),
+        ("svi", "SVI", True, "_push_svi_intent_for_device"),
+        ("subinterface", "Subinterface", True, "_push_subinterface_intent_for_device"),
+        ("interface_mtu", "Interface MTU", True, "_push_interface_mtu_intent_for_device"),
+        ("vlan", "VLAN", True, "_push_vlan_intent_for_device"),
+        ("bfd", "BFD", True, "_push_bfd_intent_for_device"),
+        ("static_route", "Static route", True, "_push_static_route_intent_for_device"),
+        ("isis_flex_algo", "IS-IS Flex-Algo", True, "_push_isis_flex_algo_intent_for_device"),
+        ("l2_sap", "L2 SAP", True, "_push_l2_sap_intent_for_device"),
+        ("isis", "IS-IS", True, "_push_isis_intent_for_device"),
+        ("bgp", "BGP", True, "_push_bgp_intent_for_device"),
+        ("route_policy", "Route policy", True, "_push_route_policy_intent_for_device"),
+        ("ospf", "OSPF", True, "_push_ospf_intent_for_device"),
+        ("lacp", "LACP", False, "_push_lacp_intent_for_device"),
+        ("switchport", "Switchport", False, "_push_switchport_intent_for_device"),
     ]
     return {
         key: DeliveryKey(
@@ -87,9 +91,9 @@ def _build() -> dict[str, DeliveryKey]:
             in_protocol=in_protocol,
             # Static routes leave ``query_flag`` at O3, one key at a time; O1 changes none.
             marking_mode=MARKING_QUERY_FLAG,
-            push=push,
+            push_name=push_name,
         )
-        for key, label, in_protocol, push in keys
+        for key, label, in_protocol, push_name in keys
     }
 
 

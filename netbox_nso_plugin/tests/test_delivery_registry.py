@@ -69,7 +69,7 @@ class TestDeliveryRegistry(SimpleTestCase):
         from netbox_nso_plugin.delivery import DeliveryKey, deliver
 
         fields = {f.name for f in dataclasses.fields(DeliveryKey)}
-        assert fields == {"key", "label", "in_protocol", "marking_mode", "push"}
+        assert fields == {"key", "label", "in_protocol", "marking_mode", "push_name"}
         assert "mode" in inspect.signature(deliver).parameters
 
     def test_every_drift_scope_names_a_registered_delivery_key(self):
@@ -91,6 +91,14 @@ class TestDeliveryRegistry(SimpleTestCase):
         from netbox_nso_plugin.delivery import delivery_keys
 
         assert {entry.marking_mode for entry in delivery_keys().values()} == {"query_flag"}
+
+    def test_every_entry_names_a_push_that_exists(self):
+        """The registry holds names, so a typo has to fail here rather than at push time."""
+        from netbox_nso_plugin import signals
+        from netbox_nso_plugin.delivery import delivery_keys
+
+        missing = [entry.push_name for entry in delivery_keys().values() if not hasattr(signals, entry.push_name)]
+        assert missing == []
 
 
 def _fixture(tag: str, adapter_device_id: int):
@@ -220,6 +228,24 @@ class TestDeliverySuccessHooks(IntentPushResetMixin, TestCase):
         assert answer == response
         mgmt.refresh_from_db()
         assert "vlan" not in (mgmt.intent_push_errors or {})
+
+    def test_a_patch_of_a_push_never_outlives_the_registry_build(self):
+        """The registry is built once per process, so a bound function object freezes in
+        whatever mock happened to be installed at that moment (CI: "rendered 0 bodies")."""
+        from netbox_nso_plugin import delivery
+
+        device, mgmt = _fixture("calltime", 7307)
+
+        with patch.dict(delivery._REGISTRY, clear=True):
+            with patch("netbox_nso_plugin.signals._push_ip_intent_for_device") as mock_push:
+                with self.assertRaisesRegex(RuntimeError, "rendered 0 bodies"):
+                    delivery.render("ip", device.pk, mgmt.adapter_device_id)
+            mock_push.assert_called_once_with(device.pk, mgmt.adapter_device_id)
+
+            rendered = delivery.render("ip", device.pk, mgmt.adapter_device_id)
+
+        assert rendered.key == (device.pk, "ip")
+        assert rendered.payload == []
 
     def test_an_out_of_protocol_delivery_carries_no_sequence_header(self):
         """``lacp`` and ``switchport`` keep today's direct client calls (Rev 15 split)."""
