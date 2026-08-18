@@ -770,7 +770,16 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
         from netbox_nso_plugin.adapter_client import AdapterError, list_device_generations, reset_session
 
         self.addCleanup(reset_session)
-        for payload in ({"generations": []}, [None]):
+        # The first two fail the shape check; the rest reach the per-row seq guard, which is
+        # what stops a repeated or out-of-order page from looping the cursor forever.
+        for payload in (
+            {"generations": []},
+            [None],
+            [{"generation_id": 1}],
+            [{"generation_id": 1, "seq": True}],
+            [{"generation_id": 1, "seq": "1"}],
+            [{"generation_id": 2, "seq": 2}, {"generation_id": 1, "seq": 1}],
+        ):
             with self.subTest(payload=payload):
                 reset_session()
                 mock_s.return_value = self._make_session(200, payload)
