@@ -686,21 +686,49 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "accepted")
 
-    def test_deployment_gate_503_is_deliberate_and_rolls_back_without_retry(self):
+    def test_the_deployment_gate_refuses_the_apply_in_the_json_the_caller_parses(self):
+        """The gate is the plugin's own middleware, so the Apply view never runs.
+
+        `IntentDeploymentMiddleware` answers the POST itself, which makes the 503 the only
+        thing the tab's `runAction` ever sees for a quiesced Apply. It does `await r.json()`
+        on every action response, so a text/plain body reaches the operator as a generic
+        parse-error "Request failed" instead of the deliberate refusal.
+        """
+        from netbox_nso_plugin.deployment import quiesce, resume
+
         calls = []
 
-        def quiesced(selected):
+        def unreachable(selected):
             calls.append(selected)
-            # Copied from the 503 quiesce-middleware behavior named in
-            # .handoff/1558-slice2c-brief.md. It has no JSON error envelope.
-            return 503, None
+            return 202, _promoted(selected)
 
-        response = self._post(_ApplyContractAdapter(quiesced))
+        quiesce()
+        try:
+            response = self._post(_ApplyContractAdapter(unreachable))
+        finally:
+            resume()
 
         self.assertEqual(response.status_code, 503)
+        self.assertEqual(response["Content-Type"], "application/json")
         self.assertEqual(response.json()["status"], "error")
-        self.assertIn("deployment gate active", response.json()["message"])
-        self.assertEqual(len(calls), 1)
+        self.assertIn("deployment", response.json()["message"].lower())
+        self.assertEqual(calls, [], "the gate let an Apply reach the adapter")
+        self.vlan_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "accepted")
+
+    def test_an_adapter_503_keeps_the_adapters_own_message_and_rolls_back(self):
+        """Only the plugin's middleware speaks for the gate — an adapter 503 is not it."""
+
+        def unavailable(_selected):
+            # Copied from ErrorEnvelope in ../nso-adapter/tests/api/openapi_snapshot.json,
+            # with the nso_unreachable code the adapter answers 503 with.
+            return 503, {"error": {"code": "nso_unreachable", "message": "NSO is not reachable", "detail": {}}}
+
+        response = self._post(_ApplyContractAdapter(unavailable))
+
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["status"], "error")
+        self.assertIn("NSO is not reachable", response.json()["message"])
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "accepted")
 
