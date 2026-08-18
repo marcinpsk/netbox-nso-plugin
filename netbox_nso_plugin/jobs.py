@@ -96,6 +96,7 @@ class RefreshDeviceSyncCacheJob(JobRunner):
         drain_started = settle_started = time.monotonic()
         if by_id is None:
             compact_intent_outbox()
+            settle_started = time.monotonic()
             logger.warning("RefreshDeviceSyncCacheJob: adapter snapshot unavailable, sends and sweep skipped")
         else:
             # Same rule as the sweep, and for the same reason: a proven global outage is not
