@@ -65,6 +65,9 @@ class SettlementStore:
         #: That page is the apply-activity probe, and it fails independently of the feed:
         #: a walk can drain while the probe times out.
         self.jobs_error_devices: set[int] = set()
+        #: ids of jobs the ASCENDING page serves even though they hold no sequence: the
+        #: feed contract broken the way only the adapter itself can break it
+        self.unsequenced_in_feed: set[str] = set()
         #: every feed request the consumer made, as ``(device_id, after_settle_seq, limit)``
         self.feed_requests: list[tuple[int, int, int]] = []
         self.readback_requests: list[int] = []
@@ -129,6 +132,18 @@ class SettlementStore:
         self.jobs.append(job)
         return job
 
+    def unsequenced_job(self, device_id: int, *, results=None, job_type="apply") -> dict:
+        """Add a TERMINAL job that the ascending feed serves with no sequence.
+
+        The page's predicate is NULL-false by construction, so this is the adapter breaking
+        its own feed contract, a state nothing but the server can produce, and the one the
+        consumer must skip rather than stall on. Served at the head, where it would block.
+        """
+        job = self._job(device_id, settle_seq=None, status="succeeded", results=results, job_type=job_type)
+        self.jobs.append(job)
+        self.unsequenced_in_feed.add(job["id"])
+        return job
+
     def echo(self, device_id: int, route_id: int, generation: int, fingerprint: str) -> None:
         """Record what the last intent PUT for *route_id* would re-serve."""
         self.routes.setdefault(device_id, []).append(
@@ -154,13 +169,18 @@ class SettlementStore:
         return list(reversed(rows))[:limit]
 
     def feed(self, device_id: int, after: int, limit: int) -> list[dict]:
-        """The adapter's ascending page: sequenced rows only, in commit order."""
+        """The adapter's ascending page: sequenced rows only, in commit order.
+
+        Unless a job was registered through :meth:`unsequenced_job`, which serves it at the
+        head with no sequence at all.
+        """
         rows = [
             job
             for job in self.jobs
-            if job["device_id"] == device_id and job["settle_seq"] is not None and job["settle_seq"] > after
+            if job["device_id"] == device_id
+            and (job["settle_seq"] > after if job["settle_seq"] is not None else job["id"] in self.unsequenced_in_feed)
         ]
-        rows.sort(key=lambda job: job["settle_seq"])
+        rows.sort(key=lambda job: (job["settle_seq"] is not None, job["settle_seq"] or 0))
         return rows[:limit]
 
 

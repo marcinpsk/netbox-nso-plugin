@@ -109,7 +109,8 @@ def build_onboarding_dashboard(instance) -> dict:
         out["error"] = str(exc)
         return out
     except Exception as exc:  # defensive — never 500 the dashboard
-        out["error"] = repr(exc)
+        logger.exception("build_onboarding_dashboard: listing devices for instance %s failed", instance.pk)
+        out["error"] = f"Could not list NSO devices ({type(exc).__name__}); see the server log."
         return out
 
     _devices, by_id, by_name, by_ip = _index_netbox_devices()
@@ -262,7 +263,8 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
             oob_ip=oob_address,
         )
     except Exception as exc:
-        result["error"] = repr(exc)
+        logger.exception("onboard_candidate: provision request failed for %s", nso_name)
+        result["error"] = f"Provisioning request failed ({type(exc).__name__}); see the server log."
         return result
 
     job_id = str((prov or {}).get("job_id") or "")
@@ -298,7 +300,8 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
         )
         result["error"] = (
             f"Provision job {job_id} started, but the NetBox tracking row could not be created "
-            f"({exc}). The NSO node may still be provisioning — recover via job {job_id}."
+            f"({type(exc).__name__}; see the server log). The NSO node may still be provisioning: "
+            f"recover via job {job_id}."
         )
         result["job_id"] = job_id
         return result
@@ -448,7 +451,8 @@ def manage_existing(device, instance, nso_device_name) -> dict:
             nso_device_name=name,
         )
     except Exception as exc:
-        result["error"] = repr(exc)
+        logger.exception("manage_existing: creating the management row for %s failed", name)
+        result["error"] = f"Could not create the management row ({type(exc).__name__}); see the server log."
         return result
 
     result["ok"] = True

@@ -10,6 +10,7 @@ from django.http import HttpResponseBadRequest, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils import timezone
+from django.utils.html import escape
 from django.views import View
 from netbox.object_actions import AddObject, BulkDelete, BulkExport
 from netbox.views import generic
@@ -779,7 +780,8 @@ class NSOCategoryView(LoginRequiredMixin, View):
 
         partial = self._PARTIALS.get(key)
         if partial is None:
-            return HttpResponseBadRequest(f"unknown category: {key}")
+            # ``key`` is a raw URL segment reflected into an HTML body: escape it.
+            return HttpResponseBadRequest(f"unknown category: {escape(key)}")
 
         ctx = {"object": device, "mgmt": mgmt, "status_badge": _STATUS_BADGE}
         if mgmt is not None and mgmt.adapter_device_id is not None:
@@ -2136,7 +2138,11 @@ class NSOOnboardingDashboardView(LoginRequiredMixin, View):
             managed = []
         else:
             data = build_onboarding_dashboard(instance)
-            managed = list(NSODeviceManagement.objects.filter(nso_instance=instance).select_related("device"))
+            # nso_instance: the refresh below classifies every row through it, so without the
+            # join the page costs one more query per managed device.
+            managed = list(
+                NSODeviceManagement.objects.filter(nso_instance=instance).select_related("device", "nso_instance")
+            )
             # Mirror the adapter's current last-sync state onto the rows before rendering.
             # The periodic job keeps them fresh with nobody watching; this makes the page
             # the operator is actually looking at current to the second. Best-effort: the
@@ -2193,7 +2199,8 @@ class NSOOnboardView(NSOActionPermissionMixin, View):
         try:
             result = onboard_candidate(device, instance, ned_id=ned_id)
         except Exception as exc:  # never 500 the action
-            messages.error(request, f"Onboarding {device} failed: {exc}")
+            logger.exception("onboard action failed for device %s", device.pk)
+            messages.error(request, f"Onboarding {device} failed ({type(exc).__name__}); see the server log.")
             return redirect(f"{redirect_url}?instance={instance.adapter_instance_id}")
 
         if result["ok"]:
@@ -2238,7 +2245,8 @@ class NSOQuickManageView(NSOActionPermissionMixin, View):
         try:
             result = manage_existing(device, instance, nso_name)
         except Exception as exc:  # never 500 the action
-            messages.error(request, f"Managing {device} failed: {exc}")
+            logger.exception("manage action failed for device %s", device.pk)
+            messages.error(request, f"Managing {device} failed ({type(exc).__name__}); see the server log.")
             return redirect(f"{redirect_url}?instance={instance.adapter_instance_id}")
 
         if result["ok"]:

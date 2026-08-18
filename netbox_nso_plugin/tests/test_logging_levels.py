@@ -154,6 +154,35 @@ class TestReconcileLoggingLevels(LevelsTestBase):
         self.assertEqual(row.console_severity, "WARNING", "operator intent must never be clobbered by a read")
         self.assertEqual(row.status, "accepted")
 
+    def test_owned_singleton_deleted_after_load_returns_none(self):
+        """A concurrent singleton deletion must not crash the read reconciliation.
+
+        The sysinfo precedent: the post-CAS reload of a row another writer removed raises
+        DoesNotExist, which takes the whole device's logging reconcile with it.
+        """
+        from django.db.models.signals import post_init
+
+        from netbox_nso_plugin.models import NSOLoggingLevelState
+
+        row = self._row(console_severity="WARNING", status="accepted", accepted_at=timezone.now())
+        deleted = []
+
+        def _delete_after_load(sender, instance, **kwargs):
+            # post_init = the reconciler has just SELECTed the row; the delete lands before
+            # its post-CAS reload. Queryset delete: no post_init, hence no recursion.
+            if deleted or instance.pk != row.pk:
+                return
+            deleted.append(True)
+            NSOLoggingLevelState.objects.filter(pk=instance.pk).delete()
+
+        post_init.connect(_delete_after_load, sender=NSOLoggingLevelState, weak=False)
+        self.addCleanup(post_init.disconnect, _delete_after_load, sender=NSOLoggingLevelState)
+
+        res = self._reconcile(self._payload(local_levels={"console_severity": "WARNING"}))
+
+        self.assertEqual(deleted, [True])
+        self.assertIsNone(res["local_levels"])
+
     def test_no_mgmt_returns_none(self):
         from netbox_nso_plugin.template_content import _reconcile_logging_config
 

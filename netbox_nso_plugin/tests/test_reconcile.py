@@ -3,14 +3,18 @@
 """Tests for the off-request reconcile job and the sync-complete callback endpoint."""
 
 import os
+import threading
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
+from django.db import connections
 from django.test import TestCase
 from rest_framework import status
 from utilities.testing import APITestCase
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+from ._settlement_case import _make_mgmt, _SettlementCase
 
 
 def _make_device(name="rec-dev"):
@@ -361,6 +365,190 @@ class TestEscalateStuckDeploying(APITestCase):
         self.assertEqual(row.status, "deploying")
 
 
+def _during_settlement(action):
+    """Run *action* inside Step 4's ``settle_static_routes`` call, before it locks the row.
+
+    That call resolves its adapter device id from the row it LOCKS, so whatever *action*
+    lands is what the settlement consumes, while Step 4 read its job state before the call.
+    """
+    from netbox_nso_plugin import settlement
+
+    real_settle = settlement.settle_static_routes
+
+    def act_then_settle(mgmt, **kwargs):
+        action()
+        return real_settle(mgmt, **kwargs)
+
+    return patch.object(settlement, "settle_static_routes", act_then_settle)
+
+
+def _commit_link_repair(mgmt_pk: int, new_adapter_device_id: int | None):
+    """A link repair that really COMMITS: written on another connection, joined before it returns.
+
+    The consumer takes the row with ``SELECT … FOR UPDATE`` and so can only ever see a
+    committed write. A same-connection write inside a test transaction would discriminate
+    just as well while exercising nothing but same-connection visibility.
+    """
+
+    def repair():
+        def other_connection():
+            try:
+                NSODeviceManagement.objects.filter(pk=mgmt_pk).update(adapter_device_id=new_adapter_device_id)
+            finally:
+                connections.close_all()
+
+        thread = threading.Thread(target=other_connection)
+        thread.start()
+        thread.join(timeout=30)
+        assert not thread.is_alive(), "the repair never committed, so the window is not exercised"
+
+    return repair
+
+
+class TestStepFourRereadsAfterTheSettlement(_SettlementCase):
+    """Step 4's later helpers must judge the state the settlement left, not the one before it.
+
+    ``settle_static_routes`` locks the management row, resolves its adapter device id from
+    that locked row and walks the adapter's feed. The failure settle, the stuck-deploying
+    escalation and the apply journal run after it, and everything Step 4 read BEFORE it can
+    by then be about another adapter device (a link repair committed in the window) or about
+    an apply that was not running yet (one started while the feed was walked).
+
+    A real transaction boundary is what makes that window real, so this suite runs on
+    ``_SettlementCase`` (``TransactionTestCase``) like every other adapter-double suite.
+    """
+
+    def _setup(self, tag, adapter_device_id):
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin.signals import suppress_intent_push
+        from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
+
+        device = _make_device(tag)
+        mgmt = _make_mgmt(device, tag, adapter_device_id)
+        # Real commits here, so the fixture's own writes would push VLAN intent the double
+        # does not serve, and the failed push re-onboards the device onto a fresh adapter id.
+        with suppress_intent_push():
+            vlan = VLAN.objects.create(group=_device_vlan_group(device), vid=303, name="V303")
+            row = NSOVLANState.objects.create(management=mgmt, vlan=vlan, device_name="V303", status="deploying")
+        return mgmt, row
+
+    @staticmethod
+    def _aged(job, minutes=30):
+        """Age one of the double's jobs past the stuck-deploying grace, in the adapter's wire format."""
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        job["updated_at"] = (timezone.now() - timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+        return job
+
+    def _reconcile(self, mgmt, action):
+        """Run Step 4 with *action* landing inside the settlement call."""
+        from netbox_nso_plugin import reconcile
+
+        with (
+            patch.object(reconcile, "reconcile_device", return_value={}),
+            _during_settlement(action),
+        ):
+            reconcile.run_device_reconcile(mgmt.device_id)
+
+    def test_the_escalation_stands_down_when_the_repaired_device_is_mid_apply(self):
+        """Escalating a row whose device is mid-apply is unrecoverable: that apply's own
+        in_sync cannot lift a row back out of apply_failed."""
+        mgmt, row = self._setup("rec-repair-active", 70)
+        # 70's last apply succeeded long ago, which is an escalation verdict; 71 is mid-apply.
+        self._aged(
+            self.adapter.store.terminal_job(70, extra={"vlan_count_by_outcome": {"in_sync": 1, "apply_failed": 0}})
+        )
+        self.adapter.store.queued_job(71)
+
+        self._reconcile(mgmt, _commit_link_repair(mgmt.pk, 71))
+
+        self.assertEqual(self.adapter.store.feed_requests[0][0], 71, "the settlement did not consume the repair")
+        row.refresh_from_db()
+        self.assertEqual(
+            row.status,
+            "deploying",
+            "the escalation stood on adapter device 70's job and failed a row that now belongs "
+            "to 71, where an apply is in flight",
+        )
+
+    def test_the_failure_settle_and_the_journal_read_the_repaired_devices_job(self):
+        mgmt, row = self._setup("rec-repair-job", 72)
+        # 72's apply failed the VLAN scope; 73's succeeded and carried route-policy only.
+        self._aged(
+            self.adapter.store.terminal_job(
+                72, status="failed", extra={"vlan_count_by_outcome": {"in_sync": 0, "apply_failed": 1}}
+            )
+        )
+        repaired = self._aged(
+            self.adapter.store.terminal_job(
+                73, extra={"route_policy_count_by_outcome": {"in_sync": 2, "apply_failed": 0}}
+            )
+        )
+
+        self._reconcile(mgmt, _commit_link_repair(mgmt.pk, 73))
+
+        self.assertEqual(self.adapter.store.feed_requests[0][0], 73, "the settlement did not consume the repair")
+        row.refresh_from_db()
+        mgmt.refresh_from_db()
+        self.assertEqual(
+            row.status, "deploying", "adapter device 72's failed apply settled a row that now belongs to 73"
+        )
+        self.assertEqual(
+            mgmt.last_journaled_apply_job,
+            repaired["id"],
+            "the apply journal recorded adapter device 72's job for a device that now holds 73",
+        )
+
+    def test_an_unlinked_device_is_not_judged_by_the_id_it_held(self):
+        """The repair's other branch: the row loses its adapter device id entirely. There is
+        no apply to judge it by, so the helpers must skip it exactly as the outer guard does."""
+        mgmt, row = self._setup("rec-repair-unlinked", 74)
+        self._aged(
+            self.adapter.store.terminal_job(74, extra={"vlan_count_by_outcome": {"in_sync": 1, "apply_failed": 0}})
+        )
+
+        self._reconcile(mgmt, _commit_link_repair(mgmt.pk, None))
+
+        row.refresh_from_db()
+        mgmt.refresh_from_db()
+        self.assertEqual(row.status, "deploying", "an unlinked device was judged by adapter device 74's job")
+        self.assertFalse(mgmt.last_journaled_apply_job, "and its apply was journaled onto the unlinked device")
+        self.assertIsNone(mgmt.adapter_device_id, "the repair did not land, so this proves nothing")
+
+    def test_an_apply_that_starts_during_the_settlement_stands_the_escalation_down(self):
+        """The re-read is not only about a repaired id. This device keeps the one it had, and
+        its own apply state turns active while the feed is walked: the operator pressed Apply,
+        which re-marks these rows deploying without re-stamping anything Step 4 read.
+
+        Judging them by the pre-settlement probe fails every one of them, and that is
+        unrecoverable: the running apply's own in_sync cannot lift a row back out of
+        apply_failed. A re-read taken only when the adapter device id CHANGED skips exactly
+        this case, which is the common one.
+        """
+        mgmt, row = self._setup("rec-apply-starts", 75)
+        # A stale succeeded apply: an escalation verdict, until 75's next apply starts.
+        self._aged(
+            self.adapter.store.terminal_job(75, extra={"vlan_count_by_outcome": {"in_sync": 1, "apply_failed": 0}})
+        )
+
+        self._reconcile(mgmt, lambda: self.adapter.store.queued_job(75))
+
+        self.assertEqual(
+            self.adapter.store.feed_requests[0][0], 75, "the settlement consumed the same id: nothing was repaired"
+        )
+        row.refresh_from_db()
+        self.assertEqual(
+            row.status,
+            "deploying",
+            "the escalation stood on the probe taken before the settlement and failed a row "
+            "whose device has an apply in flight",
+        )
+
+
 class TestStaticRouteApplySettle(APITestCase):
     """Static routes join the deploying→settle flow (the MTU/route-policy regression class:
     a scope missing from _prepare_apply/_APPLY_DEPLOYING_SCOPES strands its rows). Found
@@ -421,6 +609,9 @@ class TestStaticRouteApplySettle(APITestCase):
             patch("netbox_nso_plugin.signals._push_bfd_intent_for_device"),
             patch("netbox_nso_plugin.signals._push_interface_mtu_intent_for_device"),
             patch("netbox_nso_plugin.signals._push_route_policy_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_logging_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_l2_sap_intent_for_device"),
+            patch("netbox_nso_plugin.signals._push_snmp_intent_for_device"),
             # A stored count, not a bare mock: the promotion gate reads the count.
             patch(
                 "netbox_nso_plugin.signals._push_static_route_intent_for_device",

@@ -1238,7 +1238,7 @@ _UNCLOCKED_STATIC_ROUTE_ERROR = (
 )
 
 
-def _escalate_stuck_static_routes(mgmt, *, adapter_device_id) -> None:
+def _escalate_stuck_static_routes(mgmt, *, adapter_device_id, apply_active: bool | None = None) -> None:
     """Static-route rows left 'deploying' past the grace with no correlated result → apply_failed.
 
     Static routes left :data:`_APPLY_DEPLOYING_SCOPES`, so :func:`_escalate_stuck_deploying`
@@ -1267,8 +1267,9 @@ def _escalate_stuck_static_routes(mgmt, *, adapter_device_id) -> None:
     rows ``deploying`` without re-stamping the generation clock, so a route staged long
     before its Apply looks stuck the moment that Apply starts. Failing it there is
     unrecoverable — the apply's own ``in_sync`` cannot lift a row out of ``apply_failed``.
-    That lookup is deliberately made only when there is something to escalate, so a quiet
-    device costs no adapter call.
+    A caller that already fetched the job state **for this adapter device** passes it as
+    *apply_active*; otherwise the lookup is made here, and only when there is something to
+    escalate, so a quiet device on the maintenance tick costs no adapter call.
     """
     from django.db.models import Q
     from django.utils import timezone
@@ -1287,7 +1288,8 @@ def _escalate_stuck_static_routes(mgmt, *, adapter_device_id) -> None:
     )
     if not rows:
         return
-    _job, apply_active = _apply_job_state(adapter_device_id)
+    if apply_active is None:
+        _job, apply_active = _apply_job_state(adapter_device_id)
     if apply_active:
         logger.debug(
             "nso reconcile: static-route escalation stands down for adapter device %s — an apply is in flight",
@@ -1479,6 +1481,7 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
     from dcim.models import Device
 
     from .adapter_client import AdapterError
+    from .models import NSODeviceManagement
     from .settlement import settle_static_routes
 
     try:
@@ -1514,7 +1517,8 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
         # Reverse one-to-one: a plain attribute read raises for an unmanaged device.
         mgmt = getattr(device, "nso_management", None)
         if mgmt is not None and mgmt.adapter_device_id is not None:
-            job, apply_active = _apply_job_state(mgmt.adapter_device_id)
+            adapter_device_id = mgmt.adapter_device_id
+            job, apply_active = _apply_job_state(adapter_device_id)
             # BEFORE the coarse settle and both backstops, in the same invocation.
             # `_escalate_stuck_deploying`'s own justification is that the settling step "runs
             # right before this"; static routes no longer settle by reconcile, so without
@@ -1523,7 +1527,8 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
             # including the apply-in-flight check — an error here therefore stands the static
             # backstop down and touches nothing else.
             try:
-                settle_static_routes(mgmt)
+                # The pair names the device the state was read for; the consumer locks its own.
+                settle_static_routes(mgmt, apply_state=(adapter_device_id, apply_active))
             except Exception as exc:  # noqa: BLE001 — narrow: only the static backstop stands down
                 logger.warning(
                     "nso reconcile: static-route settlement failed for device %s: %s — "
@@ -1531,10 +1536,16 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
                     device_id,
                     exc,
                 )
-            _settle_apply_failures(mgmt, job.get("result") if job else None, job)
-            if not apply_active:
-                _escalate_stuck_deploying(mgmt, job)
-            _journal_route_policy_apply(mgmt, job)
+            # settle_static_routes locks the row and consumes the id IT reads, so a link repair
+            # committing in that window leaves the state read above about another adapter device.
+            # A fresh fetch, not refresh_from_db: an unmanaged device must skip here, not raise.
+            mgmt = NSODeviceManagement.objects.filter(pk=mgmt.pk).first()
+            if mgmt is not None and mgmt.adapter_device_id is not None:
+                job, apply_active = _apply_job_state(mgmt.adapter_device_id)
+                _settle_apply_failures(mgmt, job.get("result") if job else None, job)
+                if not apply_active:
+                    _escalate_stuck_deploying(mgmt, job)
+                _journal_route_policy_apply(mgmt, job)
     except Exception as exc:  # noqa: BLE001 — settling is best-effort, never crash the worker
         logger.warning("nso reconcile: apply-failure settle skipped for device %s: %s", device_id, exc)
 

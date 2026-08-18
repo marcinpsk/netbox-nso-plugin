@@ -411,6 +411,82 @@ class TestStallBound(_SettlementCase):
         assert self._cursor(mgmt).settle_cursor_seq == 2
 
 
+class TestAFeedRowWithNoSequenceIsSkipped(_SettlementCase):
+    """S4.6: a page that breaks the feed contract may not block the sequences behind it.
+
+    An unsequenced row carries no position, so it blocks no position: the cursor can never
+    move past it and nothing sits behind it in settlement order. Stalling on it instead costs
+    twice. The entry has no durable identity, so no cursor can exclude it and every pass after
+    the bound starts the count again — the feed then drains one pass in five, forever. And the
+    stall triple it borrows is the one an undecided *sequence* needs: the two reset each
+    other's count on every cycle, so that bound is never reached and the device head-of-line
+    blocks for good, which is the failure the bound exists to prevent.
+
+    Skipping loses nothing. A job that later takes a sequence takes one above this cursor and
+    is consumed then, exactly like the queued sibling the feed never served.
+    """
+
+    def _broken_feed(self, tag, adapter_device_id, *, expected=True):
+        """A device whose feed head is an unsequenced row, with a real settlement behind it."""
+        device = _make_device(tag)
+        mgmt = _make_mgmt(device, tag, adapter_device_id)
+        sr = _route(f"10.12.{adapter_device_id % 250}.0/24", "10.12.0.1", devices=[device])
+        state = _own(sr, mgmt, generation=74, expected=expected)
+        self.adapter.store.unsequenced_job(adapter_device_id, results=[_result(sr.pk, 74)])
+        self.adapter.store.terminal_job(adapter_device_id, results=[_result(sr.pk, 74)])
+        return mgmt, state
+
+    def test_the_sequenced_job_behind_it_drains_on_the_first_pass(self):
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        mgmt, state = self._broken_feed("nosequence", 91)
+
+        result = consume_static_route_settlements(mgmt)
+
+        assert result.stalled is False, "an entry that holds no position blocked the feed"
+        assert result.consumed == 1, "the sequenced job behind the broken row never drained"
+        assert result.drained is True, "the backstop's precondition was lost to a positionless row"
+        row = self._cursor(mgmt)
+        assert row.settle_cursor_seq == 1
+        assert row.settle_stall_seq is None, "the bound was spent on a row that carries no sequence"
+        assert row.settle_stall_attempts == 0
+        state.refresh_from_db()
+        assert state.status == "in_sync"
+
+    def test_it_never_starts_a_stall_cycle_however_often_it_is_served(self):
+        """No cursor can exclude a row with no sequence, so every later pass meets it again."""
+        from netbox_nso_plugin.settlement import SETTLE_STALL_MAX_ATTEMPTS, consume_static_route_settlements
+
+        mgmt, _state = self._broken_feed("noseqagain", 92)
+
+        for pass_number in range(1, 2 * SETTLE_STALL_MAX_ATTEMPTS + 1):
+            result = consume_static_route_settlements(mgmt)
+            assert result.stalled is False, f"the same entry blocked the feed again on pass {pass_number}"
+            assert result.drained is True, f"the backstop's precondition was lost on pass {pass_number}"
+            assert self._cursor(mgmt).settle_stall_attempts == 0
+
+    def test_it_does_not_reset_the_bound_of_an_undecided_sequence(self):
+        """The stall triple keys ONE entry, and a row served on every pass must not be it."""
+        from netbox_nso_plugin.settlement import SETTLE_STALL_MAX_ATTEMPTS, consume_static_route_settlements
+
+        mgmt, state = self._broken_feed("noseqbound", 93, expected=False)
+        self.adapter.store.intent_status = 503  # the sequenced job behind it cannot be decided
+
+        results = [consume_static_route_settlements(mgmt) for _ in range(SETTLE_STALL_MAX_ATTEMPTS)]
+
+        assert results[0].stalled is True, "an undecided sequence did not stall at all"
+        assert results[-1].advanced_past_stall is True
+        row = self._cursor(mgmt)
+        assert row.settle_cursor_seq == 1, (
+            "the unsequenced row reset the undecided sequence's count on every cycle, so its "
+            "bound was never reached and the device head-of-line blocked forever"
+        )
+        assert row.settle_stall_seq is None
+        assert row.settle_stall_attempts == 0
+        state.refresh_from_db()
+        assert state.status == "deploying"
+
+
 class TestStaleFullSaveCannotRewindTheCursor(_SettlementCase):
     """A holder of a pre-advance instance may not carry the cursor or the bound backwards.
 
@@ -524,9 +600,12 @@ class TestDurableStallAcrossProcesses(_SettlementCase):
     """S4.3 (P5.11) — the bound survives a real process boundary, or it is not durable."""
 
     def _run_consumer(self, device_id: int, passes: int):
+        # The child names the test database directly, under the standard settings: the isolated
+        # harness refuses to build a settings module whose live NAME is already the test name.
         env = dict(os.environ)
+        env.pop("TEST_DB_NAME", None)
         env["DB_NAME"] = connection.settings_dict["NAME"]
-        env.setdefault("DJANGO_SETTINGS_MODULE", "netbox.settings")
+        env["DJANGO_SETTINGS_MODULE"] = "netbox.settings"
         return subprocess.run(  # noqa: S603 — a fixed argv, no shell
             [
                 sys.executable,

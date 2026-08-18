@@ -226,3 +226,39 @@ class TestSyncCacheTimestamp(_AwareUTCMixin, TestCase):
             refresh_sync_cache(self.mgmt, self._adapter_row("2026-06-01T10:00:00+00:00Z"))
         self.mgmt.refresh_from_db()
         self.assertIsNone(self.mgmt.last_sync_at)
+
+    def test_an_offsetless_timestamp_mirrors_as_none_instead_of_naive(self):
+        """The contract is ``<iso>Z``. An offset-less value names no instant, so it is absent."""
+        from netbox_nso_plugin.sync_cache import refresh_sync_cache
+
+        with self.assertLogs("netbox_nso_plugin.sync_cache", level="WARNING"):
+            refresh_sync_cache(self.mgmt, self._adapter_row("2026-06-01T10:00:00"))
+        self.assertIsNone(self.mgmt.last_sync_at, "a naive datetime was mirrored as if it were UTC")
+        self.mgmt.refresh_from_db()
+        self.assertIsNone(self.mgmt.last_sync_at)
+
+    def test_a_non_string_timestamp_degrades_instead_of_raising(self):
+        """``parse_datetime`` raises TypeError for a non-string; every caller is on a page render."""
+        from netbox_nso_plugin.sync_cache import parse_adapter_timestamp
+
+        for value in (1717236000, {"at": "2026-06-01T10:00:00Z"}, ["2026-06-01T10:00:00Z"]):
+            with self.subTest(value=value):
+                with self.assertLogs("netbox_nso_plugin.sync_cache", level="WARNING"):
+                    self.assertIsNone(parse_adapter_timestamp(value, "last_probe_at"))
+
+    def test_refresh_degrades_non_string_timestamps_before_persistence(self):
+        """The refresh boundary must not pass malformed adapter values to the DateTimeField."""
+        from netbox_nso_plugin.sync_cache import refresh_sync_cache
+
+        previous = datetime(2026, 5, 31, 9, 0, tzinfo=UTC)
+        self.mgmt.last_sync_at = previous
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(last_sync_at=previous)
+        for value in (1717236000, {"at": "2026-06-01T10:00:00Z"}, ["2026-06-01T10:00:00Z"]):
+            with self.subTest(value=value):
+                with self.assertLogs("netbox_nso_plugin.sync_cache", level="WARNING"):
+                    changed = refresh_sync_cache(self.mgmt, self._adapter_row(value))
+
+                self.assertNotIn("last_sync_at", changed)
+                self.assertEqual(self.mgmt.last_sync_at, previous)
+                self.mgmt.refresh_from_db()
+                self.assertEqual(self.mgmt.last_sync_at, previous)

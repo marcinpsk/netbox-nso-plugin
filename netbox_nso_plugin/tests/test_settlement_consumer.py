@@ -23,6 +23,7 @@ from ._settlement_case import (
     _result,
     _route,
     _SettlementCase,
+    _stale_clock,
 )
 
 
@@ -398,4 +399,78 @@ class TestAVerdictCannotLandOnNewerIntent(_SettlementCase):
         assert edited_state.status == "accepted", (
             "a verdict computed for generation 301 landed on generation 302 — a green badge "
             "for content the device has not been asked for"
+        )
+
+
+class TestTheReadBackIsFetchedOncePerPass(_SettlementCase):
+    """The intent read-back is keyed by device alone, so one pass may fetch it once.
+
+    ``_settle_job`` needs it for every job that carries a result whose expectation the pusher
+    never recorded. Fetching per job issues up to ``SETTLE_FEED_PAGE`` identical HTTP calls
+    while the pass holds ``SELECT … FOR UPDATE`` on the management row, and every other writer
+    of that row (the push recorder, the link repair, reconcile) waits for the sum of them.
+    """
+
+    def test_one_read_back_serves_every_job_on_the_page(self):
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        device = _make_device("readback")
+        mgmt = _make_mgmt(device, "readback", 96)
+        routes = [_route(f"10.60.{n}.0/24", f"10.60.{n}.1", devices=[device]) for n in range(3)]
+        states = [_own(sr, mgmt, generation=310, expected=False) for sr in routes]
+        for sr in routes:
+            # Committed intent whose PUT response never arrived: the read-back is the recovery.
+            self.adapter.store.echo(96, sr.pk, 310, FINGERPRINT)
+            self.adapter.store.terminal_job(96, results=[_result(sr.pk, 310)])
+
+        outcome = consume_static_route_settlements(mgmt)
+
+        assert outcome.consumed == 3
+        assert self.adapter.store.readback_requests == [96], (
+            "the device-wide read-back was re-fetched per job, under the row lock"
+        )
+        for state in states:
+            state.refresh_from_db()
+            assert state.status == "in_sync"
+
+
+class TestTheEscalationReusesStep4sJobState(_SettlementCase):
+    """The static backstop must not re-read the apply-job state Step 4 handed it.
+
+    Both reads answer the same question (may an apply be in flight) from the same descending
+    jobs page, for the same adapter device id, so the second one is a wasted round trip whose
+    answer can disagree with the first.
+
+    Step 4 itself probes twice, once on each side of the settlement, and those two are about
+    DIFFERENT devices whenever a link repair commits in between: the settlement resolves the
+    id from the row it locks, and everything after it judges by the id the row holds then.
+    """
+
+    def _jobs_page_reads(self):
+        """Reads of the DESCENDING jobs page: the apply-activity probe, not the feed."""
+        store = self.adapter.store
+        return len([path for _method, path in store.requests if path == "/api/v1/jobs"]) - len(store.feed_requests)
+
+    def test_the_escalation_reuses_step_4_s_job_state(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin.reconcile import run_device_reconcile
+
+        device = _make_device("step4")
+        mgmt = _make_mgmt(device, "step4", 97)
+        sr = _route("10.61.0.0/16", "10.61.0.1", devices=[device])
+        state = _own(sr, mgmt, generation=320)
+        _stale_clock(state)
+        # Terminal, and about no static route: the feed drains, so the backstop may judge,
+        # which is the path that fetched the job state a second time.
+        self.adapter.store.terminal_job(97)
+
+        with patch("netbox_nso_plugin.reconcile.reconcile_device", return_value={}):
+            run_device_reconcile(device.pk)
+
+        state.refresh_from_db()
+        assert state.status == "apply_failed", "the backstop never ran, so nothing proves the reuse"
+        assert self._jobs_page_reads() == 2, (
+            "Step 4 probes once before the settlement and once after it; a third read is the "
+            "escalation re-fetching the state it was handed"
         )

@@ -12,81 +12,17 @@ P6.4 pins exactly that.
 
 from __future__ import annotations
 
-import contextlib
 import threading
 import time
 from unittest.mock import patch
 
-from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.db import connection
 from django.test import TestCase, TransactionTestCase
-from django.utils import timezone
 
+from ._static_route_case import PUT, _fixtures, _make_device, _make_mgmt, _own, _route
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
-PUT = "netbox_nso_plugin.adapter_client.put_static_route_intent"
 PUT_VLAN = "netbox_nso_plugin.adapter_client.put_vlan_intent"
-
-
-def _make_device(tag: str, index: int = 1):
-    mfg, _ = Manufacturer.objects.get_or_create(name=f"Pe{tag}Mfg", slug=f"pe{tag}mfg")
-    dt, _ = DeviceType.objects.get_or_create(manufacturer=mfg, model=f"Pe{tag}Dev", slug=f"pe{tag}dev")
-    role, _ = DeviceRole.objects.get_or_create(name=f"Pe{tag}Role", slug=f"pe{tag}role")
-    site, _ = Site.objects.get_or_create(name=f"Pe{tag}Site", slug=f"pe{tag}site")
-    return Device.objects.create(name=f"pe-{tag}-rtr-{index}", device_type=dt, role=role, site=site)
-
-
-def _make_mgmt(device, tag: str, adapter_device_id: int):
-    from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
-
-    inst, _ = NSOInstance.objects.get_or_create(
-        name=f"pe-{tag}-inst", defaults={"adapter_instance_id": f"pe-{tag}-inst"}
-    )
-    return NSODeviceManagement.objects.create(
-        device=device,
-        nso_instance=inst,
-        nso_device_name=f"nso-pe-{tag}-{device.pk}",
-        adapter_device_id=adapter_device_id,
-    )
-
-
-@contextlib.contextmanager
-def _fixtures():
-    """Build fixtures with the adapter patched out, then clear the coalescer."""
-    from netbox_nso_plugin.signals import reset_intent_push_state
-
-    with patch(PUT):
-        yield
-    reset_intent_push_state()
-
-
-def _route(prefix, next_hop, *, vrf=None, metric=1, devices=()):
-    from netbox_routing.models import StaticRoute
-
-    from netbox_nso_plugin.signals import suppress_intent_push
-
-    sr = StaticRoute.objects.create(prefix=prefix, next_hop=next_hop, vrf=vrf, metric=metric)
-    if devices:
-        with suppress_intent_push():
-            sr.devices.add(*devices)
-    return sr
-
-
-def _own(sr, mgmt, *, status="in_sync"):
-    from netbox_nso_plugin.intent_generation import allocate_intent_generation
-    from netbox_nso_plugin.models import NSOStaticRouteState
-
-    return NSOStaticRouteState.objects.create(
-        management=mgmt,
-        static_route=sr,
-        status=status,
-        nso_vrf=sr.vrf.name if sr.vrf else "",
-        nso_prefix=str(sr.prefix or ""),
-        nso_next_hop=str(sr.next_hop or ""),
-        accepted_at=timezone.now(),
-        intent_generation=allocate_intent_generation(),
-        generation_started_at=timezone.now(),
-    )
 
 
 def _adapter_error(message, code, detail):

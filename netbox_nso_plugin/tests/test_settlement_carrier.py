@@ -20,6 +20,37 @@ from django.db import connections
 from ._settlement_case import _CarrierCase, _make_device, _make_mgmt, _own, _result, _route, _stale_clock
 
 
+def _repair_before_the_lock(mgmt_pk: int, new_id: int):
+    """Commit a link repair to *new_id* in the window Step 4 leaves open.
+
+    Anchored on the consumer's entry point: Step 4 has handed over its cached ``mgmt`` object
+    and read whatever it reads, and the consumer has not taken its lock yet.
+    """
+    from netbox_nso_plugin import settlement
+    from netbox_nso_plugin.models import NSODeviceManagement
+
+    real_settle = settlement.settle_static_routes
+    repaired = []
+
+    def barrier(passed_mgmt, **kwargs):
+        if not repaired:
+            repaired.append(True)
+
+            def other_connection():
+                try:
+                    NSODeviceManagement.objects.filter(pk=mgmt_pk).update(adapter_device_id=new_id)
+                finally:
+                    connections.close_all()
+
+            thread = threading.Thread(target=other_connection)
+            thread.start()
+            thread.join(timeout=30)
+            assert not thread.is_alive(), "the repair never committed, so the barrier proves nothing"
+        return real_settle(passed_mgmt, **kwargs)
+
+    return patch.object(settlement, "settle_static_routes", barrier)
+
+
 class TestTheCarrier(_CarrierCase):
     """S5.4 — the adapter's notification reaches the consumer, through production wiring only."""
 
@@ -101,9 +132,6 @@ class TestTheConsumerReadsTheLockedRow(_CarrierCase):
 
     def test_the_consumer_reads_its_device_id_from_the_locked_row(self):
         """The FIRST feed request must carry the id on the row, not the id on the argument."""
-        from netbox_nso_plugin import reconcile
-        from netbox_nso_plugin.models import NSODeviceManagement
-
         device = _make_device("stale")
         mgmt = _make_mgmt(device, "stale", 10)
         sr = _route("10.33.0.0/16", "10.33.0.1", devices=[device])
@@ -112,31 +140,12 @@ class TestTheConsumerReadsTheLockedRow(_CarrierCase):
         # end-state assertion alone could pass for the wrong reason — hence the outbound one.
         self.adapter.store.terminal_job(11, results=[_result(sr.pk, 104)])
 
-        real_apply_job_state = reconcile._apply_job_state
-        barrier_done = []
-
-        def commit_the_repair_between_materialize_and_lock(adapter_device_id):
-            """Step 4 has its `mgmt` object; the consumer has not taken its lock yet."""
-            if not barrier_done:
-                barrier_done.append(True)
-
-                def other_connection():
-                    try:
-                        NSODeviceManagement.objects.filter(pk=mgmt.pk).update(adapter_device_id=11)
-                    finally:
-                        connections.close_all()
-
-                thread = threading.Thread(target=other_connection)
-                thread.start()
-                thread.join(timeout=30)
-                assert not thread.is_alive(), "the repair never committed, so the barrier proves nothing"
-            return real_apply_job_state(adapter_device_id)
-
-        with patch.object(reconcile, "_apply_job_state", commit_the_repair_between_materialize_and_lock):
+        # Anchored on the consumer's entry point, which is the contract Step 4 calls: Step 4
+        # has handed over its `mgmt` object and the consumer has not taken its lock yet.
+        with _repair_before_the_lock(mgmt.pk, 11):
             self._notify(device.pk)
             self._drain()
 
-        assert barrier_done, "the barrier never ran — Step 4 did not materialize its row"
         assert self.adapter.store.feed_requests, "the consumer was never reached"
         assert self.adapter.store.feed_requests[0][0] == 11, (
             "the first feed request used the caller's cached adapter device id, "
@@ -144,6 +153,53 @@ class TestTheConsumerReadsTheLockedRow(_CarrierCase):
         )
         state.refresh_from_db()
         assert state.status == "in_sync"
+
+
+class TestTheApplyProbeNamesTheLockedDevice(_CarrierCase):
+    """The apply-in-flight probe must be about the adapter device the consumer locked.
+
+    Step 4 reads the job state for the id on its cached row and hands the verdict down to the
+    escalation. A link repair that commits in that window moves the row to another adapter
+    device, and a probe of the OLD one says nothing about an apply in flight on the NEW one.
+    Reusing it fails every deploying static route on a device that is mid-apply, and an
+    apply's own ``in_sync`` cannot lift a row back out of ``apply_failed``.
+    """
+
+    def test_a_probe_read_for_another_device_does_not_fail_routes_mid_apply(self):
+        device = _make_device("probe")
+        mgmt = _make_mgmt(device, "probe", 60)
+        sr = _route("10.38.0.0/16", "10.38.0.1", devices=[device])
+        state = _own(sr, mgmt, generation=120)
+        _stale_clock(state)
+        # Device 60 is idle; the repaired device 61 has an apply in flight.
+        self.adapter.store.queued_job(61)
+
+        with _repair_before_the_lock(mgmt.pk, 61):
+            self._notify(device.pk)
+            self._drain()
+
+        assert self.adapter.store.feed_requests[0][0] == 61, "the repair did not land before the lock"
+        state.refresh_from_db()
+        assert state.status == "deploying", (
+            "the backstop stood on an apply probe read for adapter device 60 and failed a route "
+            "on 61, where an apply is in flight"
+        )
+
+    def test_the_backstop_still_judges_when_the_repaired_device_is_idle(self):
+        """The control: standing down is the probe's verdict, not a disabled backstop."""
+        device = _make_device("idle")
+        mgmt = _make_mgmt(device, "idle", 62)
+        sr = _route("10.39.0.0/16", "10.39.0.1", devices=[device])
+        state = _own(sr, mgmt, generation=121)
+        _stale_clock(state)
+
+        with _repair_before_the_lock(mgmt.pk, 63):
+            self._notify(device.pk)
+            self._drain()
+
+        assert self.adapter.store.feed_requests[0][0] == 63, "the repair did not land before the lock"
+        state.refresh_from_db()
+        assert state.status == "apply_failed"
 
 
 class TestTheBackstopNeedsADrainedFeed(_CarrierCase):
@@ -206,6 +262,7 @@ class TestTheBackstopPushesNoIntent(_CarrierCase):
     """
 
     def test_escalating_a_stuck_row_sends_no_static_route_intent(self):
+        from netbox_nso_plugin import adapter_client
         from netbox_nso_plugin.signals import reset_intent_push_state
 
         device = _make_device("nopush")
@@ -225,8 +282,21 @@ class TestTheBackstopPushesNoIntent(_CarrierCase):
 
         state.refresh_from_db()
         assert state.status == "apply_failed", "the backstop did not fire, so this proves nothing"
-        pushes = [r for r in self.adapter.store.requests if r == ("PUT", "/api/v1/devices/42/static-route-intent")]
+        pushes = self._intent_puts()
         assert pushes == [], f"escalating re-pushed this device's static-route intent: {pushes}"
+        # Positive control: the same filter DOES see a push issued through the client the
+        # production path uses, so the empty list above is evidence and not a URL template
+        # the filter stopped matching.
+        adapter_client.put_static_route_intent(42, [])
+        assert self._intent_puts(), "the filter cannot see a static-route push at all"
+
+    def _intent_puts(self):
+        """Every recorded static-route intent PUT, however the client spells the path."""
+        return [
+            (method, path)
+            for method, path in self.adapter.store.requests
+            if method == "PUT" and path.endswith("/static-route-intent")
+        ]
 
 
 class TestAnUnprovenResultIsNotAFailure(_CarrierCase):

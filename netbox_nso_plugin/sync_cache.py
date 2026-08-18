@@ -47,7 +47,10 @@ def parse_adapter_timestamp(value, field="timestamp"):
     """
     try:
         parsed = parse_datetime(value)
-    except ValueError:  # regex-shaped but not a real datetime (month 13, day 32, …)
+    except (TypeError, ValueError):  # not a string, or regex-shaped but not a real datetime
+        parsed = None
+    if parsed is not None and parsed.tzinfo is None:
+        # The contract is "<iso>Z"; an offset-less value names no instant we may trust.
         parsed = None
     if parsed is None:
         logger.warning("Adapter %s %r is not a timestamp — treating as absent", field, value)
@@ -77,8 +80,8 @@ def refresh_sync_cache(mgmt, adapter_device):
     # A key absent from the payload is a different thing (partial shape) — leave it alone.
     if "last_sync_at" in adapter_device:
         raw_ts = adapter_device["last_sync_at"]
-        last_sync_at = parse_adapter_timestamp(raw_ts, "last_sync_at") if isinstance(raw_ts, str) else raw_ts
-        if mgmt.last_sync_at != last_sync_at:
+        last_sync_at = parse_adapter_timestamp(raw_ts, "last_sync_at") if raw_ts is not None else None
+        if (raw_ts is None or last_sync_at is not None) and mgmt.last_sync_at != last_sync_at:
             mgmt.last_sync_at = last_sync_at
             update_fields.append("last_sync_at")
     last_sync_status = adapter_device.get("last_sync_status") or ""
