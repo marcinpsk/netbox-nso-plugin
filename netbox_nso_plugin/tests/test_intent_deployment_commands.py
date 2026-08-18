@@ -527,6 +527,27 @@ class TestIntentRestoreResolvesEveryReceiptCase(_CascadeFlushMixin, IntentPushRe
 
         assert allocate_push_seq() > accepted
 
+    def test_a_stalled_watermark_advance_names_itself_instead_of_spinning(self):
+        """The advance was an unbounded ``while``: a non-increasing return burned the whole
+        command instead of failing with a cause an operator can read."""
+        from django.db import connection
+
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.outbox import PUSH_SEQ_ADVANCE_BATCH, PUSH_SEQ_SEQUENCE
+
+        claim, url = self._lost_vlan_response(936)
+        assert drain.settle(claim, {"count": 1}) == drain.SUCCEEDED
+        accepted = claim.push_seq + PUSH_SEQ_ADVANCE_BATCH + 1
+        self.adapter.receipts[url]["push_seq"] = accepted
+        with connection.cursor() as cursor:
+            cursor.execute(f"SELECT setval('{PUSH_SEQ_SEQUENCE}', %s, true)", [claim.push_seq])
+
+        with (
+            patch("netbox_nso_plugin.outbox.advance_push_seq", return_value=claim.push_seq),
+            self.assertRaisesRegex(CommandError, "advance stalled"),
+        ):
+            self._restore()
+
     def test_equal_sequence_with_another_digest_fails_closed_and_names_the_key(self):
         from netbox_nso_plugin.deployment import is_quiesced
 
