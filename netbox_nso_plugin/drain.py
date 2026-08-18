@@ -1348,8 +1348,13 @@ def _drain_once(
     reform=1,
     deadline=None,
     _deadline_at=None,
+    _chained=False,
 ) -> tuple[str, object]:
-    """Run one claim/send/outcome cycle, returning ``(outcome, the adapter's answer)``."""
+    """Run one claim/send/outcome cycle, returning ``(outcome, the adapter's answer)``.
+
+    ``_chained`` marks a pass the drain started for latency, not one the caller asked for:
+    its claim is nobody's operation to name, so it never records into an open capture.
+    """
     _refuse_in_transaction("drain")
     if deadline is not None and _deadline_at is None:
         _deadline_at = _send_clock() + deadline
@@ -1385,6 +1390,7 @@ def _drain_once(
             reform=reform - 1,
             deadline=deadline,
             _deadline_at=_deadline_at,
+            _chained=_chained,
         )
     if answer is _PARKED_SEND:
         return PARKED, None
@@ -1399,19 +1405,22 @@ def _drain_once(
             chain=chain,
             deadline=deadline,
             deadline_at=_deadline_at,
+            chained=_chained,
         )
         if continued is not None:
             return continued
     return outcome, answer
 
 
-def _after_success(claimed, *, mode, force, chain, deadline, deadline_at):
+def _after_success(claimed, *, mode, force, chain, deadline, deadline_at, chained):
     """Resolve any operation still owed after a successful preparatory pass."""
     device_id, scope = claimed.device_id, claimed.scope
     answered_other_work = _answered_other_work(claimed, mode, force)
-    if not answered_other_work:
+    if not answered_other_work and not chained:
         pushed = _SUCCESSFUL_PUSHES.get()
         if pushed is not None:
+            # Latest wins: one capture spans several caller calls, and a scope that settles
+            # again there has genuinely moved on to a later sequence.
             pushed[scope] = claimed.push_seq
     if answered_other_work:
         if chain <= 0:
@@ -1431,6 +1440,7 @@ def _after_success(claimed, *, mode, force, chain, deadline, deadline_at):
             chain=chain - 1,
             deadline=deadline,
             _deadline_at=deadline_at,
+            _chained=chained,
         )
     if chain > 0 and mode == delivery.MODE_NORMAL and _pending(device_id, scope):
         # This chain is a latency optimization. The tick guarantees any remaining tail.
@@ -1443,6 +1453,7 @@ def _after_success(claimed, *, mode, force, chain, deadline, deadline_at):
                 chain=chain - 1,
                 deadline=deadline,
                 _deadline_at=deadline_at,
+                _chained=True,
             )
         except DeploymentQuiesced:
             logger.info("%s/%s left its tail to the tick because a deployment started", device_id, scope)
