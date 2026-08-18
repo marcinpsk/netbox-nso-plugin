@@ -31,7 +31,7 @@ class IntentDeploymentMiddleware:
         except DeploymentQuiesced:
             logger.info("Refused a mutation during intent deployment: %r", request.path_info)
             # The gate answers before the view, so this IS the Apply response the tab's
-            # AJAX caller parses — it reads JSON, and a text/plain body reaches the
+            # AJAX caller parses. It reads JSON, and a text/plain body reaches the
             # operator as a generic parse failure instead of the deliberate refusal.
             if request.headers.get("X-Requested-With") == "XMLHttpRequest":
                 return JsonResponse({"status": "error", "message": _REFUSAL}, status=503)
