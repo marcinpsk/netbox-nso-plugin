@@ -94,14 +94,22 @@ class RefreshDeviceSyncCacheJob(JobRunner):
         _mapped, by_id, _by_identity = snapshot
         drained = drain_failed = polled = settle_failed = 0
         drain_started = settle_started = time.monotonic()
+        # The drain guards each key, not its own candidate query, so an error there would
+        # abort the tick before the sweep — the one pass that must always run.
         if by_id is None:
-            compact_intent_outbox()
+            try:
+                compact_intent_outbox()
+            except Exception:  # noqa: BLE001 — the sweep below is the retry clock
+                logger.exception("RefreshDeviceSyncCacheJob: intent-outbox compaction failed")
             settle_started = time.monotonic()
             logger.warning("RefreshDeviceSyncCacheJob: adapter snapshot unavailable, sends and sweep skipped")
         else:
             # Same rule as the sweep, and for the same reason: a proven global outage is not
             # a per-key failure, and every candidate would wait out its own read timeout.
-            drained, drain_failed = drain_intent_outbox()
+            try:
+                drained, drain_failed = drain_intent_outbox()
+            except Exception:  # noqa: BLE001 — the sweep below is the retry clock
+                logger.exception("RefreshDeviceSyncCacheJob: intent-outbox drain failed")
             settle_started = time.monotonic()
             polled, settle_failed = sweep_static_route_settlements()
         logger.info(

@@ -336,3 +336,49 @@ class TestTheSweepStandsDownOnAGlobalOutage(_SettlementCase):
             "the sweep polled every candidate after the adapter had already been proven hung: "
             f"{self.adapter.store.feed_requests}"
         )
+
+
+class TestADrainErrorCannotStopTheSweep(_SettlementCase):
+    """The sweep is the retry clock, so no earlier pass of the tick may abort it.
+
+    ``drain_candidates``/``compaction_candidates`` are evaluated outside the drain's own
+    per-key guard, so a repeating error there used to propagate out of the tick and silently
+    stop the settlement clock on every five-minute run, with no summary line to show it.
+    """
+
+    def test_a_failed_drain_still_sweeps_and_still_summarises(self):
+        device = _make_device("drainerr")
+        mgmt = _make_mgmt(device, "drainerr", 21)
+        sr = _route("10.48.0.0/16", "10.48.0.1", devices=[device])
+        state = _own(sr, mgmt, generation=209)
+        self.adapter.store.add_device(
+            nso_instance="se-drainerr-inst",
+            nso_device_name="nso-se-drainerr",
+            netbox_device_id=device.pk,
+            device_id=21,
+        )
+        self.adapter.store.terminal_job(21, results=[_result(sr.pk, 209)])
+
+        with (
+            patch("netbox_nso_plugin.drain.drain_intent_outbox", side_effect=RuntimeError("candidates exploded")),
+            self.assertLogs("netbox_nso_plugin.jobs", level="INFO") as logs,
+        ):
+            self._tick()
+
+        state.refresh_from_db()
+        assert state.status == "in_sync", "a drain error stopped the settlement clock"
+        messages = [record.getMessage() for record in logs.records]
+        assert any("outbox drained" in message for message in messages), "the tick lost its summary line"
+        assert any(record.levelname == "ERROR" for record in logs.records), "the drain error was never reported"
+
+    def test_a_failed_compaction_still_summarises_the_outage_tick(self):
+        with (
+            patch("netbox_nso_plugin.sync_cache._snapshot", return_value=([], None, {})),
+            patch("netbox_nso_plugin.drain.compact_intent_outbox", side_effect=RuntimeError("compaction exploded")),
+            self.assertLogs("netbox_nso_plugin.jobs", level="INFO") as logs,
+        ):
+            self._tick()
+
+        messages = [record.getMessage() for record in logs.records]
+        assert any("outbox drained" in message for message in messages), "the tick lost its summary line"
+        assert any(record.levelname == "ERROR" for record in logs.records), "the compaction error was never reported"
