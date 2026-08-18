@@ -717,7 +717,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertEqual(self.vlan_state.status, "accepted")
 
     def test_an_adapter_503_keeps_the_adapters_own_message_and_rolls_back(self):
-        """Only the plugin's middleware speaks for the gate — an adapter 503 is not it."""
+        """Only the plugin's middleware speaks for the gate; an adapter 503 is not it."""
 
         def unavailable(_selected):
             # Copied from ErrorEnvelope in ../nso-adapter/tests/api/openapi_snapshot.json,
