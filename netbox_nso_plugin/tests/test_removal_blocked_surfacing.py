@@ -23,6 +23,7 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 from django.urls import reverse
 
+from netbox_nso_plugin.adapter_client import _GENERATION_PAGE_LIMIT
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
 
 from ._adapter_http import make_response, make_session
@@ -214,38 +215,44 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
         self.assertEqual(data["jobs"], [jobs[1]])
 
     def test_requested_apply_generation_is_found_beyond_the_first_page(self):
+        # One row past a full page, so only a second page can reach it.
+        wanted = _GENERATION_PAGE_LIMIT + 1
         generations = [
             {
                 "generation_id": seq,
                 "seq": seq,
                 "status": "settled",
-                "job_id": 501 if seq == 501 else None,
+                "job_id": wanted if seq == wanted else None,
             }
-            for seq in range(1, 502)
+            for seq in range(1, wanted + 1)
         ]
-        jobs = [_removal_job(501, "vlan", "succeeded")]
+        jobs = [_removal_job(wanted, "vlan", "succeeded")]
 
-        data = self._get_jobs(jobs, generations=generations, generation_ids=(501,))
+        data = self._get_jobs(jobs, generations=generations, generation_ids=(wanted,))
 
-        self.assertEqual(data["generations"], [generations[500]])
+        self.assertEqual(data["generations"], [generations[-1]])
         self.assertEqual(data["jobs"], jobs)
 
     def test_requested_apply_generation_starts_after_the_browser_cursor(self):
+        wanted = _GENERATION_PAGE_LIMIT + 1
         generations = [
             {
                 "generation_id": seq,
                 "seq": seq,
                 "status": "settled",
-                "job_id": 501 if seq == 501 else None,
+                "job_id": wanted if seq == wanted else None,
             }
-            for seq in range(1, 502)
+            for seq in range(1, wanted + 1)
         ]
-        jobs = [_removal_job(501, "vlan", "succeeded")]
+        jobs = [_removal_job(wanted, "vlan", "succeeded")]
 
-        data = self._get_jobs(jobs, generations=generations, generation_ids=(501,), since_seq=500)
+        data = self._get_jobs(jobs, generations=generations, generation_ids=(wanted,), since_seq=_GENERATION_PAGE_LIMIT)
 
-        self.assertEqual(data["generations"], [generations[500]])
-        self.assertEqual(self.generation_request_params, [{"limit": 500, "since_seq": 500}])
+        self.assertEqual(data["generations"], [generations[-1]])
+        self.assertEqual(
+            self.generation_request_params,
+            [{"limit": _GENERATION_PAGE_LIMIT, "since_seq": _GENERATION_PAGE_LIMIT}],
+        )
 
     def test_a_non_integer_generation_id_is_rejected(self):
         url = reverse("plugins:netbox_nso_plugin:device_nso_jobs", args=[self.device.pk])
