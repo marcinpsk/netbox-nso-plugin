@@ -338,6 +338,52 @@ class TestRequestErrorPaths(unittest.TestCase):
 
         self.assertEqual(ctx.exception.code, "503")
 
+    def _error_from(self, status, body):
+        """Raise ``_request`` against a real *body* served with *status*, return the AdapterError."""
+        from netbox_nso_plugin.adapter_client import AdapterError, _request
+
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
+            patch("netbox_nso_plugin.adapter_client.requests.Session") as mock_s,
+        ):
+            session = make_session()
+            session.request.return_value = make_response(status, json_data=body)
+            mock_s.return_value = session
+
+            with self.assertRaises(AdapterError) as ctx:
+                _request("GET", "/test")
+        return ctx.exception
+
+    def test_error_body_whose_error_member_is_not_an_object_falls_back(self):
+        """A scalar "error" must still raise a typed AdapterError.
+
+        Reading .get() off the scalar raised AttributeError out of _request, which the
+        operator sees as a 500 instead of the adapter's error.
+        """
+        exc = self._error_from(409, {"error": "boom"})
+
+        self.assertEqual(exc.code, "409")
+        self.assertEqual(str(exc), '{"error": "boom"}')
+        self.assertIsNone(exc.detail)
+
+    def test_a_null_message_or_code_falls_back_to_the_status_and_body(self):
+        """Present-but-null members must not beat the fallbacks.
+
+        ``.get(key, default)`` returns the default only when the key is ABSENT, so an
+        emitted null produced code=None and message=None — an empty operator message.
+        """
+        exc = self._error_from(409, {"error": {"code": None, "message": None}})
+
+        self.assertEqual(exc.code, "409")
+        self.assertEqual(str(exc), '{"error": {"code": null, "message": null}}')
+
+    def test_a_non_object_detail_is_normalized_away(self):
+        """AdapterError.detail is typed dict|None, so every consumer may .get() it."""
+        exc = self._error_from(409, {"error": {"code": "conflict", "detail": "boom"}})
+
+        self.assertEqual(exc.code, "conflict")
+        self.assertIsNone(exc.detail)
+
     def test_success_response_non_json_raises_invalid_response(self):
         """A 2xx whose body is not JSON is an adapter fault, not a plugin crash."""
         from netbox_nso_plugin.adapter_client import AdapterError, _request

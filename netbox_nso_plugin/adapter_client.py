@@ -380,6 +380,20 @@ def _request(method, path, **kwargs):
         raise AdapterError("Adapter returned a response that is not valid JSON.", code="invalid_response") from exc
 
 
+def _error_envelope(resp):
+    """Return the adapter's ``{"error": {...}}`` member, or ``{}`` when the body is not that shape.
+
+    An error body reaches us from any intermediary (a proxy 502, a gateway), so unlike the
+    adapter's own typed payloads its shape is genuinely unknown and must be checked here.
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        return {}
+    err = body.get("error") if isinstance(body, dict) else None
+    return err if isinstance(err, dict) else {}
+
+
 def _request_response(method, path, **kwargs):
     """Send one adapter request and return the raw response, for callers that read a header."""
     cfg = _resolve_config()
@@ -457,14 +471,14 @@ def _request_response(method, path, **kwargs):
         ) from exc
 
     if not resp.ok:
-        try:
-            err = resp.json().get("error", {})
-        except Exception:
-            err = {}
+        err = _error_envelope(resp)
+        detail = err.get("detail")
+        # ``or`` not ``.get(key, default)``: the adapter emits nulls, and a present null
+        # would otherwise beat the fallback and leave the operator an empty message.
         raise AdapterError(
-            err.get("message", resp.text),
-            code=err.get("code", str(resp.status_code)),
-            detail=err.get("detail"),
+            err.get("message") or resp.text,
+            code=str(err.get("code") or resp.status_code),
+            detail=detail if isinstance(detail, dict) else None,
         )
     return resp
 
