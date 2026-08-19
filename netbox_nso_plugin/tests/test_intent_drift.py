@@ -11,7 +11,7 @@ from django.db import transaction
 from django.test import TestCase, TransactionTestCase
 from django.utils import timezone
 
-from netbox_nso_plugin import intent_drift
+from netbox_nso_plugin import drain, intent_drift
 from netbox_nso_plugin.models import (
     NSOBGPPeerState,
     NSODeviceManagement,
@@ -152,7 +152,7 @@ class TestIntentDrift(IntentPushResetMixin, TestCase):
         # Must never break the tab render.
         self.assertEqual(intent_drift.compute_intent_drift(self.device, self.mgmt), [])
 
-    @patch("netbox_nso_plugin.drain.drain_key", return_value="succeeded")
+    @patch("netbox_nso_plugin.drain.drain_key", return_value=drain.SUCCEEDED)
     def test_resync_calls_push_for_scope(self, mock_drain):
         from netbox_nso_plugin.delivery import MODE_STORE_ONLY
 
@@ -168,7 +168,7 @@ class TestIntentDrift(IntentPushResetMixin, TestCase):
         self.mgmt.adapter_device_id = None
         self.assertEqual(intent_drift.resync_intent(self.device, self.mgmt, ["interface_ip"]), ([], []))
 
-    @patch("netbox_nso_plugin.drain.drain_key", return_value="succeeded")
+    @patch("netbox_nso_plugin.drain.drain_key", return_value=drain.SUCCEEDED)
     @patch("netbox_nso_plugin.adapter_client.get_intent_summary")
     def test_resync_default_keys_include_partial_scopes(self, mock_sum, mock_drain):
         from netbox_nso_plugin.delivery import MODE_STORE_ONLY
@@ -255,7 +255,7 @@ class TestResyncStoreOnly(_CascadeFlushMixin, IntentPushResetMixin, TransactionT
         what the claim drops as unchanged — so without force=True the re-sync would send
         NOTHING while the view reported success, and the split-brain was never repaired.
         """
-        from netbox_nso_plugin import drain, outbox
+        from netbox_nso_plugin import outbox
 
         # The control: an ordinary claim IS dropped once the baseline names its body.
         with transaction.atomic():
