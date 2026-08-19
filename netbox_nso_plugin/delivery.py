@@ -212,9 +212,14 @@ def _under_deadline(do_push: Callable, seconds: float) -> Callable:
                 if not expired.is_set():
                     answer["error"] = exc
             finally:
-                connections.close_all()  # this thread's own connections, nobody else's
-                session.close()
-                done.set()
+                # done.set() is the waiter's only wake-up, so it cannot ride behind a
+                # teardown step: a raise there would hold the waiter for the whole budget
+                # and report a delivered push as a timeout.
+                try:
+                    connections.close_all()  # this thread's own connections, nobody else's
+                    session.close()
+                finally:
+                    done.set()
 
         threading.Thread(target=_run, name="nso-intent-push", daemon=True).start()
         if not done.wait(seconds):

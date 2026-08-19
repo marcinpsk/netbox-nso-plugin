@@ -176,32 +176,40 @@ class TestTheTransportEndsItsOwnSocket(_DripCase):
         from netbox_nso_plugin import adapter_client
 
         class _Socket:
-            def __init__(self, *, close_error=False):
-                self.close_error = close_error
+            """A socket whose shutdown may fail, and which records any close as a fault.
+
+            ``abort`` must never close: the connection belongs to urllib3's pool and the
+            file descriptor may be reissued to another thread between the close and the
+            owner's next read, which is a cross-connection misdirect.
+            """
+
+            def __init__(self, *, shutdown_error=False):
+                self.shutdown_error = shutdown_error
                 self.shutdown_called = False
                 self.close_called = False
 
             def shutdown(self, how):
                 self.shutdown_called = True
+                if self.shutdown_error:
+                    raise OSError("already closed")
 
             def close(self):
                 self.close_called = True
-                if self.close_error:
-                    raise OSError("already closed")
 
         class _Connection:
             def __init__(self, sock):
                 self.sock = sock
 
-        broken = _Socket(close_error=True)
+        broken = _Socket(shutdown_error=True)
         healthy = _Socket()
         transport = adapter_client.AbortableTransport()
         transport._live = {_Connection(broken), _Connection(healthy)}
 
         transport.abort()
 
-        assert broken.close_called
-        assert healthy.shutdown_called and healthy.close_called
+        assert broken.shutdown_called, "the failing socket was never shut down"
+        assert healthy.shutdown_called, "one socket's failure skipped the other"
+        assert not (broken.close_called or healthy.close_called), "abort closed a pooled socket"
 
     def test_closing_the_session_leaves_the_read_running_and_abort_ends_it(self):
         from netbox_nso_plugin import adapter_client
@@ -251,6 +259,20 @@ class TestTheExpiredDeadlineAbortsTheRequest(_DripCase):
         assert self.server.streaming.is_set(), "the far side never began the response this pin needs"
         assert _senders_ended(running, 15), "the sender outlived the deadline that abandoned it"
         assert self.far_side_lost_the_socket(15), "the far side kept writing, so nothing was aborted"
+
+    def test_a_teardown_failure_does_not_lose_an_answer_the_worker_already_had(self):
+        """Teardown runs after the answer is in hand, so it must not decide the outcome.
+
+        connections.close_all() raising left done unset, so the waiter sat out the whole
+        budget and raised SendDeadlineExceeded for a push the adapter had already accepted:
+        a delivered intent recorded as a timeout.
+        """
+        from netbox_nso_plugin import delivery
+
+        with patch("django.db.connections.close_all", side_effect=RuntimeError("teardown boom")):
+            answer = delivery._under_deadline(lambda body: {"ok": 1}, 0.5)({})
+
+        assert answer == {"ok": 1}
 
     def test_a_completion_arriving_after_the_deadline_is_discarded(self):
         """The waiter's verdict is final: the attempt is already recorded failed."""

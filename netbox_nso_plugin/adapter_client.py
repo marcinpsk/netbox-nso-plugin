@@ -199,8 +199,10 @@ class AbortableTransport(requests.adapters.HTTPAdapter):
             if sock is None:
                 continue
             try:
+                # Shutdown only. The connection belongs to urllib3's pool, which closes it
+                # on release; closing here frees a descriptor the pool may hand out again
+                # before the owning thread's read returns, misdirecting it to a new socket.
                 sock.shutdown(socket.SHUT_RDWR)
-                sock.close()
             except OSError:  # already gone: the request finished or the far side closed first
                 pass
 
