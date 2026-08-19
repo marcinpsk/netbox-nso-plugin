@@ -681,7 +681,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
 
         response = self._post(_ApplyContractAdapter(conflict))
 
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 409)
         self.assertEqual(response.json(), {"status": "conflict", "job_id": 900, "job_type": "apply"})
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "accepted")
