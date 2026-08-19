@@ -989,7 +989,16 @@ def get_settlement_feed(adapter_device_id, *, after_settle_seq, limit):
             f"Adapter served the settlement feed without a {STORE_INCARNATION_HEADER} header.",
             code="missing_store_incarnation",
         )
-    return _validated_jobs(resp.json() if resp.content else [], "settlement feed"), incarnation
+    # This reader decodes the body itself (it needs the header too), so it owes the same
+    # typed refusal _request gives every other caller: a gateway's HTML 200 must not reach
+    # the settlement walk as a bare requests JSONDecodeError.
+    try:
+        page = resp.json() if resp.content else []
+    except ValueError as exc:
+        raise AdapterError(
+            "Adapter returned a settlement feed that is not valid JSON.", code="invalid_response"
+        ) from exc
+    return _validated_jobs(page, "settlement feed"), incarnation
 
 
 def get_static_route_intent(adapter_device_id):

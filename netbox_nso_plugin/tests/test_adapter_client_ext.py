@@ -529,6 +529,17 @@ class TestJobBoundaryValidation(unittest.TestCase):
         session = self._session([_job_with_scalar("result")], headers={STORE_INCARNATION_HEADER: "inc-1"})
         self._refuses(session, lambda: get_settlement_feed(10, after_settle_seq=0, limit=50))
 
+    def test_settlement_feed_refuses_a_body_that_is_not_json(self):
+        """The feed reads the body itself, so its own decode must raise the typed refusal.
+
+        A gateway's HTML 200 otherwise surfaced as a bare requests JSONDecodeError, which
+        no settlement caller handles: they are written against AdapterError.
+        """
+        from netbox_nso_plugin.adapter_client import STORE_INCARNATION_HEADER, get_settlement_feed
+
+        session = self._session(content=b"<html>gateway</html>", headers={STORE_INCARNATION_HEADER: "inc-1"})
+        self._refuses(session, lambda: get_settlement_feed(10, after_settle_seq=0, limit=50))
+
     def test_static_route_read_back_refuses_a_payload_without_routes(self):
         """StaticRouteIntentOut always carries a ``routes`` list; anything else is undecidable.
 
