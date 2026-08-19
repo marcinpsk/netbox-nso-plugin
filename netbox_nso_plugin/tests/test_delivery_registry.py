@@ -115,17 +115,22 @@ class TestDeliveryRegistry(SimpleTestCase):
         }
 
     def test_no_production_reader_repeats_the_interface_receipt_literal(self):
-        offenders = []
+        offenders, scanned = [], []
         for path in PLUGIN.rglob("*.py"):
-            if path.name == "delivery.py" or "tests" in path.parts or "migrations" in path.parts:
+            # Relative to the plugin: an ancestor directory named tests/ or migrations/ would
+            # otherwise skip every module and pass this guard on an empty scan.
+            relative = path.relative_to(PLUGIN)
+            if path.name == "delivery.py" or "tests" in relative.parts or "migrations" in relative.parts:
                 continue
+            scanned.append(relative.as_posix())
             literals = {
                 node.value
                 for node in ast.walk(ast.parse(path.read_text()))
                 if isinstance(node, ast.Constant) and isinstance(node.value, str)
             }
             if "interface_config" in literals:
-                offenders.append(path.relative_to(PLUGIN).as_posix())
+                offenders.append(relative.as_posix())
+        assert "signals.py" in scanned, f"the scan reached {len(scanned)} module(s), so it proves nothing"
         assert offenders == [], f"receipt-section literals outside delivery.py: {offenders}"
 
 
