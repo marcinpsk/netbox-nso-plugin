@@ -113,7 +113,7 @@ function job(overrides) {
     {
       id: 501,
       type: "apply",
-      device_id: 1558,
+      device_id: 1, // the device mountTab() renders; a job row names its own device
       status: "succeeded",
       result: {},
       error: null,
