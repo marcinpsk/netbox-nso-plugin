@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import tomllib
 from pathlib import Path
@@ -22,7 +23,14 @@ def _locked_version(lock_text: str, package: str) -> str:
 
 
 def _uv_lock(cwd: Path) -> None:
-    subprocess.run(["uv", "lock", "--offline"], cwd=cwd, check=True, text=True, capture_output=True)
+    """Refresh the lock the way the release build does, failing by name when uv is absent.
+
+    A missing tool is a broken environment for a release pin, not a reason to pass: this
+    asserts rather than skipping, so the gap is visible instead of silently green.
+    """
+    assert shutil.which("uv"), "uv is not on PATH, so the release lock step cannot be verified"
+    result = subprocess.run(["uv", "lock", "--offline"], cwd=cwd, check=False, text=True, capture_output=True)
+    assert result.returncode == 0, f"uv lock --offline failed: {result.stderr}"
 
 
 def _git(cwd: Path, *args: str) -> str:

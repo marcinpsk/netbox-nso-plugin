@@ -335,12 +335,21 @@ class TestApplyRefusalSealing(TestCase):
 
         from netbox_nso_plugin import views
 
+        def names_apply_refused(handler):
+            """True for ``except ApplyRefused`` and for a tuple form that includes it.
+
+            Matching only the bare Name let ``except (ApplyRefused, OtherError)`` past the
+            pin, which is the shape a later handler is most likely to grow into.
+            """
+            node = handler.type
+            if isinstance(node, ast.Tuple):
+                return any(isinstance(elt, ast.Name) and elt.id == "ApplyRefused" for elt in node.elts)
+            return isinstance(node, ast.Name) and node.id == "ApplyRefused"
+
         handlers = [
             node
             for node in ast.walk(ast.parse(inspect.getsource(views)))
-            if isinstance(node, ast.ExceptHandler)
-            and isinstance(node.type, ast.Name)
-            and node.type.id == "ApplyRefused"
+            if isinstance(node, ast.ExceptHandler) and names_apply_refused(node)
         ]
         assert handlers, "the apply action lost its ApplyRefused handler"
         for handler in handlers:

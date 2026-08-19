@@ -357,6 +357,10 @@ class TestOutboxEnqueueTakesNoSharedLock(_CascadeFlushMixin, IntentPushResetMixi
             for thread in threads:
                 thread.join(timeout=60)
 
+        # join() returns on timeout as readily as on completion, so a deadlock would other-
+        # wise read as an empty error list and a row count taken while the writers still run.
+        for thread in threads:
+            assert not thread.is_alive(), "worker did not finish - deadlock"
         assert errors == []
         assert NSOIntentOutboxEntry.objects.filter(device_id=device_id).count() == 4
         # The state row is the drain's mutual-exclusion point; an enqueue that touched it
