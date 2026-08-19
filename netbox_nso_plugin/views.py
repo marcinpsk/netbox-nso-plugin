@@ -2949,6 +2949,9 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
         job_id = generations[0]["job_id"]
         response_job_id = result.get("job_id")
         if job_id is None or type(response_job_id) is not int or response_job_id != job_id:
+            # The promoted rows keep their mark (a generation carries them), but a stream
+            # the adapter skipped has none, so nothing would ever settle it.
+            _rollback_prepare_apply(prepared, keep_streams=promoted_streams)
             msg = (
                 f"Apply promoted {len(generations)} generation(s), but the adapter reported an invalid head job. "
                 "The promoted rows remain applying until a result settles them."
