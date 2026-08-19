@@ -2882,8 +2882,9 @@ def _removal_job_scope(job):
     predate context serialization, so fall back to the terminal result (succeeded)
     or the error detail (blocked/failed).
     """
+    # context/result are objects by contract, but ``error.detail`` is free-form JSON.
     for part in (job.get("context"), job.get("result"), (job.get("error") or {}).get("detail")):
-        if part and part.get("scope"):
+        if isinstance(part, dict) and part.get("scope"):
             return part["scope"]
     return None
 
@@ -2909,8 +2910,12 @@ def _blocked_removals(jobs):
         seen_scopes.add(scope)
         error = job.get("error") or {}
         if job.get("status") == "failed" and error.get("code") == "removal_blocked_collateral":
-            detail = error.get("detail") or {}
-            orphans = detail.get("orphans") or {}
+            detail = error.get("detail")
+            detail = detail if isinstance(detail, dict) else {}
+            orphans = detail.get("orphans")
+            # The block itself is the operator-critical fact, so a junk orphans map
+            # empties the list rather than hiding the banner that reports the block.
+            orphans = orphans if isinstance(orphans, dict) else {}
             if not orphans:
                 # pre-generalization job shape (isis-only guard era)
                 orphans = {

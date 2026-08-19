@@ -1085,7 +1085,11 @@ def _scope_failure_messages(job: dict | None, scope: str) -> str:
     """
     if not job:
         return ""
-    items = (((job.get("error") or {}).get("detail") or {}).get("items")) or []
+    # ``error`` is an object by contract; ``detail`` and ``items`` inside it are free-form:
+    # a scalar items raises on iteration and a string one iterates its characters.
+    detail = (job.get("error") or {}).get("detail")
+    items = (detail if isinstance(detail, dict) else {}).get("items")
+    items = items if isinstance(items, list) else []
     msgs: list[str] = []
     for it in items:
         if not isinstance(it, dict) or it.get("type") != scope:

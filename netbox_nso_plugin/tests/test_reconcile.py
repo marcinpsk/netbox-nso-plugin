@@ -765,6 +765,31 @@ class TestRoutePolicyApplySettle(APITestCase):
         self.assertIn("device parser rejected: invalid community", row.last_apply_error)
         self.assertNotIn("unrelated", row.last_apply_error)  # other scopes excluded
 
+    def test_a_free_form_error_detail_falls_back_to_the_generic_message(self):
+        """``error`` is an object by contract; ``detail`` and ``items`` inside it are not.
+
+        A scalar ``items`` raised on iteration and a string one iterated its CHARACTERS, so
+        the walk has to check what it found before walking it. Either way the row still
+        settles, on the generic pointer.
+        """
+        from netbox_nso_plugin.reconcile import _GENERIC_APPLY_ERROR, _settle_apply_failures
+
+        result = {"route_policy_count_by_outcome": {"in_sync": 0, "apply_failed": 1}}
+        mgmt, row = self._setup()
+        for error in ({"detail": "boom"}, {"detail": {"items": 3}}, {"detail": {"items": "boom"}}):
+            with self.subTest(error=error):
+                # Both fields are reset: a value leaking in from the previous iteration
+                # would let a broken walk pass on the last one's evidence.
+                row.status = "deploying"
+                row.last_apply_error = ""
+                row.save(update_fields=["status", "last_apply_error"])
+
+                _settle_apply_failures(mgmt, result, {"result": result, "error": error})
+
+                row.refresh_from_db()
+                self.assertEqual(row.status, "apply_failed")
+                self.assertEqual(row.last_apply_error, _GENERIC_APPLY_ERROR)
+
     def test_prepare_apply_marks_accepted_route_policy_deploying(self):
         from netbox_nso_plugin.views import _prepare_apply
 
