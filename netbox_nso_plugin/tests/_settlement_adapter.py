@@ -331,7 +331,11 @@ class _Handler(BaseHTTPRequestHandler):
             if device_id not in store.devices:
                 self._send(404, {"error": {"code": "not_found", "message": "Device not found"}})
                 return
-            self._send(200, store.generations.get(device_id, []))
+            # Model the paginated contract: since_seq is exclusive, limit caps the page.
+            cursor = int(query.get("since_seq") or 0)
+            limit = int(query.get("limit") or 100)
+            rows = [row for row in store.generations.get(device_id, []) if row["seq"] > cursor]
+            self._send(200, rows[:limit])
             return
 
         if parsed.path.startswith("/api/v1/devices/") and parsed.path.endswith("/static-route-intent"):
