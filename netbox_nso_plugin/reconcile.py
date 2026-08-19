@@ -1141,6 +1141,8 @@ def _settle_apply_failures(mgmt, apply_result: dict | None, job: dict | None = N
     """
     if not apply_result:
         return
+    from django.utils import timezone
+
     from . import models
     from . import status_machine as sm
 
@@ -1156,7 +1158,12 @@ def _settle_apply_failures(mgmt, apply_result: dict | None, job: dict | None = N
                 # Compare-and-set: the value-match settle writes these rows from another
                 # reconcile, and a job counter must not overrule the device truth a row
                 # reached between this read and this write.
-                model.objects.filter(pk=row.pk, status=row.status).update(status=new_status, last_apply_error=detail)
+                model.objects.filter(pk=row.pk, status=row.status).update(
+                    status=new_status,
+                    last_apply_error=detail,
+                    # A queryset update skips auto_now, and the REST serializers expose it.
+                    last_updated=timezone.now(),
+                )
 
 
 _STUCK_DEPLOYING_ERROR = (
@@ -1244,7 +1251,10 @@ def _escalate_stuck_deploying(mgmt, job: dict | None) -> None:
             # value-match settle proved in_sync in the write window has already
             # answered it.
             matched = model.objects.filter(pk=row.pk, status=row.status).update(
-                status=new_status, last_apply_error=detail
+                status=new_status,
+                last_apply_error=detail,
+                # A queryset update skips auto_now, and the REST serializers expose it.
+                last_updated=timezone.now(),
             )
             if matched:
                 logger.warning(
