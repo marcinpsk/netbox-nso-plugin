@@ -13,17 +13,19 @@ Also covers the sibling reflection bug: an unknown category key is a raw URL seg
 into an HTML body, so it must come back escaped.
 """
 
+import json
 from unittest.mock import patch
 
 import requests
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Platform, Site
-from django.test import TestCase, override_settings
+from django.test import RequestFactory, TestCase, override_settings
 from django.urls import reverse
 from ipam.models import IPAddress
 
 from netbox_nso_plugin.adapter_client import AdapterError
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOPlatformNedMapping
 
+from ._adapter_http import make_response
 from .test_django_views import ViewTestBase
 
 # Shaped like something that must never be echoed to a client: a requests transport error
@@ -341,3 +343,90 @@ class TestUnknownCategoryKeyIsEscaped(ViewTestBase):
         body = resp.content.decode()
         self.assertNotIn(self._PAYLOAD, body)
         self.assertIn("&lt;img src=x onerror=alert(1)&gt;", body)
+
+
+class _MalformedJobSession(requests.Session):
+    """A real Session answering every call 200 with a body the adapter's JobOut cannot produce.
+
+    A scalar in a ``dict | None`` member is the shape the client refuses at its boundary; the
+    point of these tests is what each caller does when it does.
+    """
+
+    #: Not a list, and its ``error`` is a scalar — malformed as a single job and as a listing.
+    BODY = {"id": 7, "type": "apply", "status": "failed", "result": None, "error": "boom", "context": None}
+
+    def request(self, *args, **kwargs):
+        return make_response(200, json_data=self.BODY)
+
+
+class TestMalformedAdapterPayloadIsRefused(ViewTestBase):
+    """A payload the contract forbids becomes a typed refusal, never an AttributeError 500.
+
+    The client validates job payloads once (``_validated_job``) rather than every reader
+    tolerating a scalar, so these assert the refusal reaches the operator through each
+    caller's existing ``except AdapterError`` leg. The views are driven through
+    ``RequestFactory`` rather than the test client: these endpoints answer ``JsonResponse``
+    with no template, so routing adds nothing the assertions depend on.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        super().setUpTestData()
+        NSODeviceManagement.objects.filter(pk=cls.mgmt.pk).update(adapter_device_id=4242)
+        cls.mgmt.refresh_from_db()
+
+    def setUp(self):
+        super().setUp()
+        import netbox_nso_plugin.adapter_client as ac
+
+        ac.reset_config_cache()
+        ac.reset_session()
+        self.addCleanup(ac.reset_session)
+        self.addCleanup(ac.reset_config_cache)
+        settings_patch = override_settings(PLUGINS_CONFIG=_PLUGINS_CONFIG)
+        settings_patch.enable()
+        self.addCleanup(settings_patch.disable)
+        session_patch = patch("netbox_nso_plugin.adapter_client.requests.Session", _MalformedJobSession)
+        session_patch.start()
+        self.addCleanup(session_patch.stop)
+        self.factory = RequestFactory()
+
+    def _get(self, view, **kwargs):
+        """Drive *view* for real with an authenticated request."""
+        request = self.factory.get("/")
+        request.user = self.superuser
+        return view.as_view()(request, **kwargs)
+
+    def test_the_job_endpoints_answer_502_not_500(self):
+        from netbox_nso_plugin.views import NSODeviceJobsView, NSOJobStatusView
+
+        for label, view, kwargs in (
+            ("NSOJobStatusView", NSOJobStatusView, {"job_id": 7}),
+            ("NSODeviceJobsView", NSODeviceJobsView, {"pk": self.device.pk}),
+        ):
+            with self.subTest(site=label):
+                resp = self._get(view, **kwargs)
+
+                self.assertEqual(resp.status_code, 502)
+                self.assertIn("malformed", json.loads(resp.content)["error"])
+
+    def test_the_onboarding_poll_stays_retryable_instead_of_failing_the_row(self):
+        """A malformed poll answer is undecided, not a terminal verdict.
+
+        The row must keep waiting for a well-formed one. Before the boundary check the
+        scalar reached ``err.get("message")`` and raised AttributeError out of the poll, so
+        the row stayed provisioning by accident and every later poll raised again.
+        """
+        from netbox_nso_plugin.onboarding import advance_provisioning
+
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(
+            onboard_status="provisioning", onboard_job_id="job-42"
+        )
+        self.mgmt.refresh_from_db()
+
+        result = advance_provisioning(self.mgmt)
+
+        self.assertEqual(result["status"], "provisioning")
+        self.assertIn("malformed", result["poll_error"])
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.onboard_status, "provisioning")

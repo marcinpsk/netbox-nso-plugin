@@ -52,6 +52,8 @@ class SettlementStore:
         self.devices: dict[int, dict] = {}
         #: status the read-back GET answers with; anything but 200 makes it unresolvable
         self.intent_status = 200
+        #: when set, the read-back answers 200 with a body StaticRouteIntentOut cannot produce
+        self.intent_malformed = False
         #: status ``GET /api/v1/devices`` answers with — the maintenance tick's shared snapshot
         self.devices_status = 200
         #: called (on the server thread) while the read-back is in flight, so a test can
@@ -296,6 +298,10 @@ class _Handler(BaseHTTPRequestHandler):
                     store.intent_status,
                     {"error": {"code": "nso_error", "message": "the read-back is unavailable"}},
                 )
+                return
+            if store.intent_malformed:
+                # A 200 whose body is not StaticRouteIntentOut: no ``routes`` at all.
+                self._send(200, {"device_id": device_id})
                 return
             self._send(200, {"device_id": device_id, "routes": store.routes.get(device_id, [])})
             return

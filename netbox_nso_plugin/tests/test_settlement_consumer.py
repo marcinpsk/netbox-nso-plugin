@@ -75,6 +75,30 @@ class TestExpectationThreeWay(_SettlementCase):
         assert self._cursor(mgmt).settle_cursor_seq == 0, "the cursor moved past an undecided head"
         assert self._cursor(mgmt).settle_stall_attempts == 1
 
+    def test_a_malformed_read_back_is_undecided_and_counts_against_the_bound(self):
+        """(b') The read-back answers 200 with a body the contract cannot produce.
+
+        Degrading it to an empty document would record ZERO expectations and settle the row
+        against nothing. It must be undecided instead — the same leg as an unreachable
+        read-back — so the durable stall bound counts it and eventually abandons it.
+        """
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        device = _make_device("malformed")
+        mgmt = _make_mgmt(device, "malformed", 25)
+        sr = _route("10.13.0.0/16", "10.13.0.1", devices=[device])
+        state = _own(sr, mgmt, generation=74, expected=False)
+        self.adapter.store.terminal_job(25, results=[_result(sr.pk, 74)])
+        self.adapter.store.intent_malformed = True
+
+        outcome = consume_static_route_settlements(mgmt)
+
+        state.refresh_from_db()
+        assert state.status == "deploying", "an undecided result settled the row"
+        assert outcome.stalled, "the walk advanced past a result it could not decide"
+        assert self._cursor(mgmt).settle_cursor_seq == 0, "the cursor moved past an undecided head"
+        assert self._cursor(mgmt).settle_stall_attempts == 1
+
     def test_expectation_three_way_mismatch(self):
         """(c) A recorded expectation the result contradicts — decided, and decided 'no'."""
         from netbox_nso_plugin.settlement import consume_static_route_settlements

@@ -436,6 +436,112 @@ class TestRequestErrorPaths(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "nso_unreachable")
 
 
+#: One job exactly as the adapter's JobOut renders it — every key present, nullables null.
+_JOB_OUT = {
+    "id": 7,
+    "type": "apply",
+    "device_id": 10,
+    "status": "succeeded",
+    "result": {"ok": True},
+    "error": None,
+    "context": {"scope": "vlan"},
+    "created_at": "2026-07-10T05:59:00Z",
+    "updated_at": "2026-07-10T06:00:00Z",
+    "started_at": None,
+    "heartbeat_at": None,
+    "settle_seq": 3,
+}
+
+
+def _job_with_scalar(member):
+    """A JobOut-shaped job whose *member* carries a scalar the model cannot emit."""
+    return {**_JOB_OUT, member: "boom"}
+
+
+class TestJobBoundaryValidation(unittest.TestCase):
+    """Job payloads are checked once here, not tolerated by every reader downstream.
+
+    The adapter's ``JobOut`` model (``../nso-adapter/nso_adapter/api/jobs.py``) always emits
+    every key and types ``result``, ``error`` and ``context`` as ``dict | None``. A scalar in
+    one of those is a broken producer, not a value to defend against at each call site, so
+    the client refuses the payload with a typed ``invalid_response`` the callers already
+    handle.
+    """
+
+    def _session(self, payload=None, *, content=None, headers=None):
+        """A pooled-session double serving one real response built from *payload*."""
+        import netbox_nso_plugin.adapter_client as ac
+
+        ac.reset_session()
+        self.addCleanup(ac.reset_session)
+        response = make_response(200, json_data=payload, content=content)
+        if headers:
+            response.headers.update(headers)
+        return make_session(response=response)
+
+    def _refuses(self, session, call):
+        """Assert *call* raises the typed refusal while *session* is the transport."""
+        from netbox_nso_plugin.adapter_client import AdapterError
+
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
+            patch("netbox_nso_plugin.adapter_client.requests.Session", return_value=session),
+        ):
+            with self.assertRaises(AdapterError) as ctx:
+                call()
+        self.assertEqual(ctx.exception.code, "invalid_response")
+
+    def test_a_job_shaped_exactly_like_jobout_is_accepted_unchanged(self):
+        """The contract pin: what the adapter's model emits must pass through untouched."""
+        from netbox_nso_plugin.adapter_client import get_job
+
+        session = self._session(_JOB_OUT)
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
+            patch("netbox_nso_plugin.adapter_client.requests.Session", return_value=session),
+        ):
+            self.assertEqual(get_job(7), _JOB_OUT)
+
+    def test_get_job_refuses_a_payload_jobout_cannot_produce(self):
+        from netbox_nso_plugin.adapter_client import get_job
+
+        for payload in ("boom", ["not-a-job"], _job_with_scalar("result"), _job_with_scalar("error")):
+            with self.subTest(payload=payload):
+                self._refuses(self._session(payload), lambda: get_job(7))
+
+    def test_an_empty_body_job_is_refused_rather_than_served_as_none(self):
+        """_request returns None on an empty-body 200, which NSOJobStatusView then handed
+        straight to JsonResponse and raised TypeError on. Refuse it at the source."""
+        from netbox_nso_plugin.adapter_client import get_job
+
+        self._refuses(self._session(content=b""), lambda: get_job(7))
+
+    def test_list_jobs_refuses_a_listing_that_is_not_a_list_of_jobs(self):
+        from netbox_nso_plugin.adapter_client import list_jobs
+
+        for payload in ({"jobs": []}, ["not-a-job"], [_job_with_scalar("context")]):
+            with self.subTest(payload=payload):
+                self._refuses(self._session(payload), lambda: list_jobs(10))
+
+    def test_settlement_feed_refuses_a_malformed_page(self):
+        from netbox_nso_plugin.adapter_client import STORE_INCARNATION_HEADER, get_settlement_feed
+
+        session = self._session([_job_with_scalar("result")], headers={STORE_INCARNATION_HEADER: "inc-1"})
+        self._refuses(session, lambda: get_settlement_feed(10, after_settle_seq=0, limit=50))
+
+    def test_static_route_read_back_refuses_a_payload_without_routes(self):
+        """StaticRouteIntentOut always carries a ``routes`` list; anything else is undecidable.
+
+        Degrading to {} here would record ZERO expectations and silently mis-settle, so the
+        read-back must fail loudly enough for the stall bound to count it.
+        """
+        from netbox_nso_plugin.adapter_client import get_static_route_intent
+
+        for payload in ("boom", {"device_id": 10}, {"device_id": 10, "routes": "nope"}):
+            with self.subTest(payload=payload):
+                self._refuses(self._session(payload), lambda: get_static_route_intent(10))
+
+
 class TestAdapterClientRemainingFunctions(unittest.TestCase):
     """Smoke tests for API functions not covered in test_models.py."""
 

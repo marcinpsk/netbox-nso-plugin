@@ -918,14 +918,46 @@ def sync_notify(adapter_device_id):
         raise
 
 
+#: Members the adapter's JobOut model types ``dict | None`` (../nso-adapter/nso_adapter/api/jobs.py).
+_JOB_MAPPING_MEMBERS = ("result", "error", "context")
+
+
+def _validated_job(job, what):
+    """Return *job* once it matches JobOut's shape, else refuse the whole payload.
+
+    The producer cannot emit a scalar in these members, so one is a broken adapter, not a
+    value to tolerate. Refusing here means every reader downstream may treat them as
+    ``dict | None`` without restating the check.
+    """
+    if not isinstance(job, dict):
+        raise AdapterError(f"Adapter returned a malformed {what}.", code="invalid_response")
+    for member in _JOB_MAPPING_MEMBERS:
+        value = job.get(member)
+        if value is not None and not isinstance(value, dict):
+            raise AdapterError(
+                f"Adapter returned a malformed {what}: {member} is not an object.",
+                code="invalid_response",
+            )
+    return job
+
+
+def _validated_jobs(jobs, what):
+    """Return *jobs* once every entry matches JobOut's shape, else refuse the whole page."""
+    if not isinstance(jobs, list):
+        raise AdapterError(f"Adapter returned a malformed {what}.", code="invalid_response")
+    for job in jobs:
+        _validated_job(job, what)
+    return jobs
+
+
 def get_job(job_id):
     """GET /api/v1/jobs/{id}."""
-    return _request("GET", f"/api/v1/jobs/{job_id}")
+    return _validated_job(_request("GET", f"/api/v1/jobs/{job_id}"), "job")
 
 
 def list_jobs(adapter_device_id):
     """GET /api/v1/jobs?device_id={id} — the device's jobs, most-recent-first."""
-    return _request("GET", "/api/v1/jobs", params={"device_id": adapter_device_id})
+    return _validated_jobs(_request("GET", "/api/v1/jobs", params={"device_id": adapter_device_id}), "jobs listing")
 
 
 def get_settlement_feed(adapter_device_id, *, after_settle_seq, limit):
@@ -957,7 +989,7 @@ def get_settlement_feed(adapter_device_id, *, after_settle_seq, limit):
             f"Adapter served the settlement feed without a {STORE_INCARNATION_HEADER} header.",
             code="missing_store_incarnation",
         )
-    return (resp.json() if resp.content else []), incarnation
+    return _validated_jobs(resp.json() if resp.content else [], "settlement feed"), incarnation
 
 
 def get_static_route_intent(adapter_device_id):
@@ -966,8 +998,16 @@ def get_static_route_intent(adapter_device_id):
     The lost-response recovery path: the adapter commits its store write before it
     answers, so a response lost in flight leaves the pusher holding a committed intent it
     recorded no expectation for, and this is the only other way to obtain one.
+
+    StaticRouteIntentOut always carries a ``routes`` list. Degrading a malformed body to an
+    empty one would record ZERO expectations and silently mis-settle, so it is refused
+    instead: the settlement stall bound counts a read-back it cannot obtain, but an empty
+    one looks like a legitimate answer and is counted as settled.
     """
-    return _request("GET", f"/api/v1/devices/{adapter_device_id}/static-route-intent")
+    echoed = _request("GET", f"/api/v1/devices/{adapter_device_id}/static-route-intent")
+    if not isinstance(echoed, dict) or not isinstance(echoed.get("routes"), list):
+        raise AdapterError("Adapter returned a malformed static-route intent read-back.", code="invalid_response")
+    return echoed
 
 
 def put_intent(adapter_device_id, attributes):
