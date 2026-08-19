@@ -611,6 +611,41 @@ class TestTheCoarseSettlersWriteThroughACompareAndSet(_LoggingChainCase):
         self.assertEqual(row.last_apply_error, "")
 
 
+class TestTheCoarseVerdictsStampLastUpdated(_LoggingChainCase):
+    """A queryset update skips ``auto_now``, and the REST serializers expose last_updated.
+
+    Both settlers write through ``.update()``, so each has to stamp what a save would have
+    stamped; otherwise an apply_failed transition is invisible to an API consumer.
+    """
+
+    tag = "lastupdated"
+
+    def test_a_failed_apply_scope_stamps_last_updated(self):
+        device, row = self._device(84)
+        self.adapter.store.terminal_job(
+            84, status="failed", extra={"logging_count_by_outcome": {"in_sync": 0, "apply_failed": 1}}
+        )
+        before = row.last_updated
+
+        self._reconcile(device)
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, "apply_failed")
+        self.assertGreater(row.last_updated, before)
+
+    def test_a_silent_drop_escalation_stamps_last_updated(self):
+        device, row = self._device(85)
+        # A succeeded apply that carried the scope, finished long before the grace.
+        self.adapter.store.terminal_job(85, extra={"logging_count_by_outcome": {"in_sync": 1, "apply_failed": 0}})
+        before = row.last_updated
+
+        self._reconcile(device)
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, "apply_failed")
+        self.assertGreater(row.last_updated, before)
+
+
 class TestSettlementAdapterContract(_SettlementCase):
     """The real-socket settlement double rejects unknown adapter devices."""
 
@@ -758,7 +793,7 @@ class TestStepFourRereadsAfterTheSettlement(_SettlementCase):
         )
         self.assertEqual(
             mgmt.last_journaled_apply_job,
-            repaired["id"],
+            str(repaired["id"]),  # the idempotency key is a CharField; the job id is an integer
             "the apply journal recorded adapter device 72's job for a device that now holds 73",
         )
 
