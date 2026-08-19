@@ -1389,22 +1389,6 @@ def _apply_job_state(adapter_device_id) -> tuple[dict | None, bool]:
     return last, active
 
 
-def _last_apply_job(adapter_device_id) -> dict | None:
-    """Best-effort: the device's most recent terminal apply job (full dict).
-
-    Returns the whole job ``{id, type, status, result}`` so callers can read both the
-    per-scope outcome (``result``) and the job id (apply-journal idempotency key).
-    """
-    job, _active = _apply_job_state(adapter_device_id)
-    return job
-
-
-def _last_apply_result(adapter_device_id) -> dict | None:
-    """Best-effort: the result of the device's most recent terminal apply job."""
-    job = _last_apply_job(adapter_device_id)
-    return job.get("result") if job else None
-
-
 def _journal_route_policy_apply(mgmt, job: dict | None) -> None:
     """Write a coarse per-object JournalEntry recording this device's route-policy apply.
 
