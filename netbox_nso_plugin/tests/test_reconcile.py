@@ -765,6 +765,26 @@ class TestRoutePolicyApplySettle(APITestCase):
         self.assertIn("device parser rejected: invalid community", row.last_apply_error)
         self.assertNotIn("unrelated", row.last_apply_error)  # other scopes excluded
 
+    def test_a_free_form_counts_member_does_not_abort_the_settle(self):
+        """``result`` is an object by contract; each ``<scope>_count_by_outcome`` is not.
+
+        A scalar there raised out of _settle_apply_failures, and the caller's blanket except
+        then skipped the whole device's settle, escalate and journal, not just this scope.
+        A junk counts map must read as "this job says nothing about this scope" instead.
+        """
+        from netbox_nso_plugin.reconcile import _settle_apply_failures
+
+        mgmt, row = self._setup()
+        for counts in ("boom", 3, ["apply_failed"]):
+            with self.subTest(counts=counts):
+                row.status = "deploying"
+                row.save(update_fields=["status"])
+
+                _settle_apply_failures(mgmt, {"route_policy_count_by_outcome": counts})
+
+                row.refresh_from_db()
+                self.assertEqual(row.status, "deploying", "a junk counts map decided the row")
+
     def test_a_free_form_error_detail_falls_back_to_the_generic_message(self):
         """``error`` is an object by contract; ``detail`` and ``items`` inside it are not.
 

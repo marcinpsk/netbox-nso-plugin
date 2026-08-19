@@ -3089,9 +3089,13 @@ def _annotate_residue_rows(ctx: dict, key: str, mgmt) -> None:
     entry = next((e for e in _residue_removals(jobs) if e.get("scope") == scope), None)
     if not entry:
         return
+    # ``result`` is an object by contract; the residue map inside it is free-form JSON,
+    # and this badge is decoration: a junk report costs the badge, never the grid.
+    residue = entry.get("residue")
     keys_by_label = {
-        label: {norm(tuple(str(p) for p in (k if isinstance(k, (list, tuple)) else (k,)))) for k in klist or []}
-        for label, klist in (entry.get("residue") or {}).items()
+        label: {norm(tuple(str(p) for p in (k if isinstance(k, (list, tuple)) else (k,)))) for k in klist}
+        for label, klist in (residue if isinstance(residue, dict) else {}).items()
+        if isinstance(klist, (list, tuple))
     }
     for ctx_path, label, keyfn in matchers:
         rows = ctx

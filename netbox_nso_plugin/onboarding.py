@@ -322,6 +322,8 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
 def _summarize_provision_failure(steps) -> str:
     """Build a one-line summary of the first failed step in a provision result."""
     for step in steps or []:
+        if not isinstance(step, dict):
+            continue
         if step.get("status") == "failed":
             detail = step.get("detail")
             return f"{step.get('step')} failed" + (f": {detail}" if detail else "")
@@ -368,7 +370,9 @@ def advance_provisioning(mgmt) -> dict:
 
     if job_status == "succeeded":
         result = (job or {}).get("result") or {}
-        steps = result.get("steps") or []
+        # ``result`` is an object by contract; ``steps`` inside it is free-form JSON.
+        steps = result.get("steps")
+        steps = steps if isinstance(steps, list) else []
         if result.get("ok"):
             # NSO node is up — flip to ready; the full save() re-fires the un-gated
             # sync_scope_to_adapter signal (adapter mapping + scope + sync-notify).

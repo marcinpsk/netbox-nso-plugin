@@ -560,3 +560,32 @@ class TestFreeFormErrorDetail(TestCase):
         self.assertEqual([e["scope"] for e in entries], ["isis"])
         self.assertEqual(entries[0]["orphans"], {})
         self.assertEqual(entries[0]["preview"], "")
+
+
+class TestFreeFormResidue(TestCase):
+    """``result`` is an object by contract; the residue map inside it is free-form JSON.
+
+    The residue badge is best-effort decoration on the category grid, so a junk report must
+    cost the badge and nothing else. Before the guard it raised out of the grid view, which
+    the call sites do not wrap.
+    """
+
+    def _annotate(self, residue):
+        """Run the real annotator against a job carrying *residue*, return the context."""
+        from netbox_nso_plugin.views import _annotate_residue_rows
+
+        job = _removal_job(90, "vlan", "succeeded")
+        job["result"] = {"scope": "vlan", "residue": residue}
+        mgmt = NSODeviceManagement(adapter_device_id=10)
+        ctx = {"vlan_states": []}
+        with patch("netbox_nso_plugin.adapter_client.list_jobs", return_value=[job]):
+            _annotate_residue_rows(ctx, "vlan", mgmt)
+        return ctx
+
+    def test_a_non_object_residue_map_costs_only_the_badge(self):
+        for residue in ("boom", 3, ["vlan"]):
+            with self.subTest(residue=residue):
+                self.assertEqual(self._annotate(residue), {"vlan_states": []})
+
+    def test_a_non_list_key_list_costs_only_that_label(self):
+        self.assertEqual(self._annotate({"vlan": "boom"}), {"vlan_states": []})
