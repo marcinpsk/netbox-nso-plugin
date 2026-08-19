@@ -757,7 +757,8 @@ class TestRoutePolicyApplySettle(APITestCase):
         from netbox_nso_plugin.reconcile import _settle_apply_failures
 
         mgmt, row = self._setup()
-        for counts in ("boom", 3, ["apply_failed"]):
+        junk_members = ({"apply_failed": "1"}, {"apply_failed": ["x"]})
+        for counts in ("boom", 3, ["apply_failed"], *junk_members):
             with self.subTest(counts=counts):
                 row.status = "deploying"
                 row.save(update_fields=["status"])

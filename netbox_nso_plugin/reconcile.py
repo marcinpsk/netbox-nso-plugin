@@ -1142,7 +1142,7 @@ def _settle_apply_failures(mgmt, apply_result: dict | None, job: dict | None = N
 
     for scope, model_name in _APPLY_DEPLOYING_SCOPES.items():
         counts = _counts_for(apply_result, scope)
-        if (counts.get("apply_failed") or 0) <= 0:
+        if _count_of(counts, "apply_failed") <= 0:
             continue
         detail = _scope_failure_messages(job, scope) or _GENERIC_APPLY_ERROR
         model = getattr(models, model_name)
