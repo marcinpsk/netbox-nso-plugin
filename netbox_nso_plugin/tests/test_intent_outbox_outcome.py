@@ -620,7 +620,10 @@ class TestTheAcknowledgementClearsOnlyWhatItReported(_OutcomeCase):
         with self.assertRaises((CommandError, SystemExit)) as raised:
             call_command("nso_acknowledge_degraded_deletions", "--scope", "vlann", stdout=StringIO())
 
-        assert "vlan" in str(raised.exception), "the refusal never named the valid keys"
+        refusal = str(raised.exception)
+        assert "vlann" in refusal, "the refusal never named the scope it rejected"
+        # A valid key that is not a prefix of the typo: echoing "vlann" back cannot satisfy this.
+        assert "static_route" in refusal, "the refusal never named the valid keys"
         assert state_of(self.device, "vlan").degraded_deletions, "a refused run cleared records anyway"
 
     def test_a_real_delivery_key_still_clears_and_reports(self):
