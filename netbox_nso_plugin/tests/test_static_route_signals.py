@@ -190,6 +190,26 @@ class TestPushStaticRouteIntentForDevice(IntentPushResetMixin, TestCase):
 
         assert "static_route" in (NSODeviceManagement.objects.get(pk=mgmt.pk).intent_push_errors or {})
 
+    def test_a_typed_adapter_refusal_is_recorded_the_same_way(self):
+        """The recorded failure must not depend on which exception the client raises.
+
+        A raw ConnectionError is the transport dying under the client; AdapterError is what
+        the client raises for everything it converts, and it is by far the commoner one on
+        this path. Both must reach the drain and both must leave the scope recorded.
+        """
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        mgmt = self._make_mgmt()
+        self._make_state(mgmt, prefix="10.2.0.0/16", next_hop="10.0.0.3", status="accepted")
+
+        with patch(PUT, side_effect=AdapterError("adapter unreachable", code="nso_unreachable")):
+            with self.assertRaises(AdapterError):
+                deliver("static_route", self.device.pk, mgmt.adapter_device_id)
+
+        assert "static_route" in (NSODeviceManagement.objects.get(pk=mgmt.pk).intent_push_errors or {})
+
 
 class TestOnStaticRouteStateSave(IntentPushDeliveryMixin, TestCase):
     """Tests for _on_static_route_state_save signal handler."""

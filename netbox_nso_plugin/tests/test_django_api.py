@@ -194,6 +194,34 @@ class NSOInterfaceStateAPITest(APITestCase):
         self.assertIn(other.pk, ids)
         self.assertNotIn(self.state.pk, ids)  # the 'changed' row is filtered out
 
+    def test_accepting_through_the_api_enqueues_exactly_one_push(self):
+        """The API write and its outbox enqueue land together, or neither does.
+
+        NetBoxModelViewSet saves inside a transaction and the enqueue rides the same
+        post_save signal the UI uses, so the REST path owes the same guarantee as the tab:
+        an accepted overlay the adapter is never told about is silent drift.
+        """
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry
+
+        self.add_permissions("netbox_nso_plugin.change_nsointerfacestate")
+        device = self.state.interface.device
+        instance = NSOInstance.objects.create(name="api-accept", adapter_instance_id="api-accept")
+        NSODeviceManagement.objects.filter(
+            pk=NSODeviceManagement.objects.create(
+                device=device, nso_instance=instance, nso_device_name="api-accept-rtr"
+            ).pk
+        ).update(adapter_device_id=7788)
+        NSOIntentOutboxEntry.objects.filter(device=device).delete()
+
+        response = self.client.patch(
+            self._get_detail_url(self.state), {"status": "accepted"}, format="json", **self.header
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.state.refresh_from_db()
+        self.assertEqual(self.state.status, "accepted")
+        self.assertEqual(NSOIntentOutboxEntry.objects.filter(device=device, scope="interface").count(), 1)
+
 
 class OnboardAPIPermissionTest(APITestCase):
     """The onboard API action provisions a device into NSO (create node → host-keys → unlock →
