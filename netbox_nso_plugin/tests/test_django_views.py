@@ -1250,7 +1250,7 @@ class TestNSODeviceActionView(ViewTestBase):
 
         url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[mgmt.pk, "sync"])
         response = self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 409)
         data = json.loads(response.content)
         self.assertEqual(data["status"], "conflict")
 
@@ -1316,7 +1316,7 @@ class TestNSODeviceActionView(ViewTestBase):
 
         url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[mgmt.pk, "sync"])
         response = self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 409)
         data = json.loads(response.content)
         self.assertEqual(data["status"], "conflict")
         self.assertEqual(data["job_id"], 3)
@@ -1352,7 +1352,7 @@ class TestNSODeviceActionView(ViewTestBase):
 
         url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[mgmt.pk, "sync"])
         response = self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 409)
         data = json.loads(response.content)
         self.assertEqual(data["status"], "conflict")
         self.assertIsNone(data["job_type"])
@@ -1382,7 +1382,7 @@ class TestNSODeviceActionView(ViewTestBase):
         url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[mgmt.pk, "sync"])
         response = self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
 
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 409)
         self.assertEqual(response.json(), {"status": "conflict", "job_id": None, "job_type": None})
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config")
@@ -5888,6 +5888,35 @@ class TestDeviceNSOTabDegradedDeletions(ViewTestBase):
         self.assertContains(response, "detached before the fence opened")
         self.assertContains(response, "nso_acknowledge_degraded_deletions")
         self.assertNotContains(response, "{#")
+
+    def test_the_headline_counts_records_not_deleted_objects(self):
+        """One record can name many objects, so the count must not be read as a deletion count.
+
+        The banner counts entries in ``degraded_deletions``; wording it as "1 deletion" while
+        the entry lists three route ids understates what stayed on the device.
+        """
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        NSOIntentOutboxState.objects.create(
+            device=self.device,
+            scope="static_route",
+            degraded_deletions=[
+                {
+                    "route_ids": [1, 2, 3],
+                    "triples": [],
+                    "at": "2026-08-11T05:00:00+00:00",
+                    "reason": "pre_fence_detach",
+                    "device": self.device.pk,
+                }
+            ],
+        )
+
+        response = self.client.get(self._url())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "mdi-delete-alert-outline")
+        self.assertNotContains(response, "1 deletion left")
+        self.assertContains(response, "1 degraded deletion record")
 
     def test_a_device_with_no_record_renders_no_banner(self):
         response = self.client.get(self._url())

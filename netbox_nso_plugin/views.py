@@ -2679,7 +2679,9 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
             except AdapterError:
                 incumbent_type = None
         if is_ajax:
-            return JsonResponse({"status": "conflict", "job_id": job_id, "job_type": incumbent_type})
+            # 409, not 200: the action did not happen, and a poller that reads only the
+            # status line must not record this as a started job.
+            return JsonResponse({"status": "conflict", "job_id": job_id, "job_type": incumbent_type}, status=409)
         msg = (
             f"Another job is already running: {incumbent_type}."
             if incumbent_type

@@ -79,8 +79,9 @@
     <div class="alert alert-danger d-flex align-items-start mb-3" role="alert">
       <span class="mdi mdi-delete-alert-outline me-2 mt-1"></span>
       <div class="flex-grow-1">
-        <strong>{{ degraded_deletions|length }} deletion{{ degraded_deletions|length|pluralize }}
-          left the configuration on the device.</strong>
+        {# Counts RECORDS, not objects: one record can name many route ids. #}
+        <strong>{{ degraded_deletions|length }} degraded deletion record{{ degraded_deletions|length|pluralize }}
+          left configuration on the device.</strong>
         NetBox no longer holds this intent, but the adapter detached the row instead of
         retracting it, so the device still carries what it named. Removing it from the device
         takes a change of your own.
