@@ -36,9 +36,11 @@ def _production_modules():
     from pathlib import Path
 
     plugin = Path(__file__).resolve().parent.parent
-    for path in sorted(plugin.rglob("*.py")):
-        if "tests" not in path.parts and "migrations" not in path.parts:
-            yield path
+    # Relative to the plugin: an ancestor directory named tests/ or migrations/ would otherwise
+    # yield nothing, and every guard below asserts an EMPTY set, so the scan must be non-empty.
+    paths = [p for p in sorted(plugin.rglob("*.py")) if not {"tests", "migrations"} & set(p.relative_to(plugin).parts)]
+    assert any(p.name == "signals.py" for p in paths), f"the scan reached {len(paths)} module(s), so it proves nothing"
+    return paths
 
 
 class TestEveryProductionSendGoesThroughTheOutbox(SimpleTestCase):

@@ -48,7 +48,8 @@ def _forced_calls() -> collections.Counter:
     """Every production call passing ``force=True``, as the compiler sees it."""
     found: collections.Counter = collections.Counter()
     for path in sorted(PLUGIN.rglob("*.py")):
-        if "tests" in path.parts or "migrations" in path.parts:
+        # Relative to the plugin: an ancestor directory of that name would skip every module.
+        if {"tests", "migrations"} & set(path.relative_to(PLUGIN).parts):
             continue
         tree = ast.parse(path.read_text())
         parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
