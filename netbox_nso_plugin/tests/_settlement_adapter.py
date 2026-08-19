@@ -70,7 +70,7 @@ class SettlementStore:
         self.generations: dict[int, list[dict]] = {}
         #: ids of jobs the ASCENDING page serves even though they hold no sequence: the
         #: feed contract broken the way only the adapter itself can break it
-        self.unsequenced_in_feed: set[str] = set()
+        self.unsequenced_in_feed: set[int] = set()
         #: every feed request the consumer made, as ``(device_id, after_settle_seq, limit)``
         self.feed_requests: list[tuple[int, int, int]] = []
         self.readback_requests: list[int] = []
@@ -103,7 +103,10 @@ class SettlementStore:
         if extra:
             result = {**(result or {}), **extra}
         return {
-            "id": f"job-{self._next_id}",
+            # An integer, like JobOut.id and DeviceGenerationOut.job_id in
+            # ../nso-adapter/tests/api/openapi_snapshot.json: the settlers pivot on job-id
+            # equality across those two surfaces and render the id into operator text.
+            "id": self._next_id,
             "type": job_type,
             "device_id": device_id,
             "status": status,
