@@ -795,13 +795,26 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
 
                 self.assertEqual(raised.exception.code, "invalid_response")
 
+    def test_the_page_limit_stays_within_what_the_adapter_accepts(self):
+        """The one thing deriving the fixtures from the constant cannot check: its VALUE.
+
+        The adapter caps a page at ``LIMIT_MAX`` (../nso-adapter/nso_adapter/api/pagination.py)
+        and answers 422 rather than clamping, so raising this past it fails every generations
+        read at runtime while the derived tests above stay green.
+        """
+        from netbox_nso_plugin.adapter_client import _GENERATION_PAGE_LIMIT
+
+        self.assertLessEqual(_GENERATION_PAGE_LIMIT, 500)
+
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_device_generations_reads_every_ascending_page(self, mock_s, _cfg):
-        from netbox_nso_plugin.adapter_client import list_device_generations
+        from netbox_nso_plugin.adapter_client import _GENERATION_PAGE_LIMIT, list_device_generations
 
-        first_page = [{"generation_id": seq, "seq": seq} for seq in range(1, 501)]
-        final_page = [{"generation_id": 501, "seq": 501}]
+        # A page of exactly the limit is what makes the reader ask for another; the short one stops it.
+        last_full_seq = _GENERATION_PAGE_LIMIT
+        first_page = [{"generation_id": seq, "seq": seq} for seq in range(1, last_full_seq + 1)]
+        final_page = [{"generation_id": last_full_seq + 1, "seq": last_full_seq + 1}]
         session = make_session()
         session.request.side_effect = [
             make_response(200, first_page),
@@ -811,10 +824,13 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
 
         generations = list_device_generations(5)
 
-        self.assertEqual([row["seq"] for row in generations], list(range(1, 502)))
+        self.assertEqual([row["seq"] for row in generations], list(range(1, last_full_seq + 2)))
         self.assertEqual(
             [call.kwargs["params"] for call in session.request.call_args_list],
-            [{"limit": 500}, {"limit": 500, "since_seq": 500}],
+            [
+                {"limit": _GENERATION_PAGE_LIMIT},
+                {"limit": _GENERATION_PAGE_LIMIT, "since_seq": last_full_seq},
+            ],
         )
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
