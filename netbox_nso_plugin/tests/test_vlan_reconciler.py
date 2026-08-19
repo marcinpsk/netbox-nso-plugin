@@ -17,7 +17,7 @@ from netbox_nso_plugin.models import (
 from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
 
 from ._outbox_case import without_commit_drain
-from .mixins import IntentPushResetMixin, _CascadeFlushMixin
+from .mixins import IntentPushResetMixin, _CascadeFlushMixin, isolate_other_scopes
 
 
 def _make_device(tag="m34"):
@@ -506,8 +506,12 @@ class TestVlanApplyPush(_CascadeFlushMixin, IntentPushResetMixin, TransactionTes
             drain.drain_key(self.device.pk, "vlan")
         unforced.assert_not_called()
 
-        # The other scopes reach the (blocked) adapter and _prepare_apply swallows each one.
-        with patch("netbox_nso_plugin.adapter_client.put_vlan_intent", return_value={}) as mock_vlan:
+        # Every other scope is isolated from the registry, so this asserts on the VLAN push
+        # alone instead of relying on _prepare_apply swallowing the others' adapter failures.
+        with (
+            isolate_other_scopes("vlan"),
+            patch("netbox_nso_plugin.adapter_client.put_vlan_intent", return_value={}) as mock_vlan,
+        ):
             _prepare_apply(self.management)
         mock_vlan.assert_called_once()
         self.assertEqual(mock_vlan.call_args[0][1], [{"vlan_id": 2213, "name": "LIVE_RENAMED"}])

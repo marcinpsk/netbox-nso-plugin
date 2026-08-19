@@ -4,7 +4,6 @@
 
 import os
 import threading
-from contextlib import ExitStack
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
@@ -17,24 +16,7 @@ from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
 
 from ._outbox_case import without_commit_drain
 from ._settlement_case import _make_mgmt, _SettlementCase
-from .mixins import IntentPushResetMixin, _CascadeFlushMixin
-
-#: Every transport an Apply's forced claims reach, one per delivery key bar SNMP. Doubled
-#: where a case drives the real claim, so no scope of the twelve leaves the process.
-_APPLY_TRANSPORTS = (
-    "apply_lag_config",
-    "apply_switchport_config",
-    "put_bfd_intent",
-    "put_intent",
-    "put_interface_mtu_intent",
-    "put_l2_sap_intent",
-    "put_logging_intent",
-    "put_route_policy_intent",
-    "put_static_route_intent",
-    "put_subinterface_intent",
-    "put_svi_intent",
-    "put_vlan_intent",
-)
+from .mixins import IntentPushResetMixin, _CascadeFlushMixin, isolate_other_scopes
 
 
 def _make_device(name="rec-dev"):
@@ -901,9 +883,7 @@ class TestSnmpApplyForcePush(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         def _record_store_only(*args, **kwargs):
             seen["store_only"] = adapter_client._store_only_push.get()
 
-        with ExitStack() as stack:
-            for name in _APPLY_TRANSPORTS:
-                stack.enter_context(patch(f"netbox_nso_plugin.adapter_client.{name}"))
+        with isolate_other_scopes("snmp") as stack:
             put_snmp = stack.enter_context(
                 patch("netbox_nso_plugin.adapter_client.put_snmp_intent", side_effect=_record_store_only)
             )

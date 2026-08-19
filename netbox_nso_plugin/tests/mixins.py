@@ -2,6 +2,7 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Shared test mixins."""
 
+import contextlib
 import logging
 
 logger = logging.getLogger(__name__)
@@ -130,3 +131,43 @@ class IntentPushDeliveryMixin(IntentPushResetMixin):
         patcher = patch("netbox_nso_plugin.signals._drain_intent_pushes", deliver_or_drain)
         patcher.start()
         self.addCleanup(patcher.stop)
+
+
+@contextlib.contextmanager
+def isolate_other_scopes(*under_test: str):
+    """Let only *under_test* reach the adapter; every other delivery scope answers settled.
+
+    Derived from ``delivery.delivery_keys()``, which is the registry the Apply itself walks,
+    so registering a new scope isolates it here automatically. The three hand-maintained
+    transport tuples this replaced had each drifted from that registry by a different set of
+    scopes, and each had to be edited by hand for every new one.
+
+    The claim boundary is the seam rather than the adapter transports the tuples named: the
+    scope under test still renders and sends for real, so a test may assert on its transport,
+    while the others are answered without rendering anything. ``drain_key`` is patched beside
+    ``push_now`` because the Apply routes SNMP through it and every other scope through
+    ``push_now``.
+    """
+    from unittest.mock import patch
+
+    from netbox_nso_plugin import delivery, drain
+
+    keys = delivery.delivery_keys()
+    unknown = set(under_test) - set(keys)
+    assert not unknown, f"not delivery scopes: {sorted(unknown)}"
+    real_push_now, real_drain_key = drain.push_now, drain.drain_key
+
+    def push_now(device_id, scope, **kwargs):
+        if scope in under_test:
+            return real_push_now(device_id, scope, **kwargs)
+        return {"status": "deployed"}
+
+    def drain_key(device_id, scope, **kwargs):
+        if scope in under_test:
+            return real_drain_key(device_id, scope, **kwargs)
+        return drain.SUCCEEDED
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(patch("netbox_nso_plugin.drain.push_now", side_effect=push_now))
+        stack.enter_context(patch("netbox_nso_plugin.drain.drain_key", side_effect=drain_key))
+        yield stack

@@ -16,7 +16,6 @@ result and by nothing else, which puts two obligations on the ``deploying`` stat
 
 from __future__ import annotations
 
-from contextlib import ExitStack
 from itertools import count
 from unittest.mock import patch
 
@@ -24,24 +23,7 @@ from django.test import TestCase
 from django.utils import timezone
 
 from ._settlement_case import _make_device, _make_mgmt, _own, _route, _SettlementCase, _stale_clock
-
-#: Every transport an Apply reaches bar the static route's. Doubled where the Apply claims
-#: for real: the adapter double serves the static-route endpoint, and the rest are a
-#: different subsystem here.
-_OTHER_TRANSPORTS = (
-    "apply_lag_config",
-    "apply_switchport_config",
-    "put_bfd_intent",
-    "put_intent",
-    "put_interface_mtu_intent",
-    "put_l2_sap_intent",
-    "put_logging_intent",
-    "put_route_policy_intent",
-    "put_snmp_intent",
-    "put_subinterface_intent",
-    "put_svi_intent",
-    "put_vlan_intent",
-)
+from .mixins import isolate_other_scopes
 
 
 class TestApplyPromotion(TestCase):
@@ -208,9 +190,7 @@ class TestTheStuckDeployingBackstop(_SettlementCase):
 
         # The static-route claim runs for real against the adapter double, which is what
         # promotes the row; the other scopes only have their transports doubled.
-        with ExitStack() as stack:
-            for name in _OTHER_TRANSPORTS:
-                stack.enter_context(patch(f"netbox_nso_plugin.adapter_client.{name}"))
+        with isolate_other_scopes("static_route"):
             _prepare_apply(mgmt)
 
         state.refresh_from_db()
