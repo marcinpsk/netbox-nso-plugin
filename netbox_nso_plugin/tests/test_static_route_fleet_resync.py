@@ -225,6 +225,51 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         assert by_device[first.device_id]["count"] == 1
         assert by_device[second.device_id]["ok"] is True  # the pass carried on
 
+    def test_a_failing_restore_does_not_abort_the_rest_of_the_pass(self):
+        """The rollback runs in the handler that keeps one device's failure local.
+
+        A database error inside it escaped the per-device try, because a raise from an
+        except block is not caught by the handlers beside it. The very failure the handler
+        exists to contain then took every later device with it: unattempted and unreported,
+        since the results list never reaches the caller.
+        """
+        from django.db import connection
+
+        from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet
+
+        _, first = self._managed_device("restoreraiser", 8031)
+        _, second = self._managed_device("restoreafter", 8032)
+        self._own_route(first, "10.73.0.0/16", "10.0.0.74")
+        self._own_route(second, "10.74.0.0/16", "10.0.0.75")
+
+        # Armed by the first device's unacknowledged push, so the fault lands on the
+        # rollback and not on the arming before it.
+        pending = {"fail": False}
+
+        def _unacknowledged(adapter_device_id, routes):
+            # No count: the push is not acknowledged, so the handler rolls the arming back.
+            pending["fail"] = adapter_device_id == 8031
+            return {"device_id": adapter_device_id, "count": None, "routes": []}
+
+        def die_on_the_restore(execute, sql, params, many, context):
+            """Fail the rollback's compare-and-set, which is the write that restores the sentinel."""
+            statement = sql.lower()
+            if pending["fail"] and statement.lstrip().startswith("update") and "intent_generation" in statement:
+                pending["fail"] = False
+                raise RuntimeError("the restore could not reach the database")
+            return execute(sql, params, many, context)
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_static_route_intent", side_effect=_unacknowledged),
+            connection.execute_wrapper(die_on_the_restore),
+            self.assertLogs("netbox_nso_plugin.intent_drift", level="ERROR"),
+        ):
+            results = resync_static_route_intent_fleet()
+
+        by_device = {r["device_id"]: r for r in results}
+        assert by_device[first.device_id]["ok"] is False
+        assert second.device_id in by_device, "the failed restore took the rest of the pass with it"
+
     def test_only_a_real_route_count_acknowledges_a_push(self):
         """The count IS the acknowledgement, so an answer that carries no honest one must arm
         nothing: a device reported stored holds a generation the adapter has never seen. ``True``

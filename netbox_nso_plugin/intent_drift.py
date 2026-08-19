@@ -357,6 +357,21 @@ def _backfill_static_route_generations(mgmt) -> list[dict]:
     return before
 
 
+def _safe_restore(before: list[dict], device_id: int) -> int:
+    """Restore *before*, reporting a failure rather than raising it.
+
+    The rollback runs inside the handlers that keep one device's failure local, and a raise
+    from an except block is not caught by the handlers beside it. Letting one out would make
+    the containment itself abort the pass, stranding every later device unattempted and
+    unreported. The rows it could not restore stay armed and a later run retries them.
+    """
+    try:
+        return _restore_static_route_generations(before)
+    except Exception:  # noqa: BLE001 — the pass must outlive one device's rollback
+        logger.exception("Static-route generation rollback failed for device %s", device_id)
+        return 0
+
+
 def _restore_static_route_generations(before: list[dict]) -> int:
     """Put back every armed row this pass still owns, and return how many.
 
@@ -430,13 +445,13 @@ def resync_static_route_intent_fleet(device_ids: list[int] | None = None) -> lis
                 raise _PushNotAcknowledged
         except _PushNotAcknowledged:
             logger.warning("Static-route intent re-sync was not acknowledged for device %s", mgmt.device_id)
-            rolled_back, count = _restore_static_route_generations(armed_rows), None
+            rolled_back, count = _safe_restore(armed_rows, mgmt.device_id), None
             armed_rows = []
         # Not an adapter rejection (the claim records those and answers None), so letting it
         # out would strand every later device unattempted and unreported.
         except Exception:  # noqa: BLE001
             logger.exception("Static-route intent re-sync raised for device %s", mgmt.device_id)
-            rolled_back, count = _restore_static_route_generations(armed_rows), None
+            rolled_back, count = _safe_restore(armed_rows, mgmt.device_id), None
             armed_rows = []
         results.append(
             {
