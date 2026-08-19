@@ -323,6 +323,40 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "deploying")
 
+    def test_a_bad_head_job_releases_the_rows_no_generation_promoted(self):
+        """The 502 keeps the promoted rows applying; it must not keep the others too.
+
+        A stream the adapter SKIPPED was prepared locally but has no generation, so nothing
+        will ever settle it. Left deploying it reads as applying forever, which is exactly
+        what _rollback_prepare_apply exists to prevent; the success path already releases it.
+        """
+        from netbox_nso_plugin.models import NSOLoggingLevelState
+
+        with without_commit_drain(), transaction.atomic():
+            logging_state = NSOLoggingLevelState.objects.create(
+                management=self.mgmt,
+                console_severity="warning",
+                status="accepted",
+            )
+
+        def skips_logging_with_a_mismatched_head(selected):
+            promoted = {stream: revision for stream, revision in selected.items() if stream != "logging"}
+            result = _promoted(promoted)  # generations cover everything but logging
+            result["selected"] = dict(selected)  # the echo must repeat the whole selector
+            result["skipped"] = {"logging": "unchanged"}
+            result["job_id"] = 502  # disagrees with the head generation's 501
+            return result
+
+        response = self._post(
+            _ApplyContractAdapter(lambda selected: (202, skips_logging_with_a_mismatched_head(selected)))
+        )
+
+        self.assertEqual(response.status_code, 502)
+        self.vlan_state.refresh_from_db()
+        logging_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "deploying", "a promoted row was released")
+        self.assertEqual(logging_state.status, "accepted", "a skipped row was stranded applying")
+
     def test_deploying_marks_are_atomic_and_apply_is_not_submitted_after_a_database_failure(self):
         from netbox_nso_plugin.models import NSOLoggingLevelState
 
