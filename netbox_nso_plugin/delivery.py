@@ -202,9 +202,9 @@ def _under_deadline(do_push: Callable, seconds: float) -> Callable:
         expired = threading.Event()
 
         def _run():
-            from django.db import connections
-
             try:
+                from django.db import connections
+
                 result = context.run(do_push, body)
                 if not expired.is_set():
                     answer["result"] = result
