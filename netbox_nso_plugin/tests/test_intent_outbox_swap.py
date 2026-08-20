@@ -144,10 +144,11 @@ class TestTheTestCaseDeliveryDouble(_CascadeFlushMixin, IntentPushResetMixin, Tr
         from netbox_nso_plugin import delivery, signals
 
         signals._pending_intent_keys().add((self.device.pk, "vlan"))
-        with patch.object(delivery, "deliver") as deliver:
+        with patch.object(delivery, "render") as render, patch.object(delivery, "send") as send:
             _deliver_scheduled_keys()
 
-        deliver.assert_not_called()
+        render.assert_not_called()
+        send.assert_not_called()
 
     def test_a_delivery_failure_is_logged_and_does_not_escape(self):
         from netbox_nso_plugin import delivery, outbox, signals
