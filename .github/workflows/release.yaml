@@ -107,6 +107,50 @@ jobs:
           push: false
           vcs_release: false
 
+      - name: Validate the release commit versions
+        id: validate_release_commit_versions
+        if: steps.trigger.outputs.stale != 'true' && steps.release.outputs.released == 'true'
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          git show HEAD:pyproject.toml > "${RUNNER_TEMP}/release-pyproject.toml"
+          git show HEAD:netbox_nso_plugin/__init__.py > "${RUNNER_TEMP}/release-init.py"
+          git show HEAD:uv.lock > "${RUNNER_TEMP}/release-uv.lock"
+          python - <<'PY'
+          import os
+          import re
+          import sys
+          import tomllib
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"])
+          expected = os.environ["RELEASE_VERSION"]
+          if not expected:
+              sys.exit("::error::semantic-release returned no version")
+
+          project = tomllib.loads((root / "release-pyproject.toml").read_text(encoding="utf-8"))
+          init_source = (root / "release-init.py").read_text(encoding="utf-8")
+          init_versions = re.findall(r'^__version__\s*=\s*["\']([^"\']+)["\']\s*$', init_source, re.MULTILINE)
+          if len(init_versions) != 1:
+              sys.exit(f"::error::expected one __version__ line in HEAD, got {len(init_versions)}")
+
+          lock = tomllib.loads((root / "release-uv.lock").read_text(encoding="utf-8"))
+          lock_entries = [pkg for pkg in lock["package"] if pkg["name"] == "netbox-nso-plugin"]
+          if len(lock_entries) != 1:
+              sys.exit(f"::error::expected one netbox-nso-plugin entry in HEAD:uv.lock, got {len(lock_entries)}")
+
+          found = {
+              "HEAD:pyproject.toml": project["project"]["version"],
+              "HEAD:netbox_nso_plugin/__init__.py": init_versions[0],
+              "HEAD:uv.lock": lock_entries[0]["version"],
+          }
+          for source, version in found.items():
+              if version != expected:
+                  sys.exit(f"::error::{source} declares {version}, but semantic-release returned {expected}")
+              print(f"{source}: {version}")
+          PY
+
       # Revalidate immediately before the first remote mutation. The atomic push
       # makes the branch, baseline tag, and release tag share one expected-tip lease.
       - name: Publish release refs with expected-tip lease

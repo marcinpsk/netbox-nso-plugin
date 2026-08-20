@@ -4,10 +4,13 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import tomllib
 from pathlib import Path
+
+import yaml
 
 WORKFLOW = Path(__file__).parents[2] / ".github" / "workflows" / "release.yaml"
 PYPROJECT = Path(__file__).parents[2] / "pyproject.toml"
@@ -83,6 +86,17 @@ def test_release_refs_use_one_expected_tip_transaction():
     assert "vcs_release: false" in release_action
 
 
+def test_release_commit_versions_are_validated_before_ref_publish():
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    step_ids = [step.get("id") or step["name"] for step in workflow["jobs"]["release"]["steps"]]
+
+    assert (
+        step_ids.index("release")
+        < step_ids.index("validate_release_commit_versions")
+        < step_ids.index("Publish release refs with expected-tip lease")
+    )
+
+
 def test_the_release_commit_carries_a_regenerated_lock():
     """The lock records this project's own version, so the release commit has to refresh it."""
     config = tomllib.loads(PYPROJECT.read_text())["tool"]["semantic_release"]
@@ -90,7 +104,6 @@ def test_the_release_commit_carries_a_regenerated_lock():
     # The PSR action container has no uv, so the command must bootstrap its own.
     assert "set -e" in build_command
     assert "command -v uv" in build_command
-    assert "pip install 'uv ~= 0.12" in build_command
     # Scoped to this package so a release cannot re-resolve the whole graph.
     lock_lines = [line for line in build_command.splitlines() if "uv lock" in line]
     assert lock_lines == ["uv lock --upgrade-package netbox-nso-plugin"]
@@ -108,6 +121,12 @@ def test_the_release_commit_carries_a_regenerated_lock():
     assert "build: true" in release_action
     assert "astral-sh/setup-uv" in install_uv
     assert 'version: "0.12.4"' in install_uv
+    bootstrap_uv = re.search(r"pip install 'uv (?P<operator>==|~=) (?P<version>[^']+)'", build_command)
+    workflow_uv = re.search(r'^\s*version: "(?P<version>[^"]+)"$', install_uv, re.MULTILINE)
+    assert bootstrap_uv is not None, "the release build does not pin its bootstrapped uv"
+    assert workflow_uv is not None, "the release workflow does not pin setup-uv"
+    assert bootstrap_uv.group("operator") == "=="
+    assert bootstrap_uv.group("version") == workflow_uv.group("version")
 
 
 def test_uv_lock_records_the_declared_project_version():

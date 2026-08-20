@@ -56,7 +56,7 @@ version_variables = ["netbox_nso_plugin/__init__.py:__version__"]
 # unrelated dependency upgrades into a release commit nobody reviewed.
 build_command = """
 set -e
-command -v uv >/dev/null || python -m pip install 'uv ~= 0.12.3'
+command -v uv >/dev/null || python -m pip install 'uv == 0.12.4'
 uv lock --upgrade-package netbox-nso-plugin
 """
 # PSR adds these to the release commit, so the tag ships a lock matching its version.
