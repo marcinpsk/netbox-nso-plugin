@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 import logging
-import time
 
 from dcim.models import Device
 from django.contrib import messages
@@ -2541,10 +2540,10 @@ def _prepare_apply(mgmt):
     from .delivery import MODE_STORE_ONLY
     from .signals import stored_static_route_count
 
-    prepare_deadline = time.monotonic() + drain.SEND_DEADLINE.total_seconds()
+    prepare_deadline = drain._send_clock() + drain.SEND_DEADLINE.total_seconds()
 
     def remaining_budget():
-        remaining = prepare_deadline - time.monotonic()
+        remaining = prepare_deadline - drain._send_clock()
         if remaining <= 0:
             raise ApplyDeadlineExpired(_APPLY_DEADLINE_MESSAGE)
         return remaining

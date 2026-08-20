@@ -378,7 +378,7 @@ class TestApplyRefusalSealing(TestCase):
 
         mgmt = self._mgmt("seal-deadline", 98)
         spent = drain.SEND_DEADLINE.total_seconds() + 1
-        with patch("time.monotonic", side_effect=chain([0, spent], repeat(spent))):
+        with patch("netbox_nso_plugin.drain._send_clock", side_effect=chain([0, spent], repeat(spent))):
             url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[mgmt.pk, "apply"])
             response = self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
 
