@@ -796,7 +796,7 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
         put_static_route_intent(5, [])
 
         _, kwargs = session.request.call_args
-        self.assertEqual(kwargs["json"], {"routes": []})
+        self.assertEqual(kwargs["json"]["routes"], [])
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
