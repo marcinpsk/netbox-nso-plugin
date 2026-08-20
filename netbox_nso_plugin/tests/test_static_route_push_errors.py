@@ -48,6 +48,13 @@ def _duplicate_route_id(route_id):
     )
 
 
+def _raises(exc):
+    def do_push(body):
+        raise exc
+
+    return do_push
+
+
 def _push(device_id, adapter_device_id):
     """Render and send the snapshot, swallowing what the drain isolates in production.
 
@@ -209,7 +216,7 @@ class TestIntentPushRejectionIsolation(IntentPushResetMixin, TestCase):
         self.assertIsNotNone(_record(self.mgmt))
 
         # Another scope fails, then succeeds. Neither may reach static_route.
-        _send(self.device.pk, "vlan", lambda body: (_ for _ in ()).throw(ValueError("vlan down")))
+        _send(self.device.pk, "vlan", _raises(ValueError("vlan down")))
         self.assertIsNotNone(_record(self.mgmt, "vlan"))
         _send(self.device.pk, "vlan", lambda body: {"ok": True})
         self.assertIsNone(_record(self.mgmt, "vlan"))
@@ -323,7 +330,7 @@ class TestIntentPushRejectionConcurrency(_CascadeFlushMixin, IntentPushResetMixi
             rendered = Rendered(
                 key=(self.device.pk, scope),
                 payload=[{"scope": scope}],
-                do_push=lambda body: (_ for _ in ()).throw(ValueError(f"{scope} down")),
+                do_push=_raises(ValueError(f"{scope} down")),
             )
             try:
                 start.wait()

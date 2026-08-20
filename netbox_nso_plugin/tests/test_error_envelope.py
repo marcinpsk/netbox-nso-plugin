@@ -58,6 +58,8 @@ class _LeakingSession(requests.Session):
 class _UnreachableAdapterMixin:
     """Point adapter_client at the leaking transport for the duration of one test."""
 
+    session_class = _LeakingSession
+
     def setUp(self):
         super().setUp()
         import netbox_nso_plugin.adapter_client as ac
@@ -69,7 +71,7 @@ class _UnreachableAdapterMixin:
         settings_patch = override_settings(PLUGINS_CONFIG=_PLUGINS_CONFIG)
         settings_patch.enable()
         self.addCleanup(settings_patch.disable)
-        session_patch = patch("netbox_nso_plugin.adapter_client.requests.Session", _LeakingSession)
+        session_patch = patch("netbox_nso_plugin.adapter_client.requests.Session", self.session_class)
         session_patch.start()
         self.addCleanup(session_patch.stop)
 
@@ -359,7 +361,7 @@ class _MalformedJobSession(requests.Session):
         return make_response(200, json_data=self.BODY)
 
 
-class TestMalformedAdapterPayloadIsRefused(ViewTestBase):
+class TestMalformedAdapterPayloadIsRefused(_UnreachableAdapterMixin, ViewTestBase):
     """A payload the contract forbids becomes a typed refusal, never an AttributeError 500.
 
     The client validates job payloads once (``_validated_job``) rather than every reader
@@ -369,6 +371,8 @@ class TestMalformedAdapterPayloadIsRefused(ViewTestBase):
     with no template, so routing adds nothing the assertions depend on.
     """
 
+    session_class = _MalformedJobSession
+
     @classmethod
     def setUpTestData(cls):
         super().setUpTestData()
@@ -377,18 +381,6 @@ class TestMalformedAdapterPayloadIsRefused(ViewTestBase):
 
     def setUp(self):
         super().setUp()
-        import netbox_nso_plugin.adapter_client as ac
-
-        ac.reset_config_cache()
-        ac.reset_session()
-        self.addCleanup(ac.reset_session)
-        self.addCleanup(ac.reset_config_cache)
-        settings_patch = override_settings(PLUGINS_CONFIG=_PLUGINS_CONFIG)
-        settings_patch.enable()
-        self.addCleanup(settings_patch.disable)
-        session_patch = patch("netbox_nso_plugin.adapter_client.requests.Session", _MalformedJobSession)
-        session_patch.start()
-        self.addCleanup(session_patch.stop)
         self.factory = RequestFactory()
 
     def _get(self, view, **kwargs):

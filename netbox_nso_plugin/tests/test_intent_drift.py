@@ -258,11 +258,11 @@ class TestResyncStoreOnly(_CascadeFlushMixin, IntentPushResetMixin, TransactionT
         from netbox_nso_plugin import outbox
 
         # The control: an ordinary claim IS dropped once the baseline names its body.
-        with transaction.atomic():
+        with without_commit_drain(), transaction.atomic():
             outbox.enqueue(self.device.pk, "logging")
         primed = self._recorded_requests(lambda: drain.drain_key(self.device.pk, "logging"))
         self.assertEqual(len(primed), 1)
-        with transaction.atomic():
+        with without_commit_drain(), transaction.atomic():
             outbox.enqueue(self.device.pk, "logging")
         again = self._recorded_requests(lambda: drain.drain_key(self.device.pk, "logging"))
         self.assertEqual(len(again), 0, "an unchanged ordinary claim is still dropped")

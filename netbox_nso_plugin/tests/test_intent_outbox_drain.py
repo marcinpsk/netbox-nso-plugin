@@ -105,6 +105,7 @@ class TestTheTickDrainsTheTail(_DrainCase):
     def test_the_tail_left_by_the_chain_drains_within_one_interval(self):
         from netbox_nso_plugin import drain
 
+        assert drain.DRAIN_BATCH >= drain.DRAIN_CHAIN_MAX + 1
         keys = [
             self.managed(f"tail{index}", 7600 + index, index=index, vid=900 + index)
             for index in range(drain.DRAIN_CHAIN_MAX + 2)

@@ -23,6 +23,7 @@ from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.db import connections, transaction
 from django.test import SimpleTestCase, TransactionTestCase
 
+from ._outbox_case import without_commit_drain
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 PREFIX = "10.90.0.0/16"
@@ -60,7 +61,7 @@ class _ClobberBarrierCase(IntentPushResetMixin, _CascadeFlushMixin, TransactionT
             self.route = StaticRoute.objects.create(prefix=PREFIX, next_hop=NEXT_HOP, metric=1)
         with suppress_intent_push():
             self.route.devices.add(self.device)
-        with patch(PUT), transaction.atomic():
+        with patch(PUT), without_commit_drain(), transaction.atomic():
             self.state = NSOStaticRouteState.objects.create(
                 management=self.mgmt,
                 static_route=self.route,

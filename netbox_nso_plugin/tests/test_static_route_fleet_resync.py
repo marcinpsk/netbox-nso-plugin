@@ -268,7 +268,8 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
 
         by_device = {r["device_id"]: r for r in results}
         assert by_device[first.device_id]["ok"] is False
-        assert second.device_id in by_device, "the failed restore took the rest of the pass with it"
+        assert by_device[first.device_id]["armed_rolled_back"] == 0
+        assert by_device[second.device_id]["ok"] is False, "the second unacknowledged push was reported successful"
 
     def test_only_a_real_route_count_acknowledges_a_push(self):
         """The count IS the acknowledgement, so an answer that carries no honest one must arm
@@ -483,18 +484,17 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         mode. Answering the resync with that replay reports a device backfilled while the
         generations this pass armed were never on the wire and no result can settle them.
         """
+        from django.utils import timezone
+
         from netbox_nso_plugin import adapter_client, drain
         from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet
         from netbox_nso_plugin.intent_generation import UNALLOCATED
+        from netbox_nso_plugin.models import NSOIntentOutboxState
 
         _, mgmt = self._managed_device("staleclaim", 8108)
         row = self._own_route(mgmt, "10.81.0.0/16", "10.0.0.82")
         with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", side_effect=ConnectionError("down")):
             assert drain.drain_key(mgmt.device_id, "static_route") == drain.FAILED
-        from django.utils import timezone
-
-        from netbox_nso_plugin.models import NSOIntentOutboxState
-
         NSOIntentOutboxState.objects.filter(device_id=mgmt.device_id, scope="static_route").update(
             claimed_at=timezone.now() - 2 * drain.LEASE
         )

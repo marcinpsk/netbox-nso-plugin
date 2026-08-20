@@ -20,9 +20,10 @@ UV_LOCK = ROOT / "uv.lock"
 
 
 def _workflow_version() -> str:
-    found = re.search(r"ruff==(\S+)", WORKFLOW.read_text())
+    found = re.findall(r"ruff==([0-9][^\s\"']*)", WORKFLOW.read_text())
     assert found, "the lint workflow installs an unpinned ruff"
-    return found.group(1)
+    assert len(set(found)) == 1, f"the lint workflow installs different ruff versions: {found}"
+    return found[0]
 
 
 def _pre_commit_version() -> str:

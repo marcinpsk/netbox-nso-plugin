@@ -56,7 +56,7 @@ class TestEveryProductionSendGoesThroughTheOutbox(SimpleTestCase):
         for path in _production_modules():
             if path.name == "delivery.py":
                 continue  # the registry, which is the one place that may hold them
-            for node in ast.walk(ast.parse(path.read_text())):
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
                 # A call, an attribute access and an import all name it, and all three count.
                 if isinstance(node, ast.Name):
                     named_here = node.id
@@ -94,7 +94,7 @@ class TestTheCoalescerSymbolsAreGone(SimpleTestCase):
         gone = {"_pending_pushes", "_last_pushed_hashes"}
         read = set()
         for path in _production_modules():
-            for node in ast.walk(ast.parse(path.read_text())):
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
                 if isinstance(node, ast.Name):
                     named_here = node.id
                 elif isinstance(node, ast.Attribute):

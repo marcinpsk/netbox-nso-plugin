@@ -98,6 +98,7 @@ class TestExpectationThreeWay(_SettlementCase):
         assert outcome.stalled, "the walk advanced past a result it could not decide"
         assert self._cursor(mgmt).settle_cursor_seq == 0, "the cursor moved past an undecided head"
         assert self._cursor(mgmt).settle_stall_attempts == 1
+        assert self.adapter.store.readback_requests == [25]
 
     def test_expectation_three_way_mismatch(self):
         """(c) A recorded expectation the result contradicts — decided, and decided 'no'."""

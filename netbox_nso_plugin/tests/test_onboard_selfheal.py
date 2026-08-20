@@ -167,9 +167,9 @@ class TestAdvanceStaleOnboardingSweep(TestCase):
         """
         from netbox_nso_plugin.onboarding import advance_provisioning
 
-        for steps in ("boom", 3, [{"status": "failed"}, "boom"]):
+        for index, steps in enumerate(("boom", 3, [{"status": "failed"}, "boom"])):
             with self.subTest(steps=steps):
-                mgmt = self._provisioning(f"sweep-steps-{abs(hash(str(steps)))}", "J-STEPS")
+                mgmt = self._provisioning(f"sweep-steps-{index}", "J-STEPS")
                 job = {"status": "succeeded", "result": {"ok": False, "steps": steps}}
 
                 with patch("netbox_nso_plugin.adapter_client.get_job", return_value=job):

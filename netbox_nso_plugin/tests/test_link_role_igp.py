@@ -22,11 +22,13 @@ from netbox_nso_plugin.models import (
     NSOOSPFInterfaceState,
 )
 
+from .mixins import IntentPushResetMixin
+
 #: The consumer records the key in the outbox; the drain is what sends it (#1503 Appendix O).
 _SCHEDULE = "netbox_nso_plugin.signals._schedule_intent_push"
 
 
-class TestEnableIgpForRole(TestCase):
+class TestEnableIgpForRole(IntentPushResetMixin, TestCase):
     @classmethod
     def setUpTestData(cls):
         mfg = Manufacturer.objects.create(name="LgMfg", slug="lgmfg")

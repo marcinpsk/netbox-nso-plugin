@@ -331,14 +331,19 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
             _accept_static_route_for_device(route, self.device)
             waited.append(time.monotonic() - started)
 
-        timer = threading.Timer(2.0, release.set)
-        timer.daemon = True
-        timer.start()
-        self.addCleanup(timer.cancel)
+        def release_after_delete():
+            deleted.wait()
+            time.sleep(2.0)
+            release.set()
+
+        releaser = threading.Thread(target=release_after_delete, daemon=True)
+        releaser.start()
+        self.addCleanup(release.set)
         self._run(
             self._remove(route, after=deleted, hold=release),
             self._transaction(own_the_same_route, before=deleted),
         )
+        releaser.join(timeout=5)
 
         assert waited and waited[0] > 1.0, f"the second writer never waited: {waited}"
 

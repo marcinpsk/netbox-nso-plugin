@@ -15,6 +15,7 @@ permission gating, JSON shapes — runs for real.
 
 import json
 import re
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
@@ -571,21 +572,22 @@ class TestFreeFormResidue(TestCase):
     """
 
     def _annotate(self, residue):
-        """Run the real annotator against a job carrying *residue*, return the context."""
+        """Run the real annotator against a job carrying *residue*, return its VLAN row."""
         from netbox_nso_plugin.views import _annotate_residue_rows
 
         job = _removal_job(90, "vlan", "succeeded")
         job["result"] = {"scope": "vlan", "residue": residue}
         mgmt = NSODeviceManagement(adapter_device_id=10)
-        ctx = {"vlan_states": []}
+        row = SimpleNamespace(vlan=SimpleNamespace(vid="b"))
+        ctx = {"vlan_states": [row]}
         with patch("netbox_nso_plugin.adapter_client.list_jobs", return_value=[job]):
             _annotate_residue_rows(ctx, "vlan", mgmt)
-        return ctx
+        return row
 
     def test_a_non_object_residue_map_costs_only_the_badge(self):
         for residue in ("boom", 3, ["vlan"]):
             with self.subTest(residue=residue):
-                self.assertEqual(self._annotate(residue), {"vlan_states": []})
+                self.assertFalse(hasattr(self._annotate(residue), "residue_survivor"))
 
     def test_a_non_list_key_list_costs_only_that_label(self):
-        self.assertEqual(self._annotate({"vlan": "boom"}), {"vlan_states": []})
+        self.assertFalse(hasattr(self._annotate({"vlan": "boom"}), "residue_survivor"))

@@ -298,6 +298,7 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
         reset_intent_push_state()
         with patch("netbox_nso_plugin.adapter_client.put_subinterface_intent") as mock_put:
             deliver("subinterface", self.device.pk, 42)
+        mock_put.assert_called_once()
         ifaces = mock_put.call_args[0][1]
         assert [i["interface_name"] for i in ifaces] == ["ge-0/0/0.100"]
 
