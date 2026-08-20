@@ -151,7 +151,8 @@ class TestProvisionP2P(_Base):
                 {self.dev_a.pk, self.dev_b.pk},
                 scope,
             )
-        self.assertNotIn("ospf", {scope for _device_id, scope in forced}, "an IS-IS role pushed OSPF intent")
+        all_scopes = {call.args[1] for call in push.call_args_list}
+        self.assertNotIn("ospf", all_scopes, "an IS-IS role pushed OSPF intent")
 
     def test_an_outer_rollback_suppresses_forced_delivery(self):
         role = self._p2p_role()
