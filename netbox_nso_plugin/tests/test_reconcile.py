@@ -2,6 +2,7 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for the off-request reconcile job and the sync-complete callback endpoint."""
 
+import contextlib
 import os
 import threading
 from unittest.mock import patch
@@ -27,18 +28,23 @@ def _make_device(name="rec-dev"):
     return Device.objects.create(name=name, device_type=dt, role=role, site=site)
 
 
+@contextlib.contextmanager
 def _patch_apply_pushes(answers=None):
     """Double the forced claims the Apply takes, keyed by delivery scope.
 
-    Apply routes every scope through ``drain.push_now``, so the claim is the boundary: what
-    it answers is what the promotion gate reads. *answers* maps a scope to that answer;
-    every other scope answers ``None``, which is what an unacknowledged claim returns.
+    Apply routes SNMP through ``drain_key`` and every other scope through ``push_now``.
+    *answers* maps a scope to its answer. Every other scope answers ``None``.
     """
     answers = answers or {}
-    return patch(
-        "netbox_nso_plugin.drain.push_now",
-        side_effect=lambda device_id, scope, **kwargs: answers.get(scope),
-    )
+
+    def side_effect(device_id, scope, **kwargs):
+        return answers.get(scope)
+
+    with (
+        patch("netbox_nso_plugin.drain.push_now", side_effect=side_effect) as push,
+        patch("netbox_nso_plugin.drain.drain_key", side_effect=side_effect),
+    ):
+        yield push
 
 
 def _forced_scopes(push, device_id):
@@ -353,6 +359,18 @@ class TestEscalateStuckDeploying(APITestCase):
 
         rp.refresh_from_db()
         self.assertEqual(rp.status, "deploying")
+
+    def test_boolean_counts_do_not_mark_a_scope_as_applied(self):
+        from netbox_nso_plugin.reconcile import _escalate_stuck_deploying
+
+        mgmt, row = self._setup()
+        job = self._job(minutes_ago=30)
+        job["result"]["vlan_count_by_outcome"] = {"in_sync": False, "apply_failed": True}
+
+        _escalate_stuck_deploying(mgmt, job)
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, "deploying")
 
     def test_run_device_reconcile_escalates_after_grace(self):
         from netbox_nso_plugin import reconcile
@@ -757,7 +775,7 @@ class TestRoutePolicyApplySettle(APITestCase):
         from netbox_nso_plugin.reconcile import _settle_apply_failures
 
         mgmt, row = self._setup()
-        junk_members = ({"apply_failed": "1"}, {"apply_failed": ["x"]})
+        junk_members = ({"apply_failed": "1"}, {"apply_failed": ["x"]}, {"apply_failed": True})
         for counts in ("boom", 3, ["apply_failed"], *junk_members):
             with self.subTest(counts=counts):
                 row.status = "deploying"

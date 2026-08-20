@@ -1091,7 +1091,7 @@ def _counts_for(result: dict | None, scope: str) -> dict:
 def _count_of(counts: dict, outcome: str) -> int:
     """Return one outcome's tally, treating a non-integer as no rows."""
     count = counts.get(outcome)
-    return count if isinstance(count, int) else 0
+    return count if isinstance(count, int) and not isinstance(count, bool) else 0
 
 
 def _scope_failure_messages(job: dict | None, scope: str) -> str:
@@ -1228,7 +1228,7 @@ def _escalate_stuck_deploying(mgmt, job: dict | None) -> None:
     detail = _STUCK_DEPLOYING_ERROR.format(job_id=job.get("id"))
     for scope, model_name in _APPLY_DEPLOYING_SCOPES.items():
         counts = _counts_for(result, scope)
-        if sum(int(count or 0) for count in counts.values() if isinstance(count, int)) <= 0:
+        if sum(_count_of(counts, outcome) for outcome in counts) <= 0:
             continue  # this job never applied this scope — it cannot testify about its rows
         model = getattr(models, model_name)
         for row in model.objects.filter(management=mgmt, status="deploying"):
