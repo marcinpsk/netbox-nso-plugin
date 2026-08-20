@@ -142,8 +142,8 @@ class AbortableTransport(requests.adapters.HTTPAdapter):
         """Return the pool this request will use, instrumented to record its connections."""
         pool = super().get_connection_with_tls_context(request, verify, proxies=proxies, cert=cert)
         with self._lock:
-            fresh = id(pool) not in self._instrumented
-            self._instrumented.add(id(pool))
+            fresh = pool not in self._instrumented
+            self._instrumented.add(pool)
         return self._instrument(pool) if fresh else pool
 
     def _instrument(self, pool):

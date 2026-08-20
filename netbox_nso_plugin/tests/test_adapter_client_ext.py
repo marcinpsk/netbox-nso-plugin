@@ -42,6 +42,17 @@ class TestClientResetHelpers(unittest.TestCase):
 
         self.assertEqual(ac._cfg_cache, {})
 
+    def test_abortable_transport_keeps_the_instrumented_pool_alive(self):
+        from netbox_nso_plugin.adapter_client import AbortableTransport
+
+        transport = AbortableTransport()
+        self.addCleanup(transport.close)
+        request = requests.Request("GET", "https://example.invalid").prepare()
+
+        pool = transport.get_connection_with_tls_context(request, verify=True)
+
+        self.assertIn(pool, transport._instrumented)
+
 
 class TestResolveConfigCacheConcurrency(_CascadeFlushMixin, TransactionTestCase):
     """Database-backed concurrency coverage for adapter config invalidation."""
@@ -774,10 +785,18 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
         prepared = requests.Request("PUT", "https://example.invalid/x", **kwargs).prepare()
         self.assertEqual(prepared.body, b'{"a": 2, "b": 1}')
 
-    def test_static_route_intent_doc_names_the_list_that_clears_the_mirror(self):
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_empty_static_route_intent_clears_the_mirror_on_the_wire(self, mock_s, _cfg):
         from netbox_nso_plugin.adapter_client import put_static_route_intent
 
-        self.assertIn("empty ``routes`` list clears", put_static_route_intent.__doc__)
+        session = self._make_session(200, {"device_id": 5, "count": 0, "routes": []})
+        mock_s.return_value = session
+
+        put_static_route_intent(5, [])
+
+        _, kwargs = session.request.call_args
+        self.assertEqual(kwargs["json"], {"routes": []})
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
