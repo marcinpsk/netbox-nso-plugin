@@ -51,7 +51,7 @@ def _forced_calls() -> collections.Counter:
         # Relative to the plugin: an ancestor directory of that name would skip every module.
         if {"tests", "migrations"} & set(path.relative_to(PLUGIN).parts):
             continue
-        tree = ast.parse(path.read_text())
+        tree = ast.parse(path.read_text(encoding="utf-8"))
         parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):

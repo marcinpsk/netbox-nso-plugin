@@ -108,9 +108,9 @@ class TestABareEnqueueIsRefused(_DurabilityCase):
 
     def test_public_docs_require_the_writer_transaction(self):
         root = Path(__file__).resolve().parents[2]
-        readme = (root / "README.md").read_text()
-        signals = (root / "netbox_nso_plugin" / "signals.py").read_text()
-        views = (root / "netbox_nso_plugin" / "views.py").read_text()
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        signals = (root / "netbox_nso_plugin" / "signals.py").read_text(encoding="utf-8")
+        views = (root / "netbox_nso_plugin" / "views.py").read_text(encoding="utf-8")
 
         assert "transaction.atomic()" in readme
         assert "must hold a writer transaction" in views
