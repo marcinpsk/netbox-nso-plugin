@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import unittest
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -540,6 +541,8 @@ class TestO3CJoinedCrossRepositoryPin(_CascadeFlushMixin, IntentPushResetMixin, 
 
     @classmethod
     def setUpClass(cls):
+        if not _ADAPTER_ROOT.is_dir():
+            raise unittest.SkipTest(f"O3c adapter worktree is missing at {_ADAPTER_ROOT}")
         super().setUpClass()
         cls.environment = _O3CEnvironment()
         try:
@@ -740,6 +743,24 @@ class TestO3CEnvironmentFailFast(SimpleTestCase):
     """Prove a failed preflight tears down without hanging the suite."""
 
     databases = {"default"}
+
+    def test_a_missing_adapter_worktree_skips_the_joined_class(self):
+        class MissingAdapterCase(TestO3CJoinedCrossRepositoryPin):
+            def test_probe(self):
+                pass
+
+        result = unittest.TestResult()
+        with tempfile.TemporaryDirectory() as directory:
+            missing_root = Path(directory) / "missing-adapter"
+            with (
+                patch(f"{__name__}._adapter_database_name", lambda: f"test_o3c_missing_{Path(directory).name}"),
+                patch(f"{__name__}._ADAPTER_ROOT", missing_root),
+            ):
+                unittest.TestSuite([MissingAdapterCase("test_probe")]).run(result)
+
+        assert result.skipped, result.errors
+        assert result.errors == []
+        assert "O3c adapter worktree is missing" in result.skipped[0][1]
 
     def test_log_text_redacts_the_store_credential(self):
         environment = _O3CEnvironment()
