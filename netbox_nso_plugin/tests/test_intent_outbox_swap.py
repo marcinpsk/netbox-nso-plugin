@@ -157,11 +157,28 @@ class TestTheTestCaseDeliveryDouble(_CascadeFlushMixin, IntentPushResetMixin, Tr
             outbox.enqueue(self.device.pk, "vlan")
         signals._pending_intent_keys().add((self.device.pk, "vlan"))
         with (
-            patch.object(delivery, "send", side_effect=RuntimeError("send failed")),
+            patch.object(delivery, "send", side_effect=RuntimeError("send failed")) as send,
             self.assertLogs("netbox_nso_plugin.tests.mixins", level="ERROR") as logs,
         ):
             _deliver_scheduled_keys()
 
+        send.assert_called_once()
+        assert any("test delivery failed" in line for line in logs.output)
+        assert [entry.consumed_by_push_seq for entry in entries(self.device, "vlan")] == [None]
+
+    def test_an_adapter_error_is_logged_and_leaves_the_row_unconsumed(self):
+        from netbox_nso_plugin import delivery, outbox, signals
+
+        with transaction.atomic():
+            outbox.enqueue(self.device.pk, "vlan")
+        signals._pending_intent_keys().add((self.device.pk, "vlan"))
+        with (
+            patch.object(delivery, "send", side_effect=AdapterError("adapter client failed")) as send,
+            self.assertLogs("netbox_nso_plugin.tests.mixins", level="ERROR") as logs,
+        ):
+            _deliver_scheduled_keys()
+
+        send.assert_called_once()
         assert any("test delivery failed" in line for line in logs.output)
         assert [entry.consumed_by_push_seq for entry in entries(self.device, "vlan")] == [None]
 
