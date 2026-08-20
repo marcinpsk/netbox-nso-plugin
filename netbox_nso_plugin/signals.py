@@ -496,10 +496,10 @@ def _push_changed(key, payload, do_push, on_response=None):
 def _send_rendered(rendered, body):
     """Send one rendered body: the attempt mark, the call, the outcome record, the side effect.
 
-    The coalescer and the claim protocol share this, so a push made either way is marked,
-    recorded and settled identically. It RAISES on a failed call, because the claim has to
-    tell a failure from a success; :func:`_push_changed` is what swallows it for the
-    coalescer.
+    The claim drain reaches this through :func:`drain.send_claim`, which calls
+    :func:`delivery.send`. Direct delivery reaches this through :func:`delivery.deliver`,
+    which also calls :func:`delivery.send`. It raises on a failed call so each caller can
+    tell a failure from a success.
     """
     device_id, scope = rendered.key
     attempt = _allocate_push_attempt(device_id, scope)
@@ -518,7 +518,7 @@ def _send_rendered(rendered, body):
 
 
 def _push_interface_intent_for_device(device_id, adapter_device_id) -> None:
-    """Build the full OWNED interface intent snapshot and push it (change-detected).
+    """Build and capture the full OWNED interface intent snapshot.
 
     Owned = ``status in OWNED_STATES`` (accepted/deploying/in_sync/apply_failed) — the
     canonical ownership test, identical to every other scope's push predicate and to
@@ -1918,7 +1918,7 @@ def stored_static_route_count(response):
 
 
 def _push_static_route_intent_for_device(device_id, adapter_device_id):
-    """Build and push the full static route intent snapshot for a device.
+    """Build and capture the full static route intent snapshot for a device.
 
     Each route names the NetBox ``StaticRoute`` pk and the generation of the intent it
     carries: the pk is what lets the adapter tell a *replacement* from an unrelated
@@ -1927,8 +1927,8 @@ def _push_static_route_intent_for_device(device_id, adapter_device_id):
     NULL — the adapter adopts a generation only when non-null, so a sentinel row simply has
     nothing to correlate with instead of correlating with everything at 0.
 
-    Records echoed fingerprints as this device's settlement expectations. The claim handles
-    the adapter response after this function captures the rendered body.
+    The captured ``on_response`` hook records echoed fingerprints as this device's settlement
+    expectations. :func:`_send_rendered` runs the hook after it sends the captured body.
     """
     from . import adapter_client as client
     from .models import NSOStaticRouteState
