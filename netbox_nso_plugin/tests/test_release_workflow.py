@@ -86,7 +86,14 @@ def test_release_refs_use_one_expected_tip_transaction():
 def test_the_release_commit_carries_a_regenerated_lock():
     """The lock records this project's own version, so the release commit has to refresh it."""
     config = tomllib.loads(PYPROJECT.read_text())["tool"]["semantic_release"]
-    assert config["build_command"] == "uv lock"
+    build_command = config["build_command"]
+    # The PSR action container has no uv, so the command must bootstrap its own.
+    assert "set -e" in build_command
+    assert "command -v uv" in build_command
+    assert "pip install 'uv ~= 0.12" in build_command
+    # Scoped to this package so a release cannot re-resolve the whole graph.
+    lock_lines = [line for line in build_command.splitlines() if "uv lock" in line]
+    assert lock_lines == ["uv lock --upgrade-package netbox-nso-plugin"]
     assert config["assets"] == ["uv.lock"]
 
     workflow = WORKFLOW.read_text()

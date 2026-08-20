@@ -51,10 +51,19 @@ commit_parser = "conventional"
 tag_format = "v{version}"
 version_toml = ["pyproject.toml:project.version"]
 version_variables = ["netbox_nso_plugin/__init__.py:__version__"]
-# The lock records this project's own version, so a bump leaves it stale. semantic-release runs
-# build_command before it stages, and assets is what carries the result into the release commit.
-build_command = "uv lock"
+# The PSR action container has no uv, so bootstrap it before locking. Scoped to THIS
+# package on purpose: a bare `uv lock` re-resolves the whole graph, which would fold
+# unrelated dependency upgrades into a release commit nobody reviewed.
+build_command = """
+set -e
+command -v uv >/dev/null || python -m pip install 'uv ~= 0.12.3'
+uv lock --upgrade-package netbox-nso-plugin
+"""
+# PSR adds these to the release commit, so the tag ships a lock matching its version.
 assets = ["uv.lock"]
+# PSR strips the build env to an allowlist; forward only vars that are safe when
+# empty (PSR passes unset entries as "", which uv rejects for boolish UV_* vars).
+build_command_env = ["http_proxy", "https_proxy", "no_proxy"]
 
 [tool.semantic_release.branches.main]
 match = "^main$"
