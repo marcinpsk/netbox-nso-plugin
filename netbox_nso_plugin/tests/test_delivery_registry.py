@@ -249,7 +249,7 @@ class TestDeliverySuccessHooks(IntentPushResetMixin, TestCase):
 
     def test_an_out_of_protocol_delivery_carries_no_sequence_header(self):
         """``lacp`` and ``switchport`` keep today's direct client calls (Rev 15 split)."""
-        from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.delivery import render, send
 
         from ._adapter_http import make_response, make_session
 
@@ -259,7 +259,8 @@ class TestDeliverySuccessHooks(IntentPushResetMixin, TestCase):
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=self._CFG),
             patch("netbox_nso_plugin.adapter_client.requests.Session", return_value=session),
         ):
-            deliver("lacp", device.pk, 7303)
+            rendered = render("lacp", device.pk, 7303)
+            send(rendered, rendered.payload, push_seq=17)
 
         assert session.request.call_count >= 1
         for call in session.request.call_args_list:
