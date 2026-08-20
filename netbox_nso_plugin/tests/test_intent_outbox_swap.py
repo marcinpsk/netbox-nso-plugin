@@ -68,7 +68,7 @@ class TestEveryProductionSendGoesThroughTheOutbox(SimpleTestCase):
                     continue
                 if pattern.fullmatch(named_here):
                     named.add(f"{path.name}:{node.lineno}")
-        assert named == set()
+        assert named == set(), named
 
     def test_a_push_outside_a_render_refuses_rather_than_sending(self):
         """The fallback is gone with its callers: nothing may deliver intent around the claim."""
@@ -105,7 +105,7 @@ class TestTheCoalescerSymbolsAreGone(SimpleTestCase):
                     continue
                 if named_here in gone:
                     read.add(f"{path.name}:{node.lineno}")
-        assert read == set()
+        assert read == set(), read
 
 
 class TestTheReceiptAdapterInjectionSeam(SimpleTestCase):
@@ -162,6 +162,22 @@ class TestTheTestCaseDeliveryDouble(_CascadeFlushMixin, IntentPushResetMixin, Tr
             _deliver_scheduled_keys()
 
         assert any("test delivery failed" in line for line in logs.output)
+        assert [entry.consumed_by_push_seq for entry in entries(self.device, "vlan")] == [None]
+
+    def test_a_success_retires_rows_before_the_next_delivery(self):
+        from netbox_nso_plugin import delivery, outbox, signals
+
+        marks = []
+        key = (self.device.pk, "vlan")
+        for delete_origin in (False, True):
+            with transaction.atomic():
+                outbox.enqueue(*key, delete_origin=delete_origin)
+            signals._pending_intent_keys().add(key)
+            with patch.object(delivery, "deliver", side_effect=lambda *args, mark: marks.append(mark)):
+                _deliver_scheduled_keys()
+
+        assert marks == [False, True]
+        assert all(entry.consumed_by_push_seq is not None for entry in entries(self.device, "vlan"))
 
 
 class _SwapCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):

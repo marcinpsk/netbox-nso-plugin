@@ -7,6 +7,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+_TEST_DELIVERY_PUSH_SEQ = 0
+
 
 class _CascadeFlushMixin:
     """Make TransactionTestCase's post-test flush use ``TRUNCATE ... CASCADE``.
@@ -90,17 +92,20 @@ def _deliver_scheduled_keys():
         )
         if adapter_device_id is None:
             continue
-        marks = list(
+        entries = list(
             NSOIntentOutboxEntry.objects.filter(
                 device_id=device_id, scope=scope, consumed_by_push_seq__isnull=True
-            ).values_list("mark_and", flat=True)
+            ).values_list("id", "mark_and")
         )
-        if not marks:
+        if not entries:
             continue
+        entry_ids = [entry_id for entry_id, _mark in entries]
         try:
-            delivery.deliver(scope, device_id, adapter_device_id, mark=all(marks))
+            delivery.deliver(scope, device_id, adapter_device_id, mark=all(mark for _entry_id, mark in entries))
         except Exception:  # noqa: BLE001 (one key's failure must not abort its siblings)
             logger.exception("test delivery failed for %s/%s", device_id, scope)
+            continue
+        NSOIntentOutboxEntry.objects.filter(id__in=entry_ids).update(consumed_by_push_seq=_TEST_DELIVERY_PUSH_SEQ)
 
 
 class IntentPushDeliveryMixin(IntentPushResetMixin):
