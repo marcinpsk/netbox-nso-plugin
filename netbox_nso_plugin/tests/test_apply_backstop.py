@@ -316,6 +316,41 @@ class TestTheStuckDeployingBackstop(_SettlementCase):
         state.refresh_from_db()
         assert state.status == "deploying", "the clock failed a row the running apply is about to settle"
 
+    def test_a_malformed_generation_cohort_keeps_apply_activity_unknown(self):
+        from netbox_nso_plugin.reconcile import _apply_job_state
+
+        for adapter_device_id, malformed_cohort in ((65, "73"), (66, True)):
+            with self.subTest(settlement_cohort=malformed_cohort):
+                self._device(f"cohorttype{adapter_device_id}", adapter_device_id)
+                self.adapter.store.add_generation(
+                    adapter_device_id,
+                    generation_id=81,
+                    seq=4,
+                    status="pending",
+                    job_id=None,
+                    mode="networked",
+                    settlement_cohort=malformed_cohort,
+                    digest="a" * 64,
+                    stream_revisions={"static_route": 11},
+                    source_push_seq={"static_route": 501},
+                )
+                self.adapter.store.add_generation(
+                    adapter_device_id,
+                    generation_id=82,
+                    seq=5,
+                    status="settled",
+                    job_id=501,
+                    mode="networked",
+                    settlement_cohort=73,
+                    digest="b" * 64,
+                    stream_revisions={"static_route": 12},
+                    source_push_seq={"static_route": 502},
+                )
+
+                _last_apply, active = _apply_job_state(adapter_device_id)
+
+                self.assertTrue(active)
+
     def test_an_unattached_pending_successor_keeps_the_apply_active(self):
         """A settled head does not finish its chain before the pending successor gets a job."""
         from netbox_nso_plugin.reconcile import _apply_job_state

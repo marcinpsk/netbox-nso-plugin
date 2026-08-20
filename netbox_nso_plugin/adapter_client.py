@@ -1032,7 +1032,12 @@ def list_device_generations(adapter_device_id, *, since_seq=None):
             raise AdapterError("Adapter returned a malformed generations listing.", code="invalid_response")
         for row in page:
             seq = row.get("seq")
-            if type(seq) is not int or (last_seq is not None and seq <= last_seq):
+            settlement_cohort = row.get("settlement_cohort")
+            if (
+                type(seq) is not int
+                or (last_seq is not None and seq <= last_seq)
+                or (settlement_cohort is not None and type(settlement_cohort) is not int)
+            ):
                 raise AdapterError("Adapter returned a malformed generations listing.", code="invalid_response")
             last_seq = seq
         generations.extend(page)
