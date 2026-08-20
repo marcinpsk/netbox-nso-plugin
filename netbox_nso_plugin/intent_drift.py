@@ -257,7 +257,7 @@ def resync_intent(device, mgmt, keys: list[str] | None = None) -> tuple[list[str
     push is the plugin's normal full-snapshot push, so for a scope NetBox owns nothing in, it
     sends an empty snapshot and the adapter full-replace removes the orphaned rows.
 
-    The pushes run under ``store_only_pushes()`` (→ ``?store_only=true``): re-sync repairs the
+    The pushes use ``delivery.MODE_STORE_ONLY`` (→ ``?store_only=true``): re-sync repairs the
     adapter's intent STORE only, so the adapter must skip its shrink-removal and auto-apply
     enqueues. Without the flag, the reduced snapshot auto-enqueued a removal job whose
     PUT-replace retracted FASTMAP-owned config from the real device — the exact opposite of

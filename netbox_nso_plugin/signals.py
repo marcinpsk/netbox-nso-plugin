@@ -1139,11 +1139,7 @@ def _create_greenfield_subif_state(sender, instance, created, **kwargs):
 
 
 def _push_ip_intent_for_device(device_id, adapter_device_id):
-    """Build and push the full IP intent snapshot for a device.
-
-    A forced claim (provisioning) re-sends this snapshot whatever the acknowledged
-    baseline says, so a computed intent always lands.
-    """
+    """Build and push the full IP intent snapshot for a device."""
     from . import adapter_client as client
     from .models import NSOInterfaceIPState
 
@@ -1447,9 +1443,6 @@ def _push_svi_intent_for_device(device_id, adapter_device_id):
 
     Store-only (deferred): the single device Apply commits via the svi-reconciler.
     Only owned rows (_OWNED_PUSH_STATUSES, incl. apply_failed) are included.
-
-    A forced Apply claim re-sends this snapshot whatever the acknowledged baseline says,
-    so an owned row whose adapter intent went stale or empty is applied instead of skipped.
     """
     from . import adapter_client as client
     from .models import NSOSVIState
@@ -1500,9 +1493,6 @@ def _push_subinterface_intent_for_device(device_id, adapter_device_id):
 
     Store-only (deferred): the single device Apply commits via the
     subinterface-reconciler. Only owned rows (_OWNED_PUSH_STATUSES, incl. apply_failed) included.
-
-    A forced Apply claim re-sends this snapshot whatever the acknowledged baseline says,
-    so an owned row whose adapter intent went stale or empty is applied instead of skipped.
     """
     from . import adapter_client as client
     from .models import NSOSubinterfaceState
@@ -1555,9 +1545,6 @@ def _push_interface_mtu_intent_for_device(device_id, adapter_device_id):
 
     Store-only (deferred): the single device Apply commits via the mtu-reconciler.
     Only owned rows (_OWNED_PUSH_STATUSES, incl. apply_failed) are included.
-
-    A forced Apply claim re-sends this snapshot whatever the acknowledged baseline says,
-    so an owned row whose adapter intent went stale or empty is applied instead of skipped.
     """
     from . import adapter_client as client
     from .models import NSOInterfaceMtuState
@@ -1609,10 +1596,6 @@ def _push_vlan_intent_for_device(device_id, adapter_device_id):
     Store-only (deferred): the single device Apply commits via the vlan-reconciler.
     Only owned rows (_OWNED_PUSH_STATUSES, incl. apply_failed) are included; the VLAN name pushed
     is the LIVE NetBox name (operator is the source of truth for it).
-
-    The single Apply takes a forced claim, so a VLAN renamed in NetBox *after* it was
-    accepted (the rename touches ipam.VLAN, which fires no plugin signal) still reaches
-    the device.
     """
     from . import adapter_client as client
     from .models import NSOVLANState
@@ -1705,9 +1688,6 @@ def _push_bfd_intent_for_device(device_id, adapter_device_id):
 
     Store-only (deferred): the single device Apply commits via the bfd-reconciler.
     Only owned rows (_OWNED_PUSH_STATUSES, incl. apply_failed) are included.
-
-    A forced Apply claim re-sends this snapshot whatever the acknowledged baseline says,
-    so an owned row whose adapter intent went stale or empty is applied instead of skipped.
     """
     from . import adapter_client as client
     from .models import NSOBFDInterfaceState
@@ -2472,11 +2452,7 @@ def _on_routing_isis_flex_algo_pre_delete(sender, instance, **kwargs):
 
 
 def _push_l2_sap_intent_for_device(device_id, adapter_device_id):
-    """Build and push the full Nokia L2 SAP intent snapshot for a device.
-
-    A forced Apply claim re-sends this snapshot whatever the acknowledged baseline says,
-    so an owned row whose adapter intent went stale or empty is applied instead of skipped.
-    """
+    """Build and push the full Nokia L2 SAP intent snapshot for a device."""
     from . import adapter_client as client
     from .models import NSOL2SapState
 
@@ -2667,11 +2643,7 @@ def _isis_levels_for_state(state):
 
 
 def _push_isis_intent_for_device(device_id, adapter_device_id):
-    """Build and push the full IS-IS intent snapshot (interfaces + processes) for a device.
-
-    A forced claim (provisioning) re-sends this snapshot whatever the acknowledged
-    baseline says, so a computed intent always lands.
-    """
+    """Build and push the full IS-IS intent snapshot (interfaces + processes) for a device."""
     from . import adapter_client as client
     from .models import NSOISISInstanceState, NSOISISInterfaceState
 
@@ -3125,11 +3097,7 @@ def _on_redistribution_state_save(sender, instance, **kwargs):
 
 
 def _push_route_policy_intent_for_device(device_id, adapter_device_id):
-    """Build and push the full route-policy intent snapshot for a device.
-
-    A forced Apply claim re-sends this snapshot whatever the acknowledged baseline says,
-    so an owned row whose adapter intent went stale or empty is applied instead of skipped.
-    """
+    """Build and push the full route-policy intent snapshot for a device."""
     from . import adapter_client as client
     from .models import NSORoutePolicyState
 
@@ -3722,11 +3690,7 @@ def _collect_redistribution_by_dest_ref(device_id: int, dest_protocol: str) -> d
 
 
 def _push_ospf_intent_for_device(device_id, adapter_device_id):
-    """Build and push the full OSPF intent snapshot for a device.
-
-    A forced claim (provisioning) re-sends this snapshot whatever the acknowledged
-    baseline says, so a computed intent always lands.
-    """
+    """Build and push the full OSPF intent snapshot for a device."""
     from . import adapter_client as client
     from .models import NSOOSPFInstanceState, NSOOSPFInterfaceState
 
