@@ -156,7 +156,7 @@ class TestTheTestCaseDeliveryDouble(_CascadeFlushMixin, IntentPushResetMixin, Tr
             outbox.enqueue(self.device.pk, "vlan")
         signals._pending_intent_keys().add((self.device.pk, "vlan"))
         with (
-            patch.object(delivery, "deliver", side_effect=RuntimeError("render failed")),
+            patch.object(delivery, "send", side_effect=RuntimeError("send failed")),
             self.assertLogs("netbox_nso_plugin.tests.mixins", level="ERROR") as logs,
         ):
             _deliver_scheduled_keys()
@@ -173,7 +173,7 @@ class TestTheTestCaseDeliveryDouble(_CascadeFlushMixin, IntentPushResetMixin, Tr
             with transaction.atomic():
                 outbox.enqueue(*key, delete_origin=delete_origin)
             signals._pending_intent_keys().add(key)
-            with patch.object(delivery, "deliver", side_effect=lambda *args, mark: marks.append(mark)):
+            with patch.object(delivery, "send", side_effect=lambda *args, mark, **kwargs: marks.append(mark)):
                 _deliver_scheduled_keys()
 
         assert marks == [False, True]
