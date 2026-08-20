@@ -558,16 +558,7 @@ class TestLoggingLevelsApplyPush(_CascadeFlushMixin, IntentPushResetMixin, Trans
             drain.drain_key(self.device.pk, "logging")
         unforced.assert_not_called()
 
-        real_push_now = drain.push_now
-
-        def prepare_push(device_id, scope, **kwargs):
-            if scope == "logging":
-                return real_push_now(device_id, scope, **kwargs)
-            return {"status": "deployed"}
-
         with isolate_other_scopes("logging") as stack:
-            stack.enter_context(patch("netbox_nso_plugin.drain.push_now", side_effect=prepare_push))
-            stack.enter_context(patch("netbox_nso_plugin.drain.drain_key", return_value=drain.SUCCEEDED))
             mock_put = stack.enter_context(
                 patch("netbox_nso_plugin.adapter_client.put_logging_intent", return_value={})
             )
