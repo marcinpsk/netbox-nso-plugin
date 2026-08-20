@@ -372,6 +372,18 @@ class TestEscalateStuckDeploying(APITestCase):
         row.refresh_from_db()
         self.assertEqual(row.status, "deploying")
 
+    def test_negative_count_does_not_cancel_a_positive_count(self):
+        from netbox_nso_plugin.reconcile import _escalate_stuck_deploying
+
+        mgmt, row = self._setup()
+        job = self._job(minutes_ago=30)
+        job["result"]["vlan_count_by_outcome"] = {"in_sync": 1, "apply_failed": -1}
+
+        _escalate_stuck_deploying(mgmt, job)
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, "apply_failed")
+
     def test_run_device_reconcile_escalates_after_grace(self):
         from netbox_nso_plugin import reconcile
 

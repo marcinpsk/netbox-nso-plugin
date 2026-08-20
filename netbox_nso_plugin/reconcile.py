@@ -1089,9 +1089,9 @@ def _counts_for(result: dict | None, scope: str) -> dict:
 
 
 def _count_of(counts: dict, outcome: str) -> int:
-    """Return one outcome's tally, treating a non-integer as no rows."""
+    """Return one outcome's non-negative integer tally, or zero."""
     count = counts.get(outcome)
-    return count if isinstance(count, int) and not isinstance(count, bool) else 0
+    return count if isinstance(count, int) and not isinstance(count, bool) and count >= 0 else 0
 
 
 def _scope_failure_messages(job: dict | None, scope: str) -> str:

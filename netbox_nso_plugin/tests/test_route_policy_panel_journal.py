@@ -187,6 +187,19 @@ class TestRoutePolicyApplyJournal(_RoutePolicyFixture):
         self.assertEqual(entry.kind, "danger")
         self.assertIn("failed", entry.comments)
 
+    def test_negative_failure_count_does_not_mark_entry_danger(self):
+        from netbox_routing.models import CommunityList
+
+        from netbox_nso_plugin.reconcile import _journal_route_policy_apply
+
+        mgmt = self._make_mgmt()
+        self._owned_reconcile()
+
+        _journal_route_policy_apply(mgmt, _job(8532, in_sync=1, apply_failed=-1))
+
+        entry = self._entries_for("CLJ", CommunityList).first()
+        self.assertEqual(entry.kind, "success")
+
     def test_no_route_policy_scope_records_job_but_writes_nothing(self):
         """An apply that touched no route-policy scope is marked seen but journals nothing."""
         from netbox_routing.models import CommunityList
