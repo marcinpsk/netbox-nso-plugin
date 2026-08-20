@@ -22,6 +22,7 @@ from django.test import TransactionTestCase
 
 from ._outbox_case import (
     ReceiptAdapter,
+    enqueue,
     entries,
     expire_claim,
     make_managed,
@@ -110,6 +111,55 @@ class TestClaimFoldsEveryEntryOnce(_ClaimCase):
         assert entries(self.device, "vlan", unconsumed=True) == []
         left = sorted(len(entries(device, "vlan", unconsumed=True)) for device, _mgmt in others)
         assert left == [0, 1], "the pass claims at most DRAIN_BATCH keys and leaves the rest"
+
+
+class TestCoalescedRoutePolicyClaimPreservesSuccessHook(_ClaimCase):
+    tag = "routepolicyhook"
+    adapter_device_id = 7513
+
+    def test_two_contributions_store_unsupported_members_from_the_claim_response(self):
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import Community, CommunityList, CommunityListEntry
+
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        name = "claim-community"
+        unsupported = "color:0:12."
+        community_list = CommunityList.objects.create(name=name)
+        CommunityListEntry.objects.create(
+            community_list=community_list,
+            action="permit",
+            community=Community.objects.create(community=unsupported),
+        )
+        with suppress_intent_push():
+            state = NSORoutePolicyState.objects.create(
+                management=self.mgmt,
+                family="community_list",
+                object_name=name,
+                content_type=ContentType.objects.get_for_model(CommunityList),
+                object_id=community_list.pk,
+                status="accepted",
+            )
+
+        enqueue(self.device, "route_policy")
+        enqueue(self.device, "route_policy")
+        assert len(entries(self.device, "route_policy", unconsumed=True)) == 2
+
+        claimed = drain.claim(self.device.pk, "route_policy")
+        assert claimed is not None
+        self.adapter._respond = lambda _body: {
+            "objects": [],
+            "unsupported_members": {name: [unsupported]},
+        }
+        config, session = self.adapter.patches()
+        with config, session:
+            response = drain.send_claim(claimed)
+        assert drain.settle(claimed, response) == drain.SUCCEEDED
+
+        state.refresh_from_db()
+        assert state.unsupported_members == [unsupported]
 
 
 class TestDigestEqualClaimRetiresItsRows(_ClaimCase):
