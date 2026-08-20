@@ -369,7 +369,12 @@ class TestADrainErrorCannotStopTheSweep(_SettlementCase):
         assert state.status == "in_sync", "a drain error stopped the settlement clock"
         messages = [record.getMessage() for record in logs.records]
         assert any("outbox drained" in message for message in messages), "the tick lost its summary line"
-        assert any(record.levelname == "ERROR" for record in logs.records), "the drain error was never reported"
+        assert any(
+            record.levelname == "ERROR"
+            and record.exc_info is not None
+            and str(record.exc_info[1]) == "candidates exploded"
+            for record in logs.records
+        ), "the drain error was never reported"
 
     def test_a_failed_compaction_still_summarises_the_outage_tick(self):
         with (
@@ -381,4 +386,9 @@ class TestADrainErrorCannotStopTheSweep(_SettlementCase):
 
         messages = [record.getMessage() for record in logs.records]
         assert any("outbox drained" in message for message in messages), "the tick lost its summary line"
-        assert any(record.levelname == "ERROR" for record in logs.records), "the compaction error was never reported"
+        assert any(
+            record.levelname == "ERROR"
+            and record.exc_info is not None
+            and str(record.exc_info[1]) == "compaction exploded"
+            for record in logs.records
+        ), "the compaction error was never reported"
