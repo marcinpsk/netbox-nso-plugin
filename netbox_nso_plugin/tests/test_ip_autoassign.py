@@ -231,8 +231,33 @@ class TestAutoAssignIP(TestCase):
             _reserve_single(iface, mgmt, "ipv4", pool, result, push=False)
 
         assert result["errors"]
+        assert "Failed to create NSOInterfaceIPState" in result["errors"][0]["reason"]
         assert not IPAddress.objects.filter(assigned_object_id=iface.pk).exists()
         delete.assert_not_called()
+
+    def test_push_schedule_failure_rolls_back_the_reservation(self):
+        from netbox_nso_plugin.ip_autoassign import _reserve_single
+
+        pool = Prefix.objects.get(pk=self.pool_lo4.pk)
+        mgmt = self._make_mgmt()
+        iface = Interface.objects.create(device=self.device, name="Loopback152", type="virtual")
+        result = {"allocated": [], "errors": [], "skipped": []}
+
+        with patch(
+            "netbox_nso_plugin.signals._schedule_intent_push",
+            side_effect=[None, RuntimeError("schedule failed")],
+        ) as schedule:
+            _reserve_single(iface, mgmt, "ipv4", pool, result, push=True)
+
+        self.assertEqual(schedule.call_count, 2)
+        assert result["errors"] == [
+            {
+                "interface": str(iface),
+                "family": "ipv4",
+                "reason": "Failed to schedule the IP intent push: schedule failed",
+            }
+        ]
+        assert not IPAddress.objects.filter(assigned_object_id=iface.pk).exists()
 
     def test_fill_empty_skips_interface_with_managed_ip(self):
         from netbox_nso_plugin.models import NSOInterfaceIPState
