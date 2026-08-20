@@ -435,13 +435,11 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertEqual(self.vlan_state.status, "accepted")
 
     def test_shared_deadline_expiry_mid_selector_loop_promotes_nothing(self):
-        from types import SimpleNamespace
         from unittest.mock import patch
 
         adapter = _ApplyContractAdapter(lambda selected: (202, _promoted(selected)))
-        clock = SimpleNamespace(monotonic=lambda: 121 if adapter.receipts else 0)
 
-        with patch("netbox_nso_plugin.views.time", clock):
+        with patch("netbox_nso_plugin.drain._send_clock", lambda: 121 if adapter.receipts else 0):
             response = self._post(adapter)
 
         self.assertEqual(response.status_code, 409)
@@ -506,13 +504,11 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertEqual(self.vlan_state.status, "accepted")
 
     def test_direct_snapshots_share_the_apply_preparation_deadline(self):
-        from types import SimpleNamespace
         from unittest.mock import patch
 
         adapter = _ApplyContractAdapter(lambda selected: (202, _promoted(selected)))
-        clock = SimpleNamespace(monotonic=lambda: 121 if adapter.direct_requests else 0)
 
-        with patch("netbox_nso_plugin.views.time", clock):
+        with patch("netbox_nso_plugin.drain._send_clock", lambda: 121 if adapter.direct_requests else 0):
             response = self._post(adapter)
 
         self.assertEqual(response.status_code, 409)
