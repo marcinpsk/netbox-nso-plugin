@@ -130,7 +130,7 @@ class TestApplyPromotion(TestCase):
 
         mgmt, _state, _other = self._setup()
         with (
-            patch("time.monotonic", side_effect=count()),
+            patch("netbox_nso_plugin.drain._send_clock", side_effect=count()),
             patch(
                 "netbox_nso_plugin.drain.push_now",
                 side_effect=lambda device_id, scope, **kwargs: {"count": 0} if scope == "static_route" else None,
@@ -152,7 +152,7 @@ class TestApplyPromotion(TestCase):
         # per-scope loop instead of the refusal it pins.
         spent = drain.SEND_DEADLINE.total_seconds() + 1
         with (
-            patch("time.monotonic", side_effect=[0, spent]),
+            patch("netbox_nso_plugin.drain._send_clock", side_effect=[0, spent]),
             patch("netbox_nso_plugin.drain.push_now") as push,
             self.assertRaisesRegex(ApplyRefused, "preparation deadline"),
         ):
