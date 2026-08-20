@@ -51,13 +51,27 @@ def _commit(repo: Path, contents: str, message: str) -> str:
     return _git(repo, "rev-parse", "HEAD")
 
 
+def _workflow_step(workflow: str, name: str, next_name: str) -> str:
+    """Return one workflow step after confirming both boundary names exist."""
+    start_marker = f"- name: {name}"
+    end_marker = f"- name: {next_name}"
+    assert start_marker in workflow, f"the workflow has no {name!r} step"
+    assert end_marker in workflow, f"the workflow has no {next_name!r} step"
+    return workflow[workflow.index(start_marker) : workflow.index(end_marker)]
+
+
 def test_release_refs_use_one_expected_tip_transaction():
     workflow = WORKFLOW.read_text()
-    release_action_start = workflow.index("- name: Release from conventional commits")
-    publish_start = workflow.index("- name: Publish release refs with expected-tip lease")
-    release_action = workflow[release_action_start:publish_start]
-    release_start = workflow.index("- name: Create the GitHub release", publish_start)
-    publish_step = workflow[publish_start:release_start]
+    release_action = _workflow_step(
+        workflow,
+        "Release from conventional commits",
+        "Publish release refs with expected-tip lease",
+    )
+    publish_step = _workflow_step(
+        workflow,
+        "Publish release refs with expected-tip lease",
+        "Create the GitHub release",
+    )
 
     assert "git push --atomic" in publish_step
     assert '--force-with-lease="refs/heads/${RELEASE_REF}:${RELEASE_SHA}"' in publish_step
@@ -76,13 +90,17 @@ def test_the_release_commit_carries_a_regenerated_lock():
     assert config["assets"] == ["uv.lock"]
 
     workflow = WORKFLOW.read_text()
-    release_action_start = workflow.index("- name: Release from conventional commits")
-    publish_start = workflow.index("- name: Publish release refs with expected-tip lease")
-    release_action = workflow[release_action_start:publish_start]
+    release_action = _workflow_step(
+        workflow,
+        "Release from conventional commits",
+        "Publish release refs with expected-tip lease",
+    )
+    install_uv = _workflow_step(workflow, "Install uv", "Establish the existing version baseline")
 
     # The action maps build: false to --skip-build, which silently drops build_command.
     assert "build: true" in release_action
-    assert "astral-sh/setup-uv" in workflow[:release_action_start]
+    assert "astral-sh/setup-uv" in install_uv
+    assert 'version: "0.12.4"' in install_uv
 
 
 def test_uv_lock_records_the_declared_project_version():

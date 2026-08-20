@@ -65,6 +65,8 @@ jobs:
       # semantic-release's build_command is `uv lock`, so uv has to be on PATH here.
       - name: Install uv
         uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d  # v10.0.0
+        with:
+          version: "0.12.4"
 
       # release-please never created a tag in this repository. Establish the
       # version declared immediately before this push as the baseline; otherwise
