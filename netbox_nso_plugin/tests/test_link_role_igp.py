@@ -40,6 +40,7 @@ class TestEnableIgpForRole(IntentPushResetMixin, TestCase):
         cls.dev_b = Device.objects.create(name="lg-b", device_type=dt, role=drole, site=site)
 
     def setUp(self):
+        super().setUp()
         self.mgmt_a = NSODeviceManagement.objects.create(
             device=self.dev_a, nso_instance=self.inst, nso_device_name="lg-a", adapter_device_id=self.dev_a.pk
         )
