@@ -154,11 +154,13 @@ class TestApplyPromotion(TestCase):
         with (
             patch("netbox_nso_plugin.drain._send_clock", side_effect=[0, spent]),
             patch("netbox_nso_plugin.drain.push_now") as push,
+            patch("netbox_nso_plugin.drain.drain_key") as snmp,
             self.assertRaisesRegex(ApplyRefused, "preparation deadline"),
         ):
             _prepare_apply(mgmt)
 
         push.assert_not_called()
+        snmp.assert_not_called()
         state.refresh_from_db()
         other.refresh_from_db()
         assert (state.status, other.status) == ("accepted", "accepted")
