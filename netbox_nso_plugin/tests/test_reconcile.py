@@ -86,11 +86,13 @@ class TestRunDeviceReconcile(APITestCase):
         from netbox_nso_plugin.deployment import quiesce, resume
 
         device = _make_device("rec-quiesced")
-        quiesce()
+        activated = quiesce()
         try:
+            self.assertTrue(activated)
             result = reconcile.run_device_reconcile(device.pk)
         finally:
-            resume()
+            if activated:
+                resume()
 
         self.assertIn("error", result)
         self.assertEqual(result["device_id"], device.pk)
