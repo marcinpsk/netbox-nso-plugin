@@ -64,7 +64,7 @@ def _workflow_step(workflow: str, name: str, next_name: str) -> str:
 
 
 def test_release_refs_use_one_expected_tip_transaction():
-    workflow = WORKFLOW.read_text()
+    workflow = WORKFLOW.read_text(encoding="utf-8")
     release_action = _workflow_step(
         workflow,
         "Release from conventional commits",
@@ -87,7 +87,7 @@ def test_release_refs_use_one_expected_tip_transaction():
 
 
 def test_release_commit_versions_are_validated_before_ref_publish():
-    workflow = yaml.safe_load(WORKFLOW.read_text())
+    workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
     step_ids = [step.get("id") or step["name"] for step in workflow["jobs"]["release"]["steps"]]
 
     assert (
@@ -99,7 +99,7 @@ def test_release_commit_versions_are_validated_before_ref_publish():
 
 def test_the_release_commit_carries_a_regenerated_lock():
     """The lock records this project's own version, so the release commit has to refresh it."""
-    config = tomllib.loads(PYPROJECT.read_text())["tool"]["semantic_release"]
+    config = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["tool"]["semantic_release"]
     build_command = config["build_command"]
     # The PSR action container has no uv, so the command must bootstrap its own.
     assert "set -e" in build_command
@@ -109,7 +109,7 @@ def test_the_release_commit_carries_a_regenerated_lock():
     assert lock_lines == ["uv lock --upgrade-package netbox-nso-plugin"]
     assert config["assets"] == ["uv.lock"]
 
-    workflow = WORKFLOW.read_text()
+    workflow = WORKFLOW.read_text(encoding="utf-8")
     release_action = _workflow_step(
         workflow,
         "Release from conventional commits",
@@ -131,8 +131,8 @@ def test_the_release_commit_carries_a_regenerated_lock():
 
 def test_uv_lock_records_the_declared_project_version():
     """The committed lock must not drift from the version a release would cut."""
-    declared = tomllib.loads(PYPROJECT.read_text())["project"]["version"]
-    assert _locked_version(UV_LOCK.read_text(), "netbox-nso-plugin") == declared
+    declared = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"]["version"]
+    assert _locked_version(UV_LOCK.read_text(encoding="utf-8"), "netbox-nso-plugin") == declared
 
 
 def test_uv_lock_follows_a_version_bump(tmp_path: Path):
@@ -142,18 +142,22 @@ def test_uv_lock_follows_a_version_bump(tmp_path: Path):
     project.write_text(
         '[project]\nname = "demo-pkg"\nversion = "0.2.0"\n'
         'requires-python = ">=3.9"\ndependencies = []\n\n'
-        '[build-system]\nrequires = ["hatchling"]\nbuild-backend = "hatchling.build"\n'
+        '[build-system]\nrequires = ["hatchling"]\nbuild-backend = "hatchling.build"\n',
+        encoding="utf-8",
     )
     _uv_lock(tmp_path)
-    assert _locked_version((tmp_path / "uv.lock").read_text(), "demo-pkg") == "0.2.0"
+    assert _locked_version((tmp_path / "uv.lock").read_text(encoding="utf-8"), "demo-pkg") == "0.2.0"
 
-    project.write_text(project.read_text().replace('version = "0.2.0"', 'version = "0.3.0"'))
-    assert _locked_version((tmp_path / "uv.lock").read_text(), "demo-pkg") == "0.2.0", (
+    project.write_text(
+        project.read_text(encoding="utf-8").replace('version = "0.2.0"', 'version = "0.3.0"'),
+        encoding="utf-8",
+    )
+    assert _locked_version((tmp_path / "uv.lock").read_text(encoding="utf-8"), "demo-pkg") == "0.2.0", (
         "the version bump alone must not touch the lock"
     )
 
     _uv_lock(tmp_path)
-    assert _locked_version((tmp_path / "uv.lock").read_text(), "demo-pkg") == "0.3.0"
+    assert _locked_version((tmp_path / "uv.lock").read_text(encoding="utf-8"), "demo-pkg") == "0.3.0"
 
 
 def test_expected_tip_transaction_rejects_branch_advance_before_tag_push(tmp_path: Path):
