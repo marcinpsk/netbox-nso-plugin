@@ -136,6 +136,7 @@ class AbortableTransport(requests.adapters.HTTPAdapter):
         self._lock = threading.Lock()
         self._live: set = set()
         self._instrumented: set = set()
+        self._aborted = False
         super().__init__(*args, **kwargs)
 
     def get_connection_with_tls_context(self, request, verify, proxies=None, cert=None):
@@ -179,6 +180,13 @@ class AbortableTransport(requests.adapters.HTTPAdapter):
             with self._lock:
                 self._live.add(conn)
                 _checkout_stack().append(conn)
+                fresh = conn not in self._instrumented
+                self._instrumented.add(conn)
+                aborted = self._aborted
+            if fresh:
+                self._instrument_connection(conn)
+            if aborted:
+                self._shutdown(conn)
             return conn
 
         def _put_conn(conn):
@@ -190,21 +198,39 @@ class AbortableTransport(requests.adapters.HTTPAdapter):
         pool._get_conn, pool._put_conn = _get_conn, _put_conn
         return pool
 
+    def _instrument_connection(self, conn) -> None:
+        """Shut down a connection that finishes connecting after this transport was aborted."""
+        connect = conn.connect
+
+        def _connect():
+            result = connect()
+            with self._lock:
+                aborted = self._aborted
+            if aborted:
+                self._shutdown(conn)
+            return result
+
+        conn.connect = _connect
+
+    @staticmethod
+    def _shutdown(conn) -> None:
+        """Shut down *conn* when it has a socket, leaving descriptor ownership with its pool."""
+        sock = conn.sock
+        if sock is None:
+            return
+        try:
+            # Shutdown only. The pool closes its connection after the owning thread returns.
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:  # already gone: the request finished or the far side closed first
+            pass
+
     def abort(self) -> None:
         """Shut down the socket of every request in flight, so its reader comes back."""
         with self._lock:
+            self._aborted = True
             live = list(self._live)
         for conn in live:
-            sock = conn.sock
-            if sock is None:
-                continue
-            try:
-                # Shutdown only. The connection belongs to urllib3's pool, which closes it
-                # on release; closing here frees a descriptor the pool may hand out again
-                # before the owning thread's read returns, misdirecting it to a new socket.
-                sock.shutdown(socket.SHUT_RDWR)
-            except OSError:  # already gone: the request finished or the far side closed first
-                pass
+            self._shutdown(conn)
 
 
 def new_session(transport=None):

@@ -247,6 +247,45 @@ class TestTheExpiredDeadlineAbortsTheRequest(_DripCase):
     tag = "abort"
     adapter_device_id = 7812
 
+    def test_a_deadline_during_connect_ends_the_sender_after_one_abort(self):
+        from urllib3.connection import HTTPConnection
+
+        from netbox_nso_plugin import adapter_client, drain
+
+        own_vlan(self.mgmt, 882, self.tag)
+        original_new_conn = HTTPConnection._new_conn
+        original_abort = adapter_client.AbortableTransport.abort
+        socket_obtained = threading.Event()
+        release_connect = threading.Event()
+        aborts = []
+
+        def paused_new_conn(connection):
+            sock = original_new_conn(connection)
+            socket_obtained.set()
+            assert release_connect.wait(15), "the deadline never released the paused connect"
+            return sock
+
+        def counted_abort(transport):
+            assert socket_obtained.is_set(), "the deadline expired before the socket existed"
+            assert not release_connect.is_set(), "connect returned before the deadline abort"
+            aborts.append(transport)
+            try:
+                original_abort(transport)
+            finally:
+                release_connect.set()
+
+        running = _senders()
+        with (
+            patch.object(HTTPConnection, "_new_conn", paused_new_conn),
+            patch.object(adapter_client.AbortableTransport, "abort", counted_abort),
+            patch.object(drain, "SEND_DEADLINE", datetime.timedelta(seconds=1)),
+            self.pointed_at_the_drip(),
+        ):
+            assert drain.drain_key(self.device.pk, "vlan") == drain.FAILED
+            assert _senders_ended(running, 15), "the sender survived the only deadline abort"
+
+        assert len(aborts) == 1, "the sender needed a second abort to observe the late socket"
+
     def test_the_sender_ends_and_the_far_side_loses_the_socket(self):
         from netbox_nso_plugin import drain
 
