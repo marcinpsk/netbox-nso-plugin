@@ -266,10 +266,11 @@ class TestTheExpiredDeadlineAbortsTheRequest(_DripCase):
             return sock
 
         def counted_abort(transport):
-            assert socket_obtained.is_set(), "the deadline expired before the socket existed"
-            assert not release_connect.is_set(), "connect returned before the deadline abort"
-            aborts.append(transport)
+            # Always release the paused connect, or a failure here strands the sender.
             try:
+                assert socket_obtained.wait(15), "the sender never reached its connect"
+                assert not release_connect.is_set(), "connect returned before the deadline abort"
+                aborts.append(transport)
                 original_abort(transport)
             finally:
                 release_connect.set()
