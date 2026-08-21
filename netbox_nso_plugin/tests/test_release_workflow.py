@@ -109,24 +109,29 @@ def test_the_release_commit_carries_a_regenerated_lock():
     assert lock_lines == ["uv lock --upgrade-package netbox-nso-plugin"]
     assert config["assets"] == ["uv.lock"]
 
-    workflow = WORKFLOW.read_text(encoding="utf-8")
+    workflow_text = WORKFLOW.read_text(encoding="utf-8")
+    workflow = yaml.safe_load(workflow_text)
     release_action = _workflow_step(
-        workflow,
+        workflow_text,
         "Release from conventional commits",
         "Publish release refs with expected-tip lease",
     )
-    install_uv = _workflow_step(workflow, "Install uv", "Establish the existing version baseline")
+    setup_uv_versions = {}
+    for job_name in ("release", "build"):
+        [setup_uv] = [
+            step
+            for step in workflow["jobs"][job_name]["steps"]
+            if step.get("uses", "").startswith("astral-sh/setup-uv@")
+        ]
+        setup_uv_versions[job_name] = setup_uv.get("with", {}).get("version")
 
     # The action maps build: false to --skip-build, which silently drops build_command.
     assert "build: true" in release_action
-    assert "astral-sh/setup-uv" in install_uv
-    assert 'version: "0.12.4"' in install_uv
     bootstrap_uv = re.search(r"pip install 'uv (?P<operator>==|~=) (?P<version>[^']+)'", build_command)
-    workflow_uv = re.search(r'^\s*version: "(?P<version>[^"]+)"$', install_uv, re.MULTILINE)
     assert bootstrap_uv is not None, "the release build does not pin its bootstrapped uv"
-    assert workflow_uv is not None, "the release workflow does not pin setup-uv"
     assert bootstrap_uv.group("operator") == "=="
-    assert bootstrap_uv.group("version") == workflow_uv.group("version")
+    expected_version = bootstrap_uv.group("version")
+    assert setup_uv_versions == {"release": expected_version, "build": expected_version}
 
 
 def test_uv_lock_records_the_declared_project_version():
