@@ -134,6 +134,23 @@ class TestPushLacpIntentForDevice(_LacpBase):
 
         assert "lacp" in (NSODeviceManagement.objects.get(pk=mgmt.pk).intent_push_errors or {})
 
+    def test_an_adapter_error_is_recorded_with_its_code_and_propagates(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        mgmt = self._make_mgmt()
+        self._bundle(mgmt, status="accepted")
+        error = AdapterError("rejected", code="validation_error")
+
+        with patch("netbox_nso_plugin.adapter_client.apply_lag_config", side_effect=error):
+            with self.assertRaises(AdapterError) as raised:
+                deliver("lacp", self.device.pk, mgmt.adapter_device_id)
+
+        assert raised.exception is error
+        errors = NSODeviceManagement.objects.get(pk=mgmt.pk).intent_push_errors or {}
+        assert errors["lacp"]["code"] == "validation_error"
+
 
 class TestOnLacpStateSave(_LacpBase):
     def test_save_triggers_intent_push_in_auto_apply(self):

@@ -98,6 +98,23 @@ class TestPushL2SapIntentForDevice(IntentPushResetMixin, TestCase):
 
         assert "l2_sap" in (NSODeviceManagement.objects.get(pk=mgmt.pk).intent_push_errors or {})
 
+    def test_an_adapter_error_is_recorded_with_its_code_and_propagates(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        mgmt = self._make_mgmt()
+        self._make_state(mgmt, status="accepted")
+        error = AdapterError("rejected", code="validation_error")
+
+        with patch("netbox_nso_plugin.adapter_client.put_l2_sap_intent", side_effect=error):
+            with self.assertRaises(AdapterError) as raised:
+                deliver("l2_sap", self.device.pk, mgmt.adapter_device_id)
+
+        assert raised.exception is error
+        errors = NSODeviceManagement.objects.get(pk=mgmt.pk).intent_push_errors or {}
+        assert errors["l2_sap"]["code"] == "validation_error"
+
 
 class TestOnL2SapStateSave(IntentPushDeliveryMixin, TestCase):
     """Tests for _on_l2_sap_state_save signal handler."""
