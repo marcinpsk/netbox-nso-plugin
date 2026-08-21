@@ -165,7 +165,7 @@ def isolate_other_scopes(*under_test: str):
     def push_now(device_id, scope, **kwargs):
         if scope in under_test:
             return real_push_now(device_id, scope, **kwargs)
-        return {"status": "deployed"}
+        return {"status": "deployed", "count": 0}
 
     def drain_key(device_id, scope, **kwargs):
         if scope in under_test:

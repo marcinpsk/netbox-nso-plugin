@@ -100,6 +100,17 @@ class TestApplyPromotion(TestCase):
         assert state.status == "deploying"
         assert other.status == "deploying"
 
+    def test_isolated_scopes_promote_an_accepted_static_route(self):
+        from netbox_nso_plugin.views import _prepare_apply
+
+        mgmt, state, _other = self._setup()
+
+        with isolate_other_scopes():
+            _prepare_apply(mgmt)
+
+        state.refresh_from_db()
+        assert state.status == "deploying", "the settled isolated scope skipped static-route promotion"
+
     def test_a_refused_snmp_refresh_stops_the_apply_before_any_promotion(self):
         """codex O1 r4 F2: an Apply against a stale SNMP store re-applies what was deleted.
 
