@@ -553,6 +553,40 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         assert row.intent_generation == edited["generation"], "the restore clobbered a concurrent operator edit"
         assert results[0]["armed_rolled_back"] == 0, "a row that moved is left alone, and reported as left alone"
 
+    def test_a_concurrent_status_change_during_the_push_survives_the_restore(self):
+        """A status writer at the armed generation wins over an unacknowledged rollback."""
+        from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet
+        from netbox_nso_plugin.intent_generation import UNALLOCATED
+        from netbox_nso_plugin.models import NSOStaticRouteState
+
+        _, mgmt = self._managed_device("concurrent-status", 8109)
+        deploying = self._own_route(mgmt, "10.82.0.0/16", "10.0.0.83")
+        in_sync = self._own_route(mgmt, "10.83.0.0/16", "10.0.0.84")
+        armed_generations: dict[int, int] = {}
+
+        def _change_statuses_then_refuse(adapter_device_id, routes):
+            armed_generations.update(
+                NSOStaticRouteState.objects.filter(pk__in=(deploying.pk, in_sync.pk)).values_list(
+                    "pk", "intent_generation"
+                )
+            )
+            NSOStaticRouteState.objects.filter(pk=deploying.pk).update(status="deploying")
+            NSOStaticRouteState.objects.filter(pk=in_sync.pk).update(status="in_sync")
+
+        with patch(
+            "netbox_nso_plugin.adapter_client.put_static_route_intent",
+            side_effect=_change_statuses_then_refuse,
+        ):
+            results = resync_static_route_intent_fleet()
+
+        for row, status in ((deploying, "deploying"), (in_sync, "in_sync")):
+            row.refresh_from_db()
+            assert row.status == status
+            assert row.intent_generation == armed_generations[row.pk]
+            assert row.intent_generation > UNALLOCATED
+        assert results[0]["ok"] is False
+        assert results[0]["armed_rolled_back"] == 0
+
     def test_backfill_demotes_deploying_and_leaves_other_statuses(self):
         """S6.2 — a row already ``deploying`` cannot wait on a generation it has just replaced."""
         from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet
