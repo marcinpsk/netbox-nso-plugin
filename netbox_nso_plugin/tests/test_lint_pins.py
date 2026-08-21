@@ -65,6 +65,7 @@ def test_every_ruff_pin_names_one_version():
 
 
 def _workflow_zizmor_version() -> str:
+    # Executed references must pin literally; interpolated or indirect forms fail loudly by design.
     workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
     references = []
     for job in workflow["jobs"].values():
