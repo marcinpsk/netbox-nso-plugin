@@ -129,17 +129,23 @@ class TestApplyPromotion(TestCase):
         from netbox_nso_plugin.views import _prepare_apply
 
         mgmt, _state, _other = self._setup()
+        deadlines = []
+
+        def _push_now(device_id, scope, **kwargs):
+            deadlines.append(kwargs["deadline"])
+            return {"count": 0} if scope == "static_route" else None
+
+        def _drain_key(device_id, scope, **kwargs):
+            deadlines.append(kwargs["deadline"])
+            return drain.SUCCEEDED
+
         with (
             patch("netbox_nso_plugin.drain._send_clock", side_effect=count()),
-            patch(
-                "netbox_nso_plugin.drain.push_now",
-                side_effect=lambda device_id, scope, **kwargs: {"count": 0} if scope == "static_route" else None,
-            ) as push,
-            patch("netbox_nso_plugin.drain.drain_key", return_value=drain.SUCCEEDED) as snmp,
+            patch("netbox_nso_plugin.drain.push_now", side_effect=_push_now),
+            patch("netbox_nso_plugin.drain.drain_key", side_effect=_drain_key),
         ):
             _prepare_apply(mgmt)
 
-        deadlines = [call.kwargs["deadline"] for call in [*push.call_args_list, *snmp.call_args_list]]
         assert len(deadlines) == 13
         assert all(later < earlier for earlier, later in zip(deadlines, deadlines[1:]))
 
