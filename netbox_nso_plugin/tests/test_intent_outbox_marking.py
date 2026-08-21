@@ -233,17 +233,17 @@ class TestALateEntryNeverAbandonsTheClaim(_MarkCase):
 
         worker = threading.Thread(target=lambda: in_thread(late_writer))
         worker.start()
+        self.addCleanup(worker.join, 30)
+        self.addCleanup(release.set)
         assert started.wait(timeout=30), errors
 
         with without_commit_drain(), transaction.atomic():
             self.mgmt.static_route_states.get(static_route=route).save()
         with as_per_object("static_route"):
-            try:
-                claimed = drain.claim(self.device.pk, "static_route")
-                assert claimed is not None
-            finally:
-                release.set()
-                worker.join(timeout=30)
+            claimed = drain.claim(self.device.pk, "static_route")
+            assert claimed is not None
+            release.set()
+            worker.join(timeout=30)
             assert not worker.is_alive(), "the writer did not finish"
             assert errors == []
 
