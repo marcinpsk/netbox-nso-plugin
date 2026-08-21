@@ -12,6 +12,9 @@ import re
 import tomllib
 from pathlib import Path
 
+import pytest
+import yaml
+
 ROOT = Path(__file__).parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "lint-format.yaml"
 PRE_COMMIT = ROOT / ".pre-commit-config.yaml"
@@ -62,10 +65,43 @@ def test_every_ruff_pin_names_one_version():
 
 
 def _workflow_zizmor_version() -> str:
-    found = re.findall(r"zizmor==([0-9][^\s\"']*)", WORKFLOW.read_text(encoding="utf-8"))
-    assert found, "the lint workflow installs an unpinned zizmor"
-    assert len(set(found)) == 1, f"the lint workflow installs different zizmor versions: {found}"
-    return found[0]
+    workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    references = []
+    for job in workflow["jobs"].values():
+        for step in job.get("steps", []):
+            executed_values = [step.get("run"), step.get("uses"), *step.get("with", {}).values()]
+            references.extend(
+                match
+                for value in executed_values
+                if isinstance(value, str)
+                for match in re.finditer(r"(?<![\w-])zizmor(?:==([0-9][^\s\"']*))?(?![\w-])", value)
+            )
+
+    assert references, "the lint workflow does not install or run zizmor"
+    unpinned = [match.string for match in references if match.group(1) is None]
+    assert not unpinned, f"the lint workflow has an unpinned zizmor reference: {unpinned}"
+    versions = [match.group(1) for match in references]
+    assert len(set(versions)) == 1, f"the lint workflow installs different zizmor versions: {versions}"
+    return versions[0]
+
+
+def test_workflow_zizmor_pin_must_be_executed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    workflow = tmp_path / "lint-format.yaml"
+    workflow.write_text(
+        """
+jobs:
+  lint:
+    env:
+      UNUSED_PIN: zizmor==1.29.0
+    steps:
+      - run: uv pip install zizmor
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("netbox_nso_plugin.tests.test_lint_pins.WORKFLOW", workflow)
+
+    with pytest.raises(AssertionError, match="unpinned zizmor"):
+        _workflow_zizmor_version()
 
 
 def _pre_commit_zizmor_version() -> str:
