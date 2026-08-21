@@ -137,6 +137,27 @@ class TestDeliverySuccessHooks(IntentPushResetMixin, TestCase):
 
         assert sent == []
 
+    def test_a_backfill_only_deletion_is_rejected_before_the_send(self):
+        from netbox_nso_plugin import delivery
+
+        device, _mgmt = _fixture("backfill-mark", 7307)
+        sent = []
+        rendered = delivery.Rendered(
+            key=(device.pk, "vlan"),
+            payload=[],
+            do_push=lambda body: sent.append(body),
+        )
+
+        with self.assertRaisesRegex(ValueError, "a backfill-only request carries no authority"):
+            delivery.send(
+                rendered,
+                rendered.payload,
+                mode=delivery.MODE_BACKFILL_ONLY,
+                mark=True,
+            )
+
+        assert sent == []
+
     def test_receipt_adapter_device_failure_uses_the_client_transport_exception(self):
         from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.delivery import deliver

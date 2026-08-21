@@ -253,6 +253,8 @@ def send(
 
     if mode not in _MODES:
         raise ValueError(f"unknown delivery mode {mode!r}")
+    if mark and mode == MODE_BACKFILL_ONLY:
+        raise ValueError("a backfill-only request carries no authority, so it cannot mark a deletion")
     entry = delivery_keys()[rendered.key[1]]
     if deadline is not None:
         rendered = dataclasses.replace(rendered, do_push=_under_deadline(rendered.do_push, deadline))
