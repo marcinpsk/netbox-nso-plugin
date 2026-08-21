@@ -28,7 +28,7 @@ def _make_device(tag="m34"):
     return Device.objects.create(name=f"vlan-router-{tag}", device_type=dt, role=role, site=site)
 
 
-class TestVlanReconciler(TestCase):
+class TestVlanReconciler(IntentPushResetMixin, TestCase):
     @classmethod
     def setUpTestData(cls):
         cls.device = _make_device()
