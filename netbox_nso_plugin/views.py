@@ -2865,13 +2865,8 @@ def _promoted_stream_coverage(generations, expected_selected, skipped):
 class NSODeviceActionView(NSOActionPermissionMixin, View):
     """Trigger an adapter action (sync / detect-drift / connect) via POST."""
 
-    def _incumbent_job(self, request, mgmt, exc, *, is_ajax):
-        """Report a 409 under the name of the job that HOLDS the device (S5a C, codex R1-F7).
-
-        Without the incumbent's type the UI polls the running job under the CLICKED action's
-        label ("Sync from NSO running…" while an Apply runs). Best-effort: a failed lookup
-        degrades to the generic wording rather than losing the conflict.
-        """
+    def _incumbent_job(self, request, mgmt, exc, *, action, is_ajax):
+        """Report the job that caused the admission conflict with truthful queue wording."""
         from . import adapter_client as client
 
         detail = exc.detail if isinstance(exc.detail, dict) else {}
@@ -2882,17 +2877,19 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
                 incumbent_type = (client.get_job(job_id) or {}).get("type")
             except AdapterError:
                 incumbent_type = None
-        if is_ajax:
-            # 409, not 200: the action did not happen, and a poller that reads only the
-            # status line must not record this as a started job.
-            return JsonResponse({"status": "conflict", "job_id": job_id, "job_type": incumbent_type}, status=409)
+        incumbent_state = "queued or running" if action == "apply" else "queued"
         msg = (
-            f"Another job is already running: {incumbent_type}."
+            f"Another job is already {incumbent_state}: {incumbent_type}."
             if incumbent_type
-            else "A job is already running for this device."
+            else f"A job is already {incumbent_state} for this device."
         )
         if job_id:
             msg += f" (Job ID: {job_id})"
+        if is_ajax:
+            return JsonResponse(
+                {"status": "conflict", "message": msg, "job_id": job_id, "job_type": incumbent_type},
+                status=409,
+            )
         messages.warning(request, msg)
         return redirect(_device_nso_tab_url(mgmt.device.pk))
 
@@ -2985,7 +2982,7 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
         if prepared is not None:
             _rollback_prepare_apply(prepared)
         if exc.code == "conflict":
-            return self._incumbent_job(request, mgmt, exc, is_ajax=is_ajax)
+            return self._incumbent_job(request, mgmt, exc, action=action, is_ajax=is_ajax)
         if action == "apply" and exc.code == "apply_unexecutable":
             detail = exc.detail if isinstance(exc.detail, dict) else {}
             msg = _stream_reason_message(
