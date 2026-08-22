@@ -1031,10 +1031,12 @@ def list_device_generations(adapter_device_id, *, since_seq=None):
         if not isinstance(page, list) or any(not isinstance(row, dict) for row in page):
             raise AdapterError("Adapter returned a malformed generations listing.", code="invalid_response")
         for row in page:
+            generation_id = row.get("generation_id")
             seq = row.get("seq")
             settlement_cohort = row.get("settlement_cohort")
             if (
-                type(seq) is not int
+                type(generation_id) is not int
+                or type(seq) is not int
                 or (last_seq is not None and seq <= last_seq)
                 or (settlement_cohort is not None and type(settlement_cohort) is not int)
             ):
