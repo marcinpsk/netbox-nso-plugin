@@ -1036,6 +1036,7 @@ def list_device_generations(adapter_device_id, *, since_seq=None):
             settlement_cohort = row.get("settlement_cohort")
             if (
                 type(generation_id) is not int
+                or generation_id <= 0
                 or type(seq) is not int
                 or (last_seq is not None and seq <= last_seq)
                 or (settlement_cohort is not None and type(settlement_cohort) is not int)

@@ -785,6 +785,8 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
             [{"seq": 1}],
             [{"generation_id": "1", "seq": 1}],
             [{"generation_id": True, "seq": 1}],
+            [{"generation_id": 0, "seq": 1}],
+            [{"generation_id": -1, "seq": 1}],
             [{"generation_id": 1, "seq": True}],
             [{"generation_id": 1, "seq": "1"}],
             [{"generation_id": 2, "seq": 2}, {"generation_id": 1, "seq": 1}],
