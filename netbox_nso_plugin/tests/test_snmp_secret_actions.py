@@ -397,7 +397,7 @@ class TestV3PushDerivation(_SecretBase):
         from netbox_nso_plugin.models import NSOSnmpHostState, NSOSnmpV3UserState
         from netbox_nso_plugin.signals import reset_intent_push_state
 
-        mgmt = self._make_mgmt()
+        mgmt = self._make_mgmt(adapter_device_id=4203)
         NSOSnmpV3UserState.objects.create(
             management=mgmt,
             username="monitor",
@@ -421,8 +421,9 @@ class TestV3PushDerivation(_SecretBase):
         )
         reset_intent_push_state()
         with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
-            deliver("snmp", self.device.pk, 42)
+            deliver("snmp", self.device.pk, mgmt.adapter_device_id)
         mock_put.assert_called_once()
+        self.assertEqual(mock_put.call_args.args[0], mgmt.adapter_device_id)
         _, communities, v3_users, hosts, _ = mock_put.call_args[0]
         self.assertEqual(
             v3_users,
