@@ -587,6 +587,38 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         assert results[0]["ok"] is False
         assert results[0]["armed_rolled_back"] == 0
 
+    def test_partial_restore_reports_the_row_left_armed(self):
+        """A compare-and-set miss stays in the failed result's armed subset."""
+        from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet
+        from netbox_nso_plugin.intent_generation import UNALLOCATED
+        from netbox_nso_plugin.models import NSOStaticRouteState
+
+        _, mgmt = self._managed_device("partial-restore", 8110)
+        restored = self._own_route(mgmt, "10.84.0.0/16", "10.0.0.85")
+        moved = self._own_route(mgmt, "10.85.0.0/16", "10.0.0.86")
+        armed_generation: dict[str, int] = {}
+
+        def _move_one_then_refuse(adapter_device_id, routes):
+            armed_generation["moved"] = NSOStaticRouteState.objects.values_list("intent_generation", flat=True).get(
+                pk=moved.pk
+            )
+            NSOStaticRouteState.objects.filter(pk=moved.pk).update(status="in_sync")
+
+        with patch(
+            "netbox_nso_plugin.adapter_client.put_static_route_intent",
+            side_effect=_move_one_then_refuse,
+        ):
+            results = resync_static_route_intent_fleet()
+
+        restored.refresh_from_db()
+        moved.refresh_from_db()
+        assert restored.intent_generation == UNALLOCATED
+        assert moved.intent_generation == armed_generation["moved"]
+        assert moved.status == "in_sync"
+        assert results[0]["ok"] is False
+        assert results[0]["armed"] == 1
+        assert results[0]["armed_rolled_back"] == 1
+
     def test_backfill_demotes_deploying_and_leaves_other_statuses(self):
         """S6.2 — a row already ``deploying`` cannot wait on a generation it has just replaced."""
         from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet

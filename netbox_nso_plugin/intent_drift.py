@@ -358,7 +358,7 @@ def _backfill_static_route_generations(mgmt) -> list[dict]:
     return before
 
 
-def _safe_restore(before: list[dict], device_id: int) -> int:
+def _safe_restore(before: list[dict], device_id: int) -> tuple[int, list[dict]]:
     """Restore *before*, reporting a failure rather than raising it.
 
     The rollback runs inside the handlers that keep one device's failure local, and a raise
@@ -366,11 +366,19 @@ def _safe_restore(before: list[dict], device_id: int) -> int:
     the containment itself abort the pass, stranding every later device unattempted and
     unreported. The rows it could not restore stay armed and a later run retries them.
     """
-    try:
-        return _restore_static_route_generations(before)
-    except Exception:  # noqa: BLE001 — the pass must outlive one device's rollback
-        logger.exception("Static-route generation rollback failed for device %s", device_id)
-        return 0
+    restored = 0
+    unrestored: list[dict] = []
+    for index, snapshot in enumerate(before):
+        try:
+            restored_now = _restore_static_route_generations([snapshot])
+        except Exception:  # noqa: BLE001 — the pass must outlive one device's rollback
+            logger.exception("Static-route generation rollback failed for device %s", device_id)
+            unrestored.extend(before[index:])
+            break
+        restored += restored_now
+        if not restored_now:
+            unrestored.append(snapshot)
+    return restored, unrestored
 
 
 def _restore_static_route_generations(before: list[dict]) -> int:
@@ -455,14 +463,14 @@ def resync_static_route_intent_fleet(device_ids: list[int] | None = None) -> lis
                 raise _PushNotAcknowledged
         except _PushNotAcknowledged:
             logger.warning("Static-route intent re-sync was not acknowledged for device %s", mgmt.device_id)
-            rolled_back, count = _safe_restore(armed_rows, mgmt.device_id), None
-            armed_rows = []
+            rolled_back, armed_rows = _safe_restore(armed_rows, mgmt.device_id)
+            count = None
         # Not an adapter rejection (the claim records those and answers None), so letting it
         # out would strand every later device unattempted and unreported.
         except Exception:  # noqa: BLE001
             logger.exception("Static-route intent re-sync raised for device %s", mgmt.device_id)
-            rolled_back, count = _safe_restore(armed_rows, mgmt.device_id), None
-            armed_rows = []
+            rolled_back, armed_rows = _safe_restore(armed_rows, mgmt.device_id)
+            count = None
         results.append(
             {
                 "device_id": mgmt.device_id,
