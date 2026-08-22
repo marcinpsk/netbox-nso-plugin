@@ -329,7 +329,7 @@ class TestVerifyAndHarvestViews(_SecretBase):
         self.assertFalse(row.vault_has_priv)
 
     def test_harvest_derives_ref_and_stores_result(self):
-        mgmt = self._make_mgmt()
+        mgmt = self._make_mgmt(adapter_device_id=4202)
         row = self._community(mgmt)
         expected_ref = f"network/netbox/snmp/community/{row.community_hash}#community"
         session = make_session(
@@ -352,7 +352,10 @@ class TestVerifyAndHarvestViews(_SecretBase):
         self.assertEqual(row.vault_ref, expected_ref)
         self.assertEqual(row.vault_secret_hash, row.community_hash)
         method, url = session.request.call_args[0][:2]
-        self.assertEqual((method, url), ("POST", "http://adapter.local/api/v1/devices/42/secrets/harvest-community"))
+        self.assertEqual(
+            (method, url),
+            ("POST", f"http://adapter.local/api/v1/devices/{mgmt.adapter_device_id}/secrets/harvest-community"),
+        )
 
     def test_harvest_without_adapter_link_errors_cleanly(self):
         mgmt = self._make_mgmt(adapter_device_id=None)
