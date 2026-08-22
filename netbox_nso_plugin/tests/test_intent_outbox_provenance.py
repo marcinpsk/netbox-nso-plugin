@@ -7,7 +7,7 @@ survives: pins O1.2 (a whole-transaction rollback leaves nothing) and O1.3 (a ne
 savepoint rollback leaves the outer deletion's provenance and only that). O1.15 keeps
 reconcile and render writes out of the outbox altogether, O1.4 keeps an unmigrated
 ``query_flag`` scope's marking intact, O1.20 records a deleted route id in both marking
-modes, and O1.18 proves the enqueue takes no shared lock.
+modes, and O1.18 proves concurrent appends remain compatible under the shared deployment lock.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.db import connection, transaction
 from django.test import RequestFactory, TestCase, TransactionTestCase
 
-from ._outbox_case import without_commit_drain
+from ._outbox_case import marking_mode, without_commit_drain
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 PUT_STATIC = "netbox_nso_plugin.adapter_client.put_static_route_intent"
@@ -284,32 +284,27 @@ class TestOutboxMarkingModes(_CascadeFlushMixin, IntentPushResetMixin, Transacti
 
     def test_a_deleted_route_id_is_recorded_in_both_marking_modes(self):
         """O1.20 — an O3→O1 rollback must strand no authority, so O1 records the id already."""
-        import dataclasses
-
         from netbox_nso_plugin.delivery import MARKING_PER_OBJECT, MARKING_QUERY_FLAG, delivery_keys
         from netbox_nso_plugin.models import NSOIntentOutboxEntry
 
         registry = delivery_keys()
-        assert registry["static_route"].marking_mode == MARKING_QUERY_FLAG
-        original = registry["static_route"]
+        assert registry["static_route"].marking_mode == MARKING_PER_OBJECT
         prefixes = {MARKING_QUERY_FLAG: "203.0.113.64/28", MARKING_PER_OBJECT: "203.0.113.96/28"}
         for mode, prefix in prefixes.items():
             NSOIntentOutboxEntry.objects.all().delete()
             route = _own_route(self.mgmt, prefix, "203.0.113.4")
             NSOIntentOutboxEntry.objects.all().delete()
 
-            registry["static_route"] = dataclasses.replace(original, marking_mode=mode)
-            try:
+            with marking_mode("static_route", mode):
                 with without_commit_drain():
                     route.devices.remove(self.device)
-            finally:
-                registry["static_route"] = original
 
             recorded = [t for t in _transitions(self.device, "static_route") if t["op"] == "delete"]
             assert [(t["op"], t["route_id"]) for t in recorded] == [("delete", route.pk)], f"{mode}: {recorded}"
 
     def test_only_the_emission_is_mode_gated(self):
-        """O1.20 — while the scope is ``query_flag`` the wire still carries the query flag."""
+        """O1.20: a query-flag configuration still emits only the legacy query flag."""
+        from netbox_nso_plugin.delivery import MARKING_QUERY_FLAG
         from netbox_nso_plugin.models import NSOIntentOutboxEntry
 
         route = _own_route(self.mgmt, "203.0.113.128/28", "203.0.113.5")
@@ -317,13 +312,14 @@ class TestOutboxMarkingModes(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         # deletion's flag, so it is the only contributor left.
         NSOIntentOutboxEntry.objects.all().delete()
 
-        params = self._recorded_params(lambda: route.devices.remove(self.device))
+        with marking_mode("static_route", MARKING_QUERY_FLAG):
+            params = self._recorded_params(lambda: route.devices.remove(self.device))
 
         assert any(p.get("delete_origin") == "true" for p in params), f"saw {params}"
 
 
-class TestOutboxEnqueueTakesNoSharedLock(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
-    """O1.18 — two transactions appending two keys in opposite orders cannot deadlock."""
+class TestOutboxEnqueueSharedLockCompatibility(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    """O1.18 — the shared deployment lock keeps opposite key orders compatible."""
 
     def test_opposite_key_orders_both_commit(self):
         from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentOutboxState

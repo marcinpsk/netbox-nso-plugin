@@ -23,6 +23,8 @@ from __future__ import annotations
 import logging
 import re
 
+from .deployment import guarded as _deployment_guarded
+
 logger = logging.getLogger(__name__)
 
 
@@ -185,6 +187,7 @@ def _default_authgroup() -> str:
     return "network"
 
 
+@_deployment_guarded("provisioning")
 def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", sync=True) -> dict:
     """Onboard one NetBox device into NSO (the write action).
 
@@ -330,6 +333,7 @@ def _summarize_provision_failure(steps) -> str:
     return "Provisioning failed."
 
 
+@_deployment_guarded("provisioning")
 def advance_provisioning(mgmt) -> dict:
     """Poll a provisioning row's adapter job and advance it. Idempotent + best-effort.
 

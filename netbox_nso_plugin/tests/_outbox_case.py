@@ -202,21 +202,30 @@ def last_acked(mgmt, route):
 
 
 @contextlib.contextmanager
+def marking_mode(scope, mode):
+    """Temporarily set one delivery key's marking mode and restore it afterward."""
+    from netbox_nso_plugin import delivery
+
+    registry = delivery.delivery_keys()
+    original = registry[scope]
+    registry[scope] = dataclasses.replace(original, marking_mode=mode)
+    try:
+        yield
+    finally:
+        registry[scope] = original
+
+
+@contextlib.contextmanager
 def as_per_object(scope):
     """Run the block with *scope* in ``per_object`` marking mode, which O3 makes permanent.
 
     O1.20 records the ids in both modes and gates only emission on the mode, so a pin over
     the per-object acknowledgement can flip the registry entry and change nothing else.
     """
-    from netbox_nso_plugin import delivery
+    from netbox_nso_plugin.delivery import MARKING_PER_OBJECT
 
-    registry = delivery.delivery_keys()
-    original = registry[scope]
-    registry[scope] = dataclasses.replace(original, marking_mode=delivery.MARKING_PER_OBJECT)
-    try:
+    with marking_mode(scope, MARKING_PER_OBJECT):
         yield
-    finally:
-        registry[scope] = original
 
 
 _DEVICE_IN_URL = re.compile(r"/devices/(\d+)/")
@@ -231,7 +240,12 @@ def _body_members(body) -> set:
     so the wrapper is walked rather than named: the pin is about membership, not spelling.
     """
     if isinstance(body, dict):
-        entries_ = [entry for value in body.values() if isinstance(value, list) for entry in value]
+        entries_ = [
+            entry
+            for name, value in body.items()
+            if name != "deleted_routes" and isinstance(value, list)
+            for entry in value
+        ]
     else:
         entries_ = list(body or [])
     members = set()
@@ -264,6 +278,9 @@ class ReceiptAdapter:
 
     def __init__(self, respond=None):
         self.receipts: dict[str, dict] = {}
+        self.receipt_reads: list[dict] = []
+        self.global_max_route_id: int | None = None
+        self.include_global_max_route_id = True
         self.applied: list[tuple[str, object]] = []
         self.requests: list[dict] = []
         self.replays = 0
@@ -273,8 +290,23 @@ class ReceiptAdapter:
         #: Per adapter device id: what the device carries, and what it no longer owns.
         self.on_device: dict[int, set] = {}
         self.detached: dict[int, set] = {}
+        #: The jobs one full-replace would execute, in request order. Each names the
+        #: per-object marking that decides retract versus detach.
+        self.jobs: list[dict] = []
         self._owned: dict[int, set] = {}
-        self._respond = respond or (lambda body: {"count": len(next(iter(body.values()), []) or [])})
+        self._respond = respond or self._default_response
+
+    @staticmethod
+    def _default_response(body):
+        """Answer static routes in the landed adapter shape and other scopes by count."""
+        if isinstance(body, dict) and "deleted_routes" in body:
+            return {
+                **partition(executed=[record["route_id"] for record in body["deleted_routes"]]),
+                "count": len(body.get("routes") or []),
+                "routes": [],
+            }
+        values = next(iter(body.values()), []) if isinstance(body, dict) else body
+        return {"count": len(values or [])}
 
     @property
     def sequences(self) -> list[int | None]:
@@ -293,7 +325,19 @@ class ReceiptAdapter:
         if params.get("store_only") == "true":
             self._owned[device_id] = members
             return
-        if params.get("delete_origin") == "true":
+        if params.get("backfill_only") == "true":
+            return
+        deleted_routes = body.get("deleted_routes") if isinstance(body, dict) else None
+        if deleted_routes is not None:
+            marked = {("route_id", int(record["route_id"])) for record in deleted_routes}
+            for member in sorted(dropped):
+                marking = "delete_origin" if member in marked else "detach"
+                self.jobs.append({"device_id": device_id, "member": member, "marking": marking})
+                if marking == "delete_origin":
+                    on_device.discard(member)
+                elif member in on_device:
+                    detached.add(member)
+        elif params.get("delete_origin") == "true":
             on_device -= dropped  # authorized retraction: the object leaves the device
         else:
             detached |= dropped & on_device  # an unmarked shrink un-owns, it never removes
@@ -335,6 +379,8 @@ class ReceiptAdapter:
             raise self.fail_with
         if any(f"/devices/{device_id}/" in url for device_id in self.fail_devices):
             raise requests.exceptions.ConnectionError(f"the far side refuses {url}")
+        if method == "GET" and url.endswith("/api/v1/intent-receipts"):
+            return self._serve_receipts(kwargs.get("params") or {})
         headers = kwargs.get("headers") or {}
         raw_seq = headers.get("X-Push-Seq")
         seq = int(raw_seq) if raw_seq is not None else None
@@ -364,8 +410,53 @@ class ReceiptAdapter:
         self.applied.append((url, body))
         self._apply_to_device(url, body, params)
         if seq is not None:
-            self.receipts[url] = {"push_seq": seq, "digest": digest, "response": response}
+            self.receipts[url] = {
+                "push_seq": seq,
+                "digest": digest,
+                "response": response,
+                "params": dict(params),
+            }
         return make_response(200, response)
+
+    def _serve_receipts(self, params):
+        """Serve the adapter's landed receipt JSON, including fleet-wide maxima."""
+        rows = []
+        for url, receipt in self.receipts.items():
+            found = _DEVICE_IN_URL.search(url)
+            if found is None:
+                continue
+            device_id = int(found.group(1))
+            if "/static-route-intent" in url:
+                section = "static_route"
+            elif "/vlan-intent" in url:
+                section = "vlan"
+            else:
+                continue
+            row = {
+                "device_id": device_id,
+                "section": section,
+                "push_seq": receipt["push_seq"],
+                "request_digest": receipt["digest"],
+                "store_only": receipt["params"].get("store_only") == "true",
+                "delete_origin": receipt["params"].get("delete_origin") == "true",
+                "backfill_only": receipt["params"].get("backfill_only") == "true",
+                "status_code": 200,
+                "response": receipt["response"],
+                "generation_id": None,
+                "created_at": "2026-08-12T00:00:00Z",
+                "updated_at": "2026-08-12T00:00:00Z",
+            }
+            if params.get("device_id") is not None and int(params["device_id"]) != device_id:
+                continue
+            if params.get("section") is not None and params["section"] != section:
+                continue
+            rows.append(row)
+        self.receipt_reads.append(dict(params))
+        maximum = max((receipt["push_seq"] for receipt in self.receipts.values()), default=None)
+        document = {"receipts": rows, "global_max_push_seq": maximum}
+        if self.include_global_max_route_id:
+            document["global_max_route_id"] = self.global_max_route_id
+        return make_response(200, document)
 
     def place(self, adapter_device_id: int, *members) -> None:
         """Seed what the device already carries, which a push may only narrow when marked."""

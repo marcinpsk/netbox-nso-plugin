@@ -36,6 +36,9 @@ import time
 from django.db import IntegrityError, OperationalError, connection, transaction
 
 from . import delivery
+from .deployment import DeploymentQuiesced
+from .deployment import guarded as _deployment_guarded
+from .deployment import operation as _deployment_operation
 from .outbox import (
     OP_REVOKE,
     advance_push_seq,
@@ -690,6 +693,7 @@ def send_claim(claim: Claim, *, deadline=None):
         claim.payload,
         mode=claim.mode,
         mark=bool(claim.mark),
+        deletions=claim.deletions,
         push_seq=claim.push_seq,
         deadline=SEND_DEADLINE.total_seconds() if deadline is None else deadline,
     )
@@ -947,9 +951,14 @@ def settle(claim: Claim, response) -> str:
             _report_protocol_violation(claim, ack.reason)
             return UNACKNOWLEDGED
 
-        if claim.mark is False and claim.mark_any:
-            # The fold downgraded a marked contributor, which is today's cross-transaction
-            # AND. It is recorded because the success path pops the transient error entry.
+        if (
+            claim.mark is False
+            and claim.mark_any
+            and delivery.delivery_keys()[claim.scope].marking_mode == delivery.MARKING_QUERY_FLAG
+        ):
+            # The fold downgraded a marked contributor, which is the query-flag AND. A
+            # per-object scope delivers the deletion itself, so its AND has no wire effect.
+            # It is recorded because the success path pops the transient error entry.
             state.degraded_deletions = [
                 *state.degraded_deletions,
                 {
@@ -1248,6 +1257,7 @@ def push_now(device_id, scope, *, mode=delivery.MODE_NORMAL, force=False, deadli
     return answer if outcome == SUCCEEDED else None
 
 
+@_deployment_guarded("intent drain")
 def _drain_once(
     device_id,
     scope,
@@ -1599,7 +1609,16 @@ def drain_candidates(limit=None) -> list[tuple[int, str]]:
 
 
 def compact_intent_outbox(limit=None) -> None:
-    """Compact the tick's bounded candidate set without contacting the adapter."""
+    """Compact the bounded candidate set unless a deployment has paused it."""
+    try:
+        with _deployment_operation("intent outbox compaction"):
+            _compact_intent_outbox(limit)
+    except DeploymentQuiesced:
+        logger.info("intent outbox compaction is paused for a deployment")
+
+
+def _compact_intent_outbox(limit=None) -> None:
+    """Compact an admitted candidate set without contacting the adapter."""
     for device_id, scope in compaction_candidates(limit):
         try:
             compact(device_id, scope)
@@ -1618,12 +1637,31 @@ def drain_intent_outbox(limit=None) -> tuple[int, int]:
     replayable failure is not drainable and would never be compacted otherwise, which is
     exactly the case where a burst accumulates.
     """
-    compact_intent_outbox(limit)
+    try:
+        with _deployment_operation("intent drain tick"):
+            pass
+    except DeploymentQuiesced:
+        logger.info("the intent outbox tick is paused for a deployment")
+        return 0, 0
+    return _drain_intent_outbox(limit)
+
+
+def _drain_intent_outbox(limit=None) -> tuple[int, int]:
+    """Run one tick with a new deployment admission for each bounded stage."""
+    try:
+        with _deployment_operation("intent outbox compaction"):
+            _compact_intent_outbox(limit)
+    except DeploymentQuiesced:
+        logger.info("the intent outbox tick stopped because a deployment started")
+        return 0, 0
 
     drained = failed = 0
     for device_id, scope in drain_candidates(limit):
         try:
             outcome = drain_key(device_id, scope)
+        except DeploymentQuiesced:
+            logger.info("the intent outbox tick stopped because a deployment started")
+            break
         except Exception:  # noqa: BLE001 (one key's adapter must not abort the fleet pass)
             logger.exception("intent outbox drain failed for %s/%s", device_id, scope)
             _restamp_attempt(device_id, scope)
@@ -1653,7 +1691,7 @@ def _sent_wire_digest(state) -> str:
     payload: this hashes what was sent, not what the device would render now.
     """
     rendered = delivery.render(state.scope, state.device_id, 0)
-    return wire_digest(delivery.wire_body(rendered, state.claim_payload))
+    return wire_digest(delivery.wire_body(rendered, state.claim_payload, deletions=state.claim_deletions or []))
 
 
 def resolve_restored_claim(device_id, scope, receipt) -> str:
@@ -1743,6 +1781,17 @@ def resolve_restored_claim(device_id, scope, receipt) -> str:
     if settle(restored, receipt.get("stored_response")) != SUCCEEDED:
         return RESTORE_FAILED_CLOSED
     return RESTORE_SETTLED
+
+
+def release_restored_replay(device_id, scope) -> None:
+    """Release the snapshot's stale lease so a replay verdict can run immediately."""
+    _refuse_in_transaction("restore")
+    with transaction.atomic():
+        state = _lock_state(device_id, scope)
+        if state.push_seq is None:
+            return
+        state.claimed_at = None
+        state.save(update_fields=["claimed_at"])
 
 
 def clear_acknowledged_lineage() -> int:

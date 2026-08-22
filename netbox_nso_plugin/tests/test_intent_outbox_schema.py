@@ -28,29 +28,38 @@ def _app_migrations() -> list[str]:
 
 
 def _outbox_migration() -> str:
-    """The app's single leaf — Appendix O's migration, whatever number it landed on."""
+    """Return the migration that creates both outbox models."""
+    from importlib import import_module
+
     loader = MigrationLoader(None, ignore_no_migrations=True)
-    leaves = [name for app, name in loader.graph.leaf_nodes() if app == APP]
-    assert len(leaves) == 1, f"{APP} has conflicting leaf migrations: {leaves}"
-    return leaves[0]
+    candidates = []
+    for app, name in loader.disk_migrations:
+        if app != APP:
+            continue
+        migration = import_module(f"{APP}.migrations.{name}").Migration
+        created = {op.name for op in migration.operations if isinstance(op, migrations.CreateModel)}
+        if {"NSOIntentOutboxEntry", "NSOIntentOutboxState"} <= created:
+            candidates.append(name)
+    assert len(candidates) == 1, f"expected one outbox migration; saw {candidates}"
+    return candidates[0]
 
 
 class TestOutboxMigrationShape(SimpleTestCase):
     """O1.1 — the properties readable off the migration files alone."""
 
     def test_the_outbox_migration_chains_off_the_current_end(self):
-        """Not off a literal number: whichever appendix landed last is the parent (R12-M3)."""
+        """The outbox migration chained off the graph end that existed when it landed."""
         from importlib import import_module
 
-        leaf = _outbox_migration()
+        outbox = _outbox_migration()
         names = _app_migrations()
-        assert names[-1] == leaf, f"the outbox migration must be the chain end; saw {names[-1]}"
 
-        migration = import_module(f"{APP}.migrations.{leaf}").Migration
+        migration = import_module(f"{APP}.migrations.{outbox}").Migration
         created = {op.name for op in migration.operations if isinstance(op, migrations.CreateModel)}
-        assert {"NSOIntentOutboxEntry", "NSOIntentOutboxState"} <= created, f"the leaf creates {created}"
+        assert {"NSOIntentOutboxEntry", "NSOIntentOutboxState"} <= created, f"the migration creates {created}"
         in_app = [name for app, name in migration.dependencies if app == APP]
-        assert in_app == [names[-2]], f"the outbox migration must chain off {names[-2]}; saw {in_app}"
+        prior = names[names.index(outbox) - 1]
+        assert in_app == [prior], f"the outbox migration must chain off {prior}; saw {in_app}"
 
     def test_the_migrations_sequence_name_still_matches_the_running_one(self):
         """0018 inlines the name so a rename cannot rewrite history; this is the drift alarm."""
@@ -162,11 +171,14 @@ class TestOutboxMigrationRoundTrip(_CascadeFlushMixin, TransactionTestCase):
                 return bool(cur.fetchone()[0])
 
         assert _table_exists(ENTRY_TABLE) and _table_exists(STATE_TABLE) and _sequence_exists()
-        parent = _app_migrations()[-2]
+        executor = MigrationExecutor(connection)
+        outbox = _outbox_migration()
+        migration = executor.loader.disk_migrations[APP, outbox]
+        parents = [name for app, name in migration.dependencies if app == APP]
+        assert len(parents) == 1, f"the outbox migration must have one in-app parent; saw {parents}"
 
         try:
-            executor = MigrationExecutor(connection)
-            executor.migrate([(APP, parent)])
+            executor.migrate([(APP, parents[0])])
             assert not _table_exists(ENTRY_TABLE)
             assert not _table_exists(STATE_TABLE)
             # The sequence stays: dropping it would let the re-apply below restart at 1 and

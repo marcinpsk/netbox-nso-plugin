@@ -433,7 +433,7 @@ class TestCategoryGridResidueBadges(BlockedRemovalTestBase):
         self.assertEqual(procs["CORE"]["residue_job"], 72)
 
     def test_interface_ips_grid_badges_surviving_address_values(self):
-        """#104 phase-3: interface_config residue is VALUE-grain — the surviving
+        """#104 phase-3: interface receipt residue is value-grain. The surviving
         (interface, address, vrf) triples are badged, siblings are not. The trigger
         reports the NetBox text form while the re-imported row carries the device
         form, so IPv6 case/zero-compression must normalize before matching."""

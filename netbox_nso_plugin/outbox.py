@@ -350,9 +350,11 @@ def enqueue(device_id, scope: str, *, transitions=(), delete_origin: bool = Fals
     """Append this transaction's contribution to ``(device_id, scope)``.
 
     Writes nothing for a reconcile or render write (those mirror the adapter and are not
-    operator intent) and nothing for a device whose teardown is in progress. Takes no lock:
-    two transactions appending to two keys, in either order, never meet.
+    operator intent) and nothing for a device whose teardown is in progress. Takes the
+    deployment gate's shared transaction lock, so transactions appending to different keys
+    remain compatible in either order.
     """
+    from .deployment import lock_mutation
     from .models import NSOIntentOutboxEntry
     from .signals import _is_intent_push_suppressed, _is_render_request
 
@@ -365,6 +367,7 @@ def enqueue(device_id, scope: str, *, transitions=(), delete_origin: bool = Fals
     if scope not in delivery_keys():
         raise ValueError(f"unknown intent outbox scope {scope!r}")
     _refuse_outside_a_transaction()
+    lock_mutation()
     txid = current_txid()
     if _device_is_tearing_down(device_id, txid):
         return
