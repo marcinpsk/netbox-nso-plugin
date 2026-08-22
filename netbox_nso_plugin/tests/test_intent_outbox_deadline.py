@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+import gc
 import threading
 import time
+import weakref
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
@@ -171,6 +173,10 @@ class TestTheTransportEndsItsOwnSocket(_DripCase):
         pool._put_conn(None)
 
         assert connection not in transport._live
+        connection_ref = weakref.ref(connection)
+        del connection
+        gc.collect()
+        assert connection_ref() is None, "the transport retained a discarded connection"
 
     def test_abort_continues_when_one_socket_close_fails(self):
         from netbox_nso_plugin import adapter_client

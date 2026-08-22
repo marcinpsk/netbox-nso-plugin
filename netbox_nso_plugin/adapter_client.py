@@ -13,6 +13,7 @@ import logging
 import socket
 import threading
 import time
+import weakref
 from contextlib import contextmanager
 
 import requests
@@ -136,6 +137,7 @@ class AbortableTransport(requests.adapters.HTTPAdapter):
         self._lock = threading.Lock()
         self._live: set = set()
         self._instrumented: set = set()
+        self._instrumented_connections: weakref.WeakSet = weakref.WeakSet()
         self._aborted = False
         super().__init__(*args, **kwargs)
 
@@ -180,8 +182,8 @@ class AbortableTransport(requests.adapters.HTTPAdapter):
             with self._lock:
                 self._live.add(conn)
                 _checkout_stack().append(conn)
-                fresh = conn not in self._instrumented
-                self._instrumented.add(conn)
+                fresh = conn not in self._instrumented_connections
+                self._instrumented_connections.add(conn)
                 aborted = self._aborted
             if fresh:
                 self._instrument_connection(conn)
