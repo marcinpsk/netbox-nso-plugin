@@ -8,9 +8,12 @@ Config resolution (per call, ~30 s in-process cache):
 """
 
 import contextvars
+import json
 import logging
+import socket
 import threading
 import time
+import weakref
 from contextlib import contextmanager
 
 import requests
@@ -55,6 +58,42 @@ def delete_origin_pushes():
         _delete_origin_push.reset(token)
 
 
+# When set, every adapter request carries ``?backfill_only=true``: the adapter adopts the
+# ``route_id`` of every row the payload still names, prunes the uncorrelated NULL-id rows
+# that hold its replacement fence shut, and does nothing else — no removal, no tombstone, no
+# job. It is what opens a fence a pending genuine deletion cannot open for itself, because
+# any ordinary push omitting that route would destroy its before-image (#1503 §4.4, OQ-O-8).
+# It is expressly NOT a delivery mechanism: it accepts no content and carries no authority.
+_backfill_only_push = contextvars.ContextVar("nso_backfill_only_push", default=False)
+
+
+@contextmanager
+def backfill_only_pushes():
+    """Mark every adapter request in this context as an id backfill (no content, no jobs)."""
+    token = _backfill_only_push.set(True)
+    try:
+        yield
+    finally:
+        _backfill_only_push.reset(token)
+
+
+# The logical operation a request belongs to (#1503 Appendix O, §4.4). It rides in a header
+# rather than in every mirrored-scope body model, so one emitter covers every in-protocol
+# delivery key and no call site can forget it. The adapter admits it against its own
+# ``(device_id, scope)`` receipt, which is what makes a lost response resolvable by replay.
+_push_seq = contextvars.ContextVar("nso_push_seq", default=None)
+
+
+@contextmanager
+def push_seq(seq: int):
+    """Carry *seq* as ``X-Push-Seq`` on every adapter request made in this context."""
+    token = _push_seq.set(int(seq))
+    try:
+        yield
+    finally:
+        _push_seq.reset(token)
+
+
 _CACHE_TTL = 30  # seconds
 _cfg_cache: dict = {}
 _cfg_cache_lock = threading.Lock()
@@ -79,13 +118,156 @@ STORE_INCARNATION_HEADER = "X-Store-Incarnation"
 _session = None
 _session_cls = None
 
+# A caller that must be able to ABORT its own request cannot use the pooled session: closing
+# it would cut off every other request in the process. So a send under a wall-clock deadline
+# builds its own (#1503 §4.2, O-P16) and binds it here for the duration of that one call.
+_bound_session = contextvars.ContextVar("nso_bound_session", default=None)
+
+
+class AbortableTransport(requests.adapters.HTTPAdapter):
+    """An HTTP transport that can end the requests it has in flight (#1503 O-P16).
+
+    ``Session.close()`` empties the connection pool and nothing else: a connection a worker
+    already borrowed is not in the pool, so a thread blocked on a dripping response never
+    notices. Only the socket ends that read, so this remembers the connection each request
+    checked out and shuts its socket down on demand.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._lock = threading.Lock()
+        self._live: set = set()
+        self._instrumented: set = set()
+        self._instrumented_connections: weakref.WeakSet = weakref.WeakSet()
+        self._aborted = False
+        super().__init__(*args, **kwargs)
+
+    def get_connection_with_tls_context(self, request, verify, proxies=None, cert=None):
+        """Return the pool this request will use, instrumented to record its connections."""
+        pool = super().get_connection_with_tls_context(request, verify, proxies=proxies, cert=cert)
+        with self._lock:
+            fresh = pool not in self._instrumented
+            self._instrumented.add(pool)
+        return self._instrument(pool) if fresh else pool
+
+    def _instrument(self, pool):
+        """Wrap the pool's checkout and release, which is where a connection is identifiable."""
+        checkout, release = pool._get_conn, pool._put_conn
+        checked_out = threading.local()
+
+        def _checkout_stack() -> list:
+            stack = getattr(checked_out, "stack", None)
+            if stack is None:
+                stack = []
+                checked_out.stack = stack
+            return stack
+
+        def _remove_checkout(conn):
+            stack = getattr(checked_out, "stack", None)
+            if not stack:
+                return None
+            if conn is None:
+                actual = stack.pop()
+            else:
+                actual = None
+                for index in range(len(stack) - 1, -1, -1):
+                    if stack[index] is conn:
+                        actual = stack.pop(index)
+                        break
+            if not stack:
+                del checked_out.stack
+            return actual
+
+        def _get_conn(timeout=None):
+            conn = checkout(timeout)
+            with self._lock:
+                self._live.add(conn)
+                _checkout_stack().append(conn)
+                fresh = conn not in self._instrumented_connections
+                self._instrumented_connections.add(conn)
+                aborted = self._aborted
+            if fresh:
+                self._instrument_connection(conn)
+            if aborted:
+                self._shutdown(conn)
+            return conn
+
+        def _put_conn(conn):
+            with self._lock:
+                actual = _remove_checkout(conn)
+                self._live.discard(actual if actual is not None else conn)
+            return release(conn)
+
+        pool._get_conn, pool._put_conn = _get_conn, _put_conn
+        return pool
+
+    def _instrument_connection(self, conn) -> None:
+        """Shut down a connection that finishes connecting after this transport was aborted."""
+        connect = conn.connect
+
+        def _connect():
+            result = connect()
+            with self._lock:
+                aborted = self._aborted
+            if aborted:
+                self._shutdown(conn)
+            return result
+
+        conn.connect = _connect
+
+    @staticmethod
+    def _shutdown(conn) -> None:
+        """Shut down *conn* when it has a socket, leaving descriptor ownership with its pool."""
+        sock = conn.sock
+        if sock is None:
+            return
+        try:
+            # Shutdown only. The pool closes its connection after the owning thread returns.
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:  # already gone: the request finished or the far side closed first
+            pass
+
+    def abort(self) -> None:
+        """Shut down the socket of every request in flight, so its reader comes back."""
+        with self._lock:
+            self._aborted = True
+            live = list(self._live)
+        for conn in live:
+            self._shutdown(conn)
+
+
+def new_session(transport=None):
+    """Build one session configured like the pooled one, for a caller that owns its lifetime.
+
+    *transport* is mounted for both schemes when given, which is how a caller that must be
+    able to abort its own request gets a handle on the connection it is using.
+    """
+    session = requests.Session()
+    session.trust_env = False  # Adapter is always internal — never route through system proxy.
+    if transport is not None:
+        session.mount("http://", transport)
+        session.mount("https://", transport)
+    return session
+
+
+@contextmanager
+def bound_session(session):
+    """Send every adapter request made in this context on *session*, not on the pool."""
+    token = _bound_session.set(session)
+    try:
+        yield
+    finally:
+        _bound_session.reset(token)
+
 
 def _get_session():
-    """Return the process-wide pooled requests session, (re)creating it when needed."""
+    """Return this context's bound session, or the process-wide pooled one."""
     global _session, _session_cls
+
+    bound = _bound_session.get()
+    if bound is not None:
+        return bound
     if _session is None or _session_cls is not requests.Session:
-        _session = requests.Session()
-        _session.trust_env = False  # Adapter is always internal — never route through system proxy.
+        _session = new_session()
         _session_cls = requests.Session
     return _session
 
@@ -170,9 +352,76 @@ def _resolve_config() -> dict:
             return data
 
 
+# When set, a request is not made at all: its JSON body is recorded and ``None`` comes back.
+# The claim needs the EXACT body the client would send, because that is what the adapter
+# digests into its receipt (#1503 Appendix O, §4.4), and the wrapper each endpoint puts
+# around a payload lives in this module. Capturing through the real call is what keeps the
+# two sides on one definition instead of a second table of scope-to-envelope names.
+_capture_body: contextvars.ContextVar[list | None] = contextvars.ContextVar("nso_capture_body", default=None)
+
+
+@contextmanager
+def capture_wire_body():
+    """Record the serialized JSON bytes of every request, and send none of them."""
+    sink: list = []
+    token = _capture_body.set(sink)
+    try:
+        yield sink
+    finally:
+        _capture_body.reset(token)
+
+
+def _serialize_json_body(body) -> bytes:
+    """Serialize one canonical JSON body once, for both capture and transport.
+
+    Claims persist their payload in JSONB, which does not preserve object key order. Sorting
+    makes the restored value reproduce the bytes the adapter received without storing a
+    second copy of the request.
+    """
+    return json.dumps(body, allow_nan=False, sort_keys=True).encode()
+
+
+def _attach_serialized_json(kwargs) -> None:
+    """Attach the canonical wire bytes while retaining the structured request body."""
+    if "json" not in kwargs:
+        return
+    # Requests sends ``data`` when both are present. Keep ``json`` for transport
+    # instrumentation and tests. The canonical ``data`` value goes on the socket.
+    kwargs["data"] = _serialize_json_body(kwargs["json"])
+
+
 def _request(method, path, **kwargs):
+    sink = _capture_body.get()
+    if sink is not None:
+        if "json" not in kwargs:
+            # Skipping it silently would make the caller's "expected exactly one" count lie.
+            raise AdapterError(
+                f"cannot capture a wire body for {method} {path}: the request carries no JSON body.",
+                code="capture_without_body",
+            )
+        sink.append(_serialize_json_body(kwargs["json"]))
+        return None
     resp = _request_response(method, path, **kwargs)
-    return resp.json() if resp.content else None
+    if not resp.content:
+        return None
+    try:
+        return resp.json()
+    except ValueError as exc:
+        raise AdapterError("Adapter returned a response that is not valid JSON.", code="invalid_response") from exc
+
+
+def _error_envelope(resp):
+    """Return the adapter's ``{"error": {...}}`` member, or ``{}`` when the body is not that shape.
+
+    An error body reaches us from any intermediary (a proxy 502, a gateway), so unlike the
+    adapter's own typed payloads its shape is genuinely unknown and must be checked here.
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        return {}
+    err = body.get("error") if isinstance(body, dict) else None
+    return err if isinstance(err, dict) else {}
 
 
 def _request_response(method, path, **kwargs):
@@ -186,6 +435,11 @@ def _request_response(method, path, **kwargs):
 
     url = f"{cfg['url']}{path}"
     headers = {"Authorization": f"Bearer {cfg['token']}", "Content-Type": "application/json"}
+    _attach_serialized_json(kwargs)
+
+    seq = _push_seq.get()
+    if seq is not None:
+        headers["X-Push-Seq"] = str(seq)
 
     if _store_only_push.get():
         params = dict(kwargs.pop("params", None) or {})
@@ -195,6 +449,11 @@ def _request_response(method, path, **kwargs):
     if _delete_origin_push.get():
         params = dict(kwargs.pop("params", None) or {})
         params["delete_origin"] = "true"
+        kwargs["params"] = params
+
+    if _backfill_only_push.get():
+        params = dict(kwargs.pop("params", None) or {})
+        params["backfill_only"] = "true"
         kwargs["params"] = params
 
     if not cfg["verify_tls"]:
@@ -242,14 +501,14 @@ def _request_response(method, path, **kwargs):
         ) from exc
 
     if not resp.ok:
-        try:
-            err = resp.json().get("error", {})
-        except Exception:
-            err = {}
+        err = _error_envelope(resp)
+        detail = err.get("detail")
+        # ``or`` not ``.get(key, default)``: the adapter emits nulls, and a present null
+        # would otherwise beat the fallback and leave the operator an empty message.
         raise AdapterError(
-            err.get("message", resp.text),
-            code=err.get("code", str(resp.status_code)),
-            detail=err.get("detail"),
+            err.get("message") or resp.text,
+            code=str(err.get("code") or resp.status_code),
+            detail=detail if isinstance(detail, dict) else None,
         )
     return resp
 
@@ -689,14 +948,46 @@ def sync_notify(adapter_device_id):
         raise
 
 
+#: Members the adapter's JobOut model types ``dict | None`` (../nso-adapter/nso_adapter/api/jobs.py).
+_JOB_MAPPING_MEMBERS = ("result", "error", "context")
+
+
+def _validated_job(job, what):
+    """Return *job* once it matches JobOut's shape, else refuse the whole payload.
+
+    The producer cannot emit a scalar in these members, so one is a broken adapter, not a
+    value to tolerate. Refusing here means every reader downstream may treat them as
+    ``dict | None`` without restating the check.
+    """
+    if not isinstance(job, dict):
+        raise AdapterError(f"Adapter returned a malformed {what}.", code="invalid_response")
+    for member in _JOB_MAPPING_MEMBERS:
+        value = job.get(member)
+        if value is not None and not isinstance(value, dict):
+            raise AdapterError(
+                f"Adapter returned a malformed {what}: {member} is not an object.",
+                code="invalid_response",
+            )
+    return job
+
+
+def _validated_jobs(jobs, what):
+    """Return *jobs* once every entry matches JobOut's shape, else refuse the whole page."""
+    if not isinstance(jobs, list):
+        raise AdapterError(f"Adapter returned a malformed {what}.", code="invalid_response")
+    for job in jobs:
+        _validated_job(job, what)
+    return jobs
+
+
 def get_job(job_id):
     """GET /api/v1/jobs/{id}."""
-    return _request("GET", f"/api/v1/jobs/{job_id}")
+    return _validated_job(_request("GET", f"/api/v1/jobs/{job_id}"), "job")
 
 
 def list_jobs(adapter_device_id):
     """GET /api/v1/jobs?device_id={id} — the device's jobs, most-recent-first."""
-    return _request("GET", "/api/v1/jobs", params={"device_id": adapter_device_id})
+    return _validated_jobs(_request("GET", "/api/v1/jobs", params={"device_id": adapter_device_id}), "jobs listing")
 
 
 def get_settlement_feed(adapter_device_id, *, after_settle_seq, limit):
@@ -728,7 +1019,16 @@ def get_settlement_feed(adapter_device_id, *, after_settle_seq, limit):
             f"Adapter served the settlement feed without a {STORE_INCARNATION_HEADER} header.",
             code="missing_store_incarnation",
         )
-    return (resp.json() if resp.content else []), incarnation
+    # This reader decodes the body itself (it needs the header too), so it owes the same
+    # typed refusal _request gives every other caller: a gateway's HTML 200 must not reach
+    # the settlement walk as a bare requests JSONDecodeError.
+    try:
+        page = resp.json() if resp.content else []
+    except ValueError as exc:
+        raise AdapterError(
+            "Adapter returned a settlement feed that is not valid JSON.", code="invalid_response"
+        ) from exc
+    return _validated_jobs(page, "settlement feed"), incarnation
 
 
 def get_static_route_intent(adapter_device_id):
@@ -737,8 +1037,16 @@ def get_static_route_intent(adapter_device_id):
     The lost-response recovery path: the adapter commits its store write before it
     answers, so a response lost in flight leaves the pusher holding a committed intent it
     recorded no expectation for, and this is the only other way to obtain one.
+
+    StaticRouteIntentOut always carries a ``routes`` list. Degrading a malformed body to an
+    empty one would record ZERO expectations and silently mis-settle, so it is refused
+    instead: the settlement stall bound counts a read-back it cannot obtain, but an empty
+    one looks like a legitimate answer and is counted as settled.
     """
-    return _request("GET", f"/api/v1/devices/{adapter_device_id}/static-route-intent")
+    echoed = _request("GET", f"/api/v1/devices/{adapter_device_id}/static-route-intent")
+    if not isinstance(echoed, dict) or not isinstance(echoed.get("routes"), list):
+        raise AdapterError("Adapter returned a malformed static-route intent read-back.", code="invalid_response")
+    return echoed
 
 
 def put_intent(adapter_device_id, attributes):
@@ -834,7 +1142,7 @@ def put_static_route_intent(adapter_device_id, routes):
       [{"vrf": "", "prefix": "10.0.0.0/8", "next_hop": "192.168.1.1",
         "metric": None, "permanent": None, "tag": None,
         "accepted_at": "...Z"}, ...]
-    Empty list clears all static route intent for the device.
+    An empty ``routes`` list clears all static route intent for the device.
     Returns {"device_id": ..., "count": N}.
     """
     return _request(

@@ -2,6 +2,12 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 ---
 repos:
+  # Keep in step with the pinned zizmor in [dependency-groups].dev.
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: v1.29.0
+    hooks:
+      - id: zizmor
+
   # General file checks
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
@@ -20,7 +26,7 @@ repos:
       - id: mixed-line-ending
         args: [--fix=lf]
 
-  # Python code quality
+  # Python code quality. Keep the rev in step with [dependency-groups].dev.
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.4
     hooks:

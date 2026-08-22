@@ -2,19 +2,22 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for the off-request reconcile job and the sync-complete callback endpoint."""
 
+import contextlib
 import os
 import threading
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
-from django.db import connections
-from django.test import TestCase
+from django.db import connections, transaction
+from django.test import TestCase, TransactionTestCase
 from rest_framework import status
 from utilities.testing import APITestCase
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
 
+from ._outbox_case import without_commit_drain
 from ._settlement_case import _make_mgmt, _SettlementCase
+from .mixins import IntentPushResetMixin, _CascadeFlushMixin, isolate_other_scopes
 
 
 def _make_device(name="rec-dev"):
@@ -23,6 +26,30 @@ def _make_device(name="rec-dev"):
     role = DeviceRole.objects.create(name=f"{name}-role", slug=f"{name}-role")
     site = Site.objects.create(name=f"{name}-site", slug=f"{name}-site")
     return Device.objects.create(name=name, device_type=dt, role=role, site=site)
+
+
+@contextlib.contextmanager
+def _patch_apply_pushes(answers=None):
+    """Double the forced claims the Apply takes, keyed by delivery scope.
+
+    Apply routes SNMP through ``drain_key`` and every other scope through ``push_now``.
+    *answers* maps a scope to its answer. Every other scope answers ``None``.
+    """
+    answers = answers or {}
+
+    def side_effect(device_id, scope, **kwargs):
+        return answers.get(scope)
+
+    with (
+        patch("netbox_nso_plugin.drain.push_now", side_effect=side_effect) as push,
+        patch("netbox_nso_plugin.drain.drain_key", side_effect=side_effect),
+    ):
+        yield push
+
+
+def _forced_scopes(push, device_id):
+    """The scopes the Apply forced for *device_id*, in call order."""
+    return [call.args[1] for call in push.call_args_list if call.args[0] == device_id and call.kwargs.get("force")]
 
 
 class TestRunDeviceReconcile(APITestCase):
@@ -333,6 +360,30 @@ class TestEscalateStuckDeploying(APITestCase):
         rp.refresh_from_db()
         self.assertEqual(rp.status, "deploying")
 
+    def test_boolean_counts_do_not_mark_a_scope_as_applied(self):
+        from netbox_nso_plugin.reconcile import _escalate_stuck_deploying
+
+        mgmt, row = self._setup()
+        job = self._job(minutes_ago=30)
+        job["result"]["vlan_count_by_outcome"] = {"in_sync": False, "apply_failed": True}
+
+        _escalate_stuck_deploying(mgmt, job)
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, "deploying")
+
+    def test_negative_count_does_not_cancel_a_positive_count(self):
+        from netbox_nso_plugin.reconcile import _escalate_stuck_deploying
+
+        mgmt, row = self._setup()
+        job = self._job(minutes_ago=30)
+        job["result"]["vlan_count_by_outcome"] = {"in_sync": 1, "apply_failed": -1}
+
+        _escalate_stuck_deploying(mgmt, job)
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, "apply_failed")
+
     def test_run_device_reconcile_escalates_after_grace(self):
         from netbox_nso_plugin import reconcile
 
@@ -599,31 +650,14 @@ class TestStaticRouteApplySettle(APITestCase):
         from netbox_nso_plugin.views import _prepare_apply
 
         mgmt, row = self._setup(status_="accepted")
-        with (
-            patch("netbox_nso_plugin.signals._push_interface_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_lacp_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_switchport_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_vlan_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_svi_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_subinterface_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_bfd_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_interface_mtu_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_route_policy_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_logging_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_l2_sap_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_snmp_intent_for_device"),
-            # A stored count, not a bare mock: the promotion gate reads the count.
-            patch(
-                "netbox_nso_plugin.signals._push_static_route_intent_for_device",
-                return_value={"device_id": 89, "count": 1, "routes": []},
-            ) as push_static,
-        ):
+        # A stored count, not a bare mock: the promotion gate reads the count.
+        with _patch_apply_pushes({"static_route": {"device_id": 89, "count": 1, "routes": []}}) as push:
             _prepare_apply(mgmt)
         row.refresh_from_db()
         self.assertEqual(row.status, "deploying")
-        # And the owned snapshot is force-re-pushed so a stale adapter intent still applies.
-        push_static.assert_called_once()
-        self.assertTrue(push_static.call_args.kwargs.get("force"))
+        # And the owned snapshot is re-sent under its own forced claim, so a stale adapter
+        # intent still applies.
+        self.assertEqual(_forced_scopes(push, mgmt.device_id).count("static_route"), 1)
 
     def test_a_push_answer_with_no_stored_count_does_not_promote(self):
         """An acknowledgement is a stored count, not a truthy answer.
@@ -637,22 +671,7 @@ class TestStaticRouteApplySettle(APITestCase):
         for tag, answer in (("sr-nondict", "stored"), ("sr-nocount", {"device_id": 89, "routes": []})):
             with self.subTest(answer=answer):
                 mgmt, row = self._setup(status_="accepted", tag=tag)
-                with (
-                    patch("netbox_nso_plugin.signals._push_interface_intent_for_device"),
-                    patch("netbox_nso_plugin.signals._push_lacp_intent_for_device"),
-                    patch("netbox_nso_plugin.signals._push_switchport_intent_for_device"),
-                    patch("netbox_nso_plugin.signals._push_vlan_intent_for_device"),
-                    patch("netbox_nso_plugin.signals._push_svi_intent_for_device"),
-                    patch("netbox_nso_plugin.signals._push_subinterface_intent_for_device"),
-                    patch("netbox_nso_plugin.signals._push_bfd_intent_for_device"),
-                    patch("netbox_nso_plugin.signals._push_interface_mtu_intent_for_device"),
-                    patch("netbox_nso_plugin.signals._push_route_policy_intent_for_device"),
-                    patch("netbox_nso_plugin.signals._push_logging_intent_for_device"),
-                    patch("netbox_nso_plugin.signals._push_l2_sap_intent_for_device"),
-                    patch("netbox_nso_plugin.signals._push_snmp_intent_for_device"),
-                    # The static-route push itself runs for real; only its transport is doubled.
-                    patch("netbox_nso_plugin.adapter_client.put_static_route_intent", return_value=answer),
-                ):
+                with _patch_apply_pushes({"static_route": answer}):
                     _prepare_apply(mgmt)
                 row.refresh_from_db()
                 self.assertEqual(row.status, "accepted")
@@ -698,25 +717,13 @@ class TestL2SapApplySettle(APITestCase):
         from netbox_nso_plugin.views import _prepare_apply
 
         mgmt, row = self._setup(status_="accepted")
-        with (
-            patch("netbox_nso_plugin.signals._push_interface_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_lacp_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_switchport_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_vlan_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_svi_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_subinterface_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_bfd_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_interface_mtu_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_route_policy_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_static_route_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_l2_sap_intent_for_device") as push_sap,
-        ):
+        with _patch_apply_pushes() as push:
             _prepare_apply(mgmt)
         row.refresh_from_db()
         self.assertEqual(row.status, "deploying")
-        # And the owned snapshot is force-re-pushed so a stale adapter intent still applies.
-        push_sap.assert_called_once()
-        self.assertTrue(push_sap.call_args.kwargs.get("force"))
+        # And the owned snapshot is re-sent under its own forced claim, so a stale adapter
+        # intent still applies.
+        self.assertEqual(_forced_scopes(push, mgmt.device_id).count("l2_sap"), 1)
 
 
 class TestRoutePolicyApplySettle(APITestCase):
@@ -770,101 +777,111 @@ class TestRoutePolicyApplySettle(APITestCase):
         self.assertIn("device parser rejected: invalid community", row.last_apply_error)
         self.assertNotIn("unrelated", row.last_apply_error)  # other scopes excluded
 
+    def test_a_free_form_counts_member_does_not_abort_the_settle(self):
+        """``result`` is an object by contract; each ``<scope>_count_by_outcome`` is not.
+
+        A scalar there raised out of _settle_apply_failures, and the caller's blanket except
+        then skipped the whole device's settle, escalate and journal, not just this scope.
+        A junk counts map must read as "this job says nothing about this scope" instead.
+        """
+        from netbox_nso_plugin.reconcile import _settle_apply_failures
+
+        mgmt, row = self._setup()
+        junk_members = ({"apply_failed": "1"}, {"apply_failed": ["x"]}, {"apply_failed": True})
+        for counts in ("boom", 3, ["apply_failed"], *junk_members):
+            with self.subTest(counts=counts):
+                row.status = "deploying"
+                row.save(update_fields=["status"])
+
+                _settle_apply_failures(mgmt, {"route_policy_count_by_outcome": counts})
+
+                row.refresh_from_db()
+                self.assertEqual(row.status, "deploying", "a junk counts map decided the row")
+
+    def test_a_free_form_error_detail_falls_back_to_the_generic_message(self):
+        """``error`` is an object by contract; ``detail`` and ``items`` inside it are not.
+
+        A scalar ``items`` raised on iteration and a string one iterated its CHARACTERS, so
+        the walk has to check what it found before walking it. Either way the row still
+        settles, on the generic pointer.
+        """
+        from netbox_nso_plugin.reconcile import _GENERIC_APPLY_ERROR, _settle_apply_failures
+
+        result = {"route_policy_count_by_outcome": {"in_sync": 0, "apply_failed": 1}}
+        mgmt, row = self._setup()
+        for error in ({"detail": "boom"}, {"detail": {"items": 3}}, {"detail": {"items": "boom"}}):
+            with self.subTest(error=error):
+                # Both fields are reset: a value leaking in from the previous iteration
+                # would let a broken walk pass on the last one's evidence.
+                row.status = "deploying"
+                row.last_apply_error = ""
+                row.save(update_fields=["status", "last_apply_error"])
+
+                _settle_apply_failures(mgmt, result, {"result": result, "error": error})
+
+                row.refresh_from_db()
+                self.assertEqual(row.status, "apply_failed")
+                self.assertEqual(row.last_apply_error, _GENERIC_APPLY_ERROR)
+
     def test_prepare_apply_marks_accepted_route_policy_deploying(self):
         from netbox_nso_plugin.views import _prepare_apply
 
         mgmt, row = self._setup(status_="accepted")
-        with (
-            patch("netbox_nso_plugin.signals._push_interface_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_lacp_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_switchport_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_vlan_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_svi_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_subinterface_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_bfd_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_interface_mtu_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_route_policy_intent_for_device"),
-        ):
+        with _patch_apply_pushes():
             _prepare_apply(mgmt)
         row.refresh_from_db()
         self.assertEqual(row.status, "deploying")
 
     def test_prepare_apply_force_pushes_owned_interface_intent(self):
-        """Apply force-re-pushes the owned interface snapshot (status-based), so an owned
-        attribute whose adapter intent went stale is actually re-applied instead of silently
-        skipped. Ownership is kept durable by the reconciler's owned-guard."""
+        """Apply re-sends the owned interface snapshot (status-based) under a forced claim, so
+        an owned attribute whose adapter intent went stale is actually re-applied instead of
+        silently dropped. Ownership is kept durable by the reconciler's owned-guard."""
         from netbox_nso_plugin.views import _prepare_apply
 
         mgmt, _row = self._setup(status_="accepted")
-        with (
-            patch("netbox_nso_plugin.signals._push_interface_intent_for_device") as push_if,
-            patch("netbox_nso_plugin.signals._push_lacp_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_switchport_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_vlan_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_svi_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_subinterface_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_bfd_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_interface_mtu_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_route_policy_intent_for_device"),
-        ):
+        with _patch_apply_pushes() as push:
             _prepare_apply(mgmt)
-        push_if.assert_called_once_with(mgmt.device_id, mgmt.adapter_device_id, force=True)
+        self.assertEqual(_forced_scopes(push, mgmt.device_id).count("interface"), 1)
 
     def test_prepare_apply_force_pushes_owned_route_policy_intent(self):
-        """Apply must force-re-push owned ROUTE-POLICY intent too (like interface/VLAN). An owned
+        """Apply must re-send owned ROUTE-POLICY intent too (like interface/VLAN). An owned
         route-policy object whose adapter intent went stale/empty otherwise applies 0 items and
         the row sticks in 'deploying' forever — observed on rg03, where an owned as-path had NO
         adapter intent row, so Apply pushed nothing and the row never settled."""
         from netbox_nso_plugin.views import _prepare_apply
 
         mgmt, _row = self._setup(status_="accepted")
-        with (
-            patch("netbox_nso_plugin.signals._push_interface_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_lacp_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_switchport_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_vlan_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_svi_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_subinterface_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_bfd_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_interface_mtu_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_route_policy_intent_for_device") as push_rp,
-        ):
+        with _patch_apply_pushes() as push:
             _prepare_apply(mgmt)
-        push_rp.assert_called_once_with(mgmt.device_id, mgmt.adapter_device_id, force=True)
+        self.assertEqual(_forced_scopes(push, mgmt.device_id).count("route_policy"), 1)
 
     def test_prepare_apply_force_pushes_deferred_scopes(self):
-        """Apply marks SVI/subinterface/BFD/MTU accepted->deploying, so it must also force-re-push
+        """Apply marks SVI/subinterface/BFD/MTU accepted->deploying, so it must also re-send
         their owned snapshots. These are mirrored as adapter intent (reactive push on accept/edit),
         but that mirror can go stale/empty (a failed push, an out-of-band adapter reset). Without a
-        force-push, Apply marks the row 'deploying' but the change-detection cache skips the push →
+        forced claim, Apply marks the row 'deploying' but the acknowledged baseline drops the send →
         0 items applied → the row sticks in 'deploying' forever (route-policy's rg03 failure mode)."""
         from netbox_nso_plugin.views import _prepare_apply
 
         mgmt, _row = self._setup(status_="accepted")
-        with (
-            patch("netbox_nso_plugin.signals._push_interface_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_lacp_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_switchport_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_vlan_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_route_policy_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_svi_intent_for_device") as push_svi,
-            patch("netbox_nso_plugin.signals._push_subinterface_intent_for_device") as push_subif,
-            patch("netbox_nso_plugin.signals._push_bfd_intent_for_device") as push_bfd,
-            patch("netbox_nso_plugin.signals._push_interface_mtu_intent_for_device") as push_mtu,
-        ):
+        with _patch_apply_pushes() as push:
             _prepare_apply(mgmt)
-        for push in (push_svi, push_subif, push_bfd, push_mtu):
-            push.assert_called_once_with(mgmt.device_id, mgmt.adapter_device_id, force=True)
+        forced = _forced_scopes(push, mgmt.device_id)
+        for scope in ("svi", "subinterface", "bfd", "interface_mtu"):
+            self.assertEqual(forced.count(scope), 1, scope)
 
 
-class TestSnmpApplyForcePush(APITestCase):
-    """SNMP intent is mirrored reactively on accept, and _push_changed swallows a failed PUT —
-    so a device whose accept-time push failed has no adapter intent at all. Apply is the only
-    recovery, exactly as for logging hosts, and must force-push the owned SNMP snapshot.
+class TestSnmpApplyForcePush(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    """SNMP intent is mirrored reactively on accept, and a failed PUT is swallowed — so a
+    device whose accept-time push failed has no adapter intent at all. Apply is the only
+    recovery, exactly as for logging hosts, and must re-send the owned SNMP snapshot.
 
     The refresh must be STORE-ONLY: a plain put_snmp_intent enqueues the shrink-removal job
     (and auto-apply on auto_apply devices), and _prepare_apply runs before trigger_apply —
     whose _trigger 409s while any job is active, so the recovery would kill the Apply it serves.
+
+    It runs the real claim, which is why there is no test transaction: the mode has to reach
+    the wire as the query flag, and only the transport is doubled.
     """
 
     def test_prepare_apply_force_pushes_snmp_snapshot(self):
@@ -872,41 +889,35 @@ class TestSnmpApplyForcePush(APITestCase):
         from netbox_nso_plugin.models import NSOSnmpHostState
         from netbox_nso_plugin.views import _prepare_apply
 
-        device = _make_device("snmp-apply")
-        inst, _ = NSOInstance.objects.get_or_create(
-            name="snmp-apply-inst", defaults={"adapter_instance_id": "snmp-apply-inst"}
-        )
-        mgmt = NSODeviceManagement.objects.create(
-            device=device, nso_instance=inst, nso_device_name="snmp-apply", adapter_device_id=91
-        )
-        NSOSnmpHostState.objects.create(
-            management=mgmt,
-            address="198.18.0.40",
-            version="v2c",
-            notify_type="trap",
-            community_hash="abcd1234abcd1234",
-            status="accepted",
-        )
+        with (
+            patch("netbox_nso_plugin.signals._sync_committed_scope_to_adapter"),
+            without_commit_drain(),
+            transaction.atomic(),
+        ):
+            device = _make_device("snmp-apply")
+            inst, _ = NSOInstance.objects.get_or_create(
+                name="snmp-apply-inst", defaults={"adapter_instance_id": "snmp-apply-inst"}
+            )
+            mgmt = NSODeviceManagement.objects.create(
+                device=device, nso_instance=inst, nso_device_name="snmp-apply", adapter_device_id=91
+            )
+            NSOSnmpHostState.objects.create(
+                management=mgmt,
+                address="198.18.0.40",
+                version="v2c",
+                notify_type="trap",
+                community_hash="abcd1234abcd1234",
+                status="accepted",
+            )
         seen = {}
 
         def _record_store_only(*args, **kwargs):
             seen["store_only"] = adapter_client._store_only_push.get()
 
-        with (
-            patch("netbox_nso_plugin.signals._push_interface_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_lacp_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_switchport_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_vlan_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_svi_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_subinterface_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_bfd_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_interface_mtu_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_route_policy_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_static_route_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_l2_sap_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_logging_intent_for_device"),
-            patch("netbox_nso_plugin.adapter_client.put_snmp_intent", side_effect=_record_store_only) as put_snmp,
-        ):
+        with isolate_other_scopes("snmp") as stack:
+            put_snmp = stack.enter_context(
+                patch("netbox_nso_plugin.adapter_client.put_snmp_intent", side_effect=_record_store_only)
+            )
             _prepare_apply(mgmt)
         put_snmp.assert_called_once()
         self.assertEqual(put_snmp.call_args.args[0], mgmt.adapter_device_id)
@@ -943,15 +954,7 @@ class TestApplyRollbackOnAdapterError(APITestCase):
         admin = get_user_model().objects.create_superuser(username="apply-rb-admin", password="pw", email="a@x.y")  # noqa: S106
         self.client.force_login(admin)
         with (
-            patch("netbox_nso_plugin.signals._push_interface_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_lacp_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_switchport_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_vlan_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_svi_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_subinterface_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_bfd_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_interface_mtu_intent_for_device"),
-            patch("netbox_nso_plugin.signals._push_route_policy_intent_for_device"),
+            _patch_apply_pushes(),
             patch(
                 "netbox_nso_plugin.adapter_client.trigger_apply",
                 side_effect=AdapterError("adapter unreachable", code="unreachable"),

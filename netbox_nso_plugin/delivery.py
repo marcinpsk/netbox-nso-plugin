@@ -1,0 +1,276 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
+"""#1503 Appendix O — the delivery registry: every key a push can be delivered under.
+
+The drift registry (``intent_drift``) answers a different question — which adapter tables a
+scope owns — and enumerates sixteen scopes under partly different names (``ip`` there is
+``interface_ip`` in the adapter's API). This one enumerates the **eighteen delivery keys**
+the push sites actually use, and says of each whether it is *in protocol*: whether its
+delivery is a logical operation the adapter admits, receipts and can replay.
+
+``lacp`` and ``switchport`` are **out of protocol**. They are direct-apply endpoints whose
+device write happens synchronously inside the request and which answer a failed apply with
+HTTP 200 and an error envelope, so no receipt can be atomic with their effect and the
+generic admission path cannot tell their success from their failure. They keep today's
+direct client calls; the split card owns their entry.
+
+The request mode (normal, store-only) is an argument of :func:`deliver`, never a property of
+a key: one scope is delivered both ways — SNMP normally on save and store-only from the
+resync, and static routes likewise.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import contextvars
+import dataclasses
+import threading
+from collections.abc import Callable
+
+MODE_NORMAL = "normal"
+MODE_STORE_ONLY = "store_only"
+#: Adopt the ids of the rows the body still names and prune the uncorrelated residue; accept
+#: no content, carry no authority, spawn no job. It exists to open a fence a pending genuine
+#: deletion cannot open for itself (§4.4, OQ-O-8), and it is never a way to deliver anything.
+MODE_BACKFILL_ONLY = "backfill_only"
+_MODES = (MODE_NORMAL, MODE_STORE_ONLY, MODE_BACKFILL_ONLY)
+
+MARKING_QUERY_FLAG = "query_flag"
+MARKING_PER_OBJECT = "per_object"
+
+
+@dataclasses.dataclass(frozen=True)
+class DeliveryKey:
+    """One ``(device, scope)`` delivery key: how it is pushed, and under which contract."""
+
+    key: str
+    label: str
+    #: In protocol: carries ``X-Push-Seq``, is admitted against a receipt and can be replayed.
+    in_protocol: bool
+    #: How a deletion is authorized on the wire — a query flag today, per object after O3.
+    marking_mode: str
+    #: Name of the full-device push in ``signals``, resolved on every call so a test patch
+    #: is honored no matter when the registry was built.
+    push_name: str
+
+    def push(self, device_id, adapter_device_id):
+        from . import signals
+
+        return getattr(signals, self.push_name)(device_id, adapter_device_id)
+
+
+_REGISTRY: dict[str, DeliveryKey] = {}
+
+
+def _build() -> dict[str, DeliveryKey]:
+    # (key, label, in_protocol, push_name)
+    keys = [
+        ("interface", "Interface", True, "_push_interface_intent_for_device"),
+        ("ip", "Interface IP", True, "_push_ip_intent_for_device"),
+        ("snmp", "SNMP", True, "_push_snmp_intent_for_device"),
+        ("logging", "Logging", True, "_push_logging_intent_for_device"),
+        ("svi", "SVI", True, "_push_svi_intent_for_device"),
+        ("subinterface", "Subinterface", True, "_push_subinterface_intent_for_device"),
+        ("interface_mtu", "Interface MTU", True, "_push_interface_mtu_intent_for_device"),
+        ("vlan", "VLAN", True, "_push_vlan_intent_for_device"),
+        ("bfd", "BFD", True, "_push_bfd_intent_for_device"),
+        ("static_route", "Static route", True, "_push_static_route_intent_for_device"),
+        ("isis_flex_algo", "IS-IS Flex-Algo", True, "_push_isis_flex_algo_intent_for_device"),
+        ("l2_sap", "L2 SAP", True, "_push_l2_sap_intent_for_device"),
+        ("isis", "IS-IS", True, "_push_isis_intent_for_device"),
+        ("bgp", "BGP", True, "_push_bgp_intent_for_device"),
+        ("route_policy", "Route policy", True, "_push_route_policy_intent_for_device"),
+        ("ospf", "OSPF", True, "_push_ospf_intent_for_device"),
+        ("lacp", "LACP", False, "_push_lacp_intent_for_device"),
+        ("switchport", "Switchport", False, "_push_switchport_intent_for_device"),
+    ]
+    return {
+        key: DeliveryKey(
+            key=key,
+            label=label,
+            in_protocol=in_protocol,
+            # Static routes leave ``query_flag`` at O3, one key at a time; O1 changes none.
+            marking_mode=MARKING_QUERY_FLAG,
+            push_name=push_name,
+        )
+        for key, label, in_protocol, push_name in keys
+    }
+
+
+def delivery_keys() -> dict[str, DeliveryKey]:
+    """Return the registry, built once. It is the mapping itself, not a copy."""
+    if not _REGISTRY:
+        _REGISTRY.update(_build())
+    return _REGISTRY
+
+
+# ── Rendering and sending, which the claim protocol must be able to separate ───
+#
+# A claim renders inside its own repeatable-read transaction and sends outside every
+# transaction (§4.2), so the two halves of a push have to come apart. The push functions are
+# the only renderers there are and each reaches exactly one choke point, ``_push_changed``,
+# so the render is that function run with the send captured instead of made.
+
+_CAPTURE: contextvars.ContextVar[list | None] = contextvars.ContextVar("nso_render_capture", default=None)
+
+
+@dataclasses.dataclass
+class Rendered:
+    """One key's rendered request: the body, the call that sends a body, the success hook."""
+
+    key: tuple
+    payload: object
+    #: Takes the body to send, so a replay can send the claim's stored body rather than
+    #: whatever the re-render produced. The sequence must carry the digest it was admitted at.
+    do_push: Callable
+    #: The scope's own success side effect, run on the response the send returned.
+    on_response: Callable | None = None
+
+
+def capture(rendered: Rendered) -> bool:
+    """Record *rendered* when a render is in progress, and answer whether it was recorded."""
+    sink = _CAPTURE.get()
+    if sink is None:
+        return False
+    sink.append(rendered)
+    return True
+
+
+def render(key: str, device_id, adapter_device_id) -> Rendered:
+    """Build the key's request body for one device without sending anything."""
+    entry = delivery_keys()[key]
+    sink: list = []
+    token = _CAPTURE.set(sink)
+    try:
+        entry.push(device_id, adapter_device_id)
+    finally:
+        _CAPTURE.reset(token)
+    if len(sink) != 1:
+        raise RuntimeError(f"the {key} push rendered {len(sink)} bodies, expected exactly one")
+    return sink[0]
+
+
+def wire_body(rendered: Rendered, body):
+    """Return the exact JSON body the client would send for *body*, without sending it.
+
+    The identity the adapter's receipt carries is over the body it received (§4.4), and the
+    envelope each endpoint wraps a payload in (``{"vlans": …}``, ``{"routes": …}``) belongs
+    to the client. So the body is taken by running the same call under a capture rather than
+    by re-deriving the envelope here, where the two definitions could drift apart.
+    """
+    from . import adapter_client
+
+    with adapter_client.capture_wire_body() as captured:
+        rendered.do_push(body)
+    if len(captured) != 1:
+        raise RuntimeError(f"the {rendered.key[1]} push made {len(captured)} requests, expected exactly one")
+    return captured[0]
+
+
+class SendDeadlineExceeded(Exception):
+    """One send outlived its total wall-clock budget (O-P16)."""
+
+    code = "nso_send_deadline"
+
+
+def _under_deadline(do_push: Callable, seconds: float) -> Callable:
+    """Bound one transport call by wall clock, which the client's timeouts cannot do.
+
+    ``(connect, read)`` measures the gap between bytes, so a response dripping one byte at
+    a time resets it forever. The call therefore runs on its own thread, on a session of its
+    OWN, over a transport it can ABORT: an expired deadline shuts the in-flight socket down,
+    the worker's read comes back and the thread goes with it. Closing the session is not
+    enough — that empties the pool and leaves the borrowed connection exactly where it was,
+    so the thread and the socket outlived every retry against a far side that kept dripping.
+
+    The waiter's verdict is final. A completion that arrives after the budget ran out is
+    discarded, never applied: the attempt has been recorded failed and the operation is
+    already being replayed under its own sequence.
+    """
+
+    def _call(body):
+        from . import adapter_client
+
+        transport = adapter_client.AbortableTransport()
+        session = adapter_client.new_session(transport=transport)
+        with adapter_client.bound_session(session):
+            # Copied while the session is bound, so the worker sends on the transport the
+            # waiter can close under it.
+            context = contextvars.copy_context()
+        answer: dict = {}
+        done = threading.Event()
+        expired = threading.Event()
+
+        def _run():
+            try:
+                from django.db import connections
+
+                result = context.run(do_push, body)
+                if not expired.is_set():
+                    answer["result"] = result
+            except BaseException as exc:  # noqa: BLE001 (re-raised on the sender's thread)
+                if not expired.is_set():
+                    answer["error"] = exc
+            finally:
+                # done.set() is the waiter's only wake-up, so it cannot ride behind a
+                # teardown step: a raise there would hold the waiter for the whole budget
+                # and report a delivered push as a timeout.
+                try:
+                    connections.close_all()  # this thread's own connections, nobody else's
+                    session.close()
+                finally:
+                    done.set()
+
+        threading.Thread(target=_run, name="nso-intent-push", daemon=True).start()
+        if not done.wait(seconds):
+            expired.set()
+            transport.abort()
+            session.close()
+            raise SendDeadlineExceeded(f"the adapter did not answer within {seconds}s")
+        if "error" in answer:
+            raise answer["error"]
+        return answer["result"]
+
+    return _call
+
+
+def send(
+    rendered: Rendered,
+    body,
+    *,
+    mode: str = MODE_NORMAL,
+    mark: bool = False,
+    push_seq: int | None = None,
+    deadline: float | None = None,
+):
+    """Send *body* for an already-rendered key, and return the adapter's answer.
+
+    The mode and the deletion mark ride on the request as query flags, so they are applied
+    here rather than being baked into a key: the same scope is delivered normally and
+    store-only. The sequence is a header, and only an in-protocol key carries one.
+    """
+    from . import adapter_client, signals
+
+    if mode not in _MODES:
+        raise ValueError(f"unknown delivery mode {mode!r}")
+    if mark and mode == MODE_BACKFILL_ONLY:
+        raise ValueError("a backfill-only request carries no authority, so it cannot mark a deletion")
+    entry = delivery_keys()[rendered.key[1]]
+    if deadline is not None:
+        rendered = dataclasses.replace(rendered, do_push=_under_deadline(rendered.do_push, deadline))
+    with contextlib.ExitStack() as stack:
+        if mode == MODE_STORE_ONLY:
+            stack.enter_context(adapter_client.store_only_pushes())
+        if mode == MODE_BACKFILL_ONLY:
+            stack.enter_context(adapter_client.backfill_only_pushes())
+        if mark:
+            stack.enter_context(adapter_client.delete_origin_pushes())
+        if push_seq is not None and entry.in_protocol:
+            stack.enter_context(adapter_client.push_seq(push_seq))
+        return signals._send_rendered(rendered, body)
+
+
+def deliver(key: str, device_id, adapter_device_id, *, mode: str = MODE_NORMAL, mark: bool = False):
+    """Render *key* for one device and send it straight away, outside the claim protocol."""
+    rendered = render(key, device_id, adapter_device_id)
+    return send(rendered, rendered.payload, mode=mode, mark=mark)

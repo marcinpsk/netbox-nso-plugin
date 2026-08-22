@@ -26,6 +26,8 @@ from ipam.models import Prefix, Role
 from netbox_nso_plugin.ip_autoassign import assign_ips_for_role, rollback_auto_assigned
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOInterfaceIPState, NSOLinkRole
 
+from .mixins import IntentPushResetMixin
+
 _PUSH = "netbox_nso_plugin.signals._push_ip_intent_for_device"
 
 
@@ -36,7 +38,10 @@ def _make_cable(iface_a, iface_b):
     return cable
 
 
-class _Base(TestCase):
+class _Base(IntentPushResetMixin, TestCase):
+    """These call ``assign_ips_for_role`` directly, so the schedule is NOT suppressed and the
+    rolled-back transaction leaves its keys in the thread-local cell for the next test."""
+
     @classmethod
     def setUpTestData(cls):
         mfg = Manufacturer.objects.create(name="LripMfg", slug="lripmfg")
@@ -57,6 +62,7 @@ class TestAssignP2PForRole(_Base):
     """p2p roles: both ends from explicit prefix / role slug, mask override, dual-stack."""
 
     def setUp(self):
+        super().setUp()
         self.mgmt_a = self._manage(self.dev_a)
         self.mgmt_b = self._manage(self.dev_b)
         self.if_a = Interface.objects.create(device=self.dev_a, name="Gi0/0", type="1000base-t")
@@ -189,6 +195,7 @@ class TestAssignSingleForRole(_Base):
     """single-ended roles: loopback/access host allocation, fill-empty, no pool, no-op."""
 
     def setUp(self):
+        super().setUp()
         self.mgmt_a = self._manage(self.dev_a)
         self.lo_a = Interface.objects.create(device=self.dev_a, name="Loopback0", type="virtual")
 

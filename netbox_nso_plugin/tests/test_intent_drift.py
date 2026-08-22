@@ -7,10 +7,11 @@ from __future__ import annotations
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
-from django.test import TestCase
+from django.db import transaction
+from django.test import TestCase, TransactionTestCase
 from django.utils import timezone
 
-from netbox_nso_plugin import intent_drift
+from netbox_nso_plugin import drain, intent_drift
 from netbox_nso_plugin.models import (
     NSOBGPPeerState,
     NSODeviceManagement,
@@ -21,7 +22,8 @@ from netbox_nso_plugin.models import (
 )
 
 from ._adapter_http import make_session
-from .mixins import IntentPushResetMixin
+from ._outbox_case import without_commit_drain
+from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 _ADAPTER_CFG = {
     "url": "http://adapter.local",
@@ -150,31 +152,38 @@ class TestIntentDrift(IntentPushResetMixin, TestCase):
         # Must never break the tab render.
         self.assertEqual(intent_drift.compute_intent_drift(self.device, self.mgmt), [])
 
-    @patch("netbox_nso_plugin.signals._push_ip_intent_for_device")
-    def test_resync_calls_push_for_scope(self, mock_push):
-        done = intent_drift.resync_intent(self.device, self.mgmt, ["interface_ip"])
-        self.assertEqual(done, ["interface_ip"])
-        # force=True: the split-brain re-sync must bypass _push_changed's unchanged-skip —
-        # the plugin's cached digest is precisely what is stale here (see TestResyncStoreOnly).
-        mock_push.assert_called_once_with(self.mgmt.device_id, 88, force=True)
+    @patch("netbox_nso_plugin.drain.drain_key", return_value=drain.SUCCEEDED)
+    def test_resync_calls_push_for_scope(self, mock_drain):
+        from netbox_nso_plugin.delivery import MODE_STORE_ONLY
+
+        done, failed = intent_drift.resync_intent(self.device, self.mgmt, ["interface_ip"])
+        self.assertEqual((done, failed), (["interface_ip"], []))
+        # The drift registry calls the scope interface_ip and the delivery registry calls it
+        # ip, so the key is resolved through the one registry that enumerates the pushes.
+        # force=True: the split-brain re-sync must not be dropped against the acknowledged
+        # baseline — that baseline is precisely what is stale here (see TestResyncStoreOnly).
+        mock_drain.assert_called_once_with(self.mgmt.device_id, "ip", mode=MODE_STORE_ONLY, force=True)
 
     def test_resync_no_adapter_id_noop(self):
         self.mgmt.adapter_device_id = None
-        self.assertEqual(intent_drift.resync_intent(self.device, self.mgmt, ["interface_ip"]), [])
+        self.assertEqual(intent_drift.resync_intent(self.device, self.mgmt, ["interface_ip"]), ([], []))
 
-    @patch("netbox_nso_plugin.signals._push_ip_intent_for_device")
+    @patch("netbox_nso_plugin.drain.drain_key", return_value=drain.SUCCEEDED)
     @patch("netbox_nso_plugin.adapter_client.get_intent_summary")
-    def test_resync_default_keys_include_partial_scopes(self, mock_sum, mock_push):
+    def test_resync_default_keys_include_partial_scopes(self, mock_sum, mock_drain):
+        from netbox_nso_plugin.delivery import MODE_STORE_ONLY
+
         mock_sum.return_value = self._SUMMARY
         NSOInterfaceIPState.objects.create(
             interface=self.iface, address="10.0.0.1/32", vrf="", family="ipv4", status="accepted"
         )
-        done = intent_drift.resync_intent(self.device, self.mgmt)
+        done, failed = intent_drift.resync_intent(self.device, self.mgmt)
         self.assertIn("interface_ip", done)
-        mock_push.assert_called_once_with(self.mgmt.device_id, 88, force=True)
+        self.assertEqual(failed, [])
+        mock_drain.assert_called_once_with(self.mgmt.device_id, "ip", mode=MODE_STORE_ONLY, force=True)
 
 
-class TestResyncStoreOnly(IntentPushResetMixin, TestCase):
+class TestResyncStoreOnly(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     """Tracker #103: a re-sync push must be STORE-ONLY on the adapter side.
 
     "Re-sync adapter intent" promises it never touches the device, but its reduced
@@ -182,21 +191,27 @@ class TestResyncStoreOnly(IntentPushResetMixin, TestCase):
     retracted FASTMAP-owned config from the real device (ra1.lab, removal job 31686).
     The re-sync pushes must therefore carry ``?store_only=true``, which the adapter
     honours by skipping the removal/auto-apply enqueues. These drive the REAL path —
-    resync_intent → signals push → adapter_client PUT — down to the recorded session.
+    resync_intent → forced claim → adapter_client PUT — down to the recorded session,
+    which is why they run outside a test transaction: the claim refuses to nest in one.
     """
 
-    @classmethod
-    def setUpTestData(cls):
-        mfg = Manufacturer.objects.create(name="SoMfg", slug="somfg")
-        dt = DeviceType.objects.create(manufacturer=mfg, model="SoDev", slug="sodev")
-        role = DeviceRole.objects.create(name="SoRole", slug="sorole")
-        site = Site.objects.create(name="SoSite", slug="sosite")
-        cls.device = Device.objects.create(name="so-rtr", device_type=dt, role=role, site=site)
-        inst = NSOInstance.objects.create(name="SoNSO", adapter_instance_id="nso-so")
-        cls.mgmt = NSODeviceManagement.objects.create(
-            device=cls.device, nso_instance=inst, nso_device_name="so-rtr", adapter_device_id=91
-        )
-        NSOLoggingHostState.objects.create(management=cls.mgmt, address="10.0.0.5", status="accepted")
+    def setUp(self):
+        super().setUp()
+        with (
+            patch("netbox_nso_plugin.signals._sync_committed_scope_to_adapter"),
+            without_commit_drain(),
+            transaction.atomic(),
+        ):
+            mfg = Manufacturer.objects.create(name="SoMfg", slug="somfg")
+            dt = DeviceType.objects.create(manufacturer=mfg, model="SoDev", slug="sodev")
+            role = DeviceRole.objects.create(name="SoRole", slug="sorole")
+            site = Site.objects.create(name="SoSite", slug="sosite")
+            self.device = Device.objects.create(name="so-rtr", device_type=dt, role=role, site=site)
+            inst = NSOInstance.objects.create(name="SoNSO", adapter_instance_id="nso-so")
+            self.mgmt = NSODeviceManagement.objects.create(
+                device=self.device, nso_instance=inst, nso_device_name="so-rtr", adapter_device_id=91
+            )
+            NSOLoggingHostState.objects.create(management=self.mgmt, address="10.0.0.5", status="accepted")
 
     def _recorded_requests(self, run):
         session = make_session(json_data={})
@@ -216,32 +231,63 @@ class TestResyncStoreOnly(IntentPushResetMixin, TestCase):
         params = calls[0].kwargs.get("params") or {}
         self.assertEqual(params.get("store_only"), "true")
 
-    def test_normal_signal_push_has_no_store_only_flag(self):
-        from netbox_nso_plugin.signals import _push_logging_intent_for_device
+    def test_an_empty_success_response_is_reported_as_done(self):
+        session = make_session(content=b"")
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_ADAPTER_CFG),
+            patch("netbox_nso_plugin.adapter_client._get_session", return_value=session),
+        ):
+            result = intent_drift.resync_intent(self.device, self.mgmt, ["logging"])
 
-        calls = self._recorded_requests(lambda: _push_logging_intent_for_device(self.device.pk, 91))
+        self.assertEqual(result, (["logging"], []))
+
+    def test_normal_signal_push_has_no_store_only_flag(self):
+        from netbox_nso_plugin.delivery import deliver
+
+        calls = self._recorded_requests(lambda: deliver("logging", self.device.pk, self.mgmt.adapter_device_id))
         self.assertEqual(len(calls), 1)
         params = calls[0].kwargs.get("params") or {}
         self.assertNotIn("store_only", params)
 
-    def test_resync_pushes_even_when_the_hash_cache_says_unchanged(self):
-        """The split-brain re-sync exists for: the ADAPTER lost the intent while the plugin
-        still holds the digest of its last (successful) push in the process-global
-        _last_pushed_hashes. That is exactly the state _push_changed reads as "unchanged,
-        skip" — so without force=True the re-sync silently pushed NOTHING while the view
-        reported success, and the operator's split-brain was never repaired.
+    def test_resync_pushes_even_when_the_acknowledged_baseline_names_that_body(self):
+        """The split-brain re-sync exists for: the ADAPTER lost the intent while the plugin's
+        ``last_success_identity`` still names the body it last acknowledged. That is exactly
+        what the claim drops as unchanged — so without force=True the re-sync would send
+        NOTHING while the view reported success, and the split-brain was never repaired.
         """
-        from netbox_nso_plugin.signals import _push_logging_intent_for_device
+        from netbox_nso_plugin import outbox
 
-        # Prime the cache the way a normal, successful push would.
-        primed = self._recorded_requests(lambda: _push_logging_intent_for_device(self.device.pk, 91))
+        # The control: an ordinary claim IS dropped once the baseline names its body.
+        with without_commit_drain(), transaction.atomic():
+            outbox.enqueue(self.device.pk, "logging")
+        primed = self._recorded_requests(lambda: drain.drain_key(self.device.pk, "logging"))
         self.assertEqual(len(primed), 1)
+        with without_commit_drain(), transaction.atomic():
+            outbox.enqueue(self.device.pk, "logging")
+        again = self._recorded_requests(lambda: drain.drain_key(self.device.pk, "logging"))
+        self.assertEqual(len(again), 0, "an unchanged ordinary claim is still dropped")
 
-        # A second identical ordinary push is correctly skipped as unchanged...
-        again = self._recorded_requests(lambda: _push_logging_intent_for_device(self.device.pk, 91))
-        self.assertEqual(len(again), 0, "an unchanged ordinary push is still skipped")
+        # The re-sync is forced, so its own repeat goes out against the baseline it just set.
+        first = self._recorded_requests(lambda: intent_drift.resync_intent(self.device, self.mgmt, ["logging"]))
+        repeated = self._recorded_requests(lambda: intent_drift.resync_intent(self.device, self.mgmt, ["logging"]))
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(repeated), 1, "the re-sync was dropped against the baseline it had just set")
+        self.assertEqual((repeated[0].kwargs.get("params") or {}).get("store_only"), "true")
 
-        # ...but the re-sync must go out regardless.
-        calls = self._recorded_requests(lambda: intent_drift.resync_intent(self.device, self.mgmt, ["logging"]))
-        self.assertEqual(len(calls), 1, "the re-sync must push even when the payload digest is unchanged")
-        self.assertEqual((calls[0].kwargs.get("params") or {}).get("store_only"), "true")
+    def test_a_refused_push_is_reported_rather_than_reported_cleared(self):
+        """codex O1 r4 F5 (board #1557): a key nothing was sent for is not a key that cleared.
+
+        The deletion of an owned row is authority a store-only request can never carry
+        (§4.3(d)), so the claim refuses and the wire stays empty. Appending the key anyway
+        told the operator the orphaned intent was gone while the drift was untouched.
+        """
+        with without_commit_drain(), transaction.atomic():
+            NSOLoggingHostState.objects.filter(management=self.mgmt).delete()
+
+        returned: list = []
+        calls = self._recorded_requests(
+            lambda: returned.append(intent_drift.resync_intent(self.device, self.mgmt, ["logging"]))
+        )
+
+        self.assertEqual(len(calls), 0, "a store-only request writes no removal, so it may not carry one")
+        self.assertEqual(returned, [([], ["logging"])], "the refused key is reported, never counted as cleared")

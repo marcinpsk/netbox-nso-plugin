@@ -41,7 +41,7 @@ class AdvanceStaleOnboardingJob(JobRunner):
 class RefreshDeviceSyncCacheJob(JobRunner):
     """The plugin's per-device maintenance tick. The name is kept; it does more than it says.
 
-    Three passes today, in this order and for these reasons:
+    Four passes today, in this order and for these reasons:
 
     1. **the last-sync mirror.** ``NSODeviceManagement.last_sync_at``/``last_sync_status``
        are a cache of the adapter's device row, and page renders used to be the only thing
@@ -50,7 +50,11 @@ class RefreshDeviceSyncCacheJob(JobRunner):
        all along.
     2. **the adapter-mapping repair.** A row whose mapping is broken cannot be mirrored at
        all, and its adapter device id is half the settlement cursor's epoch.
-    3. **the static-route settlement sweep.** The retry clock for #1502's consumer, and the
+    3. **the intent-outbox drain.** #1503 Appendix O's pass, and the clock that carries a
+       scheduled push whose commit callback was lost. It runs after the repair because it
+       needs a repaired adapter id, and it re-queries its own candidates rather than reading
+       the rows this job materialized, which the repair leaves stale in two of its branches.
+    4. **the static-route settlement sweep.** The retry clock for #1502's consumer, and the
        reason it is here rather than on a schedule of its own: this job runs
        plugin-to-adapter, so it survives the failure the callback channel cannot — an
        invalid adapter-to-NetBox token answers 401 on every notification while reads stay
@@ -64,7 +68,8 @@ class RefreshDeviceSyncCacheJob(JobRunner):
         name = "Refresh NSO device sync cache"
 
     def run(self, *args, **kwargs):
-        """Refresh the last-sync mirror, repair broken adapter mappings, then sweep settlements."""
+        """Refresh the last-sync mirror, repair mappings, drain the outbox, sweep settlements."""
+        from .drain import compact_intent_outbox, drain_intent_outbox
         from .models import NSODeviceManagement
         from .settlement import sweep_static_route_settlements
         from .sync_cache import _snapshot, reconcile_device_links, refresh_sync_caches
@@ -87,20 +92,38 @@ class RefreshDeviceSyncCacheJob(JobRunner):
         # timeout in turn, so a hundred of them can hold a five-minute job for the best part
         # of an hour. Skip the pass; the next tick is five minutes away.
         _mapped, by_id, _by_identity = snapshot
-        started = time.monotonic()
+        drained = drain_failed = polled = settle_failed = 0
+        drain_started = settle_started = time.monotonic()
+        # The drain guards each key, not its own candidate query, so an error there would
+        # abort the tick before the sweep — the one pass that must always run.
         if by_id is None:
-            logger.warning("RefreshDeviceSyncCacheJob: adapter snapshot unavailable — settlement sweep skipped")
-            polled, settle_failed = 0, 0
+            try:
+                compact_intent_outbox()
+            except Exception:  # noqa: BLE001 — the sweep below is the retry clock
+                logger.exception("RefreshDeviceSyncCacheJob: intent-outbox compaction failed")
+            settle_started = time.monotonic()
+            logger.warning("RefreshDeviceSyncCacheJob: adapter snapshot unavailable, sends and sweep skipped")
         else:
+            # Same rule as the sweep, and for the same reason: a proven global outage is not
+            # a per-key failure, and every candidate would wait out its own read timeout.
+            try:
+                drained, drain_failed = drain_intent_outbox()
+            except Exception:  # noqa: BLE001 — the sweep below is the retry clock
+                logger.exception("RefreshDeviceSyncCacheJob: intent-outbox drain failed")
+            settle_started = time.monotonic()
             polled, settle_failed = sweep_static_route_settlements()
         logger.info(
             "RefreshDeviceSyncCacheJob: %d checked, %d updated, %d broken, %d repair attempted, "
+            "%d outbox drained, %d outbox failed, outbox drain %.3fs, "
             "%d settlement polled, %d settlement failed, settlement sweep %.3fs",
             checked,
             updated,
             broken,
             attempted,
+            drained,
+            drain_failed,
+            settle_started - drain_started,
             polled,
             settle_failed,
-            time.monotonic() - started,
+            time.monotonic() - settle_started,
         )

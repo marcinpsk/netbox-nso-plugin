@@ -53,8 +53,9 @@ class TestRegistryMatchesRealPush(_IsisPolicyBase):
         from netbox_routing.models import ISISInstance, ISISLevel
 
         from netbox_nso_plugin import adapter_client
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.models import NSOISISInstanceState, NSOISISInterfaceState
-        from netbox_nso_plugin.signals import _push_isis_intent_for_device, suppress_intent_push
+        from netbox_nso_plugin.signals import suppress_intent_push
 
         mgmt = self._mgmt()
         # A fork instance carrying every read-only scalar the reconciler mirrors —
@@ -92,7 +93,7 @@ class TestRegistryMatchesRealPush(_IsisPolicyBase):
         orig = adapter_client.put_isis_interface_intent
         adapter_client.put_isis_interface_intent = _fake_put
         try:
-            _push_isis_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+            deliver("isis", mgmt.device_id, mgmt.adapter_device_id)
         finally:
             adapter_client.put_isis_interface_intent = orig
         self.assertEqual(len(captured.get("processes") or []), 1)

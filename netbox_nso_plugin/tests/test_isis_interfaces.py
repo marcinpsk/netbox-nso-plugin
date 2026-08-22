@@ -11,6 +11,7 @@ from django.db import OperationalError
 from django.test import TestCase
 
 from ._adapter_http import make_session
+from .mixins import IntentPushDeliveryMixin
 
 _BASE_CFG = {
     "url": "http://adapter.local",
@@ -115,7 +116,7 @@ class TestIsisChildFailurePolicy(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestReconcileIsisInterfaces(TestCase):
+class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
     """Integration tests for _reconcile_isis_interfaces()."""
 
     @classmethod
@@ -229,9 +230,6 @@ class TestReconcileIsisInterfaces(TestCase):
         self.assertTrue(
             NSOISISInterfaceState.objects.filter(management=mgmt, interface=self.iface_ge1, af="ipv4").exists()
         )
-        from netbox_nso_plugin.signals import reset_intent_push_state
-
-        reset_intent_push_state()  # cold cache so the removal push isn't change-detection-skipped
         with patch("netbox_nso_plugin.adapter_client.put_isis_interface_intent") as mock_push:
             with self.captureOnCommitCallbacks(execute=True):
                 isis_if.delete()
@@ -471,8 +469,8 @@ class TestReconcileIsisInterfaces(TestCase):
         from netbox_routing.models import ISISInstance, ISISInterface
 
         from netbox_nso_plugin import adapter_client
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.models import NSOISISInterfaceState
-        from netbox_nso_plugin.signals import _push_isis_intent_for_device
 
         mgmt = self._make_mgmt()
         inst = ISISInstance.objects.create(device=self.device, process_tag="")
@@ -493,7 +491,7 @@ class TestReconcileIsisInterfaces(TestCase):
         orig = adapter_client.put_isis_interface_intent
         adapter_client.put_isis_interface_intent = _fake_put
         try:
-            _push_isis_intent_for_device(mgmt.device_id, mgmt.adapter_device_id, force=True)
+            deliver("isis", mgmt.device_id, mgmt.adapter_device_id)
         finally:
             adapter_client.put_isis_interface_intent = orig
         entry = next(i for i in captured["interfaces"] if i["interface_name"] == "GigabitEthernet0/1")

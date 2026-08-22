@@ -42,6 +42,17 @@ class TestClientResetHelpers(unittest.TestCase):
 
         self.assertEqual(ac._cfg_cache, {})
 
+    def test_abortable_transport_keeps_the_instrumented_pool_alive(self):
+        from netbox_nso_plugin.adapter_client import AbortableTransport
+
+        transport = AbortableTransport()
+        self.addCleanup(transport.close)
+        request = requests.Request("GET", "https://example.invalid").prepare()
+
+        pool = transport.get_connection_with_tls_context(request, verify=True)
+
+        self.assertIn(pool, transport._instrumented)
+
 
 class TestResolveConfigCacheConcurrency(_CascadeFlushMixin, TransactionTestCase):
     """Database-backed concurrency coverage for adapter config invalidation."""
@@ -338,6 +349,69 @@ class TestRequestErrorPaths(unittest.TestCase):
 
         self.assertEqual(ctx.exception.code, "503")
 
+    def _error_from(self, status, body):
+        """Raise ``_request`` against a real *body* served with *status*, return the AdapterError."""
+        from netbox_nso_plugin.adapter_client import AdapterError, _request
+
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
+            patch("netbox_nso_plugin.adapter_client.requests.Session") as mock_s,
+        ):
+            session = make_session()
+            session.request.return_value = make_response(status, json_data=body)
+            mock_s.return_value = session
+
+            with self.assertRaises(AdapterError) as ctx:
+                _request("GET", "/test")
+        return ctx.exception
+
+    def test_error_body_whose_error_member_is_not_an_object_falls_back(self):
+        """A scalar "error" must still raise a typed AdapterError.
+
+        Reading .get() off the scalar raised AttributeError out of _request, which the
+        operator sees as a 500 instead of the adapter's error.
+        """
+        exc = self._error_from(409, {"error": "boom"})
+
+        self.assertEqual(exc.code, "409")
+        self.assertEqual(str(exc), '{"error": "boom"}')
+        self.assertIsNone(exc.detail)
+
+    def test_a_null_message_or_code_falls_back_to_the_status_and_body(self):
+        """Present-but-null members must not beat the fallbacks.
+
+        ``.get(key, default)`` returns the default only when the key is ABSENT, so an
+        emitted null produced code=None and message=None — an empty operator message.
+        """
+        exc = self._error_from(409, {"error": {"code": None, "message": None}})
+
+        self.assertEqual(exc.code, "409")
+        self.assertEqual(str(exc), '{"error": {"code": null, "message": null}}')
+
+    def test_a_non_object_detail_is_normalized_away(self):
+        """AdapterError.detail is typed dict|None, so every consumer may .get() it."""
+        exc = self._error_from(409, {"error": {"code": "conflict", "detail": "boom"}})
+
+        self.assertEqual(exc.code, "conflict")
+        self.assertIsNone(exc.detail)
+
+    def test_success_response_non_json_raises_invalid_response(self):
+        """A 2xx whose body is not JSON is an adapter fault, not a plugin crash."""
+        from netbox_nso_plugin.adapter_client import AdapterError, _request
+
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
+            patch("netbox_nso_plugin.adapter_client.requests.Session") as mock_s,
+        ):
+            session = make_session()
+            session.request.return_value = make_response(200, content=b"<html>gateway</html>")
+            mock_s.return_value = session
+
+            with self.assertRaises(AdapterError) as ctx:
+                _request("GET", "/test")
+
+        self.assertEqual(ctx.exception.code, "invalid_response")
+
     def test_read_timeout_surfaces_as_nso_timeout(self):
         """A connected-but-hung adapter (ReadTimeout) → distinct nso_timeout code, not nso_unreachable."""
         from netbox_nso_plugin.adapter_client import AdapterError, _request
@@ -371,6 +445,123 @@ class TestRequestErrorPaths(unittest.TestCase):
                 _request("GET", "/test")
 
         self.assertEqual(ctx.exception.code, "nso_unreachable")
+
+
+#: One job exactly as the adapter's JobOut renders it — every key present, nullables null.
+_JOB_OUT = {
+    "id": 7,
+    "type": "apply",
+    "device_id": 10,
+    "status": "succeeded",
+    "result": {"ok": True},
+    "error": None,
+    "context": {"scope": "vlan"},
+    "created_at": "2026-07-10T05:59:00Z",
+    "updated_at": "2026-07-10T06:00:00Z",
+    "started_at": None,
+    "heartbeat_at": None,
+    "settle_seq": 3,
+}
+
+
+def _job_with_scalar(member):
+    """A JobOut-shaped job whose *member* carries a scalar the model cannot emit."""
+    return {**_JOB_OUT, member: "boom"}
+
+
+class TestJobBoundaryValidation(unittest.TestCase):
+    """Job payloads are checked once here, not tolerated by every reader downstream.
+
+    The adapter's ``JobOut`` model (``../nso-adapter/nso_adapter/api/jobs.py``) always emits
+    every key and types ``result``, ``error`` and ``context`` as ``dict | None``. A scalar in
+    one of those is a broken producer, not a value to defend against at each call site, so
+    the client refuses the payload with a typed ``invalid_response`` the callers already
+    handle.
+    """
+
+    def _session(self, payload=None, *, content=None, headers=None):
+        """A pooled-session double serving one real response built from *payload*."""
+        import netbox_nso_plugin.adapter_client as ac
+
+        ac.reset_session()
+        self.addCleanup(ac.reset_session)
+        response = make_response(200, json_data=payload, content=content)
+        if headers:
+            response.headers.update(headers)
+        return make_session(response=response)
+
+    def _refuses(self, session, call):
+        """Assert *call* raises the typed refusal while *session* is the transport."""
+        from netbox_nso_plugin.adapter_client import AdapterError
+
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
+            patch("netbox_nso_plugin.adapter_client.requests.Session", return_value=session),
+        ):
+            with self.assertRaises(AdapterError) as ctx:
+                call()
+        self.assertEqual(ctx.exception.code, "invalid_response")
+
+    def test_a_job_shaped_exactly_like_jobout_is_accepted_unchanged(self):
+        """The contract pin: what the adapter's model emits must pass through untouched."""
+        from netbox_nso_plugin.adapter_client import get_job
+
+        session = self._session(_JOB_OUT)
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
+            patch("netbox_nso_plugin.adapter_client.requests.Session", return_value=session),
+        ):
+            self.assertEqual(get_job(7), _JOB_OUT)
+
+    def test_get_job_refuses_a_payload_jobout_cannot_produce(self):
+        from netbox_nso_plugin.adapter_client import get_job
+
+        for payload in ("boom", ["not-a-job"], _job_with_scalar("result"), _job_with_scalar("error")):
+            with self.subTest(payload=payload):
+                self._refuses(self._session(payload), lambda: get_job(7))
+
+    def test_an_empty_body_job_is_refused_rather_than_served_as_none(self):
+        """_request returns None on an empty-body 200, which NSOJobStatusView then handed
+        straight to JsonResponse and raised TypeError on. Refuse it at the source."""
+        from netbox_nso_plugin.adapter_client import get_job
+
+        self._refuses(self._session(content=b""), lambda: get_job(7))
+
+    def test_list_jobs_refuses_a_listing_that_is_not_a_list_of_jobs(self):
+        from netbox_nso_plugin.adapter_client import list_jobs
+
+        for payload in ({"jobs": []}, ["not-a-job"], [_job_with_scalar("context")]):
+            with self.subTest(payload=payload):
+                self._refuses(self._session(payload), lambda: list_jobs(10))
+
+    def test_settlement_feed_refuses_a_malformed_page(self):
+        from netbox_nso_plugin.adapter_client import STORE_INCARNATION_HEADER, get_settlement_feed
+
+        session = self._session([_job_with_scalar("result")], headers={STORE_INCARNATION_HEADER: "inc-1"})
+        self._refuses(session, lambda: get_settlement_feed(10, after_settle_seq=0, limit=50))
+
+    def test_settlement_feed_refuses_a_body_that_is_not_json(self):
+        """The feed reads the body itself, so its own decode must raise the typed refusal.
+
+        A gateway's HTML 200 otherwise surfaced as a bare requests JSONDecodeError, which
+        no settlement caller handles: they are written against AdapterError.
+        """
+        from netbox_nso_plugin.adapter_client import STORE_INCARNATION_HEADER, get_settlement_feed
+
+        session = self._session(content=b"<html>gateway</html>", headers={STORE_INCARNATION_HEADER: "inc-1"})
+        self._refuses(session, lambda: get_settlement_feed(10, after_settle_seq=0, limit=50))
+
+    def test_static_route_read_back_refuses_a_payload_without_routes(self):
+        """StaticRouteIntentOut always carries a ``routes`` list; anything else is undecidable.
+
+        Degrading to {} here would record ZERO expectations and silently mis-settle, so the
+        read-back must fail loudly enough for the stall bound to count it.
+        """
+        from netbox_nso_plugin.adapter_client import get_static_route_intent
+
+        for payload in ("boom", {"device_id": 10}, {"device_id": 10, "routes": "nope"}):
+            with self.subTest(payload=payload):
+                self._refuses(self._session(payload), lambda: get_static_route_intent(10))
 
 
 class TestAdapterClientRemainingFunctions(unittest.TestCase):
@@ -585,6 +776,28 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
         _, kwargs = session.request.call_args
         self.assertEqual(kwargs["json"]["attributes"], attrs)
 
+    def test_the_canonical_bytes_are_what_requests_prepares(self):
+        """Both keys go to ``session.request``; requests must put the canonical ``data`` on the wire."""
+        from netbox_nso_plugin.adapter_client import _attach_serialized_json
+
+        kwargs = {"json": {"b": 1, "a": 2}}
+        _attach_serialized_json(kwargs)
+        prepared = requests.Request("PUT", "https://example.invalid/x", **kwargs).prepare()
+        self.assertEqual(prepared.body, b'{"a": 2, "b": 1}')
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_empty_static_route_intent_clears_the_mirror_on_the_wire(self, mock_s, _cfg):
+        from netbox_nso_plugin.adapter_client import put_static_route_intent
+
+        session = self._make_session(200, {"device_id": 5, "count": 0, "routes": []})
+        mock_s.return_value = session
+
+        put_static_route_intent(5, [])
+
+        _, kwargs = session.request.call_args
+        self.assertEqual(kwargs["json"]["routes"], [])
+
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_trigger_apply(self, mock_s, _cfg):
@@ -624,3 +837,25 @@ class TestGetApplyDiffOutformat(TestCase):
         with patch("netbox_nso_plugin.adapter_client._request", return_value={"diffs": {}}) as req:
             adapter_client.get_apply_diff(5, outformat="cli")
         req.assert_called_once_with("GET", "/api/v1/devices/5/actions/apply-diff", params={"outformat": "cli"})
+
+
+class TestCaptureWireBody(unittest.TestCase):
+    """``delivery.wire_body`` counts the requests one push made, so a skipped one lies."""
+
+    def test_a_request_with_no_json_body_is_refused_by_name(self):
+        from netbox_nso_plugin.adapter_client import AdapterError, _request, capture_wire_body
+
+        with capture_wire_body() as captured, self.assertRaises(AdapterError) as raised:
+            _request("GET", "/api/v1/devices/1/static-routes")
+
+        assert raised.exception.code == "capture_without_body"
+        assert "GET /api/v1/devices/1/static-routes" in str(raised.exception)
+        assert captured == []
+
+    def test_a_json_body_is_captured_as_the_canonical_bytes(self):
+        from netbox_nso_plugin.adapter_client import _request, capture_wire_body
+
+        with capture_wire_body() as captured:
+            assert _request("PUT", "/api/v1/devices/1/vlans", json={"b": 2, "a": 1}) is None
+
+        assert captured == [b'{"a": 1, "b": 2}']

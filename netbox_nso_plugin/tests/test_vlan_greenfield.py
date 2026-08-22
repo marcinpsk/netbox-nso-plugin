@@ -13,10 +13,10 @@ from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.test import TestCase
 from django.urls import reverse
 
-from .mixins import IntentPushResetMixin
+from .mixins import IntentPushDeliveryMixin
 
 
-class _VlanGreenfieldBase(IntentPushResetMixin, TestCase):
+class _VlanGreenfieldBase(IntentPushDeliveryMixin, TestCase):
     @classmethod
     def setUpTestData(cls):
         mfg = Manufacturer.objects.create(name="VgMfg", slug="vgmfg")

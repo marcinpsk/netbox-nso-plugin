@@ -15,7 +15,7 @@ from __future__ import annotations
 import threading
 from unittest.mock import patch
 
-from django.db import connections
+from django.db import connections, transaction
 
 from ._settlement_case import _CarrierCase, _make_device, _make_mgmt, _own, _result, _route, _stale_clock
 
@@ -98,15 +98,19 @@ class TestOrderingAndIsolation(_CarrierCase):
     def test_a_consumer_error_suppresses_only_the_static_backstop(self):
         """(b) Fail closed and narrow: the other scopes settle, the static row waits."""
         from netbox_nso_plugin.models import NSOLoggingLevelState
+        from netbox_nso_plugin.signals import suppress_intent_push
 
         device = _make_device("iso")
         mgmt = _make_mgmt(device, "iso", 21)
         sr = _route("10.32.0.0/16", "10.32.0.1", devices=[device])
         state = _own(sr, mgmt, generation=103)
         _stale_clock(state)
-        other_scope = NSOLoggingLevelState.objects.create(
-            management=mgmt, console_severity="warning", status="deploying"
-        )
+        with suppress_intent_push(), transaction.atomic():
+            other_scope = NSOLoggingLevelState.objects.create(
+                management=mgmt, console_severity="warning", status="deploying"
+            )
+        logging_path = f"/api/v1/devices/{mgmt.adapter_device_id}/logging-intent"
+        assert ("PUT", logging_path) not in self.adapter.store.requests
         # One job carrying both channels' evidence: the per-route settlement the consumer
         # would read, and the per-scope counter the coarse settle reads.
         self.adapter.store.terminal_job(

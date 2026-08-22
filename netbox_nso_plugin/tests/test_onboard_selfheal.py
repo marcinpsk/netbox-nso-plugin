@@ -158,6 +158,28 @@ class TestAdvanceStaleOnboardingSweep(TestCase):
         self.assertEqual(good.onboard_status, "")
         self.assertEqual(bad.onboard_status, "provisioning")  # untouched by its own error
 
+    def test_a_free_form_steps_member_still_records_the_failure(self):
+        """``result`` is an object by contract; ``steps`` inside it is free-form JSON.
+
+        A scalar steps raised on iteration and a non-dict entry raised on .get(), both out
+        of the poll, so the row could never reach its terminal verdict and every later poll
+        raised again. The verdict still lands, on the generic summary.
+        """
+        from netbox_nso_plugin.onboarding import advance_provisioning
+
+        for index, steps in enumerate(("boom", 3, [{"status": "failed"}, "boom"])):
+            with self.subTest(steps=steps):
+                mgmt = self._provisioning(f"sweep-steps-{index}", "J-STEPS")
+                job = {"status": "succeeded", "result": {"ok": False, "steps": steps}}
+
+                with patch("netbox_nso_plugin.adapter_client.get_job", return_value=job):
+                    result = advance_provisioning(mgmt)
+
+                self.assertEqual(result["status"], "provision_failed")
+                mgmt.refresh_from_db()
+                self.assertEqual(mgmt.onboard_status, "provision_failed")
+                self.assertTrue(mgmt.onboard_error)
+
     def test_system_job_run_delegates_to_sweep(self):
         """The JobRunner.run wrapper calls the sweep (thin shell around the domain function)."""
         from netbox_nso_plugin.jobs import AdvanceStaleOnboardingJob

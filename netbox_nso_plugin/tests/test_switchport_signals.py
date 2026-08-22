@@ -55,12 +55,12 @@ class _SwBase(IntentPushResetMixin, TestCase):
 
 class TestPushSwitchportIntent(_SwBase):
     def test_pushes_owned_switchports_mapped_to_nso_mode(self):
-        from netbox_nso_plugin.signals import _push_switchport_intent_for_device
+        from netbox_nso_plugin.delivery import deliver
 
         mgmt = self._make_mgmt()
         self._state(mgmt, mode="access", status="accepted")
         with patch("netbox_nso_plugin.adapter_client.apply_switchport_config") as mock_apply:
-            _push_switchport_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("switchport", self.device.pk, mgmt.adapter_device_id)
         mock_apply.assert_called_once()
         dev_id, ifaces = mock_apply.call_args[0]
         assert dev_id == mgmt.adapter_device_id
@@ -69,12 +69,13 @@ class TestPushSwitchportIntent(_SwBase):
         assert ifaces[0]["untagged_vlan"] == 10
 
     def test_excludes_non_owned(self):
-        from netbox_nso_plugin.signals import _push_switchport_intent_for_device
+        from netbox_nso_plugin.delivery import deliver
 
         mgmt = self._make_mgmt()
         self._state(mgmt, status="changed")  # not owned
         with patch("netbox_nso_plugin.adapter_client.apply_switchport_config") as mock_apply:
-            _push_switchport_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("switchport", self.device.pk, mgmt.adapter_device_id)
+        mock_apply.assert_called_once()
         assert mock_apply.call_args[0][1] == []
 
     def test_save_no_push_without_auto_apply(self):
