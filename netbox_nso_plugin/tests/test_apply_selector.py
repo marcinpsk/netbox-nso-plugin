@@ -696,14 +696,13 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
 
     def test_conflict_keeps_the_existing_incumbent_job_semantics_and_rolls_back(self):
         def conflict(_selected):
-            # Copied from ../nso-adapter/docs/api-contract.md, actions/apply 409 conflict,
-            # using the ErrorEnvelope from openapi_snapshot.json.
+            # This is the actions/apply 409 ErrorEnvelope from the adapter contract.
             return (
                 409,
                 {
                     "error": {
                         "code": "conflict",
-                        "message": "A job is already running for this device",
+                        "message": "A job is already queued or running for this device",
                         "detail": {"job_id": 900},
                     }
                 },
@@ -712,7 +711,15 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         response = self._post(_ApplyContractAdapter(conflict))
 
         self.assertEqual(response.status_code, 409)
-        self.assertEqual(response.json(), {"status": "conflict", "job_id": 900, "job_type": "apply"})
+        self.assertEqual(
+            response.json(),
+            {
+                "status": "conflict",
+                "message": "Another job is already queued or running: apply. (Job ID: 900)",
+                "job_id": 900,
+                "job_type": "apply",
+            },
+        )
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "accepted")
 

@@ -401,7 +401,7 @@
     </div>
   </template>
 
-  {# ── Job activity (loaded on tab open; shows any running job + last finished) ── #}
+  {# Job activity loads on tab open and shows any active job plus the last finished job. #}
   <div id="nso-job-activity" class="mb-3"
        data-jobs-url="{% url 'plugins:netbox_nso_plugin:device_nso_jobs' pk=object.pk %}"></div>
   <script>
@@ -437,7 +437,7 @@
       if (r) {
         box.innerHTML = '<div class="alert alert-info mb-0 py-2 d-flex align-items-center">'
           + '<span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>'
-          + '<strong class="me-1">' + esc(r.type) + '</strong> running'
+          + '<strong class="me-1">' + esc(r.type) + '</strong> active'
           + (r.started_at ? ' · started ' + esc(rel(r.started_at)) : ' · queued ' + esc(rel(r.created_at)))
           + '</div>';
       } else if (l) {
@@ -615,7 +615,7 @@
             setStatus(label + ' failed — ' + formatApplyError(job) + ' (Job #' + jobId + ').', 'danger', false); setButtons(false);
             document.dispatchEvent(new CustomEvent('nso:refresh-categories'));  // reflect any partial state change
           } else {
-            setStatus(label + ' running… (Job #' + jobId + ', status: ' + job.status + ')', 'info', true);
+            setStatus(label + ' ' + job.status + '… (Job #' + jobId + ')', 'info', true);
           }
         } catch (e) { clearInterval(interval); setStatus('Polling error: ' + e.message, 'warning', false); setButtons(false); }
       }, 2000);
@@ -702,7 +702,7 @@
           }
           var waiting = links.some(function (link) { return link.jobId == null; }) ? ', waiting for the next chain job' : '';
           if (guard.canWrite()) {
-            setStatus(statusMessage(label + ' running across ' + expected + ' generation(s)' + waiting + '.'), 'info', true);
+            setStatus(statusMessage(label + ' active across ' + expected + ' generation(s)' + waiting + '.'), 'info', true);
           }
         } catch (error) {
           stop('Polling error: ' + error.message, 'warning');
@@ -731,18 +731,17 @@
         if (data.status === 'error') { setStatus('Error: ' + data.message, 'danger', false); setButtons(false); }
         else if (data.status === 'no_op') { setStatus(data.message, 'info', false); setButtons(false); }
         else if (data.status === 'conflict') {
-          // S5a C (codex R1-F7): poll the INCUMBENT under its own name — never claim the
-          // clicked action is running when it was rejected.
-          var who = data.job_type ? ('Another job is already running: ' + data.job_type) : 'Another job is already running';
-          if (data.job_id) { setStatus(who + ' — tracking it (Job #' + data.job_id + ').', 'warning', true); pollJob(data.job_id, data.job_type || 'Job'); }
-          else { setStatus(who + '.', 'warning', false); setButtons(false); }
+          // Poll the incumbent under its own name and use the server's admission wording.
+          var conflictMessage = data.message || 'The adapter reported a job conflict.';
+          if (data.job_id) { setStatus(conflictMessage, 'warning', true); pollJob(data.job_id, data.job_type || 'Job'); }
+          else { setStatus(conflictMessage, 'warning', false); setButtons(false); }
         }
         else if (data.generations && data.generations.length) {
           var applyNotice = data.skipped && Object.keys(data.skipped).length ? data.message : '';
-          setStatus(applyNotice || (label + ' running across ' + data.generations.length + ' generation(s).'), 'info', true);
+          setStatus(applyNotice || (label + ' active across ' + data.generations.length + ' generation(s).'), 'info', true);
           pollApplyChain(data.generations, label, applyNotice);
         }
-        else if (data.job_id) { setStatus(label + ' running… (Job #' + data.job_id + ')', 'info', true); pollJob(data.job_id, label); }
+        else if (data.job_id) { setStatus(label + ' queued… (Job #' + data.job_id + ')', 'info', true); pollJob(data.job_id, label); }
         else { setStatus(label + ' triggered (no job to track).', 'success', false); setButtons(false); }
       } catch (err) { setStatus('Request failed: ' + err.message, 'danger', false); setButtons(false); }
     }

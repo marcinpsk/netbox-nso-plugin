@@ -1229,7 +1229,7 @@ class TestNSODeviceActionView(ViewTestBase):
     @patch("netbox_nso_plugin.adapter_client._resolve_config")
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_post_sync_conflict_ajax(self, mock_session_cls, mock_cfg):
-        """AJAX POST returns conflict JSON when a job is already running."""
+        """AJAX POST reports that the conflicting sync job is queued."""
         mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
         mgmt.adapter_device_id = 10
         mgmt.save(update_fields=["adapter_device_id"])
@@ -1243,7 +1243,14 @@ class TestNSODeviceActionView(ViewTestBase):
         }
         session = make_session(
             response=make_response(
-                409, json_data={"error": {"code": "conflict", "message": "running", "detail": {"job_id": 3}}}
+                409,
+                json_data={
+                    "error": {
+                        "code": "conflict",
+                        "message": "A job of the requested type is already queued for this device",
+                        "detail": {"job_id": 3},
+                    }
+                },
             )
         )
         mock_session_cls.return_value = session
@@ -1251,8 +1258,15 @@ class TestNSODeviceActionView(ViewTestBase):
         url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[mgmt.pk, "sync"])
         response = self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
         self.assertEqual(response.status_code, 409)
-        data = json.loads(response.content)
-        self.assertEqual(data["status"], "conflict")
+        self.assertEqual(
+            response.json(),
+            {
+                "status": "conflict",
+                "message": "A job is already queued for this device. (Job ID: 3)",
+                "job_id": 3,
+                "job_type": None,
+            },
+        )
 
         mgmt.adapter_device_id = None
         mgmt.save(update_fields=["adapter_device_id"])
@@ -1290,10 +1304,8 @@ class TestNSODeviceActionView(ViewTestBase):
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config")
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
-    def test_post_conflict_reports_incumbent_type(self, mock_session_cls, mock_cfg):
-        """S5a C (codex R1-F7): a 409 must name the INCUMBENT job's type — today the UI
-        polls the incumbent under the CLICKED action's label ('Sync from NSO running…'
-        while an Apply runs)."""
+    def test_post_sync_conflict_reports_queued_incumbent_type(self, mock_session_cls, mock_cfg):
+        """A sync conflict names its queued incumbent without calling it running."""
         mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
         mgmt.adapter_device_id = 10
         mgmt.save(update_fields=["adapter_device_id"])
@@ -1308,9 +1320,16 @@ class TestNSODeviceActionView(ViewTestBase):
         session = make_session()
         session.request.side_effect = [
             make_response(
-                409, json_data={"error": {"code": "conflict", "message": "running", "detail": {"job_id": 3}}}
+                409,
+                json_data={
+                    "error": {
+                        "code": "conflict",
+                        "message": "A job of the requested type is already queued for this device",
+                        "detail": {"job_id": 3},
+                    }
+                },
             ),
-            make_response(200, json_data={"id": 3, "type": "apply", "status": "running"}),
+            make_response(200, json_data={"id": 3, "type": "sync", "status": "queued"}),
         ]
         mock_session_cls.return_value = session
 
@@ -1319,8 +1338,9 @@ class TestNSODeviceActionView(ViewTestBase):
         self.assertEqual(response.status_code, 409)
         data = json.loads(response.content)
         self.assertEqual(data["status"], "conflict")
+        self.assertEqual(data["message"], "Another job is already queued: sync. (Job ID: 3)")
         self.assertEqual(data["job_id"], 3)
-        self.assertEqual(data["job_type"], "apply")
+        self.assertEqual(data["job_type"], "sync")
 
         mgmt.adapter_device_id = None
         mgmt.save(update_fields=["adapter_device_id"])
@@ -1344,7 +1364,14 @@ class TestNSODeviceActionView(ViewTestBase):
         session = make_session()
         session.request.side_effect = [
             make_response(
-                409, json_data={"error": {"code": "conflict", "message": "running", "detail": {"job_id": 3}}}
+                409,
+                json_data={
+                    "error": {
+                        "code": "conflict",
+                        "message": "A job of the requested type is already queued for this device",
+                        "detail": {"job_id": 3},
+                    }
+                },
             ),
             make_response(500, content=b"boom"),
         ]
@@ -1355,6 +1382,7 @@ class TestNSODeviceActionView(ViewTestBase):
         self.assertEqual(response.status_code, 409)
         data = json.loads(response.content)
         self.assertEqual(data["status"], "conflict")
+        self.assertEqual(data["message"], "A job is already queued for this device. (Job ID: 3)")
         self.assertIsNone(data["job_type"])
 
         mgmt.adapter_device_id = None
@@ -1375,7 +1403,14 @@ class TestNSODeviceActionView(ViewTestBase):
         }
         mock_session_cls.return_value = make_session(
             response=make_response(
-                409, json_data={"error": {"code": "conflict", "message": "running", "detail": ["busy"]}}
+                409,
+                json_data={
+                    "error": {
+                        "code": "conflict",
+                        "message": "A job of the requested type is already queued for this device",
+                        "detail": ["busy"],
+                    }
+                },
             )
         )
 
@@ -1383,7 +1418,15 @@ class TestNSODeviceActionView(ViewTestBase):
         response = self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
 
         self.assertEqual(response.status_code, 409)
-        self.assertEqual(response.json(), {"status": "conflict", "job_id": None, "job_type": None})
+        self.assertEqual(
+            response.json(),
+            {
+                "status": "conflict",
+                "message": "A job is already queued for this device.",
+                "job_id": None,
+                "job_type": None,
+            },
+        )
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config")
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
@@ -1440,7 +1483,13 @@ class TestNSODeviceActionView(ViewTestBase):
 
         mgmt.adapter_device_id = None
         mgmt.save(update_fields=["adapter_device_id"])
-        """Non-AJAX conflict POST redirects with warning."""
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config")
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_post_sync_conflict_non_ajax_uses_queued_wording(self, mock_session_cls, mock_cfg):
+        """A non-AJAX sync conflict redirects with truthful queued wording."""
+        from django.contrib.messages import get_messages
+
         mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
         mgmt.adapter_device_id = 10
         mgmt.save(update_fields=["adapter_device_id"])
@@ -1452,16 +1501,29 @@ class TestNSODeviceActionView(ViewTestBase):
             "ca_cert_path": None,
             "timeout": 30,
         }
-        session = make_session(
-            response=make_response(
-                409, json_data={"error": {"code": "conflict", "message": "running", "detail": {"job_id": 3}}}
-            )
-        )
+        session = make_session()
+        session.request.side_effect = [
+            make_response(
+                409,
+                json_data={
+                    "error": {
+                        "code": "conflict",
+                        "message": "A job of the requested type is already queued for this device",
+                        "detail": {"job_id": 3},
+                    }
+                },
+            ),
+            make_response(200, json_data={"id": 3, "type": "sync", "status": "queued"}),
+        ]
         mock_session_cls.return_value = session
 
         url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[mgmt.pk, "sync"])
         response = self.client.post(url)
         self.assertEqual(response.status_code, 302)
+        self.assertEqual(
+            [str(message) for message in get_messages(response.wsgi_request)],
+            ["Another job is already queued: sync. (Job ID: 3)"],
+        )
 
         mgmt.adapter_device_id = None
         mgmt.save(update_fields=["adapter_device_id"])
@@ -2192,6 +2254,19 @@ class TestNSOBulkAcceptView(ViewTestBase):
 
 class TestDeviceNSOTabView(ViewTestBase):
     """Tests for DeviceNSOTabView (device NSO tab)."""
+
+    def test_job_activity_uses_active_and_polled_status_wording(self):
+        """The tab does not describe every queued or active job as running."""
+        response = self.client.get(reverse("dcim:device_nso", kwargs={"pk": self.device.pk}))
+
+        self.assertEqual(response.status_code, 200)
+        body = response.content.decode()
+        self.assertIn("</strong> active", body)
+        self.assertIn("label + ' ' + job.status + '…", body)
+        self.assertIn("label + ' active across ' + expected", body)
+        self.assertIn("label + ' active across ' + data.generations.length", body)
+        self.assertIn("label + ' queued… (Job #'", body)
+        self.assertNotIn("already running", body)
 
     def test_device_nso_tab_no_mgmt(self):
         """Device without NSODeviceManagement returns 200 with empty context."""

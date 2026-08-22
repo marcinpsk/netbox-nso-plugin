@@ -964,8 +964,7 @@ def sync_notify(adapter_device_id):
     """POST /api/v1/devices/{id}/sync-notify — notify adapter of scope/intent change.
 
     Triggers an immediate sync so the user sees results without waiting for the
-    scheduled poll. Returns the job dict, or None if no job was started (e.g. 409).
-    A 409 (job already running) is not an error — log it and return the existing job id.
+    scheduled poll. A 409 conflict returns the adapter's detail payload, which names the queued incumbent.
     """
     try:
         return _request("POST", f"/api/v1/devices/{adapter_device_id}/sync-notify")
@@ -1426,7 +1425,10 @@ def preflight_route_policy(
 
 
 def trigger_apply(adapter_device_id, selected):
-    """Promote the exact stored intent receipts named by a frozen selector."""
+    """Promote the exact stored intent receipts named by a frozen selector.
+
+    Raise AdapterError when a device job is already queued or running.
+    """
     return _request(
         "POST",
         f"/api/v1/devices/{adapter_device_id}/actions/apply",
