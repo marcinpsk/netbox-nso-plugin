@@ -64,10 +64,11 @@ class TestApplyPromotion(TestCase):
     def _prepare(self, static_response):
         """Run the Apply with the static-route claim answering *static_response*.
 
-        The Apply routes every scope through ``drain.push_now``, so that is the boundary the
-        promotion gate reads: the other scopes are a different subsystem here and answer
-        ``None``, which the gate consults for none of them.
+        The Apply routes SNMP through ``drain.drain_key`` and every other scope through
+        ``drain.push_now``. Isolate both send boundaries so this helper tests only the
+        static-route promotion gate.
         """
+        from netbox_nso_plugin import drain
         from netbox_nso_plugin.views import _prepare_apply
 
         mgmt, state, other = self._setup()
@@ -77,16 +78,20 @@ class TestApplyPromotion(TestCase):
         )
         push = patcher.start()
         self.addCleanup(patcher.stop)
+        snmp_patcher = patch("netbox_nso_plugin.drain.drain_key", return_value=drain.SUCCEEDED)
+        snmp = snmp_patcher.start()
+        self.addCleanup(snmp_patcher.stop)
         _prepare_apply(mgmt)
         state.refresh_from_db()
         other.refresh_from_db()
-        return state, other, push
+        return state, other, push, snmp
 
     def test_a_failed_force_push_skips_promotion(self):
-        """A forced claim answers ``None`` only on a real rejection — the adapter stored nothing."""
-        state, other, push = self._prepare(static_response=None)
+        """A forced claim answers ``None`` only on a real rejection: the adapter stored nothing."""
+        state, other, push, snmp = self._prepare(static_response=None)
 
         assert [call.args[1] for call in push.call_args_list].count("static_route") == 1
+        snmp.assert_called_once()
         assert state.status == "accepted", (
             "the Apply promoted a route whose intent the adapter refused: nothing can ever "
             "settle that row, so it waits for the backstop to call it failed"
@@ -95,8 +100,9 @@ class TestApplyPromotion(TestCase):
 
     def test_an_acknowledged_push_still_promotes(self):
         """The guard is a precondition, not a new refusal: the normal path is unchanged."""
-        state, other, _push = self._prepare(static_response={"device_id": 95, "count": 1, "routes": []})
+        state, other, _push, snmp = self._prepare(static_response={"device_id": 95, "count": 1, "routes": []})
 
+        snmp.assert_called_once()
         assert state.status == "deploying"
         assert other.status == "deploying"
 
