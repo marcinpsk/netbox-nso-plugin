@@ -193,6 +193,9 @@ class TestTheApplyProbeNamesTheLockedDevice(_CarrierCase):
         """The control: standing down is the probe's verdict, not a disabled backstop."""
         device = _make_device("idle")
         mgmt = _make_mgmt(device, "idle", 62)
+        # The generation probe must succeed. It 404s for a device the store does not hold, and an
+        # unknown result stands the backstop down, which removes this test's premise.
+        self.adapter.store.add_device(nso_instance="se-idle-inst", nso_device_name="nso-se-idle", device_id=63)
         sr = _route("10.39.0.0/16", "10.39.0.1", devices=[device])
         state = _own(sr, mgmt, generation=121)
         _stale_clock(state)
@@ -271,6 +274,7 @@ class TestTheBackstopPushesNoIntent(_CarrierCase):
 
         device = _make_device("nopush")
         mgmt = _make_mgmt(device, "nopush", 42)
+        self.adapter.store.add_device(nso_instance="se-nopush-inst", nso_device_name="nso-se-nopush", device_id=42)
         sr = _route("10.36.0.0/16", "10.36.0.1", devices=[device])
         state = _own(sr, mgmt, generation=112)
         _stale_clock(state)

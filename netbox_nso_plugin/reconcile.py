@@ -1141,6 +1141,8 @@ def _settle_apply_failures(mgmt, apply_result: dict | None, job: dict | None = N
     """
     if not apply_result:
         return
+    from django.utils import timezone
+
     from . import models
     from . import status_machine as sm
 
@@ -1153,9 +1155,15 @@ def _settle_apply_failures(mgmt, apply_result: dict | None, job: dict | None = N
         for row in model.objects.filter(management=mgmt, status="deploying"):
             new_status = sm.on_apply_result(row.status, ok=False)
             if new_status != row.status:
-                row.status = new_status
-                row.last_apply_error = detail
-                row.save(update_fields=["status", "last_apply_error"])
+                # Compare-and-set: the value-match settle writes these rows from another
+                # reconcile, and a job counter must not overrule the device truth a row
+                # reached between this read and this write.
+                model.objects.filter(pk=row.pk, status=row.status).update(
+                    status=new_status,
+                    last_apply_error=detail,
+                    # A queryset update skips auto_now, and the REST serializers expose it.
+                    last_updated=timezone.now(),
+                )
 
 
 _STUCK_DEPLOYING_ERROR = (
@@ -1237,10 +1245,18 @@ def _escalate_stuck_deploying(mgmt, job: dict | None) -> None:
         model = getattr(models, model_name)
         for row in model.objects.filter(management=mgmt, status="deploying"):
             new_status = sm.on_apply_result(row.status, ok=False)
-            if new_status != row.status:
-                row.status = new_status
-                row.last_apply_error = detail
-                row.save(update_fields=["status", "last_apply_error"])
+            if new_status == row.status:
+                continue
+            # Compare-and-set: this judges a row for never landing, so a row the
+            # value-match settle proved in_sync in the write window has already
+            # answered it.
+            matched = model.objects.filter(pk=row.pk, status=row.status).update(
+                status=new_status,
+                last_apply_error=detail,
+                # A queryset update skips auto_now, and the REST serializers expose it.
+                last_updated=timezone.now(),
+            )
+            if matched:
                 logger.warning(
                     "nso reconcile: %s %s stuck deploying after successful apply #%s — "
                     "escalated to apply_failed (silent drop)",
@@ -1357,19 +1373,19 @@ def _escalate_stuck_static_routes(mgmt, *, adapter_device_id, apply_active: bool
         )
 
 
+_TERMINAL_GENERATION_STATUSES = frozenset({"settled", "failed", "outcome_unknown", "abandoned"})
+
+
 def _apply_job_state(adapter_device_id) -> tuple[dict | None, bool]:
-    """Best-effort: (most recent terminal apply job, may an apply be in flight now).
+    """Best-effort: (most recent terminal apply job, may its generation chain be active).
 
-    One jobs fetch serves both the failure-settle (which needs the last terminal
-    apply's result) and the stuck-deploying escalation (which must stand down while
-    a new apply is in flight).
+    The jobs surface supplies the last apply result and visible queued or running work.
+    The generations surface covers the barrier interval after a head job finishes and
+    before its pending successor gets a job.
 
-    A probe that FAILED answers the second question with **True**, because it did not
-    answer it at all. Its only consumer is a fail-closed gate, and the two directions are
-    not symmetric: standing down costs one tick, while escalating a row whose Apply is
-    running is unrecoverable — the apply's own ``in_sync`` cannot lift a row back out of
-    ``apply_failed``. Reading an unreadable jobs list as "nothing is running" is the same
-    shape as trusting a drained feed the adapter never served.
+    A failed or malformed probe answers the second question with **True**, because it did
+    not answer it at all. Its only consumer is a fail-closed gate. Standing down costs one
+    tick, while escalating a row whose Apply is running is unrecoverable.
     """
     from . import adapter_client as client
 
@@ -1384,12 +1400,34 @@ def _apply_job_state(adapter_device_id) -> tuple[dict | None, bool]:
         return None, True
     last, active = None, False
     for job in jobs or []:
-        if job.get("type") != "apply":
-            continue
+        job_type = job.get("type")
         if job.get("status") in ("queued", "running"):
-            active = True
-        elif last is None and job.get("status") in ("succeeded", "failed"):
+            if job_type in ("apply", "removal"):
+                active = True
+        elif job_type == "apply" and last is None and job.get("status") in ("succeeded", "failed"):
             last = job
+    try:
+        generations = client.list_device_generations(adapter_device_id)
+    except Exception as exc:  # noqa: BLE001 (adapter transient; the gate fails closed)
+        logger.warning(
+            "nso reconcile: could not read adapter device %s's generations (%s), treating apply activity as unknown",
+            adapter_device_id,
+            exc,
+        )
+        return last, True
+    current_chain = []
+    if generations:
+        latest = generations[-1]
+        cohort = latest.get("settlement_cohort")
+        current_chain = (
+            [latest]
+            if cohort is None
+            else [generation for generation in generations if generation.get("settlement_cohort") == cohort]
+        )
+    for generation in current_chain:
+        if generation.get("status") not in _TERMINAL_GENERATION_STATUSES:
+            active = True
+            break
     return last, active
 
 
@@ -1494,6 +1532,7 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
     from .deployment import DeploymentQuiesced
     from .models import NSODeviceManagement
     from .settlement import settle_static_routes
+    from .signals import suppress_intent_push
 
     try:
         device = Device.objects.get(pk=device_id)
@@ -1553,10 +1592,14 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
             mgmt = NSODeviceManagement.objects.filter(pk=mgmt.pk).first()
             if mgmt is not None and mgmt.adapter_device_id is not None:
                 job, apply_active = _apply_job_state(mgmt.adapter_device_id)
-                _settle_apply_failures(mgmt, job.get("result") if job else None, job)
-                if not apply_active:
-                    _escalate_stuck_deploying(mgmt, job)
-                _journal_route_policy_apply(mgmt, job)
+                # These are mirror writes, not operator intent: without the suppression the
+                # first status flip's push-on-save signal refuses (no writer transaction) and
+                # takes the rest of Step 4 with it.
+                with suppress_intent_push():
+                    _settle_apply_failures(mgmt, job.get("result") if job else None, job)
+                    if not apply_active:
+                        _escalate_stuck_deploying(mgmt, job)
+                    _journal_route_policy_apply(mgmt, job)
     except Exception as exc:  # noqa: BLE001 — settling is best-effort, never crash the worker
         logger.warning("nso reconcile: apply-failure settle skipped for device %s: %s", device_id, exc)
 

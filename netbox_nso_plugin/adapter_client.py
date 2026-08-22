@@ -122,6 +122,7 @@ _CONNECT_TIMEOUT = 5  # seconds
 # The live store incarnation, served on the job collection's 200s. Named once here so the
 # consumer and the adapter cannot drift on the spelling.
 STORE_INCARNATION_HEADER = "X-Store-Incarnation"
+_GENERATION_PAGE_LIMIT = 500
 
 # Process-wide pooled session, reused across calls so connections to the (internal)
 # adapter are kept alive instead of a fresh TCP+TLS handshake per request. Keyed by the
@@ -1016,6 +1017,37 @@ def list_jobs(adapter_device_id):
     return _validated_jobs(_request("GET", "/api/v1/jobs", params={"device_id": adapter_device_id}), "jobs listing")
 
 
+def list_device_generations(adapter_device_id, *, since_seq=None):
+    """GET every ascending generation page for one device after ``since_seq``."""
+    if since_seq is not None and (type(since_seq) is not int or since_seq < 0):
+        raise ValueError("since_seq must be a non-negative integer")
+    generations = []
+    last_seq = since_seq
+    while True:
+        params = {"limit": _GENERATION_PAGE_LIMIT}
+        if last_seq is not None:
+            params["since_seq"] = last_seq
+        page = _request("GET", f"/api/v1/devices/{adapter_device_id}/generations", params=params)
+        if not isinstance(page, list) or any(not isinstance(row, dict) for row in page):
+            raise AdapterError("Adapter returned a malformed generations listing.", code="invalid_response")
+        for row in page:
+            generation_id = row.get("generation_id")
+            seq = row.get("seq")
+            settlement_cohort = row.get("settlement_cohort")
+            if (
+                type(generation_id) is not int
+                or generation_id <= 0
+                or type(seq) is not int
+                or (last_seq is not None and seq <= last_seq)
+                or (settlement_cohort is not None and type(settlement_cohort) is not int)
+            ):
+                raise AdapterError("Adapter returned a malformed generations listing.", code="invalid_response")
+            last_seq = seq
+        generations.extend(page)
+        if len(page) < _GENERATION_PAGE_LIMIT:
+            return generations
+
+
 def get_settlement_feed(adapter_device_id, *, after_settle_seq, limit):
     """GET the device's ordered settlement feed → ``(jobs, store_incarnation)``.
 
@@ -1393,16 +1425,12 @@ def preflight_route_policy(
         return {"known": False, "fully_supported": True, "unsupported": [], "coverage_unknown": False}
 
 
-def trigger_apply(adapter_device_id, force=True):
-    """POST /api/v1/devices/{id}/actions/apply → job_id.
-
-    ``force=True`` (default) pushes all eligible attributes including in_sync.
-    Returns the job dict, or raises AdapterError on conflict (existing job running).
-    """
+def trigger_apply(adapter_device_id, selected):
+    """Promote the exact stored intent receipts named by a frozen selector."""
     return _request(
         "POST",
         f"/api/v1/devices/{adapter_device_id}/actions/apply",
-        json={"force": force},
+        json={"selected": dict(selected)},
     )
 
 

@@ -32,6 +32,8 @@ import hashlib
 import json
 import logging
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 from django.db import IntegrityError, OperationalError, connection, transaction
 
@@ -90,6 +92,8 @@ REJECTED = "rejected"
 
 WITHHELD = "withheld"
 
+_SUCCESSFUL_PUSHES: ContextVar[dict[str, int] | None] = ContextVar("nso_successful_pushes", default=None)
+
 #: Why a durable ``degraded_deletions`` record was written. Never cleared by a push outcome:
 #: only the explicit operator acknowledgement clears either of them.
 LEGACY_MARK_DOWNGRADED = "legacy_mark_downgraded"
@@ -137,6 +141,17 @@ class DirectApplyFailed(Exception):
     """A direct-apply endpoint answered HTTP 200 with an error envelope (§7.1)."""
 
     code = "nso_direct_apply_failed"
+
+
+@contextmanager
+def capture_successful_pushes():
+    """Collect each caller-owned claim that settles successfully inside this block."""
+    pushed: dict[str, int] = {}
+    token = _SUCCESSFUL_PUSHES.set(pushed)
+    try:
+        yield pushed
+    finally:
+        _SUCCESSFUL_PUSHES.reset(token)
 
 
 @dataclasses.dataclass
@@ -1257,6 +1272,16 @@ def push_now(device_id, scope, *, mode=delivery.MODE_NORMAL, force=False, deadli
     return answer if outcome == SUCCEEDED else None
 
 
+def _send_failure_outcome(claimed, exc) -> str:
+    """Triage one send failure into the outcome its evidence supports."""
+    logger.warning("push_seq %s failed for %s/%s: %s", claimed.push_seq, claimed.device_id, claimed.scope, exc)
+    if _proven_no_effect(exc):
+        return _withhold(claimed, exc)
+    if _rejected_at_boundary(exc):
+        return _dissolve(claimed, exc)
+    return record_failure(claimed, exc)
+
+
 @_deployment_guarded("intent drain")
 def _drain_once(
     device_id,
@@ -1268,8 +1293,13 @@ def _drain_once(
     reform=1,
     deadline=None,
     _deadline_at=None,
+    _chained=False,
 ) -> tuple[str, object]:
-    """Run one claim/send/outcome cycle, returning ``(outcome, the adapter's answer)``."""
+    """Run one claim/send/outcome cycle, returning ``(outcome, the adapter's answer)``.
+
+    ``_chained`` marks a pass the drain started for latency, not one the caller asked for:
+    its claim is nobody's operation to name, so it never records into an open capture.
+    """
     _refuse_in_transaction("drain")
     if deadline is not None and _deadline_at is None:
         _deadline_at = _send_clock() + deadline
@@ -1291,12 +1321,7 @@ def _drain_once(
     try:
         answer = send_claim(claimed, deadline=_remaining_send_deadline(_deadline_at))
     except Exception as exc:  # noqa: BLE001 (the operation is replayed, so the failure is data)
-        logger.warning("push_seq %s failed for %s/%s: %s", claimed.push_seq, device_id, scope, exc)
-        if _proven_no_effect(exc):
-            return _withhold(claimed, exc), None
-        if _rejected_at_boundary(exc):
-            return _dissolve(claimed, exc), None
-        return record_failure(claimed, exc), None
+        return _send_failure_outcome(claimed, exc), None
     if answer is _ABANDONED_SEND and reform > 0:
         # A fixed revocation resolves in ONE re-form: the re-form folds the revoking entry
         # with everything else, so the authority no longer names that route. A revocation
@@ -1310,6 +1335,7 @@ def _drain_once(
             reform=reform - 1,
             deadline=deadline,
             _deadline_at=_deadline_at,
+            _chained=_chained,
         )
     if answer is _PARKED_SEND:
         return PARKED, None
@@ -1324,16 +1350,24 @@ def _drain_once(
             chain=chain,
             deadline=deadline,
             deadline_at=_deadline_at,
+            chained=_chained,
         )
         if continued is not None:
             return continued
     return outcome, answer
 
 
-def _after_success(claimed, *, mode, force, chain, deadline, deadline_at):
+def _after_success(claimed, *, mode, force, chain, deadline, deadline_at, chained):
     """Resolve any operation still owed after a successful preparatory pass."""
     device_id, scope = claimed.device_id, claimed.scope
-    if _answered_other_work(claimed, mode, force):
+    answered_other_work = _answered_other_work(claimed, mode, force)
+    if not answered_other_work and not chained:
+        pushed = _SUCCESSFUL_PUSHES.get()
+        if pushed is not None:
+            # Latest wins: one capture spans several caller calls, and a scope that settles
+            # again there has genuinely moved on to a later sequence.
+            pushed[scope] = claimed.push_seq
+    if answered_other_work:
         if chain <= 0:
             logger.info(
                 "%s/%s settled a preparatory operation after the chain budget expired",
@@ -1351,6 +1385,7 @@ def _after_success(claimed, *, mode, force, chain, deadline, deadline_at):
             chain=chain - 1,
             deadline=deadline,
             _deadline_at=deadline_at,
+            _chained=chained,
         )
     if chain > 0 and mode == delivery.MODE_NORMAL and _pending(device_id, scope):
         # This chain is a latency optimization. The tick guarantees any remaining tail.
@@ -1362,6 +1397,7 @@ def _after_success(claimed, *, mode, force, chain, deadline, deadline_at):
             chain=chain - 1,
             deadline=deadline,
             _deadline_at=deadline_at,
+            _chained=True,
         )
     return None
 
