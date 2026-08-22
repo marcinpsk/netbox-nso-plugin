@@ -10,6 +10,7 @@ import subprocess
 import tomllib
 from pathlib import Path
 
+import pytest
 import yaml
 
 WORKFLOW = Path(__file__).parents[2] / ".github" / "workflows" / "release.yaml"
@@ -19,10 +20,26 @@ UV_LOCK = Path(__file__).parents[2] / "uv.lock"
 
 def _locked_version(lock_text: str, package: str) -> str:
     """Return the version ``uv.lock`` records for one package."""
-    for entry in tomllib.loads(lock_text)["package"]:
-        if entry["name"] == package:
-            return entry["version"]
-    raise AssertionError(f"{package} is absent from the lock file")
+    versions = [entry["version"] for entry in tomllib.loads(lock_text)["package"] if entry["name"] == package]
+    assert len(versions) == 1, f"{package} must appear exactly once in the lock file; found {len(versions)}"
+    return versions[0]
+
+
+def test_locked_version_rejects_duplicate_package_entries():
+    lock_text = """
+version = 1
+
+[[package]]
+name = "netbox-nso-plugin"
+version = "1.0.0"
+
+[[package]]
+name = "netbox-nso-plugin"
+version = "1.0.1"
+"""
+
+    with pytest.raises(AssertionError, match="exactly once"):
+        _locked_version(lock_text, "netbox-nso-plugin")
 
 
 def _uv_lock(cwd: Path) -> None:
