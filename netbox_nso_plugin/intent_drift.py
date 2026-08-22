@@ -371,7 +371,7 @@ def _safe_restore(before: list[dict], device_id: int) -> tuple[int, list[dict]]:
     for index, snapshot in enumerate(before):
         try:
             restored_now = _restore_static_route_generations([snapshot])
-        except Exception:  # noqa: BLE001 — the pass must outlive one device's rollback
+        except Exception:  # noqa: BLE001, the pass must outlive one device's rollback
             logger.exception("Static-route generation rollback failed for device %s", device_id)
             unrestored.extend(before[index:])
             break
