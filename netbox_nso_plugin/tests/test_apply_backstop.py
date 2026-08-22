@@ -100,7 +100,7 @@ class TestApplyPromotion(TestCase):
         state, other, push, snmp = self._prepare(static_response=None, expect_refused=True)
 
         assert [call.args[1] for call in push.call_args_list].count("static_route") == 1
-        snmp.assert_called_once()
+        snmp.assert_not_called()
         assert (state.status, other.status) == ("accepted", "accepted"), "the abort promoted rows"
 
     def test_an_acknowledged_push_still_promotes(self):
