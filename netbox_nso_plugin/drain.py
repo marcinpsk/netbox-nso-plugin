@@ -43,6 +43,7 @@ from .outbox import (
     OP_REVOKE,
     advance_push_seq,
     allocate_push_seq,
+    fold_state_transitions,
     fold_transitions,
     issued_push_seq,
     reduce_transitions,
@@ -451,13 +452,7 @@ def _form(state, mgmt, now, mode, force) -> Claim | None:
     entry_ids = [row.pk for row in rows]
     mark = all(row.mark_and for row in rows) if rows else None
     mark_any = any(row.mark_any for row in rows)
-    folded = fold_transitions(
-        [record for row in rows for record in row.transitions],
-        claim_deletions=[int(record["route_id"]) for record in state.claim_deletions or []],
-        queued=state.queued_deletions,
-        revoked=state.revoked_ids,
-        lineage_carry=state.lineage_carry,
-    )
+    folded = fold_state_transitions([record for row in rows for record in row.transitions], state)
     deletions = list(folded.queued.values())
     if mode == delivery.MODE_STORE_ONLY:
         # A deletion mark on a key whose pending rows recorded no provenance at all is
