@@ -80,6 +80,23 @@ def _workflow_step(workflow: str, name: str, next_name: str) -> str:
     return workflow[workflow.index(start_marker) : workflow.index(end_marker)]
 
 
+def _bootstrap_uv_pin(build_command: str) -> re.Match[str] | None:
+    """Return the uv bootstrap pin without depending on shell whitespace."""
+    return re.search(
+        r"pip install 'uv\s*(?P<operator>==|~=)\s*(?P<version>[^'\s]+)\s*'",
+        build_command,
+    )
+
+
+@pytest.mark.parametrize("pin", ["uv==0.12.4", "uv == 0.12.4", "uv  ==  0.12.4"])
+def test_bootstrap_uv_pin_accepts_equivalent_operator_whitespace(pin: str):
+    match = _bootstrap_uv_pin(f"pip install '{pin}'")
+
+    assert match is not None
+    assert match.group("operator") == "=="
+    assert match.group("version") == "0.12.4"
+
+
 def test_release_refs_use_one_expected_tip_transaction():
     workflow = WORKFLOW.read_text(encoding="utf-8")
     release_action = _workflow_step(
@@ -146,7 +163,7 @@ def test_the_release_commit_carries_a_regenerated_lock():
 
     # The action maps build: false to --skip-build, which silently drops build_command.
     assert "build: true" in release_action
-    bootstrap_uv = re.search(r"pip install 'uv (?P<operator>==|~=) (?P<version>[^']+)'", build_command)
+    bootstrap_uv = _bootstrap_uv_pin(build_command)
     assert bootstrap_uv is not None, "the release build does not pin its bootstrapped uv"
     assert bootstrap_uv.group("operator") == "=="
     expected_version = bootstrap_uv.group("version")

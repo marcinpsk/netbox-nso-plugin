@@ -61,9 +61,24 @@ class TestSnmpV3HostPush(IntentPushResetMixin, _HostBase):
 
         reset_intent_push_state()
         with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
-            deliver("snmp", self.device.pk, 42)
+            deliver("snmp", self.device.pk, self.mgmt.adapter_device_id)
         mock_put.assert_called_once()
+        self.assertEqual(mock_put.call_args.args[0], self.mgmt.adapter_device_id)
         return mock_put.call_args[0][3]  # hosts
+
+    def test_push_uses_current_management_adapter_device_id(self):
+        self.mgmt.adapter_device_id = 43
+        self.mgmt.save(update_fields=["adapter_device_id"])
+        NSOSnmpHostState.objects.create(
+            management=self.mgmt,
+            address="198.18.0.5",
+            version="3",
+            notify_type="trap",
+            username="netmon-v3",
+            status="accepted",
+        )
+
+        self._push()
 
     def test_a_v3_host_WITH_a_user_name_is_pushed(self):
         """The feature. The user name goes into community_or_user — the field both writers key on."""
