@@ -177,6 +177,17 @@ def fold_transitions(transitions, *, claim_deletions=(), queued=(), revoked=(), 
     return folded
 
 
+def fold_state_transitions(transitions, state) -> FoldedAuthority:
+    """Fold *transitions* with every authority value held on *state*."""
+    return fold_transitions(
+        transitions,
+        claim_deletions=[route_id_of(record["route_id"]) for record in state.claim_deletions or []],
+        queued=state.queued_deletions,
+        revoked=state.revoked_ids,
+        lineage_carry=state.lineage_carry,
+    )
+
+
 def carried_triple(route_id, *, transitions=(), queued=(), claim_deletions=(), lineage_carry=None) -> dict | None:
     """Return the acknowledged triple a re-ownership of *route_id* inherits (§4.3(b)).
 

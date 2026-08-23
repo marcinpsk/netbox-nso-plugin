@@ -100,19 +100,8 @@ def _deliver_scheduled_keys():
         if not rows:
             continue
         entry_ids = [row["id"] for row in rows]
-        state = (
-            NSOIntentOutboxState.objects.filter(device_id=device_id, scope=scope)
-            .values("claim_deletions", "queued_deletions", "revoked_ids", "lineage_carry")
-            .first()
-            or {}
-        )
-        folded = outbox.fold_transitions(
-            [record for row in rows for record in row["transitions"]],
-            claim_deletions=[int(record["route_id"]) for record in state.get("claim_deletions") or []],
-            queued=state.get("queued_deletions") or [],
-            revoked=state.get("revoked_ids") or [],
-            lineage_carry=state.get("lineage_carry") or {},
-        )
+        state, _created = NSOIntentOutboxState.objects.get_or_create(device_id=device_id, scope=scope)
+        folded = outbox.fold_state_transitions([record for row in rows for record in row["transitions"]], state)
         try:
             rendered = delivery.render(scope, device_id, adapter_device_id)
             delivery.send(
