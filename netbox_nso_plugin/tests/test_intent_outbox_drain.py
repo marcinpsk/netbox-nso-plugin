@@ -152,6 +152,7 @@ class TestTheTickDrainsTheTail(_DrainCase):
 
         waiter_pid = []
         waiter_errors = []
+        thread_connections_closed = []
         # The drain catches broad Exception, and `self.failureException` is one: a `self.fail`
         # inside the patched send is logged and swallowed, and never reaches the runner.
         send_failures = []
@@ -168,7 +169,8 @@ class TestTheTickDrainsTheTail(_DrainCase):
             except BaseException as exc:
                 waiter_errors.append(exc)
             finally:
-                close_old_connections()
+                connection.close()
+                thread_connections_closed.append(connection.connection is None)
 
         waiter = threading.Thread(target=request_quiesce)
 
@@ -210,6 +212,7 @@ class TestTheTickDrainsTheTail(_DrainCase):
             self.assertEqual(send_failures, [], send_failures[0] if send_failures else "")
             self.assertFalse(waiter.is_alive(), "the exclusive transition did not finish")
             self.assertEqual(waiter_errors, [])
+            self.assertEqual(thread_connections_closed, [True])
             self.assertEqual(len(self.adapter.requests), 1)
             self.assertEqual(
                 sorted(bool(entries(device, "vlan", unconsumed=True)) for device in (first, second)),
@@ -229,6 +232,7 @@ class TestTheTickDrainsTheTail(_DrainCase):
         quiesce_finished = threading.Event()
         waiter_pid = []
         errors = []
+        thread_connections_closed = []
 
         def snapshot(rows):
             snapshot_started.set()
@@ -242,7 +246,8 @@ class TestTheTickDrainsTheTail(_DrainCase):
             except BaseException as exc:
                 errors.append(exc)
             finally:
-                close_old_connections()
+                connection.close()
+                thread_connections_closed.append(connection.connection is None)
 
         def request_quiesce():
             close_old_connections()
@@ -255,7 +260,8 @@ class TestTheTickDrainsTheTail(_DrainCase):
             except BaseException as exc:
                 errors.append(exc)
             finally:
-                close_old_connections()
+                connection.close()
+                thread_connections_closed.append(connection.connection is None)
 
         with (
             patch("netbox_nso_plugin.sync_cache._snapshot", side_effect=snapshot),
@@ -294,6 +300,7 @@ class TestTheTickDrainsTheTail(_DrainCase):
             self.assertFalse(worker.is_alive(), "the maintenance job did not finish")
             self.assertFalse(waiter.is_alive(), "the exclusive transition did not finish")
             self.assertEqual(errors, [])
+            self.assertEqual(thread_connections_closed, [True, True])
         finally:
             if deployment.is_quiesced():
                 deployment.resume()

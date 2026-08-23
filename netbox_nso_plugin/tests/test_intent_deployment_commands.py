@@ -212,6 +212,28 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         self.assertEqual([response.status_code for response in plugin_responses], [503, 503])
         self.assertEqual(unrelated_response.status_code, 200)
 
+    def test_quiescence_quotes_the_refused_request_path_in_the_log(self):
+        from django.http import HttpResponse
+        from django.test import RequestFactory
+
+        from netbox_nso_plugin.deployment import quiesce, resume
+        from netbox_nso_plugin.middleware import IntentDeploymentMiddleware
+
+        request = RequestFactory().post("/plugins/nso/refused/")
+        request.path_info = "/plugins/nso/refused\nforged-record"
+
+        quiesce()
+        try:
+            with self.assertLogs("netbox_nso_plugin.middleware", level="INFO") as logged:
+                response = IntentDeploymentMiddleware(lambda _request: HttpResponse("mutated"))(request)
+        finally:
+            resume()
+
+        assert response.status_code == 503
+        message = logged.output[0].split(":", 2)[-1]
+        assert "\n" not in message
+        assert repr(request.path_info) in message
+
     def test_quiescence_returns_503_and_rolls_back_a_core_intent_mutation(self):
         from django.http import HttpResponse
         from django.test import RequestFactory
