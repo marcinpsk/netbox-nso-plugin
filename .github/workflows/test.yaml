@@ -134,7 +134,7 @@ jobs:
         # plugin conftest gives each worker an isolated PostgreSQL database.
         # The pythonpath override replaces the ini value (devcontainer netbox +
         # netbox_stubs): the stubs would shadow the real NetBox checkout here.
-        run: pytest -n 4 --dist loadscope --disable-warnings -o pythonpath=../netbox/netbox
+        run: pytest -n 4 --disable-warnings -o pythonpath=../netbox/netbox
 
   live-adapter-contract:
     name: Live adapter contract

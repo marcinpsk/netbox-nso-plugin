@@ -9,6 +9,7 @@ from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.test import TestCase
 
 from ._adapter_http import make_session
+from .mixins import IntentPushResetMixin
 
 _BASE_CFG = {
     "url": "http://adapter.local",
@@ -99,7 +100,7 @@ def _make_bgp_device(suffix="bgp"):
     return Device.objects.create(name=f"bgp-router-{suffix}", device_type=dt, role=role, site=site)
 
 
-class TestReconcileBgpConfig(TestCase):
+class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
     """Integration tests for _reconcile_bgp_config() — real Django DB."""
 
     @classmethod
@@ -190,7 +191,7 @@ class TestReconcileBgpConfig(TestCase):
         self.assertTrue(state.enabled)
 
     def test_push_includes_peer_source_ip(self):
-        """_push_bgp_intent_for_device must send a peer's source (the local-address IP).
+        """BGP delivery must send a peer's source (the local-address IP).
 
         The PUT peer dict previously dropped source entirely, so the reconciler — which can now
         write local-address/update-source — never received it: the BGP session source was lost on
@@ -201,7 +202,7 @@ class TestReconcileBgpConfig(TestCase):
         from ipam.models import IPAddress
 
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
-        from netbox_nso_plugin.signals import _push_bgp_intent_for_device
+        from netbox_nso_plugin.delivery import deliver
 
         mgmt = self._make_mgmt()
         IPAddress.objects.create(address="198.18.255.1/32")
@@ -222,13 +223,13 @@ class TestReconcileBgpConfig(TestCase):
             return {"device_id": adapter_device_id, "router_count": len(routers)}
 
         with patch("netbox_nso_plugin.adapter_client.put_bgp_intent", side_effect=_capture):
-            _push_bgp_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("bgp", self.device.pk, mgmt.adapter_device_id)
 
         peers = captured["routers"][0]["scopes"][0]["peers"]
         self.assertEqual(peers[0]["source"], "198.18.255.1")
 
     def test_push_includes_local_as_ttl_password_peer_group(self):
-        """_push_bgp_intent_for_device must send local_as, ttl, password, and peer-group.
+        """BGP delivery must send local_as, ttl, password, and peer-group.
 
         These leaves are imported from the device onto the netbox-routing BGPPeer and are
         fully supported by the adapter intent schema + reconciler YANG, but the PUT peer dict
@@ -239,7 +240,7 @@ class TestReconcileBgpConfig(TestCase):
         from unittest.mock import patch
 
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
-        from netbox_nso_plugin.signals import _push_bgp_intent_for_device
+        from netbox_nso_plugin.delivery import deliver
 
         mgmt = self._make_mgmt()
         result = _reconcile_bgp_config(
@@ -274,7 +275,7 @@ class TestReconcileBgpConfig(TestCase):
             return {"device_id": adapter_device_id, "router_count": len(routers)}
 
         with patch("netbox_nso_plugin.adapter_client.put_bgp_intent", side_effect=_capture):
-            _push_bgp_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("bgp", self.device.pk, mgmt.adapter_device_id)
 
         peer = captured["routers"][0]["scopes"][0]["peers"][0]
         self.assertEqual(peer["local_as"], "65199")
@@ -329,7 +330,7 @@ class TestReconcileBgpConfig(TestCase):
         from unittest.mock import patch
 
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
-        from netbox_nso_plugin.signals import _push_bgp_intent_for_device
+        from netbox_nso_plugin.delivery import deliver
 
         mgmt = self._make_mgmt()
         result = _reconcile_bgp_config(
@@ -347,7 +348,7 @@ class TestReconcileBgpConfig(TestCase):
             return {"device_id": adapter_device_id, "router_count": len(routers)}
 
         with patch("netbox_nso_plugin.adapter_client.put_bgp_intent", side_effect=_capture):
-            _push_bgp_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("bgp", self.device.pk, mgmt.adapter_device_id)
 
         self.assertEqual(captured["routers"][0]["router_id"], "10.255.0.1")
 
@@ -531,7 +532,7 @@ class TestReconcileBgpConfig(TestCase):
         self.assertIsNone(bp.update_source_id)
 
     def test_push_sends_update_source_iface_name(self):
-        """_push_bgp_intent_for_device sends the update-source interface NAME for a peer whose
+        """BGP delivery sends the update-source interface name for a peer whose
         source is a dcim.Interface (IOS/IOS-XR), so the cisco writer round-trips it.
 
         Counterpart to test_push_includes_peer_source_ip (Junos/Nokia local-address IP): the
@@ -542,7 +543,7 @@ class TestReconcileBgpConfig(TestCase):
         from dcim.models import Interface
 
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
-        from netbox_nso_plugin.signals import _push_bgp_intent_for_device
+        from netbox_nso_plugin.delivery import deliver
 
         mgmt = self._make_mgmt()
         Interface.objects.create(device=self.device, name="Loopback0", type="virtual")
@@ -564,7 +565,7 @@ class TestReconcileBgpConfig(TestCase):
             return {"device_id": adapter_device_id, "router_count": len(routers)}
 
         with patch("netbox_nso_plugin.adapter_client.put_bgp_intent", side_effect=_capture):
-            _push_bgp_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("bgp", self.device.pk, mgmt.adapter_device_id)
 
         peers = captured["routers"][0]["scopes"][0]["peers"]
         self.assertEqual(peers[0]["source"], "Loopback0")

@@ -21,13 +21,13 @@ from django.urls import reverse
 from netbox_nso_plugin import adapter_client as _adapter_client
 
 from ._static_route_case import PUT, _fixtures, _make_device, _make_mgmt, _own, _route
-from .mixins import IntentPushResetMixin, _CascadeFlushMixin
+from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 #: Captured at import, before any test can patch it — see ``_assert_put_patch_did_not_leak``.
 _REAL_PUT = _adapter_client.put_static_route_intent
 
 
-class TestStaticRouteContentTransition(IntentPushResetMixin, TestCase):
+class TestStaticRouteContentTransition(IntentPushDeliveryMixin, TestCase):
     """P2.1–P2.7(a), P2.10, P2.11 — the transition itself."""
 
     @classmethod
@@ -298,7 +298,7 @@ class TestStaticRouteBulkAcceptOutsideATransaction(_CascadeFlushMixin, IntentPus
 
     def _drifted(self, count):
         states = []
-        with _fixtures():
+        with _fixtures(), transaction.atomic():
             for index in range(count):
                 sr = _route(f"10.39.{index}.0/24", "10.0.0.1", devices=[self.device])
                 state = _own(sr, self.mgmt, status="in_sync")
@@ -333,6 +333,28 @@ class TestStaticRouteBulkAcceptOutsideATransaction(_CascadeFlushMixin, IntentPus
         pushed = put.call_args.args[1]
         self.assertEqual(len(pushed), 3)
         self.assertTrue(all(route["generation"] for route in pushed))
+
+    def test_the_bulk_accept_push_is_claimed_and_sequenced(self):
+        """Codex O1 F5 — a bulk accept called the builder directly, so it sent with no claim.
+
+        No sequence, no entry, no durable record: the swallowed failure of a push that
+        published ownership left nothing for the tick to carry, which is the one thing the
+        outbox exists to prevent.
+        """
+        from ._outbox_case import ReceiptAdapter, entries, state_of
+
+        self._drifted(2)
+        adapter = ReceiptAdapter()
+        config, session = adapter.patches()
+        with config, session:
+            response = self._post()
+
+        assert response.status_code == 302
+        mine = [request for request in adapter.requests if "/devices/8821/" in request["url"]]
+        assert len(mine) == 1, mine
+        assert mine[0]["push_seq"] is not None, "the bulk accept reached the adapter outside the protocol"
+        assert state_of(self.device, "static_route").last_success_identity != ""
+        assert entries(self.device, "static_route") == []
 
     def test_no_observer_ever_sees_an_accepted_row_still_on_its_old_generation(self):
         """Committing the status ahead of the generation leaves a window in which a concurrent

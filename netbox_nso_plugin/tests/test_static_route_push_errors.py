@@ -2,9 +2,9 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """#1396 R3 P6 — surfacing what an intent push was rejected with.
 
-``_push_changed`` used to swallow every failure into one log line, so an operator whose
-edit the adapter refused saw a freshly-accepted green row and no reason. R3 persists the
-rejection per ``(device, scope)`` and renders it. Pins P6.1 through P6.7.
+The push used to swallow every failure into one log line, so an operator whose edit the
+adapter refused saw a freshly-accepted green row and no reason. R3 persists the rejection
+per ``(device, scope)`` and renders it. Pins P6.1 through P6.7.
 
 R3 records; **#1474 owns the retry** — nothing here re-sends, times out or queues, and
 P6.4 pins exactly that.
@@ -12,6 +12,7 @@ P6.4 pins exactly that.
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 from unittest.mock import patch
@@ -47,10 +48,37 @@ def _duplicate_route_id(route_id):
     )
 
 
-def _push(device_id, adapter_device_id, *, force=True):
-    from netbox_nso_plugin.signals import _push_static_route_intent_for_device
+def _raises(exc):
+    def do_push(body):
+        raise exc
 
-    return _push_static_route_intent_for_device(device_id, adapter_device_id, force=force)
+    return do_push
+
+
+def _push(device_id, adapter_device_id):
+    """Render and send the snapshot, swallowing what the drain isolates in production.
+
+    ``_send_rendered`` writes the record under test before the exception leaves it; since
+    #1503 Appendix O the claim is what decides a failed send's fate, so nothing under the
+    send swallows it any more.
+    """
+    from netbox_nso_plugin.delivery import deliver
+
+    try:
+        return deliver("static_route", device_id, adapter_device_id)
+    except Exception:  # noqa: BLE001 — the pin is the RECORD, not who isolates the failure
+        return None
+
+
+def _send(device_id, scope, do_push):
+    """Send one body for *scope*, swallowing the failure the drain isolates in production."""
+    from netbox_nso_plugin.delivery import Rendered
+    from netbox_nso_plugin.signals import _send_rendered
+
+    rendered = Rendered(key=(device_id, scope), payload=[{"scope": scope}], do_push=do_push)
+    with contextlib.suppress(Exception):
+        return _send_rendered(rendered, rendered.payload)
+    return None
 
 
 def _record(mgmt, scope="static_route"):
@@ -165,21 +193,6 @@ class TestIntentPushRejectionRecord(IntentPushResetMixin, TestCase):
         self.assertIn("ValueError", entry["message"])
         self.assertIn("boom", entry["message"])
 
-    def test_a_skipped_unchanged_push_allocates_no_attempt(self):
-        """No request was made, so there is nothing to record and no mark to burn."""
-        with _fixtures():
-            sr = _route("10.65.0.0/16", "10.0.0.1", devices=[self.device])
-            _own(sr, self.mgmt)
-
-        with patch(PUT, return_value={"device_id": 1, "count": 1, "routes": []}):
-            _push(self.device.pk, self.mgmt.adapter_device_id, force=False)
-            self.mgmt.refresh_from_db()
-            self.assertEqual(self.mgmt.intent_push_attempts.get("static_route"), 1)
-            _push(self.device.pk, self.mgmt.adapter_device_id, force=False)
-
-        self.mgmt.refresh_from_db()
-        self.assertEqual(self.mgmt.intent_push_attempts.get("static_route"), 1)
-
 
 class TestIntentPushRejectionIsolation(IntentPushResetMixin, TestCase):
     """P6.2 — per-scope isolation, and the watermark that outlives the cleared entry."""
@@ -196,18 +209,16 @@ class TestIntentPushRejectionIsolation(IntentPushResetMixin, TestCase):
             _own(self.sr, self.mgmt)
 
     def test_one_scopes_failure_and_success_never_touch_another_scopes_record(self):
-        """P6.2 — `_push_changed` is shared by every scope, so a device-wide record would let
-        the VLAN push's success erase the static route's unresolved rejection."""
-        from netbox_nso_plugin.signals import _push_changed
-
+        """P6.2 — the record is shared by every scope, so a device-wide one would let the
+        VLAN push's success erase the static route's unresolved rejection."""
         with patch(PUT, side_effect=_duplicate_triple(("", "10.70.0.0/16", "10.0.0.1"))):
             _push(self.device.pk, self.mgmt.adapter_device_id)
         self.assertIsNotNone(_record(self.mgmt))
 
         # Another scope fails, then succeeds. Neither may reach static_route.
-        _push_changed((self.device.pk, "vlan"), [{"a": 1}], lambda: (_ for _ in ()).throw(ValueError("vlan down")))
+        _send(self.device.pk, "vlan", _raises(ValueError("vlan down")))
         self.assertIsNotNone(_record(self.mgmt, "vlan"))
-        _push_changed((self.device.pk, "vlan"), [{"a": 2}], lambda: {"ok": True})
+        _send(self.device.pk, "vlan", lambda body: {"ok": True})
         self.assertIsNone(_record(self.mgmt, "vlan"))
 
         self.assertIsNotNone(_record(self.mgmt), "another scope's success cleared the static record")
@@ -309,19 +320,22 @@ class TestIntentPushRejectionConcurrency(_CascadeFlushMixin, IntentPushResetMixi
         self.mgmt = _make_mgmt(self.device, "conc", 9103)
 
     def test_two_workers_writing_different_scopes_both_survive(self):
-        from netbox_nso_plugin.signals import _push_changed
+        from netbox_nso_plugin.delivery import Rendered
+        from netbox_nso_plugin.signals import _send_rendered
 
         start = threading.Barrier(2, timeout=30)
         errors: list[BaseException] = []
 
         def _fail(scope):
+            rendered = Rendered(
+                key=(self.device.pk, scope),
+                payload=[{"scope": scope}],
+                do_push=_raises(ValueError(f"{scope} down")),
+            )
             try:
                 start.wait()
-                _push_changed(
-                    (self.device.pk, scope),
-                    [{"scope": scope}],
-                    lambda: (_ for _ in ()).throw(ValueError(f"{scope} down")),
-                )
+                with contextlib.suppress(ValueError):  # the drain isolates it; the record is the pin
+                    _send_rendered(rendered, rendered.payload)
             except BaseException as exc:  # noqa: BLE001 — reported, not swallowed
                 errors.append(exc)
             finally:

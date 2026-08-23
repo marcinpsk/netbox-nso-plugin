@@ -401,7 +401,7 @@ def _assign_one_p2p_family(
     from ipam.models import IPAddress, Prefix
 
     from .models import NSOInterfaceIPState
-    from .signals import _push_ip_intent_for_device
+    from .signals import _schedule_intent_push
 
     _OCCUPIED = ("reserved", "accepted", "deploying", "in_sync")
     now = timezone.now()
@@ -485,21 +485,16 @@ def _assign_one_p2p_family(
             state_a.save(update_fields=["peer_state"])
             state_b.peer_state = state_a
             state_b.save(update_fields=["peer_state"])
+            if push:
+                # Appended inside the allocation's own transaction: an in-protocol send is
+                # a claimed, sequenced operation, and the drain runs on this commit.
+                for dev_id in (mgmt.device_id, peer_mgmt.device_id):
+                    _schedule_intent_push((dev_id, "ip"))
     except Exception as exc:
         result["errors"].append(
             {"interface": str(interface), "family": family, "reason": f"P2P allocation failed: {exc}"}
         )
         return
-
-    if push:
-        for dev_id, adapter_id in [
-            (mgmt.device_id, mgmt.adapter_device_id),
-            (peer_mgmt.device_id, peer_mgmt.adapter_device_id),
-        ]:
-            try:
-                _push_ip_intent_for_device(dev_id, adapter_id)
-            except Exception as exc:
-                logger.warning("ip_autoassign.p2p: failed to push intent for device %s: %s", dev_id, exc)
 
     result["allocated"].extend(
         [
@@ -562,18 +557,19 @@ def _single_family_occupied(interface, family: str) -> bool:
 
 
 def _reserve_single(interface, mgmt, family: str, pool, result, push=True) -> None:
-    """Draw one host from *pool*, reserve it, create the accepted state, push. Mutates *result*.
+    """Draw one host from *pool*, reserve it, and create the accepted state. Mutates *result*.
 
     The caller has already resolved *pool* and passed the fill-empty guard; this is
-    the shared reserve/state/push body used by both the M13 classification path and
-    the link-role single-ended path. *push* False skips the immediate adapter push
-    (the link-role orchestrator defers pushes to after an atomic commit).
+    the shared reservation, state, and outbox body used by both the M13 classification
+    path and the link-role single-ended path. The commit callback drains the scheduled
+    outbox entry. *push* False skips that scheduling.
     """
+    from django.db import transaction
     from django.utils import timezone
     from ipam.models import IPAddress
 
     from .models import NSOInterfaceIPState
-    from .signals import _push_ip_intent_for_device
+    from .signals import _schedule_intent_push
 
     available_str = pool.get_first_available_ip()
     if available_str is None:
@@ -586,55 +582,53 @@ def _reserve_single(interface, mgmt, family: str, pool, result, push=True) -> No
         )
         return
 
-    # Reserve the IPAddress in IPAM so concurrent allocations don't collide. It carries the
-    # pool's VRF so a VRF-scoped pool lands the address in the right table (and rollback, which
-    # filters by VRF, can find it).
+    # One transaction, so the reservation, the overlay and the outbox entry they schedule
+    # commit together. The link-role orchestrator's own atomic block nests as a savepoint.
     try:
-        ip_obj = IPAddress(address=available_str, vrf=pool.vrf, status="reserved")
-        ip_obj.assigned_object = interface
-        ip_obj.save()
+        with transaction.atomic():
+            failed_step = "IPAddress"
+            try:
+                with transaction.atomic():
+                    # Reserve the IPAddress so concurrent allocations do not collide.
+                    ip_obj = IPAddress(address=available_str, vrf=pool.vrf, status="reserved")
+                    ip_obj.assigned_object = interface
+                    ip_obj.save()
+
+                    vrf_name = pool.vrf.name if pool.vrf else ""
+                    failed_step = "NSOInterfaceIPState"
+                    state, _ = NSOInterfaceIPState.objects.update_or_create(
+                        interface=interface,
+                        address=available_str,
+                        vrf=vrf_name,
+                        defaults={
+                            "family": family,
+                            "status": "accepted",
+                            "auto_assigned": True,
+                            "source_pool": pool,
+                            "accepted_at": timezone.now(),
+                        },
+                    )
+            except Exception as exc:
+                result["errors"].append(
+                    {
+                        "interface": str(interface),
+                        "family": family,
+                        "reason": f"Failed to create {failed_step}: {exc}",
+                    }
+                )
+                return
+
+            if push:
+                _schedule_intent_push((mgmt.device_id, "ip"))
     except Exception as exc:
         result["errors"].append(
-            {"interface": str(interface), "family": family, "reason": f"Failed to create IPAddress: {exc}"}
-        )
-        return
-
-    vrf_name = pool.vrf.name if pool.vrf else ""
-
-    # Create (or update the signal-created) NSOInterfaceIPState as 'accepted'.
-    try:
-        state, _ = NSOInterfaceIPState.objects.update_or_create(
-            interface=interface,
-            address=available_str,
-            vrf=vrf_name,
-            defaults={
+            {
+                "interface": str(interface),
                 "family": family,
-                "status": "accepted",
-                "auto_assigned": True,
-                "source_pool": pool,
-                "accepted_at": timezone.now(),
-            },
-        )
-    except Exception as exc:
-        try:
-            ip_obj.delete()
-        except Exception:
-            pass
-        result["errors"].append(
-            {"interface": str(interface), "family": family, "reason": f"Failed to create NSOInterfaceIPState: {exc}"}
+                "reason": f"Failed to schedule the IP intent push: {exc}",
+            }
         )
         return
-
-    if push:
-        try:
-            _push_ip_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
-        except Exception as exc:
-            logger.warning(
-                "ip_autoassign: failed to push IP intent for device %s after allocating %s: %s",
-                mgmt.device_id,
-                available_str,
-                exc,
-            )
 
     result["allocated"].append(
         {

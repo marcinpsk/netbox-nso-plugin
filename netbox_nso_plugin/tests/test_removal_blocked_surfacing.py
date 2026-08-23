@@ -15,6 +15,7 @@ permission gating, JSON shapes — runs for real.
 
 import json
 import re
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
@@ -499,3 +500,94 @@ class TestTabBannerWiring(BlockedRemovalTestBase):
         self.assertIn('id="nso-blocked-removal-tpl"', html)
         force_url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_force_removal", args=[self.mgmt.pk])
         self.assertIn(force_url, html)
+
+
+class TestFreeFormErrorDetail(TestCase):
+    """``error`` is an object by contract; what is INSIDE it is free-form JSON.
+
+    The client boundary pins ``job.error`` to ``dict | None``, and nothing more: ``detail``
+    and its members are an unschema'd JSON column in the adapter's store. So the readers
+    that walk into it still check what they find, and the helpers are called directly here
+    because that walk is the whole unit under test.
+    """
+
+    def _job(self, error):
+        job = _removal_job(80, "isis", "failed", context=False)
+        job["error"] = error
+        return job
+
+    def test_the_scope_falls_back_to_the_error_detail(self):
+        """The attribution path the blocked-job legacy shape actually depends on.
+
+        Context and result are both absent here, so ``error.detail`` is the only place a
+        scope can come from; a job without one is skipped before any error is read.
+        """
+        from netbox_nso_plugin.views import _removal_job_scope
+
+        self.assertEqual(_removal_job_scope(self._job({"detail": {"scope": "isis"}})), "isis")
+
+    def test_a_non_object_detail_does_not_break_the_attribution(self):
+        from netbox_nso_plugin.views import _removal_job_scope
+
+        for detail in ("boom", 3, ["scope"]):
+            with self.subTest(detail=detail):
+                self.assertIsNone(_removal_job_scope(self._job({"detail": detail})))
+
+    def test_a_non_object_orphans_map_still_raises_the_banner(self):
+        """The block is the operator-critical fact: a junk orphans map must not hide it."""
+        from netbox_nso_plugin.views import _blocked_removals
+
+        job = _removal_job(81, "isis", "failed")
+        job["error"] = {
+            "code": "removal_blocked_collateral",
+            "message": "blocked",
+            "detail": {"scope": "isis", "orphans": "boom", "preview": "p"},
+        }
+
+        entries = _blocked_removals([job])
+
+        self.assertEqual([e["scope"] for e in entries], ["isis"])
+        self.assertEqual(entries[0]["orphans"], {})
+
+    def test_a_non_object_detail_on_a_blocked_job_still_reports_the_block(self):
+        """Scope comes from the context here, so the block is known even with no usable detail."""
+        from netbox_nso_plugin.views import _blocked_removals
+
+        job = _removal_job(82, "isis", "failed")
+        job["error"] = {"code": "removal_blocked_collateral", "message": "blocked", "detail": "boom"}
+
+        entries = _blocked_removals([job])
+
+        self.assertEqual([e["scope"] for e in entries], ["isis"])
+        self.assertEqual(entries[0]["orphans"], {})
+        self.assertEqual(entries[0]["preview"], "")
+
+
+class TestFreeFormResidue(TestCase):
+    """``result`` is an object by contract; the residue map inside it is free-form JSON.
+
+    The residue badge is best-effort decoration on the category grid, so a junk report must
+    cost the badge and nothing else. Before the guard it raised out of the grid view, which
+    the call sites do not wrap.
+    """
+
+    def _annotate(self, residue):
+        """Run the real annotator against a job carrying *residue*, return its VLAN row."""
+        from netbox_nso_plugin.views import _annotate_residue_rows
+
+        job = _removal_job(90, "vlan", "succeeded")
+        job["result"] = {"scope": "vlan", "residue": residue}
+        mgmt = NSODeviceManagement(adapter_device_id=10)
+        row = SimpleNamespace(vlan=SimpleNamespace(vid="b"))
+        ctx = {"vlan_states": [row]}
+        with patch("netbox_nso_plugin.adapter_client.list_jobs", return_value=[job]):
+            _annotate_residue_rows(ctx, "vlan", mgmt)
+        return row
+
+    def test_a_non_object_residue_map_costs_only_the_badge(self):
+        for residue in ("boom", 3, ["vlan"]):
+            with self.subTest(residue=residue):
+                self.assertFalse(hasattr(self._annotate(residue), "residue_survivor"))
+
+    def test_a_non_list_key_list_costs_only_that_label(self):
+        self.assertFalse(hasattr(self._annotate({"vlan": "boom"}), "residue_survivor"))

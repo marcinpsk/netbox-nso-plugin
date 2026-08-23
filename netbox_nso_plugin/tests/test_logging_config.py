@@ -7,6 +7,8 @@ from unittest.mock import patch
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Platform, Site
 from django.test import TestCase
 
+from .mixins import IntentPushResetMixin
+
 
 def _make_device(suffix="log"):
     mfg, _ = Manufacturer.objects.get_or_create(name=f"LogMfg{suffix}", slug=f"logmfg{suffix}")
@@ -16,7 +18,7 @@ def _make_device(suffix="log"):
     return Device.objects.create(name=f"log-rtr-{suffix}", device_type=dt, role=role, site=site)
 
 
-class TestReconcileLoggingConfig(TestCase):
+class TestReconcileLoggingConfig(IntentPushResetMixin, TestCase):
     @classmethod
     def setUpTestData(cls):
         cls.device = _make_device("main")
@@ -123,8 +125,8 @@ class TestReconcileLoggingConfig(TestCase):
         self.assertEqual(row.status, "accepted")
 
     def test_nx_device_default_facility_settles_and_pushes_explicit_intent(self):
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.models import NSOLoggingHostState, NSOPlatformNedMapping
-        from netbox_nso_plugin.signals import _push_logging_intent_for_device
         from netbox_nso_plugin.template_content import _reconcile_logging_config
 
         mgmt = self._mgmt()
@@ -140,7 +142,7 @@ class TestReconcileLoggingConfig(TestCase):
         )
 
         with patch("netbox_nso_plugin.adapter_client.put_logging_intent") as put:
-            _push_logging_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("logging", self.device.pk, mgmt.adapter_device_id)
         # Keep the explicit semantic intent on the write path: the NSO
         # reconciler needs local7 to retract a brownfield non-default facility.
         # Only observed-state comparison canonicalizes local7 to omission.
@@ -237,8 +239,8 @@ class TestReconcileLoggingConfig(TestCase):
         self.assertEqual(row.status, "accepted")
 
     def test_timos_writer_and_reader_tokens_settle_to_one_canonical_value(self):
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.models import NSOLoggingHostState, NSOPlatformNedMapping
-        from netbox_nso_plugin.signals import _push_logging_intent_for_device
         from netbox_nso_plugin.template_content import _reconcile_logging_config
 
         mgmt = self._mgmt()
@@ -255,7 +257,7 @@ class TestReconcileLoggingConfig(TestCase):
         )
 
         with patch("netbox_nso_plugin.adapter_client.put_logging_intent") as put:
-            _push_logging_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("logging", self.device.pk, mgmt.adapter_device_id)
         host = put.call_args.args[1][0]
         self.assertEqual(host["severity"], "info")
         self.assertEqual(host["facility"], "local6")
@@ -271,8 +273,8 @@ class TestReconcileLoggingConfig(TestCase):
         self.assertEqual(row.status, "in_sync")
 
     def test_junos_writer_and_reader_tokens_settle_to_one_canonical_value(self):
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.models import NSOLoggingHostState, NSOPlatformNedMapping
-        from netbox_nso_plugin.signals import _push_logging_intent_for_device
         from netbox_nso_plugin.template_content import _reconcile_logging_config
 
         mgmt = self._mgmt()
@@ -289,7 +291,7 @@ class TestReconcileLoggingConfig(TestCase):
         )
 
         with patch("netbox_nso_plugin.adapter_client.put_logging_intent") as put:
-            _push_logging_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("logging", self.device.pk, mgmt.adapter_device_id)
         host = put.call_args.args[1][0]
         self.assertEqual(host["severity"], "info")
         self.assertEqual(host["facility"], "local7")
@@ -303,8 +305,8 @@ class TestReconcileLoggingConfig(TestCase):
         self.assertEqual(row.status, "in_sync")
 
     def test_arcos_writer_and_reader_tokens_settle_to_one_canonical_value(self):
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.models import NSOLoggingHostState, NSOPlatformNedMapping
-        from netbox_nso_plugin.signals import _push_logging_intent_for_device
         from netbox_nso_plugin.template_content import _reconcile_logging_config
 
         mgmt = self._mgmt()
@@ -321,7 +323,7 @@ class TestReconcileLoggingConfig(TestCase):
         )
 
         with patch("netbox_nso_plugin.adapter_client.put_logging_intent") as put:
-            _push_logging_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("logging", self.device.pk, mgmt.adapter_device_id)
         host = put.call_args.args[1][0]
         self.assertEqual(host["severity"], "INFORMATIONAL")
         self.assertEqual(host["facility"], "ALL")
@@ -335,8 +337,8 @@ class TestReconcileLoggingConfig(TestCase):
         self.assertEqual(row.status, "in_sync")
 
     def test_cisco_writer_and_reader_tokens_settle_to_one_canonical_value(self):
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.models import NSOLoggingHostState, NSOPlatformNedMapping
-        from netbox_nso_plugin.signals import _push_logging_intent_for_device
         from netbox_nso_plugin.template_content import _reconcile_logging_config
 
         mgmt = self._mgmt()
@@ -361,7 +363,7 @@ class TestReconcileLoggingConfig(TestCase):
                 )
 
                 with patch("netbox_nso_plugin.adapter_client.put_logging_intent") as put:
-                    _push_logging_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+                    deliver("logging", self.device.pk, mgmt.adapter_device_id)
                 host = put.call_args.args[1][0]
                 self.assertEqual(host["severity"], "informational")
                 self.assertEqual(host["facility"], "local5")
@@ -381,8 +383,8 @@ class TestReconcileLoggingConfig(TestCase):
                 row.delete()
 
     def test_value_suppressed_default_port_stays_absent_in_push_payload(self):
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.models import NSOLoggingHostState, NSOPlatformNedMapping
-        from netbox_nso_plugin.signals import _push_logging_intent_for_device
 
         mgmt = self._mgmt()
         platform = Platform.objects.create(name="Logging push Nokia", slug="logging-push-nokia")
@@ -397,14 +399,14 @@ class TestReconcileLoggingConfig(TestCase):
         )
 
         with patch("netbox_nso_plugin.adapter_client.put_logging_intent") as put:
-            _push_logging_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("logging", self.device.pk, mgmt.adapter_device_id)
 
         host = put.call_args.args[1][0]
         self.assertNotIn("port", host)
 
     def test_default_free_family_preserves_explicit_conventional_port(self):
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.models import NSOLoggingHostState, NSOPlatformNedMapping
-        from netbox_nso_plugin.signals import _push_logging_intent_for_device
 
         mgmt = self._mgmt()
         platform = Platform.objects.create(name="Logging push Junos", slug="logging-push-junos")
@@ -419,7 +421,7 @@ class TestReconcileLoggingConfig(TestCase):
         )
 
         with patch("netbox_nso_plugin.adapter_client.put_logging_intent") as put:
-            _push_logging_intent_for_device(self.device.pk, mgmt.adapter_device_id)
+            deliver("logging", self.device.pk, mgmt.adapter_device_id)
 
         self.assertEqual(put.call_args.args[1][0]["port"], 514)
 

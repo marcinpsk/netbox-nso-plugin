@@ -11,9 +11,11 @@ import re
 from datetime import UTC, datetime
 from unittest.mock import patch
 
+import requests
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
 from django.contrib.auth import get_user_model
-from django.test import SimpleTestCase, TestCase
+from django.db import transaction
+from django.test import SimpleTestCase, TestCase, TransactionTestCase
 from django.urls import reverse
 
 from netbox_nso_plugin.adapter_client import AdapterError
@@ -26,7 +28,8 @@ from netbox_nso_plugin.models import (
 )
 
 from ._adapter_http import make_response, make_session
-from .mixins import IntentPushResetMixin
+from ._outbox_case import ReceiptAdapter, make_managed, without_commit_drain
+from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 User = get_user_model()
 TEST_PASSWORD = "testpass789"  # noqa: S105
@@ -56,8 +59,13 @@ def _make_fixtures():
     }
 
 
-class ViewTestBase(IntentPushResetMixin, TestCase):
-    """Base class: creates superuser and logs in, creates fixtures."""
+class ViewTestBase(IntentPushDeliveryMixin, TestCase):
+    """Base class: creates superuser and logs in, creates fixtures.
+
+    The view cases assert that an edit reached the adapter, and a ``TestCase`` cannot drain:
+    its transaction never commits and the drain refuses to run inside one. The mixin delivers
+    what the transaction scheduled instead, through the same choke point the claim uses.
+    """
 
     @classmethod
     def setUpTestData(cls):
@@ -1242,7 +1250,7 @@ class TestNSODeviceActionView(ViewTestBase):
 
         url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[mgmt.pk, "sync"])
         response = self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 409)
         data = json.loads(response.content)
         self.assertEqual(data["status"], "conflict")
 
@@ -1308,7 +1316,7 @@ class TestNSODeviceActionView(ViewTestBase):
 
         url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[mgmt.pk, "sync"])
         response = self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 409)
         data = json.loads(response.content)
         self.assertEqual(data["status"], "conflict")
         self.assertEqual(data["job_id"], 3)
@@ -1344,13 +1352,38 @@ class TestNSODeviceActionView(ViewTestBase):
 
         url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[mgmt.pk, "sync"])
         response = self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 409)
         data = json.loads(response.content)
         self.assertEqual(data["status"], "conflict")
         self.assertIsNone(data["job_type"])
 
         mgmt.adapter_device_id = None
         mgmt.save(update_fields=["adapter_device_id"])
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config")
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_post_conflict_with_non_object_detail_still_returns_conflict(self, mock_session_cls, mock_cfg):
+        mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+        mgmt.adapter_device_id = 10
+        mgmt.save(update_fields=["adapter_device_id"])
+        mock_cfg.return_value = {
+            "url": "http://adapter",
+            "token": "tok",
+            "verify_tls": True,
+            "ca_cert_path": None,
+            "timeout": 30,
+        }
+        mock_session_cls.return_value = make_session(
+            response=make_response(
+                409, json_data={"error": {"code": "conflict", "message": "running", "detail": ["busy"]}}
+            )
+        )
+
+        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[mgmt.pk, "sync"])
+        response = self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json(), {"status": "conflict", "job_id": None, "job_type": None})
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config")
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
@@ -2173,6 +2206,18 @@ class TestDeviceNSOTabView(ViewTestBase):
         response = self.client.get(url)
         self.assertIn(response.status_code, [200, 302])  # may redirect if no tab
         device2.delete()
+
+    def test_degraded_deletion_read_failure_does_not_break_the_tab(self):
+        mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+        mgmt.adapter_device_id = None
+        mgmt.save(update_fields=["adapter_device_id"])
+        url = reverse("dcim:device_nso", kwargs={"pk": self.device.pk})
+
+        with patch("netbox_nso_plugin.drain.degraded_deletions", side_effect=ValueError("bad timestamp")):
+            response = self.client.get(url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context["degraded_deletions"], [])
 
     def test_oob_probe_timeout_is_not_rendered_as_unreachable(self):
         """The adapter can still connect after its short health window; preserve that as a
@@ -3282,13 +3327,15 @@ class TestPushIntentForDevice(ViewTestBase):
     @patch("netbox_nso_plugin.adapter_client._resolve_config")
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_pushes_accepted_states(self, mock_session_cls, mock_cfg):
-        """_push_intent_for_device pushes all accepted interface states."""
-        from netbox_nso_plugin.views import _push_intent_for_device
+        """The interface render carries every accepted state (#1503 Appendix O: rendered, then sent)."""
+        from netbox_nso_plugin.delivery import deliver
 
         NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="accepted")
+        self.addCleanup(NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update, status="changed")
         mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
         mgmt.adapter_device_id = 20
         mgmt.save(update_fields=["adapter_device_id"])
+        self.addCleanup(NSODeviceManagement.objects.filter(pk=mgmt.pk).update, adapter_device_id=None)
 
         mock_cfg.return_value = {
             "url": "http://adapter",
@@ -3300,17 +3347,23 @@ class TestPushIntentForDevice(ViewTestBase):
         session = make_session(response=make_response(200, json_data={}))
         mock_session_cls.return_value = session
 
-        _push_intent_for_device(self.device.pk)
-
-        mgmt.adapter_device_id = None
-        mgmt.save(update_fields=["adapter_device_id"])
-        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="changed")
+        deliver("interface", self.device.pk, mgmt.adapter_device_id)
+        session.request.assert_called_once()
+        sent = session.request.call_args.kwargs["json"]["attributes"]
+        assert sent == [
+            {
+                "interface": self.interface.name,
+                "attribute": "description",
+                "intent_value": self.interface.description,
+                "accepted_at": None,
+            }
+        ]
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config")
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_pushes_enabled_attribute(self, mock_session_cls, mock_cfg):
-        """_push_intent_for_device includes 'enabled' attribute states in push."""
-        from netbox_nso_plugin.views import _push_intent_for_device
+        """The interface render includes 'enabled' attribute states."""
+        from netbox_nso_plugin.delivery import deliver
 
         # Create an 'enabled' interface state in accepted status
         enabled_state = NSOInterfaceState.objects.create(
@@ -3322,6 +3375,7 @@ class TestPushIntentForDevice(ViewTestBase):
         mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
         mgmt.adapter_device_id = 21
         mgmt.save(update_fields=["adapter_device_id"])
+        self.addCleanup(NSODeviceManagement.objects.filter(pk=mgmt.pk).update, adapter_device_id=None)
 
         mock_cfg.return_value = {
             "url": "http://adapter",
@@ -3333,18 +3387,28 @@ class TestPushIntentForDevice(ViewTestBase):
         session = make_session(response=make_response(200, json_data={}))
         mock_session_cls.return_value = session
 
-        _push_intent_for_device(self.device.pk)
+        deliver("interface", self.device.pk, mgmt.adapter_device_id)
+        session.request.assert_called_once()
+        sent = session.request.call_args.kwargs["json"]["attributes"]
+        assert sent == [
+            {
+                "interface": self.interface.name,
+                "attribute": "enabled",
+                "intent_value": str(self.interface.enabled).lower(),
+                "accepted_at": None,
+            }
+        ]
 
-        mgmt.adapter_device_id = None
-        mgmt.save(update_fields=["adapter_device_id"])
         enabled_state.delete()
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config")
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_skips_unknown_attribute(self, mock_session_cls, mock_cfg):
-        """_push_intent_for_device skips accepted states with unknown attribute."""
-        from netbox_nso_plugin.views import _push_intent_for_device
+        """The interface render skips accepted states with an unknown attribute."""
+        from netbox_nso_plugin.delivery import deliver
 
+        NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="accepted")
+        self.addCleanup(NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update, status="changed")
         # Create a state with an unknown attribute — should be skipped
         unknown_state = NSOInterfaceState.objects.create(
             interface=self.interface,
@@ -3355,6 +3419,7 @@ class TestPushIntentForDevice(ViewTestBase):
         mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
         mgmt.adapter_device_id = 22
         mgmt.save(update_fields=["adapter_device_id"])
+        self.addCleanup(NSODeviceManagement.objects.filter(pk=mgmt.pk).update, adapter_device_id=None)
 
         mock_cfg.return_value = {
             "url": "http://adapter",
@@ -3366,38 +3431,59 @@ class TestPushIntentForDevice(ViewTestBase):
         session = make_session(response=make_response(200, json_data={}))
         mock_session_cls.return_value = session
 
-        _push_intent_for_device(self.device.pk)
+        deliver("interface", self.device.pk, mgmt.adapter_device_id)
+        session.request.assert_called_once()
+        sent = session.request.call_args.kwargs["json"]["attributes"]
+        assert sent == [
+            {
+                "interface": self.interface.name,
+                "attribute": "description",
+                "intent_value": self.interface.description,
+                "accepted_at": None,
+            }
+        ]
 
-        mgmt.adapter_device_id = None
-        mgmt.save(update_fields=["adapter_device_id"])
         unknown_state.delete()
 
-    @patch("netbox_nso_plugin.adapter_client._resolve_config")
-    @patch("netbox_nso_plugin.adapter_client.requests.Session")
-    def test_put_intent_exception_is_swallowed(self, mock_session_cls, mock_cfg):
-        """_push_intent_for_device logs and swallows exceptions from put_intent."""
+    def test_the_intent_is_recorded_even_when_the_adapter_is_down(self):
+        """The accept records the key; the drain owns the send, and the tick owns the retry.
+
+        The direct push this replaced swallowed the failure of a request that had already
+        published ownership, leaving nothing durable behind (#1503 Appendix O, §2).
+        """
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry
         from netbox_nso_plugin.views import _push_intent_for_device
 
         NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="accepted")
+        self.addCleanup(NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update, status="changed")
         mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
         mgmt.adapter_device_id = 23
         mgmt.save(update_fields=["adapter_device_id"])
+        self.addCleanup(NSODeviceManagement.objects.filter(pk=mgmt.pk).update, adapter_device_id=None)
 
-        mock_cfg.return_value = {
-            "url": "http://adapter",
-            "token": "tok",
-            "verify_tls": True,
-            "ca_cert_path": None,
-            "timeout": 30,
-        }
         session = make_session()
-        # Simulate a connection error to make put_intent raise
-        session.request.side_effect = OSError("connection refused")
-        mock_session_cls.return_value = session
+        session.request.side_effect = requests.exceptions.ConnectionError("adapter unavailable")
+        with (
+            patch(
+                "netbox_nso_plugin.adapter_client._resolve_config",
+                return_value={
+                    "url": "http://adapter",
+                    "token": "tok",
+                    "verify_tls": True,
+                    "ca_cert_path": None,
+                    "timeout": 30,
+                },
+            ),
+            patch("netbox_nso_plugin.adapter_client.requests.Session", return_value=session),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            with transaction.atomic():
+                _push_intent_for_device(self.device.pk)
 
-        # Should not raise — exception is swallowed with a warning log
-        _push_intent_for_device(self.device.pk)
-
+        assert NSOIntentOutboxEntry.objects.filter(device=self.device, scope="interface").exists()
+        assert session.request.called, "the test did not reach the transport failure"
+        mgmt.refresh_from_db()
+        assert "interface" in (mgmt.intent_push_errors or {}), "the failed send was recorded as complete"
         mgmt.adapter_device_id = None
         mgmt.save(update_fields=["adapter_device_id"])
         NSOInterfaceState.objects.filter(pk=self.iface_state.pk).update(status="changed")
@@ -5695,3 +5781,218 @@ class TestRoutePolicyGrid(ViewTestBase):
         self.assertIsNone(self.mgmt.adapter_device_id)
         data = json.loads(self.client.get(self._url(), {"format": "json"}).content)
         self.assertEqual(len(data["rows"]), 3)
+
+
+class TestApplyRefusesAStaleSnmpStore(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    """codex O1 r4 F2: the Apply may not commit an SNMP store a refused push left stale.
+
+    The Apply refreshes SNMP store-only ahead of ``trigger_apply`` so the adapter commits
+    what NetBox owns now. That push is refused while the key holds deletion authority
+    (§4.3(d)), and the refusal was discarded: the Apply then committed the adapter's stored
+    SNMP intent, which still carries the community the operator deleted.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.user = User.objects.create_superuser(
+            username="applysnmpadmin", password=TEST_PASSWORD, email="applysnmp@test.example"
+        )
+        self.client.force_login(self.user)
+        self.adapter = ReceiptAdapter(respond=lambda body: {"job_id": 7712, "count": 0})
+        self.device, self.mgmt = make_managed("apsnmp", 7790)
+
+    def _apply(self):
+        from django.contrib.messages import get_messages
+
+        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[self.mgmt.pk, "apply"])
+        config, session = self.adapter.patches()
+        with config, session:
+            response = self.client.post(url)
+        applied = [request for request in self.adapter.requests if "/actions/apply" in request["url"]]
+        return applied, [str(message) for message in get_messages(response.wsgi_request)]
+
+    def _own_a_community(self):
+        from netbox_nso_plugin.models import NSOSnmpCommunityState
+
+        with without_commit_drain(), transaction.atomic():
+            return NSOSnmpCommunityState.objects.create(
+                management=self.mgmt, community_hash="ab12cd34ef56ab78", access="RO", status="accepted"
+            )
+
+    def _own_then_delete_a_community(self):
+        community = self._own_a_community()
+        with without_commit_drain(), transaction.atomic():
+            community.delete()
+
+    def test_a_pending_snmp_deletion_stops_the_apply(self):
+        self._own_then_delete_a_community()
+
+        applied, messages_shown = self._apply()
+
+        assert applied == [], (
+            "the Apply committed the adapter's stored SNMP intent, which still holds the community the operator deleted"
+        )
+        assert any("SNMP" in message for message in messages_shown), messages_shown
+
+    def test_an_acknowledged_refresh_still_applies(self):
+        """The guard is a precondition, not a new refusal: the normal path is unchanged."""
+        from netbox_nso_plugin import drain
+
+        self._own_a_community()
+        config, session = self.adapter.patches()
+        with config, session:
+            assert drain.drain_key(self.device.pk, "snmp") == drain.SUCCEEDED
+
+        applied, _messages_shown = self._apply()
+
+        assert len(applied) == 1
+
+
+class TestDeviceNSOTabDegradedDeletions(ViewTestBase):
+    """codex O1 r4 F3 (§4.3(c)): the durable degradation record needs an operator surface.
+
+    ``degraded_deletions`` had exactly one production reader, the acknowledgement command,
+    so a deletion that left the device configured was recorded where nobody looked. The tab
+    renders it as its own banner, from the database alone, until the command clears it.
+    """
+
+    def _url(self):
+        return reverse("dcim:device_nso", kwargs={"pk": self.device.pk})
+
+    def _record(self):
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        return NSOIntentOutboxState.objects.create(
+            device=self.device,
+            scope="static_route",
+            degraded_deletions=[
+                {
+                    "route_ids": [424242],
+                    "triples": [{"vrf": "BLUEVRF", "prefix": "198.51.100.0/28", "next_hop": "198.51.100.9"}],
+                    "at": "2026-08-11T05:00:00+00:00",
+                    "reason": "pre_fence_detach",
+                    "device": self.device.pk,
+                }
+            ],
+        )
+
+    def test_the_record_renders_as_its_own_banner(self):
+        self._record()
+
+        response = self.client.get(self._url())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "mdi-delete-alert-outline")
+        self.assertContains(response, "Static route")  # the delivery key's label
+        self.assertContains(response, "424242")
+        self.assertContains(response, "198.51.100.0/28")  # the triple actually removed
+        self.assertContains(response, "198.51.100.9")
+        self.assertContains(response, "BLUEVRF")
+        self.assertContains(response, "detached before the fence opened")
+        self.assertContains(response, "nso_acknowledge_degraded_deletions")
+        self.assertNotContains(response, "{#")
+
+    def test_the_headline_counts_records_not_deleted_objects(self):
+        """One record can name many objects, so the count must not be read as a deletion count.
+
+        The banner counts entries in ``degraded_deletions``; wording it as "1 deletion" while
+        the entry lists three route ids understates what stayed on the device.
+        """
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        NSOIntentOutboxState.objects.create(
+            device=self.device,
+            scope="static_route",
+            degraded_deletions=[
+                {
+                    "route_ids": [1, 2, 3],
+                    "triples": [],
+                    "at": "2026-08-11T05:00:00+00:00",
+                    "reason": "pre_fence_detach",
+                    "device": self.device.pk,
+                }
+            ],
+        )
+
+        response = self.client.get(self._url())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "mdi-delete-alert-outline")
+        self.assertNotContains(response, "1 deletion left")
+        self.assertContains(response, "1 degraded deletion record")
+
+    def test_a_device_with_no_record_renders_no_banner(self):
+        response = self.client.get(self._url())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, "mdi-delete-alert-outline")
+
+    def test_only_the_acknowledgement_clears_the_banner(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        self._record()
+        self.assertContains(self.client.get(self._url()), "424242")
+
+        out = StringIO()
+        call_command("nso_acknowledge_degraded_deletions", device_id=self.device.pk, stdout=out)
+
+        assert "198.51.100.0/28 via 198.51.100.9 (vrf BLUEVRF)" in out.getvalue(), out.getvalue()
+        self.assertNotContains(self.client.get(self._url()), "mdi-delete-alert-outline")
+
+
+class TestReviewRegressionPins(ViewTestBase):
+    def test_interface_ip_residue_uses_the_adapter_removal_scope(self):
+        # Residue flows adapter -> plugin under the adapter's removal-scope vocabulary
+        # (nso_adapter/core/removal.py VALID_REMOVAL_SCOPES), where interface-IP residue
+        # is "interface_config". The plugin's outbound delivery key "ip" names a
+        # different direction; #1591 owns unifying the two.
+        from netbox_nso_plugin.views import _residue_matchers
+
+        assert _residue_matchers()["interface_ips"][0] == "interface_config"
+
+    def test_redistribution_bulk_accept_schedules_only_owned_destinations(self):
+        from netbox_nso_plugin.models import NSORedistributionState
+        from netbox_nso_plugin.views import NSORedistributionBulkAcceptView
+
+        NSORedistributionState.objects.create(
+            management=self.mgmt,
+            dest_protocol="bgp",
+            dest_ref="65001",
+            source_protocol="static",
+            status="accepted",
+        )
+        NSORedistributionState.objects.create(
+            management=self.mgmt,
+            dest_protocol="bgp",
+            dest_ref="65001",
+            source_protocol="connected",
+            status="in_sync",
+        )
+        NSORedistributionState.objects.create(
+            management=self.mgmt,
+            dest_protocol="isis",
+            dest_ref="CORE",
+            source_protocol="static",
+            status="imported",
+        )
+        NSORedistributionState.objects.create(
+            management=self.mgmt,
+            dest_protocol="unknown",
+            source_protocol="static",
+            status="accepted",
+        )
+        # A delivery key that is NOT a redistribution destination: adapter payload data
+        # populates this column, and the signal path refuses what this path must too.
+        NSORedistributionState.objects.create(
+            management=self.mgmt,
+            dest_protocol="vlan",
+            source_protocol="static",
+            status="accepted",
+        )
+
+        with patch("netbox_nso_plugin.views._schedule_intent_push") as schedule:
+            NSORedistributionBulkAcceptView()._push(self.mgmt)
+
+        schedule.assert_called_once_with((self.device.pk, "bgp"))

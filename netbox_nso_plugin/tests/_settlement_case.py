@@ -13,6 +13,7 @@ from datetime import timedelta
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
+from django.db import transaction
 from django.test import TransactionTestCase
 from django.utils import timezone
 
@@ -62,7 +63,7 @@ def _own(sr, mgmt, *, generation, expected=True, status="deploying"):
     """An owned overlay at *generation*, with or without a recorded expectation."""
     from netbox_nso_plugin.models import NSOStaticRouteState
 
-    with patch(PUT):
+    with patch(PUT), transaction.atomic():
         return NSOStaticRouteState.objects.create(
             management=mgmt,
             static_route=sr,

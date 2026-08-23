@@ -1076,6 +1076,24 @@ _APPLY_DEPLOYING_SCOPES = {
 _GENERIC_APPLY_ERROR = "Apply reported a failure for this scope (see the adapter apply job)."
 
 
+def _counts_for(result: dict | None, scope: str) -> dict:
+    """Return the apply's ``<scope>_count_by_outcome`` map, or an empty one.
+
+    ``result`` is an object by contract but each counts map inside it is free-form JSON.
+    An empty map reads as "this job says nothing about this scope", which is what a junk
+    one should mean: raising here loses the whole device's settle to the caller's blanket
+    except, not just this scope.
+    """
+    counts = (result or {}).get(f"{scope}_count_by_outcome")
+    return counts if isinstance(counts, dict) else {}
+
+
+def _count_of(counts: dict, outcome: str) -> int:
+    """Return one outcome's non-negative integer tally, or zero."""
+    count = counts.get(outcome)
+    return count if isinstance(count, int) and not isinstance(count, bool) and count >= 0 else 0
+
+
 def _scope_failure_messages(job: dict | None, scope: str) -> str:
     """Join the real per-item error messages for *scope* from a failed apply job.
 
@@ -1085,7 +1103,11 @@ def _scope_failure_messages(job: dict | None, scope: str) -> str:
     """
     if not job:
         return ""
-    items = (((job.get("error") or {}).get("detail") or {}).get("items")) or []
+    # ``error`` is an object by contract; ``detail`` and ``items`` inside it are free-form:
+    # a scalar items raises on iteration and a string one iterates its characters.
+    detail = (job.get("error") or {}).get("detail")
+    items = (detail if isinstance(detail, dict) else {}).get("items")
+    items = items if isinstance(items, list) else []
     msgs: list[str] = []
     for it in items:
         if not isinstance(it, dict) or it.get("type") != scope:
@@ -1119,8 +1141,8 @@ def _settle_apply_failures(mgmt, apply_result: dict | None, job: dict | None = N
     from . import status_machine as sm
 
     for scope, model_name in _APPLY_DEPLOYING_SCOPES.items():
-        counts = apply_result.get(f"{scope}_count_by_outcome") or {}
-        if (counts.get("apply_failed") or 0) <= 0:
+        counts = _counts_for(apply_result, scope)
+        if _count_of(counts, "apply_failed") <= 0:
             continue
         detail = _scope_failure_messages(job, scope) or _GENERIC_APPLY_ERROR
         model = getattr(models, model_name)
@@ -1205,8 +1227,8 @@ def _escalate_stuck_deploying(mgmt, job: dict | None) -> None:
     result = job.get("result") or {}
     detail = _STUCK_DEPLOYING_ERROR.format(job_id=job.get("id"))
     for scope, model_name in _APPLY_DEPLOYING_SCOPES.items():
-        counts = result.get(f"{scope}_count_by_outcome") or {}
-        if sum(int(count or 0) for count in counts.values()) <= 0:
+        counts = _counts_for(result, scope)
+        if sum(_count_of(counts, outcome) for outcome in counts) <= 0:
             continue  # this job never applied this scope — it cannot testify about its rows
         model = getattr(models, model_name)
         for row in model.objects.filter(management=mgmt, status="deploying"):
@@ -1367,22 +1389,6 @@ def _apply_job_state(adapter_device_id) -> tuple[dict | None, bool]:
     return last, active
 
 
-def _last_apply_job(adapter_device_id) -> dict | None:
-    """Best-effort: the device's most recent terminal apply job (full dict).
-
-    Returns the whole job ``{id, type, status, result}`` so callers can read both the
-    per-scope outcome (``result``) and the job id (apply-journal idempotency key).
-    """
-    job, _active = _apply_job_state(adapter_device_id)
-    return job
-
-
-def _last_apply_result(adapter_device_id) -> dict | None:
-    """Best-effort: the result of the device's most recent terminal apply job."""
-    job = _last_apply_job(adapter_device_id)
-    return job.get("result") if job else None
-
-
 def _journal_route_policy_apply(mgmt, job: dict | None) -> None:
     """Write a coarse per-object JournalEntry recording this device's route-policy apply.
 
@@ -1399,9 +1405,9 @@ def _journal_route_policy_apply(mgmt, job: dict | None) -> None:
     job_id = str(job.get("id") or "")
     if not job_id or job_id == (mgmt.last_journaled_apply_job or ""):
         return
-    counts = (job.get("result") or {}).get("route_policy_count_by_outcome") or {}
-    applied = int(counts.get("in_sync") or 0)
-    failed = int(counts.get("apply_failed") or 0)
+    counts = _counts_for(job.get("result"), "route_policy")
+    applied = _count_of(counts, "in_sync")
+    failed = _count_of(counts, "apply_failed")
     # Mark the job seen FIRST so a failure mid-write can't double-post next reconcile.
     mgmt.last_journaled_apply_job = job_id
     mgmt.save(update_fields=["last_journaled_apply_job"])

@@ -8,7 +8,7 @@ from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 
-from .mixins import IntentPushResetMixin
+from .mixins import IntentPushDeliveryMixin
 
 
 def _superuser():
@@ -16,7 +16,7 @@ def _superuser():
     return User.objects.create_superuser(username="snmp-admin", password="pw", email="snmp@test.x")  # noqa: S106
 
 
-class _SnmpBase(IntentPushResetMixin, TestCase):
+class _SnmpBase(IntentPushDeliveryMixin, TestCase):
     @classmethod
     def setUpTestData(cls):
         mfg = Manufacturer.objects.create(name="SnmpAccMfg", slug="snmpaccmfg")
@@ -212,13 +212,13 @@ class TestSnmpUnpushableRowsAreRefusedNotDowngraded(_SnmpBase):
     def test_an_already_owned_v3_user_missing_protocols_is_never_pushed_degraded(self):
         """Defence in depth for rows owned before the accept-time guard existed (or via the
         API): the snapshot builder must drop them AND surface them, not emit a null protocol."""
-        from netbox_nso_plugin.signals import _push_snmp_intent_for_device
+        from netbox_nso_plugin.delivery import deliver
 
         mgmt = self._make_mgmt()
         user = self._v3_user(mgmt, status="accepted")  # owned, protocols never declared
 
         with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
-            _push_snmp_intent_for_device(mgmt.device_id, mgmt.adapter_device_id)
+            deliver("snmp", mgmt.device_id, mgmt.adapter_device_id)
 
         mock_put.assert_called_once()
         assert mock_put.call_args[0][2] == [], "a protocol-less v3 user must not reach the device"

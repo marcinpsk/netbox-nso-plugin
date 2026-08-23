@@ -16,7 +16,7 @@ from django.test import TestCase
 from netbox_nso_plugin.vault_refs import secret_fingerprint
 
 from ._adapter_http import make_session
-from .mixins import IntentPushResetMixin
+from .mixins import IntentPushDeliveryMixin
 
 _BASE_CFG = {
     "url": "http://adapter.local",
@@ -32,7 +32,7 @@ def _superuser():
     return User.objects.create_superuser(username="vault-admin", password="pw", email="vault@test.x")  # noqa: S106
 
 
-class _SecretBase(IntentPushResetMixin, TestCase):
+class _SecretBase(IntentPushDeliveryMixin, TestCase):
     @classmethod
     def setUpTestData(cls):
         mfg = Manufacturer.objects.create(name="VaultMfg", slug="vaultmfg")
@@ -329,7 +329,7 @@ class TestVerifyAndHarvestViews(_SecretBase):
         self.assertFalse(row.vault_has_priv)
 
     def test_harvest_derives_ref_and_stores_result(self):
-        mgmt = self._make_mgmt()
+        mgmt = self._make_mgmt(adapter_device_id=4202)
         row = self._community(mgmt)
         expected_ref = f"network/netbox/snmp/community/{row.community_hash}#community"
         session = make_session(
@@ -352,7 +352,10 @@ class TestVerifyAndHarvestViews(_SecretBase):
         self.assertEqual(row.vault_ref, expected_ref)
         self.assertEqual(row.vault_secret_hash, row.community_hash)
         method, url = session.request.call_args[0][:2]
-        self.assertEqual((method, url), ("POST", "http://adapter.local/api/v1/devices/42/secrets/harvest-community"))
+        self.assertEqual(
+            (method, url),
+            ("POST", f"http://adapter.local/api/v1/devices/{mgmt.adapter_device_id}/secrets/harvest-community"),
+        )
 
     def test_harvest_without_adapter_link_errors_cleanly(self):
         mgmt = self._make_mgmt(adapter_device_id=None)
@@ -390,10 +393,11 @@ class TestDeletePropagation(_SecretBase):
 
 class TestV3PushDerivation(_SecretBase):
     def test_push_derives_auth_priv_refs_from_protocols_and_skips_v3_hosts(self):
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.models import NSOSnmpHostState, NSOSnmpV3UserState
-        from netbox_nso_plugin.signals import _push_snmp_intent_for_device, reset_intent_push_state
+        from netbox_nso_plugin.signals import reset_intent_push_state
 
-        mgmt = self._make_mgmt()
+        mgmt = self._make_mgmt(adapter_device_id=4203)
         NSOSnmpV3UserState.objects.create(
             management=mgmt,
             username="monitor",
@@ -417,8 +421,9 @@ class TestV3PushDerivation(_SecretBase):
         )
         reset_intent_push_state()
         with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
-            _push_snmp_intent_for_device(self.device.pk, 42)
+            deliver("snmp", self.device.pk, mgmt.adapter_device_id)
         mock_put.assert_called_once()
+        self.assertEqual(mock_put.call_args.args[0], mgmt.adapter_device_id)
         _, communities, v3_users, hosts, _ = mock_put.call_args[0]
         self.assertEqual(
             v3_users,

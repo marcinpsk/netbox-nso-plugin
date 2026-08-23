@@ -5,7 +5,8 @@
 from __future__ import annotations
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
-from django.test import TestCase
+from django.db import transaction
+from django.test import TestCase, TransactionTestCase
 from ipam.models import VLAN, VLANGroup
 
 from netbox_nso_plugin.models import (
@@ -15,7 +16,8 @@ from netbox_nso_plugin.models import (
 )
 from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
 
-from .mixins import IntentPushResetMixin
+from ._outbox_case import without_commit_drain
+from .mixins import IntentPushResetMixin, _CascadeFlushMixin, isolate_other_scopes
 
 
 def _make_device(tag="m34"):
@@ -26,7 +28,7 @@ def _make_device(tag="m34"):
     return Device.objects.create(name=f"vlan-router-{tag}", device_type=dt, role=role, site=site)
 
 
-class TestVlanReconciler(TestCase):
+class TestVlanReconciler(IntentPushResetMixin, TestCase):
     @classmethod
     def setUpTestData(cls):
         cls.device = _make_device()
@@ -73,7 +75,7 @@ class TestVlanReconciler(TestCase):
         """
         from unittest.mock import patch
 
-        from netbox_nso_plugin.signals import _push_vlan_intent_for_device
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
 
         self.management.adapter_device_id = 42
@@ -86,7 +88,7 @@ class TestVlanReconciler(TestCase):
             row.save()
 
         with patch("netbox_nso_plugin.adapter_client.put_vlan_intent") as mock_put:
-            _push_vlan_intent_for_device(self.device.pk, 42, force=True)
+            deliver("vlan", self.device.pk, 42)
 
         pushed = {v["vlan_id"]: v["name"] for v in mock_put.call_args[0][1]}
         self.assertEqual(pushed[5], "", "the fabricated placeholder must not be pushed as a device VLAN name")
@@ -96,7 +98,7 @@ class TestVlanReconciler(TestCase):
         """The suppression keys on the name being UNTOUCHED — a rename is real intent."""
         from unittest.mock import patch
 
-        from netbox_nso_plugin.signals import _push_vlan_intent_for_device
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
 
         self.management.adapter_device_id = 42
@@ -108,7 +110,7 @@ class TestVlanReconciler(TestCase):
         row.save()
 
         with patch("netbox_nso_plugin.adapter_client.put_vlan_intent") as mock_put:
-            _push_vlan_intent_for_device(self.device.pk, 42, force=True)
+            deliver("vlan", self.device.pk, 42)
 
         self.assertEqual(mock_put.call_args[0][1], [{"vlan_id": 5, "name": "STORAGE"}])
 
@@ -422,57 +424,17 @@ class TestVlanWritePath(IntentPushResetMixin, TestCase):
     def test_push_builds_owned_snapshot_with_live_name(self):
         from unittest.mock import patch
 
-        from netbox_nso_plugin.signals import _push_vlan_intent_for_device, reset_intent_push_state
+        from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.signals import reset_intent_push_state
 
-        owned = self._state(vid=2213, name="RENAMED", status="accepted", device_name="OLD")
+        self._state(vid=2213, name="RENAMED", status="accepted", device_name="OLD")
         self._state(vid=10, name="MGMT", status="imported")  # not owned → excluded
         reset_intent_push_state()
         with patch("netbox_nso_plugin.adapter_client.put_vlan_intent") as mock_put:
-            _push_vlan_intent_for_device(self.device.pk, 77)
+            deliver("vlan", self.device.pk, 77)
         mock_put.assert_called_once()
         vlans = mock_put.call_args[0][1]
         assert vlans == [{"vlan_id": 2213, "name": "RENAMED"}]  # live NetBox name, owned only
-        del owned
-
-    def test_force_repushes_owned_vlan_with_live_name(self):
-        """Apply force-pushes owned VLANs so a post-accept rename (no signal) still ships.
-
-        Renaming the ipam.VLAN fires no plugin signal, so the row stays 'in_sync' and a
-        normal push dedups. The single Apply calls the push with force=True, which
-        bypasses the dedup and ships the LIVE NetBox name.
-        """
-        from unittest.mock import patch
-
-        from netbox_nso_plugin.signals import _push_vlan_intent_for_device, reset_intent_push_state
-
-        self._state(vid=2213, name="LIVE_RENAMED", status="in_sync", device_name="OLD")
-        reset_intent_push_state()
-        with patch("netbox_nso_plugin.adapter_client.put_vlan_intent") as mock_put:
-            _push_vlan_intent_for_device(self.device.pk, 77)  # first push
-            _push_vlan_intent_for_device(self.device.pk, 77)  # unchanged → deduped
-            self.assertEqual(mock_put.call_count, 1)
-            _push_vlan_intent_for_device(self.device.pk, 77, force=True)  # Apply path
-            self.assertEqual(mock_put.call_count, 2)
-            self.assertEqual(mock_put.call_args[0][1], [{"vlan_id": 2213, "name": "LIVE_RENAMED"}])
-
-    def test_prepare_apply_pushes_vlan_intent(self):
-        """_prepare_apply ships owned VLAN intent (not just LACP/switchport)."""
-        from unittest.mock import patch
-
-        from netbox_nso_plugin.signals import reset_intent_push_state
-        from netbox_nso_plugin.views import _prepare_apply
-
-        mgmt = NSODeviceManagement.objects.get(pk=self.management.pk)
-        mgmt.adapter_device_id = 77
-        mgmt.save(update_fields=["adapter_device_id"])
-        self._state(vid=2213, name="LIVE_RENAMED", status="in_sync", device_name="OLD")
-        reset_intent_push_state()
-        # LACP/switchport pushes hit the (blocked) adapter network and are swallowed by
-        # _prepare_apply's per-push try/except; only the VLAN push is asserted here.
-        with patch("netbox_nso_plugin.adapter_client.put_vlan_intent") as mock_vlan:
-            _prepare_apply(mgmt)
-        mock_vlan.assert_called_once()
-        self.assertEqual(mock_vlan.call_args[0][1], [{"vlan_id": 2213, "name": "LIVE_RENAMED"}])
 
     def test_accept_marks_owned(self):
         from unittest.mock import patch
@@ -504,3 +466,52 @@ class TestVlanWritePath(IntentPushResetMixin, TestCase):
         self._state(vid=2300, name="NEW", status="accepted")
         reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 2300, "name": "OLD"}]})
         assert NSOVLANState.objects.get(vlan__vid=2300).status == "accepted"
+
+
+class TestVlanApplyPush(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    """The Apply's forced VLAN push, which needs a committed transaction to take.
+
+    ``drain.push_now`` refuses to run nested in a caller's block (#1503 Appendix O), so this
+    runs outside a test transaction, against the real claim. Renaming the ipam.VLAN fires no
+    plugin signal, so the row stays 'in_sync' and its acknowledged baseline still names the
+    old body: only the forced claim ships the LIVE NetBox name.
+    """
+
+    def setUp(self):
+        super().setUp()
+        with without_commit_drain(), transaction.atomic():
+            self.device = _make_device("vap")
+            instance = NSOInstance.objects.create(name="nso-vap", adapter_instance_id="nso-vap")
+            self.management = NSODeviceManagement.objects.create(
+                device=self.device, nso_instance=instance, nso_device_name="vlan-router-vap", adapter_device_id=77
+            )
+            vlan = VLAN.objects.create(group=_device_vlan_group(self.device), vid=2213, name="OLD")
+            self.state = NSOVLANState.objects.create(
+                management=self.management, vlan=vlan, device_name="OLD", status="in_sync"
+            )
+
+    def test_prepare_apply_pushes_vlan_intent(self):
+        """_prepare_apply ships owned VLAN intent (not just LACP/switchport)."""
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.views import _prepare_apply
+
+        with patch("netbox_nso_plugin.adapter_client.put_vlan_intent", return_value={}):
+            drain.drain_key(self.device.pk, "vlan")  # the acknowledged baseline, carrying "OLD"
+        VLAN.objects.filter(pk=self.state.vlan_id).update(name="LIVE_RENAMED")
+
+        # The premise: the rename owes the key nothing, so an ordinary drain sends nothing.
+        with patch("netbox_nso_plugin.adapter_client.put_vlan_intent", return_value={}) as unforced:
+            drain.drain_key(self.device.pk, "vlan")
+        unforced.assert_not_called()
+
+        # Every other scope is isolated from the registry, so this asserts on the VLAN push
+        # alone instead of relying on _prepare_apply swallowing the others' adapter failures.
+        with (
+            isolate_other_scopes("vlan"),
+            patch("netbox_nso_plugin.adapter_client.put_vlan_intent", return_value={}) as mock_vlan,
+        ):
+            _prepare_apply(self.management)
+        mock_vlan.assert_called_once()
+        self.assertEqual(mock_vlan.call_args[0][1], [{"vlan_id": 2213, "name": "LIVE_RENAMED"}])

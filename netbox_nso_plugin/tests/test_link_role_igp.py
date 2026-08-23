@@ -22,11 +22,13 @@ from netbox_nso_plugin.models import (
     NSOOSPFInterfaceState,
 )
 
-_ISIS_PUSH = "netbox_nso_plugin.signals._push_isis_intent_for_device"
-_OSPF_PUSH = "netbox_nso_plugin.signals._push_ospf_intent_for_device"
+from .mixins import IntentPushResetMixin
+
+#: The consumer records the key in the outbox; the drain is what sends it (#1503 Appendix O).
+_SCHEDULE = "netbox_nso_plugin.signals._schedule_intent_push"
 
 
-class TestEnableIgpForRole(TestCase):
+class TestEnableIgpForRole(IntentPushResetMixin, TestCase):
     @classmethod
     def setUpTestData(cls):
         mfg = Manufacturer.objects.create(name="LgMfg", slug="lgmfg")
@@ -38,6 +40,7 @@ class TestEnableIgpForRole(TestCase):
         cls.dev_b = Device.objects.create(name="lg-b", device_type=dt, role=drole, site=site)
 
     def setUp(self):
+        super().setUp()
         self.mgmt_a = NSODeviceManagement.objects.create(
             device=self.dev_a, nso_instance=self.inst, nso_device_name="lg-a", adapter_device_id=self.dev_a.pk
         )
@@ -56,7 +59,7 @@ class TestEnableIgpForRole(TestCase):
             isis_metric=10,
             isis_process_tag="CORE",
         )
-        with patch(_ISIS_PUSH) as push:
+        with patch(_SCHEDULE) as push:
             result = enable_igp_for_role(self.if_a, role)
         self.assertTrue(result["enabled"])
         state = NSOISISInterfaceState.objects.get(management=self.mgmt_a, interface=self.if_a, af="ipv4")
@@ -64,7 +67,7 @@ class TestEnableIgpForRole(TestCase):
         self.assertEqual(state.circuit_type, "point-to-point")
         self.assertEqual(state.metric, 10)
         self.assertEqual(state.process_tag, "CORE")
-        push.assert_called_once_with(self.mgmt_a.device_id, self.mgmt_a.adapter_device_id)
+        push.assert_called_once_with((self.mgmt_a.device_id, "isis"))
 
     def test_isis_passive_on_loopback(self):
         role = NSOLinkRole.objects.create(
@@ -76,7 +79,7 @@ class TestEnableIgpForRole(TestCase):
             igp="isis",
             isis_passive=True,
         )
-        with patch(_ISIS_PUSH):
+        with patch(_SCHEDULE):
             enable_igp_for_role(self.lo_a, role)
         state = NSOISISInterfaceState.objects.get(management=self.mgmt_a, interface=self.lo_a, af="ipv4")
         self.assertTrue(state.passive)
@@ -95,7 +98,7 @@ class TestEnableIgpForRole(TestCase):
             ospf_cost=100,
             ospf_process_id="1",
         )
-        with patch(_OSPF_PUSH) as push:
+        with patch(_SCHEDULE) as push:
             result = enable_igp_for_role(self.if_a, role)
         self.assertTrue(result["enabled"])
         state = NSOOSPFInterfaceState.objects.get(management=self.mgmt_a, interface=self.if_a)
@@ -104,7 +107,7 @@ class TestEnableIgpForRole(TestCase):
         self.assertEqual(state.network_type, "point-to-point")
         self.assertEqual(state.cost, 100)
         self.assertEqual(state.process_id, "1")
-        push.assert_called_once_with(self.mgmt_a.device_id, self.mgmt_a.adapter_device_id)
+        push.assert_called_once_with((self.mgmt_a.device_id, "ospf"))
 
     def test_ospf_passive_loopback(self):
         role = NSOLinkRole.objects.create(
@@ -117,7 +120,7 @@ class TestEnableIgpForRole(TestCase):
             ospf_area="0",
             ospf_passive=True,
         )
-        with patch(_OSPF_PUSH):
+        with patch(_SCHEDULE):
             enable_igp_for_role(self.lo_a, role)
         state = NSOOSPFInterfaceState.objects.get(management=self.mgmt_a, interface=self.lo_a)
         self.assertTrue(state.passive)
@@ -131,7 +134,7 @@ class TestEnableIgpForRole(TestCase):
             ipv4_pool_role="loopback",
             igp="none",
         )
-        with patch(_ISIS_PUSH), patch(_OSPF_PUSH):
+        with patch(_SCHEDULE):
             result = enable_igp_for_role(self.lo_a, role)
         self.assertFalse(result["enabled"])
         self.assertIsNotNone(result["skipped"])
@@ -148,7 +151,7 @@ class TestEnableIgpForRole(TestCase):
             igp="isis",
             isis_metric=5,
         )
-        with patch(_ISIS_PUSH):
+        with patch(_SCHEDULE):
             enable_igp_for_role(self.if_a, role)
             enable_igp_for_role(self.if_a, role)
         self.assertEqual(
@@ -165,6 +168,6 @@ class TestEnableIgpForRole(TestCase):
             igp="isis",
         )
         if_b = Interface.objects.create(device=self.dev_b, name="Gi9/0", type="1000base-t")
-        with patch(_ISIS_PUSH):
+        with patch(_SCHEDULE):
             result = enable_igp_for_role(if_b, role)  # dev_b not managed
         self.assertIn("not managed", result["error"])

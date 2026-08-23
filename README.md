@@ -60,6 +60,13 @@ Run migrations:
 python manage.py migrate netbox_nso_plugin
 ```
 
+Programmatic writers must wrap each create, save, or delete of a managed intent model in
+`transaction.atomic()`. The model write and its intent outbox entry must commit together.
+`QuerySet.update()`, `bulk_update()`, and `bulk_create()` bypass the save signals that schedule
+the outbox. Programmatic intent writes must not use them unless an outbox-aware service runs
+inside `transaction.atomic()`. Reconcile and drain bookkeeping writes are exempt when they do
+not change operator intent.
+
 ## Development
 
 See `.devcontainer/` for the Docker-based development environment.
