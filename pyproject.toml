@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "netbox-nso-plugin"
-version = "0.3.0"
+version = "1.0.0"
 description = "NetBox plugin integrating NetBox with Cisco NSO via the nso-adapter REST API"
 readme = "README.md"
 requires-python = ">=3.12.0"
