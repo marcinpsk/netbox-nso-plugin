@@ -664,6 +664,17 @@ class TestIntentRestoreResolvesEveryReceiptCase(_CascadeFlushMixin, IntentPushRe
         } in self.adapter.receipt_reads
         assert state_of(self.device, "static_route").push_seq is None
 
+    def test_restore_rejects_invalid_persisted_claim_flags(self):
+        claim, _url = self._lost_vlan_response(938)
+        state = state_of(self.device, "vlan")
+        state.claim_flags = {**state.claim_flags, "marking_mode": "corrupt"}
+        state.save(update_fields=["claim_flags"])
+
+        with self.assertRaisesRegex(CommandError, rf"{self.device.pk}/vlan.*invalid claim flags"):
+            self._restore()
+
+        assert state_of(self.device, "vlan").push_seq == claim.push_seq
+
     def test_non_boolean_receipt_modes_fail_closed(self):
         from netbox_nso_plugin.management.commands.nso_intent_restore import _normalize
 
@@ -775,6 +786,42 @@ class TestIntentRestoreProtectsTheRouteIdentityNamespace(
             self._restore()
 
         assert self._next_route_id() == issued + 2, "the refused watermark burned through the route-id namespace"
+
+    def test_a_stalled_route_sequence_names_itself(self):
+        from django.db import connection
+
+        from netbox_nso_plugin.restore import advance_static_route_pk
+
+        class StalledCursor:
+            def __init__(self):
+                self.row = None
+                self.advance_attempts = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def execute(self, sql, _params):
+                if "pg_get_serial_sequence" in sql:
+                    self.row = ("public.netbox_routing_staticroute_id_seq",)
+                elif "SELECT nextval" in sql:
+                    self.row = (40,)
+                else:
+                    self.advance_attempts += 1
+                    if self.advance_attempts > 1:
+                        raise AssertionError("the sequence loop retried after it stopped advancing")
+                    self.row = (40,)
+
+            def fetchone(self):
+                return self.row
+
+        with (
+            patch.object(connection, "cursor", return_value=StalledCursor()),
+            self.assertRaisesRegex(CommandError, "route-id advance stalled at 40"),
+        ):
+            advance_static_route_pk(41)
 
     def test_a_missing_route_id_maximum_fails_fast_instead_of_defaulting(self):
         self.adapter.include_global_max_route_id = False
