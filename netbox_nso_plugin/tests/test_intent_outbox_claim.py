@@ -437,6 +437,30 @@ class TestAForcedCallFormsItsOwnClaim(_ClaimCase):
 
         assert self.adapter.sequences == [stale]
 
+    def test_a_quiesced_latency_tail_does_not_reclassify_a_settled_success(self):
+        from netbox_nso_plugin import delivery, drain
+        from netbox_nso_plugin.deployment import DeploymentQuiesced
+
+        own_vlan(self.mgmt, 880, self.tag)
+        claimed = drain.claim(self.device.pk, "vlan")
+        assert drain.settle(claimed, {"count": 1}) == drain.SUCCEEDED
+
+        with (
+            patch.object(drain, "_answered_other_work", return_value=False),
+            patch.object(drain, "_pending", return_value=True),
+            patch.object(drain, "_drain_once", side_effect=DeploymentQuiesced("deployment started")),
+        ):
+            continued = drain._after_success(
+                claimed,
+                mode=delivery.MODE_NORMAL,
+                force=False,
+                chain=1,
+                deadline=None,
+                deadline_at=None,
+            )
+
+        assert continued is None
+
 
 class TestUnmanagedClaimIsParked(_ClaimCase):
     """O1.13 (R11-m1): unmanaging is not a third abandon cause; the claim simply waits."""
