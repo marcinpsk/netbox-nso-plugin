@@ -241,7 +241,12 @@ class TestFailureKeepsTheWorkAndTheBaseline(_ClaimCase):
         assert row.push_seq is None and row.attempts == 0
         rendered = delivery.render("vlan", self.device.pk, self.adapter_device_id)
         assert row.last_success_identity == drain.request_identity(
-            rendered.payload, mode="normal", deletions=[], mark=None, epoch=drain.mapping_epoch(self.mgmt)
+            rendered.payload,
+            mode="normal",
+            marking_mode=delivery.MARKING_QUERY_FLAG,
+            deletions=[],
+            mark=None,
+            epoch=drain.mapping_epoch(self.mgmt),
         )
         assert self.adapter.sequences[0] == failed_seq, "the failed operation is replayed, never reallocated"
 

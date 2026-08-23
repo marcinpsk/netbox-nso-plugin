@@ -83,13 +83,15 @@ def _normalize(receipt):
     }
 
 
-def _claim_modes(state, entry):
+def _claim_modes(state):
     """Return the receipt-mode booleans the restored claim's own send carried."""
-    mode = (state.claim_flags or {}).get("mode", delivery.MODE_NORMAL)
+    flags = state.claim_flags or {}
+    mode = flags.get("mode", delivery.MODE_NORMAL)
+    marking_mode = flags["marking_mode"]
     return {
         "store_only": mode == delivery.MODE_STORE_ONLY,
         "backfill_only": mode == delivery.MODE_BACKFILL_ONLY,
-        "delete_origin": bool(state.claim_mark) and entry.marking_mode == delivery.MARKING_QUERY_FLAG,
+        "delete_origin": bool(state.claim_mark) and marking_mode == delivery.MARKING_QUERY_FLAG,
     }
 
 
@@ -142,7 +144,7 @@ class Command(BaseCommand):
                 if receipt is not None and receipt["accepted_push_seq"] == state.push_seq:
                     # Mode is part of the receipt identity (seq + digest + three booleans):
                     # a same-sequence receipt in another mode is NOT this claim's outcome.
-                    wanted = _claim_modes(state, entry)
+                    wanted = _claim_modes(state)
                     served = {name: receipt[name] for name in wanted}
                     if served != wanted:
                         raise CommandError(

@@ -148,7 +148,9 @@ class Command(BaseCommand):
             except Exception as exc:
                 if self._active_verification_claim(device_id, claim.push_seq):
                     drain.record_failure(claim, exc)
-                raise
+                if isinstance(exc, CommandError):
+                    raise
+                raise CommandError(f"Verification failed: {exc}") from exc
         blockers = drain.gate_blockers()
         if blockers:
             raise CommandError("New work appeared during verification: " + "; ".join(blockers))
