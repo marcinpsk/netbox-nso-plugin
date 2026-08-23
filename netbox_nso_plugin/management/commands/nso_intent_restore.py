@@ -41,7 +41,10 @@ def _advance_push_seq_to(watermark: int) -> None:
     advance spins for the life of the command instead of naming itself.
     """
     reached = outbox.issued_push_seq()
-    attempts = math.ceil(max(watermark - reached, 0) / outbox.PUSH_SEQ_ADVANCE_BATCH) + 1
+    gap = watermark - reached
+    if gap > drain.MAX_RESTORE_GAP:
+        raise CommandError(f"The adapter's push-seq watermark {watermark} is {gap} values ahead of the local sequence")
+    attempts = math.ceil(max(gap, 0) / outbox.PUSH_SEQ_ADVANCE_BATCH) + 1
     for _ in range(attempts):
         reached = outbox.advance_push_seq(watermark)
         if reached >= watermark:

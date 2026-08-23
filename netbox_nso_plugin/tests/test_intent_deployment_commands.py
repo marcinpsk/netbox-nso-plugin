@@ -506,9 +506,9 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         ):
             with self.assertRaises(DeploymentQuiesced):
                 operation()
-        with patch("netbox_nso_plugin.drain._drain_intent_outbox") as admitted_tick:
+        with patch("netbox_nso_plugin.drain._compact_intent_outbox") as compact:
             assert drain.drain_intent_outbox() == (0, 0), "the scheduled drain tick ran while quiesced"
-        admitted_tick.assert_not_called()
+        compact.assert_not_called()
 
         stdout = io.StringIO()
         config, session = self.adapter.patches()
@@ -633,6 +633,25 @@ class TestIntentRestoreResolvesEveryReceiptCase(_CascadeFlushMixin, IntentPushRe
             self.assertRaisesRegex(CommandError, "advance stalled"),
         ):
             self._restore()
+
+    def test_an_implausibly_distant_push_sequence_watermark_is_refused_before_advancing(self):
+        from netbox_nso_plugin import drain, outbox
+
+        claim, url = self._lost_vlan_response(939)
+        before = outbox.issued_push_seq()
+        self.adapter.receipts[url]["push_seq"] = claim.push_seq + drain.MAX_RESTORE_GAP + 1
+
+        with (
+            patch(
+                "netbox_nso_plugin.outbox.advance_push_seq",
+                side_effect=AssertionError("an out-of-range watermark reached the sequence"),
+            ) as advance,
+            self.assertRaisesRegex(CommandError, "push-seq watermark .* ahead"),
+        ):
+            self._restore()
+
+        advance.assert_not_called()
+        assert outbox.issued_push_seq() == before, "the refused watermark burned the push-sequence namespace"
 
     def test_equal_sequence_with_another_digest_fails_closed_and_names_the_key(self):
         from netbox_nso_plugin.deployment import is_quiesced

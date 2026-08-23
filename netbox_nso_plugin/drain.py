@@ -1409,15 +1409,18 @@ def _after_success(claimed, *, mode, force, chain, deadline, deadline_at):
         )
     if chain > 0 and mode == delivery.MODE_NORMAL and _pending(device_id, scope):
         # This chain is a latency optimization. The tick guarantees any remaining tail.
-        _drain_once(
-            device_id,
-            scope,
-            mode=mode,
-            force=False,
-            chain=chain - 1,
-            deadline=deadline,
-            _deadline_at=deadline_at,
-        )
+        try:
+            _drain_once(
+                device_id,
+                scope,
+                mode=mode,
+                force=False,
+                chain=chain - 1,
+                deadline=deadline,
+                _deadline_at=deadline_at,
+            )
+        except DeploymentQuiesced:
+            logger.info("%s/%s left its tail to the tick because a deployment started", device_id, scope)
     return None
 
 
@@ -1692,12 +1695,6 @@ def drain_intent_outbox(limit=None) -> tuple[int, int]:
     replayable failure is not drainable and would never be compacted otherwise, which is
     exactly the case where a burst accumulates.
     """
-    try:
-        with _deployment_operation("intent drain tick"):
-            pass
-    except DeploymentQuiesced:
-        logger.info("the intent outbox tick is paused for a deployment")
-        return 0, 0
     return _drain_intent_outbox(limit)
 
 
@@ -1707,7 +1704,7 @@ def _drain_intent_outbox(limit=None) -> tuple[int, int]:
         with _deployment_operation("intent outbox compaction"):
             _compact_intent_outbox(limit)
     except DeploymentQuiesced:
-        logger.info("the intent outbox tick stopped because a deployment started")
+        logger.info("the intent outbox tick is paused for a deployment")
         return 0, 0
 
     drained = failed = 0

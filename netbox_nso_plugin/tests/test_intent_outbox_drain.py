@@ -142,6 +142,15 @@ class TestTheTickDrainsTheTail(_DrainCase):
         drain_key.assert_called_once_with(1, "vlan")
         restamp.assert_not_called()
 
+    def test_the_tick_enters_the_deployment_gate_once_before_compaction(self):
+        from netbox_nso_plugin import drain
+
+        with CaptureQueriesContext(connection) as queries:
+            assert drain.drain_intent_outbox() == (0, 0)
+
+        admissions = [query["sql"] for query in queries if "pg_try_advisory_lock_shared" in query["sql"].lower()]
+        assert len(admissions) == 1, admissions
+
     def test_a_queued_exclusive_transition_stops_a_real_drain_between_keys(self):
         from netbox_nso_plugin import deployment, drain, jobs
 
