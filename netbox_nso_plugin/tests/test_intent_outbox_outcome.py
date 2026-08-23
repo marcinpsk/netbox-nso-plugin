@@ -597,6 +597,8 @@ class TestTheAcknowledgementClearsOnlyWhatItReported(_OutcomeCase):
                 """Django's OutputWrapper flushes what it wrote."""
 
         reporter = _Reporter()
+        self.addCleanup(appender.join, 30)
+        self.addCleanup(recorded.set)
         call_command("nso_acknowledge_degraded_deletions", device_id=self.device.pk, stdout=reporter)
         appender.join(timeout=30)
         assert recorded.is_set(), "the concurrent degradation never landed, so this pin proves nothing"
