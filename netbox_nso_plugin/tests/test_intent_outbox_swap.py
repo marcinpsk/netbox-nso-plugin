@@ -184,6 +184,7 @@ class TestTheTestCaseDeliveryDouble(_CascadeFlushMixin, IntentPushResetMixin, Tr
 
     def test_a_success_retires_rows_before_the_next_delivery(self):
         from netbox_nso_plugin import delivery, outbox, signals
+        from netbox_nso_plugin.models import NSOIntentOutboxState
 
         marks = []
         key = (self.device.pk, "vlan")
@@ -196,6 +197,7 @@ class TestTheTestCaseDeliveryDouble(_CascadeFlushMixin, IntentPushResetMixin, Tr
 
         assert marks == [False, True]
         assert all(entry.consumed_by_push_seq is not None for entry in entries(self.device, "vlan"))
+        assert not NSOIntentOutboxState.objects.filter(device=self.device, scope="vlan").exists()
 
     def test_a_deletion_already_held_by_a_claim_is_not_sent_again(self):
         from netbox_nso_plugin import delivery, outbox, signals
