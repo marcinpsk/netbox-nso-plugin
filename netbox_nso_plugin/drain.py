@@ -139,6 +139,36 @@ class DirectApplyFailed(Exception):
     code = "nso_direct_apply_failed"
 
 
+@dataclasses.dataclass(frozen=True)
+class ClaimFlags:
+    """The validated delivery semantics persisted with one active claim."""
+
+    mode: str
+    marking_mode: str
+    mark_any: bool
+    force: bool
+
+    def __post_init__(self):
+        if self.mode not in {delivery.MODE_NORMAL, delivery.MODE_STORE_ONLY, delivery.MODE_BACKFILL_ONLY}:
+            raise ValueError(f"unknown claim mode {self.mode!r}")
+        if self.marking_mode not in {delivery.MARKING_QUERY_FLAG, delivery.MARKING_PER_OBJECT}:
+            raise ValueError(f"unknown marking mode {self.marking_mode!r}")
+        if type(self.mark_any) is not bool or type(self.force) is not bool:
+            raise ValueError("claim mark_any and force flags must be booleans")
+
+    @classmethod
+    def from_json(cls, value):
+        """Decode the exact JSON shape stored in ``claim_flags``."""
+        fields = {field.name for field in dataclasses.fields(cls)}
+        if not isinstance(value, dict) or set(value) != fields:
+            raise ValueError(f"claim flags must contain exactly {sorted(fields)}")
+        return cls(**value)
+
+    def as_json(self) -> dict:
+        """Return the canonical JSON shape stored in ``claim_flags``."""
+        return dataclasses.asdict(self)
+
+
 @dataclasses.dataclass
 class Claim:
     """One logical operation: the request, its authority, and the id it is admitted under."""
@@ -157,6 +187,9 @@ class Claim:
     marking_mode: str
     rendered: object
     replayed: bool = False
+
+    def __post_init__(self):
+        ClaimFlags(self.mode, self.marking_mode, self.mark_any, False)
 
 
 @dataclasses.dataclass
@@ -368,12 +401,11 @@ def _claim_locked(device_id, scope, mode, force) -> Claim | None:
 
 def _takeover(state, mgmt, now) -> Claim | None:
     """Replay the unacknowledged operation: same sequence, same body, fresh lease."""
-    flags = state.claim_flags or {}
-    marking_mode = flags["marking_mode"]
+    flags = ClaimFlags.from_json(state.claim_flags)
     current_identity = request_identity(
         state.claim_payload,
-        mode=flags.get("mode", delivery.MODE_NORMAL),
-        marking_mode=marking_mode,
+        mode=flags.mode,
+        marking_mode=flags.marking_mode,
         deletions=state.claim_deletions or [],
         mark=state.claim_mark,
         epoch=mapping_epoch(mgmt),
@@ -399,9 +431,9 @@ def _takeover(state, mgmt, now) -> Claim | None:
         identity=state.claim_identity,
         deletions=list(state.claim_deletions or []),
         mark=state.claim_mark,
-        mark_any=bool(flags.get("mark_any")),
-        mode=flags.get("mode", delivery.MODE_NORMAL),
-        marking_mode=marking_mode,
+        mark_any=flags.mark_any,
+        mode=flags.mode,
+        marking_mode=flags.marking_mode,
         rendered=delivery.render(state.scope, state.device_id, mgmt.adapter_device_id),
         replayed=True,
     )
@@ -464,12 +496,8 @@ def _form(state, mgmt, now, mode, force) -> Claim | None:
     state.claim_identity = identity
     state.claim_deletions = deletions
     state.claim_mark = mark
-    state.claim_flags = {
-        "mode": mode,
-        "marking_mode": marking_mode,
-        "mark_any": mark_any,
-        "force": bool(force),
-    }
+    flags = ClaimFlags(mode, marking_mode, mark_any, bool(force))
+    state.claim_flags = flags.as_json()
     state.queued_deletions = []
     state.save()
     return Claim(
@@ -481,9 +509,9 @@ def _form(state, mgmt, now, mode, force) -> Claim | None:
         identity=identity,
         deletions=deletions,
         mark=mark,
-        mark_any=mark_any,
-        mode=mode,
-        marking_mode=marking_mode,
+        mark_any=flags.mark_any,
+        mode=flags.mode,
+        marking_mode=flags.marking_mode,
         rendered=rendered,
     )
 
@@ -526,12 +554,8 @@ def _form_store_only(state, mgmt, now, deletions, untracked_mark, force) -> Clai
     )
     state.claim_deletions = []
     state.claim_mark = None
-    state.claim_flags = {
-        "mode": delivery.MODE_STORE_ONLY,
-        "marking_mode": marking_mode,
-        "mark_any": False,
-        "force": bool(force),
-    }
+    flags = ClaimFlags(delivery.MODE_STORE_ONLY, marking_mode, False, bool(force))
+    state.claim_flags = flags.as_json()
     state.save()
     return Claim(
         device_id=device_id,
@@ -542,9 +566,9 @@ def _form_store_only(state, mgmt, now, deletions, untracked_mark, force) -> Clai
         identity=state.claim_identity,
         deletions=[],
         mark=None,
-        mark_any=False,
-        mode=delivery.MODE_STORE_ONLY,
-        marking_mode=marking_mode,
+        mark_any=flags.mark_any,
+        mode=flags.mode,
+        marking_mode=flags.marking_mode,
         rendered=rendered,
     )
 
@@ -573,12 +597,8 @@ def _form_backfill(state, mgmt, now) -> Claim:
     )
     state.claim_deletions = []
     state.claim_mark = None
-    state.claim_flags = {
-        "mode": delivery.MODE_BACKFILL_ONLY,
-        "marking_mode": marking_mode,
-        "mark_any": False,
-        "force": True,
-    }
+    flags = ClaimFlags(delivery.MODE_BACKFILL_ONLY, marking_mode, False, True)
+    state.claim_flags = flags.as_json()
     state.save()
     return Claim(
         device_id=state.device_id,
@@ -589,9 +609,9 @@ def _form_backfill(state, mgmt, now) -> Claim:
         identity=state.claim_identity,
         deletions=[],
         mark=None,
-        mark_any=False,
-        mode=delivery.MODE_BACKFILL_ONLY,
-        marking_mode=marking_mode,
+        mark_any=flags.mark_any,
+        mode=flags.mode,
+        marking_mode=flags.marking_mode,
         rendered=rendered,
     )
 
@@ -1722,7 +1742,7 @@ RESTORE_FAILED_CLOSED = "failed_closed"
 RESTORE_REPLAY = "replay"
 
 
-def _sent_wire_digest(state) -> str:
+def _sent_wire_digest(state, flags: ClaimFlags | None = None) -> str:
     """Digest the body the unresolved claim put on the wire, from the row that recorded it.
 
     The claim persists the payload it sent, and the envelope around it (``{"routes": …}``)
@@ -1730,14 +1750,14 @@ def _sent_wire_digest(state) -> str:
     digested into its receipt. The render is for the endpoint's own call, never for its
     payload: this hashes what was sent, not what the device would render now.
     """
+    flags = flags or ClaimFlags.from_json(state.claim_flags)
     rendered = delivery.render(state.scope, state.device_id, 0)
-    marking_mode = (state.claim_flags or {})["marking_mode"]
     return wire_digest(
         delivery.wire_body(
             rendered,
             state.claim_payload,
             deletions=state.claim_deletions or [],
-            marking_mode=marking_mode,
+            marking_mode=flags.marking_mode,
         )
     )
 
@@ -1768,6 +1788,11 @@ def resolve_restored_claim(device_id, scope, receipt) -> str:
             state = _lock_state(device_id, scope)
             if state.push_seq is None:
                 return RESTORE_REPLAY
+            try:
+                flags = ClaimFlags.from_json(state.claim_flags)
+            except ValueError as exc:
+                logger.error("%s/%s has invalid persisted claim flags: %s", device_id, scope, exc)
+                return RESTORE_FAILED_CLOSED
             if accepted is None or accepted < state.push_seq:
                 return RESTORE_REPLAY  # the far side never saw it; the ordinary replay carries it
             if accepted > state.push_seq:
@@ -1801,7 +1826,7 @@ def resolve_restored_claim(device_id, scope, receipt) -> str:
                 _clear_claim(state)
                 state.save()
                 return RESTORE_REBASED
-            if receipt.get("request_digest") != _sent_wire_digest(state):
+            if receipt.get("request_digest") != _sent_wire_digest(state, flags):
                 logger.error(
                     "%s/%s holds push_seq %s at a digest the receipt does not name",
                     device_id,
@@ -1821,9 +1846,9 @@ def resolve_restored_claim(device_id, scope, receipt) -> str:
         identity=state.claim_identity,
         deletions=list(state.claim_deletions or []),
         mark=state.claim_mark,
-        mark_any=bool((state.claim_flags or {}).get("mark_any")),
-        mode=(state.claim_flags or {}).get("mode", delivery.MODE_NORMAL),
-        marking_mode=(state.claim_flags or {})["marking_mode"],
+        mark_any=flags.mark_any,
+        mode=flags.mode,
+        marking_mode=flags.marking_mode,
         rendered=None,
         replayed=True,
     )

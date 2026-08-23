@@ -83,15 +83,12 @@ def _normalize(receipt):
     }
 
 
-def _claim_modes(state):
+def _claim_modes(state, flags):
     """Return the receipt-mode booleans the restored claim's own send carried."""
-    flags = state.claim_flags or {}
-    mode = flags.get("mode", delivery.MODE_NORMAL)
-    marking_mode = flags["marking_mode"]
     return {
-        "store_only": mode == delivery.MODE_STORE_ONLY,
-        "backfill_only": mode == delivery.MODE_BACKFILL_ONLY,
-        "delete_origin": bool(state.claim_mark) and marking_mode == delivery.MARKING_QUERY_FLAG,
+        "store_only": flags.mode == delivery.MODE_STORE_ONLY,
+        "backfill_only": flags.mode == delivery.MODE_BACKFILL_ONLY,
+        "delete_origin": bool(state.claim_mark) and flags.marking_mode == delivery.MARKING_QUERY_FLAG,
     }
 
 
@@ -115,6 +112,10 @@ class Command(BaseCommand):
             states = list(NSOIntentOutboxState.objects.filter(push_seq__isnull=False).order_by("device_id", "scope"))
             for state in states:
                 key_name = f"{state.device_id}/{state.scope}"
+                try:
+                    flags = drain.ClaimFlags.from_json(state.claim_flags)
+                except ValueError as exc:
+                    raise CommandError(f"Restore failed closed for {key_name}: invalid claim flags: {exc}") from exc
                 entry = delivery.delivery_keys().get(state.scope)
                 if entry is None or not entry.in_protocol:
                     raise CommandError(f"Restore failed closed for {key_name}: unknown receipt section")
@@ -144,7 +145,7 @@ class Command(BaseCommand):
                 if receipt is not None and receipt["accepted_push_seq"] == state.push_seq:
                     # Mode is part of the receipt identity (seq + digest + three booleans):
                     # a same-sequence receipt in another mode is NOT this claim's outcome.
-                    wanted = _claim_modes(state)
+                    wanted = _claim_modes(state, flags)
                     served = {name: receipt[name] for name in wanted}
                     if served != wanted:
                         raise CommandError(
