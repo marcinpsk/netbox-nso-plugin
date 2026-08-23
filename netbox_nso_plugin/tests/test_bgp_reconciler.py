@@ -191,7 +191,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         self.assertTrue(state.enabled)
 
     def test_push_includes_peer_source_ip(self):
-        """_push_bgp_intent_for_device must send a peer's source (the local-address IP).
+        """BGP delivery must send a peer's source (the local-address IP).
 
         The PUT peer dict previously dropped source entirely, so the reconciler — which can now
         write local-address/update-source — never received it: the BGP session source was lost on
@@ -229,7 +229,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         self.assertEqual(peers[0]["source"], "198.18.255.1")
 
     def test_push_includes_local_as_ttl_password_peer_group(self):
-        """_push_bgp_intent_for_device must send local_as, ttl, password, and peer-group.
+        """BGP delivery must send local_as, ttl, password, and peer-group.
 
         These leaves are imported from the device onto the netbox-routing BGPPeer and are
         fully supported by the adapter intent schema + reconciler YANG, but the PUT peer dict
@@ -532,7 +532,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         self.assertIsNone(bp.update_source_id)
 
     def test_push_sends_update_source_iface_name(self):
-        """_push_bgp_intent_for_device sends the update-source interface NAME for a peer whose
+        """BGP delivery sends the update-source interface name for a peer whose
         source is a dcim.Interface (IOS/IOS-XR), so the cisco writer round-trips it.
 
         Counterpart to test_push_includes_peer_source_ip (Junos/Nokia local-address IP): the

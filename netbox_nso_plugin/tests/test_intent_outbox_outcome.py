@@ -597,10 +597,15 @@ class TestTheAcknowledgementClearsOnlyWhatItReported(_OutcomeCase):
                 """Django's OutputWrapper flushes what it wrote."""
 
         reporter = _Reporter()
-        self.addCleanup(appender.join, 30)
+
+        def join_if_started():
+            if appender.ident is not None:
+                appender.join(timeout=30)
+
+        self.addCleanup(join_if_started)
         self.addCleanup(recorded.set)
         call_command("nso_acknowledge_degraded_deletions", device_id=self.device.pk, stdout=reporter)
-        appender.join(timeout=30)
+        join_if_started()
         assert recorded.is_set(), "the concurrent degradation never landed, so this pin proves nothing"
 
         assert any("route(s) [11]" in line for line in reporter.lines), reporter.lines

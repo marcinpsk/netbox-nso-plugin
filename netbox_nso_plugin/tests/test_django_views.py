@@ -3348,6 +3348,7 @@ class TestPushIntentForDevice(ViewTestBase):
         mock_session_cls.return_value = session
 
         deliver("interface", self.device.pk, mgmt.adapter_device_id)
+        session.request.assert_called_once()
         sent = session.request.call_args.kwargs["json"]["attributes"]
         assert sent == [
             {
@@ -3387,6 +3388,7 @@ class TestPushIntentForDevice(ViewTestBase):
         mock_session_cls.return_value = session
 
         deliver("interface", self.device.pk, mgmt.adapter_device_id)
+        session.request.assert_called_once()
         sent = session.request.call_args.kwargs["json"]["attributes"]
         assert sent == [
             {
@@ -3430,6 +3432,7 @@ class TestPushIntentForDevice(ViewTestBase):
         mock_session_cls.return_value = session
 
         deliver("interface", self.device.pk, mgmt.adapter_device_id)
+        session.request.assert_called_once()
         sent = session.request.call_args.kwargs["json"]["attributes"]
         assert sent == [
             {

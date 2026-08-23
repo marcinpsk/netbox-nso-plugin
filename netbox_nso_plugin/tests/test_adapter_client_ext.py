@@ -516,7 +516,13 @@ class TestJobBoundaryValidation(unittest.TestCase):
     def test_get_job_refuses_a_payload_jobout_cannot_produce(self):
         from netbox_nso_plugin.adapter_client import get_job
 
-        for payload in ("boom", ["not-a-job"], _job_with_scalar("result"), _job_with_scalar("error")):
+        for payload in (
+            "boom",
+            ["not-a-job"],
+            _job_with_scalar("result"),
+            _job_with_scalar("error"),
+            _job_with_scalar("context"),
+        ):
             with self.subTest(payload=payload):
                 self._refuses(self._session(payload), lambda: get_job(7))
 

@@ -105,7 +105,9 @@ def test_release_refs_use_one_expected_tip_transaction():
 
 def test_release_commit_versions_are_validated_before_ref_publish():
     workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
-    step_ids = [step.get("id") or step["name"] for step in workflow["jobs"]["release"]["steps"]]
+    step_ids = [
+        step.get("id") or step.get("name") or step.get("uses", "") for step in workflow["jobs"]["release"]["steps"]
+    ]
 
     assert (
         step_ids.index("release")

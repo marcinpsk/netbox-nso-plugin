@@ -133,11 +133,14 @@ class TestCompactionAndTheClaimAreMutuallyExclusive(_CompactionCase):
         with patch("netbox_nso_plugin.drain._unconsumed", side_effect=hold_the_lock):
             compactor = threading.Thread(target=compact, name="compactor")
             compactor.start()
+            self.addCleanup(compactor.join, 60)
+            self.addCleanup(release.set)
             assert locked.wait(timeout=30), "the compactor never took the lock"
 
             claimed: list = []
             claimant = threading.Thread(target=lambda: in_thread(lambda: claimed.append(self._claim())))
             claimant.start()
+            self.addCleanup(claimant.join, 60)
             claimant.join(timeout=3)
             assert claimant.is_alive(), "the claimant did not wait for the compactor's lock"
 
