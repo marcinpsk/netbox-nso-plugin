@@ -164,9 +164,17 @@ def _wire_deletions(records) -> list[dict]:
     ]
 
 
-def _per_object_context(stack, entry: DeliveryKey, records) -> None:
+def _resolved_marking_mode(entry: DeliveryKey, marking_mode: str | None) -> str:
+    """Return one request's marking mode, with validation at the delivery seam."""
+    resolved = entry.marking_mode if marking_mode is None else marking_mode
+    if resolved not in {MARKING_QUERY_FLAG, MARKING_PER_OBJECT}:
+        raise ValueError(f"unknown marking mode {resolved!r}")
+    return resolved
+
+
+def _per_object_context(stack, entry: DeliveryKey, records, *, marking_mode: str) -> None:
     """Put one per-object scope's deletion records on its request body."""
-    if entry.marking_mode != MARKING_PER_OBJECT:
+    if marking_mode != MARKING_PER_OBJECT:
         return
     if entry.key != "static_route":
         raise RuntimeError(f"the {entry.key} per-object wire projection is not implemented")
@@ -175,7 +183,7 @@ def _per_object_context(stack, entry: DeliveryKey, records) -> None:
     stack.enter_context(adapter_client.static_route_deletions(_wire_deletions(records)))
 
 
-def wire_body(rendered: Rendered, body, *, deletions=()):
+def wire_body(rendered: Rendered, body, *, deletions=(), marking_mode: str | None = None):
     """Return the exact JSON body the client would send for *body*, without sending it.
 
     The identity the adapter's receipt carries is over the body it received (§4.4), and the
@@ -186,8 +194,9 @@ def wire_body(rendered: Rendered, body, *, deletions=()):
     from . import adapter_client
 
     entry = delivery_keys()[rendered.key[1]]
+    marking_mode = _resolved_marking_mode(entry, marking_mode)
     with adapter_client.capture_wire_body() as captured, contextlib.ExitStack() as stack:
-        _per_object_context(stack, entry, deletions)
+        _per_object_context(stack, entry, deletions, marking_mode=marking_mode)
         rendered.do_push(body)
     if len(captured) != 1:
         raise RuntimeError(f"the {rendered.key[1]} push made {len(captured)} requests, expected exactly one")
@@ -268,6 +277,7 @@ def send(
     mode: str = MODE_NORMAL,
     mark: bool = False,
     deletions=(),
+    marking_mode: str | None = None,
     push_seq: int | None = None,
     deadline: float | None = None,
 ):
@@ -284,6 +294,7 @@ def send(
     if mark and mode == MODE_BACKFILL_ONLY:
         raise ValueError("a backfill-only request carries no authority, so it cannot mark a deletion")
     entry = delivery_keys()[rendered.key[1]]
+    marking_mode = _resolved_marking_mode(entry, marking_mode)
     if deadline is not None:
         rendered = dataclasses.replace(rendered, do_push=_under_deadline(rendered.do_push, deadline))
     with contextlib.ExitStack() as stack:
@@ -291,9 +302,9 @@ def send(
             stack.enter_context(adapter_client.store_only_pushes())
         if mode == MODE_BACKFILL_ONLY:
             stack.enter_context(adapter_client.backfill_only_pushes())
-        if mark and entry.marking_mode == MARKING_QUERY_FLAG:
+        if mark and marking_mode == MARKING_QUERY_FLAG:
             stack.enter_context(adapter_client.delete_origin_pushes())
-        _per_object_context(stack, entry, deletions)
+        _per_object_context(stack, entry, deletions, marking_mode=marking_mode)
         if push_seq is not None and entry.in_protocol:
             stack.enter_context(adapter_client.push_seq(push_seq))
         return signals._send_rendered(rendered, body)

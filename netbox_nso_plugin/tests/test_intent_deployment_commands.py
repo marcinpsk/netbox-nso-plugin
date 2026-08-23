@@ -19,6 +19,7 @@ from ._outbox_case import (
     ReceiptAdapter,
     entries,
     make_managed,
+    marking_mode,
     own_route,
     own_vlan,
     state_of,
@@ -211,6 +212,35 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         self.assertEqual([response.status_code for response in plugin_responses], [503, 503])
         self.assertEqual(unrelated_response.status_code, 200)
 
+    def test_quiescence_returns_503_and_rolls_back_a_core_intent_mutation(self):
+        from django.http import HttpResponse
+        from django.test import RequestFactory
+
+        from netbox_nso_plugin.deployment import quiesce, resume
+        from netbox_nso_plugin.middleware import IntentDeploymentMiddleware
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOStaticRouteState
+
+        route = own_route(self.mgmt, "198.18.43.0/24", "198.18.0.1")
+        NSOIntentOutboxEntry.objects.all().delete()
+
+        def remove_route(_request):
+            with transaction.atomic():
+                route.devices.remove(self.device)
+            return HttpResponse("mutated")
+
+        quiesce()
+        try:
+            response = IntentDeploymentMiddleware(remove_route)(
+                RequestFactory().post(f"/plugins/netbox-routing/static-routes/{route.pk}/edit/")
+            )
+        finally:
+            resume()
+
+        assert response.status_code == 503
+        assert route.devices.filter(pk=self.device.pk).exists(), "the refused request committed the route removal"
+        assert NSOStaticRouteState.objects.filter(management=self.mgmt, static_route=route).exists()
+        assert not NSOIntentOutboxEntry.objects.exists(), "the refused request left partial outbox work"
+
     def test_each_dirty_key_shape_refuses_the_gate(self):
         from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentOutboxState
 
@@ -286,6 +316,40 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
 
         call_command("nso_intent_deployment_gate", abort=True, stdout=io.StringIO(), stderr=io.StringIO())
         assert not is_quiesced(), "--abort must release the gate"
+
+    def test_a_receipt_read_failure_is_a_named_command_failure(self):
+        from netbox_nso_plugin import adapter_client, drain
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.deployment import is_quiesced
+
+        own_route(self.mgmt, "198.18.42.0/24", "198.18.0.1")
+        config, session = self.adapter.patches()
+        with config, session:
+            assert drain.drain_key(self.device.pk, "static_route") == drain.SUCCEEDED
+
+        with patch("netbox_nso_plugin.management.commands.nso_intent_deployment_gate.time.sleep"):
+            self._prepare()
+
+        config, session = self.adapter.patches()
+        with (
+            config,
+            session,
+            patch.object(
+                adapter_client,
+                "get_intent_receipts",
+                side_effect=AdapterError("receipt read failed", code="nso_unreachable"),
+            ),
+            self.assertRaisesRegex(CommandError, "Verification failed: receipt read failed"),
+        ):
+            call_command(
+                "nso_intent_deployment_gate",
+                verify=True,
+                device_id=self.device.pk,
+                stdout=io.StringIO(),
+                stderr=io.StringIO(),
+            )
+
+        assert is_quiesced(), "a failed receipt read resumed writes"
 
     def test_a_reprepare_after_a_failed_verification_keeps_the_gate(self):
         """codex O3b review P1: --prepare must not release a gate it did not create."""
@@ -575,6 +639,31 @@ class TestIntentRestoreResolvesEveryReceiptCase(_CascadeFlushMixin, IntentPushRe
         assert state_of(self.device, "vlan").push_seq == claim.push_seq
         assert is_quiesced(), "a mode-mismatched receipt settled a restored claim"
 
+    def test_restore_uses_the_claims_persisted_marking_mode(self):
+        from netbox_nso_plugin import delivery, drain
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry
+
+        route = own_route(self.mgmt, "198.18.44.0/24", "198.18.0.1")
+        NSOIntentOutboxEntry.objects.all().delete()
+
+        with marking_mode("static_route", delivery.MARKING_QUERY_FLAG):
+            with without_commit_drain():
+                route.devices.remove(self.device)
+            claim = drain.claim(self.device.pk, "static_route")
+            assert [record["route_id"] for record in claim.deletions] == [route.pk]
+            config, session = self.adapter.patches()
+            with config, session:
+                drain.send_claim(claim)
+
+        self._restore()
+
+        assert {} in self.adapter.receipt_reads
+        assert {
+            "device_id": self.adapter_device_id,
+            "section": "static_route",
+        } in self.adapter.receipt_reads
+        assert state_of(self.device, "static_route").push_seq is None
+
     def test_non_boolean_receipt_modes_fail_closed(self):
         from netbox_nso_plugin.management.commands.nso_intent_restore import _normalize
 
@@ -675,6 +764,17 @@ class TestIntentRestoreProtectsTheRouteIdentityNamespace(
 
         assert self._next_route_id() > watermark
         assert {} in self.adapter.receipt_reads, "production did not read the maximum from the HTTP response"
+
+    def test_an_implausibly_distant_route_watermark_is_refused_before_advancing(self):
+        from netbox_nso_plugin import drain
+
+        issued = self._next_route_id()
+        self.adapter.global_max_route_id = issued + drain.MAX_RESTORE_GAP + 2
+
+        with self.assertRaisesRegex(CommandError, "route-id watermark .* ahead"):
+            self._restore()
+
+        assert self._next_route_id() == issued + 2, "the refused watermark burned through the route-id namespace"
 
     def test_a_missing_route_id_maximum_fails_fast_instead_of_defaulting(self):
         self.adapter.include_global_max_route_id = False
