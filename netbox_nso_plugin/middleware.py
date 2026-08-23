@@ -28,5 +28,5 @@ class IntentDeploymentMiddleware:
                     return self.get_response(request)
             return self.get_response(request)
         except DeploymentQuiesced:
-            logger.info("Refused a mutation during intent deployment: %s", request.path_info)
+            logger.info("Refused a mutation during intent deployment: %r", request.path_info)
             return HttpResponse("Intent deployment is quiesced.", status=503, content_type="text/plain")

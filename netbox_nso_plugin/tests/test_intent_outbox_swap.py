@@ -197,6 +197,34 @@ class TestTheTestCaseDeliveryDouble(_CascadeFlushMixin, IntentPushResetMixin, Tr
         assert marks == [False, True]
         assert all(entry.consumed_by_push_seq is not None for entry in entries(self.device, "vlan"))
 
+    def test_a_deletion_already_held_by_a_claim_is_not_sent_again(self):
+        from netbox_nso_plugin import delivery, outbox, signals
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentOutboxState
+
+        deletion = outbox.delete_transition(7, last_acked=None, current=None)
+        NSOIntentOutboxState.objects.create(
+            device=self.device,
+            scope="static_route",
+            claim_deletions=[deletion],
+        )
+        NSOIntentOutboxEntry.objects.create(
+            device=self.device,
+            scope="static_route",
+            batch_id=1,
+            transitions=[deletion],
+        )
+        signals._pending_intent_keys().add((self.device.pk, "static_route"))
+        rendered = delivery.Rendered((self.device.pk, "static_route"), {}, lambda _body: None)
+
+        with (
+            patch.object(delivery, "render", return_value=rendered),
+            patch.object(delivery, "send") as send,
+        ):
+            _deliver_scheduled_keys()
+
+        send.assert_called_once()
+        assert send.call_args.kwargs["deletions"] == []
+
 
 class _SwapCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     """A managed device and a recorded far side, driven through the PRODUCTION trigger."""
