@@ -293,7 +293,7 @@ class _O3CEnvironment:
     """Own the adapter process, its isolated store, and the RESTCONF fake."""
 
     def __init__(self):
-        self.adapter_port = _free_loopback_port()
+        self.adapter_port = 0
         self.db_name = _adapter_database_name()
         self.serving = False
         self.restconf = _RestconfState()
@@ -436,6 +436,7 @@ class _O3CEnvironment:
         }
         log_path = Path(self.tempdir.name) / "adapter.log"
         self.log_handle = log_path.open("w+b")
+        self.adapter_port = _free_loopback_port()
         self.process = subprocess.Popen(
             [
                 uv,
@@ -743,6 +744,13 @@ class TestO3CEnvironmentFailFast(SimpleTestCase):
     """Prove a failed preflight tears down without hanging the suite."""
 
     databases = {"default"}
+
+    def test_adapter_port_is_selected_only_when_starting_the_process(self):
+        with patch(f"{__name__}._adapter_database_name", return_value="test_o3c_port_selection"):
+            environment = _O3CEnvironment()
+        self.addCleanup(environment.stop)
+
+        assert environment.adapter_port == 0
 
     def test_a_missing_adapter_worktree_skips_the_joined_class(self):
         class MissingAdapterCase(TestO3CJoinedCrossRepositoryPin):
