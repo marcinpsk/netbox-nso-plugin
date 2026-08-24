@@ -241,7 +241,12 @@ class TestFailureKeepsTheWorkAndTheBaseline(_ClaimCase):
         assert row.push_seq is None and row.attempts == 0
         rendered = delivery.render("vlan", self.device.pk, self.adapter_device_id)
         assert row.last_success_identity == drain.request_identity(
-            rendered.payload, mode="normal", deletions=[], mark=None, epoch=drain.mapping_epoch(self.mgmt)
+            rendered.payload,
+            mode="normal",
+            marking_mode=delivery.MARKING_QUERY_FLAG,
+            deletions=[],
+            mark=None,
+            epoch=drain.mapping_epoch(self.mgmt),
         )
         assert self.adapter.sequences[0] == failed_seq, "the failed operation is replayed, never reallocated"
 
@@ -431,6 +436,30 @@ class TestAForcedCallFormsItsOwnClaim(_ClaimCase):
         assert self.drain() == drain.SUCCEEDED
 
         assert self.adapter.sequences == [stale]
+
+    def test_a_quiesced_latency_tail_does_not_reclassify_a_settled_success(self):
+        from netbox_nso_plugin import delivery, drain
+        from netbox_nso_plugin.deployment import DeploymentQuiesced
+
+        own_vlan(self.mgmt, 880, self.tag)
+        claimed = drain.claim(self.device.pk, "vlan")
+        assert drain.settle(claimed, {"count": 1}) == drain.SUCCEEDED
+
+        with (
+            patch.object(drain, "_answered_other_work", return_value=False),
+            patch.object(drain, "_pending", return_value=True),
+            patch.object(drain, "_drain_once", side_effect=DeploymentQuiesced("deployment started")),
+        ):
+            continued = drain._after_success(
+                claimed,
+                mode=delivery.MODE_NORMAL,
+                force=False,
+                chain=1,
+                deadline=None,
+                deadline_at=None,
+            )
+
+        assert continued is None
 
 
 class TestUnmanagedClaimIsParked(_ClaimCase):

@@ -36,10 +36,14 @@ import time
 from django.db import IntegrityError, OperationalError, connection, transaction
 
 from . import delivery
+from .deployment import DeploymentQuiesced
+from .deployment import guarded as _deployment_guarded
+from .deployment import operation as _deployment_operation
 from .outbox import (
     OP_REVOKE,
     advance_push_seq,
     allocate_push_seq,
+    fold_state_transitions,
     fold_transitions,
     issued_push_seq,
     reduce_transitions,
@@ -136,6 +140,36 @@ class DirectApplyFailed(Exception):
     code = "nso_direct_apply_failed"
 
 
+@dataclasses.dataclass(frozen=True)
+class ClaimFlags:
+    """The validated delivery semantics persisted with one active claim."""
+
+    mode: str
+    marking_mode: str
+    mark_any: bool
+    force: bool
+
+    def __post_init__(self):
+        if self.mode not in {delivery.MODE_NORMAL, delivery.MODE_STORE_ONLY, delivery.MODE_BACKFILL_ONLY}:
+            raise ValueError(f"unknown claim mode {self.mode!r}")
+        if self.marking_mode not in {delivery.MARKING_QUERY_FLAG, delivery.MARKING_PER_OBJECT}:
+            raise ValueError(f"unknown marking mode {self.marking_mode!r}")
+        if type(self.mark_any) is not bool or type(self.force) is not bool:
+            raise ValueError("claim mark_any and force flags must be booleans")
+
+    @classmethod
+    def from_json(cls, value):
+        """Decode the exact JSON shape stored in ``claim_flags``."""
+        fields = {field.name for field in dataclasses.fields(cls)}
+        if not isinstance(value, dict) or set(value) != fields:
+            raise ValueError(f"claim flags must contain exactly {sorted(fields)}")
+        return cls(**value)
+
+    def as_json(self) -> dict:
+        """Return the canonical JSON shape stored in ``claim_flags``."""
+        return dataclasses.asdict(self)
+
+
 @dataclasses.dataclass
 class Claim:
     """One logical operation: the request, its authority, and the id it is admitted under."""
@@ -151,8 +185,12 @@ class Claim:
     mark: bool | None
     mark_any: bool
     mode: str
+    marking_mode: str
     rendered: object
     replayed: bool = False
+
+    def __post_init__(self):
+        ClaimFlags(self.mode, self.marking_mode, self.mark_any, False)
 
 
 @dataclasses.dataclass
@@ -246,8 +284,8 @@ def _work_pending(state) -> bool:
     )
 
 
-def request_identity(payload, *, mode, deletions, mark, epoch) -> str:
-    """Return the identity of one request: its body, its mode, its authority, its legacy flag.
+def request_identity(payload, *, mode, marking_mode, deletions, mark, epoch) -> str:
+    """Return the identity of one request: its body, delivery modes, authority, and epoch.
 
     Two claims with the same identity are the same operation, which is what lets an unchanged
     save be dropped against the acknowledged baseline instead of re-sent. It is a PLUGIN-side
@@ -263,6 +301,7 @@ def request_identity(payload, *, mode, deletions, mark, epoch) -> str:
     material = {
         "payload": payload,
         "mode": mode,
+        "marking_mode": marking_mode,
         "deletions": sorted(int(record["route_id"]) for record in deletions),
         # The flag as the wire carries it: no contributors and unmarked contributors are one
         # request, so they must be one identity or an unchanged save re-sends forever.
@@ -363,10 +402,11 @@ def _claim_locked(device_id, scope, mode, force) -> Claim | None:
 
 def _takeover(state, mgmt, now) -> Claim | None:
     """Replay the unacknowledged operation: same sequence, same body, fresh lease."""
-    flags = state.claim_flags or {}
+    flags = ClaimFlags.from_json(state.claim_flags)
     current_identity = request_identity(
         state.claim_payload,
-        mode=flags.get("mode", delivery.MODE_NORMAL),
+        mode=flags.mode,
+        marking_mode=flags.marking_mode,
         deletions=state.claim_deletions or [],
         mark=state.claim_mark,
         epoch=mapping_epoch(mgmt),
@@ -392,8 +432,9 @@ def _takeover(state, mgmt, now) -> Claim | None:
         identity=state.claim_identity,
         deletions=list(state.claim_deletions or []),
         mark=state.claim_mark,
-        mark_any=bool(flags.get("mark_any")),
-        mode=flags.get("mode", delivery.MODE_NORMAL),
+        mark_any=flags.mark_any,
+        mode=flags.mode,
+        marking_mode=flags.marking_mode,
         rendered=delivery.render(state.scope, state.device_id, mgmt.adapter_device_id),
         replayed=True,
     )
@@ -404,19 +445,14 @@ def _form(state, mgmt, now, mode, force) -> Claim | None:
     from .models import NSOIntentOutboxEntry
 
     device_id, scope = state.device_id, state.scope
+    marking_mode = delivery.delivery_keys()[scope].marking_mode
     if mode == delivery.MODE_BACKFILL_ONLY:
         return _form_backfill(state, mgmt, now)
     rows = list(_unconsumed(device_id, scope).select_for_update().order_by("id"))
     entry_ids = [row.pk for row in rows]
     mark = all(row.mark_and for row in rows) if rows else None
     mark_any = any(row.mark_any for row in rows)
-    folded = fold_transitions(
-        [record for row in rows for record in row.transitions],
-        claim_deletions=[int(record["route_id"]) for record in state.claim_deletions or []],
-        queued=state.queued_deletions,
-        revoked=state.revoked_ids,
-        lineage_carry=state.lineage_carry,
-    )
+    folded = fold_state_transitions([record for row in rows for record in row.transitions], state)
     deletions = list(folded.queued.values())
     if mode == delivery.MODE_STORE_ONLY:
         # A deletion mark on a key whose pending rows recorded no provenance at all is
@@ -426,7 +462,14 @@ def _form(state, mgmt, now, mode, force) -> Claim | None:
         return _form_store_only(state, mgmt, now, deletions, untracked, force)
 
     rendered = delivery.render(scope, device_id, mgmt.adapter_device_id)
-    identity = request_identity(rendered.payload, mode=mode, deletions=deletions, mark=mark, epoch=mapping_epoch(mgmt))
+    identity = request_identity(
+        rendered.payload,
+        mode=mode,
+        marking_mode=marking_mode,
+        deletions=deletions,
+        mark=mark,
+        epoch=mapping_epoch(mgmt),
+    )
 
     state.revoked_ids = sorted(folded.revoked)
     state.lineage_carry = folded.lineage_carry
@@ -448,7 +491,8 @@ def _form(state, mgmt, now, mode, force) -> Claim | None:
     state.claim_identity = identity
     state.claim_deletions = deletions
     state.claim_mark = mark
-    state.claim_flags = {"mode": mode, "mark_any": mark_any, "force": bool(force)}
+    flags = ClaimFlags(mode, marking_mode, mark_any, bool(force))
+    state.claim_flags = flags.as_json()
     state.queued_deletions = []
     state.save()
     return Claim(
@@ -460,8 +504,9 @@ def _form(state, mgmt, now, mode, force) -> Claim | None:
         identity=identity,
         deletions=deletions,
         mark=mark,
-        mark_any=mark_any,
-        mode=mode,
+        mark_any=flags.mark_any,
+        mode=flags.mode,
+        marking_mode=flags.marking_mode,
         rendered=rendered,
     )
 
@@ -486,6 +531,7 @@ def _form_store_only(state, mgmt, now, deletions, untracked_mark, force) -> Clai
     that no longer names the object and retract nothing.
     """
     device_id, scope = state.device_id, state.scope
+    marking_mode = delivery.delivery_keys()[scope].marking_mode
     if deletions or untracked_mark:
         raise AuthorityPending(f"{device_id}/{scope} holds deletion authority a store-only request cannot carry")
     rendered = delivery.render(scope, device_id, mgmt.adapter_device_id)
@@ -494,11 +540,17 @@ def _form_store_only(state, mgmt, now, deletions, untracked_mark, force) -> Clai
     state.claimed_at = now
     state.claim_payload = rendered.payload
     state.claim_identity = request_identity(
-        rendered.payload, mode=delivery.MODE_STORE_ONLY, deletions=[], mark=None, epoch=mapping_epoch(mgmt)
+        rendered.payload,
+        mode=delivery.MODE_STORE_ONLY,
+        marking_mode=marking_mode,
+        deletions=[],
+        mark=None,
+        epoch=mapping_epoch(mgmt),
     )
     state.claim_deletions = []
     state.claim_mark = None
-    state.claim_flags = {"mode": delivery.MODE_STORE_ONLY, "mark_any": False, "force": bool(force)}
+    flags = ClaimFlags(delivery.MODE_STORE_ONLY, marking_mode, False, bool(force))
+    state.claim_flags = flags.as_json()
     state.save()
     return Claim(
         device_id=device_id,
@@ -509,8 +561,9 @@ def _form_store_only(state, mgmt, now, deletions, untracked_mark, force) -> Clai
         identity=state.claim_identity,
         deletions=[],
         mark=None,
-        mark_any=False,
-        mode=delivery.MODE_STORE_ONLY,
+        mark_any=flags.mark_any,
+        mode=flags.mode,
+        marking_mode=flags.marking_mode,
         rendered=rendered,
     )
 
@@ -524,16 +577,23 @@ def _form_backfill(state, mgmt, now) -> Claim:
     forbids. It consumes no entry, so the real work is still owed after it succeeds.
     """
     rendered = delivery.render(state.scope, state.device_id, mgmt.adapter_device_id)
+    marking_mode = delivery.delivery_keys()[state.scope].marking_mode
     push_seq = allocate_push_seq()
     state.push_seq = push_seq
     state.claimed_at = now
     state.claim_payload = rendered.payload
     state.claim_identity = request_identity(
-        rendered.payload, mode=delivery.MODE_BACKFILL_ONLY, deletions=[], mark=None, epoch=mapping_epoch(mgmt)
+        rendered.payload,
+        mode=delivery.MODE_BACKFILL_ONLY,
+        marking_mode=marking_mode,
+        deletions=[],
+        mark=None,
+        epoch=mapping_epoch(mgmt),
     )
     state.claim_deletions = []
     state.claim_mark = None
-    state.claim_flags = {"mode": delivery.MODE_BACKFILL_ONLY, "mark_any": False, "force": True}
+    flags = ClaimFlags(delivery.MODE_BACKFILL_ONLY, marking_mode, False, True)
+    state.claim_flags = flags.as_json()
     state.save()
     return Claim(
         device_id=state.device_id,
@@ -544,8 +604,9 @@ def _form_backfill(state, mgmt, now) -> Claim:
         identity=state.claim_identity,
         deletions=[],
         mark=None,
-        mark_any=False,
-        mode=delivery.MODE_BACKFILL_ONLY,
+        mark_any=flags.mark_any,
+        mode=flags.mode,
+        marking_mode=flags.marking_mode,
         rendered=rendered,
     )
 
@@ -690,6 +751,8 @@ def send_claim(claim: Claim, *, deadline=None):
         claim.payload,
         mode=claim.mode,
         mark=bool(claim.mark),
+        deletions=claim.deletions,
+        marking_mode=claim.marking_mode,
         push_seq=claim.push_seq,
         deadline=SEND_DEADLINE.total_seconds() if deadline is None else deadline,
     )
@@ -783,7 +846,7 @@ def acknowledgement(claim: Claim, response) -> Acknowledgement:
             ids = sorted(int(value) for value in named)
             return Acknowledgement(False, reason=f"the acknowledgement names unrequested ids {ids}")
         return Acknowledgement(True)
-    if delivery.delivery_keys()[claim.scope].marking_mode != delivery.MARKING_PER_OBJECT:
+    if claim.marking_mode != delivery.MARKING_PER_OBJECT:
         return Acknowledgement(True, frozenset(requested))
     if not isinstance(response, dict):
         return Acknowledgement(False, reason="the response carries no acknowledgement lists")
@@ -947,9 +1010,10 @@ def settle(claim: Claim, response) -> str:
             _report_protocol_violation(claim, ack.reason)
             return UNACKNOWLEDGED
 
-        if claim.mark is False and claim.mark_any:
-            # The fold downgraded a marked contributor, which is today's cross-transaction
-            # AND. It is recorded because the success path pops the transient error entry.
+        if claim.mark is False and claim.mark_any and claim.marking_mode == delivery.MARKING_QUERY_FLAG:
+            # The fold downgraded a marked contributor, which is the query-flag AND. A
+            # per-object scope delivers the deletion itself, so its AND has no wire effect.
+            # It is recorded because the success path pops the transient error entry.
             state.degraded_deletions = [
                 *state.degraded_deletions,
                 {
@@ -1248,6 +1312,7 @@ def push_now(device_id, scope, *, mode=delivery.MODE_NORMAL, force=False, deadli
     return answer if outcome == SUCCEEDED else None
 
 
+@_deployment_guarded("intent drain")
 def _drain_once(
     device_id,
     scope,
@@ -1344,15 +1409,18 @@ def _after_success(claimed, *, mode, force, chain, deadline, deadline_at):
         )
     if chain > 0 and mode == delivery.MODE_NORMAL and _pending(device_id, scope):
         # This chain is a latency optimization. The tick guarantees any remaining tail.
-        _drain_once(
-            device_id,
-            scope,
-            mode=mode,
-            force=False,
-            chain=chain - 1,
-            deadline=deadline,
-            _deadline_at=deadline_at,
-        )
+        try:
+            _drain_once(
+                device_id,
+                scope,
+                mode=mode,
+                force=False,
+                chain=chain - 1,
+                deadline=deadline,
+                _deadline_at=deadline_at,
+            )
+        except DeploymentQuiesced:
+            logger.info("%s/%s left its tail to the tick because a deployment started", device_id, scope)
     return None
 
 
@@ -1599,7 +1667,16 @@ def drain_candidates(limit=None) -> list[tuple[int, str]]:
 
 
 def compact_intent_outbox(limit=None) -> None:
-    """Compact the tick's bounded candidate set without contacting the adapter."""
+    """Compact the bounded candidate set unless a deployment has paused it."""
+    try:
+        with _deployment_operation("intent outbox compaction"):
+            _compact_intent_outbox(limit)
+    except DeploymentQuiesced:
+        logger.info("intent outbox compaction is paused for a deployment")
+
+
+def _compact_intent_outbox(limit=None) -> None:
+    """Compact an admitted candidate set without contacting the adapter."""
     for device_id, scope in compaction_candidates(limit):
         try:
             compact(device_id, scope)
@@ -1618,12 +1695,25 @@ def drain_intent_outbox(limit=None) -> tuple[int, int]:
     replayable failure is not drainable and would never be compacted otherwise, which is
     exactly the case where a burst accumulates.
     """
-    compact_intent_outbox(limit)
+    return _drain_intent_outbox(limit)
+
+
+def _drain_intent_outbox(limit=None) -> tuple[int, int]:
+    """Run one tick with a new deployment admission for each bounded stage."""
+    try:
+        with _deployment_operation("intent outbox compaction"):
+            _compact_intent_outbox(limit)
+    except DeploymentQuiesced:
+        logger.info("the intent outbox tick is paused for a deployment")
+        return 0, 0
 
     drained = failed = 0
     for device_id, scope in drain_candidates(limit):
         try:
             outcome = drain_key(device_id, scope)
+        except DeploymentQuiesced:
+            logger.info("the intent outbox tick stopped because a deployment started")
+            break
         except Exception:  # noqa: BLE001 (one key's adapter must not abort the fleet pass)
             logger.exception("intent outbox drain failed for %s/%s", device_id, scope)
             _restamp_attempt(device_id, scope)
@@ -1644,7 +1734,7 @@ RESTORE_FAILED_CLOSED = "failed_closed"
 RESTORE_REPLAY = "replay"
 
 
-def _sent_wire_digest(state) -> str:
+def _sent_wire_digest(state, flags: ClaimFlags | None = None) -> str:
     """Digest the body the unresolved claim put on the wire, from the row that recorded it.
 
     The claim persists the payload it sent, and the envelope around it (``{"routes": …}``)
@@ -1652,8 +1742,16 @@ def _sent_wire_digest(state) -> str:
     digested into its receipt. The render is for the endpoint's own call, never for its
     payload: this hashes what was sent, not what the device would render now.
     """
+    flags = flags or ClaimFlags.from_json(state.claim_flags)
     rendered = delivery.render(state.scope, state.device_id, 0)
-    return wire_digest(delivery.wire_body(rendered, state.claim_payload))
+    return wire_digest(
+        delivery.wire_body(
+            rendered,
+            state.claim_payload,
+            deletions=state.claim_deletions or [],
+            marking_mode=flags.marking_mode,
+        )
+    )
 
 
 def resolve_restored_claim(device_id, scope, receipt) -> str:
@@ -1682,6 +1780,11 @@ def resolve_restored_claim(device_id, scope, receipt) -> str:
             state = _lock_state(device_id, scope)
             if state.push_seq is None:
                 return RESTORE_REPLAY
+            try:
+                flags = ClaimFlags.from_json(state.claim_flags)
+            except ValueError as exc:
+                logger.error("%s/%s has invalid persisted claim flags: %s", device_id, scope, exc)
+                return RESTORE_FAILED_CLOSED
             if accepted is None or accepted < state.push_seq:
                 return RESTORE_REPLAY  # the far side never saw it; the ordinary replay carries it
             if accepted > state.push_seq:
@@ -1715,7 +1818,7 @@ def resolve_restored_claim(device_id, scope, receipt) -> str:
                 _clear_claim(state)
                 state.save()
                 return RESTORE_REBASED
-            if receipt.get("request_digest") != _sent_wire_digest(state):
+            if receipt.get("request_digest") != _sent_wire_digest(state, flags):
                 logger.error(
                     "%s/%s holds push_seq %s at a digest the receipt does not name",
                     device_id,
@@ -1735,14 +1838,26 @@ def resolve_restored_claim(device_id, scope, receipt) -> str:
         identity=state.claim_identity,
         deletions=list(state.claim_deletions or []),
         mark=state.claim_mark,
-        mark_any=bool((state.claim_flags or {}).get("mark_any")),
-        mode=(state.claim_flags or {}).get("mode", delivery.MODE_NORMAL),
+        mark_any=flags.mark_any,
+        mode=flags.mode,
+        marking_mode=flags.marking_mode,
         rendered=None,
         replayed=True,
     )
     if settle(restored, receipt.get("stored_response")) != SUCCEEDED:
         return RESTORE_FAILED_CLOSED
     return RESTORE_SETTLED
+
+
+def release_restored_replay(device_id, scope) -> None:
+    """Release the snapshot's stale lease so a replay verdict can run immediately."""
+    _refuse_in_transaction("restore")
+    with transaction.atomic():
+        state = _lock_state(device_id, scope)
+        if state.push_seq is None:
+            return
+        state.claimed_at = None
+        state.save(update_fields=["claimed_at"])
 
 
 def clear_acknowledged_lineage() -> int:

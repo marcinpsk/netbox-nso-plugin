@@ -144,10 +144,11 @@ class TestTheTestCaseDeliveryDouble(_CascadeFlushMixin, IntentPushResetMixin, Tr
         from netbox_nso_plugin import delivery, signals
 
         signals._pending_intent_keys().add((self.device.pk, "vlan"))
-        with patch.object(delivery, "deliver") as deliver:
+        with patch.object(delivery, "render") as render, patch.object(delivery, "send") as send:
             _deliver_scheduled_keys()
 
-        deliver.assert_not_called()
+        render.assert_not_called()
+        send.assert_not_called()
 
     def test_a_delivery_failure_is_logged_and_does_not_escape(self):
         from netbox_nso_plugin import delivery, outbox, signals
@@ -156,16 +157,34 @@ class TestTheTestCaseDeliveryDouble(_CascadeFlushMixin, IntentPushResetMixin, Tr
             outbox.enqueue(self.device.pk, "vlan")
         signals._pending_intent_keys().add((self.device.pk, "vlan"))
         with (
-            patch.object(delivery, "deliver", side_effect=RuntimeError("render failed")),
+            patch.object(delivery, "send", side_effect=RuntimeError("send failed")) as send,
             self.assertLogs("netbox_nso_plugin.tests.mixins", level="ERROR") as logs,
         ):
             _deliver_scheduled_keys()
 
+        send.assert_called_once()
+        assert any("test delivery failed" in line for line in logs.output)
+        assert [entry.consumed_by_push_seq for entry in entries(self.device, "vlan")] == [None]
+
+    def test_an_adapter_error_is_logged_and_leaves_the_row_unconsumed(self):
+        from netbox_nso_plugin import delivery, outbox, signals
+
+        with transaction.atomic():
+            outbox.enqueue(self.device.pk, "vlan")
+        signals._pending_intent_keys().add((self.device.pk, "vlan"))
+        with (
+            patch.object(delivery, "send", side_effect=AdapterError("adapter client failed")) as send,
+            self.assertLogs("netbox_nso_plugin.tests.mixins", level="ERROR") as logs,
+        ):
+            _deliver_scheduled_keys()
+
+        send.assert_called_once()
         assert any("test delivery failed" in line for line in logs.output)
         assert [entry.consumed_by_push_seq for entry in entries(self.device, "vlan")] == [None]
 
     def test_a_success_retires_rows_before_the_next_delivery(self):
         from netbox_nso_plugin import delivery, outbox, signals
+        from netbox_nso_plugin.models import NSOIntentOutboxState
 
         marks = []
         key = (self.device.pk, "vlan")
@@ -173,11 +192,40 @@ class TestTheTestCaseDeliveryDouble(_CascadeFlushMixin, IntentPushResetMixin, Tr
             with transaction.atomic():
                 outbox.enqueue(*key, delete_origin=delete_origin)
             signals._pending_intent_keys().add(key)
-            with patch.object(delivery, "deliver", side_effect=lambda *args, mark: marks.append(mark)):
+            with patch.object(delivery, "send", side_effect=lambda *args, mark, **kwargs: marks.append(mark)):
                 _deliver_scheduled_keys()
 
         assert marks == [False, True]
         assert all(entry.consumed_by_push_seq is not None for entry in entries(self.device, "vlan"))
+        assert not NSOIntentOutboxState.objects.filter(device=self.device, scope="vlan").exists()
+
+    def test_a_deletion_already_held_by_a_claim_is_not_sent_again(self):
+        from netbox_nso_plugin import delivery, outbox, signals
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentOutboxState
+
+        deletion = outbox.delete_transition(7, last_acked=None, current=None)
+        NSOIntentOutboxState.objects.create(
+            device=self.device,
+            scope="static_route",
+            claim_deletions=[deletion],
+        )
+        NSOIntentOutboxEntry.objects.create(
+            device=self.device,
+            scope="static_route",
+            batch_id=1,
+            transitions=[deletion],
+        )
+        signals._pending_intent_keys().add((self.device.pk, "static_route"))
+        rendered = delivery.Rendered((self.device.pk, "static_route"), {}, lambda _body: None)
+
+        with (
+            patch.object(delivery, "render", return_value=rendered),
+            patch.object(delivery, "send") as send,
+        ):
+            _deliver_scheduled_keys()
+
+        send.assert_called_once()
+        assert send.call_args.kwargs["deletions"] == []
 
 
 class _SwapCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):

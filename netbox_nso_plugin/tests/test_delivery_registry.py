@@ -20,6 +20,7 @@ from django.test import SimpleTestCase, TestCase
 from .mixins import IntentPushResetMixin
 
 APP = "netbox_nso_plugin"
+PLUGIN = Path(__file__).resolve().parent.parent
 
 
 def _delivery_keys_at_the_push_sites() -> set[str]:
@@ -69,7 +70,7 @@ class TestDeliveryRegistry(SimpleTestCase):
         from netbox_nso_plugin.delivery import DeliveryKey, deliver
 
         fields = {f.name for f in dataclasses.fields(DeliveryKey)}
-        assert fields == {"key", "label", "in_protocol", "marking_mode", "push_name"}
+        assert fields == {"key", "section", "label", "in_protocol", "marking_mode", "push_name"}
         assert "mode" in inspect.signature(deliver).parameters
 
     def test_every_drift_scope_names_a_registered_delivery_key(self):
@@ -87,10 +88,14 @@ class TestDeliveryRegistry(SimpleTestCase):
         assert unknown == {}
 
     def test_marking_mode_is_declared_per_key(self):
-        """O1 records ids in both modes; static routes only leave ``query_flag`` at O3."""
-        from netbox_nso_plugin.delivery import delivery_keys
+        """O3.4: only static routes activate; every other key keeps its query flag."""
+        from netbox_nso_plugin.delivery import MARKING_PER_OBJECT, MARKING_QUERY_FLAG, delivery_keys
 
-        assert {entry.marking_mode for entry in delivery_keys().values()} == {"query_flag"}
+        registry = delivery_keys()
+        assert registry["static_route"].marking_mode == MARKING_PER_OBJECT
+        assert {key: entry.marking_mode for key, entry in registry.items() if key != "static_route"} == {
+            key: MARKING_QUERY_FLAG for key in registry if key != "static_route"
+        }
 
     def test_every_entry_names_a_push_that_exists(self):
         """The registry holds names, so a typo has to fail here rather than at push time."""
@@ -99,6 +104,34 @@ class TestDeliveryRegistry(SimpleTestCase):
 
         missing = [entry.push_name for entry in delivery_keys().values() if not hasattr(signals, entry.push_name)]
         assert missing == []
+
+    def test_receipt_sections_are_a_registry_fact(self):
+        from netbox_nso_plugin.delivery import delivery_keys
+
+        registry = delivery_keys()
+        assert registry["interface"].section == "interface_config"
+        assert {key: entry.section for key, entry in registry.items() if key != "interface"} == {
+            key: key for key in registry if key != "interface"
+        }
+
+    def test_no_production_reader_repeats_the_interface_receipt_literal(self):
+        offenders, scanned = [], []
+        for path in PLUGIN.rglob("*.py"):
+            # Relative to the plugin: an ancestor directory named tests/ or migrations/ would
+            # otherwise skip every module and pass this guard on an empty scan.
+            relative = path.relative_to(PLUGIN)
+            if path.name == "delivery.py" or "tests" in relative.parts or "migrations" in relative.parts:
+                continue
+            scanned.append(relative.as_posix())
+            literals = {
+                node.value
+                for node in ast.walk(ast.parse(path.read_text()))
+                if isinstance(node, ast.Constant) and isinstance(node.value, str)
+            }
+            if "interface_config" in literals:
+                offenders.append(relative.as_posix())
+        assert "signals.py" in scanned, f"the scan reached {len(scanned)} module(s), so it proves nothing"
+        assert offenders == [], f"receipt-section literals outside delivery.py: {offenders}"
 
 
 def _fixture(tag: str, adapter_device_id: int):

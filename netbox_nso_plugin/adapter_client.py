@@ -66,6 +66,10 @@ def delete_origin_pushes():
 # It is expressly NOT a delivery mechanism: it accepts no content and carries no authority.
 _backfill_only_push = contextvars.ContextVar("nso_backfill_only_push", default=False)
 
+# Static-route per-object deletion authority. The default is the required empty list, so
+# direct client users and claims with no deletion both send the activated body shape.
+_static_route_deletions = contextvars.ContextVar("nso_static_route_deletions", default=())
+
 
 @contextmanager
 def backfill_only_pushes():
@@ -75,6 +79,16 @@ def backfill_only_pushes():
         yield
     finally:
         _backfill_only_push.reset(token)
+
+
+@contextmanager
+def static_route_deletions(records):
+    """Put one claim's folded static-route deletion records on its request body."""
+    token = _static_route_deletions.set(tuple(records))
+    try:
+        yield
+    finally:
+        _static_route_deletions.reset(token)
 
 
 # The logical operation a request belongs to (#1503 Appendix O, §4.4). It rides in a header
@@ -295,10 +309,11 @@ def reset_config_cache():
 class AdapterError(Exception):
     """Raised when the nso-adapter returns an error or is unreachable."""
 
-    def __init__(self, message, code=None, detail=None):
+    def __init__(self, message, code=None, detail=None, status_code=None):
         super().__init__(message)
         self.code = code
         self.detail = detail
+        self.status_code = status_code
 
 
 def _resolve_config() -> dict:
@@ -509,6 +524,7 @@ def _request_response(method, path, **kwargs):
             err.get("message") or resp.text,
             code=str(err.get("code") or resp.status_code),
             detail=detail if isinstance(detail, dict) else None,
+            status_code=resp.status_code,
         )
     return resp
 
@@ -620,6 +636,16 @@ def get_device(adapter_device_id):
 def list_devices():
     """GET /api/v1/devices — every device the adapter knows, across all NSO instances."""
     return _request("GET", "/api/v1/devices")
+
+
+def get_intent_receipts(*, device_id: int | None = None, section: str | None = None) -> dict:
+    """GET the adapter's per-key receipts and fleet-wide restore watermarks."""
+    params = {}
+    if device_id is not None:
+        params["device_id"] = int(device_id)
+    if section is not None:
+        params["section"] = section
+    return _request("GET", "/api/v1/intent-receipts", params=params)
 
 
 def get_interfaces(adapter_device_id):
@@ -1142,13 +1168,15 @@ def put_static_route_intent(adapter_device_id, routes):
       [{"vrf": "", "prefix": "10.0.0.0/8", "next_hop": "192.168.1.1",
         "metric": None, "permanent": None, "tag": None,
         "accepted_at": "...Z"}, ...]
+    ``deleted_routes`` comes from the active claim's deletion context. It is always present,
+    including as an empty list for direct callers and store-only or backfill-only pushes.
     An empty ``routes`` list clears all static route intent for the device.
     Returns {"device_id": ..., "count": N}.
     """
     return _request(
         "PUT",
         f"/api/v1/devices/{adapter_device_id}/static-route-intent",
-        json={"routes": routes},
+        json={"routes": routes, "deleted_routes": list(_static_route_deletions.get())},
     )
 
 

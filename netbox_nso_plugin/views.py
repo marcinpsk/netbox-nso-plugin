@@ -18,6 +18,7 @@ from netbox.views import generic
 from utilities.views import ViewTab, register_model_view
 
 from .adapter_client import AdapterError
+from .deployment import DeploymentQuiesced
 from .filters import (
     NSODerivedIntentTemplateFilterSet,
     NSODeviceManagementFilterSet,
@@ -800,9 +801,9 @@ class NSOCategoryView(LoginRequiredMixin, View):
         if mgmt is not None and mgmt.adapter_device_id is not None:
             try:
                 ctx.update(reconcile_category(device, mgmt, key))
-            except AdapterError as exc:
+            except (AdapterError, DeploymentQuiesced) as exc:
                 ctx["adapter_error"] = str(exc)
-                ctx["adapter_error_code"] = exc.code
+                ctx["adapter_error_code"] = getattr(exc, "code", "deployment_quiesced")
                 # The banner explains the failed refresh; the rows must not vanish
                 # with it — render last-synced state underneath.
                 ctx.update(_persisted_category_context(device, mgmt, key))
@@ -905,7 +906,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
 
             try:
                 reconcile_category(device, mgmt, key)
-            except AdapterError as exc:
+            except (AdapterError, DeploymentQuiesced) as exc:
                 adapter_error = str(exc)
 
         qs = spec["model"].objects.filter(management=mgmt)
@@ -994,7 +995,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
         if request.GET.get("refresh") and mgmt is not None and mgmt.adapter_device_id is not None:
             try:
                 reconcile_category(device, mgmt, "interface")
-            except AdapterError as exc:
+            except (AdapterError, DeploymentQuiesced) as exc:
                 adapter_error = str(exc)
 
         dev_filter = {"interface__device": device}
@@ -1602,7 +1603,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
 
             try:
                 reconcile_category(device, mgmt, key)
-            except AdapterError as exc:
+            except (AdapterError, DeploymentQuiesced) as exc:
                 adapter_error = str(exc)
 
         payload = self._grid_payload(key, device, mgmt, adapter_error)
@@ -3003,6 +3004,7 @@ def _residue_matchers():
     opaque SHA-256 label the export publishes (never the community string), so no
     secret is involved anywhere in the residue path.
     """
+    from .delivery import delivery_keys
 
     def _iface(r):
         return (r.interface.name,)
@@ -3053,12 +3055,12 @@ def _residue_matchers():
                 ("snmp_data.hosts", "host", lambda r: (r.address or "",)),
             ],
         ),
-        # #104 phase-3: interface_config residue is VALUE-grain — the adapter reports
+        # #104 phase-3: interface receipt residue is value-grain. The adapter reports
         # the removed (interface, address, vrf) triples that survived the retraction.
         # The key is the ADAPTER's removal scope (VALID_REMOVAL_SCOPES), not the plugin's
         # outbound delivery key "ip"; card #1591 owns unifying the two vocabularies.
         "interface_ips": (
-            "interface_config",
+            delivery_keys()["interface"].section,
             [("interface_ips", "address", lambda r: (r.interface.name, r.address, r.vrf or ""))],
             _norm_ip_triple,
         ),
