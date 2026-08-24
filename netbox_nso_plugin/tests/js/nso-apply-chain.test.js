@@ -72,15 +72,25 @@ describe("pollUrl", () => {
 });
 
 describe("pollRequestOptions", () => {
+  const platformTimeout = AbortSignal.timeout;
+
   it("bounds each generation-chain request to ten seconds", () => {
     const signal = {};
     const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(signal);
 
-    expect(C.pollRequestOptions()).toEqual({
-      headers: { "X-Requested-With": "XMLHttpRequest" },
-      signal,
-    });
-    expect(timeout).toHaveBeenCalledWith(10_000);
+    try {
+      expect(C.pollRequestOptions()).toEqual({
+        headers: { "X-Requested-With": "XMLHttpRequest" },
+        signal,
+      });
+      expect(timeout).toHaveBeenCalledWith(10_000);
+    } finally {
+      timeout.mockRestore();
+    }
+  });
+
+  it("leaves the platform timeout implementation intact", () => {
+    expect(AbortSignal.timeout).toBe(platformTimeout);
   });
 });
 
