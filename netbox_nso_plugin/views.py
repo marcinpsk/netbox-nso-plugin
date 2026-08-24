@@ -2912,6 +2912,8 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
         outcome = result.get("outcome")
         expected_selected, skipped, partition_error = _apply_stream_partition(result, selected)
         if partition_error:
+            if outcome == "no_op":
+                _rollback_prepare_apply(prepared)
             return self._apply_unreadable_response(request, mgmt, partition_error, is_ajax=is_ajax)
         if outcome == "no_op":
             if set(skipped) != set(expected_selected) or result.get("generations") != []:

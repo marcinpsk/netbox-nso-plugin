@@ -573,6 +573,39 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "accepted")
 
+    def test_no_op_with_malformed_skip_results_rolls_back_prepared_rows(self):
+        from netbox_nso_plugin.views import NSODeviceActionView, _prepare_apply
+
+        def malformed_no_op(selected):
+            result = _no_op(selected)
+            result["skipped"] = None
+            return result
+
+        adapter = _ApplyContractAdapter(lambda selected: (202, malformed_no_op(selected)))
+        config, session = adapter.patches()
+        with config, session:
+            prepared, selected = _prepare_apply(self.mgmt)
+
+        self.vlan_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "deploying")
+        response = NSODeviceActionView()._apply_result(
+            RequestFactory().post("/"),
+            self.mgmt,
+            malformed_no_op(dict(selected)),
+            prepared,
+            selected,
+            label="Apply",
+            is_ajax=True,
+        )
+
+        self.assertEqual(response.status_code, 502)
+        self.assertJSONEqual(
+            response.content,
+            {"status": "error", "message": "Adapter returned invalid Apply skip results."},
+        )
+        self.vlan_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "accepted")
+
     def test_promoted_apply_rolls_back_a_skipped_stream_without_rolling_back_its_generation(self):
         from netbox_nso_plugin.models import NSOLoggingLevelState
 
