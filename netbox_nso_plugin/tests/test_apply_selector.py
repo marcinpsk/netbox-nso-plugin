@@ -7,7 +7,7 @@ from __future__ import annotations
 from dcim.models import Interface
 from django.contrib.auth import get_user_model
 from django.db import DatabaseError, connection, transaction
-from django.test import SimpleTestCase, TransactionTestCase
+from django.test import RequestFactory, SimpleTestCase, TransactionTestCase
 from django.urls import reverse
 from requests.exceptions import ConnectionError
 
@@ -537,6 +537,39 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         selected_receipts = list(adapter.receipts.values())
         self.assertEqual(len(selected_receipts), len(adapter.apply_requests[0]["selected"]))
         self.assertTrue(all(receipt["params"] == {"store_only": "true"} for receipt in selected_receipts))
+        self.vlan_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "accepted")
+
+    def test_no_op_with_incomplete_skip_results_rolls_back_prepared_rows(self):
+        from netbox_nso_plugin.views import NSODeviceActionView, _prepare_apply
+
+        def incomplete_no_op(selected):
+            result = _no_op(selected)
+            result["skipped"].pop("vlan")
+            return result
+
+        adapter = _ApplyContractAdapter(lambda selected: (202, incomplete_no_op(selected)))
+        config, session = adapter.patches()
+        with config, session:
+            prepared, selected = _prepare_apply(self.mgmt)
+
+        self.vlan_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "deploying")
+        response = NSODeviceActionView()._apply_result(
+            RequestFactory().post("/"),
+            self.mgmt,
+            incomplete_no_op(dict(selected)),
+            prepared,
+            selected,
+            label="Apply",
+            is_ajax=True,
+        )
+
+        self.assertEqual(response.status_code, 502)
+        self.assertJSONEqual(
+            response.content,
+            {"status": "error", "message": "Adapter returned incomplete Apply skip results."},
+        )
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "accepted")
 
