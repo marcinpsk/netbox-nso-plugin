@@ -2915,6 +2915,7 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
             return self._apply_unreadable_response(request, mgmt, partition_error, is_ajax=is_ajax)
         if outcome == "no_op":
             if set(skipped) != set(expected_selected) or result.get("generations") != []:
+                _rollback_prepare_apply(prepared)
                 return self._apply_unreadable_response(
                     request, mgmt, "Adapter returned incomplete Apply skip results.", is_ajax=is_ajax
                 )

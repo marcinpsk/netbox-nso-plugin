@@ -69,6 +69,21 @@ describe("pollUrl", () => {
     expect(new URL(url).searchParams.getAll("generation_id")).toEqual(["81", "82"]);
     expect(new URL(url).searchParams.get("since_seq")).toBe("80");
   });
+
+  it("omits since_seq when any generation has no usable sequence", () => {
+    for (const generations of [
+      [{ generation_id: 81 }],
+      [{ generation_id: 81, seq: 0 }],
+      [{ generation_id: 81, seq: 1 }, { generation_id: 82 }],
+    ]) {
+      const url = new URL(C.pollUrl("https://netbox.example/plugins/nso/devices/10/jobs/", generations));
+
+      expect(url.searchParams.getAll("generation_id")).toEqual(
+        generations.map(({ generation_id }) => String(generation_id)),
+      );
+      expect(url.searchParams.has("since_seq")).toBe(false);
+    }
+  });
 });
 
 describe("pollRequestOptions", () => {
