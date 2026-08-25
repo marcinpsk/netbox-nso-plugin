@@ -2698,7 +2698,7 @@ def _prepare_apply(mgmt):
 
     Refresh every adapter intent mirror with store-only pushes first. LACP and
     switchport are owned in NetBox, so push their device snapshots only after
-    every store-only push succeeds. Then move owned 'accepted' overlays →
+    every store-only push succeeds. Then move owned 'accepted' or 'apply_failed' overlays →
     'deploying' so they read as "applying" and settle to 'in_sync' on the next
     reconcile once the device reflects them (VLAN value-aware; SVI/subif/BFD when
     re-reported). ``.update()`` avoids firing the per-row push signal.
@@ -2812,19 +2812,19 @@ def _prepare_apply(mgmt):
 
 
 def _rollback_prepare_apply(moved, *, keep_streams=()) -> None:
-    """Revert accepted→deploying marks for streams without an enqueued generation.
+    """Restore pre-Apply statuses for streams without an enqueued generation.
 
     Only the rows THIS Apply moved are reverted (by pk), so a genuinely in-flight 'deploying'
-    row from a prior Apply is left untouched. Reverting to 'accepted' is safe — an accepted row
-    still settles to in_sync on the next reconcile once the device matches; leaving it 'deploying'
-    with no apply job would strand it as 'applying' forever (nothing settles it).
+    row from a prior Apply is left untouched. Restoring the source status preserves whether the
+    row was pending its first Apply or retrying a failed one. Leaving it 'deploying' with no apply
+    job would strand it as 'applying' forever because nothing can settle it.
     """
     keep_streams = set(keep_streams)
-    for section, model, pks in moved or []:
+    for section, model, pks, previous_status in moved or []:
         if section in keep_streams:
             continue
         try:
-            model.objects.filter(pk__in=pks, status="deploying").update(status="accepted")
+            model.objects.filter(pk__in=pks, status="deploying").update(status=previous_status)
         except Exception as exc:  # noqa: BLE001 — best-effort rollback; log and move on
             logger.warning("Apply rollback failed: %s", exc)
 

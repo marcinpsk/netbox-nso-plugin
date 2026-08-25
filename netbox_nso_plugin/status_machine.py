@@ -32,7 +32,7 @@ Write side (operator-driven):
   ``accepted``     operator owns the row; intent pushed to the adapter; pending Apply.
   ``deploying``    Apply in flight (marker set by the Apply action / ``_prepare_apply``).
   ``in_sync``      applied and the device re-reports the matching value.
-  ``apply_failed`` the apply errored; retryable via Accept.
+  ``apply_failed`` the apply errored; retryable via Accept or Apply.
   ``error``        unexpected exception during reconcile; recovers on the next good read.
 """
 
@@ -184,6 +184,7 @@ TRANSITIONS: tuple[Transition, ...] = (
     Transition(REVERT, APPLY_FAILED, IMPORTED, True, "operator un-accepts a failed apply instead of retrying"),
     # -- operator: apply ------------------------------------------------------
     Transition(APPLY, ACCEPTED, DEPLOYING, True, "_prepare_apply marks owned accepted→deploying"),
+    Transition(APPLY, APPLY_FAILED, DEPLOYING, True, "_prepare_apply retries a failed owned row"),
     Transition(APPLY_OK, DEPLOYING, IN_SYNC, True, "apply worker reported success"),
     Transition(APPLY_ERR, DEPLOYING, APPLY_FAILED, True, "apply worker reported a per-intent failure"),
     # A correlated settlement may settle a row that never passed through ``deploying``:
@@ -259,7 +260,7 @@ def allowed(event: str, src: str, *, implemented_only: bool = False) -> frozense
 # caller plus flipping ``implemented=True``; ``advance`` already permits it.
 #
 # Today every call site does a raw ``state.status = "..."`` with no check, so an
-# illegal jump (a reconcile clobbering an owned row, an apply from an un-accepted
+# illegal jump (a reconcile clobbering an owned row, an apply from an unowned
 # row) corrupts state silently. Routing through ``advance`` turns each of those
 # into a raised error at the source.
 

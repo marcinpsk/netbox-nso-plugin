@@ -294,6 +294,32 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         self.assertFalse(VLAN.objects.filter(pk=per_device_vlan.pk).exists())
         self.assertEqual(VLAN.objects.filter(group=site, vid=41).count(), 1)
 
+    def test_rescope_merge_repends_an_owned_placeholder_when_its_wire_name_changes(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database, rescope_vlan
+
+        (source_state,) = reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 41, "name": ""}]})
+        NSOVLANState.objects.filter(pk=source_state.pk).update(status="in_sync")
+        source_state.refresh_from_db()
+        target_group = VLANGroup.objects.create(name="Rendered Name Target", slug="rendered-name-target")
+        target_vlan = VLAN.objects.create(group=target_group, vid=41, name=source_state.vlan.name)
+        target_state = NSOVLANState.objects.create(
+            management=self.management,
+            vlan=target_vlan,
+            device_name=target_vlan.name,
+            status="in_sync",
+        )
+        NSODeviceManagement.objects.filter(pk=self.management.pk).update(adapter_device_id=41)
+
+        with patch("netbox_nso_plugin.signals._schedule_intent_push") as schedule:
+            action, surviving = rescope_vlan(source_state, target_group)
+
+        self.assertEqual((action, surviving.pk), ("merged", target_vlan.pk))
+        target_state.refresh_from_db()
+        self.assertEqual(target_state.status, "accepted")
+        schedule.assert_called_once_with((self.device.pk, "vlan"))
+
     def test_rescope_noop_same_group(self):
         from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database, rescope_vlan
 

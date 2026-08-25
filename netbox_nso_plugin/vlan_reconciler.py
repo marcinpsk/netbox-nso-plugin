@@ -63,6 +63,11 @@ def is_placeholder_vlan_name(row) -> bool:
     return not row.device_name and row.vlan is not None and row.vlan.name == placeholder_vlan_name(row.vlan.vid)
 
 
+def rendered_vlan_name(row) -> str:
+    """Return the VLAN name emitted by the owned-intent snapshot."""
+    return "" if is_placeholder_vlan_name(row) else (row.vlan.name or "")
+
+
 def _resolve_synced_vlan(management, group, vid, *, name=None, create=True):
     """Return the ipam.VLAN this device's *vid* is synced to.
 
@@ -96,8 +101,7 @@ def lock_vlan_reconcile_dependencies(device, payload: dict) -> None:
     from ipam.models import VLAN
 
     from .apply_state import (
-        lock_device_vlan_membership_transaction,
-        lock_vlan_intent_transaction,
+        lock_native_vlan_dependency_rows,
         vlan_ids_for_dependency_lock,
     )
     from .models import NSODeviceManagement, NSOVLANState
@@ -105,14 +109,15 @@ def lock_vlan_reconcile_dependencies(device, payload: dict) -> None:
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:
         return
-    lock_device_vlan_membership_transaction(device.pk)
     items = payload.get("vlans", []) or [] if isinstance(payload, dict) else []
     vids = vlan_ids_for_dependency_lock(items)
-    vlan_ids = set(NSOVLANState.objects.filter(management=management).values_list("vlan_id", flat=True))
-    vlan_ids.update(VLAN.objects.filter(group__slug=f"nso-{device.pk}", vid__in=vids).values_list("pk", flat=True))
-    for vlan_id in sorted(vlan_ids):
-        lock_vlan_intent_transaction(vlan_id)
-    list(VLAN.objects.select_for_update(of=("self",)).filter(pk__in=vlan_ids).order_by("pk"))
+
+    def collect_vlan_ids():
+        vlan_ids = set(NSOVLANState.objects.filter(management=management).values_list("vlan_id", flat=True))
+        vlan_ids.update(VLAN.objects.filter(group__slug=f"nso-{device.pk}", vid__in=vids).values_list("pk", flat=True))
+        return vlan_ids
+
+    lock_native_vlan_dependency_rows(device.pk, collect_vlan_ids)
 
 
 def lock_switchport_reconcile_dependencies(device, payload: dict) -> None:
@@ -120,8 +125,7 @@ def lock_switchport_reconcile_dependencies(device, payload: dict) -> None:
     from ipam.models import VLAN
 
     from .apply_state import (
-        lock_device_vlan_membership_transaction,
-        lock_vlan_intent_transaction,
+        lock_native_vlan_dependency_rows,
         vlan_ids_for_dependency_lock,
     )
     from .models import NSODeviceManagement, NSOSwitchportState, NSOVLANState
@@ -129,19 +133,20 @@ def lock_switchport_reconcile_dependencies(device, payload: dict) -> None:
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:
         return
-    lock_device_vlan_membership_transaction(device.pk)
     items = payload.get("interfaces", []) or [] if isinstance(payload, dict) else []
     vids = vlan_ids_for_dependency_lock(items, "untagged_vlan", "tagged_vlans")
-    states = list(NSOSwitchportState.objects.filter(management=management).prefetch_related("tagged_vlans"))
-    vlan_ids = {state.untagged_vlan_id for state in states if state.untagged_vlan_id is not None}
-    vlan_ids.update(vlan.pk for state in states for vlan in state.tagged_vlans.all())
-    vlan_ids.update(
-        NSOVLANState.objects.filter(management=management, vlan__vid__in=vids).values_list("vlan_id", flat=True)
-    )
-    vlan_ids.update(VLAN.objects.filter(group__slug=f"nso-{device.pk}", vid__in=vids).values_list("pk", flat=True))
-    for vlan_id in sorted(vlan_ids):
-        lock_vlan_intent_transaction(vlan_id)
-    list(VLAN.objects.select_for_update(of=("self",)).filter(pk__in=vlan_ids).order_by("pk"))
+
+    def collect_vlan_ids():
+        states = list(NSOSwitchportState.objects.filter(management=management).prefetch_related("tagged_vlans"))
+        vlan_ids = {state.untagged_vlan_id for state in states if state.untagged_vlan_id is not None}
+        vlan_ids.update(vlan.pk for state in states for vlan in state.tagged_vlans.all())
+        vlan_ids.update(
+            NSOVLANState.objects.filter(management=management, vlan__vid__in=vids).values_list("vlan_id", flat=True)
+        )
+        vlan_ids.update(VLAN.objects.filter(group__slug=f"nso-{device.pk}", vid__in=vids).values_list("pk", flat=True))
+        return vlan_ids
+
+    lock_native_vlan_dependency_rows(device.pk, collect_vlan_ids)
 
 
 def _rescope_managed_device_ids(old_vlan) -> set[int]:
@@ -176,7 +181,6 @@ def _merge_vlan_references(old_vlan, existing) -> set[tuple[int, str]]:
     from .signals import suppress_intent_push
 
     push_targets = set()
-    rendered_name_changed = old_vlan.name != existing.name
     with suppress_intent_push():
         Interface.objects.filter(untagged_vlan=old_vlan).update(untagged_vlan=existing)
         for interface in Interface.objects.filter(tagged_vlans=old_vlan):
@@ -191,14 +195,16 @@ def _merge_vlan_references(old_vlan, existing) -> set[tuple[int, str]]:
         locked_states = list(
             NSOVLANState.objects.select_for_update(of=("self",))
             .filter(vlan_id__in=(old_vlan.pk, existing.pk))
-            .select_related("management")
+            .select_related("management", "vlan")
             .order_by("pk")
         )
         target_states = {state.management_id: state for state in locked_states if state.vlan_id == existing.pk}
         for vlan_state in (state for state in locked_states if state.vlan_id == old_vlan.pk):
             was_owned = sm.is_owned(vlan_state.status)
+            source_rendered_name = rendered_vlan_name(vlan_state)
             surviving_state = target_states.get(vlan_state.management_id)
             if surviving_state is not None:
+                rendered_name_changed = source_rendered_name != rendered_vlan_name(surviving_state)
                 transfer_ownership = was_owned and not sm.is_owned(surviving_state.status)
                 if was_owned and (rendered_name_changed or transfer_ownership):
                     surviving_state.status = (
@@ -208,6 +214,7 @@ def _merge_vlan_references(old_vlan, existing) -> set[tuple[int, str]]:
                 vlan_state.delete()
             else:
                 vlan_state.vlan = existing
+                rendered_name_changed = source_rendered_name != rendered_vlan_name(vlan_state)
                 update_fields = ["vlan"]
                 if rendered_name_changed:
                     vlan_state.status = (
