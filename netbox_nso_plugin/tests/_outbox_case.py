@@ -17,6 +17,7 @@ import dataclasses
 import hashlib
 import json
 import re
+import threading
 from unittest.mock import MagicMock, patch
 
 import requests
@@ -157,6 +158,15 @@ def in_thread(work, timeout=30):
         raise errors[0]
 
 
+_commit_drain_patch_lock = threading.Lock()
+_commit_drain_patch_depth = 0
+_commit_drain_original = None
+
+
+def _suppressed_commit_drain(*args, **kwargs):
+    return None
+
+
 @contextlib.contextmanager
 def without_commit_drain():
     """Leave the key's entries unconsumed by silencing the commit callback.
@@ -168,8 +178,22 @@ def without_commit_drain():
     (``test_intent_outbox_swap``); silencing it here is about arranging the world, never
     about what the drain does with it.
     """
-    with patch("netbox_nso_plugin.signals._drain_intent_pushes"):
+    from netbox_nso_plugin import signals
+
+    global _commit_drain_original, _commit_drain_patch_depth
+    with _commit_drain_patch_lock:
+        if _commit_drain_patch_depth == 0:
+            _commit_drain_original = signals._drain_intent_pushes
+            signals._drain_intent_pushes = _suppressed_commit_drain
+        _commit_drain_patch_depth += 1
+    try:
         yield
+    finally:
+        with _commit_drain_patch_lock:
+            _commit_drain_patch_depth -= 1
+            if _commit_drain_patch_depth == 0:
+                signals._drain_intent_pushes = _commit_drain_original
+                _commit_drain_original = None
 
 
 def partition(*, executed=(), degraded=(), moot=(), removed=()) -> dict:

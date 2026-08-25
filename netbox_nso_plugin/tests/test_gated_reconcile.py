@@ -442,4 +442,4 @@ class TestCategoryViewSkipFallback(TestCase):
         live_read.assert_not_called()  # the window blocks the live read, it never 500s
         html = resp.content.decode()
         self.assertIn("lag-60:390", html)  # persisted state renders under the banner
-        self.assertIn("quiesced", html)
+        self.assertIn("Intent deployment is temporarily unavailable. See the server log.", html)

@@ -1430,6 +1430,67 @@ class TestNSODeviceActionView(ViewTestBase):
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config")
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_post_conflict_does_not_reflect_an_invalid_job_id(self, mock_session_cls, mock_cfg):
+        supplied = "Traceback: private job path"
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_device_id=10)
+        mock_cfg.return_value = {
+            "url": "http://adapter",
+            "token": "tok",
+            "verify_tls": True,
+            "ca_cert_path": None,
+            "timeout": 30,
+        }
+        mock_session_cls.return_value = make_session(
+            response=make_response(
+                409,
+                json_data={
+                    "error": {
+                        "code": "conflict",
+                        "message": "busy",
+                        "detail": {"job_id": supplied},
+                    }
+                },
+            )
+        )
+
+        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[self.mgmt.pk, "sync"])
+        response = self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["job_id"], None)
+        self.assertNotIn(supplied, response.content.decode())
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config")
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_post_conflict_does_not_reflect_an_invalid_job_type(self, mock_session_cls, mock_cfg):
+        supplied = "private_adapter_job"
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_device_id=10)
+        mock_cfg.return_value = {
+            "url": "http://adapter",
+            "token": "tok",
+            "verify_tls": True,
+            "ca_cert_path": None,
+            "timeout": 30,
+        }
+        session = make_session()
+        session.request.side_effect = [
+            make_response(
+                409,
+                json_data={"error": {"code": "conflict", "message": "busy", "detail": {"job_id": 3}}},
+            ),
+            make_response(200, json_data={"id": 3, "type": supplied, "status": "queued"}),
+        ]
+        mock_session_cls.return_value = session
+
+        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[self.mgmt.pk, "sync"])
+        response = self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIsNone(response.json()["job_type"])
+        self.assertNotIn(supplied, response.content.decode())
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config")
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_post_sync_success_no_job_id(self, mock_session_cls, mock_cfg):
         """Non-AJAX POST sync with no job_id in response shows generic success message."""
         mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
@@ -5420,7 +5481,7 @@ class TestNSOAdapterLinkRetryView(ViewTestBase):
         onboard.assert_not_called()
         self.mgmt.refresh_from_db()
         self.assertEqual(self.mgmt.adapter_device_id, 196)  # mapping left alone
-        self.assertIn("adapter down", self.mgmt.adapter_link_error)
+        self.assertEqual(self.mgmt.adapter_link_error, "The NSO adapter request failed. See the server log.")
 
     def test_retry_failure_refreshes_error(self):
         NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(
@@ -5433,8 +5494,25 @@ class TestNSOAdapterLinkRetryView(ViewTestBase):
             resp = self.client.post(self._url())
         self.assertEqual(resp.status_code, 302)
         self.mgmt.refresh_from_db()
-        self.assertIn("still down", self.mgmt.adapter_link_error)  # surfaced for the banner
+        self.assertEqual(self.mgmt.adapter_link_error, "The NSO adapter request failed. See the server log.")
         self.assertIsNone(self.mgmt.adapter_device_id)  # still unlinked
+
+
+class TestNSOIntentResyncView(ViewTestBase):
+    def test_unexpected_failure_uses_a_fixed_public_message(self):
+        from django.contrib.messages import get_messages
+
+        supplied = "Traceback: private resync path"
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_device_id=196)
+        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_intent_resync", args=[self.mgmt.pk])
+
+        with patch("netbox_nso_plugin.intent_drift.resync_intent", side_effect=RuntimeError(supplied)):
+            response = self.client.post(url)
+
+        rendered = " ".join(str(message) for message in get_messages(response.wsgi_request))
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("Intent re-sync failed. See the server log.", rendered)
+        self.assertNotIn(supplied, rendered)
 
 
 class TestBfdGrid(ViewTestBase):
@@ -5757,7 +5835,8 @@ class TestUnlinkedReconcileOnExpandCategories(ViewTestBase):
             resp = self._get("logging")
 
         body = resp.content.decode()
-        self.assertIn("adapter is down", body)  # the banner
+        self.assertIn("The NSO adapter request failed. See the server log.", body)
+        self.assertNotIn("adapter is down", body)
         self.assertNotIn("No remote syslog servers configured", body)
         self.assertIn("192.0.2.99", body)  # persisted rows still render
 

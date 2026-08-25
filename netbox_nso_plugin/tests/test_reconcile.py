@@ -1169,9 +1169,7 @@ class TestSnmpApplyForcePush(_CascadeFlushMixin, IntentPushResetMixin, Transacti
 
 
 class TestApplyRollbackOnAdapterError(APITestCase):
-    """A failed Apply (adapter unreachable / 500 — no job enqueued) must roll the rows
-    _prepare_apply moved accepted→deploying back to accepted. Otherwise they are stuck
-    'applying' forever: no apply job exists for _settle_apply_failures to ever settle."""
+    """Apply rollback follows whether the POST definitely failed before enqueue."""
 
     def _setup(self):
         from netbox_nso_plugin.models import NSORoutePolicyState
@@ -1188,25 +1186,55 @@ class TestApplyRollbackOnAdapterError(APITestCase):
         )
         return mgmt, row
 
-    def test_non_conflict_adapter_error_rolls_back_deploying(self):
+    def _post_with_error(self, mgmt, error):
         from django.contrib.auth import get_user_model
 
-        from netbox_nso_plugin.adapter_client import AdapterError
-
-        mgmt, row = self._setup()
         admin = get_user_model().objects.create_superuser(username="apply-rb-admin", password="pw", email="a@x.y")  # noqa: S106
         self.client.force_login(admin)
         with (
             _patch_apply_pushes(),
             patch(
                 "netbox_nso_plugin.adapter_client.trigger_apply",
-                side_effect=AdapterError("adapter unreachable", code="unreachable"),
+                side_effect=error,
             ),
         ):
-            resp = self.client.post(f"/plugins/nso/device-management/{mgmt.pk}/actions/apply/")
+            return self.client.post(f"/plugins/nso/device-management/{mgmt.pk}/actions/apply/")
+
+    def test_an_ambiguous_transport_failure_keeps_deploying_for_reconciliation(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+
+        mgmt, row = self._setup()
+        resp = self._post_with_error(mgmt, AdapterError("socket closed after send", code="nso_unreachable"))
+
         self.assertEqual(resp.status_code, 302)
         row.refresh_from_db()
-        self.assertEqual(row.status, "accepted")  # rolled back — NOT stuck in deploying
+        self.assertEqual(row.status, "deploying")
+
+    def test_an_ambiguous_http_server_error_keeps_deploying_for_reconciliation(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+
+        mgmt, row = self._setup()
+        resp = self._post_with_error(
+            mgmt,
+            AdapterError("gateway failed after forwarding Apply", code="bad_gateway", status_code=502),
+        )
+
+        self.assertEqual(resp.status_code, 302)
+        row.refresh_from_db()
+        self.assertEqual(row.status, "deploying")
+
+    def test_a_definite_http_client_rejection_rolls_back_deploying(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+
+        mgmt, row = self._setup()
+        resp = self._post_with_error(
+            mgmt,
+            AdapterError("adapter rejected the request shape", code="validation_error", status_code=422),
+        )
+
+        self.assertEqual(resp.status_code, 302)
+        row.refresh_from_db()
+        self.assertEqual(row.status, "accepted")
 
 
 class TestApplyPreviewInterfaceScope(APITestCase):

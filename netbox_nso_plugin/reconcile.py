@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 
+from .apply_state import APPLY_DEPLOYING_MODEL_NAMES
 from .deployment import guarded as _deployment_guarded
 
 logger = logging.getLogger(__name__)
@@ -142,7 +143,17 @@ def _acquire_reconcile_lease(mgmt, device_pk: int, call_class: str) -> _LeaseOut
     return _LeaseOutcome(lease=out)
 
 
-def _gated(ctx: dict, mgmt, family: str, payload, body, *, epoch, ctx_key: str | None = None):
+def _gated(
+    ctx: dict,
+    mgmt,
+    family: str,
+    payload,
+    body,
+    *,
+    epoch,
+    ctx_key: str | None = None,
+    pre_body=None,
+):
     """Gate ONE family document (D9): record the disposition, run *body* iff admitted.
 
     ``payload`` is the fetched family document; its ``read_state`` key (absent on a
@@ -160,7 +171,7 @@ def _gated(ctx: dict, mgmt, family: str, payload, body, *, epoch, ctx_key: str |
         read_state = {}
     context_before = dict(ctx)
     try:
-        result = gated_family_run(mgmt, family, read_state, body, epoch=epoch)
+        result = gated_family_run(mgmt, family, read_state, body, epoch=epoch, pre_body=pre_body)
     except ReconcileScopeError as exc:
         from .read_gate import (
             SKIPPED_STALE_ATTEMPT,
@@ -195,6 +206,23 @@ def _gated(ctx: dict, mgmt, family: str, payload, body, *, epoch, ctx_key: str |
     if ctx_key is not None and result.disposition in (RAN, LEGACY):
         ctx[ctx_key] = result.value
     return result
+
+
+def _lock_native_vlan_dependencies(device, payload, family: str) -> None:
+    """Take shared native-object fences before one device publication lock."""
+    if family == "vlan":
+        from .vlan_reconciler import lock_vlan_reconcile_dependencies
+
+        lock_vlan_reconcile_dependencies(device, payload)
+        return
+    if family == "switchport":
+        from .vlan_reconciler import lock_switchport_reconcile_dependencies
+
+        lock_switchport_reconcile_dependencies(device, payload)
+        return
+    from .svi_reconciler import lock_svi_reconcile_dependencies
+
+    lock_svi_reconcile_dependencies(device, payload)
 
 
 def _mark_all_gated(ctx: dict, families, disposition: str) -> None:
@@ -501,6 +529,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                 svi_doc,
                 lambda: _safe_reconcile(ctx, "svi_states", mgmt, ("NSOSVIState",), reconcile_svi, device, svi_doc),
                 epoch=dev_id,
+                pre_body=lambda: _lock_native_vlan_dependencies(device, svi_doc, "svi"),
             )
             # materialise dot1q subinterfaces (virtual interface + Interface.parent
             # link) BEFORE the IP reconcile, for the same ordering reason as SVIs.
@@ -584,6 +613,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                     ctx, "vlan_states", mgmt, ("NSOVLANState",), reconcile_vlan_database, device, vlan_doc
                 ),
                 epoch=dev_id,
+                pre_body=lambda: _lock_native_vlan_dependencies(device, vlan_doc, "vlan"),
             )
             sw_doc = client.get_switchport(dev_id)
             _gated(
@@ -595,6 +625,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                     ctx, "switchport_states", mgmt, ("NSOSwitchportState",), reconcile_switchport, device, sw_doc
                 ),
                 epoch=dev_id,
+                pre_body=lambda: _lock_native_vlan_dependencies(device, sw_doc, "switchport"),
             )
         if mgmt.manage_snmp:
             snmp_doc = client.get_snmp_config(dev_id)
@@ -732,7 +763,14 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 ctx["state"] = fetched_state
             svi_doc = client.get_svi(dev_id)  # before IPs
             _gated(
-                ctx, mgmt, "svi", svi_doc, lambda: reconcile_svi(device, svi_doc), epoch=dev_id, ctx_key="svi_states"
+                ctx,
+                mgmt,
+                "svi",
+                svi_doc,
+                lambda: reconcile_svi(device, svi_doc),
+                epoch=dev_id,
+                ctx_key="svi_states",
+                pre_body=lambda: _lock_native_vlan_dependencies(device, svi_doc, "svi"),
             )
             sub_doc = client.get_subinterface(dev_id)
             _gated(
@@ -766,7 +804,15 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
             )
             # VLAN DB first so switchport vid lookups resolve in the per-device group.
             vlan_doc = client.get_vlan_database(dev_id)
-            _gated(ctx, mgmt, "vlan", vlan_doc, lambda: reconcile_vlan_database(device, vlan_doc), epoch=dev_id)
+            _gated(
+                ctx,
+                mgmt,
+                "vlan",
+                vlan_doc,
+                lambda: reconcile_vlan_database(device, vlan_doc),
+                epoch=dev_id,
+                pre_body=lambda: _lock_native_vlan_dependencies(device, vlan_doc, "vlan"),
+            )
             sw_doc = client.get_switchport(dev_id)
             _gated(
                 ctx,
@@ -776,6 +822,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_switchport(device, sw_doc),
                 epoch=dev_id,
                 ctx_key="switchport_states",
+                pre_body=lambda: _lock_native_vlan_dependencies(device, sw_doc, "switchport"),
             )
         elif key == "interfaces":
             from .subinterface_reconciler import reconcile_subinterface
@@ -798,7 +845,14 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 ctx["state"] = fetched_state
             svi_doc = client.get_svi(dev_id)  # before IPs
             _gated(
-                ctx, mgmt, "svi", svi_doc, lambda: reconcile_svi(device, svi_doc), epoch=dev_id, ctx_key="svi_states"
+                ctx,
+                mgmt,
+                "svi",
+                svi_doc,
+                lambda: reconcile_svi(device, svi_doc),
+                epoch=dev_id,
+                ctx_key="svi_states",
+                pre_body=lambda: _lock_native_vlan_dependencies(device, svi_doc, "svi"),
             )
             sub_doc = client.get_subinterface(dev_id)
             _gated(
@@ -826,7 +880,14 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
 
             svi_doc = client.get_svi(dev_id)  # SVIs exist before IPs
             _gated(
-                ctx, mgmt, "svi", svi_doc, lambda: reconcile_svi(device, svi_doc), epoch=dev_id, ctx_key="svi_states"
+                ctx,
+                mgmt,
+                "svi",
+                svi_doc,
+                lambda: reconcile_svi(device, svi_doc),
+                epoch=dev_id,
+                ctx_key="svi_states",
+                pre_body=lambda: _lock_native_vlan_dependencies(device, svi_doc, "svi"),
             )
             sub_doc = client.get_subinterface(dev_id)
             _gated(
@@ -873,13 +934,22 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_vlan_database(device, vlan_doc),
                 epoch=dev_id,
                 ctx_key="vlan_states",
+                pre_body=lambda: _lock_native_vlan_dependencies(device, vlan_doc, "vlan"),
             )
         elif key == "switchport":
             from .vlan_reconciler import reconcile_switchport, reconcile_vlan_database
 
             # VLAN DB first so switchport vid lookups resolve in the per-device group.
             vlan_doc = client.get_vlan_database(dev_id)
-            _gated(ctx, mgmt, "vlan", vlan_doc, lambda: reconcile_vlan_database(device, vlan_doc), epoch=dev_id)
+            _gated(
+                ctx,
+                mgmt,
+                "vlan",
+                vlan_doc,
+                lambda: reconcile_vlan_database(device, vlan_doc),
+                epoch=dev_id,
+                pre_body=lambda: _lock_native_vlan_dependencies(device, vlan_doc, "vlan"),
+            )
             sw_doc = client.get_switchport(dev_id)
             _gated(
                 ctx,
@@ -889,13 +959,21 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_switchport(device, sw_doc),
                 epoch=dev_id,
                 ctx_key="switchport_states",
+                pre_body=lambda: _lock_native_vlan_dependencies(device, sw_doc, "switchport"),
             )
         elif key == "svi":
             from .svi_reconciler import reconcile_svi
 
             svi_doc = client.get_svi(dev_id)
             _gated(
-                ctx, mgmt, "svi", svi_doc, lambda: reconcile_svi(device, svi_doc), epoch=dev_id, ctx_key="svi_states"
+                ctx,
+                mgmt,
+                "svi",
+                svi_doc,
+                lambda: reconcile_svi(device, svi_doc),
+                epoch=dev_id,
+                ctx_key="svi_states",
+                pre_body=lambda: _lock_native_vlan_dependencies(device, svi_doc, "svi"),
             )
         elif key == "subinterface":
             from .subinterface_reconciler import reconcile_subinterface
@@ -1053,28 +1131,14 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
 
 _RECONCILE_QUEUE = "default"
 
-# Scopes that move owned rows accepted→deploying on Apply (views._prepare_apply), so a
-# stuck 'deploying' is the failure signal. scope key → NSO*State model attribute name.
+# Coarse settlement applies to the shared Apply-in-flight registry except static routes.
 _APPLY_DEPLOYING_SCOPES = {
-    "vlan": "NSOVLANState",
-    "svi": "NSOSVIState",
-    "subinterface": "NSOSubinterfaceState",
-    "bfd": "NSOBFDInterfaceState",
-    "interface_mtu": "NSOInterfaceMtuState",
-    "route_policy": "NSORoutePolicyState",
-    # "static_route" deliberately absent (#1502 Appendix S): a static-route row is settled
-    # by the generation-correlated settlement consumer, which knows WHICH intent the result
-    # is about. The two coarse channels here do not — a scope counter says the apply
-    # succeeded, not that it carried this row's generation — so both were writing verdicts
-    # on evidence they did not have. `_escalate_stuck_static_routes` is the backstop half's
-    # replacement, and it runs only after the consumer has walked the feed.
-    "l2_sap": "NSOL2SapState",
-    # Levels only — NSOLoggingHostState still settles via reconcile-matching alone
-    # (the pre-existing family behavior). The levels singleton needs the failure leg:
-    # a CLOSED adapter write-gate fails the whole logging scope by design (NX-P4a),
-    # and without apply_failed surfacing the row would read accepted/green forever.
-    "logging": "NSOLoggingLevelState",
+    scope: model_name for scope, model_name in APPLY_DEPLOYING_MODEL_NAMES.items() if scope != "static_route"
 }
+
+# Static routes deliberately stay outside the coarse map (#1502 Appendix S). Their
+# generation-correlated consumer knows which intent a result describes. A scope counter
+# says only that an Apply succeeded, not that it carried this row's generation.
 
 
 _GENERIC_APPLY_ERROR = "Apply reported a failure for this scope (see the adapter apply job)."

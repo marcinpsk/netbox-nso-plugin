@@ -93,7 +93,16 @@ REJECTED = "rejected"
 
 WITHHELD = "withheld"
 
-_SUCCESSFUL_PUSHES: ContextVar[dict[str, int] | None] = ContextVar("nso_successful_pushes", default=None)
+
+@dataclasses.dataclass(frozen=True)
+class SuccessfulPush:
+    """A caller-owned receipt and the exact plugin-side intent identity it stored."""
+
+    push_seq: int
+    identity: str
+
+
+_SUCCESSFUL_PUSHES: ContextVar[dict[str, SuccessfulPush] | None] = ContextVar("nso_successful_pushes", default=None)
 
 #: Why a durable ``degraded_deletions`` record was written. Never cleared by a push outcome:
 #: only the explicit operator acknowledgement clears either of them.
@@ -177,7 +186,7 @@ class ClaimFlags:
 @contextmanager
 def capture_successful_pushes():
     """Collect each caller-owned claim that settles successfully inside this block."""
-    pushed: dict[str, int] = {}
+    pushed: dict[str, SuccessfulPush] = {}
     token = _SUCCESSFUL_PUSHES.set(pushed)
     try:
         yield pushed
@@ -1421,7 +1430,7 @@ def _after_success(claimed, *, mode, force, chain, deadline, deadline_at, chaine
         if pushed is not None:
             # Latest wins: one capture spans several caller calls, and a scope that settles
             # again there has genuinely moved on to a later sequence.
-            pushed[scope] = claimed.push_seq
+            pushed[scope] = SuccessfulPush(claimed.push_seq, claimed.identity)
     if answered_other_work:
         if chain <= 0:
             logger.info(

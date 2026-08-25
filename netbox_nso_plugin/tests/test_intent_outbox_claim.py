@@ -714,7 +714,7 @@ class TestTheCapturedSequenceNamesTheCallersOwnClaim(_ClaimCase):
 
         assert outcome == drain.SUCCEEDED
         assert len(self.adapter.sequences) == 2, "the chain ran a second pass"
-        assert pushed["vlan"] == self.adapter.sequences[0], (
+        assert pushed["vlan"].push_seq == self.adapter.sequences[0], (
             "the selector must name the caller's own claim, not the chained one"
         )
 
@@ -728,12 +728,12 @@ class TestTheCapturedSequenceNamesTheCallersOwnClaim(_ClaimCase):
         with config, session:
             with drain.capture_successful_pushes() as pushed:
                 assert drain.drain_key(self.device.pk, "vlan") == drain.SUCCEEDED
-                first = pushed["vlan"]
+                first = pushed["vlan"].push_seq
                 with without_commit_drain():
                     own_vlan(self.mgmt, 884, self.tag)
                 assert drain.drain_key(self.device.pk, "vlan") == drain.SUCCEEDED
 
         assert first == self.adapter.sequences[0]
-        assert pushed["vlan"] == self.adapter.sequences[-1], (
+        assert pushed["vlan"].push_seq == self.adapter.sequences[-1], (
             "a caller-owned re-settle supersedes the sequence the earlier call named"
         )

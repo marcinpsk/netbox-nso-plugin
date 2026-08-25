@@ -212,7 +212,7 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
         self.assertTrue(form.is_valid(), form.errors)
         obj = form.save()
         self.assertEqual(obj.l2_mtu, 9100)
-        self.assertEqual(obj.status, "in_sync")  # owned → ownership preserved, value re-pushed
+        self.assertEqual(obj.status, "accepted")  # changed owned intent must be applied again
 
     def test_edit_then_accept_owns_and_writes_native(self):
         from unittest.mock import patch

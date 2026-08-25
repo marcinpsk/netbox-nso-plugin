@@ -281,7 +281,7 @@ class TestSyncScopeToAdapter(_SignalDBBase):
         self.assertEqual(mgmt.adapter_source_epoch, 4)
         self.assertTrue(mgmt.source_epoch_aware)
         self.assertTrue(mgmt.source_rekey_pending)
-        self.assertIn("omitted source_epoch", mgmt.adapter_link_error)
+        self.assertEqual(mgmt.adapter_link_error, "The adapter link failed. See the server log.")
 
     def test_old_wire_rekey_cannot_reopen_legacy_admission(self):
         from netbox_nso_plugin.read_gate import SKIPPED_UNAVAILABLE, gated_family_run
@@ -435,7 +435,7 @@ class TestSyncScopeToAdapter(_SignalDBBase):
             self._sync_scope(mgmt, created=True)
 
         mgmt.refresh_from_db()
-        self.assertIn("nso down", mgmt.adapter_link_error)  # recorded, not swallowed
+        self.assertEqual(mgmt.adapter_link_error, "The NSO adapter request failed. See the server log.")
         self.assertIsNone(mgmt.adapter_device_id)  # still unlinked
 
     def test_successful_link_clears_prior_error(self):

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 import logging
+import re
 from types import MappingProxyType
 
 from dcim.models import Device
@@ -18,7 +19,7 @@ from netbox.object_actions import AddObject, BulkDelete, BulkExport
 from netbox.views import generic
 from utilities.views import ViewTab, register_model_view
 
-from .adapter_client import AdapterError
+from .adapter_client import AdapterError, public_error_message
 from .deployment import DeploymentQuiesced
 from .filters import (
     NSODerivedIntentTemplateFilterSet,
@@ -92,6 +93,13 @@ from .tables import (
 )
 
 logger = logging.getLogger(__name__)
+
+_PUBLIC_DEPLOYMENT_ERROR = "Intent deployment is temporarily unavailable. See the server log."
+
+
+def _public_refresh_error(exc) -> str:
+    """Return fixed public text for a failed adapter-backed refresh."""
+    return public_error_message(exc) if isinstance(exc, AdapterError) else _PUBLIC_DEPLOYMENT_ERROR
 
 
 def _device_nso_tab_url(device_pk):
@@ -244,7 +252,7 @@ class DeviceNSOTabView(generic.ObjectView):
                 # Surface adapter↔NetBox split-brain (orphaned intent) — only renders if any.
                 intent_drift = compute_intent_drift(device, mgmt)
             except AdapterError as exc:
-                adapter_error = str(exc)
+                adapter_error = public_error_message(exc)
                 adapter_error_code = exc.code
                 logger.debug("Adapter unavailable for device %s: %s", device.pk, exc)
 
@@ -485,6 +493,18 @@ _KIND_SEVERITY = ("apply_failed", "drift", "pending", "deploying", "unknown", "i
 # Only the scopes whose push failures are persisted appear here (see
 # signals._record_push_outcome); a category with no entry simply renders no banner.
 _CATEGORY_PUSH_SCOPES = {"static": "static_route"}
+_PUBLIC_STATIC_ROUTE_PUSH_REASONS = frozenset(
+    {
+        "backfill_carries_deletions",
+        "backfill_missing_route_id",
+        "backfill_only_unsupported",
+        "device_claimed",
+        "duplicate_deleted_route_id",
+        "duplicate_route_id",
+        "duplicate_triple",
+        "fence_shut",
+    }
+)
 
 
 # How definite a recorded push failure is. Only `configuration_error` is raised before a
@@ -526,8 +546,26 @@ def _category_push_error(key, mgmt):
     entry = (mgmt.intent_push_errors or {}).get(scope)
     if not isinstance(entry, dict):
         return None
-    kind = _push_error_kind(entry.get("code") or "")
-    return {**entry, "kind": kind, "headline": _PUSH_HEADLINES[kind]}
+    code = entry.get("code") if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", str(entry.get("code") or "")) else ""
+    kind = _push_error_kind(code)
+    detail = entry.get("detail") if isinstance(entry.get("detail"), dict) else {}
+    reason = detail.get("reason")
+    public_detail = {"reason": reason} if type(reason) is str and reason in _PUBLIC_STATIC_ROUTE_PUSH_REASONS else {}
+    result = {
+        "code": code,
+        "message": public_error_message(AdapterError("", code=code)),
+        "detail": public_detail,
+        "kind": kind,
+        "headline": _PUSH_HEADLINES[kind],
+    }
+    if type(entry.get("attempt")) is int and entry["attempt"] >= 0:
+        result["attempt"] = entry["attempt"]
+    if isinstance(entry.get("at"), str) and len(entry["at"]) <= 64:
+        result["at"] = entry["at"]
+    route_ids = entry.get("route_ids")
+    if isinstance(route_ids, list) and all(type(route_id) is int for route_id in route_ids):
+        result["route_ids"] = route_ids
+    return result
 
 
 def _row_state(kinds) -> str:
@@ -803,7 +841,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
             try:
                 ctx.update(reconcile_category(device, mgmt, key))
             except (AdapterError, DeploymentQuiesced) as exc:
-                ctx["adapter_error"] = str(exc)
+                ctx["adapter_error"] = _public_refresh_error(exc)
                 ctx["adapter_error_code"] = getattr(exc, "code", "deployment_quiesced")
                 # The banner explains the failed refresh; the rows must not vanish
                 # with it — render last-synced state underneath.
@@ -908,7 +946,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
             try:
                 reconcile_category(device, mgmt, key)
             except (AdapterError, DeploymentQuiesced) as exc:
-                adapter_error = str(exc)
+                adapter_error = _public_refresh_error(exc)
 
         qs = spec["model"].objects.filter(management=mgmt)
         if spec["sr"]:
@@ -997,7 +1035,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
             try:
                 reconcile_category(device, mgmt, "interface")
             except (AdapterError, DeploymentQuiesced) as exc:
-                adapter_error = str(exc)
+                adapter_error = _public_refresh_error(exc)
 
         dev_filter = {"interface__device": device}
         # Index every overlay by interface id (enabled/description keyed by attribute).
@@ -1605,7 +1643,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
             try:
                 reconcile_category(device, mgmt, key)
             except (AdapterError, DeploymentQuiesced) as exc:
-                adapter_error = str(exc)
+                adapter_error = _public_refresh_error(exc)
 
         payload = self._grid_payload(key, device, mgmt, adapter_error)
         if want_json:
@@ -1899,7 +1937,7 @@ class NSODeviceNamesView(LoginRequiredMixin, View):
             device_names = client.list_nso_devices(nso_instance.adapter_instance_id)
             return JsonResponse({"devices": device_names})
         except AdapterError as exc:
-            return JsonResponse({"error": str(exc)}, status=502)
+            return JsonResponse({"error": public_error_message(exc)}, status=502)
 
 
 # ── Adapter Connection (singleton) ───────────────────────────────────────────
@@ -2443,7 +2481,7 @@ class NSODeviceManagementView(generic.ObjectView):
                 interfaces = client.get_interfaces_doc(instance.adapter_device_id).get("interfaces", [])
                 compliance = client.get_state(instance.adapter_device_id)
             except AdapterError as exc:
-                adapter_error = str(exc)
+                adapter_error = public_error_message(exc)
                 adapter_error_code = exc.code
                 # Fall back to snapshot so the page remains useful
                 snapshot = instance.state_snapshot or {}
@@ -2534,6 +2572,10 @@ class ApplyPromotionFailed(ApplyRefused):
     """NetBox could not mark the selected intent as deploying, so nothing was submitted."""
 
 
+class ApplyIntentChanged(ApplyRefused):
+    """Intent changed after one selected receipt was stored, so Apply must be retried."""
+
+
 #: What a preparation step did, in the operator's words. A closed vocabulary: with the
 #: delivery-registry labels it is everything a refusal may say.
 _PREPARE_FAILED = "failed"
@@ -2545,15 +2587,22 @@ _APPLY_PROMOTION_MESSAGE = (
     "Apply stopped because NetBox could not mark the selected intent as deploying. "
     "No Apply job was enqueued and all local promotion marks were rolled back."
 )
+_APPLY_INTENT_CHANGED_MESSAGE = (
+    "Apply stopped because NetBox intent changed during preparation. No Apply job was enqueued and no row was "
+    "promoted. Direct configuration snapshots might already have completed. Retry Apply for the current intent."
+)
 _APPLY_REFUSED_MESSAGE = (
     "Apply stopped before submission because a precondition was unmet. Nothing was applied and no row was promoted."
 )
 
 
 def _push_error_message(mgmt, scope) -> str:
-    """Read back the cause the claim recorded for *scope*, which the NSO tab also renders."""
+    """Map the persisted failure code for *scope* to safe operator text."""
     mgmt.refresh_from_db(fields=["intent_push_errors"])
-    return (mgmt.intent_push_errors or {}).get(scope, {}).get("message") or "no cause was recorded"
+    entry = (mgmt.intent_push_errors or {}).get(scope)
+    if not isinstance(entry, dict):
+        return "No cause was recorded."
+    return public_error_message(AdapterError("", code=entry.get("code")))
 
 
 def _snmp_refusal_message(mgmt) -> str:
@@ -2607,6 +2656,8 @@ def _apply_refusal_message(exc, mgmt) -> str:
         return _prepare_failure_message(exc.key, exc.failure)
     if isinstance(exc, ApplyPromotionFailed):
         return _APPLY_PROMOTION_MESSAGE
+    if isinstance(exc, ApplyIntentChanged):
+        return _APPLY_INTENT_CHANGED_MESSAGE
     if isinstance(exc, ApplyDeadlineExpired):
         return _APPLY_DEADLINE_MESSAGE
     return _APPLY_REFUSED_MESSAGE
@@ -2672,9 +2723,8 @@ def _prepare_apply(mgmt):
     # Each of these takes its OWN forced claim, so Apply re-ships the operator's intent
     # whatever the acknowledged baseline says and whatever a queued claim was carrying:
     #   - LACP / switchport: owned in NetBox, never mirrored as adapter intent.
-    #   - VLAN: the name lives on ipam.VLAN; renaming it fires no plugin signal, so a
-    #     post-accept rename would otherwise be stranded in NetBox (the row stays
-    #     'in_sync' and the stale old name is what gets applied).
+    #   - VLAN: the name lives on ipam.VLAN. Its signal queues a fresh snapshot, and this
+    #     forced refresh also repairs any older missed or failed delivery before Apply.
     #   - interface description/enabled: an owned attribute (status in OWNED_STATES)
     #     whose adapter intent went stale is re-sent so Apply actually re-applies it.
     #     Ownership is status-based and kept durable by the reconciler's owned-guard,
@@ -2741,34 +2791,20 @@ def _prepare_apply(mgmt):
 
         _push_direct_snapshots(mgmt, registry, remaining_budget)
 
-    selected = MappingProxyType({registry[scope].section: push_seq for scope, push_seq in pushed.items()})
+    selected = MappingProxyType({registry[scope].section: successful.push_seq for scope, successful in pushed.items()})
 
-    moved: list[tuple] = []  # (adapter section, model, [pks]) actually moved, for selective rollback
+    if not static_route_stored:
+        logger.warning(
+            "Apply: the static-route intent push was not acknowledged for device %s: "
+            "leaving those rows accepted because the adapter does not hold their intent",
+            mgmt.device_id,
+        )
     try:
-        with transaction.atomic():
-            for scope, model in (
-                ("vlan", NSOVLANState),
-                ("svi", NSOSVIState),
-                ("subinterface", NSOSubinterfaceState),
-                ("bfd", NSOBFDInterfaceState),
-                ("interface_mtu", NSOInterfaceMtuState),
-                ("route_policy", NSORoutePolicyState),
-                ("static_route", NSOStaticRouteState),
-                ("l2_sap", NSOL2SapState),
-                ("logging", NSOLoggingLevelState),
-            ):
-                if model is NSOStaticRouteState and not static_route_stored:
-                    logger.warning(
-                        "Apply: the static-route intent push was not acknowledged for device %s: "
-                        "leaving those rows accepted because the adapter does not hold their intent",
-                        mgmt.device_id,
-                    )
-                    continue
-                section = registry[scope].section
-                pks = list(model.objects.filter(management=mgmt, status="accepted").values_list("pk", flat=True))
-                if pks:
-                    model.objects.filter(pk__in=pks).update(status="deploying")
-                    moved.append((section, model, pks))
+        from .apply_state import IntentChangedDuringPreparation, promote_current_intent
+
+        moved = promote_current_intent(mgmt, registry, pushed, static_route_stored=static_route_stored)
+    except IntentChangedDuringPreparation as exc:
+        raise ApplyIntentChanged from exc
     except Exception as exc:  # noqa: BLE001 (abort before the adapter can promote a partial local state)
         logger.warning("Apply deploying-mark transaction failed for device %s: %s", mgmt.device_id, exc)
         raise ApplyPromotionFailed from exc
@@ -2808,7 +2844,11 @@ def _apply_stream_partition(result, selected):
     skipped = result.get("skipped")
     if not isinstance(returned_selected, dict) or returned_selected != expected_selected:
         return None, None, "Adapter returned an invalid Apply selector."
-    if not isinstance(skipped, dict) or not set(skipped).issubset(expected_selected):
+    if (
+        not isinstance(skipped, dict)
+        or not set(skipped).issubset(expected_selected)
+        or any(type(reason) is not str or reason not in _APPLY_SKIP_REASONS for reason in skipped.values())
+    ):
         return None, None, "Adapter returned invalid Apply skip results."
     return expected_selected, skipped, None
 
@@ -2816,11 +2856,45 @@ def _apply_stream_partition(result, selected):
 _APPLY_GENERATION_FIELDS = frozenset(
     {"generation_id", "seq", "job_id", "mode", "source_push_seq", "stream_revisions", "digest"}
 )
+_APPLY_SKIP_REASONS = frozenset(
+    {"superseded", "already_applied", "already_authorized", "no_receipt", "backfill_only", "revision_mismatch"}
+)
+_APPLY_UNEXECUTABLE_REASONS = frozenset(
+    {
+        "interface_attribute_eligibility_unresolved",
+        "mixed_detach_replacement",
+        "no_executable_interface",
+        "unresolved_interface_identity",
+        "outstanding_deletion_provenance",
+    }
+)
+_PUBLIC_JOB_TYPES = frozenset(
+    {"apply", "connect", "detect_drift", "provision", "removal", "sync", "sync_from_nso", "sync_now"}
+)
+
+
+def _validated_unexecutable_reasons(detail) -> dict:
+    """Return only the adapter contract's fixed stream and reason vocabulary."""
+    from . import delivery
+
+    streams = detail.get("streams") if isinstance(detail, dict) else None
+    valid_streams = {entry.section for entry in delivery.delivery_keys().values()}
+    if (
+        not isinstance(streams, dict)
+        or not streams
+        or any(
+            stream not in valid_streams or type(reason) is not str or reason not in _APPLY_UNEXECUTABLE_REASONS
+            for stream, reason in streams.items()
+        )
+    ):
+        return {}
+    return streams
 
 
 def _promoted_stream_coverage(generations, expected_selected, skipped):
     """Return the promoted stream union when every generation proves its selector."""
     promoted_streams = set()
+    generation_ids = set()
     previous_seq = None
     for link in generations:
         if not isinstance(link, dict) or not _APPLY_GENERATION_FIELDS.issubset(link):
@@ -2835,6 +2909,7 @@ def _promoted_stream_coverage(generations, expected_selected, skipped):
         valid_shape = (
             type(generation_id) is int
             and generation_id > 0
+            and generation_id not in generation_ids
             and type(seq) is int
             and seq > 0
             and (previous_seq is None or seq > previous_seq)
@@ -2856,6 +2931,7 @@ def _promoted_stream_coverage(generations, expected_selected, skipped):
         ):
             return None, "Adapter returned an invalid Apply generation provenance."
         promoted_streams.update(revisions)
+        generation_ids.add(generation_id)
         previous_seq = seq
     if promoted_streams != set(expected_selected) - set(skipped):
         return None, "Adapter returned incomplete Apply generation coverage."
@@ -2871,19 +2947,23 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
 
         detail = exc.detail if isinstance(exc.detail, dict) else {}
         job_id = detail.get("job_id")
+        if type(job_id) is not int or job_id <= 0:
+            job_id = None
         incumbent_type = None
-        if job_id:
+        if job_id is not None:
             try:
                 incumbent_type = (client.get_job(job_id) or {}).get("type")
             except AdapterError:
                 incumbent_type = None
+        if incumbent_type not in _PUBLIC_JOB_TYPES:
+            incumbent_type = None
         incumbent_state = "queued or running" if action == "apply" else "queued"
         msg = (
             f"Another job is already {incumbent_state}: {incumbent_type}."
             if incumbent_type
             else f"A job is already {incumbent_state} for this device."
         )
-        if job_id:
+        if job_id is not None:
             msg += f" (Job ID: {job_id})"
         if is_ajax:
             return JsonResponse(
@@ -2981,8 +3061,11 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
         return redirect(_device_nso_tab_url(mgmt.device.pk))
 
     def _adapter_error(self, request, mgmt, exc, prepared, *, action, label, is_ajax):
-        """Roll back an unenqueued Apply and surface the adapter's failure."""
-        if prepared is not None:
+        """Roll back a definitely rejected Apply and surface the adapter's failure."""
+        definitely_not_enqueued = exc.code == "configuration_error" or (
+            type(exc.status_code) is int and 400 <= exc.status_code < 500
+        )
+        if prepared is not None and definitely_not_enqueued:
             _rollback_prepare_apply(prepared)
         if exc.code == "conflict":
             return self._incumbent_job(request, mgmt, exc, action=action, is_ajax=is_ajax)
@@ -2990,18 +3073,18 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
             detail = exc.detail if isinstance(exc.detail, dict) else {}
             msg = _stream_reason_message(
                 "Apply cannot execute the selected streams",
-                detail.get("streams"),
+                _validated_unexecutable_reasons(detail),
             )
             if is_ajax:
                 return JsonResponse({"status": "error", "message": msg}, status=409)
             messages.error(request, msg)
             return redirect(_device_nso_tab_url(mgmt.device.pk))
-        # No deployment-gate branch here: the gate is the plugin's OWN middleware, which
+        # No deployment-gate branch here: the gate is the plugin's own middleware, which
         # answers the POST before this view runs. An adapter 503 is an ordinary adapter
-        # failure and keeps the adapter's own message.
+        # failure and receives the same fixed public message as other adapter failures.
         if is_ajax:
-            return JsonResponse({"status": "error", "message": str(exc)}, status=502)
-        messages.error(request, f"Adapter error triggering {label}: {exc}")
+            return JsonResponse({"status": "error", "message": public_error_message(exc)}, status=502)
+        messages.error(request, f"Adapter error triggering {label}: {public_error_message(exc)}")
         return redirect(_device_nso_tab_url(mgmt.device.pk))
 
     def post(self, request, pk, action):
@@ -3067,9 +3150,8 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
             else:
                 messages.success(request, f"{label} triggered.")
         except AdapterError as exc:
-            # The Apply never enqueued a job (adapter unreachable/500, or a conflict rejected
-            # ours), so roll back the deploying marks THIS Apply made — otherwise the rows are
-            # stuck 'applying' with nothing to ever settle them.
+            # A typed HTTP rejection proves no Apply was accepted. A transport failure or
+            # unreadable success can happen after enqueue, so reconciliation owns that outcome.
             return self._adapter_error(
                 request,
                 mgmt,
@@ -3114,7 +3196,7 @@ class NSOIntentResyncView(NSOActionPermissionMixin, View):
                 messages.info(request, "No orphaned adapter intent to clear.")
         except Exception as exc:  # noqa: BLE001
             logger.warning("Intent re-sync failed for device %s: %s", mgmt.device_id, exc)
-            messages.error(request, f"Intent re-sync failed: {exc}")
+            messages.error(request, "Intent re-sync failed. See the server log.")
         return redirect(_device_nso_tab_url(mgmt.device.pk))
 
 
@@ -3180,8 +3262,8 @@ class NSOForceRemovalView(NSOActionPermissionMixin, View):
             )
         except AdapterError as exc:
             if is_ajax:
-                return JsonResponse({"status": "error", "message": str(exc)}, status=502)
-            messages.error(request, f"Adapter error triggering force removal: {exc}")
+                return JsonResponse({"status": "error", "message": public_error_message(exc)}, status=502)
+            messages.error(request, f"Adapter error triggering force removal: {public_error_message(exc)}")
         return redirect(_device_nso_tab_url(mgmt.device.pk))
 
 
@@ -3196,7 +3278,7 @@ class NSOJobStatusView(LoginRequiredMixin, View):
             job = client.get_job(job_id)
             return JsonResponse(job)
         except AdapterError as exc:
-            return JsonResponse({"error": str(exc)}, status=502)
+            return JsonResponse({"error": public_error_message(exc)}, status=502)
 
 
 def _removal_job_scope(job):
@@ -3486,7 +3568,7 @@ class NSODeviceJobsView(LoginRequiredMixin, View):
                 client.list_device_generations(mgmt.adapter_device_id, since_seq=since_seq) if generation_ids else []
             )
         except AdapterError as exc:
-            return JsonResponse({"error": str(exc)}, status=502)
+            return JsonResponse({"error": public_error_message(exc)}, status=502)
         generations = [row for row in generations if row.get("generation_id") in generation_ids]
         serialized_jobs = jobs
         if generation_ids:
@@ -3547,7 +3629,7 @@ class NSORefreshStateView(NSOActionPermissionMixin, View):
             )
             messages.success(request, "Compliance data refreshed.")
         except AdapterError as exc:
-            messages.error(request, f"Could not reach adapter: {exc}")
+            messages.error(request, f"Could not reach adapter: {public_error_message(exc)}")
 
         return redirect(_device_nso_tab_url(mgmt.device.pk))
 
@@ -4178,6 +4260,7 @@ def _save_owned_overlay_edit(obj, key):
     from django.db import transaction
 
     from . import status_machine as sm
+    from .apply_state import mark_explicit_accept
 
     with transaction.atomic():
         if not sm.is_owned(obj.status):
@@ -4209,6 +4292,7 @@ def _save_owned_overlay_edit(obj, key):
 
             with suppress_intent_push():
                 obj.static_route.save(update_fields=["metric", "permanent", "tag"])
+        mark_explicit_accept(obj)
         obj.save()
         if key == "static_route":
             from .signals import _transition_static_route_content
@@ -4300,6 +4384,7 @@ def _save_route_map_name_edit(state, old_name):
 
     from . import signals
     from . import status_machine as sm
+    from .apply_state import mark_explicit_accept
     from .models import NSORoutePolicyObjectClass, NSORoutePolicyState
 
     route_map = state.assigned_object
@@ -4318,6 +4403,7 @@ def _save_route_map_name_edit(state, old_name):
             state.accepted_at = timezone.now()
         if state.status != "deploying":
             state.status = "accepted"
+        mark_explicit_accept(state)
         state.save()
 
         route_map.name = new_name
@@ -4375,13 +4461,17 @@ def _save_vlan_name_edit(obj):
     from django.db import transaction
 
     from . import status_machine as sm
-    from .models import NSOVLANState
+    from .apply_state import lock_vlan_intent_rows, mark_explicit_accept
     from .signals import suppress_intent_push
     from .vlan_reconciler import is_placeholder_vlan_name
 
+    desired_name = obj.vlan.name
     with transaction.atomic():
-        vlan = obj.vlan
-        states = list(NSOVLANState.objects.select_for_update(of=("self",)).filter(vlan_id=vlan.pk))
+        vlan, rows = lock_vlan_intent_rows(obj.vlan_id, ("vlan",))
+        if vlan is None:
+            return
+        vlan.name = desired_name
+        states = rows["vlan"]
         with suppress_intent_push():
             vlan.save(update_fields=["name"])
 
@@ -4391,8 +4481,8 @@ def _save_vlan_name_edit(obj):
             if not sm.is_owned(state.status):
                 state.accepted_at = now
             matches = state.device_name == vlan.name if state.device_name else is_placeholder_vlan_name(state)
-            if state.status != "deploying":
-                state.status = "in_sync" if matches else "accepted"
+            state.status = "accepted" if state.status == "deploying" else "in_sync" if matches else "accepted"
+            mark_explicit_accept(state)
             state.save()
 
 
@@ -5138,6 +5228,52 @@ class NSOLACPBundleStateAcceptView(NSOActionPermissionMixin, View):
         return redirect(_device_nso_tab_url(state.management.device_id))
 
 
+class _SwitchportAcceptRetry(Exception):
+    """The switchport dependencies changed before their locks were acquired."""
+
+
+def _switchport_vlan_ids(state) -> set[int]:
+    vlan_ids = set(state.tagged_vlans.values_list("pk", flat=True))
+    if state.untagged_vlan_id is not None:
+        vlan_ids.add(state.untagged_vlan_id)
+    return vlan_ids
+
+
+def _lock_switchport_accept_state(state):
+    """Lock and reload one switchport in VLAN-before-device order."""
+    from ipam.models import VLAN
+
+    from .apply_state import (
+        lock_device_vlan_membership_transaction,
+        lock_interface_intent_rows,
+        lock_vlan_intent_transaction,
+        lock_vlan_membership_transaction,
+    )
+
+    vlan_ids = _switchport_vlan_ids(state)
+    for vlan_id in sorted(vlan_ids):
+        lock_vlan_membership_transaction(vlan_id)
+    lock_device_vlan_membership_transaction(state.management.device_id)
+    for vlan_id in sorted(vlan_ids):
+        lock_vlan_intent_transaction(vlan_id)
+    locked_vlan_ids = set(
+        VLAN.objects.select_for_update(of=("self",)).filter(pk__in=vlan_ids).values_list("pk", flat=True)
+    )
+    if locked_vlan_ids != vlan_ids:
+        raise _SwitchportAcceptRetry
+
+    interface, _management, rows = lock_interface_intent_rows(state.interface_id)
+    locked_state = next((candidate for candidate in rows["switchport"] if candidate.pk == state.pk), None)
+    if (
+        interface is None
+        or locked_state is None
+        or locked_state.interface_id != interface.pk
+        or _switchport_vlan_ids(locked_state) != vlan_ids
+    ):
+        raise _SwitchportAcceptRetry
+    return locked_state, interface
+
+
 class NSOSwitchportStateAcceptView(NSOActionPermissionMixin, View):
     """Accept one L2 switchport: native-write the observed mode/VLANs + mark owned.
 
@@ -5152,17 +5288,25 @@ class NSOSwitchportStateAcceptView(NSOActionPermissionMixin, View):
 
         from .models import NSOSwitchportState
 
-        state = get_object_or_404(NSOSwitchportState, pk=pk)
-        with transaction.atomic():
-            # native-write-on-accept: make the NetBox interface match what NSO observed.
-            iface = state.interface
-            iface.mode = state.mode or ""
-            iface.untagged_vlan = state.untagged_vlan
-            iface.save()
-            iface.tagged_vlans.set(state.tagged_vlans.all())
-            state.status = _status_after_accept(state.status)
-            state.accepted_at = timezone.now()
-            state.save(update_fields=["status", "accepted_at"])
+        for _attempt in range(2):
+            state = get_object_or_404(NSOSwitchportState, pk=pk)
+            with transaction.atomic():
+                try:
+                    state, iface = _lock_switchport_accept_state(state)
+                except _SwitchportAcceptRetry:
+                    continue
+                # native-write-on-accept: make the NetBox interface match what NSO observed.
+                iface.mode = state.mode or ""
+                iface.untagged_vlan = state.untagged_vlan
+                iface.save()
+                iface.tagged_vlans.set(state.tagged_vlans.all())
+                state.status = _status_after_accept(state.status)
+                state.accepted_at = timezone.now()
+                state.save(update_fields=["status", "accepted_at"])
+            break
+        else:
+            messages.error(request, "The switchport changed. Refresh the page and try again.")
+            return redirect(_device_nso_tab_url(state.management.device_id))
         messages.success(request, f"Accepted switchport {state.interface.name}.")
         return redirect(_device_nso_tab_url(state.management.device_id))
 
@@ -5930,16 +6074,21 @@ class OverlayStateAcceptMixin(NSOActionPermissionMixin, View):
         """
         return ""
 
+    def lock_state_for_accept(self, state):
+        """Return the state that this accept operation must update."""
+        return state
+
     def post(self, request, pk):  # noqa: D102
         state = get_object_or_404(self.model_class, pk=pk)
-        blocker = self.push_blocker(state)
-        if blocker:
-            messages.error(request, f"Cannot accept {state}: {blocker}")
-            return redirect(_device_nso_tab_url(state.management.device_id))
-        state.status = _status_after_accept(state.status)
-        state.accepted_at = timezone.now()
         # One transaction, so the row and the outbox entry it schedules commit together.
         with transaction.atomic():
+            state = self.lock_state_for_accept(state)
+            blocker = self.push_blocker(state)
+            if blocker:
+                messages.error(request, f"Cannot accept {state}: {blocker}")
+                return redirect(_device_nso_tab_url(state.management.device_id))
+            state.status = _status_after_accept(state.status)
+            state.accepted_at = timezone.now()
             state.save(update_fields=["status", "accepted_at"])
         messages.success(request, f"Accepted {state}.")
         return redirect(_device_nso_tab_url(state.management.device_id))
@@ -5998,7 +6147,7 @@ class NSOSnmpCommunityStateVerifyView(NSOActionPermissionMixin, View):
         try:
             result = adapter_client.verify_secret(state.vault_ref)
         except AdapterError as exc:
-            messages.error(request, f"Vault verify failed: {exc}")
+            messages.error(request, f"Vault verify failed: {public_error_message(exc)}")
             return redirect(redirect_url)
 
         hashes = result.get("hashes") or {}
@@ -6032,7 +6181,7 @@ class NSOSnmpV3UserStateVerifyView(NSOActionPermissionMixin, View):
         try:
             result = adapter_client.verify_secret(state.vault_ref)
         except AdapterError as exc:
-            messages.error(request, f"Vault verify failed: {exc}")
+            messages.error(request, f"Vault verify failed: {public_error_message(exc)}")
             return redirect(redirect_url)
 
         fields = set(result.get("fields") or [])
@@ -6078,7 +6227,7 @@ class NSOSnmpCommunityStateHarvestView(NSOActionPermissionMixin, View):
         try:
             result = adapter_client.harvest_community(state.management.adapter_device_id, state.community_hash, ref)
         except AdapterError as exc:
-            messages.error(request, f"Harvest failed: {exc}")
+            messages.error(request, f"Harvest failed: {public_error_message(exc)}")
             return redirect(redirect_url)
 
         state.vault_ref = result.get("vault_ref") or ref
@@ -6189,6 +6338,13 @@ class NSOInterfaceMtuStateAcceptView(OverlayStateAcceptMixin):
 class NSOVLANStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOVLANState
 
+    def lock_state_for_accept(self, state):
+        """Serialize ownership changes with VLAN rescope row replacement."""
+        return get_object_or_404(
+            self.model_class.objects.select_for_update(of=("self",)),
+            pk=state.pk,
+        )
+
 
 class NSOVLANRescopeView(NSOActionPermissionMixin, View):
     """Re-scope a synced VLAN into a different (e.g. site-wide/shared) VLAN group.
@@ -6217,12 +6373,16 @@ class NSOVLANRescopeView(NSOActionPermissionMixin, View):
     def post(self, request, pk):  # noqa: D102
         from ipam.models import VLANGroup
 
-        from .vlan_reconciler import rescope_vlan
+        from .vlan_reconciler import VLANRescopeConflict, rescope_vlan
 
         state = get_object_or_404(NSOVLANState, pk=pk)
         group = get_object_or_404(VLANGroup, pk=request.POST.get("group"))
         device_id = state.management.device_id
-        action, vlan = rescope_vlan(state, group)
+        try:
+            action, vlan = rescope_vlan(state, group)
+        except VLANRescopeConflict:
+            messages.error(request, "The VLAN attachment changed. Refresh the page and try again.")
+            return redirect(_device_nso_tab_url(device_id))
         if action == "noop":
             messages.info(request, f"VLAN {vlan.vid} is already in group {group}.")
         elif action == "moved":
@@ -6308,6 +6468,8 @@ class NSORoutePolicyAttachView(NSOActionPermissionMixin, View):
             )
 
         with transaction.atomic():
+            from .apply_state import mark_explicit_accept
+
             state, created = NSORoutePolicyState.objects.get_or_create(
                 management=mgmt,
                 family=family,
@@ -6325,6 +6487,7 @@ class NSORoutePolicyAttachView(NSOActionPermissionMixin, View):
             state.content_type = ct
             state.object_id = obj.pk
             state.last_sync_at = timezone.now()
+            mark_explicit_accept(state)
             state.save()  # → _on_route_policy_state_save schedules the push
             cascade = None
             if family == "route_map":
@@ -6581,8 +6744,29 @@ class NSOVLANAttachView(NSOActionPermissionMixin, View):
         from ipam.models import VLAN
 
         mgmt = get_object_or_404(NSODeviceManagement, device_id=device_pk)
-        vlan = get_object_or_404(VLAN, pk=request.POST.get("vlan"))
+        try:
+            vlan_id = int(request.POST.get("vlan", ""))
+        except (TypeError, ValueError):
+            messages.error(request, "Select a valid VLAN.")
+            return redirect(_device_nso_tab_url(mgmt.device_id))
         with transaction.atomic():
+            from .apply_state import (
+                lock_device_intent_transaction,
+                lock_device_vlan_membership_transaction,
+                lock_vlan_intent_transaction,
+                lock_vlan_membership_transaction,
+                mark_explicit_accept,
+            )
+
+            lock_vlan_membership_transaction(vlan_id)
+            vlan = VLAN.objects.select_for_update(of=("self",)).filter(pk=vlan_id).first()
+            if vlan is None:
+                messages.error(request, "The selected VLAN is no longer available.")
+                return redirect(_device_nso_tab_url(mgmt.device_id))
+            lock_device_vlan_membership_transaction(mgmt.device_id)
+            lock_vlan_intent_transaction(vlan.pk)
+            lock_device_intent_transaction(mgmt.device_id)
+
             state, created = NSOVLANState.objects.get_or_create(
                 management=mgmt,
                 vlan=vlan,
@@ -6592,6 +6776,7 @@ class NSOVLANAttachView(NSOActionPermissionMixin, View):
                 state.status = "accepted"
                 state.accepted_at = timezone.now()
             state.last_sync_at = timezone.now()
+            mark_explicit_accept(state)
             state.save()  # → _on_vlan_state_save schedules the owned-VLAN intent push
         messages.success(
             request, f"Attached VLAN {vlan.vid} ({vlan.name or '—'}) to {mgmt.device.name} — Apply to write it."
