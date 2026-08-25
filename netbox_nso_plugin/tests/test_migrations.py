@@ -14,7 +14,7 @@ import importlib
 from io import StringIO
 
 from django.core.management import call_command
-from django.db import connection
+from django.db import connection, transaction
 from django.db.migrations.loader import MigrationLoader
 from django.test import SimpleTestCase, TestCase, TransactionTestCase
 
@@ -24,6 +24,7 @@ APP = "netbox_nso_plugin"
 OUTBOX = "0018_intent_outbox"
 PRE_OUTBOX = "0017_settlement_cursor_epoch"
 DEPLOYMENT_CONTROL = "0019_intent_deployment_control"
+APPLY_IDENTITY = "0020_nsoapplyattempt_nsointentrevision_and_more"
 
 
 class TestMigrationGraph(SimpleTestCase):
@@ -157,3 +158,47 @@ class TestThePushSequenceOutlivesARollback(_CascadeFlushMixin, TransactionTestCa
         self._migrate(OUTBOX)
 
         assert self._nextval() > burnt, "the re-applied sequence re-issues values the adapter already admitted"
+
+
+class TestApplyIdentityMigration(_CascadeFlushMixin, TransactionTestCase):
+    def _migrate(self, target):
+        from django.db.migrations.executor import MigrationExecutor
+
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate([(APP, target)])
+
+    def _migrate_to_leaves(self):
+        from django.db.migrations.executor import MigrationExecutor
+
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate(executor.loader.graph.leaf_nodes(APP))
+
+    def test_unattributed_deploying_rows_return_to_operator_pending(self):
+        from netbox_nso_plugin.models import NSOLoggingLevelState
+
+        from ._outbox_case import make_managed, without_commit_drain
+
+        _device, management = make_managed("apply-migration", 1625)
+        with without_commit_drain(), transaction.atomic():
+            row = NSOLoggingLevelState.objects.create(
+                management=management,
+                console_severity="WARNING",
+                status="accepted",
+                last_apply_error="stale result",
+            )
+        self.addCleanup(self._migrate_to_leaves)
+        self._migrate(DEPLOYMENT_CONTROL)
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE netbox_nso_plugin_nsologginglevelstate SET status = %s WHERE id = %s",
+                ["deploying", row.pk],
+            )
+
+        self._migrate(APPLY_IDENTITY)
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, "accepted")
+        self.assertIsNone(row.apply_attempt_id)
+        self.assertEqual(row.last_apply_error, "")

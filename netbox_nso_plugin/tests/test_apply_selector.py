@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from uuid import UUID, uuid4
+
 from dcim.models import Interface
 from django.contrib.auth import get_user_model
 from django.db import DatabaseError, connection, transaction
@@ -44,6 +46,7 @@ def _promoted(selected):
         "job_id": 501,
         "selected": selected,
         "skipped": {},
+        "skipped_detail": None,
         "generations": [
             {
                 "generation_id": 81,
@@ -85,6 +88,7 @@ def _no_op(selected):
             )[index % 6]
             for index, stream in enumerate(sorted(selected))
         },
+        "skipped_detail": None,
         "generations": [],
     }
 
@@ -117,7 +121,11 @@ class _ApplyContractAdapter(ReceiptAdapter):
         if method == "POST" and url.endswith("/actions/apply"):
             body = kwargs.get("json")
             self.apply_requests.append(body)
-            if not isinstance(body, dict) or set(body) != {"selected"} or not isinstance(body["selected"], dict):
+            if (
+                not isinstance(body, dict)
+                or set(body) != {"apply_attempt_id", "selected"}
+                or not isinstance(body["selected"], dict)
+            ):
                 # Copied from ../nso-adapter/tests/api/openapi_snapshot.json,
                 # actions/apply 422 ErrorEnvelope response.
                 return make_response(
@@ -127,6 +135,19 @@ class _ApplyContractAdapter(ReceiptAdapter):
                             "code": "validation_error",
                             "message": "Request validation failed",
                             "detail": {"errors": [{"loc": ["body", "selected"], "type": "missing"}]},
+                        }
+                    },
+                )
+            try:
+                UUID(body["apply_attempt_id"])
+            except (TypeError, ValueError, AttributeError):
+                return make_response(
+                    422,
+                    {
+                        "error": {
+                            "code": "validation_error",
+                            "message": "Request validation failed",
+                            "detail": {"errors": [{"loc": ["body", "apply_attempt_id"], "type": "uuid_parsing"}]},
                         }
                     },
                 )
@@ -211,6 +232,25 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         with config, session:
             return self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
 
+    def _promotion_snapshot(self):
+        from types import SimpleNamespace
+
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        registry = delivery.delivery_keys()
+        pushed = {}
+        for push_seq, entry in enumerate(
+            (candidate for candidate in registry.values() if candidate.in_protocol),
+            start=1,
+        ):
+            revision, _created = NSOIntentRevision.objects.get_or_create(
+                device=self.device,
+                scope=entry.key,
+            )
+            pushed[entry.key] = SimpleNamespace(revision=revision.revision, push_seq=push_seq)
+        return registry, pushed
+
     def test_promoted_apply_selects_the_store_only_receipt_and_returns_the_whole_chain(self):
         adapter = _ApplyContractAdapter(lambda selected: (202, _promoted(selected)))
 
@@ -231,8 +271,15 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertEqual(pushed["push_seq"], receipt["push_seq"])
         self.assertRegex(receipt["digest"], r"^[0-9a-f]{64}$")
         self.assertEqual([link["digest"] for link in result["generations"]], ["a" * 64, "b" * 64])
+        attempt_id = UUID(adapter.apply_requests[0]["apply_attempt_id"])
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "deploying")
+        self.assertEqual(self.vlan_state.apply_attempt_id, attempt_id)
+        from netbox_nso_plugin.models import NSOApplyAttempt
+
+        attempt = NSOApplyAttempt.objects.get(pk=attempt_id)
+        self.assertEqual(attempt.selected, adapter.apply_requests[0]["selected"])
+        self.assertEqual(attempt.response, _promoted(attempt.selected))
 
     def test_promoted_retry_moves_apply_failed_intent_back_to_deploying(self):
         type(self.vlan_state).objects.filter(pk=self.vlan_state.pk).update(
@@ -247,6 +294,27 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "deploying")
         self.assertIsNotNone(self.vlan_state.last_apply_at)
+
+    def test_a_lost_apply_response_keeps_the_exact_attempt_available_for_replay(self):
+        def lose_response(_selected):
+            raise ConnectionError("response lost after admission")
+
+        adapter = _ApplyContractAdapter(lose_response)
+
+        response = self._post(adapter)
+
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(len(adapter.apply_requests), 1)
+        request = adapter.apply_requests[0]
+        from netbox_nso_plugin.models import NSOApplyAttempt
+
+        attempt = NSOApplyAttempt.objects.get(pk=UUID(request["apply_attempt_id"]))
+        self.assertEqual(attempt.selected, request["selected"])
+        self.assertIsNone(attempt.http_status)
+        self.assertIsNone(attempt.response)
+        self.vlan_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "deploying")
+        self.assertEqual(self.vlan_state.apply_attempt_id, attempt.pk)
 
     def test_no_op_retry_restores_apply_failed_intent(self):
         type(self.vlan_state).objects.filter(pk=self.vlan_state.pk).update(status="apply_failed")
@@ -546,6 +614,25 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
 
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "accepted")
+
+    def test_rollback_cannot_release_a_row_repromoted_by_a_later_attempt(self):
+        from uuid import uuid4
+
+        from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin.views import _prepare_apply, _rollback_prepare_apply
+
+        adapter = _ApplyContractAdapter(lambda selected: (202, _promoted(selected)))
+        config, session = adapter.patches()
+        with config, session:
+            prepared, _selected = _prepare_apply(self.mgmt)
+        newer_attempt_id = uuid4()
+        NSOVLANState.objects.filter(pk=self.vlan_state.pk).update(apply_attempt_id=newer_attempt_id)
+
+        _rollback_prepare_apply(prepared)
+
+        self.vlan_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "deploying")
+        self.assertEqual(self.vlan_state.apply_attempt_id, newer_attempt_id)
 
     def test_the_inline_vlan_editor_repends_the_deploying_scope(self):
         from netbox_nso_plugin.views import _prepare_apply, _save_vlan_name_edit
@@ -2763,71 +2850,36 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         second.refresh_from_db()
         self.assertEqual(second.status, "accepted")
 
-    def test_promotion_refuses_a_row_locked_by_an_intent_transaction(self):
-        """Apply must fail closed when it cannot lock every candidate intent row."""
-        import threading
-        from types import SimpleNamespace
+    def test_promotion_does_not_render_under_its_locks(self):
         from unittest.mock import patch
 
-        from django.db import connections
+        from netbox_nso_plugin import apply_state
 
-        from netbox_nso_plugin import apply_state, delivery
-        from netbox_nso_plugin.models import NSOVLANState
+        registry, pushed = self._promotion_snapshot()
+        with patch("netbox_nso_plugin.delivery.render", side_effect=AssertionError("promotion rendered")):
+            _attempt, moved = apply_state.promote_current_intent(
+                self.mgmt,
+                registry,
+                pushed,
+                apply_attempt_id=uuid4(),
+                static_route_stored=False,
+            )
 
-        row_locked = threading.Event()
-        release_mutation = threading.Event()
-        errors = []
-
-        def mutate():
-            try:
-                with without_commit_drain(), transaction.atomic():
-                    NSOVLANState.objects.select_for_update().get(pk=self.vlan_state.pk)
-                    row_locked.set()
-                    if not release_mutation.wait(10):
-                        raise AssertionError("Apply did not inspect the locked intent row")
-                    vlan = self.vlan_state.vlan
-                    vlan.name = "intent-changing-under-row-lock"
-                    vlan.save(update_fields=["name"])
-            except Exception as exc:  # noqa: BLE001 (the main test re-raises the worker failure)
-                errors.append(exc)
-            finally:
-                connections.close_all()
-
-        with patch("netbox_nso_plugin.apply_state._current_identity", return_value="matching-intent"):
-            worker = threading.Thread(target=mutate)
-            worker.start()
-            self.assertTrue(row_locked.wait(10), "the mutation did not lock the intent row")
-            with self.assertRaises(apply_state.IntentChangedDuringPreparation):
-                apply_state.promote_current_intent(
-                    self.mgmt,
-                    delivery.delivery_keys(),
-                    {"vlan": SimpleNamespace(identity="matching-intent")},
-                    static_route_stored=False,
-                )
-            release_mutation.set()
-            worker.join(10)
-
-        self.assertFalse(worker.is_alive(), "the intent transaction deadlocked with Apply promotion")
-        if errors:
-            raise errors[0]
-        self.vlan_state.refresh_from_db()
-        self.assertEqual(self.vlan_state.status, "accepted")
+        self.assertEqual(moved[0][2], [self.vlan_state.pk])
 
     def test_promotion_waits_for_an_unchanged_reconcile_transaction(self):
         import threading
         import time
-        from types import SimpleNamespace
 
         from django.db import connections
 
-        from netbox_nso_plugin import apply_state, delivery
+        from netbox_nso_plugin import apply_state
         from netbox_nso_plugin.models import NSOVLANState
 
         with connection.cursor() as cursor:
             cursor.execute("SELECT pg_backend_pid()")
             promotion_pid = cursor.fetchone()[0]
-        registry = delivery.delivery_keys()
-        identity = apply_state._current_identity(self.mgmt, registry, "vlan")
+        registry, pushed = self._promotion_snapshot()
 
         row_locked = threading.Event()
         promotion_waited = threading.Event()
@@ -2863,10 +2915,11 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         worker.start()
         try:
             self.assertTrue(row_locked.wait(10), "the reconcile did not lock the intent row")
-            moved = apply_state.promote_current_intent(
+            _attempt, moved = apply_state.promote_current_intent(
                 self.mgmt,
                 registry,
-                {"vlan": SimpleNamespace(identity=identity)},
+                pushed,
+                apply_attempt_id=uuid4(),
                 static_route_stored=False,
             )
         finally:
@@ -2882,19 +2935,17 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertEqual(self.vlan_state.status, "deploying")
 
     def test_promotion_stamps_the_apply_start_time(self):
-        from types import SimpleNamespace
-
         from django.utils import timezone
 
-        from netbox_nso_plugin import apply_state, delivery
+        from netbox_nso_plugin import apply_state
 
-        registry = delivery.delivery_keys()
-        identity = apply_state._current_identity(self.mgmt, registry, "vlan")
+        registry, pushed = self._promotion_snapshot()
         promotion_started_at = timezone.now()
         apply_state.promote_current_intent(
             self.mgmt,
             registry,
-            {"vlan": SimpleNamespace(identity=identity)},
+            pushed,
+            apply_attempt_id=uuid4(),
             static_route_stored=False,
         )
 
@@ -2974,6 +3025,12 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertTrue(all(receipt["params"] == {"store_only": "true"} for receipt in selected_receipts))
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "accepted")
+        self.assertIsNone(self.vlan_state.apply_attempt_id)
+        from netbox_nso_plugin.models import NSOApplyAttempt
+
+        attempt = NSOApplyAttempt.objects.get(pk=UUID(adapter.apply_requests[0]["apply_attempt_id"]))
+        self.assertEqual(attempt.http_status, 200)
+        self.assertEqual(attempt.response, _no_op(attempt.selected))
 
     def test_no_op_with_incomplete_skip_results_rolls_back_prepared_rows(self):
         from netbox_nso_plugin.views import NSODeviceActionView, _prepare_apply

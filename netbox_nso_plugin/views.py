@@ -2,7 +2,9 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 import logging
 import re
+from dataclasses import dataclass
 from types import MappingProxyType
+from uuid import uuid4
 
 from dcim.models import Device
 from django.contrib import messages
@@ -2576,6 +2578,14 @@ class ApplyIntentChanged(ApplyRefused):
     """Intent changed after one selected receipt was stored, so Apply must be retried."""
 
 
+@dataclass(frozen=True)
+class PreparedApply:
+    """The durable attempt and the exact local rows that it promoted."""
+
+    attempt_id: object
+    moved: tuple
+
+
 #: What a preparation step did, in the operator's words. A closed vocabulary: with the
 #: delivery-registry labels it is everything a refusal may say.
 _PREPARE_FAILED = "failed"
@@ -2802,13 +2812,19 @@ def _prepare_apply(mgmt):
     try:
         from .apply_state import IntentChangedDuringPreparation, promote_current_intent
 
-        moved = promote_current_intent(mgmt, registry, pushed, static_route_stored=static_route_stored)
+        attempt, moved = promote_current_intent(
+            mgmt,
+            registry,
+            pushed,
+            apply_attempt_id=uuid4(),
+            static_route_stored=static_route_stored,
+        )
     except IntentChangedDuringPreparation as exc:
         raise ApplyIntentChanged from exc
     except Exception as exc:  # noqa: BLE001 (abort before the adapter can promote a partial local state)
         logger.warning("Apply deploying-mark transaction failed for device %s: %s", mgmt.device_id, exc)
         raise ApplyPromotionFailed from exc
-    return moved, selected
+    return PreparedApply(attempt.pk, tuple(moved)), selected
 
 
 def _rollback_prepare_apply(moved, *, keep_streams=()) -> None:
@@ -2820,13 +2836,39 @@ def _rollback_prepare_apply(moved, *, keep_streams=()) -> None:
     job would strand it as 'applying' forever because nothing can settle it.
     """
     keep_streams = set(keep_streams)
-    for section, model, pks, previous_status in moved or []:
+    if not isinstance(moved, PreparedApply):
+        raise TypeError("Apply rollback requires a durable prepared attempt")
+    for section, model, pks, previous_status in moved.moved:
         if section in keep_streams:
             continue
         try:
-            model.objects.filter(pk__in=pks, status="deploying").update(status=previous_status)
+            model.objects.filter(
+                pk__in=pks,
+                status="deploying",
+                apply_attempt_id=moved.attempt_id,
+            ).update(
+                status=previous_status,
+                apply_attempt_id=None,
+            )
         except Exception as exc:  # noqa: BLE001 — best-effort rollback; log and move on
             logger.warning("Apply rollback failed: %s", exc)
+
+
+def _record_apply_response(prepared, *, http_status, response) -> None:
+    """Persist the exact replayable adapter answer for one local attempt."""
+    from .models import NSOApplyAttempt
+
+    if not isinstance(prepared, PreparedApply):
+        raise TypeError("Apply response recording requires a durable prepared attempt")
+    with transaction.atomic():
+        updated = NSOApplyAttempt.objects.filter(pk=prepared.attempt_id, response__isnull=True).update(
+            http_status=http_status,
+            response=response,
+        )
+        if updated != 1:
+            stored = NSOApplyAttempt.objects.get(pk=prepared.attempt_id)
+            if stored.http_status != http_status or stored.response != response:
+                raise RuntimeError("an Apply attempt received two different responses")
 
 
 def _stream_reason_message(prefix, reasons) -> str:
@@ -2990,6 +3032,7 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
                 request, mgmt, "Adapter returned an invalid Apply response.", is_ajax=is_ajax
             )
         outcome = result.get("outcome")
+        _record_apply_response(prepared, http_status=200 if outcome == "no_op" else 202, response=result)
         expected_selected, skipped, partition_error = _apply_stream_partition(result, selected)
         if partition_error:
             if outcome == "no_op" and result.get("generations") == []:
@@ -3066,6 +3109,8 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
         definitely_not_enqueued = exc.code == "configuration_error" or (
             type(exc.status_code) is int and 400 <= exc.status_code < 500
         )
+        if prepared is not None and type(exc.status_code) is int and isinstance(exc.response, dict):
+            _record_apply_response(prepared, http_status=exc.status_code, response=exc.response)
         if prepared is not None and definitely_not_enqueued:
             _rollback_prepare_apply(prepared)
         if exc.code == "conflict":
@@ -3138,7 +3183,9 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
 
         try:
             result = (
-                action_fn(mgmt.adapter_device_id, selected) if action == "apply" else action_fn(mgmt.adapter_device_id)
+                action_fn(mgmt.adapter_device_id, prepared.attempt_id, selected)
+                if action == "apply"
+                else action_fn(mgmt.adapter_device_id)
             )
             if action == "apply":
                 return self._apply_result(request, mgmt, result, prepared, selected, label=label, is_ajax=is_ajax)

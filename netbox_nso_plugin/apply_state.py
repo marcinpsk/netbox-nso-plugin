@@ -360,46 +360,75 @@ def lock_interface_intent_rows(interface_id) -> tuple[object | None, object | No
     return interface, management, rows
 
 
-def _current_identity(management, registry, scope) -> str:
-    """Render one scope under the promotion lock and return its store-only identity."""
-    from . import delivery, drain
+def lock_intent_revisions(device_id: int, scopes) -> dict[str, int]:
+    """Lock and return one device's durable scope revisions in canonical order."""
+    from .models import NSOIntentRevision
 
-    entry = registry[scope]
-    rendered = delivery.render(scope, management.device_id, management.adapter_device_id)
-    return drain.request_identity(
-        rendered.payload,
-        mode=delivery.MODE_STORE_ONLY,
-        marking_mode=entry.marking_mode,
-        deletions=[],
-        mark=None,
-        epoch=drain.mapping_epoch(management),
+    ordered_scopes = tuple(sorted(scopes))
+    for scope in ordered_scopes:
+        NSOIntentRevision.objects.get_or_create(device_id=device_id, scope=scope)
+    rows = (
+        NSOIntentRevision.objects.select_for_update(of=("self",))
+        .filter(device_id=device_id, scope__in=ordered_scopes)
+        .order_by("scope")
     )
+    current = {row.scope: int(row.revision) for row in rows}
+    if set(current) != set(ordered_scopes):
+        raise IntentChangedDuringPreparation
+    return current
 
 
-def promote_current_intent(management, registry, pushed, *, static_route_stored: bool) -> list[tuple]:
-    """Atomically validate stored receipts and mark their unchanged rows deploying."""
+def promote_current_intent(
+    management,
+    registry,
+    pushed,
+    *,
+    apply_attempt_id,
+    static_route_stored: bool,
+):
+    """CAS stored receipt revisions, create the attempt, and stamp its rows."""
     from . import status_machine as sm
-    from .models import NSODeviceManagement, NSOStaticRouteState
+    from .models import NSOApplyAttempt, NSODeviceManagement, NSOStaticRouteState
 
-    moved: list[tuple] = []
+    expected_scopes = {entry.key for entry in registry.values() if entry.in_protocol}
+    if set(pushed) != expected_scopes or any(type(snapshot.revision) is not int for snapshot in pushed.values()):
+        raise IntentChangedDuringPreparation
+
     with transaction.atomic():
         lock_device_intent_transaction(management.device_id)
         locked = NSODeviceManagement.objects.select_for_update(of=("self",)).order_by().get(pk=management.pk)
+        if locked.adapter_device_id != management.adapter_device_id or locked.source_rekey_pending:
+            raise IntentChangedDuringPreparation
+        current = lock_intent_revisions(locked.device_id, expected_scopes)
+        if any(current[scope] != snapshot.revision for scope, snapshot in pushed.items()):
+            raise IntentChangedDuringPreparation
 
-        locked_rows = []
+        locked_rows: list[tuple] = []
         for scope, model in deploying_models().items():
             if model is NSOStaticRouteState and not static_route_stored:
                 continue
-            rows = model.objects.filter(management=locked).order_by("pk")
-            expected_pks = list(rows.values_list("pk", flat=True))
-            locked_statuses = list(rows.select_for_update(skip_locked=True).values_list("pk", "status"))
-            if [pk for pk, _status in locked_statuses] != expected_pks:
-                raise IntentChangedDuringPreparation
+            locked_statuses = list(
+                model.objects.select_for_update(of=("self",))
+                .filter(management=locked, status__in=(sm.ACCEPTED, sm.APPLY_FAILED))
+                .order_by("pk")
+                .values_list("pk", "status")
+            )
             locked_rows.append((scope, model, locked_statuses))
 
-        if any(_current_identity(locked, registry, scope) != snapshot.identity for scope, snapshot in pushed.items()):
-            raise IntentChangedDuringPreparation
+        selected = {
+            registry[scope].section: pushed[scope].push_seq
+            for scope in sorted(pushed, key=lambda candidate: registry[candidate].section)
+        }
+        attempt = NSOApplyAttempt.objects.create(
+            id=apply_attempt_id,
+            management=locked,
+            adapter_device_id=locked.adapter_device_id,
+            scope_revisions=current,
+            selected=selected,
+        )
 
+        moved: list[tuple] = []
+        now = timezone.now()
         for scope, model, rows in locked_rows:
             section = registry[scope].section
             for previous_status in (sm.ACCEPTED, sm.APPLY_FAILED):
@@ -408,7 +437,9 @@ def promote_current_intent(management, registry, pushed, *, static_route_stored:
                     continue
                 model.objects.filter(pk__in=pks, status=previous_status).update(
                     status=sm.advance(previous_status, sm.APPLY),
-                    last_apply_at=timezone.now(),
+                    apply_attempt_id=attempt.pk,
+                    last_apply_at=now,
+                    last_apply_error="",
                 )
                 moved.append((section, model, pks, previous_status))
-    return moved
+    return attempt, moved

@@ -985,11 +985,16 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
         mock_s.return_value = session
         selector = MappingProxyType({"vlan": 4711})
 
-        result = trigger_apply(5, selector)
+        apply_attempt_id = "8a2c9231-7ad8-4b17-a4b8-f5b4df745dd8"
+
+        result = trigger_apply(5, apply_attempt_id, selector)
 
         self.assertEqual(result, promoted)
         _, kwargs = session.request.call_args
-        self.assertEqual(kwargs["json"], {"selected": {"vlan": 4711}})
+        self.assertEqual(
+            kwargs["json"],
+            {"apply_attempt_id": apply_attempt_id, "selected": {"vlan": 4711}},
+        )
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
@@ -1009,10 +1014,39 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
         mock_s.return_value = session
 
         with self.assertRaises(AdapterError) as raised:
-            trigger_apply(5, MappingProxyType({"unknown": 9}))
+            trigger_apply(
+                5,
+                "8a2c9231-7ad8-4b17-a4b8-f5b4df745dd8",
+                MappingProxyType({"unknown": 9}),
+            )
 
         self.assertEqual(raised.exception.status_code, 422)
         self.assertEqual(raised.exception.code, "validation_error")
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_deployment_evidence_posts_only_the_requested_attempt_ids(self, mock_s, _cfg):
+        from netbox_nso_plugin.adapter_client import get_deployment_evidence
+
+        attempt_id = "8a2c9231-7ad8-4b17-a4b8-f5b4df745dd8"
+        evidence = {
+            "device_id": 5,
+            "head": None,
+            "blocked": False,
+            "write_work_pending": False,
+            "held_jobs": [],
+            "pending_generations": 0,
+            "attempts": [],
+            "unknown_apply_attempt_ids": [attempt_id],
+        }
+        session = self._make_session(200, evidence)
+        mock_s.return_value = session
+
+        result = get_deployment_evidence(5, [attempt_id])
+
+        self.assertEqual(result, evidence)
+        _, kwargs = session.request.call_args
+        self.assertEqual(kwargs["json"], {"apply_attempt_ids": [attempt_id]})
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")

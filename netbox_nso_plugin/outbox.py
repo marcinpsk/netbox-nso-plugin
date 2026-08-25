@@ -357,6 +357,39 @@ def _refuse_outside_a_transaction() -> None:
         raise RuntimeError("an intent outbox entry must be appended inside the writer's own transaction")
 
 
+def _repend_scope(device_id: int, scope: str) -> None:
+    """Invalidate every in-flight Apply row rendered by one delivery scope."""
+    from .apply_state import deploying_models
+
+    model = deploying_models().get(scope)
+    if model is None:
+        return
+    model.objects.filter(management__device_id=device_id, status="deploying").update(
+        status="accepted",
+        apply_attempt_id=None,
+    )
+
+
+def bump_intent_revision(device_id: int, scope: str) -> int:
+    """Advance one delivery scope's durable content revision."""
+    from django.db import connection
+
+    if not connection.in_atomic_block:
+        raise RuntimeError("an intent revision must be bumped inside the writer's own transaction")
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "INSERT INTO netbox_nso_plugin_nsointentrevision "
+            "(device_id, scope, revision, updated_at) VALUES (%s, %s, 1, NOW()) "
+            "ON CONFLICT (device_id, scope) DO UPDATE SET "
+            "revision = netbox_nso_plugin_nsointentrevision.revision + 1, updated_at = NOW() "
+            "RETURNING revision",
+            [device_id, scope],
+        )
+        revision = int(cursor.fetchone()[0])
+    _repend_scope(device_id, scope)
+    return revision
+
+
 def enqueue(device_id, scope: str, *, transitions=(), delete_origin: bool = False) -> None:
     """Append this transaction's contribution to ``(device_id, scope)``.
 
@@ -382,6 +415,7 @@ def enqueue(device_id, scope: str, *, transitions=(), delete_origin: bool = Fals
     txid = current_txid()
     if _device_is_tearing_down(device_id, txid):
         return
+    bump_intent_revision(device_id, scope)
     NSOIntentOutboxEntry.objects.create(
         device_id=device_id,
         scope=scope,

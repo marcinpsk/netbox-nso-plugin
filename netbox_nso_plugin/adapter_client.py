@@ -312,11 +312,12 @@ def reset_config_cache():
 class AdapterError(Exception):
     """Raised when the nso-adapter returns an error or is unreachable."""
 
-    def __init__(self, message, code=None, detail=None, status_code=None):
+    def __init__(self, message, code=None, detail=None, status_code=None, response=None):
         super().__init__(message)
         self.code = code
         self.detail = detail
         self.status_code = status_code
+        self.response = response
 
 
 _PUBLIC_ERROR_MESSAGES = {
@@ -532,6 +533,10 @@ def _request_response(method, path, **kwargs):
 
     if not resp.ok:
         err = _error_envelope(resp)
+        try:
+            response = resp.json()
+        except ValueError:
+            response = None
         detail = err.get("detail")
         # ``or`` not ``.get(key, default)``: the adapter emits nulls, and a present null
         # would otherwise beat the fallback and leave the operator an empty message.
@@ -540,6 +545,7 @@ def _request_response(method, path, **kwargs):
             code=str(err.get("code") or resp.status_code),
             detail=detail if isinstance(detail, dict) else None,
             status_code=resp.status_code,
+            response=response,
         )
     return resp
 
@@ -1449,7 +1455,7 @@ def preflight_route_policy(
         return {"known": False, "fully_supported": True, "unsupported": [], "coverage_unknown": False}
 
 
-def trigger_apply(adapter_device_id, selected):
+def trigger_apply(adapter_device_id, apply_attempt_id, selected):
     """Promote the exact stored intent receipts named by a frozen selector.
 
     Raise AdapterError when a device job is already queued or running.
@@ -1457,7 +1463,30 @@ def trigger_apply(adapter_device_id, selected):
     return _request(
         "POST",
         f"/api/v1/devices/{adapter_device_id}/actions/apply",
-        json={"selected": dict(selected)},
+        json={"apply_attempt_id": str(apply_attempt_id), "selected": dict(selected)},
+    )
+
+
+DEPLOYMENT_EVIDENCE_FIELDS = frozenset(
+    {
+        "device_id",
+        "head",
+        "blocked",
+        "write_work_pending",
+        "held_jobs",
+        "pending_generations",
+        "attempts",
+        "unknown_apply_attempt_ids",
+    }
+)
+
+
+def get_deployment_evidence(adapter_device_id, apply_attempt_ids):
+    """Return barrier and durable evidence for the named Apply attempts."""
+    return _request(
+        "POST",
+        f"/api/v1/devices/{adapter_device_id}/deployment-evidence",
+        json={"apply_attempt_ids": [str(attempt_id) for attempt_id in apply_attempt_ids]},
     )
 
 
