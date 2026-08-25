@@ -2992,12 +2992,13 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
         outcome = result.get("outcome")
         expected_selected, skipped, partition_error = _apply_stream_partition(result, selected)
         if partition_error:
-            if outcome == "no_op":
+            if outcome == "no_op" and result.get("generations") == []:
                 _rollback_prepare_apply(prepared)
             return self._apply_unreadable_response(request, mgmt, partition_error, is_ajax=is_ajax)
         if outcome == "no_op":
             if set(skipped) != set(expected_selected) or result.get("generations") != []:
-                _rollback_prepare_apply(prepared)
+                if result.get("generations") == []:
+                    _rollback_prepare_apply(prepared)
                 return self._apply_unreadable_response(
                     request, mgmt, "Adapter returned incomplete Apply skip results.", is_ajax=is_ajax
                 )
@@ -4265,8 +4266,7 @@ def _save_owned_overlay_edit(obj, key):
     with transaction.atomic():
         if not sm.is_owned(obj.status):
             obj.accepted_at = timezone.now()
-        if obj.status != "deploying":  # don't stomp an apply already in flight
-            obj.status = "accepted"
+        obj.status = "accepted"
         if key == "interface_mtu" and obj.l2_mtu is not None:
             iface = obj.interface
             clamped = min(int(obj.l2_mtu), NSOInterfaceMtuStateAcceptView._NETBOX_MTU_MAX)
@@ -5251,9 +5251,9 @@ def _lock_switchport_accept_state(state):
     )
 
     vlan_ids = _switchport_vlan_ids(state)
+    lock_device_vlan_membership_transaction(state.management.device_id)
     for vlan_id in sorted(vlan_ids):
         lock_vlan_membership_transaction(vlan_id)
-    lock_device_vlan_membership_transaction(state.management.device_id)
     for vlan_id in sorted(vlan_ids):
         lock_vlan_intent_transaction(vlan_id)
     locked_vlan_ids = set(
@@ -6076,7 +6076,10 @@ class OverlayStateAcceptMixin(NSOActionPermissionMixin, View):
 
     def lock_state_for_accept(self, state):
         """Return the state that this accept operation must update."""
-        return state
+        return get_object_or_404(
+            self.model_class.objects.select_for_update(of=("self",)),
+            pk=state.pk,
+        )
 
     def post(self, request, pk):  # noqa: D102
         state = get_object_or_404(self.model_class, pk=pk)
@@ -6337,13 +6340,6 @@ class NSOInterfaceMtuStateAcceptView(OverlayStateAcceptMixin):
 
 class NSOVLANStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOVLANState
-
-    def lock_state_for_accept(self, state):
-        """Serialize ownership changes with VLAN rescope row replacement."""
-        return get_object_or_404(
-            self.model_class.objects.select_for_update(of=("self",)),
-            pk=state.pk,
-        )
 
 
 class NSOVLANRescopeView(NSOActionPermissionMixin, View):
@@ -6758,13 +6754,13 @@ class NSOVLANAttachView(NSOActionPermissionMixin, View):
                 mark_explicit_accept,
             )
 
+            lock_device_vlan_membership_transaction(mgmt.device_id)
             lock_vlan_membership_transaction(vlan_id)
+            lock_vlan_intent_transaction(vlan_id)
             vlan = VLAN.objects.select_for_update(of=("self",)).filter(pk=vlan_id).first()
             if vlan is None:
                 messages.error(request, "The selected VLAN is no longer available.")
                 return redirect(_device_nso_tab_url(mgmt.device_id))
-            lock_device_vlan_membership_transaction(mgmt.device_id)
-            lock_vlan_intent_transaction(vlan.pk)
             lock_device_intent_transaction(mgmt.device_id)
 
             state, created = NSOVLANState.objects.get_or_create(

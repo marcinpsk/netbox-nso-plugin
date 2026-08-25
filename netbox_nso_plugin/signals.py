@@ -265,18 +265,12 @@ def _clear_management_teardown(sender, instance, **kwargs):
     outbox.clear_device_teardown(instance.device_id, outbox.current_txid())
 
 
-def _changed_intent_instance(instance, signal_kwargs):
-    """Return an existing row only when this save can change its rendered intent."""
-    if signal_kwargs.get("created") or not getattr(instance, "_nso_intent_fields_changed", False):
-        return None
-    return instance
-
-
 def _capture_intent_field_change(sender, instance, *, scope, **kwargs):
     """Compare wire-visible fields before a save so its post-save hook can re-pend safely."""
     from .apply_state import capture_intent_field_change
 
-    instance._nso_intent_fields_changed = False
+    instance._nso_intent_previous_status = None
+    instance._nso_intent_forced_status = None
     if _is_intent_push_suppressed() or _is_render_request():
         return
     capture_intent_field_change(instance, scope, update_fields=kwargs.get("update_fields"))
@@ -296,7 +290,7 @@ def _finalise_intent_field_change(sender, instance, *, scope, **kwargs):
     repend_changed_row(instance, scope)
 
 
-def _schedule_intent_push(key, transitions=(), *, changed_instance=None) -> None:
+def _schedule_intent_push(key, transitions=()) -> None:
     """Append this transaction's contribution to *key* and arrange for the key to drain.
 
     *transitions* is the provenance of what this transaction did to the key — which routes
@@ -1542,10 +1536,7 @@ def _on_logging_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    _schedule_intent_push(
-        (device_id, "logging"),
-        changed_instance=_changed_intent_instance(instance, kwargs),
-    )
+    _schedule_intent_push((device_id, "logging"))
 
 
 def _push_svi_intent_for_device(device_id, adapter_device_id):
@@ -1595,10 +1586,7 @@ def _on_svi_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    _schedule_intent_push(
-        (device_id, "svi"),
-        changed_instance=_changed_intent_instance(instance, kwargs),
-    )
+    _schedule_intent_push((device_id, "svi"))
 
 
 def _push_subinterface_intent_for_device(device_id, adapter_device_id):
@@ -1650,10 +1638,7 @@ def _on_subinterface_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    _schedule_intent_push(
-        (device_id, "subinterface"),
-        changed_instance=_changed_intent_instance(instance, kwargs),
-    )
+    _schedule_intent_push((device_id, "subinterface"))
 
 
 def _push_interface_mtu_intent_for_device(device_id, adapter_device_id):
@@ -1703,10 +1688,7 @@ def _on_mtu_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    _schedule_intent_push(
-        (device_id, "interface_mtu"),
-        changed_instance=_changed_intent_instance(instance, kwargs),
-    )
+    _schedule_intent_push((device_id, "interface_mtu"))
 
 
 def _push_vlan_intent_for_device(device_id, adapter_device_id):
@@ -1754,10 +1736,7 @@ def _on_vlan_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    _schedule_intent_push(
-        (device_id, "vlan"),
-        changed_instance=_changed_intent_instance(instance, kwargs),
-    )
+    _schedule_intent_push((device_id, "vlan"))
 
 
 @_skip_on_render
@@ -1901,10 +1880,7 @@ def _on_bfd_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    _schedule_intent_push(
-        (device_id, "bfd"),
-        changed_instance=_changed_intent_instance(instance, kwargs),
-    )
+    _schedule_intent_push((device_id, "bfd"))
 
 
 def _on_ip_address_pre_save(sender, instance, **kwargs):
@@ -2183,10 +2159,7 @@ def _on_static_route_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    _schedule_intent_push(
-        (device_id, "static_route"),
-        changed_instance=_changed_intent_instance(instance, kwargs),
-    )
+    _schedule_intent_push((device_id, "static_route"))
 
 
 # ── Greenfield static routes (operator-created in NetBox, not yet on the device) ──
@@ -2675,10 +2648,7 @@ def _on_l2_sap_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    _schedule_intent_push(
-        (device_id, "l2_sap"),
-        changed_instance=_changed_intent_instance(instance, kwargs),
-    )
+    _schedule_intent_push((device_id, "l2_sap"))
 
 
 def _push_lacp_intent_for_device(device_id, adapter_device_id):
@@ -3661,10 +3631,7 @@ def _on_route_policy_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    _schedule_intent_push(
-        (device_id, "route_policy"),
-        changed_instance=_changed_intent_instance(instance, kwargs),
-    )
+    _schedule_intent_push((device_id, "route_policy"))
 
 
 @_skip_on_render
