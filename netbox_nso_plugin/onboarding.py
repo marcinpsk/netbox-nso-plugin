@@ -92,7 +92,7 @@ def build_onboarding_dashboard(instance) -> dict:
     failure ``error`` is set and the lists are empty (the view renders the banner).
     """
     from . import adapter_client as client
-    from .adapter_client import AdapterError
+    from .adapter_client import AdapterError, public_error_message
     from .models import NSOPlatformNedMapping
 
     out: dict = {
@@ -108,7 +108,7 @@ def build_onboarding_dashboard(instance) -> dict:
     try:
         nso_devices = client.list_instance_devices(instance.adapter_instance_id)
     except AdapterError as exc:
-        out["error"] = str(exc)
+        out["error"] = public_error_message(exc)
         return out
     except Exception as exc:  # defensive — never 500 the dashboard
         logger.exception("build_onboarding_dashboard: listing devices for instance %s failed", instance.pk)
@@ -349,7 +349,7 @@ def advance_provisioning(mgmt) -> dict:
     ``poll_error`` on a transient adapter outage (the row is kept provisioning so callers retry).
     """
     from . import adapter_client as client
-    from .adapter_client import AdapterError
+    from .adapter_client import AdapterError, public_error_message
 
     # Terminal or ready row → just report it (never re-poll). Keeps the sweep/tab cheap and
     # the poll endpoint idempotent.
@@ -366,7 +366,7 @@ def advance_provisioning(mgmt) -> dict:
         job = client.get_job(mgmt.onboard_job_id)
     except AdapterError as exc:
         # Transient — leave the row provisioning so the next poll/tab/sweep retries.
-        return {"status": "provisioning", "poll_error": str(exc)}
+        return {"status": "provisioning", "poll_error": public_error_message(exc)}
 
     job_status = (job or {}).get("status")
     if job_status in ("queued", "running"):

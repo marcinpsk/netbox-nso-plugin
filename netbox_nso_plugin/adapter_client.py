@@ -317,6 +317,18 @@ class AdapterError(Exception):
         self.status_code = status_code
 
 
+_PUBLIC_ERROR_MESSAGES = {
+    "configuration_error": "The NSO adapter is not configured. See the server log.",
+    "invalid_response": "The NSO adapter returned an invalid response. See the server log.",
+}
+_PUBLIC_ERROR_DEFAULT = "The NSO adapter request failed. See the server log."
+
+
+def public_error_message(error: AdapterError) -> str:
+    """Map an adapter failure code to fixed text that is safe for HTTP responses."""
+    return _PUBLIC_ERROR_MESSAGES.get(error.code, _PUBLIC_ERROR_DEFAULT)
+
+
 def _resolve_config() -> dict:
     """Return resolved config dict, using a short in-process cache."""
     while True:
@@ -1021,6 +1033,7 @@ def list_device_generations(adapter_device_id, *, since_seq=None):
     if since_seq is not None and (type(since_seq) is not int or since_seq < 0):
         raise ValueError("since_seq must be a non-negative integer")
     generations = []
+    generation_ids = set()
     last_seq = since_seq
     while True:
         params = {"limit": _GENERATION_PAGE_LIMIT}
@@ -1034,13 +1047,17 @@ def list_device_generations(adapter_device_id, *, since_seq=None):
             seq = row.get("seq")
             settlement_cohort = row.get("settlement_cohort")
             if (
-                type(generation_id) is not int
+                "settlement_cohort" not in row
+                or type(generation_id) is not int
                 or generation_id <= 0
+                or generation_id in generation_ids
                 or type(seq) is not int
+                or seq <= 0
                 or (last_seq is not None and seq <= last_seq)
-                or (settlement_cohort is not None and type(settlement_cohort) is not int)
+                or (settlement_cohort is not None and (type(settlement_cohort) is not int or settlement_cohort <= 0))
             ):
                 raise AdapterError("Adapter returned a malformed generations listing.", code="invalid_response")
+            generation_ids.add(generation_id)
             last_seq = seq
         generations.extend(page)
         if len(page) < _GENERATION_PAGE_LIMIT:

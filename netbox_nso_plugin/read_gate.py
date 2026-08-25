@@ -884,7 +884,15 @@ def mark_publication_error_if_current(mgmt, family: str, decision: _Decision, ep
     return True
 
 
-def gated_family_run(mgmt, family: str, read_state: dict | None, body: Callable[[], Any], *, epoch) -> GateResult:
+def gated_family_run(
+    mgmt,
+    family: str,
+    read_state: dict | None,
+    body: Callable[[], Any],
+    *,
+    epoch,
+    pre_body: Callable[[], None] | None = None,
+) -> GateResult:
     """ONE family document → ONE gate decision → at most ONE body run (R3-6).
 
     The admission transaction commits BEFORE the body runs, so a body failure after
@@ -905,6 +913,11 @@ def gated_family_run(mgmt, family: str, read_state: dict | None, body: Callable[
         for deadlock_attempt in range(3):
             try:
                 with transaction.atomic():
+                    from .apply_state import lock_device_intent_transaction
+
+                    if pre_body is not None:
+                        pre_body()
+                    lock_device_intent_transaction(mgmt.device_id)
                     value = body()
                     current_management = NSODeviceManagement.objects.select_for_update().get(pk=mgmt.pk)
                     row = NSOFamilyReadState.objects.select_for_update().get(

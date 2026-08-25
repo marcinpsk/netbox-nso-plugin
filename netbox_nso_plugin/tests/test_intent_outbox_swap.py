@@ -88,6 +88,63 @@ class TestTheCoalescerSymbolsAreGone(SimpleTestCase):
             with self.subTest(symbol=name):
                 assert not hasattr(signals, name)
 
+
+class TestFixtureCommitDrainSuppression(SimpleTestCase):
+    def test_overlapping_thread_contexts_restore_the_production_callback(self):
+        import threading
+
+        from netbox_nso_plugin import signals
+
+        from ._outbox_case import without_commit_drain
+
+        original = signals._drain_intent_pushes
+        first_entered = threading.Event()
+        second_entered = threading.Event()
+        release_first = threading.Event()
+        release_second = threading.Event()
+        first_exited = threading.Event()
+        errors = []
+
+        def first_context():
+            try:
+                with without_commit_drain():
+                    first_entered.set()
+                    if not release_first.wait(5):
+                        raise AssertionError("the second suppression context did not enter")
+                first_exited.set()
+            except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
+                errors.append(exc)
+
+        def second_context():
+            try:
+                if not first_entered.wait(5):
+                    raise AssertionError("the first suppression context did not enter")
+                with without_commit_drain():
+                    second_entered.set()
+                    if not release_second.wait(5):
+                        raise AssertionError("the first suppression context did not exit")
+            except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
+                errors.append(exc)
+
+        first = threading.Thread(target=first_context)
+        second = threading.Thread(target=second_context)
+        first.start()
+        second.start()
+        self.assertTrue(second_entered.wait(5), "the suppression contexts did not overlap")
+        release_first.set()
+        self.assertTrue(first_exited.wait(5), "the first suppression context did not exit first")
+        release_second.set()
+        first.join(5)
+        second.join(5)
+
+        leaked = signals._drain_intent_pushes is not original
+        signals._drain_intent_pushes = original
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        if errors:
+            raise errors[0]
+        self.assertFalse(leaked, "the later context restored the earlier thread's mock")
+
     def test_no_module_still_reads_them(self):
         import ast
 

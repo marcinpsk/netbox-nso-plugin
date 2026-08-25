@@ -223,6 +223,7 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
                 "seq": seq,
                 "status": "settled",
                 "job_id": wanted if seq == wanted else None,
+                "settlement_cohort": None,
             }
             for seq in range(1, wanted + 1)
         ]
@@ -241,6 +242,7 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
                 "seq": seq,
                 "status": "settled",
                 "job_id": wanted if seq == wanted else None,
+                "settlement_cohort": None,
             }
             for seq in range(1, wanted + 1)
         ]
@@ -279,7 +281,10 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
             response = self.client.get(url, {"generation_id": 81})
 
         self.assertEqual(response.status_code, 502)
-        self.assertEqual(response.json()["error"], "Adapter returned a malformed generations listing.")
+        self.assertEqual(
+            response.json()["error"],
+            "The NSO adapter returned an invalid response. See the server log.",
+        )
 
     def test_ordinary_failed_removal_not_blocked(self):
         """A removal that failed for another reason does not raise the banner."""

@@ -319,7 +319,7 @@ class TestTheStuckDeployingBackstop(_SettlementCase):
     def test_a_malformed_generation_cohort_keeps_apply_activity_unknown(self):
         from netbox_nso_plugin.reconcile import _apply_job_state
 
-        for adapter_device_id, malformed_cohort in ((65, "73"), (66, True)):
+        for adapter_device_id, malformed_cohort in ((65, "73"), (66, True), (67, 0), (68, -1)):
             with self.subTest(settlement_cohort=malformed_cohort):
                 self._device(f"cohorttype{adapter_device_id}", adapter_device_id)
                 self.adapter.store.add_generation(
@@ -517,7 +517,7 @@ class TestApplyRefusalSealing(TestCase):
         )
 
     def test_a_refused_snmp_refresh_answers_the_rebuilt_wording(self):
-        """End to end: POST → view → 409 whose body carries the recorded cause, not str(exc)."""
+        """End to end: POST to view to 409 never exposes the persisted exception text."""
         from django.urls import reverse
 
         from netbox_nso_plugin import drain
@@ -525,8 +525,9 @@ class TestApplyRefusalSealing(TestCase):
         from netbox_nso_plugin.views import _snmp_refusal_message
 
         mgmt = self._mgmt("seal-snmp", 97)
+        supplied = "Traceback: private adapter path and response body"
         NSODeviceManagement.objects.filter(pk=mgmt.pk).update(
-            intent_push_errors={"snmp": {"message": "the store refused the shrink"}}
+            intent_push_errors={"snmp": {"code": "nso_error", "message": supplied}}
         )
         for name, answer in (("push_now", {"count": 0}), ("drain_key", drain.REFUSED)):
             patcher = patch(f"netbox_nso_plugin.drain.{name}", side_effect=lambda *a, answer=answer, **kw: answer)
@@ -539,7 +540,8 @@ class TestApplyRefusalSealing(TestCase):
         assert response.status_code == 409
         mgmt.refresh_from_db()
         assert response.json()["message"] == _snmp_refusal_message(mgmt)
-        assert "the store refused the shrink" in response.json()["message"]
+        assert supplied not in response.json()["message"]
+        assert "The NSO adapter request failed. See the server log." in response.json()["message"]
 
     def test_an_expired_budget_answers_the_deadline_wording(self):
         """End to end: the deadline refusal serves its fixed wording with a 409."""

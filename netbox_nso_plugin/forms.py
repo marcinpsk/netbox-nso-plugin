@@ -312,8 +312,7 @@ class NSOSnmpCommunityStateForm(NetBoxModelForm):
             try:
                 result = adapter_client.set_secret(ref, {key: secret})
             except adapter_client.AdapterError as exc:
-                # AdapterError text comes from the adapter, which never echoes values.
-                self.add_error("secret_value", f"Vault write failed: {exc}")
+                self.add_error("secret_value", f"Vault write failed: {adapter_client.public_error_message(exc)}")
             else:
                 self._secret_result = {"hash": new_hash, "version": result.get("version")}
         return cleaned
@@ -409,7 +408,7 @@ class NSOSnmpV3UserStateForm(NetBoxModelForm):
             try:
                 result = adapter_client.set_secret(ref, values)
             except adapter_client.AdapterError as exc:
-                self.add_error(None, f"Vault write failed: {exc}")
+                self.add_error(None, f"Vault write failed: {adapter_client.public_error_message(exc)}")
             else:
                 self._secret_result = {"fields": set(values), "version": result.get("version")}
         return cleaned

@@ -587,7 +587,7 @@ class TestReconcileDeviceLinks(_SyncCacheTestBase):
         self.assertEqual((broken, attempted), (1, 1))
         mgmt.refresh_from_db()
         self.assertEqual(mgmt.adapter_device_id, 196)  # still broken — nothing invented
-        self.assertIn("adapter down", mgmt.adapter_link_error)  # banner + Retry button
+        self.assertEqual(mgmt.adapter_link_error, "The NSO adapter request failed. See the server log.")
 
     def test_adapter_outage_reconciles_nothing(self):
         """An unreachable adapter proves nothing about any mapping — do not touch the rows."""

@@ -781,15 +781,27 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
         for payload in (
             {"generations": []},
             [None],
-            [{"generation_id": 1}],
-            [{"seq": 1}],
-            [{"generation_id": "1", "seq": 1}],
-            [{"generation_id": True, "seq": 1}],
-            [{"generation_id": 0, "seq": 1}],
-            [{"generation_id": -1, "seq": 1}],
-            [{"generation_id": 1, "seq": True}],
-            [{"generation_id": 1, "seq": "1"}],
-            [{"generation_id": 2, "seq": 2}, {"generation_id": 1, "seq": 1}],
+            [{"generation_id": 1, "settlement_cohort": None}],
+            [{"seq": 1, "settlement_cohort": None}],
+            [{"generation_id": 1, "seq": 1}],
+            [{"generation_id": "1", "seq": 1, "settlement_cohort": None}],
+            [{"generation_id": True, "seq": 1, "settlement_cohort": None}],
+            [{"generation_id": 0, "seq": 1, "settlement_cohort": None}],
+            [{"generation_id": -1, "seq": 1, "settlement_cohort": None}],
+            [{"generation_id": 1, "seq": 0, "settlement_cohort": None}],
+            [{"generation_id": 1, "seq": -1, "settlement_cohort": None}],
+            [{"generation_id": 1, "seq": True, "settlement_cohort": None}],
+            [{"generation_id": 1, "seq": "1", "settlement_cohort": None}],
+            [{"generation_id": 1, "seq": 1, "settlement_cohort": 0}],
+            [{"generation_id": 1, "seq": 1, "settlement_cohort": -1}],
+            [
+                {"generation_id": 2, "seq": 2, "settlement_cohort": None},
+                {"generation_id": 1, "seq": 1, "settlement_cohort": None},
+            ],
+            [
+                {"generation_id": 1, "seq": 1, "settlement_cohort": 73},
+                {"generation_id": 1, "seq": 2, "settlement_cohort": 73},
+            ],
         ):
             with self.subTest(payload=payload):
                 reset_session()
@@ -818,8 +830,10 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
 
         # A page of exactly the limit is what makes the reader ask for another; the short one stops it.
         last_full_seq = _GENERATION_PAGE_LIMIT
-        first_page = [{"generation_id": seq, "seq": seq} for seq in range(1, last_full_seq + 1)]
-        final_page = [{"generation_id": last_full_seq + 1, "seq": last_full_seq + 1}]
+        first_page = [
+            {"generation_id": seq, "seq": seq, "settlement_cohort": None} for seq in range(1, last_full_seq + 1)
+        ]
+        final_page = [{"generation_id": last_full_seq + 1, "seq": last_full_seq + 1, "settlement_cohort": None}]
         session = make_session()
         session.request.side_effect = [
             make_response(200, first_page),
