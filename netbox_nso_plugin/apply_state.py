@@ -3,6 +3,7 @@
 """Serialize Apply promotion with the intent transactions it represents."""
 
 from django.db import connection, transaction
+from django.utils import timezone
 
 
 class IntentChangedDuringPreparation(Exception):
@@ -135,7 +136,6 @@ def deploying_models() -> dict:
 
 def capture_intent_field_change(instance, scope, *, update_fields=None) -> None:
     """Remember whether this save changes fields rendered for one Apply scope."""
-    instance._nso_intent_fields_changed = False
     instance._nso_intent_previous_status = None
     instance._nso_intent_forced_status = None
     explicit_accept = bool(getattr(instance, "_nso_explicit_accept", False)) and instance.status == "accepted"
@@ -157,7 +157,6 @@ def capture_intent_field_change(instance, scope, *, update_fields=None) -> None:
         from .status_machine import is_owned
 
         intent_changed = any(current[field.attname] != getattr(instance, field.attname) for field in fields)
-        instance._nso_intent_fields_changed = intent_changed
         current_status = current["status"]
         loaded_status = getattr(instance, "_nso_loaded_status", current_status)
         stale_status = loaded_status != current_status
@@ -207,10 +206,11 @@ def lock_vlan_intent_rows(vlan_id, scopes) -> tuple[object | None, dict[str, lis
         ),
     }
     candidates = {scope: state_queries[scope].order_by("pk") for scope in requested}
+    empty = {scope: [] for scope in requested}
+    if not any(queryset.exists() for queryset in candidates.values()):
+        return None, empty
     if not connection.in_atomic_block:
-        if any(queryset.exists() for queryset in candidates.values()):
-            raise RuntimeError("VLAN intent edit must be saved inside a transaction")
-        return None, {scope: [] for scope in requested}
+        raise RuntimeError("VLAN intent edit must be saved inside a transaction")
 
     lock_mutation()
     lock_vlan_intent_transaction(vlan_id)
@@ -226,7 +226,7 @@ def lock_vlan_intent_rows(vlan_id, scopes) -> tuple[object | None, dict[str, lis
     )
     management_ids = sorted(management_devices)
     if not management_ids:
-        return vlan, {scope: [] for scope in requested}
+        return vlan, empty
 
     for device_id in sorted(management_devices.values()):
         lock_device_intent_transaction(device_id)
@@ -344,6 +344,7 @@ def promote_current_intent(management, registry, pushed, *, static_route_stored:
 
     moved: list[tuple] = []
     with transaction.atomic():
+        lock_device_intent_transaction(management.device_id)
         locked = NSODeviceManagement.objects.select_for_update(of=("self",)).order_by().get(pk=management.pk)
 
         locked_rows = []
@@ -364,6 +365,6 @@ def promote_current_intent(management, registry, pushed, *, static_route_stored:
             section = registry[scope].section
             pks = [pk for pk, status in rows if status == "accepted"]
             if pks:
-                model.objects.filter(pk__in=pks).update(status="deploying")
+                model.objects.filter(pk__in=pks).update(status="deploying", last_apply_at=timezone.now())
                 moved.append((section, model, pks))
     return moved

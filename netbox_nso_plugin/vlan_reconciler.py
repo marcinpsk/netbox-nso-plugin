@@ -291,15 +291,15 @@ def rescope_vlan(state, target_group):
         if existing is not None:
             vlan_ids.append(existing.pk)
         vlan_ids.sort()
+        managed_device_ids = _rescope_managed_device_ids(old_vlan)
+        for device_id in sorted(managed_device_ids):
+            lock_device_vlan_membership_transaction(device_id)
         for vlan_id in vlan_ids:
             lock_vlan_membership_transaction(vlan_id)
         current_vlan_id = NSOVLANState.objects.filter(pk=state.pk).values_list("vlan_id", flat=True).first()
         if current_vlan_id != old_vlan.pk:
             raise VLANRescopeConflict("the VLAN attachment changed while the rescope request waited")
 
-        managed_device_ids = _rescope_managed_device_ids(old_vlan)
-        for device_id in sorted(managed_device_ids):
-            lock_device_vlan_membership_transaction(device_id)
         for vlan_id in vlan_ids:
             lock_vlan_intent_transaction(vlan_id)
         locked_vlans = {

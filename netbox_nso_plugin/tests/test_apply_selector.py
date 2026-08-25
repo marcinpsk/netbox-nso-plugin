@@ -757,6 +757,34 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 stale.refresh_from_db()
                 self.assertEqual(stale.status, "imported")
 
+    def test_suppressed_save_discards_the_previous_intent_change_verdict(self):
+        from django.utils import timezone
+
+        from netbox_nso_plugin.models import NSOInterfaceMtuState
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        interface = Interface.objects.create(device=self.device, name="Ethernet9.35", type="1000base-t")
+        with suppress_intent_push():
+            state = NSOInterfaceMtuState.objects.create(
+                management=self.mgmt,
+                interface=interface,
+                l2_mtu=1500,
+                status="in_sync",
+            )
+
+        state.l2_mtu = 1600
+        with without_commit_drain(), transaction.atomic():
+            state.save(update_fields=["l2_mtu"])
+        self.assertEqual(NSOInterfaceMtuState.objects.get(pk=state.pk).status, "accepted")
+
+        state.status = "in_sync"
+        state.last_sync_at = timezone.now()
+        with suppress_intent_push(), transaction.atomic():
+            state.save(update_fields=["status", "last_sync_at"])
+
+        state.refresh_from_db()
+        self.assertEqual(state.status, "in_sync")
+
     def test_same_row_intent_writers_serialize_before_comparing(self):
         import threading
 
@@ -829,6 +857,77 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertFalse(writer.is_alive())
         if errors:
             raise errors[0]
+        state.refresh_from_db()
+        self.assertEqual(state.status, "accepted")
+
+    def test_accept_derives_status_from_the_locked_current_row(self):
+        import threading
+        import time
+
+        from django.contrib.messages.storage.fallback import FallbackStorage
+        from django.db import connections
+
+        from netbox_nso_plugin.models import NSOBFDInterfaceState
+        from netbox_nso_plugin.signals import suppress_intent_push
+        from netbox_nso_plugin.views import NSOBFDInterfaceStateAcceptView
+
+        interface = Interface.objects.create(device=self.device, name="Ethernet9.4", type="1000base-t")
+        with suppress_intent_push():
+            state = NSOBFDInterfaceState.objects.create(
+                management=self.mgmt,
+                interface=interface,
+                min_tx=300,
+                min_rx=300,
+                multiplier=3,
+                status="imported",
+            )
+
+        row_updated = threading.Event()
+        accept_waited = threading.Event()
+        errors = []
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_backend_pid()")
+            accept_pid = cursor.fetchone()[0]
+
+        def promote_row():
+            try:
+                with transaction.atomic():
+                    NSOBFDInterfaceState.objects.filter(pk=state.pk).update(status="deploying")
+                    row_updated.set()
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        with connection.cursor() as cursor:
+                            cursor.execute(
+                                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = %s AND NOT granted)",
+                                [accept_pid],
+                            )
+                            if cursor.fetchone()[0]:
+                                accept_waited.set()
+                                break
+                        time.sleep(0.01)
+                    if not accept_waited.is_set():
+                        raise AssertionError("the accept view did not wait for the concurrent row update")
+            except Exception as exc:  # noqa: BLE001 (the main test re-raises the worker failure)
+                errors.append(exc)
+            finally:
+                connections.close_all()
+
+        updater = threading.Thread(target=promote_row)
+        updater.start()
+        self.assertTrue(row_updated.wait(10), "the concurrent promotion did not update the accepted row")
+        request = RequestFactory().post("/")
+        request.user = self.user
+        request.session = {}
+        request._messages = FallbackStorage(request)
+        with suppress_intent_push():
+            response = NSOBFDInterfaceStateAcceptView().post(request, state.pk)
+        updater.join(10)
+
+        self.assertTrue(accept_waited.is_set(), "the accept view did not wait for the concurrent row update")
+        self.assertFalse(updater.is_alive())
+        if errors:
+            raise errors[0]
+        self.assertEqual(response.status_code, 302)
         state.refresh_from_db()
         self.assertEqual(state.status, "accepted")
 
@@ -1042,8 +1141,11 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from ipam.models import VLAN
 
         from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin.signals import suppress_intent_push
 
         vlan = VLAN.objects.create(vid=3558, name="before-rename")
+        with suppress_intent_push():
+            NSOVLANState.objects.create(management=self.mgmt, vlan=vlan, device_name=vlan.name, status="imported")
         other_device, other_mgmt = make_managed("apply-selector-vlan-attach", 2558)
         attach_client = Client()
         attach_client.force_login(self.user)
@@ -1119,29 +1221,202 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         vlan.refresh_from_db()
         self.assertEqual(vlan.name, "after-rename")
 
+    def test_vlan_attachment_and_rename_use_the_same_lock_order(self):
+        import threading
+        from unittest.mock import patch
+
+        from django.db import connections
+        from django.test import Client
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin import apply_state
+        from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        vlan = VLAN.objects.create(vid=3557, name="attach-before-rename")
+        with suppress_intent_push():
+            NSOVLANState.objects.create(management=self.mgmt, vlan=vlan, device_name=vlan.name, status="imported")
+        other_device, other_mgmt = make_managed("apply-selector-attach-order", 2557)
+        attach_client = Client()
+        attach_client.force_login(self.user)
+        attach_between_locks = threading.Event()
+        release_attach = threading.Event()
+        rename_holds_vlan_intent = threading.Event()
+        errors = []
+        original_device_membership_lock = apply_state.lock_device_vlan_membership_transaction
+        original_vlan_intent_lock = apply_state.lock_vlan_intent_transaction
+        attacher = None
+        renamer = None
+
+        def hold_attach_after_device_membership(device_id):
+            original_device_membership_lock(device_id)
+            if threading.current_thread() is attacher and device_id == other_device.pk:
+                attach_between_locks.set()
+                if not release_attach.wait(10):
+                    raise AssertionError("the VLAN rename did not reach its intent lock")
+
+        def note_rename_vlan_intent(vlan_id):
+            original_vlan_intent_lock(vlan_id)
+            if threading.current_thread() is renamer and vlan_id == vlan.pk:
+                rename_holds_vlan_intent.set()
+
+        def attach_vlan():
+            try:
+                with without_commit_drain():
+                    response = attach_client.post(
+                        reverse("plugins:netbox_nso_plugin:vlan_attach", args=[other_device.pk]),
+                        {"vlan": vlan.pk},
+                    )
+                if response.status_code != 302:
+                    raise AssertionError(f"VLAN attachment returned HTTP {response.status_code}")
+            except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
+                errors.append(exc)
+            finally:
+                connections.close_all()
+
+        def rename_vlan():
+            try:
+                if not attach_between_locks.wait(10):
+                    raise AssertionError("the attachment did not pause between its locks")
+                with without_commit_drain(), transaction.atomic():
+                    current = VLAN.objects.get(pk=vlan.pk)
+                    current.name = "rename-after-attach-started"
+                    current.save(update_fields=["name"])
+            except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
+                errors.append(exc)
+            finally:
+                connections.close_all()
+
+        with (
+            patch(
+                "netbox_nso_plugin.apply_state.lock_device_vlan_membership_transaction",
+                side_effect=hold_attach_after_device_membership,
+            ),
+            patch(
+                "netbox_nso_plugin.apply_state.lock_vlan_intent_transaction",
+                side_effect=note_rename_vlan_intent,
+            ),
+        ):
+            attacher = threading.Thread(target=attach_vlan)
+            renamer = threading.Thread(target=rename_vlan)
+            attacher.start()
+            self.assertTrue(attach_between_locks.wait(10), "the attachment did not pause between its locks")
+            renamer.start()
+            try:
+                self.assertTrue(rename_holds_vlan_intent.wait(10), "the rename did not acquire VLAN intent")
+            finally:
+                release_attach.set()
+                attacher.join(10)
+                renamer.join(10)
+
+        self.assertFalse(attacher.is_alive())
+        self.assertFalse(renamer.is_alive())
+        if errors:
+            raise errors[0]
+        self.assertTrue(NSOVLANState.objects.filter(management=other_mgmt, vlan=vlan).exists())
+        vlan.refresh_from_db()
+        self.assertEqual(vlan.name, "rename-after-attach-started")
+
     def test_native_vlan_prelocks_leave_malformed_payloads_to_scope_isolation(self):
+        from netbox_nso_plugin.models import NSOVLANState
         from netbox_nso_plugin.svi_reconciler import lock_svi_reconcile_dependencies
         from netbox_nso_plugin.vlan_reconciler import (
             lock_switchport_reconcile_dependencies,
             lock_vlan_reconcile_dependencies,
         )
 
+        state_before = list(NSOVLANState.objects.filter(management=self.mgmt).values_list("pk", "vlan_id", "status"))
         with transaction.atomic():
-            lock_vlan_reconcile_dependencies(
-                self.device,
-                {"vlans": [{"vlan_id": "not-an-integer"}, None]},
+            results = [
+                lock_vlan_reconcile_dependencies(
+                    self.device,
+                    {"vlans": [{"vlan_id": "not-an-integer"}, None]},
+                ),
+                lock_svi_reconcile_dependencies(
+                    self.device,
+                    {"interfaces": [{"vlan_id": "not-an-integer"}, None]},
+                ),
+                lock_switchport_reconcile_dependencies(
+                    self.device,
+                    {"interfaces": [{"untagged_vlan": "bad", "tagged_vlans": 5}, None]},
+                ),
+                lock_vlan_reconcile_dependencies(self.device, {"vlans": 5}),
+                lock_svi_reconcile_dependencies(self.device, {"interfaces": 5}),
+                lock_switchport_reconcile_dependencies(self.device, {"interfaces": 5}),
+            ]
+
+        self.assertEqual(results, [None] * 6)
+        self.assertEqual(
+            list(NSOVLANState.objects.filter(management=self.mgmt).values_list("pk", "vlan_id", "status")),
+            state_before,
+        )
+
+    def test_advisory_lock_helpers_use_distinct_transaction_namespaces(self):
+        from netbox_nso_plugin.apply_state import (
+            lock_device_intent_transaction,
+            lock_device_vlan_membership_transaction,
+            lock_vlan_intent_transaction,
+            lock_vlan_membership_transaction,
+            lock_vlan_rescope_transaction,
+        )
+
+        lock_id = 1611
+        namespaces = [
+            1_503_003_007,
+            1_503_003_008,
+            1_503_003_009,
+            1_503_003_010,
+            1_503_003_011,
+        ]
+        helpers = [
+            lock_device_intent_transaction,
+            lock_vlan_intent_transaction,
+            lock_device_vlan_membership_transaction,
+            lock_vlan_membership_transaction,
+            lock_vlan_rescope_transaction,
+        ]
+
+        with transaction.atomic():
+            for helper in helpers:
+                helper(lock_id)
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT classid::bigint, objid::bigint, objsubid, mode, granted "
+                    "FROM pg_locks WHERE pid = pg_backend_pid() AND locktype = 'advisory' "
+                    "AND classid = ANY(%s) AND objid = %s ORDER BY classid",
+                    [namespaces, lock_id],
+                )
+                held_locks = cursor.fetchall()
+
+        self.assertEqual(
+            held_locks,
+            [(namespace, lock_id, 2, "ExclusiveLock", True) for namespace in namespaces],
+        )
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT count(*) FROM pg_locks WHERE pid = pg_backend_pid() AND locktype = 'advisory' "
+                "AND classid = ANY(%s) AND objid = %s",
+                [namespaces, lock_id],
             )
-            lock_svi_reconcile_dependencies(
-                self.device,
-                {"interfaces": [{"vlan_id": "not-an-integer"}, None]},
-            )
-            lock_switchport_reconcile_dependencies(
-                self.device,
-                {"interfaces": [{"untagged_vlan": "bad", "tagged_vlans": 5}, None]},
-            )
-            lock_vlan_reconcile_dependencies(self.device, {"vlans": 5})
-            lock_svi_reconcile_dependencies(self.device, {"interfaces": 5})
-            lock_switchport_reconcile_dependencies(self.device, {"interfaces": 5})
+            self.assertEqual(cursor.fetchone()[0], 0)
+
+    def test_quiescence_allows_an_unmanaged_vlan_edit(self):
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin.deployment import quiesce, resume
+
+        vlan = VLAN.objects.create(vid=3556, name="outside-nso-intent")
+
+        quiesce()
+        try:
+            with transaction.atomic():
+                vlan.name = "still-outside-nso-intent"
+                vlan.save(update_fields=["name"])
+        finally:
+            resume()
+
+        vlan.refresh_from_db()
+        self.assertEqual(vlan.name, "still-outside-nso-intent")
 
     def test_switchport_dependency_discovery_fences_a_new_vlan_attachment(self):
         import threading
@@ -1514,7 +1789,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         accept_waiting = threading.Event()
         errors = []
         original_device_lock = apply_state.lock_device_intent_transaction
-        original_membership_lock = apply_state.lock_vlan_membership_transaction
+        original_membership_lock = apply_state.lock_device_vlan_membership_transaction
         rescoping = None
         accepting = None
 
@@ -1525,10 +1800,10 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 if not release_rescope.wait(10):
                     raise AssertionError("switchport Accept did not inspect the device-intent fence")
 
-        def note_accept_waiting(vlan_id):
-            if threading.current_thread() is accepting and vlan_id == source_vlan.pk:
+        def note_accept_waiting(device_id):
+            if threading.current_thread() is accepting and device_id == self.device.pk:
                 accept_waiting.set()
-            return original_membership_lock(vlan_id)
+            return original_membership_lock(device_id)
 
         def merge_vlan():
             try:
@@ -1560,7 +1835,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 side_effect=hold_rescope_device_lock,
             ),
             patch(
-                "netbox_nso_plugin.apply_state.lock_vlan_membership_transaction",
+                "netbox_nso_plugin.apply_state.lock_device_vlan_membership_transaction",
                 side_effect=note_accept_waiting,
             ),
         ):
@@ -2092,6 +2367,95 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "accepted")
 
+    def test_promotion_waits_for_an_unchanged_reconcile_transaction(self):
+        import threading
+        import time
+        from types import SimpleNamespace
+
+        from django.db import connections
+
+        from netbox_nso_plugin import apply_state, delivery
+        from netbox_nso_plugin.models import NSOVLANState
+
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_backend_pid()")
+            promotion_pid = cursor.fetchone()[0]
+        registry = delivery.delivery_keys()
+        identity = apply_state._current_identity(self.mgmt, registry, "vlan")
+
+        row_locked = threading.Event()
+        promotion_waited = threading.Event()
+        abort_reconcile = threading.Event()
+        errors = []
+
+        def reconcile_without_changes():
+            try:
+                with transaction.atomic():
+                    apply_state.lock_device_intent_transaction(self.mgmt.device_id)
+                    NSOVLANState.objects.select_for_update().get(pk=self.vlan_state.pk)
+                    row_locked.set()
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline and not abort_reconcile.is_set():
+                        with connection.cursor() as cursor:
+                            cursor.execute(
+                                "SELECT EXISTS (SELECT 1 FROM pg_locks "
+                                "WHERE pid = %s AND locktype = 'advisory' AND NOT granted)",
+                                [promotion_pid],
+                            )
+                            if cursor.fetchone()[0]:
+                                promotion_waited.set()
+                                return
+                        abort_reconcile.wait(0.01)
+                    if not abort_reconcile.is_set():
+                        raise AssertionError("Apply did not wait on the reconcile transaction")
+            except Exception as exc:  # noqa: BLE001 (the main test re-raises the worker failure)
+                errors.append(exc)
+            finally:
+                connections.close_all()
+
+        worker = threading.Thread(target=reconcile_without_changes)
+        worker.start()
+        try:
+            self.assertTrue(row_locked.wait(10), "the reconcile did not lock the intent row")
+            moved = apply_state.promote_current_intent(
+                self.mgmt,
+                registry,
+                {"vlan": SimpleNamespace(identity=identity)},
+                static_route_stored=False,
+            )
+        finally:
+            abort_reconcile.set()
+            worker.join(10)
+
+        self.assertTrue(promotion_waited.is_set(), "Apply did not wait for the reconcile transaction")
+        self.assertFalse(worker.is_alive())
+        if errors:
+            raise errors[0]
+        self.assertEqual(moved, [(registry["vlan"].section, NSOVLANState, [self.vlan_state.pk])])
+        self.vlan_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "deploying")
+
+    def test_promotion_stamps_the_apply_start_time(self):
+        from types import SimpleNamespace
+
+        from django.utils import timezone
+
+        from netbox_nso_plugin import apply_state, delivery
+
+        registry = delivery.delivery_keys()
+        identity = apply_state._current_identity(self.mgmt, registry, "vlan")
+        promotion_started_at = timezone.now()
+        apply_state.promote_current_intent(
+            self.mgmt,
+            registry,
+            {"vlan": SimpleNamespace(identity=identity)},
+            static_route_stored=False,
+        )
+
+        self.vlan_state.refresh_from_db()
+        self.assertIsNotNone(self.vlan_state.last_apply_at)
+        self.assertGreaterEqual(self.vlan_state.last_apply_at, promotion_started_at)
+
     def test_a_terminal_snmp_preparation_failure_happens_before_any_direct_push(self):
         adapter = _ApplyContractAdapter(
             lambda selected: (202, _promoted(selected)),
@@ -2171,6 +2535,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         def incomplete_no_op(selected):
             result = _no_op(selected)
             result["skipped"].pop("vlan")
+            result["generations"] = []
             return result
 
         adapter = _ApplyContractAdapter(lambda selected: (202, incomplete_no_op(selected)))
@@ -2204,6 +2569,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         def malformed_no_op(selected):
             result = _no_op(selected)
             result["skipped"] = None
+            result["generations"] = []
             return result
 
         adapter = _ApplyContractAdapter(lambda selected: (202, malformed_no_op(selected)))
@@ -2230,6 +2596,40 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         )
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "accepted")
+
+    def test_malformed_no_op_with_a_generation_keeps_prepared_rows_deploying(self):
+        from netbox_nso_plugin.views import NSODeviceActionView, _prepare_apply
+
+        def malformed_no_op(selected):
+            result = _no_op(selected)
+            result["skipped"] = None
+            result["generations"] = [{"generation_id": 81}]
+            return result
+
+        adapter = _ApplyContractAdapter(lambda selected: (202, malformed_no_op(selected)))
+        config, session = adapter.patches()
+        with config, session:
+            prepared, selected = _prepare_apply(self.mgmt)
+
+        self.vlan_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "deploying")
+        response = NSODeviceActionView()._apply_result(
+            RequestFactory().post("/"),
+            self.mgmt,
+            malformed_no_op(dict(selected)),
+            prepared,
+            selected,
+            label="Apply",
+            is_ajax=True,
+        )
+
+        self.assertEqual(response.status_code, 502)
+        self.assertJSONEqual(
+            response.content,
+            {"status": "error", "message": "Adapter returned invalid Apply skip results."},
+        )
+        self.vlan_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "deploying")
 
     def test_no_op_with_an_unknown_skip_reason_is_rejected_and_rolled_back(self):
         def malformed_no_op(selected):
