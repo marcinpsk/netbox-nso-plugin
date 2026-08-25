@@ -130,20 +130,27 @@ class TestFixtureCommitDrainSuppression(SimpleTestCase):
         second = threading.Thread(target=second_context)
         first.start()
         second.start()
-        self.assertTrue(second_entered.wait(5), "the suppression contexts did not overlap")
-        release_first.set()
-        self.assertTrue(first_exited.wait(5), "the first suppression context did not exit first")
-        release_second.set()
-        first.join(5)
-        second.join(5)
+        # Always release non-daemon workers because an earlier assertion failure would block pytest.
+        try:
+            self.assertTrue(second_entered.wait(5), "the suppression contexts did not overlap")
+            release_first.set()
+            self.assertTrue(first_exited.wait(5), "the first suppression context did not exit first")
+            release_second.set()
+            first.join(5)
+            second.join(5)
 
-        leaked = signals._drain_intent_pushes is not original
-        signals._drain_intent_pushes = original
-        self.assertFalse(first.is_alive())
-        self.assertFalse(second.is_alive())
-        if errors:
-            raise errors[0]
-        self.assertFalse(leaked, "the later context restored the earlier thread's mock")
+            leaked = signals._drain_intent_pushes is not original
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            if errors:
+                raise errors[0]
+            self.assertFalse(leaked, "the later context restored the earlier thread's mock")
+        finally:
+            release_first.set()
+            release_second.set()
+            first.join(5)
+            second.join(5)
+            signals._drain_intent_pushes = original
 
     def test_no_module_still_reads_them(self):
         import ast

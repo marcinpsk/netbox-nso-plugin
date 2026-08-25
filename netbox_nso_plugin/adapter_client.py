@@ -1045,6 +1045,8 @@ def list_device_generations(adapter_device_id, *, since_seq=None):
         for row in page:
             generation_id = row.get("generation_id")
             seq = row.get("seq")
+            job_id = row.get("job_id")
+            status = row.get("status")
             settlement_cohort = row.get("settlement_cohort")
             if (
                 "settlement_cohort" not in row
@@ -1053,6 +1055,9 @@ def list_device_generations(adapter_device_id, *, since_seq=None):
                 or generation_id in generation_ids
                 or type(seq) is not int
                 or seq <= 0
+                or (job_id is not None and (type(job_id) is not int or job_id <= 0))
+                or not isinstance(status, str)
+                or not status
                 or (last_seq is not None and seq <= last_seq)
                 or (settlement_cohort is not None and (type(settlement_cohort) is not int or settlement_cohort <= 0))
             ):

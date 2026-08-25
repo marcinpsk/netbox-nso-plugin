@@ -4679,6 +4679,47 @@ class TestOverlayFieldEditView(ViewTestBase):
         member_state.refresh_from_db()
         self.assertEqual((member_state.mode, member_state.port_priority), ("passive", 65535))
 
+    def test_edit_lacp_member_repends_the_deploying_bundle(self):
+        from netbox_nso_plugin.models import NSOLACPBundleState, NSOLACPMemberState
+
+        lag = Interface.objects.create(device=self.device, name="Port-channel11", type="lag")
+        edited = Interface.objects.create(device=self.device, name="GigabitEthernet0/11", type="1000base-t")
+        sibling = Interface.objects.create(device=self.device, name="GigabitEthernet0/12", type="1000base-t")
+        bundle = NSOLACPBundleState.objects.create(
+            management=self.mgmt,
+            interface=lag,
+            lag_id=11,
+            min_links=1,
+            status="deploying",
+        )
+        edited_state = NSOLACPMemberState.objects.create(
+            management=self.mgmt,
+            interface=edited,
+            lag_bundle=lag,
+            mode="active",
+            port_priority=100,
+            status="deploying",
+        )
+        sibling_state = NSOLACPMemberState.objects.create(
+            management=self.mgmt,
+            interface=sibling,
+            lag_bundle=lag,
+            mode="active",
+            port_priority=200,
+            status="deploying",
+        )
+
+        response = self.client.post(
+            self._url("lacp_member", edited_state.pk),
+            {"mode": "passive"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        bundle.refresh_from_db()
+        edited_state.refresh_from_db()
+        sibling_state.refresh_from_db()
+        self.assertEqual((bundle.status, edited_state.status, sibling_state.status), ("accepted",) * 3)
+
     def test_edit_shared_vlan_name_updates_native_object_and_owns_every_attached_device(self):
         from ipam.models import VLAN, VLANGroup
 
@@ -4720,6 +4761,35 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual((first.status, second.status), ("accepted", "accepted"))
         self.assertIsNotNone(first.accepted_at)
         self.assertIsNotNone(second.accepted_at)
+
+    def test_edit_vlan_name_reports_when_the_vlan_is_deleted_before_save(self):
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin.apply_state import lock_vlan_intent_rows
+        from netbox_nso_plugin.models import NSOVLANState
+
+        group = VLANGroup.objects.create(name="Removed Inline VLANs", slug="removed-inline-vlans")
+        vlan = VLAN.objects.create(group=group, vid=123, name="REMOVED-NAME")
+        state = NSOVLANState.objects.create(
+            management=self.mgmt,
+            vlan=vlan,
+            device_name="REMOVED-NAME",
+            status="imported",
+        )
+
+        def delete_then_lock(vlan_id, scopes):
+            VLAN.objects.filter(pk=vlan_id).delete()
+            return lock_vlan_intent_rows(vlan_id, scopes)
+
+        with patch("netbox_nso_plugin.apply_state.lock_vlan_intent_rows", new=delete_then_lock):
+            response = self.client.post(self._url("vlan_name", state.pk), {"name": "UNSAVED-NAME"})
+
+        self.assertEqual(response.status_code, 400, response.content)
+        self.assertEqual(response.json()["status"], "error")
+        self.assertIn("no longer exists", " ".join(response.json()["errors"]["name"]).lower())
+        self.assertFalse(VLAN.objects.filter(pk=vlan.pk).exists())
+        self.assertFalse(NSOVLANState.objects.filter(pk=state.pk).exists())
+        self.assertFalse(VLAN.objects.filter(name="UNSAVED-NAME").exists())
 
     def test_edit_svi_vrf_takes_ownership_without_changing_structural_identity(self):
         from ipam.models import VLAN, VLANGroup
@@ -4931,6 +5001,36 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(put_policy.call_args.args[1][0]["name"], "RM-INLINE-NEW")
         ospf_payload = put_ospf.call_args.args[1]
         self.assertEqual(ospf_payload["instances"][0]["redistribution"][0]["route_map"], "RM-INLINE-NEW")
+
+    def test_edit_route_map_name_repends_a_deploying_row(self):
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import RouteMap
+
+        from netbox_nso_plugin import status_machine as sm
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.signals import suppress_intent_push
+        from netbox_nso_plugin.views import _save_route_map_name_edit
+
+        route_map = RouteMap.objects.create(name="RM-IN-FLIGHT-OLD")
+        row = NSORoutePolicyState.objects.create(
+            management=self.mgmt,
+            family="route_map",
+            object_name=route_map.name,
+            content_type=ContentType.objects.get_for_model(RouteMap),
+            object_id=route_map.pk,
+            status="deploying",
+        )
+
+        row.object_name = "RM-IN-FLIGHT-NEW"
+        with suppress_intent_push():
+            _save_route_map_name_edit(row, route_map.name)
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, "accepted")
+        row.status = sm.on_apply_result(row.status, ok=True)
+        row.save(update_fields=["status"])
+        row.refresh_from_db()
+        self.assertEqual(row.status, "accepted")
 
     def test_edit_route_map_name_rejects_native_name_collision_without_writing(self):
         from django.contrib.contenttypes.models import ContentType

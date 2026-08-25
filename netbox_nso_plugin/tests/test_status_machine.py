@@ -134,6 +134,11 @@ class TestStateMachineSpec(SimpleTestCase):
 class TestAdvanceEngine(SimpleTestCase):
     """The runtime guard. Pure functions — no DB."""
 
+    def test_operator_edit_repends_every_existing_status(self):
+        for current in sm.STATES:
+            with self.subTest(current=current):
+                self.assertEqual(sm.on_operator_edit(current), sm.ACCEPTED)
+
     def test_deterministic_edges_infer_target(self):
         self.assertEqual(sm.advance(sm.IMPORTED, sm.ACCEPT), sm.ACCEPTED)
         self.assertEqual(sm.advance(sm.CHANGED, sm.ACCEPT), sm.ACCEPTED)
