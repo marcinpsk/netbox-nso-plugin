@@ -1025,6 +1025,32 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_trigger_apply_preserves_a_same_uuid_different_selection_conflict(self, mock_s, _cfg):
+        from netbox_nso_plugin.adapter_client import AdapterError, trigger_apply
+
+        conflict = {
+            "error": {
+                "code": "conflict",
+                "message": "Apply attempt identity does not match the stored request",
+                "detail": {"apply_attempt_id": "8a2c9231-7ad8-4b17-a4b8-f5b4df745dd8"},
+            }
+        }
+        session = self._make_session(409, conflict)
+        mock_s.return_value = session
+
+        with self.assertRaises(AdapterError) as raised:
+            trigger_apply(
+                5,
+                "8a2c9231-7ad8-4b17-a4b8-f5b4df745dd8",
+                MappingProxyType({"vlan": 4712}),
+            )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(raised.exception.code, "conflict")
+        self.assertEqual(raised.exception.detail, conflict["error"]["detail"])
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_deployment_evidence_posts_only_the_requested_attempt_ids(self, mock_s, _cfg):
         from netbox_nso_plugin.adapter_client import get_deployment_evidence
 

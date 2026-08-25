@@ -1,19 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""#1502 Appendix S — the settlement consumer: cursor epoch, feed walk, stall bound, verdicts.
+"""The static-route settlement consumer: cursor epoch, feed walk, and exact verdicts.
 
 This module walks one device's ordered settlement feed, decides for each terminal job
 whether that job's per-route results can be correlated at all, applies the per-route
 verdict to the overlay, advances a durable cursor over the jobs it decided, and bounds the
 ones it cannot decide so a single unresolvable result never blocks a device forever.
 
-It is the **only** writer of a static-route overlay's apply status. ``"static_route"`` left
-``reconcile._APPLY_DEPLOYING_SCOPES`` and the static reconciler passes
-``settles_deploying=False``, because neither of those channels can say *which* generation
-the device is reflecting: both settled a row green for content the device may never have
-received. Two clocks drive this one implementation — the adapter's post-apply notification
-through ``run_device_reconcile``'s Step 4, and the plugin's own five-minute maintenance
-tick (:func:`sweep_static_route_settlements`), which survives a dead callback channel.
+It is the only writer of a static-route row from precise per-route results. Attempt-addressed
+evidence owns every coarse verdict because it proves which Apply and generation carried the
+row. The adapter's post-apply notification and the plugin's maintenance tick both drive this
+consumer, so settlement survives a dead callback channel.
 
 Three properties are load-bearing and each cost a review round to establish:
 
@@ -94,39 +91,13 @@ def consume_static_route_settlements(mgmt) -> ConsumeResult:
         return _consume_locked(row)
 
 
-def settle_static_routes(mgmt, *, escalate: bool = True, apply_state: tuple[int, bool] | None = None) -> ConsumeResult:
-    """Walk the feed, then let the timeout backstop judge — but only a **drained** feed.
+def settle_static_routes(mgmt) -> ConsumeResult:
+    """Walk the exact per-route result feed once.
 
-    The one implementation both clocks call, so the post-apply carrier and the five-minute
-    maintenance tick cannot drift on either half. Two properties live here rather than at
-    the call sites, because getting them wrong is silent in both directions:
-
-    * **The backstop runs only on a drained, unstalled feed.** A walk that stopped on an
-      unresolved head, or that filled its page and owes another, has not proven anything
-      about a row still ``deploying`` — its result may be the very sequence the walk did not
-      reach. Escalating there fails a healthy row on the first read-back outage and bypasses
-      the durable stall bound that exists to make one unresolvable result survivable.
-    * **The escalation belongs to BOTH clocks.** A dead callback channel is exactly the case
-      the tick exists for; a tick that consumed but never escalated would advance past an
-      unresolvable result on attempt five and then leave the row ``deploying`` forever,
-      because every later page is empty and only the carrier judged. That is the same
-      shared-failure-domain trap one level down.
-
-    The remaining precondition, no apply in flight, is the backstop's own, so that both clocks
-    get it without either restating it. A caller that already read the job state hands over the
-    ``(adapter device id, active)`` pair rather than paying for a second jobs fetch, and the id
-    travels with the verdict because the consumer resolves its own: a probe of the device this
-    row held before a link repair says nothing about an apply in flight on the one it holds
-    now. A pair that names another device is dropped and the backstop looks the state up for
-    the id it locked; the maintenance tick, which has read nothing, passes none.
+    Attempt-addressable deployment evidence owns every coarse verdict. The caller passes
+    this result's ``drained`` flag to that state machine before it may judge a settled route.
     """
-    from .reconcile import _escalate_stuck_static_routes
-
-    outcome = consume_static_route_settlements(mgmt)
-    if escalate and outcome.drained and outcome.adapter_device_id is not None:
-        apply_active = apply_state[1] if apply_state and apply_state[0] == outcome.adapter_device_id else None
-        _escalate_stuck_static_routes(mgmt, adapter_device_id=outcome.adapter_device_id, apply_active=apply_active)
-    return outcome
+    return consume_static_route_settlements(mgmt)
 
 
 def sweep_static_route_settlements() -> tuple[int, int]:
@@ -159,7 +130,12 @@ def sweep_static_route_settlements() -> tuple[int, int]:
     failed = 0
     for pk in candidates:
         try:
-            settle_static_routes(pk)
+            outcome = settle_static_routes(pk)
+            if outcome.drained and outcome.adapter_device_id is not None:
+                from .apply_settlement import settle_device_apply_attempts
+
+                management = NSODeviceManagement.objects.get(pk=pk)
+                settle_device_apply_attempts(management, static_route_feed_drained=True)
         except Exception:  # noqa: BLE001 — one device's adapter must not abort the fleet sweep
             logger.exception("static-route settlement sweep failed for management row %s", pk)
             failed += 1
@@ -459,6 +435,7 @@ def _write_verdict(state, **fields) -> bool:
     matched = NSOStaticRouteState.objects.filter(
         pk=state.pk,
         status=state.status,
+        apply_attempt_id=state.apply_attempt_id,
         intent_generation=state.intent_generation,
         expected_generation=state.expected_generation,
         expected_fingerprint=state.expected_fingerprint,

@@ -2799,7 +2799,9 @@ def _prepare_apply(mgmt):
         if outcome != drain.SUCCEEDED:
             raise ApplyPreparationRefused("snmp", _PREPARE_NOT_SETTLED)
 
-        _push_direct_snapshots(mgmt, registry, remaining_budget)
+    # Direct snapshots do not participate in the adapter selector. Keep them outside
+    # the receipt capture so only in-protocol store-only claims reach promotion.
+    _push_direct_snapshots(mgmt, registry, remaining_budget)
 
     selected = MappingProxyType({registry[scope].section: successful.push_seq for scope, successful in pushed.items()})
 

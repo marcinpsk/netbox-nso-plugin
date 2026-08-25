@@ -12,8 +12,8 @@ and ``tests/test_status_machine.py`` asserts two invariants:
   1. every overlay's ``status`` choices stay within :data:`STATES`, and
   2. every declared state is *reachable* through real (``implemented=True``) transitions.
 
-Both ``apply_failed`` (a failed apply, wired in step 4 via :func:`on_apply_result` +
-``reconcile._settle_apply_failures``) and ``error`` (an unexpected exception during a
+Both ``apply_failed`` (a failed attempt, wired in step 4 through exact deployment evidence)
+and ``error`` (an unexpected exception during a
 reconcile, wired via :func:`on_reconcile_error` + ``reconcile._safe_reconcile``) are
 now reachable through real code — there are no ``implemented=False`` gaps left, so the
 reachability guard is fully green.

@@ -12,6 +12,7 @@ category/summary wiring.
 """
 
 from unittest.mock import patch
+from uuid import uuid4
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.contrib.auth import get_user_model
@@ -339,7 +340,15 @@ class TestLoggingLevelsViews(LevelsTestBase):
         self.assertEqual(row.status, "imported")
 
     def test_unaccept_deploying_row_is_refused(self):
-        row = self._row(console_severity="CRITICAL", status="deploying", accepted_at=timezone.now())
+        from netbox_nso_plugin.models import NSOLoggingLevelState
+
+        attempt_id = uuid4()
+        row = self._row(
+            console_severity="CRITICAL",
+            status="accepted",
+            accepted_at=timezone.now(),
+        )
+        NSOLoggingLevelState.objects.filter(pk=row.pk).update(status="deploying", apply_attempt_id=attempt_id)
         self._unaccept(row)
         row.refresh_from_db()
         self.assertEqual(row.status, "deploying", "an in-flight Apply must settle before ownership is released")
@@ -436,19 +445,15 @@ class TestLoggingLevelsApplyLifecycle(LevelsTestBase):
     failure (`logging_count_by_outcome.apply_failed`) never reaches the row.
     """
 
-    def test_settle_apply_failures_marks_levels_apply_failed(self):
-        from netbox_nso_plugin.reconcile import _settle_apply_failures
-
-        row = self._row(console_severity="CRITICAL", status="deploying", accepted_at=timezone.now())
-        _settle_apply_failures(self.mgmt, {"logging_count_by_outcome": {"in_sync": 0, "apply_failed": 1}})
-        row.refresh_from_db()
-        self.assertEqual(row.status, "apply_failed")
-        self.assertTrue(row.last_apply_error)
-
     def test_deploying_row_settles_in_sync_when_device_matches(self):
         from netbox_nso_plugin.template_content import _reconcile_logging_config
 
-        row = self._row(console_severity="CRITICAL", status="deploying", accepted_at=timezone.now())
+        row = self._row(
+            console_severity="CRITICAL",
+            status="deploying",
+            accepted_at=timezone.now(),
+            apply_attempt_id=uuid4(),
+        )
         _reconcile_logging_config(
             self.device, {"hosts": [], "local_levels": {"console_severity": "CRITICAL"}, "refresh_source": "test"}
         )
@@ -562,13 +567,13 @@ class TestLoggingLevelsApplyPush(_CascadeFlushMixin, IntentPushResetMixin, Trans
             mock_put = stack.enter_context(
                 patch("netbox_nso_plugin.adapter_client.put_logging_intent", return_value={})
             )
-            moved, selected = _prepare_apply(self.mgmt)
+            prepared, selected = _prepare_apply(self.mgmt)
 
         mock_put.assert_called_once()
         self.assertEqual(mock_put.call_args.args[2], {"console_severity": "CRITICAL"})
         self.row.refresh_from_db()
         self.assertEqual(self.row.status, "deploying")
-        moved_pks = [pk for stream, _model, pks, _previous in moved for pk in pks if stream == "logging"]
+        moved_pks = [pk for stream, _model, pks, _previous in prepared.moved for pk in pks if stream == "logging"]
         self.assertIn(self.row.pk, moved_pks)
         self.assertIn("logging", selected)
         with self.assertRaises(TypeError):

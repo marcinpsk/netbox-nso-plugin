@@ -60,46 +60,6 @@ class _AwareUTCMixin:
         self.assertEqual(value.microsecond, expected.microsecond)
 
 
-class TestJobTimestampParser(_AwareUTCMixin, TestCase):
-    """``reconcile._parse_adapter_ts`` — the clock the stuck-deploying escalation runs on."""
-
-    def test_both_shapes_parse_aware_utc(self):
-        from netbox_nso_plugin.reconcile import _parse_adapter_ts
-
-        for wire, expected in _SHAPES:
-            with self.subTest(wire=wire):
-                self.assertAwareUTC(_parse_adapter_ts(wire), expected, wire)
-
-    def test_escalation_fires_on_a_whole_second_job_timestamp(self):
-        """The grace comparison is ``timezone.now() - finished``; a None here silently
-        disables the escalation, so drive it through the real function end to end."""
-        from django.utils import timezone
-        from ipam.models import VLAN
-
-        from netbox_nso_plugin.models import NSOVLANState
-        from netbox_nso_plugin.reconcile import _escalate_stuck_deploying
-        from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
-
-        mgmt = _make_mgmt(_make_device("ts-escalate"))
-        vlan = VLAN.objects.create(group=_device_vlan_group(mgmt.device), vid=131, name="V131")
-        row = NSOVLANState.objects.create(management=mgmt, vlan=vlan, device_name="V131", status="deploying")
-        finished = (timezone.now() - timedelta(minutes=30)).astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-        _escalate_stuck_deploying(
-            mgmt,
-            {
-                "id": 931,
-                "type": "apply",
-                "status": "succeeded",
-                "updated_at": finished,
-                "result": {"vlan_count_by_outcome": {"in_sync": 1, "apply_failed": 0}},
-            },
-        )
-
-        row.refresh_from_db()
-        self.assertEqual(row.status, "apply_failed")
-
-
 class TestInterfaceStateTimestamp(_AwareUTCMixin, TestCase):
     """``template_content._upsert_interface_states`` — ``last_apply_at`` on the interface tab."""
 

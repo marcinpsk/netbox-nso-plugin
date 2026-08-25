@@ -82,7 +82,7 @@ def reconcile_svi(device, payload: dict) -> list:
         rows.append(state)
 
     # SVI states the device no longer reports: NEVER hard-delete an owned row (operator
-    # intent / in-flight Apply marker — NSOSVIState is in _APPLY_DEPLOYING_SCOPES). An unowned
+    # intent or an in-flight Apply marker). An unowned
     # SVI overlay is a pure device mirror with no separate native config object (the virtual
     # interface is kept regardless), so a stale unowned row is a vestigial husk → drop it to
     # avoid orphan churn; owned rows surface as drift (``changed``) instead of data-loss.

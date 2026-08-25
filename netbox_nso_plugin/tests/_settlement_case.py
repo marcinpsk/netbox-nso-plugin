@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 from unittest.mock import patch
+from uuid import uuid4
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.db import transaction
@@ -68,6 +69,7 @@ def _own(sr, mgmt, *, generation, expected=True, status="deploying"):
             management=mgmt,
             static_route=sr,
             status=status,
+            apply_attempt_id=uuid4() if status == "deploying" else None,
             nso_prefix=str(sr.prefix or ""),
             nso_next_hop=str(sr.next_hop or ""),
             accepted_at=timezone.now(),

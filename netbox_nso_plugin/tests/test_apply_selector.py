@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 from dcim.models import Interface
 from django.contrib.auth import get_user_model
 from django.db import DatabaseError, connection, transaction
-from django.test import RequestFactory, SimpleTestCase, TransactionTestCase
+from django.test import RequestFactory, TransactionTestCase
 from django.urls import reverse
 from requests.exceptions import ConnectionError
 
@@ -664,6 +664,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 interface=interface,
                 l2_mtu=1500,
                 status="deploying",
+                apply_attempt_id=uuid4(),
             )
 
         state.l2_mtu = 1600
@@ -686,6 +687,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 interface=interface,
                 l2_mtu=1500,
                 status="deploying",
+                apply_attempt_id=uuid4(),
             )
 
         stale = NSOInterfaceMtuState.objects.get(pk=state.pk)
@@ -714,6 +716,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 interface=interface,
                 l2_mtu=1500,
                 status="deploying",
+                apply_attempt_id=uuid4(),
             )
 
         first = NSOInterfaceMtuState.objects.get(pk=state.pk)
@@ -741,6 +744,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 interface=interface,
                 l2_mtu=1500,
                 status="deploying",
+                apply_attempt_id=uuid4(),
             )
         NSOInterfaceMtuState.objects.filter(pk=stale.pk).update(status="accepted")
 
@@ -763,7 +767,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 l2_mtu=1500,
                 status="accepted",
             )
-        NSOInterfaceMtuState.objects.filter(pk=stale.pk).update(status="deploying")
+        NSOInterfaceMtuState.objects.filter(pk=stale.pk).update(status="deploying", apply_attempt_id=uuid4())
 
         with without_commit_drain(), transaction.atomic():
             stale.save()
@@ -914,6 +918,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 interface=interface,
                 l2_mtu=1500,
                 status="deploying",
+                apply_attempt_id=uuid4(),
             )
         stale = NSOInterfaceMtuState.objects.get(pk=state.pk)
         first_locked = threading.Event()
@@ -1004,7 +1009,9 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         def promote_row():
             try:
                 with transaction.atomic():
-                    NSOBFDInterfaceState.objects.filter(pk=state.pk).update(status="deploying")
+                    NSOBFDInterfaceState.objects.filter(pk=state.pk).update(
+                        status="deploying", apply_attempt_id=uuid4()
+                    )
                     row_updated.set()
                     deadline = time.monotonic() + 5
                     while time.monotonic() < deadline:
@@ -2704,7 +2711,9 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from netbox_nso_plugin.vlan_reconciler import placeholder_vlan_name
 
         old_vid = self.vlan_state.vlan.vid
-        NSOVLANState.objects.filter(pk=self.vlan_state.pk).update(device_name="", status="deploying")
+        NSOVLANState.objects.filter(pk=self.vlan_state.pk).update(
+            device_name="", status="deploying", apply_attempt_id=uuid4()
+        )
         type(self.vlan_state.vlan).objects.filter(pk=self.vlan_state.vlan_id).update(
             name=placeholder_vlan_name(old_vid)
         )
@@ -2797,7 +2806,9 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             second = NSOInterfaceMtuState.objects.create(
                 management=self.mgmt, interface=second_interface, l2_mtu=1500, status="accepted"
             )
-        NSOInterfaceMtuState.objects.filter(pk__in=(first.pk, second.pk)).update(status="deploying")
+        NSOInterfaceMtuState.objects.filter(pk__in=(first.pk, second.pk)).update(
+            status="deploying", apply_attempt_id=uuid4()
+        )
         first.status = "deploying"
         second.status = "deploying"
 
@@ -3444,28 +3455,3 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertEqual(response.json()["message"], "The NSO adapter request failed. See the server log.")
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "deploying")
-
-
-class TestApplyChainSettlement(SimpleTestCase):
-    """Apply remains active until every device-writing link in its chain settles."""
-
-    def test_a_running_removal_successor_keeps_apply_active(self):
-        from unittest.mock import patch
-
-        from netbox_nso_plugin.reconcile import _apply_job_state
-
-        jobs = [
-            # Copied from JobOut in ../nso-adapter/tests/api/openapi_snapshot.json.
-            {"id": 502, "type": "removal", "status": "running", "result": None},
-            {"id": 501, "type": "apply", "status": "succeeded", "result": {}},
-        ]
-
-        # Empty list is the landed GET devices/{id}/generations list shape before any promotion.
-        with (
-            patch("netbox_nso_plugin.adapter_client.list_jobs", return_value=jobs),
-            patch("netbox_nso_plugin.adapter_client.list_device_generations", return_value=[]),
-        ):
-            last_apply, active = _apply_job_state(1558)
-
-        self.assertEqual(last_apply["id"], 501)
-        self.assertTrue(active)
