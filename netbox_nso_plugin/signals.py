@@ -1788,6 +1788,7 @@ def _on_vlan_change(sender, instance, **kwargs):
     if not changed_fields:
         return
 
+    from . import delivery
     from . import status_machine as sm
     from .vlan_reconciler import is_placeholder_vlan_name
 
@@ -1811,7 +1812,8 @@ def _on_vlan_change(sender, instance, **kwargs):
                 if new_status != state.status:
                     state.status = new_status
                     state.save(update_fields=["status"])
-                may_deliver = scope != "switchport" or state.management.auto_apply
+                entry = delivery.delivery_keys()[scope]
+                may_deliver = entry.in_protocol or state.management.auto_apply
                 if was_owned and state.management.adapter_device_id is not None and may_deliver:
                     targets.add((state.management.device_id, scope))
     for key in sorted(targets):

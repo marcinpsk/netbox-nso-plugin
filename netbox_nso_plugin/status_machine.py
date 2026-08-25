@@ -5,7 +5,7 @@
 This module is the **single source of truth** for the overlay lifecycle. The
 reconcilers (``vlan_reconciler``, ``svi_reconciler``, ``subinterface_reconciler``,
 ``bfd_reconciler``, ``lacp_reconciler`` …) now route their status decisions through
-the helpers here (:func:`on_reconcile`, :func:`on_apply_result`,
+the helpers here (:func:`on_reconcile`, :func:`on_operator_edit`, :func:`on_apply_result`,
 :func:`on_reconcile_error`) instead of assigning ``state.status = "..."`` by hand,
 and ``tests/test_status_machine.py`` asserts two invariants:
 
@@ -105,6 +105,7 @@ RECONCILE = "reconcile"  # device read refreshed the row (automatic)
 DRIFT = "drift"  # device diverged / payload dropped the row (automatic)
 CONFLICT_DETECTED = "conflict_detected"  # native object exists, not ours (automatic)
 ACCEPT = "accept"  # operator takes ownership
+EDIT = "edit"  # operator edited the row's content
 REVERT = "revert"  # operator edits back to device value / un-accepts
 APPLY = "apply"  # operator triggers Apply → mark deploying
 APPLY_OK = "apply_ok"  # apply landed (today: realized by the next reconcile)
@@ -112,7 +113,7 @@ APPLY_ERR = "apply_err"  # apply worker reported a failure
 RECONCILE_ERROR = "reconcile_error"  # unexpected exception during reconcile
 
 EVENTS: frozenset[str] = frozenset(
-    {RECONCILE, DRIFT, CONFLICT_DETECTED, ACCEPT, REVERT, APPLY, APPLY_OK, APPLY_ERR, RECONCILE_ERROR}
+    {RECONCILE, DRIFT, CONFLICT_DETECTED, ACCEPT, EDIT, REVERT, APPLY, APPLY_OK, APPLY_ERR, RECONCILE_ERROR}
 )
 
 
@@ -175,6 +176,21 @@ TRANSITIONS: tuple[Transition, ...] = (
     Transition(ACCEPT, CHANGED, ACCEPTED, True, "accept the drifted value"),
     Transition(ACCEPT, CONFLICT, ACCEPTED, True, "resolve adoption ambiguity"),
     Transition(ACCEPT, APPLY_FAILED, ACCEPTED, True, "retry after a failed apply"),
+    Transition(EDIT, UNKNOWN, ACCEPTED, True, "operator edited the row before its first device read"),
+    Transition(EDIT, IMPORTED, ACCEPTED, True, "operator edited imported content"),
+    Transition(EDIT, CHANGED, ACCEPTED, True, "operator edited drifted content"),
+    Transition(EDIT, CONFLICT, ACCEPTED, True, "operator edited conflicting content"),
+    Transition(EDIT, ACCEPTED, ACCEPTED, True, "operator changed pending content"),
+    Transition(
+        EDIT,
+        DEPLOYING,
+        ACCEPTED,
+        True,
+        "re-pend edited content so a stale Apply cannot settle it and lose the new intent",
+    ),
+    Transition(EDIT, IN_SYNC, ACCEPTED, True, "operator changed applied content"),
+    Transition(EDIT, APPLY_FAILED, ACCEPTED, True, "operator changed content before retry"),
+    Transition(EDIT, ERROR, ACCEPTED, True, "operator replaced content after a reconcile error"),
     Transition(REVERT, ACCEPTED, IMPORTED, True, "edit back to device value clears pending (c160039)"),
     # Un-accept (P4b): the operator releases ownership of an owned row; the next
     # snapshot push drops it, so the adapter retracts the previously-owned intent.
@@ -330,6 +346,11 @@ def is_owned(status: str) -> bool:
     A reconcile must never clobber an owned row back to an unowned state.
     """
     return status in OWNED_STATES
+
+
+def on_operator_edit(current: str) -> str:
+    """Re-pend content after an operator edit, including during an in-flight Apply."""
+    return advance(current, EDIT, to=ACCEPTED)
 
 
 def on_reconcile(

@@ -202,7 +202,7 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
         self.assertEqual(obj.l2_mtu, 9000)
         self.assertEqual(obj.status, "changed")  # diverged from device → needs accept
 
-    def test_edit_form_preserves_owned_status(self):
+    def test_edit_form_repends_an_owned_row_for_apply(self):
         from netbox_nso_plugin.forms import NSOInterfaceMtuStateForm
 
         state = self._state(l2_mtu=9216, status="in_sync")

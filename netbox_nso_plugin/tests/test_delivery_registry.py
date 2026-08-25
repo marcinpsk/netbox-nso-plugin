@@ -60,6 +60,8 @@ class TestDeliveryRegistry(SimpleTestCase):
         out_of_protocol = {key for key, entry in delivery_keys().items() if not entry.in_protocol}
 
         assert out_of_protocol == {"lacp", "switchport"}
+        assert delivery_keys()["switchport"].in_protocol is False
+        assert delivery_keys()["vlan"].in_protocol is True
         assert len(in_protocol) == 16
         assert "static_route" in in_protocol
 

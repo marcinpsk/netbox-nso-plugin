@@ -4266,7 +4266,7 @@ def _save_owned_overlay_edit(obj, key):
     with transaction.atomic():
         if not sm.is_owned(obj.status):
             obj.accepted_at = timezone.now()
-        obj.status = "accepted"
+        obj.status = sm.on_operator_edit(obj.status)
         if key == "interface_mtu" and obj.l2_mtu is not None:
             iface = obj.interface
             clamped = min(int(obj.l2_mtu), NSOInterfaceMtuStateAcceptView._NETBOX_MTU_MAX)
@@ -4401,8 +4401,7 @@ def _save_route_map_name_edit(state, old_name):
 
         if not sm.is_owned(state.status):
             state.accepted_at = timezone.now()
-        if state.status != "deploying":
-            state.status = "accepted"
+        state.status = sm.on_operator_edit(state.status)
         mark_explicit_accept(state)
         state.save()
 
@@ -4440,19 +4439,19 @@ def _save_lacp_edit(obj, key):
         for member in members:
             if member.pk == getattr(obj, "pk", None) and key == "lacp_member":
                 member = obj
-                target_status = "accepted"
+                target_status = sm.on_operator_edit(member.status)
+            elif member.status == "deploying":
+                target_status = sm.on_operator_edit(member.status)
             else:
                 target_status = _status_after_accept(member.status)
             if not sm.is_owned(member.status):
                 member.accepted_at = now
-            if member.status != "deploying":
-                member.status = target_status
+            member.status = target_status
             member.save()
 
         if not sm.is_owned(bundle.status):
             bundle.accepted_at = now
-        if bundle.status != "deploying":
-            bundle.status = "accepted"
+        bundle.status = sm.on_operator_edit(bundle.status) if bundle.status == "deploying" else "accepted"
         bundle.save()
 
 
@@ -4469,7 +4468,7 @@ def _save_vlan_name_edit(obj):
     with transaction.atomic():
         vlan, rows = lock_vlan_intent_rows(obj.vlan_id, ("vlan",))
         if vlan is None:
-            return
+            return {"name": ["This VLAN no longer exists. Refresh the page before editing it."]}
         vlan.name = desired_name
         states = rows["vlan"]
         with suppress_intent_push():
@@ -4481,9 +4480,14 @@ def _save_vlan_name_edit(obj):
             if not sm.is_owned(state.status):
                 state.accepted_at = now
             matches = state.device_name == vlan.name if state.device_name else is_placeholder_vlan_name(state)
-            state.status = "accepted" if state.status == "deploying" else "in_sync" if matches else "accepted"
+            state.status = (
+                sm.on_operator_edit(state.status)
+                if state.status == "deploying"
+                else ("in_sync" if matches else "accepted")
+            )
             mark_explicit_accept(state)
             state.save()
+    return None
 
 
 def _logging_levels_errors(obj, old_values):
@@ -4551,9 +4555,10 @@ def _save_overlay_edit(obj, key, old_values):
     elif key in ("lacp_bundle", "lacp_member"):
         _save_lacp_edit(obj, key)
     elif key == "vlan_name":
-        _save_vlan_name_edit(obj)
+        return _save_vlan_name_edit(obj)
     else:
         _save_owned_overlay_edit(obj, key)
+    return None
 
 
 class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
@@ -4673,7 +4678,9 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
 
             # Claim ownership (same transition as Accept on a differing value):
             # the edited value is intent the device doesn't have yet.
-            _save_overlay_edit(obj, key, old_values)
+            errors = _save_overlay_edit(obj, key, old_values)
+            if errors:
+                return JsonResponse({"status": "error", "errors": errors}, status=400)
         return JsonResponse({"status": "ok", "changed": changed})
 
     @staticmethod
