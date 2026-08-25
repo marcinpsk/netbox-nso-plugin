@@ -220,9 +220,12 @@ def _lock_native_vlan_dependencies(device, payload, family: str) -> None:
 
         lock_switchport_reconcile_dependencies(device, payload)
         return
-    from .svi_reconciler import lock_svi_reconcile_dependencies
+    if family == "svi":
+        from .svi_reconciler import lock_svi_reconcile_dependencies
 
-    lock_svi_reconcile_dependencies(device, payload)
+        lock_svi_reconcile_dependencies(device, payload)
+        return
+    raise ValueError(f"unknown native VLAN dependency family: {family}")
 
 
 def _mark_all_gated(ctx: dict, families, disposition: str) -> None:

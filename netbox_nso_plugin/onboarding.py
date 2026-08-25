@@ -322,15 +322,7 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
     return result
 
 
-def _summarize_provision_failure(steps) -> str:
-    """Build a one-line summary of the first failed step in a provision result."""
-    for step in steps or []:
-        if not isinstance(step, dict):
-            continue
-        if step.get("status") == "failed":
-            detail = step.get("detail")
-            return f"{step.get('step')} failed" + (f": {detail}" if detail else "")
-    return "Provisioning failed."
+_PROVISION_FAILURE_PUBLIC_MESSAGE = "Provisioning failed. See the server log."
 
 
 @_deployment_guarded("provisioning")
@@ -387,14 +379,27 @@ def advance_provisioning(mgmt) -> dict:
             return {"status": "ready"}
         mgmt.onboard_status = "provision_failed"
         mgmt.onboard_steps = steps
-        mgmt.onboard_error = _summarize_provision_failure(steps)
+        mgmt.onboard_error = _PROVISION_FAILURE_PUBLIC_MESSAGE
+        logger.warning(
+            "Provisioning job %s returned an unsuccessful result for management row %s: %r",
+            mgmt.onboard_job_id,
+            mgmt.pk,
+            result,
+        )
         mgmt.save(update_fields=["onboard_status", "onboard_steps", "onboard_error"])
         return {"status": "provision_failed", "error": mgmt.onboard_error}
 
     # failed / timeout / unknown-terminal
     err = (job or {}).get("error") or {}
     mgmt.onboard_status = "provision_failed"
-    mgmt.onboard_error = err.get("message") or "Provision job failed."
+    mgmt.onboard_error = _PROVISION_FAILURE_PUBLIC_MESSAGE
+    logger.warning(
+        "Provisioning job %s finished with status %r for management row %s: %r",
+        mgmt.onboard_job_id,
+        job_status,
+        mgmt.pk,
+        err,
+    )
     mgmt.save(update_fields=["onboard_status", "onboard_error"])
     return {"status": "provision_failed", "error": mgmt.onboard_error}
 

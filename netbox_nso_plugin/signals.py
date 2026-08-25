@@ -1700,7 +1700,7 @@ def _push_vlan_intent_for_device(device_id, adapter_device_id):
     """
     from . import adapter_client as client
     from .models import NSOVLANState
-    from .vlan_reconciler import is_placeholder_vlan_name
+    from .vlan_reconciler import rendered_vlan_name
 
     vlans = []
     for row in NSOVLANState.objects.filter(
@@ -1709,11 +1709,7 @@ def _push_vlan_intent_for_device(device_id, adapter_device_id):
     ).select_related("vlan"):
         if row.vlan is None:
             continue
-        # A nameless device VLAN was imported under a fabricated "VLAN <vid>" placeholder
-        # (NetBox cannot hold two name='' VLANs in one group). Pushing it verbatim would
-        # write a name the device never had; the writer omits the name when it is empty.
-        name = "" if is_placeholder_vlan_name(row) else (row.vlan.name or "")
-        vlans.append({"vlan_id": row.vlan.vid, "name": name})
+        vlans.append({"vlan_id": row.vlan.vid, "name": rendered_vlan_name(row)})
 
     _push_changed(
         (device_id, "vlan"),
@@ -1741,7 +1737,13 @@ def _on_vlan_state_save(sender, instance, **kwargs):
 
 @_skip_on_render
 def _on_vlan_pre_save(sender, instance, **kwargs):
-    """Lock and record changes to fields rendered by VLAN or SVI intent."""
+    """Lock and record changes to fields rendered by VLAN or SVI intent.
+
+    A VID-only save can require a new fabricated display name while ``update_fields``
+    excludes ``name``. The direct update keeps that derived placeholder consistent without
+    recording it as a separate operator edit. Adding ``name`` to the captured changed fields
+    makes the post-save path re-pend every affected intent row.
+    """
     update_fields = kwargs.get("update_fields")
     candidate_fields = {"name", "vid"}
     if update_fields is not None:
@@ -1809,8 +1811,8 @@ def _on_vlan_change(sender, instance, **kwargs):
                 if new_status != state.status:
                     state.status = new_status
                     state.save(update_fields=["status"])
-                auto_apply_direct = scope != "switchport" or (was_owned and state.management.auto_apply)
-                if state.management.adapter_device_id is not None and auto_apply_direct:
+                may_deliver = scope != "switchport" or state.management.auto_apply
+                if was_owned and state.management.adapter_device_id is not None and may_deliver:
                     targets.add((state.management.device_id, scope))
     for key in sorted(targets):
         _schedule_intent_push(key)

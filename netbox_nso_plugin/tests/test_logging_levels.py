@@ -568,7 +568,7 @@ class TestLoggingLevelsApplyPush(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertEqual(mock_put.call_args.args[2], {"console_severity": "CRITICAL"})
         self.row.refresh_from_db()
         self.assertEqual(self.row.status, "deploying")
-        moved_pks = [pk for stream, _model, pks in moved for pk in pks if stream == "logging"]
+        moved_pks = [pk for stream, _model, pks, _previous in moved for pk in pks if stream == "logging"]
         self.assertIn(self.row.pk, moved_pks)
         self.assertIn("logging", selected)
         with self.assertRaises(TypeError):

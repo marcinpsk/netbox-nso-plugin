@@ -323,9 +323,11 @@ class TestOnboardStatusView(ViewTestBase):
         mgmt = self._provisioning_mgmt("prov-stepfail")
         resp = self._post_status(mgmt)
         self.assertEqual(resp.json()["status"], "provision_failed")
+        self.assertEqual(resp.json()["error"], "Provisioning failed. See the server log.")
+        self.assertNotIn("timeout", resp.content.decode())
         mgmt.refresh_from_db()
         self.assertEqual(mgmt.onboard_status, "provision_failed")
-        self.assertIn("fetch_host_keys", mgmt.onboard_error)
+        self.assertEqual(mgmt.onboard_error, "Provisioning failed. See the server log.")
 
     @patch(
         "netbox_nso_plugin.adapter_client.get_job",
@@ -335,9 +337,11 @@ class TestOnboardStatusView(ViewTestBase):
         mgmt = self._provisioning_mgmt("prov-jobfail")
         resp = self._post_status(mgmt)
         self.assertEqual(resp.json()["status"], "provision_failed")
+        self.assertEqual(resp.json()["error"], "Provisioning failed. See the server log.")
+        self.assertNotIn("600s", resp.content.decode())
         mgmt.refresh_from_db()
         self.assertEqual(mgmt.onboard_status, "provision_failed")
-        self.assertIn("600s", mgmt.onboard_error)
+        self.assertEqual(mgmt.onboard_error, "Provisioning failed. See the server log.")
 
     def test_already_terminal_is_idempotent(self):
         """A row that already reached a terminal state just reports it (no adapter poll)."""

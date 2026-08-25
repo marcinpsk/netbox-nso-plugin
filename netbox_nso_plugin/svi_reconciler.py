@@ -21,8 +21,7 @@ def lock_svi_reconcile_dependencies(device, payload: dict) -> None:
     from ipam.models import VLAN
 
     from .apply_state import (
-        lock_device_vlan_membership_transaction,
-        lock_vlan_intent_transaction,
+        lock_native_vlan_dependency_rows,
         vlan_ids_for_dependency_lock,
     )
     from .models import NSODeviceManagement, NSOSVIState
@@ -30,16 +29,17 @@ def lock_svi_reconcile_dependencies(device, payload: dict) -> None:
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:
         return
-    lock_device_vlan_membership_transaction(device.pk)
     items = payload.get("interfaces", []) or [] if isinstance(payload, dict) else []
     vids = vlan_ids_for_dependency_lock(items)
-    vlan_ids = set(
-        NSOSVIState.objects.filter(management=management, vlan__isnull=False).values_list("vlan_id", flat=True)
-    )
-    vlan_ids.update(VLAN.objects.filter(group__slug=f"nso-{device.pk}", vid__in=vids).values_list("pk", flat=True))
-    for vlan_id in sorted(vlan_ids):
-        lock_vlan_intent_transaction(vlan_id)
-    list(VLAN.objects.select_for_update(of=("self",)).filter(pk__in=vlan_ids).order_by("pk"))
+
+    def collect_vlan_ids():
+        vlan_ids = set(
+            NSOSVIState.objects.filter(management=management, vlan__isnull=False).values_list("vlan_id", flat=True)
+        )
+        vlan_ids.update(VLAN.objects.filter(group__slug=f"nso-{device.pk}", vid__in=vids).values_list("pk", flat=True))
+        return vlan_ids
+
+    lock_native_vlan_dependency_rows(device.pk, collect_vlan_ids)
 
 
 def reconcile_svi(device, payload: dict) -> list:

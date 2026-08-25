@@ -117,6 +117,17 @@ def vlan_ids_for_dependency_lock(items, *field_names: str) -> set[int]:
     return vlan_ids
 
 
+def lock_native_vlan_dependency_rows(device_id: int, collect_vlan_ids) -> None:
+    """Fence membership, discover dependencies, then lock their intent and rows."""
+    from ipam.models import VLAN
+
+    lock_device_vlan_membership_transaction(device_id)
+    ordered_vlan_ids = sorted(set(collect_vlan_ids()))
+    for vlan_id in ordered_vlan_ids:
+        lock_vlan_intent_transaction(vlan_id)
+    list(VLAN.objects.select_for_update(of=("self",)).filter(pk__in=ordered_vlan_ids).order_by("pk"))
+
+
 def mark_explicit_accept(instance) -> None:
     """Mark one save as an intentional transition into owned pending state."""
     instance._nso_explicit_accept = True
@@ -149,6 +160,8 @@ def capture_intent_field_change(instance, scope, *, update_fields=None) -> None:
         field_names = field_names.intersection(update_fields)
     if not field_names:
         return
+    if not connection.in_atomic_block:
+        raise RuntimeError("an intent field edit must be saved inside a transaction")
 
     fields = [model._meta.get_field(name) for name in field_names]
     attnames = [field.attname for field in fields]
@@ -295,6 +308,8 @@ def lock_interface_intent_rows(interface_id) -> tuple[object | None, object | No
     lock_mutation()
     lock_device_intent_transaction(current["device_id"])
     interface = Interface.objects.select_for_update(of=("self",)).get(pk=interface_id)
+    if interface.device_id != current["device_id"]:
+        raise RuntimeError("interface changed devices while acquiring intent locks")
     list(Interface.objects.select_for_update(of=("self",)).filter(parent_id=interface_id).order_by("pk"))
     management = (
         NSODeviceManagement.objects.select_for_update(of=("self",))
@@ -340,6 +355,7 @@ def _current_identity(management, registry, scope) -> str:
 
 def promote_current_intent(management, registry, pushed, *, static_route_stored: bool) -> list[tuple]:
     """Atomically validate stored receipts and mark their unchanged rows deploying."""
+    from . import status_machine as sm
     from .models import NSODeviceManagement, NSOStaticRouteState
 
     moved: list[tuple] = []
@@ -363,8 +379,13 @@ def promote_current_intent(management, registry, pushed, *, static_route_stored:
 
         for scope, model, rows in locked_rows:
             section = registry[scope].section
-            pks = [pk for pk, status in rows if status == "accepted"]
-            if pks:
-                model.objects.filter(pk__in=pks).update(status="deploying", last_apply_at=timezone.now())
-                moved.append((section, model, pks))
+            for previous_status in (sm.ACCEPTED, sm.APPLY_FAILED):
+                pks = [pk for pk, status in rows if status == previous_status]
+                if not pks:
+                    continue
+                model.objects.filter(pk__in=pks, status=previous_status).update(
+                    status=sm.advance(previous_status, sm.APPLY),
+                    last_apply_at=timezone.now(),
+                )
+                moved.append((section, model, pks, previous_status))
     return moved
