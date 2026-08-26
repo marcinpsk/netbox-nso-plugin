@@ -27,7 +27,7 @@ from django.db.models.signals import (
     pre_migrate,
     pre_save,
 )
-from sqlparse.sql import Comparison, Identifier, IdentifierList, Parenthesis
+from sqlparse.sql import Comparison, Identifier, IdentifierList
 from sqlparse.tokens import Comment, Keyword, Literal
 
 ABSENT = ("ABSENT",)
@@ -2609,10 +2609,12 @@ def _dml_guard(execute, sql, params, many, context):
         return execute(sql, params, many, context)
     if target.table not in _TABLE_REGISTRY:
         return execute(sql, params, many, context)
+    touched_columns = _dml_columns(statement, target.operation)
+    if target.operation == "INSERT INTO" and touched_columns == frozenset():
+        return execute(sql, params, many, context)
     permit = _ACTIVE_PERMIT.get()
     table = target.table
     spec = _TABLE_REGISTRY[table]
-    touched_columns = _dml_columns(statement, target.operation)
     guarded_fields = spec.content_fields | _FRAGMENT_GATE_FIELDS.get(spec.model_label, set())
     content_columns = {spec.model._meta.get_field(field_name).column for field_name in guarded_fields}
     if touched_columns and touched_columns.isdisjoint(content_columns):
@@ -2735,7 +2737,7 @@ def _mentioned_registered_tables(statement: str) -> set[str]:
 
 
 def _dml_columns(statement: str, operation: str) -> frozenset[str] | None:
-    """Return columns written by UPDATE/INSERT SQL, or None when they are unknown."""
+    """Return columns that can mutate existing rows, or None when they are unknown."""
     if operation == "DELETE FROM":
         return None
     parsed = sqlparse.parse(statement)
@@ -2759,18 +2761,80 @@ def _dml_columns(statement: str, operation: str) -> frozenset[str] | None:
         columns = tuple(_comparison_column(comparison) for comparison in comparisons)
         return None if not columns or any(column is None for column in columns) else frozenset(columns)
     if operation == "INSERT INTO":
-        column_list = next((token for token in tokens if isinstance(token, Parenthesis)), None)
-        if column_list is None:
+        return _insert_update_columns(parsed[0])
+    return None
+
+
+def _insert_update_columns(statement) -> frozenset[str] | None:
+    """Return ON CONFLICT DO UPDATE columns, with an empty set for creation."""
+    tokens = tuple(token for token in statement.flatten() if not token.is_whitespace and token.ttype not in Comment)
+    conflict_index = next(
+        (
+            index
+            for index in range(len(tokens) - 1)
+            if tokens[index].normalized == "ON" and tokens[index + 1].normalized == "CONFLICT"
+        ),
+        None,
+    )
+    if conflict_index is None:
+        return frozenset()
+    do_index = next(
+        (index for index in range(conflict_index + 2, len(tokens)) if tokens[index].normalized == "DO"),
+        None,
+    )
+    if do_index is None or do_index + 1 >= len(tokens):
+        return None
+    if tokens[do_index + 1].normalized == "NOTHING":
+        return frozenset()
+    if (
+        tokens[do_index + 1].normalized != "UPDATE"
+        or do_index + 2 >= len(tokens)
+        or tokens[do_index + 2].normalized != "SET"
+    ):
+        return None
+    return _flattened_assignment_columns(tokens[do_index + 3 :])
+
+
+def _flattened_assignment_columns(tokens) -> frozenset[str] | None:
+    """Return columns from a flattened PostgreSQL assignment list."""
+    columns = []
+    index = 0
+    while index < len(tokens):
+        column = _postgres_column_token_name(tokens[index])
+        if column is None or index + 1 >= len(tokens) or tokens[index + 1].value != "=":
             return None
-        column_tokens = _sql_tokens(column_list)[1:-1]
-        if len(column_tokens) == 1 and isinstance(column_tokens[0], IdentifierList):
-            identifiers = tuple(column_tokens[0].get_identifiers())
-        elif column_tokens and all(isinstance(token, Identifier) for token in column_tokens):
-            identifiers = tuple(column_tokens)
+        columns.append(column)
+        index += 2
+        expression_started = False
+        depth = 0
+        while index < len(tokens):
+            token = tokens[index]
+            if depth == 0 and token.ttype in Keyword and token.normalized in {"WHERE", "RETURNING"}:
+                return frozenset(columns) if expression_started else None
+            if depth == 0 and token.value == ",":
+                if not expression_started:
+                    return None
+                index += 1
+                break
+            if token.value in {"(", "[", "{"}:
+                depth += 1
+            elif token.value in {")", "]", "}"}:
+                depth -= 1
+                if depth < 0:
+                    return None
+            expression_started = True
+            index += 1
         else:
-            return None
-        columns = tuple(_postgres_identifier_name(identifier) for identifier in identifiers)
-        return None if not columns or any(column is None for column in columns) else frozenset(columns)
+            return frozenset(columns) if expression_started and depth == 0 else None
+    return None
+
+
+def _postgres_column_token_name(token) -> str | None:
+    """Return one PostgreSQL assignment column with case folding applied."""
+    if token.ttype == Literal.String.Symbol:
+        return token.value[1:-1].replace('""', '"')
+    if token.ttype in sqlparse.tokens.Name:
+        return token.value.lower()
     return None
 
 

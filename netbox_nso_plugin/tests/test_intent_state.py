@@ -56,6 +56,51 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 [self.state.vlan_id, self.state.pk],
             )
 
+    def test_registered_upsert_content_update_requires_a_content_permit(self):
+        table = NSOVLANState._meta.db_table
+
+        with self.assertRaises(IntentMutationProtocolError), connection.cursor() as cursor:
+            cursor.execute(
+                f'INSERT INTO "{table}" SELECT * FROM "{table}" WHERE id = %s '
+                "ON CONFLICT (id) DO UPDATE SET device_name = EXCLUDED.device_name",
+                [self.state.pk],
+            )
+
+    def test_registered_upsert_with_unknown_update_columns_fails_closed(self):
+        table = NSOVLANState._meta.db_table
+
+        with self.assertRaises(IntentMutationProtocolError), connection.cursor() as cursor:
+            cursor.execute(
+                f'INSERT INTO "{table}" SELECT * FROM "{table}" WHERE id = %s '
+                "ON CONFLICT (id) DO UPDATE SET "
+                "(device_name, status) = (EXCLUDED.device_name, EXCLUDED.status)",
+                [self.state.pk],
+            )
+
+    def test_registered_upsert_non_content_update_does_not_require_a_content_permit(self):
+        table = NSOVLANState._meta.db_table
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f'INSERT INTO "{table}" SELECT * FROM "{table}" WHERE id = %s '
+                "ON CONFLICT (id) DO UPDATE SET last_apply_error = %s, last_apply_at = NULL",
+                [self.state.pk, "upserted"],
+            )
+
+        self.state.refresh_from_db()
+        self.assertEqual(self.state.last_apply_error, "upserted")
+
+    def test_registered_insert_on_conflict_do_nothing_does_not_require_a_content_permit(self):
+        table = NSOVLANState._meta.db_table
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f'INSERT INTO "{table}" SELECT * FROM "{table}" WHERE id = %s ON CONFLICT (id) DO NOTHING',
+                [self.state.pk],
+            )
+
+        self.assertEqual(NSOVLANState.objects.filter(pk=self.state.pk).count(), 1)
+
     def test_registered_raw_dml_with_unknown_columns_fails_closed(self):
         table = NSOVLANState._meta.db_table
 
@@ -161,6 +206,24 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
 
         self.device.refresh_from_db()
         self.assertEqual(self.device.interface_count, initial_count + 1)
+
+    def test_module_install_creates_registered_interface_without_a_content_permit(self):
+        from dcim.models import InterfaceTemplate, Module, ModuleBay, ModuleType
+
+        module_type = ModuleType.objects.create(
+            manufacturer=self.device.device_type.manufacturer,
+            model="Intent Guard Module",
+        )
+        InterfaceTemplate.objects.create(
+            module_type=module_type,
+            name="Ethernet1623/1",
+            type="1000base-t",
+        )
+        module_bay = ModuleBay.objects.create(device=self.device, name="Module Bay 1623", position="1623")
+
+        module = Module.objects.create(device=self.device, module_bay=module_bay, module_type=module_type)
+
+        self.assertEqual(module.interfaces.get().name, "Ethernet1623/1")
 
     def test_registered_bulk_dml_allows_a_non_rendered_interface_update(self):
         from dcim.models import Interface
