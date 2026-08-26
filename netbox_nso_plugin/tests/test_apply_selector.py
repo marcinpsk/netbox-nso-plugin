@@ -698,6 +698,48 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         state.refresh_from_db()
         self.assertEqual(state.status, "accepted")
 
+    def test_a_stale_edit_footprint_repends_rows_promoted_by_the_next_apply(self):
+        from netbox_nso_plugin import apply_state
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+        from netbox_nso_plugin.models import NSOInterfaceMtuState
+
+        first_interface = self._create_interface(device=self.device, name="Ethernet9.01", type="1000base-t")
+        second_interface = self._create_interface(device=self.device, name="Ethernet9.02", type="1000base-t")
+        with without_commit_drain(), transaction.atomic():
+            first = NSOInterfaceMtuState.objects.create(
+                management=self.mgmt,
+                interface=first_interface,
+                l2_mtu=1500,
+                status="accepted",
+            )
+            second = NSOInterfaceMtuState.objects.create(
+                management=self.mgmt,
+                interface=second_interface,
+                l2_mtu=1500,
+                status="accepted",
+            )
+        stale_footprint = footprint_for_instance(first)
+        registry, pushed = self._promotion_snapshot()
+        next_attempt_id = uuid4()
+        apply_state.promote_current_intent(
+            self.mgmt,
+            registry,
+            pushed,
+            apply_attempt_id=next_attempt_id,
+            static_route_stored=False,
+        )
+
+        with without_commit_drain(), intent_transaction(stale_footprint):
+            current = NSOInterfaceMtuState.objects.get(pk=first.pk)
+            current.l2_mtu = 1600
+            current.save(update_fields=["l2_mtu"])
+
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertEqual((first.status, second.status), ("accepted", "accepted"))
+        self.assertIsNone(first.apply_attempt_id)
+        self.assertIsNone(second.apply_attempt_id)
+
     def test_a_stale_overlay_instance_cannot_restore_deploying(self):
 
         from netbox_nso_plugin.models import NSOInterfaceMtuState
@@ -2666,7 +2708,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         vlan.refresh_from_db()
         self.assertEqual((vlan.vid, vlan.name), (new_vid, old_placeholder))
 
-    def test_editing_one_deploying_row_does_not_lock_an_unrelated_row(self):
+    def test_editing_one_deploying_row_locks_and_repends_the_complete_scope(self):
         import threading
 
         from django.db import connections
@@ -2698,7 +2740,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                     NSOInterfaceMtuState.objects.select_for_update().get(pk=first.pk)
                     first_locked.set()
                     if not release_first.wait(10):
-                        raise AssertionError("the unrelated edit waited on the first row")
+                        raise AssertionError("the complete-scope edit did not inspect the first row")
             except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
                 errors.append(exc)
             finally:
@@ -2723,7 +2765,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         holder.start()
         editor.start()
         try:
-            self.assertTrue(second_committed.wait(5), "the unrelated edit waited on the first row")
+            self.assertFalse(second_committed.wait(1), "the edit did not lock the complete deploying scope")
         finally:
             release_first.set()
         holder.join(10)
@@ -2733,8 +2775,11 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertFalse(editor.is_alive())
         if errors:
             raise errors[0]
+        first.refresh_from_db()
         second.refresh_from_db()
-        self.assertEqual(second.status, "accepted")
+        self.assertEqual((first.status, second.status), ("accepted", "accepted"))
+        self.assertIsNone(first.apply_attempt_id)
+        self.assertIsNone(second.apply_attempt_id)
 
     def test_promotion_does_not_render_under_its_locks(self):
         from unittest.mock import patch
