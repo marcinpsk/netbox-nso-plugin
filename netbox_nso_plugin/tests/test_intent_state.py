@@ -225,6 +225,15 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
 
         self.assertEqual(module.interfaces.get().name, "Ethernet1623/1")
 
+    def test_unpermitted_bulk_creation_is_authorized_and_logged(self):
+        from dcim.models import Interface
+
+        with self.assertLogs("netbox_nso_plugin.intent_state", level="WARNING") as logs:
+            Interface.objects.bulk_create([Interface(device=self.device, name="Ethernet1623/9", type="1000base-t")])
+
+        self.assertEqual(Interface.objects.filter(name="Ethernet1623/9").count(), 1)
+        self.assertTrue(any("dcim_interface" in line for line in logs.output))
+
     def test_registered_bulk_dml_allows_a_non_rendered_interface_update(self):
         from dcim.models import Interface
 
