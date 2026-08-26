@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 import requests
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Platform, Site
+from django.conf import settings
 from django.test import RequestFactory, TestCase, override_settings
 from django.urls import reverse
 from ipam.models import IPAddress
@@ -43,7 +44,8 @@ _AJAX = {"HTTP_X_REQUESTED_WITH": "XMLHttpRequest"}
 _PUBLIC_ADAPTER_ERROR = "The NSO adapter request failed. See the server log."
 _PUBLIC_INVALID_RESPONSE = "The NSO adapter returned an invalid response. See the server log."
 _PLUGINS_CONFIG = {
-    "netbox_nso_plugin": {"adapter_url": "http://adapter.invalid", "adapter_token": "envelope-test-token"}
+    **settings.PLUGINS_CONFIG,
+    "netbox_nso_plugin": {"adapter_url": "http://adapter.invalid", "adapter_token": "envelope-test-token"},
 }
 
 
