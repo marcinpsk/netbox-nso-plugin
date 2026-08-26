@@ -8,6 +8,7 @@ import contextlib
 import contextvars
 import copy
 import functools
+import logging
 import operator
 import re
 from collections.abc import Callable
@@ -29,6 +30,8 @@ from django.db.models.signals import (
 )
 from sqlparse.sql import Comparison, Identifier, IdentifierList
 from sqlparse.tokens import Comment, Keyword, Literal
+
+logger = logging.getLogger(__name__)
 
 ABSENT = ("ABSENT",)
 
@@ -2611,6 +2614,9 @@ def _dml_guard(execute, sql, params, many, context):
         return execute(sql, params, many, context)
     touched_columns = _dml_columns(statement, target.operation)
     if target.operation == "INSERT INTO" and touched_columns == frozenset():
+        if _ACTIVE_PERMIT.get() is None:
+            # drift signal: this creation skips the pre_save bookkeeping (revision bump, re-pend)
+            logger.warning("unpermitted creation on renderer input %s proceeded without bookkeeping", target.table)
         return execute(sql, params, many, context)
     permit = _ACTIVE_PERMIT.get()
     table = target.table
