@@ -760,6 +760,53 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_generation_barrier_actions_send_the_exact_generation_identity(self, mock_s, _cfg):
+        from netbox_nso_plugin.adapter_client import abandon_generation, reset_session, retry_generation
+
+        self.addCleanup(reset_session)
+        response = {"generation_id": 73, "seq": 11, "job_id": 901}
+        session = make_session()
+        session.request.side_effect = [make_response(202, response), make_response(202, response)]
+        mock_s.return_value = session
+
+        self.assertEqual(retry_generation(5, 73), response)
+        self.assertEqual(abandon_generation(5, 73), response)
+        self.assertEqual(
+            [
+                (call.args[0], call.args[1].rsplit("/", 1)[-1], call.kwargs["json"])
+                for call in session.request.call_args_list
+            ],
+            [
+                ("POST", "retry-generation", {"generation_id": 73}),
+                ("POST", "abandon-generation", {"generation_id": 73}),
+            ],
+        )
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_generation_barrier_action_preserves_the_moved_head_conflict(self, mock_s, _cfg):
+        from netbox_nso_plugin.adapter_client import AdapterError, retry_generation
+
+        session = self._make_session(
+            409,
+            {
+                "error": {
+                    "code": "conflict",
+                    "message": "Generation is not the current blocked head",
+                    "detail": {"head_generation_id": 74, "head_status": "failed"},
+                }
+            },
+        )
+        mock_s.return_value = session
+
+        with self.assertRaises(AdapterError) as raised:
+            retry_generation(5, 73)
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(raised.exception.detail, {"head_generation_id": 74, "head_status": "failed"})
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_get_job(self, mock_s, _cfg):
         from netbox_nso_plugin.adapter_client import get_job
 

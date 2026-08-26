@@ -3333,6 +3333,60 @@ class NSOForceRemovalView(NSOActionPermissionMixin, View):
         return redirect(_device_nso_tab_url(mgmt.device.pk))
 
 
+class _NSOGenerationActionView(NSOActionPermissionMixin, View):
+    """Apply one generation-scoped barrier action to the blocked head."""
+
+    action = ""
+    client_method = ""
+
+    def post(self, request, pk):
+        """CAS the operator action against the generation shown in the tab."""
+        from . import adapter_client as client
+
+        device = get_object_or_404(Device, pk=pk)
+        mgmt = getattr(device, "nso_management", None)
+        if mgmt is None or mgmt.adapter_device_id is None:
+            messages.warning(request, "Device is not yet onboarded.")
+            return redirect(_device_nso_tab_url(device.pk))
+        try:
+            generation_id = int(request.POST.get("generation_id", ""))
+        except (TypeError, ValueError):
+            messages.error(request, "Generation ID must be an integer.")
+            return redirect(_device_nso_tab_url(device.pk))
+
+        try:
+            result = getattr(client, self.client_method)(mgmt.adapter_device_id, generation_id)
+        except AdapterError as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            head_generation_id = detail.get("head_generation_id")
+            if exc.status_code == 409 and type(head_generation_id) is int:
+                messages.warning(
+                    request,
+                    f"Generation {generation_id} moved. The current blocked head is generation {head_generation_id}.",
+                )
+            else:
+                messages.error(request, public_error_message(exc))
+        else:
+            job_id = result.get("job_id") if isinstance(result, dict) else None
+            suffix = f" Job ID: {job_id}." if job_id is not None else ""
+            messages.success(request, f"Generation {generation_id} {self.action} queued.{suffix}")
+        return redirect(_device_nso_tab_url(device.pk))
+
+
+class NSOGenerationRetryView(_NSOGenerationActionView):
+    """Retry the exact blocked generation shown to the operator."""
+
+    action = "retry"
+    client_method = "retry_generation"
+
+
+class NSOGenerationAbandonView(_NSOGenerationActionView):
+    """Abandon the exact blocked generation shown to the operator."""
+
+    action = "abandonment"
+    client_method = "abandon_generation"
+
+
 class NSOJobStatusView(LoginRequiredMixin, View):
     """Return JSON status of an adapter job — used for client-side polling."""
 
@@ -3610,6 +3664,7 @@ class NSODeviceJobsView(LoginRequiredMixin, View):
                     "last": None,
                     "jobs": [],
                     "generations": [],
+                    "apply_state": None,
                     "blocked_removals": [],
                     "residue_removals": [],
                 }
@@ -3630,6 +3685,7 @@ class NSODeviceJobsView(LoginRequiredMixin, View):
             return JsonResponse({"error": "since_seq must be non-negative"}, status=400)
         try:
             jobs = client.list_jobs(mgmt.adapter_device_id)
+            apply_state = client.get_device_apply_state(mgmt.adapter_device_id)
             generations = (
                 client.list_device_generations(mgmt.adapter_device_id, since_seq=since_seq) if generation_ids else []
             )
@@ -3651,6 +3707,7 @@ class NSODeviceJobsView(LoginRequiredMixin, View):
                 "last": last,
                 "jobs": serialized_jobs,
                 "generations": generations,
+                "apply_state": apply_state,
                 "blocked_removals": _blocked_removals(jobs),
                 "residue_removals": _residue_removals(jobs),
             }

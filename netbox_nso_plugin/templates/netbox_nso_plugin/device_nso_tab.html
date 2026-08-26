@@ -347,6 +347,39 @@
     </div>
   </div>
 
+  {# The poll fills this panel only when the executable Apply head is blocked. #}
+  <div id="nso-blocked-generation" class="alert alert-danger mb-3 d-none" role="alert">
+    <div class="d-flex align-items-start">
+      <span class="mdi mdi-progress-alert me-2 mt-1"></span>
+      <div class="flex-grow-1">
+        <strong>Apply generation <span data-slot="generation"></span> is blocked
+          (<span data-slot="status"></span>).</strong>
+        Its sections are <span data-slot="sections"></span>.
+        <span data-slot="pending"></span> later generation(s) are waiting behind it.
+        Held job(s): <span data-slot="held"></span>.
+        <div class="mt-2 d-flex gap-2">
+          <form method="post" data-action="retry"
+                action="{% url 'plugins:netbox_nso_plugin:generation_retry' object.pk %}">
+            {% csrf_token %}
+            <input type="hidden" name="generation_id" value="">
+            <button type="submit" class="btn btn-sm btn-warning">
+              <span class="mdi mdi-reload"></span> Retry generation
+            </button>
+          </form>
+          <form method="post" data-action="abandon"
+                action="{% url 'plugins:netbox_nso_plugin:generation_abandon' object.pk %}"
+                onsubmit="return confirm('Abandon this generation and release the generations behind it?');">
+            {% csrf_token %}
+            <input type="hidden" name="generation_id" value="">
+            <button type="submit" class="btn btn-sm btn-danger">
+              <span class="mdi mdi-cancel"></span> Abandon generation
+            </button>
+          </form>
+        </div>
+      </div>
+    </div>
+  </div>
+
   {# ── Blocked removals (collateral guard) — filled by the jobs poll below ── #}
   {# A removal the adapter refused because the PUT-replace would flush service rows  #}
   {# nobody removed (orphaned intent). Persists until the operator re-accepts the    #}
@@ -451,6 +484,21 @@
         box.innerHTML = '';
       }
     }
+    var applyStateBox = document.getElementById('nso-blocked-generation');
+    function renderApplyState(state) {
+      var head = state && state.head;
+      if (!applyStateBox) return;
+      if (!state || !state.blocked || !head) { applyStateBox.classList.add('d-none'); return; }
+      applyStateBox.querySelector('[data-slot="generation"]').textContent = head.generation_id;
+      applyStateBox.querySelector('[data-slot="status"]').textContent = head.status;
+      applyStateBox.querySelector('[data-slot="sections"]').textContent = (head.sections || []).join(', ') || 'none';
+      applyStateBox.querySelector('[data-slot="pending"]').textContent = state.pending_generations || 0;
+      applyStateBox.querySelector('[data-slot="held"]').textContent = (state.held_jobs || []).join(', ') || 'none';
+      applyStateBox.querySelectorAll('input[name="generation_id"]').forEach(function (input) {
+        input.value = head.generation_id;
+      });
+      applyStateBox.classList.remove('d-none');
+    }
     var blockedBox = document.getElementById('nso-blocked-removals');
     var blockedTpl = document.getElementById('nso-blocked-removal-tpl');
     function renderBlocked(list) {
@@ -508,6 +556,7 @@
         .then(function (r) { return r.json(); })
         .then(function (d) {
           render(d);
+          renderApplyState(d && d.apply_state);
           renderBlocked(d && d.blocked_removals);
           renderResidue(d && d.residue_removals);
           var running = !!(d && d.running);

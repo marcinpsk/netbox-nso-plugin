@@ -985,6 +985,29 @@ def trigger_force_removal(adapter_device_id, scope):
     return _request("POST", f"/api/v1/devices/{adapter_device_id}/actions/force-removal", json={"scope": scope})
 
 
+def retry_generation(adapter_device_id: int, generation_id: int) -> dict:
+    """Retry the exact blocked generation the operator inspected."""
+    return _request(
+        "POST",
+        f"/api/v1/devices/{adapter_device_id}/actions/retry-generation",
+        json={"generation_id": generation_id},
+    )
+
+
+def abandon_generation(adapter_device_id: int, generation_id: int) -> dict:
+    """Abandon the exact blocked generation the operator inspected."""
+    return _request(
+        "POST",
+        f"/api/v1/devices/{adapter_device_id}/actions/abandon-generation",
+        json={"generation_id": generation_id},
+    )
+
+
+def get_device_apply_state(adapter_device_id: int) -> dict:
+    """Return the device-wide executable Apply head and barrier state."""
+    return _request("GET", f"/api/v1/devices/{adapter_device_id}/apply-state")
+
+
 def sync_notify(adapter_device_id):
     """POST /api/v1/devices/{id}/sync-notify — notify adapter of scope/intent change.
 
