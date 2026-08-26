@@ -7,7 +7,7 @@ from __future__ import annotations
 from unittest.mock import patch
 from uuid import uuid4
 
-from django.db import transaction
+from django.db import connection, transaction
 from django.db.models import F
 from django.test import TransactionTestCase
 
@@ -47,11 +47,39 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         with self.assertRaises(IntentMutationProtocolError):
             NSOVLANState.objects.filter(pk=self.state.pk).update(vlan_id=self.state.vlan_id + 100000)
 
+    def test_registered_raw_dml_with_unquoted_content_column_requires_a_content_permit(self):
+        table = NSOVLANState._meta.db_table
+
+        with self.assertRaises(IntentMutationProtocolError), connection.cursor() as cursor:
+            cursor.execute(
+                f'UPDATE "{table}" SET vlan_id = %s WHERE id = %s',
+                [self.state.vlan_id, self.state.pk],
+            )
+
+    def test_registered_raw_dml_with_unknown_columns_fails_closed(self):
+        table = NSOVLANState._meta.db_table
+
+        with self.assertRaises(IntentMutationProtocolError), connection.cursor() as cursor:
+            cursor.execute(
+                f'UPDATE "{table}" SET (management_id, vlan_id) = (%s, %s) WHERE id = %s',
+                [self.management.pk, self.state.vlan_id, self.state.pk],
+            )
+
     def test_registered_bulk_dml_allows_a_non_content_counter_update(self):
         type(self.device).objects.filter(pk=self.device.pk).update(interface_count=F("interface_count") + 1)
 
         self.device.refresh_from_db()
         self.assertEqual(self.device.interface_count, 1)
+
+    def test_interface_create_updates_the_registered_device_counter(self):
+        from dcim.models import Interface
+
+        initial_count = self.device.interface_count
+
+        Interface.objects.create(device=self.device, name="Ethernet1623", type="1000base-t")
+
+        self.device.refresh_from_db()
+        self.assertEqual(self.device.interface_count, initial_count + 1)
 
     def test_registered_bulk_dml_allows_a_non_rendered_interface_update(self):
         from dcim.models import Interface
@@ -217,6 +245,13 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
             with self.subTest(label=label):
                 self.assertTrue(callable(spec.resolver))
                 self.assertTrue(callable(spec.fragment))
+
+    def test_interface_channel_cable_fields_are_registered_as_non_content(self):
+        spec = renderer_input_specs()["dcim.interface"]
+        cable_fields = {"cable", "cable_end", "cable_connector", "cable_positions"}
+
+        self.assertTrue(cable_fields <= spec.lifecycle_fields)
+        self.assertTrue(cable_fields.isdisjoint(spec.content_fields))
 
     def test_vlan_fragment_is_the_exact_renderer_item(self):
         rendered = delivery.render("vlan", self.device.pk, self.management.adapter_device_id)

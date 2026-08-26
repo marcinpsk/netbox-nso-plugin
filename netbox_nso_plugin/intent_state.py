@@ -14,6 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+import sqlparse
 from django.apps import apps
 from django.db import connections, transaction
 from django.db.backends.signals import connection_created
@@ -26,6 +27,8 @@ from django.db.models.signals import (
     pre_migrate,
     pre_save,
 )
+from sqlparse.sql import Comparison, Identifier, IdentifierList, Parenthesis
+from sqlparse.tokens import Comment, Keyword
 
 ABSENT = ("ABSENT",)
 
@@ -2156,7 +2159,7 @@ def _begin_implicit(
             footprint_override,
         )
     else:
-        proposed_footprint = footprint_for_instance(instance, spec)
+        proposed_footprint = footprint_override or footprint_for_instance(instance, spec)
         benign_insert = _benign_unrendered_insert(instance, before, after)
     if (
         not _is_intent_push_suppressed()
@@ -2164,7 +2167,9 @@ def _begin_implicit(
         and not (instance._state.adding and proposed_footprint.overlay_rows and not benign_insert)
     ):
         benign_footprint = MutationFootprint() if benign_insert else proposed_footprint
-        secondary_footprint = None if benign_insert else _secondary_dml_footprint(instance, spec)
+        secondary_footprint = (
+            None if benign_insert or footprint_override is not None else _secondary_dml_footprint(instance, spec)
+        )
         if secondary_footprint is not None or benign_footprint.shared_keys or benign_footprint.overlay_rows:
             permit = _Permit(
                 footprint=secondary_footprint or benign_footprint,
@@ -2191,8 +2196,7 @@ def _begin_implicit(
                 implicit=True,
             )
     elif not _is_intent_push_suppressed():
-        footprint = footprint_override or footprint_for_instance(instance, spec)
-        permit = _Permit(footprint=footprint, dml_kind="content", implicit=True)
+        permit = _Permit(footprint=proposed_footprint, dml_kind="content", implicit=True)
     token = _ACTIVE_PERMIT.set(permit)
     if transaction.get_connection().atomic_blocks:
         permit.atomic_block_id = id(transaction.get_connection().atomic_blocks[-1])
@@ -2444,7 +2448,7 @@ def _dml_guard(execute, sql, params, many, context):
     touched_columns = _dml_columns(statement, match)
     guarded_fields = spec.content_fields | _FRAGMENT_GATE_FIELDS.get(spec.model_label, set())
     content_columns = {spec.model._meta.get_field(field_name).column for field_name in guarded_fields}
-    if touched_columns is not None and touched_columns.isdisjoint(content_columns):
+    if touched_columns and touched_columns.isdisjoint(content_columns):
         return execute(sql, params, many, context)
     if permit is not None and permit.dml_kind == "offline":
         return execute(sql, params, many, context)
@@ -2457,26 +2461,12 @@ def _dml_guard(execute, sql, params, many, context):
         }
         if permit.footprint.device_ids:
             footprint_tables.add(apps.get_model("netbox_nso_plugin.nsodevicemanagement")._meta.db_table)
-    interface_assignment_cascade = (
-        spec.model_label == "ipam.ipaddress"
-        and (touched_columns is None or touched_columns <= {"assigned_object_type_id", "assigned_object_id"})
-        and permit is not None
-        and permit.dml_kind == "content"
-        and any(row.model_label == "dcim.interface" for row in permit.footprint.source_rows)
-    )
-    # The pool pointer is an audit trail, not part of the pushed IP intent.
-    source_pool_cascade = (
-        spec.model_label == "netbox_nso_plugin.nsointerfaceipstate"
-        and touched_columns == frozenset({"source_pool_id"})
-        and _is_pool_delete_cascade(statement, params, context["connection"])
-    )
-    if interface_assignment_cascade or source_pool_cascade:
-        return execute(sql, params, many, context)
     if remaining < 1 and table not in footprint_tables:
+        column_detail = "unknown" if touched_columns is None else sorted(touched_columns)
         _clear_failed_implicit_permit(permit)
         raise IntentMutationProtocolError(
             f"bulk/raw DML on renderer input {table} requires an exact content_mutation permit; "
-            f"active={getattr(permit, 'dml_kind', None)!r}, columns={sorted(touched_columns or ())!r}, "
+            f"active={getattr(permit, 'dml_kind', None)!r}, columns={column_detail!r}, "
             f"tables={sorted(footprint_tables)!r}"
         )
     if remaining:
@@ -2499,17 +2489,59 @@ def _clear_failed_implicit_permit(permit) -> None:
 
 
 def _dml_columns(statement: str, match) -> frozenset[str] | None:
-    """Return columns written by generated UPDATE/INSERT SQL, or None for DELETE/unknown."""
+    """Return columns written by UPDATE/INSERT SQL, or None when they are unknown."""
     operation = re.sub(r"\s+", " ", match.group("operation").upper())
-    tail = statement[match.end() :]
+    if operation == "DELETE FROM":
+        return None
+    parsed = sqlparse.parse(statement)
+    if len(parsed) != 1:
+        return None
+    tokens = _sql_tokens(parsed[0])
     if operation == "UPDATE":
-        set_clause = re.split(r"\s+WHERE\s+", tail, maxsplit=1, flags=re.IGNORECASE)[0]
-        return frozenset(re.findall(r'"(?P<column>[A-Za-z0-9_]+)"\s*=', set_clause))
+        set_index = next(
+            (index for index, token in enumerate(tokens) if token.ttype in Keyword and token.normalized == "SET"),
+            None,
+        )
+        if set_index is None or set_index + 1 >= len(tokens):
+            return None
+        assignments = tokens[set_index + 1]
+        if isinstance(assignments, Comparison):
+            comparisons = (assignments,)
+        elif isinstance(assignments, IdentifierList):
+            comparisons = tuple(assignments.get_identifiers())
+        else:
+            return None
+        columns = tuple(_comparison_column(comparison) for comparison in comparisons)
+        return None if not columns or any(column is None for column in columns) else frozenset(columns)
     if operation == "INSERT INTO":
-        columns = re.match(r"\s*\((?P<columns>[^)]*)\)\s*VALUES\b", tail, re.IGNORECASE)
-        if columns is not None:
-            return frozenset(re.findall(r'"(?P<column>[A-Za-z0-9_]+)"', columns.group("columns")))
+        column_list = next((token for token in tokens if isinstance(token, Parenthesis)), None)
+        if column_list is None:
+            return None
+        column_tokens = _sql_tokens(column_list)[1:-1]
+        if len(column_tokens) == 1 and isinstance(column_tokens[0], IdentifierList):
+            identifiers = tuple(column_tokens[0].get_identifiers())
+        elif column_tokens and all(isinstance(token, Identifier) for token in column_tokens):
+            identifiers = tuple(column_tokens)
+        else:
+            return None
+        columns = tuple(identifier.get_real_name() for identifier in identifiers)
+        return None if not columns or any(column is None for column in columns) else frozenset(columns)
     return None
+
+
+def _comparison_column(comparison) -> str | None:
+    """Return the column assigned by one parsed UPDATE comparison."""
+    if not isinstance(comparison, Comparison):
+        return None
+    tokens = _sql_tokens(comparison)
+    if len(tokens) < 3 or tokens[1].value != "=" or not isinstance(tokens[0], Identifier):
+        return None
+    return tokens[0].get_real_name()
+
+
+def _sql_tokens(group) -> tuple:
+    """Return significant direct children from one parsed SQL token group."""
+    return tuple(token for token in group.tokens if not token.is_whitespace and token.ttype not in Comment)
 
 
 def _install_guard(connection, **kwargs):
