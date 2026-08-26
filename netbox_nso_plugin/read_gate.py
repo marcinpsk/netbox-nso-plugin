@@ -874,9 +874,12 @@ def _locked_publication_matches(management, row, decision: _Decision, epoch) -> 
 
 def mark_publication_error_if_current(mgmt, family: str, decision: _Decision, epoch, mark_error) -> bool:
     """Run *mark_error* only while this failed admission remains current under both locks."""
+    from .intent_state import ReconcileMutationPlan, reconcile_family_footprint, reconcile_transaction
     from .models import NSODeviceManagement, NSOFamilyReadState
 
-    with transaction.atomic():
+    scopes = _INTENT_SCOPES_BY_READ_FAMILY.get(family, (family,))
+    plan = ReconcileMutationPlan(reconcile_family_footprint(mgmt.device_id, scopes))
+    with reconcile_transaction(plan):
         management = NSODeviceManagement.objects.select_for_update().get(pk=mgmt.pk)
         row = NSOFamilyReadState.objects.select_for_update().get(management=management, family=family)
         if not _locked_publication_matches(management, row, decision, epoch):
@@ -912,14 +915,22 @@ def gated_family_run(
     from .models import NSODeviceManagement, NSOFamilyReadState
 
     try:
-        from .intent_state import MutationFootprint, ReconcileMutationPlan, reconcile_transaction
+        from .intent_state import (
+            MutationFootprint,
+            ReconcileMutationPlan,
+            reconcile_family_footprint,
+            reconcile_transaction,
+        )
 
         scopes = _INTENT_SCOPES_BY_READ_FAMILY.get(family, (family,))
         plan = pre_body() if pre_body is not None else None
         if plan is None:
-            plan = ReconcileMutationPlan(MutationFootprint.for_keys({(mgmt.device_id, scope) for scope in scopes}))
+            plan = ReconcileMutationPlan(
+                reconcile_family_footprint(mgmt.device_id, scopes),
+                detect_content_changes=True,
+            )
         elif isinstance(plan, MutationFootprint):
-            plan = ReconcileMutationPlan(plan)
+            plan = ReconcileMutationPlan(plan, detect_content_changes=True)
 
         with reconcile_transaction(plan):
             current_management = NSODeviceManagement.objects.select_for_update().get(pk=mgmt.pk)

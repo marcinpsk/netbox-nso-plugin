@@ -471,22 +471,41 @@ class TestReconcileRedistribution(TestCase):
         self.assertEqual(NSORedistributionState.objects.count(), 0)  # overlay gone
         self.assertEqual(Redistribution.objects.count(), 0)  # object gone
 
-    def test_category_reconcile_deletes_the_last_unowned_native_row(self):
-        management = self._make_mgmt()
+    def test_gated_removal_locks_and_deletes_the_native_redistribution(self):
+        mgmt = self._make_mgmt()
+        mgmt.manage_routing = True
+        mgmt.manage_redistribution = True
+        mgmt.save(update_fields=["manage_routing", "manage_redistribution"])
+        from django.db import connection
         from netbox_routing.models import ISISInstance, Redistribution
 
         ISISInstance.objects.create(device=self.device, process_tag="")
         from netbox_nso_plugin.models import NSORedistributionState
-        from netbox_nso_plugin.reconcile import _LeaseOutcome, reconcile_category
+        from netbox_nso_plugin.reconcile import reconcile_category
         from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
 
         reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
-        with (
-            patch("netbox_nso_plugin.reconcile._acquire_reconcile_lease", return_value=_LeaseOutcome()),
-            patch("netbox_nso_plugin.adapter_client.get_redistribution", return_value={"entries": []}),
-        ):
-            reconcile_category(self.device, management, "redistribution")
+        native = Redistribution.objects.get()
+        statements = []
 
+        def observe_sql(execute, sql, params, many, context):
+            statements.append((str(sql), tuple(params or ())))
+            return execute(sql, params, many, context)
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.get_redistribution", return_value={"entries": []}),
+            connection.execute_wrapper(observe_sql),
+        ):
+            context = reconcile_category(self.device, mgmt, "redistribution")
+
+        self.assertEqual(context["_gate"]["redistribution"], "legacy")
+        self.assertTrue(
+            any(
+                f'FROM "{native._meta.db_table}"' in sql and "FOR UPDATE" in sql and native.pk in params
+                for sql, params in statements
+            ),
+            "the gated footprint did not lock the exact native redistribution row",
+        )
         self.assertFalse(NSORedistributionState.objects.exists())
         self.assertFalse(Redistribution.objects.exists())
 

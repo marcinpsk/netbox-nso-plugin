@@ -9,7 +9,7 @@ from uuid import uuid4
 from django.db import IntegrityError, models, transaction
 from django.test import SimpleTestCase, TestCase
 
-from ._outbox_case import make_managed, mirror_update
+from ._outbox_case import make_managed, mirror_update, without_commit_drain
 
 PROMOTED_MODEL_NAMES = (
     "NSOVLANState",
@@ -116,6 +116,30 @@ class TestIntentRevisionWrites(TestCase):
         row.refresh_from_db()
         self.assertEqual(row.status, "accepted")
         self.assertIsNone(row.apply_attempt_id)
+
+    def test_a_logging_host_edit_repends_the_deploying_level_row(self):
+        from netbox_nso_plugin.models import NSOLoggingHostState, NSOLoggingLevelState
+
+        with without_commit_drain(), transaction.atomic():
+            host = NSOLoggingHostState.objects.create(
+                management=self.management,
+                address="198.18.0.10",
+                status="accepted",
+            )
+            level = NSOLoggingLevelState.objects.create(
+                management=self.management,
+                console_severity="WARNING",
+                status="accepted",
+            )
+        mirror_update(level, status="deploying", apply_attempt_id=uuid4())
+
+        with without_commit_drain(), transaction.atomic():
+            host.port = 5514
+            host.save(update_fields=["port"])
+
+        level.refresh_from_db()
+        self.assertEqual(level.status, "accepted")
+        self.assertIsNone(level.apply_attempt_id)
 
     def test_savepoint_rollback_does_not_suppress_the_next_revision_bump(self):
         from netbox_nso_plugin import outbox

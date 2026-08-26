@@ -65,11 +65,92 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 [self.management.pk, self.state.vlan_id, self.state.pk],
             )
 
+    def test_cte_led_raw_dml_requires_a_content_permit(self):
+        table = NSOVLANState._meta.db_table
+
+        with self.assertRaises(IntentMutationProtocolError), connection.cursor() as cursor:
+            cursor.execute(
+                f'WITH target AS (SELECT id FROM "{table}" WHERE id = %s) '
+                f'UPDATE "{table}" AS state SET vlan_id = %s FROM target WHERE state.id = target.id',
+                [self.state.pk, self.state.vlan_id],
+            )
+
+    def test_schema_qualified_raw_dml_requires_a_content_permit(self):
+        table = NSOVLANState._meta.db_table
+
+        with self.assertRaises(IntentMutationProtocolError), connection.cursor() as cursor:
+            cursor.execute(
+                f'UPDATE "public"."{table}" SET vlan_id = %s WHERE id = %s',
+                [self.state.vlan_id, self.state.pk],
+            )
+
+    def test_unquoted_uppercase_raw_dml_requires_a_content_permit(self):
+        table = NSOVLANState._meta.db_table.upper()
+
+        with self.assertRaises(IntentMutationProtocolError), connection.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE {table} SET VLAN_ID = %s WHERE ID = %s",
+                [self.state.vlan_id, self.state.pk],
+            )
+
+    def test_comment_prefixed_raw_dml_requires_a_content_permit(self):
+        table = NSOVLANState._meta.db_table
+
+        with self.assertRaises(IntentMutationProtocolError), connection.cursor() as cursor:
+            cursor.execute(
+                f'/* guard regression */ UPDATE "{table}" SET vlan_id = %s WHERE id = %s',
+                [self.state.vlan_id, self.state.pk],
+            )
+
+    def test_merge_raw_dml_requires_a_content_permit(self):
+        table = NSOVLANState._meta.db_table
+
+        with self.assertRaises(IntentMutationProtocolError), connection.cursor() as cursor:
+            cursor.execute(
+                f'MERGE INTO "{table}" AS target '
+                "USING (VALUES (%s, %s)) AS source(id, vlan_id) ON target.id = source.id "
+                "WHEN MATCHED THEN UPDATE SET vlan_id = source.vlan_id",
+                [self.state.pk, self.state.vlan_id],
+            )
+
+    def test_data_mutating_cte_with_outer_select_requires_a_content_permit(self):
+        table = NSOVLANState._meta.db_table
+
+        with self.assertRaises(IntentMutationProtocolError), connection.cursor() as cursor:
+            cursor.execute(
+                f'WITH changed AS (UPDATE "{table}" SET vlan_id = %s WHERE id = %s RETURNING id) '
+                "SELECT id FROM changed",
+                [self.state.vlan_id, self.state.pk],
+            )
+
+    def test_data_mutating_cte_after_read_only_cte_requires_a_content_permit(self):
+        table = NSOVLANState._meta.db_table
+
+        with self.assertRaises(IntentMutationProtocolError), connection.cursor() as cursor:
+            cursor.execute(
+                f'WITH existing AS (SELECT id FROM "{table}" WHERE id = %s), '
+                f'changed AS (UPDATE "{table}" SET vlan_id = %s WHERE id IN (SELECT id FROM existing) RETURNING id) '
+                "SELECT id FROM changed",
+                [self.state.pk, self.state.vlan_id],
+            )
+
+    def test_unparseable_sql_that_names_a_registered_table_fails_closed(self):
+        table = NSOVLANState._meta.db_table
+
+        with self.assertRaises(IntentMutationProtocolError), transaction.atomic(), connection.cursor() as cursor:
+            cursor.execute(f'UPDATE ??? "{table}" SET vlan_id = %s', [self.state.vlan_id])
+
     def test_registered_bulk_dml_allows_a_non_content_counter_update(self):
         type(self.device).objects.filter(pk=self.device.pk).update(interface_count=F("interface_count") + 1)
 
         self.device.refresh_from_db()
         self.assertEqual(self.device.interface_count, 1)
+
+    def test_select_for_update_of_a_registered_table_is_not_dml(self):
+        with transaction.atomic():
+            locked = NSOVLANState.objects.select_for_update(of=("self",)).get(pk=self.state.pk)
+
+        self.assertEqual(locked.pk, self.state.pk)
 
     def test_interface_create_updates_the_registered_device_counter(self):
         from dcim.models import Interface

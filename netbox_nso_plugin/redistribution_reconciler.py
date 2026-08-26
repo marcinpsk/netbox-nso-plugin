@@ -565,6 +565,9 @@ def reconcile_redistribution(device, payload: dict) -> list:
             rd = stale.redistribution
             stale.delete()
             if rd is not None and not rd.nso_redistribution_states.exists():
-                rd.delete()
+                from .intent_state import reconcile_cascade_dml
+
+                with reconcile_cascade_dml(NSORedistributionState):
+                    rd.delete()
 
     return list(NSORedistributionState.objects.filter(management=mgmt))

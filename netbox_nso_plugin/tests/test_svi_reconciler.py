@@ -210,6 +210,28 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         self.assertEqual(state.status, "deploying")
         self.assertEqual(state.apply_attempt_id, attempt_id)
 
+    def test_predicted_scope_change_repends_a_row_settled_by_the_body(self):
+        from uuid import uuid4
+
+        from netbox_nso_plugin.svi_reconciler import reconcile_svi
+
+        from ._outbox_case import mirror_update
+
+        deploying = self._state(name="Vlan100", vid=100, status="accepted")
+        confirmed = self._state(name="Vlan200", vid=200, status="in_sync")
+        mirror_update(deploying, status="deploying", apply_attempt_id=uuid4())
+
+        reconcile_svi(
+            self.device,
+            {"interfaces": [{"interface_name": "Vlan100", "vlan_id": 100, "type": "svi", "vrf": "MGMT"}]},
+        )
+
+        deploying.refresh_from_db()
+        confirmed.refresh_from_db()
+        self.assertEqual(confirmed.status, "changed")
+        self.assertEqual(deploying.status, "accepted")
+        self.assertIsNone(deploying.apply_attempt_id)
+
     def test_owned_state_survives_when_interface_drops_from_payload(self):
         """An owned SVI overlay must NOT be hard-deleted when the device stops reporting it.
 

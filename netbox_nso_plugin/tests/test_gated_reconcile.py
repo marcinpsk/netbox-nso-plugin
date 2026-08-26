@@ -471,29 +471,6 @@ _DEVICE_FETCHERS = {
     "get_redistribution": {"entries": []},
 }
 
-#: reconciler bodies reconcile_device dispatches to (patch target → gated family).
-_DEVICE_BODIES = {
-    "netbox_nso_plugin.template_content._upsert_interface_states": "interface_attributes",
-    "netbox_nso_plugin.svi_reconciler.reconcile_svi": "svi",
-    "netbox_nso_plugin.subinterface_reconciler.reconcile_subinterface": "subinterface",
-    "netbox_nso_plugin.interface_mtu_reconciler.reconcile_interface_mtu": "interface_mtu",
-    "netbox_nso_plugin.template_content._reconcile_interface_ips": "interface_ip",
-    "netbox_nso_plugin.lacp_reconciler.reconcile_lag_config": "lag_config",
-    "netbox_nso_plugin.vlan_reconciler.reconcile_vlan_database": "vlan",
-    "netbox_nso_plugin.vlan_reconciler.reconcile_switchport": "switchport",
-    "netbox_nso_plugin.template_content._reconcile_snmp_config": "snmp",
-    "netbox_nso_plugin.template_content._reconcile_logging_config": "logging",
-    "netbox_nso_plugin.l2_service_reconciler.reconcile_l2_services": "l2_service",
-    "netbox_nso_plugin.template_content._reconcile_static_routes": "static_route",
-    "netbox_nso_plugin.template_content._reconcile_isis_interfaces": "isis",
-    "netbox_nso_plugin.template_content._reconcile_isis_process": "isis",
-    "netbox_nso_plugin.route_policy_reconciler.reconcile_route_policy": "route_policy",
-    "netbox_nso_plugin.template_content._reconcile_ospf": "ospf",
-    "netbox_nso_plugin.bgp_reconciler._reconcile_bgp_config": "bgp",
-    "netbox_nso_plugin.bfd_reconciler.reconcile_bfd": "bfd",
-    "netbox_nso_plugin.redistribution_reconciler.reconcile_redistribution": "redistribution",
-}
-
 _ALL_SCOPES = {
     "manage_interfaces": True,
     "manage_snmp": True,
@@ -509,13 +486,12 @@ _ALL_SCOPES = {
 }
 
 
-class TestNoBypassSweep(TestCase):
-    """Behavioral no-bypass: with EVERY family declared unavailable, NO reconciler
-    body may run — a single bypassed call site fails this. The admit sweep proves
-    the same wiring runs every body (nothing silently dropped by the gating)."""
+class TestRealBodyGateSweep(TestCase):
+    """Exercise real reconciler bodies through each gate plan shape."""
 
     def setUp(self):
         self.device, self.mgmt = _make(f"gn{uuid.uuid4().hex[:6]}", **_ALL_SCOPES)
+        Interface.objects.create(device=self.device, name="Ethernet1", type="1000base-t")
 
     def _run(self, read_state):
         from contextlib import ExitStack
@@ -525,32 +501,172 @@ class TestNoBypassSweep(TestCase):
         with ExitStack() as stack:
             for fetcher, shape in _DEVICE_FETCHERS.items():
                 doc = dict(shape)
+                if fetcher == "get_interface_mtu":
+                    doc["interfaces"] = [
+                        {
+                            "interface_name": "Ethernet1",
+                            "mtu": 9100,
+                            "ip_mtu": 9000,
+                            "mpls_mtu": 9088,
+                        }
+                    ]
+                elif fetcher == "get_l2_services":
+                    doc = _l2_payload(("gate-sweep-l2",))
+                elif fetcher == "get_route_policy":
+                    doc["prefix_lists"] = [{"name": "GATE-SWEEP-PREFIX", "entries": []}]
                 if fetcher != "get_state" and read_state is not None:
                     doc["read_state"] = read_state
                 stack.enter_context(patch(f"netbox_nso_plugin.adapter_client.{fetcher}", return_value=doc))
-            bodies = {target: stack.enter_context(patch(target, return_value=[])) for target in _DEVICE_BODIES}
-            ctx = reconcile_device(self.device, self.mgmt)
-        return ctx, bodies
+            return reconcile_device(self.device, self.mgmt)
 
-    def test_all_unavailable_runs_zero_bodies(self):
-        ctx, bodies = self._run(_rs(outcome="unavailable", reason="export_down", result="kept", succeeded=False))
-        ran = {t: m.call_count for t, m in bodies.items() if m.call_count}
-        self.assertEqual(ran, {}, f"reconciler bodies bypassed the gate: {ran}")
-        for family in set(_DEVICE_BODIES.values()):
+    def test_all_unavailable_skips_every_real_body(self):
+        from netbox_nso_plugin.models import NSOInterfaceMtuState, NSORoutePolicyState
+
+        ctx = self._run(_rs(outcome="unavailable", reason="export_down", result="kept", succeeded=False))
+        from netbox_nso_plugin.reconcile import _enabled_device_families
+
+        for family in _enabled_device_families(self.mgmt):
             self.assertEqual(ctx["_gate"].get(family), "skipped_unavailable", family)
+        self.assertFalse(NSOInterfaceMtuState.objects.filter(management=self.mgmt).exists())
+        self.assertFalse(NSOL2SapState.objects.filter(management=self.mgmt).exists())
+        self.assertFalse(NSORoutePolicyState.objects.filter(management=self.mgmt).exists())
 
-    def test_all_present_runs_every_body_once(self):
-        ctx, bodies = self._run(_rs())
-        missing = {t: m.call_count for t, m in bodies.items() if m.call_count != 1}
-        self.assertEqual(missing, {}, f"bodies not run exactly once: {missing}")
-        for family in set(_DEVICE_BODIES.values()):
+    def test_all_present_runs_real_bodies_for_every_plan_shape(self):
+        from netbox_nso_plugin.models import NSOInterfaceMtuState, NSORoutePolicyState
+
+        ctx = self._run(_rs())
+        from netbox_nso_plugin.reconcile import _enabled_device_families
+
+        for family in _enabled_device_families(self.mgmt):
             self.assertEqual(ctx["_gate"].get(family), "ran", family)
+        mtu = NSOInterfaceMtuState.objects.get(management=self.mgmt, interface__name="Ethernet1")
+        self.assertEqual((mtu.l2_mtu, mtu.ip_mtu, mtu.mpls_mtu), (9100, 9000, 9088))
+        self.assertTrue(NSOL2SapState.objects.filter(management=self.mgmt, service_name="gate-sweep-l2").exists())
+        self.assertTrue(
+            NSORoutePolicyState.objects.filter(management=self.mgmt, object_name="GATE-SWEEP-PREFIX").exists()
+        )
 
     def test_interfaces_fetch_uses_the_s4_doc(self):
         """The bare-list get_interfaces must no longer be reconcile's source."""
         with patch("netbox_nso_plugin.adapter_client.get_interfaces") as legacy:
             self._run(_rs())
         legacy.assert_not_called()
+
+
+class TestDefaultPlanContentMutation(TestCase):
+    """Exercise an owned-fragment change through a real default-plan body."""
+
+    def test_direct_stale_mtu_transition_repends_the_complete_scope(self):
+        from netbox_nso_plugin.models import NSOInterfaceMtuState
+        from netbox_nso_plugin.reconcile import reconcile_category
+
+        device, mgmt = _make(f"gm{uuid.uuid4().hex[:6]}", manage_interfaces=True)
+        confirmed_interface = Interface.objects.create(device=device, name="Ethernet2", type="1000base-t")
+        deploying_interface = Interface.objects.create(device=device, name="Ethernet3", type="1000base-t")
+        confirmed = NSOInterfaceMtuState.objects.create(
+            management=mgmt,
+            interface=confirmed_interface,
+            l2_mtu=9100,
+            status="in_sync",
+        )
+        deploying = NSOInterfaceMtuState.objects.create(
+            management=mgmt,
+            interface=deploying_interface,
+            l2_mtu=9100,
+            status="deploying",
+            apply_attempt_id=uuid.uuid4(),
+        )
+        document = {"interfaces": [], "read_state": _rs()}
+
+        with patch("netbox_nso_plugin.adapter_client.get_interface_mtu", return_value=document):
+            context = reconcile_category(device, mgmt, "interface_mtu")
+
+        confirmed.refresh_from_db()
+        deploying.refresh_from_db()
+        self.assertEqual(context["_gate"]["interface_mtu"], "ran")
+        self.assertEqual(confirmed.status, "changed")
+        self.assertEqual(deploying.status, "accepted")
+        self.assertIsNone(deploying.apply_attempt_id)
+
+    def test_late_stale_mtu_transition_repends_a_row_settled_earlier_in_the_body(self):
+        from netbox_nso_plugin.models import NSOInterfaceMtuState
+        from netbox_nso_plugin.reconcile import reconcile_category
+
+        device, mgmt = _make(f"gl{uuid.uuid4().hex[:6]}", manage_interfaces=True)
+        deploying_interface = Interface.objects.create(device=device, name="Ethernet2", type="1000base-t")
+        confirmed_interface = Interface.objects.create(device=device, name="Ethernet3", type="1000base-t")
+        deploying = NSOInterfaceMtuState.objects.create(
+            management=mgmt,
+            interface=deploying_interface,
+            l2_mtu=9100,
+            ip_mtu=9000,
+            mpls_mtu=9088,
+            status="accepted",
+        )
+        confirmed = NSOInterfaceMtuState.objects.create(
+            management=mgmt,
+            interface=confirmed_interface,
+            l2_mtu=9100,
+            status="in_sync",
+        )
+        mirror_update(deploying, status="deploying", apply_attempt_id=uuid.uuid4())
+        document = {
+            "interfaces": [
+                {
+                    "interface_name": deploying_interface.name,
+                    "mtu": 9100,
+                    "ip_mtu": 9000,
+                    "mpls_mtu": 9088,
+                }
+            ],
+            "read_state": _rs(),
+        }
+
+        with patch("netbox_nso_plugin.adapter_client.get_interface_mtu", return_value=document):
+            context = reconcile_category(device, mgmt, "interface_mtu")
+
+        deploying.refresh_from_db()
+        confirmed.refresh_from_db()
+        self.assertEqual(context["_gate"]["interface_mtu"], "ran")
+        self.assertEqual(confirmed.status, "changed")
+        self.assertEqual(deploying.status, "accepted")
+        self.assertIsNone(deploying.apply_attempt_id)
+
+    def test_stale_bfd_drift_repends_the_complete_scope(self):
+        from netbox_nso_plugin.models import NSOBFDInterfaceState
+        from netbox_nso_plugin.reconcile import reconcile_category
+
+        device, mgmt = _make(f"gd{uuid.uuid4().hex[:6]}", manage_routing=True, manage_bgp=True)
+        confirmed_interface = Interface.objects.create(device=device, name="Ethernet2", type="1000base-t")
+        deploying_interface = Interface.objects.create(device=device, name="Ethernet3", type="1000base-t")
+        confirmed = NSOBFDInterfaceState.objects.create(
+            management=mgmt,
+            interface=confirmed_interface,
+            min_tx=300,
+            min_rx=300,
+            multiplier=3,
+            status="in_sync",
+        )
+        deploying = NSOBFDInterfaceState.objects.create(
+            management=mgmt,
+            interface=deploying_interface,
+            min_tx=300,
+            min_rx=300,
+            multiplier=3,
+            status="deploying",
+            apply_attempt_id=uuid.uuid4(),
+        )
+        document = {"interfaces": [], "read_state": _rs()}
+
+        with patch("netbox_nso_plugin.adapter_client.get_bfd", return_value=document):
+            context = reconcile_category(device, mgmt, "bfd")
+
+        confirmed.refresh_from_db()
+        deploying.refresh_from_db()
+        self.assertEqual(context["_gate"]["bfd"], "ran")
+        self.assertEqual(confirmed.status, "changed")
+        self.assertEqual(deploying.status, "accepted")
+        self.assertIsNone(deploying.apply_attempt_id)
 
 
 class TestContentionDispositions(TestCase):

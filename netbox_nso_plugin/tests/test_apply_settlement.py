@@ -112,6 +112,7 @@ class TestAttemptSettlement(TestCase):
         first_id, second_id = uuid4(), uuid4()
         first = self._vlan_row(1626, first_id)
         second = self._vlan_row(1627, second_id)
+        mirror_update(first, status="deploying", apply_attempt_id=first_id)
         self._local_attempt(first_id, 31, {"vlan": 101})
         self._local_attempt(second_id, 32, {"vlan": 102})
         first_evidence = _attempt(first_id, self.adapter_device_id, 31, {"vlan": 101}, "failed")
@@ -528,6 +529,66 @@ class TestAttemptSettlement(TestCase):
 
         row.refresh_from_db()
         self.assertEqual(row.status, "in_sync")
+
+    def test_a_rowless_lost_no_op_response_is_recovered_by_exact_replay(self):
+        from netbox_nso_plugin.apply_settlement import settle_device_apply_attempts
+
+        attempt_id = uuid4()
+        selected = {"ip": 402}
+        local = self._local_attempt(attempt_id, 62, selected, answered=False)
+        no_op = {
+            "device_id": self.adapter_device_id,
+            "outcome": "no_op",
+            "job_id": None,
+            "selected": selected,
+            "skipped": {"ip": "already_applied"},
+            "skipped_detail": None,
+            "generations": [],
+        }
+        known = {
+            "apply_attempt_id": str(attempt_id),
+            "admission_state": "admitted",
+            "http_status": 200,
+            "response": no_op,
+            "generations": [],
+        }
+        requests = []
+        admitted = False
+
+        class ReplaySession:
+            def request(_self, method, url, **kwargs):
+                nonlocal admitted
+                body = kwargs["json"]
+                requests.append((method, url, body))
+                if url.endswith("/deployment-evidence"):
+                    payload = _payload(self.adapter_device_id, [known] if admitted else [])
+                    payload["unknown_apply_attempt_ids"] = [] if admitted else [str(attempt_id)]
+                    return make_response(200, payload)
+                self.assertTrue(url.endswith("/actions/apply"))
+                self.assertEqual(
+                    body,
+                    {"apply_attempt_id": str(attempt_id), "selected": selected},
+                )
+                admitted = True
+                return make_response(200, no_op)
+
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_CLIENT_CONFIG),
+            patch("netbox_nso_plugin.adapter_client._get_session", return_value=ReplaySession()),
+        ):
+            evidence = settle_device_apply_attempts(
+                self.management,
+                static_route_feed_drained=True,
+            )
+
+        self.assertIsNotNone(evidence)
+        self.assertEqual(
+            [url.rsplit("/", 1)[-1] for _method, url, _body in requests],
+            ["deployment-evidence", "apply", "deployment-evidence"],
+        )
+        local.refresh_from_db()
+        self.assertEqual(local.http_status, 200)
+        self.assertEqual(local.response, no_op)
 
     def test_unknown_generation_status_is_a_non_actionable_contract_error(self):
         from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_apply_attempts
