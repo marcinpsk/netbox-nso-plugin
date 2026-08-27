@@ -4503,7 +4503,15 @@ def _save_owned_overlay_only_edit(obj, old_values):
 
 def _save_owned_overlay_edit(obj, key, old_values):
     """Claim an edited overlay and update its matching native NetBox object atomically."""
-    if key in {"logging_host", "logging_levels", "svi", "subinterface"}:
+    if key in {
+        "logging_host",
+        "logging_levels",
+        "snmp_community",
+        "snmp_host",
+        "snmp_system_info",
+        "svi",
+        "subinterface",
+    }:
         _save_owned_overlay_only_edit(obj, old_values)
         return
     if key == "bfd":
@@ -6594,10 +6602,12 @@ class OverlayStateAcceptMixin(NSOActionPermissionMixin, View):
 
 class NSOSnmpCommunityStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOSnmpCommunityState
+    renderer_scope = "snmp"
 
 
 class NSOSnmpV3UserStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOSnmpV3UserState
+    renderer_scope = "snmp"
 
     def push_blocker(self, state):
         """Never let an accept downgrade a device-held authPriv user to noAuthNoPriv."""
@@ -6608,6 +6618,7 @@ class NSOSnmpV3UserStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
 
 class NSOSnmpHostStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOSnmpHostState
+    renderer_scope = "snmp"
 
     def push_blocker(self, state):
         """v3 trap hosts have no username source on the overlay — not pushable."""
@@ -6618,6 +6629,17 @@ class NSOSnmpHostStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
 
 class NSOSnmpSystemInfoStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOSnmpSystemInfoState
+    renderer_scope = "snmp"
+
+
+def _save_exact_overlay_fields(state, fields):
+    """Save exact overlay fields and finalize content fingerprints when needed."""
+    from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
+
+    plan = RendererMutationPlan.build(saves=(planned_save(state, update_fields=fields),))
+    mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+    with mutation as writer:
+        writer.save(state, update_fields=fields)
 
 
 class NSOSnmpCommunityStateVerifyView(NSOActionPermissionMixin, View):
@@ -6652,8 +6674,7 @@ class NSOSnmpCommunityStateVerifyView(NSOActionPermissionMixin, View):
         if result.get("exists") and key in hashes:
             state.vault_secret_hash = hashes[key]
             state.vault_secret_version = result.get("version")
-            with transaction.atomic():
-                state.save(update_fields=["vault_secret_hash", "vault_secret_version"])
+            _save_exact_overlay_fields(state, ("vault_secret_hash", "vault_secret_version"))
             verdict = (
                 "matches the device value"
                 if state.vault_secret_hash == state.community_hash
@@ -6685,8 +6706,7 @@ class NSOSnmpV3UserStateVerifyView(NSOActionPermissionMixin, View):
         fields = set(result.get("fields") or [])
         state.vault_has_auth = "auth" in fields
         state.vault_has_priv = "priv" in fields
-        with transaction.atomic():
-            state.save(update_fields=["vault_has_auth", "vault_has_priv"])
+        _save_exact_overlay_fields(state, ("vault_has_auth", "vault_has_priv"))
         if fields:
             messages.success(request, f"Vault holds: {', '.join(sorted(fields))} (v{result.get('version')}).")
         else:
@@ -6731,8 +6751,10 @@ class NSOSnmpCommunityStateHarvestView(NSOActionPermissionMixin, View):
         state.vault_ref = result.get("vault_ref") or ref
         state.vault_secret_hash = result.get("secret_hash") or ""
         state.vault_secret_version = result.get("version")
-        with transaction.atomic():
-            state.save(update_fields=["vault_ref", "vault_secret_hash", "vault_secret_version"])
+        _save_exact_overlay_fields(
+            state,
+            ("vault_ref", "vault_secret_hash", "vault_secret_version"),
+        )
         messages.success(
             request,
             f"Community harvested into Vault at {state.vault_ref!r} (v{result.get('version')}).",

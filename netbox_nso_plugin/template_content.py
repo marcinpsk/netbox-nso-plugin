@@ -522,237 +522,309 @@ def _reconcile_interface_ips(device, payload: dict) -> list:
     return list(NSOInterfaceIPState.objects.filter(interface__device=device).select_related("interface"))
 
 
-def _retire_absent_snmp_rows(model, mgmt, key_field, incoming):
-    """Handle rows the device stopped reporting: delete unowned mirrors, DRIFT owned ones.
+def _snmp_reconcile_operations(device, payload, planned_at):  # noqa: C901
+    """Build the deterministic SNMP write sequence for preflight and apply."""
+    from .models import (
+        NSODeviceManagement,
+        NSOSnmpCommunityState,
+        NSOSnmpHostState,
+        NSOSnmpSystemInfoState,
+        NSOSnmpV3UserState,
+    )
+    from .renderer_writer import planned_delete, planned_save
+    from .signals import snmp_host_push_blocker, snmp_v3_user_push_blocker
 
-    Excluding owned rows from the stale delete (so a just-accepted row is not destroyed
-    mid-flight) is only half the contract. Without the ``present=False`` leg the other half
-    was missing: an OWNED community/user/host that the device no longer reports kept whatever
-    status it had — an applied row sat at ``in_sync``, green, forever, even though the config
-    had been removed out-of-band. Every other family (VLAN, IP, interface) already drifts
-    these to ``changed``; SNMP now does too.
-    """
-    absent = model.objects.filter(management=mgmt).exclude(**{f"{key_field}__in": incoming})
-    absent.exclude(status__in=sm.OWNED_STATES).delete()
-    for row in absent.filter(status__in=sm.OWNED_STATES):
-        new_status = sm.on_reconcile(row.status, present=False)
-        if new_status != row.status:
-            row.status = new_status
-            row.save(update_fields=["status"])
+    try:
+        management = device.nso_management
+    except NSODeviceManagement.DoesNotExist:
+        return [], [], [], None
 
+    saves = []
+    deletes = []
+    operations = []
 
-def _reconcile_snmp_system_info(mgmt, sys_data: dict, now):
-    """Reconcile the SNMP system-info singleton; return the row (or None when there is none).
-
-    An empty ``sys_data`` is the singleton form of "the device stopped reporting it": an
-    OWNED row must drift rather than keep reading in_sync (see _retire_absent_snmp_rows).
-    """
-    from .models import NSOSnmpSystemInfoState
-
-    if not sys_data:
-        owned = NSOSnmpSystemInfoState.objects.filter(management=mgmt, status__in=sm.OWNED_STATES).first()
-        if owned is None:
-            return None
-        new_status = sm.on_reconcile(owned.status, present=False)
-        if new_status != owned.status:
-            owned.status = new_status
-            owned.save(update_fields=["status"])
-        return owned
-
-    state, _ = NSOSnmpSystemInfoState.objects.get_or_create(management=mgmt)
-    dev_location = sys_data.get("location") or ""
-    dev_contact = sys_data.get("contact") or ""
-    if sm.is_owned(state.status):
-        # Owned: location/contact are operator intent — never clobber with the
-        # device read; settle accepted → in_sync only when the device matches.
-        matches = state.location == dev_location and state.contact == dev_contact
-        # CAS: settle only if the row still holds the values `matches` saw — a concurrent edit wins wholesale
-        state = _cas_mirror_update(
-            NSOSnmpSystemInfoState.objects.filter(
-                pk=state.pk,
-                status=state.status,
-                location=state.location,
-                contact=state.contact,
-            ),
-            status=sm.on_reconcile(state.status, matches=matches, settles_deploying=False),
-            last_sync_at=now,
+    def save(instance, *, update_fields=None, force_insert=False, natural_key=()):
+        saves.append(
+            planned_save(
+                instance,
+                update_fields=update_fields,
+                force_insert=force_insert,
+                natural_key=natural_key,
+            )
         )
-        if state is None:
-            state = NSOSnmpSystemInfoState.objects.filter(management=mgmt).first()
+        operations.append(("save", instance, update_fields, force_insert))
+
+    def delete(instance):
+        deletes.append(planned_delete(instance))
+        operations.append(("delete", instance, None, False))
+
+    def retire_absent(rows, incoming):
+        for key, row in rows.items():
+            if key in incoming:
+                continue
+            if not sm.is_owned(row.status):
+                delete(row)
+                continue
+            new_status = sm.on_reconcile(row.status, present=False)
+            if new_status != row.status:
+                candidate = copy.copy(row)
+                candidate.status = new_status
+                save(candidate, update_fields=("status",))
+
+    communities = {
+        row.community_hash: row for row in NSOSnmpCommunityState.objects.filter(management=management).order_by("pk")
+    }
+    incoming_communities = {}
+    for entry in payload.get("communities") or []:
+        if isinstance(entry, dict) and (community_hash := entry.get("community_hash") or ""):
+            incoming_communities[community_hash] = entry
+    value_compare = _snmp_value_compare_supported(device)
+    for community_hash, entry in incoming_communities.items():
+        current = communities.get(community_hash)
+        candidate = (
+            copy.copy(current)
+            if current is not None
+            else NSOSnmpCommunityState(management=management, community_hash=community_hash)
+        )
+        access = entry.get("access") or "RO"
+        acl = entry.get("acl") or ""
+        has_secret = bool(entry.get("has_secret", True))
+        owned = current is not None and sm.is_owned(current.status)
+        if owned:
+            if not NSOSnmpCommunityState.objects.filter(
+                pk=current.pk,
+                community_hash=community_hash,
+                status=current.status,
+                access=current.access,
+                acl=current.acl,
+                vault_secret_hash=current.vault_secret_hash,
+            ).exists():
+                continue
+            matches = None
+            if value_compare and candidate.vault_secret_hash:
+                matches = (
+                    candidate.vault_secret_hash == community_hash
+                    and candidate.access == access
+                    and candidate.acl == acl
+                )
+            candidate.status = sm.on_reconcile(
+                candidate.status,
+                matches=matches,
+                settles_deploying=False,
+            )
+            candidate.has_secret = has_secret
+            candidate.last_sync_at = planned_at
+            fields = ("status", "has_secret", "last_sync_at")
+        else:
+            candidate.access = access
+            candidate.acl = acl
+            candidate.has_secret = has_secret
+            candidate.status = sm.on_reconcile(candidate.status)
+            candidate.last_sync_at = planned_at
+            fields = None if current is None else ("access", "acl", "has_secret", "status", "last_sync_at")
+        save(
+            candidate,
+            update_fields=fields,
+            force_insert=current is None,
+            natural_key=("management", "community_hash"),
+        )
+    retire_absent(communities, incoming_communities)
+
+    users = {row.username: row for row in NSOSnmpV3UserState.objects.filter(management=management).order_by("pk")}
+    incoming_users = {}
+    for entry in payload.get("v3_users") or []:
+        if isinstance(entry, dict) and (username := entry.get("username") or ""):
+            incoming_users[username] = entry
+    for username, entry in incoming_users.items():
+        current = users.get(username)
+        candidate = (
+            copy.copy(current) if current is not None else NSOSnmpV3UserState(management=management, username=username)
+        )
+        candidate.has_auth_secret = bool(entry.get("has_auth_secret", False))
+        candidate.has_priv_secret = bool(entry.get("has_priv_secret", False))
+        candidate.status = sm.on_reconcile(candidate.status, settles_deploying=False)
+        candidate.last_sync_at = planned_at
+        if sm.is_owned(candidate.status) and (reason := snmp_v3_user_push_blocker(candidate)):
+            logger.warning("SNMP reconcile: %s cannot be rendered: %s", candidate, reason)
+            candidate.status = sm.ERROR
+        fields = None if current is None else ("has_auth_secret", "has_priv_secret", "status", "last_sync_at")
+        save(
+            candidate,
+            update_fields=fields,
+            force_insert=current is None,
+            natural_key=("management", "username"),
+        )
+    retire_absent(users, incoming_users)
+
+    hosts = {row.address: row for row in NSOSnmpHostState.objects.filter(management=management).order_by("pk")}
+    incoming_hosts = {}
+    for entry in payload.get("hosts") or []:
+        if isinstance(entry, dict) and (address := entry.get("address") or ""):
+            incoming_hosts[address] = entry
+    suppress_default_port = _device_ned_id(device).startswith(("timos", "arcos-", "cisco-ios-cli", "cisco-iosxe-cli"))
+    host_fields = ("version", "notify_type", "port", "community_hash", "username")
+    for address, entry in incoming_hosts.items():
+        current = hosts.get(address)
+        candidate = (
+            copy.copy(current) if current is not None else NSOSnmpHostState(management=management, address=address)
+        )
+        device_values = {
+            "version": entry.get("version") or "v2c",
+            "notify_type": entry.get("notify_type") or "trap",
+            "port": entry.get("port"),
+            "community_hash": entry.get("community_hash") or "",
+            "username": entry.get("username") or "",
+        }
+        owned = current is not None and sm.is_owned(current.status)
+        if owned:
+            if not NSOSnmpHostState.objects.filter(
+                pk=current.pk,
+                address=address,
+                status=current.status,
+                **{field: getattr(current, field) for field in host_fields},
+            ).exists():
+                continue
+            matches = all(
+                (
+                    suppress_default_port
+                    and field == "port"
+                    and value is None
+                    and getattr(candidate, field) in (None, 162)
+                )
+                or (
+                    field == "version"
+                    and canonical_snmp_version(getattr(candidate, field)) == canonical_snmp_version(value)
+                )
+                or getattr(candidate, field) == value
+                for field, value in device_values.items()
+            )
+            candidate.status = sm.on_reconcile(
+                candidate.status,
+                matches=matches,
+                settles_deploying=False,
+            )
+            fields = ("status", "last_sync_at")
+        else:
+            for field, value in device_values.items():
+                setattr(candidate, field, value)
+            candidate.status = sm.on_reconcile(candidate.status)
+            fields = None if current is None else (*host_fields, "status", "last_sync_at")
+        candidate.last_sync_at = planned_at
+        if sm.is_owned(candidate.status) and (reason := snmp_host_push_blocker(candidate)):
+            logger.warning("SNMP reconcile: %s cannot be rendered: %s", candidate, reason)
+            candidate.status = sm.ERROR
+        save(
+            candidate,
+            update_fields=fields,
+            force_insert=current is None,
+            natural_key=("management", "address"),
+        )
+    retire_absent(hosts, incoming_hosts)
+
+    system_data = payload.get("system_info") or {}
+    current_system = NSOSnmpSystemInfoState.objects.filter(management=management).first()
+    system_result = None
+    if not system_data:
+        if current_system is not None and sm.is_owned(current_system.status):
+            system_result = copy.copy(current_system)
+            new_status = sm.on_reconcile(system_result.status, present=False)
+            if new_status != system_result.status:
+                system_result.status = new_status
+                save(system_result, update_fields=("status",))
     else:
-        state.last_sync_at = now
-        state.location = dev_location
-        state.contact = dev_contact
-        state.status = sm.on_reconcile(state.status, matches=None)
-        state.save()
-    return state
+        system_result = (
+            copy.copy(current_system) if current_system is not None else NSOSnmpSystemInfoState(management=management)
+        )
+        location = system_data.get("location") or ""
+        contact = system_data.get("contact") or ""
+        owned = current_system is not None and sm.is_owned(current_system.status)
+        if owned:
+            if NSOSnmpSystemInfoState.objects.filter(
+                pk=current_system.pk,
+                status=current_system.status,
+                location=current_system.location,
+                contact=current_system.contact,
+            ).exists():
+                matches = system_result.location == location and system_result.contact == contact
+                system_result.status = sm.on_reconcile(
+                    system_result.status,
+                    matches=matches,
+                    settles_deploying=False,
+                )
+                system_result.last_sync_at = planned_at
+                save(system_result, update_fields=("status", "last_sync_at"))
+            else:
+                system_result = None
+        else:
+            system_result.location = location
+            system_result.contact = contact
+            system_result.status = sm.on_reconcile(system_result.status)
+            system_result.last_sync_at = planned_at
+            fields = None if current_system is None else ("location", "contact", "status", "last_sync_at")
+            save(
+                system_result,
+                update_fields=fields,
+                force_insert=current_system is None,
+                natural_key=("management",),
+            )
+
+    return saves, deletes, operations, system_result
 
 
-def _surface_unpushable_snmp_row(model, pk, blocker) -> None:
-    """Mark an owned row as errored when its current state cannot render safely."""
-    row = model.objects.select_for_update(of=("self",)).filter(pk=pk).first()
-    if row is None or not sm.is_owned(row.status):
-        return
-    reason = blocker(row)
-    if not reason:
-        return
-    logger.warning("SNMP reconcile: %s cannot be rendered — %s", row, reason)
-    row.status = sm.ERROR
-    row.save(update_fields=["status"])
-
-
-@mirror_reconciler
-def _reconcile_snmp_config(device, payload: dict) -> dict:
-    """Full-replace import of SNMP config from adapter into plugin SNMP state models.
-
-    Applies import semantics: existing rows whose key matches the payload are
-    updated; rows absent from the payload are deleted; new rows are created with
-    status=``imported``.  Rows already in ``accepted``/``deploying``/``in_sync``
-    retain their status (write path progress must not be clobbered by a read
-    refresh).
-
-    Returns a dict with keys ``communities``, ``v3_users``, ``hosts``,
-    ``system_info``, ``last_refreshed_at``, ``refresh_source`` for the template.
-    """
+def _snmp_plan_and_operations(device, payload):
     from django.utils import timezone
 
+    from .renderer_writer import RendererMutationPlan
+
+    planned_at = timezone.now()
+    saves, deletes, operations, system_result = _snmp_reconcile_operations(device, payload, planned_at)
+    plan = RendererMutationPlan.build(saves=saves, deletes=deletes, planned_at=planned_at)
+    return plan, operations, system_result
+
+
+def snmp_reconcile_plan(device, payload):
+    """Freeze every SNMP overlay write before reconciliation."""
+    plan, _operations, _system_result = _snmp_plan_and_operations(device, payload)
+    return plan
+
+
+def _reconcile_snmp_config(device, payload: dict) -> dict:
+    """Apply one frozen SNMP reconciliation through the renderer writer."""
     from .models import (
         NSODeviceManagement,
         NSOSnmpCommunityState,
         NSOSnmpHostState,
         NSOSnmpV3UserState,
     )
-    from .signals import snmp_host_push_blocker, snmp_v3_user_push_blocker
-
-    now = timezone.now()
+    from .renderer_writer import active_renderer_writer, renderer_mirror_writes, renderer_writes
+    from .signals import suppress_intent_push
 
     try:
-        mgmt = device.nso_management
+        management = device.nso_management
     except NSODeviceManagement.DoesNotExist:
         return {"communities": [], "v3_users": [], "hosts": [], "system_info": None}
 
-    # ── Communities ────────────────────────────────────────────────────────────
-    value_compare = _snmp_value_compare_supported(device)
-    incoming_community_hashes = set()
-    for entry in payload.get("communities") or []:
-        h = entry.get("community_hash") or ""
-        if not h:
-            continue
-        incoming_community_hashes.add(h)
-        state, _ = NSOSnmpCommunityState.objects.get_or_create(management=mgmt, community_hash=h)
-        dev_access = entry.get("access") or "RO"
-        dev_acl = entry.get("acl") or ""
-        dev_has_secret = bool(entry.get("has_secret", True))
-        if sm.is_owned(state.status):
-            # Owned: access/acl are operator intent — never clobber them with the
-            # device read (the next snapshot push would silently revert the edit).
-            # Settle only on genuine device confirmation: the device reporting the
-            # Vault-held fingerprint AND the intent attributes. Without a
-            # fingerprint (or on hash2 platforms) the value is unknowable —
-            # mirror semantics (matches=None).
-            matches = None
-            if value_compare and state.vault_secret_hash:
-                matches = state.vault_secret_hash == h and state.access == dev_access and state.acl == dev_acl
-            # CAS: settle only if the row still holds the identity + values `matches` saw —
-            # a concurrent edit (a rekey included) wins wholesale
-            _cas_mirror_update(
-                NSOSnmpCommunityState.objects.filter(
-                    pk=state.pk,
-                    community_hash=h,
-                    status=state.status,
-                    access=state.access,
-                    acl=state.acl,
-                    vault_secret_hash=state.vault_secret_hash,
-                ),
-                status=sm.on_reconcile(state.status, matches=matches, settles_deploying=False),
-                last_sync_at=now,
-                has_secret=dev_has_secret,
-            )
-        else:
-            state.has_secret = dev_has_secret
-            state.last_sync_at = now
-            state.access = dev_access
-            state.acl = dev_acl
-            state.status = sm.on_reconcile(state.status, matches=None)
-            state.save()
-    # Owned rows absent from the payload must SURVIVE (an operator-created or
-    # just-rotated row would otherwise lose its vault_ref/status mid-flight
-    # between Accept and the device reporting the new value) — but they must DRIFT,
-    # not stay green: see _retire_absent_snmp_rows.
-    _retire_absent_snmp_rows(NSOSnmpCommunityState, mgmt, "community_hash", incoming_community_hashes)
-
-    # ── V3 users ───────────────────────────────────────────────────────────────
-    incoming_usernames = set()
-    for entry in payload.get("v3_users") or []:
-        username = entry.get("username") or ""
-        if not username:
-            continue
-        incoming_usernames.add(username)
-        state, _ = NSOSnmpV3UserState.objects.get_or_create(management=mgmt, username=username)
-        state.has_auth_secret = bool(entry.get("has_auth_secret", False))
-        state.has_priv_secret = bool(entry.get("has_priv_secret", False))
-        state.last_sync_at = now
-        state.status = sm.on_reconcile(state.status, matches=None, settles_deploying=False)  # mirror overlay
-        state.save(update_fields=["has_auth_secret", "has_priv_secret", "last_sync_at", "status"])
-        _surface_unpushable_snmp_row(NSOSnmpV3UserState, state.pk, snmp_v3_user_push_blocker)
-    _retire_absent_snmp_rows(NSOSnmpV3UserState, mgmt, "username", incoming_usernames)
-
-    # ── Hosts ──────────────────────────────────────────────────────────────────
-    suppress_default_port = _device_ned_id(device).startswith(("timos", "arcos-", "cisco-ios-cli", "cisco-iosxe-cli"))
-    incoming_addresses = set()
-    for entry in payload.get("hosts") or []:
-        address = entry.get("address") or ""
-        if not address:
-            continue
-        incoming_addresses.add(address)
-        state, _ = NSOSnmpHostState.objects.get_or_create(management=mgmt, address=address)
-        dev = {
-            "version": entry.get("version") or "v2c",
-            "notify_type": entry.get("notify_type") or "trap",
-            "port": entry.get("port"),
-            "community_hash": entry.get("community_hash") or "",
-            # CR-P16. v3 hosts only — the export gates it on version so a v1/v2c host's COMMUNITY
-            # (the same NED field) can never arrive here. This is what makes an imported v3 trap
-            # host pushable at all: both NSO writers key the receiver on the user name.
-            "username": entry.get("username") or "",
-        }
-        if sm.is_owned(state.status):
-            # Owned: attributes are operator intent — settle only when the device
-            # reports exactly the intent values, never overwrite them.
-            matches = all(
-                (suppress_default_port and f == "port" and v is None and getattr(state, f) in (None, 162))
-                or (f == "version" and canonical_snmp_version(getattr(state, f)) == canonical_snmp_version(v))
-                or getattr(state, f) == v
-                for f, v in dev.items()
-            )
-            # CAS: settle only if the row still holds the identity + values `matches` saw —
-            # a concurrent edit (a rename included) wins wholesale
-            _cas_mirror_update(
-                NSOSnmpHostState.objects.filter(
-                    pk=state.pk,
-                    address=address,
-                    status=state.status,
-                    **{f: getattr(state, f) for f in dev},
-                ),
-                status=sm.on_reconcile(state.status, matches=matches, settles_deploying=False),
-                last_sync_at=now,
-            )
-        else:
-            state.last_sync_at = now
-            for f, v in dev.items():
-                setattr(state, f, v)
-            state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
-            state.save()
-        _surface_unpushable_snmp_row(NSOSnmpHostState, state.pk, snmp_host_push_blocker)
-    _retire_absent_snmp_rows(NSOSnmpHostState, mgmt, "address", incoming_addresses)
-
-    system_info_state = _reconcile_snmp_system_info(mgmt, payload.get("system_info") or {}, now)
+    active = active_renderer_writer()
+    if active is None:
+        plan, operations, system_result = _snmp_plan_and_operations(device, payload)
+    else:
+        plan = active.plan
+        _saves, _deletes, operations, system_result = _snmp_reconcile_operations(device, payload, plan.planned_at)
+    mutation = contextlib.nullcontext(active)
+    if active is None:
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+    with mutation as writer, suppress_intent_push():
+        for operation, instance, update_fields, force_insert in operations:
+            if operation == "delete":
+                writer.delete(instance)
+            else:
+                writer.save(instance, update_fields=update_fields, force_insert=force_insert)
 
     return {
-        "communities": list(NSOSnmpCommunityState.objects.filter(management=mgmt)),
-        "v3_users": list(NSOSnmpV3UserState.objects.filter(management=mgmt)),
-        "hosts": list(NSOSnmpHostState.objects.filter(management=mgmt)),
-        "system_info": system_info_state,
+        "communities": list(NSOSnmpCommunityState.objects.filter(management=management)),
+        "v3_users": list(NSOSnmpV3UserState.objects.filter(management=management)),
+        "hosts": list(NSOSnmpHostState.objects.filter(management=management)),
+        "system_info": system_result,
         "last_refreshed_at": payload.get("last_refreshed_at"),
         "refresh_source": payload.get("refresh_source", "never"),
         "snmp_value_compare": _snmp_value_compare_supported(device),

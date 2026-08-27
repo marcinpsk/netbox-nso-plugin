@@ -486,6 +486,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
         _reconcile_snmp_config,
         _upsert_interface_states,
         logging_reconcile_plan,
+        snmp_reconcile_plan,
     )
 
     ctx = _empty_context()
@@ -686,6 +687,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                     snmp_doc,
                 ),
                 epoch=dev_id,
+                pre_body=lambda: snmp_reconcile_plan(device, snmp_doc),
             )
         if mgmt.manage_logging:
             log_doc = client.get_logging_config(dev_id)
@@ -751,6 +753,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
         _reconcile_snmp_config,
         _reconcile_static_routes,
         _upsert_interface_states,
+        snmp_reconcile_plan,
     )
 
     ctx = _empty_context()
@@ -1064,6 +1067,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: _reconcile_snmp_config(device, snmp_doc),
                 epoch=dev_id,
                 ctx_key="snmp_data",
+                pre_body=lambda: snmp_reconcile_plan(device, snmp_doc),
             )
         elif key == "logging":
             from .template_content import logging_reconcile_plan

@@ -244,6 +244,39 @@ class NSODeviceManagementForm(NetBoxModelForm):
 # (for SNMP secrets) set a vault_ref. Identity/status/sync fields are not editable.
 
 
+class _ExactOverlayFormMixin:
+    """Save one renderer overlay through its immutable exact plan."""
+
+    _NATURAL_KEYS = {
+        "netbox_nso_plugin.nsosnmphoststate": ("management", "address"),
+        "netbox_nso_plugin.nsosnmpsysteminfostate": ("management",),
+        "netbox_nso_plugin.nsologginghoststate": ("management", "address"),
+        "netbox_nso_plugin.nsologginglevelstate": ("management",),
+    }
+
+    def save(self, commit=True):
+        from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
+
+        obj = super().save(commit=False)
+        if not commit:
+            return obj
+        created = obj.pk is None or obj._state.adding
+        plan = RendererMutationPlan.build(
+            saves=(
+                planned_save(
+                    obj,
+                    force_insert=created,
+                    natural_key=self._NATURAL_KEYS[obj._meta.label_lower],
+                ),
+            )
+        )
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+        with mutation as writer:
+            writer.save(obj, force_insert=created)
+            self.save_m2m()
+        return obj
+
+
 class NSOSnmpCommunityStateForm(NetBoxModelForm):
     """Edit an SNMP community overlay — access/ACL, Vault ref, or set a new secret value.
 
@@ -317,7 +350,9 @@ class NSOSnmpCommunityStateForm(NetBoxModelForm):
                 self._secret_result = {"hash": new_hash, "version": result.get("version")}
         return cleaned
 
-    def save(self, *args, **kwargs):
+    def save(self, commit=True):
+        import copy
+
         if self._secret_result:
             from django.utils import timezone
 
@@ -326,34 +361,38 @@ class NSOSnmpCommunityStateForm(NetBoxModelForm):
             self.instance.vault_secret_version = self._secret_result["version"]
             self.instance.status = "accepted"
             self.instance.accepted_at = timezone.now()
-            from .intent_state import MutationFootprint, SourceRow, footprint_for_instance, intent_transaction
+        obj = super().save(commit=False)
+        if not commit:
+            return obj
 
-            # The trap hosts are discovered under the lock, so the footprint carries their
-            # table sentinel: a host the SNMP reconciler commits before acquisition is covered.
-            footprint = MutationFootprint.merge(
-                footprint_for_instance(self.instance),
-                MutationFootprint.for_keys(
-                    (),
-                    overlay_rows=(SourceRow(NSOSnmpHostState._meta.label_lower, None),),
-                ),
+        from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
+
+        created = obj.pk is None or obj._state.adding
+        saves = [
+            planned_save(
+                obj,
+                force_insert=created,
+                natural_key=("management", "community_hash"),
             )
-            with intent_transaction(footprint):
-                obj = super().save(*args, **kwargs)
-                if self._old_hash and self._old_hash != obj.community_hash:
-                    # Trap hosts reference the community by hash-as-label; re-point them
-                    # so the push does not reference the rotated-away hash.
-                    host_pks = list(
-                        NSOSnmpHostState.objects.select_for_update(of=("self",))
-                        .filter(management=obj.management, community_hash=self._old_hash)
-                        .order_by("pk")
-                        .values_list("pk", flat=True)
-                    )
-                    NSOSnmpHostState.objects.filter(pk__in=host_pks).update(community_hash=obj.community_hash)
-                    # _acquire settles only pk-named rows, never the sentinel, so the rekey settles
-                    # the hosts it re-points (this model carries no apply_attempt_id to clear).
-                    NSOSnmpHostState.objects.filter(pk__in=host_pks, status="deploying").update(status="accepted")
-                return obj
-        return super().save(*args, **kwargs)
+        ]
+        host_candidates = []
+        if self._old_hash and self._old_hash != obj.community_hash:
+            for host in NSOSnmpHostState.objects.filter(
+                management=obj.management,
+                community_hash=self._old_hash,
+            ).order_by("pk"):
+                candidate = copy.copy(host)
+                candidate.community_hash = obj.community_hash
+                host_candidates.append(candidate)
+                saves.append(planned_save(candidate, update_fields=("community_hash",)))
+        plan = RendererMutationPlan.build(saves=saves)
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+        with mutation as writer:
+            writer.save(obj, force_insert=created)
+            for candidate in host_candidates:
+                writer.save(candidate, update_fields=("community_hash",))
+            self.save_m2m()
+        return obj
 
 
 class NSOSnmpV3UserStateForm(NetBoxModelForm):
@@ -432,7 +471,7 @@ class NSOSnmpV3UserStateForm(NetBoxModelForm):
                 self._secret_result = {"fields": set(values), "version": result.get("version")}
         return cleaned
 
-    def save(self, *args, **kwargs):
+    def save(self, commit=True):
         if self._secret_result:
             from django.utils import timezone
 
@@ -442,14 +481,30 @@ class NSOSnmpV3UserStateForm(NetBoxModelForm):
                 self.instance.vault_has_priv = True
             self.instance.status = "accepted"
             self.instance.accepted_at = timezone.now()
-            from .intent_state import footprint_for_instance, intent_transaction
+        obj = super().save(commit=False)
+        if not commit:
+            return obj
 
-            with intent_transaction(footprint_for_instance(self.instance)):
-                return super().save(*args, **kwargs)
-        return super().save(*args, **kwargs)
+        from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
+
+        created = obj.pk is None or obj._state.adding
+        plan = RendererMutationPlan.build(
+            saves=(
+                planned_save(
+                    obj,
+                    force_insert=created,
+                    natural_key=("management", "username"),
+                ),
+            )
+        )
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+        with mutation as writer:
+            writer.save(obj, force_insert=created)
+            self.save_m2m()
+        return obj
 
 
-class NSOSnmpHostStateForm(NetBoxModelForm):
+class NSOSnmpHostStateForm(_ExactOverlayFormMixin, NetBoxModelForm):
     """Edit an SNMP trap/inform host overlay.
 
     ``username`` is the SNMPv3 security user name. It is editable because a v3 host cannot be
@@ -462,29 +517,12 @@ class NSOSnmpHostStateForm(NetBoxModelForm):
         fields = ["address", "version", "notify_type", "port", "username", "tags"]
 
 
-class NSOSnmpSystemInfoStateForm(NetBoxModelForm):
+class NSOSnmpSystemInfoStateForm(_ExactOverlayFormMixin, NetBoxModelForm):
     """Edit the SNMP system location/contact overlay."""
 
     class Meta:
         model = NSOSnmpSystemInfoState
         fields = ["location", "contact", "tags"]
-
-
-class _ExactOverlayFormMixin:
-    """Save one renderer overlay through its immutable exact plan."""
-
-    def save(self, commit=True):
-        from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
-
-        obj = super().save(commit=False)
-        if not commit:
-            return obj
-        plan = RendererMutationPlan.build(saves=(planned_save(obj),))
-        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-        with mutation as writer:
-            writer.save(obj)
-            self.save_m2m()
-        return obj
 
 
 class NSOLoggingHostStateForm(_ExactOverlayFormMixin, NetBoxModelForm):

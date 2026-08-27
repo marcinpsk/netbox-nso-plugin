@@ -154,6 +154,31 @@ _CONVERTED_SCOPE_RULES = {
         deletion_authority=True,
         intentional_semantic_delta=("Acquire from persisted logging rows. Save events are not ownership evidence."),
     ),
+    "snmp": ScopeOwnershipRule(
+        scope="snmp",
+        native_model_labels=(
+            "netbox_nso_plugin.nsosnmpcommunitystate",
+            "netbox_nso_plugin.nsosnmpv3userstate",
+            "netbox_nso_plugin.nsosnmphoststate",
+            "netbox_nso_plugin.nsosnmpsysteminfostate",
+        ),
+        native_key_fields=("management_id", "pk"),
+        overlay_model_labels=(
+            "netbox_nso_plugin.nsosnmpcommunitystate",
+            "netbox_nso_plugin.nsosnmpv3userstate",
+            "netbox_nso_plugin.nsosnmphoststate",
+            "netbox_nso_plugin.nsosnmpsysteminfostate",
+        ),
+        overlay_native_fields=(
+            ("netbox_nso_plugin.nsosnmpcommunitystate", "__self__"),
+            ("netbox_nso_plugin.nsosnmpv3userstate", "__self__"),
+            ("netbox_nso_plugin.nsosnmphoststate", "__self__"),
+            ("netbox_nso_plugin.nsosnmpsysteminfostate", "__self__"),
+        ),
+        foreign_overlay_delete="reown",
+        deletion_authority=True,
+        intentional_semantic_delta=("Acquire from persisted SNMP rows. Save events are not ownership evidence."),
+    ),
 }
 
 
