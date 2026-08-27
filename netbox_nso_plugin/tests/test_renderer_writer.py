@@ -621,6 +621,32 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         management.refresh_from_db()
         assert management.adapter_link_error == "concurrent"
 
+    def test_save_rejects_a_planned_value_mutated_before_pre_save(self):
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_save,
+            renderer_mirror_writes,
+        )
+
+        _device, management = make_managed("writer-pre-save-mutation", 16285)
+        candidate = copy.copy(management)
+        candidate.adapter_link_error = "planned"
+        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("adapter_link_error",)),))
+        model_save = candidate.save
+
+        def mutate_before_pre_save(*args, **kwargs):
+            candidate.adapter_link_error = "mutated"
+            return model_save(*args, **kwargs)
+
+        candidate.save = mutate_before_pre_save
+
+        with self.assertRaisesRegex(IntentMutationProtocolError, "bypassed the active renderer writer"):
+            with renderer_mirror_writes(plan) as writer:
+                writer.save(candidate, update_fields=("adapter_link_error",))
+
+        management.refresh_from_db()
+        assert management.adapter_link_error == ""
+
     def test_delete_refuses_a_plan_with_an_omitted_collector_target(self):
         from netbox_routing.models import StaticRoute
 

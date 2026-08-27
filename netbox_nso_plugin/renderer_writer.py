@@ -1262,6 +1262,7 @@ class RendererWriter:
             and write.model_label == instance._meta.label_lower
             and self._active_instance is instance
             and write.update_fields == normalized_fields
+            and self._fields_match(write.values, instance)
         )
 
     def signal_m2m_is_authorized(self, instance, action, field_name, pk_set) -> bool:
