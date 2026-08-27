@@ -8,17 +8,22 @@ import contextlib
 import contextvars
 import functools
 
-from django.db import connection, transaction
+from django.db import OperationalError, connection, transaction
 from django.utils import timezone
 
 # One PostgreSQL advisory-lock namespace for the deployment switch. Normal operations take
 # a shared lock. Activation takes the exclusive lock and waits for every old operation.
 _LOCK_KEY = 1_503_003_006
+_EXCLUSIVE_LOCK_TIMEOUT_MS = 60_000
 _bypass = contextvars.ContextVar("nso_intent_deployment_bypass", default=False)
 
 
 class DeploymentQuiesced(RuntimeError):
     """An intent operation was refused while the deployment gate was active."""
+
+
+class DeploymentTransitionTimeout(RuntimeError):
+    """The fleet switch could not acquire its exclusive lock before the deadline."""
 
 
 def is_quiesced() -> bool:
@@ -110,9 +115,21 @@ def _set_active(active: bool) -> bool:
     """Change the switch and return whether activation created it."""
     from .models import NSOIntentDeploymentControl
 
-    with connection.cursor() as cursor:
-        cursor.execute("SELECT pg_advisory_lock(%s)", [_LOCK_KEY])
+    acquired = False
     try:
+        try:
+            with transaction.atomic():
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT set_config('lock_timeout', %s, true)",
+                        [f"{_EXCLUSIVE_LOCK_TIMEOUT_MS}ms"],
+                    )
+                    cursor.execute("SELECT pg_advisory_lock(%s)", [_LOCK_KEY])
+                    acquired = True
+        except OperationalError as exc:
+            if getattr(exc.__cause__, "sqlstate", None) == "55P03":
+                raise DeploymentTransitionTimeout("Timed out waiting for active intent operations to finish") from None
+            raise
         with transaction.atomic():
             if active:
                 _control, created = NSOIntentDeploymentControl.objects.update_or_create(
@@ -123,8 +140,9 @@ def _set_active(active: bool) -> bool:
             NSOIntentDeploymentControl.objects.filter(pk=1).delete()
             return False
     finally:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT pg_advisory_unlock(%s)", [_LOCK_KEY])
+        if acquired:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_advisory_unlock(%s)", [_LOCK_KEY])
 
 
 def quiesce() -> bool:

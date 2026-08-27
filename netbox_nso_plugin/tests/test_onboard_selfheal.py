@@ -188,6 +188,29 @@ class TestAdvanceStaleOnboardingSweep(TestCase):
             AdvanceStaleOnboardingJob.run(None)  # self unused by run()
         sweep.assert_called_once()
 
+    def test_system_job_pauses_once_without_logging_a_failed_poll(self):
+        from netbox_nso_plugin.deployment import quiesce, resume
+        from netbox_nso_plugin.jobs import AdvanceStaleOnboardingJob
+
+        mgmt = self._provisioning("sweep-quiesced", "J-QUIESCED")
+        quiesce()
+        try:
+            with (
+                self.assertNoLogs("netbox_nso_plugin.onboarding", level="ERROR"),
+                self.assertLogs("netbox_nso_plugin.jobs", level="INFO") as logged,
+                patch("netbox_nso_plugin.adapter_client.get_job") as get_job,
+            ):
+                result = AdvanceStaleOnboardingJob.run(None)
+        finally:
+            resume()
+
+        self.assertIsNone(result)
+        self.assertEqual(len(logged.output), 1)
+        self.assertIn("paused for an intent deployment", logged.output[0])
+        get_job.assert_not_called()
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.onboard_status, "provisioning")
+
     def test_system_job_registered_hourly(self):
         """The job is registered as an hourly system job so NetBox schedules it automatically."""
         from netbox.registry import registry

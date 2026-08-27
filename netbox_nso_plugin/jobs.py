@@ -37,7 +37,10 @@ class AdvanceStaleOnboardingJob(JobRunner):
         """Advance every NSODeviceManagement row still in 'provisioning'."""
         from .onboarding import advance_stale_onboarding_rows
 
-        advance_stale_onboarding_rows()
+        try:
+            advance_stale_onboarding_rows()
+        except DeploymentQuiesced:
+            logger.info("AdvanceStaleOnboardingJob: paused for an intent deployment")
 
 
 @system_job(interval=SYNC_CACHE_REFRESH_MINUTES)

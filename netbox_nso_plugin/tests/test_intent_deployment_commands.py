@@ -47,6 +47,56 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
             stderr=io.StringIO(),
         )
 
+    def test_quiesce_times_out_while_a_shared_operation_is_active(self):
+        from netbox_nso_plugin import deployment
+
+        holder_ready = threading.Event()
+        release_holder = threading.Event()
+        errors = []
+
+        def hold_shared_lock():
+            close_old_connections()
+            try:
+                with deployment.operation("timeout test holder"):
+                    holder_ready.set()
+                    release_holder.wait(10)
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                close_old_connections()
+
+        def request_quiesce():
+            close_old_connections()
+            try:
+                deployment.quiesce()
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                close_old_connections()
+
+        holder = threading.Thread(target=hold_shared_lock)
+        waiter = threading.Thread(target=request_quiesce)
+        holder.start()
+        waiter_finished = False
+        try:
+            self.assertTrue(holder_ready.wait(5), "the shared lock was not acquired")
+            with patch.object(deployment, "_EXCLUSIVE_LOCK_TIMEOUT_MS", 50, create=True):
+                waiter.start()
+                waiter.join(timeout=1)
+                waiter_finished = not waiter.is_alive()
+        finally:
+            release_holder.set()
+            holder.join(timeout=10)
+            if waiter.ident is not None:
+                waiter.join(timeout=10)
+            if deployment.is_quiesced():
+                deployment.resume()
+
+        self.assertTrue(waiter_finished, "quiesce ignored its advisory-lock timeout")
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], deployment.DeploymentTransitionTimeout)
+        self.assertIn("timed out", str(errors[0]).lower())
+
     def test_a_pending_exclusive_transition_refuses_new_shared_work(self):
         from netbox_nso_plugin import deployment
 
@@ -301,7 +351,7 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
                         consumed_by_push_seq=row_seq,
                     )
 
-                with patch("netbox_nso_plugin.management.commands.nso_intent_deployment_gate.time.sleep"):
+                with patch("netbox_nso_plugin.management.commands.nso_intent_deployment_gate._sleep"):
                     with self.assertRaisesRegex(CommandError, expected):
                         self._prepare()
 
@@ -316,7 +366,7 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         with config, session:
             assert drain.drain_key(self.device.pk, "static_route") == drain.SUCCEEDED
 
-        with patch("netbox_nso_plugin.management.commands.nso_intent_deployment_gate.time.sleep"):
+        with patch("netbox_nso_plugin.management.commands.nso_intent_deployment_gate._sleep"):
             self._prepare()
 
         self.adapter.fail_with = AdapterError("adapter exploded", code="internal_error", status_code=500)
@@ -349,7 +399,7 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         with config, session:
             assert drain.drain_key(self.device.pk, "static_route") == drain.SUCCEEDED
 
-        with patch("netbox_nso_plugin.management.commands.nso_intent_deployment_gate.time.sleep"):
+        with patch("netbox_nso_plugin.management.commands.nso_intent_deployment_gate._sleep"):
             self._prepare()
 
         config, session = self.adapter.patches()
@@ -384,7 +434,7 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         with config, session:
             assert drain.drain_key(self.device.pk, "static_route") == drain.SUCCEEDED
 
-        with patch("netbox_nso_plugin.management.commands.nso_intent_deployment_gate.time.sleep"):
+        with patch("netbox_nso_plugin.management.commands.nso_intent_deployment_gate._sleep"):
             self._prepare()
         self.adapter.fail_with = AdapterError("adapter exploded", code="internal_error", status_code=500)
         config, session = self.adapter.patches()
@@ -399,7 +449,7 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
                 )
         assert is_quiesced()
 
-        with patch("netbox_nso_plugin.management.commands.nso_intent_deployment_gate.time.sleep"):
+        with patch("netbox_nso_plugin.management.commands.nso_intent_deployment_gate._sleep"):
             with self.assertRaisesRegex(CommandError, "Deployment gate blocked"):
                 self._prepare()
         assert is_quiesced(), "a failed re-prepare released a gate it did not create"
@@ -424,7 +474,7 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
                     "netbox_nso_plugin.management.commands.nso_intent_deployment_gate.quiesce",
                     side_effect=competing_transition,
                 ),
-                patch("netbox_nso_plugin.management.commands.nso_intent_deployment_gate.time.sleep"),
+                patch("netbox_nso_plugin.management.commands.nso_intent_deployment_gate._sleep"),
             ):
                 with self.assertRaisesRegex(CommandError, "Deployment gate blocked"):
                     self._prepare()
@@ -488,7 +538,7 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
             assert drain.drain_key(self.device.pk, "static_route") == drain.SUCCEEDED
         assert entries(self.device, "static_route") == []
 
-        with patch("netbox_nso_plugin.management.commands.nso_intent_deployment_gate.time.sleep") as sleeper:
+        with patch("netbox_nso_plugin.management.commands.nso_intent_deployment_gate._sleep") as sleeper:
             self._prepare()
 
         with self.assertRaisesRegex(RuntimeError, "deployment is quiesced"):

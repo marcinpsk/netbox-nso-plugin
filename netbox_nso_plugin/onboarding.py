@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import re
 
+from .deployment import DeploymentQuiesced
 from .deployment import guarded as _deployment_guarded
 
 logger = logging.getLogger(__name__)
@@ -419,6 +420,8 @@ def advance_stale_onboarding_rows() -> tuple:
     for mgmt in rows:
         try:
             res = advance_provisioning(mgmt)
+        except DeploymentQuiesced:
+            raise
         except Exception:  # noqa: BLE001 — one bad row must not abort the whole sweep
             logger.exception("advance_stale_onboarding_rows: failed for mgmt %s", mgmt.pk)
             continue

@@ -12,6 +12,8 @@ from django.core.management.base import BaseCommand, CommandError
 from netbox_nso_plugin import adapter_client, delivery, drain
 from netbox_nso_plugin.deployment import gate_bypass, is_quiesced, quiesce, resume
 
+_sleep = time.sleep
+
 
 def _old_client_wait() -> int:
     """Return capped connect plus longest read timeout plus the outbox lease margin."""
@@ -92,7 +94,7 @@ class Command(BaseCommand):
         try:
             wait = _old_client_wait()
             self.stdout.write(f"Intent work is quiesced; waiting {wait} seconds for old clients and the lease")
-            time.sleep(wait)
+            _sleep(wait)
             blockers = drain.gate_blockers()
             if blockers:
                 raise CommandError("Deployment gate blocked: " + "; ".join(blockers))
