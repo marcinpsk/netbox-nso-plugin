@@ -285,10 +285,9 @@ def _effective_after(instance, before, update_fields):
     effective = copy.copy(before)
     for name in update_fields:
         field = instance._meta.get_field(name)
-        if field.is_relation and field.many_to_one and field.is_cached(instance):
-            setattr(effective, field.name, field.get_cached_value(instance))
-        else:
-            setattr(effective, field.attname, getattr(instance, field.attname))
+        setattr(effective, field.attname, getattr(instance, field.attname))
+        if field.is_relation and field.is_cached(instance):
+            field.set_cached_value(effective, field.get_cached_value(instance))
     return effective
 
 
