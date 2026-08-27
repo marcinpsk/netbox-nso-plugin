@@ -155,13 +155,13 @@ def expire_claim(device, scope) -> bool:
     return True
 
 
-def enqueue(device, scope, *, transitions=(), delete_origin=False):
+def enqueue(device, scope, *, transitions=(), delete_origin=False, kind="ordinary"):
     """Append one entry the way an operator transaction does, without a render."""
     from netbox_nso_plugin import outbox
     from netbox_nso_plugin.intent_state import content_mutation
 
     with content_mutation({(device.pk, scope)}):
-        outbox.enqueue(device.pk, scope, transitions=transitions, delete_origin=delete_origin)
+        outbox.enqueue(device.pk, scope, transitions=transitions, delete_origin=delete_origin, kind=kind)
 
 
 def in_thread(work, timeout=30):

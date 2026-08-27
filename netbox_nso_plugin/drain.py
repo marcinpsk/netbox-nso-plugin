@@ -29,7 +29,6 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import hashlib
-import json
 import logging
 import time
 from contextlib import contextmanager
@@ -42,6 +41,8 @@ from .deployment import DeploymentQuiesced
 from .deployment import guarded as _deployment_guarded
 from .deployment import operation as _deployment_operation
 from .outbox import (
+    CONTRIBUTION_KIND_ORDINARY,
+    CONTRIBUTION_KIND_REPAIR,
     OP_REVOKE,
     advance_push_seq,
     allocate_push_seq,
@@ -306,6 +307,15 @@ def _unconsumed(device_id, scope):
     return NSOIntentOutboxEntry.objects.filter(device_id=device_id, scope=scope, consumed_by_push_seq__isnull=True)
 
 
+def _contribution_marks(rows) -> tuple[bool | None, bool]:
+    """Fold deletion marks from the ordinary contribution partition only."""
+    ordinary = [row for row in rows if row.kind == CONTRIBUTION_KIND_ORDINARY]
+    return (
+        all(row.mark_and for row in ordinary) if ordinary else None,
+        any(row.mark_any for row in ordinary),
+    )
+
+
 def _intent_revision(device_id, scope) -> int:
     """Lock and return the revision that brackets this claim's rendered snapshot.
 
@@ -390,7 +400,7 @@ def wire_digest(body) -> str:
 
 
 def _sha256(material) -> str:
-    return hashlib.sha256(json.dumps(material, sort_keys=True, default=str).encode()).hexdigest()
+    return delivery.canonical_fingerprint(material)
 
 
 # ── The claim ─────────────────────────────────────────────────────────────────
@@ -501,15 +511,15 @@ def _form(state, mgmt, now, mode, force) -> Claim | None:
     marking_mode = delivery.delivery_keys()[scope].marking_mode
     rows = list(_unconsumed(device_id, scope).select_for_update().order_by("id"))
     entry_ids = [row.pk for row in rows]
-    mark = all(row.mark_and for row in rows) if rows else None
-    mark_any = any(row.mark_any for row in rows)
+    mark, mark_any = _contribution_marks(rows)
     folded = fold_state_transitions([record for row in rows for record in row.transitions], state)
     deletions = list(folded.queued.values())
     if mode == delivery.MODE_STORE_ONLY:
         # A deletion mark on a key whose pending rows recorded no provenance at all is
         # authority the FOLD cannot see: the request flag is the whole of it. Where a row
         # DID record its transitions the fold decides, so a revocation withdraws it as usual.
-        untracked = mark_any and not any(row.transitions for row in rows)
+        ordinary = [row for row in rows if row.kind == CONTRIBUTION_KIND_ORDINARY]
+        untracked = mark_any and not any(row.transitions for row in ordinary)
         return _form_store_only(state, mgmt, now, deletions, untracked, force)
 
     revision = _intent_revision(device_id, scope)
@@ -713,24 +723,32 @@ def _compact_locked(device_id, scope) -> int:
     state = _lock_state(device_id, scope)
     held = {int(record["route_id"]) for record in state.claim_deletions or []}
     rows = list(_unconsumed(device_id, scope).select_for_update().order_by("id"))
-    inputs = [row for row in rows if _compactable(row, held)]
-    if len(inputs) < 2:
-        return 0
-
-    # The HIGHEST-id input, updated in place. A minted row would take an id above anything
-    # that committed while this ran, so the later fold would apply that entry's transition
-    # before the compacted one and reverse the real order.
-    survivor, retired = inputs[-1], [row.pk for row in inputs[:-1]]
-    updated = NSOIntentOutboxEntry.objects.filter(pk=survivor.pk, consumed_by_push_seq__isnull=True).update(
-        transitions=reduce_transitions([record for row in inputs for record in row.transitions]),
-        mark_and=all(row.mark_and for row in inputs),
-        mark_any=any(row.mark_any for row in inputs),
+    compactable = [row for row in rows if _compactable(row, held)]
+    partitions = (
+        [row for row in compactable if row.kind == CONTRIBUTION_KIND_ORDINARY],
+        [row for row in compactable if row.kind == CONTRIBUTION_KIND_REPAIR],
     )
-    if updated != 1:
-        raise ClaimConflict(f"compaction rewrote {updated} rows for entry {survivor.pk}")
-    _retire(NSOIntentOutboxEntry.objects.filter(pk__in=retired), retired)
-    logger.debug("compacted %s rows into entry %s for %s/%s", len(inputs), survivor.pk, device_id, scope)
-    return len(retired)
+    retired_count = 0
+    for inputs in partitions:
+        if len(inputs) < 2:
+            continue
+
+        # The HIGHEST-id input, updated in place. A minted row would take an id above anything
+        # that committed while this ran, so the later fold would apply that entry's transition
+        # before the compacted one and reverse the real order.
+        survivor, retired = inputs[-1], [row.pk for row in inputs[:-1]]
+        mark, mark_any = _contribution_marks(inputs)
+        updated = NSOIntentOutboxEntry.objects.filter(pk=survivor.pk, consumed_by_push_seq__isnull=True).update(
+            transitions=reduce_transitions([record for row in inputs for record in row.transitions]),
+            mark_and=bool(mark),
+            mark_any=mark_any,
+        )
+        if updated != 1:
+            raise ClaimConflict(f"compaction rewrote {updated} rows for entry {survivor.pk}")
+        _retire(NSOIntentOutboxEntry.objects.filter(pk__in=retired), retired)
+        retired_count += len(retired)
+        logger.debug("compacted %s rows into entry %s for %s/%s", len(inputs), survivor.pk, device_id, scope)
+    return retired_count
 
 
 def _compactable(row, held) -> bool:
@@ -754,12 +772,19 @@ def compaction_candidates(limit=None) -> list[tuple[int, str]]:
     limit = DRAIN_BATCH if limit is None else limit
     grouped = (
         NSOIntentOutboxEntry.objects.filter(consumed_by_push_seq__isnull=True)
-        .values_list("device_id", "scope")
+        .values_list("device_id", "scope", "kind")
         .annotate(rows=Count("id"))
         .filter(rows__gt=1)
-        .order_by("device_id", "scope")
+        .order_by("device_id", "scope", "kind")
     )
-    return [(device_id, scope) for device_id, scope, _rows in grouped[:limit]]
+    candidates = []
+    for device_id, scope, _kind, _rows in grouped[: limit * 2]:
+        key = (device_id, scope)
+        if key not in candidates:
+            candidates.append(key)
+        if len(candidates) == limit:
+            break
+    return candidates
 
 
 # ── The send ──────────────────────────────────────────────────────────────────
@@ -1273,7 +1298,8 @@ def _take_direct_entries(device_id, scope, force) -> tuple[str, tuple | None]:
     rendered = delivery.render(scope, device_id, mgmt.adapter_device_id)
     entry_ids = [row.pk for row in rows]
     _retire(NSOIntentOutboxEntry.objects.filter(id__in=entry_ids), entry_ids)
-    return _SENDING, (rendered, all(row.mark_and for row in rows) if rows else None)
+    mark, _mark_any = _contribution_marks(rows)
+    return _SENDING, (rendered, mark)
 
 
 def _apply_envelope_error(answer) -> str:
