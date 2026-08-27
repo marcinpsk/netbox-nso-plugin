@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Greenfield routed sub-interface write path (Phase A of intent-integrity).
+"""Foreign greenfield routed sub-interface writes stay outside NSO ownership.
 
-Creating a routed sub-interface in NetBox (virtual + parent + dot1q name suffix) on a
-managed device must own + push it as intent, so the subinterface-reconciler creates the
-unit on the device — the operator-driven greenfield write the brownfield pipeline lacked.
+Only an explicit sub-interface workflow may acquire renderer ownership. A generic native
+Interface create is not ownership evidence and must not create an overlay as a side effect.
 """
 
 from __future__ import annotations
@@ -31,15 +30,10 @@ class TestGreenfieldSubinterfaceState(IntentPushResetMixin, TestCase):
         )
         cls.parent = Interface.objects.create(device=cls.device, name="ae99", type="lag")
 
-    def test_creating_routed_subif_owns_and_tracks_it(self):
-        """A new virtual subif with a parent + dot1q suffix → an owned NSOSubinterfaceState."""
+    def test_creating_routed_subif_does_not_acquire_ownership(self):
+        """A foreign native create does not acquire a sub-interface overlay."""
         subif = Interface.objects.create(device=self.device, name="ae99.999", type="virtual", parent=self.parent)
-        state = NSOSubinterfaceState.objects.get(interface=subif)
-        self.assertEqual(state.dot1q_vlan, 999)
-        self.assertEqual(state.parent_interface_id, self.parent.id)
-        self.assertEqual(state.management_id, self.mgmt.id)
-        self.assertEqual(state.status, "accepted")
-        self.assertIsNotNone(state.accepted_at)
+        self.assertFalse(NSOSubinterfaceState.objects.filter(interface=subif).exists())
 
     def test_physical_interface_creates_no_subif_state(self):
         """A plain interface (no dot1q suffix) must NOT be treated as a subinterface."""

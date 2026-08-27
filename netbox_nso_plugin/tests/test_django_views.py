@@ -3718,8 +3718,14 @@ class TestInterfaceIntentDelivery(ViewTestBase):
             self.captureOnCommitCallbacks(execute=True),
         ):
             with transaction.atomic():
+                from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
                 self.iface_state.status = "accepted"
-                self.iface_state.save(update_fields={"status"})
+                plan = RendererMutationPlan.build(
+                    saves=(planned_save(self.iface_state, update_fields=("status",)),),
+                )
+                with renderer_writes(plan) as writer:
+                    writer.save(self.iface_state, update_fields=("status",))
 
         assert NSOIntentOutboxEntry.objects.filter(device=self.device, scope="interface").exists()
         assert session.request.called, "the test did not reach the transport failure"
@@ -7050,21 +7056,56 @@ class TestApplyRefusesAStaleSnmpStore(_CascadeFlushMixin, IntentPushResetMixin, 
         return applied, [str(message) for message in get_messages(response.wsgi_request)]
 
     def _own_a_community(self):
-        from netbox_nso_plugin.models import NSOSnmpCommunityState
+        import copy
 
-        with without_commit_drain(), transaction.atomic():
-            return NSOSnmpCommunityState.objects.create(
-                management=self.mgmt,
-                community_hash="ab12cd34ef56ab78",
-                access="RO",
-                status="accepted",
-                vault_ref="test/snmp/community",
+        from django.utils import timezone
+
+        from netbox_nso_plugin.models import NSOSnmpCommunityState
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_save,
+            renderer_mirror_writes,
+            renderer_writes,
+        )
+
+        community = NSOSnmpCommunityState(
+            management=self.mgmt,
+            community_hash="ab12cd34ef56ab78",
+            access="RO",
+            status="imported",
+            vault_ref="secret/snmp/community#community",
+        )
+        create_plan = RendererMutationPlan.build(
+            saves=(
+                planned_save(
+                    community,
+                    force_insert=True,
+                    natural_key=("management", "community_hash"),
+                ),
             )
+        )
+        with renderer_mirror_writes(create_plan) as writer:
+            writer.save(community, force_insert=True)
+
+        acquired = copy.copy(community)
+        acquired.status = "accepted"
+        acquired.accepted_at = timezone.now()
+        fields = ("status", "accepted_at")
+        accept_plan = RendererMutationPlan.build(
+            saves=(planned_save(acquired, update_fields=fields),),
+            planned_at=acquired.accepted_at,
+        )
+        with without_commit_drain(), renderer_writes(accept_plan) as writer:
+            writer.save(acquired, update_fields=fields)
+        return acquired
 
     def _own_then_delete_a_community(self):
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
+
         community = self._own_a_community()
-        with without_commit_drain(), transaction.atomic():
-            community.delete()
+        plan = RendererMutationPlan.build(deletes=(planned_delete(community),))
+        with without_commit_drain(), renderer_writes(plan) as writer:
+            writer.delete(community)
 
     def test_a_pending_snmp_deletion_stops_the_apply(self):
         self._own_then_delete_a_community()

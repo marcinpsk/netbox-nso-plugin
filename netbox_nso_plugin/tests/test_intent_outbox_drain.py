@@ -33,6 +33,7 @@ from ._outbox_case import (
     wait_until_postgres_blocks,
     without_commit_drain,
 )
+from ._static_route_case import _unassign_and_retire
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -485,7 +486,7 @@ class TestOutOfOrderCommitVisibility(_DrainCase):
         leaving = own_route(mgmt, "198.51.100.64/28", "198.51.100.5")
         self.clear_entries()
         with without_commit_drain():
-            leaving.devices.remove(device)
+            _unassign_and_retire(leaving, device)
         removal_ids = [row.pk for row in entries(device, "static_route")]
         assert removal_ids, "the removal recorded the deletion this claim will carry"
 
@@ -556,7 +557,7 @@ class TestOutOfOrderCommitVisibility(_DrainCase):
         route = own_route(mgmt, "198.51.100.80/28", "198.51.100.6")
         self.clear_entries()
         with without_commit_drain():
-            route.devices.remove(device)
+            _unassign_and_retire(route, device)
         claimed = drain.claim(device.pk, "static_route")
         NSOIntentOutboxEntry.objects.create(
             device=device,

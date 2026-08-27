@@ -1456,6 +1456,26 @@ def _specialized_generic_keys(instance, spec: RendererInputSpec) -> set[tuple[in
                 dest_protocol__in=spec.scopes,
             ).values_list("management__device_id", "dest_protocol")
         }
+    if instance._meta.label_lower == "ipam.ipaddress":
+        from dcim.models import Interface
+        from django.db.models import Q
+
+        from .models import NSOBGPPeerState
+        from .status_machine import OWNED_STATES
+
+        keys = set()
+        assigned = getattr(instance, "assigned_object", None)
+        if isinstance(assigned, Interface):
+            keys.update(_management_keys({assigned.device_id}, ("ip",)))
+        if instance.pk is not None:
+            keys.update(
+                (device_id, "bgp")
+                for device_id in NSOBGPPeerState.objects.filter(
+                    Q(bgp_peer__peer_id=instance.pk) | Q(bgp_peer__source_id=instance.pk),
+                    status__in=OWNED_STATES,
+                ).values_list("management__device_id", flat=True)
+            )
+        return keys
     if instance._meta.label_lower == "ipam.vrf":
         StaticRouteState = apps.get_model("netbox_nso_plugin.nsostaticroutestate")
         device_ids = StaticRouteState.objects.filter(
@@ -2389,16 +2409,13 @@ def reconcile_cascade_dml(model):
             permit.authorized_dml.pop(table, None)
 
 
-def _content_permit_covers(instance, spec: RendererInputSpec, permit: _Permit) -> bool:
+def _content_permit_covers(instance, _spec: RendererInputSpec, permit: _Permit) -> bool:
     row = SourceRow(instance._meta.label_lower, instance.pk)
     future = SourceRow(instance._meta.label_lower, None)
-    if row in (*permit.footprint.source_rows, *permit.footprint.overlay_rows) or future in (
+    return row in (*permit.footprint.source_rows, *permit.footprint.overlay_rows) or future in (
         *permit.footprint.source_rows,
         *permit.footprint.overlay_rows,
-    ):
-        return True
-    resolved = spec.resolver(instance, spec)
-    return bool(resolved) and resolved <= set(permit.footprint.revision_keys)
+    )
 
 
 def _footprint_covers_row(instance, permit: _Permit) -> bool:

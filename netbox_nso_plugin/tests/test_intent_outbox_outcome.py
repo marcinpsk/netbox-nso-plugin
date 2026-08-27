@@ -37,6 +37,7 @@ from ._outbox_case import (
     triple,
     without_commit_drain,
 )
+from ._static_route_case import _edit_owned_route, _touch_owned_route, _unassign_and_retire
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -66,7 +67,7 @@ class _OutcomeCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase
     def unown(self, route):
         """Remove the device from the route, which is what records the deletion."""
         with without_commit_drain():
-            route.devices.remove(self.device)
+            _unassign_and_retire(route, self.device)
 
     def reown(self, route):
         from ._static_route_case import _accept_with_permit
@@ -284,7 +285,7 @@ class TestStampingFollowsTheAcknowledgedBody(_OutcomeCase):
     def _touch(self):
         """One ordinary operator edit, so the key owes a send."""
         with without_commit_drain(), transaction.atomic():
-            self.mgmt.static_route_states.get(static_route=self.route).save()
+            _touch_owned_route(self.route)
 
     def test_a_normal_success_stamps_the_body_it_sent(self):
         from netbox_nso_plugin import drain
@@ -1159,8 +1160,7 @@ class TestABoundaryRejectionDissolvesTheClaim(_OutcomeCase):
     def _move(self, route, next_hop):
         """The operator's edit, left unconsumed for the drain under test to fold."""
         with without_commit_drain(), transaction.atomic():
-            route.next_hop = next_hop
-            route.save()
+            _edit_owned_route(route, next_hop=next_hop)
 
     def test_a_rejected_body_abandons_and_the_correction_sends_at_a_fresh_sequence(self):
         from netbox_nso_plugin import drain
@@ -1205,10 +1205,8 @@ class TestTheDowngradeRecordNamesWhatLeftTheDevice(_OutcomeCase):
 
     def _touch(self, route):
         """An unmarked contributor: the operator saves an overlay the deletion folds with."""
-        from netbox_nso_plugin.models import NSOStaticRouteState
-
         with without_commit_drain(), transaction.atomic():
-            NSOStaticRouteState.objects.get(management=self.mgmt, static_route=route).save()
+            _touch_owned_route(route)
 
     def test_a_downgraded_fold_records_the_triples_the_banner_renders(self):
         from netbox_nso_plugin import drain

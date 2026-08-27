@@ -99,6 +99,37 @@ class NSOInterfaceStateViewSet(NetBoxModelViewSet):
     serializer_class = NSOInterfaceStateSerializer
     filterset_class = NSOInterfaceStateFilterSet
 
+    def perform_update(self, serializer):
+        """Apply an API overlay update through one exact renderer plan."""
+        import copy
+
+        from django.core.exceptions import FieldDoesNotExist
+
+        from ..renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
+
+        candidate = copy.copy(serializer.instance)
+        if "status" in serializer.validated_data:
+            candidate._nso_explicit_status_update = True
+        deferred_m2m = []
+        for field_name, value in serializer.validated_data.items():
+            try:
+                field = candidate._meta.get_field(field_name)
+            except FieldDoesNotExist:
+                setattr(candidate, field_name, value)
+                continue
+            if field.many_to_many:
+                deferred_m2m.append((field_name, value))
+                continue
+            setattr(candidate, field_name, value)
+
+        plan = RendererMutationPlan.build(saves=(planned_save(candidate),))
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+        with mutation as writer:
+            writer.save(candidate)
+        for field_name, value in deferred_m2m:
+            getattr(candidate, field_name).set(value)
+        serializer.instance = candidate
+
 
 class NSOLinkRoleViewSet(NetBoxModelViewSet):
     """REST API for NSOLinkRole — the configurable provisioning catalog."""

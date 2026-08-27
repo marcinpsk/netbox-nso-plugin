@@ -31,6 +31,7 @@ from ._outbox_case import (
     state_of,
     without_commit_drain,
 )
+from ._static_route_case import _unassign_and_retire
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -327,7 +328,7 @@ class TestCrashedAttemptsReplayAtTheirOwnSequence(_ClaimCase):
 
         route = own_route(self.mgmt, "198.51.100.0/28", "198.51.100.1")
         with without_commit_drain():
-            route.devices.remove(self.device)
+            _unassign_and_retire(route, self.device)
 
         claimed = drain.claim(self.device.pk, "static_route")
         assert [d["route_id"] for d in claimed.deletions] == [route.pk]
@@ -525,7 +526,7 @@ class TestUnmanagedClaimIsParked(_ClaimCase):
 
         route = own_route(self.mgmt, "198.51.100.16/28", "198.51.100.2")
         with without_commit_drain():
-            route.devices.remove(self.device)
+            _unassign_and_retire(route, self.device)
         claimed = drain.claim(self.device.pk, "static_route")
         assert claimed.deletions
         return claimed

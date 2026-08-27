@@ -2312,8 +2312,11 @@ def _carried_last_acked(mgmt, route_id):
 
 
 def _accept_static_route_for_device(static_route, device) -> None:
-    """Own a greenfield route for *device* (accepted overlay) → its save pushes intent."""
+    """Own a greenfield route for one device through an exact overlay plan."""
+    import copy
+
     from .models import NSODeviceManagement, NSOStaticRouteState
+    from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
     if static_route.next_hop is None:
         return  # interface-only next-hop not supported by static-route-reconciler v1
@@ -2323,40 +2326,59 @@ def _accept_static_route_for_device(static_route, device) -> None:
         return
     if mgmt.adapter_device_id is None:
         return
-    state, created = NSOStaticRouteState.objects.get_or_create(
+    state = NSOStaticRouteState.objects.filter(
         management=mgmt,
         static_route=static_route,
-        defaults={
-            "status": "accepted",
-            "accepted_at": timezone.now(),
-        },
+    ).first()
+    created = state is None
+    candidate = (
+        NSOStaticRouteState(
+            management=mgmt,
+            static_route=static_route,
+            status="accepted",
+            accepted_at=timezone.now(),
+        )
+        if created
+        else copy.copy(state)
     )
     if created:
         # A fresh row inherits the last acknowledged triple from its pending deletion.
-        state.last_acked_triple = _carried_last_acked(mgmt, static_route.pk)
-    was_owned = not created and state.status in _OWNED_PUSH_STATUSES
+        candidate.last_acked_triple = _carried_last_acked(mgmt, static_route.pk)
+    was_owned = not created and candidate.status in _OWNED_PUSH_STATUSES
     if not created and not was_owned:
-        state.status = "accepted"
-        state.accepted_at = timezone.now()
+        candidate.status = "accepted"
+        candidate.accepted_at = timezone.now()
     if not was_owned:
         # Entering ownership is intent this device did not carry before, so it needs a
         # generation of its own — an already-owned row keeps the one it is mid-flight on.
-        _arm_static_route_generation(state)
+        _arm_static_route_generation(candidate)
     # nso_vrf too: the residue key is the (vrf, prefix, next_hop) triple, so a VRF route
     # adopted with an empty mirror never matches its own device row.
-    state.nso_vrf = static_route.vrf.name if static_route.vrf else ""
-    state.nso_prefix = str(static_route.prefix or "")
-    state.nso_next_hop = str(static_route.next_hop or "")
-    state.last_sync_at = timezone.now()
-    state.save()  # → _on_static_route_state_save schedules the push
-    if not was_owned:
-        from . import outbox
+    candidate.nso_vrf = static_route.vrf.name if static_route.vrf else ""
+    candidate.nso_prefix = str(static_route.prefix or "")
+    candidate.nso_next_hop = str(static_route.next_hop or "")
+    candidate.last_sync_at = timezone.now()
+    plan = RendererMutationPlan.build(
+        saves=(
+            planned_save(
+                candidate,
+                force_insert=created,
+                natural_key=("management", "static_route") if created else (),
+            ),
+        ),
+        planned_at=candidate.accepted_at,
+    )
+    mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+    with mutation as writer:
+        writer.save(candidate, force_insert=created)
+        if not was_owned:
+            from . import outbox
 
-        # Re-ownership withdraws whatever deletion authority is pending for this pk: without
-        # the record, a delete/re-own/re-delete sequence would ship the deletion of a route
-        # NetBox owns again.
-        device_id, _adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
-        _schedule_intent_push((device_id, "static_route"), transitions=[outbox.revoke_transition(static_route.pk)])
+            # Re-ownership withdraws whatever deletion authority is pending for this pk.
+            _schedule_intent_push(
+                (mgmt.device_id, "static_route"),
+                transitions=[outbox.revoke_transition(static_route.pk)],
+            )
 
 
 def _static_route_delete_transition(row, static_route_id):

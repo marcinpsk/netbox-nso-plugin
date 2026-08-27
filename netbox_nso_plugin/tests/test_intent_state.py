@@ -417,22 +417,22 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         device.delete()
         self.assertFalse(IPAddress.objects.filter(pk=address.pk).exists())
 
-    def test_failed_static_route_m2m_behavior_closes_its_implicit_permit(self):
+    def test_foreign_static_route_m2m_skips_behavior_and_closes_its_implicit_permit(self):
         from netbox_routing.models import StaticRoute
 
         from netbox_nso_plugin.intent_state import _ACTIVE_PERMIT
 
         route = StaticRoute.objects.create(prefix="198.18.16.0/28", next_hop="198.18.16.1", metric=1)
-        with self.assertRaises(RuntimeError):
-            with (
-                transaction.atomic(),
-                patch(
-                    "netbox_nso_plugin.signals._schedule_intent_push",
-                    side_effect=RuntimeError("behavior failed"),
-                ),
-            ):
-                route.devices.add(self.device)
+        with (
+            transaction.atomic(),
+            patch(
+                "netbox_nso_plugin.signals._schedule_intent_push",
+                side_effect=RuntimeError("behavior failed"),
+            ) as schedule,
+        ):
+            route.devices.add(self.device)
 
+        schedule.assert_not_called()
         self.assertIsNone(_ACTIVE_PERMIT.get())
 
     def test_foreign_post_save_skips_converted_behavior_and_closes_its_implicit_permit(self):
@@ -467,6 +467,20 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         other.refresh_from_db()
         self.assertEqual(other.device_name, "")
         self.assertNotEqual(other_device.pk, self.device.pk)
+
+    def test_revision_locks_alone_do_not_authorize_registered_content_dml(self):
+        vlan = self.state.vlan
+        spec = renderer_input_specs()[vlan._meta.label_lower]
+        footprint = MutationFootprint.for_keys(spec.resolver(vlan, spec))
+        original_name = vlan.name
+
+        with self.assertRaises(IntentMutationProtocolError), transaction.atomic(), suppress_intent_push():
+            with intent_transaction(footprint):
+                vlan.name = "revision-only-permit"
+                vlan.save(update_fields=["name"])
+
+        vlan.refresh_from_db()
+        self.assertEqual(vlan.name, original_name)
 
     def test_content_mutation_bumps_before_write_and_repends_deploying_rows(self):
         attempt_id = uuid4()

@@ -1188,22 +1188,34 @@ _STATIC_ROUTE_MIRROR_FIELDS = ("nso_vrf", "nso_prefix", "nso_next_hop", "last_sy
 
 def static_route_reconcile_plan(device, payload: dict):
     """Freeze every native route, assignment, and overlay write for one mirror pass."""
+    planned_at = timezone.now()
+    plan, _operations = _static_route_plan_and_operations(device, payload, planned_at)
+    return plan
+
+
+def _static_route_plan_and_operations(device, payload, planned_at, *, resolve_status=True):
+    """Build one exact static-route plan and its matching replay operations."""
     from .renderer_writer import RendererMutationPlan
 
-    planned_at = timezone.now()
     try:
-        saves, deletes, m2m_writes, _operations = _static_route_reconcile_operations(device, payload, planned_at)
+        saves, deletes, m2m_writes, operations = _static_route_reconcile_operations(
+            device,
+            payload,
+            planned_at,
+            resolve_status=resolve_status,
+        )
     except ImportError:
-        return RendererMutationPlan.build(planned_at=planned_at)
-    return RendererMutationPlan.build(
+        return RendererMutationPlan.build(planned_at=planned_at), []
+    plan = RendererMutationPlan.build(
         saves=saves,
         deletes=deletes,
         m2m_writes=m2m_writes,
         planned_at=planned_at,
     )
+    return plan, operations
 
 
-def _static_route_reconcile_operations(device, payload, planned_at):  # noqa: C901
+def _static_route_reconcile_operations(device, payload, planned_at, *, resolve_status=True):  # noqa: C901
     """Build the deterministic static-route write sequence for preflight and apply."""
     from ipam.models import VRF
     from netbox_routing.models import StaticRoute
@@ -1324,15 +1336,16 @@ def _static_route_reconcile_operations(device, payload, planned_at):  # noqa: C9
             m2m_writes.append(planned_m2m_add(route, "devices", (device,)))
             operations.append(("m2m_add", route, None, False, (device,)))
 
-        state.status = sm.on_reconcile(
-            state.status,
-            matches=(
-                on_device and route.metric == _static_route_metric(entry, device) and route.tag == entry.get("tag")
-            ),
-            conflict=not on_device,
-            settles_owned=False,
-            settles_deploying=False,
-        )
+        if resolve_status:
+            state.status = sm.on_reconcile(
+                state.status,
+                matches=(
+                    on_device and route.metric == _static_route_metric(entry, device) and route.tag == entry.get("tag")
+                ),
+                conflict=not on_device,
+                settles_owned=False,
+                settles_deploying=False,
+            )
         state_created = current_state is None
         save(
             state,
@@ -1347,8 +1360,8 @@ def _static_route_reconcile_operations(device, payload, planned_at):  # noqa: C9
         if current.pk in seen_state_pks:
             continue
         if sm.is_owned(current.status):
-            new_status = sm.on_reconcile(current.status, present=False)
-            if new_status != current.status:
+            new_status = sm.on_reconcile(current.status, present=False) if resolve_status else current.status
+            if new_status != current.status or not resolve_status:
                 candidate = copy.copy(current)
                 candidate.status = new_status
                 save(candidate, update_fields=("status",))
@@ -1366,6 +1379,7 @@ def _static_route_reconcile_operations(device, payload, planned_at):  # noqa: C9
 @mirror_reconciler
 def _reconcile_static_routes(device, payload: dict) -> list:
     """Apply one frozen static-route reconciliation through the renderer writer."""
+    from .intent_state import mirror_transaction
     from .models import NSODeviceManagement, NSOStaticRouteState
     from .renderer_writer import active_renderer_writer, renderer_mirror_writes, renderer_writes
     from .signals import suppress_intent_push
@@ -1374,29 +1388,44 @@ def _reconcile_static_routes(device, payload: dict) -> list:
     if management is None:
         return []
     active = active_renderer_writer()
-    plan = active.plan if active is not None else static_route_reconcile_plan(device, payload)
-    mutation = contextlib.nullcontext(active)
-    if active is None:
-        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-    with mutation as writer, suppress_intent_push():
+    if active is not None:
+        plan = active.plan
         _saves, _deletes, _m2m_writes, operations = _static_route_reconcile_operations(
             device,
             payload,
             plan.planned_at,
         )
-        for operation, instance, update_fields, force_insert, related in operations:
-            if operation == "save":
-                writer.save(instance, update_fields=update_fields, force_insert=force_insert)
-            elif operation == "m2m_add":
-                writer.m2m_add(instance, "devices", related)
-            elif operation == "m2m_set":
-                writer.m2m_set(instance, "devices", related)
-            else:
-                writer.delete(instance)
+        _execute_static_route_operations(active, operations)
+    else:
+        planned_at = timezone.now()
+        preflight, _operations = _static_route_plan_and_operations(
+            device,
+            payload,
+            planned_at,
+            resolve_status=False,
+        )
+        with mirror_transaction(preflight.lock_footprint, detect_content_changes=True):
+            plan, operations = _static_route_plan_and_operations(device, payload, planned_at)
+            mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+            with mutation as writer, suppress_intent_push():
+                _execute_static_route_operations(writer, operations)
 
     return list(
         NSOStaticRouteState.objects.filter(management=management).select_related("static_route", "static_route__vrf")
     )
+
+
+def _execute_static_route_operations(writer, operations):
+    """Replay the operations paired with one frozen static-route plan."""
+    for operation, instance, update_fields, force_insert, related in operations:
+        if operation == "save":
+            writer.save(instance, update_fields=update_fields, force_insert=force_insert)
+        elif operation == "m2m_add":
+            writer.m2m_add(instance, "devices", related)
+        elif operation == "m2m_set":
+            writer.m2m_set(instance, "devices", related)
+        else:
+            writer.delete(instance)
 
 
 def _reconcile_isis_settings(obj, settings: dict | None, *, write: bool = True) -> bool:

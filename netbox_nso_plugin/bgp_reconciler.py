@@ -326,7 +326,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         from .models import NSOBGPPeerState, NSOBGPPeerTemplateState, NSODeviceManagement
 
         self.device = device
-        self.payload = payload
+        self.payload = {"routers": payload} if isinstance(payload, list) else payload
         self.planned_at = planned_at
         self.operations = _Operations()
         self.management = NSODeviceManagement.objects.filter(device=device).first()

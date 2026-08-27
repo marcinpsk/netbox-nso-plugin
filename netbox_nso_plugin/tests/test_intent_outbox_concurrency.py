@@ -41,6 +41,7 @@ from ._outbox_case import (
     wait_until_postgres_blocks,
     without_commit_drain,
 )
+from ._static_route_case import _accept_with_permit, _unassign_and_retire
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -224,7 +225,7 @@ class TestTheFoldAndTheRenderShareOneSnapshot(_ConcurrencyCase):
                     remover_pid.append(cursor.fetchone()[0])
                 remover_started.set()
                 with transaction.atomic():
-                    route.devices.remove(self.device)
+                    _unassign_and_retire(route, self.device)
             except BaseException as exc:  # noqa: BLE001 (reported on the main thread)
                 failures.append(exc)
             finally:
@@ -507,11 +508,11 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
         return work
 
     def _remove(self, route, **barriers):
-        return self._transaction(lambda: route.devices.remove(self.device), **barriers)
+        return self._transaction(lambda: _unassign_and_retire(route, self.device), **barriers)
 
     def _reown(self, route, **barriers):
         def own():
-            route.devices.add(self.device)
+            _accept_with_permit(route, self.device)
 
         return self._transaction(own, **barriers)
 
@@ -542,7 +543,7 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
 
     def test_a_second_writer_of_one_route_waits_on_the_first(self):
         """The overlay row is the serialization point, which is what the id order rests on."""
-        from netbox_nso_plugin.signals import _accept_static_route_for_device
+        from ._static_route_case import _accept_with_permit
 
         route = own_route(self.mgmt, "198.51.100.144/28", "198.51.100.10")
         self.clear_entries()
@@ -552,7 +553,7 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
 
         def own_the_same_route():
             started = time.monotonic()
-            _accept_static_route_for_device(route, self.device)
+            _accept_with_permit(route, self.device)
             waited.append(time.monotonic() - started)
 
         def release_after_delete():
@@ -589,7 +590,7 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
     def test_a_re_ownership_committing_first_takes_the_lower_entry_id(self):
         route = own_route(self.mgmt, "198.51.100.160/28", "198.51.100.11")
         with without_commit_drain():
-            route.devices.remove(self.device)  # un-owned, so the re-ownership is a real one
+            _unassign_and_retire(route, self.device)  # un-owned, so the re-ownership is a real one
         self.clear_entries()
         owned = threading.Event()
 
@@ -609,7 +610,7 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
         leaving = own_route(self.mgmt, "198.51.100.176/28", "198.51.100.12")
         returning = own_route(self.mgmt, "198.51.100.192/28", "198.51.100.13")
         with without_commit_drain():
-            returning.devices.remove(self.device)
+            _unassign_and_retire(returning, self.device)
         self.clear_entries()
         held = threading.Event()
         release = threading.Event()

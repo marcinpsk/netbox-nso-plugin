@@ -1743,7 +1743,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             row = NSOStaticRouteState.objects.create(
                 management=mgmt, static_route=route, nso_prefix="198.18.99.0/24", status="accepted"
             )
-        self._delete_pushes(row, "put_static_route_intent")
+        self._delete_pushes(row, "put_static_route_intent", exact_writer=True)
 
     def test_static_route_overlay_delete_records_per_object_authority(self):
         from netbox_routing.models import StaticRoute
@@ -1861,7 +1861,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             row = NSOISISInterfaceState.objects.create(
                 management=mgmt, interface=self.iface, af="ipv4", status="accepted"
             )
-        self._delete_pushes(row, "put_isis_interface_intent")
+        self._delete_pushes(row, "put_isis_interface_intent", exact_writer=True)
 
     def test_isis_instance_delete_pushes_reduced_snapshot(self):
         """No native pre_delete exists for ISISInstance — the overlay post_delete is the
@@ -1874,7 +1874,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             self.captureOnCommitCallbacks(execute=True),
         ):
             row = NSOISISInstanceState.objects.create(management=mgmt, process_tag="CORE", status="accepted")
-        mock_put = self._delete_pushes(row, "put_isis_interface_intent")
+        mock_put = self._delete_pushes(row, "put_isis_interface_intent", exact_writer=True)
         self.assertEqual(mock_put.call_args.kwargs.get("processes"), [])
 
     def test_bgp_peer_delete_pushes_reduced_snapshot(self):
@@ -2137,13 +2137,6 @@ class TestDeleteOriginMarking(_SignalDBBase):
         with renderer_writes(plan) as writer:
             writer.save(row)
 
-    @staticmethod
-    def _static_route_assignment_footprint(route, device_id):
-        """The production M2M footprint for assigning *device_id* to *route*."""
-        from netbox_nso_plugin.intent_state import _static_route_devices_footprint
-
-        return _static_route_devices_footprint(route, "pre_add", {device_id}, False)
-
     def test_overlay_delete_push_is_marked_delete_origin(self):
         mgmt = self._mgmt()
         row = self._owned_svi(mgmt)
@@ -2174,19 +2167,14 @@ class TestDeleteOriginMarking(_SignalDBBase):
         its activated push must leave the legacy query flag off."""
         from netbox_routing.models import StaticRoute
 
-        from netbox_nso_plugin.models import NSOStaticRouteState
-
         mgmt = self._mgmt()
         route = StaticRoute.objects.create(prefix="198.18.77.0/24", next_hop="198.18.0.1", name="do-sr", metric=1)
-        from netbox_nso_plugin.intent_state import intent_transaction
+        from ._static_route_case import _assign_and_accept, _delete_owned_route
 
-        with self._arranged(), intent_transaction(self._static_route_assignment_footprint(route, mgmt.device_id)):
-            route.devices.add(mgmt.device)
-            NSOStaticRouteState.objects.create(
-                management=mgmt, static_route=route, nso_prefix="198.18.77.0/24", status="accepted"
-            )
+        with self._arranged():
+            _assign_and_accept(route, mgmt.device)
         route_id = route.pk
-        requests = self._recorded_requests(route.delete)
+        requests = self._recorded_requests(lambda: _delete_owned_route(route))
         params = [params for _method, _url, params, _body in requests]
         self.assertTrue(params, "the native delete must push")
         self.assertFalse(
@@ -2210,11 +2198,10 @@ class TestDeleteOriginMarking(_SignalDBBase):
         mgmt = self._mgmt()
         route = StaticRoute.objects.create(prefix="198.18.88.0/24", next_hop="198.18.0.1", name="do-add", metric=1)
 
-        from django.db import transaction
+        from ._static_route_case import _assign_and_accept
 
         def assign():
-            with transaction.atomic():
-                route.devices.add(mgmt.device)
+            _assign_and_accept(route, mgmt.device)
 
         params = self._recorded_params(assign)
         self.assertTrue(params, "assigning the device must push the (grown) snapshot")
@@ -2227,18 +2214,14 @@ class TestDeleteOriginMarking(_SignalDBBase):
         """post_remove is a deletion, but its activated push uses no legacy query flag."""
         from netbox_routing.models import StaticRoute
 
-        from netbox_nso_plugin.signals import _accept_static_route_for_device
-
         mgmt = self._mgmt()
         route = StaticRoute.objects.create(prefix="198.18.88.0/24", next_hop="198.18.0.1", name="do-rm", metric=1)
-        from netbox_nso_plugin.intent_state import intent_transaction
+        from ._static_route_case import _assign_and_accept, _unassign_and_retire
 
-        with self._arranged(), intent_transaction(self._static_route_assignment_footprint(route, mgmt.device_id)):
-            # The assignment handler is suppressed too, so the overlay is owned explicitly.
-            route.devices.add(mgmt.device)
-            _accept_static_route_for_device(route, mgmt.device)
+        with self._arranged():
+            _assign_and_accept(route, mgmt.device)
 
-        requests = self._recorded_requests(lambda: route.devices.remove(mgmt.device))
+        requests = self._recorded_requests(lambda: _unassign_and_retire(route, mgmt.device))
         params = [params for _method, _url, params, _body in requests]
         self.assertTrue(params, "un-assigning the device must push the reduced snapshot")
         self.assertFalse(
