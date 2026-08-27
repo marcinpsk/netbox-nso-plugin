@@ -49,6 +49,7 @@ class ScopeOwnershipRule:
     deletion_authority: bool
     intentional_semantic_delta: str
     acknowledged_lineage_field: str | None = None
+    manifest_scope_field: str | None = None
 
 
 _CONVERTED_SCOPE_RULES = {
@@ -245,6 +246,25 @@ _CONVERTED_SCOPE_RULES = {
             "Acquire from a persisted Flex-Algo and linked overlay. Native Flex-Algo save and delete events are not "
             "ownership evidence."
         ),
+    ),
+    "redistribution": ScopeOwnershipRule(
+        scope="redistribution",
+        native_model_labels=("netbox_routing.redistribution",),
+        native_key_fields=(
+            "destination_type_id",
+            "destination_id",
+            "source_protocol",
+            "source_ref",
+        ),
+        overlay_model_labels=("netbox_nso_plugin.nsoredistributionstate",),
+        overlay_native_fields=(("netbox_nso_plugin.nsoredistributionstate", "redistribution"),),
+        foreign_overlay_delete="reown",
+        deletion_authority=True,
+        intentional_semantic_delta=(
+            "Acquire from a persisted destination-specific redistribution and linked overlay. Native and overlay "
+            "save events are not ownership evidence. The manifest delivery scope comes from the destination protocol."
+        ),
+        manifest_scope_field="dest_protocol",
     ),
 }
 

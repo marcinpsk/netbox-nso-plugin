@@ -243,6 +243,36 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
 
         assert not BFDInterface.objects.filter(pk=native.pk).exists()
 
+    def test_one_plan_can_delete_a_child_before_its_set_null_parent(self):
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_delete,
+            renderer_mirror_writes,
+        )
+
+        _device, management = make_managed("writer-related-delete", 16284)
+        native = StaticRoute.objects.create(prefix="198.18.84.0/24", next_hop="198.18.0.84", metric=1)
+        state = NSOStaticRouteState.objects.create(
+            management=management,
+            static_route=native,
+            status="imported",
+        )
+        plan = RendererMutationPlan.build(
+            deletes=(
+                planned_delete(state),
+                planned_delete(native),
+            )
+        )
+
+        with renderer_mirror_writes(plan) as writer:
+            writer.delete(state)
+            writer.delete(native)
+
+        assert not NSOStaticRouteState.objects.filter(pk=state.pk).exists()
+        assert not StaticRoute.objects.filter(pk=native.pk).exists()
+
     def test_one_plan_can_create_a_native_row_and_its_overlay(self):
         from ipam.models import VLANGroup
 

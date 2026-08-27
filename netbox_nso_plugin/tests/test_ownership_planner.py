@@ -210,6 +210,7 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
             "lacp",
             "l2_sap",
             "logging",
+            "redistribution",
             "snmp",
             "static_route",
             "subinterface",
@@ -240,3 +241,17 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
         assert rule.native_model_labels == ("netbox_routing.isisflexalgo",)
         assert rule.native_key_fields == ("instance_id", "algo_id")
         assert rule.overlay_native_fields == (("netbox_nso_plugin.nsoisisflexalgostate", "isis_flex_algo"),)
+
+    def test_redistribution_rule_uses_its_destination_protocol_as_manifest_scope(self):
+        from netbox_nso_plugin.ownership_planner import converted_scope_rules
+
+        rule = converted_scope_rules()["redistribution"]
+
+        assert rule.native_model_labels == ("netbox_routing.redistribution",)
+        assert rule.native_key_fields == (
+            "destination_type_id",
+            "destination_id",
+            "source_protocol",
+            "source_ref",
+        )
+        assert rule.manifest_scope_field == "dest_protocol"
