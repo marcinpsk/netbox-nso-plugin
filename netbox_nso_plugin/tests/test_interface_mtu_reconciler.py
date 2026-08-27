@@ -40,6 +40,21 @@ class TestInterfaceMtuReconciler(TestCase):
         orphan = _make_device("orphan")
         assert reconcile_interface_mtu(orphan, {"interfaces": [{"interface_name": "X", "mtu": 9000}]}) == []
 
+    def test_reconcile_preflights_exact_overlay_creation(self):
+        from netbox_nso_plugin.interface_mtu_reconciler import interface_mtu_reconcile_plan
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+
+        plan = interface_mtu_reconcile_plan(
+            self.device,
+            {"interfaces": [{"interface_name": self.po1.name, "mtu": 9000}]},
+        )
+
+        self.assertIsInstance(plan, RendererMutationPlan)
+        self.assertEqual(
+            [(write.operation, write.model_label) for write in plan.write_set],
+            [("save", "netbox_nso_plugin.nsointerfacemtustate")],
+        )
+
     def test_mirrors_l2_and_ip_mtu(self):
         from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
 
@@ -148,9 +163,19 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
         self.assertEqual(state.l2_mtu, 9216)  # operator intent preserved, not overwritten
         self.assertEqual(state.status, "accepted")  # device mismatch → holds accepted
 
-    def test_deploying_waits_for_correlated_apply_evidence(self):
-        from netbox_nso_plugin.models import NSOIntentRevision
-        from netbox_nso_plugin.reconcile import _LeaseOutcome, reconcile_category
+    def test_foreign_overlay_save_does_not_schedule_mtu_behavior(self):
+        from unittest.mock import patch
+
+        state = self._state(l2_mtu=9216, status="accepted")
+
+        with patch("netbox_nso_plugin.signals._schedule_intent_push") as schedule:
+            state.l2_mtu = 9000
+            state.save(update_fields=("l2_mtu",))
+
+        schedule.assert_not_called()
+
+    def test_deploying_settles_in_sync_when_device_matches(self):
+        from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
 
         from ._outbox_case import mirror_update
 
@@ -231,8 +256,9 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
         from django.contrib.auth import get_user_model
         from django.db.models.signals import pre_save
 
+        from netbox_nso_plugin import delivery
         from netbox_nso_plugin.intent_state import revision_was_acquired
-        from netbox_nso_plugin.models import NSOIntentRevision
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOOwnershipManifest
 
         state = self._state(l2_mtu=9216, status="imported")
         revision, _created = NSOIntentRevision.objects.get_or_create(device=self.device, scope="interface_mtu")
@@ -261,6 +287,23 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
         self.assertEqual(revision.revision, revision_before + 1)
         self.assertTrue(interface_scope_acquired)
         self.assertTrue(all(interface_scope_acquired))
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="interface_mtu")
+        self.assertEqual(revision.verified_revision, revision.revision)
+        self.assertEqual(
+            revision.verified_fingerprint,
+            delivery.canonical_fingerprint(
+                delivery.render("interface_mtu", self.device.pk, self.management.adapter_device_id).payload
+            ),
+        )
+        self.assertTrue(
+            NSOOwnershipManifest.objects.filter(
+                device=self.device,
+                scope="interface_mtu",
+                native_model_label="dcim.interface",
+                native_key={"device_id": self.po1.device_id, "name": self.po1.name},
+                ownership_state="owned",
+            ).exists()
+        )
 
     def test_accept_differing_value_marks_accepted_pending_apply(self):
         from unittest.mock import patch
@@ -289,7 +332,9 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
         self.assertEqual(obj.status, "changed")  # diverged from device → needs accept
 
     def test_edit_form_repends_an_owned_row_for_apply(self):
+        from netbox_nso_plugin import delivery
         from netbox_nso_plugin.forms import NSOInterfaceMtuStateForm
+        from netbox_nso_plugin.models import NSOIntentRevision
 
         state = self._state(l2_mtu=9216, status="in_sync")
         state.accepted_at = timezone.now()
@@ -299,6 +344,14 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
         obj = form.save()
         self.assertEqual(obj.l2_mtu, 9100)
         self.assertEqual(obj.status, "accepted")  # changed owned intent must be applied again
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="interface_mtu")
+        self.assertEqual(revision.verified_revision, revision.revision)
+        self.assertEqual(
+            revision.verified_fingerprint,
+            delivery.canonical_fingerprint(
+                delivery.render("interface_mtu", self.device.pk, self.management.adapter_device_id).payload
+            ),
+        )
 
     def test_edit_then_accept_owns_and_writes_native(self):
         from unittest.mock import patch

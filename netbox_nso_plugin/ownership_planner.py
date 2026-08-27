@@ -99,6 +99,18 @@ _CONVERTED_SCOPE_RULES = {
         deletion_authority=True,
         intentional_semantic_delta=("Acquire from current L2 state. M2M edit events are not ownership evidence."),
     ),
+    "interface_mtu": ScopeOwnershipRule(
+        scope="interface_mtu",
+        native_model_labels=("dcim.interface",),
+        native_key_fields=("device_id", "name"),
+        overlay_model_labels=("netbox_nso_plugin.nsointerfacemtustate",),
+        overlay_native_fields=(("netbox_nso_plugin.nsointerfacemtustate", "interface"),),
+        foreign_overlay_delete="reown",
+        deletion_authority=True,
+        intentional_semantic_delta=(
+            "Acquire from persisted per-interface MTU state. A save event is not ownership evidence."
+        ),
+    ),
 }
 
 

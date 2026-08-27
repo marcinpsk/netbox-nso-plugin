@@ -502,13 +502,18 @@ class NSOInterfaceMtuStateForm(NetBoxModelForm):
     def save(self, commit=True):
         """Flag an edited unowned row as ``changed`` (diverged → needs Accept)."""
         from . import status_machine as sm
+        from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
         obj = super().save(commit=False)
-        if not sm.is_owned(obj.status):
-            obj.status = "changed"
+        changed_content = bool({"l2_mtu", "ip_mtu", "mpls_mtu"} & set(self.changed_data))
+        if changed_content:
+            obj.status = sm.on_operator_edit(obj.status) if sm.is_owned(obj.status) else "changed"
         if commit:
-            obj.save()
-            self.save_m2m()
+            plan = RendererMutationPlan.build(saves=(planned_save(obj),))
+            mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+            with mutation as writer:
+                writer.save(obj)
+                self.save_m2m()
         return obj
 
 

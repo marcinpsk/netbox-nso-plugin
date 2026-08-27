@@ -6770,28 +6770,32 @@ class NSOInterfaceMtuStateAcceptView(OverlayStateAcceptMixin):
     _NETBOX_MTU_MAX = 65536
 
     def post(self, request, pk):  # noqa: D102
-        state = get_object_or_404(self.model_class, pk=pk)
-        from .intent_state import MutationFootprint, footprint_for_instance, intent_transaction
+        import copy
 
-        footprint = MutationFootprint.merge(
-            footprint_for_instance(state),
-            footprint_for_instance(state.interface),
-        )
-        # One transaction, so the native adoption, the row and the outbox entry it
-        # schedules commit together.
-        with intent_transaction(footprint):
-            state = get_object_or_404(self.model_class, pk=state.pk)
-            state.status = _status_after_accept(state.status)
-            state.accepted_at = timezone.now()
-            if state.l2_mtu is not None:
-                iface = state.interface
-                clamped = min(int(state.l2_mtu), self._NETBOX_MTU_MAX)
-                if iface.mtu != clamped:
-                    iface.mtu = clamped
-                    iface.save(update_fields=["mtu"])
-            state.save(update_fields=["status", "accepted_at"])
-        messages.success(request, f"Accepted {state}.")
-        return redirect(_device_nso_tab_url(state.management.device_id))
+        from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
+
+        state = get_object_or_404(self.model_class, pk=pk)
+        candidate = copy.copy(state)
+        candidate.status = _status_after_accept(state.status)
+        candidate.accepted_at = timezone.now()
+        saves = []
+        interface_candidate = None
+        if candidate.l2_mtu is not None:
+            clamped = min(int(candidate.l2_mtu), self._NETBOX_MTU_MAX)
+            if candidate.interface.mtu != clamped:
+                interface_candidate = copy.copy(candidate.interface)
+                interface_candidate.mtu = clamped
+                saves.append(planned_save(interface_candidate, update_fields=("mtu",)))
+        saves.append(planned_save(candidate, update_fields=("status", "accepted_at")))
+
+        plan = RendererMutationPlan.build(saves=saves, planned_at=candidate.accepted_at)
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+        with mutation as writer:
+            if interface_candidate is not None:
+                writer.save(interface_candidate, update_fields=("mtu",))
+            writer.save(candidate, update_fields=("status", "accepted_at"))
+        messages.success(request, f"Accepted {candidate}.")
+        return redirect(_device_nso_tab_url(candidate.management.device_id))
 
 
 class NSOVLANStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
