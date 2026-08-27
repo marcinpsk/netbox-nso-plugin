@@ -280,6 +280,24 @@ _CONVERTED_SCOPE_RULES = {
         ),
         manifest_scope_field="dest_protocol",
     ),
+    "route_policy": ScopeOwnershipRule(
+        scope="route_policy",
+        native_model_labels=(
+            "netbox_routing.prefixlist",
+            "netbox_routing.communitylist",
+            "netbox_routing.aspath",
+            "netbox_routing.routemap",
+        ),
+        native_key_fields=("name",),
+        overlay_model_labels=("netbox_nso_plugin.nsoroutepolicystate",),
+        overlay_native_fields=(("netbox_nso_plugin.nsoroutepolicystate", "assigned_object"),),
+        foreign_overlay_delete="reown",
+        deletion_authority=True,
+        intentional_semantic_delta=(
+            "Acquire from a persisted named policy root and its linked device overlay. Native root, entry, M2M, "
+            "and through-row events are not ownership evidence. Entries and references are graph dependencies."
+        ),
+    ),
     "isis": ScopeOwnershipRule(
         scope="isis",
         native_model_labels=(

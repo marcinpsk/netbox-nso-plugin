@@ -233,6 +233,12 @@ def rematerialize(state) -> None:
     separate, explicit operator Accept.  Runs under ``suppress_intent_push`` so the
     NetBox-object saves don't fire the operator-edit push handlers.
     """
+    if state._meta.label_lower == "netbox_nso_plugin.nsoroutepolicystate":
+        from .route_policy_reconciler import rematerialize_route_policy
+
+        rematerialize_route_policy(state)
+        return
+
     from . import status_machine as sm
     from .intent_state import intent_transaction, route_policy_footprint
     from .signals import suppress_intent_push
