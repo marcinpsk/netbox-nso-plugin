@@ -1691,6 +1691,8 @@ def _on_logging_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
+    if not _converted_writer_owns_content(device_id, "logging"):
+        return
     _schedule_intent_push((device_id, "logging"))
 
 

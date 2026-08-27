@@ -645,7 +645,7 @@ def _manifest_binding(instance):
         native_field = dict(rule.overlay_native_fields).get(label)
         if native_field is None:
             continue
-        native = getattr(instance, native_field, None)
+        native = instance if native_field == "__self__" else getattr(instance, native_field, None)
         management = getattr(instance, "management", None)
         if native is None or management is None:
             return None

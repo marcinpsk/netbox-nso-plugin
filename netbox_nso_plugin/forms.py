@@ -470,7 +470,24 @@ class NSOSnmpSystemInfoStateForm(NetBoxModelForm):
         fields = ["location", "contact", "tags"]
 
 
-class NSOLoggingHostStateForm(NetBoxModelForm):
+class _ExactOverlayFormMixin:
+    """Save one renderer overlay through its immutable exact plan."""
+
+    def save(self, commit=True):
+        from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
+
+        obj = super().save(commit=False)
+        if not commit:
+            return obj
+        plan = RendererMutationPlan.build(saves=(planned_save(obj),))
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+        with mutation as writer:
+            writer.save(obj)
+            self.save_m2m()
+        return obj
+
+
+class NSOLoggingHostStateForm(_ExactOverlayFormMixin, NetBoxModelForm):
     """Edit a remote syslog server overlay."""
 
     class Meta:
@@ -478,7 +495,7 @@ class NSOLoggingHostStateForm(NetBoxModelForm):
         fields = ["address", "port", "severity", "facility", "transport", "vrf", "source", "tags"]
 
 
-class NSOLoggingLevelStateForm(NetBoxModelForm):
+class NSOLoggingLevelStateForm(_ExactOverlayFormMixin, NetBoxModelForm):
     """Edit the per-device local logging severity levels overlay (console/monitor/module)."""
 
     class Meta:
