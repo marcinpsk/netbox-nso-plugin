@@ -1463,13 +1463,20 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
     # change-detection cache), then DELETE it — without a post_delete receiver no
     # push fires and the adapter keeps applying the deleted intent forever.
 
-    def _delete_pushes(self, row, patch_target, expect_empty_list=True):
+    def _delete_pushes(self, row, patch_target, expect_empty_list=True, exact_writer=False):
         """Delete *row* and assert the reduced snapshot push fired at the client boundary."""
         with (
             patch(f"netbox_nso_plugin.adapter_client.{patch_target}") as mock_put,
             self.captureOnCommitCallbacks(execute=True),
         ):
-            row.delete()
+            if exact_writer:
+                from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
+
+                plan = RendererMutationPlan.build(deletes=(planned_delete(row),))
+                with renderer_writes(plan) as writer:
+                    writer.delete(row)
+            else:
+                row.delete()
         mock_put.assert_called_once()
         if expect_empty_list:
             self.assertEqual(mock_put.call_args[0][1], [], "Deleted row must not appear in the push snapshot")
@@ -1764,7 +1771,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
                 timer="fast",
                 status="accepted",
             )
-        self._delete_pushes(row, "apply_lag_config")
+        self._delete_pushes(row, "apply_lag_config", exact_writer=True)
 
     def test_lacp_member_delete_pushes_reduced_snapshot(self):
         from dcim.models import Interface
@@ -1802,7 +1809,11 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             patch("netbox_nso_plugin.adapter_client.apply_lag_config") as mock_put,
             self.captureOnCommitCallbacks(execute=True),
         ):
-            member.delete()
+            from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
+
+            plan = RendererMutationPlan.build(deletes=(planned_delete(member),))
+            with renderer_writes(plan) as writer:
+                writer.delete(member)
         mock_put.assert_called_once()
 
     def test_switchport_delete_pushes_reduced_snapshot(self):

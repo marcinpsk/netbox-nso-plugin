@@ -61,6 +61,13 @@ def _is_intent_push_suppressed() -> bool:
     return getattr(_intent_push_suppressed, "active", False)
 
 
+def _converted_writer_owns_content(device_id, scope) -> bool:
+    """Return whether a converted behavior signal belongs to its explicit writer."""
+    from .renderer_writer import renderer_writer_owns_key
+
+    return renderer_writer_owns_key(device_id, scope, content=True)
+
+
 class suppress_intent_push:  # noqa: N801 — context-manager named like a verb on purpose
     """Context manager: silence intent-push signals for the duration of a reconcile.
 
@@ -2952,6 +2959,8 @@ def _on_lacp_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
+    if not _converted_writer_owns_content(device_id, "lacp"):
+        return
     _schedule_intent_push((device_id, "lacp"))
 
 

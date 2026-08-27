@@ -931,8 +931,15 @@ def gated_family_run(
             )
         elif isinstance(plan, MutationFootprint):
             plan = ReconcileMutationPlan(plan, detect_content_changes=True)
+        from .renderer_writer import RendererMutationPlan, renderer_mirror_writes, renderer_writes
 
-        with reconcile_transaction(plan):
+        if isinstance(plan, RendererMutationPlan):
+            mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+        else:
+            from .intent_state import reconcile_transaction
+
+            mutation = reconcile_transaction(plan)
+        with mutation:
             current_management = NSODeviceManagement.objects.select_for_update().get(pk=mgmt.pk)
             row = NSOFamilyReadState.objects.select_for_update().get(management=current_management, family=family)
             if not _locked_publication_matches(current_management, row, decision, epoch):
