@@ -210,6 +210,7 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
             "lacp",
             "l2_sap",
             "logging",
+            "ospf",
             "redistribution",
             "snmp",
             "static_route",
@@ -255,3 +256,17 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
             "source_ref",
         )
         assert rule.manifest_scope_field == "dest_protocol"
+
+    def test_ospf_rule_names_process_and_interface_native_identities(self):
+        from netbox_nso_plugin.ownership_planner import converted_scope_rules
+
+        rule = converted_scope_rules()["ospf"]
+
+        assert rule.native_model_labels == (
+            "netbox_routing.ospfinstance",
+            "netbox_routing.ospfinterface",
+        )
+        assert rule.native_key_fields_by_model == (
+            ("netbox_routing.ospfinstance", ("device_id", "process_id")),
+            ("netbox_routing.ospfinterface", ("interface_id",)),
+        )

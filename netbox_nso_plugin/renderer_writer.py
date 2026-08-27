@@ -715,6 +715,10 @@ def _manifest_binding(instance):
                 assigned_object_type=interface_type,
                 assigned_object_id=instance.interface_id,
             ).first()
+        elif native_field == "__ospf_interface__":
+            from netbox_routing.models import OSPFInterface
+
+            native = OSPFInterface.objects.filter(interface_id=instance.interface_id).first()
         else:
             native = getattr(instance, native_field, None)
         management = getattr(instance, "management", None)
@@ -730,7 +734,8 @@ def _manifest_binding(instance):
                 return [json_value(item) for item in value]
             return str(value)
 
-        native_key = {name: json_value(getattr(native, name)) for name in rule.native_key_fields}
+        key_fields = dict(rule.native_key_fields_by_model).get(native._meta.label_lower, rule.native_key_fields)
+        native_key = {name: json_value(getattr(native, name)) for name in key_fields}
         scope = getattr(instance, rule.manifest_scope_field) if rule.manifest_scope_field else rule.scope
         return rule, scope, management.device_id, native._meta.label_lower, native_key
     return None
