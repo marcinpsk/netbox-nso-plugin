@@ -11,6 +11,8 @@ from django.db.models.functions import Now
 from django.urls import reverse
 from netbox.models import NetBoxModel
 
+from .outbox import CONTRIBUTION_KIND_CHOICES, CONTRIBUTION_KIND_ORDINARY
+
 
 class AdapterConnection(NetBoxModel):
     """Singleton — URL and non-secret connection settings for the nso-adapter.
@@ -2980,6 +2982,11 @@ class NSOIntentOutboxEntry(models.Model):
 
     device = models.ForeignKey(to="dcim.Device", on_delete=models.CASCADE, related_name="nso_intent_outbox_entries")
     scope = models.CharField(max_length=32)
+    kind = models.CharField(
+        max_length=16,
+        choices=CONTRIBUTION_KIND_CHOICES,
+        default=CONTRIBUTION_KIND_ORDINARY,
+    )
     # ``txid_current()`` — provenance only: the fold is transaction-blind (OQ-O-9), so no
     # rule reads this. It groups the rows one transaction wrote, for an operator reading them.
     batch_id = models.BigIntegerField()

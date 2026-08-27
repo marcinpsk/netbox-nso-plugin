@@ -113,6 +113,37 @@ class TestClaimFoldsEveryEntryOnce(_ClaimCase):
         assert left == [0, 1], "the pass claims at most DRAIN_BATCH keys and leaves the rest"
 
 
+class TestRepairContributionsAreMarkingNeutral(_ClaimCase):
+    tag = "repairmark"
+    adapter_device_id = 7514
+
+    def test_a_repair_cannot_strip_an_ordinary_deletion_mark(self):
+        from netbox_nso_plugin import drain, outbox
+
+        enqueue(self.device, "vlan", delete_origin=True)
+        enqueue(self.device, "vlan", kind=outbox.CONTRIBUTION_KIND_REPAIR)
+
+        claimed = drain.claim(self.device.pk, "vlan")
+
+        assert claimed.mark is True
+        assert claimed.mark_any is True
+
+    def test_a_repair_only_claim_has_no_marking_partition(self):
+        from netbox_nso_plugin import drain, outbox
+
+        enqueue(
+            self.device,
+            "vlan",
+            delete_origin=True,
+            kind=outbox.CONTRIBUTION_KIND_REPAIR,
+        )
+
+        claimed = drain.claim(self.device.pk, "vlan")
+
+        assert claimed.mark is None
+        assert claimed.mark_any is False
+
+
 class TestCoalescedRoutePolicyClaimPreservesSuccessHook(_ClaimCase):
     tag = "routepolicyhook"
     adapter_device_id = 7513

@@ -67,13 +67,19 @@ class _CompactionCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestC
 
         NSOIntentOutboxEntry.objects.all().delete()
 
-    def append(self, *transitions, scope="static_route", delete_origin=False):
+    def append(self, *transitions, scope="static_route", delete_origin=False, kind="ordinary"):
         """One operator transaction's contribution, appended the way the choke point does."""
         from netbox_nso_plugin import outbox
         from netbox_nso_plugin.intent_state import content_mutation
 
         with content_mutation({(self.device.pk, scope)}):
-            outbox.enqueue(self.device.pk, scope, transitions=list(transitions), delete_origin=delete_origin)
+            outbox.enqueue(
+                self.device.pk,
+                scope,
+                transitions=list(transitions),
+                delete_origin=delete_origin,
+                kind=kind,
+            )
 
     def delete_of(self, route_id, *, last_acked=TRIPLE_A, current=TRIPLE_C):
         from netbox_nso_plugin import outbox
@@ -379,6 +385,32 @@ class TestTheReductionAppliesTheAlgebra(_CompactionCase):
         survivor = self.rows()[0]
         assert survivor.mark_and is False
         assert survivor.mark_any is True, "the evidence a marked contributor was downgraded is gone"
+
+    def test_compaction_preserves_kind_partitions_and_neutralizes_repair_marks(self):
+        from netbox_nso_plugin import drain, outbox
+
+        self.append(self.delete_of(4322), delete_origin=True)
+        self.append(self.delete_of(4323), delete_origin=True)
+        self.append(kind=outbox.CONTRIBUTION_KIND_REPAIR, delete_origin=True)
+        self.append(kind=outbox.CONTRIBUTION_KIND_REPAIR, delete_origin=False)
+
+        drain.compact(self.device.pk, "static_route")
+
+        rows = self.rows()
+        assert [row.kind for row in rows] == [
+            outbox.CONTRIBUTION_KIND_ORDINARY,
+            outbox.CONTRIBUTION_KIND_REPAIR,
+        ]
+        assert (rows[0].mark_and, rows[0].mark_any) == (True, True)
+        assert (rows[1].mark_and, rows[1].mark_any) == (False, False)
+
+    def test_one_row_in_each_kind_is_not_a_compaction_candidate(self):
+        from netbox_nso_plugin import drain, outbox
+
+        self.append(self.delete_of(4324))
+        self.append(kind=outbox.CONTRIBUTION_KIND_REPAIR)
+
+        assert (self.device.pk, "static_route") not in drain.compaction_candidates()
 
 
 class TestACompactedRowSendsWhatItsContributorsAuthorized(_CompactionCase):
