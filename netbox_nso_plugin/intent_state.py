@@ -44,6 +44,8 @@ SOURCE_MODEL_RANKS = (
     "dcim.device",
     "dcim.interface",
     "dcim.interface_tagged_vlans",
+    "vpn.l2vpn",
+    "vpn.l2vpntermination",
     "ipam.ipaddress",
     "vpn.l2vpn",
     "vpn.l2vpntermination",

@@ -168,6 +168,8 @@ class TestL2ServicesCategoryViewAndAccept(TestCase):
 
     def test_accept_marks_owned(self):
         self.client.force_login(self.user)
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision
         from netbox_nso_plugin.reconcile import reconcile_category
 
         with patch("netbox_nso_plugin.adapter_client.get_l2_services", return_value=_PAYLOAD):
@@ -181,6 +183,11 @@ class TestL2ServicesCategoryViewAndAccept(TestCase):
         st.refresh_from_db()
         assert st.accepted_at is not None
         assert st.status == "accepted"
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="l2_sap")
+        assert revision.verified_revision == revision.revision
+        assert revision.verified_fingerprint == delivery.canonical_fingerprint(
+            delivery.render("l2_sap", self.device.pk, self.mgmt.adapter_device_id).payload
+        )
 
     def test_reaccept_keeps_first_accepted_timestamp(self):
         self.client.force_login(self.user)

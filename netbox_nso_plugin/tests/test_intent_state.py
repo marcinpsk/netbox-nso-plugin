@@ -955,6 +955,8 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 "ipam.vlangroup",
                 "netbox_nso_plugin.nsoinstance",
                 "netbox_nso_plugin.nsoroutepolicyobjectclass",
+                "netbox_routing.bfdinterface",
+                "netbox_routing.bfdprofile",
                 "netbox_routing.staticroute_devices",
                 "vpn.l2vpn",
                 "vpn.l2vpntermination",
