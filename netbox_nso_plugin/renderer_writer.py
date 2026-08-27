@@ -16,6 +16,7 @@ from django.utils import timezone
 
 from .intent_state import (
     ABSENT,
+    OVERLAY_MODEL_RANKS,
     SOURCE_MODEL_RANKS,
     IntentMutationProtocolError,
     MutationFootprint,
@@ -324,7 +325,7 @@ def _plan_save(proposed: RendererSave, creation_refs, support_refs):
     label = instance._meta.label_lower
     spec = renderer_input_specs().get(label)
     before = _stored_instance(instance)
-    if spec is None:
+    if spec is None and label not in SOURCE_MODEL_RANKS:
         reference = creation_refs.get(id(instance))
         if before is not None or not proposed.force_insert or reference not in support_refs:
             raise IntentMutationProtocolError(f"{label} is not a registered renderer input")
@@ -354,6 +355,14 @@ def _plan_save(proposed: RendererSave, creation_refs, support_refs):
         before_values=() if before is None else _field_values(before, None),
         force_insert=proposed.force_insert,
     )
+    if spec is None:
+        if label not in SOURCE_MODEL_RANKS:
+            raise IntentMutationProtocolError(f"{label} is not a ranked native renderer dependency")
+        footprint = MutationFootprint.for_keys(
+            (),
+            source_rows=(SourceRow(label, None if before is None else before.pk),),
+        )
+        return write, footprint, set()
     base = MutationFootprint.merge(
         *(footprint_for_instance(candidate, spec) for candidate in (before, after) if candidate is not None)
     )
@@ -447,12 +456,34 @@ def _plan_delete(proposed: RendererDelete):
     instance = proposed.instance
     label = instance._meta.label_lower
     spec = renderer_input_specs().get(label)
-    if spec is None:
-        raise IntentMutationProtocolError(f"{label} is not a registered renderer input")
     before = _stored_instance(instance)
     if before is None:
         raise IntentMutationProtocolError(f"cannot plan deletion of missing {label} row {instance.pk!r}")
     writes, collector_footprint, changed_keys = _collector_writes(before)
+    if spec is None:
+        source_rows = []
+        overlay_rows = []
+        footprints = []
+        for write in writes:
+            if write.model_label in OVERLAY_MODEL_RANKS:
+                target = overlay_rows
+            elif write.model_label in SOURCE_MODEL_RANKS:
+                target = source_rows
+            else:
+                raise IntentMutationProtocolError(f"{write.model_label} is not a ranked native renderer dependency")
+            target.append(SourceRow(write.model_label, write.pk))
+            descendant_spec = renderer_input_specs().get(write.model_label)
+            if descendant_spec is None:
+                continue
+            descendant = apps.get_model(write.model_label)._default_manager.filter(pk=write.pk).first()
+            if descendant is None:
+                continue
+            footprints.append(deletion_footprint_for_instance(descendant))
+            dependency_footprint, dependency_changed = _dependencies(descendant, None, descendant_spec)
+            footprints.append(dependency_footprint)
+            changed_keys.update(_changed_keys(descendant, None, descendant_spec, dependency_changed))
+        footprints.append(MutationFootprint.for_keys((), source_rows=source_rows, overlay_rows=overlay_rows))
+        return writes, MutationFootprint.merge(collector_footprint, *footprints), changed_keys
     footprint = MutationFootprint.merge(
         deletion_footprint_for_instance(before),
         collector_footprint,
