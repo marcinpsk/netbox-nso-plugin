@@ -203,6 +203,7 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
 
         assert set(rules) == {
             "bfd",
+            "bgp",
             "interface",
             "interface_mtu",
             "ip",
@@ -289,3 +290,12 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
             ("netbox_nso_plugin.nsoisisinstancestate", "isis_instance"),
             ("netbox_nso_plugin.nsoisisinterfacestate", "isis_interface"),
         )
+
+    def test_bgp_rule_names_peer_root_and_keeps_graph_rows_as_dependencies(self):
+        from netbox_nso_plugin.ownership_planner import converted_scope_rules
+
+        rule = converted_scope_rules()["bgp"]
+
+        assert rule.native_model_labels == ("netbox_routing.bgppeer",)
+        assert rule.native_key_fields == ("scope_id", "peer_id", "name")
+        assert rule.overlay_native_fields == (("netbox_nso_plugin.nsobgppeerstate", "bgp_peer"),)

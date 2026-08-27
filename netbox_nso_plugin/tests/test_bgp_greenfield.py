@@ -1,13 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Greenfield BGP peers: an operator-created netbox_routing.BGPPeer under a managed
-device becomes an accepted NSOBGPPeerState (owned intent) and pushes; deleting it
-retracts. Real Django DB + real netbox_routing/ipam/dcim objects — no mocks except the
-adapter HTTP boundary (put_bgp_intent).
+"""Explicit and foreign BGP peer ownership behavior through real Django models.
 
-These tests are red without the native BGPPeer post_save/pre_delete signals: creating a
-BGPPeer would produce no overlay and no push, and deleting one would only SET_NULL the
-overlay FK (leaving the intent stranded on the device).
+The in-tab add workflow creates owned intent through one exact graph plan. Direct native
+events remain foreign and do not acquire or retire ownership. The adapter HTTP call is the
+only mocked boundary.
 """
 
 from __future__ import annotations
@@ -97,18 +94,14 @@ class BgpGreenfieldBase(IntentPushDeliveryMixin, TestCase):
 
 
 class TestBgpPeerGreenfieldCreate(BgpGreenfieldBase):
-    def test_create_owns_overlay_and_pushes(self):
-        mgmt = self._mgmt()
+    def test_foreign_native_create_does_not_acquire_or_push(self):
+        self._mgmt()
         scope = self._scope(self._router())
         ip = self._ip("10.0.0.2/32")
-        peer, mock_put = self._create_peer(scope, ip)
+        _peer, mock_put = self._create_peer(scope, ip)
 
-        state = NSOBGPPeerState.objects.get(management=mgmt, asn_str="65100", vrf_name="", peer_address_str="10.0.0.2")
-        self.assertEqual(state.status, "accepted")
-        self.assertIsNotNone(state.accepted_at)
-        self.assertEqual(state.bgp_peer_id, peer.pk)
-        self.assertEqual(state.remote_as_str, "65200")
-        mock_put.assert_called_once()
+        self.assertFalse(NSOBGPPeerState.objects.exists())
+        mock_put.assert_not_called()
 
     def test_peer_on_unmanaged_device_is_noop(self):
         # No NSODeviceManagement for this device → no overlay, no push.
@@ -119,27 +112,36 @@ class TestBgpPeerGreenfieldCreate(BgpGreenfieldBase):
         self.assertFalse(NSOBGPPeerState.objects.filter(peer_address_str="10.0.0.9").exists())
         mock_put.assert_not_called()
 
-    def test_edit_owned_peer_repushes(self):
-        self._mgmt()
+    def test_foreign_native_edit_does_not_repush_owned_overlay(self):
+        mgmt = self._mgmt()
         scope = self._scope(self._router())
         ip = self._ip("10.0.0.3/32")
         peer, _ = self._create_peer(scope, ip)
-        # Edit a field → re-push (the overlay stays owned; local_as change must reach the device).
+        state = NSOBGPPeerState.objects.create(
+            management=mgmt,
+            asn_str="65100",
+            vrf_name="",
+            peer_address_str="10.0.0.3",
+            bgp_peer=peer,
+            status="accepted",
+        )
         with (
             patch("netbox_nso_plugin.adapter_client.put_bgp_intent") as mock_put,
             self.captureOnCommitCallbacks(execute=True),
         ):
             peer.local_as = self.asn
             peer.save()
-        mock_put.assert_called_once()
+        state.refresh_from_db()
+        self.assertEqual(state.status, "accepted")
+        mock_put.assert_not_called()
 
     def test_edit_brownfield_peer_not_force_owned(self):
         """Editing a brownfield-adopted (imported, unowned) peer must NOT force-own it.
 
         The change surfaces via the 3-way reconcile as 'changed' for an explicit Accept —
         it is never auto-promoted to accepted or pushed. Guards the greenfield-only rule in
-        _accept_bgp_peer_for_device (without it, this edit would promote imported→accepted
-        and push)."""
+        the native save handler (without the foreign-write rule, this edit would promote
+        imported→accepted and push)."""
         from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
         from netbox_nso_plugin.signals import suppress_intent_push
 
@@ -175,9 +177,21 @@ class TestBgpPeerGreenfieldCreate(BgpGreenfieldBase):
         """The greenfield overlay key must equal reconcile's, so a later reconcile of the
         same peer reuses the one overlay (no duplicate) and preserves the accepted status."""
         mgmt = self._mgmt()
-        scope = self._scope(self._router())
         ip = self._ip("10.0.0.2/32")
-        self._create_peer(scope, ip)
+        from netbox_nso_plugin.views import NSOBgpPeerCreateView
+
+        with patch("netbox_nso_plugin.adapter_client.put_bgp_intent"), self.captureOnCommitCallbacks(execute=True):
+            NSOBgpPeerCreateView._create_peer(
+                self.device,
+                {
+                    "local_asn": self.asn,
+                    "peer": ip,
+                    "remote_as": self.remote_asn,
+                    "peer_local_as": self.asn,
+                    "enabled": True,
+                    "address_families": ["ipv4-unicast"],
+                },
+            )
         self.assertEqual(NSOBGPPeerState.objects.filter(management=mgmt).count(), 1)
 
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
@@ -215,12 +229,19 @@ class TestBgpPeerGreenfieldCreate(BgpGreenfieldBase):
 
 
 class TestBgpPeerGreenfieldDelete(BgpGreenfieldBase):
-    def test_delete_owned_peer_retracts(self):
+    def test_foreign_native_delete_detaches_overlay_without_push(self):
         mgmt = self._mgmt()
         scope = self._scope(self._router())
         ip = self._ip("10.0.0.2/32")
         peer, _ = self._create_peer(scope, ip)
-        self.assertTrue(NSOBGPPeerState.objects.filter(management=mgmt, peer_address_str="10.0.0.2").exists())
+        state = NSOBGPPeerState.objects.create(
+            management=mgmt,
+            asn_str="65100",
+            vrf_name="",
+            peer_address_str="10.0.0.2",
+            bgp_peer=peer,
+            status="imported",
+        )
 
         with (
             patch("netbox_nso_plugin.adapter_client.put_bgp_intent") as mock_put,
@@ -228,9 +249,9 @@ class TestBgpPeerGreenfieldDelete(BgpGreenfieldBase):
         ):
             peer.delete()
 
-        # Overlay gone (not merely SET_NULL) → reduced snapshot → retraction pushed.
-        self.assertFalse(NSOBGPPeerState.objects.filter(management=mgmt, peer_address_str="10.0.0.2").exists())
-        mock_put.assert_called_once()
+        state.refresh_from_db()
+        self.assertIsNone(state.bgp_peer_id)
+        mock_put.assert_not_called()
 
 
 class TestBgpPeerAddView(BgpGreenfieldBase):
