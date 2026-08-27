@@ -1825,7 +1825,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             ).exists()
         )
 
-    def test_l2_sap_delete_pushes_reduced_snapshot(self):
+    def test_foreign_l2_sap_delete_does_not_push(self):
         from netbox_nso_plugin.models import NSOL2SapState
 
         mgmt = self._mgmt()
@@ -1842,7 +1842,12 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
                 outer_tag=3999,
                 status="accepted",
             )
-        self._delete_pushes(row, "put_l2_sap_intent")
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_l2_sap_intent") as push,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            row.delete()
+        push.assert_not_called()
 
     def test_isis_flex_algo_delete_pushes_reduced_snapshot(self):
         from netbox_nso_plugin.models import NSOISISFlexAlgoState

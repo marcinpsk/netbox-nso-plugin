@@ -161,6 +161,19 @@ _CONVERTED_SCOPE_RULES = {
             "Native IP save and delete events are not ownership evidence. Reconcile activation and unassignment are atomic."
         ),
     ),
+    "l2_sap": ScopeOwnershipRule(
+        scope="l2_sap",
+        native_model_labels=("netbox_nso_plugin.nsol2sapstate",),
+        native_key_fields=("management_id", "service_name", "sap_id"),
+        overlay_model_labels=("netbox_nso_plugin.nsol2sapstate",),
+        overlay_native_fields=(("netbox_nso_plugin.nsol2sapstate", "__self__"),),
+        foreign_overlay_delete="reown",
+        deletion_authority=True,
+        intentional_semantic_delta=(
+            "Acquire from a persisted SAP overlay because the rendered SAP values live on that row. "
+            "VPN and termination mirrors do not establish ownership, and save events are not ownership evidence."
+        ),
+    ),
     "logging": ScopeOwnershipRule(
         scope="logging",
         native_model_labels=(

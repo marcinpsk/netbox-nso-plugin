@@ -5749,11 +5749,15 @@ class RoutingStateAcceptMixin(NSOActionPermissionMixin, View):
 class NSOL2SapStateAcceptView(NSOActionPermissionMixin, View):
     """Accept one Nokia L2 SAP — mark owned (accepted_at) so NetBox is the source of truth.
 
-    Saving the accepted row fires the post_save signal which pushes the device's full
-    L2 SAP intent snapshot to the adapter (write path), mirroring static routes.
+    The exact writer saves the accepted row, finalizes its fingerprint, and lets the
+    writer-gated signal schedule the device's complete L2 SAP intent snapshot.
     """
 
     def post(self, request, pk):  # noqa: D102
+        import copy
+
+        from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
         state = get_object_or_404(NSOL2SapState, pk=pk)
         if state.service_type not in ("epipe", "vpls"):
             messages.error(
@@ -5762,11 +5766,14 @@ class NSOL2SapStateAcceptView(NSOActionPermissionMixin, View):
                 "the current writer supports only epipe and vpls SAPs.",
             )
             return redirect(_device_nso_tab_url(state.management.device_id))
-        state.status = _status_after_accept(state.status)
-        if state.accepted_at is None:
-            state.accepted_at = timezone.now()
-        with transaction.atomic():
-            state.save(update_fields=["status", "accepted_at"])
+        candidate = copy.copy(state)
+        candidate.status = _status_after_accept(candidate.status)
+        if candidate.accepted_at is None:
+            candidate.accepted_at = timezone.now()
+        fields = ("status", "accepted_at")
+        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=fields),))
+        with renderer_writes(plan) as writer:
+            writer.save(candidate, update_fields=fields)
         messages.success(request, f"Accepted L2 SAP {state.service_name}:{state.sap_id}.")
         return redirect(_device_nso_tab_url(state.management.device_id))
 

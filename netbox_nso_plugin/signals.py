@@ -2661,8 +2661,13 @@ def _push_l2_sap_intent_for_device(device_id, adapter_device_id):
 
 @_skip_on_render
 def _on_l2_sap_state_save(sender, instance, **kwargs):
-    """Push L2 SAP intent whenever an NSOL2SapState row is saved."""
+    """Schedule L2 SAP intent only for an active exact content writer."""
     from .models import NSODeviceManagement
+    from .renderer_writer import active_renderer_writer
+
+    writer = active_renderer_writer()
+    if writer is None:
+        return
 
     try:
         mgmt = instance.management
@@ -2673,7 +2678,8 @@ def _on_l2_sap_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    _schedule_intent_push((device_id, "l2_sap"))
+    if _converted_writer_owns_content(device_id, "l2_sap"):
+        _schedule_intent_push((device_id, "l2_sap"))
 
 
 def lacp_member_intent_item(row):

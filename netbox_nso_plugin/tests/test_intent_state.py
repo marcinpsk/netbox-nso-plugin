@@ -723,7 +723,11 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 "netbox_nso_plugin.nsoinstance",
                 "netbox_nso_plugin.nsoroutepolicyobjectclass",
                 "netbox_routing.ospfinstance",
+                "netbox_routing.bfdinterface",
+                "netbox_routing.bfdprofile",
                 "netbox_routing.staticroute_devices",
+                "vpn.l2vpn",
+                "vpn.l2vpntermination",
             },
         )
         self.assertTrue(all(spec.required_trace_fixtures for spec in renderer_input_specs().values()))
