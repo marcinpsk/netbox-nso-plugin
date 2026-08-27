@@ -35,8 +35,7 @@ class TestStaticRouteContentTransition(IntentPushDeliveryMixin, TestCase):
         cls.device = _make_device("edit")
         cls.mgmt = _make_mgmt(cls.device, "edit", 8801)
 
-    def test_an_identity_edit_demotes_bumps_and_pushes(self):
-        """P2.1 — an in_sync row left in_sync is a green badge over content the device lacks."""
+    def test_a_foreign_identity_edit_does_not_mutate_the_overlay_or_push(self):
         with _fixtures():
             sr = _route("10.20.0.0/16", "10.0.0.1", devices=[self.device])
             state = _own(sr, self.mgmt, status="in_sync")
@@ -47,14 +46,11 @@ class TestStaticRouteContentTransition(IntentPushDeliveryMixin, TestCase):
             sr.save()
 
         state.refresh_from_db()
-        self.assertEqual(state.status, "accepted")
-        self.assertEqual(state.nso_next_hop, "10.0.0.2")
-        self.assertGreater(state.intent_generation, before)
+        self.assertEqual(state.status, "in_sync")
+        self.assertEqual(state.nso_next_hop, "10.0.0.1")
+        self.assertEqual(state.intent_generation, before)
         self.assertIsNotNone(state.generation_started_at)
-        put.assert_called_once()
-        route = put.call_args.args[1][0]
-        self.assertEqual(route["next_hop"], "10.0.0.2")
-        self.assertEqual(route["generation"], state.intent_generation)
+        put.assert_not_called()
 
     def test_a_deploying_row_is_demoted_too(self):
         """P2.2 — an apply in flight would otherwise settle the NEW intent from the OLD result."""
@@ -71,9 +67,7 @@ class TestStaticRouteContentTransition(IntentPushDeliveryMixin, TestCase):
         self.assertEqual(state.status, "accepted")
         self.assertEqual(state.accepted_at, accepted_at)
 
-    def test_the_vrf_mirror_is_written_by_the_transition(self):
-        """P2.3 — the residue key is the (vrf, prefix, next_hop) triple, so an empty nso_vrf
-        makes a VRF route's own device row read as residue."""
+    def test_a_foreign_edit_does_not_refresh_the_route_mirror(self):
         from ipam.models import VRF
 
         vrf = VRF.objects.create(name="TR-CUST-A")
@@ -86,12 +80,11 @@ class TestStaticRouteContentTransition(IntentPushDeliveryMixin, TestCase):
             sr.save()
 
         state.refresh_from_db()
-        self.assertEqual(state.nso_vrf, "TR-CUST-A")
+        self.assertEqual(state.nso_vrf, "")
         self.assertEqual(state.nso_prefix, "10.22.0.0/16")
-        self.assertEqual(state.nso_next_hop, "10.0.0.2")
+        self.assertEqual(state.nso_next_hop, "10.0.0.1")
 
-    def test_a_greenfield_accept_into_a_vrf_writes_the_vrf_mirror(self):
-        """P2.3 — the same grain on the assignment path, which never went through reconcile."""
+    def test_a_foreign_assignment_does_not_create_an_overlay(self):
         from ipam.models import VRF
 
         from netbox_nso_plugin.models import NSOStaticRouteState
@@ -103,13 +96,9 @@ class TestStaticRouteContentTransition(IntentPushDeliveryMixin, TestCase):
         with patch(PUT), self.captureOnCommitCallbacks(execute=True):
             sr.devices.add(self.device)
 
-        state = NSOStaticRouteState.objects.get(management=self.mgmt, static_route=sr)
-        self.assertEqual(state.nso_vrf, "TR-CUST-B")
-        self.assertGreater(state.intent_generation, 0)
-        self.assertIsNotNone(state.generation_started_at)
+        self.assertFalse(NSOStaticRouteState.objects.filter(management=self.mgmt, static_route=sr).exists())
 
-    def test_a_metric_only_edit_qualifies(self):
-        """P2.4 — "identity only" is a false green: a metric edit is unapplied content too."""
+    def test_a_foreign_metric_edit_does_not_mutate_the_overlay_or_push(self):
         with _fixtures():
             sr = _route("10.24.0.0/16", "10.0.0.1", devices=[self.device])
             state = _own(sr, self.mgmt, status="in_sync")
@@ -120,10 +109,9 @@ class TestStaticRouteContentTransition(IntentPushDeliveryMixin, TestCase):
             sr.save(update_fields=["metric"])
 
         state.refresh_from_db()
-        self.assertEqual(state.status, "accepted")
-        self.assertGreater(state.intent_generation, before)
-        put.assert_called_once()
-        self.assertEqual(put.call_args.args[1][0]["metric"], 7)
+        self.assertEqual(state.status, "in_sync")
+        self.assertEqual(state.intent_generation, before)
+        put.assert_not_called()
 
     def test_a_suppressed_content_save_is_refused_and_a_no_delta_save_does_nothing(self):
         """Suppression cannot hide rendered changes, and labels do not reach the wire."""
@@ -187,12 +175,10 @@ class TestStaticRouteContentTransition(IntentPushDeliveryMixin, TestCase):
         with patch(PUT) as put, self.captureOnCommitCallbacks(execute=True):
             fresh = StaticRoute.objects.create(prefix="10.27.0.0/16", next_hop="10.0.0.7", metric=1)
 
-        self.assertIsNone(fresh._nso_static_route_content)
+        self.assertFalse(hasattr(fresh, "_nso_static_route_content"))
         put.assert_not_called()
 
-    def test_a_b_a_in_one_transaction_transitions_twice(self):
-        """P2.7(a) — only the final generation is ever pushed, so the intermediate one is
-        invisible; dropping idempotence is what makes the design need no transaction identity."""
+    def test_foreign_a_b_a_edits_do_not_transition_the_overlay(self):
         from netbox_nso_plugin.models import NSOStaticRouteState
 
         with _fixtures():
@@ -208,14 +194,13 @@ class TestStaticRouteContentTransition(IntentPushDeliveryMixin, TestCase):
             sr.save()
 
         state.refresh_from_db()
-        self.assertGreater(middle, before)
-        self.assertGreater(state.intent_generation, middle)
+        self.assertEqual(middle, before)
+        self.assertEqual(state.intent_generation, before)
         self.assertEqual(state.nso_next_hop, "10.0.0.1")
-        self.assertEqual(state.status, "accepted")
-        put.assert_called_once()  # the drain sends the final state once
+        self.assertEqual(state.status, "in_sync")
+        put.assert_not_called()
 
-    def test_an_edit_clears_the_superseded_error_and_advisory(self):
-        """P2.11 — both describe a generation the operator has just replaced."""
+    def test_a_foreign_edit_preserves_the_overlay_error_and_advisory(self):
         with _fixtures():
             sr = _route("10.29.0.0/16", "10.0.0.1", devices=[self.device])
             state = _own(sr, self.mgmt, status="apply_failed")
@@ -228,9 +213,9 @@ class TestStaticRouteContentTransition(IntentPushDeliveryMixin, TestCase):
             sr.save()
 
         state.refresh_from_db()
-        self.assertEqual(state.status, "accepted")
-        self.assertEqual(state.last_apply_error, "")
-        self.assertEqual(state.last_result_advisory, "")
+        self.assertEqual(state.status, "apply_failed")
+        self.assertEqual(state.last_apply_error, "config-write-failed: no route to host")
+        self.assertEqual(state.last_result_advisory, "unproven: the reader could not be compared")
 
 
 class TestStaticRouteReAcceptBumps(IntentPushResetMixin, TestCase):
@@ -402,21 +387,21 @@ class TestStaticRouteBulkAcceptOutsideATransaction(_CascadeFlushMixin, IntentPus
         row a background reconcile has already re-classified is overwritten with `accepted`."""
         import contextlib
 
-        from netbox_nso_plugin import intent_state
+        from netbox_nso_plugin import renderer_writer
         from netbox_nso_plugin.tests._outbox_case import mirror_update
 
         state = self._drifted(1)[0]
-        original, injected = intent_state.intent_transaction, []
+        original, injected = renderer_writer.renderer_writes, []
 
         @contextlib.contextmanager
-        def _reclassify_then_lock(footprint):
+        def _reclassify_then_lock(plan):
             if not injected:
                 injected.append(True)
                 mirror_update(state, status="imported")
-            with original(footprint) as permit:
-                yield permit
+            with original(plan) as writer:
+                yield writer
 
-        with patch(PUT), patch("netbox_nso_plugin.intent_state.intent_transaction", _reclassify_then_lock):
+        with patch(PUT), patch("netbox_nso_plugin.renderer_writer.renderer_writes", _reclassify_then_lock):
             response = self._post()
 
         self.assertEqual(response.status_code, 302)
@@ -469,9 +454,7 @@ class TestStaticRouteTransitionFanOut(_CascadeFlushMixin, IntentPushResetMixin, 
         pushed = [call.args[0] for call in put.call_args_list]
         self.assertCountEqual(pushed, [8811, 8812])  # exactly one push per device
 
-    def test_a_bulk_edit_coalesces_to_one_push_per_device(self):
-        """P2.8 — three routes across two devices in one transaction is one PUT each, not six,
-        and every one of the six overlays is demoted and re-armed."""
+    def test_foreign_bulk_edits_do_not_mutate_overlays_or_push(self):
         from netbox_nso_plugin.models import NSOStaticRouteState
 
         routes = []
@@ -492,14 +475,12 @@ class TestStaticRouteTransitionFanOut(_CascadeFlushMixin, IntentPushResetMixin, 
                     sr.save(update_fields=["metric"])
 
         pushed = [call.args[0] for call in put.call_args_list]
-        self.assertCountEqual(pushed, [8811, 8812])
+        self.assertEqual(pushed, [])
         for state in NSOStaticRouteState.objects.filter(static_route__in=routes):
-            self.assertEqual(state.status, "accepted")
-            self.assertGreater(state.intent_generation, before[state.pk])
+            self.assertEqual(state.status, "in_sync")
+            self.assertEqual(state.intent_generation, before[state.pk])
 
-    def test_concurrent_edits_of_one_route_never_share_a_generation(self):
-        """P2.9(a)/(c) — two transactions edit the same shared route from opposite ends; both
-        must commit (the lock order is canonical) and neither may reuse the other's generation."""
+    def test_concurrent_foreign_edits_do_not_allocate_generations(self):
         from netbox_nso_plugin.models import NSOStaticRouteState
 
         with _fixtures():
@@ -539,13 +520,11 @@ class TestStaticRouteTransitionFanOut(_CascadeFlushMixin, IntentPushResetMixin, 
 
         self.assertEqual(errors, [])
         self.assertEqual(len(seen), 4)
-        self.assertEqual(len(set(seen)), 4)  # no generation is ever issued twice
-        self.assertTrue(all(value > highest for value in seen))
+        self.assertEqual(set(seen), {s1.intent_generation, s2.intent_generation})
+        self.assertTrue(all(value <= highest for value in seen))
         self._assert_put_patch_did_not_leak()
 
-    def test_a_re_added_overlay_outruns_every_generation_ever_issued(self):
-        """P2.9(b) — reusing a value an unconsumed result still carries would false-green the
-        new lifecycle; the allocator is plugin-global, not per row."""
+    def test_a_foreign_reassignment_does_not_recreate_an_overlay(self):
         from netbox_nso_plugin.models import NSOStaticRouteState
 
         with _fixtures():
@@ -555,21 +534,15 @@ class TestStaticRouteTransitionFanOut(_CascadeFlushMixin, IntentPushResetMixin, 
             with transaction.atomic():
                 sr.metric = 31
                 sr.save(update_fields=["metric"])
-        state.refresh_from_db()
-        highest = state.intent_generation
-
         with patch(PUT):
             with transaction.atomic():
                 NSOStaticRouteState.objects.filter(pk=state.pk).delete()
                 sr.devices.remove(self.d1)
                 sr.devices.add(self.d1)
 
-        recreated = NSOStaticRouteState.objects.get(management=self.mgmt1, static_route=sr)
-        self.assertGreater(recreated.intent_generation, highest)
+        self.assertFalse(NSOStaticRouteState.objects.filter(management=self.mgmt1, static_route=sr).exists())
 
-    def test_the_fan_out_reads_the_overlays_not_the_pre_set_membership(self):
-        """P2.12 — the fork's form writes the row and only THEN calls devices.set(), so at
-        post_save ``instance.devices`` still lists the pre-edit membership."""
+    def test_foreign_save_and_assignment_do_not_create_or_rearm_overlays(self):
         from netbox_nso_plugin.models import NSOStaticRouteState
 
         with _fixtures():
@@ -584,11 +557,9 @@ class TestStaticRouteTransitionFanOut(_CascadeFlushMixin, IntentPushResetMixin, 
                 sr.devices.set([self.d1, self.d2])  # the form's second step
 
         s1.refresh_from_db()
-        self.assertEqual(s1.status, "accepted")
-        self.assertGreater(s1.intent_generation, before)
-        s2 = NSOStaticRouteState.objects.get(management=self.mgmt2, static_route=sr)
-        self.assertEqual(s2.status, "accepted")
-        self.assertGreater(s2.intent_generation, 0)
+        self.assertEqual(s1.status, "in_sync")
+        self.assertEqual(s1.intent_generation, before)
+        self.assertFalse(NSOStaticRouteState.objects.filter(management=self.mgmt2, static_route=sr).exists())
 
     def test_an_edit_that_restores_the_value_a_concurrent_edit_replaced_still_transitions(self):
         """The baseline must be read under the same lock as the write. Two edits that both

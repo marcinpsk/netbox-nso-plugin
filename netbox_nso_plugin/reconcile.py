@@ -324,6 +324,7 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
         _reconcile_static_routes,
         isis_reconcile_plan,
         ospf_reconcile_plan,
+        static_route_reconcile_plan,
     )
 
     if not mgmt.manage_routing:
@@ -341,6 +342,7 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
                 ctx, "static_routes", mgmt, ("NSOStaticRouteState",), _reconcile_static_routes, device, static_doc
             ),
             epoch=dev_id,
+            pre_body=lambda: static_route_reconcile_plan(device, static_doc),
         )
     if mgmt.manage_isis:
         # R3-6: ONE isis document → ONE gate decision → ONE compound body driving
@@ -1113,6 +1115,8 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 pre_body=lambda: logging_reconcile_plan(device, log_doc),
             )
         elif key == "static":
+            from .template_content import static_route_reconcile_plan
+
             static_doc = client.get_static_routes(dev_id)
             _gated(
                 ctx,
@@ -1122,6 +1126,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: _reconcile_static_routes(device, static_doc),
                 epoch=dev_id,
                 ctx_key="static_routes",
+                pre_body=lambda: static_route_reconcile_plan(device, static_doc),
             )
         elif key == "isis":
             # R3-6: ONE document → ONE gate decision → ONE compound body.
