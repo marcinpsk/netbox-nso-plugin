@@ -4427,8 +4427,8 @@ def _clear_apply_attempt(obj, update_fields) -> None:
     update_fields.add("apply_attempt_id")
 
 
-def _save_owned_svi_edit(obj, old_values):
-    """Claim one edited SVI overlay through its exact writer plan."""
+def _save_owned_overlay_only_edit(obj, old_values):
+    """Claim one edited overlay that has no matching native write."""
     import copy
 
     from . import status_machine as sm
@@ -4457,8 +4457,8 @@ def _save_owned_svi_edit(obj, old_values):
 
 def _save_owned_overlay_edit(obj, key, old_values):
     """Claim an edited overlay and update its matching native NetBox object atomically."""
-    if key == "svi":
-        _save_owned_svi_edit(obj, old_values)
+    if key in {"svi", "subinterface"}:
+        _save_owned_overlay_only_edit(obj, old_values)
         return
 
     from . import status_machine as sm
@@ -6749,6 +6749,7 @@ class NSOSVIStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
 
 class NSOSubinterfaceStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOSubinterfaceState
+    renderer_scope = "subinterface"
 
     def push_blocker(self, state):
         """Refuse ownership when the full-replace serializer would omit the row."""

@@ -40,6 +40,32 @@ class TestSubinterfaceReconciler(TestCase):
             reconcile_subinterface(orphan, {"interfaces": [{"interface_name": "Gi0/1.100", "dot1q_vlan": 100}]}) == []
         )
 
+    def test_reconcile_preflights_native_and_overlay_creations(self):
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+        from netbox_nso_plugin.subinterface_reconciler import subinterface_reconcile_plan
+
+        plan = subinterface_reconcile_plan(
+            self.device,
+            {
+                "interfaces": [
+                    {
+                        "interface_name": "GigabitEthernet0/1.1627",
+                        "parent_interface": self.parent.name,
+                        "dot1q_vlan": 1627,
+                    }
+                ]
+            },
+        )
+
+        self.assertIsInstance(plan, RendererMutationPlan)
+        self.assertEqual(
+            [(write.operation, write.model_label) for write in plan.write_set],
+            [
+                ("save", "dcim.interface"),
+                ("save", "netbox_nso_plugin.nsosubinterfacestate"),
+            ],
+        )
+
     def test_creates_subinterface_with_parent_and_records_dot1q(self):
         from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
 
@@ -284,6 +310,27 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
         )
         self.assertEqual(NSOSubinterfaceState.objects.get(interface__name="ge-0/0/0.100").status, "accepted")
 
+    def test_foreign_overlay_save_does_not_schedule_subinterface_behavior(self):
+        from unittest.mock import patch
+
+        state = self._state(name="ge-0/0/0.1627", dot1q=1627, status="accepted")
+
+        with patch("netbox_nso_plugin.signals._schedule_intent_push") as schedule:
+            state.vrf = "FOREIGN"
+            state.save(update_fields=("vrf",))
+
+        schedule.assert_not_called()
+
+    def test_foreign_native_creation_does_not_acquire_subinterface_ownership(self):
+        interface = Interface.objects.create(
+            device=self.device,
+            name="ge-0/0/0.1628",
+            type="virtual",
+            parent=self.parent,
+        )
+
+        self.assertFalse(NSOSubinterfaceState.objects.filter(interface=interface).exists())
+
     def test_reconcile_preserves_owned_values_until_the_device_matches(self):
         """A refresh must compare device values without replacing pending NetBox intent."""
         from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
@@ -487,6 +534,9 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
 
         from django.contrib.auth import get_user_model
 
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOOwnershipManifest
+
         state = self._state(name="ge-0/0/0.300", dot1q=300, status="conflict")
         User = get_user_model()
         admin = User.objects.create_superuser(username="subif-admin", password="pw", email="s@x.y")  # noqa: S106
@@ -496,6 +546,18 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
         assert resp.status_code == 302
         state.refresh_from_db()
         assert state.status == "accepted" and state.accepted_at is not None
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="subinterface")
+        assert revision.verified_revision == revision.revision
+        assert revision.verified_fingerprint == delivery.canonical_fingerprint(
+            delivery.render("subinterface", self.device.pk, self.management.adapter_device_id).payload
+        )
+        assert NSOOwnershipManifest.objects.filter(
+            device=self.device,
+            scope="subinterface",
+            native_model_label="dcim.interface",
+            native_key={"device_id": state.interface.device_id, "name": state.interface.name},
+            ownership_state="owned",
+        ).exists()
 
     def test_accept_refuses_a_row_the_push_snapshot_would_skip(self):
         from django.contrib.auth import get_user_model
