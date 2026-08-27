@@ -135,6 +135,19 @@ _CONVERTED_SCOPE_RULES = {
             "Acquire from persisted per-interface BFD state. Save events are not ownership evidence."
         ),
     ),
+    "interface": ScopeOwnershipRule(
+        scope="interface",
+        native_model_labels=("dcim.interface",),
+        native_key_fields=("device_id", "name"),
+        overlay_model_labels=("netbox_nso_plugin.nsointerfacestate",),
+        overlay_native_fields=(("netbox_nso_plugin.nsointerfacestate", "interface"),),
+        foreign_overlay_delete="reown",
+        deletion_authority=True,
+        intentional_semantic_delta=(
+            "Acquire description and enabled intent from explicit persisted state changes. "
+            "Native interface and cable events are not ownership evidence and do not recompute derived values."
+        ),
+    ),
     "logging": ScopeOwnershipRule(
         scope="logging",
         native_model_labels=(

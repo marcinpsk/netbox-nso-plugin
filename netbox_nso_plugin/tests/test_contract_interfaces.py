@@ -21,7 +21,7 @@ from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer,
 from django.test import TestCase
 
 from netbox_nso_plugin.models import NSODerivedIntentTemplate, NSOInterfaceState
-from netbox_nso_plugin.template_content import _upsert_interface_states
+from netbox_nso_plugin.template_content import _upsert_interface_states, interface_reconcile_plan
 
 # Must match nso-adapter/tests/api/test_contract_interfaces.py exactly.
 # M27R added the logical-interface modeling keys (NULL for physical ports / Cisco / Junos).
@@ -112,6 +112,22 @@ class TestInterfacesContractConsumer(TestCase):
 
         # Persisted, not just returned.
         self.assertTrue(NSOInterfaceState.objects.filter(interface=self.iface, attribute="description").exists())
+
+    def test_reconcile_preflight_is_an_exact_renderer_plan(self):
+        """Preflight freezes the two overlay creations before the read-side write."""
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+
+        plan = interface_reconcile_plan(self.device, CONTRACT_PAYLOAD)
+
+        self.assertIsInstance(plan, RendererMutationPlan)
+        self.assertEqual(
+            [(write.operation, write.model_label) for write in plan.write_set],
+            [
+                ("save", "netbox_nso_plugin.nsointerfacestate"),
+                ("save", "netbox_nso_plugin.nsointerfacestate"),
+            ],
+        )
+        self.assertTrue(all(write.force_insert for write in plan.write_set))
 
     def test_owned_row_not_clobbered_by_adapter_imported(self):
         """Owned-guard: an adapter sync reporting 'imported' must not drop operator ownership.

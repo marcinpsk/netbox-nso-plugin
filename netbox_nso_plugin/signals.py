@@ -4,6 +4,7 @@
 
 import contextlib
 import contextvars
+import copy
 import functools
 import json
 import logging
@@ -1049,6 +1050,8 @@ def push_intent_on_accept(sender, instance, **kwargs):
     device_id = Interface.objects.filter(pk=instance.interface_id).values_list("device_id", flat=True).first()
     if device_id is None:
         return
+    if not _converted_writer_owns_content(device_id, "interface"):
+        return
     try:
         mgmt = NSODeviceManagement.objects.get(device_id=device_id)
     except NSODeviceManagement.DoesNotExist:
@@ -1082,7 +1085,7 @@ def _affected_interfaces(cable):
 
 
 def _recompute_one(interface, templates):
-    """Recompute the description for *interface* if it is managed by a sentinel.
+    """Recompute one managed description through an exact writer.
 
     Idempotent: no write if the current value already matches.
     """
@@ -1104,16 +1107,35 @@ def _recompute_one(interface, templates):
         return  # skip-logged inside compute_description
     if interface.description == new_value:
         return  # idempotent — terminates signal chain
-    interface.description = new_value
-    interface.save(update_fields=["description"])
+    candidate = copy.copy(interface)
+    candidate.description = new_value
+
+    from .renderer_writer import (
+        RendererMutationPlan,
+        active_renderer_writer,
+        planned_save,
+        renderer_mirror_writes,
+        renderer_writes,
+    )
+
+    active = active_renderer_writer()
+    if active is not None:
+        active.save(candidate, update_fields=("description",))
+        return
+    plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("description",)),))
+    mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+    with mutation as writer:
+        writer.save(candidate, update_fields=("description",))
 
 
 def _recompute_on_cable_change(sender, instance, **kwargs):
-    """Recompute descriptions for both ends of a cable after it is saved."""
+    """Recompute planned cable endpoints only for an active interface writer."""
     templates = _templates()
     if not templates:
         return
     for iface in _affected_interfaces(instance):
+        if not _converted_writer_owns_content(iface.device_id, "interface"):
+            continue
         _recompute_one(iface, templates)
 
 
@@ -1127,6 +1149,8 @@ def _recompute_on_cable_delete(sender, instance, **kwargs):
     if not templates:
         return
     for iface in _affected_interfaces(instance):
+        if not _converted_writer_owns_content(iface.device_id, "interface"):
+            continue
         # The termination objects retained by Django's post_delete signal still carry
         # the deleted cable's PK. NetBox's cached ``link_peers`` property would follow
         # that stale FK and raise Cable.DoesNotExist instead of seeing a disconnected
@@ -1138,9 +1162,13 @@ def _recompute_on_cable_delete(sender, instance, **kwargs):
 
 
 def _recompute_on_interface_save(sender, instance, created, **kwargs):
-    """Recompute description when an interface is saved (description may have changed)."""
-    if _is_adapter_origin_write():
-        return  # adapter import — not an operator edit; don't recompute derived intent
+    """Consume a preplanned derived description only for an exact interface writer."""
+    if (
+        _is_intent_push_suppressed()
+        or _is_adapter_origin_write()
+        or not _converted_writer_owns_content(instance.device_id, "interface")
+    ):
+        return
     templates = _templates()
     if not templates:
         return
@@ -1148,19 +1176,10 @@ def _recompute_on_interface_save(sender, instance, created, **kwargs):
 
 
 def _stash_interface_old_values(sender, instance, **kwargs):
-    """Capture native interface fields rendered by intent.
-
-    Lets :func:`_push_intent_on_interface_edit` tell which attribute the operator
-    actually changed. Without it, every save would promote *every* managed attribute
-    — so editing the description would silently own/accept ``enabled`` too (a value
-    the operator never accepted).
-    """
+    """Capture the owned scope targets of a planned interface rename."""
     if not instance.pk:
-        instance._nso_old_values = None
         instance._intent_rename_targets = set()
         return
-    fields = ("name", "description", "enabled")
-    instance._nso_old_values = sender.objects.filter(pk=instance.pk).values(*fields).first()
     instance._intent_rename_targets = set()
     update_fields = kwargs.get("update_fields")
     if (
@@ -1171,8 +1190,8 @@ def _stash_interface_old_values(sender, instance, **kwargs):
     ):
         return
 
-    current = instance._nso_old_values
-    if current is None or instance.name == current["name"]:
+    current_name = sender.objects.filter(pk=instance.pk).values_list("name", flat=True).first()
+    if current_name is None or instance.name == current_name:
         return
     from .apply_state import interface_intent_targets
 
@@ -1182,30 +1201,16 @@ def _stash_interface_old_values(sender, instance, **kwargs):
 
 @_skip_on_render
 def _repend_intent_on_interface_rename(sender, instance, created, **kwargs):
-    """Queue each scope whose payload contains a renamed interface."""
+    """Queue exact-writer scopes whose payload contains a renamed interface."""
     if created:
         return
     from . import delivery
-    from . import status_machine as sm
-    from .intent_state import interface_name_intent_rows
     from .models import NSODeviceManagement
 
     targets = getattr(instance, "_intent_rename_targets", set())
+    targets = {key for key in targets if _converted_writer_owns_content(*key)}
     if not targets:
         return
-    with suppress_intent_push():
-        for state in interface_name_intent_rows(instance.pk):
-            if not sm.is_owned(state.status):
-                continue
-            new_status = "accepted" if state.status == "deploying" else sm.on_reconcile(state.status, matches=False)
-            if new_status == state.status:
-                continue
-            state.status = new_status
-            update_fields = ["status"]
-            if state.status != "deploying" and getattr(state, "apply_attempt_id", None) is not None:
-                state.apply_attempt_id = None
-                update_fields.append("apply_attempt_id")
-            state.save(update_fields=update_fields)
     auto_apply = dict(
         NSODeviceManagement.objects.filter(device_id__in={device_id for device_id, _scope in targets}).values_list(
             "device_id", "auto_apply"
@@ -1220,74 +1225,15 @@ def _repend_intent_on_interface_rename(sender, instance, created, **kwargs):
 
 @_skip_on_render
 def _push_intent_on_interface_edit(sender, instance, created, **kwargs):
-    """Treat direct edits to description/enabled on managed interfaces as intent.
+    """Schedule explicit interface writer changes without acquiring in a signal.
 
-    Only the attribute(s) the operator actually CHANGED in this save are promoted —
-    determined by comparing against the pre-save snapshot captured in
-    :func:`_stash_interface_old_values`. A changed attribute becomes owned (NetBox
-    is the source of truth) and pending apply (its value now differs from the
-    device). Untouched attributes are left exactly as they were.
-
-    Decision G (activated in Phase 2): editing description/enabled on a managed
-    interface IS an intent change — identical to an explicit Accept action.
-
-    Adapter-origin writes (imports/applies) are skipped: importing a value is not
-    an operator accept, and re-promoting + pushing it back would both corrupt the
-    imported→accepted gate and, during a bulk sync, fire one full-device intent
-    push per interface (the device-27 sync wall).
+    The mutation planner owns the interface and overlay transition. The signal only
+    schedules behavior when that exact content writer is active. A foreign native
+    save is not ownership evidence and has no side effects.
     """
-    if created:
-        return  # new interface — nothing to accept yet
-
-    if _is_adapter_origin_write():
-        return  # import/apply, not an operator intent edit
-
-    old_values = getattr(instance, "_nso_old_values", None)
-    if old_values is None:
-        # No pre-save snapshot (signal not wired / programmatic save). Be
-        # conservative and own nothing, rather than risk adopting untouched
-        # attributes — the pre_save handler supplies this for every real edit.
+    if created or not _converted_writer_owns_content(instance.device_id, "interface"):
         return
-
-    from .models import NSODeviceManagement, NSOInterfaceState
-    from .summary import matches_device_value
-
-    try:
-        mgmt = NSODeviceManagement.objects.get(device_id=instance.device_id)
-    except NSODeviceManagement.DoesNotExist:
-        return
-
-    if mgmt.adapter_device_id is None:
-        return
-
-    now = timezone.now()
-    updated = False
-    for attribute in ("description", "enabled"):
-        if attribute not in mgmt.managed_attributes:
-            continue
-        new_value = instance.description if attribute == "description" else instance.enabled
-        if new_value == old_values.get(attribute):
-            continue  # operator did not change this attribute — leave it untouched
-        state = NSOInterfaceState.objects.filter(
-            interface=instance,
-            attribute=attribute,
-        ).first()
-        if state is None:
-            continue
-        # Operator changed this attribute → NetBox owns it. Whether it is "pending
-        # apply" depends on the value: editing it back to the device's value (e.g.
-        # flip enabled off then on) leaves nothing to apply → in_sync, not accepted.
-        state.status = "in_sync" if matches_device_value(attribute, new_value, state.nso_value) else "accepted"
-        if state.accepted_at is None:
-            state.accepted_at = now
-        state.save(update_fields=["status", "accepted_at"])
-        updated = True
-
-    if not updated:
-        return
-
-    device_id = instance.device_id
-    _schedule_intent_push((device_id, "interface"))
+    _schedule_intent_push((instance.device_id, "interface"))
 
 
 def _create_greenfield_subif_state(sender, instance, created, **kwargs):

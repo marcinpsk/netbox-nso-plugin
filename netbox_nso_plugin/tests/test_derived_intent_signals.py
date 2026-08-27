@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Tests for derived-intent signal wiring (Phase 5).
+"""Tests for derived-intent writer and signal behavior.
 
-Uses a real Django/NetBox DB.  Exercises _recompute_on_cable_change,
-_recompute_on_cable_delete, _recompute_on_interface_save, and the full
+Uses a real Django/NetBox DB. Exercises the exact recompute helper, foreign-neutral
+cable and interface signals, and the full
 loop-termination property via django.test.override_settings to inject
 sentinel templates into the AppConfig.
 """
@@ -178,7 +178,7 @@ class TestCableSignalHandlers(TestCase):
         cls.dev1 = _make_device("cblsig-dev1", dt, role, site)
         cls.dev2 = _make_device("cblsig-dev2", dt, role, site)
 
-    def test_cable_save_triggers_recompute(self):
+    def test_foreign_cable_save_does_not_recompute(self):
         iface1 = _make_iface(self.dev1, "Gi0/1-cbl")
         iface2 = _make_iface(self.dev2, "Gi0/2-cbl")
         iface1.description = "[auto]"
@@ -194,10 +194,10 @@ class TestCableSignalHandlers(TestCase):
 
         iface1_after = Interface.objects.get(pk=iface1.pk)
         iface2_after = Interface.objects.get(pk=iface2.pk)
-        self.assertEqual(iface1_after.description, "[auto] to cblsig-dev2:Gi0/2-cbl")
-        self.assertEqual(iface2_after.description, "[auto] to cblsig-dev1:Gi0/1-cbl")
+        self.assertEqual(iface1_after.description, "[auto]")
+        self.assertEqual(iface2_after.description, "[auto]")
 
-    def test_cable_delete_reverts_to_bare_sentinel(self):
+    def test_foreign_cable_delete_does_not_recompute(self):
         iface1 = _make_iface(self.dev1, "Gi0/3-cbl")
         iface2 = _make_iface(self.dev2, "Gi0/4-cbl")
         iface1.description = "[auto] to cblsig-dev2:Gi0/4-cbl"
@@ -211,12 +211,10 @@ class TestCableSignalHandlers(TestCase):
         cable_with_terms = Cable.objects.prefetch_related("terminations__termination").get(pk=cable.pk)
         cable_with_terms.delete()
 
-        # The real post-delete handler must recompute immediately; no later interface save
-        # should be required to clear the peer-derived suffix.
         iface1_final = Interface.objects.get(pk=iface1.pk)
         iface2_final = Interface.objects.get(pk=iface2.pk)
-        self.assertEqual(iface1_final.description, "[auto]")
-        self.assertEqual(iface2_final.description, "[auto]")
+        self.assertEqual(iface1_final.description, "[auto] to cblsig-dev2:Gi0/4-cbl")
+        self.assertEqual(iface2_final.description, "[auto] to cblsig-dev1:Gi0/3-cbl")
 
     def test_cable_handler_noop_when_feature_off(self):
         iface1 = _make_iface(self.dev1, "Gi0/5-off")
@@ -269,7 +267,7 @@ class TestInterfaceSaveHandler(TestCase):
         cls.dev1 = _make_device("ifsave-dev1", dt, role, site)
         cls.dev2 = _make_device("ifsave-dev2", dt, role, site)
 
-    def test_interface_save_triggers_recompute(self):
+    def test_foreign_interface_save_does_not_recompute(self):
         iface1 = _make_iface(self.dev1, "Gi0/1-ifs")
         iface2 = _make_iface(self.dev2, "Gi0/2-ifs")
         _make_cable(iface1, iface2)
@@ -282,7 +280,7 @@ class TestInterfaceSaveHandler(TestCase):
         _recompute_on_interface_save(sender=Interface, instance=iface1_fresh, created=False)
 
         iface1_after = Interface.objects.get(pk=iface1.pk)
-        self.assertEqual(iface1_after.description, "[auto] to ifsave-dev2:Gi0/2-ifs")
+        self.assertEqual(iface1_after.description, "[auto]")
 
     def test_interface_save_noop_when_feature_off(self):
         iface = _make_iface(self.dev1, "Gi0/3-off")

@@ -10,6 +10,7 @@ instances plus a sys.modules-injected fake `models` module, which bypassed exact
 queries — e.g. the OWNED-states filter — and so could not catch a regression in them.)
 """
 
+import copy
 import threading
 import unittest
 from types import SimpleNamespace
@@ -64,11 +65,22 @@ def _bulk_create_management_without_signals(rows):
 
 
 def _invoke_push_intent_on_accept(state):
-    from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
-    from netbox_nso_plugin.signals import push_intent_on_accept
+    from datetime import timedelta
 
-    with intent_transaction(footprint_for_instance(state)):
-        push_intent_on_accept(sender=type(state), instance=state)
+    from netbox_nso_plugin.renderer_writer import (
+        RendererMutationPlan,
+        planned_save,
+        renderer_mirror_writes,
+        renderer_writes,
+    )
+
+    candidate = copy.copy(state)
+    candidate.accepted_at = (candidate.accepted_at or timezone.now()) + timedelta(microseconds=1)
+    fields = ("accepted_at",)
+    plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=fields),))
+    mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+    with mutation as writer:
+        writer.save(candidate, update_fields=fields)
 
 
 def _invoke_interface_edit(interface):
@@ -972,6 +984,19 @@ class TestPushIntentOnAccept(_SignalDBBase):
 
         mock_put.assert_not_called()
 
+    def test_foreign_owned_overlay_save_does_not_schedule_interface_behavior(self):
+        """A registered row save is behavior-neutral without its exact writer."""
+        state = self._accepted_state(self.iface, "description", nso_value="uplink")
+
+        with (
+            patch("netbox_nso_plugin.signals._schedule_intent_push") as mock_schedule,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            state.status = "in_sync"
+            state.save(update_fields=["status"])
+
+        mock_schedule.assert_not_called()
+
     def test_skips_when_status_unowned_despite_stale_accepted_at(self):
         # Behavior change: ownership is status-based, NOT accepted_at. An attribute reverted/
         # drifted back to an unowned status keeps a stale accepted_at from a past acceptance
@@ -1080,7 +1105,7 @@ class TestPushIntentOnAccept(_SignalDBBase):
         mock_put.assert_not_called()
 
     def test_skips_unknown_attribute(self):
-        """An owned state with an attribute outside (description, enabled) is dropped."""
+        """An owned row outside the wire schema schedules no interface behavior."""
         self._make_mgmt(adapter_device_id=7)
         state = self._accepted_state(self.iface, "mtu", nso_value="1500")
 
@@ -1088,9 +1113,7 @@ class TestPushIntentOnAccept(_SignalDBBase):
             with self.captureOnCommitCallbacks(execute=True):
                 _invoke_push_intent_on_accept(state)
 
-        # put_intent is still called, but the unknown attribute was filtered out.
-        attrs = mock_put.call_args[0][1]
-        self.assertEqual(attrs, [])
+        mock_put.assert_not_called()
 
     def test_put_intent_error_is_swallowed(self):
         """put_intent raising AdapterError is caught and logged, not propagated."""
@@ -1116,12 +1139,18 @@ class TestSkipOnRenderGuard(_SignalDBBase):
 
     def _fire_with_method(self, method):
         """Drive push_intent_on_accept with current_request set to a real GET/POST/None."""
+        import uuid
+
+        from django.contrib.auth import get_user_model
         from netbox.context import current_request
 
         self._make_mgmt(adapter_device_id=7)
         state = self._accepted_state(self.iface, "description", nso_value="uplink")
 
         req = None if method is None else getattr(RequestFactory(), method.lower())("/")
+        if req is not None:
+            req.user = get_user_model().objects.create_user(username=f"render-{method.lower()}", password="x")
+            req.id = uuid.uuid4()
         token = current_request.set(req)
         try:
             with patch(f"{_MOD}.put_intent") as mock_put:
@@ -1426,15 +1455,11 @@ try:
 
             return NSOInterfaceState.objects.get(interface=self.iface, attribute="description")
 
-        def test_operator_edit_promotes_and_pushes(self):
-            """A normal (non-adapter) edit promotes imported→accepted and pushes intent.
-
-            (put_intent may fire more than once — the state's own post_save also
-            pushes — so assert it was called, not the exact count.)
-            """
+        def test_foreign_native_edit_does_not_acquire_or_push(self):
+            """A native save event is not persisted ownership evidence."""
             mock_put = self._fire(header=None)
-            self.assertEqual(self._state().status, "accepted")
-            mock_put.assert_called()
+            self.assertEqual(self._state().status, "imported")
+            mock_put.assert_not_called()
 
         def test_adapter_origin_edit_is_skipped(self):
             """An adapter-origin write (import header) does NOT promote or push."""
@@ -1468,8 +1493,7 @@ try:
             enabled_state.refresh_from_db()
             self.assertEqual(enabled_state.status, "imported")
             self.assertIsNone(enabled_state.accepted_at)
-            # the changed attribute (description) IS promoted
-            self.assertEqual(self._state().status, "accepted")
+            self.assertEqual(self._state().status, "imported")
 
     class TestGreenfieldOspfSignals(IntentPushDeliveryMixin, DjangoTestCase):
         """Operator-created netbox_routing OSPF → accepted overlays + OSPF intent push."""
@@ -1629,13 +1653,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             row = NSOSubinterfaceState.objects.create(
                 management=mgmt, interface=child, parent_interface=self.iface, dot1q_vlan=99, status="accepted"
             )
-        with (
-            patch("netbox_nso_plugin.adapter_client.put_subinterface_intent") as mock_put,
-            self.captureOnCommitCallbacks(execute=True),
-        ):
-            row.delete()
-        mock_put.assert_called_once()
-        self.assertEqual(mock_put.call_args[0][1], [])
+        self._delete_pushes(row, "put_subinterface_intent", exact_writer=True)
 
     def test_logging_host_delete_pushes_reduced_snapshot(self):
         from netbox_nso_plugin.models import NSOLoggingHostState
@@ -1669,13 +1687,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             row = NSOInterfaceMtuState.objects.create(
                 management=mgmt, interface=self.iface, l2_mtu=9000, status="accepted"
             )
-        with (
-            patch("netbox_nso_plugin.adapter_client.put_interface_mtu_intent") as mock_put,
-            self.captureOnCommitCallbacks(execute=True),
-        ):
-            row.delete()
-        mock_put.assert_called_once()
-        self.assertEqual(mock_put.call_args[0][1], [])
+        self._delete_pushes(row, "put_interface_mtu_intent", exact_writer=True)
 
     # ── #105 sweep: the 13 families that had post_save ONLY (f282e9e class) ──
     # Each red-first test: create an OWNED row (push #1 fires and warms the
@@ -1721,7 +1733,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
                 nso_value="owned-by-nso",
                 status="accepted",
             )
-        self._delete_pushes(row, "put_intent")
+        self._delete_pushes(row, "put_intent", exact_writer=True)
 
     def test_vlan_delete_pushes_reduced_snapshot(self):
         from ipam.models import VLAN

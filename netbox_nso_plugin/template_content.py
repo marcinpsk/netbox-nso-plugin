@@ -94,9 +94,8 @@ def _resolve_interface_attr_status(state, *, created, attr_name, iface, nso_valu
     return adapter_status, False
 
 
-@mirror_reconciler
-def _upsert_interface_states(device, interfaces: list) -> dict:
-    """Sync NSOInterfaceState rows from adapter interface data.
+def _interface_reconcile_operations(device, interfaces, planned_at):
+    """Build the exact interface-attribute writes used by preflight and apply.
 
     Returns a dict keyed by (interface_name, attribute) → NSOInterfaceState instance.
     Only updates fields that come from the adapter; never overwrites accepted_at.
@@ -114,6 +113,7 @@ def _upsert_interface_states(device, interfaces: list) -> dict:
 
     from .derived_intent import get_sentinel_templates
     from .models import NSOInterfaceState
+    from .renderer_writer import planned_save
 
     # Derived-intent templates (e.g. description-from-cable). A description whose NetBox
     # value matches one is NetBox intent BY DEFINITION (the plugin computes it from
@@ -124,6 +124,12 @@ def _upsert_interface_states(device, interfaces: list) -> dict:
     # Build name → Interface map for this device's interfaces in the DB
     iface_map = {i.name: i for i in Interface.objects.filter(device=device)}
 
+    current_by_key = {
+        (row.interface_id, row.attribute): row
+        for row in NSOInterfaceState.objects.filter(interface__device=device).order_by("pk")
+    }
+    saves = []
+    operations = []
     result: dict = {}
     for iface_data in interfaces or []:
         iface = iface_map.get(iface_data["name"])
@@ -143,10 +149,12 @@ def _upsert_interface_states(device, interfaces: list) -> dict:
                 except ValueError:
                     pass
 
-            state, created = NSOInterfaceState.objects.get_or_create(
-                interface=iface,
-                attribute=attr_name,
-                defaults={"status": status, "nso_value": nso_value},
+            current = current_by_key.get((iface.pk, attr_name))
+            created = current is None
+            state = (
+                NSOInterfaceState(interface=iface, attribute=attr_name, status=status, nso_value=nso_value)
+                if created
+                else copy.copy(current)
             )
             # Resolve the next status BEFORE overwriting it (ownership-aware — see helper).
             update_fields = []
@@ -163,7 +171,7 @@ def _upsert_interface_states(device, interfaces: list) -> dict:
                 state.status = new_status
                 update_fields.append("status")
             if promote and state.accepted_at is None:
-                state.accepted_at = timezone.now()
+                state.accepted_at = planned_at
                 update_fields.append("accepted_at")
             if state.nso_value != nso_value:
                 state.nso_value = nso_value
@@ -176,13 +184,56 @@ def _upsert_interface_states(device, interfaces: list) -> dict:
                 state.last_apply_error = last_apply_error
                 update_fields.append("last_apply_error")
             # Stamp last_sync_at
-            state.last_sync_at = timezone.now()
+            state.last_sync_at = planned_at
             update_fields.append("last_sync_at")
-            if update_fields:
-                state.save(update_fields=update_fields)
+            fields = None if created else tuple(update_fields)
+            saves.append(
+                planned_save(
+                    state,
+                    update_fields=fields,
+                    force_insert=created,
+                    natural_key=("interface", "attribute"),
+                )
+            )
+            operations.append((state, fields, created))
 
             result[(iface_data["name"], attr_name)] = state
 
+    return saves, operations, result
+
+
+def _interface_plan_and_operations(device, interfaces):
+    """Freeze one interface-attribute reconciliation before lock acquisition."""
+    from .renderer_writer import RendererMutationPlan
+
+    planned_at = timezone.now()
+    saves, operations, result = _interface_reconcile_operations(device, interfaces, planned_at)
+    return RendererMutationPlan.build(saves=saves, planned_at=planned_at), operations, result
+
+
+def interface_reconcile_plan(device, interfaces: list):
+    """Return the exact renderer mutation plan for interface attributes."""
+    plan, _operations, _result = _interface_plan_and_operations(device, interfaces)
+    return plan
+
+
+def _upsert_interface_states(device, interfaces: list) -> dict:
+    """Apply one frozen interface-attribute reconciliation."""
+    from .renderer_writer import active_renderer_writer, renderer_mirror_writes, renderer_writes
+    from .signals import suppress_intent_push
+
+    active = active_renderer_writer()
+    if active is None:
+        plan, operations, result = _interface_plan_and_operations(device, interfaces)
+    else:
+        plan = active.plan
+        _saves, operations, result = _interface_reconcile_operations(device, interfaces, plan.planned_at)
+    mutation = contextlib.nullcontext(active)
+    if active is None:
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+    with mutation as writer, suppress_intent_push():
+        for state, update_fields, force_insert in operations:
+            writer.save(state, update_fields=update_fields, force_insert=force_insert)
     return result
 
 

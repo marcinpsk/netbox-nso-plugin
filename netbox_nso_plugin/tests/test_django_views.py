@@ -1881,6 +1881,37 @@ class TestNSOAcceptDeviceView(ViewTestBase):
         self.assertEqual(self.iface_state.status, "in_sync")
 
 
+class TestNSOInterfaceStateDeleteView(ViewTestBase):
+    """The plugin delete endpoint executes the overlay removal as an own write."""
+
+    def test_delete_uses_exact_writer_and_pushes_reduced_snapshot(self):
+        mirror_update(self.mgmt, adapter_device_id=42)
+        content_bulk_update(self.iface_state, status="accepted", accepted_at=datetime.now(UTC))
+        url = reverse("plugins:netbox_nso_plugin:nsointerfacestate_delete", args=[self.iface_state.pk])
+
+        with patch("netbox_nso_plugin.adapter_client.put_intent") as mock_put:
+            with self.captureOnCommitCallbacks(execute=True):
+                response = self.client.post(url, {"confirm": "true"})
+
+        self.assertEqual(response.status_code, 302)
+        self.assertFalse(NSOInterfaceState.objects.filter(pk=self.iface_state.pk).exists())
+        mock_put.assert_called_once()
+        self.assertEqual(mock_put.call_args.args[1], [])
+
+    def test_delete_foreign_row_uses_mirror_writer_without_push(self):
+        mirror_update(self.mgmt, adapter_device_id=42)
+        content_bulk_update(self.iface_state, status="imported", accepted_at=None)
+        url = reverse("plugins:netbox_nso_plugin:nsointerfacestate_delete", args=[self.iface_state.pk])
+
+        with patch("netbox_nso_plugin.adapter_client.put_intent") as mock_put:
+            with self.captureOnCommitCallbacks(execute=True):
+                response = self.client.post(url, {"confirm": "true"})
+
+        self.assertEqual(response.status_code, 302)
+        self.assertFalse(NSOInterfaceState.objects.filter(pk=self.iface_state.pk).exists())
+        mock_put.assert_not_called()
+
+
 class TestNSOInterfaceEditFieldView(ViewTestBase):
     """Tests for NSOInterfaceEditFieldView (inline edit of description/enabled from the tab)."""
 

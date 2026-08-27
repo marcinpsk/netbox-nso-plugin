@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
+import copy
 import logging
 import re
 from dataclasses import dataclass
@@ -3846,6 +3847,72 @@ class NSOInterfaceStateBulkDeleteView(generic.BulkDeleteView):
     table = NSOInterfaceStateTable
     filterset = NSOInterfaceStateFilterSet
 
+    def post(self, request, **kwargs):
+        """Delete the confirmed frozen row set through one renderer plan."""
+        if "_confirm" not in request.POST:
+            return super().post(request, **kwargs)
+
+        from django.db.models import ProtectedError, RestrictedError
+        from django.utils.safestring import mark_safe
+        from django.utils.translation import gettext as _
+        from utilities.error_handlers import handle_protectederror
+        from utilities.exceptions import AbortRequest
+        from utilities.forms import BulkDeleteForm
+        from utilities.jobs import is_background_request, process_request_as_job
+
+        model = self.queryset.model
+        if request.POST.get("_all"):
+            queryset = model.objects.all()
+            if self.filterset is not None:
+                queryset = self.filterset(request.GET, queryset, request=request).qs
+        else:
+            queryset = self.queryset.filter(pk__in=[int(pk) for pk in request.POST.getlist("pk")])
+        form = BulkDeleteForm(model, request.POST)
+        if not form.is_valid():
+            return super().post(request, **kwargs)
+        if form.cleaned_data["background_job"]:
+            job_name = _("Bulk delete {count} {object_type}").format(
+                count=len(form.cleaned_data["pk"]),
+                object_type=model._meta.verbose_name_plural,
+            )
+            if process_request_as_job(self.__class__, request, name=job_name):
+                return redirect(self.get_return_url(request))
+
+        rows = list(queryset.order_by("pk"))
+        for obj in rows:
+            if hasattr(obj, "snapshot"):
+                obj.snapshot()
+            obj._changelog_message = form.cleaned_data.get("changelog_message")
+        try:
+            from .renderer_writer import (
+                RendererMutationPlan,
+                planned_delete,
+                renderer_mirror_writes,
+                renderer_writes,
+            )
+
+            plan = RendererMutationPlan.build(deletes=(planned_delete(obj) for obj in rows))
+            mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+            with mutation as writer:
+                for obj in rows:
+                    writer.delete(obj)
+                    if is_background_request(request):
+                        request.job.logger.info(f"Deleted {obj}")
+        except (ProtectedError, RestrictedError) as exc:
+            handle_protectederror(queryset, request, exc)
+        except AbortRequest as exc:
+            messages.error(request, mark_safe(exc.message))
+        else:
+            msg = _("Deleted {count} {object_type}").format(
+                count=len(rows),
+                object_type=model._meta.verbose_name_plural,
+            )
+            if is_background_request(request):
+                request.job.logger.info(msg)
+                return None
+            messages.success(request, msg)
+        return redirect(self.get_return_url(request))
+
 
 class NSOInterfaceStateView(generic.ObjectView):
     """Detail view for an NSOInterfaceState record."""
@@ -3858,6 +3925,52 @@ class NSOInterfaceStateDeleteView(generic.ObjectDeleteView):
 
     template_name = "netbox_nso_plugin/links_object_delete.html"
     queryset = NSOInterfaceState.objects.all()
+
+    def post(self, request, *args, **kwargs):
+        """Delete one state through its exact renderer plan."""
+        from django.db.models import ProtectedError, RestrictedError
+        from django.utils.safestring import mark_safe
+        from utilities.error_handlers import handle_protectederror
+        from utilities.exceptions import AbortRequest
+        from utilities.forms import DeleteForm
+
+        from .renderer_writer import RendererMutationPlan, planned_delete, renderer_mirror_writes, renderer_writes
+
+        obj = self.get_object(**kwargs)
+        form = DeleteForm(request.POST, instance=obj)
+        if not form.is_valid():
+            return render(
+                request,
+                self.template_name,
+                {
+                    "object": obj,
+                    "form": form,
+                    "return_url": self.get_return_url(request, obj),
+                    **self.get_extra_context(request, obj),
+                },
+            )
+
+        if hasattr(obj, "snapshot"):
+            obj.snapshot()
+        obj._changelog_message = form.cleaned_data.pop("changelog_message", "")
+        label = str(obj)
+        try:
+            plan = RendererMutationPlan.build(deletes=(planned_delete(obj),))
+            mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+            with mutation as writer:
+                writer.delete(obj)
+        except (ProtectedError, RestrictedError) as exc:
+            handle_protectederror([obj], request, exc)
+            return redirect(obj.get_absolute_url())
+        except AbortRequest as exc:
+            messages.error(request, mark_safe(exc.message))
+            return redirect(obj.get_absolute_url())
+
+        messages.success(request, f"Deleted {self.queryset.model._meta.verbose_name} {label}")
+        return_url = form.cleaned_data.get("return_url")
+        if return_url and return_url.startswith("/"):
+            return redirect(return_url)
+        return redirect(self.get_return_url(request, obj))
 
 
 # ── Accept workflow ───────────────────────────────────────────────────────────
@@ -3888,17 +4001,26 @@ class NSOAcceptAttributeView(NSOActionPermissionMixin, View):
         Accepting a value that matches the device → in_sync (nothing to apply);
         a differing value → accepted, and the post_save signal pushes intent.
         """
-        state = get_object_or_404(NSOInterfaceState, pk=pk)
-        state.status = _status_after_accept(state.status)
-        state.accepted_at = timezone.now()
-        with transaction.atomic():
-            state.save(update_fields=["status", "accepted_at"])
+        from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
-        msg = f"Accepted {state.attribute} on {state.interface}."
+        state = get_object_or_404(NSOInterfaceState, pk=pk)
+        candidate = copy.copy(state)
+        candidate.status = _status_after_accept(state.status)
+        candidate.accepted_at = timezone.now()
+        fields = ("status", "accepted_at")
+        plan = RendererMutationPlan.build(
+            saves=(planned_save(candidate, update_fields=fields),),
+            planned_at=candidate.accepted_at,
+        )
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+        with mutation as writer:
+            writer.save(candidate, update_fields=fields)
+
+        msg = f"Accepted {candidate.attribute} on {candidate.interface}."
         if request.headers.get("X-Requested-With") == "XMLHttpRequest":
             return JsonResponse({"status": "ok", "message": msg})
         messages.success(request, msg)
-        return redirect(_device_nso_tab_url(state.interface.device_id))
+        return redirect(_device_nso_tab_url(candidate.interface.device_id))
 
 
 class NSOAcceptDeviceView(NSOActionPermissionMixin, View):
@@ -3912,22 +4034,31 @@ class NSOAcceptDeviceView(NSOActionPermissionMixin, View):
 
     def post(self, request, pk):
         """Copy the device value onto the interface and mark the state in_sync."""
-        from .intent_state import footprint_for_instance, intent_transaction
+        from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
         from .signals import suppress_intent_push
 
         state = get_object_or_404(NSOInterfaceState, pk=pk)
         iface = state.interface
         dev_val = state.nso_value
-        with intent_transaction(footprint_for_instance(iface)), suppress_intent_push():
-            if state.attribute == "description":
-                iface.description = dev_val or ""
-                iface.save(update_fields=["description"])
-            elif state.attribute == "enabled":
-                iface.enabled = str(dev_val).lower() == "true"
-                iface.save(update_fields=["enabled"])
-            state.status = "in_sync"
-            state.accepted_at = timezone.now()
-            state.save(update_fields=["status", "accepted_at"])
+        iface_candidate = copy.copy(iface)
+        state_candidate = copy.copy(state)
+        saves = []
+        if state.attribute == "description":
+            iface_candidate.description = dev_val or ""
+            saves.append(planned_save(iface_candidate, update_fields=("description",)))
+        elif state.attribute == "enabled":
+            iface_candidate.enabled = str(dev_val).lower() == "true"
+            saves.append(planned_save(iface_candidate, update_fields=("enabled",)))
+        state_candidate.status = "in_sync"
+        state_candidate.accepted_at = timezone.now()
+        state_fields = ("status", "accepted_at")
+        saves.append(planned_save(state_candidate, update_fields=state_fields))
+        plan = RendererMutationPlan.build(saves=saves, planned_at=state_candidate.accepted_at)
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+        with mutation as writer, suppress_intent_push():
+            if state.attribute in {"description", "enabled"}:
+                writer.save(iface_candidate, update_fields=(state.attribute,))
+            writer.save(state_candidate, update_fields=state_fields)
 
         msg = f"Adopted device value for {state.attribute} on {iface}."
         if request.headers.get("X-Requested-With") == "XMLHttpRequest":
@@ -3939,33 +4070,51 @@ class NSOAcceptDeviceView(NSOActionPermissionMixin, View):
 class NSOInterfaceEditFieldView(NSOActionPermissionMixin, View):
     """Inline-edit a managed interface attribute (description / enabled) from the NSO tab.
 
-    Writes the new value onto the ``dcim.Interface`` and saves it, which fires the
-    Decision-G signal chain (:func:`signals._push_intent_on_interface_edit`) exactly
-    as editing the interface through the NetBox UI would: the attribute becomes
-    NetBox-owned intent and is pushed to the adapter. AJAX-only — returns JSON so the
-    tab's inline editor can refresh just the rows without collapsing the category.
+    One exact writer changes the native value and acquires the matching overlay.
+    AJAX returns JSON so the tab can refresh rows without collapsing the category.
     """
 
     _EDITABLE = ("description", "enabled")
     _TRUE = ("true", "1", "on", "yes")
 
     def post(self, request, pk):
-        """Apply the new value to the interface; Decision-G handles ownership + push."""
+        """Apply and acquire the new value through one frozen mutation plan."""
         state = get_object_or_404(NSOInterfaceState, pk=pk)
         attribute = state.attribute
         if attribute not in self._EDITABLE:
             return JsonResponse({"status": "error", "message": f"{attribute} is not editable here."}, status=400)
 
+        from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
+        from .summary import matches_device_value
+
         iface = state.interface
         raw = request.POST.get("value", "")
+        iface_candidate = copy.copy(iface)
         if attribute == "description":
-            iface.description = raw.strip()
+            iface_candidate.description = raw.strip()
         else:  # enabled
-            iface.enabled = raw.strip().lower() in self._TRUE
-        with transaction.atomic():
-            iface.save(update_fields=[attribute])
+            iface_candidate.enabled = raw.strip().lower() in self._TRUE
+        state_candidate = copy.copy(state)
+        new_value = getattr(iface_candidate, attribute)
+        state_candidate.status = (
+            "in_sync" if matches_device_value(attribute, new_value, state_candidate.nso_value) else "accepted"
+        )
+        if state_candidate.accepted_at is None:
+            state_candidate.accepted_at = timezone.now()
+        state_fields = ("status", "accepted_at")
+        plan = RendererMutationPlan.build(
+            saves=(
+                planned_save(iface_candidate, update_fields=(attribute,)),
+                planned_save(state_candidate, update_fields=state_fields),
+            ),
+            planned_at=state_candidate.accepted_at,
+        )
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+        with mutation as writer:
+            writer.save(iface_candidate, update_fields=(attribute,))
+            writer.save(state_candidate, update_fields=state_fields)
 
-        return JsonResponse({"status": "ok", "message": f"Updated {attribute} on {iface.name}."})
+        return JsonResponse({"status": "ok", "message": f"Updated {attribute} on {iface_candidate.name}."})
 
 
 def _unique_collision_response(obj, editable):
@@ -5135,24 +5284,28 @@ class NSOBulkAcceptView(NSOActionPermissionMixin, View):
         device = get_object_or_404(Device, pk=device_pk)  # 404 a bad pk BEFORE mutating anything
         now = timezone.now()
         base = NSOInterfaceState.objects.filter(interface__device_id=device_pk)
-        from .intent_state import MutationFootprint, footprint_for_instance, intent_transaction
+        from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
         candidates = list(base.filter(status__in=("imported", "changed")).order_by("pk"))
-        footprint = MutationFootprint.merge(*(footprint_for_instance(row) for row in candidates))
-        # One transaction for the ownership and the entry that records it: appended after
-        # the commit, the entry could be lost while the rows read as owned.
-        with intent_transaction(footprint):
-            updated = 0
-            for row in base.filter(pk__in=[candidate.pk for candidate in candidates]).order_by("pk"):
-                if row.status not in {"imported", "changed"}:
-                    continue
-                row.status = "in_sync" if row.status == "imported" else "accepted"
-                update_fields = {"status"}
-                if row.accepted_at is None:
-                    row.accepted_at = now
-                    update_fields.add("accepted_at")
-                row.save(update_fields=update_fields)
-                updated += 1
+        planned_candidates = []
+        for row in candidates:
+            candidate = copy.copy(row)
+            candidate.status = "in_sync" if row.status == "imported" else "accepted"
+            fields = ("status",)
+            if candidate.accepted_at is None:
+                candidate.accepted_at = now
+                fields = ("status", "accepted_at")
+            planned_candidates.append((candidate, fields))
+        plan = RendererMutationPlan.build(
+            saves=(planned_save(candidate, update_fields=fields) for candidate, fields in planned_candidates),
+            planned_at=now,
+        )
+        if planned_candidates:
+            mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+            with mutation as writer:
+                for candidate, fields in planned_candidates:
+                    writer.save(candidate, update_fields=fields)
+        updated = len(planned_candidates)
 
         if updated:
             messages.success(request, f"Accepted {updated} interface attribute(s).")
