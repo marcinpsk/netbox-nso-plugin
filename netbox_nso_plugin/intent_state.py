@@ -489,6 +489,7 @@ class RendererInputSpec:
     required_trace_fixtures: tuple[str, ...]
     fragment: Any
     shared_kind: str | None = None
+    dependency_resolver: Any = None
 
     @property
     def model(self):
@@ -695,7 +696,65 @@ def _lacp_member_fragment(instance):
 
     if instance.status not in ("accepted", "deploying", "in_sync"):
         return ABSENT
+    Bundle = apps.get_model("netbox_nso_plugin.nsolacpbundlestate")
+    if not Bundle.objects.filter(
+        management_id=instance.management_id,
+        interface_id=instance.lag_bundle_id,
+        status__in=("accepted", "deploying", "in_sync"),
+        vpc_sensitive=False,
+    ).exists():
+        return ABSENT
     return _normal(lacp_member_intent_item(instance))
+
+
+def _lacp_bundle_dependencies(before, after, spec):
+    """Resolve the member rows nested below a proposed LACP bundle write."""
+    Member = apps.get_model("netbox_nso_plugin.nsolacpmemberstate")
+    candidates = tuple(candidate for candidate in (before, after) if candidate is not None)
+    pairs = {(row.management_id, row.interface_id) for row in candidates}
+    members = tuple(
+        Member.objects.filter(management_id=management_id, lag_bundle_id=interface_id).order_by("pk")
+        for management_id, interface_id in sorted(pairs)
+    )
+    member_rows = tuple(member for queryset in members for member in queryset)
+    interface_ids = {
+        interface_id for row in candidates for interface_id in (row.interface_id,) if interface_id is not None
+    }
+    interface_ids.update(member.interface_id for member in member_rows)
+    return MutationFootprint.for_keys(
+        (key for row in candidates for key in spec.resolver(row, spec)),
+        source_rows=(SourceRow("dcim.interface", interface_id) for interface_id in interface_ids),
+        overlay_rows=(SourceRow(member._meta.label_lower, member.pk) for member in member_rows),
+    ), False
+
+
+def _lacp_member_dependencies(before, after, spec):
+    """Resolve both containing bundles for a proposed LACP member write."""
+    Bundle = apps.get_model("netbox_nso_plugin.nsolacpbundlestate")
+    candidates = tuple(candidate for candidate in (before, after) if candidate is not None)
+    management_ids = {row.management_id for row in candidates}
+    interface_ids = {
+        interface_id
+        for row in candidates
+        for interface_id in (row.interface_id, row.lag_bundle_id)
+        if interface_id is not None
+    }
+    bundles = tuple(
+        Bundle.objects.filter(
+            management_id__in=management_ids,
+            interface_id__in=interface_ids,
+        ).order_by("pk")
+    )
+    before_fragment = ABSENT if before is None else _lacp_member_fragment(before)
+    after_fragment = ABSENT if after is None else _lacp_member_fragment(after)
+    placement_changed = (None if before is None else (before.management_id, before.lag_bundle_id)) != (
+        None if after is None else (after.management_id, after.lag_bundle_id)
+    )
+    return MutationFootprint.for_keys(
+        (key for row in candidates for key in spec.resolver(row, spec)),
+        source_rows=(SourceRow("dcim.interface", interface_id) for interface_id in interface_ids),
+        overlay_rows=(SourceRow(bundle._meta.label_lower, bundle.pk) for bundle in bundles),
+    ), placement_changed and (before_fragment != ABSENT or after_fragment != ABSENT)
 
 
 def _switchport_fragment(instance):
@@ -1763,13 +1822,13 @@ def _revalidate_sources(footprint: MutationFootprint) -> None:
             )
 
 
-def _deploying_scope_rows(footprint: MutationFootprint) -> tuple[SourceRow, ...]:
+def _deploying_scope_rows(footprint: MutationFootprint, revision_keys=None) -> tuple[SourceRow, ...]:
     """Discover candidate Apply-in-flight rows after their revision locks are held."""
     from .apply_state import deploying_models
 
     models_by_scope = deploying_models()
     rows = []
-    for device_id, scope in footprint.revision_keys:
+    for device_id, scope in revision_keys if revision_keys is not None else footprint.revision_keys:
         model = models_by_scope.get(scope)
         if model is None:
             continue
@@ -1800,13 +1859,14 @@ def _still_deploying_rows(rows: tuple[SourceRow, ...]) -> tuple[SourceRow, ...]:
     return tuple(row for row in rows if row in current)
 
 
-def _bump_and_lock_deploying(footprint: MutationFootprint) -> tuple[SourceRow, ...]:
+def _bump_and_lock_deploying(footprint: MutationFootprint, revision_keys=None) -> tuple[SourceRow, ...]:
     """Advance locked revisions and lock the complete promoted scope."""
     from .outbox import bump_intent_revision
 
-    for device_id, scope in footprint.revision_keys:
+    revision_keys = tuple(footprint.revision_keys if revision_keys is None else revision_keys)
+    for device_id, scope in revision_keys:
         bump_intent_revision(device_id, scope)
-    deploying_rows = _deploying_scope_rows(footprint)
+    deploying_rows = _deploying_scope_rows(footprint, revision_keys)
     locked_overlay_rows = tuple(set(footprint.overlay_rows) | set(deploying_rows))
     _lock_rows(locked_overlay_rows, level=8, ranks=OVERLAY_MODEL_RANKS)
     return _still_deploying_rows(deploying_rows)
@@ -1838,6 +1898,7 @@ def _acquire(
     join_deployment_gate: bool = True,
     defer_repend: bool = False,
     capture_deploying: bool = False,
+    bump_keys=None,
 ) -> tuple[SourceRow, ...]:
     from .apply_state import (
         _enter_level,
@@ -1885,7 +1946,7 @@ def _acquire(
     for device_id, scopes in sorted(scopes_by_device.items()):
         lock_intent_revisions(device_id, scopes)
     if bump:
-        deploying_rows = _bump_and_lock_deploying(footprint)
+        deploying_rows = _bump_and_lock_deploying(footprint, bump_keys)
         if not defer_repend:
             _repend_locked_rows(deploying_rows)
         return deploying_rows
@@ -1929,12 +1990,7 @@ def _join_active_permit(
 
 
 @contextlib.contextmanager
-def _intent_transaction(
-    footprint: MutationFootprint,
-    *,
-    defer_repend: bool = False,
-    settles_deploying: bool = True,
-):
+def _intent_transaction(footprint: MutationFootprint, *, defer_repend: bool = False, bump_keys=None):
     """Acquire one content permit, optionally forcing its re-pend at body exit."""
     _discard_rolled_back_implicit_permit()
     active = _join_active_permit(footprint, settles_deploying=settles_deploying)
@@ -1951,7 +2007,7 @@ def _intent_transaction(
         )
         token = _ACTIVE_PERMIT.set(permit)
         try:
-            deploying_rows = _acquire(footprint, defer_repend=defer_repend)
+            deploying_rows = _acquire(footprint, defer_repend=defer_repend, bump_keys=bump_keys)
             yield permit
             if defer_repend and permit.settles_deploying and deploying_rows:
                 _repend_locked_rows(deploying_rows)
@@ -2310,6 +2366,9 @@ def _suppressed_permit(instance, spec, before, after, update_fields, footprint_o
 
 def _authorize_active_write(active, sender, instance, spec, *, deleting, update_fields):
     """Validate one nested registered write against the current immutable permit."""
+    from .renderer_writer import active_renderer_writer
+
+    writer = active_renderer_writer()
     if active.dml_kind == "mirror":
         requested = frozenset(update_fields or ())
         if (
@@ -2337,7 +2396,7 @@ def _authorize_active_write(active, sender, instance, spec, *, deleting, update_
                 raise IntentMutationProtocolError(
                     f"read-side {sender._meta.label_lower} write changes rendered content"
                 )
-    elif not _content_permit_covers(instance, spec, active):
+    elif writer is None and not _content_permit_covers(instance, spec, active):
         before = canonical_fragment(instance, spec) if deleting else _database_fragment(instance, spec)
         after = ABSENT if deleting else _effective_after_fragment(instance, spec, update_fields)
         if before != after:
@@ -2366,6 +2425,9 @@ def _begin_implicit(
         return
     active = _ACTIVE_PERMIT.get()
     if active is not None:
+        from .renderer_writer import require_planned_signal_write
+
+        require_planned_signal_write(instance, deleting=deleting, update_fields=update_fields)
         _authorize_active_write(
             active,
             sender,
@@ -2543,6 +2605,17 @@ def _begin_m2m_implicit(sender, instance, action, **kwargs):
         return
     _discard_rolled_back_implicit_permit()
     label = sender._meta.label_lower
+    if not kwargs.get("reverse", False):
+        from .renderer_writer import active_renderer_writer, require_planned_m2m_signal
+
+        if active_renderer_writer() is not None:
+            field_name = next(
+                (field.name for field in instance._meta.many_to_many if field.remote_field.through is sender),
+                None,
+            )
+            if field_name is None:
+                raise IntentMutationProtocolError("the active writer cannot resolve the M2M field")
+            require_planned_m2m_signal(instance, action, field_name, kwargs.get("pk_set"))
     static_route_assignment = label == "netbox_routing.staticroute_devices"
     spec = None if static_route_assignment else _REGISTRY[label]
     token_key = (id(instance), label)
@@ -3006,6 +3079,7 @@ def register_renderer_input(spec: RendererInputSpec, *, connect_ends: bool = Tru
         required_trace_fixtures=tuple(spec.required_trace_fixtures),
         fragment=spec.fragment,
         shared_kind=spec.shared_kind,
+        dependency_resolver=spec.dependency_resolver,
     )
     _REGISTRY[label] = normalized
     _TABLE_REGISTRY[model._meta.db_table] = normalized
@@ -3210,6 +3284,7 @@ def register_builtin_renderer_inputs(*, connect_ends: bool = True) -> None:
     _REGISTRY["netbox_nso_plugin.nsolacpbundlestate"] = replace(
         _REGISTRY["netbox_nso_plugin.nsolacpbundlestate"],
         fragment=_lacp_bundle_fragment,
+        dependency_resolver=_lacp_bundle_dependencies,
     )
     _TABLE_REGISTRY[_REGISTRY["netbox_nso_plugin.nsolacpbundlestate"].table] = _REGISTRY[
         "netbox_nso_plugin.nsolacpbundlestate"
@@ -3237,7 +3312,12 @@ def register_builtin_renderer_inputs(*, connect_ends: bool = True) -> None:
         "netbox_nso_plugin.nsoswitchportstate": _switchport_fragment,
     }
     for label, fragment in exact_direct_fragments.items():
-        _REGISTRY[label] = replace(_REGISTRY[label], fragment=fragment)
+        dependency_resolver = _lacp_member_dependencies if label == "netbox_nso_plugin.nsolacpmemberstate" else None
+        _REGISTRY[label] = replace(
+            _REGISTRY[label],
+            fragment=fragment,
+            dependency_resolver=dependency_resolver,
+        )
         _TABLE_REGISTRY[_REGISTRY[label].table] = _REGISTRY[label]
     _REGISTRY["netbox_nso_plugin.nsointerfacestate"] = replace(
         _REGISTRY["netbox_nso_plugin.nsointerfacestate"],
