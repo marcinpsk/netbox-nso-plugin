@@ -50,6 +50,7 @@ class ScopeOwnershipRule:
     intentional_semantic_delta: str
     acknowledged_lineage_field: str | None = None
     manifest_scope_field: str | None = None
+    native_key_fields_by_model: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
 
 _CONVERTED_SCOPE_RULES = {
@@ -265,6 +266,32 @@ _CONVERTED_SCOPE_RULES = {
             "save events are not ownership evidence. The manifest delivery scope comes from the destination protocol."
         ),
         manifest_scope_field="dest_protocol",
+    ),
+    "ospf": ScopeOwnershipRule(
+        scope="ospf",
+        native_model_labels=(
+            "netbox_routing.ospfinstance",
+            "netbox_routing.ospfinterface",
+        ),
+        native_key_fields=(),
+        native_key_fields_by_model=(
+            ("netbox_routing.ospfinstance", ("device_id", "process_id")),
+            ("netbox_routing.ospfinterface", ("interface_id",)),
+        ),
+        overlay_model_labels=(
+            "netbox_nso_plugin.nsoospfinstancestate",
+            "netbox_nso_plugin.nsoospfinterfacestate",
+        ),
+        overlay_native_fields=(
+            ("netbox_nso_plugin.nsoospfinstancestate", "ospf_instance"),
+            ("netbox_nso_plugin.nsoospfinterfacestate", "__ospf_interface__"),
+        ),
+        foreign_overlay_delete="reown",
+        deletion_authority=True,
+        intentional_semantic_delta=(
+            "Acquire from a persisted native process or interface and its overlay. Native and overlay save events "
+            "are not ownership evidence. A shared OSPF area is a dependency, not a device-owned object."
+        ),
     ),
 }
 

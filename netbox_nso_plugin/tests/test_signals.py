@@ -1476,8 +1476,8 @@ try:
             self.assertIsNone(enabled_state.accepted_at)
             self.assertEqual(self._state().status, "imported")
 
-    class TestGreenfieldOspfSignals(IntentPushDeliveryMixin, DjangoTestCase):
-        """Operator-created netbox_routing OSPF → accepted overlays + OSPF intent push."""
+    class TestForeignOspfSignals(IntentPushDeliveryMixin, DjangoTestCase):
+        """Foreign native OSPF writes remain outside ownership and delivery."""
 
         @classmethod
         def setUpTestData(cls):
@@ -1505,7 +1505,7 @@ try:
             )
 
         @patch("netbox_nso_plugin.adapter_client.put_ospf_intent")
-        def test_create_ospf_iface_owns_overlays_and_pushes(self, mock_put):
+        def test_create_ospf_graph_does_not_acquire_or_push(self, mock_put):
             from netbox_routing.models import OSPFArea, OSPFInstance, OSPFInterface
 
             from netbox_nso_plugin.models import NSOOSPFInstanceState, NSOOSPFInterfaceState
@@ -1517,21 +1517,9 @@ try:
                 area = OSPFArea.objects.create(area_id="0", area_type="standard")
                 OSPFInterface.objects.create(instance=inst, area=area, interface=self.iface, cost=100)
 
-            inst_state = NSOOSPFInstanceState.objects.get(management__device=self.device, process_id="1")
-            self.assertEqual(inst_state.status, "accepted")
-            iface_state = NSOOSPFInterfaceState.objects.get(management__device=self.device, interface=self.iface)
-            self.assertEqual(iface_state.status, "accepted")
-            self.assertEqual(iface_state.area_id, "0")
-            self.assertEqual(iface_state.process_id, "1")
-            self.assertEqual(iface_state.cost, 100)
-
-            self.assertTrue(mock_put.called)
-            _, payload = mock_put.call_args[0]
-            iface_entry = next(i for i in payload["interfaces"] if i["interface_name"] == "LAG99:99")
-            self.assertEqual(iface_entry["area_id"], "0")
-            self.assertEqual(iface_entry["process_id"], "1")
-            self.assertEqual(iface_entry["cost"], 100)
-            self.assertTrue(any(i["process_id"] == "1" for i in payload["instances"]))
+            self.assertFalse(NSOOSPFInstanceState.objects.exists())
+            self.assertFalse(NSOOSPFInterfaceState.objects.exists())
+            mock_put.assert_not_called()
 
 except ImportError:
     pass  # Outside devcontainer — Django not available; tests skipped
@@ -1951,7 +1939,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             row = NSOOSPFInstanceState.objects.create(
                 management=mgmt, process_id="999", ospf_instance=None, status="accepted"
             )
-        self._delete_pushes(row, "put_ospf_intent", expect_empty_list=False)
+        self._delete_pushes(row, "put_ospf_intent", expect_empty_list=False, exact_writer=True)
 
     def test_ospf_interface_delete_pushes_reduced_snapshot(self):
         from netbox_nso_plugin.models import NSOOSPFInterfaceState
@@ -1961,7 +1949,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             row = NSOOSPFInterfaceState.objects.create(
                 management=mgmt, interface=self.iface, process_id="10", area_id="0.0.0.0", status="accepted"
             )
-        self._delete_pushes(row, "put_ospf_intent", expect_empty_list=False)
+        self._delete_pushes(row, "put_ospf_intent", expect_empty_list=False, exact_writer=True)
 
     def test_lacp_bundle_delete_pushes_reduced_snapshot(self):
         """LACP rides the direct-apply path and is auto_apply-gated on save; deletion

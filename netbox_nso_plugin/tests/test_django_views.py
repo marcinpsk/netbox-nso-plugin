@@ -4148,7 +4148,7 @@ class TestOverlayFieldEditView(ViewTestBase):
     def test_edit_ospf_interface_updates_overlay_and_native_object(self):
         from netbox_routing.models import OSPFArea, OSPFInstance, OSPFInterface
 
-        from netbox_nso_plugin.models import NSOOSPFInterfaceState
+        from netbox_nso_plugin.models import NSOOSPFInterfaceState, NSOOwnershipManifest
 
         instance = OSPFInstance.objects.create(
             device=self.device,
@@ -4196,6 +4196,15 @@ class TestOverlayFieldEditView(ViewTestBase):
         )
         self.assertEqual(native.area.area_id, "0.0.0.1")
         self.assertEqual((native.network_type, native.cost, native.passive), ("point-to-point", 25, True))
+        self.assertTrue(
+            NSOOwnershipManifest.objects.filter(
+                device=self.device,
+                scope="ospf",
+                native_model_label="netbox_routing.ospfinterface",
+                native_key={"interface_id": self.interface.pk},
+                ownership_state="owned",
+            ).exists()
+        )
 
     def test_edit_ospf_interface_rejects_invalid_config_without_writing(self):
         from netbox_routing.models import OSPFArea, OSPFInstance, OSPFInterface
@@ -4244,7 +4253,7 @@ class TestOverlayFieldEditView(ViewTestBase):
     def test_edit_ospf_instance_router_id_updates_native_object(self):
         from netbox_routing.models import OSPFInstance
 
-        from netbox_nso_plugin.models import NSOOSPFInstanceState
+        from netbox_nso_plugin.models import NSOOSPFInstanceState, NSOOwnershipManifest
 
         native = OSPFInstance.objects.create(
             device=self.device,
@@ -4271,6 +4280,15 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(row.router_id, "192.0.2.10")
         self.assertEqual(str(native.router_id), "192.0.2.10")
         self.assertEqual(row.status, "accepted")
+        self.assertTrue(
+            NSOOwnershipManifest.objects.filter(
+                device=self.device,
+                scope="ospf",
+                native_model_label="netbox_routing.ospfinstance",
+                native_key={"device_id": self.device.pk, "process_id": "9"},
+                ownership_state="owned",
+            ).exists()
+        )
 
     def test_edit_isis_interface_updates_overlay_and_native_object(self):
         from netbox_routing.models import ISISInstance, ISISInterface

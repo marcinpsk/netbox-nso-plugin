@@ -4554,46 +4554,74 @@ def _save_owned_redistribution_edit(obj, old_values):
         writer.save(candidate, update_fields=state_fields)
 
 
-def _sync_native_ospf_instance(obj):
-    """Keep the native OSPF instance aligned with an edited overlay."""
-    from .signals import suppress_intent_push
-
-    native = obj.ospf_instance
-    vrf_model = native._meta.get_field("vrf").remote_field.model
-    vrf = vrf_model.objects.filter(name=obj.vrf).first() if obj.vrf else None
-    native.router_id = obj.router_id
-    native.vrf = vrf
-    with suppress_intent_push():
-        native.save(update_fields=["router_id", "vrf"])
-
-
-def _sync_native_ospf_interface(obj):
-    """Mirror the whole owned overlay row into its native OSPF interface."""
+def _save_owned_ospf_edit(obj, key, old_values):
+    """Apply one OSPF process or interface edit through an exact plan."""
     from netbox_routing.models import OSPFArea, OSPFInstance, OSPFInterface
 
-    from .signals import suppress_intent_push
-    from .template_content import _OSPF_AUTH_MAP, _resolve_ospf_area
+    from . import status_machine as sm
+    from .ospf_reconciler import _area_candidates
+    from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+    from .template_content import _OSPF_AUTH_MAP
 
-    native = OSPFInterface.objects.get(interface=obj.interface)
-    native.instance = OSPFInstance.objects.get(device=obj.interface.device, process_id=obj.process_id)
-    native.area = _resolve_ospf_area(OSPFArea, obj.area_id)
-    native.passive = obj.passive
-    native.priority = obj.priority
-    native.cost = obj.cost
-    native.network_type = obj.network_type or None
-    native.authentication = _OSPF_AUTH_MAP.get(obj.auth_type or "")
-    with suppress_intent_push():
-        native.save(
-            update_fields=[
-                "instance",
-                "area",
-                "passive",
-                "priority",
-                "cost",
-                "network_type",
-                "authentication",
-            ]
+    planned_at = timezone.now()
+    saves = []
+    operations = []
+    if key == "ospf_instance":
+        native = copy.copy(obj.ospf_instance)
+        vrf_model = native._meta.get_field("vrf").remote_field.model
+        native.router_id = obj.router_id
+        native.vrf = vrf_model.objects.filter(name=obj.vrf).first() if obj.vrf else None
+        native_fields = ("router_id", "vrf")
+        saves.append(planned_save(native, update_fields=native_fields))
+        operations.append((native, native_fields, False))
+    else:
+        current_native = OSPFInterface.objects.get(interface=obj.interface)
+        native = copy.copy(current_native)
+        area = OSPFArea.objects.filter(area_id__in=_area_candidates(obj.area_id)).first()
+        if area is None:
+            area = OSPFArea(area_id=obj.area_id, area_type="standard")
+            saves.append(planned_save(area, force_insert=True, natural_key=("area_id",)))
+            operations.append((area, None, True))
+        native.instance = OSPFInstance.objects.get(device=obj.interface.device, process_id=obj.process_id)
+        native.area = area
+        native.passive = obj.passive
+        native.priority = obj.priority
+        native.cost = obj.cost
+        native.network_type = obj.network_type or None
+        native.authentication = _OSPF_AUTH_MAP.get(obj.auth_type or "")
+        native_fields = (
+            "instance",
+            "area",
+            "passive",
+            "priority",
+            "cost",
+            "network_type",
+            "authentication",
         )
+        saves.append(planned_save(native, update_fields=native_fields))
+        operations.append((native, native_fields, False))
+
+    candidate = copy.copy(obj)
+    if not sm.is_owned(candidate.status):
+        candidate.accepted_at = planned_at
+    candidate.status = sm.on_operator_edit(candidate.status)
+    state_fields = {
+        field_name for field_name, old_value in old_values.items() if getattr(candidate, field_name) != old_value
+    }
+    state_fields.add("status")
+    if candidate.accepted_at is not None:
+        state_fields.add("accepted_at")
+    saves.append(planned_save(candidate, update_fields=state_fields))
+    operations.append((candidate, state_fields, False))
+
+    plan = RendererMutationPlan.build(saves=saves, planned_at=planned_at)
+    with renderer_writes(plan) as writer:
+        for instance, update_fields, force_insert in operations:
+            writer.save(
+                instance,
+                update_fields=update_fields,
+                force_insert=force_insert,
+            )
 
 
 def _sync_native_isis_instance(obj):
@@ -4727,6 +4755,9 @@ def _save_owned_overlay_edit(obj, key, old_values):
     if key == "redistribution":
         _save_owned_redistribution_edit(obj, old_values)
         return
+    if key in {"ospf_instance", "ospf_interface"}:
+        _save_owned_ospf_edit(obj, key, old_values)
+        return
 
     from . import status_machine as sm
     from .intent_state import intent_transaction
@@ -4741,10 +4772,6 @@ def _save_owned_overlay_edit(obj, key, old_values):
             if iface.mtu != clamped:
                 iface.mtu = clamped
                 iface.save(update_fields=["mtu"])
-        if key == "ospf_instance":
-            _sync_native_ospf_instance(obj)
-        if key == "ospf_interface":
-            _sync_native_ospf_interface(obj)
         if key == "isis_instance":
             _sync_native_isis_instance(obj)
         if key == "isis_interface":

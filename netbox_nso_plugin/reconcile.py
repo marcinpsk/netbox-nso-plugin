@@ -310,6 +310,7 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
     """Reconcile each opted-in routing protocol into *ctx* (gated by kill-switches)."""
     from .bfd_reconciler import bfd_reconcile_plan, reconcile_bfd
     from .bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
+    from .ospf_reconciler import ospf_reconcile_plan
     from .redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
     from .route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
     from .template_content import (
@@ -407,6 +408,7 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
                 ospf_doc,
             ),
             epoch=dev_id,
+            pre_body=lambda: ospf_reconcile_plan(device, ospf_doc),
         )
     if mgmt.manage_bgp:
         bgp_doc = client.get_bgp_config(dev_id)
@@ -747,6 +749,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
     """
     from . import adapter_client as client
     from .bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
+    from .ospf_reconciler import ospf_reconcile_plan
     from .redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
     from .route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
     from .signals import suppress_intent_push
@@ -1129,6 +1132,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: _reconcile_ospf(device, ospf_doc),
                 epoch=dev_id,
                 ctx_key="ospf_data",
+                pre_body=lambda: ospf_reconcile_plan(device, ospf_doc),
             )
         elif key == "bgp":
             from .models import NSOBGPPeerTemplateState

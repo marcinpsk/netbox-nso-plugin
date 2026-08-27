@@ -69,6 +69,18 @@ def _converted_writer_owns_content(device_id, scope) -> bool:
     return renderer_writer_owns_key(device_id, scope, content=True)
 
 
+def _schedule_exact_writer_scope(target_scope) -> None:
+    """Schedule keys for one scope only from its active exact content writer."""
+    from .renderer_writer import active_renderer_writer
+
+    writer = active_renderer_writer()
+    if writer is None:
+        return
+    for device_id, scope in writer.plan.content_keys:
+        if scope == target_scope and _converted_writer_owns_content(device_id, scope):
+            _schedule_intent_push((device_id, scope))
+
+
 class suppress_intent_push:  # noqa: N801 — context-manager named like a verb on purpose
     """Context manager: silence intent-push signals for the duration of a reconcile.
 
@@ -3109,7 +3121,7 @@ def _accept_bgp_peer_for_device(peer, device) -> None:
         peer_address_str=peer_address_str,
         defaults={"status": "accepted", "accepted_at": timezone.now()},
     )
-    # Greenfield-only ownership (mirrors _accept_ospf_interface): own a peer whose overlay
+    # Greenfield-only ownership: own a peer whose overlay
     # was just created here, or one already owned. A pre-existing UNOWNED (brownfield-adopted)
     # overlay is left to the 3-way reconcile — editing the netbox-routing object surfaces as
     # 'changed' for an explicit Accept, it is NOT force-owned/pushed. (The reconciler that
@@ -3830,7 +3842,7 @@ def _push_ospf_intent_for_device(device_id, adapter_device_id):
 
 @_skip_on_render
 def _on_ospf_instance_state_save(sender, instance, **kwargs):
-    """Push OSPF intent whenever an NSOOSPFInstanceState row is saved."""
+    """Schedule OSPF only when the exact writer owns this device key."""
     from .models import NSODeviceManagement
 
     try:
@@ -3842,12 +3854,13 @@ def _on_ospf_instance_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    _schedule_intent_push((device_id, "ospf"))
+    if _converted_writer_owns_content(device_id, "ospf"):
+        _schedule_intent_push((device_id, "ospf"))
 
 
 @_skip_on_render
 def _on_ospf_interface_state_save(sender, instance, **kwargs):
-    """Push OSPF intent whenever an NSOOSPFInterfaceState row is saved."""
+    """Schedule OSPF only when the exact writer owns this device key."""
     from .models import NSODeviceManagement
 
     try:
@@ -3859,101 +3872,24 @@ def _on_ospf_interface_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    _schedule_intent_push((device_id, "ospf"))
+    if _converted_writer_owns_content(device_id, "ospf"):
+        _schedule_intent_push((device_id, "ospf"))
 
 
 # ── netbox_routing OSPF greenfield write path ───────────────────────────────
-# The reconcile path only creates NSOOSPF*State overlays for OSPF the device already
-# reports (brownfield adoption). These handlers add the operator-created direction: a
-# netbox_routing OSPFInstance/OSPFInterface created on a managed device becomes an
-# *accepted* overlay (owned intent) whose save pushes the OSPF intent → ospf-reconciler.
-
-_OWNED_OSPF = ("accepted", "deploying", "in_sync", "apply_failed")
-
-
-def _accept_ospf_instance(ospf_instance) -> None:
-    """Own a greenfield OSPF process for its device (accepted overlay → push)."""
-    from .models import NSODeviceManagement, NSOOSPFInstanceState
-
-    try:
-        mgmt = NSODeviceManagement.objects.get(device=ospf_instance.device)
-    except NSODeviceManagement.DoesNotExist:
-        return
-    if mgmt.adapter_device_id is None:
-        return
-    state, created = NSOOSPFInstanceState.objects.get_or_create(
-        management=mgmt,
-        process_id=str(ospf_instance.process_id),
-        defaults={"status": "accepted", "accepted_at": timezone.now()},
-    )
-    # Only own a GREENFIELD process (overlay newly created here) or one already owned.
-    # A pre-existing unowned overlay is brownfield-adopted: editing the netbox-routing
-    # object must surface via the 3-way reconcile (changed/conflict), not be force-owned.
-    if not created and state.status not in _OWNED_OSPF:
-        return
-    state.router_id = str(ospf_instance.router_id or "")
-    state.vrf = ospf_instance.vrf.name if ospf_instance.vrf else ""
-    state.ospf_instance = ospf_instance
-    # Greenfield default: an operator-created OSPF process is meant to be enabled —
-    # set the admin-state intent True (re-asserts Nokia SR OS 'admin-state enable',
-    # which a freshly-created instance lacks). Preserve an explicit prior value.
-    if state.enabled is None:
-        state.enabled = True
-    # Instance-level area list (the timos apply binds areas per-interface, but other
-    # NEDs surface the area set here) — collect distinct areas from bound interfaces.
-    areas, seen = [], set()
-    for oi in ospf_instance.interfaces.all():
-        if oi.area and oi.area.area_id not in seen:
-            seen.add(oi.area.area_id)
-            areas.append({"area_id": oi.area.area_id, "area_type": oi.area.area_type or "standard"})
-    state.areas = areas
-    state.last_sync_at = timezone.now()
-    state.save()  # → _on_ospf_instance_state_save schedules the push
-
-
-def _accept_ospf_interface(ospf_iface) -> None:
-    """Own a greenfield OSPF interface (accepted overlay → push)."""
-    from .models import NSODeviceManagement, NSOOSPFInterfaceState
-
-    iface = ospf_iface.interface
-    try:
-        mgmt = NSODeviceManagement.objects.get(device=iface.device)
-    except NSODeviceManagement.DoesNotExist:
-        return
-    if mgmt.adapter_device_id is None:
-        return
-    state, created = NSOOSPFInterfaceState.objects.get_or_create(
-        management=mgmt,
-        interface=iface,
-        defaults={"status": "accepted", "accepted_at": timezone.now()},
-    )
-    # Greenfield-only ownership (see _accept_ospf_instance): don't force-own a
-    # pre-existing unowned (brownfield) overlay — leave it to the 3-way reconcile.
-    if not created and state.status not in _OWNED_OSPF:
-        return
-    state.process_id = str(ospf_iface.instance.process_id) if ospf_iface.instance else None
-    state.area_id = ospf_iface.area.area_id if ospf_iface.area else ""
-    state.passive = bool(ospf_iface.passive)
-    state.priority = ospf_iface.priority
-    state.cost = ospf_iface.cost
-    state.network_type = ospf_iface.network_type or ""
-    state.last_sync_at = timezone.now()
-    state.save()  # → _on_ospf_interface_state_save schedules the push
-    # Refresh the instance overlay so its area list reflects the new binding.
-    if ospf_iface.instance is not None:
-        _accept_ospf_instance(ospf_iface.instance)
+# Native OSPF signals are delivery notifications only. Exact planners establish ownership.
 
 
 @_skip_on_render
 def _on_routing_ospf_instance_save(sender, instance, **kwargs):
-    """netbox_routing OSPFInstance created/edited on a managed device → own + push."""
-    _accept_ospf_instance(instance)
+    """Keep foreign native OSPF process saves outside ownership bookkeeping."""
+    _schedule_exact_writer_scope("ospf")
 
 
 @_skip_on_render
 def _on_routing_ospf_interface_save(sender, instance, **kwargs):
-    """netbox_routing OSPFInterface created/edited → own + push."""
-    _accept_ospf_interface(instance)
+    """Keep foreign native OSPF interface saves outside ownership bookkeeping."""
+    _schedule_exact_writer_scope("ospf")
 
 
 _OWNED_ISIS = ("accepted", "deploying", "in_sync", "apply_failed")
@@ -3962,8 +3898,8 @@ _OWNED_ISIS = ("accepted", "deploying", "in_sync", "apply_failed")
 def _accept_isis_interface(isis_iface) -> None:
     """Own a greenfield IS-IS interface (operator-edited ISISInterface → accepted overlay → push).
 
-    Mirrors _accept_ospf_interface: copies the operator's metric / network-type /
-    circuit-type / passive from the netbox_routing.ISISInterface into the
+    Copies the operator's metric, network type, circuit type, and passive value from the
+    netbox_routing.ISISInterface into the
     NSOISISInterfaceState overlay (keyed by interface + address-family) and marks it
     owned so _on_isis_interface_state_save pushes. Greenfield-only: a pre-existing
     unowned (brownfield) overlay is left to the 3-way reconcile.
@@ -4110,35 +4046,14 @@ def _on_routing_isis_interface_post_delete(sender, instance, **kwargs):
 
 @_skip_on_render
 def _on_routing_ospf_instance_pre_delete(sender, instance, **kwargs):
-    """Operator deletes an OSPF process → drop its overlay + push the removal."""
-    from .models import NSODeviceManagement, NSOOSPFInstanceState
-
-    try:
-        mgmt = NSODeviceManagement.objects.get(device=instance.device)
-    except NSODeviceManagement.DoesNotExist:
-        return
-    if mgmt.adapter_device_id is None:
-        return
-    NSOOSPFInstanceState.objects.filter(management=mgmt, process_id=str(instance.process_id)).delete()
-    device_id, _adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
-    _schedule_intent_push((device_id, "ospf"))
+    """Keep foreign native OSPF process deletes outside ownership bookkeeping."""
+    _schedule_exact_writer_scope("ospf")
 
 
 @_skip_on_render
 def _on_routing_ospf_interface_pre_delete(sender, instance, **kwargs):
-    """Operator deletes an OSPF interface → drop its overlay + push the removal."""
-    from .models import NSODeviceManagement, NSOOSPFInterfaceState
-
-    iface = instance.interface
-    try:
-        mgmt = NSODeviceManagement.objects.get(device=iface.device)
-    except NSODeviceManagement.DoesNotExist:
-        return
-    if mgmt.adapter_device_id is None:
-        return
-    NSOOSPFInterfaceState.objects.filter(management=mgmt, interface=iface).delete()
-    device_id, _adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
-    _schedule_intent_push((device_id, "ospf"))
+    """Keep foreign native OSPF interface deletes outside ownership bookkeeping."""
+    _schedule_exact_writer_scope("ospf")
 
 
 @_skip_on_render
@@ -4642,7 +4557,7 @@ def _connect_g_activated():  # pragma: no cover
     except ImportError:
         logger.debug("netbox_routing not installed — static-route greenfield signals not registered")
 
-    # netbox_routing OSPF greenfield write path (operator-created OSPF → accepted overlay → push)
+    # netbox_routing OSPF exact-writer delivery notifications.
     try:
         from netbox_routing.models import OSPFInstance, OSPFInterface
 
