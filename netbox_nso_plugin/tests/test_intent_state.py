@@ -4,9 +4,11 @@
 
 from __future__ import annotations
 
+from time import perf_counter
 from unittest.mock import patch
 from uuid import uuid4
 
+import sqlparse
 from django.db import connection, transaction
 from django.db.models import F
 from django.test import TransactionTestCase
@@ -18,6 +20,7 @@ from netbox_nso_plugin.intent_state import (
     IntentMutationProtocolError,
     MutationFootprint,
     SourceRow,
+    _dml_guard,
     canonical_fragment,
     content_mutation,
     deletion_footprint_for_instance,
@@ -190,6 +193,74 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
 
         self.device.refresh_from_db()
         self.assertEqual(self.device.interface_count, 1)
+
+    def test_registered_table_select_skips_sqlparse(self):
+        table = NSOVLANState._meta.db_table
+        real_parse = sqlparse.parse
+        parse_calls = 0
+
+        def counting_parse(*args, **kwargs):
+            nonlocal parse_calls
+            parse_calls += 1
+            return real_parse(*args, **kwargs)
+
+        with patch("netbox_nso_plugin.intent_state.sqlparse.parse", counting_parse), connection.cursor() as cursor:
+            cursor.execute(f'SELECT id FROM "{table}" WHERE id = %s', [self.state.pk])
+            selected = cursor.fetchone()
+
+        self.assertEqual(selected, (self.state.pk,))
+        self.assertEqual(parse_calls, 0)
+
+    def test_repeated_insert_shape_is_parsed_at_most_once(self):
+        statement = "INSERT INTO intent_guard_parse_cache (value) VALUES (%s)"
+        real_parse = sqlparse.parse
+        parse_calls = 0
+
+        def counting_parse(*args, **kwargs):
+            nonlocal parse_calls
+            parse_calls += 1
+            return real_parse(*args, **kwargs)
+
+        with connection.cursor() as cursor:
+            cursor.execute("CREATE TEMP TABLE intent_guard_parse_cache (value integer)")
+            with patch("netbox_nso_plugin.intent_state.sqlparse.parse", counting_parse):
+                cursor.execute(statement, [1])
+                cursor.execute(statement, [2])
+
+        self.assertLessEqual(parse_calls, 1)
+
+    def test_repeated_registered_dml_shape_caches_column_classification(self):
+        table = NSOVLANState._meta.db_table
+        statement = f'UPDATE "{table}" SET last_apply_error = %s WHERE id = %s /* intent guard column cache */'
+        real_parse = sqlparse.parse
+        parse_calls = 0
+
+        def counting_parse(*args, **kwargs):
+            nonlocal parse_calls
+            parse_calls += 1
+            return real_parse(*args, **kwargs)
+
+        with patch("netbox_nso_plugin.intent_state.sqlparse.parse", counting_parse), connection.cursor() as cursor:
+            cursor.execute(statement, ["first", self.state.pk])
+            cursor.execute(statement, ["second", self.state.pk])
+
+        self.assertLessEqual(parse_calls, 2)
+
+    def test_select_classification_stays_below_the_timing_bound(self):
+        table = NSOVLANState._meta.db_table
+        statements = (
+            f'SELECT "{table}"."id", "{table}"."management_id", "{table}"."vlan_id", '
+            f'"{table}"."device_name", "{table}"."status" FROM "{table}" '
+            f'WHERE "{table}"."id" = %s /* intent guard timing {index} */'
+            for index in range(1000)
+        )
+
+        started = perf_counter()
+        for statement in statements:
+            _dml_guard(lambda *args: None, statement, (self.state.pk,), False, {})
+        elapsed = perf_counter() - started
+
+        self.assertLess(elapsed, 0.5)
 
     def test_select_for_update_of_a_registered_table_is_not_dml(self):
         with transaction.atomic():

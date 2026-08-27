@@ -535,6 +535,13 @@ _DELETING_POOLS: contextvars.ContextVar[frozenset[tuple]] = contextvars.ContextV
     "nso_intent_deleting_pools", default=frozenset()
 )
 _RECONCILER_ACTIVE: contextvars.ContextVar[int] = contextvars.ContextVar("nso_intent_reconciler_active", default=0)
+_DML_PARSE_SKIP_KEYWORDS = frozenset(
+    {"SELECT", "SET", "SAVEPOINT", "RELEASE", "SHOW", "BEGIN", "COMMIT", "ROLLBACK", "DECLARE", "FETCH", "CLOSE"}
+)
+_FIRST_SQL_KEYWORD = re.compile(
+    r"\A(?:\s+|--[^\r\n]*(?:\r\n?|\n|\Z)|/\*.*?\*/)*([A-Za-z]+)",
+    re.DOTALL,
+)
 
 
 def _discard_rolled_back_implicit_permit() -> None:
@@ -2600,9 +2607,21 @@ def _is_pool_delete_cascade(statement, params, connection) -> bool:
     return bool(targets) and targets <= marked
 
 
+def _execute_with_permit_cleanup(execute, sql, params, many, context, permit):
+    """Execute SQL and retire an implicit permit when the database rejects it."""
+    try:
+        return execute(sql, params, many, context)
+    except Exception:
+        _clear_failed_implicit_permit(permit)
+        raise
+
+
 def _dml_guard(execute, sql, params, many, context):
     statement = str(sql)
     if _MIGRATIONS_ACTIVE.get():
+        return execute(sql, params, many, context)
+    first_keyword = _FIRST_SQL_KEYWORD.match(statement)
+    if first_keyword is not None and first_keyword.group(1).upper() in _DML_PARSE_SKIP_KEYWORDS:
         return execute(sql, params, many, context)
     target, unparseable = _parse_dml_target(statement)
     if target is None:
@@ -2613,12 +2632,12 @@ def _dml_guard(execute, sql, params, many, context):
     if target.table not in _TABLE_REGISTRY:
         return execute(sql, params, many, context)
     touched_columns = _dml_columns(statement, target.operation)
+    permit = _ACTIVE_PERMIT.get()
     if target.operation == "INSERT INTO" and touched_columns == frozenset():
-        if _ACTIVE_PERMIT.get() is None:
+        if permit is None:
             # drift signal: this creation skips the pre_save bookkeeping (revision bump, re-pend)
             logger.warning("unpermitted creation on renderer input %s proceeded without bookkeeping", target.table)
-        return execute(sql, params, many, context)
-    permit = _ACTIVE_PERMIT.get()
+        return _execute_with_permit_cleanup(execute, sql, params, many, context, permit)
     table = target.table
     spec = _TABLE_REGISTRY[table]
     guarded_fields = spec.content_fields | _FRAGMENT_GATE_FIELDS.get(spec.model_label, set())
@@ -2646,11 +2665,7 @@ def _dml_guard(execute, sql, params, many, context):
         )
     if remaining:
         permit.authorized_dml[table] = remaining - 1
-    try:
-        return execute(sql, params, many, context)
-    except Exception:
-        _clear_failed_implicit_permit(permit)
-        raise
+    return _execute_with_permit_cleanup(execute, sql, params, many, context, permit)
 
 
 def _clear_failed_implicit_permit(permit) -> None:
@@ -2663,6 +2678,7 @@ def _clear_failed_implicit_permit(permit) -> None:
     _ACTIVE_PERMIT.reset(token)
 
 
+@functools.lru_cache(maxsize=512)
 def _parse_dml_target(statement: str) -> tuple[_DMLTarget | None, bool]:
     """Return one parsed mutation target and whether classification failed."""
     parsed = sqlparse.parse(statement)
@@ -2742,6 +2758,7 @@ def _mentioned_registered_tables(statement: str) -> set[str]:
     }
 
 
+@functools.lru_cache(maxsize=512)
 def _dml_columns(statement: str, operation: str) -> frozenset[str] | None:
     """Return columns that can mutate existing rows, or None when they are unknown."""
     if operation == "DELETE FROM":
