@@ -74,7 +74,8 @@ class TestApplyAttemptSchema(SimpleTestCase):
 
 
 class TestDeployingAttemptConstraint(TestCase):
-    def test_postgresql_refuses_deploying_without_an_attempt_uuid(self):
+    def test_postgresql_refusal_releases_the_implicit_mutation_permit(self):
+        from netbox_nso_plugin.intent_state import _ACTIVE_PERMIT
         from netbox_nso_plugin.models import NSOLoggingLevelState
 
         _device, management = make_managed("apply-identity-constraint", 1623)
@@ -85,6 +86,8 @@ class TestDeployingAttemptConstraint(TestCase):
                 console_severity="WARNING",
                 status="deploying",
             )
+
+        self.assertIsNone(_ACTIVE_PERMIT.get())
 
 
 class TestIntentRevisionWrites(TestCase):
