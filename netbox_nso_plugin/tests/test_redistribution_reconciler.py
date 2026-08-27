@@ -98,6 +98,62 @@ class TestReconcileRedistribution(TestCase):
         self.assertEqual(NSORedistributionState.objects.filter(management=management).count(), 1)
         self.assertEqual(Redistribution.objects.filter(source_protocol="static").count(), 1)
 
+    def test_preflight_plan_freezes_native_and_overlay_creates(self):
+        self._make_mgmt()
+        from netbox_routing.models import ISISInstance
+
+        ISISInstance.objects.create(device=self.device, process_tag="")
+        from netbox_nso_plugin.redistribution_reconciler import redistribution_reconcile_plan
+
+        plan = redistribution_reconcile_plan(self.device, {"entries": [self._entry(metric=10)]})
+
+        assert [(write.operation, write.model_label) for write in plan.write_set] == [
+            ("save", "netbox_routing.redistribution"),
+            ("save", "netbox_nso_plugin.nsoredistributionstate"),
+        ]
+        assert plan.content_keys == ()
+
+    def test_foreign_overlay_save_is_neutral(self):
+        mgmt = self._make_mgmt()
+        from netbox_nso_plugin.models import NSORedistributionState
+
+        with patch("netbox_nso_plugin.signals._schedule_redistribution_push") as schedule:
+            NSORedistributionState.objects.create(
+                management=mgmt,
+                dest_protocol="isis",
+                source_protocol="static",
+                status="accepted",
+            )
+
+        schedule.assert_not_called()
+
+    def test_foreign_native_save_is_neutral(self):
+        mgmt = self._make_mgmt()
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import ISISInstance, Redistribution
+
+        destination = ISISInstance.objects.create(device=self.device, process_tag="")
+        native = Redistribution.objects.create(
+            destination_type=ContentType.objects.get_for_model(destination),
+            destination_id=destination.pk,
+            source_protocol="static",
+        )
+        from netbox_nso_plugin.models import NSORedistributionState
+
+        NSORedistributionState.objects.create(
+            management=mgmt,
+            dest_protocol="isis",
+            source_protocol="static",
+            redistribution=native,
+            status="accepted",
+        )
+
+        with patch("netbox_nso_plugin.signals._schedule_redistribution_push") as schedule:
+            native.metric = 20
+            native.save(update_fields=("metric",))
+
+        schedule.assert_not_called()
+
     def test_missing_destination_stays_imported(self):
         """No matching ISISInstance → no Redistribution created, status=imported."""
         self._make_mgmt()

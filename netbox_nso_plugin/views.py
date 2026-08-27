@@ -4518,6 +4518,42 @@ def _save_owned_static_route_edit(obj, old_values):
             writer.save(instance, update_fields=update_fields)
 
 
+def _save_owned_redistribution_edit(obj, old_values):
+    """Apply one destination-specific redistribution edit through an exact plan."""
+    from netbox_routing.models import RouteMap
+
+    from . import status_machine as sm
+    from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
+    planned_at = timezone.now()
+    native = copy.copy(obj.redistribution)
+    native.route_map = RouteMap.objects.filter(name=obj.route_map).first() if obj.route_map else None
+    native.metric = obj.metric
+    native.metric_type = obj.metric_type
+    native_fields = ("route_map", "metric", "metric_type")
+
+    candidate = copy.copy(obj)
+    if not sm.is_owned(candidate.status):
+        candidate.accepted_at = planned_at
+    candidate.status = sm.on_operator_edit(candidate.status)
+    state_fields = {
+        field_name for field_name, old_value in old_values.items() if getattr(candidate, field_name) != old_value
+    }
+    state_fields.add("status")
+    if candidate.accepted_at is not None:
+        state_fields.add("accepted_at")
+    plan = RendererMutationPlan.build(
+        saves=(
+            planned_save(native, update_fields=native_fields),
+            planned_save(candidate, update_fields=state_fields),
+        ),
+        planned_at=planned_at,
+    )
+    with renderer_writes(plan) as writer:
+        writer.save(native, update_fields=native_fields)
+        writer.save(candidate, update_fields=state_fields)
+
+
 def _sync_native_ospf_instance(obj):
     """Keep the native OSPF instance aligned with an edited overlay."""
     from .signals import suppress_intent_push
@@ -4609,20 +4645,6 @@ def _sync_native_bgp_peer(obj):
         native.save(update_fields=["remote_as", "enabled"])
 
 
-def _sync_native_redistribution(obj):
-    """Mirror route-map and metric policy into the linked native redistribution."""
-    from netbox_routing.models import RouteMap
-
-    from .signals import suppress_intent_push
-
-    native = obj.redistribution
-    native.route_map = RouteMap.objects.filter(name=obj.route_map).first() if obj.route_map else None
-    native.metric = obj.metric
-    native.metric_type = obj.metric_type
-    with suppress_intent_push():
-        native.save(update_fields=["route_map", "metric", "metric_type"])
-
-
 def _owned_overlay_edit_footprint(obj, key):
     """Resolve the overlay and native rows changed by one inline edit."""
     from .intent_state import MutationFootprint, footprint_for_instance, renderer_input_specs
@@ -4702,6 +4724,9 @@ def _save_owned_overlay_edit(obj, key, old_values):
     if key == "static_route":
         _save_owned_static_route_edit(obj, old_values)
         return
+    if key == "redistribution":
+        _save_owned_redistribution_edit(obj, old_values)
+        return
 
     from . import status_machine as sm
     from .intent_state import intent_transaction
@@ -4726,8 +4751,6 @@ def _save_owned_overlay_edit(obj, key, old_values):
             _sync_native_isis_interface(obj)
         if key == "bgp_peer":
             _sync_native_bgp_peer(obj)
-        if key == "redistribution":
-            _sync_native_redistribution(obj)
         update_fields = {
             field_name
             for field_name, old_value in old_values.items()

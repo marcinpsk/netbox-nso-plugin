@@ -3162,7 +3162,7 @@ def _on_routing_bgp_peer_pre_delete(sender, instance, **kwargs):
 
 @_skip_on_render
 def _on_redistribution_state_save(sender, instance, **kwargs):
-    """Push the relevant routing protocol intent when an NSORedistributionState row is saved."""
+    """Schedule redistribution only when its exact writer owns the destination key."""
     from .models import NSODeviceManagement
 
     try:
@@ -3173,7 +3173,8 @@ def _on_redistribution_state_save(sender, instance, **kwargs):
     if mgmt.adapter_device_id is None:
         return
 
-    _schedule_redistribution_push(mgmt.device_id, instance.dest_protocol)
+    if _converted_writer_owns_content(mgmt.device_id, instance.dest_protocol):
+        _schedule_redistribution_push(mgmt.device_id, instance.dest_protocol)
 
 
 def route_policy_intent_item(row):
@@ -4142,24 +4143,15 @@ def _on_routing_ospf_interface_pre_delete(sender, instance, **kwargs):
 
 @_skip_on_render
 def _on_redistribution_fork_save(sender, instance, **kwargs):
-    """Push protocol intent when a netbox_routing.Redistribution fork object is saved.
+    """Keep foreign native redistribution saves outside synchronous bookkeeping."""
+    from .renderer_writer import active_renderer_writer
 
-    Finds all NSORedistributionState rows linked to this Redistribution, determines
-    their destination protocol, and triggers the appropriate intent push.
-    Deduplicates pushes so each (device, dest_protocol) pair is pushed at most once.
-    """
-    from .models import NSORedistributionState
-
-    seen: set[tuple] = set()
-    for state in NSORedistributionState.objects.filter(redistribution=instance).select_related("management"):
-        mgmt = state.management
-        if mgmt.adapter_device_id is None:
-            continue
-        key = (mgmt.device_id, state.dest_protocol)
-        if key in seen:
-            continue
-        seen.add(key)
-        _schedule_redistribution_push(mgmt.device_id, state.dest_protocol)
+    writer = active_renderer_writer()
+    if writer is None:
+        return
+    for device_id, scope in writer.plan.content_keys:
+        if scope in redistribution_destinations() and _converted_writer_owns_content(device_id, scope):
+            _schedule_redistribution_push(device_id, scope)
 
 
 def _connect_g_activated():  # pragma: no cover

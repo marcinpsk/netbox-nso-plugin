@@ -1919,7 +1919,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
                 source_ref="",
                 status="accepted",
             )
-        self._delete_pushes(row, "put_bgp_intent")
+        self._delete_pushes(row, "put_bgp_intent", exact_writer=True)
 
     def test_route_policy_delete_pushes_reduced_snapshot(self):
         from django.contrib.contenttypes.models import ContentType

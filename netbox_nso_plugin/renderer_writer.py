@@ -731,7 +731,8 @@ def _manifest_binding(instance):
             return str(value)
 
         native_key = {name: json_value(getattr(native, name)) for name in rule.native_key_fields}
-        return rule, management.device_id, native._meta.label_lower, native_key
+        scope = getattr(instance, rule.manifest_scope_field) if rule.manifest_scope_field else rule.scope
+        return rule, scope, management.device_id, native._meta.label_lower, native_key
     return None
 
 
@@ -742,10 +743,10 @@ def _maintain_manifest(instance):
     binding = _manifest_binding(instance)
     if binding is None:
         return
-    rule, device_id, native_model_label, native_key = binding
+    rule, scope, device_id, native_model_label, native_key = binding
     identity = {
         "device_id": device_id,
-        "scope": rule.scope,
+        "scope": scope,
         "native_model_label": native_model_label,
         "native_key": native_key,
     }
