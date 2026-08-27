@@ -18,28 +18,22 @@ logger = logging.getLogger(__name__)
 
 def lock_svi_reconcile_dependencies(device, payload: dict) -> None:
     """Lock native VLANs before the device lock and SVI overlay writes."""
-    from ipam.models import VLAN
+    from .models import NSOSVIState
+    from .vlan_reconciler import _lock_reconcile_vlan_dependencies
 
-    from .apply_state import (
-        lock_native_vlan_dependency_rows,
-        vlan_ids_for_dependency_lock,
-    )
-    from .models import NSODeviceManagement, NSOSVIState
-
-    management = NSODeviceManagement.objects.filter(device=device).first()
-    if management is None:
-        return
-    items = payload.get("interfaces", []) or [] if isinstance(payload, dict) else []
-    vids = vlan_ids_for_dependency_lock(items)
-
-    def collect_vlan_ids():
-        vlan_ids = set(
-            NSOSVIState.objects.filter(management=management, vlan__isnull=False).values_list("vlan_id", flat=True)
+    def collect_overlay_vlan_ids(management, _vids):
+        return NSOSVIState.objects.filter(management=management, vlan__isnull=False).values_list(
+            "vlan_id",
+            flat=True,
         )
-        vlan_ids.update(VLAN.objects.filter(group__slug=f"nso-{device.pk}", vid__in=vids).values_list("pk", flat=True))
-        return vlan_ids
 
-    lock_native_vlan_dependency_rows(device.pk, collect_vlan_ids)
+    _lock_reconcile_vlan_dependencies(
+        device,
+        payload,
+        payload_key="interfaces",
+        vid_fields=("vlan_id",),
+        collect_overlay_vlan_ids=collect_overlay_vlan_ids,
+    )
 
 
 def reconcile_svi(device, payload: dict) -> list:

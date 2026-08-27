@@ -31,11 +31,14 @@ class VLANRescopeConflict(Exception):
 _NSO_TO_NETBOX_MODE = {"access": "access", "trunk": "tagged", "trunk-all": "tagged-all"}
 
 
-def _device_vlan_group(device):
+def _device_vlan_group(device, *, create=True):
     """Per-device VLAN group — the default landing spot for newly-imported vids."""
     from ipam.models import VLANGroup
 
-    group, _ = VLANGroup.objects.get_or_create(slug=f"nso-{device.pk}", defaults={"name": f"NSO {device.name}"})
+    slug = f"nso-{device.pk}"
+    if not create:
+        return VLANGroup.objects.filter(slug=slug).first()
+    group, _ = VLANGroup.objects.get_or_create(slug=slug, defaults={"name": f"NSO {device.name}"})
     return group
 
 
@@ -96,57 +99,75 @@ def _resolve_synced_vlan(management, group, vid, *, name=None, create=True):
     return VLAN.objects.filter(group=group, vid=vid).first()
 
 
-def lock_vlan_reconcile_dependencies(device, payload: dict) -> None:
-    """Lock native VLANs before the device lock and VLAN overlay writes."""
+def _lock_reconcile_vlan_dependencies(
+    device,
+    payload: dict,
+    *,
+    payload_key: str,
+    vid_fields: tuple[str, ...],
+    collect_overlay_vlan_ids,
+) -> None:
+    """Lock one reconcile family's native VLAN dependencies after its membership fence."""
     from ipam.models import VLAN
 
     from .apply_state import (
         lock_native_vlan_dependency_rows,
         vlan_ids_for_dependency_lock,
     )
-    from .models import NSODeviceManagement, NSOVLANState
+    from .models import NSODeviceManagement
 
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:
         return
-    items = payload.get("vlans", []) or [] if isinstance(payload, dict) else []
-    vids = vlan_ids_for_dependency_lock(items)
+    items = payload.get(payload_key, []) or [] if isinstance(payload, dict) else []
+    vids = vlan_ids_for_dependency_lock(items, *vid_fields)
 
     def collect_vlan_ids():
-        vlan_ids = set(NSOVLANState.objects.filter(management=management).values_list("vlan_id", flat=True))
-        vlan_ids.update(VLAN.objects.filter(group__slug=f"nso-{device.pk}", vid__in=vids).values_list("pk", flat=True))
+        vlan_ids = set(collect_overlay_vlan_ids(management, vids))
+        group = _device_vlan_group(device, create=False)
+        if group is not None:
+            vlan_ids.update(VLAN.objects.filter(group=group, vid__in=vids).values_list("pk", flat=True))
         return vlan_ids
 
     lock_native_vlan_dependency_rows(device.pk, collect_vlan_ids)
 
 
+def lock_vlan_reconcile_dependencies(device, payload: dict) -> None:
+    """Lock native VLANs before the device lock and VLAN overlay writes."""
+    from .models import NSOVLANState
+
+    def collect_overlay_vlan_ids(management, _vids):
+        return NSOVLANState.objects.filter(management=management).values_list("vlan_id", flat=True)
+
+    _lock_reconcile_vlan_dependencies(
+        device,
+        payload,
+        payload_key="vlans",
+        vid_fields=("vlan_id",),
+        collect_overlay_vlan_ids=collect_overlay_vlan_ids,
+    )
+
+
 def lock_switchport_reconcile_dependencies(device, payload: dict) -> None:
     """Lock native VLANs before the device lock and switchport overlay writes."""
-    from ipam.models import VLAN
+    from .models import NSOSwitchportState, NSOVLANState
 
-    from .apply_state import (
-        lock_native_vlan_dependency_rows,
-        vlan_ids_for_dependency_lock,
-    )
-    from .models import NSODeviceManagement, NSOSwitchportState, NSOVLANState
-
-    management = NSODeviceManagement.objects.filter(device=device).first()
-    if management is None:
-        return
-    items = payload.get("interfaces", []) or [] if isinstance(payload, dict) else []
-    vids = vlan_ids_for_dependency_lock(items, "untagged_vlan", "tagged_vlans")
-
-    def collect_vlan_ids():
+    def collect_overlay_vlan_ids(management, vids):
         states = list(NSOSwitchportState.objects.filter(management=management).prefetch_related("tagged_vlans"))
         vlan_ids = {state.untagged_vlan_id for state in states if state.untagged_vlan_id is not None}
         vlan_ids.update(vlan.pk for state in states for vlan in state.tagged_vlans.all())
         vlan_ids.update(
             NSOVLANState.objects.filter(management=management, vlan__vid__in=vids).values_list("vlan_id", flat=True)
         )
-        vlan_ids.update(VLAN.objects.filter(group__slug=f"nso-{device.pk}", vid__in=vids).values_list("pk", flat=True))
         return vlan_ids
 
-    lock_native_vlan_dependency_rows(device.pk, collect_vlan_ids)
+    _lock_reconcile_vlan_dependencies(
+        device,
+        payload,
+        payload_key="interfaces",
+        vid_fields=("untagged_vlan", "tagged_vlans"),
+        collect_overlay_vlan_ids=collect_overlay_vlan_ids,
+    )
 
 
 def _rescope_managed_device_ids(old_vlan) -> set[int]:

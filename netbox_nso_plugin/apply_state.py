@@ -227,7 +227,9 @@ def lock_vlan_intent_rows(vlan_id, scopes) -> tuple[object | None, dict[str, lis
 
     lock_mutation()
     lock_vlan_intent_transaction(vlan_id)
-    vlan = VLAN.objects.select_for_update(of=("self",)).get(pk=vlan_id)
+    vlan = VLAN.objects.select_for_update(of=("self",)).filter(pk=vlan_id).first()
+    if vlan is None:
+        return None, empty
     management_devices = dict(
         NSODeviceManagement.objects.filter(
             pk__in={
@@ -307,7 +309,9 @@ def lock_interface_intent_rows(interface_id) -> tuple[object | None, object | No
 
     lock_mutation()
     lock_device_intent_transaction(current["device_id"])
-    interface = Interface.objects.select_for_update(of=("self",)).get(pk=interface_id)
+    interface = Interface.objects.select_for_update(of=("self",)).filter(pk=interface_id).first()
+    if interface is None:
+        return None, None, empty
     if interface.device_id != current["device_id"]:
         raise RuntimeError("interface changed devices while acquiring intent locks")
     list(Interface.objects.select_for_update(of=("self",)).filter(parent_id=interface_id).order_by("pk"))

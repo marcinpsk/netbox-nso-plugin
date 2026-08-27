@@ -4765,7 +4765,7 @@ class TestOverlayFieldEditView(ViewTestBase):
     def test_edit_vlan_name_reports_when_the_vlan_is_deleted_before_save(self):
         from ipam.models import VLAN, VLANGroup
 
-        from netbox_nso_plugin.apply_state import lock_vlan_intent_rows
+        from netbox_nso_plugin import apply_state
         from netbox_nso_plugin.models import NSOVLANState
 
         group = VLANGroup.objects.create(name="Removed Inline VLANs", slug="removed-inline-vlans")
@@ -4777,11 +4777,16 @@ class TestOverlayFieldEditView(ViewTestBase):
             status="imported",
         )
 
-        def delete_then_lock(vlan_id, scopes):
-            VLAN.objects.filter(pk=vlan_id).delete()
-            return lock_vlan_intent_rows(vlan_id, scopes)
+        original_lock = apply_state.lock_vlan_intent_transaction
 
-        with patch("netbox_nso_plugin.apply_state.lock_vlan_intent_rows", new=delete_then_lock):
+        def lock_then_delete(vlan_id):
+            original_lock(vlan_id)
+            VLAN.objects.filter(pk=vlan_id).delete()
+
+        with patch(
+            "netbox_nso_plugin.apply_state.lock_vlan_intent_transaction",
+            side_effect=lock_then_delete,
+        ):
             response = self.client.post(self._url("vlan_name", state.pk), {"name": "UNSAVED-NAME"})
 
         self.assertEqual(response.status_code, 400, response.content)

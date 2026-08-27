@@ -1766,8 +1766,18 @@ def _on_vlan_pre_save(sender, instance, **kwargs):
         display_placeholder = locked_vlan.name == placeholder_vlan_name(locked_vlan.vid) and all(
             not state.device_name for state in rows["vlan"]
         )
-        if display_placeholder:
-            instance.name = placeholder_vlan_name(instance.vid)
+        derived_name = placeholder_vlan_name(instance.vid)
+        name_taken = (
+            locked_vlan.group_id is not None
+            and sender.objects.filter(
+                group_id=locked_vlan.group_id,
+                name=derived_name,
+            )
+            .exclude(pk=instance.pk)
+            .exists()
+        )
+        if display_placeholder and not name_taken:
+            instance.name = derived_name
             if update_fields is not None and "name" not in update_fields:
                 sender.objects.filter(pk=instance.pk).update(name=instance.name)
             changed_fields.add("name")
@@ -1797,7 +1807,7 @@ def _on_vlan_change(sender, instance, **kwargs):
     targets = set()
     with suppress_intent_push():
         for scope, states in rows.items():
-            if scope == "svi" and not vid_changed:
+            if scope in ("svi", "switchport") and not vid_changed:
                 continue
             for state in states:
                 was_owned = sm.is_owned(state.status)
