@@ -1739,7 +1739,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             row = NSOBFDInterfaceState.objects.create(
                 management=mgmt, interface=self.iface, min_tx=300, min_rx=300, multiplier=3, status="accepted"
             )
-        self._delete_pushes(row, "put_bfd_intent")
+        self._delete_pushes(row, "put_bfd_intent", exact_writer=True)
 
     def test_static_route_overlay_delete_pushes_reduced_snapshot(self):
         """Direct OVERLAY deletion (the native StaticRoute pre_delete path is separately

@@ -4046,7 +4046,8 @@ class TestOverlayFieldEditView(ViewTestBase):
     def test_edit_bfd_updates_overlay_and_native_profile(self):
         from netbox_routing.models import BFDInterface, BFDProfile
 
-        from netbox_nso_plugin.models import NSOBFDInterfaceState
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOBFDInterfaceState, NSOIntentRevision
 
         old_profile = BFDProfile.objects.create(
             name="bfd-inline-old",
@@ -4085,6 +4086,12 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(
             (native.bfd_profile.min_tx_int, native.bfd_profile.min_rx_int, native.bfd_profile.multiplier),
             (500, 600, 5),
+        )
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="bfd")
+        self.assertEqual(revision.verified_revision, revision.revision)
+        self.assertEqual(
+            revision.verified_fingerprint,
+            delivery.canonical_fingerprint(delivery.render("bfd", self.device.pk, self.mgmt.adapter_device_id).payload),
         )
 
     def test_edit_bfd_rejects_out_of_range_timer_without_writing(self):

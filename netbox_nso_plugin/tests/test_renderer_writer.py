@@ -155,6 +155,63 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         self.assertEqual(planned.pk, existing.pk)
         self.assertEqual(Interface.objects.filter(device=device, name="Loopback1627").count(), 1)
 
+    def test_one_plan_can_create_unregistered_native_rows_and_registered_overlay(self):
+        from netbox_routing.models import BFDInterface, BFDProfile
+
+        from netbox_nso_plugin.models import NSOBFDInterfaceState
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_save,
+            renderer_mirror_writes,
+        )
+
+        device, management = make_managed("writer-bfd-native-create", 16281)
+        interface = Interface.objects.create(device=device, name="Ethernet1/10", type="1000base-t")
+        profile = BFDProfile(name="writer-bfd-profile", min_tx_int=300, min_rx_int=300, multiplier=3)
+        native = BFDInterface(interface=interface, bfd_profile=profile, micro_bfd=False, enabled=True)
+        state = NSOBFDInterfaceState(
+            management=management,
+            interface=interface,
+            min_tx=300,
+            min_rx=300,
+            multiplier=3,
+            status="imported",
+        )
+        plan = RendererMutationPlan.build(
+            saves=(
+                planned_save(profile, force_insert=True, natural_key=("name",)),
+                planned_save(native, force_insert=True, natural_key=("interface",)),
+                planned_save(state, force_insert=True, natural_key=("management", "interface")),
+            )
+        )
+
+        with renderer_mirror_writes(plan) as writer:
+            writer.save(profile, force_insert=True)
+            writer.save(native, force_insert=True)
+            writer.save(state, force_insert=True)
+
+        assert native.bfd_profile_id == profile.pk
+        assert NSOBFDInterfaceState.objects.filter(pk=state.pk).exists()
+
+    def test_one_plan_can_delete_an_unregistered_native_row(self):
+        from netbox_routing.models import BFDInterface
+
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_delete,
+            renderer_mirror_writes,
+        )
+
+        device, _management = make_managed("writer-bfd-native-delete", 16282)
+        interface = Interface.objects.create(device=device, name="Ethernet1/11", type="1000base-t")
+        native = BFDInterface.objects.create(interface=interface, enabled=True)
+        plan = RendererMutationPlan.build(deletes=(planned_delete(native),))
+
+        with renderer_mirror_writes(plan) as writer:
+            writer.delete(native)
+
+        assert not BFDInterface.objects.filter(pk=native.pk).exists()
+
     def test_one_plan_can_create_a_native_row_and_its_overlay(self):
         from ipam.models import VLANGroup
 

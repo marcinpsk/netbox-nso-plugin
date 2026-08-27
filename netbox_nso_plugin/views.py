@@ -4264,30 +4264,76 @@ def _subinterface_errors(obj):
     return errors
 
 
-def _sync_native_bfd(obj):
-    """Keep netbox-routing's native BFD row aligned with an edited overlay."""
-    try:
-        from netbox_routing.models import BFDInterface, BFDProfile
-    except ImportError:
-        return
+def _save_owned_bfd_edit(obj, old_values):
+    """Claim one BFD edit and apply its exact native and overlay write set."""
+    import copy
 
-    from .bfd_reconciler import _get_or_create_bfd_profile
+    from netbox_routing.models import BFDInterface, BFDProfile
 
-    profile = _get_or_create_bfd_profile(
-        {"min_tx": obj.min_tx, "min_rx": obj.min_rx, "multiplier": obj.multiplier},
-        BFDProfile,
-        {},
+    from . import status_machine as sm
+    from .bfd_reconciler import _profile_values
+    from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
+    planned_at = timezone.now()
+    saves = []
+    operations = []
+
+    profile_values = _profile_values({"min_tx": obj.min_tx, "min_rx": obj.min_rx, "multiplier": obj.multiplier})
+    profile = None
+    if profile_values is not None:
+        name, tx, rx, multiplier = profile_values
+        profile = BFDProfile.objects.filter(name=name).first()
+        if profile is None:
+            profile = BFDProfile(name=name, min_tx_int=tx, min_rx_int=rx, multiplier=multiplier)
+            saves.append(planned_save(profile, force_insert=True, natural_key=("name",)))
+            operations.append((profile, None, True))
+
+    current_native = BFDInterface.objects.filter(interface=obj.interface).first()
+    native = (
+        BFDInterface(interface=obj.interface, bfd_profile=profile, micro_bfd=obj.micro_bfd, enabled=True)
+        if current_native is None
+        else copy.copy(current_native)
     )
-    native, created = BFDInterface.objects.get_or_create(
-        interface=obj.interface,
-        defaults={"bfd_profile": profile, "micro_bfd": obj.micro_bfd, "enabled": True},
-    )
-    if not created and (
-        native.bfd_profile_id != (profile.pk if profile else None) or native.micro_bfd != obj.micro_bfd
-    ):
+    native_fields = None
+    native_created = current_native is None
+    if current_native is not None:
         native.bfd_profile = profile
         native.micro_bfd = obj.micro_bfd
-        native.save(update_fields=["bfd_profile", "micro_bfd"])
+        if (
+            current_native.bfd_profile_id != (profile.pk if profile is not None else None)
+            or current_native.micro_bfd != obj.micro_bfd
+        ):
+            native_fields = ("bfd_profile", "micro_bfd")
+        else:
+            native = None
+    if native is not None:
+        saves.append(
+            planned_save(
+                native,
+                update_fields=native_fields,
+                force_insert=native_created,
+                natural_key=("interface",),
+            )
+        )
+        operations.append((native, native_fields, native_created))
+
+    state = copy.copy(obj)
+    if not sm.is_owned(state.status):
+        state.accepted_at = planned_at
+    state.status = sm.on_operator_edit(state.status)
+    state_fields = {
+        field_name for field_name, old_value in old_values.items() if getattr(state, field_name) != old_value
+    }
+    state_fields.add("status")
+    if state.accepted_at is not None:
+        state_fields.add("accepted_at")
+    saves.append(planned_save(state, update_fields=state_fields))
+    operations.append((state, state_fields, False))
+
+    plan = RendererMutationPlan.build(saves=saves, planned_at=planned_at)
+    with renderer_writes(plan) as writer:
+        for instance, update_fields, force_insert in operations:
+            writer.save(instance, update_fields=update_fields, force_insert=force_insert)
 
 
 def _sync_native_ospf_instance(obj):
@@ -4460,6 +4506,9 @@ def _save_owned_overlay_edit(obj, key, old_values):
     if key in {"svi", "subinterface"}:
         _save_owned_overlay_only_edit(obj, old_values)
         return
+    if key == "bfd":
+        _save_owned_bfd_edit(obj, old_values)
+        return
 
     from . import status_machine as sm
     from .intent_state import intent_transaction
@@ -4474,8 +4523,6 @@ def _save_owned_overlay_edit(obj, key, old_values):
             if iface.mtu != clamped:
                 iface.mtu = clamped
                 iface.save(update_fields=["mtu"])
-        if key == "bfd":
-            _sync_native_bfd(obj)
         if key == "ospf_instance":
             _sync_native_ospf_instance(obj)
         if key == "ospf_interface":
@@ -7261,6 +7308,7 @@ class NSOVLANAttachView(NSOActionPermissionMixin, View):
 
 class NSOBFDInterfaceStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOBFDInterfaceState
+    renderer_scope = "bfd"
 
 
 class NSOSnmpCommunityStateEditView(generic.ObjectEditView):  # noqa: D101

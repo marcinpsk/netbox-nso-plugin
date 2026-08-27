@@ -2030,6 +2030,8 @@ def _on_bfd_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
+    if not _converted_writer_owns_content(device_id, "bfd"):
+        return
     _schedule_intent_push((device_id, "bfd"))
 
 

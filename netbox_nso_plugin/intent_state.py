@@ -72,6 +72,8 @@ SOURCE_MODEL_RANKS = (
     "netbox_routing.bgpaddressfamily",
     "netbox_routing.bgppeeraddressfamily",
     "netbox_routing.redistribution",
+    "netbox_routing.bfdprofile",
+    "netbox_routing.bfdinterface",
     "netbox_nso_plugin.nsodevicemanagement",
     "netbox_nso_plugin.nsoinstance",
     "netbox_nso_plugin.nsoroutepolicyobjectclass",

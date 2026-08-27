@@ -123,6 +123,18 @@ _CONVERTED_SCOPE_RULES = {
             "Acquire from persisted parent and dot1q state. Native save events are not ownership evidence."
         ),
     ),
+    "bfd": ScopeOwnershipRule(
+        scope="bfd",
+        native_model_labels=("dcim.interface",),
+        native_key_fields=("device_id", "name"),
+        overlay_model_labels=("netbox_nso_plugin.nsobfdinterfacestate",),
+        overlay_native_fields=(("netbox_nso_plugin.nsobfdinterfacestate", "interface"),),
+        foreign_overlay_delete="reown",
+        deletion_authority=True,
+        intentional_semantic_delta=(
+            "Acquire from persisted per-interface BFD state. Save events are not ownership evidence."
+        ),
+    ),
 }
 
 
