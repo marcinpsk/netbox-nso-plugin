@@ -548,8 +548,19 @@ class TestO3CJoinedCrossRepositoryPin(_CascadeFlushMixin, IntentPushResetMixin, 
         cls.environment = _O3CEnvironment()
         try:
             cls.environment.start()
-        except BaseException:
-            cls.environment.stop()
+        except BaseException as start_error:
+            cleanup_failures = []
+            for label, cleanup in (
+                ("O3C environment cleanup", cls.environment.stop),
+                ("Django class teardown", super().tearDownClass),
+                ("Django class cleanups", cls.doClassCleanups),
+            ):
+                try:
+                    cleanup()
+                except Exception as cleanup_error:  # noqa: BLE001 - preserve the primary setup failure
+                    cleanup_failures.append(f"{label} failed with {type(cleanup_error).__name__}")
+            for failure in cleanup_failures:
+                start_error.add_note(failure)
             raise
 
     @classmethod
@@ -759,6 +770,38 @@ class TestO3CEnvironmentFailFast(SimpleTestCase):
     """Prove a failed preflight tears down without hanging the suite."""
 
     databases = {"default"}
+
+    def test_joined_class_start_failure_releases_django_setup_and_keeps_the_original_error(self):
+        from django.conf import settings
+
+        events = []
+
+        class FailingEnvironment:
+            def start(self):
+                events.append("start")
+                raise RuntimeError("adapter start failed")
+
+            def stop(self):
+                events.append("stop")
+                raise RuntimeError("adapter stop failed")
+
+        class FailingJoinedCase(TestO3CJoinedCrossRepositoryPin):
+            _overridden_settings = {"EMAIL_SUBJECT_PREFIX": "joined-pin-start"}
+
+            def test_probe(self):
+                pass
+
+        original_prefix = settings.EMAIL_SUBJECT_PREFIX
+        with (
+            patch(f"{__name__}._ADAPTER_ROOT", Path.cwd()),
+            patch(f"{__name__}._O3CEnvironment", FailingEnvironment),
+            self.assertRaisesRegex(RuntimeError, "^adapter start failed$") as raised,
+        ):
+            FailingJoinedCase.setUpClass()
+
+        assert events == ["start", "stop"]
+        assert settings.EMAIL_SUBJECT_PREFIX == original_prefix
+        assert raised.exception.__notes__ == ["O3C environment cleanup failed with RuntimeError"]
 
     def test_adapter_port_is_selected_only_when_starting_the_process(self):
         with patch(f"{__name__}._adapter_database_name", return_value="test_o3c_port_selection"):
