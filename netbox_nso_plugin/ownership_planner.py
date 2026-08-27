@@ -233,6 +233,19 @@ _CONVERTED_SCOPE_RULES = {
         ),
         acknowledged_lineage_field="last_acked_triple",
     ),
+    "isis_flex_algo": ScopeOwnershipRule(
+        scope="isis_flex_algo",
+        native_model_labels=("netbox_routing.isisflexalgo",),
+        native_key_fields=("instance_id", "algo_id"),
+        overlay_model_labels=("netbox_nso_plugin.nsoisisflexalgostate",),
+        overlay_native_fields=(("netbox_nso_plugin.nsoisisflexalgostate", "isis_flex_algo"),),
+        foreign_overlay_delete="reown",
+        deletion_authority=True,
+        intentional_semantic_delta=(
+            "Acquire from a persisted Flex-Algo and linked overlay. Native Flex-Algo save and delete events are not "
+            "ownership evidence."
+        ),
+    ),
 }
 
 

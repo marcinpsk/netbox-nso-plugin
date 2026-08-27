@@ -1860,7 +1860,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             row = NSOISISFlexAlgoState.objects.create(
                 management=mgmt, process_tag="CORE", algo_id=130, status="accepted"
             )
-        self._delete_pushes(row, "put_isis_flex_algo_intent")
+        self._delete_pushes(row, "put_isis_flex_algo_intent", exact_writer=True)
 
     def test_isis_interface_delete_pushes_reduced_snapshot(self):
         from netbox_nso_plugin.models import NSOISISInterfaceState

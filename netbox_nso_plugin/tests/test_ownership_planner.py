@@ -206,6 +206,7 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
             "interface",
             "interface_mtu",
             "ip",
+            "isis_flex_algo",
             "lacp",
             "l2_sap",
             "logging",
@@ -230,3 +231,12 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
         rule = converted_scope_rules()["static_route"]
 
         assert rule.acknowledged_lineage_field == "last_acked_triple"
+
+    def test_flex_algo_rule_uses_the_native_process_and_algorithm_identity(self):
+        from netbox_nso_plugin.ownership_planner import converted_scope_rules
+
+        rule = converted_scope_rules()["isis_flex_algo"]
+
+        assert rule.native_model_labels == ("netbox_routing.isisflexalgo",)
+        assert rule.native_key_fields == ("instance_id", "algo_id")
+        assert rule.overlay_native_fields == (("netbox_nso_plugin.nsoisisflexalgostate", "isis_flex_algo"),)

@@ -2460,7 +2460,7 @@ def _push_isis_flex_algo_intent_for_device(device_id, adapter_device_id):
 
 @_skip_on_render
 def _on_isis_flex_algo_state_save(sender, instance, **kwargs):
-    """Push Flex-Algo intent whenever an NSOISISFlexAlgoState row is saved."""
+    """Schedule Flex-Algo intent only for a declared exact writer mutation."""
     from .models import NSODeviceManagement
 
     try:
@@ -2470,118 +2470,18 @@ def _on_isis_flex_algo_state_save(sender, instance, **kwargs):
     if mgmt.adapter_device_id is None:
         return
     device_id, _adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
-    _schedule_intent_push((device_id, "isis_flex_algo"))
-
-
-# ── Greenfield Flex-Algo (operator-created in NetBox, not yet on the device) ──
-#
-# ISISFlexAlgo belongs to an ISISInstance which carries the device + process-tag,
-# so a flex-algo the operator creates becomes an *accepted* overlay (owned intent)
-# and pushes; editing re-pushes; deleting pushes the removal (full-replace).
-
-
-def _accept_isis_flex_algo(flex_algo) -> None:
-    """Own a greenfield flex-algo (accepted overlay) → its save pushes intent."""
-    from .models import NSODeviceManagement, NSOISISFlexAlgoState
-
-    inst = flex_algo.instance
-    device = getattr(inst, "device", None)
-    if device is None:
-        return
-    try:
-        mgmt = NSODeviceManagement.objects.get(device=device)
-    except NSODeviceManagement.DoesNotExist:
-        return
-    if mgmt.adapter_device_id is None:
-        return
-    state, created = NSOISISFlexAlgoState.objects.get_or_create(
-        management=mgmt,
-        process_tag=inst.process_tag or "",
-        algo_id=int(flex_algo.algo_id),
-        defaults={
-            "isis_flex_algo": flex_algo,
-            "status": "accepted",
-            "accepted_at": timezone.now(),
-        },
-    )
-    if not created and state.status not in ("accepted", "deploying", "in_sync", "apply_failed"):
-        state.status = "accepted"
-        state.accepted_at = timezone.now()
-    state.isis_flex_algo = flex_algo
-    state.metric_type = flex_algo.metric_type or ""
-    state.priority = flex_algo.priority
-    state.admin_group_exclude = flex_algo.admin_group_exclude or ""
-    state.admin_group_include_any = flex_algo.admin_group_include_any or ""
-    state.admin_group_include_all = flex_algo.admin_group_include_all or ""
-    state.last_sync_at = timezone.now()
-    state.save()  # → _on_isis_flex_algo_state_save schedules the push
-
-
-def _on_routing_isis_flex_algo_pre_delete(sender, instance, **kwargs):
-    """Capture linked overlays before Django clears their native foreign key."""
-    from .models import NSOISISFlexAlgoState
-
-    instance._nso_linked_flex_algo_state_pks = tuple(
-        NSOISISFlexAlgoState.objects.filter(isis_flex_algo=instance).values_list("pk", flat=True)
-    )
-
-
-def _remove_isis_flex_algo(flex_algo) -> None:
-    """Drop the overlay for this flex-algo and push the removal (full-replace)."""
-    from django.db import transaction
-
-    from .apply_state import lock_device_intent_transaction, lock_order_scope
-    from .deployment import lock_mutation
-    from .intent_state import IntentTransactionNoOp, MutationFootprint, SourceRow, intent_transaction
-    from .models import NSODeviceManagement, NSOISISFlexAlgoState
-
-    inst = flex_algo.instance
-    device = getattr(inst, "device", None)
-    if device is None:
-        return
-    try:
-        mgmt = NSODeviceManagement.objects.get(device=device)
-    except NSODeviceManagement.DoesNotExist:
-        return
-    if mgmt.adapter_device_id is None:
-        return
-    device_id, _adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
-    key = (device_id, "isis_flex_algo")
-    footprint = MutationFootprint.for_keys(
-        {key},
-        overlay_rows=(SourceRow("netbox_nso_plugin.nsoisisflexalgostate", None),),
-    )
-    with transaction.atomic(), lock_order_scope():
-        lock_mutation()
-        lock_device_intent_transaction(device_id)
-        try:
-            with intent_transaction(footprint):
-                state_pks = set(getattr(flex_algo, "_nso_linked_flex_algo_state_pks", ()))
-                state_pks.update(
-                    NSOISISFlexAlgoState.objects.filter(
-                        management=mgmt,
-                        process_tag=inst.process_tag or "",
-                        algo_id=int(flex_algo.algo_id),
-                    ).values_list("pk", flat=True)
-                )
-                if not state_pks:
-                    raise IntentTransactionNoOp
-                NSOISISFlexAlgoState.objects.filter(pk__in=state_pks).delete()
-                _schedule_intent_push(key)
-        except IntentTransactionNoOp:
-            return
+    if _converted_writer_owns_content(device_id, "isis_flex_algo"):
+        _schedule_intent_push((device_id, "isis_flex_algo"))
 
 
 @_skip_on_render
 def _on_routing_isis_flex_algo_save(sender, instance, **kwargs):
-    """Flex-algo created/edited in NetBox → own it (accepted overlay) + push."""
-    _accept_isis_flex_algo(instance)
+    """Keep foreign native Flex-Algo saves outside synchronous bookkeeping."""
 
 
 @_skip_on_render
-def _on_routing_isis_flex_algo_post_delete(sender, instance, **kwargs):
-    """Flex-algo deleted in NetBox → drop its overlay and push the removal."""
-    _remove_isis_flex_algo(instance)
+def _on_routing_isis_flex_algo_pre_delete(sender, instance, **kwargs):
+    """Keep foreign native Flex-Algo deletes outside synchronous bookkeeping."""
 
 
 def l2_sap_intent_item(row):
