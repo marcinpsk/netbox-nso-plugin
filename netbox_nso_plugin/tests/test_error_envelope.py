@@ -24,7 +24,7 @@ from django.urls import reverse
 from ipam.models import IPAddress
 
 from netbox_nso_plugin.adapter_client import AdapterError
-from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOPlatformNedMapping
+from netbox_nso_plugin.models import NSOInstance, NSOPlatformNedMapping
 
 from ._adapter_http import make_response
 from ._outbox_case import mirror_update
@@ -276,7 +276,7 @@ class TestOnboardingErrorEnvelope(TestCase):
 
         with (
             patch("netbox_nso_plugin.adapter_client.provision_device", return_value={"job_id": "job-77"}),
-            patch.object(NSODeviceManagement.objects, "create", side_effect=RuntimeError(_LEAK)),
+            patch("netbox_nso_plugin.management_lifecycle.save_management", side_effect=RuntimeError(_LEAK)),
             self.assertLogs(_ONBOARDING_LOG, level="ERROR") as logs,
         ):
             result = onboard_candidate(self.device, self.instance)
@@ -292,7 +292,7 @@ class TestOnboardingErrorEnvelope(TestCase):
         from netbox_nso_plugin.onboarding import manage_existing
 
         with (
-            patch.object(NSODeviceManagement.objects, "create", side_effect=RuntimeError(_LEAK)),
+            patch("netbox_nso_plugin.management_lifecycle.save_management", side_effect=RuntimeError(_LEAK)),
             self.assertLogs(_ONBOARDING_LOG, level="ERROR") as logs,
         ):
             result = manage_existing(self.device, self.instance, "env-router-01")

@@ -24,7 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from django.db import connection, transaction
 from django.test import TransactionTestCase
 
-from ._outbox_case import make_managed, own_route, own_vlan, without_commit_drain
+from ._outbox_case import make_managed, own_route, own_vlan, rename_vlan, without_commit_drain
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 #: Run by both processes. The role decides whether it holds the key or races for it.
@@ -246,9 +246,7 @@ class TestOneClaimerAcrossTwoProcesses(_CascadeFlushMixin, IntentPushResetMixin,
         from ._outbox_case import without_commit_drain
 
         with without_commit_drain(), transaction.atomic():
-            state.vlan.name = "proc-renamed"
-            state.vlan.save()
-            state.save()
+            rename_vlan(state, "proc-renamed")
 
     def _await(self, marker, *processes):
         deadline = time.monotonic() + 120

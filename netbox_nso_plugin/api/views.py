@@ -66,6 +66,27 @@ class NSODeviceManagementViewSet(NetBoxModelViewSet):
     serializer_class = NSODeviceManagementSerializer
     filterset_class = NSODeviceManagementFilterSet
 
+    def perform_create(self, serializer):
+        """Route API creates through the exact management writer."""
+        from ..management_lifecycle import management_crud_writes
+
+        with management_crud_writes():
+            return super().perform_create(serializer)
+
+    def perform_update(self, serializer):
+        """Route API updates through the exact management writer."""
+        from ..management_lifecycle import management_crud_writes
+
+        with management_crud_writes():
+            return super().perform_update(serializer)
+
+    def perform_destroy(self, instance):
+        """Route API deletes through the exact management writer."""
+        from ..management_lifecycle import management_crud_writes
+
+        with management_crud_writes():
+            return super().perform_destroy(instance)
+
 
 class NSOInterfaceStateViewSet(NetBoxModelViewSet):
     """REST API for NSOInterfaceState — per-interface intent status overlay.

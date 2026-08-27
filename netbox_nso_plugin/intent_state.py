@@ -73,6 +73,7 @@ SOURCE_MODEL_RANKS = (
     "netbox_routing.bgpaddressfamily",
     "netbox_routing.bgppeeraddressfamily",
     "netbox_routing.redistribution",
+    "netbox_nso_plugin.nsodevicemanagement",
     "netbox_nso_plugin.nsoinstance",
     "netbox_nso_plugin.nsoroutepolicyobjectclass",
     "netbox_nso_plugin.nsoplatformnedmapping",
@@ -762,6 +763,86 @@ def _lacp_member_dependencies(before, after, spec):
         source_rows=(SourceRow("dcim.interface", interface_id) for interface_id in interface_ids),
         overlay_rows=(SourceRow(bundle._meta.label_lower, bundle.pk) for bundle in bundles),
     ), placement_changed and (before_fragment != ABSENT or after_fragment != ABSENT)
+
+
+def _vlan_state_dependencies(before, after, spec):
+    """Lock each native VLAN anchor referenced by a VLAN overlay write."""
+    candidates = tuple(candidate for candidate in (before, after) if candidate is not None)
+    vlan_ids = {row.vlan_id for row in candidates if row.vlan_id is not None}
+    return MutationFootprint.for_keys(
+        (
+            *(key for row in candidates for key in spec.resolver(row, spec)),
+            *_vlan_anchor_keys(vlan_ids, spec.scopes),
+        ),
+        shared_keys=(("vlan", str(vlan_id)) for vlan_id in vlan_ids),
+        source_rows=(SourceRow("ipam.vlan", vlan_id) for vlan_id in vlan_ids),
+    ), False
+
+
+def _vlan_anchor_keys(vlan_ids, scopes):
+    """Resolve the devices that already render a shared native VLAN anchor."""
+    Vlan = apps.get_model("ipam.vlan")
+    native_spec = _REGISTRY["ipam.vlan"]
+    device_ids = {
+        device_id
+        for vlan in Vlan.objects.filter(pk__in=vlan_ids).order_by("pk")
+        for device_id, _scope in native_spec.resolver(vlan, native_spec)
+    }
+    return {(device_id, scope) for device_id in device_ids for scope in scopes}
+
+
+def _svi_dependencies(before, after, spec):
+    """Lock the native interface and VLAN anchors of an SVI overlay write."""
+    candidates = tuple(candidate for candidate in (before, after) if candidate is not None)
+    interface_ids = {row.interface_id for row in candidates if row.interface_id is not None}
+    vlan_ids = {row.vlan_id for row in candidates if row.vlan_id is not None}
+    return MutationFootprint.for_keys(
+        (
+            *(key for row in candidates for key in spec.resolver(row, spec)),
+            *_vlan_anchor_keys(vlan_ids, spec.scopes),
+        ),
+        shared_keys=(("vlan", str(vlan_id)) for vlan_id in vlan_ids),
+        source_rows=(
+            *(SourceRow("dcim.interface", interface_id) for interface_id in interface_ids),
+            *(SourceRow("ipam.vlan", vlan_id) for vlan_id in vlan_ids),
+        ),
+    ), False
+
+
+def _switchport_dependencies(before, after, spec):
+    """Lock every native interface and VLAN read by a switchport write."""
+    candidates = tuple(candidate for candidate in (before, after) if candidate is not None)
+    interface_ids = {row.interface_id for row in candidates if row.interface_id is not None}
+    vlan_ids = {row.untagged_vlan_id for row in candidates if row.untagged_vlan_id is not None}
+    for row in candidates:
+        if row.pk is not None and not row._state.adding:
+            vlan_ids.update(row.tagged_vlans.values_list("pk", flat=True))
+    return MutationFootprint.for_keys(
+        (
+            *(key for row in candidates for key in spec.resolver(row, spec)),
+            *_vlan_anchor_keys(vlan_ids, spec.scopes),
+        ),
+        shared_keys=(("vlan", str(vlan_id)) for vlan_id in vlan_ids),
+        source_rows=(
+            *(SourceRow("dcim.interface", interface_id) for interface_id in interface_ids),
+            *(SourceRow("ipam.vlan", vlan_id) for vlan_id in vlan_ids),
+            SourceRow("netbox_nso_plugin.nsoswitchportstate_tagged_vlans", None),
+        ),
+    ), False
+
+
+def _interface_dependencies(before, after, spec):
+    """Lock VLAN anchors read by an exact native interface write."""
+    candidates = tuple(candidate for candidate in (before, after) if candidate is not None)
+    vlan_ids = {row.untagged_vlan_id for row in candidates if row.untagged_vlan_id is not None}
+    for row in candidates:
+        if row.pk is not None and not row._state.adding:
+            vlan_ids.update(row.tagged_vlans.values_list("pk", flat=True))
+    return MutationFootprint.for_keys(
+        _vlan_anchor_keys(vlan_ids, spec.scopes),
+        shared_keys=(("vlan", str(vlan_id)) for vlan_id in vlan_ids),
+        source_rows=(SourceRow("ipam.vlan", vlan_id) for vlan_id in vlan_ids),
+    ), False
 
 
 def _switchport_fragment(instance):
@@ -1629,6 +1710,7 @@ def _regular_instance_footprint(instance, spec) -> MutationFootprint:
             keys,
             shared_keys=shared_keys,
             source_rows=(
+                *row,
                 SourceRow("dcim.device", instance.device_id),
                 SourceRow("dcim.interface", None),
                 *(SourceRow("dcim.interface", interface_id) for interface_id in interface_ids),
@@ -1864,8 +1946,10 @@ def _revalidate_sources(footprint: MutationFootprint) -> None:
         if spec is None:
             continue
         instance = apps.get_model(row.model_label).objects.filter(pk=row.pk).first()
+        if instance is None:
+            raise IntentMutationProtocolError(f"{row.model_label} row {row.pk!r} disappeared during acquisition")
         resolved_devices = {device_id for device_id, _scope in spec.resolver(instance, spec)}
-        if instance is not None and not resolved_devices <= expected_devices:
+        if not resolved_devices <= expected_devices:
             raise RendererTargetsChanged(
                 f"{row.model_label} row {row.pk!r} changed its renderer targets during acquisition"
             )
@@ -2081,10 +2165,11 @@ def _intent_transaction(
     footprint: MutationFootprint,
     *,
     defer_repend: bool = False,
+    repend_after: bool = False,
     settles_deploying: bool = True,
     bump_keys=None,
 ):
-    """Acquire one content permit, optionally forcing its re-pend at body exit."""
+    """Acquire one content permit and apply the requested re-pend timing."""
     _discard_rolled_back_implicit_permit()
     active = _join_active_permit(footprint, settles_deploying=settles_deploying)
     if active is not None:
@@ -2104,11 +2189,11 @@ def _intent_transaction(
                 footprint,
                 bump_keys=None if bump_keys is None else frozenset(bump_keys),
                 settles_deploying=settles_deploying,
-                defer_repend=defer_repend,
+                defer_repend=defer_repend or repend_after,
             )
             permit.bumped.update(acquired.bumped)
             yield permit
-            if defer_repend and permit.settles_deploying and acquired.deploying_rows:
+            if (defer_repend or repend_after) and permit.settles_deploying and acquired.deploying_rows:
                 _repend_locked_rows(acquired.deploying_rows)
         finally:
             _ACTIVE_PERMIT.reset(token)
@@ -2477,7 +2562,7 @@ def _authorize_active_write(active, sender, instance, spec, *, deleting, update_
             or not requested <= (active.mirror_update_fields or frozenset())
         ):
             raise IntentMutationProtocolError("the write is outside the active mirror_refresh permit")
-    elif active.dml_kind == "reconcile":
+    elif active.dml_kind == "reconcile" and writer is None:
         if not _footprint_covers_row(instance, active):
             raise IntentMutationProtocolError(
                 f"{sender._meta.label_lower} row {instance.pk!r} is outside the active mirror footprint"
@@ -3468,13 +3553,27 @@ def register_builtin_renderer_inputs(*, connect_ends: bool = True) -> None:
         "netbox_nso_plugin.nsoswitchportstate": _switchport_fragment,
     }
     for label, fragment in exact_direct_fragments.items():
-        dependency_resolver = _lacp_member_dependencies if label == "netbox_nso_plugin.nsolacpmemberstate" else None
+        dependency_resolvers = {
+            "netbox_nso_plugin.nsolacpmemberstate": _lacp_member_dependencies,
+            "netbox_nso_plugin.nsosvistate": _svi_dependencies,
+            "netbox_nso_plugin.nsoswitchportstate": _switchport_dependencies,
+        }
         _REGISTRY[label] = replace(
             _REGISTRY[label],
             fragment=fragment,
-            dependency_resolver=dependency_resolver,
+            dependency_resolver=dependency_resolvers.get(label),
         )
         _TABLE_REGISTRY[_REGISTRY[label].table] = _REGISTRY[label]
+    _REGISTRY["netbox_nso_plugin.nsovlanstate"] = replace(
+        _REGISTRY["netbox_nso_plugin.nsovlanstate"],
+        dependency_resolver=_vlan_state_dependencies,
+    )
+    _TABLE_REGISTRY[_REGISTRY["netbox_nso_plugin.nsovlanstate"].table] = _REGISTRY["netbox_nso_plugin.nsovlanstate"]
+    _REGISTRY["dcim.interface"] = replace(
+        _REGISTRY["dcim.interface"],
+        dependency_resolver=_interface_dependencies,
+    )
+    _TABLE_REGISTRY[_REGISTRY["dcim.interface"].table] = _REGISTRY["dcim.interface"]
     _REGISTRY["netbox_nso_plugin.nsointerfacestate"] = replace(
         _REGISTRY["netbox_nso_plugin.nsointerfacestate"],
         fragment=_interface_state_fragment,

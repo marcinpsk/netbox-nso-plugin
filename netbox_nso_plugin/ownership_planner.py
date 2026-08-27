@@ -127,3 +127,16 @@ def plan_ownership(rule: ScopeOwnershipRule, signature: OwnershipSignature) -> O
     if signature.overlay_present:
         return OwnershipAction.ACQUIRE
     return OwnershipAction.CREATE
+
+
+def retire_manifest_identity(*, device_ids, scope, native_model_label, native_key) -> None:
+    """Retire owned manifest entries after an own authoritative native replacement."""
+    from .models import NSOOwnershipManifest
+
+    NSOOwnershipManifest.objects.filter(
+        device_id__in=set(device_ids),
+        scope=scope,
+        native_model_label=native_model_label,
+        native_key=native_key,
+        ownership_state="owned",
+    ).update(ownership_state="retired")
