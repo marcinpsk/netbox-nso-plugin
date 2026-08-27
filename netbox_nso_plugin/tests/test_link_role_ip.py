@@ -28,7 +28,7 @@ from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOInterf
 
 from .mixins import IntentPushResetMixin
 
-_PUSH = "netbox_nso_plugin.signals._push_ip_intent_for_device"
+_PUSH = "netbox_nso_plugin.adapter_client.put_ip_intent"
 
 
 def _make_cable(iface_a, iface_b):

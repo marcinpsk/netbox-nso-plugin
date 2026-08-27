@@ -25,6 +25,7 @@ from ._outbox_case import (
     state_of,
     without_commit_drain,
 )
+from ._static_route_case import _unassign_and_retire
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -408,7 +409,7 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         def remove_route(_request):
             Tag.objects.create(name="request rollback witness", slug="request-rollback-witness")
             with transaction.atomic():
-                route.devices.remove(self.device)
+                _unassign_and_retire(route, self.device)
             return HttpResponse("mutated")
 
         quiesce()
@@ -625,7 +626,7 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         with config, session:
             assert drain.drain_key(self.device.pk, "static_route") == drain.SUCCEEDED
         with without_commit_drain():
-            route.devices.remove(self.device)
+            _unassign_and_retire(route, self.device)
         claim = drain.claim(self.device.pk, "static_route")
         assert claim is not None and [record["route_id"] for record in claim.deletions] == [route.pk]
 
@@ -874,7 +875,7 @@ class TestIntentRestoreResolvesEveryReceiptCase(_CascadeFlushMixin, IntentPushRe
 
         with marking_mode("static_route", delivery.MARKING_QUERY_FLAG):
             with without_commit_drain():
-                route.devices.remove(self.device)
+                _unassign_and_retire(route, self.device)
             claim = drain.claim(self.device.pk, "static_route")
             assert [record["route_id"] for record in claim.deletions] == [route.pk]
             config, session = self.adapter.patches()
