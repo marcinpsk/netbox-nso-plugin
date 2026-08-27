@@ -206,6 +206,7 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
             "interface_mtu",
             "lacp",
             "logging",
+            "snmp",
             "subinterface",
             "vlan",
             "svi",
