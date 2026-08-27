@@ -4669,9 +4669,11 @@ def _save_route_map_name_edit(state, old_name):
 
 def _save_lacp_edit(obj, key, old_values):
     """Own a complete LACP bundle while preserving which member actually changed."""
+    import copy
+
     from . import status_machine as sm
-    from .intent_state import MutationFootprint, footprint_for_instance, intent_transaction
     from .models import NSOLACPBundleState, NSOLACPMemberState
+    from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
     bundle = (
         obj
@@ -4684,51 +4686,51 @@ def _save_lacp_edit(obj, key, old_values):
             lag_bundle=bundle.interface,
         )
     )
-    footprint = MutationFootprint.merge(
-        footprint_for_instance(bundle),
-        *(footprint_for_instance(member) for member in members),
-    )
     changed_values = {
         field_name: getattr(obj, field_name)
         for field_name, old_value in old_values.items()
         if getattr(obj, field_name) != old_value
     }
-    with intent_transaction(footprint):
-        bundle = NSOLACPBundleState.objects.get(pk=bundle.pk)
-        members = list(
-            NSOLACPMemberState.objects.filter(
-                management=bundle.management,
-                lag_bundle=bundle.interface,
-            ).order_by("pk")
-        )
-        now = timezone.now()
-        for member in members:
-            if member.pk == getattr(obj, "pk", None) and key == "lacp_member":
-                for field_name, value in changed_values.items():
-                    setattr(member, field_name, value)
-                target_status = sm.on_operator_edit(member.status)
-            elif member.status == "deploying":
-                target_status = sm.on_operator_edit(member.status)
-            else:
-                target_status = _status_after_accept(member.status)
-            if not sm.is_owned(member.status):
-                member.accepted_at = now
-            member.status = target_status
-            update_fields = {"status", "accepted_at"}
-            if member.pk == getattr(obj, "pk", None) and key == "lacp_member":
-                update_fields.update(changed_values)
-            member.save(update_fields=update_fields)
-
-        if key == "lacp_bundle":
+    now = timezone.now()
+    saves = []
+    candidates = []
+    for member in members:
+        candidate = copy.copy(member)
+        if member.pk == getattr(obj, "pk", None) and key == "lacp_member":
             for field_name, value in changed_values.items():
-                setattr(bundle, field_name, value)
-        if not sm.is_owned(bundle.status):
-            bundle.accepted_at = now
-        bundle.status = sm.on_operator_edit(bundle.status) if bundle.status == "deploying" else "accepted"
-        bundle_update_fields = {"status", "accepted_at"}
-        if key == "lacp_bundle":
-            bundle_update_fields.update(changed_values)
-        bundle.save(update_fields=bundle_update_fields)
+                setattr(candidate, field_name, value)
+            target_status = sm.on_operator_edit(member.status)
+        elif member.status == "deploying":
+            target_status = sm.on_operator_edit(member.status)
+        else:
+            target_status = _status_after_accept(member.status)
+        if not sm.is_owned(member.status):
+            candidate.accepted_at = now
+        candidate.status = target_status
+        update_fields = {"status", "accepted_at"}
+        if member.pk == getattr(obj, "pk", None) and key == "lacp_member":
+            update_fields.update(changed_values)
+        candidates.append((candidate, update_fields))
+        saves.append(planned_save(candidate, update_fields=update_fields))
+
+    bundle_candidate = copy.copy(bundle)
+    if key == "lacp_bundle":
+        for field_name, value in changed_values.items():
+            setattr(bundle_candidate, field_name, value)
+    if not sm.is_owned(bundle.status):
+        bundle_candidate.accepted_at = now
+    bundle_candidate.status = sm.on_operator_edit(bundle.status) if bundle.status == "deploying" else "accepted"
+    bundle_update_fields = {"status", "accepted_at"}
+    if key == "lacp_bundle":
+        bundle_update_fields.update(changed_values)
+    candidates.append((bundle_candidate, bundle_update_fields))
+    saves.append(planned_save(bundle_candidate, update_fields=bundle_update_fields))
+
+    plan = RendererMutationPlan.build(saves=saves, planned_at=now)
+    mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+    with mutation as writer:
+        for candidate, update_fields in candidates:
+            writer.save(candidate, update_fields=update_fields)
 
 
 def _save_vlan_name_edit(obj):
@@ -5505,9 +5507,10 @@ class NSOLACPBundleStateAcceptView(NSOActionPermissionMixin, View):
     """
 
     def post(self, request, pk):  # noqa: D102
-        from django.db import transaction
+        import copy
 
         from .models import NSOLACPBundleState, NSOLACPMemberState
+        from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
         state = get_object_or_404(NSOLACPBundleState, pk=pk)
         # NX-P2 vPC preserve/REFUSE: a vPC-protected bundle cannot be onboarded — the
@@ -5521,19 +5524,27 @@ class NSOLACPBundleStateAcceptView(NSOActionPermissionMixin, View):
             )
             return redirect(_device_nso_tab_url(state.management.device_id))
         now = timezone.now()
-        # Accept the bundle + all its members in ONE transaction so the per-save intent
-        # pushes coalesce (via _schedule_intent_push) into a single snapshot push at commit —
-        # otherwise each non-atomic save fires its own push and the member-before-bundle order
-        # emits a spurious bundle_count=0 push (FASTMAP briefly clears the bundle) before the
-        # real bundle_count=1 one.
-        with transaction.atomic():
-            for m in NSOLACPMemberState.objects.filter(management=state.management, lag_bundle=state.interface):
-                m.status = _status_after_accept(m.status)
-                m.accepted_at = now
-                m.save(update_fields=["status", "accepted_at"])
-            state.status = _status_after_accept(state.status)
-            state.accepted_at = now
-            state.save(update_fields=["status", "accepted_at"])
+        candidates = []
+        for member in NSOLACPMemberState.objects.filter(
+            management=state.management,
+            lag_bundle=state.interface,
+        ).order_by("pk"):
+            candidate = copy.copy(member)
+            candidate.status = _status_after_accept(member.status)
+            candidate.accepted_at = now
+            candidates.append(candidate)
+        bundle_candidate = copy.copy(state)
+        bundle_candidate.status = _status_after_accept(state.status)
+        bundle_candidate.accepted_at = now
+        candidates.append(bundle_candidate)
+        plan = RendererMutationPlan.build(
+            saves=(planned_save(candidate, update_fields=("status", "accepted_at")) for candidate in candidates),
+            planned_at=now,
+        )
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+        with mutation as writer:
+            for candidate in candidates:
+                writer.save(candidate, update_fields=("status", "accepted_at"))
         messages.success(request, f"Accepted LACP bundle {state.interface.name}.")
         return redirect(_device_nso_tab_url(state.management.device_id))
 

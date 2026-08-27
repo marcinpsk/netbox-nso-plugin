@@ -18,99 +18,146 @@ NetBox are logged and skipped.
 
 from __future__ import annotations
 
+import contextlib
+import copy
 import logging
-
-from .intent_state import mirror_reconciler
 
 logger = logging.getLogger(__name__)
 
 
-def lag_config_reconcile_plan(device, payload: dict):
-    """Declare LACP overlay rows and predict changes to owned wire fragments."""
-    import copy
-
+def lacp_reconcile_plan(device, payload: dict):
+    """Freeze every LACP overlay save/delete before the first lock or write."""
     from dcim.models import Interface
+    from django.utils import timezone
 
     from . import status_machine as sm
-    from .intent_state import MutationFootprint, ReconcileMutationPlan, SourceRow, canonical_fragment
     from .models import NSODeviceManagement, NSOLACPBundleState, NSOLACPMemberState
+    from .renderer_writer import RendererMutationPlan, planned_delete, planned_save
 
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:
-        return ReconcileMutationPlan(MutationFootprint())
-    interfaces = tuple(Interface.objects.filter(device=device).order_by("pk"))
-    interface_by_name = {interface.name: interface for interface in interfaces}
-    bundles = tuple(NSOLACPBundleState.objects.filter(management=management).select_related("interface").order_by("pk"))
-    members = tuple(NSOLACPMemberState.objects.filter(management=management).select_related("interface").order_by("pk"))
-    reported_bundles = {
-        item.get("name"): item
-        for item in payload.get("bundles", []) or []
-        if isinstance(item, dict) and item.get("name") in interface_by_name
+        return RendererMutationPlan.build()
+    interfaces = {row.name: row for row in Interface.objects.filter(device=device)}
+    bundle_states = {
+        row.interface_id: row for row in NSOLACPBundleState.objects.filter(management=management).order_by("pk")
     }
-    reported_members = {
-        member.get("interface_name"): (item, member)
-        for item in reported_bundles.values()
-        for member in item.get("members", []) or []
-        if isinstance(member, dict) and member.get("interface_name") in interface_by_name
+    member_states = {
+        row.interface_id: row
+        for row in NSOLACPMemberState.objects.filter(management=management).select_related("interface").order_by("pk")
     }
-    changes_content = False
-    for state in bundles:
-        candidate = copy.copy(state)
-        item = reported_bundles.get(state.interface.name)
-        if item is None:
-            candidate.status = sm.on_reconcile(state.status, present=False)
-        else:
-            candidate.lag_id = item.get("lag_id")
-            candidate.min_links = item.get("min_links")
-            candidate.system_priority = item.get("system_priority")
-            candidate.system_id = item.get("system_id") or ""
-            candidate.timer = item.get("timer") or ""
-            candidate.admin_key = item.get("admin_key")
-            candidate.vpc_sensitive = bool(item.get("vpc_sensitive"))
-            candidate.status = sm.on_reconcile(state.status, matches=None)
-        if canonical_fragment(state) != canonical_fragment(candidate):
-            changes_content = True
-            break
-    if not changes_content:
-        for state in members:
-            candidate = copy.copy(state)
-            observed = reported_members.get(state.interface.name)
-            if observed is None:
-                candidate.status = sm.on_reconcile(state.status, present=False)
-            else:
-                item, member = observed
-                candidate.lag_bundle = interface_by_name[item["name"]]
-                candidate.mode = member.get("mode") or ""
-                candidate.port_priority = member.get("port_priority")
-                candidate.status = sm.on_reconcile(state.status, matches=None)
-            if canonical_fragment(state) != canonical_fragment(candidate):
-                changes_content = True
-                break
-    states = (*bundles, *members)
-    return ReconcileMutationPlan(
-        MutationFootprint.for_keys(
-            {(device.pk, "lacp")},
-            source_rows=(SourceRow("dcim.interface", interface.pk) for interface in interfaces),
-            overlay_rows=(
-                SourceRow("netbox_nso_plugin.nsolacpbundlestate", None),
-                SourceRow("netbox_nso_plugin.nsolacpmemberstate", None),
-                *(SourceRow(state._meta.label_lower, state.pk) for state in states),
-            ),
-        ),
-        changes_content=changes_content,
-    )
+    planned_at = timezone.now()
+    saves = []
+    deletes = []
+    seen_bundles = set()
+    seen_members = set()
+
+    for bundle_data in payload.get("bundles", []) or []:
+        lag_interface = interfaces.get(bundle_data.get("name") or "")
+        if lag_interface is None:
+            continue
+        current = bundle_states.get(lag_interface.pk)
+        candidate = (
+            copy.copy(current)
+            if current is not None
+            else NSOLACPBundleState(management=management, interface=lag_interface, status="unknown")
+        )
+        candidate.lag_id = bundle_data.get("lag_id")
+        candidate.min_links = bundle_data.get("min_links")
+        candidate.system_priority = bundle_data.get("system_priority")
+        candidate.system_id = bundle_data.get("system_id") or ""
+        candidate.timer = bundle_data.get("timer") or ""
+        candidate.admin_key = bundle_data.get("admin_key")
+        candidate.vpc_sensitive = bool(bundle_data.get("vpc_sensitive"))
+        candidate.last_sync_at = planned_at
+        candidate.status = sm.on_reconcile(candidate.status, matches=None)
+        saves.append(
+            planned_save(
+                candidate,
+                force_insert=current is None,
+                natural_key=("management", "interface"),
+            )
+        )
+        seen_bundles.add(lag_interface.pk)
+
+        for member_data in bundle_data.get("members", []) or []:
+            member_interface = interfaces.get(member_data.get("interface_name") or "")
+            if member_interface is None:
+                continue
+            current_member = member_states.get(member_interface.pk)
+            member = (
+                copy.copy(current_member)
+                if current_member is not None
+                else NSOLACPMemberState(management=management, interface=member_interface, status="unknown")
+            )
+            member.lag_bundle = lag_interface
+            member.mode = member_data.get("mode") or ""
+            member.port_priority = member_data.get("port_priority")
+            member.last_sync_at = planned_at
+            member.status = sm.on_reconcile(member.status, matches=None)
+            saves.append(
+                planned_save(
+                    member,
+                    force_insert=current_member is None,
+                    natural_key=("management", "interface"),
+                )
+            )
+            seen_members.add(member_interface.pk)
+
+    for stale in bundle_states.values():
+        if stale.interface_id in seen_bundles:
+            continue
+        vestigial = not Interface.objects.filter(lag_id=stale.interface_id).exists()
+        if not sm.is_owned(stale.status) and vestigial:
+            deletes.append(planned_delete(stale))
+            continue
+        new_status = sm.on_reconcile(stale.status, present=False)
+        if new_status != stale.status:
+            candidate = copy.copy(stale)
+            candidate.status = new_status
+            candidate.last_sync_at = planned_at
+            saves.append(planned_save(candidate, update_fields=("status", "last_sync_at")))
+    for stale in member_states.values():
+        if stale.interface_id in seen_members:
+            continue
+        if not sm.is_owned(stale.status) and stale.interface.lag_id is None:
+            deletes.append(planned_delete(stale))
+            continue
+        new_status = sm.on_reconcile(stale.status, present=False)
+        if new_status != stale.status:
+            candidate = copy.copy(stale)
+            candidate.status = new_status
+            candidate.last_sync_at = planned_at
+            saves.append(planned_save(candidate, update_fields=("status", "last_sync_at")))
+
+    return RendererMutationPlan.build(saves=saves, deletes=deletes, planned_at=planned_at)
 
 
-@mirror_reconciler
 def reconcile_lag_config(device, payload: dict) -> list:
-    """Upsert NSOLACPBundleState + NSOLACPMemberState from the adapter lag-config payload.
+    """Apply one frozen LACP reconciliation through the renderer writer.
 
     ``payload`` is the JSON body of GET /api/v1/devices/{id}/lag-config. Returns
     all current NSOLACPBundleState rows for the device (``[]`` if the device has
     no NSO management).
     """
+    from .renderer_writer import (
+        active_renderer_writer,
+        renderer_mirror_writes,
+        renderer_writes,
+    )
+    from .signals import suppress_intent_push
+
+    active = active_renderer_writer()
+    plan = active.plan if active is not None else lacp_reconcile_plan(device, payload)
+    mutation = contextlib.nullcontext(active)
+    if active is None:
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+    with mutation as writer, suppress_intent_push():
+        return _reconcile_lag_config(device, payload, writer, plan.planned_at)
+
+
+def _reconcile_lag_config(device, payload: dict, writer, planned_at) -> list:
+    """Apply the LACP payload after its exact write set is frozen."""
     from dcim.models import Interface
-    from django.utils import timezone
 
     from . import status_machine as sm
     from .models import (
@@ -126,7 +173,7 @@ def reconcile_lag_config(device, payload: dict) -> list:
 
     bundles = payload.get("bundles", []) or []
     iface_map = {i.name: i for i in Interface.objects.filter(device=device)}
-    now = timezone.now()
+    now = planned_at
     seen_bundles: set[int] = set()
     seen_members: set[int] = set()
     dropped: list[str] = []
@@ -140,11 +187,10 @@ def reconcile_lag_config(device, payload: dict) -> list:
             dropped.append(bundle_name)
             continue
 
-        state, _ = NSOLACPBundleState.objects.get_or_create(
-            management=mgmt,
-            interface=lag_iface,
-            defaults={"status": "unknown"},
-        )
+        state = NSOLACPBundleState.objects.filter(management=mgmt, interface=lag_iface).first()
+        created = state is None
+        if created:
+            state = NSOLACPBundleState(management=mgmt, interface=lag_iface, status="unknown")
         state.lag_id = bundle_data.get("lag_id")
         state.min_links = bundle_data.get("min_links")
         state.system_priority = bundle_data.get("system_priority")
@@ -156,7 +202,7 @@ def reconcile_lag_config(device, payload: dict) -> list:
         state.vpc_sensitive = bool(bundle_data.get("vpc_sensitive"))
         state.last_sync_at = now
         state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
-        state.save()
+        writer.save(state, force_insert=created)
         seen_bundles.add(lag_iface.pk)
 
         for member_data in bundle_data.get("members", []) or []:
@@ -168,29 +214,22 @@ def reconcile_lag_config(device, payload: dict) -> list:
                 dropped.append(iface_name)
                 continue
 
-            m_state, _ = NSOLACPMemberState.objects.get_or_create(
-                management=mgmt,
-                interface=member_iface,
-                defaults={"status": "unknown"},
-            )
+            m_state = NSOLACPMemberState.objects.filter(management=mgmt, interface=member_iface).first()
+            member_created = m_state is None
+            if member_created:
+                m_state = NSOLACPMemberState(management=mgmt, interface=member_iface, status="unknown")
             m_state.lag_bundle = lag_iface
             m_state.mode = member_data.get("mode") or ""
             m_state.port_priority = member_data.get("port_priority")
             m_state.last_sync_at = now
             m_state.status = sm.on_reconcile(m_state.status, matches=None)  # mirror overlay
-            m_state.save()
+            writer.save(m_state, force_insert=member_created)
             seen_members.add(member_iface.pk)
 
     # Rows the payload no longer reports → prune vestigial husks, else drift (clobber-safe;
     # native interfaces untouched). A stale bundle is vestigial when its LAG interface has
     # no members left; a stale member when its interface is no longer assigned to any LAG.
-    for stale in NSOLACPBundleState.objects.filter(management=mgmt):
-        if stale.interface_id not in seen_bundles:
-            vestigial = not Interface.objects.filter(lag_id=stale.interface_id).exists()
-            sm.finalise_stale_overlay(stale, vestigial=vestigial, now=now)
-    for stale in NSOLACPMemberState.objects.filter(management=mgmt).select_related("interface"):
-        if stale.interface_id not in seen_members:
-            sm.finalise_stale_overlay(stale, vestigial=stale.interface.lag_id is None, now=now)
+    _finalise_stale_lacp(mgmt, seen_bundles, seen_members, writer, now)
 
     if dropped:
         logger.warning(
@@ -201,3 +240,36 @@ def reconcile_lag_config(device, payload: dict) -> list:
         )
 
     return list(NSOLACPBundleState.objects.filter(management=mgmt).select_related("interface"))
+
+
+def _finalise_stale_lacp(management, seen_bundles, seen_members, writer, now) -> None:
+    """Apply the planned stale-row outcomes for one LACP snapshot."""
+    from dcim.models import Interface
+
+    from . import status_machine as sm
+    from .models import NSOLACPBundleState, NSOLACPMemberState
+
+    groups = (
+        (
+            NSOLACPBundleState.objects.filter(management=management),
+            seen_bundles,
+            lambda row: not Interface.objects.filter(lag_id=row.interface_id).exists(),
+        ),
+        (
+            NSOLACPMemberState.objects.filter(management=management).select_related("interface"),
+            seen_members,
+            lambda row: row.interface.lag_id is None,
+        ),
+    )
+    for rows, seen, is_vestigial in groups:
+        for stale in rows:
+            if stale.interface_id in seen:
+                continue
+            if not sm.is_owned(stale.status) and is_vestigial(stale):
+                writer.delete(stale)
+                continue
+            new_status = sm.on_reconcile(stale.status, present=False)
+            if new_status != stale.status:
+                stale.status = new_status
+                stale.last_sync_at = now
+                writer.save(stale, update_fields=("status", "last_sync_at"))

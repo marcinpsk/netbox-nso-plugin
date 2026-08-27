@@ -90,6 +90,39 @@ class TestReconcileLagConfig(TestCase):
         m2 = NSOLACPMemberState.objects.get(interface=self.m2)
         assert m2.port_priority is None
 
+    def test_owned_member_move_bumps_the_lacp_document(self):
+        """A lag_bundle change affects the nested LACP document, not only the member row."""
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        second_lag = Interface.objects.create(device=self.device, name="Port-channel2", type="lag")
+        reconcile_lag_config(
+            self.device,
+            _payload(
+                [
+                    self._bundle(
+                        members=[{"interface_name": self.m1.name, "mode": "active"}],
+                    )
+                ]
+            ),
+        )
+        bundle = NSOLACPBundleState.objects.get(interface=self.lag)
+        member = NSOLACPMemberState.objects.get(interface=self.m1)
+        bundle.status = "accepted"
+        bundle.save(update_fields=["status"])
+        member.status = "accepted"
+        member.save(update_fields=["status"])
+        before = NSOIntentRevision.objects.get(device=self.device, scope="lacp").revision
+
+        moved = self._bundle(
+            name=second_lag.name, lag_id=2, members=[{"interface_name": self.m1.name, "mode": "active"}]
+        )
+        reconcile_lag_config(self.device, _payload([self._bundle(), moved]))
+
+        member.refresh_from_db()
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="lacp")
+        assert member.lag_bundle_id == second_lag.pk
+        assert revision.revision == before + 1
+
     def test_idempotent_second_reconcile(self):
         data = _payload([self._bundle(min_links=3)])
         reconcile_lag_config(self.device, data)
