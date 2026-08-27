@@ -544,6 +544,12 @@ _FIRST_SQL_KEYWORD = re.compile(
 )
 
 
+@functools.lru_cache(maxsize=1)
+def _registered_table_names() -> tuple[str, ...]:
+    """Return lower-case table names for the guard's raw SQL prescan."""
+    return tuple(table.lower() for table in _TABLE_REGISTRY)
+
+
 def _discard_rolled_back_implicit_permit() -> None:
     """Drop an implicit permit whose acquisition savepoint no longer exists."""
     permit = _ACTIVE_PERMIT.get()
@@ -2620,6 +2626,9 @@ def _dml_guard(execute, sql, params, many, context):
     statement = str(sql)
     if _MIGRATIONS_ACTIVE.get():
         return execute(sql, params, many, context)
+    lowered_statement = statement.lower()
+    if not any(table in lowered_statement for table in _registered_table_names()):
+        return execute(sql, params, many, context)
     first_keyword = _FIRST_SQL_KEYWORD.match(statement)
     if first_keyword is not None and first_keyword.group(1).upper() in _DML_PARSE_SKIP_KEYWORDS:
         return execute(sql, params, many, context)
@@ -2927,6 +2936,7 @@ def register_renderer_input(spec: RendererInputSpec, *, connect_ends: bool = Tru
     )
     _REGISTRY[label] = normalized
     _TABLE_REGISTRY[model._meta.db_table] = normalized
+    _registered_table_names.cache_clear()
     uid = f"nso_intent_guard_{label}"
     pre_save.connect(_begin_implicit, sender=model, dispatch_uid=f"{uid}_pre_save", weak=False)
     pre_delete.connect(_begin_delete_implicit, sender=model, dispatch_uid=f"{uid}_pre_delete", weak=False)
