@@ -211,6 +211,59 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertEqual(selected, (self.state.pk,))
         self.assertEqual(parse_calls, 0)
 
+    def test_unregistered_changelog_insert_skips_sqlparse(self):
+        statement = (
+            "INSERT INTO intent_guard_unregistered_objectchange "
+            "(object_type_id, changed_object_id, action) VALUES (%s, %s, %s)"
+        )
+        real_parse = sqlparse.parse
+        parse_calls = 0
+
+        def counting_parse(*args, **kwargs):
+            nonlocal parse_calls
+            parse_calls += 1
+            return real_parse(*args, **kwargs)
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "CREATE TEMP TABLE intent_guard_unregistered_objectchange "
+                "(object_type_id integer, changed_object_id bigint, action varchar(50))"
+            )
+            with patch("netbox_nso_plugin.intent_state.sqlparse.parse", counting_parse):
+                cursor.execute(statement, [1, 1623, "update"])
+                cursor.execute(
+                    "SELECT object_type_id, changed_object_id, action FROM intent_guard_unregistered_objectchange"
+                )
+                inserted = cursor.fetchone()
+
+        self.assertEqual(inserted, (1, 1623, "update"))
+        self.assertEqual(parse_calls, 0)
+
+    def test_unregistered_cte_led_update_skips_sqlparse(self):
+        statement = (
+            "WITH target AS (SELECT id FROM intent_guard_unregistered_cte WHERE id = %s) "
+            "UPDATE intent_guard_unregistered_cte AS candidate SET value = %s "
+            "FROM target WHERE candidate.id = target.id"
+        )
+        real_parse = sqlparse.parse
+        parse_calls = 0
+
+        def counting_parse(*args, **kwargs):
+            nonlocal parse_calls
+            parse_calls += 1
+            return real_parse(*args, **kwargs)
+
+        with connection.cursor() as cursor:
+            cursor.execute("CREATE TEMP TABLE intent_guard_unregistered_cte (id integer PRIMARY KEY, value text)")
+            cursor.execute("INSERT INTO intent_guard_unregistered_cte (id, value) VALUES (%s, %s)", [1, "before"])
+            with patch("netbox_nso_plugin.intent_state.sqlparse.parse", counting_parse):
+                cursor.execute(statement, [1, "after"])
+                cursor.execute("SELECT value FROM intent_guard_unregistered_cte WHERE id = %s", [1])
+                updated = cursor.fetchone()
+
+        self.assertEqual(updated, ("after",))
+        self.assertEqual(parse_calls, 0)
+
     def test_repeated_insert_shape_is_parsed_at_most_once(self):
         statement = "INSERT INTO intent_guard_parse_cache (value) VALUES (%s)"
         real_parse = sqlparse.parse
