@@ -196,12 +196,12 @@ class TestManifestRetirement(TestCase):
 
 
 class TestConvertedScopeRuleTable(SimpleTestCase):
-    def test_first_tranche_has_reviewed_acquisition_and_retirement_entries(self):
+    def test_converted_scopes_have_reviewed_acquisition_and_retirement_entries(self):
         from netbox_nso_plugin.ownership_planner import converted_scope_rules
 
         rules = converted_scope_rules()
 
-        assert set(rules) == {"lacp", "vlan", "svi", "switchport"}
+        assert set(rules) == {"interface_mtu", "lacp", "vlan", "svi", "switchport"}
         for scope, rule in rules.items():
             assert rule.scope == scope
             assert rule.native_model_labels
