@@ -1428,15 +1428,8 @@ def _execute_static_route_operations(writer, operations):
             writer.delete(instance)
 
 
-def _reconcile_isis_settings(obj, settings: dict | None, *, write: bool = True) -> bool:
-    """Reconcile a netbox_routing ISISSetting EAV bag for *obj* (instance/interface).
-
-    *settings* is the {key: value} dict the adapter mirrored from the device.
-    Clobber-safe: when ``write`` (the overlay row is being seeded on first import) it
-    creates/updates/deletes to mirror the device; when ``write`` is False it touches
-    nothing (operator edits survive). Returns ``matches`` = the bag already equals the
-    device. No-op (matches=True) when netbox-routing lacks ISISSetting or *obj* is None.
-    """
+def _reconcile_isis_settings(obj, settings: dict | None) -> bool:
+    """Return whether an ISISSetting EAV bag equals the reported settings."""
     if obj is None:
         return True
     try:
@@ -1451,24 +1444,7 @@ def _reconcile_isis_settings(obj, settings: dict | None, *, write: bool = True) 
 
     ct = ContentType.objects.get_for_model(type(obj))
     existing = {s.key: s for s in ISISSetting.objects.filter(assigned_object_type=ct, assigned_object_id=obj.pk)}
-    matches = True
-    for key, value in wanted.items():
-        row = existing.get(key)
-        if row is None:
-            matches = False
-            if write:
-                ISISSetting.objects.create(assigned_object=obj, key=key, value=value)
-        elif row.value != value:
-            matches = False
-            if write:
-                row.value = value
-                row.save(update_fields=["value"])
-    for key, row in existing.items():
-        if key not in wanted:
-            matches = False
-            if write:
-                row.delete()
-    return matches
+    return existing.keys() == wanted.keys() and all(existing[key].value == value for key, value in wanted.items())
 
 
 def _reconcile_child_levels(
@@ -1477,16 +1453,8 @@ def _reconcile_child_levels(
     parent,
     cols,
     levels,
-    *,
-    write: bool = True,
 ) -> bool:
-    """Per-level child rows (ISISLevel/ISISInterfaceLevel) for *parent*.
-
-    Clobber-safe: when ``write`` (seeding on first import) it mirrors the device
-    (create/update present levels, delete dropped ones); when ``write`` is False it
-    touches nothing. Returns ``matches`` = the levels already equal the device.
-    No-op (matches=True) when *parent* is None.
-    """
+    """Return whether per-level child rows equal the reported levels."""
     if parent is None:
         return True
     incoming = {}
@@ -1496,32 +1464,19 @@ def _reconcile_child_levels(
         except (KeyError, TypeError, ValueError):
             continue
     existing = {row.level: row for row in model.objects.filter(**{parent_field: parent})}
-    matches = True
+    if existing.keys() != incoming.keys():
+        return False
     for lvl, data in incoming.items():
-        row = existing.get(lvl) or model(**{parent_field: parent, "level": lvl})
-        changed = row.pk is None
+        row = existing[lvl]
         for col in cols:
             if col not in data:
-                if row.pk is not None and getattr(row, col, None) is not None:
-                    matches = False
-                    if write:
-                        setattr(row, col, _model_absent_value(row, col))
-                        changed = True
+                if getattr(row, col, None) is not None:
+                    return False
                 continue
             val = data.get(col)
             if val is not None and getattr(row, col, None) != val:
-                setattr(row, col, val)
-                changed = True
-        if changed:
-            matches = False
-            if write:
-                row.save()
-    for lvl, row in existing.items():
-        if lvl not in incoming:
-            matches = False
-            if write:
-                row.delete()
-    return matches
+                return False
+    return True
 
 
 # ISISPrefixSID columns mirrored per (interface, algorithm). Unlike the levels
@@ -1531,13 +1486,8 @@ def _reconcile_child_levels(
 _ISIS_PREFIX_SID_COLS = ("sid_index", "sid_label", "n_flag", "no_php", "explicit_null", "readvertise")
 
 
-def _reconcile_isis_prefix_sids(ri, prefix_sids, *, write: bool = True) -> bool:
-    """Per-loopback ISISPrefixSID rows for the ISISInterface *ri*, keyed by algorithm.
-
-    Clobber-safe brownfield mirror (create/update present, delete dropped); no-op
-    (matches=True) when the fork lacks ISISPrefixSID or *ri* is None. Runs under
-    suppress_intent_push so seeding never trips the accept->push signal.
-    """
+def _reconcile_isis_prefix_sids(ri, prefix_sids) -> bool:
+    """Return whether per-loopback prefix-SIDs equal the reported rows."""
     if ri is None:
         return True
     try:
@@ -1551,28 +1501,10 @@ def _reconcile_isis_prefix_sids(ri, prefix_sids, *, write: bool = True) -> bool:
         except (KeyError, TypeError, ValueError):
             continue
     existing = {row.algorithm: row for row in ISISPrefixSID.objects.filter(interface=ri)}
-    matches = True
-    from .signals import suppress_intent_push
-
-    with suppress_intent_push():
-        for algo, data in incoming.items():
-            row = existing.get(algo) or ISISPrefixSID(interface=ri, algorithm=algo)
-            changed = row.pk is None
-            for col in _ISIS_PREFIX_SID_COLS:
-                val = data.get(col)
-                if getattr(row, col, None) != val:
-                    setattr(row, col, val)
-                    changed = True
-            if changed:
-                matches = False
-                if write:
-                    row.save()
-        for algo, row in existing.items():
-            if algo not in incoming:
-                matches = False
-                if write:
-                    row.delete()
-    return matches
+    return existing.keys() == incoming.keys() and all(
+        all(getattr(existing[algo], col, None) == data.get(col) for col in _ISIS_PREFIX_SID_COLS)
+        for algo, data in incoming.items()
+    )
 
 
 # Instance-level ISISSegmentRouting columns mirrored from the device SR bag.
@@ -1614,129 +1546,6 @@ def _model_absent_value(obj, field_name):
     raise ValueError(f"{type(obj).__name__}.{field_name} cannot represent an omitted device value")
 
 
-def _sync_isis_segment_routing_values(row, cols, values, *, write: bool) -> bool:
-    """Compare/mirror one existing SR row, treating omitted values as absent."""
-    matches = True
-    fields = []
-    for col in cols:
-        val = values.get(col)
-        if val is None:
-            val = _model_absent_value(row, col)
-        if getattr(row, col, None) != val:
-            matches = False
-            if write:
-                setattr(row, col, val)
-                fields.append(col)
-    if fields:
-        row.save(update_fields=fields)
-    return matches
-
-
-def _reconcile_isis_segment_routing(
-    inst,
-    sr: dict | None,
-    *,
-    reported: bool | None = None,
-    configured: bool | None = None,
-    write: bool = True,
-) -> bool:
-    """Upsert the netbox_routing ISISSegmentRouting (1:1) for *inst* from *sr*.
-
-    Clobber-safe: mirrors the device only when ``write`` (seeding); otherwise touches
-    nothing. Returns ``matches`` = the SR row already equals the device. No-op
-    (matches=True) when the fork lacks ISISSegmentRouting or *inst* is None.
-    """
-    if inst is None:
-        return True
-    try:
-        from netbox_routing.models import ISISSegmentRouting
-    except (ImportError, AttributeError):
-        return True
-    if reported is True and configured is False:
-        exists = ISISSegmentRouting.objects.filter(instance=inst).exists()
-        if exists and write:
-            ISISSegmentRouting.objects.filter(instance=inst).delete()
-        return not exists
-    if sr is None and not (reported is True and configured is True):
-        # Legacy adapters did not report SR provenance. Preserve any child and do
-        # not let unknown payload shape block the rest of the process reconcile.
-        return True
-    if not sr:
-        # A configured presence container may have no modeled child values.
-        row = ISISSegmentRouting.objects.filter(instance=inst).first()
-        if row is None:
-            if write:
-                ISISSegmentRouting.objects.create(instance=inst)
-            return False
-        return _sync_isis_segment_routing_values(
-            row,
-            _sr_instance_cols(ISISSegmentRouting),
-            {},
-            write=write,
-        )
-    cols = _sr_instance_cols(ISISSegmentRouting)
-    row, created = ISISSegmentRouting.objects.get_or_create(instance=inst) if write else (None, False)
-    if row is None:
-        row = ISISSegmentRouting.objects.filter(instance=inst).first()
-    if row is None:
-        return False
-    values_match = _sync_isis_segment_routing_values(row, cols, sr, write=write)
-    return not created and values_match
-
-
-def _reconcile_isis_flex_algos(inst, flex_algos, *, write: bool = True) -> bool:
-    """ISISFlexAlgo rows for *inst* from the adapter's flex-algo list.
-
-    Clobber-safe: mirrors the device only when ``write`` (seeding); otherwise touches
-    nothing. Returns ``matches`` = the flex-algo set already equals the device. No-op
-    (matches=True) when the fork lacks ISISFlexAlgo or *inst* is None.
-    """
-    if inst is None:
-        return True
-    try:
-        from netbox_routing.models import ISISFlexAlgo
-    except Exception:
-        return True
-    cols = (
-        "metric_type",
-        "priority",
-        "admin_group_exclude",
-        "admin_group_include_any",
-        "admin_group_include_all",
-    )
-    incoming = {}
-    for fa in flex_algos or []:
-        try:
-            incoming[int(fa["algo_id"])] = fa
-        except (KeyError, TypeError, ValueError):
-            continue
-    existing = {row.algo_id: row for row in ISISFlexAlgo.objects.filter(instance=inst)}
-    matches = True
-    # Brownfield mirror: writing ISISFlexAlgo must not trip the greenfield
-    # accept→push signal (that handler is _skip_on_render-gated → suppressed here).
-    from .signals import suppress_intent_push
-
-    with suppress_intent_push():
-        for aid, data in incoming.items():
-            row = existing.get(aid) or ISISFlexAlgo(instance=inst, algo_id=aid)
-            changed = row.pk is None
-            for col in cols:
-                val = data.get(col)
-                if val is not None and getattr(row, col, None) != val:
-                    setattr(row, col, val)
-                    changed = True
-            if changed:
-                matches = False
-                if write:
-                    row.save()
-        for aid, row in existing.items():
-            if aid not in incoming:
-                matches = False
-                if write:
-                    row.delete()
-    return matches
-
-
 # ISISSRv6Locator columns mirrored per (instance, name). ``prefix`` is required on
 # the model (IPNetworkField, NOT NULL), so a locator without a prefix is skipped; it
 # reads back as an IPNetwork, so it is compared stringified to avoid phantom drift
@@ -1759,70 +1568,6 @@ _ISIS_SRV6_LOCATOR_COLS = (
 def _isis_srv6_locator_value(data, col, omitted_defaults):
     value = data.get(col)
     return omitted_defaults.get(col) if value is None and col in omitted_defaults else value
-
-
-def _sync_isis_srv6_locator_row(row, data, omitted_defaults) -> tuple[bool, bool]:
-    """Return ``(changed, matches)`` while applying reported locator columns."""
-    changed = row.pk is None
-    matches = True
-    for col in _ISIS_SRV6_LOCATOR_COLS:
-        val = _isis_srv6_locator_value(data, col, omitted_defaults)
-        if val is None:
-            if row.pk is not None and getattr(row, col, None) not in (None, ""):
-                matches = False
-                setattr(row, col, _model_absent_value(row, col))
-                changed = True
-            continue
-        cur = getattr(row, col, None)
-        differs = (str(cur) != str(val)) if col == "prefix" else (cur != val)
-        if differs:
-            setattr(row, col, val)
-            changed = True
-    return changed, matches
-
-
-def _reconcile_isis_srv6_locators(inst, srv6_locators, *, write: bool = True) -> bool:
-    """ISISSRv6Locator rows for *inst* from the adapter's srv6-locator list (keyed by name).
-
-    Clobber-safe brownfield mirror (create/update present, delete dropped); no-op
-    (matches=True) when the fork lacks ISISSRv6Locator or *inst* is None. A locator
-    with no resolvable prefix is skipped (prefix is required on the model). Runs under
-    suppress_intent_push so seeding never trips the accept->push signal.
-    """
-    if inst is None:
-        return True
-    try:
-        from netbox_routing.models import ISISSRv6Locator
-    except Exception:
-        return True
-    incoming = {}
-    for loc in srv6_locators or []:
-        try:
-            name = str(loc["name"])
-        except (KeyError, TypeError):
-            continue
-        if name and loc.get("prefix"):  # prefix is required (IPNetworkField, NOT NULL)
-            incoming[name] = loc
-    existing = {row.name: row for row in ISISSRv6Locator.objects.filter(instance=inst)}
-    omitted_defaults = _isis_srv6_locator_omitted_defaults(inst.device)
-    matches = True
-    from .signals import suppress_intent_push
-
-    with suppress_intent_push():
-        for name, data in incoming.items():
-            row = existing.get(name) or ISISSRv6Locator(instance=inst, name=name)
-            changed, row_matches = _sync_isis_srv6_locator_row(row, data, omitted_defaults)
-            matches = matches and row_matches
-            if changed:
-                matches = False
-                if write:
-                    row.save()
-        for name, row in existing.items():
-            if name not in incoming:
-                matches = False
-                if write:
-                    row.delete()
-    return matches
 
 
 _ISIS_LEVEL_COLS = ("default_metric", "wide_metrics_only", "preference", "labeled_preference", "disabled", "auth_type")
@@ -2006,27 +1751,9 @@ def _isis_process_device_matches_intent(entry, state, device=None, inst=None) ->
     return True
 
 
-def _isis_interface_pass(state, entry, ri, bfd_enabled, *, write: bool) -> bool:
-    """Compare (and, when ``write``, mirror) the device ISIS-interface graph onto *ri*."""
-    fields: list[str] = []
-    scalar_matches = True
-    for attr, val in _isis_interface_routing_fields(state, entry, ri, bfd_enabled):
-        if getattr(ri, attr) != val:
-            scalar_matches = False
-            if write:
-                setattr(ri, attr, val)
-                fields.append(attr)
-    if fields:
-        ri.save(update_fields=fields)
-    children_match = _isis_interface_children_match(entry, ri, write=write)
-    if write:
-        return True
-    return scalar_matches and children_match
-
-
-def _isis_interface_children_match(entry, ri, *, write: bool) -> bool:
-    """Compare/mirror settings, levels, and prefix-SIDs without top-level defaults."""
-    settings_matches = _reconcile_isis_settings(ri, entry.get("settings"), write=write)
+def _isis_interface_children_match(entry, ri) -> bool:
+    """Compare settings, levels, and prefix-SIDs without top-level defaults."""
+    settings_matches = _reconcile_isis_settings(ri, entry.get("settings"))
     try:
         from netbox_routing.models import ISISInterfaceLevel
     except (ImportError, AttributeError):
@@ -2038,9 +1765,8 @@ def _isis_interface_children_match(entry, ri, *, write: bool) -> bool:
             ri,
             _ISIS_IFACE_LEVEL_COLS,
             entry.get("levels"),
-            write=write,
         )
-    prefix_sid_matches = _reconcile_isis_prefix_sids(ri, entry.get("prefix_sids"), write=write)
+    prefix_sid_matches = _reconcile_isis_prefix_sids(ri, entry.get("prefix_sids"))
     return settings_matches and levels_matches and prefix_sid_matches
 
 
@@ -2087,48 +1813,12 @@ def _isis_interface_object_hash(ri) -> str:
     return merge_util.content_hash(content)
 
 
-def _link_routing_isis_interface(device, iface, af, state, instances: dict, bfd_enabled=None, entry=None, base=""):
-    """3-way reconcile the netbox_routing.ISISInterface graph for this row.
-
-    Object-content-hash 3-way: device changes auto-mirror when the object is untouched;
-    operator edits survive + surface as 'changed'. The structural ``instance`` FK is
-    always kept correct. Returns ``(ri, matches, base)``; ``(None, True, base)`` when
-    netbox-routing isn't installed.
-    """
-    try:
-        from netbox_routing.models import ISISInstance, ISISInterface
-    except Exception:
-        return None, True, base
-
-    entry = entry or {}
-    tag = state.process_tag
-    if tag not in instances:
-        instances[tag], _ = ISISInstance.objects.get_or_create(device=device, process_tag=tag)
-    inst = instances[tag]
-
-    ri, _ = ISISInterface.objects.get_or_create(interface=iface, address_family=af, defaults={"instance": inst})
-    if ri.instance_id != inst.id:  # structural FK — always keep correct
-        ri.instance = inst
-        ri.save(update_fields=["instance"])
-
-    matches = _isis_interface_pass(state, entry, ri, bfd_enabled, write=False)
-    if matches:
-        return ri, True, _isis_interface_object_hash(ri)
-    if sm.is_owned(state.status):
-        return ri, False, base
-    if (not base) or _isis_interface_object_hash(ri) == base:
-        mirrored = _isis_interface_pass(state, entry, ri, bfd_enabled, write=True)
-        if mirrored:
-            return ri, True, _isis_interface_object_hash(ri)
-    return ri, False, base
-
-
 # netbox_routing ISISInstance scalar columns synced from NSO. Each is
 # guarded by hasattr so the reconcile no-ops on a fork without the column.
 # NOTE: segment-routing state (the adapter's top-level ``sr_enabled`` /
 # ``sr_node_msd``) is NOT an ISISInstance scalar — netbox-routing moved it to the
-# dedicated 1:1 ``ISISSegmentRouting`` child, reconciled via the ``segment_routing``
-# bag in :func:`_reconcile_isis_segment_routing` (so it is not duplicated here).
+# dedicated 1:1 ``ISISSegmentRouting`` child, planned from the ``segment_routing``
+# bag in :mod:`netbox_nso_plugin.isis_reconciler` (so it is not duplicated here).
 _ISIS_INSTANCE_SCALAR_ATTRS = (
     "spf_initial_wait",
     "spf_max_wait",
@@ -2148,109 +1838,6 @@ _ISIS_INSTANCE_SCALAR_ATTRS = (
     "maximum_paths",
     "reference_bandwidth",
 )
-
-
-def _sync_isis_instance_long_scalars(inst, entry, omitted_defaults, *, write: bool) -> tuple[bool, list[str]]:
-    matches = True
-    fields = []
-    for attr in _ISIS_INSTANCE_SCALAR_ATTRS:
-        if not hasattr(inst, attr):
-            continue
-        if attr not in entry:
-            if attr not in omitted_defaults:
-                # Several process fields are emitted only when the NED reports
-                # them. Their absence is unknown, not an instruction to erase a
-                # previously mirrored value.
-                continue
-            val = omitted_defaults[attr]
-        else:
-            val = entry.get(attr)
-        if val is None:
-            absent = _model_absent_value(inst, attr)
-            if getattr(inst, attr) != absent:
-                matches = False
-                if write:
-                    setattr(inst, attr, absent)
-                    fields.append(attr)
-            continue
-        if getattr(inst, attr) != val:
-            matches = False
-            if write:
-                setattr(inst, attr, val)
-                fields.append(attr)
-    return matches, fields
-
-
-def _isis_instance_pass(state, entry, inst, *, write: bool) -> bool:
-    """Compare/mirror the whole device ISIS-instance graph onto *inst*.
-
-    When ``write`` is set, mirror device → object; always return ``matches`` (the
-    object already equals the device).
-    """
-    inst_fields: list[str] = []
-    scalar_matches = True
-    for attr, val in (
-        ("net", state.net),
-        ("is_type", state.is_type),
-        ("metric_style", state.metric_style),
-        ("area_auth_type", state.area_auth_type),
-        ("area_auth_key", state.area_auth_key),
-        ("domain_auth_type", state.domain_auth_type),
-        ("domain_auth_key", state.domain_auth_key),
-    ):
-        # is_type is provenance-explicit and corrected readers omit an unset
-        # schema default. On an unowned mirror, blank must therefore migrate an
-        # old reader's fabricated level-1-2 value out of the linked object.
-        # The remaining scalars keep their existing absence/no-op semantics.
-        should_compare = bool(val) or attr == "is_type"
-        if should_compare and getattr(inst, attr) != val:
-            scalar_matches = False
-            if write:
-                setattr(inst, attr, val)
-                inst_fields.append(attr)
-    if state.overload_bit is not None and inst.overload_bit != state.overload_bit:
-        scalar_matches = False
-        if write:
-            inst.overload_bit = state.overload_bit
-            inst_fields.append("overload_bit")
-    omitted_defaults = _isis_instance_omitted_defaults(inst.device)
-    long_matches, long_fields = _sync_isis_instance_long_scalars(
-        inst,
-        entry,
-        omitted_defaults,
-        write=write,
-    )
-    scalar_matches = scalar_matches and long_matches
-    inst_fields.extend(long_fields)
-    if inst_fields:
-        inst.save(update_fields=inst_fields)
-
-    settings_matches = _reconcile_isis_settings(inst, entry.get("settings"), write=write)
-    try:
-        from netbox_routing.models import ISISLevel
-    except (ImportError, AttributeError):
-        levels_matches = True
-    else:
-        levels_matches = _reconcile_child_levels(
-            ISISLevel,
-            "instance",
-            inst,
-            _ISIS_LEVEL_COLS,
-            entry.get("levels"),
-            write=write,
-        )
-    sr_matches = _reconcile_isis_segment_routing(
-        inst,
-        entry.get("segment_routing"),
-        reported=entry.get("segment_routing_reported"),
-        configured=entry.get("segment_routing_configured"),
-        write=write,
-    )
-    flex_matches = _reconcile_isis_flex_algos(inst, entry.get("flex_algos"), write=write)
-    srv6_matches = _reconcile_isis_srv6_locators(inst, entry.get("srv6_locators"), write=write)
-    if write:
-        return True
-    return scalar_matches and settings_matches and levels_matches and sr_matches and flex_matches and srv6_matches
 
 
 def _isis_instance_object_hash(inst) -> str:
@@ -2329,42 +1916,16 @@ def _isis_instance_object_hash(inst) -> str:
     return merge_util.content_hash(content)
 
 
-def _sync_routing_isis_instance(device, tag, state, entry, base):
-    """3-way reconcile the netbox_routing.ISISInstance graph for *tag*.
-
-    Uses an object-content hash + the object-vs-device compare: device-side changes
-    auto-mirror when the object is untouched (object_hash == base); operator edits
-    survive and surface as 'changed'. Returns ``(inst, matches, base)`` (returned base
-    advanced on seed/mirror/insync). ``(None, True, base)`` when netbox-routing absent.
-    (ISIS folds both-moved into 'changed' — the edit is always preserved either way.)
-    """
-    try:
-        from netbox_routing.models import ISISInstance
-    except Exception:
-        return None, True, base
-
-    inst, _ = ISISInstance.objects.get_or_create(device=device, process_tag=tag)
-    matches = _isis_instance_pass(state, entry, inst, write=False)
-    if matches:
-        return inst, True, _isis_instance_object_hash(inst)
-    if sm.is_owned(state.status):
-        return inst, False, base
-    if (not base) or _isis_instance_object_hash(inst) == base:
-        # first import (seed) OR device moved while the object was untouched (mirror)
-        mirrored = _isis_instance_pass(state, entry, inst, write=True)
-        if mirrored:
-            return inst, True, _isis_instance_object_hash(inst)
-    return inst, False, base  # operator edited → changed (edit preserved)
-
-
 # Keep the long-standing test and call-site names while the exact reconciler owns all
 # IS-IS DML.
+@mirror_reconciler
 def _reconcile_isis_interfaces(device, interfaces: list) -> list:
     from .isis_reconciler import reconcile_isis_interfaces
 
     return reconcile_isis_interfaces(device, interfaces)
 
 
+@mirror_reconciler
 def _reconcile_isis_process(device, process_list: list) -> list:
     from .isis_reconciler import reconcile_isis_process
 

@@ -321,8 +321,11 @@ _CONVERTED_SCOPE_RULES = {
         deletion_authority=True,
         intentional_semantic_delta=(
             "Acquire from a persisted native process or interface and its linked overlay. Native and overlay save "
-            "events are not ownership evidence. Settings, levels, Segment Routing, Flex-Algo, Prefix-SID, and SRv6 "
-            "locator rows are graph dependencies, not independently owned device objects."
+            "events are not ownership evidence. Native interface edits no longer refresh owned overlays. Native "
+            "interface deletes no longer delete overlays and push retirement synchronously. ISISLevel edits and "
+            "deletes no longer re-push immediately. Reconciliation and ownership audits handle these changes. "
+            "Settings, levels, Segment Routing, Flex-Algo, Prefix-SID, and SRv6 locator rows are graph dependencies, "
+            "not independently owned device objects."
         ),
     ),
     "ospf": ScopeOwnershipRule(
@@ -348,7 +351,9 @@ _CONVERTED_SCOPE_RULES = {
         deletion_authority=True,
         intentional_semantic_delta=(
             "Acquire from a persisted native process or interface and its overlay. Native and overlay save events "
-            "are not ownership evidence. A shared OSPF area is a dependency, not a device-owned object."
+            "are not ownership evidence and no longer create or refresh owned overlays. Native process and interface "
+            "deletes no longer delete overlays and push retirement synchronously. Reconciliation and ownership "
+            "audits handle these changes. A shared OSPF area is a dependency, not a device-owned object."
         ),
     ),
 }
