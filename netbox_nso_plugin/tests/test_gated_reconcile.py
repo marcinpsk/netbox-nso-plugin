@@ -229,17 +229,18 @@ class TestIsisCompoundGate(TestCase):
 
         with (
             patch("netbox_nso_plugin.adapter_client.get_isis_interfaces", return_value=doc),
-            patch("netbox_nso_plugin.template_content._reconcile_isis_interfaces", return_value=[]) as m_if,
-            patch("netbox_nso_plugin.template_content._reconcile_isis_process", return_value=[]) as m_proc,
+            patch(
+                "netbox_nso_plugin.isis_reconciler.reconcile_isis",
+                return_value={"interfaces": [], "processes": []},
+            ) as reconcile,
         ):
             ctx = reconcile_category(self.device, self.mgmt, "isis")
-        return ctx, m_if, m_proc
+        return ctx, reconcile
 
     def test_admit_runs_both_bodies_exactly_once(self):
         doc = {"interfaces": [], "processes": [], "read_state": _rs()}
-        ctx, m_if, m_proc = self._reconcile(doc)
-        self.assertEqual(m_if.call_count, 1)
-        self.assertEqual(m_proc.call_count, 1)
+        ctx, reconcile = self._reconcile(doc)
+        self.assertEqual(reconcile.call_count, 1)
         self.assertEqual(ctx["_gate"]["isis"], "ran")
 
     def test_skip_runs_zero_bodies(self):
@@ -248,9 +249,8 @@ class TestIsisCompoundGate(TestCase):
             "processes": [],
             "read_state": _rs(outcome="unavailable", reason="not_ready", result=None, succeeded=None),
         }
-        ctx, m_if, m_proc = self._reconcile(doc)
-        self.assertEqual(m_if.call_count, 0)
-        self.assertEqual(m_proc.call_count, 0)
+        ctx, reconcile = self._reconcile(doc)
+        self.assertEqual(reconcile.call_count, 0)
         self.assertEqual(ctx["_gate"]["isis"], "skipped_unavailable")
 
 

@@ -66,7 +66,14 @@ SOURCE_MODEL_RANKS = (
     "netbox_routing.staticroute_devices",
     "netbox_routing.ospfinstance",
     "netbox_routing.isisinstance",
+    "netbox_routing.isissetting",
     "netbox_routing.isislevel",
+    "netbox_routing.isissegmentrouting",
+    "netbox_routing.isisflexalgo",
+    "netbox_routing.isissrv6locator",
+    "netbox_routing.isisinterface",
+    "netbox_routing.isisinterfacelevel",
+    "netbox_routing.isisprefixsid",
     "netbox_routing.ospfarea",
     "netbox_routing.ospfinstance",
     "netbox_routing.ospfinterface",
@@ -941,6 +948,10 @@ def _direct_overlay_fragment(instance):
     if label == "netbox_nso_plugin.nsoisisinterfacestate":
         return _owned_wire_fragment(instance, signals.isis_interface_intent_item)
     if label == "netbox_nso_plugin.nsoisisinstancestate":
+        from .status_machine import is_owned
+
+        if not is_owned(instance.status):
+            return ABSENT
         redist = signals._collect_redistribution_by_dest_ref(
             instance.management.device_id,
             "isis",

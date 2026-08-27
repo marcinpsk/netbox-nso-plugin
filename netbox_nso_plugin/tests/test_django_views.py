@@ -4293,7 +4293,7 @@ class TestOverlayFieldEditView(ViewTestBase):
     def test_edit_isis_interface_updates_overlay_and_native_object(self):
         from netbox_routing.models import ISISInstance, ISISInterface
 
-        from netbox_nso_plugin.models import NSOISISInterfaceState
+        from netbox_nso_plugin.models import NSOISISInterfaceState, NSOOwnershipManifest
 
         instance = ISISInstance.objects.create(device=self.device, process_tag="CORE")
         native = ISISInterface.objects.create(
@@ -4348,6 +4348,15 @@ class TestOverlayFieldEditView(ViewTestBase):
             ),
             ("level-2-only", "point-to-point", 25, True, True, True, "node"),
         )
+        self.assertTrue(
+            NSOOwnershipManifest.objects.filter(
+                device=self.device,
+                scope="isis",
+                native_model_label="netbox_routing.isisinterface",
+                native_key={"interface_id": self.interface.pk, "address_family": "ipv4"},
+                ownership_state="owned",
+            ).exists()
+        )
         self.assertEqual(
             (
                 native.circuit_type,
@@ -4364,7 +4373,7 @@ class TestOverlayFieldEditView(ViewTestBase):
     def test_edit_isis_instance_updates_safe_core_fields(self):
         from netbox_routing.models import ISISInstance
 
-        from netbox_nso_plugin.models import NSOISISInstanceState
+        from netbox_nso_plugin.models import NSOISISInstanceState, NSOOwnershipManifest
 
         native = ISISInstance.objects.create(
             device=self.device,
@@ -4415,6 +4424,15 @@ class TestOverlayFieldEditView(ViewTestBase):
             expected,
         )
         self.assertEqual(row.status, "accepted")
+        self.assertTrue(
+            NSOOwnershipManifest.objects.filter(
+                device=self.device,
+                scope="isis",
+                native_model_label="netbox_routing.isisinstance",
+                native_key={"device_id": self.device.pk, "process_tag": "CORE"},
+                ownership_state="owned",
+            ).exists()
+        )
 
     def test_edit_isis_rejects_invalid_net_and_inconsistent_frr(self):
         from netbox_routing.models import ISISInstance, ISISInterface

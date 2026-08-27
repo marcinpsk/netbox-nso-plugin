@@ -69,6 +69,7 @@ class RendererSave:
     update_fields: tuple[str, ...] | None = None
     force_insert: bool = False
     natural_key_fields: tuple[str, ...] = ()
+    reference_fields: tuple[tuple[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -106,14 +107,23 @@ class RendererM2MSet:
     related: tuple[Any, ...]
 
 
-def planned_save(instance, *, update_fields=None, force_insert=False, natural_key=()) -> RendererSave:
+def planned_save(
+    instance,
+    *,
+    update_fields=None,
+    force_insert=False,
+    natural_key=(),
+    references=(),
+) -> RendererSave:
     """Describe one save for :meth:`RendererMutationPlan.build`."""
     fields = None if update_fields is None else tuple(sorted(set(update_fields)))
+    normalized_references = tuple((instance._meta.get_field(name).attname, related) for name, related in references)
     return RendererSave(
         instance=instance,
         update_fields=fields,
         force_insert=bool(force_insert),
         natural_key_fields=tuple(natural_key),
+        reference_fields=normalized_references,
     )
 
 
@@ -242,7 +252,13 @@ def _effective_after(instance, before, update_fields):
     return effective
 
 
-def _planned_field_value(instance, field, creation_refs):
+def _planned_field_value(instance, field, creation_refs, reference_fields=()):
+    explicit_related = dict(reference_fields).get(field.attname)
+    if explicit_related is not None:
+        reference = creation_refs.get(id(explicit_related))
+        if reference is not None:
+            return reference
+        return _normal(explicit_related.pk)
     if field.is_relation and field.many_to_one and field.is_cached(instance):
         related = field.get_cached_value(instance)
         reference = creation_refs.get(id(related))
@@ -251,7 +267,7 @@ def _planned_field_value(instance, field, creation_refs):
     return _normal(getattr(instance, field.attname))
 
 
-def _field_values(instance, update_fields, creation_refs=None):
+def _field_values(instance, update_fields, creation_refs=None, reference_fields=()):
     creation_refs = creation_refs or {}
     fields = instance._meta.concrete_fields
     if update_fields is not None:
@@ -259,15 +275,28 @@ def _field_values(instance, update_fields, creation_refs=None):
         fields = tuple(field for field in fields if field.name in selected or field.attname in selected)
     else:
         fields = tuple(field for field in fields if not field.primary_key)
-    return tuple(sorted((field.attname, _planned_field_value(instance, field, creation_refs)) for field in fields))
+    return tuple(
+        sorted(
+            (
+                field.attname,
+                _planned_field_value(instance, field, creation_refs, reference_fields),
+            )
+            for field in fields
+        )
+    )
 
 
-def _natural_key(instance, fields, creation_refs=None):
+def _natural_key(instance, fields, creation_refs=None, reference_fields=()):
     creation_refs = creation_refs or {}
     return tuple(
         (
             instance._meta.get_field(name).attname,
-            _planned_field_value(instance, instance._meta.get_field(name), creation_refs),
+            _planned_field_value(
+                instance,
+                instance._meta.get_field(name),
+                creation_refs,
+                reference_fields,
+            ),
         )
         for name in fields
     )
@@ -283,7 +312,12 @@ def _creation_refs(saves):
             continue
         references[id(instance)] = RendererCreationRef(
             model_label=instance._meta.label_lower,
-            natural_key=_natural_key(instance, proposed.natural_key_fields, references),
+            natural_key=_natural_key(
+                instance,
+                proposed.natural_key_fields,
+                references,
+                proposed.reference_fields,
+            ),
         )
     return references
 
@@ -344,14 +378,28 @@ def _plan_save(proposed: RendererSave, creation_refs, support_refs):
     after = _effective_after(instance, before, proposed.update_fields)
     if before is None and not proposed.natural_key_fields:
         raise IntentMutationProtocolError(f"a {label} creation requires a stable natural key")
-    identity = () if before is not None else _natural_key(after, proposed.natural_key_fields, creation_refs)
+    identity = (
+        ()
+        if before is not None
+        else _natural_key(
+            after,
+            proposed.natural_key_fields,
+            creation_refs,
+            proposed.reference_fields,
+        )
+    )
     write = RendererWrite(
         operation="save",
         model_label=label,
         pk=None if before is None else before.pk,
         natural_key=identity,
         update_fields=proposed.update_fields,
-        values=_field_values(after, proposed.update_fields, creation_refs),
+        values=_field_values(
+            after,
+            proposed.update_fields,
+            creation_refs,
+            proposed.reference_fields,
+        ),
         before_values=() if before is None else _field_values(before, None),
         force_insert=proposed.force_insert,
     )
@@ -784,16 +832,34 @@ class RendererWriter:
         self.permit = permit
         self._consumed: set[int] = set()
         self._active_operation: int | None = None
+        self._active_instance = None
 
     def _reference_matches(self, reference, related):
         if related is None or related._meta.label_lower != reference.model_label:
             return False
         return all(self._value_matches(related, attname, expected) for attname, expected in reference.natural_key)
 
+    def _resolve_reference(self, reference):
+        model = apps.get_model(reference.model_label)
+        filters = {}
+        for attname, expected in reference.natural_key:
+            if isinstance(expected, RendererCreationRef):
+                related = self._resolve_reference(expected)
+                if related is None:
+                    return None
+                expected = related.pk
+            filters[attname] = expected
+        return model._default_manager.filter(**filters).first()
+
     def _value_matches(self, instance, attname, expected):
         if isinstance(expected, RendererCreationRef):
             field = next(field for field in instance._meta.concrete_fields if field.attname == attname)
-            return self._reference_matches(expected, getattr(instance, field.name, None))
+            if field.is_relation:
+                related = getattr(instance, field.name, None)
+                if related is not None:
+                    return self._reference_matches(expected, related)
+            related = self._resolve_reference(expected)
+            return related is not None and getattr(instance, attname) == related.pk
         return _normal(getattr(instance, attname)) == expected
 
     def _fields_match(self, expected_values, instance):
@@ -945,18 +1011,21 @@ class RendererWriter:
         return False
 
     @contextlib.contextmanager
-    def _operation(self, index):
+    def _operation(self, index, instance=None):
         previous = self._active_operation
+        previous_instance = self._active_instance
         self._active_operation = index
+        self._active_instance = instance
         try:
             yield
         finally:
             self._active_operation = previous
+            self._active_instance = previous_instance
 
     def save(self, instance, *, update_fields=None, force_insert=False):
         """Execute one exact planned save."""
         index = self._find_save(instance, update_fields, force_insert)
-        with self._operation(index):
+        with self._operation(index, instance):
             if not force_insert:
                 instance.save(update_fields=update_fields)
             else:
@@ -1145,9 +1214,8 @@ class RendererWriter:
         return (
             write.operation == "save"
             and write.model_label == instance._meta.label_lower
-            and self._identity_matches(write, instance)
+            and self._active_instance is instance
             and write.update_fields == normalized_fields
-            and self._fields_match(write.values, instance)
         )
 
     def signal_m2m_is_authorized(self, instance, action, field_name, pk_set) -> bool:

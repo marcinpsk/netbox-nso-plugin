@@ -310,12 +310,11 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
     """Reconcile each opted-in routing protocol into *ctx* (gated by kill-switches)."""
     from .bfd_reconciler import bfd_reconcile_plan, reconcile_bfd
     from .bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
+    from .isis_reconciler import isis_reconcile_plan, reconcile_isis
     from .ospf_reconciler import ospf_reconcile_plan
     from .redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
     from .route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
     from .template_content import (
-        _reconcile_isis_interfaces,
-        _reconcile_isis_process,
         _reconcile_ospf,
         _reconcile_static_routes,
         static_route_reconcile_plan,
@@ -346,24 +345,26 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
         def _isis_body():
             _safe_reconcile(
                 ctx,
-                "isis_interfaces",
+                "isis_data",
                 mgmt,
-                ("NSOISISInterfaceState",),
-                _reconcile_isis_interfaces,
+                ("NSOISISInstanceState", "NSOISISInterfaceState"),
+                reconcile_isis,
                 device,
-                isis_payload.get("interfaces", []),
+                isis_payload,
             )
-            _safe_reconcile(
-                ctx,
-                "isis_processes",
-                mgmt,
-                ("NSOISISInstanceState",),
-                _reconcile_isis_process,
-                device,
-                isis_payload.get("processes", []),
-            )
+            result = ctx.pop("isis_data")
+            ctx["isis_interfaces"] = result["interfaces"]
+            ctx["isis_processes"] = result["processes"]
 
-        _gated(ctx, mgmt, "isis", isis_payload, _isis_body, epoch=dev_id)
+        _gated(
+            ctx,
+            mgmt,
+            "isis",
+            isis_payload,
+            _isis_body,
+            epoch=dev_id,
+            pre_body=lambda: isis_reconcile_plan(device, isis_payload),
+        )
     if mgmt.manage_route_policy:
         from .apply_settlement import route_policy_deploying_attempt_ids
 
@@ -749,14 +750,13 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
     """
     from . import adapter_client as client
     from .bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
+    from .isis_reconciler import isis_reconcile_plan, reconcile_isis
     from .ospf_reconciler import ospf_reconcile_plan
     from .redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
     from .route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
     from .signals import suppress_intent_push
     from .template_content import (
         _reconcile_interface_ips,
-        _reconcile_isis_interfaces,
-        _reconcile_isis_process,
         _reconcile_logging_config,
         _reconcile_ospf,
         _reconcile_snmp_config,
@@ -1118,10 +1118,19 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
             isis_payload = client.get_isis_interfaces(dev_id)
 
             def _isis_body():
-                ctx["isis_interfaces"] = _reconcile_isis_interfaces(device, isis_payload.get("interfaces", []))
-                ctx["isis_processes"] = _reconcile_isis_process(device, isis_payload.get("processes", []))
+                result = reconcile_isis(device, isis_payload)
+                ctx["isis_interfaces"] = result["interfaces"]
+                ctx["isis_processes"] = result["processes"]
 
-            _gated(ctx, mgmt, "isis", isis_payload, _isis_body, epoch=dev_id)
+            _gated(
+                ctx,
+                mgmt,
+                "isis",
+                isis_payload,
+                _isis_body,
+                epoch=dev_id,
+                pre_body=lambda: isis_reconcile_plan(device, isis_payload),
+            )
         elif key == "ospf":
             ospf_doc = client.get_ospf(dev_id)
             _gated(

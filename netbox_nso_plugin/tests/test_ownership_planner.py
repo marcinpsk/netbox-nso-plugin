@@ -206,6 +206,7 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
             "interface",
             "interface_mtu",
             "ip",
+            "isis",
             "isis_flex_algo",
             "lacp",
             "l2_sap",
@@ -269,4 +270,22 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
         assert rule.native_key_fields_by_model == (
             ("netbox_routing.ospfinstance", ("device_id", "process_id")),
             ("netbox_routing.ospfinterface", ("interface_id",)),
+        )
+
+    def test_isis_rule_names_graph_roots_and_keeps_children_as_dependencies(self):
+        from netbox_nso_plugin.ownership_planner import converted_scope_rules
+
+        rule = converted_scope_rules()["isis"]
+
+        assert rule.native_model_labels == (
+            "netbox_routing.isisinstance",
+            "netbox_routing.isisinterface",
+        )
+        assert rule.native_key_fields_by_model == (
+            ("netbox_routing.isisinstance", ("device_id", "process_tag")),
+            ("netbox_routing.isisinterface", ("interface_id", "address_family")),
+        )
+        assert rule.overlay_native_fields == (
+            ("netbox_nso_plugin.nsoisisinstancestate", "isis_instance"),
+            ("netbox_nso_plugin.nsoisisinterfacestate", "isis_interface"),
         )

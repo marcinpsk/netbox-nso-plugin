@@ -2797,7 +2797,7 @@ def _push_isis_intent_for_device(device_id, adapter_device_id):
 
 @_skip_on_render
 def _on_isis_interface_state_save(sender, instance, **kwargs):
-    """Push IS-IS interface intent whenever an NSOISISInterfaceState row is saved."""
+    """Schedule IS-IS only when the exact writer owns this device key."""
     from .models import NSODeviceManagement
 
     try:
@@ -2809,12 +2809,13 @@ def _on_isis_interface_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    _schedule_intent_push((device_id, "isis"))
+    if _converted_writer_owns_content(device_id, "isis"):
+        _schedule_intent_push((device_id, "isis"))
 
 
 @_skip_on_render
 def _on_isis_instance_state_save(sender, instance, **kwargs):
-    """Push IS-IS intent (interfaces + processes) whenever an NSOISISInstanceState row is saved."""
+    """Schedule IS-IS only when the exact writer owns this device key."""
     from .models import NSODeviceManagement
 
     try:
@@ -2826,7 +2827,8 @@ def _on_isis_instance_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    _schedule_intent_push((device_id, "isis"))
+    if _converted_writer_owns_content(device_id, "isis"):
+        _schedule_intent_push((device_id, "isis"))
 
 
 def _build_bgp_router_list(routers: dict, scope_afs: dict, router_ids: dict | None = None) -> list:
@@ -3892,156 +3894,27 @@ def _on_routing_ospf_interface_save(sender, instance, **kwargs):
     _schedule_exact_writer_scope("ospf")
 
 
-_OWNED_ISIS = ("accepted", "deploying", "in_sync", "apply_failed")
-
-
-def _accept_isis_interface(isis_iface) -> None:
-    """Own a greenfield IS-IS interface (operator-edited ISISInterface → accepted overlay → push).
-
-    Copies the operator's metric, network type, circuit type, and passive value from the
-    netbox_routing.ISISInterface into the
-    NSOISISInterfaceState overlay (keyed by interface + address-family) and marks it
-    owned so _on_isis_interface_state_save pushes. Greenfield-only: a pre-existing
-    unowned (brownfield) overlay is left to the 3-way reconcile.
-    """
-    from .models import NSODeviceManagement, NSOISISInterfaceState
-
-    iface = isis_iface.interface
-    af = isis_iface.address_family
-    if not af:
-        return
-    try:
-        mgmt = NSODeviceManagement.objects.get(device=iface.device)
-    except NSODeviceManagement.DoesNotExist:
-        return
-    if mgmt.adapter_device_id is None:
-        return
-    state, created = NSOISISInterfaceState.objects.get_or_create(
-        management=mgmt,
-        interface=iface,
-        af=af,
-        defaults={"status": "accepted", "accepted_at": timezone.now()},
-    )
-    if not created and state.status not in _OWNED_ISIS:
-        return
-    state.process_tag = isis_iface.instance.process_tag if isis_iface.instance else ""
-    state.circuit_type = isis_iface.circuit_type or ""
-    state.network_type = isis_iface.network_type or ""
-    state.metric = isis_iface.metric
-    state.passive = bool(isis_iface.passive)
-    # tri-state (None/True/False preserved verbatim): clearing bfd_enabled on the
-    # ISISInterface flows None into the overlay → the push retracts the owned BFD.
-    state.bfd_enabled = getattr(isis_iface, "bfd_enabled", None)
-    # FRR (#83): same contract as bfd_enabled; the protection kind rides along.
-    state.frr_enabled = getattr(isis_iface, "frr_enabled", None)
-    state.frr_protection = getattr(isis_iface, "frr_protection", "") or ""
-    state.isis_interface = isis_iface
-    state.last_sync_at = timezone.now()
-    state.save()  # → _on_isis_interface_state_save schedules the push
-
-
-@_skip_on_render
-def _push_isis_for_routing_level(level) -> None:
-    """Re-push the isis intent when a fork ISISLevel of an OWNED instance changes.
-
-    Levels ride the process intent (a level is accepted with its process), so an
-    operator edit/delete on ISISLevel re-pushes the full snapshot for the owning
-    device — but only when the instance is linked to an owned NSOISISInstanceState
-    (an unowned instance's levels stay NetBox-local).
-    """
-    from .models import NSODeviceManagement, NSOISISInstanceState
-
-    inst = getattr(level, "instance", None)
-    device = getattr(inst, "device", None)
-    if device is None:
-        return
-    try:
-        mgmt = NSODeviceManagement.objects.get(device=device)
-    except NSODeviceManagement.DoesNotExist:
-        return
-    if mgmt.adapter_device_id is None:
-        return
-    if not NSOISISInstanceState.objects.filter(
-        management=mgmt,
-        process_tag=inst.process_tag or "",
-        status__in=_OWNED_PUSH_STATUSES,
-    ).exists():
-        return
-    device_id, _adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
-    _schedule_intent_push((device_id, "isis"))
-
-
 @_skip_on_render
 def _on_routing_isis_level_save(sender, instance, **kwargs):
-    """netbox_routing ISISLevel created/edited → re-push the owning process intent."""
-    _push_isis_for_routing_level(instance)
+    """Keep foreign native IS-IS child saves outside ownership bookkeeping."""
+    _schedule_exact_writer_scope("isis")
 
 
 @_skip_on_render
 def _on_routing_isis_level_post_delete(sender, instance, **kwargs):
-    """Operator deletes a per-level row → push the reduced snapshot (full-replace)."""
-    _push_isis_for_routing_level(instance)
-
-
-def _on_routing_isis_interface_save(sender, instance, **kwargs):
-    """netbox_routing ISISInterface created/edited → own + push."""
-    _accept_isis_interface(instance)
-
-
-def _on_routing_isis_interface_pre_delete(sender, instance, **kwargs):
-    """Capture linked overlays before Django clears their native foreign key."""
-    from .models import NSOISISInterfaceState
-
-    instance._nso_linked_isis_interface_state_pks = tuple(
-        NSOISISInterfaceState.objects.filter(isis_interface=instance).values_list("pk", flat=True)
-    )
+    """Keep foreign native IS-IS child deletes outside ownership bookkeeping."""
+    _schedule_exact_writer_scope("isis")
 
 
 @_skip_on_render
-def _on_routing_isis_interface_post_delete(sender, instance, **kwargs):
-    """Operator deletes an IS-IS interface → drop its overlay + push the removal (parity with OSPF).
+def _on_routing_isis_interface_save(sender, instance, **kwargs):
+    """Keep foreign native IS-IS interface saves outside ownership bookkeeping."""
+    _schedule_exact_writer_scope("isis")
 
-    Without this, deleting an ISISInterface only SET_NULLs NSOISISInterfaceState.isis_interface;
-    the overlay row lingers with its owned status and no reduced IS-IS intent is pushed, so the
-    device keeps the IS-IS config NetBox just removed.
-    """
-    from django.db import transaction
 
-    from .apply_state import lock_device_intent_transaction, lock_order_scope
-    from .deployment import lock_mutation
-    from .intent_state import IntentTransactionNoOp, MutationFootprint, SourceRow, intent_transaction
-    from .models import NSODeviceManagement, NSOISISInterfaceState
-
-    iface = instance.interface
-    af = instance.address_family
-    try:
-        mgmt = NSODeviceManagement.objects.get(device=iface.device)
-    except NSODeviceManagement.DoesNotExist:
-        return
-    if mgmt.adapter_device_id is None:
-        return
-    qs = NSOISISInterfaceState.objects.filter(management=mgmt, interface=iface)
-    if af:
-        qs = qs.filter(af=af)  # scope to this ISISInterface's address-family; leave a sibling AF alone
-    device_id, _adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
-    key = (device_id, "isis")
-    footprint = MutationFootprint.for_keys(
-        {key},
-        overlay_rows=(SourceRow("netbox_nso_plugin.nsoisisinterfacestate", None),),
-    )
-    with transaction.atomic(), lock_order_scope():
-        lock_mutation()
-        lock_device_intent_transaction(device_id)
-        try:
-            with intent_transaction(footprint):
-                state_pks = set(getattr(instance, "_nso_linked_isis_interface_state_pks", ()))
-                state_pks.update(qs.values_list("pk", flat=True))
-                if not state_pks:
-                    raise IntentTransactionNoOp
-                NSOISISInterfaceState.objects.filter(pk__in=state_pks).delete()
-                _schedule_intent_push(key)
-        except IntentTransactionNoOp:
-            return
+def _on_routing_isis_interface_pre_delete(sender, instance, **kwargs):
+    """Keep foreign native IS-IS interface deletes outside ownership bookkeeping."""
+    _schedule_exact_writer_scope("isis")
 
 
 @_skip_on_render

@@ -4624,39 +4624,69 @@ def _save_owned_ospf_edit(obj, key, old_values):
             )
 
 
-def _sync_native_isis_instance(obj):
-    """Mirror editable process intent into the native IS-IS instance."""
-    from .signals import suppress_intent_push
+def _save_owned_isis_edit(obj, key, old_values):
+    """Claim one IS-IS edit and update its graph root through one exact plan."""
+    import copy
 
-    native = obj.isis_instance
-    fields = ("net", "is_type", "metric_style", "overload_bit", "fast_reroute", "microloop_avoidance")
-    for name in fields:
-        setattr(native, name, getattr(obj, name))
-    with suppress_intent_push():
-        native.save(update_fields=list(fields))
+    from . import status_machine as sm
+    from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
+    planned_at = timezone.now()
+    candidate = copy.copy(obj)
+    if not sm.is_owned(candidate.status):
+        candidate.accepted_at = planned_at
+    candidate.status = sm.on_operator_edit(candidate.status)
 
-def _sync_native_isis_interface(obj):
-    """Mirror editable interface intent into the native IS-IS interface."""
-    from netbox_routing.models import ISISInstance
+    if key == "isis_instance":
+        native = copy.copy(candidate.isis_instance)
+        native_fields = (
+            "net",
+            "is_type",
+            "metric_style",
+            "overload_bit",
+            "fast_reroute",
+            "microloop_avoidance",
+        )
+    else:
+        from netbox_routing.models import ISISInstance
 
-    from .signals import suppress_intent_push
+        native = copy.copy(candidate.isis_interface)
+        native.instance = ISISInstance.objects.get(
+            device=candidate.interface.device,
+            process_tag=candidate.process_tag,
+        )
+        native_fields = (
+            "instance",
+            "circuit_type",
+            "network_type",
+            "metric",
+            "passive",
+            "bfd_enabled",
+            "frr_enabled",
+            "frr_protection",
+        )
+    for name in native_fields:
+        if name != "instance":
+            setattr(native, name, getattr(candidate, name))
 
-    native = obj.isis_interface
-    native.instance = ISISInstance.objects.get(device=obj.interface.device, process_tag=obj.process_tag)
-    fields = (
-        "circuit_type",
-        "network_type",
-        "metric",
-        "passive",
-        "bfd_enabled",
-        "frr_enabled",
-        "frr_protection",
+    state_fields = {
+        field_name
+        for field_name, old_value in old_values.items()
+        if hasattr(candidate, field_name) and getattr(candidate, field_name) != old_value
+    }
+    state_fields.add("status")
+    if candidate.accepted_at is not None:
+        state_fields.add("accepted_at")
+    plan = RendererMutationPlan.build(
+        saves=(
+            planned_save(native, update_fields=native_fields),
+            planned_save(candidate, update_fields=state_fields),
+        ),
+        planned_at=planned_at,
     )
-    for name in fields:
-        setattr(native, name, getattr(obj, name))
-    with suppress_intent_push():
-        native.save(update_fields=["instance", *fields])
+    with renderer_writes(plan) as writer:
+        writer.save(native, update_fields=native_fields)
+        writer.save(candidate, update_fields=state_fields)
 
 
 def _sync_native_bgp_peer(obj):
@@ -4758,6 +4788,9 @@ def _save_owned_overlay_edit(obj, key, old_values):
     if key in {"ospf_instance", "ospf_interface"}:
         _save_owned_ospf_edit(obj, key, old_values)
         return
+    if key in {"isis_instance", "isis_interface"}:
+        _save_owned_isis_edit(obj, key, old_values)
+        return
 
     from . import status_machine as sm
     from .intent_state import intent_transaction
@@ -4772,10 +4805,6 @@ def _save_owned_overlay_edit(obj, key, old_values):
             if iface.mtu != clamped:
                 iface.mtu = clamped
                 iface.save(update_fields=["mtu"])
-        if key == "isis_instance":
-            _sync_native_isis_instance(obj)
-        if key == "isis_interface":
-            _sync_native_isis_interface(obj)
         if key == "bgp_peer":
             _sync_native_bgp_peer(obj)
         update_fields = {

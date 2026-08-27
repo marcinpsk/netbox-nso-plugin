@@ -2094,131 +2094,6 @@ def _link_routing_isis_interface(device, iface, af, state, instances: dict, bfd_
     return ri, False, base
 
 
-@mirror_reconciler
-def _reconcile_isis_interfaces(device, interfaces: list) -> list:
-    """Reconcile IS-IS interface data from the adapter into NSOISISInterfaceState rows.
-
-    For each (interface, af) entry reported by NSO:
-    - Find or create an NSOISISInterfaceState keyed by (management, interface, af).
-    - Update all NSO-reported fields (process_tag, circuit_type, network_type, metric, passive).
-    - Set status='imported' if not already in a write-path status.
-
-    Stale rows (no longer reported by NSO): set status='changed'.
-
-    Returns a list of NSOISISInterfaceState instances for this device.
-    """
-    from dcim.models import Interface
-    from django.utils import timezone
-
-    from .models import NSODeviceManagement, NSOISISInterfaceState
-
-    try:
-        mgmt = NSODeviceManagement.objects.get(device=device)
-    except NSODeviceManagement.DoesNotExist:
-        return []
-
-    iface_map = {i.name: i for i in Interface.objects.filter(device=device)}
-    now = timezone.now()
-    seen_keys: set[tuple] = set()
-    dropped: list[str] = []
-    instances: dict[str, object] = {}  # process_tag -> netbox_routing ISISInstance (cache)
-
-    for entry in interfaces or []:
-        iface_name = entry.get("interface_name") or ""
-        af = entry.get("af") or ""
-        if not iface_name or not af:
-            continue
-
-        iface = iface_map.get(iface_name)
-        if iface is None:
-            # Nokia SR OS IS-IS interfaces are logical router-interfaces (e.g.
-            # "LAG99:10") whose name does not match a NetBox dcim.Interface (named
-            # by port-id). bound_port carries the physical/LAG binding ("lag-99:10")
-            # the adapter derived from the device — correlate through it. Mirrors
-            # the interface-IP reconcile's bound_port fallback.
-            bound_port = entry.get("bound_port")
-            if bound_port:
-                iface = iface_map.get(bound_port)
-        if iface is None:
-            # The interface the adapter reports does not exist in NetBox — most
-            # often a logical unit (e.g. Junos ae98.100) that is not yet modelled
-            # as a dcim.Interface. Record it so the drop is visible rather than
-            # silent (see docs/junos-subinterface-modeling-plan.md).
-            dropped.append(iface_name)
-            continue
-
-        state, _ = NSOISISInterfaceState.objects.get_or_create(
-            management=mgmt,
-            interface=iface,
-            af=af,
-            defaults={"status": "unknown"},
-        )
-        # Owned (operator-claimed) rows hold the intent we push — set by
-        # _accept_isis_interface and refreshed on every ISISInterface edit. A reconcile
-        # must NOT clobber them with the device's current values (a greenfield owned
-        # change isn't on the device yet, so the adapter reports metric/network-type as
-        # None and would wipe the intent). Mirror device values only into unowned rows.
-        if not sm.is_owned(state.status):
-            state.process_tag = entry.get("process_tag") or ""
-            state.circuit_type = entry.get("circuit_type") or ""
-            state.network_type = entry.get("network_type") or ""
-            state.metric = entry.get("metric")
-            state.passive = bool(entry.get("passive", False))
-            # tri-state, mirror the device verbatim (None when the NED reports no BFD)
-            state.bfd_enabled = entry.get("bfd_enabled")
-            # FRR (#83): same tri-state mirror; protection kind '' when unreported.
-            state.frr_enabled = entry.get("frr_enabled")
-            state.frr_protection = entry.get("frr_protection") or ""
-            state.hello_auth_type = entry.get("hello_auth_type") or ""
-            state.hello_auth_present = bool(entry.get("hello_auth_present", False))
-        state.last_sync_at = now
-
-        # 3-way merge: device changes auto-mirror when the ISISInterface object is
-        # untouched (object_hash == base); operator edits survive + surface as 'changed'.
-        state.isis_interface, iface_matches, new_base = _link_routing_isis_interface(
-            device,
-            iface,
-            af,
-            state,
-            instances,
-            bfd_enabled=entry.get("bfd_enabled"),
-            entry=entry,
-            base=state.device_base_hash,
-        )
-        state.device_base_hash = new_base
-        if sm.is_owned(state.status):
-            # Owned rows hold the intent we push; the clobber guard keeps the overlay
-            # equal to the netbox-routing object, so _isis_interface_pass would always
-            # "match" and prematurely settle in_sync before the change reaches the
-            # device (which would also drop the row from the Apply preview). Instead,
-            # gauge whether the DEVICE (entry) has caught up to the pushed intent —
-            # mirrors the OSPF device-vs-netbox semantics.
-            iface_matches = _isis_device_matches_intent(
-                entry,
-                state,
-                state.isis_interface,
-                device,
-            ) and _isis_interface_children_match(entry, state.isis_interface, write=False)
-        state.status = sm.on_reconcile(state.status, matches=iface_matches)
-        state.save()
-        seen_keys.add((iface.pk, af))
-
-    for stale in NSOISISInterfaceState.objects.filter(management=mgmt):
-        if (stale.interface_id, stale.af) not in seen_keys:
-            # vestigial = status-only ghost (no linked netbox-routing ISISInterface)
-            sm.finalise_stale_overlay(stale, vestigial=stale.isis_interface_id is None)
-
-    if dropped:
-        logger.warning(
-            "IS-IS reconcile for %s: %d interface(s) not found in NetBox, dropped: %s",
-            device,
-            len(dropped),
-            ", ".join(sorted(set(dropped))),
-        )
-
-    return list(NSOISISInterfaceState.objects.filter(management=mgmt).select_related("interface", "isis_interface"))
-
-
 # netbox_routing ISISInstance scalar columns synced from NSO. Each is
 # guarded by hasattr so the reconcile no-ops on a fork without the column.
 # NOTE: segment-routing state (the adapter's top-level ``sr_enabled`` /
@@ -2453,91 +2328,18 @@ def _sync_routing_isis_instance(device, tag, state, entry, base):
     return inst, False, base  # operator edited → changed (edit preserved)
 
 
-@mirror_reconciler
+# Keep the long-standing test and call-site names while the exact reconciler owns all
+# IS-IS DML.
+def _reconcile_isis_interfaces(device, interfaces: list) -> list:
+    from .isis_reconciler import reconcile_isis_interfaces
+
+    return reconcile_isis_interfaces(device, interfaces)
+
+
 def _reconcile_isis_process(device, process_list: list) -> list:
-    """Reconcile IS-IS process data from the adapter into NSOISISInstanceState rows.
+    from .isis_reconciler import reconcile_isis_process
 
-    For each process entry reported by NSO (keyed by process_tag):
-    - Find or create NSOISISInstanceState keyed by (management, process_tag).
-    - Update all NSO-reported fields.
-    - Set status='imported' if not already in a write-path status.
-    - Try to link to an existing ISISInstance in netbox-routing.
-
-    Stale rows (no longer reported by NSO): set status='changed'.
-
-    Returns a list of NSOISISInstanceState instances for this device.
-    """
-    from django.utils import timezone
-
-    from .models import NSODeviceManagement, NSOISISInstanceState
-
-    try:
-        mgmt = NSODeviceManagement.objects.get(device=device)
-    except NSODeviceManagement.DoesNotExist:
-        return []
-
-    now = timezone.now()
-    seen_tags: set[str] = set()
-
-    for entry in process_list or []:
-        # Junos' default IS-IS instance has an empty process tag — "" is a valid
-        # key (NSOISISInstanceState.process_tag defaults to ""). Only skip an
-        # entry that genuinely omits the field.
-        tag = entry.get("process_tag")
-        if tag is None:
-            continue
-
-        state, _ = NSOISISInstanceState.objects.get_or_create(
-            management=mgmt,
-            process_tag=tag,
-            defaults={"status": "unknown"},
-        )
-        # Owned rows hold the intent pushed back to NSO. An omitted configured-only
-        # field (for example a default is-type) is device provenance, not permission
-        # to erase accepted intent from the overlay and the next push snapshot.
-        if not sm.is_owned(state.status):
-            state.net = entry.get("net") or ""
-            state.is_type = entry.get("is_type") or ""
-            state.metric_style = entry.get("metric_style") or ""
-            state.overload_bit = entry.get("overload_bit")
-            state.area_auth_type = entry.get("area_auth_type") or ""
-            state.area_auth_present = bool(entry.get("area_auth_present", False))
-            state.area_auth_key = entry.get("area_auth_key") or ""
-            state.domain_auth_type = entry.get("domain_auth_type") or ""
-            state.domain_auth_present = bool(entry.get("domain_auth_present", False))
-            state.domain_auth_key = entry.get("domain_auth_key") or ""
-            # FRR (#83): flavor '' when unreported; microloop tri-state verbatim.
-            state.fast_reroute = entry.get("fast_reroute") or ""
-            state.microloop_avoidance = entry.get("microloop_avoidance")
-        state.last_sync_at = now
-
-        # 3-way merge over the whole ISIS graph: device changes auto-mirror when the
-        # object is untouched (object_hash == base); operator edits survive + surface
-        # as 'changed'. device_base_hash persists the agreed object snapshot.
-        state.isis_instance, inst_matches, new_base = _sync_routing_isis_instance(
-            device, tag, state, entry, state.device_base_hash
-        )
-        state.device_base_hash = new_base
-        if sm.is_owned(state.status):
-            # The object merge compares NetBox intent with its linked object. Owned
-            # status must additionally be gated by the device report; otherwise an
-            # omitted configured-only default falsely settles accepted intent in_sync.
-            inst_matches = inst_matches and _isis_process_device_matches_intent(
-                entry,
-                state,
-                device,
-                state.isis_instance,
-            )
-        state.status = sm.on_reconcile(state.status, matches=inst_matches)
-        state.save()
-        seen_tags.add(tag)
-
-    for stale in NSOISISInstanceState.objects.filter(management=mgmt):
-        if stale.process_tag not in seen_tags:
-            # vestigial = status-only ghost (no linked netbox-routing ISISInstance)
-            sm.finalise_stale_overlay(stale, vestigial=stale.isis_instance_id is None)
-
-    return list(NSOISISInstanceState.objects.filter(management=mgmt).select_related("isis_instance"))
+    return reconcile_isis_process(device, process_list)
 
 
 def _clean_router_id(value) -> str:
