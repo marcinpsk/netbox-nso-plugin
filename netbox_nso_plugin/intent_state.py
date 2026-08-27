@@ -1091,6 +1091,39 @@ def _route_policy_groups(instance) -> tuple[tuple[str, str], ...]:
     return tuple(sorted(groups, key=lambda group: (group[0], group[1].casefold())))
 
 
+def _route_map_consumer_rows(instance):
+    """Return owned overlays whose rendered body reads one route-map name."""
+    if instance._meta.label_lower != "netbox_routing.routemap" or instance.pk is None:
+        return ()
+
+    from django.db.models import Q
+
+    from .models import NSOBGPPeerState, NSORedistributionState
+    from .status_machine import OWNED_STATES
+
+    bgp_states = NSOBGPPeerState.objects.filter(
+        Q(bgp_peer__address_families__routemap_in_id=instance.pk)
+        | Q(bgp_peer__address_families__routemap_out_id=instance.pk),
+        status__in=OWNED_STATES,
+    ).select_related("management")
+    redistribution_states = NSORedistributionState.objects.filter(
+        Q(redistribution__route_map_id=instance.pk) | Q(redistribution__isnull=True, route_map__iexact=instance.name),
+        status__in=OWNED_STATES,
+    ).select_related("management")
+    return (*bgp_states, *redistribution_states)
+
+
+def _route_map_consumer_keys(instance) -> set[tuple[int, str]]:
+    """Resolve route-map consumers to their actual delivery scopes."""
+    keys = set()
+    for row in _route_map_consumer_rows(instance):
+        if row._meta.label_lower == "netbox_nso_plugin.nsobgppeerstate":
+            keys.add((row.management.device_id, "bgp"))
+        else:
+            keys.add((row.management.device_id, row.dest_protocol))
+    return keys
+
+
 def _indirect_route_policy_groups(instance, label) -> set[tuple[str, str]]:
     """Resolve policy groups for leaf objects and auto-created through rows."""
     groups = set()
@@ -1506,7 +1539,7 @@ def _generic_keys(instance, spec: RendererInputSpec) -> set[tuple[int, str]]:
         if family and name:
             rows = rows.filter(family=family, object_name__iexact=name)
         device_ids = set(rows.values_list("management__device_id", flat=True))
-        return _management_keys(device_ids, spec.scopes)
+        return _management_keys(device_ids, spec.scopes) | _route_map_consumer_keys(instance)
     if instance._meta.label_lower in {
         "netbox_nso_plugin.nsoinstance",
         "netbox_nso_plugin.nsoplatformnedmapping",
@@ -1601,11 +1634,29 @@ def footprint_for_instance(instance, spec: RendererInputSpec | None = None) -> M
 def _route_policy_instance_footprint(instance, spec) -> MutationFootprint:
     """Include current and stored groups so a rename locks both identities."""
     groups = set(_route_policy_groups(instance))
+    if instance._meta.label_lower == "netbox_nso_plugin.nsoroutepolicystate":
+        family = getattr(instance, "family", "")
+        name = getattr(instance, "object_name", "")
+        management = getattr(instance, "management", None)
+        if family and name and management is not None:
+            return route_policy_footprint(
+                {(family, name)},
+                device_ids=(management.device_id,),
+            )
+    candidates = [instance]
     if instance.pk is not None:
         current = type(instance).objects.filter(pk=instance.pk).first()
         if current is not None:
             groups.update(_route_policy_groups(current))
-    return route_policy_footprint(groups) if groups else _regular_instance_footprint(instance, spec)
+            candidates.append(current)
+    base = route_policy_footprint(groups) if groups else _regular_instance_footprint(instance, spec)
+    consumers = {
+        (row._meta.label_lower, row.pk): row for candidate in candidates for row in _route_map_consumer_rows(candidate)
+    }
+    return MutationFootprint.merge(
+        base,
+        *(_regular_instance_footprint(row, _REGISTRY[row._meta.label_lower]) for row in consumers.values()),
+    )
 
 
 def _regular_instance_footprint(instance, spec) -> MutationFootprint:
@@ -3471,6 +3522,7 @@ def register_builtin_renderer_inputs(*, connect_ends: bool = True) -> None:
             _REGISTRY[label],
             fragment=fragment,
             dependency_resolver=dependency_resolvers.get(label),
+            shared_kind="route_policy" if label == "netbox_nso_plugin.nsoroutepolicystate" else None,
         )
         _TABLE_REGISTRY[_REGISTRY[label].table] = _REGISTRY[label]
     _REGISTRY["netbox_nso_plugin.nsovlanstate"] = replace(

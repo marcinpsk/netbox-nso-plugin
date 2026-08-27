@@ -5215,6 +5215,8 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(state.status, "imported")
 
     def test_edit_route_map_name_updates_shared_object_overlays_and_dependent_intent(self):
+        from copy import copy
+
         from django.contrib.contenttypes.models import ContentType
         from netbox_routing.models import OSPFInstance, Redistribution, RouteMap
 
@@ -5224,6 +5226,7 @@ class TestOverlayFieldEditView(ViewTestBase):
             NSORoutePolicyObjectClass,
             NSORoutePolicyState,
         )
+        from netbox_nso_plugin.views import _route_map_name_edit_plan
 
         route_map = RouteMap.objects.create(name="RM-INLINE-OLD")
         route_map_ct = ContentType.objects.get_for_model(RouteMap)
@@ -5265,6 +5268,27 @@ class TestOverlayFieldEditView(ViewTestBase):
             status="accepted",
         )
         mirror_update(self.mgmt, adapter_device_id=321)
+
+        candidate = copy(row)
+        candidate.object_name = "RM-INLINE-NEW"
+        plan = _route_map_name_edit_plan(candidate, route_map.name)
+
+        route_map.refresh_from_db()
+        row.refresh_from_db()
+        policy_class.refresh_from_db()
+        self.assertEqual((route_map.name, row.object_name, policy_class.object_name), ("RM-INLINE-OLD",) * 3)
+        self.assertEqual(
+            {write.model_label for write in plan.write_set},
+            {
+                "netbox_routing.routemap",
+                "netbox_nso_plugin.nsoroutepolicystate",
+                "netbox_nso_plugin.nsoroutepolicyobjectclass",
+            },
+        )
+        self.assertTrue(
+            {(self.device.pk, "route_policy"), (self.device.pk, "ospf")} <= set(plan.content_keys),
+            plan.content_keys,
+        )
 
         with (
             patch("netbox_nso_plugin.adapter_client.put_route_policy_intent") as put_policy,

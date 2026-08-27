@@ -223,6 +223,8 @@ class RendererMutationPlan:
             footprints.append(footprint)
             content_keys.update(changed_keys)
 
+        content_keys.update(_prospective_route_policy_acquisition_keys(saves))
+
         lock_footprint = MutationFootprint.merge(*footprints) if footprints else MutationFootprint()
         return cls(
             write_set=tuple(writes),
@@ -231,6 +233,44 @@ class RendererMutationPlan:
             planned_at=planned_at,
             settles_deploying=settles_deploying,
         )
+
+
+def _prospective_route_policy_acquisition_keys(saves):
+    """Include native writes made visible by an overlay acquired in the same plan."""
+    from . import status_machine as sm
+    from .intent_state import _route_policy_groups
+
+    acquired_groups = set()
+    effective = []
+    for proposed in saves:
+        instance = proposed.instance
+        before = _stored_instance(instance)
+        after = _effective_after(instance, before, proposed.update_fields)
+        effective.append((before, after))
+        if instance._meta.label_lower != "netbox_nso_plugin.nsoroutepolicystate":
+            continue
+        if (before is None or not sm.is_owned(before.status)) and sm.is_owned(after.status):
+            acquired_groups.add((after.family, after.object_name.casefold()))
+    if not acquired_groups:
+        return set()
+
+    keys = set()
+    specs = renderer_input_specs()
+    for before, after in effective:
+        spec = specs.get(after._meta.label_lower)
+        if spec is None or spec.shared_kind != "route_policy":
+            continue
+        if after._meta.label_lower == "netbox_nso_plugin.nsoroutepolicystate":
+            continue
+        groups = {
+            (family, name.casefold())
+            for candidate in (before, after)
+            if candidate is not None
+            for family, name in _route_policy_groups(candidate)
+        }
+        if groups & acquired_groups:
+            keys.update(spec.resolver(after, spec))
+    return keys
 
 
 def _stored_instance(instance):
@@ -1088,6 +1128,8 @@ class RendererWriter:
 
         collector = Collector(using=instance._state.db or "default", origin=instance)
         collector.collect([instance])
+        for model_label in {write.model_label for write in closure if write.operation == "delete"}:
+            _authorize_dml(self.permit, apps.get_model(model_label)._meta.db_table)
         for (_field, _value), querysets in collector.field_updates.items():
             for rows in querysets:
                 model, _materialized = _materialize_field_update_rows(rows)

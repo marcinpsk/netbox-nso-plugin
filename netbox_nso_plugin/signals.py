@@ -3458,7 +3458,7 @@ def _as_json_dict(value):
 
 @_skip_on_render
 def _on_route_policy_state_save(sender, instance, **kwargs):
-    """Push route-policy intent whenever an NSORoutePolicyState row is saved."""
+    """Schedule route policy only when the exact writer owns this device key."""
     from .models import NSODeviceManagement
 
     try:
@@ -3470,34 +3470,14 @@ def _on_route_policy_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    _schedule_intent_push((device_id, "route_policy"))
+    if _converted_writer_owns_content(device_id, "route_policy"):
+        _schedule_intent_push((device_id, "route_policy"))
 
 
 @_skip_on_render
 def _on_routing_policy_pre_delete(sender, instance, **kwargs):
-    """Drop overlays + push the reduced snapshot when a netbox-routing policy is deleted.
-
-    Reverts the removal on each attached device.
-    The overlay links via a content-type GFK (no DB cascade), so the overlays must be
-    removed explicitly here, before the object is gone. Captures attached devices first,
-    then a deferred push (post-commit, overlays gone) sends the reduced snapshot.
-    """
-    from django.contrib.contenttypes.models import ContentType
-
-    from .models import NSORoutePolicyState
-
-    ct = ContentType.objects.get_for_model(type(instance))
-    states = list(
-        NSORoutePolicyState.objects.filter(content_type=ct, object_id=instance.pk).select_related("management")
-    )
-    targets = []
-    for state in states:
-        mgmt = state.management
-        if mgmt.adapter_device_id is not None:
-            targets.append((mgmt.device_id, mgmt.adapter_device_id))
-    NSORoutePolicyState.objects.filter(content_type=ct, object_id=instance.pk).delete()
-    for device_id, adapter_device_id in targets:
-        _schedule_intent_push((device_id, "route_policy"))
+    """Keep foreign policy-root deletions outside ownership bookkeeping."""
+    _schedule_exact_writer_scope("route_policy")
 
 
 # ── netbox_routing route-policy edit write path ─────────────────────────────
@@ -3539,14 +3519,19 @@ def _own_route_map_contributors(mgmt, route_map) -> CascadeResult:
     provenance is collected into ``cross_device`` so the caller can warn that owning the
     route-map here will push another device's version of that object onto this device.
     """
-    from django.contrib.contenttypes.models import ContentType
+    plan, operations, result = _route_policy_acquisition_plan(mgmt, route_maps=(route_map,))
+    from .renderer_writer import renderer_mirror_writes, renderer_writes
 
-    from .models import NSORoutePolicyState
-    from .shared_object_ownership import materialized_row
-    from .status_machine import CHANGED, CONFLICT
+    mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+    with mutation as writer:
+        for candidate, fields, created in operations:
+            writer.save(candidate, update_fields=fields, force_insert=created)
+    return result
 
-    now = timezone.now()
-    referenced: list = []  # (family, obj), de-duplicated by (family, name)
+
+def _route_map_contributors(route_maps):
+    """Return de-duplicated policy objects referenced by route maps."""
+    referenced = []
     seen_refs: set = set()
 
     def _add_ref(family, obj):
@@ -3555,100 +3540,116 @@ def _own_route_map_contributors(mgmt, route_map) -> CascadeResult:
             seen_refs.add(key)
             referenced.append((family, obj))
 
-    for entry in route_map.route_map_entries.all():
-        for o in entry.match_prefix_list.all():
-            _add_ref("prefix_list", o)
-        for o in entry.match_community_list.all():
-            _add_ref("community_list", o)
-        for o in entry.match_aspath.all():
-            _add_ref("as_path", o)
-        # SET community-list references (`set community <list> add|delete|…`) are dependencies
-        # too — a `set comm-list delete <CL>` rejects on the device if <CL> isn't defined.
-        for sc in entry.set_communities.all():
-            if sc.community_list_id:
-                _add_ref("community_list", sc.community_list)
+    for route_map in route_maps:
+        for entry in route_map.route_map_entries.all():
+            for obj in entry.match_prefix_list.all():
+                _add_ref("prefix_list", obj)
+            for obj in entry.match_community_list.all():
+                _add_ref("community_list", obj)
+            for obj in entry.match_aspath.all():
+                _add_ref("as_path", obj)
+            for set_community in entry.set_communities.all():
+                if set_community.community_list_id:
+                    _add_ref("community_list", set_community.community_list)
+    return referenced
+
+
+def _route_policy_acquisition_plan(mgmt, *, primary_operations=(), route_maps=()):
+    """Freeze explicit root acquisitions and eligible route-map contributors."""
+    import copy
+
+    from django.contrib.contenttypes.models import ContentType
+
+    from .models import NSORoutePolicyState
+    from .renderer_writer import RendererMutationPlan, planned_save
+    from .shared_object_ownership import materialized_row
+    from .status_machine import CHANGED, CONFLICT
+
+    planned_at = timezone.now()
+    saves = []
+    operations = list(primary_operations)
+    staged = {(candidate.family, candidate.object_name.casefold()) for candidate, _fields, _created in operations}
+    for candidate, fields, created in operations:
+        saves.append(
+            planned_save(
+                candidate,
+                update_fields=fields,
+                force_insert=created,
+                natural_key=("management", "family", "object_name") if created else (),
+            )
+        )
     drifted: list = []
     cross_device: list = []
-    for family, obj in referenced:
+    for family, obj in _route_map_contributors(route_maps):
+        key = (family, obj.name.casefold())
+        if key in staged:
+            continue
         ct = ContentType.objects.get_for_model(obj)
-        state, created = NSORoutePolicyState.objects.get_or_create(
+        state = NSORoutePolicyState.objects.filter(
             management=mgmt,
             family=family,
-            object_name=obj.name,
-            defaults={"content_type": ct, "object_id": obj.pk, "status": "accepted", "accepted_at": now},
-        )
-        if created:
-            # Greenfield on this device — owned. If the shared NetBox content was materialized
-            # from ANOTHER device, owning here pushes that device's version; surface provenance.
+            object_name__iexact=obj.name,
+        ).first()
+        created = state is None
+        if state is None:
+            candidate = NSORoutePolicyState(
+                management=mgmt,
+                family=family,
+                object_name=obj.name,
+                content_type=ct,
+                object_id=obj.pk,
+                status="accepted",
+                accepted_at=planned_at,
+            )
+            fields = None
             owner = materialized_row(NSORoutePolicyState, family, obj.name)
             if owner is not None and owner.management.device_id != mgmt.device_id:
                 cross_device.append((family, obj.name, owner.management.device.name))
-            continue
-        if state.status in _OWNED_PUSH_STATUSES:
+        elif state.status in _OWNED_PUSH_STATUSES:
             continue  # already owned → nothing to do
-        if state.status in (CHANGED, CONFLICT):
-            # The device has a diverging version — don't silently overwrite it. The reference
-            # resolves against the device's existing object; surface it for explicit resolution.
+        elif state.status in (CHANGED, CONFLICT):
             drifted.append((family, obj.name))
             continue
-        # imported / unknown — device matches NetBox (no drift) → safe to adopt.
-        state.content_type, state.object_id = ct, obj.pk
-        state.status, state.accepted_at = "accepted", now
-        state.save()
-    return CascadeResult(drifted=drifted, cross_device=cross_device)
-
-
-def _accept_route_policy_object(obj) -> None:
-    """Re-own + push every OWNED overlay attached to a saved route-policy object."""
-    from django.contrib.contenttypes.models import ContentType
-    from django.db import transaction
-
-    from .models import NSORoutePolicyState
-
-    is_route_map = hasattr(obj, "route_map_entries")
-    ct = ContentType.objects.get_for_model(type(obj))
-    with transaction.atomic():
-        states = NSORoutePolicyState.objects.filter(content_type=ct, object_id=obj.pk).select_related("management")
-        for state in states:
-            mgmt = state.management
-            if mgmt.adapter_device_id is None:
-                continue
-            # Only re-own an already-owned overlay (incl. in_sync). A brownfield/un-owned
-            # (imported/unknown) overlay must surface the edit via reconcile, not be force-owned.
-            if state.status not in _OWNED_PUSH_STATUSES:
-                continue
-            if state.status != "accepted":
-                state.status = "accepted"
-            state.last_sync_at = timezone.now()
-            state.save(update_fields=["status", "last_sync_at"])
-            if is_route_map:
-                # Owning a route-map owns its contributors (else dangling device references).
-                _own_route_map_contributors(mgmt, obj)
+        else:
+            candidate = copy.copy(state)
+            candidate.content_type = ct
+            candidate.object_id = obj.pk
+            candidate.status = "accepted"
+            candidate.accepted_at = planned_at
+            fields = ("content_type", "object_id", "status", "accepted_at")
+        saves.append(
+            planned_save(
+                candidate,
+                update_fields=fields,
+                force_insert=created,
+                natural_key=("management", "family", "object_name") if created else (),
+            )
+        )
+        operations.append((candidate, fields, created))
+        staged.add(key)
+    return (
+        RendererMutationPlan.build(saves=saves, planned_at=planned_at),
+        operations,
+        CascadeResult(drifted=drifted, cross_device=cross_device),
+    )
 
 
 @_skip_on_render
 def _on_routing_policy_object_save(sender, instance, **kwargs):
-    """netbox_routing CommunityList/RouteMap/PrefixList/ASPath edited → own + push."""
-    _accept_route_policy_object(instance)
+    """Keep foreign policy-root saves outside ownership bookkeeping."""
+    _schedule_exact_writer_scope("route_policy")
 
 
 @_skip_on_render
 def _on_routing_policy_entry_save(sender, instance, **kwargs):
-    """Own + push the parent object when a route-policy ENTRY (member) is edited/added."""
-    parent = (
-        getattr(instance, "community_list", None)
-        or getattr(instance, "prefix_list", None)
-        or getattr(instance, "route_map", None)
-        or getattr(instance, "aspath", None)
-    )
-    if parent is not None:
-        _accept_route_policy_object(parent)
+    """Keep foreign policy-entry saves outside ownership bookkeeping."""
+    _schedule_exact_writer_scope("route_policy")
 
 
 @_skip_on_render
 def _on_routing_policy_entry_delete(sender, instance, **kwargs):
-    """Own + push the parent object when a route-policy ENTRY is removed (reduced member set)."""
-    _on_routing_policy_entry_save(sender, instance, **kwargs)
+    """Keep foreign policy-entry deletes outside ownership bookkeeping."""
+    _schedule_exact_writer_scope("route_policy")
 
 
 def redistribution_intent_item(row):

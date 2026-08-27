@@ -4930,135 +4930,102 @@ def _route_map_rename_dependents(route_map, old_name):
     return bgp_states, redistribution_states, dependent_groups
 
 
+def _route_map_name_edit_operations(state, old_name, planned_at):
+    """Build one prospective route-map rename and its dependent targets."""
+    import copy
+
+    from . import status_machine as sm
+    from .models import NSORoutePolicyObjectClass, NSORoutePolicyState
+    from .renderer_writer import RendererMutationPlan, planned_save
+
+    assigned = state.assigned_object
+    route_map = type(assigned).objects.get(pk=assigned.pk)
+    new_name = state.object_name
+    bgp_states, redistribution_states, _dependent_groups = _route_map_rename_dependents(route_map, old_name)
+    attached = list(
+        NSORoutePolicyState.objects.filter(
+            content_type_id=state.content_type_id,
+            object_id=state.object_id,
+        ).order_by("pk")
+    )
+    classes = list(
+        NSORoutePolicyObjectClass.objects.filter(family="route_map", object_name__iexact=old_name).order_by("pk")
+    )
+    fallback_redistribution = [
+        row
+        for row in redistribution_states
+        if row.redistribution_id is None and row.route_map.casefold() == old_name.casefold()
+    ]
+    operations = []
+    for attached_state in attached:
+        candidate = copy.copy(attached_state)
+        candidate.object_name = new_name
+        update_fields = {"object_name"}
+        if candidate.pk == state.pk:
+            if not sm.is_owned(candidate.status):
+                candidate.accepted_at = planned_at
+            candidate.status = sm.on_operator_edit(candidate.status)
+            candidate.apply_attempt_id = None
+            update_fields.update({"status", "accepted_at", "apply_attempt_id"})
+        operations.append((candidate, tuple(sorted(update_fields))))
+    for policy_class in classes:
+        candidate = copy.copy(policy_class)
+        candidate.object_name = new_name
+        operations.append((candidate, ("object_name",)))
+    route_map_candidate = copy.copy(route_map)
+    route_map_candidate.name = new_name
+    operations.append((route_map_candidate, ("name",)))
+    for redistribution_state in fallback_redistribution:
+        candidate = copy.copy(redistribution_state)
+        candidate.route_map = new_name
+        operations.append((candidate, ("route_map",)))
+    plan = RendererMutationPlan.build(
+        saves=(planned_save(candidate, update_fields=fields) for candidate, fields in operations),
+        planned_at=planned_at,
+    )
+    targets = (
+        {
+            attached_state.management.device_id
+            for attached_state in attached
+            if attached_state.management.adapter_device_id is not None
+        },
+        {row.management.device_id for row in bgp_states if row.management.adapter_device_id is not None},
+        {
+            (row.management.device_id, row.dest_protocol)
+            for row in redistribution_states
+            if row.management.adapter_device_id is not None
+        },
+    )
+    return plan, operations, targets
+
+
+def _route_map_name_edit_plan(state, old_name):
+    """Freeze a shared route-map rename without changing the database."""
+    plan, _operations, _targets = _route_map_name_edit_operations(state, old_name, timezone.now())
+    return plan
+
+
 def _save_route_map_name_edit(state, old_name):
     """Atomically rename a shared route map and refresh every dependent intent scope."""
-    from django.db import IntegrityError
-
     from . import signals
-    from . import status_machine as sm
-    from .intent_state import (
-        MutationFootprint,
-        footprint_for_instance,
-        intent_transaction,
-        route_policy_footprint,
-    )
-    from .models import NSORedistributionState, NSORoutePolicyObjectClass, NSORoutePolicyState
+    from .renderer_writer import renderer_mirror_writes, renderer_writes
     from .signals import suppress_intent_push
 
-    route_map = state.assigned_object
-    new_name = state.object_name
-    bgp_states, redistribution_states, dependent_groups = _route_map_rename_dependents(route_map, old_name)
-    groups = {("route_map", old_name), ("route_map", new_name), *dependent_groups}
-    footprint = MutationFootprint.merge(
-        route_policy_footprint(groups),
-        *(footprint_for_instance(row) for row in (*bgp_states, *redistribution_states)),
-    )
-    try:
-        with intent_transaction(footprint):
-            attached = list(
-                NSORoutePolicyState.objects.filter(
-                    content_type_id=state.content_type_id,
-                    object_id=state.object_id,
-                ).order_by("pk")
-            )
-            classes = list(
-                NSORoutePolicyObjectClass.objects.filter(family="route_map", object_name__iexact=old_name).order_by(
-                    "pk"
-                )
-            )
-            fallback_redistribution = list(
-                NSORedistributionState.objects.filter(
-                    pk__in=[row.pk for row in redistribution_states],
-                    redistribution__isnull=True,
-                    route_map__iexact=old_name,
-                ).order_by("pk")
-            )
-            now = timezone.now()
-            with suppress_intent_push():
-                class_ids = [policy_class.pk for policy_class in classes]
-                try:
-                    with transaction.atomic():
-                        for attached_state in attached:
-                            attached_state.object_name = new_name
-                            update_fields = {"object_name"}
-                            if attached_state.pk == state.pk:
-                                if not sm.is_owned(attached_state.status):
-                                    attached_state.accepted_at = now
-                                attached_state.status = sm.on_operator_edit(attached_state.status)
-                                attached_state.apply_attempt_id = None
-                                update_fields.update({"status", "accepted_at", "apply_attempt_id"})
-                            attached_state.save(update_fields=update_fields)
-                        for policy_class in classes:
-                            policy_class.object_name = new_name
-                            policy_class.save(update_fields=["object_name"])
-                        route_map.name = new_name
-                        route_map.save(update_fields=["name"])
-                        classification_collision = (
-                            NSORoutePolicyObjectClass.objects.filter(
-                                family="route_map",
-                                object_name__iexact=new_name,
-                            )
-                            .exclude(pk__in=class_ids)
-                            .exists()
-                        )
-                        if classes and classification_collision:
-                            raise IntegrityError
-                except IntegrityError:
-                    attached_collision = (
-                        NSORoutePolicyState.objects.filter(
-                            management_id__in=[row.management_id for row in attached],
-                            family="route_map",
-                            object_name=new_name,
-                        )
-                        .exclude(pk__in=[row.pk for row in attached])
-                        .exists()
-                    )
-                    if attached_collision:
-                        raise _IntentTransactionNoOp({"object_name": ["A route map with this name already exists."]})
-                    collision = type(route_map).objects.filter(name__iexact=new_name).exclude(pk=route_map.pk)
-                    if collision.exists():
-                        raise _IntentTransactionNoOp({"object_name": ["A route map with this name already exists."]})
-                    classification_collision = (
-                        NSORoutePolicyObjectClass.objects.filter(
-                            family="route_map",
-                            object_name__iexact=new_name,
-                        )
-                        .exclude(pk__in=class_ids)
-                        .exists()
-                    )
-                    if classes and classification_collision:
-                        raise _IntentTransactionNoOp(
-                            {"object_name": ["A route-map classification with this name already exists."]}
-                        )
-                    raise
-                for redistribution_state in fallback_redistribution:
-                    redistribution_state.route_map = new_name
-                    redistribution_state.save(update_fields=["route_map"])
-
-            route_policy_targets = {
-                attached_state.management.device_id
-                for attached_state in attached
-                if attached_state.management.adapter_device_id is not None
-            }
-            bgp_targets = {
-                row.management.device_id for row in bgp_states if row.management.adapter_device_id is not None
-            }
-            redistribution_targets = {
-                (row.management.device_id, row.dest_protocol)
-                for row in redistribution_states
-                if row.management.adapter_device_id is not None
-            }
-            # Appended here, not on commit: the entry belongs to the transaction that renamed
-            # the map, and the drain it schedules still runs after that transaction commits.
-            for device_id in route_policy_targets:
-                signals._schedule_intent_push((device_id, "route_policy"))
-            for device_id in bgp_targets:
-                signals._schedule_intent_push((device_id, "bgp"))
-            for device_id, dest_protocol in redistribution_targets:
-                signals._schedule_redistribution_push(device_id, dest_protocol)
-    except _IntentTransactionNoOp as exc:
-        return exc.result
-    return None
+    plan, operations, targets = _route_map_name_edit_operations(state, old_name, timezone.now())
+    route_policy_targets, bgp_targets, redistribution_targets = targets
+    mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+    with mutation as writer:
+        with suppress_intent_push():
+            for candidate, update_fields in operations:
+                writer.save(candidate, update_fields=update_fields)
+        # Appended here, not on commit: the entry belongs to the transaction that renamed
+        # the map, and the drain it schedules still runs after that transaction commits.
+        for device_id in route_policy_targets:
+            signals._schedule_intent_push((device_id, "route_policy"))
+        for device_id in bgp_targets:
+            signals._schedule_intent_push((device_id, "bgp"))
+        for device_id, dest_protocol in redistribution_targets:
+            signals._schedule_redistribution_push(device_id, dest_protocol)
 
 
 def _save_lacp_edit(obj, key, old_values):
@@ -6435,17 +6402,30 @@ class NSORoutePolicyStateAcceptView(RoutingStateAcceptMixin):
     model_class = NSORoutePolicyState
 
     def post(self, request, pk):  # noqa: D102
-        from django.db import transaction
+        import copy
 
-        from .signals import _own_route_map_contributors
+        from .renderer_writer import renderer_mirror_writes, renderer_writes
+        from .signals import _route_policy_acquisition_plan
 
         state = get_object_or_404(NSORoutePolicyState, pk=pk)
-        with transaction.atomic():
-            state.status = _status_after_accept(state.status)
-            state.save(update_fields=["status"])
-            if state.family == "route_map" and state.assigned_object is not None:
-                _own_route_map_contributors(state.management, state.assigned_object)
-        messages.success(request, f"Accepted routing state {state.pk}.")
+        candidate = copy.copy(state)
+        candidate.status = _status_after_accept(candidate.status)
+        if candidate.accepted_at is None:
+            candidate.accepted_at = timezone.now()
+        fields = ("status", "accepted_at")
+        route_maps = (
+            (candidate.assigned_object,) if candidate.family == "route_map" and candidate.assigned_object else ()
+        )
+        plan, operations, _cascade = _route_policy_acquisition_plan(
+            candidate.management,
+            primary_operations=((candidate, fields, False),),
+            route_maps=route_maps,
+        )
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+        with mutation as writer:
+            for operation, update_fields, created in operations:
+                writer.save(operation, update_fields=update_fields, force_insert=created)
+        messages.success(request, f"Accepted routing state {candidate.pk}.")
         return redirect(_device_nso_tab_url(state.management.device_id))
 
 
@@ -6629,8 +6609,26 @@ class NSORoutePolicyClassifyBulkView(NSOActionPermissionMixin, View):
         return redirect(_device_nso_tab_url(device_pk))
 
 
-class NSORoutePolicyMaterializeView(SharedObjectMaterializeMixin):  # noqa: D101
+class NSORoutePolicyMaterializeView(SharedObjectMaterializeMixin):
+    """Re-point one route-policy group through its exact graph plan."""
+
     model_class = NSORoutePolicyState
+
+    def post(self, request, pk):  # noqa: D102
+        from .route_policy_reconciler import rematerialize_route_policy
+
+        state = get_object_or_404(self.model_class, pk=pk)
+        try:
+            rematerialize_route_policy(state)
+        except ValueError as exc:
+            messages.error(request, f"Could not use this version: {exc}")
+            return redirect(_device_nso_tab_url(state.management.device_id))
+        messages.success(
+            request,
+            f"NetBox now mirrors {state.management.device}'s version of "
+            f"{state.family.replace('_', '-')} “{state.object_name}”.",
+        )
+        return redirect(_device_nso_tab_url(state.management.device_id))
 
 
 # ── Drift delta: what differs between the device and what NetBox holds ──────────
@@ -6716,11 +6714,17 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
         """Add family-specific accepted fields to one candidate."""
         return ()
 
+    def _build_accept_plan(self, mgmt, accepted, saves):
+        """Build the family-specific exact plan and replay operations."""
+        from .renderer_writer import RendererMutationPlan
+
+        return RendererMutationPlan.build(saves=saves), [(*operation, False) for operation in accepted]
+
     def post(self, request, device_pk):  # noqa: D102
         import copy
 
         from .intent_state import IntentMutationProtocolError
-        from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
+        from .renderer_writer import planned_save, renderer_mirror_writes, renderer_writes
 
         try:
             mgmt = NSODeviceManagement.objects.get(device_id=device_pk)
@@ -6756,12 +6760,12 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
             count = len(accepted)
             if not count:
                 break
-            plan = RendererMutationPlan.build(saves=saves)
+            plan, write_operations = self._build_accept_plan(mgmt, accepted, saves)
             mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
             try:
                 with mutation as writer:
-                    for candidate, fields in accepted:
-                        writer.save(candidate, update_fields=fields)
+                    for candidate, fields, created in write_operations:
+                        writer.save(candidate, update_fields=fields, force_insert=created)
                     if mgmt.adapter_device_id is not None:
                         self._push(mgmt)
             except IntentMutationProtocolError:
@@ -6818,15 +6822,19 @@ class NSOBGPPeerBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
 class NSORoutePolicyBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     model_class = NSORoutePolicyState
 
-    def _after_accept(self, mgmt, accepted_pks):
-        from .signals import _own_route_map_contributors
+    def _build_accept_plan(self, mgmt, accepted, saves):
+        from .signals import _route_policy_acquisition_plan
 
-        # Owning a route-map owns its contributors — cascade for every now-owned route-map.
-        owned = ("accepted", "deploying", "in_sync", "apply_failed")
-        for st in NSORoutePolicyState.objects.filter(management=mgmt, family="route_map", status__in=owned):
-            obj = st.assigned_object
-            if obj is not None:
-                _own_route_map_contributors(mgmt, obj)
+        route_maps = tuple(
+            candidate.assigned_object
+            for candidate, _fields in accepted
+            if candidate.family == "route_map" and candidate.assigned_object is not None
+        )
+        return _route_policy_acquisition_plan(
+            mgmt,
+            primary_operations=tuple((candidate, fields, False) for candidate, fields in accepted),
+            route_maps=route_maps,
+        )[:2]
 
     def _push(self, mgmt):
         _schedule_intent_push((mgmt.device_id, "route_policy"))
@@ -7358,31 +7366,50 @@ class NSORoutePolicyAttachView(NSOActionPermissionMixin, View):
                 },
             )
 
-        with transaction.atomic():
-            state, created = NSORoutePolicyState.objects.get_or_create(
+        import copy
+
+        from .renderer_writer import renderer_mirror_writes, renderer_writes
+        from .signals import _OWNED_PUSH_STATUSES, _route_policy_acquisition_plan
+
+        planned_at = timezone.now()
+        current = NSORoutePolicyState.objects.filter(
+            management=mgmt,
+            family=family,
+            object_name__iexact=obj.name,
+        ).first()
+        created = current is None
+        if current is None:
+            candidate = NSORoutePolicyState(
                 management=mgmt,
                 family=family,
                 object_name=obj.name,
-                defaults={
-                    "content_type": ct,
-                    "object_id": obj.pk,
-                    "status": "accepted",
-                    "accepted_at": timezone.now(),
-                },
+                content_type=ct,
+                object_id=obj.pk,
+                status="accepted",
+                accepted_at=planned_at,
+                last_sync_at=planned_at,
             )
-            if not created and state.status not in ("accepted", "deploying", "in_sync", "apply_failed"):
-                state.status = "accepted"
-                state.accepted_at = timezone.now()
-            state.content_type = ct
-            state.object_id = obj.pk
-            state.last_sync_at = timezone.now()
-            state.save()  # → _on_route_policy_state_save schedules the push
-            cascade = None
-            if family == "route_map":
-                # Owning a route-map owns its contributors too (else dangling device references).
-                from .signals import _own_route_map_contributors
-
-                cascade = _own_route_map_contributors(mgmt, obj)
+            fields = None
+        else:
+            candidate = copy.copy(current)
+            fields_set = {"content_type", "object_id", "last_sync_at"}
+            if candidate.status not in _OWNED_PUSH_STATUSES:
+                candidate.status = "accepted"
+                candidate.accepted_at = planned_at
+                fields_set.update(("status", "accepted_at"))
+            candidate.content_type = ct
+            candidate.object_id = obj.pk
+            candidate.last_sync_at = planned_at
+            fields = tuple(sorted(fields_set))
+        plan, operations, cascade = _route_policy_acquisition_plan(
+            mgmt,
+            primary_operations=((candidate, fields, created),),
+            route_maps=(obj,) if family == "route_map" else (),
+        )
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+        with mutation as writer:
+            for operation, update_fields, force_insert in operations:
+                writer.save(operation, update_fields=update_fields, force_insert=force_insert)
         if cascade is not None:
             if cascade.drifted:
                 # A referenced object the device already has but that diverges from NetBox was

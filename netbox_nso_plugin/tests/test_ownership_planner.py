@@ -214,6 +214,7 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
             "logging",
             "ospf",
             "redistribution",
+            "route_policy",
             "snmp",
             "static_route",
             "subinterface",
@@ -299,3 +300,17 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
         assert rule.native_model_labels == ("netbox_routing.bgppeer",)
         assert rule.native_key_fields == ("scope_id", "peer_id", "name")
         assert rule.overlay_native_fields == (("netbox_nso_plugin.nsobgppeerstate", "bgp_peer"),)
+
+    def test_route_policy_rule_names_shared_roots_and_keeps_graph_rows_as_dependencies(self):
+        from netbox_nso_plugin.ownership_planner import converted_scope_rules
+
+        rule = converted_scope_rules()["route_policy"]
+
+        assert rule.native_model_labels == (
+            "netbox_routing.prefixlist",
+            "netbox_routing.communitylist",
+            "netbox_routing.aspath",
+            "netbox_routing.routemap",
+        )
+        assert rule.native_key_fields == ("name",)
+        assert rule.overlay_native_fields == (("netbox_nso_plugin.nsoroutepolicystate", "assigned_object"),)

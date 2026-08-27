@@ -1925,7 +1925,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
                 object_id=pl.pk,
                 status="accepted",
             )
-        self._delete_pushes(row, "put_route_policy_intent")
+        self._delete_pushes(row, "put_route_policy_intent", exact_writer=True)
 
     def test_ospf_instance_delete_pushes_reduced_snapshot(self):
         from netbox_nso_plugin.models import NSOOSPFInstanceState
