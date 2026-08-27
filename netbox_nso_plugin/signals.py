@@ -1340,6 +1340,9 @@ def _create_greenfield_subif_state(sender, instance, created, **kwargs):
     if mgmt.adapter_device_id is None:
         return
 
+    if not _converted_writer_owns_content(instance.device_id, "subinterface"):
+        return
+
     # Brand-new interface → no prior state; create + own it. The post_save signal on the
     # new state pushes the device's full subinterface intent snapshot to the adapter.
     NSOSubinterfaceState.objects.create(
@@ -1798,6 +1801,8 @@ def _on_subinterface_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
+    if not _converted_writer_owns_content(device_id, "subinterface"):
+        return
     _schedule_intent_push((device_id, "subinterface"))
 
 

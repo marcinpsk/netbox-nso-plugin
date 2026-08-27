@@ -111,6 +111,18 @@ _CONVERTED_SCOPE_RULES = {
             "Acquire from persisted per-interface MTU state. A save event is not ownership evidence."
         ),
     ),
+    "subinterface": ScopeOwnershipRule(
+        scope="subinterface",
+        native_model_labels=("dcim.interface",),
+        native_key_fields=("device_id", "name"),
+        overlay_model_labels=("netbox_nso_plugin.nsosubinterfacestate",),
+        overlay_native_fields=(("netbox_nso_plugin.nsosubinterfacestate", "interface"),),
+        foreign_overlay_delete="reown",
+        deletion_authority=True,
+        intentional_semantic_delta=(
+            "Acquire from persisted parent and dot1q state. Native save events are not ownership evidence."
+        ),
+    ),
 }
 
 
