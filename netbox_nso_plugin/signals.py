@@ -1985,166 +1985,25 @@ def _on_bfd_state_save(sender, instance, **kwargs):
     _schedule_intent_push((device_id, "bfd"))
 
 
-def _on_ip_address_pre_save(sender, instance, **kwargs):
-    """Stash the IPAddress's pre-save interface binding for the reassignment cleanup.
-
-    A GenericForeignKey change fires a single post_save keyed on the NEW interface; without
-    the previous binding, the OLD interface's ``NSOInterfaceIPState`` is orphaned and its
-    device keeps an IP NetBox just moved away. Not ``@_skip_on_render``: it only reads + stashes
-    on the instance (no push), and post_save's own guard decides whether the cleanup runs.
-    """
-    from dcim.models import Interface as _Interface
-
-    instance._nso_prev_ip_binding = None
-    if not instance.pk:
-        return
-    try:
-        prev = sender.objects.get(pk=instance.pk)
-    except sender.DoesNotExist:
-        return
-    prev_assigned = prev.assigned_object
-    if isinstance(prev_assigned, _Interface):
-        instance._nso_prev_ip_binding = (prev_assigned, str(prev.address), prev.vrf.name if prev.vrf else "")
-
-
-def _cleanup_reassigned_ip_overlay(instance) -> None:
-    """Drop the OLD interface's IP overlay + push the reduced intent when an IP moved.
-
-    Fires when an IPAddress's interface/address/vrf changed vs its pre-save binding (captured by
-    :func:`_on_ip_address_pre_save`): the overlay keyed on the OLD (interface, address, vrf) is
-    orphaned, so delete it and full-replace-push the OLD device's IP intent (which drops it on the
-    device). The new binding's overlay is (re)created by the normal post_save path.
-    """
-    from dcim.models import Interface as _Interface
-
-    from .models import NSODeviceManagement, NSOInterfaceIPState
-
-    prev = getattr(instance, "_nso_prev_ip_binding", None)
-    if not prev:
-        return
-    prev_iface, prev_addr, prev_vrf = prev
-    assigned = instance.assigned_object
-    cur_addr = str(instance.address)
-    cur_vrf = instance.vrf.name if instance.vrf else ""
-    if (
-        isinstance(assigned, _Interface)
-        and assigned.pk == prev_iface.pk
-        and prev_addr == cur_addr
-        and prev_vrf == cur_vrf
-    ):
-        return  # same binding → not a move, nothing to clean
-    try:
-        mgmt = NSODeviceManagement.objects.get(device_id=prev_iface.device_id)
-    except NSODeviceManagement.DoesNotExist:
-        return
-    if mgmt.adapter_device_id is None:
-        return
-    deleted, _ = NSOInterfaceIPState.objects.filter(interface=prev_iface, address=prev_addr, vrf=prev_vrf).delete()
-    if not deleted:
-        return
-    device_id, _adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
-    _schedule_intent_push((device_id, "ip"))
-
-
 @_skip_on_render
 def _on_ip_address_change(sender, instance, **kwargs):
-    """Push IP intent when an IPAddress assigned to a managed interface changes.
-
-    Decorated ``@_skip_on_render`` like every other push handler so that
-    ``suppress_intent_push()`` (the rqworker reconcile/import guard) also silences
-    the IP path — otherwise a reconciler saving an interface IP would push intent
-    back to the adapter and force-promote imported rows to ``accepted``. The
-    P2P-pair guard (``_p2p_allocation_active``) is orthogonal and stays below.
-    """
-    from dcim.models import Interface as _Interface
-
-    from .models import NSODeviceManagement, NSOInterfaceIPState
-
-    # If this IP was reassigned off another interface (or unassigned), drop the OLD
-    # interface's overlay first so it isn't stranded (device keeps a moved-away IP).
-    _cleanup_reassigned_ip_overlay(instance)
-
-    assigned = instance.assigned_object
-    if not isinstance(assigned, _Interface):
+    """Schedule only the IP keys declared by the active exact writer."""
+    if getattr(_p2p_allocation_active, "active", False):
         return
+    from .renderer_writer import active_renderer_writer
 
-    device_id = assigned.device_id
-
-    try:
-        mgmt = NSODeviceManagement.objects.get(device_id=device_id)
-    except NSODeviceManagement.DoesNotExist:
+    writer = active_renderer_writer()
+    if writer is None:
         return
-
-    if mgmt.adapter_device_id is None:
-        return
-
-    addr_str = str(instance.address)  # "ip/plen"
-    vrf_name = instance.vrf.name if instance.vrf else ""
-    family = "ipv6" if ":" in addr_str.split("/")[0] else "ipv4"
-
-    ip_state, created = NSOInterfaceIPState.objects.get_or_create(
-        interface=assigned,
-        address=addr_str,
-        vrf=vrf_name,
-        defaults={
-            "status": "accepted",
-            "accepted_at": timezone.now(),
-            "family": family,
-            "secondary": False,
-        },
-    )
-
-    if not created:
-        if ip_state.status == "conflict":
-            logger.debug(
-                "IP %s on interface %s is in conflict state; skipping intent push",
-                addr_str,
-                assigned.name,
-            )
-            return
-        if ip_state.status != "accepted":
-            ip_state.status = "accepted"
-            ip_state.accepted_at = timezone.now()
-            ip_state.save(update_fields=["status", "accepted_at"])
-
-    if not getattr(_p2p_allocation_active, "active", False):
-        _schedule_intent_push((device_id, "ip"))
+    for device_id, scope in writer.plan.content_keys:
+        if scope == "ip" and _converted_writer_owns_content(device_id, scope):
+            _schedule_intent_push((device_id, scope))
 
 
 @_skip_on_render
 def _on_ip_address_delete(sender, instance, **kwargs):
-    """Push IP intent (with the deleted IP removed) when an IPAddress is deleted.
-
-    Decorated ``@_skip_on_render`` so ``suppress_intent_push()`` silences the push
-    when a reconciler (or a rolled-back allocation) deletes an interface IP.
-    """
-    from dcim.models import Interface as _Interface
-
-    from .models import NSODeviceManagement, NSOInterfaceIPState
-
-    assigned = instance.assigned_object
-    if not isinstance(assigned, _Interface):
-        return
-
-    device_id = assigned.device_id
-
-    try:
-        mgmt = NSODeviceManagement.objects.get(device_id=device_id)
-    except NSODeviceManagement.DoesNotExist:
-        return
-
-    if mgmt.adapter_device_id is None:
-        return
-
-    addr_str = str(instance.address)
-    vrf_name = instance.vrf.name if instance.vrf else ""
-    NSOInterfaceIPState.objects.filter(
-        interface=assigned,
-        address=addr_str,
-        vrf=vrf_name,
-    ).delete()
-
-    _schedule_intent_push((device_id, "ip"))
+    """Schedule only the IP keys declared by the active exact delete writer."""
+    _on_ip_address_change(sender, instance, **kwargs)
 
 
 #: The overlays a static-route push actually serializes: owned, and carrying an IP next
@@ -4485,11 +4344,6 @@ def _connect_g_activated():  # pragma: no cover
         _create_greenfield_subif_state,
         sender=Interface,
         dispatch_uid="nso_plugin_iface_greenfield_subif",
-    )
-    pre_save.connect(
-        _on_ip_address_pre_save,
-        sender=IPAddress,
-        dispatch_uid="nso_plugin_ipaddress_pre_save",
     )
     post_save.connect(
         _on_ip_address_change,

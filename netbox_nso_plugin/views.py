@@ -6010,51 +6010,69 @@ def _ip_update_collision_errors(updates):
     return errors
 
 
-def _apply_ip_update(update, now):
-    """Re-key one overlay and create/update its assigned native IPAddress."""
+def _ip_edit_plan_and_operations(updates, planned_at):
+    """Freeze every native and overlay write for one paired-address edit."""
     from ipam.models import IPAddress
 
-    state = update["state"]
-    changed = update["address"] != state.address
-    state.address = update["address"]
-    state.family = update["family"]
-    state.status = "accepted" if changed else _status_after_accept(state.status)
-    state.accepted_at = now
-    update_fields = ["address", "family", "status", "accepted_at"]
-    if changed and state.auto_assigned:
-        if state.peer_state_id:
-            state.__class__.objects.filter(pk=state.peer_state_id, peer_state_id=state.pk).update(peer_state=None)
-        state.auto_assigned = False
-        state.source_pool = None
-        state.peer_state = None
-        update_fields.extend(["auto_assigned", "source_pool", "peer_state"])
-    state.full_clean()
-    state.save(update_fields=update_fields)
+    from .renderer_writer import RendererMutationPlan, planned_save
 
-    ip_obj = update["native"] or IPAddress(vrf=update["vrf"], status="active")
-    ip_obj.address = update["address"]
-    ip_obj.vrf = update["vrf"]
-    ip_obj.assigned_object = state.interface
-    ip_obj.full_clean()
-    ip_obj.save()
+    saves = []
+    native_operations = []
+    state_candidates = {}
+    state_fields = {}
+    state_order = []
+    update_ids = {update["state"].pk for update in updates}
 
+    for update in updates:
+        state = update["state"]
+        changed = update["address"] != state.address
+        candidate = state_candidates.setdefault(state.pk, copy.copy(state))
+        if state.pk not in state_order:
+            state_order.append(state.pk)
+        fields = state_fields.setdefault(state.pk, set())
+        candidate.address = update["address"]
+        candidate.family = update["family"]
+        candidate.status = "accepted" if changed else _status_after_accept(state.status)
+        candidate.accepted_at = planned_at
+        fields.update(("address", "family", "status", "accepted_at"))
+        if changed and state.auto_assigned:
+            candidate.auto_assigned = False
+            candidate.source_pool = None
+            candidate.peer_state = None
+            fields.update(("auto_assigned", "source_pool", "peer_state"))
+            if state.peer_state_id and state.peer_state_id not in update_ids:
+                inverse = state.__class__.objects.filter(pk=state.peer_state_id, peer_state_id=state.pk).first()
+                if inverse is not None:
+                    inverse_candidate = state_candidates.setdefault(inverse.pk, copy.copy(inverse))
+                    inverse_candidate.peer_state = None
+                    state_fields.setdefault(inverse.pk, set()).add("peer_state")
+                    if inverse.pk not in state_order:
+                        state_order.append(inverse.pk)
+        candidate.full_clean()
 
-def _ip_edit_footprint(updates):
-    """Freeze every native and overlay row that one paired-address edit can write."""
-    from .intent_state import MutationFootprint, SourceRow, footprint_for_instance
+        current_native = update["native"]
+        native = copy.copy(current_native) if current_native is not None else IPAddress(status="active")
+        native.address = update["address"]
+        native.vrf = update["vrf"]
+        native.assigned_object = state.interface
+        native.full_clean()
+        created = current_native is None
+        saves.append(
+            planned_save(
+                native,
+                force_insert=created,
+                natural_key=("address", "vrf"),
+            )
+        )
+        native_operations.append((native, created))
 
-    states = [update["state"] for update in updates]
-    inverse_ids = {state.peer_state_id for state in states if state.auto_assigned and state.peer_state_id is not None}
-    source_rows = [SourceRow("ipam.ipaddress", None)]
-    source_rows.extend(
-        SourceRow("ipam.ipaddress", update["native"].pk) for update in updates if update["native"] is not None
-    )
-    overlay_rows = [SourceRow(states[0]._meta.label_lower, pk) for pk in inverse_ids]
-    keys = {(state.interface.device_id, "ip") for state in states}
-    return MutationFootprint.merge(
-        *(footprint_for_instance(state) for state in states),
-        MutationFootprint.for_keys(keys, source_rows=source_rows, overlay_rows=overlay_rows),
-    )
+    state_operations = []
+    for state_id in state_order:
+        candidate = state_candidates[state_id]
+        fields = tuple(sorted(state_fields[state_id]))
+        saves.append(planned_save(candidate, update_fields=fields))
+        state_operations.append((candidate, fields))
+    return RendererMutationPlan.build(saves=saves, planned_at=planned_at), native_operations, state_operations
 
 
 class NSOInterfaceIPStateEditView(NSOActionPermissionMixin, View):
@@ -6070,8 +6088,8 @@ class NSOInterfaceIPStateEditView(NSOActionPermissionMixin, View):
         from django.core.exceptions import ValidationError
         from django.db import IntegrityError
 
-        from .intent_state import intent_transaction
         from .models import NSODeviceManagement, NSOInterfaceIPState
+        from .renderer_writer import renderer_mirror_writes, renderer_writes
         from .signals import _schedule_intent_push, suppress_intent_push
 
         state = get_object_or_404(
@@ -6110,12 +6128,13 @@ class NSOInterfaceIPStateEditView(NSOActionPermissionMixin, View):
                 raise PermissionDenied
 
         try:
-            with intent_transaction(_ip_edit_footprint(updates)):
-                now = timezone.now()
-                with suppress_intent_push():
-                    for update in updates:
-                        _apply_ip_update(update, now)
-
+            plan, native_operations, state_operations = _ip_edit_plan_and_operations(updates, timezone.now())
+            mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+            with mutation as writer, suppress_intent_push():
+                for native, created in native_operations:
+                    writer.save(native, force_insert=created)
+                for candidate, update_fields in state_operations:
+                    writer.save(candidate, update_fields=update_fields)
                 device_ids = {update["state"].interface.device_id for update in updates}
                 for mgmt in NSODeviceManagement.objects.filter(
                     device_id__in=device_ids,
@@ -6152,7 +6171,6 @@ class NSOInterfaceIPStateAcceptView(NSOActionPermissionMixin, View):
     """
 
     def post(self, request, pk):  # noqa: D102
-        from django.db import transaction
         from ipam.models import IPAddress
 
         try:
@@ -6161,23 +6179,36 @@ class NSOInterfaceIPStateAcceptView(NSOActionPermissionMixin, View):
             VRF = None
 
         from .models import NSOInterfaceIPState
+        from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+        from .signals import suppress_intent_push
 
         state = get_object_or_404(NSOInterfaceIPState, pk=pk)
         iface = state.interface
         vrf_obj = VRF.objects.filter(name=state.vrf).first() if state.vrf and VRF is not None else None
 
-        with transaction.atomic():
-            existing = IPAddress.objects.filter(address=state.address, vrf=vrf_obj).first()
-            if existing is None:
-                existing = IPAddress(address=state.address, vrf=vrf_obj, status="active")
-            existing.assigned_object = iface
-            existing.save()  # signal skips the push while this row is still `conflict`
-            # Device already has the address on `iface`; NetBox now matches → in_sync, owned.
-            state.status = "in_sync"
-            state.accepted_at = timezone.now()
-            state.save(update_fields=["status", "accepted_at"])
+        current_native = IPAddress.objects.filter(address=state.address, vrf=vrf_obj).first()
+        native = copy.copy(current_native) if current_native is not None else IPAddress(status="active")
+        native.address = state.address
+        native.vrf = vrf_obj
+        native.assigned_object = iface
+        native.full_clean()
+        candidate = copy.copy(state)
+        candidate.status = "in_sync"
+        candidate.accepted_at = timezone.now()
+        state_fields = ("status", "accepted_at")
+        created = current_native is None
+        plan = RendererMutationPlan.build(
+            saves=(
+                planned_save(native, force_insert=created, natural_key=("address", "vrf")),
+                planned_save(candidate, update_fields=state_fields),
+            ),
+            planned_at=candidate.accepted_at,
+        )
+        with renderer_writes(plan) as writer, suppress_intent_push():
+            writer.save(native, force_insert=created)
+            writer.save(candidate, update_fields=state_fields)
 
-        messages.success(request, f"Adopted {state.address} onto {iface.name}.")
+        messages.success(request, f"Adopted {candidate.address} onto {iface.name}.")
         return redirect(_device_nso_tab_url(iface.device_id))
 
 

@@ -1225,8 +1225,8 @@ try:
             return ContentType.objects.get_for_model(Interface)
 
         @patch("netbox_nso_plugin.adapter_client.put_ip_intent")
-        def test_post_save_creates_ip_state_accepted_and_pushes(self, mock_put):
-            """Creating an IPAddress on a managed interface → state=accepted + push."""
+        def test_foreign_post_save_does_not_acquire_or_push(self, mock_put):
+            """A native IP save event is not persisted ownership evidence."""
             from ipam.models import IPAddress
 
             from netbox_nso_plugin.models import NSOInterfaceIPState
@@ -1236,20 +1236,12 @@ try:
                     address="10.1.0.1/24", assigned_object_type=self._ct(), assigned_object_id=self.iface.pk
                 )
 
-            state = NSOInterfaceIPState.objects.get(interface=self.iface, address="10.1.0.1/24", vrf="")
-            self.assertEqual(state.status, "accepted")
-            self.assertIsNotNone(state.accepted_at)
-
-            mock_put.assert_called_once()
-            call_device_id, call_addresses = mock_put.call_args[0]
-            self.assertEqual(call_device_id, 42)
-            self.assertEqual(len(call_addresses), 1)
-            self.assertEqual(call_addresses[0]["address"], "10.1.0.1/24")
-            self.assertEqual(call_addresses[0]["interface"], "GigabitEthernet0/0")
+            self.assertFalse(NSOInterfaceIPState.objects.filter(interface=self.iface, address="10.1.0.1/24").exists())
+            mock_put.assert_not_called()
 
         @patch("netbox_nso_plugin.adapter_client.put_ip_intent")
-        def test_greenfield_nokia_routed_binding_in_push(self, mock_put):
-            """A parented LAG99:99 sub-interface pushes routed/parent_binding/encap_tag."""
+        def test_foreign_greenfield_nokia_ip_does_not_push(self, mock_put):
+            """A native IP event is not ownership evidence, including on a Nokia sub-interface."""
             from dcim.models import Interface
             from ipam.models import IPAddress
 
@@ -1261,12 +1253,7 @@ try:
                     address="198.18.249.160/31", assigned_object_type=self._ct(), assigned_object_id=sub.pk
                 )
 
-            mock_put.assert_called_once()
-            _, call_addresses = mock_put.call_args[0]
-            entry = next(a for a in call_addresses if a["interface"] == "LAG99:99")
-            self.assertTrue(entry["routed"])
-            self.assertEqual(entry["parent_binding"], "lag-99")
-            self.assertEqual(entry["encap_tag"], "99")
+            mock_put.assert_not_called()
 
         def test_nokia_routed_binding_helper(self):
             """_nokia_routed_binding: only emits for a parented :tag interface."""
@@ -1351,8 +1338,8 @@ try:
             mock_put.assert_not_called()
 
         @patch("netbox_nso_plugin.adapter_client.put_ip_intent")
-        def test_post_delete_pushes_snapshot_without_deleted_ip(self, mock_put):
-            """Deleting an IPAddress fires push with that address excluded."""
+        def test_foreign_post_delete_does_not_push(self, mock_put):
+            """A native IP delete event is not ownership evidence."""
             from ipam.models import IPAddress
 
             with self.captureOnCommitCallbacks(execute=True):
@@ -1364,13 +1351,7 @@ try:
             with self.captureOnCommitCallbacks(execute=True):
                 ip.delete()
 
-            mock_put.assert_called_once()
-            call_device_id, call_addresses = mock_put.call_args[0]
-            self.assertEqual(call_device_id, 42)
-            self.assertFalse(
-                any(a["address"] == "10.1.2.1/30" for a in call_addresses),
-                "Deleted IP must not appear in the push snapshot",
-            )
+            mock_put.assert_not_called()
 
         @patch("netbox_nso_plugin.adapter_client.put_ip_intent")
         def test_ip_not_assigned_skipped(self, mock_put):

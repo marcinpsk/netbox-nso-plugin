@@ -469,6 +469,10 @@ def _plan_delete(proposed: RendererDelete):
                 target = overlay_rows
             elif write.model_label in SOURCE_MODEL_RANKS:
                 target = source_rows
+            elif write.model_label == label and write.pk == before.pk:
+                # An unregistered root can still have an exact registered Collector
+                # closure. The caller must lock that root before building the plan.
+                continue
             else:
                 raise IntentMutationProtocolError(f"{write.model_label} is not a ranked native renderer dependency")
             target.append(SourceRow(write.model_label, write.pk))
@@ -478,10 +482,26 @@ def _plan_delete(proposed: RendererDelete):
             descendant = apps.get_model(write.model_label)._default_manager.filter(pk=write.pk).first()
             if descendant is None:
                 continue
-            footprints.append(deletion_footprint_for_instance(descendant))
-            dependency_footprint, dependency_changed = _dependencies(descendant, None, descendant_spec)
+            if write.operation == "delete":
+                after = None
+                footprints.append(deletion_footprint_for_instance(descendant))
+            elif write.operation == "set_update":
+                after = copy.copy(descendant)
+                for attname, value in write.values:
+                    setattr(after, attname, value)
+                footprints.extend(
+                    (
+                        footprint_for_instance(descendant, descendant_spec),
+                        footprint_for_instance(after, descendant_spec),
+                    )
+                )
+            else:
+                raise IntentMutationProtocolError(f"unsupported Collector operation {write.operation!r}")
+            dependency_footprint, dependency_changed = _dependencies(descendant, after, descendant_spec)
             footprints.append(dependency_footprint)
-            changed_keys.update(_changed_keys(descendant, None, descendant_spec, dependency_changed))
+            changed_keys.update(_changed_keys(descendant, after, descendant_spec, dependency_changed))
+        if not source_rows and not overlay_rows:
+            raise IntentMutationProtocolError(f"{label} has no registered renderer-input delete closure")
         footprints.append(MutationFootprint.for_keys((), source_rows=source_rows, overlay_rows=overlay_rows))
         return writes, MutationFootprint.merge(collector_footprint, *footprints), changed_keys
     footprint = MutationFootprint.merge(
@@ -645,7 +665,28 @@ def _manifest_binding(instance):
         native_field = dict(rule.overlay_native_fields).get(label)
         if native_field is None:
             continue
-        native = instance if native_field == "__self__" else getattr(instance, native_field, None)
+        if native_field == "__self__":
+            native = instance
+        elif native_field == "__ip_address__":
+            from dcim.models import Interface
+            from django.contrib.contenttypes.models import ContentType
+            from ipam.models import IPAddress
+
+            interface_type = ContentType.objects.get_for_model(Interface)
+            vrf_name = getattr(instance, "vrf", "")
+            vrf_id = None
+            if vrf_name:
+                from ipam.models import VRF
+
+                vrf_id = VRF.objects.filter(name=vrf_name).values_list("pk", flat=True).first()
+            native = IPAddress.objects.filter(
+                address=instance.address,
+                vrf_id=vrf_id,
+                assigned_object_type=interface_type,
+                assigned_object_id=instance.interface_id,
+            ).first()
+        else:
+            native = getattr(instance, native_field, None)
         management = getattr(instance, "management", None)
         if native is None or management is None:
             return None

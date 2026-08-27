@@ -205,6 +205,7 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
             "bfd",
             "interface",
             "interface_mtu",
+            "ip",
             "lacp",
             "logging",
             "snmp",

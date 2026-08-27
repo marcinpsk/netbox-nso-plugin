@@ -485,6 +485,8 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
         _reconcile_logging_config,
         _reconcile_snmp_config,
         _upsert_interface_states,
+        interface_ip_reconcile_plan,
+        interface_reconcile_plan,
         logging_reconcile_plan,
         snmp_reconcile_plan,
     )
@@ -544,6 +546,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                     fetched_interfaces,
                 ),
                 epoch=dev_id,
+                pre_body=lambda: interface_reconcile_plan(device, fetched_interfaces),
             )
             if interface_result.disposition in ("ran", "legacy"):
                 ctx["interfaces"] = fetched_interfaces
@@ -613,6 +616,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                     ctx, "interface_ips", mgmt, ("NSOInterfaceIPState",), _reconcile_interface_ips, device, ip_doc
                 ),
                 epoch=dev_id,
+                pre_body=lambda: interface_ip_reconcile_plan(device, ip_doc),
             )
             # LACP/LAG bundle + member overlay states (interface-level).
             from .lacp_reconciler import lacp_reconcile_plan, reconcile_lag_config
@@ -753,6 +757,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
         _reconcile_snmp_config,
         _reconcile_static_routes,
         _upsert_interface_states,
+        interface_ip_reconcile_plan,
         interface_reconcile_plan,
         snmp_reconcile_plan,
     )
@@ -841,6 +846,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: _reconcile_interface_ips(device, ip_doc),
                 epoch=dev_id,
                 ctx_key="interface_ips",
+                pre_body=lambda: interface_ip_reconcile_plan(device, ip_doc),
             )
             mtu_doc = client.get_interface_mtu(dev_id)
             _gated(
@@ -927,6 +933,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: _reconcile_interface_ips(device, ip_doc),
                 epoch=dev_id,
                 ctx_key="interface_ips",
+                pre_body=lambda: interface_ip_reconcile_plan(device, ip_doc),
             )
         elif key == "interface_ips":
             from .subinterface_reconciler import reconcile_subinterface, subinterface_reconcile_plan
@@ -963,6 +970,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: _reconcile_interface_ips(device, ip_doc),
                 epoch=dev_id,
                 ctx_key="interface_ips",
+                pre_body=lambda: interface_ip_reconcile_plan(device, ip_doc),
             )
         elif key == "lacp":
             from .lacp_reconciler import lacp_reconcile_plan, reconcile_lag_config
