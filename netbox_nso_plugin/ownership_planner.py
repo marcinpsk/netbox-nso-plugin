@@ -48,6 +48,7 @@ class ScopeOwnershipRule:
     foreign_overlay_delete: str
     deletion_authority: bool
     intentional_semantic_delta: str
+    acknowledged_lineage_field: str | None = None
 
 
 _CONVERTED_SCOPE_RULES = {
@@ -217,6 +218,20 @@ _CONVERTED_SCOPE_RULES = {
         foreign_overlay_delete="reown",
         deletion_authority=True,
         intentional_semantic_delta=("Acquire from persisted SNMP rows. Save events are not ownership evidence."),
+    ),
+    "static_route": ScopeOwnershipRule(
+        scope="static_route",
+        native_model_labels=("netbox_routing.staticroute",),
+        native_key_fields=("vrf_id", "prefix", "next_hop", "interface_next_hop"),
+        overlay_model_labels=("netbox_nso_plugin.nsostaticroutestate",),
+        overlay_native_fields=(("netbox_nso_plugin.nsostaticroutestate", "static_route"),),
+        foreign_overlay_delete="reown",
+        deletion_authority=True,
+        intentional_semantic_delta=(
+            "Acquire from a persisted route assignment and overlay. Native route and assignment events are not "
+            "ownership evidence. Deletion authority carries only the adapter-acknowledged route triple."
+        ),
+        acknowledged_lineage_field="last_acked_triple",
     ),
 }
 

@@ -2120,7 +2120,7 @@ def _record_static_route_expectations(device_id, generations: dict, echoes) -> N
 
 @_skip_on_render
 def _on_static_route_state_save(sender, instance, **kwargs):
-    """Push static route intent whenever an NSOStaticRouteState row is saved."""
+    """Schedule static-route intent only for an active exact content writer."""
     from .models import NSODeviceManagement
 
     try:
@@ -2132,6 +2132,8 @@ def _on_static_route_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
+    if not _converted_writer_owns_content(device_id, "static_route"):
+        return
     _schedule_intent_push((device_id, "static_route"))
 
 
@@ -2376,95 +2378,49 @@ def _remove_static_route_for_device(static_route, device) -> None:
 
 
 def _on_routing_static_route_pre_save(sender, instance, **kwargs):
-    """Stash the committed row's wire-visible content so post_save can see the delta.
-
-    The stash lives on the instance, so a save of a *different* route on the same thread
-    can never be read as this one's baseline. Re-reading on every save is deliberate:
-    within one transaction a second save sees the transaction's own first write, which is
-    what makes an A→B→A edit two real transitions instead of a silently swallowed one.
-
-    The baseline is read under the row's own lock, held to COMMIT. Two concurrent edits
-    would otherwise both load A; the one that lands second — writing A back over the
-    first's B — would compare A against A, transition nothing and push nothing, leaving
-    the adapter holding B while NetBox reads A.
-    """
-    from django.db import connection
-
-    instance._nso_static_route_content = None
-    # Same guard as post_save's @_skip_on_render: with no transition to feed there is no
-    # baseline to read, and reconcile writes must not take a route lock.
-    if _is_intent_push_suppressed() or _is_render_request() or not instance.pk:
-        return
-    # order_by(pk): the model's Meta ordering starts at the nullable ``vrf``, whose LEFT
-    # JOIN PostgreSQL refuses to lock ("FOR UPDATE cannot be applied to the nullable side").
-    rows = sender.objects.filter(pk=instance.pk).order_by("pk")
-    if connection.in_atomic_block:
-        rows = rows.select_for_update()  # outside a transaction there is nothing to hold it to
-    previous = rows.first()
-    if previous is not None:
-        instance._nso_static_route_content = _static_route_content(previous)
+    """Treat a native save event as neither ownership evidence nor a mutation planner."""
 
 
 @_skip_on_render
 def _on_routing_static_route_save(sender, instance, created=False, **kwargs):
-    """Re-arm every overlay owning this route when its content changed, and push.
+    """Schedule only the static-route keys declared by the active exact writer."""
+    from .renderer_writer import active_renderer_writer
 
-    Delta-gated against the pre-save row: a save that touches nothing the wire carries is
-    not intent and must neither bump a generation nor push. The comparison itself happens
-    inside the transition, against the *committed* row. A create is left to the
-    ``post_add`` that assigns the route its first devices — there is no overlay yet.
-    """
-    previous = getattr(instance, "_nso_static_route_content", None)
-    if created or previous is None:
+    writer = active_renderer_writer()
+    if writer is None:
         return
-    _transition_static_route_content(instance, previous=previous)
+    for device_id, scope in writer.plan.content_keys:
+        if scope == "static_route" and _converted_writer_owns_content(device_id, scope):
+            _schedule_intent_push((device_id, scope))
 
 
 @_close_renderer_m2m_permit
 @_skip_on_render
 def _on_routing_static_route_devices_changed(sender, instance, action, pk_set, reverse, **kwargs):
-    """Device assigned to / removed from a route → own / remove + push (greenfield).
-
-    m2m_changed is NOT a deletion-only signal, so this handler must not be registered under
-    _as_delete_origin: that would stamp ``?delete_origin=true`` on the push born from an
-    ADD, authorizing the adapter to retract from the live device any route the full-replace
-    snapshot happens not to carry. Only the removal branches open the mark.
-    """
-    from dcim.models import Device
-
-    try:
-        from netbox_routing.models import StaticRoute
-    except ImportError:
+    """Schedule only exact-writer assignment changes, without acquiring in the signal."""
+    if not action.startswith("post_"):
         return
-    if reverse or not isinstance(instance, StaticRoute):
-        return  # only the StaticRoute.devices side
-    if action == "post_add":
-        for device in Device.objects.filter(pk__in=pk_set or []):
-            _accept_static_route_for_device(instance, device)
-    elif action == "post_remove":
-        with _delete_origin_dispatch():
-            for device in Device.objects.filter(pk__in=pk_set or []):
-                _remove_static_route_for_device(instance, device)
-    elif action == "post_clear":
-        # Django sends pk_set=None on .clear(): every device was detached. `pk_set or []`
-        # would silently remove nothing, orphaning every overlay + leaving stale adapter
-        # intent. Drive the removal from the overlay rows still referencing this route —
-        # their devices are exactly the ones just detached.
-        from .models import NSOStaticRouteState
+    from .renderer_writer import active_renderer_writer
 
-        device_ids = set(
-            NSOStaticRouteState.objects.filter(static_route=instance).values_list("management__device_id", flat=True)
-        )
-        with _delete_origin_dispatch():
-            for device in Device.objects.filter(pk__in=device_ids):
-                _remove_static_route_for_device(instance, device)
+    writer = active_renderer_writer()
+    if writer is None:
+        return
+    for device_id, scope in writer.plan.content_keys:
+        if scope == "static_route" and _converted_writer_owns_content(device_id, scope):
+            _schedule_intent_push((device_id, scope))
 
 
 @_skip_on_render
 def _on_routing_static_route_pre_delete(sender, instance, **kwargs):
-    """Route deleted in NetBox → drop overlays + push removal before the cascade lands."""
-    for device in instance.devices.all():
-        _remove_static_route_for_device(instance, device)
+    """Schedule only exact-writer route deletions, without mutating overlays."""
+    from .renderer_writer import active_renderer_writer
+
+    writer = active_renderer_writer()
+    if writer is None:
+        return
+    for device_id, scope in writer.plan.content_keys:
+        if scope == "static_route" and _converted_writer_owns_content(device_id, scope):
+            _schedule_intent_push((device_id, scope))
 
 
 # ── IS-IS Flex-Algorithm intent (process-tag scoped) ────────────────────────

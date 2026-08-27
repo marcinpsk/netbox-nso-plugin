@@ -1183,339 +1183,220 @@ def _static_route_metric(entry: dict, device=None) -> int:
     return m if isinstance(m, int) and 0 <= m <= 255 else 1
 
 
-def _resolve_static_route(entry, StaticRoute, VRF, auto_create, vrf_auto_create, device, logger):
-    """Find/create a StaticRoute for one adapter entry. Returns (route, created) or (None, False).
-
-    ``interface_next_hop`` carries interface-, discard/reject- and next-table-style
-    next hops (routes with no IP next hop); a route needs at least one of next_hop
-    or interface_next_hop or it is skipped.
-    """
-    vrf_name = entry.get("vrf") or ""
-    prefix = entry.get("prefix") or ""
-    next_hop = entry.get("next_hop") or None
-    iface_nh = entry.get("interface_next_hop") or None
-
-    if not prefix or (not next_hop and not iface_nh):
-        return None, False
-
-    vrf_obj = None
-    if vrf_name and VRF is not None:
-        vrf_obj = VRF.objects.filter(name=vrf_name).first()
-        if vrf_obj is None:
-            if vrf_auto_create:
-                vrf_obj = VRF.objects.create(name=vrf_name)
-                logger.info("Auto-created VRF %r for static route %s", vrf_name, prefix)
-            else:
-                logger.warning("VRF %r not found in NetBox; skipping route %s", vrf_name, prefix)
-                return None, False
-
-    # Idempotent lookup. IP next-hop routes key on next_hop; interface/pseudo
-    # next-hop routes (discard, reject, next-table) have a null next_hop, so key
-    # on interface_next_hop too to avoid duplicating them.
-    lookup = {"vrf": vrf_obj, "prefix": prefix, "next_hop": next_hop}
-    if next_hop is None:
-        lookup["interface_next_hop"] = iface_nh
-    existing = StaticRoute.objects.filter(**lookup).first()
-    if existing is not None:
-        return existing, False
-
-    if not auto_create:
-        logger.debug("StaticRoute %s not found and auto_create=False; skipping device %s", prefix, device)
-        return None, False
-
-    try:
-        route = StaticRoute(
-            vrf=vrf_obj,
-            prefix=prefix,
-            next_hop=next_hop,
-            interface_next_hop=iface_nh,
-            metric=_static_route_metric(entry, device),
-            permanent=bool(entry.get("permanent", False)),
-            tag=entry.get("tag"),
-            name=entry.get("name") or "",
-        )
-        route.full_clean()
-        route.save()
-        # Brownfield adoption (reconcile-created route) — not operator intent; suppress
-        # so the greenfield static-route signal doesn't auto-Accept it.
-        from .signals import suppress_intent_push
-
-        with suppress_intent_push():
-            route.devices.add(device)
-        return route, True
-    except Exception as exc:
-        logger.warning("Could not create StaticRoute %s: %s", prefix, exc)
-        return None, False
-
-
-#: The only columns the static-route reconciler may write from device truth. Named in
-#: every ``save()`` it makes, as a module constant mirroring
-#: ``signals._STATIC_ROUTE_ARMED_FIELDS``, so the two sides of the overlay cannot drift.
-#: An unrestricted save writes every column it read, and this reconciler reads the row
-#: without a lock — so it would restore the generation, the generation clock and the
-#: settlement expectations of any writer that committed after that read (#1502 Appendix S).
-#: These four are pure device mirrors: a stale write of them is corrected by the next pass.
 _STATIC_ROUTE_MIRROR_FIELDS = ("nso_vrf", "nso_prefix", "nso_next_hop", "last_sync_at")
 
 
-def _write_static_route_status(state, observed: str, new_status: str) -> None:
-    """Write the reconciled status under a compare-and-set on the status that was observed.
+def static_route_reconcile_plan(device, payload: dict):
+    """Freeze every native route, assignment, and overlay write for one mirror pass."""
+    from .renderer_writer import RendererMutationPlan
 
-    ``status`` cannot be protected by the allow-list, because the reconciler legitimately
-    owns it. A stale instance therefore has to lose on the value instead: zero rows matched
-    means the row moved under the unlocked read, so this pass writes no status at all and
-    the next one recomputes from a fresh read. Same shape as
-    ``signals._record_static_route_expectations``'s CAS. ``mirror_reconciler`` suppresses
-    the intent push fired by the instance save inside :func:`_cas_mirror_update`.
-    """
-    from .models import NSOStaticRouteState
-
-    if new_status == observed:
-        return
-    matched = _cas_mirror_update(
-        NSOStaticRouteState.objects.filter(pk=state.pk, status=observed),
-        status=new_status,
-    )
-    if matched is not None:
-        state.status = new_status
-        return
-    logger.debug(
-        "static-route reconcile skipped the status write for overlay %s: the row moved from %r under the read",
-        state.pk,
-        observed,
+    planned_at = timezone.now()
+    try:
+        saves, deletes, m2m_writes, _operations = _static_route_reconcile_operations(device, payload, planned_at)
+    except ImportError:
+        return RendererMutationPlan.build(planned_at=planned_at)
+    return RendererMutationPlan.build(
+        saves=saves,
+        deletes=deletes,
+        m2m_writes=m2m_writes,
+        planned_at=planned_at,
     )
 
 
-def _static_route_reconcile_footprint(device, payload):
-    """Discover every existing and future renderer row before a route mirror pass."""
+def _static_route_reconcile_operations(device, payload, planned_at):  # noqa: C901
+    """Build the deterministic static-route write sequence for preflight and apply."""
+    from ipam.models import VRF
     from netbox_routing.models import StaticRoute
 
-    from .intent_state import MutationFootprint, SourceRow
     from .models import NSODeviceManagement, NSOStaticRouteState
+    from .renderer_writer import planned_delete, planned_m2m_add, planned_m2m_set, planned_save
 
-    mgmt = NSODeviceManagement.objects.filter(device=device).first()
-    if mgmt is None:
-        return MutationFootprint(), {}
-    route_ids = set(NSOStaticRouteState.objects.filter(management=mgmt).values_list("static_route_id", flat=True))
-    reported_routes = {}
-    vrf_ids = set()
-    try:
-        from ipam.models import VRF
-    except ImportError:
-        VRF = None
-    for entry in payload.get("routes") or []:
+    management = NSODeviceManagement.objects.filter(device=device).first()
+    if management is None:
+        return [], [], [], []
+
+    auto_create = _adapter_setting("static_route_auto_create")
+    vrf_auto_create = _adapter_setting("vrf_auto_create")
+    vrfs = {row.name: row for row in VRF.objects.order_by("pk")}
+    planned_routes = {}
+    states = {
+        row.static_route_id: row
+        for row in NSOStaticRouteState.objects.filter(management=management)
+        .select_related("static_route", "static_route__vrf")
+        .prefetch_related("static_route__devices")
+        .order_by("pk")
+    }
+    saves = []
+    deletes = []
+    m2m_writes = []
+    operations = []
+    seen_state_pks = set()
+
+    def save(instance, *, update_fields=None, force_insert=False, natural_key=()):
+        saves.append(
+            planned_save(
+                instance,
+                update_fields=update_fields,
+                force_insert=force_insert,
+                natural_key=natural_key,
+            )
+        )
+        operations.append(("save", instance, update_fields, force_insert, None))
+
+    def route_identity(vrf_name, prefix, next_hop, interface_next_hop):
+        return vrf_name, prefix, next_hop, interface_next_hop if next_hop is None else None
+
+    routes = payload.get("routes", []) if isinstance(payload, dict) else []
+    routes = routes if isinstance(routes, list) else []
+    for entry in routes:
+        if not isinstance(entry, dict):
+            continue
+        vrf_name = entry.get("vrf") or ""
         prefix = entry.get("prefix") or ""
         next_hop = entry.get("next_hop") or None
         interface_next_hop = entry.get("interface_next_hop") or None
         if not prefix or (not next_hop and not interface_next_hop):
             continue
-        vrf_name = entry.get("vrf") or ""
-        vrf = None if not vrf_name or VRF is None else VRF.objects.filter(name=vrf_name).first()
-        if vrf is not None:
-            vrf_ids.add(vrf.pk)
-        if vrf_name and vrf is None:
-            continue
-        lookup = {"vrf": vrf, "prefix": prefix, "next_hop": next_hop}
-        if next_hop is None:
-            lookup["interface_next_hop"] = interface_next_hop
-        resolved_route_id = StaticRoute.objects.filter(**lookup).values_list("pk", flat=True).first()
-        if resolved_route_id is not None:
-            route_ids.add(resolved_route_id)
-            reported_routes[resolved_route_id] = entry
-    overlay_ids = NSOStaticRouteState.objects.filter(management=mgmt).values_list("pk", flat=True)
-    return (
-        MutationFootprint.for_keys(
-            {(device.pk, "static_route")},
-            source_rows=(
-                SourceRow("ipam.vrf", None),
-                *(SourceRow("ipam.vrf", pk) for pk in vrf_ids),
-                SourceRow("netbox_routing.staticroute", None),
-                SourceRow("netbox_routing.staticroute_devices", None),
-                *(SourceRow("netbox_routing.staticroute", pk) for pk in route_ids),
-            ),
-            overlay_rows=(
-                SourceRow("netbox_nso_plugin.nsostaticroutestate", None),
-                *(SourceRow("netbox_nso_plugin.nsostaticroutestate", pk) for pk in overlay_ids),
-            ),
-        ),
-        reported_routes,
-    )
+        vrf = None
+        if vrf_name:
+            vrf = vrfs.get(vrf_name)
+            if vrf is None and not vrf_auto_create:
+                logger.warning("VRF %r not found in NetBox; skipping route %s", vrf_name, prefix)
+                continue
+            if vrf is None:
+                vrf = VRF(name=vrf_name)
+                vrf.full_clean()
+                save(vrf, force_insert=True, natural_key=("name",))
+                vrfs[vrf_name] = vrf
 
-
-def _static_route_reconcile_plan(device, payload):
-    """Declare one static-route refresh and any rendered membership change."""
-    try:
-        from netbox_routing.models import StaticRoute
-    except ImportError:
-        StaticRoute = None
-    from . import signals
-    from .intent_state import MutationFootprint, ReconcileMutationPlan
-    from .models import NSODeviceManagement, NSOStaticRouteState
-
-    if StaticRoute is None:
-        return ReconcileMutationPlan(MutationFootprint())
-    footprint, reported_routes = _static_route_reconcile_footprint(device, payload)
-    reported_route_ids = set(reported_routes)
-    management = NSODeviceManagement.objects.filter(device=device).first()
-    if management is None:
-        return ReconcileMutationPlan(footprint)
-    changes_content = (
-        NSOStaticRouteState.objects.filter(
-            signals.PUSHED_STATIC_ROUTE_FILTER,
-            management=management,
-            status="in_sync",
-        )
-        .exclude(static_route_id__in=reported_route_ids)
-        .exists()
-    )
-    if not changes_content:
-        reported_owned_states = NSOStaticRouteState.objects.filter(
-            signals.PUSHED_STATIC_ROUTE_FILTER,
-            management=management,
-            status="in_sync",
-            static_route_id__in=reported_route_ids,
-        ).select_related("static_route")
-        changes_content = any(
-            state.static_route.metric != _static_route_metric(reported_routes[state.static_route_id], device)
-            or state.static_route.tag != reported_routes[state.static_route_id].get("tag")
-            for state in reported_owned_states
-        )
-    if not changes_content and _adapter_setting("static_route_auto_create"):
-        owned_reported_route_ids = NSOStaticRouteState.objects.filter(
-            signals.PUSHED_STATIC_ROUTE_FILTER,
-            management=management,
-            static_route_id__in=reported_route_ids,
-        ).values_list("static_route_id", flat=True)
-        changes_content = StaticRoute.objects.filter(pk__in=owned_reported_route_ids).exclude(devices=device).exists()
-    return ReconcileMutationPlan(
-        footprint,
-        changes_content=changes_content,
-        settles_deploying=False,
-    )
-
-
-@mirror_reconciler
-def _reconcile_static_routes(device, payload: dict) -> list:
-    from .intent_state import reconcile_transaction
-
-    with reconcile_transaction(_static_route_reconcile_plan(device, payload)):
-        return _reconcile_static_routes_locked(device, payload)
-
-
-def _reconcile_static_routes_locked(device, payload: dict) -> list:
-    """Reconcile static routes from the adapter payload into NetBox routing.
-
-    For each route reported by NSO:
-    - Resolve VRF name → ipam.VRF FK (None = global routing table).
-    - Find or create StaticRoute by (vrf, prefix, next_hop).
-    - If this device is already in the route's M2M → update status to imported.
-    - If auto_create=True and device not in M2M → add device to M2M.
-    - If auto_create=False and device not in M2M → status='conflict'.
-
-    Stale state rows (no longer reported): remove device from M2M, status='changed'.
-
-    Returns a list of NSOStaticRouteState instances for this device.
-    """
-    from django.utils import timezone
-
-    from .signals import suppress_intent_push
-
-    try:
-        from netbox_routing.models import StaticRoute
-    except ImportError:
-        logger.warning("netbox_routing not installed; skipping static route reconcile")
-        return []
-
-    try:
-        from ipam.models import VRF
-    except ImportError:
-        VRF = None
-
-    from .models import NSODeviceManagement, NSOStaticRouteState
-
-    try:
-        mgmt = NSODeviceManagement.objects.get(device=device)
-    except NSODeviceManagement.DoesNotExist:
-        return []
-
-    auto_create = _adapter_setting("static_route_auto_create")
-    vrf_auto_create = _adapter_setting("vrf_auto_create")
-    now = timezone.now()
-    seen_route_ids: set[int] = set()
-
-    for entry in payload.get("routes") or []:
-        route, created = _resolve_static_route(entry, StaticRoute, VRF, auto_create, vrf_auto_create, device, logger)
+        identity = route_identity(vrf_name, prefix, next_hop, interface_next_hop)
+        route = planned_routes.get(identity)
         if route is None:
+            lookup = {"vrf": vrf, "prefix": prefix, "next_hop": next_hop}
+            if next_hop is None:
+                lookup["interface_next_hop"] = interface_next_hop
+            route = None if vrf is not None and vrf.pk is None else StaticRoute.objects.filter(**lookup).first()
+        created = route is None
+        if created and not auto_create:
+            logger.debug("StaticRoute %s not found and auto_create=False; skipping device %s", prefix, device)
             continue
+        if created:
+            route = StaticRoute(
+                vrf=vrf,
+                prefix=prefix,
+                next_hop=next_hop,
+                interface_next_hop=interface_next_hop,
+                metric=_static_route_metric(entry, device),
+                permanent=bool(entry.get("permanent", False)),
+                tag=entry.get("tag"),
+                name=entry.get("name") or "",
+            )
+            try:
+                route.full_clean(exclude=("vrf",) if vrf is not None and vrf.pk is None else ())
+            except Exception as exc:
+                logger.warning("Could not create StaticRoute %s: %s", prefix, exc)
+                continue
+            save(
+                route,
+                force_insert=True,
+                natural_key=("vrf", "prefix", "next_hop", "interface_next_hop"),
+            )
+        planned_routes[identity] = route
 
-        vrf_name = entry.get("vrf") or ""
-        prefix = entry.get("prefix") or ""
-        next_hop = entry.get("next_hop") or None
-
-        state, _ = NSOStaticRouteState.objects.get_or_create(
-            management=mgmt,
-            static_route=route,
-            defaults={"status": "unknown"},
+        current_state = None if created else states.get(route.pk)
+        state = (
+            NSOStaticRouteState(management=management, static_route=route, status="unknown")
+            if current_state is None
+            else copy.copy(current_state)
         )
         state.nso_vrf = vrf_name
         state.nso_prefix = prefix
         state.nso_next_hop = next_hop or ""
-        state.last_sync_at = now
-        seen_route_ids.add(route.pk)
+        state.last_sync_at = planned_at
 
-        # FK overlay: materialized = the StaticRoute is linked to this device.
-        on_device = created or route.devices.filter(pk=device.pk).exists()
+        assigned = () if created else tuple(route.devices.order_by("pk"))
+        on_device = created or any(row.pk == device.pk for row in assigned)
         if not on_device and auto_create:
-            # Brownfield adoption: this M2M change is not operator intent — suppress so the
-            # greenfield static-route signal doesn't mistake it for an Accept.
-            with suppress_intent_push():
-                route.devices.add(device)
+            m2m_writes.append(planned_m2m_add(route, "devices", (device,)))
+            operations.append(("m2m_add", route, None, False, (device,)))
             on_device = True
-        desired_metric = _static_route_metric(entry, device)
-        metric_matches = route.metric == desired_metric
-        # `tag` is compared on the same terms as `metric` (#1381): checking metric alone
-        # left a device tag against an untagged NetBox route reading as fully in sync.
-        tag_matches = route.tag == entry.get("tag")
-        # StaticRoute is shared across all associated devices.  A refresh from
-        # one platform must never rewrite its metric or tag to that platform's
-        # value: another device may legitimately differ.  Keep the shared intent
-        # and surface the per-device mismatch through this state.
-        # A 'deploying' static route settles ONLY on a generation-correlated apply result
-        # (#1502 Appendix S). Re-reading the route says nothing about which generation the
-        # device is reflecting, so a reconcile settle here was a green badge over content
-        # the device may never have received — a metric edit still in flight read as
-        # in_sync the moment the OLD route came back on a sync.
-        observed = state.status
-        new_status = sm.on_reconcile(
-            observed,
-            matches=on_device and metric_matches and tag_matches,
+        elif created:
+            m2m_writes.append(planned_m2m_add(route, "devices", (device,)))
+            operations.append(("m2m_add", route, None, False, (device,)))
+
+        state.status = sm.on_reconcile(
+            state.status,
+            matches=(
+                on_device and route.metric == _static_route_metric(entry, device) and route.tag == entry.get("tag")
+            ),
             conflict=not on_device,
             settles_owned=False,
             settles_deploying=False,
         )
-        state.save(update_fields=list(_STATIC_ROUTE_MIRROR_FIELDS))
-        _write_static_route_status(state, observed, new_status)
+        state_created = current_state is None
+        save(
+            state,
+            update_fields=None if state_created else (*_STATIC_ROUTE_MIRROR_FIELDS, "status"),
+            force_insert=state_created,
+            natural_key=("management", "static_route"),
+        )
+        if current_state is not None:
+            seen_state_pks.add(current_state.pk)
 
-    stale_qs = NSOStaticRouteState.objects.filter(management=mgmt).exclude(static_route_id__in=seen_route_ids)
-    for stale in stale_qs:
-        if sm.is_owned(stale.status):
-            # Operator-owned (greenfield) route the device stopped reporting → genuine
-            # removal drift. KEEP the device↔route association + overlay so the operator
-            # can resolve it; removing it from the M2M would silently discard their intent.
-            # A pure status write, so it is only the CAS: an unrestricted save here would
-            # restore every settlement column this row was read with.
-            _write_static_route_status(stale, stale.status, sm.on_reconcile(stale.status, present=False))
-        else:
-            # Brownfield mirror: the route is gone from the device → un-materialise it.
-            # Drop the device↔route association AND the overlay. (The old code removed the
-            # M2M but then re-saved the overlay as 'changed', resurrecting a dangling
-            # overlay orphaned from the M2M — a route shown as drift on a device its
-            # devices-list no longer includes.)
-            with suppress_intent_push():
-                stale.static_route.devices.remove(device)
-            stale.delete()
+    for current in states.values():
+        if current.pk in seen_state_pks:
+            continue
+        if sm.is_owned(current.status):
+            new_status = sm.on_reconcile(current.status, present=False)
+            if new_status != current.status:
+                candidate = copy.copy(current)
+                candidate.status = new_status
+                save(candidate, update_fields=("status",))
+            continue
+        remaining = tuple(row for row in current.static_route.devices.order_by("pk") if row.pk != device.pk)
+        if current.static_route.devices.filter(pk=device.pk).exists():
+            m2m_writes.append(planned_m2m_set(current.static_route, "devices", remaining))
+            operations.append(("m2m_set", current.static_route, None, False, remaining))
+        deletes.append(planned_delete(current))
+        operations.append(("delete", current, None, False, None))
 
-    return list(NSOStaticRouteState.objects.filter(management=mgmt).select_related("static_route"))
+    return saves, deletes, m2m_writes, operations
+
+
+@mirror_reconciler
+def _reconcile_static_routes(device, payload: dict) -> list:
+    """Apply one frozen static-route reconciliation through the renderer writer."""
+    from .models import NSODeviceManagement, NSOStaticRouteState
+    from .renderer_writer import active_renderer_writer, renderer_mirror_writes, renderer_writes
+    from .signals import suppress_intent_push
+
+    management = NSODeviceManagement.objects.filter(device=device).first()
+    if management is None:
+        return []
+    active = active_renderer_writer()
+    plan = active.plan if active is not None else static_route_reconcile_plan(device, payload)
+    mutation = contextlib.nullcontext(active)
+    if active is None:
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+    with mutation as writer, suppress_intent_push():
+        _saves, _deletes, _m2m_writes, operations = _static_route_reconcile_operations(
+            device,
+            payload,
+            plan.planned_at,
+        )
+        for operation, instance, update_fields, force_insert, related in operations:
+            if operation == "save":
+                writer.save(instance, update_fields=update_fields, force_insert=force_insert)
+            elif operation == "m2m_add":
+                writer.m2m_add(instance, "devices", related)
+            elif operation == "m2m_set":
+                writer.m2m_set(instance, "devices", related)
+            else:
+                writer.delete(instance)
+
+    return list(
+        NSOStaticRouteState.objects.filter(management=management).select_related("static_route", "static_route__vrf")
+    )
 
 
 def _reconcile_isis_settings(obj, settings: dict | None, *, write: bool = True) -> bool:

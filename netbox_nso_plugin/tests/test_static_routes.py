@@ -191,27 +191,11 @@ class TestReconcileStaticRoutes(TestCase):
         self.assertEqual(state.management, mgmt)
         self.assertTrue(state.static_route.devices.filter(pk=self.device.pk).exists())
 
-    def test_plan_reuses_routes_resolved_for_its_footprint(self):
-        self._make_mgmt(self.device, nso_device_name="sr-plan-dependencies")
-        from netbox_nso_plugin.template_content import _reconcile_static_routes, _static_route_reconcile_plan
-
-        payload = self._route_payload(self._route_entry("198.18.42.0/24", "198.18.0.42"))
-        with self._auto_create_ctx(True):
-            _reconcile_static_routes(self.device, payload)
-
-        with patch(
-            "netbox_nso_plugin.template_content._resolve_static_route",
-            side_effect=AssertionError("the plan resolved one route twice"),
-        ):
-            plan = _static_route_reconcile_plan(self.device, payload)
-
-        self.assertFalse(plan.changes_content)
-
     def test_plan_matches_only_the_duplicate_route_selected_by_the_body(self):
         from netbox_routing.models import StaticRoute
 
         from netbox_nso_plugin.models import NSOStaticRouteState
-        from netbox_nso_plugin.template_content import _reconcile_static_routes, _static_route_reconcile_plan
+        from netbox_nso_plugin.template_content import _reconcile_static_routes, static_route_reconcile_plan
 
         management = self._make_mgmt(self.device, nso_device_name="sr-plan-duplicate")
         routes = [
@@ -228,7 +212,7 @@ class TestReconcileStaticRoutes(TestCase):
             )
         payload = self._route_payload(self._route_entry("198.18.43.0/24", "198.18.0.43"))
 
-        self.assertTrue(_static_route_reconcile_plan(self.device, payload).changes_content)
+        self.assertTrue(static_route_reconcile_plan(self.device, payload).changes_content)
         _reconcile_static_routes(self.device, payload)
 
         self.assertEqual(NSOStaticRouteState.objects.filter(status="changed").count(), 1)
@@ -459,7 +443,7 @@ class TestReconcileStaticRoutes(TestCase):
 
                 self.assertEqual(tag_result, expected)
                 self.assertEqual(tag_result, state.status)
-                baseline_entries.append(entry)
+                route.delete()
 
     def test_idempotent_second_reconcile_same_result(self):
         """Second reconcile with same payload → same state rows, no duplicates."""

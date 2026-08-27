@@ -4485,6 +4485,39 @@ def _save_owned_bfd_edit(obj, old_values):
             writer.save(instance, update_fields=update_fields, force_insert=force_insert)
 
 
+def _save_owned_static_route_edit(obj, old_values):
+    """Apply one shared static-route edit and re-arm its owned overlays exactly."""
+    from . import status_machine as sm
+    from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+    from .signals import _STATIC_ROUTE_TRANSITION_FIELDS, _arm_static_route_generation
+
+    route = obj.static_route
+    native_fields = tuple(name for name, value in old_values.items() if getattr(route, name) != value)
+    saves = [planned_save(route, update_fields=native_fields)]
+    operations = [(route, native_fields)]
+    planned_at = timezone.now()
+    for state in NSOStaticRouteState.objects.filter(static_route=route).select_related("management").order_by("pk"):
+        if state.pk != obj.pk and not sm.is_owned(state.status):
+            continue
+        candidate = copy.copy(state)
+        candidate.status = sm.on_operator_edit(candidate.status)
+        fields = list(_STATIC_ROUTE_TRANSITION_FIELDS)
+        if state.pk == obj.pk and candidate.accepted_at is None:
+            candidate.accepted_at = planned_at
+            fields.append("accepted_at")
+        candidate.nso_vrf = route.vrf.name if route.vrf else ""
+        candidate.nso_prefix = str(route.prefix or "")
+        candidate.nso_next_hop = str(route.next_hop or "")
+        _arm_static_route_generation(candidate)
+        saves.append(planned_save(candidate, update_fields=fields))
+        operations.append((candidate, fields))
+
+    plan = RendererMutationPlan.build(saves=saves, planned_at=planned_at)
+    with renderer_writes(plan) as writer:
+        for instance, update_fields in operations:
+            writer.save(instance, update_fields=update_fields)
+
+
 def _sync_native_ospf_instance(obj):
     """Keep the native OSPF instance aligned with an edited overlay."""
     from .signals import suppress_intent_push
@@ -4666,6 +4699,9 @@ def _save_owned_overlay_edit(obj, key, old_values):
     if key == "bfd":
         _save_owned_bfd_edit(obj, old_values)
         return
+    if key == "static_route":
+        _save_owned_static_route_edit(obj, old_values)
+        return
 
     from . import status_machine as sm
     from .intent_state import intent_transaction
@@ -4692,11 +4728,6 @@ def _save_owned_overlay_edit(obj, key, old_values):
             _sync_native_bgp_peer(obj)
         if key == "redistribution":
             _sync_native_redistribution(obj)
-        if key == "static_route":
-            from .signals import suppress_intent_push
-
-            with suppress_intent_push():
-                obj.static_route.save(update_fields=["metric", "permanent", "tag"])
         update_fields = {
             field_name
             for field_name, old_value in old_values.items()
@@ -4707,14 +4738,6 @@ def _save_owned_overlay_edit(obj, key, old_values):
         if obj.accepted_at is not None:
             update_fields.add("accepted_at")
         obj.save(update_fields=update_fields)
-        if key == "static_route":
-            from .signals import _transition_static_route_content
-
-            # The native save above ran suppressed and only THIS overlay was saved, but the
-            # fork object is shared by every device the route is on — editing through one
-            # device's row silently changes the others' content. Re-arm them all.
-            _transition_static_route_content(obj.static_route)
-            obj.refresh_from_db()
 
 
 def _route_map_name_errors(state, old_name):
@@ -5721,7 +5744,7 @@ class NSOProvisionLinkRoleView(NSOActionPermissionMixin, View):
 
 
 class RoutingStateAcceptMixin(NSOActionPermissionMixin, View):
-    """Per-row accept for a routing state model — sets status to 'accepted' and fires push signal."""
+    """Accept one routing row through an exact renderer mutation plan."""
 
     model_class = None
     # Extra columns _arm_accept() writes, saved in the same UPDATE as the status.
@@ -5731,19 +5754,29 @@ class RoutingStateAcceptMixin(NSOActionPermissionMixin, View):
         """Set family-specific state on *state* before the accepted row is saved."""
 
     def post(self, request, pk):  # noqa: D102
+        import copy
+
+        from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
+
         state = get_object_or_404(self.model_class, pk=pk)
+        candidate = copy.copy(state)
         # Matching (imported/in_sync) → nothing to apply → in_sync; differing → accepted.
-        state.status = _status_after_accept(state.status)
+        candidate.status = _status_after_accept(state.status)
         # First acceptance only — staged_days measures waiting time since the operator
         # FIRST took ownership, so a re-accept must not reset it (#107 staleness badge).
-        if state.accepted_at is None:
-            state.accepted_at = timezone.now()
-        self._arm_accept(state)
-        # One transaction, so the row and the outbox entry it schedules commit together.
-        with transaction.atomic():
-            state.save(update_fields=["status", "accepted_at", *self.accept_extra_fields])
-        messages.success(request, f"Accepted routing state {state.pk}.")
-        return redirect(_device_nso_tab_url(state.management.device_id))
+        if candidate.accepted_at is None:
+            candidate.accepted_at = timezone.now()
+        self._arm_accept(candidate)
+        fields = ("status", "accepted_at", *self.accept_extra_fields)
+        plan = RendererMutationPlan.build(
+            saves=(planned_save(candidate, update_fields=fields),),
+            planned_at=candidate.accepted_at,
+        )
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+        with mutation as writer:
+            writer.save(candidate, update_fields=fields)
+        messages.success(request, f"Accepted routing state {candidate.pk}.")
+        return redirect(_device_nso_tab_url(candidate.management.device_id))
 
 
 class NSOL2SapStateAcceptView(NSOActionPermissionMixin, View):
@@ -6554,16 +6587,15 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
     def _push(self, mgmt):
         """Record the accepted rows in the outbox; override in subclasses."""
 
-    def _after_accept(self, mgmt, accepted_pks):
-        """Run after the bulk ownership update, before the push (override in subclasses).
-
-        *accepted_pks* are the rows this call moved from drift into ownership — the ones
-        that now carry intent the device does not have.
-        """
+    def _prepare_accept(self, current, candidate, *, drift):
+        """Add family-specific accepted fields to one candidate."""
+        return ()
 
     def post(self, request, device_pk):  # noqa: D102
-        from .intent_state import MutationFootprint, footprint_for_instance, intent_transaction
-        from .signals import suppress_intent_push
+        import copy
+
+        from .intent_state import IntentMutationProtocolError
+        from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
         try:
             mgmt = NSODeviceManagement.objects.get(device_id=device_pk)
@@ -6575,34 +6607,44 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
         # and for drift. Already-owned rows (in_sync/accepted) are skipped (accepting
         # them was a repeatable no-op). Matching (imported) -> in_sync (nothing to
         # push); drift -> accepted (pending apply). _push() sends the snapshot once.
-        candidates = list(
-            self.model_class.objects.filter(management=mgmt, status__in=["imported", "changed", "conflict"])
-            .select_related("management")
-            .order_by("pk")
-        )
-        footprint = MutationFootprint.merge(*(footprint_for_instance(row) for row in candidates))
-        # One transaction: a request is not wrapped in one, so committing the status ahead
-        # of _after_accept() would publish rows that read as owned while still carrying the
-        # state the previous apply named — which a concurrent Apply would then act on.
-        with intent_transaction(footprint):
-            current = list(self.model_class.objects.filter(pk__in=[row.pk for row in candidates]).order_by("pk"))
-            drift_pks = [row.pk for row in current if row.status in {"changed", "conflict"}]
-            accepted = [row for row in current if row.status in {"imported", "changed", "conflict"}]
-            now = timezone.now()
-            with suppress_intent_push():
-                for row in accepted:
-                    row.status = "in_sync" if row.status == "imported" else "accepted"
-                    update_fields = ["status"]
-                    if row.accepted_at is None:
-                        row.accepted_at = now
-                        update_fields.append("accepted_at")
-                    row.save(update_fields=update_fields)
+        count = 0
+        for _attempt in range(2):
+            candidates = list(
+                self.model_class.objects.filter(management=mgmt, status__in=["imported", "changed", "conflict"])
+                .select_related("management")
+                .order_by("pk")
+            )
+            accepted = []
+            saves = []
+            for row in candidates:
+                candidate = copy.copy(row)
+                drift = row.status in {"changed", "conflict"}
+                candidate.status = "accepted" if drift else "in_sync"
+                fields = ["status"]
+                if candidate.accepted_at is None:
+                    candidate.accepted_at = timezone.now()
+                    fields.append("accepted_at")
+                extra_fields = self._prepare_accept(row, candidate, drift=drift)
+                fields = (*fields, *extra_fields)
+                accepted.append((candidate, fields))
+                saves.append(planned_save(candidate, update_fields=fields))
             count = len(accepted)
-            if count and mgmt.adapter_device_id is not None:
-                self._after_accept(mgmt, drift_pks)
-                # Inside the same transaction as the ownership it records: appended after
-                # the commit, the entry could be lost while the rows read as owned.
-                self._push(mgmt)
+            if not count:
+                break
+            plan = RendererMutationPlan.build(saves=saves)
+            mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+            try:
+                with mutation as writer:
+                    for candidate, fields in accepted:
+                        writer.save(candidate, update_fields=fields)
+                    if mgmt.adapter_device_id is not None:
+                        self._push(mgmt)
+            except IntentMutationProtocolError:
+                continue
+            break
+        else:
+            messages.error(request, "Routing state changed. Refresh the page and try again.")
+            return redirect(_device_nso_tab_url(device_pk))
 
         if count:
             messages.success(request, f"Accepted {count} routing state(s).")
@@ -6614,19 +6656,14 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
 class NSOStaticRouteBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     model_class = NSOStaticRouteState
 
-    def _after_accept(self, mgmt, accepted_pks):
-        """Arm a generation on every row this accept moved from drift into ownership.
+    def _prepare_accept(self, current, candidate, *, drift):
+        """Arm every static route this bulk action moves from drift into ownership."""
+        if not drift:
+            return ()
+        from .signals import _arm_static_route_generation
 
-        Suppressed: a request is not wrapped in a transaction, so each unsuppressed save
-        would PUT the full snapshot on the spot — N adapter calls carrying half-armed
-        intent. ``_push()`` sends the finished snapshot once, immediately after.
-        """
-        from .signals import _arm_static_route_generation, suppress_intent_push
-
-        with suppress_intent_push():
-            for state in self.model_class.objects.filter(pk__in=accepted_pks, status="accepted"):
-                _arm_static_route_generation(state)
-                state.save(update_fields=list(_STATIC_ROUTE_ARMED_FIELDS))
+        _arm_static_route_generation(candidate)
+        return _STATIC_ROUTE_ARMED_FIELDS
 
     def _push(self, mgmt):
         _schedule_intent_push((mgmt.device_id, "static_route"))

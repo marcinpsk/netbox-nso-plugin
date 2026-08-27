@@ -210,6 +210,7 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
             "l2_sap",
             "logging",
             "snmp",
+            "static_route",
             "subinterface",
             "vlan",
             "svi",
@@ -222,3 +223,10 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
             assert rule.deletion_authority
             assert rule.intentional_semantic_delta
             assert rule.foreign_overlay_delete == "reown"
+
+    def test_static_route_rule_names_only_acknowledged_lineage(self):
+        from netbox_nso_plugin.ownership_planner import converted_scope_rules
+
+        rule = converted_scope_rules()["static_route"]
+
+        assert rule.acknowledged_lineage_field == "last_acked_triple"

@@ -155,6 +155,37 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         self.assertEqual(planned.pk, existing.pk)
         self.assertEqual(Interface.objects.filter(device=device, name="Loopback1627").count(), 1)
 
+    def test_static_route_manifest_carries_only_acknowledged_lineage(self):
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
+        device, management = make_managed("writer-static-lineage", 16283)
+        route = StaticRoute.objects.create(prefix="198.18.83.0/24", next_hop="198.18.0.83", metric=1)
+        route.devices.add(device)
+        acknowledged = {
+            "vrf": "",
+            "prefix": "198.18.82.0/24",
+            "next_hop": "198.18.0.82",
+        }
+        state = NSOStaticRouteState.objects.create(
+            management=management,
+            static_route=route,
+            status="imported",
+            nso_prefix=str(route.prefix),
+            nso_next_hop=str(route.next_hop),
+            last_acked_triple=acknowledged,
+        )
+        candidate = copy.copy(state)
+        candidate.status = "accepted"
+        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("status",)),))
+
+        with renderer_writes(plan) as writer:
+            writer.save(candidate, update_fields=("status",))
+
+        manifest = NSOOwnershipManifest.objects.get(device=device, scope="static_route")
+        assert manifest.acknowledged_lineage == [acknowledged]
+
     def test_one_plan_can_create_unregistered_native_rows_and_registered_overlay(self):
         from netbox_routing.models import BFDInterface, BFDProfile
 

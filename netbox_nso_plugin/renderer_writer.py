@@ -597,6 +597,36 @@ def _plan_m2m_add(proposed: RendererM2MAdd, creation_refs):
         **{row_kind: (SourceRow(through._meta.label_lower, None),)},
     )
     footprint = MutationFootprint.merge(owner_footprint, *related_footprints, through_footprint)
+    if instance._meta.label_lower == "netbox_routing.staticroute" and proposed.field_name == "devices":
+        from .models import NSODeviceManagement, NSOStaticRouteState
+
+        device_ids = set(existing)
+        device_ids.update(row.pk for row in proposed.related if row.pk is not None)
+        managed_ids = set(
+            NSODeviceManagement.objects.filter(device_id__in=device_ids).values_list("device_id", flat=True)
+        )
+        overlay_rows = (
+            NSOStaticRouteState.objects.filter(
+                management__device_id__in=device_ids,
+                static_route_id=instance.pk,
+            ).order_by("pk")
+            if instance.pk is not None
+            else ()
+        )
+        footprint = MutationFootprint.merge(
+            footprint,
+            MutationFootprint.for_keys(
+                {(device_id, "static_route") for device_id in managed_ids},
+                source_rows=(
+                    SourceRow("netbox_routing.staticroute", instance.pk),
+                    SourceRow("netbox_routing.staticroute_devices", None),
+                ),
+                overlay_rows=(
+                    SourceRow("netbox_nso_plugin.nsostaticroutestate", None),
+                    *(SourceRow(row._meta.label_lower, row.pk) for row in overlay_rows),
+                ),
+            ),
+        )
     scopes = set(owner_spec.scopes)
     if instance._meta.label_lower == "dcim.interface" and proposed.field_name == "tagged_vlans":
         scopes = {"switchport"}
@@ -690,7 +720,17 @@ def _manifest_binding(instance):
         management = getattr(instance, "management", None)
         if native is None or management is None:
             return None
-        native_key = {name: _normal(getattr(native, name)) for name in rule.native_key_fields}
+
+        def json_value(value):
+            if value is None or isinstance(value, (bool, int, float, str)):
+                return value
+            if isinstance(value, dict):
+                return {str(key): json_value(item) for key, item in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [json_value(item) for item in value]
+            return str(value)
+
+        native_key = {name: json_value(getattr(native, name)) for name in rule.native_key_fields}
         return rule, management.device_id, native._meta.label_lower, native_key
     return None
 
@@ -710,12 +750,20 @@ def _maintain_manifest(instance):
         "native_key": native_key,
     }
     if sm.is_owned(instance.status):
+        lineage = (
+            getattr(instance, rule.acknowledged_lineage_field, None)
+            if rule.acknowledged_lineage_field is not None
+            else None
+        )
+        defaults = {
+            "ownership_state": "owned",
+            "deletion_authority": rule.deletion_authority,
+        }
+        if lineage is not None:
+            defaults["acknowledged_lineage"] = [copy.deepcopy(lineage)]
         NSOOwnershipManifest.objects.update_or_create(
             **identity,
-            defaults={
-                "ownership_state": "owned",
-                "deletion_authority": rule.deletion_authority,
-            },
+            defaults=defaults,
         )
     else:
         NSOOwnershipManifest.objects.filter(**identity, ownership_state="owned").update(ownership_state="detached")
