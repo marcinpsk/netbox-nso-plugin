@@ -17,12 +17,12 @@ import "../../static/netbox_nso_plugin/nso-apply-chain.js";
 const TEMPLATE = resolve(process.cwd(), "netbox_nso_plugin/templates/netbox_nso_plugin/device_nso_tab.html");
 
 function applyChainScript() {
-  const blocks = readFileSync(TEMPLATE, "utf8").match(/<script>([\s\S]*?)<\/script>/g) || [];
+  const blocks = readFileSync(TEMPLATE, "utf8").match(/<script>([\s\S]*?)<\/script>/gi) || [];
   const matching = blocks.filter((block) => block.includes("function pollApplyChain("));
   if (matching.length !== 1) {
     throw new Error(`expected one inline Apply-chain block in the tab template, found ${matching.length}`);
   }
-  const body = matching[0].replace(/^<script>/, "").replace(/<\/script>$/, "");
+  const body = matching[0].replace(/^<script>/i, "").replace(/<\/script>$/i, "");
   if (/\{[{%#]/.test(body)) {
     throw new Error("the inline Apply-chain block gained Django template syntax; this loader cannot run it");
   }
