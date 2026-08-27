@@ -2839,6 +2839,10 @@ def _push_isis_intent_for_device(device_id, adapter_device_id):
 @_skip_on_render
 def _on_isis_interface_state_save(sender, instance, **kwargs):
     """Schedule IS-IS only when the exact writer owns this device key."""
+    from .renderer_writer import active_renderer_writer
+
+    if active_renderer_writer() is None:
+        return
     from .models import NSODeviceManagement
 
     try:
@@ -2857,6 +2861,10 @@ def _on_isis_interface_state_save(sender, instance, **kwargs):
 @_skip_on_render
 def _on_isis_instance_state_save(sender, instance, **kwargs):
     """Schedule IS-IS only when the exact writer owns this device key."""
+    from .renderer_writer import active_renderer_writer
+
+    if active_renderer_writer() is None:
+        return
     from .models import NSODeviceManagement
 
     try:
@@ -3787,6 +3795,10 @@ def _push_ospf_intent_for_device(device_id, adapter_device_id):
 @_skip_on_render
 def _on_ospf_instance_state_save(sender, instance, **kwargs):
     """Schedule OSPF only when the exact writer owns this device key."""
+    from .renderer_writer import active_renderer_writer
+
+    if active_renderer_writer() is None:
+        return
     from .models import NSODeviceManagement
 
     try:
@@ -3805,6 +3817,10 @@ def _on_ospf_instance_state_save(sender, instance, **kwargs):
 @_skip_on_render
 def _on_ospf_interface_state_save(sender, instance, **kwargs):
     """Schedule OSPF only when the exact writer owns this device key."""
+    from .renderer_writer import active_renderer_writer
+
+    if active_renderer_writer() is None:
+        return
     from .models import NSODeviceManagement
 
     try:

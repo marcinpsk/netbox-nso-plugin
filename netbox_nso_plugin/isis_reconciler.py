@@ -792,7 +792,7 @@ def _isis_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
                         current_native,
                         device,
                     )
-                    and _isis_interface_children_match(entry, current_native, write=False)
+                    and _isis_interface_children_match(entry, current_native)
                 )
             state.status = sm.on_reconcile(state.status, matches=matches)
             _state_save(
