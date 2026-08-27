@@ -108,7 +108,7 @@ class TestIsisChildFailurePolicy(unittest.TestCase):
             ),
         ):
             with self.assertRaisesRegex(OperationalError, "level query failed"):
-                _isis_interface_children_match({}, SimpleNamespace(), write=False)
+                _isis_interface_children_match({}, SimpleNamespace())
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +306,52 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
         self.assertEqual(ISISInterfaceLevel.objects.count(), 1)
         self.assertEqual(ISISPrefixSID.objects.count(), 1)
 
+    def test_preflight_tracks_reparent_to_a_planned_instance_by_reference(self):
+        """A re-parent write names the process that the same plan creates."""
+        mgmt = self._make_mgmt()
+
+        from netbox_routing.models import ISISInstance, ISISInterface
+
+        from netbox_nso_plugin.isis_reconciler import isis_reconcile_plan, reconcile_isis
+        from netbox_nso_plugin.models import NSOISISInterfaceState
+        from netbox_nso_plugin.renderer_writer import RendererCreationRef, renderer_mirror_writes
+
+        old_instance = ISISInstance.objects.create(device=self.device, process_tag="OLD")
+        native = ISISInterface.objects.create(
+            interface=self.iface_ge0,
+            address_family="ipv4",
+            instance=old_instance,
+        )
+        NSOISISInterfaceState.objects.create(
+            management=mgmt,
+            interface=self.iface_ge0,
+            af="ipv4",
+            process_tag="OLD",
+            isis_interface=native,
+            status="imported",
+        )
+        payload = {"interfaces": [self._entry(process_tag="NEW")]}
+
+        plan = isis_reconcile_plan(self.device, payload)
+
+        interface_write = next(
+            write
+            for write in plan.write_set
+            if write.operation == "save"
+            and write.model_label == "netbox_routing.isisinterface"
+            and write.pk == native.pk
+            and "instance" in write.update_fields
+        )
+        planned_instance = dict(interface_write.values)["instance_id"]
+        self.assertIsInstance(planned_instance, RendererCreationRef)
+        self.assertEqual(dict(planned_instance.natural_key)["process_tag"], "NEW")
+
+        with renderer_mirror_writes(plan):
+            reconcile_isis(self.device, payload)
+
+        native.refresh_from_db()
+        self.assertEqual(native.instance.process_tag, "NEW")
+
     # ── Basic cases ────────────────────────────────────────────────────────────
 
     def test_no_mgmt_returns_empty(self):
@@ -382,6 +428,40 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
         state.refresh_from_db()
         self.assertIsNone(state.isis_interface_id)
         mock_push.assert_not_called()
+
+    def test_owned_overlay_with_deleted_native_does_not_reach_in_sync(self):
+        """A reported interface cannot settle while its owned native anchor is absent."""
+        from netbox_routing.models import ISISInstance, ISISInterface
+
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis
+        from netbox_nso_plugin.models import NSOISISInterfaceState
+
+        mgmt = self._make_mgmt()
+        instance = ISISInstance.objects.create(device=self.device, process_tag="")
+        native = ISISInterface.objects.create(
+            interface=self.iface_ge0,
+            address_family="ipv4",
+            instance=instance,
+            circuit_type="level-1-2",
+        )
+        state = NSOISISInterfaceState.objects.create(
+            management=mgmt,
+            interface=self.iface_ge0,
+            af="ipv4",
+            process_tag="",
+            circuit_type="level-1-2",
+            isis_interface=native,
+            status="accepted",
+        )
+        native.delete()
+        state.refresh_from_db()
+        self.assertIsNone(state.isis_interface_id)
+
+        reconcile_isis(self.device, {"interfaces": [self._entry()]})
+
+        state.refresh_from_db()
+        self.assertEqual(state.status, "accepted")
+        self.assertIsNone(state.isis_interface_id)
 
     def test_owned_overlay_metric_network_type_not_clobbered(self):
         """A reconcile must not wipe an owned IS-IS row's pushed metric/network-type.
@@ -1992,6 +2072,35 @@ class TestReconcileIsisInterfaceLevels(TestCase):
             [{"process_tag": "0", "srv6_locators": [{"name": "LOC1", "prefix": "2001:db8:a1::/64"}]}],
         )
         self.assertEqual(set(ISISSRv6Locator.objects.filter(instance=inst).values_list("name", flat=True)), {"LOC1"})
+
+    def test_existing_srv6_locator_prefix_does_not_plan_a_phantom_update(self):
+        """An equal typed prefix stays outside the next exact write set."""
+        self._make_mgmt()
+
+        from netbox_nso_plugin.isis_reconciler import isis_reconcile_plan, reconcile_isis
+        from netbox_nso_plugin.models import NSOISISInstanceState
+
+        payload = {
+            "processes": [
+                {
+                    "process_tag": "0",
+                    "srv6_locators": [{"name": "LOC1", "prefix": "2001:db8:a3::/64"}],
+                }
+            ]
+        }
+        reconcile_isis(self.device, payload)
+        state = NSOISISInstanceState.objects.get(management__device=self.device, process_tag="0")
+        state.device_base_hash = ""
+        state.save(update_fields=("device_base_hash",))
+
+        plan = isis_reconcile_plan(self.device, payload)
+
+        locator_saves = [
+            write
+            for write in plan.write_set
+            if write.operation == "save" and write.model_label == "netbox_routing.isissrv6locator"
+        ]
+        self.assertEqual(locator_saves, [])
 
     def test_routing_instance_attached_bit(self):
         """suppress/ignore-attached-bit flow onto ISISInstance; re-reconcile stays in sync."""

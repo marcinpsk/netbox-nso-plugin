@@ -305,7 +305,14 @@ def _srv6_locator_plan(instance, entries):
                     values[column] = _absent_value(row, column)
                 continue
             values[column] = value
-        changed = _changed_fields(row, values)
+        changed = []
+        for column, value in values.items():
+            current = getattr(row, column)
+            differs = str(current) != str(value) if column == "prefix" else current != value
+            if differs:
+                setattr(row, column, value)
+                changed.append(column)
+        changed = tuple(changed)
         if created:
             operations.save(
                 row,
@@ -489,7 +496,7 @@ def _state_save(operations, state, created, natural_key):
     )
 
 
-def _plan_stale_states(operations, states, seen, key, planned_at, native_field):
+def _plan_stale_states(operations, states, seen, planned_at, native_field):
     from . import status_machine as sm
 
     for identity, current in states.items():
@@ -633,7 +640,6 @@ def _isis_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
             operations,
             process_states,
             seen_processes,
-            lambda row: row.process_tag,
             planned_at,
             "isis_instance",
         )
@@ -716,6 +722,7 @@ def _isis_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
             structural_change = not created_native and native.instance_id != native_instance.pk
             if structural_change:
                 native.instance = native_instance
+            structural_references = (("instance", native_instance),) if structural_change else ()
             changed, child_operations, device_hash = _interface_device_graph(native, entry, state)
             object_hash = "" if current_native is None else _isis_interface_object_hash(current_native)
             action = merge_util.three_way(
@@ -726,7 +733,11 @@ def _isis_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
             )
             if owned:
                 if structural_change:
-                    operations.save(native, update_fields=("instance",))
+                    operations.save(
+                        native,
+                        update_fields=("instance",),
+                        references=structural_references,
+                    )
                 matches = False
                 native = current_native if not structural_change else native
             elif created_native:
@@ -743,31 +754,46 @@ def _isis_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
                 structural_fields = ("instance",) if structural_change else ()
                 fields = tuple(dict.fromkeys((*structural_fields, *changed)))
                 if fields:
-                    operations.save(native, update_fields=fields)
+                    operations.save(
+                        native,
+                        update_fields=fields,
+                        references=structural_references,
+                    )
                 for child_ops in child_operations:
                     operations.extend(child_ops)
                 matches = True
                 state.device_base_hash = device_hash
             elif action == "insync":
                 if structural_change:
-                    operations.save(native, update_fields=("instance",))
+                    operations.save(
+                        native,
+                        update_fields=("instance",),
+                        references=structural_references,
+                    )
                 matches = True
                 state.device_base_hash = device_hash
                 native = current_native if not structural_change else native
             else:
                 if structural_change:
-                    operations.save(native, update_fields=("instance",))
+                    operations.save(
+                        native,
+                        update_fields=("instance",),
+                        references=structural_references,
+                    )
                 matches = False
                 native = current_native if not structural_change else native
             native_interfaces[identity] = native
             state.isis_interface = native
             if owned:
-                matches = _isis_device_matches_intent(
-                    entry,
-                    state,
-                    current_native,
-                    device,
-                ) and _isis_interface_children_match(entry, current_native, write=False)
+                matches = current_native is not None and (
+                    _isis_device_matches_intent(
+                        entry,
+                        state,
+                        current_native,
+                        device,
+                    )
+                    and _isis_interface_children_match(entry, current_native, write=False)
+                )
             state.status = sm.on_reconcile(state.status, matches=matches)
             _state_save(
                 operations,
@@ -780,7 +806,6 @@ def _isis_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
             operations,
             interface_states,
             seen_interfaces,
-            lambda row: (row.interface_id, row.af),
             planned_at,
             "isis_interface",
         )
@@ -809,7 +834,8 @@ def reconcile_isis(device, payload):
                 writer.delete(instance)
                 continue
             for field_name, related in references:
-                setattr(instance, field_name, related.pk)
+                field = instance._meta.get_field(field_name)
+                setattr(instance, field.attname, related.pk)
             writer.save(
                 instance,
                 update_fields=update_fields,
