@@ -267,6 +267,33 @@ _CONVERTED_SCOPE_RULES = {
         ),
         manifest_scope_field="dest_protocol",
     ),
+    "isis": ScopeOwnershipRule(
+        scope="isis",
+        native_model_labels=(
+            "netbox_routing.isisinstance",
+            "netbox_routing.isisinterface",
+        ),
+        native_key_fields=(),
+        native_key_fields_by_model=(
+            ("netbox_routing.isisinstance", ("device_id", "process_tag")),
+            ("netbox_routing.isisinterface", ("interface_id", "address_family")),
+        ),
+        overlay_model_labels=(
+            "netbox_nso_plugin.nsoisisinstancestate",
+            "netbox_nso_plugin.nsoisisinterfacestate",
+        ),
+        overlay_native_fields=(
+            ("netbox_nso_plugin.nsoisisinstancestate", "isis_instance"),
+            ("netbox_nso_plugin.nsoisisinterfacestate", "isis_interface"),
+        ),
+        foreign_overlay_delete="reown",
+        deletion_authority=True,
+        intentional_semantic_delta=(
+            "Acquire from a persisted native process or interface and its linked overlay. Native and overlay save "
+            "events are not ownership evidence. Settings, levels, Segment Routing, Flex-Algo, Prefix-SID, and SRv6 "
+            "locator rows are graph dependencies, not independently owned device objects."
+        ),
+    ),
     "ospf": ScopeOwnershipRule(
         scope="ospf",
         native_model_labels=(
