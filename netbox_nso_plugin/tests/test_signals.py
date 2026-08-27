@@ -1650,7 +1650,11 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             patch("netbox_nso_plugin.adapter_client.put_logging_intent") as mock_put,
             self.captureOnCommitCallbacks(execute=True),
         ):
-            row.delete()
+            from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
+
+            plan = RendererMutationPlan.build(deletes=(planned_delete(row),))
+            with renderer_writes(plan) as writer:
+                writer.delete(row)
         mock_put.assert_called_once()
         self.assertEqual(mock_put.call_args[0][1], [])
 

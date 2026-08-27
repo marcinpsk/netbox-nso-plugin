@@ -135,6 +135,25 @@ _CONVERTED_SCOPE_RULES = {
             "Acquire from persisted per-interface BFD state. Save events are not ownership evidence."
         ),
     ),
+    "logging": ScopeOwnershipRule(
+        scope="logging",
+        native_model_labels=(
+            "netbox_nso_plugin.nsologginghoststate",
+            "netbox_nso_plugin.nsologginglevelstate",
+        ),
+        native_key_fields=("management_id", "pk"),
+        overlay_model_labels=(
+            "netbox_nso_plugin.nsologginghoststate",
+            "netbox_nso_plugin.nsologginglevelstate",
+        ),
+        overlay_native_fields=(
+            ("netbox_nso_plugin.nsologginghoststate", "__self__"),
+            ("netbox_nso_plugin.nsologginglevelstate", "__self__"),
+        ),
+        foreign_overlay_delete="reown",
+        deletion_authority=True,
+        intentional_semantic_delta=("Acquire from persisted logging rows. Save events are not ownership evidence."),
+    ),
 }
 
 

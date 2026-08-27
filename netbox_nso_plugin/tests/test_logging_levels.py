@@ -84,6 +84,27 @@ class TestReconcileLoggingLevels(LevelsTestBase):
 
         return _reconcile_logging_config(self.device, payload)
 
+    def test_reconcile_preflights_exact_host_and_level_creations(self):
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+        from netbox_nso_plugin.template_content import logging_reconcile_plan
+
+        plan = logging_reconcile_plan(
+            self.device,
+            self._payload(
+                local_levels=_LEVELS_PAYLOAD,
+                hosts=({"address": "198.18.0.70", "severity": "warning"},),
+            ),
+        )
+
+        self.assertIsInstance(plan, RendererMutationPlan)
+        self.assertEqual(
+            [(write.operation, write.model_label) for write in plan.write_set],
+            [
+                ("save", "netbox_nso_plugin.nsologginghoststate"),
+                ("save", "netbox_nso_plugin.nsologginglevelstate"),
+            ],
+        )
+
     def test_creates_singleton_imported(self):
         from netbox_nso_plugin.models import NSOLoggingLevelState
 
@@ -279,13 +300,39 @@ class TestLoggingLevelsPush(LevelsTestBase):
         self.assertIsNone(calls[0].kwargs["json"]["local_levels"])
 
     def test_saving_a_levels_row_triggers_the_push(self):
+        from netbox_nso_plugin.models import NSOLoggingLevelState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
+        row = NSOLoggingLevelState(
+            management=self.mgmt,
+            console_severity="ERROR",
+            status="accepted",
+            accepted_at=timezone.now(),
+        )
+        plan = RendererMutationPlan.build(saves=(planned_save(row, force_insert=True, natural_key=("management",)),))
         with (
             patch("netbox_nso_plugin.adapter_client.put_logging_intent") as mock_put,
             self.captureOnCommitCallbacks(execute=True),
         ):
-            self._row(console_severity="ERROR", status="accepted", accepted_at=timezone.now())
+            with renderer_writes(plan) as writer:
+                writer.save(row, force_insert=True)
         mock_put.assert_called_once()
         self.assertEqual(mock_put.call_args.args[2], {"console_severity": "ERROR"})
+
+    def test_foreign_levels_save_does_not_schedule_logging_behavior(self):
+        from netbox_nso_plugin.models import NSOLoggingLevelState
+
+        row = NSOLoggingLevelState.objects.create(
+            management=self.mgmt,
+            console_severity="ERROR",
+            status="accepted",
+            accepted_at=timezone.now(),
+        )
+        with patch("netbox_nso_plugin.signals._schedule_intent_push") as schedule:
+            row.console_severity = "CRITICAL"
+            row.save(update_fields=("console_severity",))
+
+        schedule.assert_not_called()
 
     def test_deleting_a_levels_row_pushes_null(self):
         with (
@@ -297,7 +344,11 @@ class TestLoggingLevelsPush(LevelsTestBase):
             patch("netbox_nso_plugin.adapter_client.put_logging_intent") as mock_put,
             self.captureOnCommitCallbacks(execute=True),
         ):
-            row.delete()
+            from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
+
+            plan = RendererMutationPlan.build(deletes=(planned_delete(row),))
+            with renderer_writes(plan) as writer:
+                writer.delete(row)
         mock_put.assert_called_once()
         self.assertIsNone(mock_put.call_args.args[2])
 
@@ -332,6 +383,9 @@ class TestLoggingLevelsViews(LevelsTestBase):
             return self._row(**kwargs)
 
     def test_accept_matching_imported_row_becomes_owned_in_sync(self):
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOOwnershipManifest
+
         row = self._row_flushed(console_severity="CRITICAL", status="imported")
         with (
             patch("netbox_nso_plugin.adapter_client.put_logging_intent") as mock_put,
@@ -342,6 +396,23 @@ class TestLoggingLevelsViews(LevelsTestBase):
         row.refresh_from_db()
         self.assertEqual(row.status, "in_sync")
         self.assertIsNotNone(row.accepted_at)
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="logging")
+        self.assertEqual(revision.verified_revision, revision.revision)
+        self.assertEqual(
+            revision.verified_fingerprint,
+            delivery.canonical_fingerprint(
+                delivery.render("logging", self.device.pk, self.mgmt.adapter_device_id).payload
+            ),
+        )
+        self.assertTrue(
+            NSOOwnershipManifest.objects.filter(
+                device=self.device,
+                scope="logging",
+                native_model_label="netbox_nso_plugin.nsologginglevelstate",
+                native_key={"management_id": self.mgmt.pk, "pk": row.pk},
+                ownership_state="owned",
+            ).exists()
+        )
         mock_put.assert_called_once()
         self.assertEqual(mock_put.call_args.args[2], {"console_severity": "CRITICAL"})
 

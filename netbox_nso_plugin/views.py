@@ -4503,7 +4503,7 @@ def _save_owned_overlay_only_edit(obj, old_values):
 
 def _save_owned_overlay_edit(obj, key, old_values):
     """Claim an edited overlay and update its matching native NetBox object atomically."""
-    if key in {"svi", "subinterface"}:
+    if key in {"logging_host", "logging_levels", "svi", "subinterface"}:
         _save_owned_overlay_only_edit(obj, old_values)
         return
     if key == "bfd":
@@ -6742,10 +6742,12 @@ class NSOSnmpCommunityStateHarvestView(NSOActionPermissionMixin, View):
 
 class NSOLoggingHostStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOLoggingHostState
+    renderer_scope = "logging"
 
 
 class NSOLoggingLevelStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOLoggingLevelState
+    renderer_scope = "logging"
 
     def push_blocker(self, state):
         """Refuse ownership of an all-blank row — it manages nothing, so the push would un-manage."""
@@ -6777,10 +6779,18 @@ class NSOLoggingLevelStateUnacceptView(NSOActionPermissionMixin, View):
         if not sm.is_owned(state.status):
             messages.error(request, f"Cannot un-accept {state}: it is not owned.")
             return redirect(_device_nso_tab_url(device_id))
-        state.status = sm.advance(state.status, sm.REVERT, to=sm.IMPORTED)
-        state.accepted_at = None
-        with transaction.atomic():
-            state.save(update_fields=["status", "accepted_at"])
+        import copy
+
+        from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
+        candidate = copy.copy(state)
+        candidate.status = sm.advance(candidate.status, sm.REVERT, to=sm.IMPORTED)
+        candidate.accepted_at = None
+        fields = ("status", "accepted_at")
+        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=fields),))
+        with renderer_writes(plan) as writer:
+            writer.save(candidate, update_fields=fields)
+        state = candidate
         messages.warning(
             request,
             f"Un-accepted {state}: the managed levels are being retracted from the device — "

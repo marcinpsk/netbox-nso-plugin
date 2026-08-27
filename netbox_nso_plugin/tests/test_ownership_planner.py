@@ -201,7 +201,16 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
 
         rules = converted_scope_rules()
 
-        assert set(rules) == {"bfd", "interface_mtu", "lacp", "subinterface", "vlan", "svi", "switchport"}
+        assert set(rules) == {
+            "bfd",
+            "interface_mtu",
+            "lacp",
+            "logging",
+            "subinterface",
+            "vlan",
+            "svi",
+            "switchport",
+        }
         for scope, rule in rules.items():
             assert rule.scope == scope
             assert rule.native_model_labels

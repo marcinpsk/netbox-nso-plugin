@@ -2,6 +2,8 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """NetBox template extensions — interface badge (device NSO tab is now a registered tab view)."""
 
+import contextlib
+import copy
 import logging
 from datetime import datetime
 
@@ -776,90 +778,6 @@ def _snmp_value_compare_supported(device) -> bool:
     return True
 
 
-def _reconcile_logging_levels(mgmt, levels_data: dict, now):
-    """Reconcile the local logging-levels singleton; return the row (or None when there is none).
-
-    An empty/absent ``local_levels`` payload is the singleton form of "the device
-    stopped reporting it": an OWNED row must drift rather than keep reading
-    in_sync (the _reconcile_snmp_system_info precedent).
-    """
-    from .models import NSOLoggingLevelState
-
-    if not levels_data:
-        owned = NSOLoggingLevelState.objects.filter(management=mgmt, status__in=sm.OWNED_STATES).first()
-        if owned is None:
-            return None
-        new_status = sm.on_reconcile(owned.status, present=False)
-        if new_status != owned.status:
-            owned.status = new_status
-            owned.save(update_fields=["status"])
-        return owned
-
-    state, _ = NSOLoggingLevelState.objects.get_or_create(management=mgmt)
-    dev = {f: (levels_data.get(f) or "") for f in NSOLoggingLevelState.SEVERITY_FIELDS}
-    if sm.is_owned(state.status):
-        # Owned: severities are operator intent — never clobber with the device
-        # read; settle accepted → in_sync only when the device matches exactly.
-        matches = all(getattr(state, f) == v for f, v in dev.items())
-        # CAS: settle only if the row still holds the values `matches` saw — a concurrent edit wins wholesale
-        state = _cas_mirror_update(
-            NSOLoggingLevelState.objects.filter(
-                pk=state.pk,
-                status=state.status,
-                **{f: getattr(state, f) for f in dev},
-            ),
-            status=sm.on_reconcile(state.status, matches=matches, settles_deploying=False),
-            last_sync_at=now,
-        )
-        if state is None:
-            state = NSOLoggingLevelState.objects.filter(management=mgmt).first()
-    else:
-        state.last_sync_at = now
-        for f, v in dev.items():
-            setattr(state, f, v)
-        state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
-        state.save()
-    return state
-
-
-def logging_reconcile_plan(device, payload):
-    """Declare all logging overlay rows the full-replace read can mutate."""
-    from .intent_state import MutationFootprint, ReconcileMutationPlan, SourceRow
-    from .models import NSODeviceManagement, NSOLoggingHostState, NSOLoggingLevelState
-
-    try:
-        management = device.nso_management
-    except NSODeviceManagement.DoesNotExist:
-        return ReconcileMutationPlan(MutationFootprint())
-    host_rows = tuple(NSOLoggingHostState.objects.filter(management=management).order_by("pk"))
-    level_rows = tuple(NSOLoggingLevelState.objects.filter(management=management).order_by("pk"))
-    addresses = {host.get("address") for host in (payload.get("hosts") or []) if host.get("address")}
-    changes_content = any(
-        sm.is_owned(row.status)
-        and row.address not in addresses
-        and not sm.is_owned(sm.on_reconcile(row.status, present=False))
-        for row in host_rows
-    )
-    if not (payload.get("local_levels") or {}):
-        changes_content = changes_content or any(
-            sm.is_owned(row.status) and not sm.is_owned(sm.on_reconcile(row.status, present=False))
-            for row in level_rows
-        )
-    return ReconcileMutationPlan(
-        MutationFootprint.for_keys(
-            {(device.pk, "logging")},
-            overlay_rows=(
-                SourceRow(NSOLoggingHostState._meta.label_lower, None),
-                *(SourceRow(row._meta.label_lower, row.pk) for row in host_rows),
-                SourceRow(NSOLoggingLevelState._meta.label_lower, None),
-                *(SourceRow(row._meta.label_lower, row.pk) for row in level_rows),
-            ),
-        ),
-        changes_content=changes_content,
-        settles_deploying=False,
-    )
-
-
 _TIMOS_LOGGING_SEVERITY = {
     "emergencies": "emergency",
     "alerts": "alert",
@@ -929,84 +847,205 @@ def _canonical_logging_intent_field(ned_id: str, field: str, value):
     return _canonical_logging_field(ned_id, field, value)
 
 
-@mirror_reconciler
-def _reconcile_logging_config(device, payload: dict) -> dict:
-    """Full-replace import of logging config into the NSOLogging* overlays.
-
-    Syslog hosts: rows whose address matches the payload are updated; rows absent
-    from the payload are deleted; new rows are created with status='imported'.
-    The ``local_levels`` scalar block reconciles into the NSOLoggingLevelState
-    singleton. Returns {"hosts": [...], "local_levels": row-or-None, ...}.
-    """
-    from django.utils import timezone
-
-    from .models import NSODeviceManagement, NSOLoggingHostState
+def _logging_reconcile_operations(device, payload, planned_at):  # noqa: C901
+    """Build the deterministic logging write sequence for preflight and apply."""
+    from .models import NSODeviceManagement, NSOLoggingHostState, NSOLoggingLevelState
+    from .renderer_writer import planned_delete, planned_save
 
     try:
-        mgmt = device.nso_management
+        management = device.nso_management
     except NSODeviceManagement.DoesNotExist:
-        return {"hosts": [], "local_levels": None, "last_refreshed_at": None, "refresh_source": "never"}
+        return [], [], [], None
 
-    now = timezone.now()
-    payload_hosts = {h.get("address"): h for h in (payload.get("hosts") or []) if h.get("address")}
+    saves = []
+    deletes = []
+    operations = []
 
-    # Rows the device no longer reports: owned rows are operator intent (the device
-    # may simply not have caught up yet) → keep, transition via present=False;
-    # unowned vestigial rows are pruned.
-    for stale in NSOLoggingHostState.objects.filter(management=mgmt).exclude(address__in=payload_hosts.keys()):
-        if sm.is_owned(stale.status):
-            stale.status = sm.on_reconcile(stale.status, present=False)
-            stale.last_sync_at = now
-            stale.save(update_fields=["status", "last_sync_at"])
-        else:
-            stale.delete()
+    def save(instance, *, update_fields=None, force_insert=False, natural_key=()):
+        saves.append(
+            planned_save(
+                instance,
+                update_fields=update_fields,
+                force_insert=force_insert,
+                natural_key=natural_key,
+            )
+        )
+        operations.append(("save", instance, update_fields, force_insert))
+
+    def delete(instance):
+        deletes.append(planned_delete(instance))
+        operations.append(("delete", instance, None, False))
+
+    current_hosts = {
+        row.address: row for row in NSOLoggingHostState.objects.filter(management=management).order_by("pk")
+    }
+    payload_hosts = {
+        item.get("address"): item
+        for item in (payload.get("hosts") or [])
+        if isinstance(item, dict) and item.get("address")
+    }
+    for address, stale in current_hosts.items():
+        if address in payload_hosts:
+            continue
+        if not sm.is_owned(stale.status):
+            delete(stale)
+            continue
+        candidate = copy.copy(stale)
+        candidate.status = sm.on_reconcile(candidate.status, present=False)
+        candidate.last_sync_at = planned_at
+        save(candidate, update_fields=("status", "last_sync_at"))
 
     ned_id = _device_ned_id(device)
     suppress_default_port = ned_id.startswith(("timos", "arcos-"))
-    for addr, h in payload_hosts.items():
-        state, _ = NSOLoggingHostState.objects.get_or_create(
-            management=mgmt, address=addr, defaults={"status": "unknown"}
+    host_fields = ("port", "severity", "facility", "transport", "vrf", "source")
+    for address, item in payload_hosts.items():
+        current = current_hosts.get(address)
+        candidate = (
+            copy.copy(current) if current is not None else NSOLoggingHostState(management=management, address=address)
         )
-        dev = {
-            "port": h.get("port"),
-            "severity": h.get("severity") or "",
-            "facility": h.get("facility") or "",
-            "transport": h.get("transport") or "",
-            "vrf": h.get("vrf") or "",
-            "source": h.get("source") or "",
+        device_values = {
+            "port": item.get("port"),
+            "severity": item.get("severity") or "",
+            "facility": item.get("facility") or "",
+            "transport": item.get("transport") or "",
+            "vrf": item.get("vrf") or "",
+            "source": item.get("source") or "",
         }
-        if sm.is_owned(state.status):
-            # Owned: field values are operator intent — never clobber with the
-            # device read; settle only when the device reports the intent exactly.
+        owned = current is not None and sm.is_owned(current.status)
+        if owned:
+            if not NSOLoggingHostState.objects.filter(
+                pk=current.pk,
+                address=address,
+                status=current.status,
+                **{field: getattr(current, field) for field in host_fields},
+            ).exists():
+                continue
             matches = all(
-                (suppress_default_port and f == "port" and v is None and getattr(state, f) in (None, 514))
-                or _canonical_logging_field(ned_id, f, getattr(state, f)) == v
-                for f, v in dev.items()
+                (
+                    suppress_default_port
+                    and field == "port"
+                    and value is None
+                    and getattr(candidate, field) in (None, 514)
+                )
+                or _canonical_logging_field(ned_id, field, getattr(candidate, field)) == value
+                for field, value in device_values.items()
             )
-            # CAS: settle only if the row still holds the identity + values `matches` saw —
-            # a concurrent edit (a rename included) wins wholesale
-            _cas_mirror_update(
-                NSOLoggingHostState.objects.filter(
-                    pk=state.pk,
-                    address=addr,
-                    status=state.status,
-                    **{f: getattr(state, f) for f in dev},
-                ),
-                status=sm.on_reconcile(state.status, matches=matches, settles_deploying=False),
-                last_sync_at=now,
+            candidate.status = sm.on_reconcile(
+                candidate.status,
+                matches=matches,
+                settles_deploying=False,
             )
+            fields = ("status", "last_sync_at")
         else:
-            state.last_sync_at = now
-            for f, v in dev.items():
-                setattr(state, f, v)
-            state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
-            state.save()
+            for field, value in device_values.items():
+                setattr(candidate, field, value)
+            candidate.status = sm.on_reconcile(candidate.status)
+            fields = None if current is None else (*host_fields, "status", "last_sync_at")
+        candidate.last_sync_at = planned_at
+        save(
+            candidate,
+            update_fields=fields,
+            force_insert=current is None,
+            natural_key=("management", "address"),
+        )
 
-    levels_state = _reconcile_logging_levels(mgmt, payload.get("local_levels") or {}, now)
+    levels_data = payload.get("local_levels") or {}
+    current_level = NSOLoggingLevelState.objects.filter(management=management).first()
+    level_result = None
+    if not levels_data:
+        if current_level is not None and sm.is_owned(current_level.status):
+            level_result = copy.copy(current_level)
+            new_status = sm.on_reconcile(level_result.status, present=False)
+            if new_status != level_result.status:
+                level_result.status = new_status
+                save(level_result, update_fields=("status",))
+    else:
+        level_result = (
+            copy.copy(current_level) if current_level is not None else NSOLoggingLevelState(management=management)
+        )
+        device_levels = {field: levels_data.get(field) or "" for field in NSOLoggingLevelState.SEVERITY_FIELDS}
+        owned = current_level is not None and sm.is_owned(current_level.status)
+        if owned:
+            if NSOLoggingLevelState.objects.filter(
+                pk=current_level.pk,
+                status=current_level.status,
+                **{field: getattr(current_level, field) for field in device_levels},
+            ).exists():
+                matches = all(getattr(level_result, field) == value for field, value in device_levels.items())
+                level_result.status = sm.on_reconcile(
+                    level_result.status,
+                    matches=matches,
+                    settles_deploying=False,
+                )
+                level_result.last_sync_at = planned_at
+                save(level_result, update_fields=("status", "last_sync_at"))
+            else:
+                level_result = None
+        else:
+            for field, value in device_levels.items():
+                setattr(level_result, field, value)
+            level_result.status = sm.on_reconcile(level_result.status)
+            level_result.last_sync_at = planned_at
+            fields = (
+                None if current_level is None else (*NSOLoggingLevelState.SEVERITY_FIELDS, "status", "last_sync_at")
+            )
+            save(
+                level_result,
+                update_fields=fields,
+                force_insert=current_level is None,
+                natural_key=("management",),
+            )
+
+    return saves, deletes, operations, level_result
+
+
+def _logging_plan_and_operations(device, payload):
+    from django.utils import timezone
+
+    from .renderer_writer import RendererMutationPlan
+
+    planned_at = timezone.now()
+    saves, deletes, operations, level_result = _logging_reconcile_operations(device, payload, planned_at)
+    plan = RendererMutationPlan.build(saves=saves, deletes=deletes, planned_at=planned_at)
+    return plan, operations, level_result
+
+
+def logging_reconcile_plan(device, payload):
+    """Freeze every logging overlay write before reconciliation."""
+    plan, _operations, _level_result = _logging_plan_and_operations(device, payload)
+    return plan
+
+
+def _reconcile_logging_config(device, payload: dict) -> dict:
+    """Apply one frozen logging reconciliation through the renderer writer."""
+    from .models import NSODeviceManagement, NSOLoggingHostState
+    from .renderer_writer import active_renderer_writer, renderer_mirror_writes, renderer_writes
+    from .signals import suppress_intent_push
+
+    try:
+        management = device.nso_management
+    except NSODeviceManagement.DoesNotExist:
+        return {"hosts": [], "local_levels": None, "last_refreshed_at": None, "refresh_source": "never"}
+
+    active = active_renderer_writer()
+    if active is None:
+        plan, operations, level_result = _logging_plan_and_operations(device, payload)
+    else:
+        plan = active.plan
+        _saves, _deletes, operations, level_result = _logging_reconcile_operations(device, payload, plan.planned_at)
+    mutation = contextlib.nullcontext(active)
+    if active is None:
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+    with mutation as writer, suppress_intent_push():
+        for operation, instance, update_fields, force_insert in operations:
+            if operation == "delete":
+                writer.delete(instance)
+            else:
+                writer.save(instance, update_fields=update_fields, force_insert=force_insert)
 
     return {
-        "hosts": list(NSOLoggingHostState.objects.filter(management=mgmt)),
-        "local_levels": levels_state,
+        "hosts": list(NSOLoggingHostState.objects.filter(management=management)),
+        "local_levels": level_result,
         "last_refreshed_at": payload.get("last_refreshed_at"),
         "refresh_source": payload.get("refresh_source", "never"),
     }
