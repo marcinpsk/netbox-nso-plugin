@@ -321,159 +321,208 @@ def _build_payload_index(payload: dict) -> tuple[set, dict, dict]:
     return payload_set, attr_map, bound_port_map
 
 
-def _create_and_link_ip(address, vrf_obj, iface, Prefix, logger, transaction, ValidationError) -> str:
-    """Create an IPAddress in IPAM, assign it to *iface*, and link a containing Prefix.
+def _interface_ip_vrf(VRF, name):
+    """Return the named VRF, or the global table when it is absent or unknown."""
+    if not name or VRF is None:
+        return None
+    return VRF.objects.filter(name=name).first()
 
-    Returns the new status string: 'imported' (materialized), 'conflict', or 'error'.
-    """
+
+def _interface_ip_native(state, vrf_obj, IPAddress, interface_type):
+    """Return the native IP assigned to the state interface under the exact GFK type."""
+    return IPAddress.objects.filter(
+        address=state.address,
+        vrf=vrf_obj,
+        assigned_object_type=interface_type,
+        assigned_object_id=state.interface_id,
+    ).first()
+
+
+def _interface_ip_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0915
+    """Build the exact native and overlay writes for one interface-IP read."""
+    from dcim.models import Interface
+    from django.contrib.contenttypes.models import ContentType
+    from django.core.exceptions import ValidationError
     from ipam.models import IPAddress
 
     try:
-        ip_obj = IPAddress(address=address, vrf=vrf_obj)
-        ip_obj.assigned_object = iface
-        ip_obj.full_clean()
-        with transaction.atomic():
-            ip_obj.save()
+        from ipam.models import VRF
+    except ImportError:
+        VRF = None
+
+    from .models import NSOInterfaceIPState
+    from .renderer_writer import planned_delete, planned_save
+
+    auto_create = _adapter_setting("interface_ip_auto_create")
+    interface_type = ContentType.objects.get_for_model(Interface)
+    iface_map = {row.name: row for row in Interface.objects.filter(device=device)}
+    states = {
+        (row.interface_id, row.address, row.vrf): row
+        for row in NSOInterfaceIPState.objects.filter(interface__device=device)
+        .select_related("interface", "peer_state")
+        .order_by("pk")
+    }
+    payload_set, attr_map, bound_port_map = _build_payload_index(payload)
+    resolved_keys = set()
+    saves = []
+    deletes = []
+    operations = []
+    prefixes = []
+
+    def save(instance, *, update_fields=None, force_insert=False, natural_key=()):
+        saves.append(
+            planned_save(
+                instance,
+                update_fields=update_fields,
+                force_insert=force_insert,
+                natural_key=natural_key,
+            )
+        )
+        operations.append(("save", instance, update_fields, force_insert))
+
+    def delete(instance):
+        deletes.append(planned_delete(instance))
+        operations.append(("delete", instance, None, False))
+
+    for iface_name, address, vrf_name in sorted(payload_set):
+        iface = iface_map.get(iface_name)
+        if iface is None and iface_name in bound_port_map:
+            iface = iface_map.get(bound_port_map[iface_name])
+        if iface is None:
+            continue
+        key = (iface.pk, address, vrf_name)
+        resolved_keys.add(key)
+        current = states.get(key)
+        attrs = attr_map.get((iface_name, address, vrf_name), {})
+        state = (
+            copy.copy(current)
+            if current is not None
+            else NSOInterfaceIPState(
+                interface=iface,
+                address=address,
+                vrf=vrf_name,
+                status="unknown",
+            )
+        )
+        state.nso_value = address
+        state.family = attrs.get("family", "ipv4")
+        state.secondary = attrs.get("secondary", False)
+        state.last_sync_at = planned_at
+
+        vrf_obj = _interface_ip_vrf(VRF, vrf_name)
+        existing_ip = IPAddress.objects.filter(address=address, vrf=vrf_obj).first()
+        previous_status = state.status
+        if existing_ip is not None and existing_ip.assigned_object == iface:
+            state.status = sm.on_reconcile(state.status, matches=True)
+            if (
+                state.auto_assigned
+                and state.status == "in_sync"
+                and previous_status != "in_sync"
+                and existing_ip.status == "reserved"
+                and (state.peer_state is None or state.peer_state.status == "in_sync")
+            ):
+                native = copy.copy(existing_ip)
+                native.status = "active"
+                save(native, update_fields=("status",))
+                if state.peer_state is not None:
+                    peer_vrf = _interface_ip_vrf(VRF, state.peer_state.vrf)
+                    peer_ip = _interface_ip_native(state.peer_state, peer_vrf, IPAddress, interface_type)
+                    if peer_ip is not None and peer_ip.status == "reserved":
+                        peer_candidate = copy.copy(peer_ip)
+                        peer_candidate.status = "active"
+                        save(peer_candidate, update_fields=("status",))
+        elif existing_ip is not None and existing_ip.assigned_object is None:
+            if auto_create:
+                native = copy.copy(existing_ip)
+                native.assigned_object = iface
+                save(native, update_fields=("assigned_object_type", "assigned_object_id"))
+                state.status = sm.on_reconcile(state.status, matches=True)
+            elif not sm.is_owned(state.status):
+                state.status = sm.on_reconcile(state.status, matches=True)
+        elif existing_ip is not None:
+            state.status = sm.on_reconcile(state.status, matches=False, conflict=True)
+        elif auto_create and state.status != "conflict":
+            native = IPAddress(address=address, vrf=vrf_obj)
+            native.assigned_object = iface
+            try:
+                native.full_clean()
+            except ValidationError:
+                if not sm.is_owned(state.status):
+                    state.status = "conflict"
+            else:
+                save(native, force_insert=True, natural_key=("address", "vrf"))
+                prefixes.append((address, vrf_obj))
+                if not sm.is_owned(state.status):
+                    state.status = "imported"
+        elif not sm.is_owned(state.status) and state.status != "conflict":
+            state.status = "imported"
+
+        save(
+            state,
+            force_insert=current is None,
+            natural_key=("interface", "address", "vrf"),
+        )
+
+    reported_addresses = {(interface_id, address) for interface_id, address, _vrf in resolved_keys}
+    for stale in states.values():
+        key = (stale.interface_id, stale.address, stale.vrf)
+        if key in resolved_keys:
+            continue
+        stale_vrf = _interface_ip_vrf(VRF, stale.vrf)
+        native = _interface_ip_native(stale, stale_vrf, IPAddress, interface_type)
+        if (stale.interface_id, stale.address) in reported_addresses:
+            if native is not None:
+                native_candidate = copy.copy(native)
+                native_candidate.assigned_object = None
+                save(native_candidate, update_fields=("assigned_object_type", "assigned_object_id"))
+            delete(stale)
+            continue
+        next_status = sm.on_reconcile(stale.status, present=False)
+        if next_status == stale.status:
+            continue
+        if native is not None:
+            native_candidate = copy.copy(native)
+            native_candidate.assigned_object = None
+            save(native_candidate, update_fields=("assigned_object_type", "assigned_object_id"))
+        candidate = copy.copy(stale)
+        candidate.status = next_status
+        candidate.last_sync_at = planned_at
+        save(candidate, update_fields=("status", "last_sync_at"))
+
+    return saves, deletes, operations, prefixes
+
+
+def _interface_ip_plan_and_operations(device, payload, planned_at=None):
+    """Freeze one interface-IP reconciliation before lock acquisition."""
+    from .renderer_writer import RendererMutationPlan
+
+    planned_at = planned_at or timezone.now()
+    saves, deletes, operations, prefixes = _interface_ip_reconcile_operations(device, payload, planned_at)
+    plan = RendererMutationPlan.build(saves=saves, deletes=deletes, planned_at=planned_at)
+    return plan, operations, prefixes
+
+
+def interface_ip_reconcile_plan(device, payload):
+    """Return the exact native and overlay mutation plan for interface IPs."""
+    plan, _operations, _prefixes = _interface_ip_plan_and_operations(device, payload)
+    return plan
+
+
+def _ensure_interface_ip_prefixes(prefixes):
+    """Create missing informational prefixes after their planned IP writes succeed."""
+    from django.db import transaction
+    from ipam.models import Prefix
+
+    for address, vrf_obj in prefixes:
         try:
-            containing = Prefix.objects.filter(
-                prefix__net_contains=address.split("/")[0],
-                vrf=vrf_obj,
-            ).first()
+            containing = Prefix.objects.filter(prefix__net_contains=address.split("/")[0], vrf=vrf_obj).first()
             if containing is None:
                 with transaction.atomic():
                     Prefix(prefix=address, vrf=vrf_obj).save()
-        except Exception as prefix_exc:  # pragma: no cover
-            logger.warning("nso_ip.prefix_link_failed addr=%s: %s", address, repr(prefix_exc))
-        return "imported"
-    except ValidationError:
-        return "conflict"
-    except Exception as exc:  # pragma: no cover
-        logger.warning("nso_ip.create_failed addr=%s: %s", address, repr(exc))
-        return "error"
+        except Exception as exc:  # pragma: no cover
+            logger.warning("nso_ip.prefix_link_failed addr=%s: %s", address, repr(exc))
 
 
-def _unassign_state_ip(state, VRF, IPAddress, transaction) -> None:
-    """Unassign the NetBox IPAddress backing *state* (if any) from its interface."""
-    vrf_obj = None
-    if state.vrf and VRF is not None:
-        try:
-            vrf_obj = VRF.objects.get(name=state.vrf)
-        except VRF.DoesNotExist:
-            pass
-    ip_obj = IPAddress.objects.filter(address=state.address, vrf=vrf_obj, assigned_object_id=state.interface_id).first()
-    if ip_obj is not None:
-        ip_obj.assigned_object = None
-        with transaction.atomic():
-            ip_obj.save(update_fields=["assigned_object_type", "assigned_object_id"])
-
-
-def _retire_stale_ip_states(device, resolved_keys, VRF, IPAddress, now, transaction, NSOInterfaceIPState) -> None:
-    """Reconcile state rows the payload no longer reports under their (iface, addr, vrf) key.
-
-    *resolved_keys* is a set of ``(interface_id, address, vrf)`` built during the
-    reconcile loop using the same logical→physical interface resolution applied
-    when the state rows were created.  Keying on ``interface_id`` (not the name
-    string) avoids spurious 'changed' drift on Nokia, where the payload carries a
-    logical router-interface name but the state row is bound to the physical port.
-
-    Two cases for a row whose full key is no longer reported:
-    - **VRF re-key** — the same ``(interface, address)`` IS still reported, just
-      under a different VRF (the VRF capture was corrected, e.g. ``"" → mgmtVrf``).
-      This is the *same* IP, not a removal, so the stale row is **deleted** (and its
-      orphaned NetBox IP unassigned) rather than left as a phantom 'changed'
-      duplicate alongside the correctly-keyed row.
-    - **Genuine removal** — the address is gone entirely → unassign + mark 'changed'.
-    """
-    existing_states = NSOInterfaceIPState.objects.filter(interface__device=device).select_related("interface")
-    # (interface_id, address) reported under *any* VRF this run.
-    reported_addr = {(iface_id, addr) for (iface_id, addr, _vrf) in resolved_keys}
-    for state in existing_states:
-        key = (state.interface_id, state.address, state.vrf)
-        if key in resolved_keys:
-            continue
-        if (state.interface_id, state.address) in reported_addr:
-            # VRF re-key: same IP, corrected VRF → drop the stale variant.
-            _unassign_state_ip(state, VRF, IPAddress, transaction)
-            state.delete()
-            continue
-        # Drift on genuine removal — but accepted/deploying (pending push, device
-        # legitimately doesn't have it yet) is preserved by on_reconcile.
-        new_status = sm.on_reconcile(state.status, present=False)
-        if new_status == state.status:
-            continue
-        _unassign_state_ip(state, VRF, IPAddress, transaction)
-        state.status = new_status
-        state.last_sync_at = now
-        state.save(update_fields=["status", "last_sync_at"])
-
-
-def _settle_existing_ip(
-    state, prev_status, existing_ip, iface, auto_create, address, IPAddress, transaction, logger
-) -> str:
-    """Return the next status for a payload address whose IPAddress already exists in IPAM.
-
-    Three cases:
-    - assigned to *iface* → matches (owned settles in_sync, unowned rests imported);
-      first in_sync of an auto-assigned reserved IP also activates it (+P2P peer).
-    - UNASSIGNED — nothing is "assigned elsewhere", so this is adoption, not a
-      conflict: with auto_create assign it to the reporting interface; record-only
-      mode leaves IPAM untouched. Either way the machine's conflict --reconcile-->
-      imported edge lets rows a stricter past run flagged 'conflict' self-heal.
-    - assigned to a different object → adoption conflict.
-    """
-    if existing_ip.assigned_object == iface:
-        status = sm.on_reconcile(state.status, matches=True)
-        if (
-            state.auto_assigned
-            and status == "in_sync"
-            and prev_status != "in_sync"
-            and existing_ip.status == "reserved"
-        ):
-            _activate_auto_assigned_ip(state, existing_ip, address, iface, IPAddress, logger)
-        return status
-    if existing_ip.assigned_object is None:
-        if auto_create:
-            existing_ip.assigned_object = iface
-            with transaction.atomic():
-                existing_ip.save(update_fields=["assigned_object_type", "assigned_object_id"])
-            return sm.on_reconcile(state.status, matches=True)
-        if not sm.is_owned(state.status):
-            return sm.on_reconcile(state.status, matches=True)
-        return state.status
-    return sm.on_reconcile(state.status, matches=False, conflict=True)
-
-
-def _activate_auto_assigned_ip(state, existing_ip, address, iface, IPAddress, logger):
-    """Promote *existing_ip* (and its P2P peer if applicable) from reserved → active.
-
-    Called when an auto-assigned IP reaches ``in_sync`` for the first time.
-    For P2P pairs, the second end to arrive in_sync also activates the peer's IP.
-    """
-    peer_state = state.peer_state
-    if peer_state is not None and peer_state.status != "in_sync":
-        return  # first P2P end — wait for peer
-
-    try:
-        existing_ip.status = "active"
-        existing_ip.save(update_fields=["status"])
-    except Exception as _exc:
-        logger.warning("nso_ip.activate_failed addr=%s iface=%s: %s", address, iface, repr(_exc))
-
-    if peer_state is not None:
-        try:
-            peer_ip = IPAddress.objects.filter(
-                address=peer_state.address,
-                assigned_object_id=peer_state.interface_id,
-                status="reserved",
-            ).first()
-            if peer_ip is not None:
-                peer_ip.status = "active"
-                peer_ip.save(update_fields=["status"])
-        except Exception as _exc:
-            logger.warning("nso_ip.activate_peer_failed peer_addr=%s: %s", peer_state.address, repr(_exc))
-
-
-@mirror_reconciler
 def _reconcile_interface_ips(device, payload: dict) -> list:
     """Reconcile IP addresses from the adapter payload into NetBox IPAM.
 
@@ -493,82 +542,30 @@ def _reconcile_interface_ips(device, payload: dict) -> list:
 
     Returns a list of NSOInterfaceIPState instances (all current rows for device).
     """
-    import logging
-
-    from dcim.models import Interface
-    from django.core.exceptions import ValidationError
-    from django.db import transaction
-    from django.utils import timezone
-    from ipam.models import IPAddress, Prefix
-
-    try:
-        from ipam.models import VRF
-    except ImportError:
-        VRF = None
-
     from .models import NSOInterfaceIPState
+    from .renderer_writer import active_renderer_writer, renderer_mirror_writes, renderer_writes
+    from .signals import suppress_intent_push
 
-    logger = logging.getLogger(__name__)
-    auto_create = _adapter_setting("interface_ip_auto_create")
-
-    iface_map = {i.name: i for i in Interface.objects.filter(device=device)}
-    payload_set, attr_map, bound_port_map = _build_payload_index(payload)
-    now = timezone.now()
-    # (interface_id, address, vrf) for every payload entry that resolved to a real
-    # interface — the retire pass compares against this, not the logical name set.
-    resolved_keys: set[tuple[int, str, str]] = set()
-
-    for iface_name, address, vrf_name in payload_set:
-        # For Nokia devices: logical router-interface → physical port lookup.
-        # bound_port_map[iface_name] = physical port ID (e.g. "1/1/c11/1" or "lag-99:10").
-        # If the logical interface isn't in iface_map (Nokia logical names differ from
-        # dcim.Interface names), fall back to the bound_port as the interface name.
-        iface = iface_map.get(iface_name)
-        if iface is None and iface_name in bound_port_map:
-            bound_port = bound_port_map[iface_name]
-            iface = iface_map.get(bound_port)
-        if iface is None:
-            continue
-        resolved_keys.add((iface.pk, address, vrf_name))
-
-        vrf_obj = None
-        if vrf_name and VRF is not None:
-            try:
-                vrf_obj = VRF.objects.get(name=vrf_name)
-            except VRF.DoesNotExist:
-                pass
-
-        attrs = attr_map.get((iface_name, address, vrf_name), {})
-        family = attrs.get("family", "ipv4")
-        secondary = attrs.get("secondary", False)
-
-        state, _ = NSOInterfaceIPState.objects.get_or_create(
-            interface=iface,
-            address=address,
-            vrf=vrf_name,
-            defaults={"status": "unknown", "nso_value": address, "family": family, "secondary": secondary},
+    active = active_renderer_writer()
+    if active is None:
+        plan, operations, prefixes = _interface_ip_plan_and_operations(device, payload)
+    else:
+        plan = active.plan
+        _saves, _deletes, operations, prefixes = _interface_ip_reconcile_operations(
+            device,
+            payload,
+            plan.planned_at,
         )
-        state.nso_value = address
-        state.family = family
-        state.secondary = secondary
-        state.last_sync_at = now
-
-        prev_status = state.status
-        existing_ip = IPAddress.objects.filter(address=address, vrf=vrf_obj).first()
-        if existing_ip is not None:
-            state.status = _settle_existing_ip(
-                state, prev_status, existing_ip, iface, auto_create, address, IPAddress, transaction, logger
-            )
-        elif auto_create and state.status != "conflict":
-            result = _create_and_link_ip(address, vrf_obj, iface, Prefix, logger, transaction, ValidationError)
-            if not sm.is_owned(state.status):
-                state.status = result
-        elif not sm.is_owned(state.status) and state.status != "conflict":
-            state.status = "imported"
-
-        state.save()
-
-    _retire_stale_ip_states(device, resolved_keys, VRF, IPAddress, now, transaction, NSOInterfaceIPState)
+    mutation = contextlib.nullcontext(active)
+    if active is None:
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+    with mutation as writer, suppress_intent_push():
+        for operation, instance, update_fields, force_insert in operations:
+            if operation == "delete":
+                writer.delete(instance)
+            else:
+                writer.save(instance, update_fields=update_fields, force_insert=force_insert)
+        _ensure_interface_ip_prefixes(prefixes)
 
     return list(NSOInterfaceIPState.objects.filter(interface__device=device).select_related("interface"))
 

@@ -148,6 +148,19 @@ _CONVERTED_SCOPE_RULES = {
             "Native interface and cable events are not ownership evidence and do not recompute derived values."
         ),
     ),
+    "ip": ScopeOwnershipRule(
+        scope="ip",
+        native_model_labels=("ipam.ipaddress",),
+        native_key_fields=("address", "vrf_id", "assigned_object_type_id", "assigned_object_id"),
+        overlay_model_labels=("netbox_nso_plugin.nsointerfaceipstate",),
+        overlay_native_fields=(("netbox_nso_plugin.nsointerfaceipstate", "__ip_address__"),),
+        foreign_overlay_delete="reown",
+        deletion_authority=True,
+        intentional_semantic_delta=(
+            "Acquire from an exact persisted IPAddress and interface-IP state pair. "
+            "Native IP save and delete events are not ownership evidence. Reconcile activation and unassignment are atomic."
+        ),
+    ),
     "logging": ScopeOwnershipRule(
         scope="logging",
         native_model_labels=(
