@@ -769,6 +769,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
         _reconcile_snmp_config,
         _reconcile_static_routes,
         _upsert_interface_states,
+        interface_reconcile_plan,
         isis_reconcile_plan,
         ospf_reconcile_plan,
         snmp_reconcile_plan,
@@ -822,6 +823,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: _upsert_interface_states(device, fetched_interfaces),
                 epoch=dev_id,
                 ctx_key="interface_states",
+                pre_body=lambda: interface_reconcile_plan(device, fetched_interfaces),
             )
             if interface_result.disposition in ("ran", "legacy"):
                 ctx["interfaces"] = fetched_interfaces
@@ -907,6 +909,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: _upsert_interface_states(device, fetched_interfaces),
                 epoch=dev_id,
                 ctx_key="interface_states",
+                pre_body=lambda: interface_reconcile_plan(device, fetched_interfaces),
             )
             if interface_result.disposition in ("ran", "legacy"):
                 ctx["interfaces"] = fetched_interfaces

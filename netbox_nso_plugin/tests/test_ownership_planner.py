@@ -203,6 +203,7 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
 
         assert set(rules) == {
             "bfd",
+            "interface",
             "interface_mtu",
             "lacp",
             "logging",
