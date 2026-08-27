@@ -253,11 +253,27 @@ class TestSnmpUnpushableRowsAreRefusedNotDowngraded(_SnmpBase):
 
     def test_an_already_owned_v3_user_missing_protocols_is_never_pushed_degraded(self):
         """Defence in depth for rows owned before the accept-time guard existed (or via the
-        API): the snapshot builder must drop them AND surface them, not emit a null protocol."""
+        API): reconciliation surfaces them and the pure renderer omits them."""
         from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.template_content import _reconcile_snmp_config
 
         mgmt = self._make_mgmt()
         user = self._v3_user(mgmt, status="accepted")  # owned, protocols never declared
+        _reconcile_snmp_config(
+            self.device,
+            {
+                "communities": [],
+                "v3_users": [
+                    {
+                        "username": user.username,
+                        "has_auth_secret": True,
+                        "has_priv_secret": True,
+                    }
+                ],
+                "hosts": [],
+                "system_info": None,
+            },
+        )
 
         with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
             deliver("snmp", mgmt.device_id, mgmt.adapter_device_id)

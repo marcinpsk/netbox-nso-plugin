@@ -586,6 +586,19 @@ def _reconcile_snmp_system_info(mgmt, sys_data: dict, now):
     return state
 
 
+def _surface_unpushable_snmp_row(model, pk, blocker) -> None:
+    """Mark an owned row as errored when its current state cannot render safely."""
+    row = model.objects.select_for_update(of=("self",)).filter(pk=pk).first()
+    if row is None or not sm.is_owned(row.status):
+        return
+    reason = blocker(row)
+    if not reason:
+        return
+    logger.warning("SNMP reconcile: %s cannot be rendered — %s", row, reason)
+    row.status = sm.ERROR
+    row.save(update_fields=["status"])
+
+
 @mirror_reconciler
 def _reconcile_snmp_config(device, payload: dict) -> dict:
     """Full-replace import of SNMP config from adapter into plugin SNMP state models.
@@ -607,6 +620,7 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
         NSOSnmpHostState,
         NSOSnmpV3UserState,
     )
+    from .signals import snmp_host_push_blocker, snmp_v3_user_push_blocker
 
     now = timezone.now()
 
@@ -678,6 +692,7 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
         state.last_sync_at = now
         state.status = sm.on_reconcile(state.status, matches=None, settles_deploying=False)  # mirror overlay
         state.save(update_fields=["has_auth_secret", "has_priv_secret", "last_sync_at", "status"])
+        _surface_unpushable_snmp_row(NSOSnmpV3UserState, state.pk, snmp_v3_user_push_blocker)
     _retire_absent_snmp_rows(NSOSnmpV3UserState, mgmt, "username", incoming_usernames)
 
     # ── Hosts ──────────────────────────────────────────────────────────────────
@@ -726,6 +741,7 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
                 setattr(state, f, v)
             state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
             state.save()
+        _surface_unpushable_snmp_row(NSOSnmpHostState, state.pk, snmp_host_push_blocker)
     _retire_absent_snmp_rows(NSOSnmpHostState, mgmt, "address", incoming_addresses)
 
     system_info_state = _reconcile_snmp_system_info(mgmt, payload.get("system_info") or {}, now)
