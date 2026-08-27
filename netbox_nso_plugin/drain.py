@@ -469,9 +469,9 @@ def _form(state, mgmt, now, mode, force) -> Claim | None:
     from .models import NSOIntentOutboxEntry
 
     device_id, scope = state.device_id, state.scope
-    marking_mode = delivery.delivery_keys()[scope].marking_mode
     if mode == delivery.MODE_BACKFILL_ONLY:
         return _form_backfill(state, mgmt, now)
+    marking_mode = delivery.delivery_keys()[scope].marking_mode
     rows = list(_unconsumed(device_id, scope).select_for_update().order_by("id"))
     entry_ids = [row.pk for row in rows]
     mark = all(row.mark_and for row in rows) if rows else None
@@ -1746,7 +1746,7 @@ def drain_intent_outbox(limit=None) -> tuple[int, int]:
 def _drain_intent_outbox(limit=None) -> tuple[int, int]:
     """Run one tick with a new deployment admission for each bounded stage."""
     try:
-        with _deployment_operation("intent outbox compaction"):
+        with _deployment_operation("intent outbox tick"):
             _compact_intent_outbox(limit)
     except DeploymentQuiesced:
         logger.info("the intent outbox tick is paused for a deployment")

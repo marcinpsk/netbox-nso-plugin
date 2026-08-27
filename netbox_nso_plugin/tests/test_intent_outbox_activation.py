@@ -271,8 +271,7 @@ class TestOutrightDeletionFansOutAuthority(_ActivationCase):
         from netbox_nso_plugin import drain
         from netbox_nso_plugin.signals import _accept_static_route_for_device, suppress_intent_push
 
-        other_device, _unused = make_managed("fanout-other", 7967, index=2)
-        other_mgmt = _unused
+        other_device, other_mgmt = make_managed("fanout-other", 7967, index=2)
         route = own_route(self.mgmt, "198.18.0.144/28", "198.18.0.145")
         with without_commit_drain(), transaction.atomic():
             with suppress_intent_push():

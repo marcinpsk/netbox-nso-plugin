@@ -145,11 +145,15 @@ class TestTheTickDrainsTheTail(_DrainCase):
     def test_the_tick_enters_the_deployment_gate_once_before_compaction(self):
         from netbox_nso_plugin import drain
 
-        with CaptureQueriesContext(connection) as queries:
+        with (
+            CaptureQueriesContext(connection) as queries,
+            patch.object(drain, "_deployment_operation", wraps=drain._deployment_operation) as operation,
+        ):
             assert drain.drain_intent_outbox() == (0, 0)
 
         admissions = [query["sql"] for query in queries if "pg_try_advisory_lock_shared" in query["sql"].lower()]
         assert len(admissions) == 1, admissions
+        operation.assert_called_once_with("intent outbox tick")
 
     def test_a_queued_exclusive_transition_stops_a_real_drain_between_keys(self):
         from netbox_nso_plugin import deployment, drain, jobs
@@ -272,45 +276,50 @@ class TestTheTickDrainsTheTail(_DrainCase):
                 connection.close()
                 thread_connections_closed.append(connection.connection is None)
 
-        with (
-            patch("netbox_nso_plugin.sync_cache._snapshot", side_effect=snapshot),
-            patch("netbox_nso_plugin.sync_cache.refresh_sync_caches", return_value=(0, 0)),
-            patch("netbox_nso_plugin.sync_cache.reconcile_device_links", return_value=(0, 0)),
-            patch("netbox_nso_plugin.drain.drain_intent_outbox", return_value=(0, 0)),
-            patch("netbox_nso_plugin.settlement.sweep_static_route_settlements", return_value=(0, 0)),
-        ):
-            worker = threading.Thread(target=run_job)
-            waiter = threading.Thread(target=request_quiesce)
-            worker.start()
-            self.assertTrue(snapshot_started.wait(5), "the maintenance job did not reach its snapshot")
-            waiter.start()
-
-            deadline = time.monotonic() + 5
-            queued = False
-            while time.monotonic() < deadline:
-                if waiter_pid:
-                    with connection.cursor() as cursor:
-                        cursor.execute(
-                            "SELECT EXISTS (SELECT 1 FROM pg_locks "
-                            "WHERE pid = %s AND locktype = 'advisory' AND NOT granted)",
-                            [waiter_pid[0]],
-                        )
-                        queued = cursor.fetchone()[0]
-                if queued or quiesce_finished.is_set():
-                    break
-                time.sleep(0.01)
-
-            release_snapshot.set()
-            worker.join(timeout=10)
-            waiter.join(timeout=10)
-
+        worker = threading.Thread(target=run_job)
+        waiter = threading.Thread(target=request_quiesce)
+        queued = False
         try:
+            with (
+                patch("netbox_nso_plugin.sync_cache._snapshot", side_effect=snapshot),
+                patch("netbox_nso_plugin.sync_cache.refresh_sync_caches", return_value=(0, 0)),
+                patch("netbox_nso_plugin.sync_cache.reconcile_device_links", return_value=(0, 0)),
+                patch("netbox_nso_plugin.drain.drain_intent_outbox", return_value=(0, 0)),
+                patch("netbox_nso_plugin.settlement.sweep_static_route_settlements", return_value=(0, 0)),
+            ):
+                worker.start()
+                self.assertTrue(snapshot_started.wait(5), "the maintenance job did not reach its snapshot")
+                waiter.start()
+
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    if waiter_pid:
+                        with connection.cursor() as cursor:
+                            cursor.execute(
+                                "SELECT EXISTS (SELECT 1 FROM pg_locks "
+                                "WHERE pid = %s AND locktype = 'advisory' AND NOT granted)",
+                                [waiter_pid[0]],
+                            )
+                            queued = cursor.fetchone()[0]
+                    if queued or quiesce_finished.is_set():
+                        break
+                    time.sleep(0.01)
+
+                release_snapshot.set()
+                worker.join(timeout=10)
+                waiter.join(timeout=10)
+
             self.assertTrue(queued, "the maintenance job did not hold the deployment lock")
             self.assertFalse(worker.is_alive(), "the maintenance job did not finish")
             self.assertFalse(waiter.is_alive(), "the exclusive transition did not finish")
             self.assertEqual(errors, [])
             self.assertEqual(thread_connections_closed, [True, True])
         finally:
+            release_snapshot.set()
+            if worker.ident is not None:
+                worker.join(timeout=10)
+            if waiter.ident is not None:
+                waiter.join(timeout=10)
             if deployment.is_quiesced():
                 deployment.resume()
 
