@@ -674,6 +674,20 @@ class NSODeviceManagement(NetBoxModel):
         A save that NAMES its fields is untouched: every writer of these columns names
         them deliberately, holding this same row lock.
         """
+        from .management_lifecycle import management_crud_is_active, save_management
+        from .renderer_writer import active_renderer_writer
+
+        if management_crud_is_active() and active_renderer_writer() is None:
+            if args or kwargs.keys() - {"force_insert", "update_fields", "using"}:
+                raise TypeError("the management CRUD writer accepts only force_insert, update_fields, and using")
+            using = kwargs.get("using")
+            if using not in (None, "default"):
+                raise ValueError("the management CRUD writer supports only the default database")
+            return save_management(
+                self,
+                update_fields=kwargs.get("update_fields"),
+                force_insert=kwargs.get("force_insert", False),
+            )
         if kwargs.get("update_fields") is not None or not self.pk:
             with transaction.atomic():
                 return super().save(*args, **kwargs)
@@ -684,6 +698,17 @@ class NSODeviceManagement(NetBoxModel):
                 for field in protected:
                     setattr(self, field, current[field])
             return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        """Route sanctioned management CRUD deletes through the exact writer."""
+        from .management_lifecycle import delete_management, management_crud_is_active
+        from .renderer_writer import active_renderer_writer
+
+        if management_crud_is_active() and active_renderer_writer() is None:
+            if args or kwargs:
+                raise TypeError("the management CRUD writer does not accept delete options")
+            return delete_management(self)
+        return super().delete(*args, **kwargs)
 
     def get_absolute_url(self):
         """Return the detail URL for this management record."""

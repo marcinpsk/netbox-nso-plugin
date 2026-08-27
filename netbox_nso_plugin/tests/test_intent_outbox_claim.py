@@ -71,8 +71,8 @@ class TestClaimFoldsEveryEntryOnce(_ClaimCase):
         states = [own_vlan(self.mgmt, 800 + index, self.tag) for index in range(3)]
         self.clear_entries()
         with without_commit_drain(), transaction.atomic():
-            for state in states:
-                state.save()
+            for _state in states:
+                enqueue(self.device, "vlan")
 
         assert len(entries(self.device, "vlan", unconsumed=True)) == 3
 
@@ -94,12 +94,12 @@ class TestClaimFoldsEveryEntryOnce(_ClaimCase):
         self.clear_entries()
 
         with without_commit_drain(), transaction.atomic():
-            for _device, mgmt in others:
-                mgmt.vlan_states.first().save()
+            for device, _mgmt in others:
+                enqueue(device, "vlan")
             # One key carrying more entries than the whole pass may claim keys: the cap is
             # over keys, and a fold truncated at it would ship a body without its authority.
             for _ in range(drain.DRAIN_BATCH + 1):
-                self.mgmt.vlan_states.first().save()
+                enqueue(self.device, "vlan")
 
         config, session = self.adapter.patches()
         with patch.object(drain, "DRAIN_BATCH", 2), config, session:
@@ -205,12 +205,12 @@ class TestDigestEqualClaimRetiresItsRows(_ClaimCase):
     def test_an_unchanged_save_sends_nothing_retires_its_rows_and_the_gate_then_passes(self):
         from netbox_nso_plugin import drain
 
-        state = own_vlan(self.mgmt, 840, self.tag)
+        own_vlan(self.mgmt, 840, self.tag)
         assert self.drain() == drain.SUCCEEDED
         sent = len(self.adapter.requests)
 
         with without_commit_drain(), transaction.atomic():
-            state.save()
+            enqueue(self.device, "vlan")
         assert len(entries(self.device, "vlan", unconsumed=True)) == 1
 
         assert self.drain() == drain.NOTHING
@@ -264,10 +264,11 @@ class TestFailureKeepsTheWorkAndTheBaseline(_ClaimCase):
         failed_seq = state_of(self.device, "vlan").push_seq
 
         self.adapter.fail_with = None
+        from netbox_nso_plugin.vlan_reconciler import save_vlan_content
+
         with without_commit_drain(), transaction.atomic():
             state.vlan.name = "cl-dig-renamed"
-            state.vlan.save()
-            state.save()
+            save_vlan_content(state.vlan, update_fields=("name",))
 
         assert self.drain() == drain.SUCCEEDED
 
@@ -598,14 +599,14 @@ class TestTheBaselineIsBoundToTheAdapterMapping(_ClaimCase):
         from netbox_nso_plugin import drain
         from netbox_nso_plugin.models import NSODeviceManagement
 
-        overlay = own_vlan(self.mgmt, 860, self.tag)
+        own_vlan(self.mgmt, 860, self.tag)
         assert self.drain() == drain.SUCCEEDED
         assert f"/devices/{self.adapter_device_id}/" in self.adapter.requests[-1]["url"]
 
         # The link repair's own write: our node turned up under a different adapter id.
         NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_device_id=self.moved_device_id)
         with without_commit_drain(), transaction.atomic():
-            overlay.save()
+            enqueue(self.device, "vlan")
 
         assert self.drain() == drain.SUCCEEDED, "the moved device has never been sent this intent"
 
@@ -617,13 +618,13 @@ class TestTheBaselineIsBoundToTheAdapterMapping(_ClaimCase):
         from netbox_nso_plugin import drain
         from netbox_nso_plugin.models import NSODeviceManagement
 
-        overlay = own_vlan(self.mgmt, 861, self.tag)
+        own_vlan(self.mgmt, 861, self.tag)
         assert self.drain() == drain.SUCCEEDED
         sent = len(self.adapter.requests)
 
         NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_incarnation="cl-remap-rebuilt")
         with without_commit_drain(), transaction.atomic():
-            overlay.save()
+            enqueue(self.device, "vlan")
 
         assert self.drain() == drain.SUCCEEDED
         assert len(self.adapter.requests) == sent + 1
@@ -692,7 +693,7 @@ class TestTheBaselineSeesARebuiltStoreBeforeAnythingAdoptsIt(_ClaimCase):
     def test_an_unchanged_save_sends_to_the_store_the_tab_has_only_observed(self):
         from netbox_nso_plugin import drain
 
-        overlay = own_vlan(self.mgmt, 862, self.tag)
+        own_vlan(self.mgmt, 862, self.tag)
         assert self.drain() == drain.SUCCEEDED
         sent = len(self.adapter.requests)
 
@@ -701,7 +702,7 @@ class TestTheBaselineSeesARebuiltStoreBeforeAnythingAdoptsIt(_ClaimCase):
         assert self.mgmt.reset_pending_incarnation == self.inc_b
 
         with without_commit_drain(), transaction.atomic():
-            overlay.save()
+            enqueue(self.device, "vlan")
 
         assert self.drain() == drain.SUCCEEDED, "the rebuilt store has never been sent this intent"
         assert len(self.adapter.requests) == sent + 1
@@ -715,7 +716,7 @@ class TestTheBaselineSeesARebuiltStoreBeforeAnythingAdoptsIt(_ClaimCase):
         """
         from netbox_nso_plugin import drain
 
-        overlay = own_vlan(self.mgmt, 863, self.tag)
+        own_vlan(self.mgmt, 863, self.tag)
         assert self.drain() == drain.SUCCEEDED
         sent = len(self.adapter.requests)
 
@@ -725,7 +726,7 @@ class TestTheBaselineSeesARebuiltStoreBeforeAnythingAdoptsIt(_ClaimCase):
         assert self.mgmt.reset_pending_incarnation == self.inc_b
 
         with without_commit_drain(), transaction.atomic():
-            overlay.save()
+            enqueue(self.device, "vlan")
 
         assert self.drain() == drain.SUCCEEDED
         assert len(self.adapter.requests) == sent + 1

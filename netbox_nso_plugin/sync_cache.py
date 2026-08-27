@@ -19,6 +19,8 @@ from datetime import UTC, datetime
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
+from .models import NSODeviceManagement
+
 logger = logging.getLogger(__name__)
 
 # Sort key for a row the link repair has never tried, so it goes to the front of the queue.
@@ -43,10 +45,18 @@ class _LinkReconcileNoOp(Exception):
 
 
 def _mirror_management(mgmt, **values) -> None:
-    """Persist lifecycle-only adapter observations with one locked instance save."""
-    from .intent_state import update_mirror_fields
+    """Persist lifecycle-only adapter observations through the exact writer."""
+    from .management_lifecycle import save_management
 
-    update_mirror_fields(mgmt, **values)
+    fields = frozenset(values)
+    current = NSODeviceManagement.objects.filter(pk=mgmt.pk).first()
+    if current is None:
+        return
+    for field_name, value in values.items():
+        setattr(current, field_name, value)
+    save_management(current, update_fields=fields)
+    for field_name, value in values.items():
+        setattr(mgmt, field_name, value)
 
 
 def parse_adapter_timestamp(value, field="timestamp"):
@@ -264,6 +274,7 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
         expected_source = (mgmt.nso_instance_id, mgmt.nso_device_name, mgmt.adapter_device_id)
         try:
             from .intent_state import footprint_for_instance, intent_transaction
+            from .management_lifecycle import save_management
 
             with intent_transaction(footprint_for_instance(mgmt)):
                 current = type(mgmt).objects.get(pk=mgmt.pk)
@@ -293,7 +304,7 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
                         current.nso_device_name,
                     )
                     _mirror_management(current, adapter_device_id=None)
-                current.save()  # re-fires sync_scope_to_adapter → onboard / not-found recovery → scope
+                save_management(current)
         except _LinkReconcileNoOp:
             continue
         except Exception:  # noqa: BLE001 — one bad row must not abort the sweep

@@ -949,6 +949,62 @@ class TestNSODeviceManagementEditView(ViewTestBase):
         # Should not raise; nso_device_name stays unset
         self.assertNotIn("nso_device_name", form.initial)
 
+    def test_edit_post_finalizes_the_exact_renderer_fingerprint(self):
+        """The production form update uses the exact management-row writer."""
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:nsodevicemanagement_edit", args=[self.mgmt.pk]),
+            {
+                "device": self.device.pk,
+                "nso_instance": self.nso_instance.pk,
+                "nso_device_name": self.mgmt.nso_device_name,
+                "manage_enabled": "on",
+                "sync_before_apply": "on",
+            },
+        )
+
+        self.assertEqual(response.status_code, 302)
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="interface")
+        rendered = delivery.render("interface", self.device.pk, self.mgmt.adapter_device_id)
+        self.assertEqual(revision.verified_revision, revision.revision)
+        self.assertEqual(revision.verified_fingerprint, delivery.canonical_fingerprint(rendered.payload))
+
+    def test_delete_post_finalizes_the_empty_renderer_fingerprint(self):
+        """The production form delete uses the exact management-row writer."""
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        device_id = self.device.pk
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:nsodevicemanagement_delete", args=[self.mgmt.pk]),
+            {"confirm": "on"},
+        )
+
+        self.assertEqual(response.status_code, 302)
+        revision = NSOIntentRevision.objects.get(device_id=device_id, scope="interface")
+        rendered = delivery.render("interface", device_id, None)
+        self.assertEqual(revision.verified_revision, revision.revision)
+        self.assertEqual(revision.verified_fingerprint, delivery.canonical_fingerprint(rendered.payload))
+
+    def test_bulk_delete_finalizes_the_empty_renderer_fingerprint(self):
+        """The production bulk-delete flow uses the exact management-row writer."""
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        device_id = self.device.pk
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:nsodevicemanagement_bulk_delete"),
+            {"pk": [self.mgmt.pk], "_confirm": "Confirm", "confirm": "on"},
+        )
+
+        self.assertEqual(response.status_code, 302)
+        revision = NSOIntentRevision.objects.get(device_id=device_id, scope="interface")
+        rendered = delivery.render("interface", device_id, None)
+        self.assertEqual(revision.verified_revision, revision.revision)
+        self.assertEqual(revision.verified_fingerprint, delivery.canonical_fingerprint(rendered.payload))
+
 
 class TestAdapterConnectionEditView(ViewTestBase):
     """Tests for AdapterConnectionEditView singleton."""
@@ -4737,7 +4793,8 @@ class TestOverlayFieldEditView(ViewTestBase):
         from django.utils import timezone
         from ipam.models import VLAN, VLANGroup
 
-        from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOOwnershipManifest, NSOVLANState
 
         group = VLANGroup.objects.create(name="Shared Inline VLANs", slug="shared-inline-vlans")
         vlan = VLAN.objects.create(group=group, vid=120, name="OLD-NAME")
@@ -4781,11 +4838,33 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertIsNone(second.apply_attempt_id)
         self.assertIsNotNone(first.accepted_at)
         self.assertIsNotNone(second.accepted_at)
+        for state in (first, second):
+            revision = NSOIntentRevision.objects.get(device=state.management.device, scope="vlan")
+            self.assertEqual(revision.verified_revision, revision.revision)
+            self.assertEqual(
+                revision.verified_fingerprint,
+                delivery.canonical_fingerprint(
+                    delivery.render(
+                        "vlan",
+                        state.management.device_id,
+                        state.management.adapter_device_id,
+                    ).payload
+                ),
+            )
+            self.assertTrue(
+                NSOOwnershipManifest.objects.filter(
+                    device=state.management.device,
+                    scope="vlan",
+                    native_model_label="ipam.vlan",
+                    native_key={"group_id": vlan.group_id, "vid": vlan.vid},
+                    ownership_state="owned",
+                ).exists()
+            )
 
     def test_edit_vlan_name_reports_when_the_vlan_is_deleted_before_save(self):
         from ipam.models import VLAN, VLANGroup
 
-        from netbox_nso_plugin.intent_state import deletion_footprint_for_instance, intent_transaction, vlan_footprint
+        from netbox_nso_plugin.intent_state import deletion_footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSOIntentRevision, NSOVLANState
         from netbox_nso_plugin.signals import suppress_intent_push
 
@@ -4799,14 +4878,14 @@ class TestOverlayFieldEditView(ViewTestBase):
         )
         revisions_after_delete = []
 
-        def delete_then_resolve(vlan_id, scopes, **kwargs):
+        def delete_then_load(vlan_model, vlan_id):
             doomed = VLAN.objects.get(pk=vlan_id)
             with suppress_intent_push(), intent_transaction(deletion_footprint_for_instance(doomed)):
                 doomed.delete()
             revisions_after_delete.append(NSOIntentRevision.objects.get(device=self.device, scope="vlan").revision)
-            return vlan_footprint(vlan_id, scopes, **kwargs)
+            return None, ()
 
-        with patch("netbox_nso_plugin.intent_state.vlan_footprint", new=delete_then_resolve):
+        with patch("netbox_nso_plugin.views._vlan_name_edit_rows", new=delete_then_load):
             response = self.client.post(self._url("vlan_name", state.pk), {"name": "UNSAVED-NAME"})
 
         self.assertEqual(response.status_code, 400, response.content)
@@ -4822,7 +4901,8 @@ class TestOverlayFieldEditView(ViewTestBase):
         from django.utils import timezone
         from ipam.models import VLAN, VLANGroup
 
-        from netbox_nso_plugin.models import NSOSVIState
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOOwnershipManifest, NSOSVIState
 
         group = VLANGroup.objects.create(name="Inline SVI VLANs", slug="inline-svi-vlans")
         vlan = VLAN.objects.create(group=group, vid=220, name="CUSTOMER-A")
@@ -4849,6 +4929,21 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(state.interface_id, interface.pk)
         self.assertEqual(state.vlan_id, vlan.pk)
         self.assertEqual(state.svi_type, "svi")
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="svi")
+        self.assertEqual(revision.verified_revision, revision.revision)
+        self.assertEqual(
+            revision.verified_fingerprint,
+            delivery.canonical_fingerprint(delivery.render("svi", self.device.pk, self.mgmt.adapter_device_id).payload),
+        )
+        self.assertTrue(
+            NSOOwnershipManifest.objects.filter(
+                device=self.device,
+                scope="svi",
+                native_model_label="dcim.interface",
+                native_key={"device_id": interface.device_id, "name": interface.name},
+                ownership_state="owned",
+            ).exists()
+        )
 
     def test_edit_subinterface_l3_values_takes_ownership_without_changing_identity(self):
         from netbox_nso_plugin.models import NSOSubinterfaceState

@@ -23,6 +23,8 @@ from django.test.utils import CaptureQueriesContext
 from ._outbox_case import (
     ReceiptAdapter,
     as_per_object,
+    delete_vlan_state,
+    enqueue,
     entries,
     last_acked,
     make_managed,
@@ -30,6 +32,7 @@ from ._outbox_case import (
     own_route,
     own_vlan,
     partition,
+    rename_vlan,
     state_of,
     triple,
     without_commit_drain,
@@ -414,9 +417,7 @@ class TestAnAcknowledgedSuccessRetiresItsRows(_OutcomeCase):
         state = own_vlan(self.mgmt, 900, self.tag)
         for index in range(4):
             with without_commit_drain(), transaction.atomic():
-                state.vlan.name = f"cl-{self.tag}-{index}"
-                state.vlan.save()
-                state.save()
+                rename_vlan(state, f"cl-{self.tag}-{index}")
             assert self.drain("vlan") == drain.SUCCEEDED
             assert NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").count() == 0
 
@@ -531,9 +532,7 @@ class TestTheDegradationRecordOutlivesEverySuccess(_OutcomeCase):
         )
         state = self.mgmt.vlan_states.first()
         with without_commit_drain(), transaction.atomic():
-            state.vlan.name = "cl-degr-renamed"
-            state.vlan.save()
-            state.save()
+            rename_vlan(state, "cl-degr-renamed")
 
         assert self.drain("vlan") == drain.SUCCEEDED
         assert state_of(self.device, "vlan").degraded_deletions != []
@@ -738,7 +737,7 @@ class TestStoreOnlyCarriesNoAuthority(_OutcomeCase):
         self.clear_entries()
 
         with without_commit_drain(), transaction.atomic():
-            leaving.delete()
+            delete_vlan_state(leaving)
         pending = [row.pk for row in entries(self.device, "vlan", unconsumed=True)]
         assert pending, "the marked deletion is recorded and nothing has folded it yet"
         sent = len(self.adapter.requests)
@@ -786,10 +785,10 @@ class TestGateBlockerQueriesAreDistinct(_OutcomeCase):
     def test_entry_blockers_are_deduplicated_by_the_database(self):
         from netbox_nso_plugin import drain
 
-        state = own_vlan(self.mgmt, 932, self.tag)
+        own_vlan(self.mgmt, 932, self.tag)
         with without_commit_drain(), transaction.atomic():
-            state.save()
-            state.save()
+            enqueue(self.device, "vlan")
+            enqueue(self.device, "vlan")
 
         with CaptureQueriesContext(connection) as queries:
             drain.gate_blockers(self.device.pk)
@@ -1071,9 +1070,7 @@ class TestARestoreRebaseClearsTheAdaptersWatermark(_OutcomeCase):
     def _rename(self, overlay, name):
         """One operator edit, left unconsumed so the drain under test is the one that folds it."""
         with without_commit_drain(), transaction.atomic():
-            overlay.vlan.name = name
-            overlay.vlan.save()
-            overlay.save()
+            rename_vlan(overlay, name)
 
     def test_the_rebase_advances_the_sequence_past_the_accepted_watermark(self):
         from netbox_nso_plugin import drain

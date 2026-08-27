@@ -47,6 +47,24 @@ class TestSviReconciler(TestCase):
         self.assertTrue(NSOSVIState.objects.filter(management=self.management, interface=iface).exists())
         self.assertEqual(rows[0].status, "imported")
 
+    def test_reconcile_preflights_native_and_overlay_creations(self):
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+        from netbox_nso_plugin.svi_reconciler import svi_reconcile_plan
+
+        plan = svi_reconcile_plan(
+            self.device,
+            {"interfaces": [{"interface_name": "Vlan1627", "vlan_id": 1627, "type": "svi"}]},
+        )
+
+        self.assertIsInstance(plan, RendererMutationPlan)
+        self.assertEqual(
+            [(write.operation, write.model_label) for write in plan.write_set],
+            [
+                ("save", "dcim.interface"),
+                ("save", "netbox_nso_plugin.nsosvistate"),
+            ],
+        )
+
     def test_direct_reconcile_does_not_advance_intent_revision(self):
         from netbox_nso_plugin.models import NSOIntentRevision
         from netbox_nso_plugin.svi_reconciler import reconcile_svi
@@ -297,10 +315,24 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         assert [i["interface_name"] for i in ifaces] == ["Vlan100"]
         assert ifaces[0]["vlan_id"] == 100 and ifaces[0]["vrf"] == "MGMT"
 
+    def test_foreign_overlay_save_does_not_schedule_svi_behavior(self):
+        from unittest.mock import patch
+
+        state = self._state(name="Vlan250", vid=250, status="accepted")
+
+        with patch("netbox_nso_plugin.signals._schedule_intent_push") as schedule:
+            state.vrf = "FOREIGN"
+            state.save(update_fields=("vrf",))
+
+        schedule.assert_not_called()
+
     def test_accept_marks_owned(self):
         from unittest.mock import patch
 
         from django.contrib.auth import get_user_model
+
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOOwnershipManifest
 
         state = self._state(name="Vlan300", vid=300, status="conflict")
         User = get_user_model()
@@ -311,3 +343,15 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         assert resp.status_code == 302
         state.refresh_from_db()
         assert state.status == "accepted" and state.accepted_at is not None
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="svi")
+        assert revision.verified_revision == revision.revision
+        assert revision.verified_fingerprint == delivery.canonical_fingerprint(
+            delivery.render("svi", self.device.pk, self.management.adapter_device_id).payload
+        )
+        assert NSOOwnershipManifest.objects.filter(
+            device=self.device,
+            scope="svi",
+            native_model_label="dcim.interface",
+            native_key={"device_id": state.interface.device_id, "name": state.interface.name},
+            ownership_state="owned",
+        ).exists()

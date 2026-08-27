@@ -40,9 +40,18 @@ class RendererWrite:
     natural_key: tuple[tuple[str, Any], ...] = ()
     update_fields: tuple[str, ...] | None = None
     values: tuple[tuple[str, Any], ...] = ()
+    before_values: tuple[tuple[str, Any], ...] = ()
     selected_pks: tuple[Any, ...] = ()
     cascade: bool = False
     force_insert: bool = False
+
+
+@dataclass(frozen=True)
+class RendererCreationRef:
+    """A stable reference to another row created by the same frozen plan."""
+
+    model_label: str
+    natural_key: tuple[tuple[str, Any], ...]
 
 
 @dataclass(frozen=True)
@@ -73,11 +82,11 @@ class RendererSetUpdate:
 
 @dataclass(frozen=True)
 class RendererM2MAdd:
-    """An exact set of persisted related rows to add to one M2M field."""
+    """An exact set of related rows to add to one M2M field."""
 
     instance: Any
     field_name: str
-    related_pks: tuple[Any, ...]
+    related: tuple[Any, ...]
 
 
 @dataclass(frozen=True)
@@ -86,7 +95,7 @@ class RendererM2MSet:
 
     instance: Any
     field_name: str
-    related_pks: tuple[Any, ...]
+    related: tuple[Any, ...]
 
 
 def planned_save(instance, *, update_fields=None, force_insert=False, natural_key=()) -> RendererSave:
@@ -126,18 +135,12 @@ def planned_set_update(queryset, **values) -> RendererSetUpdate:
 
 def planned_m2m_add(instance, field_name, related) -> RendererM2MAdd:
     """Freeze one M2M add operation before lock acquisition."""
-    related_pks = tuple(sorted({row.pk for row in related}))
-    if any(pk is None for pk in related_pks):
-        raise IntentMutationProtocolError("an M2M plan requires persisted related rows")
-    return RendererM2MAdd(instance=instance, field_name=field_name, related_pks=related_pks)
+    return RendererM2MAdd(instance=instance, field_name=field_name, related=tuple(related))
 
 
 def planned_m2m_set(instance, field_name, related) -> RendererM2MSet:
     """Freeze the exact final edge set for one M2M field."""
-    related_pks = tuple(sorted({row.pk for row in related}))
-    if any(pk is None for pk in related_pks):
-        raise IntentMutationProtocolError("an M2M plan requires persisted related rows")
-    return RendererM2MSet(instance=instance, field_name=field_name, related_pks=related_pks)
+    return RendererM2MSet(instance=instance, field_name=field_name, related=tuple(related))
 
 
 @dataclass(frozen=True)
@@ -157,12 +160,14 @@ class RendererMutationPlan:
     def build(cls, *, saves=(), deletes=(), set_updates=(), m2m_writes=(), planned_at=None) -> RendererMutationPlan:
         """Freeze proposed writes and derive every lock and revision dependency."""
         planned_at = planned_at or timezone.now()
+        saves = tuple(saves)
+        creation_refs = _creation_refs(saves)
         writes: list[RendererWrite] = []
         footprints: list[MutationFootprint] = []
         content_keys: set[tuple[int, str]] = set()
 
         for proposed in saves:
-            write, footprint, changed_keys = _plan_save(proposed)
+            write, footprint, changed_keys = _plan_save(proposed, creation_refs)
             writes.append(write)
             footprints.append(footprint)
             content_keys.update(changed_keys)
@@ -178,9 +183,9 @@ class RendererMutationPlan:
             content_keys.update(changed_keys)
         for proposed in m2m_writes:
             if isinstance(proposed, RendererM2MAdd):
-                write, footprint, changed_keys = _plan_m2m_add(proposed)
+                write, footprint, changed_keys = _plan_m2m_add(proposed, creation_refs)
             elif isinstance(proposed, RendererM2MSet):
-                write, footprint, changed_keys = _plan_m2m_set(proposed)
+                write, footprint, changed_keys = _plan_m2m_set(proposed, creation_refs)
             else:
                 raise IntentMutationProtocolError(f"unsupported M2M proposal {type(proposed)!r}")
             writes.append(write)
@@ -212,21 +217,50 @@ def _effective_after(instance, before, update_fields):
     return effective
 
 
-def _field_values(instance, update_fields):
+def _planned_field_value(instance, field, creation_refs):
+    if field.is_relation and field.many_to_one and field.is_cached(instance):
+        related = field.get_cached_value(instance)
+        reference = creation_refs.get(id(related))
+        if reference is not None:
+            return reference
+    return _normal(getattr(instance, field.attname))
+
+
+def _field_values(instance, update_fields, creation_refs=None):
+    creation_refs = creation_refs or {}
     fields = instance._meta.concrete_fields
     if update_fields is not None:
         selected = set(update_fields)
         fields = tuple(field for field in fields if field.name in selected or field.attname in selected)
     else:
         fields = tuple(field for field in fields if not field.primary_key)
-    return tuple(sorted((field.attname, _normal(getattr(instance, field.attname))) for field in fields))
+    return tuple(sorted((field.attname, _planned_field_value(instance, field, creation_refs)) for field in fields))
 
 
-def _natural_key(instance, fields):
+def _natural_key(instance, fields, creation_refs=None):
+    creation_refs = creation_refs or {}
     return tuple(
-        (instance._meta.get_field(name).attname, _normal(getattr(instance, instance._meta.get_field(name).attname)))
+        (
+            instance._meta.get_field(name).attname,
+            _planned_field_value(instance, instance._meta.get_field(name), creation_refs),
+        )
         for name in fields
     )
+
+
+def _creation_refs(saves):
+    references = {}
+    for proposed in saves:
+        instance = proposed.instance
+        if _stored_instance(instance) is not None:
+            continue
+        if not proposed.natural_key_fields:
+            continue
+        references[id(instance)] = RendererCreationRef(
+            model_label=instance._meta.label_lower,
+            natural_key=_natural_key(instance, proposed.natural_key_fields, references),
+        )
+    return references
 
 
 def _dependencies(before, after, spec):
@@ -248,7 +282,7 @@ def _changed_keys(before, after, spec, dependency_changed):
     return keys
 
 
-def _plan_save(proposed: RendererSave):
+def _plan_save(proposed: RendererSave, creation_refs):
     instance = proposed.instance
     label = instance._meta.label_lower
     spec = renderer_input_specs().get(label)
@@ -258,14 +292,15 @@ def _plan_save(proposed: RendererSave):
     after = _effective_after(instance, before, proposed.update_fields)
     if before is None and not proposed.natural_key_fields:
         raise IntentMutationProtocolError(f"a {label} creation requires a stable natural key")
-    identity = () if before is not None else _natural_key(after, proposed.natural_key_fields)
+    identity = () if before is not None else _natural_key(after, proposed.natural_key_fields, creation_refs)
     write = RendererWrite(
         operation="save",
         model_label=label,
         pk=None if before is None else before.pk,
         natural_key=identity,
         update_fields=proposed.update_fields,
-        values=_field_values(after, proposed.update_fields),
+        values=_field_values(after, proposed.update_fields, creation_refs),
+        before_values=() if before is None else _field_values(before, None),
         force_insert=proposed.force_insert,
     )
     base = MutationFootprint.merge(
@@ -290,6 +325,7 @@ def _collector_writes(instance):
                     operation="delete",
                     model_label=model._meta.label_lower,
                     pk=row.pk,
+                    before_values=_field_values(row, None),
                     cascade=(model._meta.label_lower, row.pk) != root_identity,
                 )
             )
@@ -298,10 +334,11 @@ def _collector_writes(instance):
             RendererWrite(
                 operation="delete",
                 model_label=queryset.model._meta.label_lower,
-                pk=pk,
+                pk=row.pk,
+                before_values=_field_values(row, None),
                 cascade=True,
             )
-            for pk in queryset.order_by("pk").values_list("pk", flat=True)
+            for row in queryset.order_by("pk")
         )
     for (field, value), querysets in collector.field_updates.items():
         for rows in querysets:
@@ -372,69 +409,94 @@ def _plan_set_update(proposed: RendererSetUpdate):
     return write, footprint, changed_keys
 
 
-def _plan_m2m_add(proposed: RendererM2MAdd):
+def _creation_identity(instance, creation_refs):
+    reference = creation_refs.get(id(instance))
+    if reference is not None:
+        return reference
+    if instance.pk is None or instance._state.adding:
+        raise IntentMutationProtocolError("an M2M row creation requires a stable natural key save")
+    return instance.pk
+
+
+def _related_identities(related, creation_refs):
+    identities = {_creation_identity(row, creation_refs) for row in related}
+    return tuple(sorted(identities, key=repr))
+
+
+def _plan_m2m_add(proposed: RendererM2MAdd, creation_refs):
     instance = proposed.instance
     owner_spec = renderer_input_specs().get(instance._meta.label_lower)
     if owner_spec is None:
         raise IntentMutationProtocolError(f"{instance._meta.label_lower} is not a registered renderer input")
-    if instance.pk is None or instance._state.adding:
-        raise IntentMutationProtocolError("an M2M plan requires a persisted owner row")
+    owner_identity = _creation_identity(instance, creation_refs)
     field = instance._meta.get_field(proposed.field_name)
     through = field.remote_field.through
-    through_spec = renderer_input_specs().get(through._meta.label_lower)
-    if through_spec is None:
-        raise IntentMutationProtocolError(f"{through._meta.label_lower} is not a registered renderer input")
     related_model = field.remote_field.model
-    existing = set(getattr(instance, proposed.field_name).values_list("pk", flat=True))
-    added_pks = tuple(pk for pk in proposed.related_pks if pk not in existing)
-    if added_pks != proposed.related_pks:
+    existing = (
+        set(getattr(instance, proposed.field_name).values_list("pk", flat=True))
+        if instance.pk is not None and not instance._state.adding
+        else set()
+    )
+    related_identities = _related_identities(proposed.related, creation_refs)
+    added_identities = tuple(identity for identity in related_identities if identity not in existing)
+    if added_identities != related_identities:
         raise IntentMutationProtocolError("an M2M add plan must contain only absent edges")
-    related = tuple(related_model._default_manager.filter(pk__in=added_pks).order_by("pk"))
-    if tuple(row.pk for row in related) != added_pks:
+    persisted_pks = tuple(identity for identity in added_identities if not isinstance(identity, RendererCreationRef))
+    persisted = tuple(related_model._default_manager.filter(pk__in=persisted_pks).order_by("pk"))
+    if {row.pk for row in persisted} != set(persisted_pks):
         raise IntentMutationProtocolError("an M2M add plan contains a missing related row")
     owner_footprint = footprint_for_instance(instance, owner_spec)
-    related_footprints = tuple(footprint_for_instance(row) for row in related)
+    related_footprints = tuple(footprint_for_instance(row) for row in proposed.related)
     row_kind = "source_rows" if through._meta.label_lower in SOURCE_MODEL_RANKS else "overlay_rows"
     through_footprint = MutationFootprint.for_keys(
         (),
         **{row_kind: (SourceRow(through._meta.label_lower, None),)},
     )
     footprint = MutationFootprint.merge(owner_footprint, *related_footprints, through_footprint)
+    scopes = set(owner_spec.scopes)
+    if instance._meta.label_lower == "dcim.interface" and proposed.field_name == "tagged_vlans":
+        scopes = {"switchport"}
     keys = (
-        set(owner_spec.resolver(instance, owner_spec)) if canonical_fragment(instance, owner_spec) != ABSENT else set()
+        {key for key in owner_spec.resolver(instance, owner_spec) if key[1] in scopes}
+        if canonical_fragment(instance, owner_spec) != ABSENT
+        else set()
     )
     write = RendererWrite(
         operation="m2m_add",
         model_label=instance._meta.label_lower,
-        pk=instance.pk,
+        pk=owner_identity,
         natural_key=(("field_name", proposed.field_name),),
-        selected_pks=added_pks,
+        selected_pks=added_identities,
         values=(("through_model", through._meta.label_lower),),
     )
     return write, footprint, keys
 
 
-def _plan_m2m_set(proposed: RendererM2MSet):
+def _plan_m2m_set(proposed: RendererM2MSet, creation_refs):
     instance = proposed.instance
     field = instance._meta.get_field(proposed.field_name)
     related_model = field.remote_field.model
-    related = tuple(related_model._default_manager.filter(pk__in=proposed.related_pks).order_by("pk"))
-    if tuple(row.pk for row in related) != proposed.related_pks:
-        raise IntentMutationProtocolError("an M2M set plan contains a missing related row")
-    before_pks = tuple(sorted(getattr(instance, proposed.field_name).values_list("pk", flat=True)))
+    related_identities = _related_identities(proposed.related, creation_refs)
+    before_pks = (
+        tuple(sorted(getattr(instance, proposed.field_name).values_list("pk", flat=True)))
+        if instance.pk is not None and not instance._state.adding
+        else ()
+    )
+    additions = tuple(row for row in proposed.related if _creation_identity(row, creation_refs) not in before_pks)
     add_write, footprint, keys = _plan_m2m_add(
         RendererM2MAdd(
             instance=instance,
             field_name=proposed.field_name,
-            related_pks=tuple(pk for pk in proposed.related_pks if pk not in before_pks),
-        )
+            related=additions,
+        ),
+        creation_refs,
     )
     write = RendererWrite(
         operation="m2m_set",
         model_label=add_write.model_label,
         pk=add_write.pk,
         natural_key=add_write.natural_key,
-        selected_pks=proposed.related_pks,
+        selected_pks=related_identities,
         values=(("before_pks", before_pks), *add_write.values),
     )
     previous_related = related_model._default_manager.filter(pk__in=before_pks).order_by("pk")
@@ -442,7 +504,7 @@ def _plan_m2m_set(proposed: RendererM2MSet):
         footprint,
         *(footprint_for_instance(row) for row in previous_related),
     )
-    if before_pks == proposed.related_pks:
+    if before_pks == related_identities:
         keys = set()
     return write, footprint, keys
 
@@ -500,16 +562,27 @@ class RendererWriter:
         self._consumed: set[int] = set()
         self._active_operation: int | None = None
 
+    def _reference_matches(self, reference, related):
+        if related is None or related._meta.label_lower != reference.model_label:
+            return False
+        return all(self._value_matches(related, attname, expected) for attname, expected in reference.natural_key)
+
+    def _value_matches(self, instance, attname, expected):
+        if isinstance(expected, RendererCreationRef):
+            field = next(field for field in instance._meta.concrete_fields if field.attname == attname)
+            return self._reference_matches(expected, getattr(instance, field.name, None))
+        return _normal(getattr(instance, attname)) == expected
+
+    def _fields_match(self, expected_values, instance):
+        return all(self._value_matches(instance, attname, expected) for attname, expected in expected_values)
+
     def _identity_matches(self, write, instance):
         if write.pk is not None:
             return instance.pk == write.pk
-        return write.natural_key == tuple(
-            (name, _normal(getattr(instance, name))) for name, _value in write.natural_key
-        )
+        return self._fields_match(write.natural_key, instance)
 
     def _find_save(self, instance, update_fields, force_insert=False):
         normalized_fields = None if update_fields is None else tuple(sorted(set(update_fields)))
-        values = _field_values(instance, normalized_fields)
         for index, write in enumerate(self.plan.write_set):
             if index in self._consumed:
                 continue
@@ -518,9 +591,15 @@ class RendererWriter:
                 and write.model_label == instance._meta.label_lower
                 and self._identity_matches(write, instance)
                 and write.update_fields == normalized_fields
-                and write.values == values
+                and self._fields_match(write.values, instance)
                 and write.force_insert is bool(force_insert)
             ):
+                if write.pk is not None:
+                    current = type(instance)._default_manager.filter(pk=write.pk).first()
+                    if current is None or not self._fields_match(write.before_values, current):
+                        raise IntentMutationProtocolError(
+                            f"{write.model_label} row {write.pk!r} changed after planning"
+                        )
                 return index
         raise IntentMutationProtocolError(
             f"save of {instance._meta.label_lower} row {instance.pk!r} is outside the frozen write set"
@@ -562,7 +641,11 @@ class RendererWriter:
             raise IntentMutationProtocolError(
                 f"delete of {instance._meta.label_lower} row {instance.pk!r} is outside the frozen write set"
             )
-        closure = _collector_writes(instance)
+        root_write = self.plan.write_set[index]
+        current = type(instance)._default_manager.filter(pk=instance.pk).first()
+        if current is None or not self._fields_match(root_write.before_values, current):
+            raise IntentMutationProtocolError(f"{root_write.model_label} row {root_write.pk!r} changed after planning")
+        closure = _collector_writes(current)
         matched = []
         available = [candidate for candidate in range(len(self.plan.write_set)) if candidate not in self._consumed]
         for expected in closure:
@@ -576,21 +659,54 @@ class RendererWriter:
             available.remove(candidate)
         if len(matched) != len(closure) or index not in matched:
             raise IntentMutationProtocolError("the planned Collector cascade changed before delete")
+        from django.db.models.deletion import Collector
+
+        collector = Collector(using=instance._state.db or "default", origin=instance)
+        collector.collect([instance])
+        for (_field, _value), querysets in collector.field_updates.items():
+            for rows in querysets:
+                if hasattr(rows, "model"):
+                    model = rows.model
+                else:
+                    materialized = tuple(rows)
+                    if not materialized:
+                        continue
+                    model = type(materialized[0])
+                _authorize_dml(self.permit, model._meta.db_table)
         with self._operation(index):
             result = instance.delete()
         self._consumed.update(matched)
         return result
 
-    def _find_m2m_add(self, instance, field_name, related_pks):
+    def _owner_matches(self, expected, instance):
+        if isinstance(expected, RendererCreationRef):
+            return self._reference_matches(expected, instance)
+        return instance.pk == expected
+
+    def _selected_matches(self, expected, related):
+        related = tuple(related)
+        if len(expected) != len(related):
+            return False
+        return all(
+            any(
+                self._reference_matches(identity, row)
+                if isinstance(identity, RendererCreationRef)
+                else row.pk == identity
+                for row in related
+            )
+            for identity in expected
+        )
+
+    def _find_m2m_add(self, instance, field_name, related):
         identity = (("field_name", field_name),)
         for index, write in enumerate(self.plan.write_set):
             if (
                 index not in self._consumed
                 and write.operation == "m2m_add"
                 and write.model_label == instance._meta.label_lower
-                and write.pk == instance.pk
+                and self._owner_matches(write.pk, instance)
                 and write.natural_key == identity
-                and write.selected_pks == related_pks
+                and self._selected_matches(write.selected_pks, related)
             ):
                 return index
         raise IntentMutationProtocolError("the M2M add is outside the frozen write set")
@@ -598,23 +714,22 @@ class RendererWriter:
     def m2m_add(self, instance, field_name, related):
         """Add exactly the related rows frozen into one planned M2M operation."""
         related = tuple(related)
-        related_pks = tuple(sorted({row.pk for row in related}))
-        index = self._find_m2m_add(instance, field_name, related_pks)
+        index = self._find_m2m_add(instance, field_name, related)
         with self._operation(index):
             getattr(instance, field_name).add(*related)
         _maintain_manifest(instance)
         self._consumed.add(index)
 
-    def _find_m2m_set(self, instance, field_name, related_pks):
+    def _find_m2m_set(self, instance, field_name, related):
         identity = (("field_name", field_name),)
         for index, write in enumerate(self.plan.write_set):
             if (
                 index not in self._consumed
                 and write.operation == "m2m_set"
                 and write.model_label == instance._meta.label_lower
-                and write.pk == instance.pk
+                and self._owner_matches(write.pk, instance)
                 and write.natural_key == identity
-                and write.selected_pks == related_pks
+                and self._selected_matches(write.selected_pks, related)
             ):
                 return index
         raise IntentMutationProtocolError("the M2M set is outside the frozen write set")
@@ -622,8 +737,7 @@ class RendererWriter:
     def m2m_set(self, instance, field_name, related):
         """Replace one M2M edge set with the exact planned persisted rows."""
         related = tuple(related)
-        related_pks = tuple(sorted({row.pk for row in related}))
-        index = self._find_m2m_set(instance, field_name, related_pks)
+        index = self._find_m2m_set(instance, field_name, related)
         write = self.plan.write_set[index]
         before_pks = dict(write.values)["before_pks"]
         current_pks = tuple(sorted(getattr(instance, field_name).values_list("pk", flat=True)))
@@ -679,7 +793,7 @@ class RendererWriter:
             and write.model_label == instance._meta.label_lower
             and self._identity_matches(write, instance)
             and write.update_fields == normalized_fields
-            and write.values == _field_values(instance, normalized_fields)
+            and self._fields_match(write.values, instance)
         )
 
     def signal_m2m_is_authorized(self, instance, action, field_name, pk_set) -> bool:
@@ -689,19 +803,20 @@ class RendererWriter:
         write = self.plan.write_set[self._active_operation]
         if (
             write.model_label != instance._meta.label_lower
-            or write.pk != instance.pk
+            or not self._owner_matches(write.pk, instance)
             or write.natural_key != (("field_name", field_name),)
         ):
             return False
-        changed_pks = tuple(sorted(pk_set or ()))
+        field = instance._meta.get_field(field_name)
+        changed = field.remote_field.model._default_manager.filter(pk__in=pk_set or ()).order_by("pk")
         if write.operation == "m2m_add":
-            return action == "pre_add" and write.selected_pks == changed_pks
+            return action == "pre_add" and self._selected_matches(write.selected_pks, changed)
         if write.operation != "m2m_set":
             return False
         before_pks = set(dict(write.values)["before_pks"])
         after_pks = set(write.selected_pks)
         expected = before_pks - after_pks if action == "pre_remove" else after_pks - before_pks
-        return action in {"pre_remove", "pre_add"} and tuple(sorted(expected)) == changed_pks
+        return action in {"pre_remove", "pre_add"} and self._selected_matches(tuple(expected), changed)
 
     def assert_complete(self):
         remaining = [
@@ -780,7 +895,11 @@ def renderer_writes(plan: RendererMutationPlan):
         raise IntentMutationProtocolError("renderer_writes requires a content-changing plan")
     if active_renderer_writer() is not None:
         raise IntentMutationProtocolError("renderer writer contexts cannot nest")
-    with _intent_transaction(plan.lock_footprint, bump_keys=plan.content_keys) as permit:
+    with _intent_transaction(
+        plan.lock_footprint,
+        bump_keys=plan.content_keys,
+        repend_after=True,
+    ) as permit:
         writer = RendererWriter(plan, content=True, permit=permit)
         token = _ACTIVE_WRITER.set(writer)
         try:

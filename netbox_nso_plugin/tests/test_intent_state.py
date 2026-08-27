@@ -401,20 +401,20 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
 
         self.assertIsNone(_ACTIVE_PERMIT.get())
 
-    def test_failed_post_save_behavior_closes_its_implicit_permit(self):
+    def test_foreign_post_save_skips_converted_behavior_and_closes_its_implicit_permit(self):
         from netbox_nso_plugin.intent_state import _ACTIVE_PERMIT
 
         self.state.device_name = "intent-permit-router"
-        with self.assertRaises(RuntimeError):
-            with (
-                transaction.atomic(),
-                patch(
-                    "netbox_nso_plugin.signals._schedule_intent_push",
-                    side_effect=RuntimeError("behavior failed"),
-                ),
-            ):
-                self.state.save(update_fields=["device_name"])
+        with (
+            transaction.atomic(),
+            patch(
+                "netbox_nso_plugin.signals._schedule_intent_push",
+                side_effect=RuntimeError("behavior failed"),
+            ) as schedule,
+        ):
+            self.state.save(update_fields=["device_name"])
 
+        schedule.assert_not_called()
         self.assertIsNone(_ACTIVE_PERMIT.get())
 
     def test_content_permit_rejects_a_write_outside_its_footprint(self):

@@ -23,6 +23,7 @@ from django.utils import timezone
 
 from ._outbox_case import (
     ReceiptAdapter,
+    enqueue,
     entries,
     make_managed,
     mirror_update,
@@ -49,7 +50,7 @@ class _DrainCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     def edit(self, mgmt):
         """One operator edit of the device's VLAN intent, which leaves one entry."""
         with without_commit_drain(), transaction.atomic():
-            mgmt.vlan_states.first().save()
+            enqueue(mgmt.device, "vlan")
 
     def run_drain(self, **kwargs):
         from netbox_nso_plugin import drain

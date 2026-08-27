@@ -54,6 +54,78 @@ class TestRendererSetUpdate(IntentPushResetMixin, TestCase):
 
 
 class TestRendererContentWriter(IntentPushResetMixin, TestCase):
+    def test_one_plan_can_create_a_native_row_and_its_overlay(self):
+        from ipam.models import VLANGroup
+
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_save,
+            renderer_mirror_writes,
+        )
+
+        _device, management = make_managed("writer-related-create", 16278)
+        group = VLANGroup.objects.create(name="Writer related create", slug="writer-related-create")
+        vlan = VLAN(group=group, vid=1637, name="writer-related-create")
+        state = NSOVLANState(
+            management=management,
+            vlan=vlan,
+            device_name=vlan.name,
+            status="imported",
+        )
+        plan = RendererMutationPlan.build(
+            saves=(
+                planned_save(vlan, force_insert=True, natural_key=("group", "vid")),
+                planned_save(
+                    state,
+                    force_insert=True,
+                    natural_key=("management", "vlan"),
+                ),
+            )
+        )
+
+        with renderer_mirror_writes(plan) as writer:
+            writer.save(vlan, force_insert=True)
+            writer.save(state, force_insert=True)
+
+        assert state.vlan_id == vlan.pk
+        assert NSOVLANState.objects.filter(management=management, vlan=vlan).exists()
+
+    def test_one_plan_can_create_an_owner_related_row_and_m2m_edge(self):
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_m2m_set,
+            planned_save,
+            renderer_mirror_writes,
+        )
+
+        device, management = make_managed("writer-create-m2m", 16279)
+        interface = Interface.objects.create(device=device, name="Ethernet1/9", type="1000base-t")
+        vlan = VLAN(vid=1639, name="writer-create-m2m")
+        state = NSOSwitchportState(
+            management=management,
+            interface=interface,
+            mode="tagged",
+            status="imported",
+        )
+        plan = RendererMutationPlan.build(
+            saves=(
+                planned_save(vlan, force_insert=True, natural_key=("group", "vid")),
+                planned_save(
+                    state,
+                    force_insert=True,
+                    natural_key=("management", "interface"),
+                ),
+            ),
+            m2m_writes=(planned_m2m_set(state, "tagged_vlans", (vlan,)),),
+        )
+
+        with renderer_mirror_writes(plan) as writer:
+            writer.save(vlan, force_insert=True)
+            writer.save(state, force_insert=True)
+            writer.m2m_set(state, "tagged_vlans", (vlan,))
+
+        assert set(state.tagged_vlans.values_list("pk", flat=True)) == {vlan.pk}
+
     def test_m2m_add_consumes_an_exact_frozen_edge_and_finalizes_fingerprint(self):
         from netbox_nso_plugin import delivery
         from netbox_nso_plugin.renderer_writer import (
@@ -186,6 +258,26 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
 
         revision.refresh_from_db()
         assert (revision.revision, revision.verified_revision, revision.verified_fingerprint) == before
+
+    def test_save_rejects_a_row_changed_after_plan_construction(self):
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_save,
+            renderer_mirror_writes,
+        )
+
+        _device, management = make_managed("writer-stale-management", 16280)
+        candidate = copy.copy(management)
+        candidate.adapter_link_error = "planned"
+        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("adapter_link_error",)),))
+        mirror_update(management, adapter_link_error="concurrent")
+
+        with self.assertRaisesRegex(IntentMutationProtocolError, "changed after planning"):
+            with renderer_mirror_writes(plan) as writer:
+                writer.save(candidate, update_fields=("adapter_link_error",))
+
+        management.refresh_from_db()
+        assert management.adapter_link_error == "concurrent"
 
     def test_delete_refuses_a_plan_with_an_omitted_collector_target(self):
         from netbox_routing.models import StaticRoute

@@ -1314,8 +1314,10 @@ def _journal_route_policy_apply_locked(mgmt, job: dict) -> None:
     applied = _count_of(counts, "in_sync")
     failed = _count_of(counts, "apply_failed")
     # Mark the job seen FIRST so a failure mid-write can't double-post next reconcile.
+    from .management_lifecycle import save_management
+
     mgmt.last_journaled_apply_job = job_id
-    type(mgmt).objects.filter(pk=mgmt.pk).update(last_journaled_apply_job=job_id)
+    save_management(mgmt, update_fields=["last_journaled_apply_job"])
     if applied == 0 and failed == 0:
         return  # this apply committed no route-policy scope → nothing to journal
 

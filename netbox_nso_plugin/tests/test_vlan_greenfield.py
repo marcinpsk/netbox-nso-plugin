@@ -99,6 +99,7 @@ class TestVlanDeletePropagation(_VlanGreenfieldBase):
 
         from netbox_nso_plugin.intent_state import intent_transaction, vlan_footprint
         from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
         from netbox_nso_plugin.signals import suppress_intent_push
 
         m3 = self._mgmt(self.sw3, 196)
@@ -115,7 +116,10 @@ class TestVlanDeletePropagation(_VlanGreenfieldBase):
             side_effect=lambda adapter_id, vlans: pushed.append((adapter_id, vlans)),
         ):
             with self.captureOnCommitCallbacks(execute=True):
-                VLAN.objects.get(pk=vlan.pk).delete()
+                candidate = VLAN.objects.get(pk=vlan.pk)
+                plan = RendererMutationPlan.build(deletes=(planned_delete(candidate),))
+                with renderer_writes(plan) as writer:
+                    writer.delete(candidate)
 
         # both attached devices got a reduced (empty) snapshot → removal propagates
         adapter_ids = sorted(a for a, _ in pushed)

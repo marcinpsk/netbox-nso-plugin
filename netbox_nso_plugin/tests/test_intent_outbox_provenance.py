@@ -139,19 +139,23 @@ class TestOutboxSuppression(IntentPushResetMixin, TestCase):
 
         assert _entries(self.device, "vlan") == []
 
-    def test_an_operator_save_does_write_an_entry(self):
-        """The control: without a guard the same save is the outbox's whole reason to exist."""
+    def test_an_own_writer_save_does_write_an_entry(self):
+        """The explicit writer preserves prompt bookkeeping for plugin-owned saves."""
         from netbox.context import current_request
 
         from netbox_nso_plugin.models import NSOIntentOutboxEntry
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
         state = self._accepted_vlan_state()
         NSOIntentOutboxEntry.objects.all().delete()
+        state.status = "imported"
 
         token = current_request.set(self._request("post"))
         try:
             with patch(PUT_VLAN), self.captureOnCommitCallbacks(execute=True):
-                state.save()
+                plan = RendererMutationPlan.build(saves=(planned_save(state),))
+                with renderer_writes(plan) as writer:
+                    writer.save(state)
         finally:
             current_request.reset(token)
 
@@ -233,34 +237,34 @@ class TestOutboxMarkingModes(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         return [call.kwargs.get("params") or {} for call in session.request.call_args_list]
 
     def _owned_vlan_state(self, vid: int):
-        from ipam.models import VLAN
+        from ._outbox_case import own_vlan
 
-        from netbox_nso_plugin.models import NSOVLANState
-
-        with without_commit_drain(), transaction.atomic():
-            vlan = VLAN.objects.create(vid=vid, name=f"ob-mk-v{vid}")
-            return NSOVLANState.objects.create(management=self.mgmt, vlan=vlan, status="accepted")
+        return own_vlan(self.mgmt, vid, "mk")
 
     def test_a_committed_vlan_deletion_still_ships_the_query_flag(self):
         """O1.4 — the outbox must not disturb an unmigrated scope's marking."""
         from netbox_nso_plugin.models import NSOIntentOutboxEntry
 
+        from ._outbox_case import delete_vlan_state
+
         state = self._owned_vlan_state(711)
         NSOIntentOutboxEntry.objects.all().delete()
         with without_commit_drain():
-            state.delete()
+            delete_vlan_state(state)
         assert [(e.mark_and, e.mark_any) for e in _entries(self.device, "vlan")] == [(True, True)]
 
         # The drain that ships the mark also retires the row that carried it, so the wire is
         # asserted on a second deletion rather than on the record above.
         other = self._owned_vlan_state(713)
         NSOIntentOutboxEntry.objects.all().delete()
-        params = self._recorded_params(other.delete)
+        params = self._recorded_params(lambda: delete_vlan_state(other))
         assert any(p.get("delete_origin") == "true" for p in params), f"saw {params}"
 
     def test_a_rolled_back_vlan_deletion_contributes_no_mark(self):
         """O1.4 — the rolled-back deletion leaves neither an entry nor a mark to AND in."""
         from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOVLANState
+
+        from ._outbox_case import delete_vlan_state, enqueue
 
         state = self._owned_vlan_state(712)
         NSOIntentOutboxEntry.objects.all().delete()
@@ -268,17 +272,17 @@ class TestOutboxMarkingModes(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         with without_commit_drain():
             try:
                 with transaction.atomic():
-                    state.delete()
+                    delete_vlan_state(state)
                     raise _Abort
             except _Abort:
                 pass
 
         assert _entries(self.device, "vlan") == []
 
-        # ``delete()`` clears the in-memory pk; the row itself came back with the rollback.
-        survivor = NSOVLANState.objects.get(management=self.mgmt, vlan__vid=712)
+        # The row came back with the rollback. Add one unmarked contribution as the fold control.
+        self.assertTrue(NSOVLANState.objects.filter(management=self.mgmt, vlan__vid=712).exists())
         with without_commit_drain(), transaction.atomic():
-            survivor.save()
+            enqueue(self.device, "vlan")
 
         assert [e.mark_and for e in _entries(self.device, "vlan")] == [False]
 

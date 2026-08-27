@@ -24,6 +24,7 @@ from django.test import TransactionTestCase
 from ._outbox_case import (
     ReceiptAdapter,
     as_per_object,
+    delete_vlan_state,
     entries,
     in_thread,
     make_managed,
@@ -32,6 +33,7 @@ from ._outbox_case import (
     state_of,
     wait_until_postgres_blocks,
     without_commit_drain,
+    write_vlan_state,
 )
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
@@ -87,14 +89,13 @@ class _MarkCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
 
     def unown(self, state):
         """An unmarked shrink: the operator hands the object back, the device keeps it."""
-        from ._outbox_case import content_update
-
-        content_update(state, status="imported")
+        with without_commit_drain(), transaction.atomic():
+            write_vlan_state(state, status="imported")
 
     def delete_overlay(self, state):
         """A marked shrink: the object is destroyed in NetBox, so the device may lose it."""
         with without_commit_drain(), transaction.atomic():
-            state.delete()
+            delete_vlan_state(state)
 
     def sent(self):
         """The requests this test's device received, in order."""
@@ -115,8 +116,8 @@ class TestOneTransactionOneMarkedPush(_MarkCase):
 
         states = self.own(801, 802, 803)
         with without_commit_drain(), transaction.atomic():
-            states[801].delete()
-            states[802].delete()
+            delete_vlan_state(states[801])
+            delete_vlan_state(states[802])
 
         assert len(entries(self.device, "vlan", unconsumed=True)) == 2
         assert self.drain() == drain.SUCCEEDED

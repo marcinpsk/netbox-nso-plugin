@@ -1,138 +1,154 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""reconcile L3 VLAN interfaces (SVIs / IRBs) from NSO into NetBox.
-
-Materialises the virtual ``dcim.Interface`` (type=virtual), links it to its VLAN
-(via per-device VLAN group), and tracks ``NSOSVIState``. IP addresses are
-NOT handled here — they ride the interface-IP path on the same interface, so
-this reconcile MUST run before ``_reconcile_interface_ips`` (which only attaches
-IPs to interfaces that already exist).
-"""
+"""Reconcile L3 VLAN interfaces from NSO into NetBox."""
 
 from __future__ import annotations
 
+import contextlib
+import copy
 import logging
-
-from .intent_state import mirror_reconciler, reconcile_transaction
 
 logger = logging.getLogger(__name__)
 
 
 def svi_reconcile_plan(device, payload: dict):
-    """Declare one SVI refresh and whether it changes rendered membership."""
-    from dcim.models import Interface
-    from ipam.models import VLAN
+    """Freeze every native interface and SVI overlay write."""
+    from django.utils import timezone
 
-    from .apply_state import vlan_ids_for_dependency_lock
-    from .intent_state import MutationFootprint, ReconcileMutationPlan, SourceRow
-    from .models import NSODeviceManagement, NSOSVIState
+    from .renderer_writer import RendererMutationPlan
 
-    management = NSODeviceManagement.objects.filter(device=device).first()
-    if management is None:
-        return ReconcileMutationPlan(MutationFootprint())
-    raw_items = payload.get("interfaces", []) if isinstance(payload, dict) else []
-    items = raw_items if isinstance(raw_items, list) else []
-    vids = vlan_ids_for_dependency_lock(items)
-
-    interfaces = tuple(Interface.objects.filter(device=device).order_by("pk"))
-    states = tuple(NSOSVIState.objects.filter(management=management).select_related("interface").order_by("pk"))
-    vlan_ids = {state.vlan_id for state in states if state.vlan_id is not None}
-    vlan_ids.update(VLAN.objects.filter(group__slug=f"nso-{device.pk}", vid__in=vids).values_list("pk", flat=True))
-    reported = {item.get("interface_name") for item in items if isinstance(item, dict) and item.get("interface_name")}
-    changes_content = any(state.status == "in_sync" and state.interface.name not in reported for state in states)
-    return ReconcileMutationPlan(
-        MutationFootprint.for_keys(
-            {(device.pk, "svi")},
-            shared_keys=(("vlan", str(vlan_id)) for vlan_id in vlan_ids),
-            source_rows=(
-                SourceRow("dcim.device", device.pk),
-                SourceRow("dcim.interface", None),
-                *(SourceRow("dcim.interface", interface.pk) for interface in interfaces),
-                *(SourceRow("ipam.vlan", vlan_id) for vlan_id in vlan_ids),
-            ),
-            overlay_rows=(
-                SourceRow("netbox_nso_plugin.nsosvistate", None),
-                *(SourceRow(state._meta.label_lower, state.pk) for state in states),
-            ),
-        ),
-        changes_content=changes_content,
-        settles_deploying=False,
-    )
+    planned_at = timezone.now()
+    saves, deletes, _operations, _rows = _svi_reconcile_operations(device, payload, planned_at)
+    return RendererMutationPlan.build(saves=saves, deletes=deletes, planned_at=planned_at)
 
 
 def svi_reconcile_footprint(device, payload: dict):
-    """Return the immutable footprint for callers that only need lock discovery."""
-    return svi_reconcile_plan(device, payload).footprint
+    """Return the mechanically derived SVI reconcile lock footprint."""
+    return svi_reconcile_plan(device, payload).lock_footprint
 
 
-@mirror_reconciler
-def reconcile_svi(device, payload: dict) -> list:
-    """Create/update virtual SVI/IRB interfaces + NSOSVIState from the adapter payload."""
-    with reconcile_transaction(svi_reconcile_plan(device, payload)):
-        return _reconcile_svi(device, payload)
-
-
-def _reconcile_svi(device, payload: dict) -> list:
-    """Apply an SVI mirror after its complete footprint is locked."""
+def _svi_reconcile_operations(device, payload, planned_at):
+    """Build the deterministic SVI writes shared by preflight and apply."""
     from dcim.models import Interface
-    from django.db import IntegrityError, transaction
-    from django.utils import timezone
     from ipam.models import VLAN
 
     from . import status_machine as sm
     from .models import NSODeviceManagement, NSOSVIState
+    from .renderer_writer import planned_delete, planned_save
     from .vlan_reconciler import _device_vlan_group
 
-    try:
-        management = NSODeviceManagement.objects.get(device=device)
-    except NSODeviceManagement.DoesNotExist:
-        return []
-
+    management = NSODeviceManagement.objects.filter(device=device).first()
+    if management is None:
+        return [], [], [], []
+    raw_items = payload.get("interfaces", []) if isinstance(payload, dict) else []
+    items = raw_items if isinstance(raw_items, list) else []
     group = _device_vlan_group(device)
-    now = timezone.now()
-    rows: list = []
-    for item in payload.get("interfaces", []):
+    interfaces = {row.name: row for row in Interface.objects.filter(device=device).order_by("pk")}
+    states = {
+        row.interface.name: row
+        for row in NSOSVIState.objects.filter(management=management).select_related("interface", "vlan").order_by("pk")
+    }
+    vlans = {row.vid: row for row in VLAN.objects.filter(group=group).order_by("pk")}
+    saves = []
+    deletes = []
+    operations = []
+    rows = []
+    reported = set()
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
         name = item.get("interface_name")
         if not name:
             continue
-        iface = Interface.objects.filter(device=device, name=name).first()
-        if iface is None:
-            iface = Interface(device=device, name=name, type="virtual")
-            try:
-                with transaction.atomic():
-                    iface.save(force_insert=True)
-            except IntegrityError:
-                iface = Interface.objects.filter(device=device, name=name).first()
-                if iface is None:
-                    raise
+        reported.add(name)
+        interface = interfaces.get(name)
+        if interface is None:
+            interface = Interface(device=device, name=name, type="virtual")
+            interface._site = device.site
+            interface._location = device.location
+            interface._rack = device.rack
+            saves.append(planned_save(interface, force_insert=True, natural_key=("device", "name")))
+            operations.append(("save", interface, None, True))
+
+        current = states.get(name)
+        state = (
+            copy.copy(current)
+            if current is not None
+            else NSOSVIState(management=management, interface=interface, status="unknown")
+        )
         vid = item.get("vlan_id")
-        vlan = VLAN.objects.filter(group=group, vid=vid).first() if vid else None
+        vlan = vlans.get(vid) if vid else None
         device_type = item.get("type") or "svi"
         device_vrf = item.get("vrf") or ""
-        state, _ = NSOSVIState.objects.get_or_create(management=management, interface=iface)
         if sm.is_owned(state.status):
-            # Owned values are NetBox intent. Compare the device read to them without
-            # replacing them; otherwise a refresh between inline edit and Apply silently
-            # restores the old device VRF and the pending change is lost.
             desired_vid = state.vlan.vid if state.vlan else None
             matches = desired_vid == vid and state.svi_type == device_type and state.vrf == device_vrf
             state.status = sm.on_reconcile(state.status, matches=matches, settles_deploying=False)
         else:
-            # Unowned rows are device mirrors and continue tracking every reported value.
             state.vlan = vlan
             state.svi_type = device_type
             state.vrf = device_vrf
             state.status = sm.on_reconcile(state.status, matches=None)
-        state.last_sync_at = now
-        state.save()
+        state.last_sync_at = planned_at
+        created = current is None
+        if created:
+            update_fields = None
+        elif sm.is_owned(current.status):
+            update_fields = ("status", "last_sync_at")
+        else:
+            update_fields = ("vlan", "svi_type", "vrf", "status", "last_sync_at")
+        saves.append(
+            planned_save(
+                state,
+                update_fields=update_fields,
+                force_insert=created,
+                natural_key=("management", "interface"),
+            )
+        )
+        operations.append(("save", state, update_fields, created))
         rows.append(state)
 
-    # SVI states the device no longer reports: NEVER hard-delete an owned row (operator
-    # intent or an in-flight Apply marker). An unowned
-    # SVI overlay is a pure device mirror with no separate native config object (the virtual
-    # interface is kept regardless), so a stale unowned row is a vestigial husk → drop it to
-    # avoid orphan churn; owned rows surface as drift (``changed``) instead of data-loss.
-    reported = {item.get("interface_name") for item in payload.get("interfaces", [])}
-    for stale in NSOSVIState.objects.filter(management=management).exclude(interface__name__in=reported):
-        sm.finalise_stale_overlay(stale, vestigial=True, now=now)
+    for stale in states.values():
+        if stale.interface.name in reported:
+            continue
+        if not sm.is_owned(stale.status):
+            deletes.append(planned_delete(stale))
+            operations.append(("delete", stale, None, False))
+            continue
+        new_status = sm.on_reconcile(stale.status, present=False)
+        if new_status == stale.status:
+            continue
+        candidate = copy.copy(stale)
+        candidate.status = new_status
+        candidate.last_sync_at = planned_at
+        fields = ("status", "last_sync_at")
+        saves.append(planned_save(candidate, update_fields=fields))
+        operations.append(("save", candidate, fields, False))
+
+    return saves, deletes, operations, rows
+
+
+def reconcile_svi(device, payload: dict) -> list:
+    """Apply one frozen SVI reconciliation through the renderer writer."""
+    from .renderer_writer import active_renderer_writer, renderer_mirror_writes, renderer_writes
+    from .signals import suppress_intent_push
+
+    active = active_renderer_writer()
+    plan = active.plan if active is not None else svi_reconcile_plan(device, payload)
+    mutation = contextlib.nullcontext(active)
+    if active is None:
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+    with mutation as writer, suppress_intent_push():
+        return _reconcile_svi(device, payload, writer, plan.planned_at)
+
+
+def _reconcile_svi(device, payload: dict, writer, planned_at) -> list:
+    """Execute the SVI operations after their exact write set is frozen."""
+    _saves, _deletes, operations, rows = _svi_reconcile_operations(device, payload, planned_at)
+    for operation, instance, update_fields, force_insert in operations:
+        if operation == "delete":
+            writer.delete(instance)
+        else:
+            writer.save(instance, update_fields=update_fields, force_insert=force_insert)
     return rows

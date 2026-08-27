@@ -91,9 +91,22 @@ class TestPushSwitchportIntent(_SwBase):
                 _on_switchport_state_save(sender=NSOSwitchportState, instance=st)
             mock_apply.assert_not_called()
 
+    def test_foreign_overlay_save_does_not_schedule_switchport_behavior(self):
+        mgmt = self._make_mgmt(auto_apply=True)
+        state = self._state(mgmt, status="accepted")
+
+        with patch("netbox_nso_plugin.signals._schedule_intent_push") as schedule:
+            state.mode = "tagged-all"
+            state.save(update_fields=("mode",))
+
+        schedule.assert_not_called()
+
 
 class TestSwitchportAcceptView(_SwBase):
     def test_accept_writes_native_and_marks_owned(self):
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOOwnershipManifest
+
         mgmt = self._make_mgmt()
         st = self._state(mgmt, mode="access", status="changed")
         self.client.force_login(_superuser())
@@ -106,6 +119,18 @@ class TestSwitchportAcceptView(_SwBase):
         self.iface.refresh_from_db()
         assert self.iface.mode == "access"
         assert self.iface.untagged_vlan_id == self.v10.pk
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="switchport")
+        assert revision.verified_revision == revision.revision
+        assert revision.verified_fingerprint == delivery.canonical_fingerprint(
+            delivery.render("switchport", self.device.pk, mgmt.adapter_device_id).payload
+        )
+        assert NSOOwnershipManifest.objects.filter(
+            device=self.device,
+            scope="switchport",
+            native_model_label="dcim.interface",
+            native_key={"device_id": self.iface.device_id, "name": self.iface.name},
+            ownership_state="owned",
+        ).exists()
 
 
 def _superuser():

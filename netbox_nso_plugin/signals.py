@@ -672,28 +672,22 @@ def _schedule_redistribution_push(device_id, dest) -> None:
 
 @receiver(pre_save, sender="netbox_nso_plugin.NSODeviceManagement")
 def remember_adapter_source(sender, instance, **kwargs):
-    """Carry a source change's fail-closed fence in the same durable row update."""
+    """Verify that a source change already carries its fail-closed writer fence."""
+    from .renderer_writer import active_renderer_writer
+
+    if active_renderer_writer() is None:
+        return
     if not instance.pk:
-        instance._nso_source_changed = True
         return
     update_fields = kwargs.get("update_fields")
     if update_fields and set(update_fields) <= _MANAGEMENT_MIRROR_FIELDS:
-        instance._nso_source_changed = False
         return
-    previous = (
-        sender.objects.filter(pk=instance.pk)
-        .values_list("nso_instance_id", "nso_device_name", "source_rekey_pending")
-        .first()
-    )
-    changed = previous is not None and (
-        previous[:2] != (instance.nso_instance_id, instance.nso_device_name) or previous[2]
-    )
-    instance._nso_source_changed = changed
-    if changed:
-        # This field is part of the source-tuple UPDATE itself. A process death
-        # before the on_commit callback can therefore never leave the new tuple
-        # admitting payloads from the old adapter source.
-        instance.source_rekey_pending = True
+    previous = sender.objects.filter(pk=instance.pk).values_list("nso_instance_id", "nso_device_name").first()
+    changed = previous is not None and previous != (instance.nso_instance_id, instance.nso_device_name)
+    if changed and not instance.source_rekey_pending:
+        from .intent_state import IntentMutationProtocolError
+
+        raise IntentMutationProtocolError("a management source change omitted its source-rekey fence")
 
 
 def _invalidate_source_admissions(instance) -> int:
@@ -752,40 +746,35 @@ def _sync_source_change(instance, client) -> bool:
         result = {"source_epoch": current.adapter_source_epoch}
     if result.get("source_epoch") is None:
         raise RuntimeError("adapter rekey response omitted source_epoch; publication remains fenced")
-    with transaction.atomic(), lock_order_scope():
-        lock_mutation()
-        lock_device_intent_transaction(instance.device_id)
-        current = management_model.objects.select_for_update().get(pk=instance.pk)
-        if (current.nso_instance_id, current.nso_device_name) != expected_source:
-            return False
-        source_epoch = result["source_epoch"]
-        source_aware = True
-        current.adapter_source_epoch = source_epoch
-        current.source_epoch_aware = source_aware
-        current.source_rekey_pending = False
-        current.reset_pending_source_epoch = source_epoch if invalidated else None
-        from .intent_state import mirror_refresh
+    current = management_model.objects.get(pk=instance.pk)
+    if (current.nso_instance_id, current.nso_device_name) != expected_source:
+        return False
+    source_epoch = result["source_epoch"]
+    source_aware = True
+    current.adapter_source_epoch = source_epoch
+    current.source_epoch_aware = source_aware
+    current.source_rekey_pending = False
+    current.reset_pending_source_epoch = source_epoch if invalidated else None
+    from .intent_state import IntentMutationProtocolError
+    from .management_lifecycle import save_management
 
-        with (
-            suppress_intent_push(),
-            mirror_refresh(
-                current,
-                {
-                    "adapter_source_epoch",
-                    "source_epoch_aware",
-                    "source_rekey_pending",
-                    "reset_pending_source_epoch",
-                },
-            ),
-        ):
-            current.save(
-                update_fields=[
-                    "adapter_source_epoch",
-                    "source_epoch_aware",
-                    "source_rekey_pending",
-                    "reset_pending_source_epoch",
-                ]
-            )
+    try:
+        save_management(
+            current,
+            update_fields=[
+                "adapter_source_epoch",
+                "source_epoch_aware",
+                "source_rekey_pending",
+                "reset_pending_source_epoch",
+            ],
+        )
+    except IntentMutationProtocolError:
+        latest = (
+            management_model.objects.filter(pk=instance.pk).values_list("nso_instance_id", "nso_device_name").first()
+        )
+        if latest != expected_source:
+            return False
+        raise
     instance.adapter_source_epoch = source_epoch
     instance.source_epoch_aware = source_aware
     instance.source_rekey_pending = False
@@ -802,27 +791,16 @@ def _onboard_into_adapter(instance, client):
         nso_device_name=instance.nso_device_name,
         netbox_device_id=instance.device_id,
     )
-    from django.db import transaction
+    from .management_lifecycle import save_management
 
-    from .apply_state import lock_device_intent_transaction, lock_order_scope
-    from .deployment import lock_mutation
-    from .intent_state import mirror_refresh
-
-    with transaction.atomic(), lock_order_scope():
-        lock_mutation()
-        lock_device_intent_transaction(instance.device_id)
-        current = type(instance).objects.select_for_update().get(pk=instance.pk)
-        current.adapter_device_id = result["id"]
-        current.adapter_source_epoch = result.get("source_epoch")
-        current.source_epoch_aware = result.get("source_epoch") is not None
-        with (
-            suppress_intent_push(),
-            mirror_refresh(
-                current,
-                {"adapter_device_id", "adapter_source_epoch", "source_epoch_aware"},
-            ),
-        ):
-            current.save(update_fields=["adapter_device_id", "adapter_source_epoch", "source_epoch_aware"])
+    current = type(instance).objects.get(pk=instance.pk)
+    current.adapter_device_id = result["id"]
+    current.adapter_source_epoch = result.get("source_epoch")
+    current.source_epoch_aware = result.get("source_epoch") is not None
+    save_management(
+        current,
+        update_fields=["adapter_device_id", "adapter_source_epoch", "source_epoch_aware"],
+    )
     instance.adapter_device_id = current.adapter_device_id
     instance.adapter_source_epoch = current.adapter_source_epoch
     instance.source_epoch_aware = current.source_epoch_aware
@@ -831,6 +809,15 @@ def _onboard_into_adapter(instance, client):
 @receiver(post_save, sender="netbox_nso_plugin.NSODeviceManagement")
 def sync_scope_to_adapter(sender, instance, created, update_fields=None, **kwargs):
     """Run adapter side effects only after the management-row transaction commits."""
+    from .renderer_writer import active_renderer_writer
+
+    if active_renderer_writer() is None:
+        return
+    _queue_scope_sync(sender, instance, created, update_fields=update_fields)
+
+
+def _queue_scope_sync(sender, instance, created, *, update_fields=None):
+    """Queue the adapter-link work for one sanctioned management-row save."""
     from django.db import transaction
 
     if update_fields and set(update_fields) <= _MANAGEMENT_MIRROR_FIELDS:
@@ -841,10 +828,18 @@ def sync_scope_to_adapter(sender, instance, created, update_fields=None, **kwarg
 
 
 def _update_management_mirror(instance, **values):
-    """Persist management lifecycle fields through a per-instance mirror permit."""
-    from .intent_state import update_mirror_fields
+    """Persist management lifecycle fields through the exact mirror writer."""
+    from .management_lifecycle import save_management
 
-    update_mirror_fields(instance, **values)
+    fields = set(values)
+    current = type(instance).objects.filter(pk=instance.pk).first()
+    if current is None:
+        return
+    for field_name, value in values.items():
+        setattr(current, field_name, value)
+    save_management(current, update_fields=fields)
+    for field_name, value in values.items():
+        setattr(instance, field_name, value)
 
 
 def _sync_committed_scope_to_adapter(sender, instance_pk, created):
@@ -957,6 +952,15 @@ def offboard_device_from_adapter(sender, instance, **kwargs):
     could see the mapping, get a 404 from the just-deleted adapter device, and re-onboard a
     fresh row that nothing then owns — this handler has already fired against the old id.
     """
+    from .renderer_writer import active_renderer_writer
+
+    if active_renderer_writer() is None:
+        return
+    _queue_adapter_offboard(instance)
+
+
+def _queue_adapter_offboard(instance):
+    """Queue adapter offboarding for one sanctioned management-row delete."""
     if instance.adapter_device_id is None:
         return
     from django.db import transaction
@@ -1710,6 +1714,8 @@ def _on_svi_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
+    if not _converted_writer_owns_content(device_id, "svi"):
+        return
     _schedule_intent_push((device_id, "svi"))
 
 
@@ -1868,26 +1874,23 @@ def _on_vlan_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
+    if not _converted_writer_owns_content(device_id, "vlan"):
+        return
     _schedule_intent_push((device_id, "vlan"))
 
 
 @_skip_on_render
 def _on_vlan_pre_save(sender, instance, **kwargs):
-    """Record changes to fields rendered by VLAN or SVI intent.
+    """Record the exact VLAN or SVI fields changed by a sanctioned writer save."""
+    from .renderer_writer import active_renderer_writer
 
-    A VID-only save can require a new fabricated display name while ``update_fields``
-    excludes ``name``. The direct update keeps that derived placeholder consistent without
-    recording it as a separate operator edit. Adding ``name`` to the captured changed fields
-    makes the post-save path re-pend every affected intent row.
-    """
     update_fields = kwargs.get("update_fields")
     candidate_fields = {"name", "vid"}
     if update_fields is not None:
         candidate_fields.intersection_update(update_fields)
     instance._intent_vlan_changed_fields = frozenset()
     instance._intent_vlan_rows = {}
-    instance._intent_vlan_update_name = False
-    if instance._state.adding or not candidate_fields:
+    if active_renderer_writer() is None or instance._state.adding or not candidate_fields:
         return
 
     from .apply_state import vlan_intent_targets
@@ -1943,38 +1946,26 @@ def _on_vlan_change(sender, instance, **kwargs):
     changed_fields = getattr(instance, "_intent_vlan_changed_fields", frozenset())
     if not changed_fields:
         return
-    if getattr(instance, "_intent_vlan_update_name", False):
-        sender.objects.filter(pk=instance.pk).update(name=instance.name)
-
     from . import delivery
     from . import status_machine as sm
-    from .vlan_reconciler import is_placeholder_vlan_name
 
     rows = getattr(instance, "_intent_vlan_rows", {})
     vid_changed = "vid" in changed_fields
     targets = set()
-    with suppress_intent_push():
-        for scope, states in rows.items():
-            if scope in ("svi", "switchport") and not vid_changed:
-                continue
-            for state in states:
-                state.refresh_from_db()
-                was_owned = sm.is_owned(state.status)
-                matches = False
-                if scope == "vlan" and not vid_changed:
-                    matches = instance.name == state.device_name or (
-                        not state.device_name and is_placeholder_vlan_name(state)
-                    )
-                new_status = (
-                    "accepted" if state.status == "deploying" else sm.on_reconcile(state.status, matches=matches)
-                )
-                if new_status != state.status:
-                    state.status = new_status
-                    state.save(update_fields=["status"])
-                entry = delivery.delivery_keys()[scope]
-                may_deliver = entry.in_protocol or state.management.auto_apply
-                if was_owned and state.management.adapter_device_id is not None and may_deliver:
-                    targets.add((state.management.device_id, scope))
+    for scope, states in rows.items():
+        if scope in ("svi", "switchport") and not vid_changed:
+            continue
+        for state in states:
+            was_owned = sm.is_owned(state.status)
+            entry = delivery.delivery_keys()[scope]
+            may_deliver = entry.in_protocol or state.management.auto_apply
+            if (
+                was_owned
+                and state.management.adapter_device_id is not None
+                and may_deliver
+                and _converted_writer_owns_content(state.management.device_id, scope)
+            ):
+                targets.add((state.management.device_id, scope))
     for key in sorted(targets):
         _schedule_intent_push(key)
 
@@ -1992,7 +1983,7 @@ def _on_ipam_vlan_pre_delete(sender, instance, **kwargs):
     targets = []
     for state in instance.nso_vlan_states.select_related("management").all():
         mgmt = state.management
-        if mgmt.adapter_device_id is not None:
+        if mgmt.adapter_device_id is not None and _converted_writer_owns_content(mgmt.device_id, "vlan"):
             targets.append((mgmt.device_id, mgmt.adapter_device_id))
     for device_id, adapter_device_id in targets:
         _schedule_intent_push((device_id, "vlan"))
@@ -3015,7 +3006,13 @@ def _on_switchport_state_save(sender, instance, **kwargs):
         return
     if mgmt.adapter_device_id is None or not mgmt.auto_apply:
         return
+    from . import status_machine as sm
+
+    if not sm.is_owned(instance.status):
+        return
     device_id = mgmt.device_id
+    if not _converted_writer_owns_content(device_id, "switchport"):
+        return
     _schedule_intent_push((device_id, "switchport"))
 
 

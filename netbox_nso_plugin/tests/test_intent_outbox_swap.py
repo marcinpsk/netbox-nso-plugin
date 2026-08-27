@@ -23,7 +23,7 @@ from django.test import SimpleTestCase, TransactionTestCase
 
 from netbox_nso_plugin.adapter_client import AdapterError
 
-from ._outbox_case import ReceiptAdapter, entries, make_managed, own_vlan, state_of
+from ._outbox_case import ReceiptAdapter, entries, make_managed, own_vlan, rename_vlan, state_of, write_vlan_state
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin, _deliver_scheduled_keys
 
 
@@ -348,9 +348,7 @@ class TestTheCommitCallbackDrainsTheOutbox(_SwapCase):
         state = own_vlan(self.mgmt, 880, self.tag)
         config, session = self.live()
         with config, session, transaction.atomic():
-            state.vlan.name = "cl-trig-renamed"
-            state.vlan.save()
-            state.save()
+            rename_vlan(state, "cl-trig-renamed")
 
         assert len(self.mine()) == 1, self.adapter.requests
         assert self.mine()[0]["push_seq"] is not None, "the production send carries the sequence"
@@ -367,17 +365,13 @@ class TestTheCommitCallbackDrainsTheOutbox(_SwapCase):
 
         with config, session:
             with contextlib.suppress(_Abort), transaction.atomic():
-                state.vlan.name = "cl-trig-rolled-back"
-                state.vlan.save()
-                state.save()
+                rename_vlan(state, "cl-trig-rolled-back")
                 raise _Abort
             assert entries(self.device, "vlan", unconsumed=True) == []
             assert self.mine() == [], "a rolled-back transaction sends nothing"
 
             with transaction.atomic():
-                state.vlan.name = "cl-trig-kept"
-                state.vlan.save()
-                state.save()
+                rename_vlan(state, "cl-trig-kept")
 
         assert len(self.mine()) == 1
         body = self.mine()[0]["body"]
@@ -404,11 +398,13 @@ class TestTheCommitTailIsConstant(_SwapCase):
         ):
             with transaction.atomic():
                 for state in states:
-                    state.save()
+                    write_vlan_state(state, status="imported")
 
         drains = [c for c in registered.call_args_list if getattr(c.args[0], "__name__", "") == "_drain_intent_pushes"]
         assert len(drains) == len(states), "registration is unconditional, so a rollback cannot lose the drain"
-        assert render.call_count == 1, "callbacks 2..N find the cell empty and do nothing"
+        assert render.call_count == len(states) + 1, (
+            "each writer verifies its fingerprint, then only the first callback renders for delivery"
+        )
         assert len(self.mine()) == 1
         assert signals._pending_intent_keys() == set(), "the first callback clears the cell"
 
@@ -425,9 +421,7 @@ class TestALoneSaveDrainsOnItsOwnCommit(_SwapCase):
         with config, session:
             assert self.mine() == [], "nothing goes out while the transaction is open"
             with transaction.atomic():
-                state.vlan.name = "cl-lone-renamed"
-                state.vlan.save()
-                state.save()
+                rename_vlan(state, "cl-lone-renamed")
                 assert self.mine() == []
 
         assert len(self.mine()) == 1
