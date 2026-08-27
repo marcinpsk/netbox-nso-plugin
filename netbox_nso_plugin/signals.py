@@ -3046,7 +3046,7 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
 
 @_skip_on_render
 def _on_bgp_peer_state_save(sender, instance, **kwargs):
-    """Push BGP intent whenever an NSOBGPPeerState row is saved."""
+    """Schedule BGP only when the exact writer owns this device key."""
     from .models import NSODeviceManagement
 
     try:
@@ -3058,120 +3058,20 @@ def _on_bgp_peer_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    _schedule_intent_push((device_id, "bgp"))
-
-
-# ── Greenfield BGP peers (operator-created in NetBox, not yet on the device) ──
-#
-# The reconcile path only creates an NSOBGPPeerState overlay for a peer the device already
-# reports (brownfield adoption). These handlers add the missing direction: a
-# netbox_routing.BGPPeer the operator creates/edits under a managed device's BGP router
-# becomes an *accepted* overlay (owned intent) and pushes; deleting the peer drops the
-# overlay and retracts (full-replace). This fills the "no native BGPPeer pre_delete" gap:
-# the overlay's bgp_peer FK is on_delete=SET_NULL, so a BGPPeer delete would otherwise only
-# null the FK and leave the intent stranded on the device.
-
-
-def _bgp_peer_device(peer):
-    """Resolve the managed Device a BGPPeer belongs to (scope→router→assigned_object), or None."""
-    from dcim.models import Device
-
-    scope = getattr(peer, "scope", None)
-    router = getattr(scope, "router", None) if scope is not None else None
-    if router is None:
-        return None
-    obj = router.assigned_object
-    return obj if isinstance(obj, Device) else None
-
-
-def _bgp_peer_overlay_key(peer):
-    """Return (asn_str, vrf_name, peer_address_str) for a BGPPeer.
-
-    MUST match the reconcile derivation (bgp_reconciler: asn_str=str(router.asn.asn),
-    vrf_name=scope.vrf.name or '', peer_address_str=host IP) so a greenfield-created
-    overlay and a later reconcile of the same peer share ONE identity key (no duplicate).
-    """
-    router = peer.scope.router
-    asn_str = str(router.asn.asn) if router.asn_id else ""
-    vrf = peer.scope.vrf
-    vrf_name = vrf.name if vrf is not None else ""
-    # peer.peer.address is a netaddr IPNetwork once loaded from the DB, but a plain
-    # "10.0.0.2/32" str on a freshly-created in-memory IPAddress — take the bare host
-    # part robustly in both cases, matching the reconciler's peer_address_str (the raw
-    # payload "peer_address", e.g. "10.0.0.2", with no mask).
-    peer_address_str = str(peer.peer.address).split("/")[0] if peer.peer_id else ""
-    return asn_str, vrf_name, peer_address_str
-
-
-def _accept_bgp_peer_for_device(peer, device) -> None:
-    """Own a greenfield BGP peer for *device* (accepted overlay) → its save pushes intent."""
-    from .models import NSOBGPPeerState, NSODeviceManagement
-
-    try:
-        mgmt = NSODeviceManagement.objects.get(device=device)
-    except NSODeviceManagement.DoesNotExist:
-        return
-    if mgmt.adapter_device_id is None:
-        return
-    asn_str, vrf_name, peer_address_str = _bgp_peer_overlay_key(peer)
-    if not asn_str or not peer_address_str:
-        return  # incomplete peer (no ASN / no address) — nothing to own yet
-    state, created = NSOBGPPeerState.objects.get_or_create(
-        management=mgmt,
-        asn_str=asn_str,
-        vrf_name=vrf_name,
-        peer_address_str=peer_address_str,
-        defaults={"status": "accepted", "accepted_at": timezone.now()},
-    )
-    # Greenfield-only ownership: own a peer whose overlay
-    # was just created here, or one already owned. A pre-existing UNOWNED (brownfield-adopted)
-    # overlay is left to the 3-way reconcile — editing the netbox-routing object surfaces as
-    # 'changed' for an explicit Accept, it is NOT force-owned/pushed. (The reconciler that
-    # materialized the brownfield peer runs under suppress_intent_push, so this handler never
-    # sees that create; it only fires on a genuine operator create/edit.)
-    if not created and state.status not in _OWNED_PUSH_STATUSES:
-        return
-    state.bgp_peer = peer
-    state.remote_as_str = str(peer.remote_as.asn) if peer.remote_as_id else ""
-    state.enabled = peer.enabled
-    state.last_sync_at = timezone.now()
-    state.save()  # → _on_bgp_peer_state_save schedules the push
+    if _converted_writer_owns_content(device_id, "bgp"):
+        _schedule_intent_push((device_id, "bgp"))
 
 
 @_skip_on_render
 def _on_routing_bgp_peer_save(sender, instance, **kwargs):
-    """netbox_routing BGPPeer created/edited on a managed device → own + push (greenfield)."""
-    device = _bgp_peer_device(instance)
-    if device is not None:
-        _accept_bgp_peer_for_device(instance, device)
+    """Keep foreign native BGP peer saves outside ownership bookkeeping."""
+    _schedule_exact_writer_scope("bgp")
 
 
 @_skip_on_render
 def _on_routing_bgp_peer_pre_delete(sender, instance, **kwargs):
-    """Operator deletes a BGP peer → drop its overlay + push the removal before the cascade.
-
-    Deleting the overlay yields a reduced push snapshot (owned rows only), retracting a
-    previously-owned peer; an un-owned (imported) peer was never in the snapshot, so its
-    delete is a safe no-op. Registered under _as_delete_origin so the removal is marked
-    delete-origin (real retraction, not a detach).
-    """
-    from .models import NSOBGPPeerState, NSODeviceManagement
-
-    device = _bgp_peer_device(instance)
-    if device is None:
-        return
-    try:
-        mgmt = NSODeviceManagement.objects.get(device=device)
-    except NSODeviceManagement.DoesNotExist:
-        return
-    if mgmt.adapter_device_id is None:
-        return
-    asn_str, vrf_name, peer_address_str = _bgp_peer_overlay_key(instance)
-    NSOBGPPeerState.objects.filter(
-        management=mgmt, asn_str=asn_str, vrf_name=vrf_name, peer_address_str=peer_address_str
-    ).delete()
-    device_id, _adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
-    _schedule_intent_push((device_id, "bgp"))
+    """Keep foreign native BGP peer deletes outside ownership bookkeeping."""
+    _schedule_exact_writer_scope("bgp")
 
 
 @_skip_on_render
@@ -4277,9 +4177,7 @@ def _connect_g_activated():  # pragma: no cover
         sender=NSOBGPPeerState,
         dispatch_uid="nso_plugin_bgp_peer_state_post_save",
     )
-    # Retraction path: deleting an overlay row pushes the reduced (owned-only) snapshot.
-    # Fired both by a direct overlay delete and by the native BGPPeer pre_delete below,
-    # which drops the row before the FK cascade would merely SET_NULL it.
+    # An exact overlay deletion pushes the reduced owned snapshot.
     post_delete.connect(
         _as_delete_origin(_on_bgp_peer_state_save),
         sender=NSOBGPPeerState,
@@ -4459,7 +4357,7 @@ def _connect_g_activated():  # pragma: no cover
     except ImportError:
         logger.debug("netbox_routing not installed — OSPF greenfield signals not registered")
 
-    # netbox_routing.BGPPeer greenfield write path (operator-created peers → accepted overlay → push)
+    # netbox_routing.BGPPeer exact-writer delivery notifications.
     try:
         from netbox_routing.models import BGPPeer
 

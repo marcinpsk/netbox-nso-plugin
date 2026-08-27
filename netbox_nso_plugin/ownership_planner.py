@@ -138,6 +138,19 @@ _CONVERTED_SCOPE_RULES = {
             "Acquire from persisted per-interface BFD state. Save events are not ownership evidence."
         ),
     ),
+    "bgp": ScopeOwnershipRule(
+        scope="bgp",
+        native_model_labels=("netbox_routing.bgppeer",),
+        native_key_fields=("scope_id", "peer_id", "name"),
+        overlay_model_labels=("netbox_nso_plugin.nsobgppeerstate",),
+        overlay_native_fields=(("netbox_nso_plugin.nsobgppeerstate", "bgp_peer"),),
+        foreign_overlay_delete="reown",
+        deletion_authority=True,
+        intentional_semantic_delta=(
+            "Acquire from a persisted BGP peer and linked overlay. Native and overlay save events are not ownership "
+            "evidence. Routers, scopes, address families, peer templates, ASNs, and peer IPs are graph dependencies."
+        ),
+    ),
     "interface": ScopeOwnershipRule(
         scope="interface",
         native_model_labels=("dcim.interface",),

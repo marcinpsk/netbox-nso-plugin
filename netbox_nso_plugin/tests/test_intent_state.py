@@ -719,7 +719,9 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
             classified - declared,
             {
                 "dcim.interface_tagged_vlans",
+                "ipam.rir",
                 "ipam.vlangroup",
+                "netbox_nso_plugin.nsobgppeertemplatestate",
                 "netbox_nso_plugin.nsoinstance",
                 "netbox_nso_plugin.nsoroutepolicyobjectclass",
                 "netbox_routing.ospfinstance",
@@ -821,6 +823,7 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         )
 
         from netbox_nso_plugin.models import (
+            NSOBGPPeerState,
             NSOISISInstanceState,
             NSOLACPBundleState,
             NSOLACPMemberState,
@@ -892,6 +895,16 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 local_as=local_as,
                 peer_group=peer_group,
                 enabled=True,
+            )
+            peer.refresh_from_db()
+            NSOBGPPeerState.objects.create(
+                management=self.management,
+                asn_str=str(local_as.asn),
+                peer_address_str=str(peer.peer.address).split("/")[0],
+                remote_as_str=str(remote_as.asn),
+                enabled=True,
+                bgp_peer=peer,
+                status="accepted",
             )
             BGPPeerAddressFamily.objects.create(
                 assigned_object_type=ContentType.objects.get_for_model(BGPPeer),

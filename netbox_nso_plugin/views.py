@@ -4689,18 +4689,54 @@ def _save_owned_isis_edit(obj, key, old_values):
         writer.save(candidate, update_fields=state_fields)
 
 
-def _sync_native_bgp_peer(obj):
-    """Mirror remote-AS and admin state into the linked native BGP peer."""
-    from ipam.models import ASN
+def _save_owned_bgp_edit(obj, old_values):
+    """Claim one BGP peer edit and update its native root through an exact plan."""
+    from ipam.models import ASN, RIR
 
-    from .bgp_reconciler import _get_or_create_asn
-    from .signals import suppress_intent_push
+    from . import status_machine as sm
+    from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
-    native = obj.bgp_peer
-    native.remote_as = _get_or_create_asn(obj.remote_as_str, ASN) if obj.remote_as_str else None
+    planned_at = timezone.now()
+    saves = []
+    operations = []
+    remote_as = None
+    if obj.remote_as_str:
+        asn_number = int(obj.remote_as_str)
+        remote_as = ASN.objects.filter(asn=asn_number).first()
+        if remote_as is None:
+            rir = RIR.objects.filter(name="NSO Auto-Discovered").first()
+            if rir is None:
+                rir = RIR(name="NSO Auto-Discovered", slug="nso-auto-discovered", is_private=True)
+                saves.append(planned_save(rir, force_insert=True, natural_key=("name",)))
+                operations.append((rir, None, True))
+            remote_as = ASN(asn=asn_number, rir=rir)
+            saves.append(planned_save(remote_as, force_insert=True, natural_key=("asn",)))
+            operations.append((remote_as, None, True))
+
+    native = copy.copy(obj.bgp_peer)
+    native.remote_as = remote_as
     native.enabled = obj.enabled
-    with suppress_intent_push():
-        native.save(update_fields=["remote_as", "enabled"])
+    native_fields = ("remote_as", "enabled")
+    saves.append(planned_save(native, update_fields=native_fields))
+    operations.append((native, native_fields, False))
+
+    candidate = copy.copy(obj)
+    if not sm.is_owned(candidate.status):
+        candidate.accepted_at = planned_at
+    candidate.status = sm.on_operator_edit(candidate.status)
+    state_fields = {
+        field_name for field_name, old_value in old_values.items() if getattr(candidate, field_name) != old_value
+    }
+    state_fields.add("status")
+    if candidate.accepted_at is not None:
+        state_fields.add("accepted_at")
+    saves.append(planned_save(candidate, update_fields=state_fields))
+    operations.append((candidate, state_fields, False))
+
+    plan = RendererMutationPlan.build(saves=saves, planned_at=planned_at)
+    with renderer_writes(plan) as writer:
+        for instance, update_fields, force_insert in operations:
+            writer.save(instance, update_fields=update_fields, force_insert=force_insert)
 
 
 def _owned_overlay_edit_footprint(obj, key):
@@ -4713,7 +4749,6 @@ def _owned_overlay_edit_footprint(obj, key):
         "ospf_interface": getattr(obj, "ospf_interface", None),
         "isis_instance": getattr(obj, "isis_instance", None),
         "isis_interface": getattr(obj, "isis_interface", None),
-        "bgp_peer": getattr(obj, "bgp_peer", None),
         "redistribution": getattr(obj, "redistribution", None),
         "static_route": getattr(obj, "static_route", None),
     }.get(key)
@@ -4791,6 +4826,9 @@ def _save_owned_overlay_edit(obj, key, old_values):
     if key in {"isis_instance", "isis_interface"}:
         _save_owned_isis_edit(obj, key, old_values)
         return
+    if key == "bgp_peer":
+        _save_owned_bgp_edit(obj, old_values)
+        return
 
     from . import status_machine as sm
     from .intent_state import intent_transaction
@@ -4805,8 +4843,6 @@ def _save_owned_overlay_edit(obj, key, old_values):
             if iface.mtu != clamped:
                 iface.mtu = clamped
                 iface.save(update_fields=["mtu"])
-        if key == "bgp_peer":
-            _sync_native_bgp_peer(obj)
         update_fields = {
             field_name
             for field_name, old_value in old_values.items()
@@ -6369,12 +6405,22 @@ class NSOBGPPeerTemplateStateAcceptView(NSOActionPermissionMixin, View):
     """
 
     def post(self, request, pk):  # noqa: D102
+        import copy
+
         from .models import NSOBGPPeerTemplateState
+        from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes
 
         state = get_object_or_404(NSOBGPPeerTemplateState, pk=pk)
-        state.status = _status_after_accept(state.status)
-        state.accepted_at = timezone.now()
-        state.save(update_fields=["status", "accepted_at"])
+        candidate = copy.copy(state)
+        candidate.status = _status_after_accept(candidate.status)
+        candidate.accepted_at = timezone.now()
+        fields = ("status", "accepted_at")
+        plan = RendererMutationPlan.build(
+            saves=(planned_save(candidate, update_fields=fields),),
+            planned_at=candidate.accepted_at,
+        )
+        with renderer_mirror_writes(plan) as writer:
+            writer.save(candidate, update_fields=fields)
         messages.success(request, f"Accepted BGP peer-group template {state.template_name}.")
         return redirect(_device_nso_tab_url(state.management.device_id))
 
@@ -7392,10 +7438,8 @@ class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
 
     Builds the netbox-routing object graph (BGPRouter → BGPScope → BGPPeer + address
     families) the reconciler would build for a brownfield peer, reusing the reconciler's
-    own get_or_create helpers so a greenfield peer and a later reconcile of the same peer
-    converge on one identity. The BGPPeer save fires the greenfield signal, which owns an
-    accepted NSOBGPPeerState overlay and pushes the (owned-only) BGP intent — written to
-    the device on the next Apply.
+    natural identities so a greenfield peer and a later reconcile of the same peer
+    converge on one object. One exact writer creates the graph and accepted overlay.
 
     Authorization is TWO-sided, because this view is a door into another app: the caller
     must hold the netbox_routing add permission for the object graph it mints (the NSO
@@ -7439,21 +7483,9 @@ class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
 
     @staticmethod
     def _create_peer(device, data):
-        """Assemble the router→scope→peer→AF graph via the reconciler's helpers.
-
-        The whole graph is built inside one ``transaction.atomic()`` block so the intent
-        push — fired by the ``BGPPeer`` post_save signal — is DEFERRED to ``on_commit`` and
-        runs only after the peer's address-families are attached. Without the wrapper the
-        view runs outside any transaction (NetBox sets no ``ATOMIC_REQUESTS``), so
-        ``_schedule_intent_push`` runs the push INLINE at ``BGPPeer.create()`` time — before
-        ``_write_peer_afs`` — and the pushed intent carries an empty ``address_families``.
-        The bgp-reconciler then writes a neighbor with no ``address-family`` activation, i.e.
-        an inert session (device-caught on ra1.lab via a greenfield dry-run). Atomicity also
-        makes the create all-or-nothing on error.
-        """
+        """Create one owned router, scope, peer, and AF graph through an exact plan."""
         from dcim.models import Device
         from django.contrib.contenttypes.models import ContentType
-        from django.db import transaction
         from netbox_routing.models import (
             BGPAddressFamily,
             BGPPeer,
@@ -7462,26 +7494,115 @@ class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
             BGPScope,
         )
 
-        from .bgp_reconciler import _get_or_create_router, _get_or_create_scope, _write_peer_afs
+        from .models import NSOBGPPeerState, NSODeviceManagement
+        from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+        from .signals import _schedule_intent_push, suppress_intent_push
 
-        with transaction.atomic():
-            router = _get_or_create_router(device, data["local_asn"], BGPRouter, ContentType, Device)
-            scope = _get_or_create_scope(router, data.get("vrf"), BGPScope)
-            peer = BGPPeer.objects.create(
-                scope=scope,
-                peer=data["peer"],
-                name=None,
-                remote_as=data.get("remote_as"),
-                local_as=data.get("peer_local_as"),
-                ttl=data.get("ttl"),
-                enabled=data.get("enabled", True),
-                password=data.get("password") or None,
-                peer_group=data.get("peer_group"),
-                source=data.get("source"),
-                update_source=data.get("update_source"),
+        management = NSODeviceManagement.objects.get(device=device)
+        planned_at = timezone.now()
+        device_type = ContentType.objects.get_for_model(Device)
+        router = BGPRouter.objects.filter(
+            assigned_object_type=device_type,
+            assigned_object_id=device.pk,
+            asn=data["local_asn"],
+        ).first()
+        saves = []
+        operations = []
+
+        def save(instance, *, force_insert=False, natural_key=(), references=()):
+            references = tuple(references)
+            saves.append(
+                planned_save(
+                    instance,
+                    force_insert=force_insert,
+                    natural_key=natural_key,
+                    references=references,
+                )
             )
-            af_list = [{"af": af, "enabled": True} for af in (data.get("address_families") or ["ipv4-unicast"])]
-            _write_peer_afs(peer, af_list, scope, BGPAddressFamily, BGPPeerAddressFamily)
+            operations.append((instance, force_insert, references))
+
+        if router is None:
+            router = BGPRouter(
+                assigned_object_type=device_type,
+                assigned_object_id=device.pk,
+                asn=data["local_asn"],
+                name=str(data["local_asn"].asn),
+            )
+            save(
+                router,
+                force_insert=True,
+                natural_key=("assigned_object_type", "assigned_object_id", "asn"),
+            )
+        scope = BGPScope.objects.filter(router=router, vrf=data.get("vrf")).first() if router.pk is not None else None
+        if scope is None:
+            scope = BGPScope(router=router, vrf=data.get("vrf"))
+            save(scope, force_insert=True, natural_key=("router", "vrf"))
+        peer = BGPPeer(
+            scope=scope,
+            peer=data["peer"],
+            name=None,
+            remote_as=data.get("remote_as"),
+            local_as=data.get("peer_local_as"),
+            ttl=data.get("ttl"),
+            enabled=data.get("enabled", True),
+            password=data.get("password") or None,
+            peer_group=data.get("peer_group"),
+            source=data.get("source"),
+            update_source=data.get("update_source"),
+        )
+        save(peer, force_insert=True, natural_key=("scope", "peer", "name"))
+        peer_type = ContentType.objects.get_for_model(BGPPeer)
+        address_families = data.get("address_families") or ["ipv4-unicast"]
+        for value in address_families:
+            address_family = (
+                BGPAddressFamily.objects.filter(scope=scope, address_family=value).first()
+                if scope.pk is not None
+                else None
+            )
+            if address_family is None:
+                address_family = BGPAddressFamily(scope=scope, address_family=value)
+                save(
+                    address_family,
+                    force_insert=True,
+                    natural_key=("scope", "address_family"),
+                )
+            peer_address_family = BGPPeerAddressFamily(
+                assigned_object_type=peer_type,
+                assigned_object_id=None,
+                address_family=address_family,
+                enabled=True,
+            )
+            save(
+                peer_address_family,
+                force_insert=True,
+                natural_key=("assigned_object_type", "assigned_object_id", "address_family"),
+                references=(("assigned_object_id", peer),),
+            )
+        state = NSOBGPPeerState(
+            management=management,
+            asn_str=str(data["local_asn"].asn),
+            vrf_name=data["vrf"].name if data.get("vrf") else "",
+            peer_address_str=str(data["peer"].address).split("/")[0],
+            bgp_peer=peer,
+            remote_as_str=str(data["remote_as"].asn) if data.get("remote_as") else "",
+            enabled=data.get("enabled", True),
+            status="accepted",
+            accepted_at=planned_at,
+            last_sync_at=planned_at,
+        )
+        save(
+            state,
+            force_insert=True,
+            natural_key=("management", "asn_str", "vrf_name", "peer_address_str"),
+        )
+        plan = RendererMutationPlan.build(saves=saves, planned_at=planned_at)
+        with renderer_writes(plan) as writer:
+            with suppress_intent_push():
+                for instance, force_insert, references in operations:
+                    for field_name, related in references:
+                        setattr(instance, field_name, related.pk)
+                    writer.save(instance, force_insert=force_insert)
+            _schedule_intent_push((device.pk, "bgp"))
         return peer
 
 

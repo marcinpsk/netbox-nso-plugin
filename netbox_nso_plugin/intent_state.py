@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 ABSENT = ("ABSENT",)
 
 SOURCE_MODEL_RANKS = (
+    "ipam.rir",
     "ipam.vlan",
     "ipam.vlangroup",
     "ipam.vrf",
@@ -113,6 +114,7 @@ OVERLAY_MODEL_RANKS = (
     "netbox_nso_plugin.nsoisisinstancestate",
     "netbox_nso_plugin.nsoisisinterfacestate",
     "netbox_nso_plugin.nsobgppeerstate",
+    "netbox_nso_plugin.nsobgppeertemplatestate",
     "netbox_nso_plugin.nsoroutepolicystate",
     "netbox_nso_plugin.nsoospfinstancestate",
     "netbox_nso_plugin.nsoospfinterfacestate",

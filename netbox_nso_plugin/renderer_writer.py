@@ -404,11 +404,15 @@ def _plan_save(proposed: RendererSave, creation_refs, support_refs):
         force_insert=proposed.force_insert,
     )
     if spec is None:
-        if label not in SOURCE_MODEL_RANKS:
+        if label in SOURCE_MODEL_RANKS:
+            row_kind = "source_rows"
+        elif label in OVERLAY_MODEL_RANKS:
+            row_kind = "overlay_rows"
+        else:
             raise IntentMutationProtocolError(f"{label} is not a ranked native renderer dependency")
         footprint = MutationFootprint.for_keys(
             (),
-            source_rows=(SourceRow(label, None if before is None else before.pk),),
+            **{row_kind: (SourceRow(label, None if before is None else before.pk),)},
         )
         return write, footprint, set()
     base = MutationFootprint.merge(

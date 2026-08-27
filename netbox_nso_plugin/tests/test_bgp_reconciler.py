@@ -153,6 +153,69 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
 
     # ── Basic cases ────────────────────────────────────────────────────────────
 
+    def test_preflight_plan_freezes_complete_bgp_graph_without_writes(self):
+        """The BGP preflight includes every graph row before it changes the database."""
+        self._make_mgmt()
+
+        from ipam.models import ASN, RIR, IPAddress
+        from netbox_routing.models import (
+            BGPAddressFamily,
+            BGPPeer,
+            BGPPeerAddressFamily,
+            BGPPeerTemplate,
+            BGPRouter,
+            BGPScope,
+        )
+
+        from netbox_nso_plugin.bgp_reconciler import bgp_reconcile_plan
+        from netbox_nso_plugin.models import NSOBGPPeerState, NSOBGPPeerTemplateState
+
+        payload = self._router_payload(
+            peers=[self._peer_entry(peer_group="EDGE")],
+            router_id="198.18.0.1",
+        )
+        payload["scopes"][0]["peer_groups"] = [
+            {
+                "name": "EDGE",
+                "remote_as": "65200",
+                "address_families": [{"af": "ipv4-unicast", "enabled": True}],
+            }
+        ]
+
+        plan = bgp_reconcile_plan(self.device, self._payload(payload))
+
+        labels = [write.model_label for write in plan.write_set if write.operation == "save"]
+        self.assertEqual(
+            set(labels),
+            {
+                "ipam.asn",
+                "ipam.ipaddress",
+                "ipam.rir",
+                "netbox_routing.bgpaddressfamily",
+                "netbox_routing.bgppeer",
+                "netbox_routing.bgppeeraddressfamily",
+                "netbox_routing.bgppeertemplate",
+                "netbox_routing.bgprouter",
+                "netbox_routing.bgpscope",
+                "netbox_nso_plugin.nsobgppeerstate",
+                "netbox_nso_plugin.nsobgppeertemplatestate",
+            },
+        )
+        for model in (
+            ASN,
+            RIR,
+            IPAddress,
+            BGPAddressFamily,
+            BGPPeer,
+            BGPPeerAddressFamily,
+            BGPPeerTemplate,
+            BGPRouter,
+            BGPScope,
+            NSOBGPPeerState,
+            NSOBGPPeerTemplateState,
+        ):
+            self.assertFalse(model.objects.exists(), model._meta.label_lower)
+
     def test_no_mgmt_returns_empty(self):
         """Device without NSODeviceManagement → empty list, no crash."""
         orphan = _make_bgp_device("orphan")
@@ -1040,6 +1103,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
     def test_plan_batches_owned_peer_dependency_lookups(self):
         from django.db import connection
         from django.test.utils import CaptureQueriesContext
+        from netbox_routing.models import PrefixList, RouteMap
 
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
         from netbox_nso_plugin.intent_state import SourceRow
@@ -1068,10 +1132,10 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
 
         one_peer = self._payload(self._router_payload(peers=peers[:1]))
         plan = bgp_reconcile_plan(self.device, one_peer)
-        self.assertIn(("route-policy", "route_map:rm-batch"), plan.footprint.shared_keys)
-        self.assertIn(("route-policy", "prefix_list:pl-batch"), plan.footprint.shared_keys)
-        self.assertIn(SourceRow("netbox_routing.routemap", None), plan.footprint.source_rows)
-        self.assertIn(SourceRow("netbox_routing.prefixlist", None), plan.footprint.source_rows)
+        self.assertIn(("route-policy", "route_map:rm-batch"), plan.lock_footprint.shared_keys)
+        self.assertIn(("route-policy", "prefix_list:pl-batch"), plan.lock_footprint.shared_keys)
+        self.assertIn(SourceRow("netbox_routing.routemap", None), plan.lock_footprint.source_rows)
+        self.assertIn(SourceRow("netbox_routing.prefixlist", None), plan.lock_footprint.source_rows)
         with CaptureQueriesContext(connection) as one_queries:
             bgp_reconcile_plan(self.device, one_peer)
         for state in states[1:]:
@@ -1079,13 +1143,20 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         with CaptureQueriesContext(connection) as four_queries:
             bgp_reconcile_plan(self.device, payload)
 
-        self.assertEqual(len(four_queries), len(one_queries))
+        policy_tables = (RouteMap._meta.db_table, PrefixList._meta.db_table)
+        one_policy_queries = [query for query in one_queries if any(table in query["sql"] for table in policy_tables)]
+        four_policy_queries = [
+            query for query in four_queries if any(table in query["sql"] for table in policy_tables)
+        ]
+        self.assertEqual(len(four_policy_queries), len(one_policy_queries))
+        self.assertEqual(len(one_policy_queries), 2)
 
     def test_plan_revalidates_a_missing_route_map_after_lock_acquisition(self):
         from netbox_routing.models import RouteMap
 
-        from netbox_nso_plugin.bgp_reconciler import bgp_reconcile_plan
-        from netbox_nso_plugin.intent_state import RendererTargetsChanged, reconcile_transaction
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
+        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
+        from netbox_nso_plugin.renderer_writer import renderer_mirror_writes, renderer_writes
 
         self._make_mgmt()
         payload = self._payload(
@@ -1106,8 +1177,9 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         plan = bgp_reconcile_plan(self.device, payload)
         RouteMap.objects.create(name="RM-RACE")
 
-        with self.assertRaises(RendererTargetsChanged), reconcile_transaction(plan):
-            pass
+        mutation = renderer_writes if plan.changes_content else renderer_mirror_writes
+        with self.assertRaises(IntentMutationProtocolError), mutation(plan):
+            _reconcile_bgp_config(self.device, payload)
 
     def test_plan_revalidates_a_created_source_interface_after_lock_acquisition(self):
         from dcim.models import Interface
@@ -1212,7 +1284,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
             )
         )
 
-        footprint = bgp_reconcile_plan(self.device, payload).footprint
+        footprint = bgp_reconcile_plan(self.device, payload).lock_footprint
 
         self.assertEqual(set(footprint.device_ids), {self.device.pk, other_device.pk})
         self.assertEqual(set(footprint.revision_keys), {(self.device.pk, "bgp")})
@@ -1237,7 +1309,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
             enabled=True,
         )
 
-        source_rows = set(bgp_reconcile_plan(self.device, payload).footprint.source_rows)
+        source_rows = set(bgp_reconcile_plan(self.device, payload).lock_footprint.source_rows)
 
         self.assertIn(SourceRow(peer_address_family._meta.label_lower, peer_address_family.pk), source_rows)
         self.assertNotIn(SourceRow(colliding._meta.label_lower, colliding.pk), source_rows)
