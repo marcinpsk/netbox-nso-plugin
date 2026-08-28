@@ -2696,6 +2696,28 @@ def _apply_refusal_message(exc, mgmt) -> str:
     return _APPLY_REFUSED_MESSAGE
 
 
+def _audit_capture(mgmt, scopes, trigger, remaining_budget) -> None:
+    """Front one Apply capture with a pre-capture audit inside the Apply's send deadline.
+
+    The audit budgets on ``time.monotonic()`` while the send deadline is on the drain's
+    clock, so it is handed the Apply's REMAINING share rather than the deadline value.
+    """
+    import time
+
+    from .renderer_audit import RendererAuditBudgetExceeded, audit_renderer_scopes
+
+    try:
+        audit_renderer_scopes(
+            mgmt.device_id,
+            scopes,
+            trigger=trigger,
+            pre_capture=True,
+            deadline=time.monotonic() + remaining_budget(),
+        )
+    except RendererAuditBudgetExceeded as exc:
+        raise ApplyDeadlineExpired from exc
+
+
 def _push_direct_snapshots(mgmt, registry, remaining_budget) -> None:
     """Force-push the out-of-protocol device snapshots, last, and abort truthfully.
 
@@ -2743,15 +2765,7 @@ def _prepare_apply(mgmt):
     Completed direct writes cannot be rolled back.
     """
     from . import delivery, drain
-    from .renderer_audit import audit_renderer_scopes
     from .signals import stored_static_route_count
-
-    audit_renderer_scopes(
-        mgmt.device_id,
-        tuple(delivery.delivery_keys()),
-        trigger="views._prepare_apply",
-        pre_capture=True,
-    )
 
     prepare_deadline = drain._send_clock() + drain.SEND_DEADLINE.total_seconds()
 
@@ -2760,6 +2774,8 @@ def _prepare_apply(mgmt):
         if remaining <= 0:
             raise ApplyDeadlineExpired
         return remaining
+
+    _audit_capture(mgmt, tuple(delivery.delivery_keys()), "views._prepare_apply", remaining_budget)
 
     # Each of these takes its OWN forced claim, so Apply re-ships the operator's intent
     # whatever the acknowledged baseline says and whatever a queued claim was carrying:
@@ -2830,19 +2846,15 @@ def _prepare_apply(mgmt):
         if outcome != drain.SUCCEEDED:
             raise ApplyPreparationRefused("snmp", _PREPARE_NOT_SETTLED)
 
+    # A foreign writer can commit after an earlier scope receipt. Audit the complete
+    # selector once more before promotion so that its repair revision invalidates any
+    # receipt captured before that commit. Ahead of the direct pushes: a repair bump that
+    # aborts the Apply after an irreversible device write leaves the device changed.
+    _audit_capture(mgmt, tuple(registry), "views._prepare_apply.finalize", remaining_budget)
+
     # Direct snapshots do not participate in the adapter selector. Keep them outside
     # the receipt capture so only in-protocol store-only claims reach promotion.
     _push_direct_snapshots(mgmt, registry, remaining_budget)
-
-    # A foreign writer can commit after an earlier scope receipt. Audit the complete
-    # selector once more before promotion so that its repair revision invalidates any
-    # receipt captured before that commit.
-    audit_renderer_scopes(
-        mgmt.device_id,
-        tuple(registry),
-        trigger="views._prepare_apply.finalize",
-        pre_capture=True,
-    )
 
     selected = MappingProxyType({registry[scope].section: successful.push_seq for scope, successful in pushed.items()})
 

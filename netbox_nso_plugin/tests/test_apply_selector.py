@@ -2147,6 +2147,44 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             ["accepted"] * 11,
         )
 
+    def test_the_finalize_audit_runs_before_the_irreversible_direct_pushes(self):
+        """A finalize repair aborts the Apply, so it may not run after a device write.
+
+        ``_push_direct_snapshots`` writes LAG and switchport config straight to the device
+        with no rollback. A finalize audit behind it can bump the revision and abort the
+        Apply with the device already changed and every promoted row stranded.
+        """
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import renderer_audit, views
+        from netbox_nso_plugin.views import _prepare_apply
+
+        real_audit = renderer_audit.audit_renderer_scopes
+        real_direct = views._push_direct_snapshots
+        adapter = _ApplyContractAdapter(lambda selected: (202, _promoted(selected)))
+        order = []
+
+        def _recording_audit(*args, **kwargs):
+            trigger = kwargs.get("trigger", args[2] if len(args) > 2 else "")
+            if trigger.endswith(".finalize"):
+                order.append("finalize-audit")
+            return real_audit(*args, **kwargs)
+
+        def _recording_direct(*args, **kwargs):
+            order.append("direct-push")
+            return real_direct(*args, **kwargs)
+
+        config, session = adapter.patches()
+        with (
+            config,
+            session,
+            patch.object(renderer_audit, "audit_renderer_scopes", _recording_audit),
+            patch.object(views, "_push_direct_snapshots", _recording_direct),
+        ):
+            _prepare_apply(self.mgmt)
+
+        self.assertEqual(order, ["finalize-audit", "direct-push"])
+
     def test_interface_footprint_refuses_a_move_after_the_device_lock(self):
         from unittest.mock import patch
 
