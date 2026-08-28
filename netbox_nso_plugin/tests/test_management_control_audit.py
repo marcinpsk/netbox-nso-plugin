@@ -4,15 +4,44 @@
 
 from __future__ import annotations
 
+import threading
 from unittest.mock import patch
 
-from dcim.models import Interface
-from django.db import connection
+from dcim.models import Device, Interface
+from django.db import OperationalError, close_old_connections, connection, transaction
 from django.test import TransactionTestCase
 from ipam.models import IPAddress
 
 from ._outbox_case import make_managed
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
+
+
+def _probe_lock(queryset):
+    """Try to take *queryset*'s row lock from a second connection; return the outcome.
+
+    ``nowait`` turns "the row is locked" into an immediate error instead of a wait, so the
+    probe is a fact about the lock window rather than a race against a timeout. ``of="self"``
+    matches how the production footprint locks, and keeps a model whose ``Meta.ordering``
+    joins another table from reporting that table's lock as its own.
+    """
+    outcome = []
+
+    def run():
+        close_old_connections()
+        try:
+            with transaction.atomic():
+                list(queryset.select_for_update(of=("self",), nowait=True))
+            outcome.append(None)
+        except OperationalError as exc:
+            outcome.append(exc)
+        finally:
+            close_old_connections()
+
+    probe = threading.Thread(target=run)
+    probe.start()
+    probe.join(timeout=10)
+    assert not probe.is_alive(), "the nowait probe never returned"
+    return outcome[0]
 
 
 class TestManagementControlAudit(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
@@ -54,6 +83,55 @@ class TestManagementControlAudit(_CascadeFlushMixin, IntentPushResetMixin, Trans
             self.assertTrue(reconcile_management_control(self.device.pk))
 
         set_scope.assert_called_once()
+
+    def test_delivery_family_locks_are_free_while_the_control_post_is_in_flight(self):
+        """The control push must not hold the 18 family revision locks across the network call.
+
+        The footprint used to merge ``reconcile_family_footprint`` over every delivery key, so
+        one adapter round trip froze the whole device: no reconciler, no Apply and no renderer
+        write for any family could proceed until the HTTP call returned.
+        """
+        from netbox_nso_plugin.management_lifecycle import reconcile_management_control
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        revision = NSOIntentRevision.objects.create(device=self.device, scope="vlan", revision=1)
+        probes = []
+
+        def probe_family_lock(*args, **kwargs):
+            probes.append(_probe_lock(NSOIntentRevision.objects.filter(pk=revision.pk)))
+            return {}
+
+        with patch("netbox_nso_plugin.adapter_client.set_scope", side_effect=probe_family_lock):
+            self.assertTrue(reconcile_management_control(self.device.pk))
+
+        self.assertEqual(probes, [None])
+
+    def test_the_address_owners_stay_locked_while_the_control_post_is_in_flight(self):
+        """The five posted values stay one snapshot: no primary-IP change can interleave.
+
+        Narrowing the footprint must not narrow away the rows the payload is read from — a
+        concurrent primary-IP move landing mid-POST would put half of an old payload and half
+        of a new one on the adapter, with no later push to correct it.
+        """
+        from netbox_nso_plugin.management_lifecycle import reconcile_management_control
+
+        interface = Interface.objects.create(device=self.device, name="Loopback1627", type="virtual")
+        primary = IPAddress.objects.create(address="198.18.175.2/32", assigned_object=interface)
+        self.device.primary_ip4 = primary
+        self.device.save(update_fields=["primary_ip4"])
+        probes = []
+
+        def probe_source_locks(*args, **kwargs):
+            probes.append(_probe_lock(Device.objects.filter(pk=self.device.pk)))
+            probes.append(_probe_lock(IPAddress.objects.filter(pk=primary.pk)))
+            return {}
+
+        with patch("netbox_nso_plugin.adapter_client.set_scope", side_effect=probe_source_locks):
+            self.assertTrue(reconcile_management_control(self.device.pk))
+
+        self.assertEqual(len(probes), 2)
+        for outcome in probes:
+            self.assertIsInstance(outcome, OperationalError)
 
     def test_cadence_runs_control_reconciliation_before_renderer_comparison(self):
         from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
