@@ -2441,15 +2441,6 @@ def reconcile_cascade_dml(model):
             permit.authorized_dml.pop(table, None)
 
 
-def _content_permit_covers(instance, _spec: RendererInputSpec, permit: _Permit) -> bool:
-    row = SourceRow(instance._meta.label_lower, instance.pk)
-    future = SourceRow(instance._meta.label_lower, None)
-    return row in (*permit.footprint.source_rows, *permit.footprint.overlay_rows) or future in (
-        *permit.footprint.source_rows,
-        *permit.footprint.overlay_rows,
-    )
-
-
 def _footprint_covers_row(instance, permit: _Permit) -> bool:
     rows = (*permit.footprint.source_rows, *permit.footprint.overlay_rows)
     return (
@@ -2617,7 +2608,7 @@ def _authorize_active_write(active, sender, instance, spec, *, deleting, update_
                 raise IntentMutationProtocolError(
                     f"read-side {sender._meta.label_lower} write changes rendered content"
                 )
-    elif writer is None and not _content_permit_covers(instance, spec, active):
+    elif writer is None and not _footprint_covers_row(instance, active):
         before = canonical_fragment(instance, spec) if deleting else _database_fragment(instance, spec)
         after = ABSENT if deleting else _effective_after_fragment(instance, spec, update_fields)
         if before != after:
