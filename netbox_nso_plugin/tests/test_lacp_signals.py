@@ -19,7 +19,9 @@ class _LacpBase(IntentPushDeliveryMixin, TestCase):
         site = Site.objects.create(name="LacpSigSite", slug="lacpsigsite")
         cls.device = Device.objects.create(name="lacp-sig-rtr", device_type=dt, role=role, site=site)
         cls.lag = Interface.objects.create(device=cls.device, name="Port-channel1", type="lag")
-        cls.m1 = Interface.objects.create(device=cls.device, name="GigabitEthernet0/1", type="1000base-t")
+        # `lag` is the native anchor the LACP member binding reads: without it the overlay
+        # owns nothing the device carries and the ownership audit demotes it.
+        cls.m1 = Interface.objects.create(device=cls.device, name="GigabitEthernet0/1", type="1000base-t", lag=cls.lag)
 
     def _make_mgmt(self, adapter_device_id=42, auto_apply=False):
         from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
