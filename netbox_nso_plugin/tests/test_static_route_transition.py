@@ -22,6 +22,7 @@ from netbox_nso_plugin import adapter_client as _adapter_client
 
 from ._static_route_case import PUT, _fixtures, _make_device, _make_mgmt, _own, _route
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
+from .strict_writer import assert_each_operation_consumed_once, strict_writer_harness
 
 #: Captured at import, before any test can patch it — see ``_assert_put_patch_did_not_leak``.
 _REAL_PUT = _adapter_client.put_static_route_intent
@@ -52,18 +53,13 @@ class TestStaticRouteContentTransition(IntentPushDeliveryMixin, TestCase):
         self.assertIsNotNone(state.generation_started_at)
         put.assert_not_called()
 
-    def test_a_foreign_edit_demotes_a_deploying_row_during_audit(self):
-        """An audit prevents an old result from settling foreign-edited intent."""
+    def _trust_the_current_baseline(self):
+        """Certify what the scope renders right now, as a settled push leaves it."""
         from django.utils import timezone
 
         from netbox_nso_plugin import delivery
         from netbox_nso_plugin.models import NSOIntentRevision
-        from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
 
-        with _fixtures():
-            sr = _route("10.21.0.0/16", "10.0.0.1", devices=[self.device])
-            state = _own(sr, self.mgmt, status="deploying")
-        accepted_at = state.accepted_at
         revision, _created = NSOIntentRevision.objects.get_or_create(device=self.device, scope="static_route")
         revision.verified_revision = revision.revision
         revision.verified_fingerprint = delivery.canonical_fingerprint(
@@ -71,6 +67,17 @@ class TestStaticRouteContentTransition(IntentPushDeliveryMixin, TestCase):
         )
         revision.verified_at = timezone.now()
         revision.save(update_fields=["verified_revision", "verified_fingerprint", "verified_at", "updated_at"])
+        return revision
+
+    def test_a_foreign_edit_demotes_a_deploying_row_during_audit(self):
+        """An audit prevents an old result from settling foreign-edited intent."""
+        from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
+
+        with _fixtures():
+            sr = _route("10.21.0.0/16", "10.0.0.1", devices=[self.device])
+            state = _own(sr, self.mgmt, status="deploying")
+        accepted_at = state.accepted_at
+        self._trust_the_current_baseline()
 
         with patch(PUT), self.captureOnCommitCallbacks(execute=True):
             sr.next_hop = "10.0.0.2"
@@ -132,13 +139,23 @@ class TestStaticRouteContentTransition(IntentPushDeliveryMixin, TestCase):
         put.assert_not_called()
 
     def test_suppression_does_not_turn_a_foreign_save_into_an_own_write(self):
-        """Foreign writes stay neutral even when the caller uses push suppression."""
+        """Foreign writes stay neutral even when the caller uses push suppression.
+
+        The refusal this case carries moved rather than went away. A suppressed content save
+        used to raise ``changes rendered content`` at the write; under foreign-writer
+        neutrality it commits silently, so the certified baseline is what refuses: the next
+        pre-capture audit finds the render moved under it and repairs the scope instead of
+        letting an Apply settle on a snapshot the device never got.
+        """
+        from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
         from netbox_nso_plugin.signals import suppress_intent_push
 
         with _fixtures():
             sr = _route("10.25.0.0/16", "10.0.0.1", devices=[self.device])
             state = _own(sr, self.mgmt, status="in_sync")
         before = state.intent_generation
+        revision = self._trust_the_current_baseline()
+        certified = revision.revision
 
         with patch(PUT) as put, self.captureOnCommitCallbacks(execute=True):
             with suppress_intent_push():
@@ -159,6 +176,16 @@ class TestStaticRouteContentTransition(IntentPushDeliveryMixin, TestCase):
         self.assertEqual(state.status, "in_sync")
         self.assertEqual(state.intent_generation, before)
         put.assert_not_called()
+
+        result = audit_renderer_scopes(self.device.pk, ("static_route",), trigger="test", pre_capture=True)
+
+        self.assertEqual(result.repaired, ("static_route",))
+        state.refresh_from_db()
+        revision.refresh_from_db()
+        self.assertEqual(state.status, "accepted")
+        self.assertGreater(state.intent_generation, before)
+        self.assertGreater(revision.revision, certified)
+        self.assertEqual(revision.verified_revision, revision.revision)
 
     def test_a_field_the_save_did_not_persist_is_not_a_content_change(self):
         """``update_fields`` means the database never saw the other attributes. Reading them
@@ -348,9 +375,10 @@ class TestStaticRouteBulkAcceptOutsideATransaction(_CascadeFlushMixin, IntentPus
         half-armed snapshot."""
         states = self._drifted(3)
 
-        with patch(PUT) as put:
+        with strict_writer_harness() as records, patch(PUT) as put:
             response = self._post()
 
+        assert_each_operation_consumed_once(records)
         self.assertEqual(response.status_code, 302)
         self.assertEqual(put.call_count, 1)
         for state in states:

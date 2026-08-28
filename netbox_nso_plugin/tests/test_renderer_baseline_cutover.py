@@ -13,6 +13,7 @@ from django.test import TransactionTestCase
 
 from ._outbox_case import make_managed, mirror_update, own_vlan
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
+from .strict_writer import assert_each_operation_consumed_once, strict_writer_harness
 
 
 class TestRendererBaselineCutover(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
@@ -42,8 +43,10 @@ class TestRendererBaselineCutover(_CascadeFlushMixin, IntentPushResetMixin, Tran
         NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").delete()
         stdout = io.StringIO()
 
-        call_command("nso_renderer_baseline_cutover", stdout=stdout)
+        with strict_writer_harness() as records:
+            call_command("nso_renderer_baseline_cutover", stdout=stdout)
 
+        assert_each_operation_consumed_once(records)
         state.refresh_from_db()
         revision.refresh_from_db()
         self.assertEqual(state.status, "accepted")
@@ -64,4 +67,38 @@ class TestRendererBaselineCutover(_CascadeFlushMixin, IntentPushResetMixin, Tran
             with self.assertRaisesMessage(Exception, "racing"):
                 call_command("nso_renderer_baseline_cutover", stdout=io.StringIO())
 
+        self.assertTrue(is_quiesced())
+
+    def test_a_baseline_that_never_stops_repairing_fails_and_stays_quiesced(self):
+        """A device whose every audit still repairs has no trusted baseline to hand over."""
+        from django.core.management.base import CommandError
+
+        from netbox_nso_plugin.deployment import is_quiesced
+        from netbox_nso_plugin.renderer_audit import RendererAuditResult
+
+        own_vlan(self.management, 1675, "renderer-cutover")
+        audits = []
+
+        def never_stabilizes(device_id, scopes, trigger, **kwargs):
+            audits.append(device_id)
+            return RendererAuditResult(tuple(scopes), tuple(scopes))
+
+        with patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes", never_stabilizes):
+            with self.assertRaisesMessage(CommandError, "did not stabilize"):
+                call_command("nso_renderer_baseline_cutover", stdout=io.StringIO())
+
+        self.assertEqual(audits, [self.device.pk] * 3)
+        self.assertTrue(is_quiesced())
+
+    def test_a_run_started_under_an_existing_gate_leaves_that_gate_standing(self):
+        """The operator who quiesced owns the resume; the cutover must not take it from them."""
+        from netbox_nso_plugin.deployment import is_quiesced, quiesce
+
+        own_vlan(self.management, 1676, "renderer-cutover")
+        self.assertTrue(quiesce())
+        stdout = io.StringIO()
+
+        call_command("nso_renderer_baseline_cutover", stdout=stdout)
+
+        self.assertIn("Renderer baseline cutover passed", stdout.getvalue())
         self.assertTrue(is_quiesced())
