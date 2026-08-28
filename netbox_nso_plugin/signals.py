@@ -69,11 +69,18 @@ def _converted_writer_owns_content(device_id, scope) -> bool:
     return renderer_writer_owns_key(device_id, scope, content=True)
 
 
-def _converted_writer_is_active() -> bool:
-    """Return whether a converted exact writer is active in this context."""
-    from .renderer_writer import active_renderer_writer
+def _require_converted_writer(handler):
+    """Run a converted state handler only inside an exact writer context."""
 
-    return active_renderer_writer() is not None
+    @functools.wraps(handler)
+    def _wrapped(*args, **kwargs):
+        from .renderer_writer import active_renderer_writer
+
+        if active_renderer_writer() is None:
+            return None
+        return handler(*args, **kwargs)
+
+    return _wrapped
 
 
 def _schedule_exact_writer_scope(target_scope) -> None:
@@ -1549,6 +1556,7 @@ def _push_snmp_intent_for_device(device_id, adapter_device_id):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_snmp_state_save(sender, instance, **kwargs):
     """Push SNMP intent whenever an SNMP state row is saved (accept triggers push)."""
     from .models import NSODeviceManagement
@@ -1626,6 +1634,7 @@ def _push_logging_intent_for_device(device_id, adapter_device_id):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_logging_state_save(sender, instance, **kwargs):
     """Push logging intent whenever an NSOLogging*State row is saved (accept → push)."""
     from .models import NSODeviceManagement
@@ -1682,6 +1691,7 @@ def _push_svi_intent_for_device(device_id, adapter_device_id):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_svi_state_save(sender, instance, **kwargs):
     """Push SVI intent whenever an NSOSVIState row is saved (accept triggers push)."""
     from .models import NSODeviceManagement
@@ -1738,6 +1748,7 @@ def _push_subinterface_intent_for_device(device_id, adapter_device_id):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_subinterface_state_save(sender, instance, **kwargs):
     """Push subinterface intent whenever an NSOSubinterfaceState row is saved."""
     from .models import NSODeviceManagement
@@ -1793,6 +1804,7 @@ def _push_interface_mtu_intent_for_device(device_id, adapter_device_id):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_mtu_state_save(sender, instance, **kwargs):
     """Push MTU intent whenever an NSOInterfaceMtuState row is saved."""
     from .models import NSODeviceManagement
@@ -1846,6 +1858,7 @@ def _push_vlan_intent_for_device(device_id, adapter_device_id):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_vlan_state_save(sender, instance, **kwargs):
     """Push VLAN intent whenever an NSOVLANState row is saved (accept triggers push)."""
     from .models import NSODeviceManagement
@@ -1986,6 +1999,7 @@ def _push_bfd_intent_for_device(device_id, adapter_device_id):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_bfd_state_save(sender, instance, **kwargs):
     """Push BFD intent whenever an NSOBFDInterfaceState row is saved (accept triggers push)."""
     from .models import NSODeviceManagement
@@ -2138,6 +2152,7 @@ def _record_static_route_expectations(device_id, generations: dict, echoes) -> N
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_static_route_state_save(sender, instance, **kwargs):
     """Schedule static-route intent only for an active exact content writer."""
     from .models import NSODeviceManagement
@@ -2403,6 +2418,7 @@ def _push_isis_flex_algo_intent_for_device(device_id, adapter_device_id):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_isis_flex_algo_state_save(sender, instance, **kwargs):
     """Schedule Flex-Algo intent only for a declared exact writer mutation."""
     from .models import NSODeviceManagement
@@ -2460,6 +2476,7 @@ def _push_l2_sap_intent_for_device(device_id, adapter_device_id):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_l2_sap_state_save(sender, instance, **kwargs):
     """Schedule L2 SAP intent only for an active exact content writer."""
     from .models import NSODeviceManagement
@@ -2543,6 +2560,7 @@ def _push_lacp_intent_for_device(device_id, adapter_device_id):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_lacp_state_save(sender, instance, **kwargs):
     """On accept, commit LACP to the device only in auto-apply mode.
 
@@ -2602,6 +2620,7 @@ def _push_switchport_intent_for_device(device_id, adapter_device_id):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_switchport_state_save(sender, instance, **kwargs):
     """On accept, commit switchport to the device only in auto-apply mode.
 
@@ -2728,10 +2747,9 @@ def _push_isis_intent_for_device(device_id, adapter_device_id):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_isis_interface_state_save(sender, instance, **kwargs):
     """Schedule IS-IS only when the exact writer owns this device key."""
-    if not _converted_writer_is_active():
-        return
     from .models import NSODeviceManagement
 
     try:
@@ -2748,10 +2766,9 @@ def _on_isis_interface_state_save(sender, instance, **kwargs):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_isis_instance_state_save(sender, instance, **kwargs):
     """Schedule IS-IS only when the exact writer owns this device key."""
-    if not _converted_writer_is_active():
-        return
     from .models import NSODeviceManagement
 
     try:
@@ -2985,10 +3002,9 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_bgp_peer_state_save(sender, instance, **kwargs):
     """Schedule BGP only when the exact writer owns this device key."""
-    if not _converted_writer_is_active():
-        return
     from .models import NSODeviceManagement
 
     try:
@@ -3017,6 +3033,7 @@ def _on_routing_bgp_peer_pre_delete(sender, instance, **kwargs):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_redistribution_state_save(sender, instance, **kwargs):
     """Schedule redistribution only when its exact writer owns the destination key."""
     from .models import NSODeviceManagement
@@ -3399,10 +3416,9 @@ def _as_json_dict(value):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_route_policy_state_save(sender, instance, **kwargs):
     """Schedule route policy only when the exact writer owns this device key."""
-    if not _converted_writer_is_active():
-        return
     from .models import NSODeviceManagement
 
     try:
@@ -3657,10 +3673,9 @@ def _push_ospf_intent_for_device(device_id, adapter_device_id):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_ospf_instance_state_save(sender, instance, **kwargs):
     """Schedule OSPF only when the exact writer owns this device key."""
-    if not _converted_writer_is_active():
-        return
     from .models import NSODeviceManagement
 
     try:
@@ -3677,10 +3692,9 @@ def _on_ospf_instance_state_save(sender, instance, **kwargs):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_ospf_interface_state_save(sender, instance, **kwargs):
     """Schedule OSPF only when the exact writer owns this device key."""
-    if not _converted_writer_is_active():
-        return
     from .models import NSODeviceManagement
 
     try:
