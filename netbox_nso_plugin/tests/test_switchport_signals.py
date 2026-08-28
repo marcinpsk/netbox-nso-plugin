@@ -69,11 +69,14 @@ class TestPushSwitchportIntent(_SwBase):
         assert ifaces[0]["untagged_vlan"] == 10
 
     def test_excludes_non_owned(self):
-        from netbox_nso_plugin.delivery import render
+        from netbox_nso_plugin.delivery import deliver
 
         mgmt = self._make_mgmt()
         self._state(mgmt, status="changed")  # not owned
-        assert render("switchport", self.device.pk, mgmt.adapter_device_id).payload == []
+        with patch("netbox_nso_plugin.adapter_client.apply_switchport_config") as mock_apply:
+            deliver("switchport", self.device.pk, mgmt.adapter_device_id)
+        mock_apply.assert_called_once()
+        assert mock_apply.call_args[0][1] == []
 
     def test_save_no_push_without_auto_apply(self):
         """Deferred flow: a switchport save does not commit to the device unless

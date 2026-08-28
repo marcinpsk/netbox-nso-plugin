@@ -6,7 +6,7 @@ from django.test import SimpleTestCase, TestCase
 
 
 class TestOwnershipStateSignatures(SimpleTestCase):
-    def test_greenfield_native_state_creates_or_acquires_an_overlay(self):
+    def test_greenfield_native_state_creates_an_overlay_but_never_promotes_one(self):
         from netbox_nso_plugin.ownership_planner import (
             OwnershipAction,
             OwnershipSignature,
@@ -23,6 +23,8 @@ class TestOwnershipStateSignatures(SimpleTestCase):
             )
             is OwnershipAction.CREATE
         )
+        # An imported/unknown/changed overlay is device-read state, not operator intent:
+        # the operator Accept is the only entry into ownership.
         assert (
             plan_ownership(
                 rule,
@@ -32,7 +34,7 @@ class TestOwnershipStateSignatures(SimpleTestCase):
                     overlay_present=True,
                 ),
             )
-            is OwnershipAction.ACQUIRE
+            is OwnershipAction.NONE
         )
 
     def test_manifest_distinguishes_native_deletion_from_foreign_overlay_deletion(self):

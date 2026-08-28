@@ -54,7 +54,7 @@ class TestSymmetricOwnershipExecutor(TestCase):
         self.assertTrue(contribution.mark_any)
         self.assertIn(("vlan", manifest.pk), completed)
 
-    def test_unowned_overlay_with_a_native_anchor_is_acquired(self):
+    def test_unowned_overlay_with_a_native_anchor_is_never_promoted(self):
         from ipam.models import VLAN, VLANGroup
 
         from netbox_nso_plugin.models import NSOOwnershipManifest, NSOVLANState
@@ -72,10 +72,33 @@ class TestSymmetricOwnershipExecutor(TestCase):
         completed = reconcile_scope_ownership(self.device.pk, ["vlan"])
 
         state.refresh_from_db()
-        manifest = NSOOwnershipManifest.objects.get(device_id=self.device.pk, scope="vlan")
-        self.assertEqual(state.status, "accepted")
-        self.assertEqual(manifest.ownership_state, "owned")
-        self.assertIn(("vlan", state.pk), completed)
+        self.assertEqual(state.status, "imported")
+        self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=self.device.pk, scope="vlan").exists())
+        self.assertEqual(completed, ())
+
+    def test_imported_overlay_survives_a_full_delivery_unpromoted(self):
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.models import NSOOwnershipManifest, NSOVLANState
+
+        group = VLANGroup.objects.create(name="Ownership delivery", slug=f"nso-{self.device.pk}")
+        vlan = VLAN.objects.create(group=group, vid=1715, name="ownership-deliver")
+        state = NSOVLANState.objects.create(
+            management=self.management,
+            vlan=vlan,
+            device_name=vlan.name,
+            status="imported",
+        )
+
+        with patch("netbox_nso_plugin.adapter_client.put_vlan_intent") as put_vlan:
+            deliver("vlan", self.device.pk, self.management.adapter_device_id)
+
+        put_vlan.assert_called_once()
+        state.refresh_from_db()
+        self.assertEqual(put_vlan.call_args[0][1], [])
+        self.assertEqual(state.status, "imported")
+        self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=self.device.pk, scope="vlan").exists())
 
     def test_cleared_ownership_detaches_without_deletion_authority(self):
         from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOOwnershipManifest, NSOVLANState

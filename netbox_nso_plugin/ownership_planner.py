@@ -28,7 +28,6 @@ class OwnershipAction(str, Enum):
 
     NONE = "none"
     CREATE = "create"
-    ACQUIRE = "acquire"
     RECORD_MANIFEST = "record_manifest"
     REOWN = "reown"
     RETRACT = "retract"
@@ -427,8 +426,10 @@ def plan_ownership(rule: ScopeOwnershipRule, signature: OwnershipSignature) -> O
         return OwnershipAction.RETRACT
     if not signature.native_present or not signature.native_qualifies:
         return OwnershipAction.NONE
+    # An unowned overlay is the device read the operator has not accepted yet. Only the
+    # operator Accept enters ownership, so a qualifying native anchor never promotes it.
     if signature.overlay_present:
-        return OwnershipAction.ACQUIRE
+        return OwnershipAction.NONE
     return OwnershipAction.CREATE
 
 
@@ -670,8 +671,8 @@ def retire_overlay_manifest(instance) -> None:
     ).update(ownership_state="retired")
 
 
-def _overlay_actions(device_id, requested, selected_actions):
-    """Return manifest-free overlay actions selected by the pure planner."""
+def _manifest_record_actions(device_id, requested):
+    """Return owned overlays whose durable manifest evidence is absent."""
     from .intent_state import OVERLAY_MODEL_RANKS, renderer_input_specs
     from .models import NSOOwnershipManifest
     from .status_machine import is_owned
@@ -775,33 +776,9 @@ def _overlay_actions(device_id, requested, selected_actions):
                     manifest_state=manifest_state,
                 ),
             )
-            if action in selected_actions:
-                planned.append((scope, instance._meta.label_lower, instance.pk, action))
+            if action is OwnershipAction.RECORD_MANIFEST:
+                planned.append((scope, instance._meta.label_lower, instance.pk))
     return tuple(planned)
-
-
-def _manifest_record_actions(device_id, requested):
-    """Return owned overlays whose durable manifest evidence is absent."""
-    return tuple(
-        (scope, model_label, pk)
-        for scope, model_label, pk, _action in _overlay_actions(
-            device_id,
-            requested,
-            {OwnershipAction.RECORD_MANIFEST},
-        )
-    )
-
-
-def _acquisition_actions(device_id, requested):
-    """Return qualifying unowned overlays that must enter ownership."""
-    return tuple(
-        (scope, model_label, pk)
-        for scope, model_label, pk, _action in _overlay_actions(
-            device_id,
-            requested,
-            {OwnershipAction.ACQUIRE},
-        )
-    )
 
 
 def _rule_for_manifest(manifest):
@@ -1532,44 +1509,6 @@ def _manifest_lifecycle_actions(device_id, requested):
     return tuple(planned)
 
 
-def _acquire_overlay(scope, model_label, pk):
-    """Promote one qualifying persisted overlay through the exact content writer."""
-    from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
-
-    model = apps.get_model(model_label)
-    instance = model.objects.filter(pk=pk).first()
-    if instance is None:
-        return None
-    candidate = copy.copy(instance)
-    candidate.status = "accepted"
-    fields = ["status"]
-    if hasattr(candidate, "accepted_at"):
-        candidate.accepted_at = timezone.now()
-        fields.append("accepted_at")
-    plan = RendererMutationPlan.build(
-        saves=(planned_save(candidate, update_fields=fields),),
-        planned_at=getattr(candidate, "accepted_at", None),
-    )
-    if (scope, model_label, pk) not in _acquisition_actions(
-        _overlay_device_id(instance),
-        frozenset({scope}),
-    ):
-        return None
-    with renderer_writes(plan) as writer:
-        writer.save(candidate, update_fields=fields)
-    return candidate
-
-
-def _overlay_device_id(instance):
-    management = getattr(instance, "management", None)
-    if management is not None:
-        return management.device_id
-    interface = getattr(instance, "interface", None)
-    if interface is not None:
-        return interface.device_id
-    raise ValueError(f"cannot resolve device for {instance._meta.label_lower}")
-
-
 def _record_missing_manifests(device_id, requested):
     from .intent_state import mirror_transaction, reconcile_family_footprint
 
@@ -1616,15 +1555,6 @@ def _execute_native_creates(device_id, requested):
     return completed
 
 
-def _execute_acquisitions(device_id, requested):
-    completed = []
-    for scope, model_label, pk in _acquisition_actions(device_id, requested):
-        acquired = _acquire_overlay(scope, model_label, pk)
-        if acquired is not None:
-            completed.append((scope, acquired.pk))
-    return completed
-
-
 def reconcile_scope_ownership(device_id: int, scopes) -> tuple[tuple[str, object], ...]:
     """Run the state-derived ownership planner before a renderer audit."""
     requested = frozenset(str(scope) for scope in scopes)
@@ -1633,5 +1563,4 @@ def reconcile_scope_ownership(device_id: int, scopes) -> tuple[tuple[str, object
     completed = _record_missing_manifests(device_id, requested)
     completed.extend(_execute_manifest_lifecycle(device_id, requested))
     completed.extend(_execute_native_creates(device_id, requested))
-    completed.extend(_execute_acquisitions(device_id, requested))
     return tuple(completed)
