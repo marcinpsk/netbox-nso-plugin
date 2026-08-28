@@ -1064,3 +1064,69 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         assert deploying.apply_attempt_id == attempt_id
         assert (revision.revision, revision.verified_revision, revision.verified_fingerprint) == before
         assert not NSOIntentOutboxEntry.objects.filter(device=device, scope="vlan").exists()
+
+
+class TestContentOwnershipComesFromThePlan(IntentPushResetMixin, TestCase):
+    """The plan decides what is content; a caller's declaration cannot widen it."""
+
+    def _lifecycle_only_plan(self, tag, adapter_device_id, vid):
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save
+
+        device, management = make_managed(tag, adapter_device_id)
+        row = own_vlan(management, vid, tag)
+        candidate = copy.copy(NSOVLANState.objects.get(pk=row.pk))
+        candidate.last_apply_error = "lifecycle only"
+        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("last_apply_error",)),))
+        assert plan.content_keys == ()
+        return device, plan, candidate
+
+    def test_a_lifecycle_only_plan_grants_no_content_ownership(self):
+        from netbox_nso_plugin.intent_state import mirror_transaction
+        from netbox_nso_plugin.renderer_writer import consume_renderer_plan, renderer_writer_owns_key
+
+        device, plan, candidate = self._lifecycle_only_plan("writer-flag", 16292, 1640)
+
+        with mirror_transaction(plan.lock_footprint) as permit:
+            with consume_renderer_plan(plan, permit, content=True) as writer:
+                owned = renderer_writer_owns_key(device.pk, "vlan", content=True)
+                writer.save(candidate, update_fields=("last_apply_error",))
+
+        assert owned is False
+        assert NSOVLANState.objects.get(pk=candidate.pk).last_apply_error == "lifecycle only"
+
+    def test_renderer_writes_refuses_the_same_lifecycle_only_plan(self):
+        from netbox_nso_plugin.renderer_writer import renderer_writes
+
+        _device, plan, _candidate = self._lifecycle_only_plan("writer-flag-bump", 16293, 1641)
+
+        with self.assertRaisesRegex(IntentMutationProtocolError, "requires a content-changing plan"):
+            with renderer_writes(plan):
+                pass
+
+
+class TestDerivedDescriptionRequiresItsWriter(IntentPushResetMixin, TestCase):
+    """RF-1: a converted signal helper consumes its writer and never opens one."""
+
+    def test_a_recompute_without_an_active_writer_is_refused(self):
+        from dcim.models import Cable, CableTermination
+
+        from netbox_nso_plugin.derived_intent import SentinelTemplate
+        from netbox_nso_plugin.signals import _recompute_one
+
+        from ._outbox_case import make_device
+
+        device, _management = make_managed("writer-derived", 16294)
+        peer = make_device("writer-derived", index=2)
+        local = Interface.objects.create(device=device, name="Ethernet16294", type="1000base-t")
+        remote = Interface.objects.create(device=peer, name="Ethernet16295", type="1000base-t")
+        cable = Cable.objects.create(status="connected")
+        CableTermination.objects.create(cable=cable, cable_end="A", termination=local)
+        CableTermination.objects.create(cable=cable, cable_end="B", termination=remote)
+        local.description = "[auto]"
+        local.save(update_fields=["description"])
+        templates = [SentinelTemplate(sentinel="[auto]", template="[auto] to {peer_host}:{peer_iface}")]
+
+        with self.assertRaisesRegex(IntentMutationProtocolError, "renderer writer"):
+            _recompute_one(Interface.objects.get(pk=local.pk), templates)
+
+        assert Interface.objects.get(pk=local.pk).description == "[auto]"
