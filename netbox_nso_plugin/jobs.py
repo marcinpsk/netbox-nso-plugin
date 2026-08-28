@@ -48,21 +48,17 @@ class AuditRendererScopesJob(JobRunner):
 
 @system_job(interval=JobIntervalChoices.INTERVAL_HOURLY)
 class AdvanceStaleOnboardingJob(JobRunner):
-    """Hourly backstop that advances async-onboarding rows stranded in 'provisioning'.
+    """Hourly backstop that advances every durable provision tombstone.
 
-    The onboarding dashboard and the device NSO tab advance a row the moment its provision
-    job finishes — but only while an operator has that page open. A job that completes with
-    no such page open would otherwise strand the row in 'provisioning' forever: NSO has
-    onboarded the node, yet the plugin never maps/scopes/syncs it (the adapter-push signal is
-    gated on that status). This sweep polls each stale row's job and advances it, self-healing
-    with nobody watching.
+    The sweep polls open attempts and completes terminal attempts. It also offboards successful
+    attempts that no longer have a matching management incarnation.
     """
 
     class Meta:
         name = "Advance stale NSO onboarding rows"
 
     def run(self, *args, **kwargs):
-        """Advance every NSODeviceManagement row still in 'provisioning'."""
+        """Advance each non-closed provision tombstone."""
         from .onboarding import advance_stale_onboarding_rows
 
         try:

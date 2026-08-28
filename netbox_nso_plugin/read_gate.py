@@ -637,6 +637,9 @@ def _adopt_incarnation(m, inc: str, born) -> None:
             m.reset_pending_incarnation = ""
             m.reset_pending_born = None
             m.reset_conflict_born = None
+    from .sync_cache import invalidate_delivery_baselines
+
+    invalidate_delivery_baselines(m.device_id)
     _save_management_mirror(m, [*_MARKER_FIELDS, "adapter_source_epoch", "reset_pending_source_epoch"])
 
 
