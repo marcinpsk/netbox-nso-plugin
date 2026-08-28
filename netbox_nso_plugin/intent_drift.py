@@ -357,9 +357,13 @@ def _backfill_static_route_generations(mgmt) -> list[dict]:
         before = []
         operations = []
         for row in candidates:
+            # apply_attempt_id rides with status: nso_static_deploy_attempt refuses
+            # `deploying` with a NULL attempt, so a rollback that put the status back
+            # without it raised out of the restore.
             snapshot = {
                 "pk": row.pk,
                 "status": row.status,
+                "apply_attempt_id": row.apply_attempt_id,
                 **{field: getattr(row, field) for field in armed_fields},
             }
             candidate = copy.copy(row)
