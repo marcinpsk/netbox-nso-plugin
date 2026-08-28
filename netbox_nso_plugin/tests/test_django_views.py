@@ -51,8 +51,16 @@ def _make_fixtures():
     site = Site.objects.create(name="ViewSiteNSO", slug="viewsitenso")
     device = Device.objects.create(name="view-router-01", device_type=device_type, role=role, site=site)
     nso_instance = NSOInstance.objects.create(name="view-nso", adapter_instance_id="view-nso-id")
+    # `managed_attributes` is the native anchor the interface binding reads: with the flag
+    # unset the row manages no attribute, so an accepted NSOInterfaceState owns nothing the
+    # device carries and the ownership audit demotes it. Only `description` is enabled here,
+    # because a managed attribute with no overlay is adopted as a fresh accepted overlay and
+    # would put a second attribute into every interface push.
     mgmt = NSODeviceManagement.objects.create(
-        device=device, nso_instance=nso_instance, nso_device_name="view-router-01"
+        device=device,
+        nso_instance=nso_instance,
+        nso_device_name="view-router-01",
+        manage_description=True,
     )
     interface = Interface.objects.create(device=device, name="Loopback0", type="virtual")
     iface_state = NSOInterfaceState.objects.create(
@@ -3704,7 +3712,10 @@ class TestInterfaceIntentDelivery(ViewTestBase):
         )
         mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
         mgmt.adapter_device_id = 21
-        mgmt.save(update_fields=["adapter_device_id"])
+        # This case owns the `enabled` attribute, so its anchor is enabled here rather than
+        # in the shared fixture, where it would adopt one on every interface.
+        mgmt.manage_enabled = True
+        mgmt.save(update_fields=["adapter_device_id", "manage_enabled"])
         self.addCleanup(mirror_update, mgmt, adapter_device_id=None)
 
         mock_cfg.return_value = {
