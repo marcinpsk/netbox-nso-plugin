@@ -151,7 +151,8 @@ _CONVERTED_SCOPE_RULES = {
             "evidence. Foreign native peer deletes no longer delete linked overlays and push a reduced snapshot "
             "synchronously. Greenfield acceptance uses exact acquisition planning and outbox delivery instead of "
             "accepting and pushing directly. Routers, scopes, address families, peer templates, ASNs, and peer IPs "
-            "are graph dependencies."
+            "are graph dependencies. BGP reconciliation no longer suppresses missing netbox-routing or IPAM imports; "
+            "missing graph dependencies fail fast."
         ),
     ),
     "interface": ScopeOwnershipRule(
