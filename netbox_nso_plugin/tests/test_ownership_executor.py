@@ -100,6 +100,40 @@ class TestSymmetricOwnershipExecutor(TestCase):
         self.assertEqual(state.status, "imported")
         self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=self.device.pk, scope="vlan").exists())
 
+    def test_retracted_overlay_leaves_the_rendered_document(self):
+        from dcim.models import Interface
+
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOInterfaceMtuState, NSOOwnershipManifest
+        from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
+
+        interface = Interface.objects.create(
+            device=self.device,
+            name="Ethernet7",
+            type="1000base-t",
+            mtu=9216,
+        )
+        state = NSOInterfaceMtuState.objects.create(
+            management=self.management,
+            interface=interface,
+            l2_mtu=9216,
+            status="accepted",
+        )
+        reconcile_scope_ownership(self.device.pk, ["interface_mtu"])
+        manifest = NSOOwnershipManifest.objects.get(device_id=self.device.pk, scope="interface_mtu")
+        # A foreign edit clears the native anchor: the desired document no longer has an MTU.
+        Interface.objects.filter(pk=interface.pk).update(mtu=None)
+
+        completed = reconcile_scope_ownership(self.device.pk, ["interface_mtu"])
+
+        manifest.refresh_from_db()
+        payload = delivery.render("interface_mtu", self.device.pk, self.management.adapter_device_id).payload
+        state.refresh_from_db()
+        self.assertEqual(manifest.ownership_state, "retired")
+        self.assertEqual((state.status, state.accepted_at), ("imported", None))
+        self.assertEqual(payload, [])
+        self.assertIn(("interface_mtu", manifest.pk), completed)
+
     def test_cleared_ownership_detaches_without_deletion_authority(self):
         from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOOwnershipManifest, NSOVLANState
         from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
