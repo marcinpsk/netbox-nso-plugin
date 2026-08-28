@@ -671,22 +671,21 @@ def retire_overlay_manifest(instance) -> None:
     ).update(ownership_state="retired")
 
 
-def _manifest_record_actions(device_id, requested):
-    """Return owned overlays whose durable manifest evidence is absent."""
-    from .intent_state import OVERLAY_MODEL_RANKS, renderer_input_specs
-    from .models import NSOOwnershipManifest
-    from .status_machine import is_owned
+def _manifest_state_key(scope, native_model_label, native_key, state_model_label, state_key):
+    return (
+        scope,
+        native_model_label,
+        json.dumps(native_key, sort_keys=True),
+        state_model_label,
+        json.dumps(state_key, sort_keys=True),
+    )
 
-    planned = []
-    seen = set()
-    manifest_states = {
-        (
-            scope,
-            native_model_label,
-            json.dumps(native_key, sort_keys=True),
-            state_model_label,
-            json.dumps(state_key, sort_keys=True),
-        ): ownership_state
+
+def _manifest_states(device_id, requested):
+    from .models import NSOOwnershipManifest
+
+    return {
+        _manifest_state_key(scope, native_model_label, native_key, state_model_label, state_key): ownership_state
         for scope, native_model_label, native_key, state_model_label, state_key, ownership_state in (
             NSOOwnershipManifest.objects.filter(
                 device_id=device_id,
@@ -701,7 +700,61 @@ def _manifest_record_actions(device_id, requested):
             )
         )
     }
-    qualifying = _qualifying_overlay_signatures(device_id, requested)
+
+
+def _record_action_for(instance, device_id, requested, qualifying, manifest_states):
+    """Return one overlay's planned record action, or ``None`` when it needs no work."""
+    from .status_machine import is_owned
+
+    binding = manifest_binding(instance)
+    if binding is None:
+        return None
+    (
+        rule,
+        scope,
+        bound_device_id,
+        native_model_label,
+        native_id,
+        native_key,
+        state_model_label,
+        state_key,
+    ) = binding
+    if scope not in requested or bound_device_id != device_id:
+        return None
+    manifest_state = manifest_states.get(
+        _manifest_state_key(scope, native_model_label, native_key, state_model_label, state_key)
+    )
+    action = plan_ownership(
+        rule,
+        OwnershipSignature(
+            native_present=True,
+            native_qualifies=(
+                is_owned(instance.status)
+                if rule.acquisition_strategy == "existing_overlay"
+                else (
+                    scope,
+                    native_model_label,
+                    native_id,
+                    state_model_label,
+                    json.dumps(state_key, sort_keys=True),
+                )
+                in qualifying
+            ),
+            overlay_present=True,
+            overlay_owned=is_owned(instance.status),
+            manifest_state=manifest_state,
+        ),
+    )
+    if action is not OwnershipAction.RECORD_MANIFEST:
+        return None
+    return (scope, instance._meta.label_lower, instance.pk)
+
+
+def _device_overlays(device_id, requested):
+    """Yield each of the device's status-carrying overlay rows exactly once."""
+    from .intent_state import OVERLAY_MODEL_RANKS, renderer_input_specs
+
+    seen = set()
     for spec in renderer_input_specs().values():
         if requested.isdisjoint(spec.scopes) or spec.model_label not in OVERLAY_MODEL_RANKS:
             continue
@@ -720,53 +773,18 @@ def _manifest_record_actions(device_id, requested):
             if identity in seen:
                 continue
             seen.add(identity)
-            binding = manifest_binding(instance)
-            if binding is None:
-                continue
-            (
-                rule,
-                scope,
-                bound_device_id,
-                native_model_label,
-                native_id,
-                native_key,
-                state_model_label,
-                state_key,
-            ) = binding
-            if scope not in requested or bound_device_id != device_id:
-                continue
-            manifest_state = manifest_states.get(
-                (
-                    scope,
-                    native_model_label,
-                    json.dumps(native_key, sort_keys=True),
-                    state_model_label,
-                    json.dumps(state_key, sort_keys=True),
-                )
-            )
-            action = plan_ownership(
-                rule,
-                OwnershipSignature(
-                    native_present=True,
-                    native_qualifies=(
-                        is_owned(instance.status)
-                        if rule.acquisition_strategy == "existing_overlay"
-                        else (
-                            scope,
-                            native_model_label,
-                            native_id,
-                            state_model_label,
-                            json.dumps(state_key, sort_keys=True),
-                        )
-                        in qualifying
-                    ),
-                    overlay_present=True,
-                    overlay_owned=is_owned(instance.status),
-                    manifest_state=manifest_state,
-                ),
-            )
-            if action is OwnershipAction.RECORD_MANIFEST:
-                planned.append((scope, instance._meta.label_lower, instance.pk))
+            yield instance
+
+
+def _manifest_record_actions(device_id, requested):
+    """Return owned overlays whose durable manifest evidence is absent."""
+    qualifying = _qualifying_overlay_signatures(device_id, requested)
+    manifest_states = _manifest_states(device_id, requested)
+    planned = []
+    for instance in _device_overlays(device_id, requested):
+        action = _record_action_for(instance, device_id, requested, qualifying, manifest_states)
+        if action is not None:
+            planned.append(action)
     return tuple(planned)
 
 
@@ -1575,12 +1593,18 @@ def _record_missing_manifests(device_id, requested):
         return completed
     footprint = reconcile_family_footprint(device_id, requested)
     with mirror_transaction(footprint):
-        current = set(_manifest_record_actions(device_id, requested))
+        # One device scan under the lock, then an O(1) re-check of each planned identity.
+        qualifying = _qualifying_overlay_signatures(device_id, requested)
+        manifest_states = _manifest_states(device_id, requested)
         for scope, model_label, pk in planned:
             instance = apps.get_model(model_label).objects.filter(pk=pk).first()
             if instance is None:
                 continue
-            if (scope, model_label, pk) not in current:
+            if _record_action_for(instance, device_id, requested, qualifying, manifest_states) != (
+                scope,
+                model_label,
+                pk,
+            ):
                 continue
             maintain_manifest(instance)
             completed.append((scope, pk))

@@ -204,12 +204,18 @@ class TestOwnershipManifestMaintenance(TestCase):
                     "_manifest_record_actions",
                     wraps=ownership_planner._manifest_record_actions,
                 ) as record_actions,
+                patch.object(
+                    ownership_planner,
+                    "_manifest_states",
+                    wraps=ownership_planner._manifest_states,
+                ) as manifest_states,
                 CaptureQueriesContext(connection) as queries,
             ):
                 completed = ownership_planner.reconcile_scope_ownership(device.pk, {"vlan"})
 
             self.assertCountEqual(completed, (("vlan", state.pk) for state in states))
-            self.assertEqual(record_actions.call_count, 2)
+            self.assertEqual(record_actions.call_count, 1)
+            self.assertEqual(manifest_states.call_count, 2)
             query_counts.append(len(queries))
 
         self.assertEqual(query_counts[2] - query_counts[1], query_counts[1] - query_counts[0])

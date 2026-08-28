@@ -201,6 +201,36 @@ class TestSymmetricOwnershipExecutor(TestCase):
                 self.assertIn(" WHERE ", sql, "the redistribution read has no device predicate")
         self.assertEqual(len(after.captured_queries), len(before.captured_queries))
 
+    def test_recording_missing_manifests_costs_one_device_scan(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
+
+        def measure(rows):
+            device, management = make_managed(f"ownscan{rows}", 16280 + rows, index=rows)
+            group = VLANGroup.objects.create(name=f"Ownership scan {rows}", slug=f"nso-{device.pk}")
+            for index in range(rows):
+                vlan = VLAN.objects.create(group=group, vid=1750 + index, name=f"ownership-scan-{rows}-{index}")
+                NSOVLANState.objects.create(
+                    management=management,
+                    vlan=vlan,
+                    device_name=vlan.name,
+                    status="accepted",
+                )
+            with CaptureQueriesContext(connection) as captured:
+                reconcile_scope_ownership(device.pk, ["vlan"])
+            return len(captured.captured_queries)
+
+        measure(1)
+        two, three, four = measure(2), measure(3), measure(4)
+
+        # One device scan builds the plan; revalidating a planned row is O(1), so the cost
+        # per extra owned overlay is constant. A per-row re-scan makes it grow.
+        self.assertEqual(four - three, three - two)
+
     def test_cleared_ownership_detaches_without_deletion_authority(self):
         from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOOwnershipManifest, NSOVLANState
         from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
