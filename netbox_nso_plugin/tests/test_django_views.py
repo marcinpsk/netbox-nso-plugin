@@ -3676,9 +3676,11 @@ class TestInterfaceIntentDelivery(ViewTestBase):
             }
         ]
 
-    def test_pushes_enabled_attribute(self):
+    @patch("netbox_nso_plugin.adapter_client._resolve_config")
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_pushes_enabled_attribute(self, mock_session_cls, mock_cfg):
         """The interface render includes 'enabled' attribute states."""
-        from netbox_nso_plugin.delivery import render
+        from netbox_nso_plugin.delivery import deliver
 
         # Create an 'enabled' interface state in accepted status
         enabled_state = NSOInterfaceState.objects.create(
@@ -3692,7 +3694,19 @@ class TestInterfaceIntentDelivery(ViewTestBase):
         mgmt.save(update_fields=["adapter_device_id"])
         self.addCleanup(mirror_update, mgmt, adapter_device_id=None)
 
-        sent = render("interface", self.device.pk, mgmt.adapter_device_id).payload
+        mock_cfg.return_value = {
+            "url": "http://adapter",
+            "token": "tok",
+            "verify_tls": True,
+            "ca_cert_path": None,
+            "timeout": 30,
+        }
+        session = make_session(response=make_response(200, json_data={}))
+        mock_session_cls.return_value = session
+
+        deliver("interface", self.device.pk, mgmt.adapter_device_id)
+        session.request.assert_called_once()
+        sent = session.request.call_args.kwargs["json"]["attributes"]
         assert sent == [
             {
                 "interface": self.interface.name,
