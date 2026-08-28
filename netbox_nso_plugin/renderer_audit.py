@@ -200,10 +200,13 @@ def _repair_candidates(device_id, candidates, management):
     """Repair one optimistic candidate batch in a repeatable-read transaction."""
     from .models import NSOIntentRevision
 
-    plans = {scope: _repair_plan(device_id, scope) for scope in candidates}
+    # Planned twice on purpose: this pass only derives the lock footprint, because a
+    # plan's dependencies are not knowable before it exists. The plan that is CONSUMED
+    # is rebuilt below, under the locks, so its full pre-image compare-and-set cannot
+    # lose to a foreign lifecycle write and fail a mandatory gate closed.
     footprint = MutationFootprint.merge(
         audit_scope_footprint(device_id, candidates),
-        *(plan.lock_footprint for plan in plans.values()),
+        *(_repair_plan(device_id, scope).lock_footprint for scope in candidates),
     )
     with mirror_transaction(footprint, repeatable_read=True) as permit:
         locked_revisions = {
@@ -224,6 +227,7 @@ def _repair_candidates(device_id, candidates, management):
 
         from .signals import suppress_intent_push
 
+        plans = {scope: _repair_plan(device_id, scope) for scope in repaired}
         with suppress_intent_push():
             for scope in repaired:
                 plan = plans[scope]
