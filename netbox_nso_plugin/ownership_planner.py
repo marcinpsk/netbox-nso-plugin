@@ -818,15 +818,18 @@ def _demote_overlay(instance, device_id, scope) -> bool:
     from .renderer_writer import consume_renderer_plan
     from .status_machine import is_owned
 
-    candidate, update_fields, plan = _demotion_plan(instance)
+    # Planned twice on purpose: this pre-pass only derives the lock footprint. The CONSUMED
+    # plan is rebuilt below, after intent_transaction re-pends the deploying rows (#1637).
+    *_, footprint_plan = _demotion_plan(instance)
     footprint = MutationFootprint.merge(
         reconcile_family_footprint(device_id, [scope]),
-        plan.lock_footprint,
+        footprint_plan.lock_footprint,
     )
     with intent_transaction(footprint) as permit:
         current = type(instance).objects.filter(pk=instance.pk).first()
         if current is None or not is_owned(current.status):
             return False
+        candidate, update_fields, plan = _demotion_plan(current)
         with consume_renderer_plan(plan, permit, content=True) as writer:
             writer.save(candidate, update_fields=update_fields)
     return True
@@ -1512,6 +1515,7 @@ def _retract_manifest(manifest, overlay=None) -> bool:
     from .models import NSOOwnershipManifest
     from .renderer_writer import consume_renderer_plan
     from .signals import _is_intent_push_suppressed, _is_render_request
+    from .status_machine import is_owned
 
     # outbox.enqueue writes nothing while pushes are suppressed. Retiring the manifest anyway
     # would drop this identity's deletion authority with no error, and plan_ownership never
@@ -1525,10 +1529,11 @@ def _retract_manifest(manifest, overlay=None) -> bool:
     # An anchor that merely stopped qualifying leaves the overlay behind, and the renderer
     # still reads it: without this the contribution authorises a deletion the re-rendered
     # document never asks for. Demoted, not deleted, so operator content survives.
-    plan = None
     if overlay is not None:
-        candidate, update_fields, plan = _demotion_plan(overlay)
-        footprint = MutationFootprint.merge(footprint, plan.lock_footprint)
+        # Planned twice on purpose: this pre-pass only derives the lock footprint. The CONSUMED
+        # plan is rebuilt below, after intent_transaction re-pends the deploying rows (#1637).
+        *_, footprint_plan = _demotion_plan(overlay)
+        footprint = MutationFootprint.merge(footprint, footprint_plan.lock_footprint)
     with intent_transaction(footprint) as permit:
         updated = NSOOwnershipManifest.objects.filter(
             pk=manifest.pk,
@@ -1536,7 +1541,9 @@ def _retract_manifest(manifest, overlay=None) -> bool:
         ).update(ownership_state="retired")
         if not updated:
             return False
-        if plan is not None:
+        current = None if overlay is None else type(overlay).objects.filter(pk=overlay.pk).first()
+        if current is not None and is_owned(current.status):
+            candidate, update_fields, plan = _demotion_plan(current)
             with consume_renderer_plan(plan, permit, content=True) as writer:
                 writer.save(candidate, update_fields=update_fields)
         transitions = ()
