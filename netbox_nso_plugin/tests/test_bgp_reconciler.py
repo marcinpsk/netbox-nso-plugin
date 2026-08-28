@@ -254,6 +254,51 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         self.assertIsNotNone(state.bgp_peer)
         self.assertTrue(state.enabled)
 
+    def test_unknown_vrf_reuses_resolved_global_scope(self):
+        """An unknown payload VRF resolves to one global scope across reconciles."""
+        self._make_mgmt()
+
+        from netbox_routing.models import BGPPeer, BGPScope
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        payload = self._payload(
+            self._router_payload(
+                vrf="MISSING-VRF",
+                peers=[self._peer_entry("198.18.0.2")],
+            )
+        )
+
+        _reconcile_bgp_config(self.device, payload)
+        _reconcile_bgp_config(self.device, payload)
+
+        self.assertEqual(BGPScope.objects.count(), 1)
+        self.assertIsNone(BGPScope.objects.get().vrf_id)
+        self.assertEqual(BGPPeer.objects.count(), 1)
+
+    def test_existing_vrf_scope_is_idempotent(self):
+        """A resolved payload VRF reuses its scope and peer across reconciles."""
+        self._make_mgmt()
+
+        from ipam.models import VRF
+        from netbox_routing.models import BGPPeer, BGPScope
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        vrf = VRF.objects.create(name="EXISTING-VRF")
+        payload = self._payload(
+            self._router_payload(
+                vrf=vrf.name,
+                peers=[self._peer_entry("198.18.0.3")],
+            )
+        )
+
+        _reconcile_bgp_config(self.device, payload)
+        _reconcile_bgp_config(self.device, payload)
+
+        self.assertEqual(BGPScope.objects.filter(vrf=vrf).count(), 1)
+        self.assertEqual(BGPPeer.objects.count(), 1)
+
     def test_push_includes_peer_source_ip(self):
         """BGP delivery must send a peer's source (the local-address IP).
 
