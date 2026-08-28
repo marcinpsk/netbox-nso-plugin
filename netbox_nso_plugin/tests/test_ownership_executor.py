@@ -54,6 +54,28 @@ class TestSymmetricOwnershipExecutor(TestCase):
         self.assertTrue(contribution.mark_any)
         self.assertIn(("vlan", manifest.pk), completed)
 
+    def test_retract_refuses_when_its_contribution_cannot_be_written(self):
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOOwnershipManifest
+        from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        state = own_vlan(self.management, 1716, "ownership-suppressed")
+        manifest = NSOOwnershipManifest.objects.get(device_id=self.device.pk, scope="vlan")
+        NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").delete()
+        VLAN.objects.filter(pk=state.vlan_id).delete()
+
+        # outbox.enqueue writes nothing while pushes are suppressed, so retiring here would
+        # drop the deletion authority silently and plan_ownership never retries a retired row.
+        with suppress_intent_push(), self.assertRaises(IntentMutationProtocolError):
+            reconcile_scope_ownership(self.device.pk, ["vlan"])
+
+        manifest.refresh_from_db()
+        self.assertEqual(manifest.ownership_state, "owned")
+        self.assertFalse(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").exists())
+
     def test_unowned_overlay_with_a_native_anchor_is_never_promoted(self):
         from ipam.models import VLAN, VLANGroup
 
