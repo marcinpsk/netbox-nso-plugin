@@ -554,6 +554,43 @@ class TestSymmetricOwnershipExecutor(TestCase):
         self.assertEqual(manifest.native_id, route.pk)
         self.assertIn(("static_route", state.pk), completed)
 
+    def test_native_create_that_renders_nothing_is_a_mirror_write(self):
+        from dcim.models import Interface
+
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import (
+            NSOLACPBundleState,
+            NSOLACPMemberState,
+            NSOOwnershipManifest,
+        )
+        from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
+
+        bundle = Interface.objects.create(device=self.device, name="Port-channel19", type="lag")
+        member = Interface.objects.create(device=self.device, name="Ethernet11", type="1000base-t", lag=bundle)
+        # The bundle overlay is device-read state, so the LACP document owns nothing and the
+        # member overlay this create seeds renders nothing either.
+        NSOLACPBundleState.objects.create(
+            management=self.management,
+            interface=bundle,
+            lag_id=19,
+            status="imported",
+        )
+
+        completed = reconcile_scope_ownership(self.device.pk, ["lacp"])
+
+        state = NSOLACPMemberState.objects.get(interface=member)
+        payload = delivery.render("lacp", self.device.pk, self.management.adapter_device_id).payload
+        self.assertEqual(state.lag_bundle, bundle)
+        self.assertIn(("lacp", state.pk), completed)
+        self.assertEqual(payload, [])
+        self.assertTrue(
+            NSOOwnershipManifest.objects.filter(
+                device_id=self.device.pk,
+                scope="lacp",
+                state_model_label="netbox_nso_plugin.nsolacpmemberstate",
+            ).exists()
+        )
+
     def test_native_flex_algo_creates_an_owned_overlay(self):
         from netbox_routing.models import ISISFlexAlgo, ISISInstance
 
