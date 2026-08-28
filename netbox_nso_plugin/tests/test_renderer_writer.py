@@ -973,6 +973,26 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         assert not NSOStaticRouteState.objects.filter(pk=state.pk).exists()
         assert type(device).objects.filter(pk=device.pk).exists()
 
+    def test_delete_authorizes_registered_collector_child_tables(self):
+        from netbox_routing.models import Community, CommunityList, CommunityListEntry
+
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_mirror_writes
+
+        community_list = CommunityList.objects.create(name="WRITER-CASCADE-CHILD")
+        community = Community.objects.create(community="64512:1627")
+        entry = CommunityListEntry.objects.create(
+            community_list=community_list,
+            action="permit",
+            community=community,
+        )
+        plan = RendererMutationPlan.build(deletes=(planned_delete(community_list),))
+
+        with renderer_mirror_writes(plan) as writer:
+            writer.delete(community_list)
+
+        assert not CommunityList.objects.filter(pk=community_list.pk).exists()
+        assert not CommunityListEntry.objects.filter(pk=entry.pk).exists()
+
     def test_rollback_removes_content_bookkeeping_and_fingerprint_together(self):
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
