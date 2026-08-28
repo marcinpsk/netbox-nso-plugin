@@ -2743,7 +2743,15 @@ def _prepare_apply(mgmt):
     Completed direct writes cannot be rolled back.
     """
     from . import delivery, drain
+    from .renderer_audit import audit_renderer_scopes
     from .signals import stored_static_route_count
+
+    audit_renderer_scopes(
+        mgmt.device_id,
+        tuple(delivery.delivery_keys()),
+        trigger="views._prepare_apply",
+        pre_capture=True,
+    )
 
     prepare_deadline = drain._send_clock() + drain.SEND_DEADLINE.total_seconds()
 

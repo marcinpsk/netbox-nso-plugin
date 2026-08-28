@@ -408,6 +408,19 @@ def _sha256(material) -> str:
 def claim(device_id, scope, *, mode=delivery.MODE_NORMAL, force=False) -> Claim | None:
     """Form or replay the key's logical operation, and return it, or ``None`` if none is owed."""
     _refuse_in_transaction("claim")
+    from .renderer_audit import audit_renderer_scopes
+
+    audit_renderer_scopes(
+        device_id,
+        (scope,),
+        trigger="drain.claim",
+        pre_capture=True,
+    )
+    return _claim_after_audit(device_id, scope, mode=mode, force=force)
+
+
+def _claim_after_audit(device_id, scope, *, mode, force) -> Claim | None:
+    """Capture one claim after its public or drain-level audit has completed."""
     return _repeatable_read(lambda: _claim_locked(device_id, scope, mode, force))
 
 
@@ -1435,6 +1448,14 @@ def _drain_once(
     its claim is nobody's operation to name, so it never records into an open capture.
     """
     _refuse_in_transaction("drain")
+    from .renderer_audit import audit_renderer_scopes
+
+    audit_renderer_scopes(
+        device_id,
+        (scope,),
+        trigger="drain._drain_once",
+        pre_capture=True,
+    )
     if deadline is not None and _deadline_at is None:
         _deadline_at = _send_clock() + deadline
     if not delivery.delivery_keys()[scope].in_protocol:
@@ -1710,11 +1731,11 @@ def acknowledge_degraded_deletions(device_id=None, scope=None) -> list[tuple[int
 def _claim_or_wait(device_id, scope, *, mode, force) -> Claim | None:
     """Take the claim. A forced call waits a bounded time for an active one, then fails fast."""
     if not force:
-        return claim(device_id, scope, mode=mode)
+        return _claim_after_audit(device_id, scope, mode=mode, force=False)
     deadline = time.monotonic() + FORCE_WAIT.total_seconds()
     while True:
         try:
-            return claim(device_id, scope, mode=mode, force=True)
+            return _claim_after_audit(device_id, scope, mode=mode, force=True)
         except ClaimBusy:
             if time.monotonic() >= deadline:
                 raise

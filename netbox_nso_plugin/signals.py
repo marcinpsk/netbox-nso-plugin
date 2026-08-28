@@ -168,41 +168,12 @@ def _skip_on_render(handler):
 
     @functools.wraps(handler)
     def _wrapped(*args, **kwargs):
-        try:
-            # suppress_intent_push() (the reconcile/import path) is the authoritative
-            # guard; the GET-render check is a belt-and-suspenders for the legacy
-            # render-time reconcile and becomes redundant once render is read-only.
-            if _is_intent_push_suppressed() or _is_render_request():
-                return None
-            return handler(*args, **kwargs)
-        except BaseException:
-            from .intent_state import _abort_m2m_implicit, _end_implicit
-
-            sender = kwargs.get("sender", args[0] if len(args) > 0 else None)
-            instance = kwargs.get("instance", args[1] if len(args) > 1 else None)
-            action = kwargs.get("action", args[2] if len(args) > 2 else None)
-            details = {key: value for key, value in kwargs.items() if key not in {"sender", "instance", "action"}}
-            if action is not None:
-                _abort_m2m_implicit(sender, instance)
-            else:
-                _end_implicit(sender, instance, **details)
-            raise
-
-    return _wrapped
-
-
-def _close_renderer_m2m_permit(handler):
-    """Close an implicit M2M permit even when a behavior handler raises."""
-
-    @functools.wraps(handler)
-    def _wrapped(sender, instance, action, **kwargs):
-        try:
-            return handler(sender, instance, action, **kwargs)
-        finally:
-            if action.startswith("post_"):
-                from .intent_state import _end_m2m_implicit
-
-                _end_m2m_implicit(sender, instance, action, **kwargs)
+        # suppress_intent_push() (the reconcile/import path) is the authoritative
+        # guard; the GET-render check is a belt-and-suspenders for the legacy
+        # render-time reconcile and becomes redundant once render is read-only.
+        if _is_intent_push_suppressed() or _is_render_request():
+            return None
+        return handler(*args, **kwargs)
 
     return _wrapped
 
@@ -2343,7 +2314,6 @@ def _on_routing_static_route_save(sender, instance, created=False, **kwargs):
     _schedule_exact_writer_scope("static_route")
 
 
-@_close_renderer_m2m_permit
 @_skip_on_render
 def _on_routing_static_route_devices_changed(sender, instance, action, pk_set, reverse, **kwargs):
     """Schedule only exact-writer assignment changes, without acquiring in the signal."""

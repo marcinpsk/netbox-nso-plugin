@@ -835,94 +835,10 @@ def _plan_m2m_set(proposed: RendererM2MSet, creation_refs):
     return write, footprint, keys
 
 
-def _manifest_binding(instance):
-    from .ownership_planner import converted_scope_rules
-
-    label = instance._meta.label_lower
-    for rule in converted_scope_rules().values():
-        native_field = dict(rule.overlay_native_fields).get(label)
-        if native_field is None:
-            continue
-        if native_field == "__self__":
-            native = instance
-        elif native_field == "__ip_address__":
-            from dcim.models import Interface
-            from django.contrib.contenttypes.models import ContentType
-            from ipam.models import IPAddress
-
-            interface_type = ContentType.objects.get_for_model(Interface)
-            vrf_name = getattr(instance, "vrf", "")
-            vrf_id = None
-            if vrf_name:
-                from ipam.models import VRF
-
-                vrf_id = VRF.objects.filter(name=vrf_name).values_list("pk", flat=True).first()
-                if vrf_id is None:
-                    return None
-            native = IPAddress.objects.filter(
-                address=instance.address,
-                vrf_id=vrf_id,
-                assigned_object_type=interface_type,
-                assigned_object_id=instance.interface_id,
-            ).first()
-        elif native_field == "__ospf_interface__":
-            from netbox_routing.models import OSPFInterface
-
-            native = OSPFInterface.objects.filter(interface_id=instance.interface_id).first()
-        else:
-            native = getattr(instance, native_field, None)
-        management = getattr(instance, "management", None)
-        if native is None or management is None:
-            return None
-
-        def json_value(value):
-            if value is None or isinstance(value, (bool, int, float, str)):
-                return value
-            if isinstance(value, dict):
-                return {str(key): json_value(item) for key, item in value.items()}
-            if isinstance(value, (list, tuple)):
-                return [json_value(item) for item in value]
-            return str(value)
-
-        key_fields = dict(rule.native_key_fields_by_model).get(native._meta.label_lower, rule.native_key_fields)
-        native_key = {name: json_value(getattr(native, name)) for name in key_fields}
-        scope = getattr(instance, rule.manifest_scope_field) if rule.manifest_scope_field else rule.scope
-        return rule, scope, management.device_id, native._meta.label_lower, native_key
-    return None
-
-
 def _maintain_manifest(instance):
-    from . import status_machine as sm
-    from .models import NSOOwnershipManifest
+    from .ownership_planner import maintain_manifest
 
-    binding = _manifest_binding(instance)
-    if binding is None:
-        return
-    rule, scope, device_id, native_model_label, native_key = binding
-    identity = {
-        "device_id": device_id,
-        "scope": scope,
-        "native_model_label": native_model_label,
-        "native_key": native_key,
-    }
-    if sm.is_owned(instance.status):
-        lineage = (
-            getattr(instance, rule.acknowledged_lineage_field, None)
-            if rule.acknowledged_lineage_field is not None
-            else None
-        )
-        defaults = {
-            "ownership_state": "owned",
-            "deletion_authority": rule.deletion_authority,
-        }
-        if lineage is not None:
-            defaults["acknowledged_lineage"] = [copy.deepcopy(lineage)]
-        NSOOwnershipManifest.objects.update_or_create(
-            **identity,
-            defaults=defaults,
-        )
-    else:
-        NSOOwnershipManifest.objects.filter(**identity, ownership_state="owned").update(ownership_state="detached")
+    maintain_manifest(instance)
 
 
 class RendererWriter:
@@ -1290,13 +1206,6 @@ class RendererWriter:
             or operation.values != normalized
         ):
             raise IntentMutationProtocolError("set-based update is outside the frozen write set")
-        selected_rows = tuple(model._default_manager.filter(pk__in=operation.selected_pks).order_by("pk"))
-        if (
-            tuple(row.pk for row in selected_rows) != operation.selected_pks
-            or tuple((row.pk, _field_values(row, None)) for row in selected_rows) != operation.selected_preimages
-        ):
-            raise IntentPlanStaleError("the frozen set-based update has stale selected rows")
-        _authorize_dml(self.permit, model._meta.db_table)
         updated = model._default_manager.filter(pk__in=operation.selected_pks).update(**values)
         if updated != len(operation.selected_pks):
             raise IntentPlanStaleError("the frozen set-based update lost a selected row")
@@ -1364,6 +1273,27 @@ _ACTIVE_WRITER: contextvars.ContextVar[RendererWriter | None] = contextvars.Cont
 def active_renderer_writer() -> RendererWriter | None:
     """Return the current explicit writer, if this call entered one."""
     return _ACTIVE_WRITER.get()
+
+
+@contextlib.contextmanager
+def consume_renderer_plan(plan: RendererMutationPlan, permit, *, content: bool):
+    """Consume one exact plan inside a caller-owned lock transaction.
+
+    The audit owns a larger per-device lock footprint and decides which optimistic
+    mismatches still need repair only after its under-lock render. This seam retains
+    exact write-set enforcement without opening a nested transaction or bumping twice.
+    """
+    if active_renderer_writer() is not None:
+        raise IntentMutationProtocolError("renderer writer contexts cannot nest")
+    if not permit.footprint.covers(plan.lock_footprint):
+        raise IntentMutationProtocolError("the caller-owned lock footprint does not cover the renderer plan")
+    writer = RendererWriter(plan, content=content, permit=permit)
+    token = _ACTIVE_WRITER.set(writer)
+    try:
+        yield writer
+        writer.assert_complete()
+    finally:
+        _ACTIVE_WRITER.reset(token)
 
 
 def renderer_writer_owns_key(device_id, scope, *, content=False) -> bool:
