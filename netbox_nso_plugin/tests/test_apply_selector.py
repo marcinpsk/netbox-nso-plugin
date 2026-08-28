@@ -1970,6 +1970,10 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             device=self.device,
             name="Ethernet9.38",
             type="1000base-t",
+            # The native anchor carries the L2 state the overlay owns: without it the
+            # switchport binding does not qualify and the ownership audit retracts.
+            mode="access",
+            untagged_vlan=self.vlan_state.vlan,
         )
         with without_commit_drain(), transaction.atomic():
             svi_state = NSOSVIState.objects.create(

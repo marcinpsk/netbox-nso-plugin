@@ -1397,20 +1397,37 @@ def _native_create_actions(device_id, requested):
     return tuple(planned)
 
 
-def _retract_manifest(manifest) -> bool:
+def _retract_manifest(manifest, overlay=None) -> bool:
     """Retire one deleted native identity through its scope's authority protocol."""
     from . import outbox
-    from .intent_state import intent_transaction, reconcile_family_footprint
+    from .intent_state import MutationFootprint, intent_transaction, reconcile_family_footprint
     from .models import NSOOwnershipManifest
+    from .renderer_writer import RendererMutationPlan, consume_renderer_plan, planned_save
 
     footprint = reconcile_family_footprint(manifest.device_id, [manifest.scope])
-    with intent_transaction(footprint):
+    # An anchor that merely stopped qualifying leaves the overlay behind, and the renderer
+    # still reads it: without this the contribution authorises a deletion the re-rendered
+    # document never asks for. Demoted, not deleted, so operator content survives.
+    plan = None
+    if overlay is not None:
+        candidate = copy.copy(overlay)
+        candidate.status = "imported"
+        update_fields = ["status"]
+        if hasattr(candidate, "accepted_at"):
+            candidate.accepted_at = None
+            update_fields.append("accepted_at")
+        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=update_fields),))
+        footprint = MutationFootprint.merge(footprint, plan.lock_footprint)
+    with intent_transaction(footprint) as permit:
         updated = NSOOwnershipManifest.objects.filter(
             pk=manifest.pk,
             ownership_state="owned",
         ).update(ownership_state="retired")
         if not updated:
             return False
+        if plan is not None:
+            with consume_renderer_plan(plan, permit, content=True) as writer:
+                writer.save(candidate, update_fields=update_fields)
         transitions = ()
         delete_origin = True
         if manifest.scope == "static_route":
@@ -1518,13 +1535,13 @@ def _record_missing_manifests(device_id, requested):
 
 def _execute_manifest_lifecycle(device_id, requested):
     completed = []
-    for manifest, rule, native, _overlay, action in _manifest_lifecycle_actions(device_id, requested):
+    for manifest, rule, native, overlay, action in _manifest_lifecycle_actions(device_id, requested):
         if action is OwnershipAction.REOWN and native is not None:
             replacement = _reown_manifest(manifest, rule, native)
             if replacement is not None:
                 completed.append((manifest.scope, replacement.pk))
         elif action is OwnershipAction.RETRACT:
-            if _retract_manifest(manifest):
+            if _retract_manifest(manifest, overlay):
                 completed.append((manifest.scope, manifest.pk))
         elif action is OwnershipAction.DETACH:
             if _detach_manifest(manifest):
