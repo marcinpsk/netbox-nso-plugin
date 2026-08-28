@@ -3,13 +3,50 @@
 """Provision tombstone completion at the real database seam."""
 
 import threading
+from datetime import timedelta
 from unittest.mock import patch
 
-from django.db import close_old_connections
+from django.db import DatabaseError, close_old_connections, connection, transaction
 from django.test import TestCase, TransactionTestCase
+from django.utils import timezone
 
 from ._outbox_case import make_device
 from .mixins import _CascadeFlushMixin
+
+
+def _in_second_connection(work) -> bool:
+    """Run *work* on its own connection and report whether it completed unblocked."""
+    observed = {}
+
+    def probe():
+        close_old_connections()
+        try:
+            with transaction.atomic():
+                with connection.cursor() as cursor:
+                    cursor.execute("SET LOCAL lock_timeout = '5s'")
+                work()
+            observed["free"] = True
+        except DatabaseError:
+            observed["free"] = False
+        finally:
+            close_old_connections()
+
+    prober = threading.Thread(target=probe)
+    prober.start()
+    prober.join(timeout=30)
+    return observed.get("free", "probe did not finish")
+
+
+def _device_is_editable(device_pk) -> bool:
+    """Report whether a foreign NetBox edit of the device row can proceed right now."""
+    from dcim.models import Device
+
+    return _in_second_connection(lambda: Device.objects.filter(pk=device_pk).update(description="foreign edit"))
+
+
+def _row_is_lockable(model, **filters) -> bool:
+    """Report whether a second connection can take the row lock right now."""
+    return _in_second_connection(lambda: list(model.objects.select_for_update().filter(**filters)))
 
 
 class TestProvisionTombstoneSweep(TestCase):
@@ -271,6 +308,112 @@ class TestProvisionTombstoneSweep(TestCase):
         legacy_poll.assert_not_called()
 
 
+class TestProvisionSweepBudget(TestCase):
+    """The fleet sweep is bounded, and an attempt the adapter lost cannot strand a row."""
+
+    def _open_tombstone(self, tag, *, netbox_device_id, age, adapter_job_id=""):
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+
+        row = NSOProvisionTombstone.objects.create(
+            netbox_device_id=netbox_device_id,
+            nso_instance=f"{tag}-nso",
+            nso_device_name=f"{tag}-device",
+            canonical_request={},
+            adapter_job_id=adapter_job_id,
+        )
+        NSOProvisionTombstone.objects.filter(pk=row.pk).update(created_at=timezone.now() - age)
+        row.refresh_from_db()
+        return row
+
+    def _stranded_attempt(self, tag, *, age):
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+        device = make_device(tag)
+        instance = NSOInstance.objects.create(name=f"{tag}-nso", adapter_instance_id=f"{tag}-nso")
+        management = NSODeviceManagement.objects.create(
+            device=device,
+            nso_instance=instance,
+            nso_device_name=f"{tag}-device",
+            onboard_status="provisioning",
+            onboard_job_id="99",
+        )
+        tombstone = self._open_tombstone(tag, netbox_device_id=device.pk, age=age, adapter_job_id="99")
+        return management, tombstone
+
+    def test_a_fleet_sweep_polls_at_most_one_budgeted_page(self):
+        from netbox_nso_plugin.provision_lifecycle import _FLEET_SWEEP_LIMIT, sweep_provision_tombstones
+
+        rows = [
+            self._open_tombstone("budget", netbox_device_id=index + 1, age=timedelta(seconds=10_000 - index))
+            for index in range(_FLEET_SWEEP_LIMIT + 2)
+        ]
+        polled = []
+
+        def poll(attempt_id):
+            polled.append(attempt_id)
+            return {"status": "running"}
+
+        with patch("netbox_nso_plugin.adapter_client.get_provision_attempt", side_effect=poll):
+            checked, closed = sweep_provision_tombstones()
+
+        self.assertEqual((checked, closed), (_FLEET_SWEEP_LIMIT, 0))
+        self.assertEqual(polled, [row.provision_attempt_id for row in rows[:_FLEET_SWEEP_LIMIT]])
+
+    def test_an_attempt_the_adapter_has_no_record_of_ages_out_to_failed(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.provision_lifecycle import _UNKNOWN_ATTEMPT_MAX_AGE, sweep_provision_tombstones
+
+        management, tombstone = self._stranded_attempt(
+            "aged-out",
+            age=_UNKNOWN_ATTEMPT_MAX_AGE + timedelta(minutes=1),
+        )
+        missing = AdapterError("no such provision attempt", code="not_found", status_code=404)
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.get_provision_attempt", side_effect=missing),
+            patch("netbox_nso_plugin.adapter_client.delete_provisioned_device") as offboard,
+        ):
+            checked, closed = sweep_provision_tombstones()
+
+        management.refresh_from_db()
+        tombstone.refresh_from_db()
+        self.assertEqual((checked, closed), (1, 1))
+        self.assertEqual(management.onboard_status, "provision_failed")
+        self.assertEqual(tombstone.state, "closed")
+        self.assertEqual(tombstone.terminal_status, "failed")
+        offboard.assert_not_called()
+
+    def test_a_recent_unknown_attempt_waits_without_logging_a_traceback(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
+
+        management, tombstone = self._stranded_attempt("still-young", age=timedelta(minutes=1))
+        missing = AdapterError("no such provision attempt", code="not_found", status_code=404)
+
+        with patch("netbox_nso_plugin.adapter_client.get_provision_attempt", side_effect=missing):
+            with self.assertNoLogs("netbox_nso_plugin.provision_lifecycle", level="ERROR"):
+                checked, closed = sweep_provision_tombstones()
+
+        management.refresh_from_db()
+        tombstone.refresh_from_db()
+        self.assertEqual((checked, closed), (1, 0))
+        self.assertEqual(tombstone.state, "open")
+        self.assertEqual(management.onboard_status, "provisioning")
+
+    def test_a_single_attempt_sweep_surfaces_its_adapter_failure(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
+
+        _management, tombstone = self._stranded_attempt("surfaced", age=timedelta(minutes=1))
+
+        with patch(
+            "netbox_nso_plugin.adapter_client.get_provision_attempt",
+            side_effect=AdapterError("adapter down", code="nso_unreachable"),
+        ):
+            with self.assertRaises(AdapterError):
+                sweep_provision_tombstones(tombstone.provision_attempt_id)
+
+
 class TestProvisionOffboardFence(_CascadeFlushMixin, TransactionTestCase):
     def test_provision_attempt_is_committed_before_the_adapter_post(self):
         from dcim.models import Interface
@@ -389,3 +532,92 @@ class TestProvisionOffboardFence(_CascadeFlushMixin, TransactionTestCase):
         self.assertEqual(errors, [])
         self.assertTrue(provision_started.is_set())
         self.assertTrue(NSODeviceManagement.objects.filter(device=device, onboard_job_id="72").exists())
+
+
+class TestProvisionSweepLockWindow(_CascadeFlushMixin, TransactionTestCase):
+    """The sweep must not pin foreign NetBox rows while it talks to the adapter."""
+
+    def _terminal_attempt(self, tag, *, with_management):
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOProvisionTombstone
+
+        device = make_device(tag)
+        instance = NSOInstance.objects.create(name=f"{tag}-nso", adapter_instance_id=f"{tag}-nso")
+        management = None
+        if with_management:
+            management = NSODeviceManagement.objects.create(
+                device=device,
+                nso_instance=instance,
+                nso_device_name=f"{tag}-device",
+                onboard_status="provisioning",
+                onboard_job_id="71",
+            )
+        evidence = {
+            "status": "succeeded",
+            "job_id": 71,
+            "result": {"ok": True, "device_id": 701, "steps": [{"name": "create", "ok": True}]},
+        }
+        tombstone = NSOProvisionTombstone.objects.create(
+            netbox_device_id=device.pk,
+            nso_instance=instance.adapter_instance_id,
+            nso_device_name=f"{tag}-device",
+            canonical_request={},
+            adapter_job_id="71",
+            adapter_device_id=701,
+            state="terminal",
+            terminal_status="succeeded",
+            terminal_evidence=evidence,
+        )
+        return device, instance, management, tombstone
+
+    def test_the_orphan_offboard_holds_no_device_or_instance_lock(self):
+        """A foreign device edit must not queue behind the offboard round trip."""
+        from netbox_nso_plugin.models import NSOInstance
+        from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
+
+        device, instance, _management, tombstone = self._terminal_attempt(
+            "provision-unlocked-offboard",
+            with_management=False,
+        )
+        observed = {}
+
+        def offboard(_adapter_device_id):
+            observed["device"] = _device_is_editable(device.pk)
+            observed["instance"] = _row_is_lockable(NSOInstance, pk=instance.pk)
+
+        with patch("netbox_nso_plugin.adapter_client.delete_provisioned_device", side_effect=offboard):
+            checked, closed = sweep_provision_tombstones(tombstone.provision_attempt_id)
+
+        self.assertEqual((checked, closed), (1, 1))
+        self.assertEqual(observed, {"device": True, "instance": True})
+
+    def test_the_completion_save_does_not_pin_the_shared_instance_row(self):
+        """Every device on the instance shares that row; the completion must not lock it.
+
+        The device row IS locked here, by the writer protocol's own renderer-source lock
+        (intent_state._lock_rows), not by the sweep. No adapter call runs under it.
+        """
+        from django.db.models.signals import post_save
+
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+        from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
+
+        _device, _instance, management, tombstone = self._terminal_attempt(
+            "provision-unlocked-save",
+            with_management=True,
+        )
+        observed = {}
+
+        def probe(sender, instance, **kwargs):
+            if instance.pk != management.pk or observed:
+                return
+            observed["instance"] = _row_is_lockable(NSOInstance, pk=instance.nso_instance_id)
+
+        post_save.connect(probe, sender=NSODeviceManagement)
+        self.addCleanup(post_save.disconnect, probe, sender=NSODeviceManagement)
+
+        checked, closed = sweep_provision_tombstones(tombstone.provision_attempt_id)
+
+        management.refresh_from_db()
+        self.assertEqual((checked, closed), (1, 1))
+        self.assertEqual(management.onboard_status, "")
+        self.assertEqual(observed, {"instance": True})
