@@ -288,6 +288,56 @@ class TestSymmetricOwnershipExecutor(TestCase):
         self.assertEqual(manifest.state_model_label, "netbox_nso_plugin.nsovlanstate")
         self.assertEqual(NSOOwnershipManifest.objects.filter(device_id=self.device.pk, scope="vlan").count(), 1)
 
+    def test_legacy_manifest_without_a_native_id_is_retired_not_raised(self):
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.models import NSOOwnershipManifest
+        from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
+
+        route = own_route(
+            self.management,
+            "198.18.174.0/24",
+            "198.18.0.174",
+            device=self.device,
+        )
+        manifest = NSOOwnershipManifest.objects.get(device_id=self.device.pk, scope="static_route")
+        StaticRoute.objects.filter(pk=route.pk).delete()
+        # The shape migrations 0026/0027 left behind: no native id and no state model.
+        NSOOwnershipManifest.objects.filter(pk=manifest.pk).update(
+            native_id=None,
+            state_model_label="",
+            state_key={},
+        )
+
+        completed = reconcile_scope_ownership(self.device.pk, ["static_route"])
+
+        manifest.refresh_from_db()
+        self.assertEqual(manifest.ownership_state, "retired")
+        self.assertIn(("static_route", manifest.pk), completed)
+
+    def test_legacy_manifest_never_authorises_a_device_deletion(self):
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOOwnershipManifest, NSOVLANState
+        from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
+
+        state = own_vlan(self.management, 1717, "ownership-legacy-delete")
+        manifest = NSOOwnershipManifest.objects.get(device_id=self.device.pk, scope="vlan")
+        vlan_id = state.vlan_id
+        NSOVLANState.objects.filter(pk=state.pk).delete()
+        NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").delete()
+        NSOOwnershipManifest.objects.filter(pk=manifest.pk).update(
+            native_id=None,
+            state_model_label="",
+            state_key={},
+        )
+
+        reconcile_scope_ownership(self.device.pk, ["vlan"])
+
+        # A blank identity names nothing the device should delete, so it must not mark one.
+        self.assertFalse(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan", mark_any=True).exists())
+        manifest.refresh_from_db()
+        self.assertEqual((manifest.native_id, manifest.ownership_state), (vlan_id, "owned"))
+        self.assertEqual(manifest.state_model_label, "netbox_nso_plugin.nsovlanstate")
+
     def test_static_route_delete_uses_manifest_id_and_lineage_authority(self):
         from netbox_routing.models import StaticRoute
 

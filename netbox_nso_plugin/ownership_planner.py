@@ -831,23 +831,13 @@ def _json_value(value):
     return str(value)
 
 
-def _state_model_for_manifest(manifest, rule):
-    if manifest.state_model_label:
-        return apps.get_model(manifest.state_model_label)
-    candidates = []
-    for model_label, native_field in rule.overlay_native_fields:
-        if native_field.startswith("__"):
-            continue
-        field = apps.get_model(model_label)._meta.get_field(native_field)
-        if field.related_model._meta.label_lower == manifest.native_model_label:
-            candidates.append(apps.get_model(model_label))
-    return candidates[0] if len(candidates) == 1 else None
+def _manifest_identity_is_complete(manifest) -> bool:
+    """Return whether one manifest can still name its native row and its overlay."""
+    return manifest.native_id is not None and bool(manifest.state_model_label)
 
 
 def _state_filters(manifest, rule, native, management):
-    model = _state_model_for_manifest(manifest, rule)
-    if model is None:
-        return None, None
+    model = apps.get_model(manifest.state_model_label)
     native_field = dict(rule.overlay_native_fields)[model._meta.label_lower]
     fields = {field.name for field in model._meta.concrete_fields}
     filters = dict(manifest.state_key)
@@ -1039,7 +1029,7 @@ def _reown_manifest(manifest, rule, native, *, revoke=True):
     if management is None:
         return None
     model, filters = _state_filters(manifest, rule, native, management)
-    if model is None or filters is None or model.objects.filter(**filters).exists():
+    if model.objects.filter(**filters).exists():
         return None
     candidate = model(**filters)
     native_field = dict(rule.overlay_native_fields)[model._meta.label_lower]
@@ -1442,7 +1432,7 @@ def _native_create_actions(device_id, requested):
             acknowledged_lineage=[],
         )
         model, filters = _state_filters(signature, rule, native, management)
-        overlay_present = model is not None and model.objects.filter(**filters).exists()
+        overlay_present = model.objects.filter(**filters).exists()
         action = plan_ownership(
             rule,
             OwnershipSignature(
@@ -1564,14 +1554,19 @@ def _manifest_lifecycle_actions(device_id, requested):
         ownership_state="owned",
     ).order_by("pk")
     for manifest in manifests:
+        # 0026/0027 added the native id and state-model columns with no backfill. A row that
+        # carries neither cannot name what it owns, so it is no longer usable evidence: retire
+        # it and let this same audit rebuild the identity from the surviving state.
+        if not _manifest_identity_is_complete(manifest):
+            planned.append((manifest, None, None, None, OwnershipAction.RETIRE))
+            continue
         rule = _rule_for_manifest(manifest)
         if rule is None:
             continue
         native = _native_for_manifest(manifest, rule)
-        model = _state_model_for_manifest(manifest, rule)
         overlay = None
-        if native is not None and model is not None:
-            _model, filters = _state_filters(manifest, rule, native, management)
+        if native is not None:
+            model, filters = _state_filters(manifest, rule, native, management)
             overlay = model.objects.filter(**filters).first()
         native_qualifies = native is not None and (
             rule.acquisition_strategy == "existing_overlay"
