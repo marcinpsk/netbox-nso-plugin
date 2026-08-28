@@ -230,8 +230,13 @@ class TestDeliverySuccessHooks(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.intent_generation import allocate_intent_generation
         from netbox_nso_plugin.models import NSOStaticRouteState
 
+        from ._static_route_case import _assign_without_push
+
         device, mgmt = _fixture("sr", 7301)
         route = StaticRoute.objects.create(prefix="198.51.100.0/24", next_hop="198.51.100.1", metric=1)
+        # The device assignment is the native anchor the static-route binding reads: an
+        # unassigned route owns nothing on this device and the ownership audit demotes it.
+        _assign_without_push(route, device)
         generation = allocate_intent_generation()
         with patch("netbox_nso_plugin.adapter_client.put_static_route_intent"):
             state = NSOStaticRouteState.objects.create(
