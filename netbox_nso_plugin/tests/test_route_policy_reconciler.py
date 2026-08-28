@@ -613,6 +613,19 @@ class TestReconcileRoutePolicy(TestCase):
             self.assertEqual(len(prefetches), 1)
             self.assertIn(" WHERE ", prefetches[0])
 
+    def test_display_projection_rejects_a_registered_through_model(self):
+        from netbox_routing.models import CommunityList, RouteMapEntry
+
+        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
+        from netbox_nso_plugin.route_policy_reconciler import _Operations
+
+        operations = _Operations()
+        entry = RouteMapEntry()
+        community_list = CommunityList(name="REGISTERED-DISPLAY")
+
+        with self.assertRaisesRegex(IntentMutationProtocolError, "registered renderer input"):
+            operations.display_m2m_add(entry, "match_community_list", (community_list,))
+
     def test_prefix_list_family_propagated_from_capture(self):
         """The materialized PrefixList mirrors the owner capture's address family.
 
@@ -1599,6 +1612,40 @@ class TestReconcileRoutePolicy(TestCase):
         matched = {str(c.community) for c in rme.match_community.all()}
         self.assertEqual(matched, {"65000:1", "65000:2"})
         self.assertEqual(Community.objects.filter(community__in=["65000:1", "65000:2"]).count(), 2)
+
+    def test_same_operation_literal_communities_share_one_set_row(self):
+        from netbox_routing.models import RouteMapEntrySetCommunity
+
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._make_mgmt(self.device)
+        reconcile_route_policy(
+            self.device,
+            {
+                "route_maps": [
+                    {
+                        "name": "RM-LITERAL-GROUP",
+                        "entries": [
+                            {
+                                "action": "permit",
+                                "set": '{"community_add": ["64540:10", "64540:20"]}',
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+
+        rows = RouteMapEntrySetCommunity.objects.filter(
+            route_map_entry__route_map__name="RM-LITERAL-GROUP",
+            operation="add",
+            community_list__isnull=True,
+        )
+        self.assertEqual(rows.count(), 1)
+        self.assertEqual(
+            set(rows.get().communities.values_list("community", flat=True)),
+            {"64540:10", "64540:20"},
+        )
 
 
 class TestDeviceCaughtUpSettle(TestCase):
