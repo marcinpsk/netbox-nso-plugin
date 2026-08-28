@@ -634,3 +634,47 @@ class TestFairSelectionRotatesAFailingHead(_DrainCase):
         candidates = drain.drain_candidates()
 
         assert candidates.index((fresh.pk, "vlan")) < candidates.index((stamped.pk, "vlan"))
+
+
+class TestTheFoldReadsTheOrdinaryPartitionOnly(_DrainCase):
+    """RF-2: a repair asserts "the snapshot changed" and can carry no authority at all."""
+
+    def test_a_repair_contribution_cannot_queue_a_deletion(self):
+        from netbox_nso_plugin import drain, outbox
+
+        device, mgmt = make_managed("repairfold", 7690)
+        route = own_route(mgmt, "198.51.100.96/28", "198.51.100.7")
+        self.clear_entries()
+        with without_commit_drain():
+            enqueue(
+                device,
+                "static_route",
+                transitions=[outbox.delete_transition(route.pk, last_acked=None, current=None)],
+                kind=outbox.CONTRIBUTION_KIND_REPAIR,
+            )
+
+        claimed = drain.claim(device.pk, "static_route")
+
+        assert claimed is not None
+        assert claimed.deletions == []
+        assert [row["route_id"] for row in claimed.payload] == [route.pk]
+
+    def test_a_repair_contribution_cannot_withdraw_an_ordinary_deletion(self):
+        from netbox_nso_plugin import drain, outbox
+
+        device, mgmt = make_managed("repairrevoke", 7691)
+        route = own_route(mgmt, "198.51.100.112/28", "198.51.100.8")
+        self.clear_entries()
+        with without_commit_drain():
+            _unassign_and_retire(route, device)
+            enqueue(
+                device,
+                "static_route",
+                transitions=[outbox.revoke_transition(route.pk)],
+                kind=outbox.CONTRIBUTION_KIND_REPAIR,
+            )
+
+        claimed = drain.claim(device.pk, "static_route")
+
+        assert claimed is not None
+        assert [record["route_id"] for record in claimed.deletions] == [route.pk]
