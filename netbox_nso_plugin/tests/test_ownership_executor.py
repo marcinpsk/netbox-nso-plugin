@@ -134,6 +134,36 @@ class TestSymmetricOwnershipExecutor(TestCase):
         self.assertEqual(payload, [])
         self.assertIn(("interface_mtu", manifest.pk), completed)
 
+    def test_foreign_overlay_delete_retires_a_scope_with_no_native_content(self):
+        from dcim.models import Interface
+
+        from netbox_nso_plugin.models import NSOBFDInterfaceState, NSOIntentOutboxEntry, NSOOwnershipManifest
+        from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
+
+        interface = Interface.objects.create(device=self.device, name="Ethernet8", type="1000base-t")
+        state = NSOBFDInterfaceState.objects.create(
+            management=self.management,
+            interface=interface,
+            min_tx=300,
+            min_rx=300,
+            multiplier=3,
+            status="accepted",
+        )
+        reconcile_scope_ownership(self.device.pk, ["bfd"])
+        manifest = NSOOwnershipManifest.objects.get(device_id=self.device.pk, scope="bfd")
+        NSOBFDInterfaceState.objects.filter(pk=state.pk).delete()
+        NSOIntentOutboxEntry.objects.filter(device=self.device, scope="bfd").delete()
+
+        completed = reconcile_scope_ownership(self.device.pk, ["bfd"])
+
+        manifest.refresh_from_db()
+        # BFD timers live only on the overlay: dcim.Interface carries no value to re-own from,
+        # so a foreign overlay delete must retire the identity, never fabricate device intent.
+        self.assertFalse(NSOBFDInterfaceState.objects.filter(interface=interface).exists())
+        self.assertEqual(manifest.ownership_state, "retired")
+        self.assertFalse(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="bfd").exists())
+        self.assertIn(("bfd", manifest.pk), completed)
+
     def test_cleared_ownership_detaches_without_deletion_authority(self):
         from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOOwnershipManifest, NSOVLANState
         from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
