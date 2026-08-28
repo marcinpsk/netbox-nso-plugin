@@ -745,9 +745,14 @@ def _record_action_for(instance, device_id, requested, qualifying, manifest_stat
             manifest_state=manifest_state,
         ),
     )
-    if action is not OwnershipAction.RECORD_MANIFEST:
-        return None
-    return (scope, instance._meta.label_lower, instance.pk)
+    if action is OwnershipAction.RECORD_MANIFEST:
+        return (action, scope, instance._meta.label_lower, instance.pk)
+    # A retract this loop can act on is an owned overlay with NO durable evidence: nothing
+    # else selects it, so it renders forever. A manifest row is the lifecycle loop's to
+    # retract, with the deletion authority this path has no record of.
+    if action is OwnershipAction.RETRACT and manifest_state is None:
+        return (action, scope, instance._meta.label_lower, instance.pk)
+    return None
 
 
 def _device_overlays(device_id, requested):
@@ -777,7 +782,7 @@ def _device_overlays(device_id, requested):
 
 
 def _manifest_record_actions(device_id, requested):
-    """Return owned overlays whose durable manifest evidence is absent."""
+    """Return the owned overlays whose durable manifest evidence needs work."""
     qualifying = _qualifying_overlay_signatures(device_id, requested)
     manifest_states = _manifest_states(device_id, requested)
     planned = []
@@ -786,6 +791,40 @@ def _manifest_record_actions(device_id, requested):
         if action is not None:
             planned.append(action)
     return tuple(planned)
+
+
+def _demotion_plan(overlay):
+    """Plan the write that takes one owned overlay out of the rendered document."""
+    from .renderer_writer import RendererMutationPlan, planned_save
+
+    candidate = copy.copy(overlay)
+    candidate.status = "imported"
+    update_fields = ["status"]
+    if hasattr(candidate, "accepted_at"):
+        candidate.accepted_at = None
+        update_fields.append("accepted_at")
+    plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=update_fields),))
+    return candidate, update_fields, plan
+
+
+def _demote_overlay(instance, device_id, scope) -> bool:
+    """Demote one owned overlay that carries no deletion authority to demote it with."""
+    from .intent_state import MutationFootprint, intent_transaction, reconcile_family_footprint
+    from .renderer_writer import consume_renderer_plan
+    from .status_machine import is_owned
+
+    candidate, update_fields, plan = _demotion_plan(instance)
+    footprint = MutationFootprint.merge(
+        reconcile_family_footprint(device_id, [scope]),
+        plan.lock_footprint,
+    )
+    with intent_transaction(footprint) as permit:
+        current = type(instance).objects.filter(pk=instance.pk).first()
+        if current is None or not is_owned(current.status):
+            return False
+        with consume_renderer_plan(plan, permit, content=True) as writer:
+            writer.save(candidate, update_fields=update_fields)
+    return True
 
 
 def _rule_for_manifest(manifest):
@@ -1457,7 +1496,7 @@ def _retract_manifest(manifest, overlay=None) -> bool:
         reconcile_family_footprint,
     )
     from .models import NSOOwnershipManifest
-    from .renderer_writer import RendererMutationPlan, consume_renderer_plan, planned_save
+    from .renderer_writer import consume_renderer_plan
     from .signals import _is_intent_push_suppressed, _is_render_request
 
     # outbox.enqueue writes nothing while pushes are suppressed. Retiring the manifest anyway
@@ -1474,13 +1513,7 @@ def _retract_manifest(manifest, overlay=None) -> bool:
     # document never asks for. Demoted, not deleted, so operator content survives.
     plan = None
     if overlay is not None:
-        candidate = copy.copy(overlay)
-        candidate.status = "imported"
-        update_fields = ["status"]
-        if hasattr(candidate, "accepted_at"):
-            candidate.accepted_at = None
-            update_fields.append("accepted_at")
-        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=update_fields),))
+        candidate, update_fields, plan = _demotion_plan(overlay)
         footprint = MutationFootprint.merge(footprint, plan.lock_footprint)
     with intent_transaction(footprint) as permit:
         updated = NSOOwnershipManifest.objects.filter(
@@ -1593,29 +1626,34 @@ def _manifest_lifecycle_actions(device_id, requested):
     return tuple(planned)
 
 
-def _record_missing_manifests(device_id, requested):
+def _execute_overlay_records(device_id, requested):
+    """Record the missing manifests, and demote the owned overlays that have none to record."""
     from .intent_state import mirror_transaction, reconcile_family_footprint
 
     completed = []
     planned = _manifest_record_actions(device_id, requested)
     if not planned:
         return completed
-    footprint = reconcile_family_footprint(device_id, requested)
-    with mirror_transaction(footprint):
-        # One device scan under the lock, then an O(1) re-check of each planned identity.
-        qualifying = _qualifying_overlay_signatures(device_id, requested)
-        manifest_states = _manifest_states(device_id, requested)
-        for scope, model_label, pk in planned:
-            instance = apps.get_model(model_label).objects.filter(pk=pk).first()
-            if instance is None:
-                continue
-            if _record_action_for(instance, device_id, requested, qualifying, manifest_states) != (
-                scope,
-                model_label,
-                pk,
-            ):
-                continue
-            maintain_manifest(instance)
+    records = tuple(entry for entry in planned if entry[0] is OwnershipAction.RECORD_MANIFEST)
+    retracts = tuple(entry for entry in planned if entry[0] is OwnershipAction.RETRACT)
+    if records:
+        footprint = reconcile_family_footprint(device_id, requested)
+        with mirror_transaction(footprint):
+            # One device scan under the lock, then an O(1) re-check of each planned identity.
+            qualifying = _qualifying_overlay_signatures(device_id, requested)
+            manifest_states = _manifest_states(device_id, requested)
+            for entry in records:
+                _action, scope, model_label, pk = entry
+                instance = apps.get_model(model_label).objects.filter(pk=pk).first()
+                if instance is None:
+                    continue
+                if _record_action_for(instance, device_id, requested, qualifying, manifest_states) != entry:
+                    continue
+                maintain_manifest(instance)
+                completed.append((scope, pk))
+    for _action, scope, model_label, pk in retracts:
+        instance = apps.get_model(model_label).objects.filter(pk=pk).first()
+        if instance is not None and _demote_overlay(instance, device_id, scope):
             completed.append((scope, pk))
     return completed
 
@@ -1653,7 +1691,7 @@ def reconcile_scope_ownership(device_id: int, scopes) -> tuple[tuple[str, object
     requested = frozenset(str(scope) for scope in scopes)
     if not requested:
         return ()
-    completed = _record_missing_manifests(device_id, requested)
+    completed = _execute_overlay_records(device_id, requested)
     completed.extend(_execute_manifest_lifecycle(device_id, requested))
     completed.extend(_execute_native_creates(device_id, requested))
     return tuple(completed)
