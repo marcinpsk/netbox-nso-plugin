@@ -132,6 +132,25 @@ class TestOwnershipStateSignatures(SimpleTestCase):
 
         assert action is OwnershipAction.NONE
 
+    def test_retired_identity_is_not_recreated_as_greenfield(self):
+        from netbox_nso_plugin.ownership_planner import (
+            OwnershipAction,
+            OwnershipSignature,
+            converted_scope_rules,
+            plan_ownership,
+        )
+
+        action = plan_ownership(
+            converted_scope_rules()["vlan"],
+            OwnershipSignature(
+                native_present=True,
+                native_qualifies=True,
+                manifest_state="retired",
+            ),
+        )
+
+        assert action is OwnershipAction.NONE
+
     def test_owned_overlay_without_native_content_retracts(self):
         from netbox_nso_plugin.ownership_planner import (
             OwnershipAction,
@@ -197,7 +216,7 @@ class TestManifestRetirement(TestCase):
 
 class TestConvertedScopeRuleTable(SimpleTestCase):
     def test_converted_scopes_have_reviewed_acquisition_and_retirement_entries(self):
-        from netbox_nso_plugin.ownership_planner import converted_scope_rules
+        from netbox_nso_plugin.ownership_planner import _NATIVE_BINDING_BUILDERS, converted_scope_rules
 
         rules = converted_scope_rules()
 
@@ -229,6 +248,21 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
             assert rule.deletion_authority
             assert rule.intentional_semantic_delta
             assert rule.foreign_overlay_delete == "reown"
+            assert rule.acquisition_strategy in {"native", "existing_overlay"}
+
+        assert {scope for scope, rule in rules.items() if rule.acquisition_strategy == "existing_overlay"} == {
+            "bfd",
+            "l2_sap",
+            "logging",
+            "route_policy",
+            "snmp",
+        }
+        assert set(_NATIVE_BINDING_BUILDERS) == {
+            scope
+            for scope, rule in rules.items()
+            if rule.acquisition_strategy == "native" and scope != "redistribution"
+        }
+        assert len(set(rules) - {"redistribution"}) == 18
 
         retirement_clauses = {
             "bgp": "Foreign native peer deletes no longer delete linked overlays and push a reduced snapshot",

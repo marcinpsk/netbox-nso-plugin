@@ -23,7 +23,9 @@ from __future__ import annotations
 import logging
 import re
 
-from .deployment import DeploymentQuiesced
+from django.db import transaction
+from django.db.models import Q
+
 from .deployment import guarded as _deployment_guarded
 
 logger = logging.getLogger(__name__)
@@ -188,6 +190,38 @@ def _default_authgroup() -> str:
     return "network"
 
 
+def _lock_provision_identity(device_id, instance, nso_name):
+    """Lock one logical provision identity and return its device or a public conflict."""
+    from dcim.models import Device
+
+    from .models import NSODeviceManagement, NSOProvisionTombstone
+
+    list(
+        NSOProvisionTombstone.objects.select_for_update()
+        .filter(
+            Q(netbox_device_id=device_id)
+            | Q(
+                nso_instance=instance.adapter_instance_id,
+                nso_device_name=nso_name,
+            )
+        )
+        .values_list("provision_attempt_id", flat=True)
+    )
+    device = Device.objects.select_for_update().filter(pk=device_id).first()
+    if device is None:
+        return None, "Device no longer exists."
+    if NSODeviceManagement.objects.filter(device=device).exists():
+        return None, "Device is already managed by NSO."
+    clash = (
+        NSODeviceManagement.objects.filter(nso_instance=instance, nso_device_name=nso_name)
+        .exclude(device=device)
+        .first()
+    )
+    if clash is not None:
+        return None, f"NSO device name '{nso_name}' is already used by {clash.device} on this instance."
+    return device, None
+
+
 @_deployment_guarded("provisioning")
 def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", sync=True) -> dict:
     """Onboard one NetBox device into NSO (the write action).
@@ -196,26 +230,26 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
     mapping; resolves the management address via :func:`device_mgmt_addresses` (primary,
     or OOB when there is no primary yet) and passes BOTH to the adapter so its failover
     bootstrap picks the reachable one; **enqueues** the adapter's ``/devices/provision``
-    job (create node → fetch-host-keys → unlock → sync-from) and immediately creates the
+    job (create node, fetch host keys, unlock, and sync from) and immediately creates the
     NSODeviceManagement row in ``provisioning`` status. The row's post_save signal is
-    *gated* on that status, so the adapter mapping + scope push + sync-notify do NOT fire
-    until the background job succeeds and the status-advance view flips the row to ready.
+    *gated* on that status, so the adapter mapping, scope push, and sync notification do not
+    fire until the tombstone sweep records successful completion.
 
     Provisioning is async because it can take minutes (probe an unreachable primary,
-    bootstrap over OOB, then a full sync-from) — far longer than the plugin's adapter
+    bootstrap over OOB, then a full sync-from). This is longer than the plugin's adapter
     read timeout, which previously aborted the onboard mid-flight while NSO kept going.
 
-    The platform→NED mapping is only a *default*: passing ``ned_id`` overrides it,
+    The platform-to-NED mapping is only a *default*: passing ``ned_id`` overrides it,
     so an operator can onboard with a different NED (software version / testing) or
     onboard a device whose platform has no mapping at all.
 
     Returns ``{"ok", "error", "provisioning", "job_id", "managed"}``. ``ok=False`` with a
     populated ``error`` for the pre-flight failures (no NED / no primary IP / already
     managed) or an adapter enqueue failure; ``ok=True, provisioning=True`` once the job is
-    queued and the row exists (the device is not yet managed — the job is still running).
+    queued and the row exists (the device is not yet managed because the job is still running).
     """
     from . import adapter_client as client
-    from .models import NSODeviceManagement, NSOPlatformNedMapping
+    from .models import NSODeviceManagement, NSOPlatformNedMapping, NSOProvisionTombstone
 
     result = {"ok": False, "error": None, "provisioning": False, "job_id": None, "managed": False}
 
@@ -225,223 +259,174 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
         if mapping is not None:
             chosen_ned = mapping.ned_id
     if not chosen_ned:
-        result["error"] = "No NED selected — pick a NED (or add a Platform → NED mapping for a default)."
+        result["error"] = "No NED selected. Pick a NED or add a Platform to NED mapping for a default."
         return result
     # Default to the primary (in-band) address; fall back to OOB when a freshly-deployed box
     # has no primary yet. Both are resolved by the shared device_mgmt_addresses helper and sent
     # to the adapter, whose failover bootstrap probes the primary and switches to OOB if it is
-    # unreachable — the plugin never decides reachability, so onboarding can't diverge from the
+    # unreachable. The plugin never decides reachability, so onboarding cannot diverge from the
     # failover loop. Require at least one address (no way to reach the device otherwise).
     primary_address, oob_address = device_mgmt_addresses(device)
     address = primary_address or oob_address
     if address is None:
-        result["error"] = "Device has no primary or OOB IP — NSO needs an address to reach it."
+        result["error"] = "Device has no primary or OOB IP. NSO needs an address to reach it."
         return result
-    if NSODeviceManagement.objects.filter(device=device).exists():
-        result["error"] = "Device is already managed by NSO."
-        return result
-
-    # NSO device name = normalized NetBox name (NSO names can't hold spaces/slashes/etc.).
+    # NSO device names cannot contain spaces, slashes, or similar characters.
     nso_name = normalize_nso_device_name(device.name)
-    clash = (
-        NSODeviceManagement.objects.filter(nso_instance=instance, nso_device_name=nso_name)
-        .exclude(device=device)
-        .first()
-    )
-    if clash is not None:
-        result["error"] = f"NSO device name '{nso_name}' is already used by {clash.device} on this instance."
-        return result
 
-    # OOB rides along as the failover fallback — a fresh device's primary (in-band) loopback is
+    # OOB rides along as the failover fallback. A fresh device's primary loopback is
     # usually unreachable until NSO configures it, so the adapter onboards over OOB when primary
     # is down (and when there is no primary at all, ``address`` already IS the OOB above).
-    try:
-        prov = client.provision_device(
-            nso_instance=instance.adapter_instance_id,
-            device_name=nso_name,
-            address=address,
-            ned_id=chosen_ned,
-            authgroup=_default_authgroup(),
-            admin_state=admin_state,
-            sync=sync,
-            oob_ip=oob_address,
+    request_body = {
+        "nso_instance": instance.adapter_instance_id,
+        "device_name": nso_name,
+        "address": address,
+        "ned_id": chosen_ned,
+        "authgroup": _default_authgroup(),
+        "admin_state": admin_state,
+        "sync": sync,
+        "oob_ip": oob_address,
+    }
+    with transaction.atomic():
+        locked_device, conflict = _lock_provision_identity(device.pk, instance, nso_name)
+        if conflict is not None:
+            result["error"] = conflict
+            return result
+
+        tombstone = next(
+            (
+                row
+                for row in NSOProvisionTombstone.objects.filter(
+                    netbox_device_id=locked_device.pk,
+                    nso_instance=instance.adapter_instance_id,
+                    nso_device_name=nso_name,
+                    state="open",
+                ).order_by("created_at", "provision_attempt_id")
+                if {key: value for key, value in row.canonical_request.items() if key != "provision_attempt_id"}
+                == request_body
+            ),
+            None,
         )
-    except Exception as exc:
-        logger.exception("onboard_candidate: provision request failed for %s", nso_name)
-        result["error"] = f"Provisioning request failed ({type(exc).__name__}); see the server log."
-        return result
-
-    job_id = str((prov or {}).get("job_id") or "")
-    if not job_id:
-        result["error"] = "Adapter did not return a provision job id."
-        return result
-
-    # Create the management row in 'provisioning' — its post_save signal is GATED on this
-    # status (signals.sync_scope_to_adapter) so it does NOT map/scope/sync while the NSO
-    # node is still being built. The dashboard polls the job (NSOOnboardStatusView): on
-    # success the status flips to "" (ready), re-firing the signal to map/scope/sync; on
-    # failure it records provision_failed + the steps.
-    from django.utils import timezone
-
-    try:
-        from .management_lifecycle import save_management
-
-        save_management(
-            NSODeviceManagement(
-                device=device,
-                nso_instance=instance,
+        if tombstone is None:
+            tombstone = NSOProvisionTombstone(
+                netbox_device_id=locked_device.pk,
+                nso_instance=instance.adapter_instance_id,
                 nso_device_name=nso_name,
-                onboarded_at=timezone.now(),
-                onboard_status="provisioning",
-                onboard_job_id=job_id,
+                canonical_request={},
             )
-        )
-    except Exception as exc:  # noqa: BLE001 — the adapter job is already running; surface it for recovery
-        # provision_device() already enqueued job_id, so NSO is building the node. Without a
-        # tracking row it would become an untracked "ghost" onboard (a later re-onboard is then
-        # blocked by the name clash), so record the job id prominently instead of raising.
-        logger.error(
-            "onboard_candidate: provision job %s started but tracking-row create failed for %s (%s)",
+            tombstone.canonical_request = {
+                **request_body,
+                "provision_attempt_id": str(tombstone.provision_attempt_id),
+            }
+            tombstone.save(force_insert=True)
+    provision_request = dict(tombstone.canonical_request)
+
+    job_id = ""
+    try:
+        with transaction.atomic():
+            locked_device, conflict = _lock_provision_identity(device.pk, instance, nso_name)
+            if conflict is not None:
+                result["error"] = conflict
+                return result
+
+            tombstone = NSOProvisionTombstone.objects.get(provision_attempt_id=tombstone.provision_attempt_id)
+            if tombstone.state != "open":
+                result["error"] = "The provision attempt is already completing."
+                return result
+
+            prov = client.provision_device(**provision_request)
+            job_id = str((prov or {}).get("job_id") or "")
+            if not job_id:
+                result["error"] = "Adapter did not return a provision job id."
+                return result
+            NSOProvisionTombstone.objects.filter(
+                provision_attempt_id=tombstone.provision_attempt_id,
+                state="open",
+                adapter_job_id="",
+            ).update(adapter_job_id=job_id)
+
+            # The post_save signal stays gated while NSO builds the node. The tombstone
+            # sweep records the terminal outcome and re-fires it after successful completion.
+            from django.utils import timezone
+
+            from .management_lifecycle import save_management
+
+            save_management(
+                NSODeviceManagement(
+                    device=locked_device,
+                    nso_instance=instance,
+                    nso_device_name=nso_name,
+                    onboarded_at=timezone.now(),
+                    onboard_status="provisioning",
+                    onboard_job_id=job_id,
+                )
+            )
+
+            # Learn the platform-to-NED mapping from this onboard. The first explicit NED
+            # becomes the default for later devices on the same platform.
+            if locked_device.platform_id is not None:
+                _, created = NSOPlatformNedMapping.objects.get_or_create(
+                    platform_id=locked_device.platform_id,
+                    defaults={"ned_id": chosen_ned},
+                )
+                result["mapping_created"] = created
+    except Exception as exc:
+        if not job_id:
+            logger.exception("onboard_candidate: provision request failed for %s", nso_name)
+            result["error"] = f"Provisioning request failed ({type(exc).__name__}); see the server log."
+            return result
+        logger.exception(
+            "onboard_candidate: provision job %s started but tracking-row create failed for %s",
             job_id,
             nso_name,
-            exc,
         )
-        result["error"] = (
-            f"Provision job {job_id} started, but the NetBox tracking row could not be created "
-            f"({type(exc).__name__}; see the server log). The NSO node may still be provisioning: "
-            f"recover via job {job_id}."
+        result.update(
+            error=(
+                f"Provision job {job_id} started, but the NetBox tracking row could not be created "
+                f"({type(exc).__name__}; see the server log). The NSO node may still be provisioning. "
+                f"Recover through job {job_id}."
+            ),
+            job_id=job_id,
         )
-        result["job_id"] = job_id
         return result
-    # Learn the platform→NED mapping from this onboard: the first device of a
-    # platform is onboarded with an explicit NED; record it so future devices of
-    # the same platform appear as onboardable candidates (no-op if one exists).
-    if device.platform_id is not None:
-        _, created = NSOPlatformNedMapping.objects.get_or_create(
-            platform_id=device.platform_id, defaults={"ned_id": chosen_ned}
-        )
-        result["mapping_created"] = created
+
     result["ok"] = True
     result["provisioning"] = True
     result["job_id"] = job_id
     return result
 
 
-_PROVISION_FAILURE_PUBLIC_MESSAGE = "Provisioning failed. See the server log."
-
-
 @_deployment_guarded("provisioning")
 def advance_provisioning(mgmt) -> dict:
-    """Poll a provisioning row's adapter job and advance it. Idempotent + best-effort.
-
-    Shared by three callers so a stranded async onboard self-heals no matter which runs
-    first: the dashboard status poll (:class:`~netbox_nso_plugin.views.NSOOnboardStatusView`),
-    the device NSO tab render, and the hourly
-    :class:`~netbox_nso_plugin.jobs.AdvanceStaleOnboardingJob` sweep. On success it flips
-    ``onboard_status`` to "" and re-saves — re-firing the (now un-gated)
-    ``sync_scope_to_adapter`` signal → adapter mapping + scope + sync-notify.
-
-    Returns the dict shape the poll endpoint serialises: ``{"status": ...}`` with the onboard
-    state ("ready"/"provisioning"/"provision_failed"), plus ``error`` on failure or
-    ``poll_error`` on a transient adapter outage (the row is kept provisioning so callers retry).
-    """
-    from . import adapter_client as client
-    from .adapter_client import AdapterError, public_error_message
-
-    # Terminal or ready row → just report it (never re-poll). Keeps the sweep/tab cheap and
-    # the poll endpoint idempotent.
+    """Delegate one UI poll to the fenced provision-attempt sweep and report its row."""
     if mgmt.onboard_status != "provisioning":
         return {"status": mgmt.onboard_status or "ready", "error": mgmt.onboard_error}
 
-    if not mgmt.onboard_job_id:
-        mgmt.onboard_status = "provision_failed"
-        mgmt.onboard_error = "No provision job id recorded."
-        from .management_lifecycle import save_management
+    from .models import NSOProvisionTombstone
+    from .provision_lifecycle import sweep_provision_tombstones
 
-        save_management(mgmt, update_fields=["onboard_status", "onboard_error"])
-        return {"status": "provision_failed", "error": mgmt.onboard_error}
-
-    try:
-        job = client.get_job(mgmt.onboard_job_id)
-    except AdapterError as exc:
-        # Transient — leave the row provisioning so the next poll/tab/sweep retries.
-        return {"status": "provisioning", "poll_error": public_error_message(exc)}
-
-    job_status = (job or {}).get("status")
-    if job_status in ("queued", "running"):
-        return {"status": "provisioning"}
-
-    if job_status == "succeeded":
-        result = (job or {}).get("result") or {}
-        # ``result`` is an object by contract; ``steps`` inside it is free-form JSON.
-        steps = result.get("steps")
-        steps = steps if isinstance(steps, list) else []
-        if result.get("ok"):
-            # NSO node is up — flip to ready; the full save() re-fires the un-gated
-            # sync_scope_to_adapter signal (adapter mapping + scope + sync-notify).
-            mgmt.onboard_status = ""
-            mgmt.onboard_steps = steps
-            mgmt.onboard_error = ""
-            from .management_lifecycle import save_management
-
-            save_management(mgmt)
-            return {"status": "ready"}
-        mgmt.onboard_status = "provision_failed"
-        mgmt.onboard_steps = steps
-        mgmt.onboard_error = _PROVISION_FAILURE_PUBLIC_MESSAGE
-        logger.warning(
-            "Provisioning job %s returned an unsuccessful result for management row %s: %r",
-            mgmt.onboard_job_id,
-            mgmt.pk,
-            result,
+    tombstone = (
+        NSOProvisionTombstone.objects.filter(
+            netbox_device_id=mgmt.device_id,
+            nso_instance=mgmt.nso_instance.adapter_instance_id,
+            nso_device_name=mgmt.nso_device_name,
+            adapter_job_id=mgmt.onboard_job_id,
         )
-        from .management_lifecycle import save_management
-
-        save_management(mgmt, update_fields=["onboard_status", "onboard_steps", "onboard_error"])
-        return {"status": "provision_failed", "error": mgmt.onboard_error}
-
-    # failed / timeout / unknown-terminal
-    err = (job or {}).get("error") or {}
-    mgmt.onboard_status = "provision_failed"
-    mgmt.onboard_error = _PROVISION_FAILURE_PUBLIC_MESSAGE
-    logger.warning(
-        "Provisioning job %s finished with status %r for management row %s: %r",
-        mgmt.onboard_job_id,
-        job_status,
-        mgmt.pk,
-        err,
+        .exclude(state="closed")
+        .order_by("created_at", "provision_attempt_id")
+        .first()
     )
-    from .management_lifecycle import save_management
-
-    save_management(mgmt, update_fields=["onboard_status", "onboard_error"])
-    return {"status": "provision_failed", "error": mgmt.onboard_error}
+    if tombstone is not None:
+        sweep_provision_tombstones(tombstone.provision_attempt_id)
+        mgmt.refresh_from_db()
+    return {"status": mgmt.onboard_status or "ready", "error": mgmt.onboard_error}
 
 
 def advance_stale_onboarding_rows() -> tuple:
-    """Advance every row still in 'provisioning' by polling its job — the periodic backstop.
+    """Delegate the periodic backstop to the sole provision completion owner."""
+    from .provision_lifecycle import sweep_provision_tombstones
 
-    The dashboard/device-tab poll advances a row the moment its provision job finishes, but
-    only while someone has that page open. This sweep (run hourly by
-    :class:`~netbox_nso_plugin.jobs.AdvanceStaleOnboardingJob`) catches rows stranded because
-    no page was open when the job completed. Returns ``(checked, advanced)``.
-    """
-    from .models import NSODeviceManagement
-
-    rows = list(NSODeviceManagement.objects.filter(onboard_status="provisioning"))
-    advanced = 0
-    for mgmt in rows:
-        try:
-            res = advance_provisioning(mgmt)
-        except DeploymentQuiesced:
-            raise
-        except Exception:  # noqa: BLE001 — one bad row must not abort the whole sweep
-            logger.exception("advance_stale_onboarding_rows: failed for mgmt %s", mgmt.pk)
-            continue
-        if res.get("status") != "provisioning":
-            advanced += 1
-    if rows:
-        logger.info("advance_stale_onboarding_rows: %d checked, %d advanced", len(rows), advanced)
-    return len(rows), advanced
+    return sweep_provision_tombstones()
 
 
 def manage_existing(device, instance, nso_device_name) -> dict:
