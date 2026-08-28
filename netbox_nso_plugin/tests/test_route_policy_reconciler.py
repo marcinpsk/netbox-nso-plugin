@@ -573,6 +573,46 @@ class TestReconcileRoutePolicy(TestCase):
             },
         )
 
+    def test_preflight_filters_shared_dependency_prefetches_to_the_payload(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from netbox_routing.models import ASPath, Community, CommunityList, CustomPrefix, PrefixList, RouteMap
+
+        from netbox_nso_plugin.route_policy_reconciler import route_policy_reconcile_plan
+
+        PrefixList.objects.create(name="PAYLOAD-PL")
+        CommunityList.objects.create(name="PAYLOAD-CL")
+        ASPath.objects.create(name="PAYLOAD-AP")
+        RouteMap.objects.create(name="PAYLOAD-RM")
+        CustomPrefix.objects.create(prefix="198.18.32.0/24")
+        Community.objects.create(community="64532:100")
+        payload = {
+            "prefix_lists": [
+                {
+                    "name": "PAYLOAD-PL",
+                    "entries": [{"action": "permit", "prefix": "198.18.32.0/24"}],
+                }
+            ],
+            "community_lists": [
+                {
+                    "name": "PAYLOAD-CL",
+                    "entries": [{"action": "permit", "community": "64532:100"}],
+                }
+            ],
+            "as_paths": [{"name": "PAYLOAD-AP", "entries": [{"action": "permit", "pattern": "^64532$"}]}],
+            "route_maps": [{"name": "PAYLOAD-RM", "entries": []}],
+        }
+
+        with CaptureQueriesContext(connection) as captured:
+            route_policy_reconcile_plan(self.device, payload)
+
+        sql = [query["sql"] for query in captured.captured_queries]
+        for model in (PrefixList, CommunityList, ASPath, RouteMap, CustomPrefix, Community):
+            table = model._meta.db_table
+            prefetches = [query for query in sql if query.startswith("SELECT") and f'FROM "{table}"' in query]
+            self.assertEqual(len(prefetches), 1)
+            self.assertIn(" WHERE ", prefetches[0])
+
     def test_prefix_list_family_propagated_from_capture(self):
         """The materialized PrefixList mirrors the owner capture's address family.
 
