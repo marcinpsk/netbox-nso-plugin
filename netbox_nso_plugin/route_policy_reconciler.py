@@ -840,6 +840,8 @@ def _mutation_plan(operations, planned_at):
 
 
 def _replay_operations(writer, operations):
+    from .renderer_writer import replay_creation_references
+
     for operation, instance, update_fields, force_insert, references, field_name, related in operations.operations:
         if operation == "delete":
             writer.delete(instance)
@@ -850,8 +852,7 @@ def _replay_operations(writer, operations):
         if operation == "display_m2m_add":
             getattr(instance, field_name).add(*related)
             continue
-        for reference_field, referenced in references:
-            setattr(instance, reference_field, referenced.pk)
+        replay_creation_references(instance, references)
         writer.save(instance, update_fields=update_fields, force_insert=force_insert)
 
 

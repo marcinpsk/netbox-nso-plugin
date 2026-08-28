@@ -816,7 +816,12 @@ def _isis_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
 def reconcile_isis(device, payload):
     """Apply one preflighted IS-IS graph reconciliation."""
     from .models import NSODeviceManagement, NSOISISInstanceState, NSOISISInterfaceState
-    from .renderer_writer import active_renderer_writer, renderer_mirror_writes, renderer_writes
+    from .renderer_writer import (
+        active_renderer_writer,
+        renderer_mirror_writes,
+        renderer_writes,
+        replay_creation_references,
+    )
     from .signals import suppress_intent_push
 
     management = NSODeviceManagement.objects.filter(device=device).first()
@@ -833,9 +838,7 @@ def reconcile_isis(device, payload):
             if operation == "delete":
                 writer.delete(instance)
                 continue
-            for field_name, related in references:
-                field = instance._meta.get_field(field_name)
-                setattr(instance, field.attname, related.pk)
+            replay_creation_references(instance, references)
             writer.save(
                 instance,
                 update_fields=update_fields,

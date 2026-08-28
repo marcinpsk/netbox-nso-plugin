@@ -155,6 +155,27 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         self.assertEqual(planned.pk, existing.pk)
         self.assertEqual(Interface.objects.filter(device=device, name="Loopback1627").count(), 1)
 
+    def test_non_route_policy_plan_has_no_visibility_queries(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save
+
+        _device, management = make_managed("writer-plan-queries", 16286)
+        candidate = copy.copy(management)
+        candidate.adapter_link_error = "planned"
+
+        with CaptureQueriesContext(connection) as captured:
+            RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("adapter_link_error",)),))
+
+        baseline_queries = [
+            query
+            for query in captured.captured_queries
+            if query["sql"].lstrip().upper().startswith("SELECT")
+            and 'FROM "netbox_nso_plugin_nsodevicemanagement"' in query["sql"]
+        ]
+        self.assertEqual(len(baseline_queries), 1)
+
     def test_static_route_manifest_carries_only_acknowledged_lineage(self):
         from netbox_routing.models import StaticRoute
 
@@ -602,6 +623,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         assert (revision.revision, revision.verified_revision, revision.verified_fingerprint) == before
 
     def test_save_rejects_a_row_changed_after_plan_construction(self):
+        from netbox_nso_plugin import renderer_writer
         from netbox_nso_plugin.renderer_writer import (
             RendererMutationPlan,
             planned_save,
@@ -614,10 +636,13 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("adapter_link_error",)),))
         mirror_update(management, adapter_link_error="concurrent")
 
-        with self.assertRaisesRegex(IntentMutationProtocolError, "changed after planning"):
+        with self.assertRaisesRegex(IntentMutationProtocolError, "changed after planning") as caught:
             with renderer_mirror_writes(plan) as writer:
                 writer.save(candidate, update_fields=("adapter_link_error",))
 
+        stale_type = getattr(renderer_writer, "IntentPlanStaleError", None)
+        self.assertIsNotNone(stale_type)
+        self.assertIsInstance(caught.exception, stale_type)
         management.refresh_from_db()
         assert management.adapter_link_error == "concurrent"
 

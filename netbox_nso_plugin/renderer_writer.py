@@ -191,17 +191,27 @@ class RendererMutationPlan:
         """Freeze proposed writes and derive every lock and revision dependency."""
         planned_at = planned_at or timezone.now()
         saves = tuple(saves)
-        creation_refs = _creation_refs(saves)
-        support_refs = _referenced_support_refs(saves, creation_refs)
+        save_states = tuple((proposed, _stored_instance(proposed.instance)) for proposed in saves)
+        creation_refs = _creation_refs(save_states)
+        support_refs = _referenced_support_refs(save_states, creation_refs)
         writes: list[RendererWrite] = []
         footprints: list[MutationFootprint] = []
         content_keys: set[tuple[int, str]] = set()
+        effective_saves = []
 
-        for proposed in saves:
-            write, footprint, changed_keys = _plan_save(proposed, creation_refs, support_refs)
+        for proposed, before in save_states:
+            after = _effective_after(proposed.instance, before, proposed.update_fields)
+            write, footprint, changed_keys = _plan_save(
+                proposed,
+                creation_refs,
+                support_refs,
+                before,
+                after,
+            )
             writes.append(write)
             footprints.append(footprint)
             content_keys.update(changed_keys)
+            effective_saves.append((before, after))
         for proposed in deletes:
             delete_writes, footprint, changed_keys = _plan_delete(proposed)
             writes.extend(delete_writes)
@@ -223,7 +233,7 @@ class RendererMutationPlan:
             footprints.append(footprint)
             content_keys.update(changed_keys)
 
-        content_keys.update(_prospective_route_policy_acquisition_keys(saves))
+        content_keys.update(_prospective_visibility_keys(effective_saves))
 
         lock_footprint = MutationFootprint.merge(*footprints) if footprints else MutationFootprint()
         return cls(
@@ -235,41 +245,18 @@ class RendererMutationPlan:
         )
 
 
-def _prospective_route_policy_acquisition_keys(saves):
-    """Include native writes made visible by an overlay acquired in the same plan."""
-    from . import status_machine as sm
-    from .intent_state import _route_policy_groups
-
-    acquired_groups = set()
-    effective = []
-    for proposed in saves:
-        instance = proposed.instance
-        before = _stored_instance(instance)
-        after = _effective_after(instance, before, proposed.update_fields)
-        effective.append((before, after))
-        if instance._meta.label_lower != "netbox_nso_plugin.nsoroutepolicystate":
-            continue
-        if (before is None or not sm.is_owned(before.status)) and sm.is_owned(after.status):
-            acquired_groups.add((after.family, after.object_name.casefold()))
-    if not acquired_groups:
-        return set()
-
+def _prospective_visibility_keys(effective_saves):
+    """Resolve content made visible by ownership changes in this plan."""
+    effective_saves = tuple(effective_saves)
     keys = set()
     specs = renderer_input_specs()
-    for before, after in effective:
+    hooks = set()
+    for _before, after in effective_saves:
         spec = specs.get(after._meta.label_lower)
-        if spec is None or spec.shared_kind != "route_policy":
-            continue
-        if after._meta.label_lower == "netbox_nso_plugin.nsoroutepolicystate":
-            continue
-        groups = {
-            (family, name.casefold())
-            for candidate in (before, after)
-            if candidate is not None
-            for family, name in _route_policy_groups(candidate)
-        }
-        if groups & acquired_groups:
-            keys.update(spec.resolver(after, spec))
+        if spec is not None and spec.prospective_visibility is not None:
+            hooks.add(spec.prospective_visibility)
+    for hook in hooks:
+        keys.update(hook(effective_saves))
     return keys
 
 
@@ -289,6 +276,13 @@ def _effective_after(instance, before, update_fields):
         if field.is_relation and field.is_cached(instance):
             field.set_cached_value(effective, field.get_cached_value(instance))
     return effective
+
+
+def replay_creation_references(instance, references) -> None:
+    """Assign planned related rows through each field's stored attribute."""
+    for field_name, related in references:
+        field = instance._meta.get_field(field_name)
+        setattr(instance, field.attname, related.pk)
 
 
 def _planned_field_value(instance, field, creation_refs, reference_fields=()):
@@ -341,11 +335,11 @@ def _natural_key(instance, fields, creation_refs=None, reference_fields=()):
     )
 
 
-def _creation_refs(saves):
+def _creation_refs(save_states):
     references = {}
-    for proposed in saves:
+    for proposed, before in save_states:
         instance = proposed.instance
-        if _stored_instance(instance) is not None:
+        if before is not None:
             continue
         if not proposed.natural_key_fields:
             continue
@@ -361,15 +355,19 @@ def _creation_refs(saves):
     return references
 
 
-def _referenced_support_refs(saves, creation_refs):
+def _referenced_support_refs(save_states, creation_refs):
     references = set()
     specs = renderer_input_specs()
-    for proposed in saves:
+    for proposed, before in save_states:
         if proposed.instance._meta.label_lower not in specs:
             continue
-        before = _stored_instance(proposed.instance)
         after = _effective_after(proposed.instance, before, proposed.update_fields)
-        values = _field_values(after, proposed.update_fields, creation_refs)
+        values = _field_values(
+            after,
+            proposed.update_fields,
+            creation_refs,
+            proposed.reference_fields,
+        )
         references.update(value for _attname, value in values if isinstance(value, RendererCreationRef))
     return frozenset(references)
 
@@ -393,12 +391,11 @@ def _changed_keys(before, after, spec, dependency_changed):
     return keys
 
 
-def _plan_save(proposed: RendererSave, creation_refs, support_refs):
+def _plan_save(proposed: RendererSave, creation_refs, support_refs, before, after):
     instance = proposed.instance
     label = instance._meta.label_lower
     spec = renderer_input_specs().get(label)
-    before = _stored_instance(instance)
-    if spec is None and label not in SOURCE_MODEL_RANKS:
+    if spec is None and label not in SOURCE_MODEL_RANKS and label not in OVERLAY_MODEL_RANKS:
         reference = creation_refs.get(id(instance))
         if before is not None or not proposed.force_insert or reference not in support_refs:
             raise IntentMutationProtocolError(f"{label} is not a registered renderer input")
@@ -408,13 +405,17 @@ def _plan_save(proposed: RendererSave, creation_refs, support_refs):
                 model_label=label,
                 natural_key=reference.natural_key,
                 update_fields=proposed.update_fields,
-                values=_field_values(instance, proposed.update_fields, creation_refs),
+                values=_field_values(
+                    after,
+                    proposed.update_fields,
+                    creation_refs,
+                    proposed.reference_fields,
+                ),
                 force_insert=True,
             ),
             MutationFootprint(),
             set(),
         )
-    after = _effective_after(instance, before, proposed.update_fields)
     if before is None and not proposed.natural_key_fields:
         raise IntentMutationProtocolError(f"a {label} creation requires a stable natural key")
     identity = (

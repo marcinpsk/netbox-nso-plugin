@@ -508,6 +508,7 @@ class RendererInputSpec:
     fragment: Any
     shared_kind: str | None = None
     dependency_resolver: Any = None
+    prospective_visibility: Any = None
 
     @property
     def model(self):
@@ -1089,6 +1090,37 @@ def _route_policy_groups(instance) -> tuple[tuple[str, str], ...]:
             )
         )
     return tuple(sorted(groups, key=lambda group: (group[0], group[1].casefold())))
+
+
+def _route_policy_prospective_visibility(effective_saves):
+    """Return keys exposed by route-policy ownership acquired in one plan."""
+    from . import status_machine as sm
+
+    state_label = "netbox_nso_plugin.nsoroutepolicystate"
+    acquired_groups = {
+        (after.family, after.object_name.casefold())
+        for before, after in effective_saves
+        if after._meta.label_lower == state_label
+        and (before is None or not sm.is_owned(before.status))
+        and sm.is_owned(after.status)
+    }
+    if not acquired_groups:
+        return set()
+
+    keys = set()
+    for before, after in effective_saves:
+        spec = _REGISTRY.get(after._meta.label_lower)
+        if spec is None or spec.shared_kind != "route_policy" or after._meta.label_lower == state_label:
+            continue
+        groups = {
+            (family, name.casefold())
+            for candidate in (before, after)
+            if candidate is not None
+            for family, name in _route_policy_groups(candidate)
+        }
+        if groups & acquired_groups:
+            keys.update(spec.resolver(after, spec))
+    return keys
 
 
 def _route_map_consumer_rows(instance):
@@ -3298,6 +3330,7 @@ def register_renderer_input(spec: RendererInputSpec, *, connect_ends: bool = Tru
         fragment=spec.fragment,
         shared_kind=spec.shared_kind,
         dependency_resolver=spec.dependency_resolver,
+        prospective_visibility=spec.prospective_visibility,
     )
     _REGISTRY[label] = normalized
     _TABLE_REGISTRY[model._meta.db_table] = normalized
@@ -3540,6 +3573,9 @@ def register_builtin_renderer_inputs(*, connect_ends: bool = True) -> None:
             fragment=fragment,
             dependency_resolver=dependency_resolvers.get(label),
             shared_kind="route_policy" if label == "netbox_nso_plugin.nsoroutepolicystate" else None,
+            prospective_visibility=(
+                _route_policy_prospective_visibility if label == "netbox_nso_plugin.nsoroutepolicystate" else None
+            ),
         )
         _TABLE_REGISTRY[_REGISTRY[label].table] = _REGISTRY[label]
     _REGISTRY["netbox_nso_plugin.nsovlanstate"] = replace(
