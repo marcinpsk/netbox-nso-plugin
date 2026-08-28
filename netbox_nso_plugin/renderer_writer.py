@@ -1066,16 +1066,16 @@ class RendererWriter:
             self._active_operation = previous
             self._active_instance = previous_instance
 
-    def save(self, instance, *, update_fields=None, force_insert=False):
-        """Execute one exact planned save."""
+    def save_via(self, instance, save, *, update_fields=None, force_insert=False):
+        """Execute one exact planned save through a model-aware callback."""
         index = self._find_save(instance, update_fields, force_insert)
         with self._operation(index, instance):
             if not force_insert:
-                instance.save(update_fields=update_fields)
+                result = save()
             else:
                 try:
                     with transaction.atomic():
-                        instance.save(force_insert=True)
+                        result = save()
                 except IntegrityError:
                     write = self.plan.write_set[index]
                     existing = self._resolve_creation(write) if write.natural_key else None
@@ -1084,9 +1084,21 @@ class RendererWriter:
                     instance.pk = existing.pk
                     instance._state.adding = False
                     instance._state.db = existing._state.db
+                    result = None
+        if result is not None and result is not instance:
+            raise IntentMutationProtocolError("a planned save callback returned a different instance")
         _maintain_manifest(instance)
         self._consumed.add(index)
         return instance
+
+    def save(self, instance, *, update_fields=None, force_insert=False):
+        """Execute one exact planned model save."""
+        return self.save_via(
+            instance,
+            lambda: instance.save(update_fields=update_fields, force_insert=force_insert),
+            update_fields=update_fields,
+            force_insert=force_insert,
+        )
 
     def delete(self, instance):
         """Execute one planned root delete and consume its Collector closure."""
