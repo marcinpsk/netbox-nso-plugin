@@ -115,7 +115,10 @@ def _deliver_scheduled_keys():
             continue
         entry_ids = [row.pk for row in rows]
         state = NSOIntentOutboxState.objects.filter(device_id=device_id, scope=scope).first() or NSOIntentOutboxState()
-        folded = outbox.fold_state_transitions([record for row in rows for record in row.transitions], state)
+        # The ordinary partition alone, exactly as ``drain._form`` folds it: a repair carries
+        # no authority, so folding one here would queue a deletion production never queues.
+        ordinary = [row for row in rows if row.kind == outbox.CONTRIBUTION_KIND_ORDINARY]
+        folded = outbox.fold_state_transitions([record for row in ordinary for record in row.transitions], state)
         # Production's own fold, not a copy of it: a repair-only contribution set yields None
         # (no marking partition at all), which a re-derivation here has already got wrong once.
         mark, _mark_any = drain._contribution_marks(rows)
