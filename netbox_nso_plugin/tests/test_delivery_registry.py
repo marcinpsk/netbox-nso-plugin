@@ -151,6 +151,22 @@ def _fixture(tag: str, adapter_device_id: int):
     return device, mgmt
 
 
+def _trust_scope(device, management, scope):
+    """Seed the exact baseline for tests whose subject is post-send behavior."""
+    from django.utils import timezone
+
+    from netbox_nso_plugin import delivery
+    from netbox_nso_plugin.models import NSOIntentRevision
+
+    revision, _created = NSOIntentRevision.objects.get_or_create(device=device, scope=scope)
+    revision.verified_revision = revision.revision
+    revision.verified_fingerprint = delivery.canonical_fingerprint(
+        delivery.render(scope, device.pk, management.adapter_device_id).payload
+    )
+    revision.verified_at = timezone.now()
+    revision.save(update_fields=["verified_revision", "verified_fingerprint", "verified_at", "updated_at"])
+
+
 class TestDeliverySuccessHooks(IntentPushResetMixin, TestCase):
     """O1.17 — delivering through the registry keeps every per-scope success side effect."""
 
@@ -241,6 +257,7 @@ class TestDeliverySuccessHooks(IntentPushResetMixin, TestCase):
                 nso_next_hop="198.51.100.1",
                 intent_generation=generation,
             )
+        _trust_scope(device, mgmt, "static_route")
         echo = {"count": 1, "routes": [{"route_id": route.pk, "generation": generation, "fingerprint": "fp-1"}]}
 
         with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", return_value=echo):
