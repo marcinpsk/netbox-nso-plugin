@@ -1067,7 +1067,13 @@ _STATE_SEEDERS = {
 
 def _reown_manifest(manifest, rule, native, *, revoke=True):
     from .models import NSODeviceManagement
-    from .renderer_writer import RendererMutationPlan, planned_m2m_set, planned_save, renderer_writes
+    from .renderer_writer import (
+        RendererMutationPlan,
+        planned_m2m_set,
+        planned_save,
+        renderer_mirror_writes,
+        renderer_writes,
+    )
 
     management = NSODeviceManagement.objects.filter(device_id=manifest.device_id).first()
     if management is None:
@@ -1087,7 +1093,10 @@ def _reown_manifest(manifest, rule, native, *, revoke=True):
         m2m_writes=m2m_writes,
         planned_at=getattr(candidate, "accepted_at", None),
     )
-    with renderer_writes(plan) as writer:
+    # An overlay whose scope renders nothing for it yet (a LACP member below an unowned
+    # bundle) changes no document, so there is no fingerprint to bump and no push to make.
+    mutation = renderer_writes if plan.changes_content else renderer_mirror_writes
+    with mutation(plan) as writer:
         writer.save(candidate, force_insert=True)
         if m2m_writes:
             writer.m2m_set(candidate, "tagged_vlans", tuple(native.tagged_vlans.all()))
