@@ -77,32 +77,37 @@ def _route(prefix, next_hop, *, vrf=None, metric=1, devices=()):
 
 def _assign_without_push(route, *devices):
     """Assign a brownfield route through its exact suppressed content footprint."""
-    from netbox_nso_plugin.intent_state import _static_route_devices_footprint, intent_transaction
+    from netbox_nso_plugin.intent_state import intent_transaction
     from netbox_nso_plugin.signals import suppress_intent_push
 
-    footprint = _static_route_devices_footprint(
-        route,
-        "pre_add",
-        {device.pk for device in devices},
-        False,
-    )
-    with suppress_intent_push(), intent_transaction(footprint):
+    with suppress_intent_push(), intent_transaction(_static_route_assignment_footprint(route, devices)):
         route.devices.add(*devices)
 
 
 def _unassign_without_push(route, *devices):
     """Remove a route assignment through its exact suppressed content footprint."""
-    from netbox_nso_plugin.intent_state import _static_route_devices_footprint, intent_transaction
+    from netbox_nso_plugin.intent_state import intent_transaction
     from netbox_nso_plugin.signals import suppress_intent_push
 
-    footprint = _static_route_devices_footprint(
-        route,
-        "pre_remove",
-        {device.pk for device in devices},
-        False,
-    )
-    with suppress_intent_push(), intent_transaction(footprint):
+    with suppress_intent_push(), intent_transaction(_static_route_assignment_footprint(route, devices)):
         route.devices.remove(*devices)
+
+
+def _static_route_assignment_footprint(route, devices):
+    """Return the exact footprint for one fixture route assignment change."""
+    from netbox_nso_plugin.intent_state import MutationFootprint, SourceRow
+    from netbox_nso_plugin.models import NSODeviceManagement
+
+    device_ids = {device.pk for device in devices}
+    managed_ids = set(NSODeviceManagement.objects.filter(device_id__in=device_ids).values_list("device_id", flat=True))
+    return MutationFootprint.for_keys(
+        {(device_id, "static_route") for device_id in managed_ids},
+        source_rows=(
+            SourceRow("netbox_routing.staticroute", route.pk),
+            SourceRow("netbox_routing.staticroute_devices", None),
+        ),
+        overlay_rows=(SourceRow("netbox_nso_plugin.nsostaticroutestate", None),),
+    )
 
 
 def _carried_last_acked(mgmt, route_id):
@@ -265,7 +270,7 @@ def _delete_owned_route(route):
     transitions = tuple(
         (
             state.management.device_id,
-            signals._static_route_delete_transition(state, current.pk),
+            signals._static_route_delete_transition(state, current),
         )
         for state in NSOStaticRouteState.objects.filter(static_route=current)
         .select_related("management")
@@ -339,7 +344,7 @@ def _unassign_and_retire(route, device):
     else:
         mutation = renderer_writes(plan)
     with mutation as writer:
-        transition = None if state is None else signals._static_route_delete_transition(state, current.pk)
+        transition = None if state is None else signals._static_route_delete_transition(state, current)
         with signals.suppress_intent_push():
             if state is not None:
                 writer.delete(state)
@@ -371,3 +376,4 @@ def _own(sr, mgmt, *, status="in_sync", mirror_vrf=None):
             intent_generation=allocate_intent_generation(),
             generation_started_at=timezone.now(),
         )
+
