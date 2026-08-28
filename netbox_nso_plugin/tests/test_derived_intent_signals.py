@@ -95,6 +95,18 @@ class TestRecomputeOne(TestCase):
         cls.dev2 = _make_device("rcp-dev2", dt, role, site)
 
     def test_recompute_updates_managed_interface(self):
+        """The recompute writes through the caller's writer, the way its call sites gate it."""
+        import copy
+
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_save,
+            renderer_mirror_writes,
+            renderer_writes,
+        )
+
+        from ._outbox_case import without_commit_drain
+
         iface1 = _make_iface(self.dev1, "Gi0/1-rcp")
         iface2 = _make_iface(self.dev2, "Gi0/2-rcp")
         _make_cable(iface1, iface2)
@@ -102,7 +114,12 @@ class TestRecomputeOne(TestCase):
         iface1.save(update_fields=["description"])
 
         iface1_fresh = Interface.objects.get(pk=iface1.pk)
-        _recompute_one(iface1_fresh, TEMPLATES)
+        planned = copy.copy(iface1_fresh)
+        planned.description = "[auto] to rcp-dev2:Gi0/2-rcp"
+        plan = RendererMutationPlan.build(saves=(planned_save(planned, update_fields=("description",)),))
+        mutation = renderer_writes if plan.changes_content else renderer_mirror_writes
+        with without_commit_drain(), mutation(plan):
+            _recompute_one(iface1_fresh, TEMPLATES)
 
         iface1_after = Interface.objects.get(pk=iface1.pk)
         self.assertEqual(iface1_after.description, "[auto] to rcp-dev2:Gi0/2-rcp")
