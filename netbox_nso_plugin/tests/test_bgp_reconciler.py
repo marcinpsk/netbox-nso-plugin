@@ -711,6 +711,75 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         self.assertEqual(str(tmpl.remote_as.asn), "65100")
         self.assertTrue(ASN.objects.filter(asn=65100).exists())
 
+    def test_existing_template_gets_a_planned_remote_as(self):
+        """A new ASN must enrich an existing template whose remote ASN is null."""
+        self._make_mgmt()
+
+        from netbox_routing.models import BGPPeerTemplate
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        initial = {"name": "PLANNED-AS", "address_families": [{"af": "ipv4-unicast"}]}
+        _reconcile_bgp_config(self.device, self._scope_with_peer_groups([initial]))
+
+        changed = {**initial, "remote_as": "64520"}
+        _reconcile_bgp_config(self.device, self._scope_with_peer_groups([changed]))
+
+        template = BGPPeerTemplate.objects.get(name="PLANNED-AS")
+        self.assertEqual(template.remote_as.asn, 64520)
+
+    def test_later_template_remote_as_updates_the_planned_save(self):
+        """The final reference to a template must define its planned remote ASN."""
+        self._make_mgmt()
+
+        from netbox_routing.models import BGPPeerTemplate
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        _reconcile_bgp_config(
+            self.device,
+            self._payload(
+                self._router_payload(asn="64521"),
+                self._router_payload(asn="64522"),
+            ),
+        )
+        peer = self._peer_entry("198.18.0.21", remote_as="64521", peer_group="SHARED-AS")
+        group = {
+            "name": "SHARED-AS",
+            "remote_as": "64522",
+            "address_families": [{"af": "ipv4-unicast"}],
+        }
+        payload = self._payload(self._router_payload(peers=[peer]))
+        payload["routers"][0]["scopes"][0]["peer_groups"] = [group]
+
+        _reconcile_bgp_config(self.device, payload)
+
+        template = BGPPeerTemplate.objects.get(name="SHARED-AS")
+        self.assertEqual(template.remote_as.asn, 64522)
+
+    def test_invalid_netbox_peer_address_does_not_abort_other_peers(self):
+        """One peer rejected by NetBox validation must not abort the device plan."""
+        self._make_mgmt()
+
+        from netbox_routing.models import BGPPeer
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        result = _reconcile_bgp_config(
+            self.device,
+            self._payload(
+                self._router_payload(
+                    peers=[
+                        self._peer_entry("198.18.0.23"),
+                        self._peer_entry("fe80::1%eth0"),
+                    ]
+                )
+            ),
+        )
+
+        self.assertEqual([state.peer_address_str for state in result], ["198.18.0.23"])
+        self.assertEqual(BGPPeer.objects.filter(scope__router__assigned_object_id=self.device.pk).count(), 1)
+
     def _scope_with_peer_groups(self, peer_groups, asn="65100", address_families=None):
         """Build a payload whose scope carries peer_groups (full-B objects)."""
         return {
