@@ -551,14 +551,26 @@ def audit_scope_footprint(device_id: int, scopes) -> MutationFootprint:
     device_id = int(device_id)
     requested = frozenset(str(scope) for scope in scopes)
     requested_keys = {(device_id, scope) for scope in requested}
-    footprints = [reconcile_family_footprint(device_id, requested)]
-    for spec in _REGISTRY.values():
-        if requested.isdisjoint(spec.scopes):
+    # The device's own overlays are the entry point: the repair writes only overlay rows,
+    # and every scan wider than the device fronts an Apply, a drain and a deliver.
+    base = reconcile_family_footprint(device_id, requested)
+    footprints = [base]
+    for row in base.overlay_rows:
+        spec = _REGISTRY.get(row.model_label)
+        if row.pk is None or spec is None:
             continue
-        for instance in spec.model._default_manager.all().order_by("pk").iterator():
-            footprint = footprint_for_instance(instance, spec)
-            if requested_keys.intersection(footprint.revision_keys):
-                footprints.append(footprint)
+        instance = apps.get_model(row.model_label)._default_manager.filter(pk=row.pk).first()
+        if instance is None:
+            continue
+        footprint = footprint_for_instance(instance, spec)
+        if not requested_keys.intersection(footprint.revision_keys):
+            continue
+        footprints.append(footprint)
+        if spec.dependency_resolver is not None:
+            # The declared dependencies are how a native anchor a repair may write
+            # through (a shared VLAN, a LAG, a tagged-VLAN edge) enters the footprint.
+            dependency_footprint, _changed = spec.dependency_resolver(instance, instance, spec)
+            footprints.append(dependency_footprint)
     return MutationFootprint.merge(*footprints)
 
 

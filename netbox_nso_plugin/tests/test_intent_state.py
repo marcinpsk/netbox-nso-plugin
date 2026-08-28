@@ -393,6 +393,28 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         interface.refresh_from_db()
         self.assertEqual(interface.label, "inventory-only")
 
+    def test_audit_footprint_reads_no_registered_table_unfiltered(self):
+        """The audit fronts every capture, so its footprint may never scan a whole table."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.intent_state import audit_scope_footprint
+
+        tables = {spec.table for spec in renderer_input_specs().values()}
+
+        with CaptureQueriesContext(connection) as captured:
+            audit_scope_footprint(self.device.pk, delivery.delivery_keys())
+
+        unfiltered = sorted(
+            {
+                table
+                for query in captured.captured_queries
+                for table in tables
+                if f'FROM "{table}"' in query["sql"] and " WHERE " not in query["sql"]
+            }
+        )
+        self.assertEqual(unfiltered, [])
+
     def test_device_delete_footprint_includes_assigned_native_addresses(self):
         from dcim.models import Device, Interface
         from ipam.models import IPAddress
