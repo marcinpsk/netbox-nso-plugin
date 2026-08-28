@@ -1460,9 +1460,23 @@ def _native_create_actions(device_id, requested):
 def _retract_manifest(manifest, overlay=None) -> bool:
     """Retire one deleted native identity through its scope's authority protocol."""
     from . import outbox
-    from .intent_state import MutationFootprint, intent_transaction, reconcile_family_footprint
+    from .intent_state import (
+        IntentMutationProtocolError,
+        MutationFootprint,
+        intent_transaction,
+        reconcile_family_footprint,
+    )
     from .models import NSOOwnershipManifest
     from .renderer_writer import RendererMutationPlan, consume_renderer_plan, planned_save
+    from .signals import _is_intent_push_suppressed, _is_render_request
+
+    # outbox.enqueue writes nothing while pushes are suppressed. Retiring the manifest anyway
+    # would drop this identity's deletion authority with no error, and plan_ownership never
+    # revisits a retired row, so the retract must refuse instead.
+    if _is_intent_push_suppressed() or _is_render_request():
+        raise IntentMutationProtocolError(
+            f"the {manifest.scope} retract cannot record its deletion authority while intent pushes are suppressed"
+        )
 
     footprint = reconcile_family_footprint(manifest.device_id, [manifest.scope])
     # An anchor that merely stopped qualifying leaves the overlay behind, and the renderer
