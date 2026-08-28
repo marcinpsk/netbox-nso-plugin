@@ -2983,6 +2983,8 @@ def bgp_peer_address_family_intent_item(row):
 
 def bgp_peer_intent_item(row, address_families):
     """Return one BGP peer in the adapter's exact nested wire shape."""
+    if row.bgp_peer is None:
+        return None
     entry = {
         "peer_address": row.peer_address_str,
         "enabled": row.enabled if row.enabled is not None else True,
@@ -3044,6 +3046,8 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
         management__device_id=device_id,
         status__in=_OWNED_PUSH_STATUSES,
     ).select_related("management", "bgp_peer", "bgp_peer__local_as", "bgp_peer__peer_group"):
+        if row.bgp_peer is None:
+            continue
         asn_str = row.asn_str
         vrf_name = row.vrf_name or ""
         if asn_str not in routers:

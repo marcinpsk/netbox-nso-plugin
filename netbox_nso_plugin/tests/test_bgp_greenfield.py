@@ -253,6 +253,35 @@ class TestBgpPeerGreenfieldDelete(BgpGreenfieldBase):
         self.assertIsNone(state.bgp_peer_id)
         mock_put.assert_not_called()
 
+    def test_push_omits_owned_overlay_after_foreign_peer_delete(self):
+        mgmt = self._mgmt()
+        scope = self._scope(self._router())
+        ip = self._ip("198.18.0.4/32")
+        peer, _mock_put = self._create_peer(scope, ip)
+        state = NSOBGPPeerState.objects.create(
+            management=mgmt,
+            asn_str="65100",
+            vrf_name="",
+            peer_address_str="198.18.0.4",
+            bgp_peer=peer,
+            status="in_sync",
+        )
+
+        with patch("netbox_nso_plugin.adapter_client.put_bgp_intent") as mock_put:
+            peer.delete()
+
+        state.refresh_from_db()
+        self.assertIsNone(state.bgp_peer_id)
+        mock_put.assert_not_called()
+
+        from netbox_nso_plugin.delivery import deliver
+
+        with patch("netbox_nso_plugin.adapter_client.put_bgp_intent") as mock_put:
+            deliver("bgp", self.device.pk, mgmt.adapter_device_id)
+
+        _adapter_id, router_list = mock_put.call_args.args
+        self.assertIsNone(_find_pushed_peer(router_list, "198.18.0.4"))
+
 
 class TestBgpPeerAddView(BgpGreenfieldBase):
     """The in-tab "Add BGP peer" form/view: a POST builds the router→scope→peer→AF graph,

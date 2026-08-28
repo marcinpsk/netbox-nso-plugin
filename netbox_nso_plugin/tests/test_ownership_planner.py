@@ -230,6 +230,13 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
             assert rule.intentional_semantic_delta
             assert rule.foreign_overlay_delete == "reown"
 
+        retirement_clauses = {
+            "bgp": "Foreign native peer deletes no longer delete linked overlays and push a reduced snapshot",
+            "route_policy": "Native policy deletes no longer delete per-device overlays and push reduced snapshots",
+        }
+        for scope, clause in retirement_clauses.items():
+            assert clause in rules[scope].intentional_semantic_delta
+
     def test_static_route_rule_names_only_acknowledged_lineage(self):
         from netbox_nso_plugin.ownership_planner import converted_scope_rules
 
