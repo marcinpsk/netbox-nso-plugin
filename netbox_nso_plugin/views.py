@@ -2834,6 +2834,16 @@ def _prepare_apply(mgmt):
     # the receipt capture so only in-protocol store-only claims reach promotion.
     _push_direct_snapshots(mgmt, registry, remaining_budget)
 
+    # A foreign writer can commit after an earlier scope receipt. Audit the complete
+    # selector once more before promotion so that its repair revision invalidates any
+    # receipt captured before that commit.
+    audit_renderer_scopes(
+        mgmt.device_id,
+        tuple(registry),
+        trigger="views._prepare_apply.finalize",
+        pre_capture=True,
+    )
+
     selected = MappingProxyType({registry[scope].section: successful.push_seq for scope, successful in pushed.items()})
 
     if not static_route_stored:

@@ -17,6 +17,9 @@ from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     def setUp(self):
         super().setUp()
+        set_scope = patch("netbox_nso_plugin.adapter_client.set_scope", return_value={})
+        set_scope.start()
+        self.addCleanup(set_scope.stop)
         self.device, self.management = make_managed("renderer-audit", 16270)
 
     def test_unknown_baseline_repairs_once_and_demotes_stale_lifecycle(self):
@@ -280,7 +283,7 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
         own_vlan(self.management, 1636, "renderer-audit-budget")
         NSOIntentRevision.objects.filter(device=self.device, scope="vlan").update(verified_revision=None)
 
-        with patch("netbox_nso_plugin.renderer_audit.time.monotonic", side_effect=(10.0, 10.1, 10.6)):
+        with patch("netbox_nso_plugin.renderer_audit._budget_expired", side_effect=(False, True)):
             result = audit_renderer_scopes(
                 self.device.pk,
                 ["vlan"],
