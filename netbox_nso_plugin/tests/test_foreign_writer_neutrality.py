@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 from unittest.mock import patch
 from uuid import uuid4
@@ -124,6 +125,41 @@ class TestForeignWriterNeutrality(_CascadeFlushMixin, IntentPushResetMixin, Tran
         self.assertEqual(list(route.devices.values_list("pk", flat=True)), [self.device.pk])
         self.assert_no_plugin_behavior(revision)
 
+    def raw_columns(self, source=None, **overrides):
+        """The overlay's non-key columns and one row expression for them.
+
+        With *source* the expression reads that relation's columns, which is what an
+        ``INSERT … SELECT`` needs; without it every column is a bound parameter, which is
+        what a ``VALUES`` list needs. Either way *overrides* replace named fields, so an
+        upsert can propose a row that genuinely differs from the one already stored — a
+        proposal copied from the target resolves to a no-op whichever conflict action it
+        carries, and cannot tell a correct ``DO UPDATE`` from a wrong one.
+        """
+        from netbox_nso_plugin.models import NSOVLANState
+
+        row = NSOVLANState.objects.get(pk=self.state.pk)
+        columns, terms, params = [], [], []
+        for field in NSOVLANState._meta.concrete_fields:
+            if field.primary_key:
+                continue
+            columns.append(f'"{field.column}"')
+            if source is not None and field.attname not in overrides:
+                terms.append(f'{source}."{field.column}"')
+                continue
+            value = overrides.get(field.attname, getattr(row, field.attname))
+            if field.get_internal_type() == "JSONField":
+                terms.append("%s::jsonb")
+                value = json.dumps(value)
+            else:
+                terms.append("%s")
+            params.append(value)
+        return ", ".join(columns), ", ".join(terms), params
+
+    def device_name_of(self, pk):
+        from netbox_nso_plugin.models import NSOVLANState
+
+        return NSOVLANState.objects.values_list("device_name", flat=True).get(pk=pk)
+
     def test_raw_update_delete_cte_update_from_and_upserts_all_commit(self):
         from ipam.models import VLAN
 
@@ -137,38 +173,112 @@ class TestForeignWriterNeutrality(_CascadeFlushMixin, IntentPushResetMixin, Tran
                 f'UPDATE "{table}" SET device_name = %s WHERE id = %s',
                 ["foreign-raw-update", self.state.pk],
             )
+            self.assertEqual(self.device_name_of(self.state.pk), "foreign-raw-update")
+
             cursor.execute(
                 f'WITH target AS (SELECT id FROM "{table}" WHERE id = %s) '
                 f'UPDATE "{table}" AS state SET device_name = %s FROM target WHERE state.id = target.id',
                 [self.state.pk, "foreign-update-from"],
             )
-            columns = [field.column for field in NSOVLANState._meta.concrete_fields if not field.primary_key]
-            quoted_columns = ", ".join(f'"{column}"' for column in columns)
-            select_columns = [
-                "%s" if field.attname == "vlan_id" else f'"{field.column}"'
-                for field in NSOVLANState._meta.concrete_fields
-                if not field.primary_key
-            ]
+            self.assertEqual(self.device_name_of(self.state.pk), "foreign-update-from")
+
+            columns, terms, params = self.raw_columns(f'"{table}"', vlan_id=vlan.pk, device_name="insert-select")
             cursor.execute(
-                f'INSERT INTO "{table}" ({quoted_columns}) '
-                f'SELECT {", ".join(select_columns)} FROM "{table}" WHERE id = %s',
-                [vlan.pk, self.state.pk],
+                f'INSERT INTO "{table}" ({columns}) SELECT {terms} FROM "{table}" WHERE id = %s',
+                [*params, self.state.pk],
             )
             inserted = NSOVLANState.objects.get(management=self.management, vlan=vlan)
+            self.assertEqual(inserted.device_name, "insert-select")
+
+            columns, terms, params = self.raw_columns(vlan_id=vlan.pk, device_name="conflict-do-nothing")
             cursor.execute(
-                f'INSERT INTO "{table}" SELECT * FROM "{table}" WHERE id = %s ON CONFLICT (id) DO NOTHING',
-                [inserted.pk],
+                f'INSERT INTO "{table}" ({columns}) VALUES ({terms}) ON CONFLICT (management_id, vlan_id) DO NOTHING',
+                params,
             )
+            self.assertEqual(self.device_name_of(inserted.pk), "insert-select")
+
+            columns, terms, params = self.raw_columns(vlan_id=vlan.pk, device_name="conflict-do-update")
             cursor.execute(
-                f'INSERT INTO "{table}" SELECT * FROM "{table}" WHERE id = %s '
-                "ON CONFLICT (id) DO UPDATE SET device_name = EXCLUDED.device_name",
-                [inserted.pk],
+                f'INSERT INTO "{table}" ({columns}) VALUES ({terms}) '
+                "ON CONFLICT (management_id, vlan_id) DO UPDATE SET device_name = EXCLUDED.device_name",
+                params,
             )
+            self.assertEqual(self.device_name_of(inserted.pk), "conflict-do-update")
+
             cursor.execute(f'DELETE FROM "{table}" WHERE id = %s', [inserted.pk])
 
         self.state.refresh_from_db()
         self.assertEqual(self.state.device_name, "foreign-update-from")
         self.assertFalse(NSOVLANState.objects.filter(pk=inserted.pk).exists())
+        self.assert_no_plugin_behavior(revision)
+
+    def test_values_inserts_at_both_arities_and_a_cte_led_insert_commit(self):
+        """A row list and a CTE-led INSERT are their own DML shapes, not the SELECT one."""
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin.models import NSOVLANState
+
+        revision = self.baseline()
+        table = NSOVLANState._meta.db_table
+        vlans = [VLAN.objects.create(vid=1680 + index, name=f"foreign-values-{index}") for index in range(4)]
+        with connection.cursor() as cursor:
+            columns, terms, params = self.raw_columns(vlan_id=vlans[0].pk, device_name="values-single")
+            cursor.execute(f'INSERT INTO "{table}" ({columns}) VALUES ({terms})', params)
+
+            columns, terms, first = self.raw_columns(vlan_id=vlans[1].pk, device_name="values-first")
+            _columns, _terms, second = self.raw_columns(vlan_id=vlans[2].pk, device_name="values-second")
+            cursor.execute(
+                f'INSERT INTO "{table}" ({columns}) VALUES ({terms}), ({terms})',
+                [*first, *second],
+            )
+
+            columns, terms, params = self.raw_columns("source", vlan_id=vlans[3].pk, device_name="cte-insert")
+            cursor.execute(
+                f'WITH source AS (SELECT * FROM "{table}" WHERE id = %s) '
+                f'INSERT INTO "{table}" ({columns}) SELECT {terms} FROM source',
+                [self.state.pk, *params],
+            )
+
+        landed = dict(NSOVLANState.objects.filter(vlan__in=vlans).values_list("vlan_id", "device_name"))
+        self.assertEqual(
+            landed,
+            {
+                vlans[0].pk: "values-single",
+                vlans[1].pk: "values-first",
+                vlans[2].pk: "values-second",
+                vlans[3].pk: "cte-insert",
+            },
+        )
+        self.assert_no_plugin_behavior(revision)
+
+    def test_a_cascade_from_an_interface_takes_its_overlays_and_its_assigned_ip(self):
+        """One Collector run over a registered core row, straight through the plugin's overlays.
+
+        The interface overlays hang off ``dcim.Interface`` rather than off the management
+        row, and the assigned address hangs off the interface through a generic relation, so
+        this cascade class reaches three registered models the VLAN cases never touch.
+        """
+        from dcim.models import Interface
+        from ipam.models import IPAddress
+
+        from netbox_nso_plugin.models import NSOInterfaceIPState, NSOInterfaceState
+
+        interface = Interface.objects.create(device=self.device, name="et-0/0/9", type="1000base-t")
+        address = IPAddress.objects.create(address="198.18.177.1/31", assigned_object=interface)
+        attribute = NSOInterfaceState.objects.create(interface=interface, attribute="description", status="in_sync")
+        overlay_ip = NSOInterfaceIPState.objects.create(
+            interface=interface, address="198.18.177.1/31", status="in_sync"
+        )
+        revision = self.baseline()
+
+        deleted, details = Interface.objects.filter(pk=interface.pk).delete()
+
+        self.assertEqual(details.get("netbox_nso_plugin.NSOInterfaceState"), 1)
+        self.assertEqual(details.get("netbox_nso_plugin.NSOInterfaceIPState"), 1)
+        self.assertFalse(NSOInterfaceState.objects.filter(pk=attribute.pk).exists())
+        self.assertFalse(NSOInterfaceIPState.objects.filter(pk=overlay_ip.pk).exists())
+        self.assertFalse(IPAddress.objects.filter(pk=address.pk).exists())
+        self.assertGreaterEqual(deleted, 4)
         self.assert_no_plugin_behavior(revision)
 
     def test_separate_thread_has_no_plugin_writer_context(self):
