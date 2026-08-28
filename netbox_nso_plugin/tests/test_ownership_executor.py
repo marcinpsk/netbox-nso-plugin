@@ -182,6 +182,40 @@ class TestSymmetricOwnershipExecutor(TestCase):
         self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=self.device.pk, scope="interface_mtu").exists())
         self.assertIn(("interface_mtu", state.pk), completed)
 
+    def test_owned_overlay_with_a_qualifying_anchor_is_never_demoted(self):
+        from dcim.models import Interface
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin.models import NSOOwnershipManifest, NSOSVIState
+        from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
+
+        # An SVI qualifies when its interface name resolves a VLAN of the device's group:
+        # a Vlan<vid> interface whose vid names no device VLAN is not a qualifying anchor.
+        group = VLANGroup.objects.create(name="Ownership svi anchor", slug=f"nso-{self.device.pk}")
+        vlan = VLAN.objects.create(group=group, vid=1731, name="ownership-svi-anchor")
+        anchored = NSOSVIState.objects.create(
+            management=self.management,
+            interface=Interface.objects.create(device=self.device, name="Vlan1731", type="virtual"),
+            vlan=vlan,
+            svi_type="svi",
+            status="accepted",
+        )
+        unanchored = NSOSVIState.objects.create(
+            management=self.management,
+            interface=Interface.objects.create(device=self.device, name="Vlan2213", type="virtual"),
+            vlan=vlan,
+            svi_type="svi",
+            status="accepted",
+        )
+
+        reconcile_scope_ownership(self.device.pk, ["svi"])
+
+        anchored.refresh_from_db()
+        unanchored.refresh_from_db()
+        self.assertEqual(anchored.status, "accepted")
+        self.assertEqual(unanchored.status, "imported")
+        self.assertEqual(NSOOwnershipManifest.objects.filter(device_id=self.device.pk, scope="svi").count(), 1)
+
     def test_foreign_overlay_delete_retires_a_scope_with_no_native_content(self):
         from dcim.models import Interface
 

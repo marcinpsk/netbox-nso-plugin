@@ -2181,18 +2181,20 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         with config, session:
             _prepare_apply(self.mgmt)
 
-        self.assertEqual(
-            [type(state).objects.get(pk=state.pk).status for state in states[:4]],
-            ["deploying"] * 4,
-        )
+        prepared = [type(state).objects.get(pk=state.pk).status for state in states]
+        self.assertEqual(prepared[:4], ["deploying"] * 4)
+        # Which settled rows the pre-Apply repair demoted is a property of which scopes this
+        # fixture left drifted, so it is not asserted; that none of them was PROMOTED is.
+        self.assertNotIn("deploying", prepared[4:])
         with without_commit_drain(), transaction.atomic():
             self._rename_interface(shared, "Port-Channel41")
             self._rename_interface(svi, "irb.1558")
 
-        self.assertEqual(
-            [type(state).objects.get(pk=state.pk).status for state in states[:4]],
-            ["accepted"] * 4,
-        )
+        after = [type(state).objects.get(pk=state.pk).status for state in states]
+        self.assertEqual(after[:4], ["accepted"] * 4)
+        # All eleven, not the promoted four: a rename re-pends what it renamed and may not
+        # flicker the badge of a settled row it did not promote.
+        self.assertEqual(after[4:], prepared[4:])
 
     def test_the_finalize_audit_runs_before_the_irreversible_direct_pushes(self):
         """A finalize repair aborts the Apply, so it may not run after a device write.

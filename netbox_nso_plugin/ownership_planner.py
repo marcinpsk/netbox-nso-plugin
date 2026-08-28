@@ -647,7 +647,12 @@ def maintain_manifest(instance) -> None:
                 **defaults,
             )
             return
-        NSOOwnershipManifest.objects.create(**identity, **defaults)
+        # The identity read above and this write are two statements, so a peer audit can land
+        # the same row in between. get_or_create absorbs that conflict in its own savepoint
+        # instead of aborting the enclosing mirror transaction.
+        recorded, created = NSOOwnershipManifest.objects.get_or_create(**identity, defaults=defaults)
+        if not created:
+            NSOOwnershipManifest.objects.filter(pk=recorded.pk).update(**defaults)
     else:
         NSOOwnershipManifest.objects.filter(**identity, ownership_state="owned").update(ownership_state="detached")
 
