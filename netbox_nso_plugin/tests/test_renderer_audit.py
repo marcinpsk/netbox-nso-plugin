@@ -446,6 +446,25 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
         self.assertEqual((first.audited, first.deferred), (("vlan",), ("interface",)))
         self.assertEqual((second.audited, second.deferred), (("interface",), ("vlan",)))
 
+    def test_the_ownership_reconcile_is_not_started_without_a_tick_budget(self):
+        """The planner's pass is outside the render budget, so it is not entered without one."""
+        from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
+
+        own_vlan(self.management, 1640, "renderer-audit-ownership-budget")
+        reconciled = []
+
+        with (
+            patch("netbox_nso_plugin.renderer_audit._budget_expired", return_value=True),
+            patch(
+                "netbox_nso_plugin.ownership_planner.reconcile_scope_ownership",
+                side_effect=lambda *args: reconciled.append(args),
+            ),
+        ):
+            result = audit_renderer_scopes(self.device.pk, ["vlan"], trigger="cadence")
+
+        self.assertEqual(reconciled, [])
+        self.assertEqual((result.repaired, result.deferred), ((), ("vlan",)))
+
     @override_settings(PLUGINS_CONFIG={"netbox_nso_plugin": {}})
     def test_the_default_batch_cap_admits_a_registry_that_grows_by_one_key(self):
         """The default is derived from the registry, so a new delivery key cannot exceed it."""
