@@ -523,14 +523,16 @@ def _form(state, mgmt, now, mode, force) -> Claim | None:
     marking_mode = delivery.delivery_keys()[scope].marking_mode
     rows = list(_unconsumed(device_id, scope).select_for_update().order_by("id"))
     entry_ids = [row.pk for row in rows]
+    # RF-2: a repair asserts "the snapshot changed" and carries no authority, marks or
+    # transitions alike, so both folds read the ordinary partition alone.
+    ordinary = [row for row in rows if row.kind == CONTRIBUTION_KIND_ORDINARY]
     mark, mark_any = _contribution_marks(rows)
-    folded = fold_state_transitions([record for row in rows for record in row.transitions], state)
+    folded = fold_state_transitions([record for row in ordinary for record in row.transitions], state)
     deletions = list(folded.queued.values())
     if mode == delivery.MODE_STORE_ONLY:
         # A deletion mark on a key whose pending rows recorded no provenance at all is
         # authority the FOLD cannot see: the request flag is the whole of it. Where a row
         # DID record its transitions the fold decides, so a revocation withdraws it as usual.
-        ordinary = [row for row in rows if row.kind == CONTRIBUTION_KIND_ORDINARY]
         untracked = mark_any and not any(row.transitions for row in ordinary)
         return _form_store_only(state, mgmt, now, deletions, untracked, force)
 
@@ -1045,7 +1047,8 @@ def _pending_deletions(state, claim: Claim) -> list[dict]:
     """
     transitions = [
         record
-        for row in _unconsumed(state.device_id, state.scope).only("transitions").order_by("id")
+        for row in _unconsumed(state.device_id, state.scope).only("kind", "transitions").order_by("id")
+        if row.kind == CONTRIBUTION_KIND_ORDINARY
         for record in row.transitions
     ]
     folded = fold_transitions(
