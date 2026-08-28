@@ -3,10 +3,11 @@
 """Symmetric ownership execution at the real database seam."""
 
 from unittest.mock import patch
+from uuid import uuid4
 
 from django.test import TestCase
 
-from ._outbox_case import make_managed, own_route, own_vlan
+from ._outbox_case import make_managed, mirror_update, own_route, own_vlan
 
 
 class TestSymmetricOwnershipExecutor(TestCase):
@@ -878,3 +879,63 @@ class TestSymmetricOwnershipExecutor(TestCase):
             row.refresh_from_db()
             self.assertEqual(row.status, "accepted")
         self.assertEqual(NSOOwnershipManifest.objects.filter(device_id=self.device.pk).count(), 5)
+
+    def test_a_retract_demotes_the_row_its_own_transaction_repended(self):
+        """#1637: a plan frozen before ``intent_transaction`` loses to the transaction's repend.
+
+        A route whose next hop is an interface never qualifies for ownership, so an owned
+        manifest for it retracts on every pass. ``intent_transaction`` re-pends every
+        deploying row of the scope it bumps, which rewrites the very overlay the demotion
+        plan captured, and the writer's full pre-image compare-and-set then fails the
+        MANDATORY pre-capture audit closed for Apply, drain and deliver alike.
+        """
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.models import NSOOwnershipManifest, NSOStaticRouteState
+        from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
+
+        from ._static_route_case import _assign_and_accept
+
+        route = StaticRoute.objects.create(
+            prefix="198.18.176.0/24",
+            interface_next_hop="Ethernet40",
+            metric=1,
+        )
+        _assign_and_accept(route, self.device)
+        state = NSOStaticRouteState.objects.get(management=self.management, static_route=route)
+        manifest = NSOOwnershipManifest.objects.get(device_id=self.device.pk, scope="static_route")
+        self.assertEqual(manifest.ownership_state, "owned")
+        mirror_update(state, status="deploying", apply_attempt_id=uuid4())
+
+        result = audit_renderer_scopes(self.device.pk, ["static_route"], trigger="test", pre_capture=True)
+
+        state.refresh_from_db()
+        manifest.refresh_from_db()
+        self.assertEqual(result.unknown, ())
+        self.assertEqual(manifest.ownership_state, "retired")
+        self.assertEqual((state.status, state.accepted_at), ("imported", None))
+
+    def test_a_manifest_less_demotion_survives_its_own_transaction_repend(self):
+        """The same #1637 shape on the record loop's retract, which has no manifest to read."""
+        from dcim.models import Interface
+
+        from netbox_nso_plugin.models import NSOInterfaceMtuState, NSOOwnershipManifest
+        from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
+
+        # No MTU on the native row, so nothing qualifies this owned overlay and no manifest
+        # was ever recorded for it: the retract runs through ``_demote_overlay``.
+        interface = Interface.objects.create(device=self.device, name="Ethernet41", type="1000base-t")
+        state = NSOInterfaceMtuState.objects.create(
+            management=self.management,
+            interface=interface,
+            l2_mtu=9216,
+            status="accepted",
+        )
+        mirror_update(state, status="deploying", apply_attempt_id=uuid4())
+
+        result = audit_renderer_scopes(self.device.pk, ["interface_mtu"], trigger="test", pre_capture=True)
+
+        state.refresh_from_db()
+        self.assertEqual(result.unknown, ())
+        self.assertEqual((state.status, state.accepted_at), ("imported", None))
+        self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=self.device.pk, scope="interface_mtu").exists())
