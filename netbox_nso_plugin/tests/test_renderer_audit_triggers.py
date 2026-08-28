@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from django.test import TransactionTestCase
 
-from ._outbox_case import make_managed, own_vlan
+from ._outbox_case import ReceiptAdapter, enqueue, entries, in_thread, make_managed, own_vlan
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -57,31 +57,45 @@ class TestRendererAuditCaptureOrder(_CascadeFlushMixin, IntentPushResetMixin, Tr
         self.assertEqual(order, ["audit", "render"])
 
     def test_each_chained_drain_pass_audits_again_before_recapture(self):
-        from netbox_nso_plugin import delivery, drain
+        """The real chain, not two hand-made calls: a tail appended mid-send earns pass two.
+
+        ``_after_success`` chains another pass when the key still has unconsumed entries, and
+        every pass has to re-audit before it recaptures — the tail was written after the
+        first pass proved its baseline.
+        """
+        from netbox_nso_plugin import drain, renderer_audit
 
         own_vlan(self.management, 1629, "renderer-audit-chain")
+        adapter = ReceiptAdapter()
+        real_respond = adapter._respond
+        real_audit = renderer_audit.audit_renderer_scopes
         calls = []
+        appended = []
+
+        def respond(body):
+            # An operator transaction committing during the send, on its own connection:
+            # the key gains a tail after this pass proved its baseline, so the drain chains.
+            if len(adapter.requests) == 1:
+                in_thread(lambda: enqueue(self.device, "vlan"))
+                appended.append(len(entries(self.device, "vlan", unconsumed=True)))
+            return real_respond(body)
 
         def audit(device_id, scopes, trigger, **kwargs):
             calls.append((device_id, tuple(scopes), trigger, kwargs))
+            return real_audit(device_id, scopes, trigger, **kwargs)
 
+        adapter._respond = respond
+        config, session = adapter.patches()
         with (
+            config,
+            session,
             patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes", side_effect=audit),
-            patch("netbox_nso_plugin.drain._claim_or_compact", side_effect=[(None, False), (None, False)]),
         ):
-            drain._drain_once(
-                self.device.pk,
-                "vlan",
-                mode=delivery.MODE_NORMAL,
-                force=False,
-            )
-            drain._drain_once(
-                self.device.pk,
-                "vlan",
-                mode=delivery.MODE_NORMAL,
-                force=False,
-                _chained=True,
-            )
+            outcome = drain.drain_key(self.device.pk, "vlan")
 
+        self.assertEqual(outcome, drain.SUCCEEDED)
         self.assertEqual(len(calls), 2)
+        self.assertEqual(appended, [1])
+        self.assertEqual(entries(self.device, "vlan", unconsumed=True), [])
         self.assertTrue(all(call[3] == {"pre_capture": True} for call in calls))
+        self.assertTrue(all(call[:3] == (self.device.pk, ("vlan",), "drain._drain_once") for call in calls))
