@@ -252,7 +252,7 @@ class TestTheLineageTransfersAcrossReOwnership(_LineageCase):
         route = own_route(self.mgmt, "198.51.100.128/28", "198.51.100.9")
         self.clear_entries()
 
-        with patch("netbox_nso_plugin.signals._carried_last_acked") as carried:
+        with patch("netbox_nso_plugin.tests._static_route_case._carried_last_acked") as carried:
             with without_commit_drain(), transaction.atomic():
                 _accept_with_permit(route, self.device)
 

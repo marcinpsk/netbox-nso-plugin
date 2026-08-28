@@ -69,6 +69,13 @@ def _converted_writer_owns_content(device_id, scope) -> bool:
     return renderer_writer_owns_key(device_id, scope, content=True)
 
 
+def _converted_writer_is_active() -> bool:
+    """Return whether a converted exact writer is active in this context."""
+    from .renderer_writer import active_renderer_writer
+
+    return active_renderer_writer() is not None
+
+
 def _schedule_exact_writer_scope(target_scope) -> None:
     """Schedule keys for one scope only from its active exact content writer."""
     from .renderer_writer import active_renderer_writer
@@ -2284,104 +2291,7 @@ def _transition_static_route_content(static_route, previous=None) -> list:
     return rows
 
 
-def _carried_last_acked(mgmt, route_id):
-    """Read the acknowledged triple a pending deletion of *route_id* hands to a new overlay.
-
-    Both the state row's own homes and the key's unfolded entries are read, because the
-    deletion may not have been folded yet: the codex sequence that needs this — delete,
-    re-own, re-delete, all before the drain — has the record sitting in an entry.
-    """
-    from . import outbox
-    from .models import NSOIntentOutboxEntry, NSOIntentOutboxState
-
-    state = NSOIntentOutboxState.objects.filter(device_id=mgmt.device_id, scope="static_route").first()
-    transitions = [
-        record
-        for row in NSOIntentOutboxEntry.objects.filter(
-            device_id=mgmt.device_id, scope="static_route", consumed_by_push_seq__isnull=True
-        ).order_by("id")
-        for record in row.transitions
-    ]
-    return outbox.carried_triple(
-        route_id,
-        transitions=transitions,
-        queued=(state.queued_deletions if state else ()),
-        claim_deletions=(state.claim_deletions if state else ()),
-        lineage_carry=(state.lineage_carry if state else None),
-    )
-
-
-def _accept_static_route_for_device(static_route, device) -> None:
-    """Own a greenfield route for one device through an exact overlay plan."""
-    import copy
-
-    from .models import NSODeviceManagement, NSOStaticRouteState
-    from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
-
-    if static_route.next_hop is None:
-        return  # interface-only next-hop not supported by static-route-reconciler v1
-    try:
-        mgmt = NSODeviceManagement.objects.get(device=device)
-    except NSODeviceManagement.DoesNotExist:
-        return
-    if mgmt.adapter_device_id is None:
-        return
-    state = NSOStaticRouteState.objects.filter(
-        management=mgmt,
-        static_route=static_route,
-    ).first()
-    created = state is None
-    candidate = (
-        NSOStaticRouteState(
-            management=mgmt,
-            static_route=static_route,
-            status="accepted",
-            accepted_at=timezone.now(),
-        )
-        if created
-        else copy.copy(state)
-    )
-    if created:
-        # A fresh row inherits the last acknowledged triple from its pending deletion.
-        candidate.last_acked_triple = _carried_last_acked(mgmt, static_route.pk)
-    was_owned = not created and candidate.status in _OWNED_PUSH_STATUSES
-    if not created and not was_owned:
-        candidate.status = "accepted"
-        candidate.accepted_at = timezone.now()
-    if not was_owned:
-        # Entering ownership is intent this device did not carry before, so it needs a
-        # generation of its own — an already-owned row keeps the one it is mid-flight on.
-        _arm_static_route_generation(candidate)
-    # nso_vrf too: the residue key is the (vrf, prefix, next_hop) triple, so a VRF route
-    # adopted with an empty mirror never matches its own device row.
-    candidate.nso_vrf = static_route.vrf.name if static_route.vrf else ""
-    candidate.nso_prefix = str(static_route.prefix or "")
-    candidate.nso_next_hop = str(static_route.next_hop or "")
-    candidate.last_sync_at = timezone.now()
-    plan = RendererMutationPlan.build(
-        saves=(
-            planned_save(
-                candidate,
-                force_insert=created,
-                natural_key=("management", "static_route") if created else (),
-            ),
-        ),
-        planned_at=candidate.accepted_at,
-    )
-    mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-    with mutation as writer:
-        writer.save(candidate, force_insert=created)
-        if not was_owned:
-            from . import outbox
-
-            # Re-ownership withdraws whatever deletion authority is pending for this pk.
-            _schedule_intent_push(
-                (mgmt.device_id, "static_route"),
-                transitions=[outbox.revoke_transition(static_route.pk)],
-            )
-
-
-def _static_route_delete_transition(row, static_route_id):
+def _static_route_delete_transition(row, static_route):
     """Record what is leaving, from the overlay that still mirrors it.
 
     The lineage leads with the triple the adapter last ACKNOWLEDGED, because a content edit
@@ -2391,7 +2301,7 @@ def _static_route_delete_transition(row, static_route_id):
     from . import outbox
 
     return outbox.delete_transition(
-        static_route_id,
+        static_route.pk,
         last_acked=row.last_acked_triple,
         current=outbox.triple_of(row.nso_vrf, row.nso_prefix, row.nso_next_hop),
     )
@@ -2820,9 +2730,7 @@ def _push_isis_intent_for_device(device_id, adapter_device_id):
 @_skip_on_render
 def _on_isis_interface_state_save(sender, instance, **kwargs):
     """Schedule IS-IS only when the exact writer owns this device key."""
-    from .renderer_writer import active_renderer_writer
-
-    if active_renderer_writer() is None:
+    if not _converted_writer_is_active():
         return
     from .models import NSODeviceManagement
 
@@ -2842,9 +2750,7 @@ def _on_isis_interface_state_save(sender, instance, **kwargs):
 @_skip_on_render
 def _on_isis_instance_state_save(sender, instance, **kwargs):
     """Schedule IS-IS only when the exact writer owns this device key."""
-    from .renderer_writer import active_renderer_writer
-
-    if active_renderer_writer() is None:
+    if not _converted_writer_is_active():
         return
     from .models import NSODeviceManagement
 
@@ -3081,6 +2987,8 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
 @_skip_on_render
 def _on_bgp_peer_state_save(sender, instance, **kwargs):
     """Schedule BGP only when the exact writer owns this device key."""
+    if not _converted_writer_is_active():
+        return
     from .models import NSODeviceManagement
 
     try:
@@ -3493,6 +3401,8 @@ def _as_json_dict(value):
 @_skip_on_render
 def _on_route_policy_state_save(sender, instance, **kwargs):
     """Schedule route policy only when the exact writer owns this device key."""
+    if not _converted_writer_is_active():
+        return
     from .models import NSODeviceManagement
 
     try:
@@ -3530,37 +3440,6 @@ def _on_routing_policy_pre_delete(sender, instance, **kwargs):
 #   cross_device — (family, name, source_device) greenfield refs whose NetBox content was
 #                  sourced (materialized) from a DIFFERENT device than the one we're owning onto
 CascadeResult = namedtuple("CascadeResult", ["drifted", "cross_device"])
-
-
-def _own_route_map_contributors(mgmt, route_map) -> CascadeResult:
-    """Own (accepted) the prefix-lists / community-lists / as-paths a route-map references.
-
-    Owning a top-level object cascades ownership to everything it depends on: a route-map
-    references prefix-lists / community-lists / as-paths by name, and owning the route-map
-    WITHOUT owning a GREENFIELD reference leaves a dangling reference on the device (the
-    ``match`` line is written but the referenced list/path is never pushed — the exact gap
-    that left an ``ip as-path access-list`` missing after a route-map apply).
-
-    BUT a reference that has DRIFTED on the device (``changed``/``conflict`` — the device has a
-    diverging version) is NOT force-owned: that would silently overwrite the device's version.
-    It already exists on the device, so the route-map's reference still resolves against it — we
-    leave it for explicit drift resolution and RETURN the skipped ``(family, name)`` tuples so
-    the caller can warn the operator. Already-owned contributors (accepted / deploying / in_sync
-    / apply_failed) are left untouched.
-
-    A GREENFIELD reference (no overlay on this device yet) whose shared NetBox content was
-    *materialized from a different device* is still owned — the route-map needs it — but its
-    provenance is collected into ``cross_device`` so the caller can warn that owning the
-    route-map here will push another device's version of that object onto this device.
-    """
-    plan, operations, result = _route_policy_acquisition_plan(mgmt, route_maps=(route_map,))
-    from .renderer_writer import renderer_mirror_writes, renderer_writes
-
-    mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-    with mutation as writer:
-        for candidate, fields, created in operations:
-            writer.save(candidate, update_fields=fields, force_insert=created)
-    return result
 
 
 def _route_map_contributors(route_maps):
@@ -3780,9 +3659,7 @@ def _push_ospf_intent_for_device(device_id, adapter_device_id):
 @_skip_on_render
 def _on_ospf_instance_state_save(sender, instance, **kwargs):
     """Schedule OSPF only when the exact writer owns this device key."""
-    from .renderer_writer import active_renderer_writer
-
-    if active_renderer_writer() is None:
+    if not _converted_writer_is_active():
         return
     from .models import NSODeviceManagement
 
@@ -3802,9 +3679,7 @@ def _on_ospf_instance_state_save(sender, instance, **kwargs):
 @_skip_on_render
 def _on_ospf_interface_state_save(sender, instance, **kwargs):
     """Schedule OSPF only when the exact writer owns this device key."""
-    from .renderer_writer import active_renderer_writer
-
-    if active_renderer_writer() is None:
+    if not _converted_writer_is_active():
         return
     from .models import NSODeviceManagement
 

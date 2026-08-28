@@ -10,11 +10,9 @@ explicit attach acquisition and foreign native signal neutrality.
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
-from django.db import transaction
-from django.test import TestCase, TransactionTestCase
+from django.test import TestCase
 
-from ._outbox_case import content_update, make_managed, without_commit_drain
-from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
+from .mixins import IntentPushDeliveryMixin
 
 
 def _save_without_push(instance):
@@ -24,6 +22,19 @@ def _save_without_push(instance):
     with suppress_intent_push(), intent_transaction(footprint_for_instance(instance)):
         instance.save()
     return instance
+
+
+def _execute_route_map_acquisition(mgmt, route_map):
+    """Execute the production acquisition plan for one route-map fixture."""
+    from netbox_nso_plugin.renderer_writer import renderer_mirror_writes, renderer_writes
+    from netbox_nso_plugin.signals import _route_policy_acquisition_plan
+
+    plan, operations, result = _route_policy_acquisition_plan(mgmt, route_maps=(route_map,))
+    mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+    with mutation as writer:
+        for candidate, fields, created in operations:
+            writer.save(candidate, update_fields=fields, force_insert=created)
+    return result
 
 
 class _RPBase(IntentPushDeliveryMixin, TestCase):
@@ -59,64 +70,34 @@ class _RPBase(IntentPushDeliveryMixin, TestCase):
         return pl
 
 
-class TestRoutePolicyNativeSaveTransactions(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
-    def setUp(self):
-        super().setUp()
-        self.device, self.management = make_managed("route-policy-save", 16230)
-
-    def _owned_prefix_list(self):
+class TestRoutePolicySignalQueries(_RPBase):
+    def test_state_save_without_writer_does_not_load_management(self):
         from django.contrib.contenttypes.models import ContentType
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
         from netbox_routing.models import PrefixList
 
         from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.signals import _on_route_policy_state_save
 
-        with without_commit_drain(), transaction.atomic():
-            prefix_list = PrefixList.objects.create(name="TESTNSO-PL-SAVE")
-            state = _save_without_push(
-                NSORoutePolicyState(
-                    management=self.management,
-                    family="prefix_list",
-                    object_name=prefix_list.name,
-                    content_type=ContentType.objects.get_for_model(PrefixList),
-                    object_id=prefix_list.pk,
-                    status="imported",
-                )
+        mgmt = self._mgmt()
+        prefix_list = self._prefix_list("QUERY-PL")
+        state = _save_without_push(
+            NSORoutePolicyState(
+                management=mgmt,
+                family="prefix_list",
+                object_name=prefix_list.name,
+                content_type=ContentType.objects.get_for_model(PrefixList),
+                object_id=prefix_list.pk,
+                status="imported",
             )
-        content_update(state, status="in_sync")
-        return prefix_list, state
+        )
+        state = NSORoutePolicyState.objects.only("pk", "management_id").get(pk=state.pk)
 
-    def test_an_owned_policy_object_save_reaccepts_the_overlay_in_a_renderer_transaction(self):
-        prefix_list, state = self._owned_prefix_list()
+        with CaptureQueriesContext(connection) as captured:
+            _on_route_policy_state_save(sender=NSORoutePolicyState, instance=state)
 
-        with without_commit_drain(), transaction.atomic():
-            prefix_list.description = "changed"
-            prefix_list.save(update_fields=["description"])
-
-        state.refresh_from_db()
-        self.assertEqual(state.status, "accepted")
-
-    def test_an_owned_policy_entry_save_reaccepts_the_overlay_in_a_renderer_transaction(self):
-        from django.contrib.contenttypes.models import ContentType
-        from netbox_routing.models import CustomPrefix, PrefixListEntry
-
-        prefix_list, state = self._owned_prefix_list()
-        with without_commit_drain(), transaction.atomic():
-            custom_prefix = CustomPrefix.objects.create(prefix="198.18.64.0/24")
-            entry = PrefixListEntry.objects.create(
-                prefix_list=prefix_list,
-                assigned_prefix_type=ContentType.objects.get_for_model(CustomPrefix),
-                assigned_prefix_id=custom_prefix.pk,
-                sequence=10,
-                action="permit",
-            )
-        content_update(state, status="in_sync")
-
-        with without_commit_drain(), transaction.atomic():
-            entry.action = "deny"
-            entry.save(update_fields=["action"])
-
-        state.refresh_from_db()
-        self.assertEqual(state.status, "accepted")
+        self.assertEqual(captured.captured_queries, [])
 
 
 class TestRoutePolicyIntentAcceptedFlag(_RPBase):
@@ -596,11 +577,10 @@ class TestOwnershipCascade(_RPBase):
 
     def test_cascade_owns_referenced_contributors(self):
         from netbox_nso_plugin.models import NSORoutePolicyState
-        from netbox_nso_plugin.signals import _own_route_map_contributors
 
         mgmt = self._mgmt()
         rm, _ap, _cl, _pl = self._route_map_with_refs()
-        _own_route_map_contributors(mgmt, rm)
+        _execute_route_map_acquisition(mgmt, rm)
 
         owned = {(s.family, s.object_name): s.status for s in NSORoutePolicyState.objects.filter(management=mgmt)}
         assert owned.get(("as_path", "50")) == "accepted"
@@ -612,7 +592,6 @@ class TestOwnershipCascade(_RPBase):
         from netbox_routing.models import ASPath
 
         from netbox_nso_plugin.models import NSORoutePolicyState
-        from netbox_nso_plugin.signals import _own_route_map_contributors
 
         mgmt = self._mgmt()
         rm, ap, _cl, _pl = self._route_map_with_refs()
@@ -626,7 +605,7 @@ class TestOwnershipCascade(_RPBase):
                 status="in_sync",
             )
         )
-        _own_route_map_contributors(mgmt, rm)
+        _execute_route_map_acquisition(mgmt, rm)
         st = NSORoutePolicyState.objects.get(management=mgmt, family="as_path", object_name="50")
         assert st.status == "in_sync"  # an already-owned contributor is left untouched
 
@@ -639,7 +618,6 @@ class TestOwnershipCascade(_RPBase):
         from netbox_routing.models import PrefixList
 
         from netbox_nso_plugin.models import NSORoutePolicyState
-        from netbox_nso_plugin.signals import _own_route_map_contributors
 
         mgmt = self._mgmt()
         rm, _ap, _cl, pl = self._route_map_with_refs()
@@ -653,7 +631,7 @@ class TestOwnershipCascade(_RPBase):
                 status="conflict",
             )
         )
-        cascade = _own_route_map_contributors(mgmt, rm)
+        cascade = _execute_route_map_acquisition(mgmt, rm)
 
         st = NSORoutePolicyState.objects.get(management=mgmt, family="prefix_list", object_name=pl.name)
         assert st.status == "conflict"  # left for explicit resolution, NOT overwritten
@@ -668,7 +646,6 @@ class TestOwnershipCascade(_RPBase):
         from netbox_routing.models import CommunityList, RouteMap, RouteMapEntry, RouteMapEntrySetCommunity
 
         from netbox_nso_plugin.models import NSORoutePolicyState
-        from netbox_nso_plugin.signals import _own_route_map_contributors
 
         mgmt = self._mgmt()
         rm = RouteMap.objects.create(name="RM-SET-COMM")
@@ -676,7 +653,7 @@ class TestOwnershipCascade(_RPBase):
         cl = CommunityList.objects.create(name="CL-SET-DELETE")
         _save_without_push(RouteMapEntrySetCommunity(route_map_entry=e, operation="delete", community_list=cl))
 
-        _own_route_map_contributors(mgmt, rm)
+        _execute_route_map_acquisition(mgmt, rm)
 
         st = NSORoutePolicyState.objects.get(management=mgmt, family="community_list", object_name="CL-SET-DELETE")
         assert st.status == "accepted"  # set-referenced list owned alongside the route-map
@@ -690,7 +667,6 @@ class TestOwnershipCascade(_RPBase):
         from netbox_routing.models import PrefixList
 
         from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSORoutePolicyState
-        from netbox_nso_plugin.signals import _own_route_map_contributors
 
         mgmt = self._mgmt()  # owning onto self.device
         rm, _ap, _cl, pl = self._route_map_with_refs()
@@ -718,7 +694,7 @@ class TestOwnershipCascade(_RPBase):
             )
         )
 
-        cascade = _own_route_map_contributors(mgmt, rm)
+        cascade = _execute_route_map_acquisition(mgmt, rm)
 
         # Greenfield reference is still owned on this device (route-map needs it)…
         st = NSORoutePolicyState.objects.get(management=mgmt, family="prefix_list", object_name=pl.name)
