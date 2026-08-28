@@ -19,9 +19,17 @@ class _SwBase(IntentPushResetMixin, TestCase):
         role = DeviceRole.objects.create(name="SwSigRole", slug="swsigrole")
         site = Site.objects.create(name="SwSigSite", slug="swsigsite")
         cls.device = Device.objects.create(name="sw-sig", device_type=dt, role=role, site=site)
-        cls.iface = Interface.objects.create(device=cls.device, name="GigabitEthernet0/1", type="1000base-t")
         cls.group = VLANGroup.objects.create(name="g", slug=f"nso-{cls.device.pk}")
         cls.v10 = VLAN.objects.create(group=cls.group, vid=10, name="MGMT")
+        # `mode` and `untagged_vlan` are the native anchor the switchport binding reads:
+        # without them the overlay owns nothing the device carries and the audit demotes it.
+        cls.iface = Interface.objects.create(
+            device=cls.device,
+            name="GigabitEthernet0/1",
+            type="1000base-t",
+            mode="access",
+            untagged_vlan=cls.v10,
+        )
 
     def _make_mgmt(self, adapter_device_id=42, auto_apply=False):
         from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
