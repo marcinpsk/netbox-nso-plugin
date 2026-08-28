@@ -177,7 +177,10 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
         cls.management = NSODeviceManagement.objects.create(
             device=cls.device, nso_instance=cls.instance, nso_device_name="rtr-mtuwp", adapter_device_id=77
         )
-        cls.po1 = Interface.objects.create(device=cls.device, name="Port-channel1", type="lag")
+        # `mtu` is the native anchor the MTU binding reads. Only this class sets it: the
+        # reconciler class above asserts what a device read CREATES, and seeding it there
+        # would pre-answer the question those cases ask.
+        cls.po1 = Interface.objects.create(device=cls.device, name="Port-channel1", type="lag", mtu=9216)
 
     def _state(self, l2_mtu=9216, status="accepted"):
         from uuid import uuid4
