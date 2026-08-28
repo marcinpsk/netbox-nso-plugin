@@ -156,7 +156,7 @@ def _af_device_content(
     route_maps_by_name=None,
     prefix_lists_by_name=None,
 ) -> list:
-    """Canonical per-AF policy content from the device payload (FKs resolved to pks).
+    """Canonical per-AF policy content from the device payload.
 
     Shared by the BGP peer and the peer-group TEMPLATE 3-way merges — both carry the
     same per-AF route-map / prefix-list policy shape.
@@ -495,6 +495,8 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         return current
 
     def peer_ip(self, value):
+        from django.core.exceptions import ValidationError
+
         try:
             target = ipaddress.ip_address(value)
         except ValueError:
@@ -503,16 +505,20 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         address = str(target)
         if address in self.ips:
             return self.ips[address]
-        current = self.IPAddress.objects.filter(address__net_host=address).first()
-        if current is None:
-            mask = 32 if target.version == 4 else 128
-            current = self.IPAddress(address=f"{address}/{mask}")
-            current.full_clean()
-            self.save(
-                current,
-                force_insert=True,
-                natural_key=("address", "vrf"),
-            )
+        try:
+            current = self.IPAddress.objects.filter(address__net_host=address).first()
+            if current is None:
+                mask = 32 if target.version == 4 else 128
+                current = self.IPAddress(address=f"{address}/{mask}")
+                current.full_clean()
+                self.save(
+                    current,
+                    force_insert=True,
+                    natural_key=("address", "vrf"),
+                )
+        except ValidationError as exc:
+            logger.warning("BGP: peer IP address %r rejected by NetBox: %s", value, exc)
+            return None
         self.ips[address] = current
         return current
 
@@ -589,8 +595,9 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         if created:
             current = self.BGPPeerTemplate(name=name, remote_as=remote_as)
             self.templates[name] = current
-        elif remote_as is not None and current.remote_as_id != remote_as.pk:
-            current = copy.copy(current)
+        elif remote_as is not None and _bgp_fk_identity(current.remote_as) != _bgp_fk_identity(remote_as):
+            if name not in self.template_saved:
+                current = copy.copy(current)
             current.remote_as = remote_as
             self.templates[name] = current
         else:
