@@ -357,10 +357,50 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         self.peer_content_type = ContentType.objects.get_for_model(BGPPeer)
         self.template_content_type = ContentType.objects.get_for_model(BGPPeerTemplate)
 
-        self.asns = {row.asn: row for row in ASN.objects.select_related("rir").order_by("pk")}
+        routers = self.payload.get("routers") or []
+        reported_asns = {
+            str(value)
+            for router in routers
+            for value in (
+                [router.get("asn")]
+                + [
+                    peer.get(key)
+                    for scope in router.get("scopes") or []
+                    for peer in scope.get("peers") or []
+                    for key in ("remote_as", "local_as")
+                ]
+                + [
+                    group.get("remote_as")
+                    for scope in router.get("scopes") or []
+                    for group in scope.get("peer_groups") or []
+                ]
+            )
+            if value not in (None, "")
+        }
+        asn_values = set()
+        for value in reported_asns:
+            try:
+                asn_values.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        self.reported_asns = reported_asns
+        vrf_names = {scope.get("vrf") for router in routers for scope in router.get("scopes") or [] if scope.get("vrf")}
+        template_names = {
+            name
+            for router in routers
+            for scope in router.get("scopes") or []
+            for name in (
+                [peer.get("peer_group") for peer in scope.get("peers") or []]
+                + [group.get("name") for group in scope.get("peer_groups") or []]
+            )
+            if name
+        }
+        self.asns = {
+            row.asn: row for row in ASN.objects.filter(asn__in=asn_values).select_related("rir").order_by("pk")
+        }
         self.rir = RIR.objects.filter(name="NSO Auto-Discovered").first()
         self.ips = {}
-        self.vrfs = {row.name: row for row in VRF.objects.order_by("pk")}
+        self.vrfs = {row.name: row for row in VRF.objects.filter(name__in=vrf_names).order_by("pk")}
         self.routers = {
             int(row.asn.asn): row
             for row in BGPRouter.objects.filter(
@@ -394,7 +434,12 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         ):
             scope_key = (row.scope.router_id, row.scope.vrf_id)
             self.peers[(scope_key, row.peer_id)] = row
-        self.templates = {row.name: row for row in BGPPeerTemplate.objects.all().order_by("pk")}
+        self.templates = {
+            row.name: row
+            for row in BGPPeerTemplate.objects.filter(name__in=template_names)
+            .select_related("remote_as")
+            .order_by("pk")
+        }
         self.template_saved = set()
         self.peer_states = (
             {
@@ -822,26 +867,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         if self.management is None:
             return self.operations
         routers = sorted(self.payload.get("routers") or [], key=lambda row: str(row.get("asn") or ""))
-        values = {
-            str(value)
-            for router in routers
-            for value in (
-                [router.get("asn")]
-                + [
-                    peer.get(key)
-                    for scope in router.get("scopes") or []
-                    for peer in scope.get("peers") or []
-                    for key in ("remote_as", "local_as")
-                ]
-                + [
-                    group.get("remote_as")
-                    for scope in router.get("scopes") or []
-                    for group in scope.get("peer_groups") or []
-                ]
-            )
-            if value not in (None, "")
-        }
-        for value in sorted(values, key=lambda item: (len(item), item)):
+        for value in sorted(self.reported_asns, key=lambda item: (len(item), item)):
             self.asn(value)
         for router_entry in routers:
             asn_str = str(router_entry.get("asn") or "")

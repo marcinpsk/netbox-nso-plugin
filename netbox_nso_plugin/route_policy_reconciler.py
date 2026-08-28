@@ -24,7 +24,7 @@ from contextlib import nullcontext
 from contextvars import ContextVar
 
 from . import shared_object_ownership as ownership
-from .route_policy_structure import canonical_route_map, prefix_list_entry_unit
+from .route_policy_structure import canonical_route_map, prefix_list_entry_unit, structure_entry
 
 logger = logging.getLogger(__name__)
 
@@ -202,8 +202,47 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
         self.RouteMapEntry = RouteMapEntry
         self.RouteMapEntrySetCommunity = RouteMapEntrySetCommunity
         self.operations = _Operations()
+        root_names = {
+            family: {row.get("name") for row in payload.get(payload_key) or [] if row.get("name")}
+            for family, payload_key in self.FAMILY_PAYLOAD_KEYS.items()
+        }
+        prefix_values = {
+            entry.get("prefix").strip()
+            for row in payload.get("prefix_lists") or []
+            for entry in row.get("entries") or []
+            if entry.get("prefix") and entry.get("prefix").strip()
+        }
+        community_values = {
+            entry.get("community").strip()
+            for row in payload.get("community_lists") or []
+            for entry in row.get("entries") or []
+            if entry.get("community") and entry.get("community").strip()
+        }
+        for route_map in payload.get("route_maps") or []:
+            for entry in route_map.get("entries") or []:
+                root_names["prefix_list"].update(entry.get("match_prefix_lists") or [])
+                root_names["community_list"].update(entry.get("match_community_lists") or [])
+                root_names["as_path"].update(entry.get("match_as_paths") or [])
+                structured = structure_entry(_load_json(entry.get("match")), _load_json(entry.get("set")))
+                if structured.call_policy:
+                    root_names["route_map"].add(structured.call_policy)
+                for action in structured.set_communities:
+                    if _looks_like_community_literal(action.name):
+                        community_values.add(action.name)
+                    else:
+                        root_names["community_list"].add(action.name)
+
+        from django.db.models import Q
+
+        def referenced_roots(model, names):
+            query = Q(pk__in=[])
+            for name in names:
+                query |= Q(name__iexact=name)
+            return model.objects.filter(query)
+
         self.roots = {
-            family: {row.name.casefold(): row for row in model.objects.all()} for family, model in self.models.items()
+            family: {row.name.casefold(): row for row in referenced_roots(model, root_names[family])}
+            for family, model in self.models.items()
         }
         self.states = (
             {
@@ -215,8 +254,8 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
             if self.management is not None
             else {}
         )
-        self.prefixes = {str(row.prefix): row for row in CustomPrefix.objects.all()}
-        self.communities = {str(row.community): row for row in Community.objects.all()}
+        self.prefixes = {str(row.prefix): row for row in CustomPrefix.objects.filter(prefix__in=prefix_values)}
+        self.communities = {str(row.community): row for row in Community.objects.filter(community__in=community_values)}
         self.name_maps = {family: {} for family in self.models}
         self.community_members = {}
         self.seen = set()
@@ -748,8 +787,6 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
             )
 
     def plan_route_map_entries(self, root, entries):  # noqa: PLR0915
-        from .route_policy_structure import structure_entry
-
         for sequence, entry in enumerate(entries, start=1):
             match_blob = _load_json(entry.get("match"))
             set_blob = _load_json(entry.get("set"))
@@ -765,9 +802,9 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
                 match=match_blob,
                 set=set_data,
                 match_afi=structured.match_afi or None,
-                call_policy=self.models["route_map"].objects.filter(name__iexact=structured.call_policy).first()
-                if structured.call_policy
-                else None,
+                call_policy=(
+                    self.roots["route_map"].get(structured.call_policy.casefold()) if structured.call_policy else None
+                ),
                 vendor_ext=vendor_ext or None,
             )
             self.operations.save(row, force_insert=True, natural_key=("route_map", "sequence"))
@@ -875,7 +912,10 @@ def _rematerialize_operations(state, planned_at):
     if not state.captured:
         raise ValueError("no captured content to materialize for this device")
 
-    planner = _RoutePolicyGraphPlanner(state.management.device, {}, planned_at)
+    payload = {payload_key: [] for payload_key in _RoutePolicyGraphPlanner.FAMILY_PAYLOAD_KEYS.values()}
+    payload[_RoutePolicyGraphPlanner.FAMILY_PAYLOAD_KEYS[state.family]] = [state.captured]
+    planner = _RoutePolicyGraphPlanner(state.management.device, payload, planned_at)
+    planner._seed_prefix_units()
     group = planner._group_rows(state)
     planner.plan_rematerialize(state, state.assigned_object, group, removed_pk=-1)
     return planner.operations

@@ -216,6 +216,33 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         ):
             self.assertFalse(model.objects.exists(), model._meta.label_lower)
 
+    def test_preflight_filters_shared_dependency_prefetches_to_the_payload(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from ipam.models import ASN, VRF
+        from netbox_routing.models import BGPPeerTemplate
+
+        from netbox_nso_plugin.bgp_reconciler import bgp_reconcile_plan
+
+        self._make_mgmt()
+        payload = self._payload(
+            self._router_payload(
+                asn="64530",
+                vrf="PAYLOAD-VRF",
+                peers=[self._peer_entry("198.18.0.32", remote_as="64531", peer_group="PAYLOAD-TEMPLATE")],
+            )
+        )
+
+        with CaptureQueriesContext(connection) as captured:
+            bgp_reconcile_plan(self.device, payload)
+
+        sql = [query["sql"] for query in captured.captured_queries]
+        for model in (ASN, VRF, BGPPeerTemplate):
+            table = model._meta.db_table
+            prefetches = [query for query in sql if query.startswith("SELECT") and f'FROM "{table}"' in query]
+            self.assertEqual(len(prefetches), 1)
+            self.assertIn(" WHERE ", prefetches[0])
+
     def test_no_mgmt_returns_empty(self):
         """Device without NSODeviceManagement → empty list, no crash."""
         orphan = _make_bgp_device("orphan")
