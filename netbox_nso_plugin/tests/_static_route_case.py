@@ -105,6 +105,93 @@ def _unassign_without_push(route, *devices):
         route.devices.remove(*devices)
 
 
+def _carried_last_acked(mgmt, route_id):
+    """Read the acknowledged triple carried by this fixture's pending deletion."""
+    from netbox_nso_plugin import outbox
+    from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentOutboxState
+
+    state = NSOIntentOutboxState.objects.filter(device_id=mgmt.device_id, scope="static_route").first()
+    transitions = [
+        record
+        for row in NSOIntentOutboxEntry.objects.filter(
+            device_id=mgmt.device_id,
+            scope="static_route",
+            consumed_by_push_seq__isnull=True,
+        ).order_by("id")
+        for record in row.transitions
+    ]
+    return outbox.carried_triple(
+        route_id,
+        transitions=transitions,
+        queued=state.queued_deletions if state else (),
+        claim_deletions=state.claim_deletions if state else (),
+        lineage_carry=state.lineage_carry if state else None,
+    )
+
+
+def _acquire_static_route(route, device) -> None:
+    """Create or own one static-route overlay for a test fixture."""
+    import copy
+
+    from netbox_nso_plugin import outbox
+    from netbox_nso_plugin.models import NSODeviceManagement, NSOStaticRouteState
+    from netbox_nso_plugin.renderer_writer import (
+        RendererMutationPlan,
+        planned_save,
+        renderer_mirror_writes,
+        renderer_writes,
+    )
+    from netbox_nso_plugin.signals import (
+        _OWNED_PUSH_STATUSES,
+        _arm_static_route_generation,
+        _schedule_intent_push,
+    )
+
+    mgmt = NSODeviceManagement.objects.get(device=device)
+    state = NSOStaticRouteState.objects.filter(management=mgmt, static_route=route).first()
+    created = state is None
+    candidate = (
+        NSOStaticRouteState(
+            management=mgmt,
+            static_route=route,
+            status="accepted",
+            accepted_at=timezone.now(),
+        )
+        if created
+        else copy.copy(state)
+    )
+    if created:
+        candidate.last_acked_triple = _carried_last_acked(mgmt, route.pk)
+    was_owned = not created and candidate.status in _OWNED_PUSH_STATUSES
+    if not created and not was_owned:
+        candidate.status = "accepted"
+        candidate.accepted_at = timezone.now()
+    if not was_owned:
+        _arm_static_route_generation(candidate)
+    candidate.nso_vrf = route.vrf.name if route.vrf else ""
+    candidate.nso_prefix = str(route.prefix or "")
+    candidate.nso_next_hop = str(route.next_hop or "")
+    candidate.last_sync_at = timezone.now()
+    plan = RendererMutationPlan.build(
+        saves=(
+            planned_save(
+                candidate,
+                force_insert=created,
+                natural_key=("management", "static_route") if created else (),
+            ),
+        ),
+        planned_at=candidate.accepted_at,
+    )
+    mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+    with mutation as writer:
+        writer.save(candidate, force_insert=created)
+        if not was_owned:
+            _schedule_intent_push(
+                (mgmt.device_id, "static_route"),
+                transitions=[outbox.revoke_transition(route.pk)],
+            )
+
+
 def _assign_and_accept(route, *devices):
     """Assign and own routes through exact assignment and acquisition plans."""
     from netbox_nso_plugin.renderer_writer import (
@@ -113,14 +200,14 @@ def _assign_and_accept(route, *devices):
         renderer_mirror_writes,
         renderer_writes,
     )
-    from netbox_nso_plugin.signals import _accept_static_route_for_device, suppress_intent_push
+    from netbox_nso_plugin.signals import suppress_intent_push
 
     assignment = RendererMutationPlan.build(m2m_writes=(planned_m2m_add(route, "devices", devices),))
     mutation = renderer_writes(assignment) if assignment.changes_content else renderer_mirror_writes(assignment)
     with mutation as writer, suppress_intent_push():
         writer.m2m_add(route, "devices", devices)
     for device in devices:
-        _accept_static_route_for_device(route, device)
+        _acquire_static_route(route, device)
 
 
 def _edit_owned_route(route, **values):
@@ -197,14 +284,14 @@ def _delete_owned_route(route):
 
 def _accept_with_permit(route, device):
     """Own one route overlay through its exact content permit."""
-    from netbox_nso_plugin.intent_state import IntentMutationProtocolError
     from netbox_nso_plugin.renderer_writer import (
+        IntentPlanStaleError,
         RendererMutationPlan,
         planned_m2m_add,
         renderer_mirror_writes,
         renderer_writes,
     )
-    from netbox_nso_plugin.signals import _accept_static_route_for_device, suppress_intent_push
+    from netbox_nso_plugin.signals import suppress_intent_push
 
     for attempt in range(2):
         try:
@@ -217,11 +304,10 @@ def _accept_with_permit(route, device):
                 )
                 with mutation as writer, suppress_intent_push():
                     writer.m2m_add(route, "devices", (device,))
-            _accept_static_route_for_device(route, device)
+            _acquire_static_route(route, device)
             return
-        except IntentMutationProtocolError as exc:
-            stale = " row " in str(exc) and str(exc).endswith(" changed after planning")
-            if attempt or not stale:
+        except IntentPlanStaleError:
+            if attempt:
                 raise
 
 

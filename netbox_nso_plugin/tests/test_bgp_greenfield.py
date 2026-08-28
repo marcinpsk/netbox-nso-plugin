@@ -94,6 +94,38 @@ class BgpGreenfieldBase(IntentPushDeliveryMixin, TestCase):
 
 
 class TestBgpPeerGreenfieldCreate(BgpGreenfieldBase):
+    def test_state_save_without_writer_does_not_load_management(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes
+        from netbox_nso_plugin.signals import _on_bgp_peer_state_save, suppress_intent_push
+
+        mgmt = self._mgmt()
+        state = NSOBGPPeerState(
+            management=mgmt,
+            asn_str="65100",
+            vrf_name="",
+            peer_address_str="198.18.0.31",
+        )
+        plan = RendererMutationPlan.build(
+            saves=(
+                planned_save(
+                    state,
+                    force_insert=True,
+                    natural_key=("management", "asn_str", "vrf_name", "peer_address_str"),
+                ),
+            )
+        )
+        with renderer_mirror_writes(plan) as writer, suppress_intent_push():
+            writer.save(state, force_insert=True)
+        state = NSOBGPPeerState.objects.only("pk", "management_id").get(pk=state.pk)
+
+        with CaptureQueriesContext(connection) as captured:
+            _on_bgp_peer_state_save(sender=NSOBGPPeerState, instance=state)
+
+        self.assertEqual(captured.captured_queries, [])
+
     def test_foreign_native_create_does_not_acquire_or_push(self):
         self._mgmt()
         scope = self._scope(self._router())
