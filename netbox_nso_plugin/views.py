@@ -6614,22 +6614,6 @@ class NSORoutePolicyMaterializeView(SharedObjectMaterializeMixin):
 
     model_class = NSORoutePolicyState
 
-    def post(self, request, pk):  # noqa: D102
-        from .route_policy_reconciler import rematerialize_route_policy
-
-        state = get_object_or_404(self.model_class, pk=pk)
-        try:
-            rematerialize_route_policy(state)
-        except ValueError as exc:
-            messages.error(request, f"Could not use this version: {exc}")
-            return redirect(_device_nso_tab_url(state.management.device_id))
-        messages.success(
-            request,
-            f"NetBox now mirrors {state.management.device}'s version of "
-            f"{state.family.replace('_', '-')} “{state.object_name}”.",
-        )
-        return redirect(_device_nso_tab_url(state.management.device_id))
-
 
 # ── Drift delta: what differs between the device and what NetBox holds ──────────
 

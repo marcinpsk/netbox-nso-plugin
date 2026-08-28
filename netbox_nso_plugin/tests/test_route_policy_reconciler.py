@@ -2101,7 +2101,55 @@ class TestSharedObjectOwnership(TestCase):
         self.assertTrue(state.is_materialized)
         self.assertFalse(PrefixListEntry.objects.filter(prefix_list_id=state.object_id).exists())
 
-    def test_resettle_sibling_bumps_last_sync_at(self):
+    def test_reconcile_plans_duplicate_materialized_owner_retirement(self):
+        from netbox_nso_plugin.intent_state import SourceRow
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+
+        from ._outbox_case import content_update
+
+        self._mgmt(self.d1)
+        self._mgmt(self.d2)
+        payload = self._pl("PL-SOLE", ["198.18.0.0/24"])
+        reconcile_route_policy(self.d1, payload)
+        reconcile_route_policy(self.d2, payload)
+        owner = NSORoutePolicyState.objects.get(management__device=self.d1, object_name="PL-SOLE")
+        sibling = NSORoutePolicyState.objects.get(management__device=self.d2, object_name="PL-SOLE")
+        content_update(sibling, is_materialized=True)
+
+        plan = route_policy_reconcile_plan(self.d1, payload)
+
+        sibling_writes = [
+            write
+            for write in plan.write_set
+            if write.operation == "save"
+            and write.model_label == "netbox_nso_plugin.nsoroutepolicystate"
+            and write.pk == sibling.pk
+        ]
+        self.assertEqual(len(sibling_writes), 1)
+        self.assertEqual(sibling_writes[0].update_fields, ("is_materialized",))
+        self.assertFalse(dict(sibling_writes[0].values)["is_materialized"])
+        self.assertIn(
+            SourceRow("netbox_nso_plugin.nsoroutepolicystate", sibling.pk),
+            plan.lock_footprint.overlay_rows,
+        )
+
+        reconcile_route_policy(self.d1, payload)
+
+        owner.refresh_from_db()
+        sibling.refresh_from_db()
+        self.assertTrue(owner.is_materialized)
+        self.assertFalse(sibling.is_materialized)
+        self.assertEqual(
+            NSORoutePolicyState.objects.filter(
+                family="prefix_list",
+                object_name="PL-SOLE",
+                is_materialized=True,
+            ).count(),
+            1,
+        )
+
+    def test_rematerialize_bumps_former_owner_last_sync_at(self):
         """Re-pointing a shared object resettles the old owner's sibling row and recomputes its
         status — its last_sync_at must be bumped too, else the UI shows a stale 'last seen' next
         to the freshly-recomputed status."""

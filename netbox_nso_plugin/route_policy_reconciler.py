@@ -449,6 +449,7 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
             if created_state or refresh_owner or not has_materialized_owner:
                 state.is_materialized = True
         if state.is_materialized:
+            self._plan_materialized_sibling_retirement(state)
             self.prospective_owner_hashes[key] = state.content_hash
         state.object_id = root.pk
         self.states[key] = state
@@ -506,6 +507,16 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
             .select_related("management", "content_type")
             .order_by("pk")
         )
+
+    def _plan_materialized_sibling_retirement(self, owner):
+        """Plan exact saves that leave ``owner`` as its group's sole materialized row."""
+        for sibling in self._group_rows(owner):
+            if sibling.pk == owner.pk or not sibling.is_materialized:
+                continue
+            candidate = copy.copy(sibling)
+            candidate.is_materialized = False
+            self.operations.save(candidate, update_fields=("is_materialized",))
+            self.modified_state_pks.add((candidate.management_id, candidate.family, candidate.object_name.casefold()))
 
     def plan_stale_states(self):  # noqa: C901, PLR0912
         from . import status_machine as sm
@@ -885,116 +896,6 @@ def rematerialize_route_policy(state):
     _execute_operations(_rematerialize_operations(state, planned_at), planned_at)
 
 
-# ---------------------------------------------------------------------------
-# Shared-object fill helpers rebuild one parent's entries with a full replace.
-# ---------------------------------------------------------------------------
-
-
-def _set_prefix_list_family(pl_obj, captured) -> None:
-    """Mirror the owner capture's address family onto the materialized PrefixList.
-
-    family is derived by the device reader (any v6 prefix → family 6); without this the
-    netbox_routing.PrefixList kept the model default (4), so a v6 list (MARTIANS_V6,
-    LGI_PREFIXES_V6, ...) displayed as IPv4 even after the reader was fixed. The dedup hash
-    is entries-only, so a family-only change is a pure display correction (never drift).
-    """
-    family = captured.get("family")
-    if family in (4, 6) and pl_obj.family != family:
-        pl_obj.family = family
-        pl_obj.save(update_fields=["family"])
-
-
-def _fill_prefix_list(pl_obj, captured) -> None:
-    """Materialize a PrefixList from a device capture: address family + entries."""
-    _set_prefix_list_family(pl_obj, captured)
-    _fill_prefix_list_entries(pl_obj, _entries(captured))
-
-
-def _fill_prefix_list_entries(pl_obj, entries: list) -> None:
-    from django.contrib.contenttypes.models import ContentType
-    from netbox_routing.models import CustomPrefix, PrefixListEntry
-
-    ct = ContentType.objects.get_for_model(CustomPrefix)
-    PrefixListEntry.objects.filter(prefix_list=pl_obj).delete()
-    # Resolve every CustomPrefix once (prefixes repeat across lists).
-    cp_by_prefix: dict[str, object] = {}
-    rows = []
-    # Sequence is assigned positionally: the model field is a (signed) smallint and the
-    # adapter's step-10 sequence overflows it on large lists (and Junos prefix-lists have
-    # no real sequence). Positional 1-based numbering preserves order and always fits.
-    seq = 0
-    for e in entries:
-        prefix = (e.get("prefix") or "").strip()
-        if not prefix:
-            continue
-        cp = cp_by_prefix.get(prefix)
-        if cp is None:
-            try:
-                cp, _ = CustomPrefix.objects.get_or_create(prefix=prefix)
-            except Exception as exc:
-                logger.warning("route-policy: bad prefix %r in %s: %s", prefix, pl_obj.name, exc)
-                continue
-            cp_by_prefix[prefix] = cp
-        seq += 1
-        rows.append(
-            PrefixListEntry(
-                prefix_list=pl_obj,
-                assigned_prefix_type=ct,
-                assigned_prefix_id=cp.pk,
-                sequence=seq,
-                action=_norm_action(e.get("action")),
-                ge=e.get("ge"),
-                le=e.get("le"),
-            )
-        )
-    if rows:
-        PrefixListEntry.objects.bulk_create(rows)
-
-
-def _fill_as_path_entries(ap_obj, entries: list) -> None:
-    from netbox_routing.models import ASPathEntry
-
-    ASPathEntry.objects.filter(aspath=ap_obj).delete()
-    # Positional sequence (smallint-safe; see _fill_prefix_list_entries).
-    rows = [
-        ASPathEntry(
-            aspath=ap_obj,
-            sequence=i,
-            action=_norm_action(e.get("action")),
-            pattern=(e.get("pattern") or "")[:1000],
-        )
-        for i, e in enumerate(entries, start=1)
-    ]
-    if rows:
-        ASPathEntry.objects.bulk_create(rows)
-
-
-def _fill_community_list_entries(cl_obj, entries: list) -> None:
-    """Fill a CommunityList's members.
-
-    The universal Community model stores every member string VERBATIM, exactly as the
-    device reports it — numeric (1111:100), well-known keywords (no-export), typed extended
-    (target:1111:100, color:0:128), RFC 8092 large (large:GA:L1:L2), and match-only
-    regex/wildcards (1111:*, 1111:1113.). The kind is derived by parsing the text on the
-    netbox_routing side; the plugin no longer routes members to parallel typed lists.
-    Empty members are skipped.
-    """
-    from netbox_routing.models import Community, CommunityListEntry
-
-    CommunityListEntry.objects.filter(community_list=cl_obj).delete()
-    rows = []
-    for e in entries:
-        value = (e.get("community") or "").strip()
-        if not value:
-            logger.info("route-policy: skipping empty community member in %s", cl_obj.name)
-            continue
-        action = _norm_action(e.get("action"))
-        comm, _ = Community.objects.get_or_create(community=value)
-        rows.append(CommunityListEntry(community_list=cl_obj, action=action, community=comm))
-    if rows:
-        CommunityListEntry.objects.bulk_create(rows)
-
-
 # Community literals (vs community-LIST names) when resolving a set-community by-ref:
 # anything with a ':' or a well-known keyword is an inline literal, the rest is a list name.
 _WELLKNOWN_COMMUNITIES = frozenset(
@@ -1016,116 +917,7 @@ def _looks_like_community_literal(name: str) -> bool:
     return ":" in n or n in _WELLKNOWN_COMMUNITIES
 
 
-def _resolve_call_policy(RouteMap, name: str | None):
-    """Resolve a Junos from-policy / IOS-XR apply policy name to an existing RouteMap (by-ref)."""
-    if not name:
-        return None
-    return RouteMap.objects.filter(name__iexact=name).first()
-
-
-def _materialise_set_communities(rme, structured, cl_by_name) -> list:
-    """Create RouteMapEntrySetCommunity rows from the structured set-actions (R3).
-
-    Each action targets a community-LIST by reference (resolved against the materialised
-    CommunityList objects), or an inline community literal (IOS-style). Anything that
-    resolves to neither — a dangling by-ref to a list the device never defined — is returned
-    so the caller can preserve it in vendor_ext rather than drop it (no silent loss).
-    """
-    from netbox_routing.models import Community, CommunityList, RouteMapEntrySetCommunity
-
-    unresolved: list = []
-    for sc in structured.set_communities:
-        cl = cl_by_name.get(sc.name) or CommunityList.objects.filter(name__iexact=sc.name).first()
-        if cl is not None:
-            RouteMapEntrySetCommunity.objects.create(route_map_entry=rme, operation=sc.operation, community_list=cl)
-        elif _looks_like_community_literal(sc.name):
-            row = RouteMapEntrySetCommunity.objects.create(route_map_entry=rme, operation=sc.operation)
-            comm, _ = Community.objects.get_or_create(community=sc.name)
-            row.communities.add(comm)
-        else:
-            unresolved.append({"operation": sc.operation, "name": sc.name})
-    return unresolved
-
-
-def _fill_route_map_entries(rm_obj, entries: list, pl_by_name, cl_by_name, ap_by_name) -> None:
-    from netbox_routing.models import RouteMap, RouteMapEntry
-
-    from .route_policy_structure import structure_entry
-
-    RouteMapEntry.objects.filter(route_map=rm_obj).delete()
-    # Positional sequence — unique per route-map and smallint-safe (the device sequence
-    # can exceed the field's range; see _fill_prefix_list_entries).
-    default_action = None
-    for i, e in enumerate(entries, start=1):
-        match_blob = _load_json(e.get("match"))
-        set_blob = _load_json(e.get("set"))
-        # Derive the structured projection: match_afi, set-community ops, call-policy,
-        # vendor_ext. The full match/set blobs are kept AS-IS (authoritative for the write-side
-        # round-trip until the reader/contract speak structured in P3) — the structured fields
-        # are an additive, queryable/display view, not a replacement. See route_policy_structure.
-        structured = structure_entry(match_blob, set_blob)
-        # flow_control (IOS route-map `continue`) rides inside set-json (no dedicated adapter
-        # leaf) — lift it into the model field; the push re-adds it so the round-trip is symmetric.
-        set_data = dict(set_blob)
-        flow_control = set_data.pop("flow_control", None)
-
-        # default-action projection (R5): mirror the device's flagged default-action entry onto
-        # RouteMap.default_action. The synthetic entry itself is KEPT so the write-side blob
-        # round-trip stays byte-symmetric (the reader still synthesises it pre-contract-v2);
-        # P2 hides it in favour of the field, P3 retires the synthesis.
-        if structured.is_default_action:
-            default_action = _norm_action(e.get("action"))
-
-        vendor_ext = dict(structured.vendor_ext)
-        rme = RouteMapEntry.objects.create(
-            route_map=rm_obj,
-            sequence=i,
-            action=_norm_action(e.get("action")),
-            flow_control=flow_control,
-            match=match_blob,
-            set=set_data,
-            match_afi=structured.match_afi or None,
-            call_policy=_resolve_call_policy(RouteMap, structured.call_policy),
-        )
-        for nm in e.get("match_prefix_lists") or []:
-            obj = pl_by_name.get(nm)
-            if obj:
-                rme.match_prefix_list.add(obj)
-        for nm in e.get("match_community_lists") or []:
-            obj = cl_by_name.get(nm)
-            if obj:
-                rme.match_community_list.add(obj)
-                # Devices match community-LISTS, never individual communities, so also
-                # link the list's member Communities into match_community — surfacing
-                # which concrete communities the route-map matches (user request).
-                member_ids = obj.communitylistentries.values_list("community_id", flat=True)
-                if member_ids:
-                    rme.match_community.add(*[cid for cid in member_ids if cid])
-            else:
-                logger.debug("route-policy: route-map %s refs community-list %r not resolvable", rm_obj.name, nm)
-        for nm in e.get("match_as_paths") or []:
-            obj = ap_by_name.get(nm)
-            if obj:
-                rme.match_aspath.add(obj)
-        unresolved = _materialise_set_communities(rme, structured, cl_by_name)
-        if unresolved:
-            vendor_ext.setdefault("unmapped", {})["set_community"] = unresolved
-        # Persist vendor_ext last (it may have grown an "unmapped" note above); null when empty.
-        rme.vendor_ext = vendor_ext or None
-        rme.save(update_fields=["vendor_ext"])
-
-    # default_action is device-sourced config on the shared RouteMap (full-replace each fill).
-    if rm_obj.default_action != default_action:
-        rm_obj.default_action = default_action
-        rm_obj.save(update_fields=["default_action"])
-
-
-# ---------------------------------------------------------------------------
-# Family materialization specs — register route-policy into the universal
-# shared_object_ownership core (route-maps/community-lists/prefix-lists/as-paths).
-# Each spec knows how to rebuild its NetBox object from a device capture and how
-# to hash a capture; ACL plugs in the same way later.
-# ---------------------------------------------------------------------------
+# Shared-object specs provide canonical hashes and current-content extractors.
 
 
 def _entries(captured: dict) -> list:
@@ -1140,52 +932,10 @@ def _cl_hash(captured: dict) -> str:
     return _hash(entries)
 
 
-def _cl_fill(obj, captured: dict) -> None:
-    invert = bool(captured.get("invert_match", False))
-    if obj.invert_match != invert:
-        obj.invert_match = invert
-        obj.save(update_fields=["invert_match"])
-    _fill_community_list_entries(obj, _entries(captured))
-
-
-def _resolve_name_maps(entries: list):
-    """Resolve a route-map capture's referenced object names to existing NetBox objects.
-
-    Used when re-materializing a route-map from a device capture: the referenced
-    prefix-lists / community-lists / as-paths already exist (global dedup), so look them
-    up case-insensitively rather than relying on the reconcile-time in-memory maps.
-    """
-    from netbox_routing.models import ASPath, CommunityList, PrefixList
-
-    pl_names: set[str] = set()
-    cl_names: set[str] = set()
-    ap_names: set[str] = set()
-    for e in entries:
-        pl_names.update(e.get("match_prefix_lists") or [])
-        cl_names.update(e.get("match_community_lists") or [])
-        ap_names.update(e.get("match_as_paths") or [])
-
-    def _lookup(model, names):
-        out = {}
-        for nm in names:
-            obj = model.objects.filter(name__iexact=nm).first()
-            if obj is not None:
-                out[nm] = obj
-        return out
-
-    return _lookup(PrefixList, pl_names), _lookup(CommunityList, cl_names), _lookup(ASPath, ap_names)
-
-
-def _rm_fill(obj, captured: dict) -> None:
-    entries = _entries(captured)
-    pl_map, cl_map, ap_map = _resolve_name_maps(entries)
-    _fill_route_map_entries(obj, entries, pl_map, cl_map, ap_map)
-
-
 def _extract_prefix_list(pl_obj) -> dict:
-    """Reverse of _fill_prefix_list: CURRENT object content in device-capture shape (#93).
+    """Return current prefix-list content in device-capture shape.
 
-    Key-compatible with the capture entries the fill consumes (prefix/action/ge/le);
+    Key-compatible with the capture entries the graph planner consumes (prefix/action/ge/le).
     sequences are positional artifacts and are renumbered by the comparator.
     """
     entries = []
@@ -1203,7 +953,7 @@ def _extract_prefix_list(pl_obj) -> dict:
 
 
 def _extract_community_list(cl_obj) -> dict:
-    """Reverse of _cl_fill: members verbatim + invert_match, capture-shaped (#93)."""
+    """Return current community-list members and invert flag in capture shape."""
     entries = []
     seq = 0
     for e in cl_obj.communitylistentries.all():
@@ -1217,7 +967,7 @@ def _extract_community_list(cl_obj) -> dict:
 
 
 def _extract_as_path(ap_obj) -> dict:
-    """Reverse of _fill_as_path_entries (#93). The fill's key is ``pattern``."""
+    """Return current AS-path content in device-capture shape."""
     return {
         "entries": [
             {"sequence": e.sequence, "action": (e.action or "permit").lower(), "pattern": e.pattern or ""}
@@ -1227,13 +977,12 @@ def _extract_as_path(ap_obj) -> dict:
 
 
 def _extract_route_map(rm_obj) -> dict:
-    """Reverse of _rm_fill, capture-shaped (#100).
+    """Return current route-map content in device-capture shape.
 
-    match/set blobs are stored VERBATIM by the fill, so returning them verbatim yields an
+    Match and set blobs are stored verbatim. Returning them verbatim yields an
     identical canonical_route_map projection (which drops sequences and sorts the name
     refs — M2M order is irrelevant); flow_control is re-lifted into set-json (the fill
-    popped it into the model field); the synthetic default-action entry was kept by the
-    fill and rides along like any entry.
+    moved it into the model field). The synthetic default-action entry stays in the result.
     """
     entries = []
     for e in rm_obj.route_map_entries.all().order_by("sequence"):
@@ -1259,7 +1008,6 @@ def _register_specs() -> None:
     ownership.register(
         "prefix_list",
         Spec(
-            fill=_fill_prefix_list,
             hash_captured=lambda c: _hash(_entries(c)),
             extract=_extract_prefix_list,
             renderer_models=(
@@ -1272,7 +1020,6 @@ def _register_specs() -> None:
     ownership.register(
         "community_list",
         Spec(
-            fill=_cl_fill,
             hash_captured=_cl_hash,
             extract=_extract_community_list,
             renderer_models=(
@@ -1285,7 +1032,6 @@ def _register_specs() -> None:
     ownership.register(
         "as_path",
         Spec(
-            fill=lambda o, c: _fill_as_path_entries(o, _entries(c)),
             hash_captured=lambda c: _hash(_entries(c)),
             extract=_extract_as_path,
             renderer_models=("netbox_routing.aspath", "netbox_routing.aspathentry"),
@@ -1301,7 +1047,6 @@ def _register_specs() -> None:
     ownership.register(
         "route_map",
         Spec(
-            fill=_rm_fill,
             hash_captured=lambda c: _hash(canonical_route_map(c, _resolve_prefix_list_units)),
             extract=_extract_route_map,
             renderer_models=(
