@@ -199,6 +199,43 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
         statements = [query["sql"].upper() for query in captured.captured_queries]
         self.assertTrue(any('FROM "IPAM_VLAN"' in statement and "FOR UPDATE" in statement for statement in statements))
 
+    def test_a_concurrent_lifecycle_write_does_not_fail_the_pre_capture_audit(self):
+        """A reconciler touching ``last_sync_at`` may not close an operator's Apply.
+
+        The plan's compare-and-set is against the FULL pre-image, and
+        ``IntentPlanStaleError`` is not a serialization failure, so
+        ``_repair_with_retries`` re-raises it out of a mandatory gate.
+        """
+        from django.utils import timezone
+
+        from netbox_nso_plugin.intent_state import audit_scope_footprint
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOVLANState
+        from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
+
+        state = own_vlan(self.management, 1636, "renderer-audit-race")
+        mirror_update(state, status="in_sync")
+        NSOIntentRevision.objects.filter(device=self.device, scope="vlan").update(verified_revision=None)
+
+        def _touch_then_delegate(device_id, scopes):
+            # Runs after the plan is frozen and before the repair takes its locks.
+            NSOVLANState.objects.filter(pk=state.pk).update(last_sync_at=timezone.now())
+            return audit_scope_footprint(device_id, scopes)
+
+        with patch(
+            "netbox_nso_plugin.renderer_audit.audit_scope_footprint",
+            side_effect=_touch_then_delegate,
+        ):
+            result = audit_renderer_scopes(
+                self.device.pk,
+                ["vlan"],
+                trigger="test",
+                pre_capture=True,
+            )
+
+        state.refresh_from_db()
+        self.assertEqual(result.repaired, ("vlan",))
+        self.assertEqual(state.status, "accepted")
+
     def test_lifecycle_only_foreign_change_does_not_repair(self):
         from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentRevision, NSOVLANState
         from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
