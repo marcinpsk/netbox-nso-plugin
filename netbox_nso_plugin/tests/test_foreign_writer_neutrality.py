@@ -6,13 +6,14 @@ from __future__ import annotations
 
 import threading
 from unittest.mock import patch
+from uuid import uuid4
 
 from django.apps import apps
 from django.db import connection, connections
 from django.db.migrations.state import ProjectState
 from django.test import TransactionTestCase
 
-from ._outbox_case import make_managed, own_vlan
+from ._outbox_case import make_managed, mirror_update, own_vlan
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -21,19 +22,28 @@ class TestForeignWriterNeutrality(_CascadeFlushMixin, IntentPushResetMixin, Tran
         super().setUp()
         self.device, self.management = make_managed("foreign-neutral", 16272)
         self.state = own_vlan(self.management, 1670, "foreign-neutral")
+        # A lifecycle a plugin hook would have something to move: an overlay mid-apply.
+        mirror_update(self.state, status="deploying", apply_attempt_id=uuid4())
 
     def assert_no_plugin_behavior(self, revision):
-        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentRevision
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentRevision, NSOVLANState
 
         current = NSOIntentRevision.objects.get(device=self.device, scope="vlan")
         self.assertEqual(current.revision, revision)
         self.assertFalse(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").exists())
+        # A foreign write moves no lifecycle. Where the write deleted the overlay outright
+        # there is no row to compare, and the delete is what the case asserts instead.
+        lifecycle = NSOVLANState.objects.filter(pk=self.state.pk).values("status", "apply_attempt_id").first()
+        if lifecycle is not None:
+            self.assertEqual((lifecycle["status"], lifecycle["apply_attempt_id"]), self.lifecycle)
 
     def baseline(self):
-        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentRevision
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentRevision, NSOVLANState
 
         revision = NSOIntentRevision.objects.get(device=self.device, scope="vlan").revision
         NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").delete()
+        row = NSOVLANState.objects.values("status", "apply_attempt_id").get(pk=self.state.pk)
+        self.lifecycle = (row["status"], row["apply_attempt_id"])
         return revision
 
     def test_per_instance_content_save_commits_exactly_without_plugin_behavior(self):
@@ -198,11 +208,14 @@ class TestForeignWriterNeutrality(_CascadeFlushMixin, IntentPushResetMixin, Tran
         self.assert_no_plugin_behavior(revision)
 
     def test_existing_and_new_connections_have_no_production_execute_wrapper(self):
+        """Any plugin module's wrapper counts: naming one leaves the rest of the package free."""
+
         def plugin_wrappers():
             return [
                 wrapper
                 for wrapper in connection.execute_wrappers
-                if getattr(wrapper, "__module__", "") == "netbox_nso_plugin.intent_state"
+                if getattr(wrapper, "__module__", "").startswith("netbox_nso_plugin.")
+                and not getattr(wrapper, "__module__", "").startswith("netbox_nso_plugin.tests")
             ]
 
         self.assertEqual(plugin_wrappers(), [])
