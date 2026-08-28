@@ -1879,12 +1879,38 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
 
     def test_bgp_peer_delete_pushes_reduced_snapshot(self):
         """An exact overlay deletion pushes the reduced owned snapshot."""
+        from dcim.models import Device
+        from django.contrib.contenttypes.models import ContentType
+        from ipam.models import ASN, RIR, IPAddress
+        from netbox_routing.models import BGPPeer, BGPRouter, BGPScope
+
         from netbox_nso_plugin.models import NSOBGPPeerState
 
         mgmt = self._mgmt()
         with patch("netbox_nso_plugin.adapter_client.put_bgp_intent"), self.captureOnCommitCallbacks(execute=True):
+            rir = RIR.objects.create(name="Signal private ASNs", slug="signal-private-asns", is_private=True)
+            local_as = ASN.objects.create(asn=64512, rir=rir)
+            remote_as = ASN.objects.create(asn=64513, rir=rir)
+            router = BGPRouter.objects.create(
+                assigned_object_type=ContentType.objects.get_for_model(Device),
+                assigned_object_id=self.device.pk,
+                asn=local_as,
+                name=str(local_as.asn),
+            )
+            scope = BGPScope.objects.create(router=router)
+            peer = BGPPeer.objects.create(
+                scope=scope,
+                peer=IPAddress.objects.create(address="198.18.0.2/32"),
+                remote_as=remote_as,
+                enabled=True,
+            )
             row = NSOBGPPeerState.objects.create(
-                management=mgmt, asn_str="65000", peer_address_str="192.0.2.1", status="accepted"
+                management=mgmt,
+                bgp_peer=peer,
+                asn_str=str(local_as.asn),
+                peer_address_str="198.18.0.2",
+                remote_as_str=str(remote_as.asn),
+                status="accepted",
             )
         self._delete_pushes(row, "put_bgp_intent", exact_writer=True)
 
