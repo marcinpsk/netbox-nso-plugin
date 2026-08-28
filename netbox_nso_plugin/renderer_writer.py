@@ -1129,8 +1129,9 @@ class RendererWriter:
 
         collector = Collector(using=instance._state.db or "default", origin=instance)
         collector.collect([instance])
-        # Django sends per-row delete signals before it issues each table's batch DELETE.
-        # Authorize the exact Collector tables that the frozen closure already verified.
+        # _begin_delete_implicit substitutes the cascade ORIGIN on every child pre_delete,
+        # so child tables never accrue credits; the reconcile path has no footprint_tables
+        # (content-only), leaving this loop as the child tables' sole authorization.
         for model_label in {write.model_label for write in closure if write.operation == "delete"}:
             _authorize_dml(self.permit, apps.get_model(model_label)._meta.db_table)
         for (_field, _value), querysets in collector.field_updates.items():
