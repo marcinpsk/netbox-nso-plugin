@@ -384,13 +384,18 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         assert revision.revision == before + 1  # the vanished confirmed SVI is a content change
 
     def test_push_builds_owned_snapshot(self):
-        from netbox_nso_plugin.delivery import render
+        from unittest.mock import patch
+
+        from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.signals import reset_intent_push_state
 
         self._state(name="Vlan100", vid=100, status="accepted")
         self._state(name="Vlan200", vid=200, status="imported")  # not owned → excluded
         reset_intent_push_state()
-        ifaces = render("svi", self.device.pk, 42).payload
+        with patch("netbox_nso_plugin.adapter_client.put_svi_intent") as mock_put:
+            deliver("svi", self.device.pk, 42)
+        mock_put.assert_called_once()
+        ifaces = mock_put.call_args[0][1]
         assert [i["interface_name"] for i in ifaces] == ["Vlan100"]
         assert ifaces[0]["vlan_id"] == 100 and ifaces[0]["vrf"] == "MGMT"
 
