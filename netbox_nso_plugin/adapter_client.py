@@ -570,7 +570,16 @@ def onboard_device(nso_instance, nso_device_name, netbox_device_id):
 
 
 def provision_device(
-    nso_instance, device_name, address, ned_id, authgroup, *, admin_state="unlocked", sync=True, oob_ip=None
+    nso_instance,
+    device_name,
+    address,
+    ned_id,
+    authgroup,
+    *,
+    provision_attempt_id,
+    admin_state="unlocked",
+    sync=True,
+    oob_ip=None,
 ):
     """POST /api/v1/devices/provision — create the device in NSO and bring it up.
 
@@ -583,6 +592,7 @@ def provision_device(
     fresh device (whose in-band loopback is not yet configured) is still onboardable.
     """
     payload = {
+        "provision_attempt_id": str(provision_attempt_id),
         "nso_instance": nso_instance,
         "device_name": device_name,
         "address": address,
@@ -594,6 +604,11 @@ def provision_device(
     if oob_ip is not None:
         payload["oob_ip"] = oob_ip
     return _request("POST", "/api/v1/devices/provision", json=payload)
+
+
+def get_provision_attempt(provision_attempt_id):
+    """GET terminal or in-flight evidence for one provision attempt."""
+    return _validated_provision_attempt(_request("GET", f"/api/v1/provision-attempts/{provision_attempt_id}"))
 
 
 def get_failover_config():
@@ -724,6 +739,11 @@ def patch_device(adapter_device_id, nso_instance=None, nso_device_name=None):
 def delete_device(adapter_device_id):
     """DELETE /api/v1/devices/{id} — offboard device."""
     _request("DELETE", f"/api/v1/devices/{adapter_device_id}")
+
+
+def delete_provisioned_device(adapter_device_id):
+    """Offboard the device created by one completed provision attempt."""
+    delete_device(adapter_device_id)
 
 
 def get_device(adapter_device_id):
@@ -1164,6 +1184,16 @@ def _validated_jobs(jobs, what):
     for job in jobs:
         _validated_job(job, what)
     return jobs
+
+
+def _validated_provision_attempt(evidence):
+    """Return structurally valid provision evidence, else leave the attempt undecided."""
+    from .provision_lifecycle import validate_provision_evidence
+
+    try:
+        return validate_provision_evidence(evidence)
+    except ValueError as exc:
+        raise AdapterError("Adapter returned a malformed provision attempt.", code="invalid_response") from exc
 
 
 def get_job(job_id):

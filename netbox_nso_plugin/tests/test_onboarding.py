@@ -190,6 +190,50 @@ class TestOnboardCandidate(TestCase):
     # adapter-push signal gated) and the dashboard polls the job to completion.
     _QUEUED = {"job_id": "55", "nso_device_name": "x", "status": "queued"}
 
+    def test_persists_provision_attempt_before_post(self):
+        """The adapter sees an attempt only after its immutable request is durable."""
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+        from netbox_nso_plugin.onboarding import onboard_candidate
+
+        device = self._mapped_device("durable-provision")
+
+        def admit(**request):
+            tombstone = NSOProvisionTombstone.objects.get(provision_attempt_id=request["provision_attempt_id"])
+            self.assertEqual(tombstone.state, "open")
+            self.assertEqual(tombstone.netbox_device_id, device.pk)
+            self.assertEqual(tombstone.nso_instance, self.instance.adapter_instance_id)
+            self.assertEqual(tombstone.nso_device_name, "durable-provision")
+            self.assertEqual(tombstone.canonical_request, request)
+            self.assertEqual(tombstone.adapter_job_id, "")
+            return self._QUEUED
+
+        with patch("netbox_nso_plugin.adapter_client.provision_device", side_effect=admit) as provision:
+            result = onboard_candidate(device, self.instance)
+
+        self.assertTrue(result["ok"])
+        provision.assert_called_once()
+        tombstone = NSOProvisionTombstone.objects.get(netbox_device_id=device.pk)
+        self.assertEqual(tombstone.adapter_job_id, "55")
+
+    def test_retries_the_same_request_with_the_same_attempt(self):
+        """A lost admission response resubmits the durable request unchanged."""
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+        from netbox_nso_plugin.onboarding import onboard_candidate
+
+        device = self._mapped_device("retry-provision")
+        with patch(
+            "netbox_nso_plugin.adapter_client.provision_device",
+            side_effect=(RuntimeError("response lost"), self._QUEUED),
+        ) as provision:
+            first = onboard_candidate(device, self.instance)
+            second = onboard_candidate(device, self.instance)
+
+        self.assertFalse(first["ok"])
+        self.assertTrue(second["ok"])
+        first_request, second_request = (call.kwargs for call in provision.call_args_list)
+        self.assertEqual(first_request, second_request)
+        self.assertEqual(NSOProvisionTombstone.objects.filter(netbox_device_id=device.pk).count(), 1)
+
     def test_no_mapping_but_explicit_ned_onboards(self):
         """No mapping is fine when an explicit ned_id is given (override / no mapping)."""
         from netbox_nso_plugin.models import NSODeviceManagement, NSOIntentRevision, NSOPlatformNedMapping

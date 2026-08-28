@@ -1587,36 +1587,26 @@ def enqueue_device_reconcile(device_id: int):
     return enqueue_reconcile_carrier(queue.connection, queue, device_id)
 
 
-def run_onboard_advance(mgmt_id: int):
-    """RQ job: advance one provisioning onboarding row (fired by the provision-complete callback).
+def run_provision_tombstone_sweep(provision_attempt_id=None):
+    """RQ job: let the fenced tombstone sweep own provision completion."""
+    from .provision_lifecycle import sweep_provision_tombstones
 
-    Fired by :class:`~netbox_nso_plugin.api.views.ProvisionCompleteView`. Idempotent — a no-op once
-    the row is terminal. See :func:`netbox_nso_plugin.onboarding.advance_provisioning`.
-    """
-    from .models import NSODeviceManagement
-    from .onboarding import advance_provisioning
-
-    mgmt = NSODeviceManagement.objects.filter(pk=mgmt_id).first()
-    if mgmt is None:
-        logger.debug("onboard advance: mgmt %s no longer exists", mgmt_id)
-        return
-    advance_provisioning(mgmt)
+    return sweep_provision_tombstones(provision_attempt_id)
 
 
-def enqueue_onboard_advance(mgmt_id: int):
-    """Enqueue a background advance of a provisioning row (fired by the provision-complete callback).
-
-    No deterministic job id: advance_provisioning is idempotent, so a duplicate enqueue is harmless
-    — and a fixed id risks an orphaned RQ job blocking every future advance (see the reconcile
-    dedup note above). Runs inline if RQ is unavailable. Returns the RQ job (or None on the inline
-    path).
-    """
+def enqueue_provision_tombstone_sweep(provision_attempt_id):
+    """Enqueue one idempotent attempt-addressed tombstone sweep."""
     try:
         import django_rq
     except ImportError:  # pragma: no cover - RQ ships with NetBox
-        logger.warning("django_rq unavailable; advancing onboard row %s inline", mgmt_id)
-        run_onboard_advance(mgmt_id)
+        logger.warning("django_rq unavailable; sweeping provision attempt %s inline", provision_attempt_id)
+        run_provision_tombstone_sweep(provision_attempt_id)
         return None
 
     queue = django_rq.get_queue(_RECONCILE_QUEUE)
-    return queue.enqueue(run_onboard_advance, mgmt_id, result_ttl=300, job_timeout=300)
+    return queue.enqueue(
+        run_provision_tombstone_sweep,
+        provision_attempt_id,
+        result_ttl=300,
+        job_timeout=300,
+    )

@@ -875,6 +875,12 @@ def _maintain_manifest(instance):
     maintain_manifest(instance)
 
 
+def _retire_overlay_manifest(instance):
+    from .ownership_planner import retire_overlay_manifest
+
+    retire_overlay_manifest(instance)
+
+
 class RendererWriter:
     """Consume one frozen plan through exact ORM operations."""
 
@@ -1137,6 +1143,7 @@ class RendererWriter:
             raise IntentMutationProtocolError("the planned Collector cascade changed before delete")
         with self._operation(index):
             result = instance.delete()
+        _retire_overlay_manifest(current)
         self._consumed.update(matched)
         return result
 

@@ -92,7 +92,7 @@ class TestPushLacpIntentForDevice(_LacpBase):
         assert b["members"][0]["interface_name"] == "GigabitEthernet0/1"
         assert b["members"][0]["port_priority"] == 128
 
-    def test_excludes_non_accepted_bundles(self):
+    def test_acquires_a_qualifying_imported_bundle_before_delivery(self):
         from netbox_nso_plugin.delivery import deliver
 
         mgmt = self._make_mgmt()
@@ -102,7 +102,7 @@ class TestPushLacpIntentForDevice(_LacpBase):
             deliver("lacp", self.device.pk, mgmt.adapter_device_id)
 
         mock_apply.assert_called_once()
-        assert mock_apply.call_args[0][1] == []
+        assert [bundle["name"] for bundle in mock_apply.call_args[0][1]] == ["Port-channel1"]
 
     def test_excludes_vpc_sensitive_bundles(self):
         # NX-P2 belt-and-suspenders: an (impossibly-)accepted vPC bundle is excluded from the

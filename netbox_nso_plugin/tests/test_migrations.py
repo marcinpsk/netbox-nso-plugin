@@ -340,6 +340,7 @@ class TestBGPMergeBaseMigration(_CascadeFlushMixin, TransactionTestCase):
         self._migrate(BGP_MERGE_BASE_RESET)
         template_state.refresh_from_db()
         template_base_was_reset = template_state.device_base_hash == ""
+        self._migrate_to_leaves()
 
         drifted = copy.deepcopy(payload)
         drifted["routers"][0]["scopes"][0]["peers"][0]["ttl"] = 2

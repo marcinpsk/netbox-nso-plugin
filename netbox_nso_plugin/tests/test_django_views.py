@@ -263,31 +263,41 @@ class TestOnboardingDashboardView(ViewTestBase):
 
 
 class TestOnboardStatusView(ViewTestBase):
-    """Async-onboarding status-advance endpoint (polled by the dashboard while a row provisions).
+    """Provision-tombstone sweep endpoint polled by the dashboard.
 
-    Drives the real view through its URL: it polls the adapter job (mocked at the HTTP-boundary
-    client) and advances the NSODeviceManagement row. The success path proves the gated
-    adapter-push signal *re-fires* once the row flips to ready.
+    The success path proves the gated adapter-push signal re-fires after the sole completion
+    owner advances the management row.
     """
 
     def _provisioning_mgmt(self, name, job_id="99"):
         dev = Device.objects.create(
             name=name, device_type=self.device.device_type, role=self.device.role, site=self.device.site
         )
-        # Created in 'provisioning' → the post_save signal is gated (no adapter call here).
-        return NSODeviceManagement.objects.create(
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+
+        mgmt = NSODeviceManagement.objects.create(
             device=dev,
             nso_instance=self.nso_instance,
             nso_device_name=name,
             onboard_status="provisioning",
             onboard_job_id=job_id,
         )
+        tombstone = NSOProvisionTombstone(
+            netbox_device_id=dev.pk,
+            nso_instance=self.nso_instance.adapter_instance_id,
+            nso_device_name=name,
+            canonical_request={},
+            adapter_job_id=job_id,
+        )
+        tombstone.canonical_request = {"provision_attempt_id": str(tombstone.provision_attempt_id)}
+        tombstone.save(force_insert=True)
+        return mgmt
 
     def _post_status(self, mgmt):
         return self.client.post(reverse("plugins:netbox_nso_plugin:onboard_status", args=[mgmt.pk]))
 
-    @patch("netbox_nso_plugin.adapter_client.get_job", return_value={"status": "running"})
-    def test_running_job_stays_provisioning(self, _job):
+    @patch("netbox_nso_plugin.adapter_client.get_provision_attempt", return_value={"status": "running"})
+    def test_running_job_stays_provisioning(self, _attempt):
         mgmt = self._provisioning_mgmt("prov-running")
         resp = self._post_status(mgmt)
         self.assertEqual(resp.status_code, 200)
@@ -299,13 +309,13 @@ class TestOnboardStatusView(ViewTestBase):
     @patch("netbox_nso_plugin.adapter_client.set_scope")
     @patch("netbox_nso_plugin.adapter_client.onboard_device", return_value={"id": 321})
     @patch(
-        "netbox_nso_plugin.adapter_client.get_job",
+        "netbox_nso_plugin.adapter_client.get_provision_attempt",
         return_value={
             "status": "succeeded",
             "result": {"ok": True, "steps": [{"step": "create", "status": "ok"}], "device_id": None},
         },
     )
-    def test_succeeded_job_flips_ready_and_fires_signal(self, _job, onboard, _scope, _notify):
+    def test_succeeded_job_flips_ready_and_fires_signal(self, _attempt, onboard, _scope, _notify):
         mgmt = self._provisioning_mgmt("prov-ok")
         # The mapping push is deferred to transaction.on_commit; TestCase never commits.
         with self.captureOnCommitCallbacks(execute=True):
@@ -318,7 +328,7 @@ class TestOnboardStatusView(ViewTestBase):
         self.assertEqual(mgmt.adapter_device_id, 321)
 
     @patch(
-        "netbox_nso_plugin.adapter_client.get_job",
+        "netbox_nso_plugin.adapter_client.get_provision_attempt",
         return_value={
             "status": "succeeded",
             "result": {
@@ -327,7 +337,7 @@ class TestOnboardStatusView(ViewTestBase):
             },
         },
     )
-    def test_succeeded_but_failed_step_marks_provision_failed(self, _job):
+    def test_succeeded_but_failed_step_marks_provision_failed(self, _attempt):
         mgmt = self._provisioning_mgmt("prov-stepfail")
         resp = self._post_status(mgmt)
         self.assertEqual(resp.json()["status"], "provision_failed")
@@ -338,10 +348,10 @@ class TestOnboardStatusView(ViewTestBase):
         self.assertEqual(mgmt.onboard_error, "Provisioning failed. See the server log.")
 
     @patch(
-        "netbox_nso_plugin.adapter_client.get_job",
+        "netbox_nso_plugin.adapter_client.get_provision_attempt",
         return_value={"status": "failed", "error": {"message": "Provision exceeded 600s timeout"}},
     )
-    def test_failed_job_marks_provision_failed(self, _job):
+    def test_failed_job_marks_provision_failed(self, _attempt):
         mgmt = self._provisioning_mgmt("prov-jobfail")
         resp = self._post_status(mgmt)
         self.assertEqual(resp.json()["status"], "provision_failed")
@@ -361,22 +371,23 @@ class TestOnboardStatusView(ViewTestBase):
         self.assertEqual(resp.json()["status"], "provision_failed")
         self.assertEqual(resp.json()["error"], "earlier failure")
 
-    def test_missing_job_id_marks_failed(self):
-        """A provisioning row with no job id can never advance → provision_failed."""
+    @patch("netbox_nso_plugin.adapter_client.get_provision_attempt", side_effect=AdapterError("receipt pending"))
+    def test_missing_job_receipt_stays_retryable(self, _attempt):
+        """An attempt with no admitted job receipt remains open for recovery."""
         mgmt = self._provisioning_mgmt("prov-nojob", job_id="")
-        resp = self._post_status(mgmt)  # no get_job patch — never reached
-        self.assertEqual(resp.json()["status"], "provision_failed")
+        resp = self._post_status(mgmt)
+        self.assertEqual(resp.json()["status"], "provisioning")
         mgmt.refresh_from_db()
-        self.assertEqual(mgmt.onboard_status, "provision_failed")
+        self.assertEqual(mgmt.onboard_status, "provisioning")
 
-    @patch("netbox_nso_plugin.adapter_client.get_job", side_effect=AdapterError("adapter down"))
-    def test_transient_adapter_error_keeps_provisioning(self, _job):
+    @patch("netbox_nso_plugin.adapter_client.get_provision_attempt", side_effect=AdapterError("adapter down"))
+    def test_transient_adapter_error_keeps_provisioning(self, _attempt):
         """A transient adapter error while polling keeps the row provisioning (client retries)."""
         mgmt = self._provisioning_mgmt("prov-blip")
         resp = self._post_status(mgmt)
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["status"], "provisioning")
-        self.assertIn("poll_error", resp.json())
+        self.assertNotIn("poll_error", resp.json())
         mgmt.refresh_from_db()
         self.assertEqual(mgmt.onboard_status, "provisioning")
 
@@ -3665,11 +3676,9 @@ class TestInterfaceIntentDelivery(ViewTestBase):
             }
         ]
 
-    @patch("netbox_nso_plugin.adapter_client._resolve_config")
-    @patch("netbox_nso_plugin.adapter_client.requests.Session")
-    def test_pushes_enabled_attribute(self, mock_session_cls, mock_cfg):
+    def test_pushes_enabled_attribute(self):
         """The interface render includes 'enabled' attribute states."""
-        from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.delivery import render
 
         # Create an 'enabled' interface state in accepted status
         enabled_state = NSOInterfaceState.objects.create(
@@ -3683,19 +3692,7 @@ class TestInterfaceIntentDelivery(ViewTestBase):
         mgmt.save(update_fields=["adapter_device_id"])
         self.addCleanup(mirror_update, mgmt, adapter_device_id=None)
 
-        mock_cfg.return_value = {
-            "url": "http://adapter",
-            "token": "tok",
-            "verify_tls": True,
-            "ca_cert_path": None,
-            "timeout": 30,
-        }
-        session = make_session(response=make_response(200, json_data={}))
-        mock_session_cls.return_value = session
-
-        deliver("interface", self.device.pk, mgmt.adapter_device_id)
-        session.request.assert_called_once()
-        sent = session.request.call_args.kwargs["json"]["attributes"]
+        sent = render("interface", self.device.pk, mgmt.adapter_device_id).payload
         assert sent == [
             {
                 "interface": self.interface.name,

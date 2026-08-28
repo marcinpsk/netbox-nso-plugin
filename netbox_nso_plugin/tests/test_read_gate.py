@@ -26,6 +26,7 @@ from unittest.mock import patch
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.db import IntegrityError, transaction
 from django.test import SimpleTestCase, TestCase, TransactionTestCase
+from django.utils import timezone
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
 from netbox_nso_plugin.tests.mixins import _CascadeFlushMixin
@@ -627,6 +628,36 @@ class TestIncarnationAdoption(TestCase):
         row = self._row("bfd")
         self.assertEqual(row.observed_incarnation, _INC_B[0])
         self.assertEqual(row.applied_attempt_id, 1)
+
+    def test_new_incarnation_invalidates_every_delivery_baseline(self):
+        """An adopted adapter store creates audit work for every delivery scope."""
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        self._run(_rs(attempt_id=5), family="bfd")
+        for scope in delivery.delivery_keys():
+            NSOIntentRevision.objects.update_or_create(
+                device=self.mgmt.device,
+                scope=scope,
+                defaults={
+                    "revision": 3,
+                    "verified_revision": 3,
+                    "verified_fingerprint": f"verified-{scope}",
+                    "verified_at": timezone.now(),
+                },
+            )
+
+        self._run(
+            _rs(attempt_id=1, incarnation=_INC_B[0], incarnation_born=_INC_B[1]),
+            family="bfd",
+        )
+
+        self.assertFalse(
+            NSOIntentRevision.objects.filter(
+                device=self.mgmt.device,
+                verified_revision__isnull=False,
+            ).exists()
+        )
 
     def test_adoption_with_existing_rows_keeps_reset_marker_until_all_reobserved(self):
         """codex B5-F1: adoption blanks every family row; until each one re-observes

@@ -16,18 +16,27 @@ class TestOwnershipManifestSchema(SimpleTestCase):
         assert not fields["device_id"].is_relation
         assert not fields["native_model_label"].is_relation
         assert not fields["native_key"].is_relation
+        assert not fields["native_id"].is_relation
+        assert not fields["state_model_label"].is_relation
+        assert not fields["state_key"].is_relation
         assert "overlay" not in fields
 
     def test_one_manifest_row_identifies_each_owned_object(self):
         from netbox_nso_plugin.models import NSOOwnershipManifest
 
         constraints = {
-            tuple(constraint.fields)
+            tuple(expression.name for expression in constraint.expressions)
             for constraint in NSOOwnershipManifest._meta.constraints
-            if getattr(constraint, "fields", None)
         }
 
-        assert ("device_id", "scope", "native_model_label", "native_key") in constraints
+        assert (
+            "device_id",
+            "scope",
+            "native_model_label",
+            "native_key",
+            "state_model_label",
+            "state_key",
+        ) in constraints
 
     def test_manifest_carries_ownership_and_deletion_evidence(self):
         from netbox_nso_plugin.models import NSOOwnershipManifest

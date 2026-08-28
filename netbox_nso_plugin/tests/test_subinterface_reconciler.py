@@ -546,18 +546,13 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
         assert revision.revision == before + 1
 
     def test_push_builds_owned_snapshot(self):
-        from unittest.mock import patch
-
-        from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.delivery import render
         from netbox_nso_plugin.signals import reset_intent_push_state
 
         self._state(name="ge-0/0/0.100", dot1q=100, status="accepted")
         self._state(name="ge-0/0/0.200", dot1q=200, status="imported")  # not owned → excluded
         reset_intent_push_state()
-        with patch("netbox_nso_plugin.adapter_client.put_subinterface_intent") as mock_put:
-            deliver("subinterface", self.device.pk, 42)
-        mock_put.assert_called_once()
-        ifaces = mock_put.call_args[0][1]
+        ifaces = render("subinterface", self.device.pk, 42).payload
         assert [i["interface_name"] for i in ifaces] == ["ge-0/0/0.100"]
         assert ifaces[0]["dot1q_vlan"] == 100
         assert ifaces[0]["parent_interface"] == "ge-0/0/0"

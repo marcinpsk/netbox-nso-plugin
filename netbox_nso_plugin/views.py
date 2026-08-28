@@ -218,10 +218,8 @@ class DeviceNSOTabView(generic.ObjectView):
         device = instance
         mgmt = getattr(device, "nso_management", None)
 
-        # Self-heal a stranded async onboard: if the provision job already finished but no
-        # dashboard/status poll was open to catch it, advance the row now so simply opening
-        # this tab completes onboarding (flip to ready → the un-gated signal maps/scopes/syncs).
-        # Best-effort: a poll error leaves the row provisioning and never breaks the render.
+        # Give the fenced provision tombstone sweep another completion opportunity. A transient
+        # attempt lookup error leaves the row provisioning and never breaks the render.
         if mgmt is not None and mgmt.onboard_status == "provisioning":
             from .onboarding import advance_provisioning
 
@@ -2314,19 +2312,10 @@ class NSOQuickManageView(NSOActionPermissionMixin, View):
 
 
 class NSOOnboardStatusView(NSOActionPermissionMixin, View):
-    """Advance + report an async onboarding job — polled by the dashboard while a row provisions.
+    """Run the fenced provision-attempt sweep and report the management status.
 
-    Provisioning runs as a background adapter job; the NSODeviceManagement row sits in
-    ``provisioning`` (its adapter-push signal gated) until this view, polled client-side,
-    sees the job finish and advances the row:
-
-      * job succeeded + result.ok  → ``onboard_status=""`` (ready). Saving re-fires
-        ``sync_scope_to_adapter`` (no longer gated) → adapter mapping + scope + sync-notify.
-      * job succeeded + ``ok=False`` (a blocking step failed) or job failed/timeout →
-        ``provision_failed`` + recorded steps/error (no adapter push).
-
-    Idempotent: once the row is terminal (``""`` / ``provision_failed``) it just reports that.
-    A transient adapter error while polling keeps the row provisioning so the client retries.
+    The dashboard invokes this view while a row is provisioning. The durable tombstone remains
+    the sole completion owner. Once the row is terminal, this view only reports its status.
 
     URL: POST /plugins/nso/onboard-status/<pk>/  (pk = NSODeviceManagement id)
     """
@@ -2334,7 +2323,7 @@ class NSOOnboardStatusView(NSOActionPermissionMixin, View):
     required_permission = "netbox_nso_plugin.add_nsodevicemanagement"
 
     def post(self, request, pk):
-        """Poll the provision job and advance the row; return its onboarding status as JSON."""
+        """Sweep the provision attempt and return its onboarding status as JSON."""
         from .onboarding import advance_provisioning
 
         mgmt = get_object_or_404(NSODeviceManagement, pk=pk)

@@ -24,7 +24,7 @@ from django.urls import reverse
 from ipam.models import IPAddress
 
 from netbox_nso_plugin.adapter_client import AdapterError
-from netbox_nso_plugin.models import NSOInstance, NSOPlatformNedMapping
+from netbox_nso_plugin.models import NSOInstance, NSOPlatformNedMapping, NSOProvisionTombstone
 
 from ._adapter_http import make_response
 from ._outbox_case import mirror_update
@@ -47,6 +47,19 @@ _PLUGINS_CONFIG = {
     **settings.PLUGINS_CONFIG,
     "netbox_nso_plugin": {"adapter_url": "http://adapter.invalid", "adapter_token": "envelope-test-token"},
 }
+
+
+def _open_provision_attempt(mgmt):
+    tombstone = NSOProvisionTombstone(
+        netbox_device_id=mgmt.device_id,
+        nso_instance=mgmt.nso_instance.adapter_instance_id,
+        nso_device_name=mgmt.nso_device_name,
+        canonical_request={},
+        adapter_job_id=mgmt.onboard_job_id,
+    )
+    tombstone.canonical_request = {"provision_attempt_id": str(tombstone.provision_attempt_id)}
+    tombstone.save(force_insert=True)
+    return tombstone
 
 
 class _LeakingSession(requests.Session):
@@ -197,16 +210,19 @@ class TestAdapterErrorEnvelopeInResponses(_UnreachableAdapterMixin, ViewTestBase
                 self.assertIn(_PUBLIC_ADAPTER_ERROR, body)
                 self.assertFalse(any(_LEAK in line for line in logs.output))
 
-    def test_onboard_status_poll_reports_a_fixed_public_error(self):
-        """A transient adapter outage while polling keeps the row provisioning, with no leak."""
+    def test_onboard_status_poll_keeps_a_transport_failure_retryable(self):
+        """A transient attempt lookup failure keeps the row provisioning, with no leak."""
         mirror_update(self.mgmt, onboard_status="provisioning", onboard_job_id="job-42")
+        self.mgmt.refresh_from_db()
+        _open_provision_attempt(self.mgmt)
 
         with self.assertLogs(_ADAPTER_LOG, level="WARNING"):
             resp = self.client.post(self._url("onboard_status", pk=self.mgmt.pk), **_AJAX)
 
         body = resp.json()
         self.assertEqual(body["status"], "provisioning")
-        self.assertEqual(body["poll_error"], _PUBLIC_ADAPTER_ERROR)
+        self.assertNotIn("poll_error", body)
+        self.assertNotIn(_LEAK, resp.content.decode())
 
     def test_onboarding_api_reports_a_fixed_public_error(self):
         """The API must not copy the dashboard's caught exception into its response."""
@@ -429,10 +445,11 @@ class TestMalformedAdapterPayloadIsRefused(_UnreachableAdapterMixin, ViewTestBas
 
         mirror_update(self.mgmt, onboard_status="provisioning", onboard_job_id="job-42")
         self.mgmt.refresh_from_db()
+        _open_provision_attempt(self.mgmt)
 
         result = advance_provisioning(self.mgmt)
 
         self.assertEqual(result["status"], "provisioning")
-        self.assertEqual(result["poll_error"], _PUBLIC_INVALID_RESPONSE)
+        self.assertNotIn("poll_error", result)
         self.mgmt.refresh_from_db()
         self.assertEqual(self.mgmt.onboard_status, "provisioning")

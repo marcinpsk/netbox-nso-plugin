@@ -986,7 +986,7 @@ class TestPushIntentOnAccept(_SignalDBBase):
         from dcim.models import Interface
         from django.utils import timezone
 
-        from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.delivery import render
         from netbox_nso_plugin.models import NSOInterfaceState
 
         self._make_mgmt(adapter_device_id=42)
@@ -1004,11 +1004,7 @@ class TestPushIntentOnAccept(_SignalDBBase):
             accepted_at=timezone.now(),  # stale
         )
 
-        with patch(f"{_MOD}.put_intent") as mock_put:
-            deliver("interface", self.device.id, 42)
-
-        mock_put.assert_called_once()
-        attrs = mock_put.call_args[0][1]
+        attrs = render("interface", self.device.id, 42).payload
         self.assertEqual([(a["interface"], a["attribute"]) for a in attrs], [("GigabitEthernet0/0", "description")])
         self.assertEqual(attrs[0]["intent_value"], "uplink to spine")
 

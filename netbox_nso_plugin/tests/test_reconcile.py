@@ -5,6 +5,7 @@
 import os
 from contextlib import contextmanager
 from unittest.mock import ANY, patch
+from uuid import uuid4
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.db import transaction
@@ -270,37 +271,81 @@ class TestProvisionCompleteEndpoint(APITestCase):
     def _url(self):
         return "/api/plugins/nso/provision-complete/"
 
-    def _provisioning_row(self, job_id="55"):
+    def _tombstone(self, job_id="55"):
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+
         device = _make_device(f"prov-{job_id}")
         inst = NSOInstance.objects.create(name=f"prov-nso-{job_id}", adapter_instance_id=f"prov-nso-{job_id}")
-        return NSODeviceManagement.objects.create(
-            device=device,
-            nso_instance=inst,
+        return NSOProvisionTombstone.objects.create(
+            netbox_device_id=device.pk,
+            nso_instance=inst.adapter_instance_id,
             nso_device_name=f"prov-{job_id}",
-            onboard_status="provisioning",
-            onboard_job_id=job_id,
+            canonical_request={"provision_attempt_id": str(uuid4())},
+            adapter_job_id=job_id,
         )
 
-    def test_missing_job_id_returns_400(self):
+    def test_missing_attempt_id_returns_400(self):
         response = self.client.post(self._url(), {}, format="json", **self.header)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
-    def test_known_job_enqueues_advance_and_returns_202(self):
-        """A provision_job_id matching a row's onboard_job_id enqueues that row's advance."""
-        mgmt = self._provisioning_row("77")
-        with patch("netbox_nso_plugin.reconcile.enqueue_onboard_advance") as m:
-            response = self.client.post(self._url(), {"provision_job_id": 77}, format="json", **self.header)
+    def test_known_attempt_only_marks_terminal_and_enqueues_the_sweep(self):
+        """The callback records evidence but never advances or offboards a device."""
+        tombstone = self._tombstone("77")
+        payload = {
+            "provision_attempt_id": str(tombstone.provision_attempt_id),
+            "status": "succeeded",
+            "job_id": 77,
+            "result": {"ok": True, "device_id": 7077},
+        }
+        with (
+            patch("netbox_nso_plugin.reconcile.enqueue_provision_tombstone_sweep") as enqueue,
+            patch("netbox_nso_plugin.onboarding.advance_provisioning") as advance,
+            patch("netbox_nso_plugin.adapter_client.delete_device") as offboard,
+        ):
+            response = self.client.post(self._url(), payload, format="json", **self.header)
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
-        m.assert_called_once_with(mgmt.id)  # matched by str(77) == onboard_job_id
+        tombstone.refresh_from_db()
+        self.assertEqual(tombstone.state, "terminal")
+        self.assertEqual(tombstone.terminal_status, "succeeded")
+        self.assertEqual(tombstone.terminal_evidence, payload)
+        enqueue.assert_called_once_with(tombstone.provision_attempt_id)
+        advance.assert_not_called()
+        offboard.assert_not_called()
         self.assertTrue(response.data["queued"])
 
-    def test_unknown_job_acked_without_enqueue(self):
-        """An untracked provision job is acked (202) without enqueue — the callback is best-effort."""
-        with patch("netbox_nso_plugin.reconcile.enqueue_onboard_advance") as m:
-            response = self.client.post(self._url(), {"provision_job_id": 999999}, format="json", **self.header)
+    def test_malformed_success_evidence_does_not_win_the_terminal_cas(self):
+        tombstone = self._tombstone("78")
+
+        with patch("netbox_nso_plugin.reconcile.enqueue_provision_tombstone_sweep") as enqueue:
+            response = self.client.post(
+                self._url(),
+                {
+                    "provision_attempt_id": str(tombstone.provision_attempt_id),
+                    "status": "succeeded",
+                    "result": "not-an-object",
+                },
+                format="json",
+                **self.header,
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        tombstone.refresh_from_db()
+        self.assertEqual(tombstone.state, "open")
+        self.assertIsNone(tombstone.terminal_evidence)
+        enqueue.assert_not_called()
+
+    def test_unknown_attempt_is_acked_without_enqueue(self):
+        """An untracked attempt is best-effort callback evidence, not completion authority."""
+        with patch("netbox_nso_plugin.reconcile.enqueue_provision_tombstone_sweep") as enqueue:
+            response = self.client.post(
+                self._url(),
+                {"provision_attempt_id": str(uuid4()), "status": "failed"},
+                format="json",
+                **self.header,
+            )
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
         self.assertFalse(response.data["queued"])
-        m.assert_not_called()
+        enqueue.assert_not_called()
 
 
 class TestStaticRouteApplySettle(APITestCase):
@@ -313,14 +358,17 @@ class TestStaticRouteApplySettle(APITestCase):
 
         from netbox_nso_plugin.models import NSOStaticRouteState
 
+        from ._static_route_case import _assign_without_push
+
         device = _make_device(tag)
         inst, _ = NSOInstance.objects.get_or_create(name=f"{tag}-inst", defaults={"adapter_instance_id": f"{tag}-inst"})
         mgmt = NSODeviceManagement.objects.create(
             device=device, nso_instance=inst, nso_device_name=tag, adapter_device_id=89
         )
-        # No device M2M on the route — the greenfield-accept signal must not fire here;
-        # the overlay row is created directly in the state under test.
         route = StaticRoute.objects.create(prefix="198.18.99.0/24", next_hop="198.18.0.1", name="sr-settle", metric=1)
+        # Assign through the suppressed writer footprint. The route is a qualifying native
+        # anchor, but the greenfield signal does not create the overlay under test.
+        _assign_without_push(route, device)
         row = NSOStaticRouteState.objects.create(
             management=mgmt,
             static_route=route,
