@@ -366,14 +366,14 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             .select_related("router__asn", "vrf")
             .order_by("pk")
         ):
-            self.scopes[(int(row.router.asn.asn), row.vrf.name if row.vrf else "")] = row
+            self.scopes[(row.router_id, row.vrf_id)] = row
         self.address_families = {}
         for row in (
             BGPAddressFamily.objects.filter(scope__in=self.scopes.values())
             .select_related("scope__router__asn", "scope__vrf")
             .order_by("pk")
         ):
-            scope_key = (int(row.scope.router.asn.asn), row.scope.vrf.name if row.scope.vrf else "")
+            scope_key = (row.scope.router_id, row.scope.vrf_id)
             self.address_families[(*scope_key, row.address_family)] = row
         self.peers = {}
         for row in (
@@ -381,8 +381,8 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             .select_related("scope__router__asn", "scope__vrf", "peer")
             .order_by("pk")
         ):
-            scope_key = (str(row.scope.router.asn.asn), row.scope.vrf.name if row.scope.vrf else "")
-            self.peers[(*scope_key, str(row.peer.address).split("/")[0])] = row
+            scope_key = (row.scope.router_id, row.scope.vrf_id)
+            self.peers[(scope_key, row.peer_id)] = row
         self.templates = {row.name: row for row in BGPPeerTemplate.objects.all().order_by("pk")}
         self.template_saved = set()
         self.peer_states = (
@@ -440,6 +440,21 @@ class _BGPGraphPlanner:  # noqa: PLR0904
     def save(self, *args, **kwargs):
         self.operations.save(*args, **kwargs)
 
+    @staticmethod
+    def _router_key(router):
+        if router.pk is not None:
+            return router.pk
+        return ("planned-router", int(router.asn.asn))
+
+    def _scope_key(self, scope):
+        return (self._router_key(scope.router), scope.vrf_id)
+
+    @staticmethod
+    def _peer_ip_key(peer_ip):
+        if peer_ip.pk is not None:
+            return peer_ip.pk
+        return ("planned-ip", str(peer_ip.address))
+
     def _ensure_rir(self):
         if self.rir is None:
             self.rir = self.RIR(
@@ -474,19 +489,20 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         except ValueError:
             logger.warning("BGP: invalid peer IP address %r", value)
             return None
-        if value in self.ips:
-            return self.ips[value]
-        current = self.IPAddress.objects.filter(address__net_host=value).first()
+        address = str(target)
+        if address in self.ips:
+            return self.ips[address]
+        current = self.IPAddress.objects.filter(address__net_host=address).first()
         if current is None:
             mask = 32 if target.version == 4 else 128
-            current = self.IPAddress(address=f"{value}/{mask}")
+            current = self.IPAddress(address=f"{address}/{mask}")
             current.full_clean()
             self.save(
                 current,
                 force_insert=True,
                 natural_key=("address", "vrf"),
             )
-        self.ips[value] = current
+        self.ips[address] = current
         return current
 
     def source(self, value):
@@ -527,10 +543,11 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         return current
 
     def scope(self, router, vrf_name):
-        key = (int(router.asn.asn), vrf_name)
+        vrf = self.vrfs.get(vrf_name) if vrf_name else None
+        key = (self._router_key(router), vrf.pk if vrf is not None else None)
         current = self.scopes.get(key)
         if current is None:
-            current = self.BGPScope(router=router, vrf=self.vrfs.get(vrf_name) if vrf_name else None)
+            current = self.BGPScope(router=router, vrf=vrf)
             self.scopes[key] = current
             self.save(
                 current,
@@ -540,7 +557,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         return current
 
     def address_family(self, scope, value):
-        scope_key = (int(scope.router.asn.asn), scope.vrf.name if scope.vrf else "")
+        scope_key = self._scope_key(scope)
         key = (*scope_key, value)
         current = self.address_families.get(key)
         if current is None:
@@ -651,21 +668,22 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         source, update_source = self.source(entry.get("source"))
         desired = _peer_desired(entry, remote_as, local_as, peer_group, source, update_source)
         af_entries = entry.get("address_families") or []
-        key = (asn_str, vrf_name, address)
-        current_peer = self.peers.get(key)
+        peer_key = (self._scope_key(scope), self._peer_ip_key(peer_ip))
+        current_peer = self.peers.get(peer_key)
         created_peer = current_peer is None
         peer = (
             self.BGPPeer(scope=scope, peer=peer_ip, name=None, **desired) if created_peer else copy.copy(current_peer)
         )
         if created_peer:
-            self.peers[key] = peer
+            self.peers[peer_key] = peer
             self.save(
                 peer,
                 force_insert=True,
                 natural_key=("scope", "peer", "name"),
             )
 
-        current_state = self.peer_states.get(key)
+        state_key = (asn_str, vrf_name, address)
+        current_state = self.peer_states.get(state_key)
         state_created = current_state is None
         state = (
             self.NSOBGPPeerState(
@@ -716,8 +734,8 @@ class _BGPGraphPlanner:  # noqa: PLR0904
                 self.save(peer)
             self.plan_address_family_rows(peer, af_entries, scope)
         state.status = sm.on_reconcile(state.status, matches=matches, conflict=conflict)
-        self.peer_states[key] = state
-        self.seen_peers.add(key)
+        self.peer_states[state_key] = state
+        self.seen_peers.add(state_key)
         self.save(
             state,
             force_insert=state_created,
