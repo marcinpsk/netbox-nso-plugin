@@ -161,6 +161,52 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
             ["repair"],
         )
 
+    def test_repair_verifies_the_render_that_follows_its_own_write(self):
+        """The stored proof is the POST-write render, so the next audit can match it.
+
+        The wrapper stands in for a renderer that emits a repair-visible field: the audit's
+        own lifecycle write moves it, so a proof taken from the pre-write render can never
+        match the next render and the scope repairs forever.
+        """
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOVLANState
+        from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
+
+        state = own_vlan(self.management, 1637, "renderer-audit-post-write")
+        mirror_update(state, status="deploying", apply_attempt_id=uuid4())
+        NSOIntentRevision.objects.filter(device=self.device, scope="vlan").update(
+            verified_revision=None,
+            verified_fingerprint=None,
+            verified_at=None,
+        )
+        real_render = delivery.render
+
+        def render_with_status(key, device_id, adapter_device_id):
+            rendered = real_render(key, device_id, adapter_device_id)
+            rendered.payload = {
+                "payload": rendered.payload,
+                "statuses": list(
+                    NSOVLANState.objects.filter(management__device_id=device_id)
+                    .order_by("pk")
+                    .values_list("status", flat=True)
+                ),
+            }
+            return rendered
+
+        with patch("netbox_nso_plugin.delivery.render", side_effect=render_with_status):
+            result = audit_renderer_scopes(
+                self.device.pk,
+                ["vlan"],
+                trigger="test",
+                pre_capture=True,
+            )
+            after = delivery.render("vlan", self.device.pk, self.management.adapter_device_id)
+
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="vlan")
+        self.assertEqual(result.repaired, ("vlan",))
+        self.assertEqual(after.payload["statuses"], ["accepted"])
+        self.assertEqual(revision.verified_fingerprint, delivery.canonical_fingerprint(after.payload))
+
     def test_matching_scope_uses_only_the_optimistic_read_committed_pass(self):
         from netbox_nso_plugin.models import NSOIntentOutboxEntry
         from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
