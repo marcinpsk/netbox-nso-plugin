@@ -62,12 +62,16 @@ class IntentPushResetMixin:
 
     def tearDown(self):
         from netbox_nso_plugin.intent_state import _ACTIVE_PERMIT
+        from netbox_nso_plugin.renderer_writer import _ACTIVE_WRITER
 
         permit = _ACTIVE_PERMIT.get()
+        writer = _ACTIVE_WRITER.get()
         try:
             self.assertIsNone(permit, f"renderer permit leaked after the test: {permit!r}")
+            self.assertIsNone(writer, f"renderer writer leaked after the test: {writer!r}")
         finally:
             _ACTIVE_PERMIT.set(None)
+            _ACTIVE_WRITER.set(None)
             super().tearDown()
 
 
@@ -88,7 +92,7 @@ def _deliver_scheduled_keys():
     ``TransactionTestCase`` pins for those (``test_intent_outbox_*``). Outside a transaction
     it is not used at all: the real drain runs.
     """
-    from netbox_nso_plugin import delivery, outbox, signals
+    from netbox_nso_plugin import delivery, drain, outbox, signals
     from netbox_nso_plugin.models import NSODeviceManagement, NSOIntentOutboxEntry, NSOIntentOutboxState
 
     keys = signals._pending_intent_keys()
@@ -103,22 +107,24 @@ def _deliver_scheduled_keys():
         if adapter_device_id is None:
             continue
         rows = list(
-            NSOIntentOutboxEntry.objects.filter(device_id=device_id, scope=scope, consumed_by_push_seq__isnull=True)
-            .order_by("id")
-            .values("id", "kind", "mark_and", "transitions")
+            NSOIntentOutboxEntry.objects.filter(
+                device_id=device_id, scope=scope, consumed_by_push_seq__isnull=True
+            ).order_by("id")
         )
         if not rows:
             continue
-        entry_ids = [row["id"] for row in rows]
+        entry_ids = [row.pk for row in rows]
         state = NSOIntentOutboxState.objects.filter(device_id=device_id, scope=scope).first() or NSOIntentOutboxState()
-        folded = outbox.fold_state_transitions([record for row in rows for record in row["transitions"]], state)
-        ordinary = [row for row in rows if row["kind"] == outbox.CONTRIBUTION_KIND_ORDINARY]
+        folded = outbox.fold_state_transitions([record for row in rows for record in row.transitions], state)
+        # Production's own fold, not a copy of it: a repair-only contribution set yields None
+        # (no marking partition at all), which a re-derivation here has already got wrong once.
+        mark, _mark_any = drain._contribution_marks(rows)
         try:
             rendered = delivery.render(scope, device_id, adapter_device_id)
             delivery.send(
                 rendered,
                 rendered.payload,
-                mark=all(row["mark_and"] for row in ordinary) if ordinary else False,
+                mark=mark,
                 deletions=list(folded.queued.values()),
             )
         except Exception:  # noqa: BLE001 (one key's failure must not abort its siblings)
