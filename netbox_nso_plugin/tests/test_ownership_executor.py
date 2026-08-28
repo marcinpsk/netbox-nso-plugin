@@ -156,6 +156,32 @@ class TestSymmetricOwnershipExecutor(TestCase):
         self.assertEqual(payload, [])
         self.assertIn(("interface_mtu", manifest.pk), completed)
 
+    def test_owned_overlay_without_a_manifest_leaves_the_rendered_document(self):
+        from dcim.models import Interface
+
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOInterfaceMtuState, NSOOwnershipManifest
+        from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
+
+        # No MTU on the native row, so nothing qualifies this owned overlay for ownership
+        # and no manifest was ever recorded for it.
+        interface = Interface.objects.create(device=self.device, name="Ethernet10", type="1000base-t")
+        state = NSOInterfaceMtuState.objects.create(
+            management=self.management,
+            interface=interface,
+            l2_mtu=9216,
+            status="accepted",
+        )
+
+        completed = reconcile_scope_ownership(self.device.pk, ["interface_mtu"])
+
+        state.refresh_from_db()
+        payload = delivery.render("interface_mtu", self.device.pk, self.management.adapter_device_id).payload
+        self.assertEqual((state.status, state.accepted_at), ("imported", None))
+        self.assertEqual(payload, [])
+        self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=self.device.pk, scope="interface_mtu").exists())
+        self.assertIn(("interface_mtu", state.pk), completed)
+
     def test_foreign_overlay_delete_retires_a_scope_with_no_native_content(self):
         from dcim.models import Interface
 
