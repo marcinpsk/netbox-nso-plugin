@@ -98,11 +98,6 @@ def bgp_reconcile_plan(device, payload):
     return replace(plan, lock_footprint=lock_footprint)
 
 
-def _pk(obj):
-    """FK target → pk (None-safe), for canonical content hashing."""
-    return obj.pk if obj is not None else None
-
-
 def _bgp_fk_identity(obj):
     """Return a stable BGP merge identity before or after a graph row is saved."""
     if obj is None:
@@ -114,6 +109,8 @@ def _bgp_fk_identity(obj):
         return ("ip", str(obj.address))
     if label == "netbox_routing.bgppeertemplate":
         return ("template", obj.name)
+    if label in ("netbox_routing.prefixlist", "netbox_routing.routemap"):
+        return (label, obj.name)
     if label == "dcim.interface":
         return ("interface", obj.device_id, obj.name)
     return (label, obj.pk)
@@ -181,10 +178,18 @@ def _af_device_content(
             {
                 "af": af_str,
                 "enabled": bool(paf.get("enabled", True)),
-                "routemap_in": _pk(resolve(paf.get("routemap_in"), route_maps_by_name, _resolve_routemap)),
-                "routemap_out": _pk(resolve(paf.get("routemap_out"), route_maps_by_name, _resolve_routemap)),
-                "prefixlist_in": _pk(resolve(paf.get("prefixlist_in"), prefix_lists_by_name, _resolve_prefixlist)),
-                "prefixlist_out": _pk(resolve(paf.get("prefixlist_out"), prefix_lists_by_name, _resolve_prefixlist)),
+                "routemap_in": _bgp_fk_identity(
+                    resolve(paf.get("routemap_in"), route_maps_by_name, _resolve_routemap)
+                ),
+                "routemap_out": _bgp_fk_identity(
+                    resolve(paf.get("routemap_out"), route_maps_by_name, _resolve_routemap)
+                ),
+                "prefixlist_in": _bgp_fk_identity(
+                    resolve(paf.get("prefixlist_in"), prefix_lists_by_name, _resolve_prefixlist)
+                ),
+                "prefixlist_out": _bgp_fk_identity(
+                    resolve(paf.get("prefixlist_out"), prefix_lists_by_name, _resolve_prefixlist)
+                ),
             }
         )
     return sorted(afs, key=lambda a: a["af"])
@@ -199,15 +204,21 @@ def _af_object_content(owner_obj) -> list:
     afs = []
     for paf in BGPPeerAddressFamily.objects.filter(
         assigned_object_type=ct, assigned_object_id=owner_obj.pk
-    ).select_related("address_family"):
+    ).select_related(
+        "address_family",
+        "routemap_in",
+        "routemap_out",
+        "prefixlist_in",
+        "prefixlist_out",
+    ):
         afs.append(
             {
                 "af": paf.address_family.address_family,
                 "enabled": bool(paf.enabled),
-                "routemap_in": paf.routemap_in_id,
-                "routemap_out": paf.routemap_out_id,
-                "prefixlist_in": paf.prefixlist_in_id,
-                "prefixlist_out": paf.prefixlist_out_id,
+                "routemap_in": _bgp_fk_identity(paf.routemap_in),
+                "routemap_out": _bgp_fk_identity(paf.routemap_out),
+                "prefixlist_in": _bgp_fk_identity(paf.prefixlist_in),
+                "prefixlist_out": _bgp_fk_identity(paf.prefixlist_out),
             }
         )
     return sorted(afs, key=lambda a: a["af"])
