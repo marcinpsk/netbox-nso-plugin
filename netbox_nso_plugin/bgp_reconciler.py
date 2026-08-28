@@ -900,7 +900,12 @@ def _reconcile_bgp_config(device, payload: dict) -> list:
     Returns a list of NSOBGPPeerState instances for this device.
     """
     from .models import NSOBGPPeerState, NSODeviceManagement
-    from .renderer_writer import active_renderer_writer, renderer_mirror_writes, renderer_writes
+    from .renderer_writer import (
+        active_renderer_writer,
+        renderer_mirror_writes,
+        renderer_writes,
+        replay_creation_references,
+    )
     from .signals import suppress_intent_push
 
     management = NSODeviceManagement.objects.filter(device=device).first()
@@ -917,7 +922,6 @@ def _reconcile_bgp_config(device, payload: dict) -> list:
             if operation == "delete":
                 writer.delete(instance)
                 continue
-            for field_name, related in references:
-                setattr(instance, field_name, related.pk)
+            replay_creation_references(instance, references)
             writer.save(instance, update_fields=update_fields, force_insert=force_insert)
     return list(NSOBGPPeerState.objects.filter(management=management).select_related("bgp_peer"))
