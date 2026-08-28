@@ -5,11 +5,17 @@
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 
 from django.db import transaction
 from django.utils import timezone
 
 logger = logging.getLogger(__name__)
+
+# One fleet tick polls at most this many attempts, oldest first, so nothing starves.
+_FLEET_SWEEP_LIMIT = 100
+# Past this age an attempt the adapter has no record of can no longer be in flight.
+_UNKNOWN_ATTEMPT_MAX_AGE = timedelta(hours=6)
 
 
 def validate_provision_evidence(evidence, *, terminal_required=False) -> dict:
@@ -102,11 +108,15 @@ def sweep_provision_tombstones(provision_attempt_id=None):
 
     tombstones = NSOProvisionTombstone.objects.exclude(state="closed").order_by("created_at", "provision_attempt_id")
     if provision_attempt_id is not None:
-        tombstones = tombstones.filter(provision_attempt_id=provision_attempt_id)
+        # One named attempt: its caller (UI poll, callback job) can act on the failure.
+        attempts = list(
+            tombstones.filter(provision_attempt_id=provision_attempt_id).values_list("provision_attempt_id", flat=True)
+        )
+        return len(attempts), sum(int(_sweep_one(attempt_id)) for attempt_id in attempts)
 
     checked = 0
     closed = 0
-    for tombstone_id in tombstones.values_list("provision_attempt_id", flat=True):
+    for tombstone_id in tombstones.values_list("provision_attempt_id", flat=True)[:_FLEET_SWEEP_LIMIT]:
         checked += 1
         try:
             closed += int(_sweep_one(tombstone_id))
@@ -116,34 +126,94 @@ def sweep_provision_tombstones(provision_attempt_id=None):
 
 
 def _sweep_one(provision_attempt_id) -> bool:
-    from dcim.models import Device
+    """Advance one attempt. Every adapter call runs outside the device and management locks."""
+    from .models import NSOProvisionTombstone
+
+    tombstone = NSOProvisionTombstone.objects.get(provision_attempt_id=provision_attempt_id)
+    if tombstone.state == "closed":
+        return False
+    if tombstone.state == "open":
+        if not _poll_open_attempt(tombstone):
+            return False
+        tombstone.refresh_from_db()
+    if tombstone.state == "offboarded":
+        return _close_tombstone(provision_attempt_id, expected_state="offboarded")
+    if tombstone.state != "terminal":
+        return False
+    return _complete_terminal_attempt(tombstone)
+
+
+def _poll_open_attempt(tombstone) -> bool:
+    """Poll one open attempt unlocked and compare-and-set whatever verdict it carries."""
+    from . import adapter_client
+    from .adapter_client import AdapterError
+    from .models import NSOProvisionTombstone
+
+    provision_attempt_id = tombstone.provision_attempt_id
+    try:
+        evidence = validate_provision_evidence(adapter_client.get_provision_attempt(provision_attempt_id))
+    except AdapterError as exc:
+        if not _is_not_found(exc):
+            raise
+        return _age_out_unknown_attempt(tombstone)
+
+    with transaction.atomic():
+        locked = NSOProvisionTombstone.objects.select_for_update().get(provision_attempt_id=provision_attempt_id)
+        if locked.state != "open":
+            return True
+        _record_open_job_id(locked, evidence)
+        if evidence["status"] in {"queued", "running"}:
+            return False
+        return mark_provision_terminal(provision_attempt_id, evidence)
+
+
+def _age_out_unknown_attempt(tombstone) -> bool:
+    """Fail an attempt the adapter has no record of, once it can no longer be in flight."""
+    age = timezone.now() - tombstone.created_at
+    if age < _UNKNOWN_ATTEMPT_MAX_AGE:
+        return False
+    logger.warning(
+        "Provision attempt %s is unknown to the adapter after %s — recording it as failed",
+        tombstone.provision_attempt_id,
+        age,
+    )
+    return mark_provision_terminal(
+        tombstone.provision_attempt_id,
+        {
+            "status": "failed",
+            "error": {
+                "code": "provision_attempt_unknown",
+                "message": "The adapter has no record of this provision attempt.",
+            },
+        },
+    )
+
+
+def _is_not_found(exc) -> bool:
+    """Report whether an adapter failure means the addressed resource does not exist."""
+    return exc.status_code == 404 or str(exc.code) == "404"
+
+
+def _complete_terminal_attempt(tombstone) -> bool:
+    """Retire one terminal attempt behind the tombstone fence, holding no foreign row lock."""
     from django.db.models import Q
 
     from . import adapter_client
     from .adapter_client import AdapterError
     from .models import NSODeviceManagement, NSOProvisionTombstone
 
+    provision_attempt_id = tombstone.provision_attempt_id
     with transaction.atomic():
-        tombstone = NSOProvisionTombstone.objects.select_for_update().get(provision_attempt_id=provision_attempt_id)
-        if tombstone.state == "closed":
-            return False
-        if tombstone.state == "offboarded":
-            return _close_tombstone(provision_attempt_id, expected_state="offboarded")
-        if tombstone.state == "open":
-            evidence = adapter_client.get_provision_attempt(provision_attempt_id)
-            evidence = validate_provision_evidence(evidence)
-            _record_open_job_id(tombstone, evidence)
-            status = evidence["status"]
-            if status in {"", "queued", "running"}:
-                return False
-            mark_provision_terminal(provision_attempt_id, evidence)
-            tombstone.refresh_from_db()
+        # The tombstone row IS the offboard fence: onboarding._lock_provision_identity takes it
+        # first, so a re-onboard cannot cross an offboard that is still in flight.
+        tombstone = NSOProvisionTombstone.objects.select_for_update().get(
+            provision_attempt_id=provision_attempt_id,
+        )
         if tombstone.state != "terminal":
             return False
-
-        Device.objects.select_for_update().filter(pk=tombstone.netbox_device_id).first()
+        # of=("self",): the joined NSOInstance row is shared by every device on the instance.
         relevant_management = (
-            NSODeviceManagement.objects.select_for_update()
+            NSODeviceManagement.objects.select_for_update(of=("self",))
             .select_related("nso_instance")
             .filter(
                 Q(device_id=tombstone.netbox_device_id)
@@ -153,63 +223,60 @@ def _sweep_one(provision_attempt_id) -> bool:
                 )
             )
         )
-        management = (
-            relevant_management.select_related("nso_instance")
-            .filter(
-                device_id=tombstone.netbox_device_id,
-                nso_instance__adapter_instance_id=tombstone.nso_instance,
-                nso_device_name=tombstone.nso_device_name,
-                onboard_job_id=tombstone.adapter_job_id,
-            )
-            .first()
-        )
-        if management is None:
-            if relevant_management.exists():
-                return _close_tombstone(provision_attempt_id, expected_state="terminal")
-            adapter_device_id = tombstone.adapter_device_id
-            if adapter_device_id is None:
-                adapter_device_id, ambiguous = _recover_adapter_device_id(tombstone)
-            else:
-                ambiguous = False
-            if ambiguous:
-                NSOProvisionTombstone.objects.filter(
-                    provision_attempt_id=provision_attempt_id,
-                    state="terminal",
-                ).update(
-                    offboard_error="The logical provision identity matches multiple adapter devices.",
-                    updated_at=timezone.now(),
-                )
-                return False
-            if adapter_device_id is not None:
-                try:
-                    adapter_client.delete_provisioned_device(adapter_device_id)
-                except AdapterError as exc:
-                    if exc.status_code != 404 and str(exc.code) != "404":
-                        NSOProvisionTombstone.objects.filter(
-                            provision_attempt_id=provision_attempt_id,
-                            state="terminal",
-                        ).update(
-                            offboard_error="The adapter offboard request failed.",
-                            updated_at=timezone.now(),
-                        )
-                        return False
-            moved = NSOProvisionTombstone.objects.filter(
-                provision_attempt_id=provision_attempt_id,
-                state="terminal",
-            ).update(
-                state="offboarded",
-                adapter_device_id=adapter_device_id,
-                offboard_error="",
-                updated_at=timezone.now(),
-            )
-            if not moved:
-                return False
-
-        else:
+        management = relevant_management.filter(
+            device_id=tombstone.netbox_device_id,
+            nso_instance__adapter_instance_id=tombstone.nso_instance,
+            nso_device_name=tombstone.nso_device_name,
+            onboard_job_id=tombstone.adapter_job_id,
+        ).first()
+        if management is not None:
             _apply_terminal_evidence(management, tombstone)
             return _close_tombstone(provision_attempt_id, expected_state="terminal")
+        if relevant_management.exists():
+            return _close_tombstone(provision_attempt_id, expected_state="terminal")
+
+        # An orphan matches no management row, so the adapter calls below hold the tombstone
+        # fence alone — no device, management, or instance row is locked across them.
+        adapter_device_id = tombstone.adapter_device_id
+        ambiguous = False
+        if adapter_device_id is None:
+            adapter_device_id, ambiguous = _recover_adapter_device_id(tombstone)
+        if ambiguous:
+            _record_offboard_error(
+                provision_attempt_id,
+                "The logical provision identity matches multiple adapter devices.",
+            )
+            return False
+        if adapter_device_id is not None:
+            try:
+                adapter_client.delete_provisioned_device(adapter_device_id)
+            except AdapterError as exc:
+                if not _is_not_found(exc):
+                    _record_offboard_error(provision_attempt_id, "The adapter offboard request failed.")
+                    return False
+        moved = NSOProvisionTombstone.objects.filter(
+            provision_attempt_id=provision_attempt_id,
+            state="terminal",
+        ).update(
+            state="offboarded",
+            adapter_device_id=adapter_device_id,
+            offboard_error="",
+            updated_at=timezone.now(),
+        )
+        if not moved:
+            return False
 
     return _close_tombstone(provision_attempt_id, expected_state="offboarded")
+
+
+def _record_offboard_error(provision_attempt_id, message: str) -> None:
+    """Record why one terminal attempt could not be offboarded, leaving it retryable."""
+    from .models import NSOProvisionTombstone
+
+    NSOProvisionTombstone.objects.filter(
+        provision_attempt_id=provision_attempt_id,
+        state="terminal",
+    ).update(offboard_error=message, updated_at=timezone.now())
 
 
 def _recover_adapter_device_id(tombstone):

@@ -387,9 +387,22 @@ class TestOnboardStatusView(ViewTestBase):
         resp = self._post_status(mgmt)
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["status"], "provisioning")
-        self.assertNotIn("poll_error", resp.json())
+        self.assertIn("poll_error", resp.json())
         mgmt.refresh_from_db()
         self.assertEqual(mgmt.onboard_status, "provisioning")
+
+    def test_a_row_no_attempt_tracks_marks_failed(self):
+        """A provisioning row no open attempt can complete must reach a terminal verdict."""
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+
+        mgmt = self._provisioning_mgmt("prov-untracked")
+        NSOProvisionTombstone.objects.filter(netbox_device_id=mgmt.device_id).delete()
+
+        resp = self._post_status(mgmt)  # no attempt patch — the poll is never reached
+
+        self.assertEqual(resp.json()["status"], "provision_failed")
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.onboard_status, "provision_failed")
 
 
 class TestFailoverSettingsDeploymentWarning(ViewTestBase):
