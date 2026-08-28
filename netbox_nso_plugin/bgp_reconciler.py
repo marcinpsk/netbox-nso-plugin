@@ -606,6 +606,8 @@ class _BGPGraphPlanner:  # noqa: PLR0904
 
     def scope(self, router, vrf_name):
         vrf = self.vrfs.get(vrf_name) if vrf_name else None
+        if vrf is None and vrf_name:
+            logger.warning("BGP: VRF %r not found in NetBox, using the global scope", vrf_name)
         key = (self._router_key(router), vrf.pk if vrf is not None else None)
         current = self.scopes.get(key)
         if current is None:
@@ -643,6 +645,8 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         elif remote_as is not None and _bgp_fk_identity(current.remote_as) != _bgp_fk_identity(remote_as):
             if name not in self.template_saved:
                 current = copy.copy(current)
+            # An already-saved template is mutated in place: build() freezes values after
+            # all operations are recorded, so the later remote_as lands in the plan.
             current.remote_as = remote_as
             self.templates[name] = current
         else:
