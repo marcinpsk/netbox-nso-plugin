@@ -398,28 +398,58 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
 
 @_deployment_guarded("provisioning")
 def advance_provisioning(mgmt) -> dict:
-    """Delegate one UI poll to the fenced provision-attempt sweep and report its row."""
+    """Delegate one UI poll to the fenced provision-attempt sweep and report its row.
+
+    Returns ``{"status", "error"}`` — the onboard state ("ready"/"provisioning"/
+    "provision_failed", or "deleted" when the row is gone) — plus ``poll_error`` when the poll
+    itself failed, so the dashboard can tell a transient adapter outage from "still running".
+    """
     if mgmt.onboard_status != "provisioning":
         return {"status": mgmt.onboard_status or "ready", "error": mgmt.onboard_error}
 
-    from .models import NSOProvisionTombstone
+    from .adapter_client import AdapterError, public_error_message
+    from .models import NSODeviceManagement, NSOProvisionTombstone
     from .provision_lifecycle import sweep_provision_tombstones
 
-    tombstone = (
+    # An attempt whose admitted job id was rolled back still tracks this row, so an empty
+    # adapter_job_id stays recoverable; no attempt at all can never complete the row.
+    attempts = list(
         NSOProvisionTombstone.objects.filter(
             netbox_device_id=mgmt.device_id,
             nso_instance=mgmt.nso_instance.adapter_instance_id,
             nso_device_name=mgmt.nso_device_name,
-            adapter_job_id=mgmt.onboard_job_id,
+            adapter_job_id__in=("", mgmt.onboard_job_id),
         )
         .exclude(state="closed")
         .order_by("created_at", "provision_attempt_id")
-        .first()
     )
-    if tombstone is not None:
+    tombstone = next(
+        (row for row in attempts if row.adapter_job_id == mgmt.onboard_job_id),
+        attempts[0] if attempts else None,
+    )
+    if tombstone is None:
+        return _fail_untracked_provisioning(mgmt)
+
+    try:
         sweep_provision_tombstones(tombstone.provision_attempt_id)
+    except AdapterError as exc:
+        return {"status": "provisioning", "poll_error": public_error_message(exc)}
+    try:
         mgmt.refresh_from_db()
+    except NSODeviceManagement.DoesNotExist:
+        return {"status": "deleted", "error": None}
     return {"status": mgmt.onboard_status or "ready", "error": mgmt.onboard_error}
+
+
+def _fail_untracked_provisioning(mgmt) -> dict:
+    """Terminate a provisioning row that no open provision attempt can ever complete."""
+    from .management_lifecycle import save_management
+
+    logger.warning("advance_provisioning: no open provision attempt tracks management row %s", mgmt.pk)
+    mgmt.onboard_status = "provision_failed"
+    mgmt.onboard_error = "No provision attempt is tracking this onboard."
+    save_management(mgmt, update_fields=["onboard_status", "onboard_error"])
+    return {"status": "provision_failed", "error": mgmt.onboard_error}
 
 
 def advance_stale_onboarding_rows() -> tuple:

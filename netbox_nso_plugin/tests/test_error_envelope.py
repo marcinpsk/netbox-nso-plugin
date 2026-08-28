@@ -221,7 +221,7 @@ class TestAdapterErrorEnvelopeInResponses(_UnreachableAdapterMixin, ViewTestBase
 
         body = resp.json()
         self.assertEqual(body["status"], "provisioning")
-        self.assertNotIn("poll_error", body)
+        self.assertEqual(body["poll_error"], _PUBLIC_ADAPTER_ERROR)
         self.assertNotIn(_LEAK, resp.content.decode())
 
     def test_onboarding_api_reports_a_fixed_public_error(self):
@@ -450,6 +450,6 @@ class TestMalformedAdapterPayloadIsRefused(_UnreachableAdapterMixin, ViewTestBas
         result = advance_provisioning(self.mgmt)
 
         self.assertEqual(result["status"], "provisioning")
-        self.assertNotIn("poll_error", result)
+        self.assertEqual(result["poll_error"], _PUBLIC_INVALID_RESPONSE)
         self.mgmt.refresh_from_db()
         self.assertEqual(self.mgmt.onboard_status, "provisioning")
