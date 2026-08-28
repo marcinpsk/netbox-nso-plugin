@@ -105,11 +105,16 @@ def delete_management(instance):
 
 
 def _control_footprint(device_id):
-    """Freeze the management row and current address owners for one control POST."""
+    """Freeze the management row and current address owners for one control POST.
+
+    Exactly what the payload is read from, and nothing else: the device intent lock and the
+    management row (L4/L5) order the pushes for this device, and the device plus its address
+    rows (L6) keep the five values one snapshot. The 18 delivery families are not read here
+    and must never be frozen across the adapter round trip.
+    """
     from dcim.models import Device
 
-    from . import delivery
-    from .intent_state import MutationFootprint, SourceRow, reconcile_family_footprint
+    from .intent_state import MutationFootprint, SourceRow
 
     identity = (
         Device.objects.filter(pk=device_id).values_list("pk", "primary_ip4_id", "primary_ip6_id", "oob_ip_id").first()
@@ -117,14 +122,11 @@ def _control_footprint(device_id):
     if identity is None:
         return None
     address_ids = {value for value in identity[1:] if value is not None}
-    return MutationFootprint.merge(
-        reconcile_family_footprint(device_id, delivery.delivery_keys()),
-        MutationFootprint.for_keys(
-            (),
-            source_rows=(
-                SourceRow("dcim.device", device_id),
-                *(SourceRow("ipam.ipaddress", address_id) for address_id in address_ids),
-            ),
+    return MutationFootprint(
+        device_ids=(device_id,),
+        source_rows=(
+            SourceRow("dcim.device", device_id),
+            *(SourceRow("ipam.ipaddress", address_id) for address_id in sorted(address_ids)),
         ),
     )
 
