@@ -872,27 +872,10 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
             if not _sync_source_change(instance, client):
                 return
 
-        # Carry the device's management addresses so the adapter's failover loop can probe
-        # primary and fall back to OOB. Resolved by the SAME helper onboarding uses, so the
-        # provision address and the failover-probed addresses never diverge. Explicit values
-        # (incl. None to clear) — the plugin is authoritative, so a removed OOB IP in NetBox
-        # clears it adapter-side.
-        from .onboarding import device_mgmt_addresses
-
-        primary_ip, oob_ip = device_mgmt_addresses(instance.device)
-
-        def push_scope():
-            client.set_scope(
-                instance.adapter_device_id,
-                instance.managed_attributes,
-                auto_apply=instance.auto_apply,
-                sync_before_apply=instance.sync_before_apply,
-                primary_ip=primary_ip,
-                oob_ip=oob_ip,
-            )
+        from .management_lifecycle import reconcile_management_control
 
         try:
-            push_scope()
+            reconcile_management_control(instance.device_id)
         except AdapterError as exc:
             # The stored id points at an adapter device row that no longer exists (a provision
             # that rolled back, a manual delete, a restored DB). Without this the branch above
@@ -907,7 +890,7 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
                 instance.device_id,
             )
             _onboard_into_adapter(instance, client)
-            push_scope()
+            reconcile_management_control(instance.device_id)
 
         notify_result = client.sync_notify(instance.adapter_device_id)
         if notify_result and notify_result.get("job_id"):

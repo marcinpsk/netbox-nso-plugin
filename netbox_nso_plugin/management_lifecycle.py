@@ -102,3 +102,62 @@ def delete_management(instance):
     context = renderer_writes if plan.changes_content else renderer_mirror_writes
     with context(plan) as writer:
         return writer.delete(instance)
+
+
+def _control_footprint(device_id):
+    """Freeze the management row and current address owners for one control POST."""
+    from dcim.models import Device
+
+    from . import delivery
+    from .intent_state import MutationFootprint, SourceRow, reconcile_family_footprint
+
+    identity = (
+        Device.objects.filter(pk=device_id).values_list("pk", "primary_ip4_id", "primary_ip6_id", "oob_ip_id").first()
+    )
+    if identity is None:
+        return None
+    address_ids = {value for value in identity[1:] if value is not None}
+    return MutationFootprint.merge(
+        reconcile_family_footprint(device_id, delivery.delivery_keys()),
+        MutationFootprint.for_keys(
+            (),
+            source_rows=(
+                SourceRow("dcim.device", device_id),
+                *(SourceRow("ipam.ipaddress", address_id) for address_id in address_ids),
+            ),
+        ),
+    )
+
+
+def reconcile_management_control(device_id: int) -> bool:
+    """POST the five authoritative control fields while their owners stay locked."""
+    from . import adapter_client
+    from .intent_state import mirror_transaction
+    from .models import NSODeviceManagement
+    from .onboarding import device_mgmt_addresses
+
+    footprint = _control_footprint(int(device_id))
+    if footprint is None:
+        return False
+    with mirror_transaction(footprint):
+        management = (
+            NSODeviceManagement.objects.select_related(
+                "device__primary_ip4",
+                "device__primary_ip6",
+                "device__oob_ip",
+            )
+            .filter(device_id=device_id)
+            .first()
+        )
+        if management is None or management.adapter_device_id is None:
+            return False
+        primary_ip, oob_ip = device_mgmt_addresses(management.device)
+        adapter_client.set_scope(
+            management.adapter_device_id,
+            management.managed_attributes,
+            auto_apply=management.auto_apply,
+            sync_before_apply=management.sync_before_apply,
+            primary_ip=primary_ip,
+            oob_ip=oob_ip,
+        )
+    return True
