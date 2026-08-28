@@ -75,13 +75,23 @@ def _copy_or_new(current, model, **values):
     return copy.copy(current), False
 
 
-def _changed_fields(instance, values):
+def _values_differ(_field_name, current, desired):
+    return current != desired
+
+
+def _changed_fields(instance, values, comparator=_values_differ):
     fields = []
     for name, value in values.items():
-        if getattr(instance, name) != value:
+        if comparator(name, getattr(instance, name), value):
             setattr(instance, name, value)
             fields.append(name)
     return tuple(fields)
+
+
+def _srv6_locator_values_differ(field_name, current, desired):
+    if field_name == "prefix":
+        return str(current) != str(desired)
+    return current != desired
 
 
 def _settings_plan(parent, settings):
@@ -289,9 +299,9 @@ def _srv6_locator_plan(instance, entries):
     defaults = _isis_srv6_locator_omitted_defaults(instance.device)
     desired = []
     for name, data in incoming.items():
-        current = existing.get(name)
+        current_locator = existing.get(name)
         row, created = _copy_or_new(
-            current,
+            current_locator,
             ISISSRv6Locator,
             instance=instance,
             name=name,
@@ -305,14 +315,7 @@ def _srv6_locator_plan(instance, entries):
                     values[column] = _absent_value(row, column)
                 continue
             values[column] = value
-        changed = []
-        for column, value in values.items():
-            current = getattr(row, column)
-            differs = str(current) != str(value) if column == "prefix" else current != value
-            if differs:
-                setattr(row, column, value)
-                changed.append(column)
-        changed = tuple(changed)
+        changed = _changed_fields(row, values, comparator=_srv6_locator_values_differ)
         if created:
             operations.save(
                 row,
