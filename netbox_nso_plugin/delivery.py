@@ -327,5 +327,13 @@ def send(
 
 def deliver(key: str, device_id, adapter_device_id, *, mode: str = MODE_NORMAL, mark: bool = False):
     """Render *key* for one device and send it straight away, outside the claim protocol."""
+    from .renderer_audit import audit_renderer_scopes
+
+    audit_renderer_scopes(
+        device_id,
+        (key,),
+        trigger="delivery.deliver",
+        pre_capture=True,
+    )
     rendered = render(key, device_id, adapter_device_id)
     return send(rendered, rendered.payload, mode=mode, mark=mark)
