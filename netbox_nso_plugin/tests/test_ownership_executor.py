@@ -182,6 +182,112 @@ class TestSymmetricOwnershipExecutor(TestCase):
         self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=self.device.pk, scope="interface_mtu").exists())
         self.assertIn(("interface_mtu", state.pk), completed)
 
+    def test_a_retract_takes_the_object_out_of_the_scope_render(self):
+        """Every scope whose overlay can outlive its native anchor must stop rendering it.
+
+        The ``existing_overlay`` scopes are not fixtured here: their overlay either IS the
+        native row (l2_sap/logging/snmp) or cascades with it (bfd), so a retract leaves
+        nothing to render. ``route_policy`` is the one exception and is reported separately.
+        """
+        from dcim.models import Interface
+        from ipam.models import VLAN, VLANGroup
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import (
+            NSOInterfaceMtuState,
+            NSOOwnershipManifest,
+            NSOSubinterfaceState,
+            NSOSwitchportState,
+        )
+        from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
+
+        def build_interface_mtu(device, management):
+            interface = Interface.objects.create(device=device, name="Ethernet20", type="1000base-t", mtu=9216)
+            NSOInterfaceMtuState.objects.create(
+                management=management,
+                interface=interface,
+                l2_mtu=9216,
+                status="accepted",
+            )
+            return lambda: Interface.objects.filter(pk=interface.pk).update(mtu=None)
+
+        def build_subinterface(device, management):
+            parent = Interface.objects.create(device=device, name="Ethernet21", type="1000base-t")
+            interface = Interface.objects.create(
+                device=device,
+                name="Ethernet21.40",
+                type="virtual",
+                parent=parent,
+            )
+            NSOSubinterfaceState.objects.create(
+                management=management,
+                interface=interface,
+                parent_interface=parent,
+                dot1q_vlan=40,
+                status="accepted",
+            )
+            return lambda: Interface.objects.filter(pk=interface.pk).update(parent=None)
+
+        def build_switchport(device, management):
+            group = VLANGroup.objects.create(name=f"Ownership retract {device.pk}", slug=f"nso-{device.pk}")
+            vlan = VLAN.objects.create(group=group, vid=1740, name="ownership-retract")
+            interface = Interface.objects.create(
+                device=device,
+                name="Ethernet22",
+                type="1000base-t",
+                mode="access",
+                untagged_vlan=vlan,
+            )
+            NSOSwitchportState.objects.create(
+                management=management,
+                interface=interface,
+                mode="access",
+                untagged_vlan=vlan,
+                status="accepted",
+            )
+            return lambda: Interface.objects.filter(pk=interface.pk).update(mode="", untagged_vlan=None)
+
+        def build_interface_attribute(device, management):
+            type(management).objects.filter(pk=management.pk).update(manage_description=True)
+            management.refresh_from_db()
+            Interface.objects.create(
+                device=device,
+                name="Ethernet23",
+                type="1000base-t",
+                description="managed uplink",
+            )
+            return lambda: type(management).objects.filter(pk=management.pk).update(manage_description=False)
+
+        def build_static_route(device, _management):
+            route = StaticRoute.objects.create(prefix="198.18.175.0/24", next_hop="198.18.0.175", metric=1)
+            route.devices.add(device)
+            return lambda: StaticRoute.objects.filter(pk=route.pk).update(next_hop=None)
+
+        scenarios = (
+            ("interface_mtu", build_interface_mtu),
+            ("subinterface", build_subinterface),
+            ("switchport", build_switchport),
+            ("interface", build_interface_attribute),
+            ("static_route", build_static_route),
+        )
+        for index, (scope, build) in enumerate(scenarios):
+            with self.subTest(scope=scope):
+                device, management = make_managed(f"ownret{index}", 16290 + index, index=index)
+                disqualify = build(device, management)
+
+                reconcile_scope_ownership(device.pk, [scope])
+
+                manifest = NSOOwnershipManifest.objects.get(device_id=device.pk, scope=scope)
+                self.assertNotEqual(delivery.render(scope, device.pk, management.adapter_device_id).payload, [])
+
+                disqualify()
+                reconcile_scope_ownership(device.pk, [scope])
+
+                manifest.refresh_from_db()
+                self.assertEqual(manifest.ownership_state, "retired")
+                self.assertEqual(delivery.render(scope, device.pk, management.adapter_device_id).payload, [])
+
     def test_owned_overlay_with_a_qualifying_anchor_is_never_demoted(self):
         from dcim.models import Interface
         from ipam.models import VLAN, VLANGroup
