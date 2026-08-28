@@ -392,6 +392,7 @@ class TestTheCommitTailIsConstant(_SwapCase):
 
         with (
             patch("django.db.transaction.on_commit", wraps=transaction.on_commit) as registered,
+            patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes"),
             patch("netbox_nso_plugin.delivery.render", wraps=delivery.render) as render,
             config,
             session,

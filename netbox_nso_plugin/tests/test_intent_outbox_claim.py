@@ -77,7 +77,10 @@ class TestClaimFoldsEveryEntryOnce(_ClaimCase):
 
         assert len(entries(self.device, "vlan", unconsumed=True)) == 3
 
-        with patch("netbox_nso_plugin.delivery.render", wraps=delivery.render) as render:
+        with (
+            patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes"),
+            patch("netbox_nso_plugin.delivery.render", wraps=delivery.render) as render,
+        ):
             outcome = self.drain()
 
         assert outcome == drain.SUCCEEDED
