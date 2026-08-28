@@ -148,7 +148,10 @@ _CONVERTED_SCOPE_RULES = {
         deletion_authority=True,
         intentional_semantic_delta=(
             "Acquire from a persisted BGP peer and linked overlay. Native and overlay save events are not ownership "
-            "evidence. Routers, scopes, address families, peer templates, ASNs, and peer IPs are graph dependencies."
+            "evidence. Foreign native peer deletes no longer delete linked overlays and push a reduced snapshot "
+            "synchronously. Greenfield acceptance uses exact acquisition planning and outbox delivery instead of "
+            "accepting and pushing directly. Routers, scopes, address families, peer templates, ASNs, and peer IPs "
+            "are graph dependencies."
         ),
     ),
     "interface": ScopeOwnershipRule(
@@ -295,7 +298,10 @@ _CONVERTED_SCOPE_RULES = {
         deletion_authority=True,
         intentional_semantic_delta=(
             "Acquire from a persisted named policy root and its linked device overlay. Native root, entry, M2M, "
-            "and through-row events are not ownership evidence. Entries and references are graph dependencies."
+            "and through-row events are not ownership evidence. Native policy deletes no longer delete per-device "
+            "overlays and push reduced snapshots synchronously. Acceptance and contributor cascades use exact "
+            "acquisition planning and outbox delivery instead of owning and pushing directly. Entries and references "
+            "are graph dependencies."
         ),
     ),
     "isis": ScopeOwnershipRule(
