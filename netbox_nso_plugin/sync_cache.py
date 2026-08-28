@@ -254,9 +254,9 @@ def _broken_links(mapped, by_id, by_identity) -> list[tuple]:
     for mgmt in mapped:
         # A row mid-provision has no adapter device yet by design and its push is gated.
         # A row mid-rekey is NOT broken either: NetBox already carries the new NSO name while
-        # the adapter still carries the old one, so it reads as "reused". Dropping its pointer
-        # here would strand it for good — _snapshot only considers rows that HAVE an id, and
-        # re-onboarding the new identity collides with the old row still holding this
+        # the adapter still carries the old one, so it classifies as identity_changed. Dropping
+        # its pointer here would strand it for good — _snapshot only considers rows that HAVE
+        # an id, and re-onboarding the new identity collides with the old row still holding this
         # netbox_device_id. _sync_source_change owns that transition, dead mapping included.
         if mgmt.onboard_status or mgmt.source_rekey_pending:
             continue
@@ -267,20 +267,26 @@ def _broken_links(mapped, by_id, by_identity) -> list[tuple]:
 
 
 def invalidate_delivery_baselines(device_id: int) -> None:
-    """Create audit work for every scope after adapter identity recovery."""
+    """Create audit work for every scope after adapter identity recovery.
+
+    The blanking UPDATE takes the same L7 revision rows either way; taking them through
+    ``lock_intent_revisions`` first is what puts them in canonical scope order, the order every
+    other writer of these rows uses (``renderer_audit._leave_unknown``, ``_acquire``).
+    """
+    from django.db import transaction
+
     from . import delivery
+    from .apply_state import lock_intent_revisions
     from .models import NSOIntentRevision
 
     scopes = tuple(delivery.delivery_keys())
-    NSOIntentRevision.objects.bulk_create(
-        [NSOIntentRevision(device_id=device_id, scope=scope) for scope in scopes],
-        ignore_conflicts=True,
-    )
-    NSOIntentRevision.objects.filter(device_id=device_id, scope__in=scopes).update(
-        verified_revision=None,
-        verified_fingerprint=None,
-        verified_at=None,
-    )
+    with transaction.atomic():
+        lock_intent_revisions(device_id, scopes)
+        NSOIntentRevision.objects.filter(device_id=device_id, scope__in=scopes).update(
+            verified_revision=None,
+            verified_fingerprint=None,
+            verified_at=None,
+        )
 
 
 def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
@@ -295,10 +301,12 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
     Repairs, all of which re-save the row so the real link path (onboard → scope → sync-notify)
     runs and records its own outcome on the row:
 
-    * *moved* — our device is present under a different id → adopt that id, no onboard needed.
-    * *reused* — our id belongs to someone else → drop the pointer FIRST, so the re-save can
-      never push this device's scope onto the other one, then re-link by identity.
-    * *missing* — our device is absent → re-save; the not-found scope push re-onboards it.
+    * *remapped* — our device is present under another id → adopt that id, no onboard needed.
+    * *identity_changed* — our id resolves to a different owner. The NetBox device still ours →
+      arm the source-rekey fence; someone else's → drop the pointer FIRST, so the re-save can
+      never push this device's scope onto theirs. Several adapter rows claiming our identity is
+      ambiguous: flag it for the operator and write nothing.
+    * *unmapped* / *deleted* — no live mapping → re-save; the not-found scope push re-onboards it.
 
     Returns ``(broken, attempted)``. Attempts are capped at :data:`MAX_RELINKS_PER_RUN`; rows
     over the cap keep an ``adapter_link_error`` so nothing is silently deferred, and the
@@ -348,10 +356,10 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
                 attempted += 1
                 if state is _REMAPPED:
                     logger.warning(
-                        "Adapter device for %s moved from id %s to %s — adopting",
+                        "Adapter device for %s now resolves to id %s (previous mapping: %s) — adopting",
                         current.nso_device_name,
-                        current.adapter_device_id,
                         adapter_device["id"],
+                        "none" if current.adapter_device_id is None else current.adapter_device_id,
                     )
                     if not _mirror_management(current, adapter_device_id=adapter_device["id"]):
                         continue
