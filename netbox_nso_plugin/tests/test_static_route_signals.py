@@ -143,17 +143,13 @@ class TestPushStaticRouteIntentForDevice(IntentPushResetMixin, TestCase):
 
     def test_excludes_non_accepted_routes(self):
         """Routes with status=imported are excluded from the intent push."""
-        from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.delivery import render
 
         mgmt = self._make_mgmt()
         self._make_state(mgmt, prefix="172.16.0.0/12", next_hop="10.0.0.1", status="imported")
 
-        with patch(PUT) as mock_push:
-            deliver("static_route", self.device.pk, mgmt.adapter_device_id)
-
-            mock_push.assert_called_once()
-            routes = mock_push.call_args[0][1]
-            assert routes == []
+        routes = render("static_route", self.device.pk, mgmt.adapter_device_id).payload
+        assert routes == []
 
     def test_excludes_interface_only_next_hop(self):
         """Routes with no IP next-hop (interface-only) are skipped."""

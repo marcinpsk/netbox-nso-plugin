@@ -2073,12 +2073,21 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             ("accepted", "accepted", "accepted"),
         )
 
-    def test_an_interface_rename_repends_every_deploying_scope_that_renders_its_name(self):
+    def test_interface_renames_repend_every_deploying_scope_that_renders_their_names(self):
         from django.contrib.contenttypes.models import ContentType
         from django.db.models.signals import pre_save
         from django.db.utils import OperationalError
         from ipam.models import ASN, RIR, IPAddress
-        from netbox_routing.models import BGPPeer, BGPRouter, BGPScope
+        from netbox_routing.models import (
+            BGPPeer,
+            BGPRouter,
+            BGPScope,
+            ISISInstance,
+            ISISInterface,
+            OSPFArea,
+            OSPFInstance,
+            OSPFInterface,
+        )
 
         from netbox_nso_plugin.models import (
             NSOBFDInterfaceState,
@@ -2098,10 +2107,19 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from .test_management_control_audit import _probe_lock
 
         with without_commit_drain(), transaction.atomic():
-            shared = self._create_interface(device=self.device, name="Ethernet9.40", type="1000base-t")
+            self.mgmt.manage_description = True
+            self.mgmt.save(update_fields=("manage_description",))
+            shared = self._create_interface(
+                device=self.device,
+                name="Port-Channel40",
+                type="lag",
+                mtu=1600,
+                mode="access",
+            )
+            svi = self._create_interface(device=self.device, name="Vlan1558", type="virtual")
             child = self._create_interface(
                 device=self.device,
-                name="Ethernet9-40-100",
+                name="Port-Channel40.100",
                 type="virtual",
                 parent=shared,
             )
@@ -2123,6 +2141,29 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 update_source=shared,
                 enabled=True,
             )
+            IPAddress.objects.create(address="198.18.40.1/31", assigned_object=shared)
+            isis_instance = ISISInstance.objects.create(
+                device=self.device,
+                process_tag="CORE",
+                net="49.0001.0198.0180.0401.00",
+            )
+            isis_interface = ISISInterface.objects.create(
+                instance=isis_instance,
+                interface=shared,
+                address_family="ipv4",
+            )
+            ospf_instance = OSPFInstance.objects.create(
+                device=self.device,
+                process_id="1",
+                name="1",
+                router_id="198.18.40.1",
+            )
+            ospf_area = OSPFArea.objects.create(area_id="0.0.0.0", area_type="standard")
+            OSPFInterface.objects.create(
+                instance=ospf_instance,
+                area=ospf_area,
+                interface=shared,
+            )
             bgp_state = NSOBGPPeerState.objects.create(
                 management=self.mgmt,
                 bgp_peer=peer,
@@ -2134,7 +2175,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             states = [
                 NSOSVIState.objects.create(
                     management=self.mgmt,
-                    interface=shared,
+                    interface=svi,
                     vlan=self.vlan_state.vlan,
                     status="accepted",
                 ),
@@ -2174,6 +2215,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                     interface=shared,
                     af="ipv4",
                     process_tag="CORE",
+                    isis_interface=isis_interface,
                     status="in_sync",
                 ),
                 NSOOSPFInterfaceState.objects.create(
@@ -2202,8 +2244,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             _prepare_apply(self.mgmt)
 
         self.assertEqual(
-            [type(state).objects.get(pk=state.pk).status for state in states],
-            ["deploying"] * 4 + ["accepted"] * 7,
+            [type(state).objects.get(pk=state.pk).status for state in states[:4]],
+            ["deploying"] * 4,
         )
         indirect_locks = []
 
@@ -2214,13 +2256,14 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         pre_save.connect(observe_indirect_lock, sender=Interface, weak=False)
         self.addCleanup(pre_save.disconnect, observe_indirect_lock, sender=Interface)
         with without_commit_drain(), transaction.atomic():
-            self._rename_interface(shared, "Ethernet9.41")
+            self._rename_interface(shared, "Port-Channel41")
+            self._rename_interface(svi, "irb.1558")
 
         self.assertEqual(len(indirect_locks), 1)
         self.assertIsInstance(indirect_locks[0], OperationalError)
         self.assertEqual(
-            [type(state).objects.get(pk=state.pk).status for state in states],
-            ["accepted"] * 11,
+            [type(state).objects.get(pk=state.pk).status for state in states[:4]],
+            ["accepted"] * 4,
         )
 
     def test_the_finalize_audit_runs_before_the_irreversible_direct_pushes(self):

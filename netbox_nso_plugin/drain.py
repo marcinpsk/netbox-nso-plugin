@@ -1193,7 +1193,7 @@ def _stamp_last_acked(claim: Claim) -> None:
     """
     if claim.scope != "static_route" or claim.mode == delivery.MODE_BACKFILL_ONLY:
         return
-    from .models import NSOStaticRouteState
+    from .models import NSOOwnershipManifest, NSOStaticRouteState
 
     triples_by_route = {}
     for route in claim.payload or []:
@@ -1215,6 +1215,18 @@ def _stamp_last_acked(claim: Claim) -> None:
         row.last_acked_triple = triples_by_route[row.static_route_id]
     if rows:
         NSOStaticRouteState.objects.bulk_update(rows, ["last_acked_triple"])
+    manifests = list(
+        NSOOwnershipManifest.objects.filter(
+            device_id=claim.device_id,
+            scope="static_route",
+            native_id__in=triples_by_route,
+            ownership_state="owned",
+        )
+    )
+    for manifest in manifests:
+        manifest.acknowledged_lineage = [triples_by_route[manifest.native_id]]
+    if manifests:
+        NSOOwnershipManifest.objects.bulk_update(manifests, ["acknowledged_lineage"])
 
 
 def record_failure(claim: Claim, exc: Exception) -> str:
