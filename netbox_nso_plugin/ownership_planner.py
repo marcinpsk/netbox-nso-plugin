@@ -1277,31 +1277,70 @@ def _ospf_bindings(management):
     return (*instances, *interfaces)
 
 
-def _redistribution_destination_identity(redistribution):
-    destination = redistribution.destination
+def _destination_reference(destination):
+    """Return ``(scope, reference)`` for one redistribution destination root."""
     label = destination._meta.label_lower
     if label == "netbox_routing.ospfinstance":
-        return "ospf", str(destination.process_id), destination.device_id
+        return "ospf", str(destination.process_id)
     if label == "netbox_routing.isisinstance":
-        return "isis", destination.process_tag or "", destination.device_id
+        return "isis", destination.process_tag or ""
     if label == "netbox_routing.bgpaddressfamily":
         router = destination.scope.router
         vrf = destination.scope.vrf.name if destination.scope.vrf_id else ""
-        return "bgp", f"{router.asn.asn}/{vrf}/{destination.address_family}", router.assigned_object_id
+        return "bgp", f"{router.asn.asn}/{vrf}/{destination.address_family}"
     return None
 
 
+def _redistribution_destination_identity(redistribution):
+    destination = redistribution.destination
+    reference = _destination_reference(destination)
+    if reference is None:
+        return None
+    if destination._meta.label_lower == "netbox_routing.bgpaddressfamily":
+        return (*reference, destination.scope.router.assigned_object_id)
+    return (*reference, destination.device_id)
+
+
+def _redistribution_destinations(management, requested):
+    """Map this device's redistribution destination roots to their scope and reference."""
+    from dcim.models import Device
+    from django.contrib.contenttypes.models import ContentType
+    from netbox_routing.models import BGPAddressFamily, ISISInstance, OSPFInstance
+
+    destinations = {}
+    for scope, model, roots in (
+        ("ospf", OSPFInstance, OSPFInstance.objects.filter(device_id=management.device_id)),
+        ("isis", ISISInstance, ISISInstance.objects.filter(device_id=management.device_id)),
+        (
+            "bgp",
+            BGPAddressFamily,
+            BGPAddressFamily.objects.filter(
+                scope__router__assigned_object_type=ContentType.objects.get_for_model(Device),
+                scope__router__assigned_object_id=management.device_id,
+            ).select_related("scope__router__asn", "scope__vrf"),
+        ),
+    ):
+        if scope not in requested:
+            continue
+        content_type_id = ContentType.objects.get_for_model(model).pk
+        for root in roots:
+            destinations[(content_type_id, root.pk)] = _destination_reference(root)
+    return destinations
+
+
 def _redistribution_bindings(management, requested):
+    from django.db.models import Q
     from netbox_routing.models import Redistribution
 
+    destinations = _redistribution_destinations(management, requested)
+    if not destinations:
+        return ()
+    predicate = Q()
+    for content_type_id, object_id in destinations:
+        predicate |= Q(destination_type_id=content_type_id, destination_id=object_id)
     bindings = []
-    for row in Redistribution.objects.select_related("destination_type", "route_map").order_by("pk"):
-        identity = _redistribution_destination_identity(row)
-        if identity is None:
-            continue
-        scope, destination_ref, device_id = identity
-        if device_id != management.device_id or scope not in requested:
-            continue
+    for row in Redistribution.objects.filter(predicate).select_related("route_map").order_by("pk"):
+        scope, destination_ref = destinations[(row.destination_type_id, row.destination_id)]
         state_key = {
             "dest_protocol": scope,
             "dest_ref": destination_ref,

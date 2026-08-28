@@ -164,6 +164,43 @@ class TestSymmetricOwnershipExecutor(TestCase):
         self.assertFalse(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="bfd").exists())
         self.assertIn(("bfd", manifest.pk), completed)
 
+    def test_scope_reconciliation_stays_device_scoped_as_the_fleet_grows(self):
+        from django.contrib.contenttypes.models import ContentType
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from netbox_routing.models import ISISInstance, Redistribution
+
+        from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
+
+        ISISInstance.objects.create(device=self.device, process_tag="CORE", net="49.0001.0198.0180.1741.00")
+        foreign_device, _foreign_management = make_managed("ownership-fleet", 16273, index=2)
+        foreign_instance = ISISInstance.objects.create(
+            device=foreign_device,
+            process_tag="CORE",
+            net="49.0001.0198.0180.1742.00",
+        )
+        isis_type = ContentType.objects.get_for_model(ISISInstance)
+        # One steady-state pass first: the measured passes must differ only by the fleet rows.
+        reconcile_scope_ownership(self.device.pk, ["isis"])
+
+        with CaptureQueriesContext(connection) as before:
+            reconcile_scope_ownership(self.device.pk, ["isis"])
+        for index in range(5):
+            Redistribution.objects.create(
+                destination_type=isis_type,
+                destination_id=foreign_instance.pk,
+                source_protocol="static",
+                source_ref=f"fleet-{index}",
+            )
+        with CaptureQueriesContext(connection) as after:
+            reconcile_scope_ownership(self.device.pk, ["isis"])
+
+        for query in after.captured_queries:
+            sql = query["sql"]
+            if "netbox_routing_redistribution" in sql and sql.lstrip().upper().startswith("SELECT"):
+                self.assertIn(" WHERE ", sql, "the redistribution read has no device predicate")
+        self.assertEqual(len(after.captured_queries), len(before.captured_queries))
+
     def test_cleared_ownership_detaches_without_deletion_authority(self):
         from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOOwnershipManifest, NSOVLANState
         from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
