@@ -249,9 +249,13 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
             assert rule.overlay_model_labels
             assert rule.deletion_authority
             assert rule.intentional_semantic_delta
-            assert rule.foreign_overlay_delete == "reown"
+            assert rule.foreign_overlay_delete in {"reown", "retire"}
             assert rule.acquisition_strategy in {"native", "existing_overlay"}
 
+        assert {scope for scope, rule in rules.items() if rule.foreign_overlay_delete == "retire"} == {
+            "bfd",
+            "route_policy",
+        }
         assert {scope for scope, rule in rules.items() if rule.acquisition_strategy == "existing_overlay"} == {
             "bfd",
             "l2_sap",
@@ -275,6 +279,18 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
         assert "missing graph dependencies fail fast" in rules["bgp"].intentional_semantic_delta
         assert "foreign-key merge identities use natural graph identities" in rules["bgp"].intentional_semantic_delta
         assert "Legacy PK-shaped peer and template merge bases are reset" in rules["bgp"].intentional_semantic_delta
+
+    def test_reown_is_declared_only_where_the_native_row_carries_the_content(self):
+        """A re-owned overlay is rebuilt from its native anchor, so one must be able to."""
+        from netbox_nso_plugin.ownership_planner import _STATE_SEEDERS, converted_scope_rules
+
+        for scope, rule in converted_scope_rules().items():
+            if rule.foreign_overlay_delete != "reown":
+                continue
+            for model_label, native_field in rule.overlay_native_fields:
+                assert native_field == "__self__" or model_label in _STATE_SEEDERS, (
+                    f"{scope} re-owns {model_label} with no state seeder"
+                )
 
     def test_static_route_rule_names_only_acknowledged_lineage(self):
         from netbox_nso_plugin.ownership_planner import converted_scope_rules

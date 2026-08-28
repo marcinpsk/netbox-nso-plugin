@@ -154,10 +154,12 @@ _CONVERTED_SCOPE_RULES = {
         native_key_fields=("device_id", "name"),
         overlay_model_labels=("netbox_nso_plugin.nsobfdinterfacestate",),
         overlay_native_fields=(("netbox_nso_plugin.nsobfdinterfacestate", "interface"),),
-        foreign_overlay_delete="reown",
+        foreign_overlay_delete="retire",
         deletion_authority=True,
         intentional_semantic_delta=(
-            "Acquire from persisted per-interface BFD state. Save events are not ownership evidence."
+            "Acquire from persisted per-interface BFD state. Save events are not ownership evidence. "
+            "The BFD timers live only on the overlay, so a foreign overlay delete retires the identity "
+            "instead of re-owning it from a native row that carries no BFD content."
         ),
     ),
     "bgp": ScopeOwnershipRule(
@@ -328,14 +330,15 @@ _CONVERTED_SCOPE_RULES = {
         native_key_fields=("name",),
         overlay_model_labels=("netbox_nso_plugin.nsoroutepolicystate",),
         overlay_native_fields=(("netbox_nso_plugin.nsoroutepolicystate", "assigned_object"),),
-        foreign_overlay_delete="reown",
+        foreign_overlay_delete="retire",
         deletion_authority=True,
         intentional_semantic_delta=(
             "Acquire from a persisted named policy root and its linked device overlay. Native root, entry, M2M, "
             "and through-row events are not ownership evidence. Native policy deletes no longer delete per-device "
             "overlays and push reduced snapshots synchronously. Acceptance and contributor cascades use exact "
             "acquisition planning and outbox delivery instead of owning and pushing directly. Entries and references "
-            "are graph dependencies."
+            "are graph dependencies. The per-device content hash lives only on the overlay, so a foreign overlay "
+            "delete retires the identity instead of re-owning it from the shared policy root."
         ),
     ),
     "isis": ScopeOwnershipRule(
@@ -1463,6 +1466,18 @@ def _detach_manifest(manifest) -> bool:
     )
 
 
+def _retire_manifest(manifest) -> bool:
+    """Close a durable identity whose only content vanished with its overlay."""
+    from .models import NSOOwnershipManifest
+
+    return bool(
+        NSOOwnershipManifest.objects.filter(
+            pk=manifest.pk,
+            ownership_state="owned",
+        ).update(ownership_state="retired")
+    )
+
+
 def _manifest_lifecycle_actions(device_id, requested):
     from .models import NSODeviceManagement, NSOOwnershipManifest
     from .status_machine import is_owned
@@ -1545,6 +1560,9 @@ def _execute_manifest_lifecycle(device_id, requested):
                 completed.append((manifest.scope, manifest.pk))
         elif action is OwnershipAction.DETACH:
             if _detach_manifest(manifest):
+                completed.append((manifest.scope, manifest.pk))
+        elif action is OwnershipAction.RETIRE:
+            if _retire_manifest(manifest):
                 completed.append((manifest.scope, manifest.pk))
     return completed
 
