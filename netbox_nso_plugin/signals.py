@@ -1136,22 +1136,15 @@ def _recompute_one(interface, templates):
     candidate = copy.copy(interface)
     candidate.description = new_value
 
-    from .renderer_writer import (
-        RendererMutationPlan,
-        active_renderer_writer,
-        planned_save,
-        renderer_mirror_writes,
-        renderer_writes,
-    )
+    from .intent_state import IntentMutationProtocolError
+    from .renderer_writer import active_renderer_writer
 
     active = active_renderer_writer()
-    if active is not None:
-        active.save(candidate, update_fields=("description",))
-        return
-    plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("description",)),))
-    mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-    with mutation as writer:
-        writer.save(candidate, update_fields=("description",))
+    # RF-1: every call site gates on _converted_writer_owns_content, so a writer is always
+    # active here. Opening one of its own from a signal is the thing that rule forbids.
+    if active is None:
+        raise IntentMutationProtocolError("a derived description recompute requires an active renderer writer")
+    active.save(candidate, update_fields=("description",))
 
 
 def _recompute_on_cable_change(sender, instance, **kwargs):
