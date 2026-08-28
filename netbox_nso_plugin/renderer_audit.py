@@ -130,27 +130,6 @@ def _repair_plan(device_id: int, scope: str) -> RendererMutationPlan:
     return RendererMutationPlan.build(saves=saves)
 
 
-def _post_repair_fingerprint(scope, payload, plan) -> str:
-    """Fingerprint the one under-lock render after deterministic repair-only fields."""
-    if scope != "static_route":
-        return delivery.canonical_fingerprint(payload)
-    from .models import NSOStaticRouteState
-
-    generations = {
-        NSOStaticRouteState.objects.filter(pk=write.pk).values_list("static_route_id", flat=True).get(): dict(
-            write.values
-        )["intent_generation"]
-        for write in plan.write_set
-        if write.model_label == NSOStaticRouteState._meta.label_lower
-    }
-    repaired_payload = copy.deepcopy(payload)
-    for route in repaired_payload:
-        route_id = route.get("route_id") if isinstance(route, dict) else None
-        if route_id in generations:
-            route["generation"] = generations[route_id]
-    return delivery.canonical_fingerprint(repaired_payload)
-
-
 def _trusted(revision) -> bool:
     return bool(
         revision is not None and revision.verified_revision == revision.revision and revision.verified_fingerprint
@@ -212,12 +191,10 @@ def _repair_candidates(device_id, candidates, management):
         locked_revisions = {
             row.scope: row for row in NSOIntentRevision.objects.filter(device_id=device_id, scope__in=candidates)
         }
-        locked_payloads = {}
         repaired = []
         for scope in candidates:
             rendered = delivery.render(scope, device_id, management.adapter_device_id)
             fingerprint = delivery.canonical_fingerprint(rendered.payload)
-            locked_payloads[scope] = rendered.payload
             revision = locked_revisions.get(scope)
             if not _trusted(revision) or revision.verified_fingerprint != fingerprint:
                 repaired.append(scope)
@@ -242,9 +219,13 @@ def _repair_candidates(device_id, candidates, management):
         verified_at = timezone.now()
         for scope in repaired:
             outbox.enqueue(device_id, scope, kind=outbox.CONTRIBUTION_KIND_REPAIR)
+            # The proof is the render that FOLLOWS this repair's own write, not the one that
+            # preceded it: a renderer emitting any field the repair moves would otherwise
+            # store a fingerprint no later render can match, and repair the scope forever.
+            rendered = delivery.render(scope, device_id, management.adapter_device_id)
             revision = NSOIntentRevision.objects.get(device_id=device_id, scope=scope)
             revision.verified_revision = revision.revision
-            revision.verified_fingerprint = _post_repair_fingerprint(scope, locked_payloads[scope], plans[scope])
+            revision.verified_fingerprint = delivery.canonical_fingerprint(rendered.payload)
             revision.verified_at = verified_at
             revision.save(
                 update_fields=[
