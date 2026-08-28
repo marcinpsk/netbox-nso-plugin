@@ -1333,15 +1333,17 @@ class TestVlanApplyPush(_CascadeFlushMixin, IntentPushResetMixin, TransactionTes
         mock_vlan.assert_called_once()
         self.assertEqual(mock_vlan.call_args[0][1], [{"vlan_id": 2213, "name": "LIVE_RENAMED"}])
 
-    def test_vlan_rename_requires_the_outbox_transaction(self):
+    def test_foreign_vlan_rename_commits_without_plugin_bookkeeping(self):
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry
+
         vlan = self.state.vlan
         vlan.name = "UNTRANSACTIONAL"
 
-        with self.assertRaisesRegex(RuntimeError, "intent_transaction requires transaction.atomic"):
-            vlan.save(update_fields=["name"])
+        vlan.save(update_fields=["name"])
 
         vlan.refresh_from_db()
-        self.assertEqual(vlan.name, "OLD")
+        self.assertEqual(vlan.name, "UNTRANSACTIONAL")
+        self.assertFalse(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").exists())
 
     def test_unmanaged_vlan_rename_uses_the_shared_dependency_transaction(self):
         with transaction.atomic():

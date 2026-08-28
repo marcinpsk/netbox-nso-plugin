@@ -407,9 +407,11 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
         )[0]
 
     def _state(self, mgmt, prefix, next_hop, *, generation=0, next_hop_is_none=False):
+        from django.utils import timezone
         from netbox_routing.models import StaticRoute
 
-        from netbox_nso_plugin.models import NSOStaticRouteState
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOStaticRouteState
 
         sr = StaticRoute.objects.create(
             prefix=prefix,
@@ -418,7 +420,7 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
             interface_next_hop="GigabitEthernet0/0" if next_hop_is_none else "",
         )
         _assign_without_push(sr, self.device)
-        return NSOStaticRouteState.objects.create(
+        state = NSOStaticRouteState.objects.create(
             management=mgmt,
             static_route=sr,
             status="accepted",
@@ -426,6 +428,14 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
             nso_next_hop="" if next_hop_is_none else next_hop,
             intent_generation=generation,
         )
+        revision, _created = NSOIntentRevision.objects.get_or_create(device=self.device, scope="static_route")
+        revision.verified_revision = revision.revision
+        revision.verified_fingerprint = delivery.canonical_fingerprint(
+            delivery.render("static_route", self.device.pk, mgmt.adapter_device_id).payload
+        )
+        revision.verified_at = timezone.now()
+        revision.save(update_fields=["verified_revision", "verified_fingerprint", "verified_at", "updated_at"])
+        return state
 
     def test_push_names_the_netbox_pk_and_the_allocated_generation(self):
         """P1.1 — the pk is what opens the fence; the generation is what a result correlates on."""

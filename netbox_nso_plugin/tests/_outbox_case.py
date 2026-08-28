@@ -13,6 +13,7 @@ an already-accepted sequence returns the stored response and applies nothing, ex
 from __future__ import annotations
 
 import contextlib
+import copy
 import dataclasses
 import hashlib
 import json
@@ -72,27 +73,42 @@ def mirror_update(instance, **values):
 
 
 def content_update(instance, **values):
-    """Persist a fixture's rendered change through its exact content footprint."""
-    from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+    """Persist a fixture change through the production exact writer."""
+    from netbox_nso_plugin.renderer_writer import (
+        RendererMutationPlan,
+        planned_save,
+        renderer_mirror_writes,
+        renderer_writes,
+    )
 
     current = type(instance).objects.get(pk=instance.pk)
-    footprint = footprint_for_instance(current)
-    with without_commit_drain(), intent_transaction(footprint):
-        for field_name, value in values.items():
-            setattr(current, field_name, value)
-        current.save(update_fields=set(values))
+    candidate = copy.copy(current)
+    for field_name, value in values.items():
+        setattr(candidate, field_name, value)
+    fields = set(values)
+    plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=fields),))
+    mutation = renderer_writes if plan.changes_content else renderer_mirror_writes
+    with without_commit_drain(), mutation(plan) as writer:
+        writer.save(candidate, update_fields=fields)
     for field_name, value in values.items():
         setattr(instance, field_name, value)
-    return current
+    return candidate
 
 
 def content_bulk_update(instance, **values):
-    """Persist exact rendered fixture DML without firing model signals."""
-    from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+    """Persist set-based fixture DML through the production exact writer."""
+    from netbox_nso_plugin.renderer_writer import (
+        RendererMutationPlan,
+        planned_set_update,
+        renderer_mirror_writes,
+        renderer_writes,
+    )
 
-    current = type(instance).objects.get(pk=instance.pk)
-    with without_commit_drain(), intent_transaction(footprint_for_instance(current)):
-        type(current).objects.filter(pk=current.pk).update(**values)
+    model = type(instance)
+    plan = RendererMutationPlan.build(set_updates=(planned_set_update(model.objects.filter(pk=instance.pk), **values),))
+    mutation = renderer_writes if plan.changes_content else renderer_mirror_writes
+    with without_commit_drain(), mutation(plan) as writer:
+        writer.set_update(model, plan.write_set[0], **values)
     for field_name, value in values.items():
         setattr(instance, field_name, value)
     return type(instance).objects.get(pk=instance.pk)

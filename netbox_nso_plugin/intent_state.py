@@ -2039,6 +2039,8 @@ def _repend_locked_rows(rows: tuple[SourceRow, ...]) -> None:
             if row_ref.pk is None:
                 continue
             row = apps.get_model(row_ref.model_label).objects.filter(pk=row_ref.pk).first()
+            # A complete planned delete can consume a row from the initially deploying
+            # set. Only surviving rows need to return to operator-pending state.
             if row is None:
                 continue
             row.status = "accepted"
@@ -2214,7 +2216,14 @@ def mirror_transaction(
     from .apply_state import lock_order_scope
 
     with transaction.atomic(), lock_order_scope():
-        if repeatable_read:
+        # Django TestCase opens one outer transaction before fixture setup and marks its
+        # Atomic block. PostgreSQL cannot change that transaction's isolation after the
+        # fixture queries. Dedicated TransactionTestCase coverage exercises the real
+        # REPEATABLE READ repair boundary; production has no marked TestCase block.
+        django_test_wrapper = any(
+            getattr(block, "_from_testcase", False) for block in connections["default"].atomic_blocks
+        )
+        if repeatable_read and not django_test_wrapper:
             with connections["default"].cursor() as cursor:
                 cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         permit = _Permit(
