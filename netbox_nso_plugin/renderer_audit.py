@@ -327,6 +327,11 @@ def audit_renderer_scopes(
     if management is None:
         return RendererAuditResult(selected, (), deferred)
 
+    if trigger == "cadence":
+        from .management_lifecycle import reconcile_management_control
+
+        reconcile_management_control(device_id)
+
     from .ownership_planner import reconcile_scope_ownership
 
     reconcile_scope_ownership(device_id, selected)
