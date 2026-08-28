@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import bisect
 import copy
 import dataclasses
 import logging
@@ -12,10 +13,12 @@ import time
 from django.apps import apps
 from django.conf import settings
 from django.db import transaction
+from django.db.models import Q
 from django.db.utils import OperationalError
 from django.utils import timezone
 
 from . import delivery, outbox
+from .deployment import DeploymentQuiesced
 from .intent_state import (
     OVERLAY_MODEL_RANKS,
     MutationFootprint,
@@ -27,10 +30,14 @@ from .renderer_writer import RendererMutationPlan, consume_renderer_plan, planne
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_SCOPE_BATCH_CAP = 18
 _DEFAULT_TICK_BUDGET_SECONDS = 240.0
 _REPAIR_ATTEMPTS = 3
 _SERIALIZATION_FAILURE = "40001"
+
+# Where the two capped cadence walks resume. Both are process-local: no column holds them,
+# and a worker restart costs one tick of fairness rather than a permanently starved tail.
+_SCOPE_ROTATION: dict[int | None, int] = {}
+_FLEET_ROTATION = {"after_device_id": 0}
 
 
 class RendererAuditBudgetExceeded(RuntimeError):
@@ -94,6 +101,11 @@ def _repair_plan(device_id: int, scope: str) -> RendererMutationPlan:
         filters = _device_filter(model, device_id)
         if filters is None:
             continue
+        # A redistribution row carries its own delivery scope, so one spec covers bgp, isis
+        # and ospf (``intent_state._specialized_generic_keys`` resolves the key from
+        # ``dest_protocol``). Repairing one destination may not demote the other two.
+        if any(field.name == "dest_protocol" for field in model._meta.concrete_fields):
+            filters = {**filters, "dest_protocol": scope}
         for row in model.objects.filter(**filters, status__in=("deploying", "in_sync")).order_by("pk"):
             identity = (row._meta.label_lower, row.pk)
             if identity in seen:
@@ -114,18 +126,28 @@ def _repair_plan(device_id: int, scope: str) -> RendererMutationPlan:
             _arm_static_route_generation,
         )
 
-        rows = NSOStaticRouteState.objects.filter(
-            PUSHED_STATIC_ROUTE_FILTER,
-            management__device_id=device_id,
-        ).order_by("pk")
+        # Two questions, two candidate sets. Only a row with a next hop is rendered, so only
+        # that row needs a fresh generation. Apply promotes rows WITHOUT that condition
+        # (``apply_state.promote_current_intent``), so every deploying row has to be
+        # demotable or an interface-next-hop route stays deploying for good.
+        rows = (
+            NSOStaticRouteState.objects.filter(
+                PUSHED_STATIC_ROUTE_FILTER | Q(status__in=("deploying", "in_sync")),
+                management__device_id=device_id,
+            )
+            .select_related("static_route")
+            .order_by("pk")
+        )
         for row in rows:
             candidate = copy.copy(row)
-            fields = list(_STATIC_ROUTE_ARMED_FIELDS)
+            fields = []
             if candidate.status in {"deploying", "in_sync"}:
                 candidate.status = "accepted"
                 candidate.apply_attempt_id = None
                 fields.extend(("status", "apply_attempt_id"))
-            _arm_static_route_generation(candidate)
+            if row.static_route.next_hop is not None:
+                _arm_static_route_generation(candidate)
+                fields.extend(_STATIC_ROUTE_ARMED_FIELDS)
             saves.append(planned_save(candidate, update_fields=fields))
     return RendererMutationPlan.build(saves=saves)
 
@@ -140,20 +162,35 @@ def _budget_expired(deadline: float) -> bool:
     return time.monotonic() >= deadline
 
 
-def _bounded_scopes(scopes, *, pre_capture):
+def _default_scope_batch_cap() -> int:
+    """Admit the whole registry, which is the most any audit can legitimately request.
+
+    A pre-capture audit (operator Apply, drain, deliver, baseline cutover) requests every
+    delivery key, so a default below the registry size would fail those gates closed the
+    day a key is added.
+    """
+    return len(delivery.delivery_keys())
+
+
+def _bounded_scopes(scopes, *, pre_capture, device_id=None):
     registry = delivery.delivery_keys()
     requested = tuple(dict.fromkeys(str(scope) for scope in scopes))
     unknown = set(requested) - set(registry)
     if unknown:
         raise ValueError(f"unknown renderer scopes {sorted(unknown)!r}")
-    cap = _setting("renderer_audit_scope_batch_cap", _DEFAULT_SCOPE_BATCH_CAP, int)
+    cap = _setting("renderer_audit_scope_batch_cap", _default_scope_batch_cap(), int)
     if len(requested) <= cap:
         return requested, ()
     if pre_capture:
         raise RendererAuditBudgetExceeded(
             f"pre-capture audit requested {len(requested)} scopes, above the configured cap {cap}"
         )
-    return requested[:cap], requested[cap:]
+    # Rotate: a fixed window would audit the same head on every tick and never reach the
+    # tail. Consecutive windows tile the ring, so ceil(len / cap) ticks cover every scope.
+    offset = _SCOPE_ROTATION.get(device_id, 0) % len(requested)
+    ordered = requested[offset:] + requested[:offset]
+    _SCOPE_ROTATION[device_id] = (offset + cap) % len(requested)
+    return ordered[:cap], ordered[cap:]
 
 
 def _optimistic_candidates(device_id, selected, management, deadline, *, pre_capture):
@@ -239,19 +276,21 @@ def _repair_candidates(device_id, candidates, management):
 
 
 def _serialization_failure(exc) -> bool:
-    return getattr(exc.__cause__, "sqlstate", None) == _SERIALIZATION_FAILURE
+    """Answer whether the driver reported a serialization failure, under either spelling."""
+    cause = exc.__cause__
+    return any(getattr(cause, name, None) == _SERIALIZATION_FAILURE for name in ("sqlstate", "pgcode"))
 
 
 def _leave_unknown(device_id, scopes) -> None:
     """Invalidate stale proof after every bounded repair attempt serialized out."""
+    from .apply_state import lock_intent_revisions, lock_order_scope
     from .models import NSOIntentRevision
 
-    with transaction.atomic():
-        rows = list(
-            NSOIntentRevision.objects.select_for_update(of=("self",))
-            .filter(device_id=device_id, scope__in=scopes)
-            .order_by("scope")
-        )
+    with transaction.atomic(), lock_order_scope():
+        # Through the canonical L7 helper, so this acquisition is ordered with every other
+        # one rather than taking the same rows outside the declared hierarchy.
+        lock_intent_revisions(device_id, scopes)
+        rows = list(NSOIntentRevision.objects.filter(device_id=device_id, scope__in=scopes).order_by("scope"))
         for revision in rows:
             revision.verified_revision = None
             revision.verified_fingerprint = None
@@ -298,7 +337,7 @@ def audit_renderer_scopes(
     from .models import NSODeviceManagement
 
     device_id = int(device_id)
-    selected, deferred = _bounded_scopes(scopes, pre_capture=pre_capture)
+    selected, deferred = _bounded_scopes(scopes, pre_capture=pre_capture, device_id=device_id)
     if not selected:
         return RendererAuditResult((), (), deferred)
     if deadline is None:
@@ -319,6 +358,11 @@ def audit_renderer_scopes(
 
     from .ownership_planner import reconcile_scope_ownership
 
+    # The planner's pass is not inside the render budget, so it is not started without one.
+    if _budget_expired(deadline):
+        if pre_capture:
+            raise RendererAuditBudgetExceeded("pre-capture audit exhausted its time budget")
+        return RendererAuditResult((), (), (*selected, *deferred))
     reconcile_scope_ownership(device_id, selected)
 
     candidates, timed_out = _optimistic_candidates(
@@ -363,6 +407,14 @@ def audit_renderer_scopes(
     return RendererAuditResult(selected, tuple(repaired), deferred)
 
 
+def _fleet_rotation(device_ids):
+    """Resume after the device the previous tick last reached, so the tail is not starved."""
+    start = bisect.bisect_right(device_ids, _FLEET_ROTATION["after_device_id"])
+    if start >= len(device_ids):
+        start = 0
+    return device_ids[start:] + device_ids[:start]
+
+
 def audit_renderer_fleet() -> RendererFleetAuditResult:
     """Audit managed devices until the one shared cadence deadline expires."""
     from .models import NSODeviceManagement
@@ -375,11 +427,15 @@ def audit_renderer_fleet() -> RendererFleetAuditResult:
     deadline = time.monotonic() + budget
     scopes = tuple(delivery.delivery_keys())
     device_ids = tuple(NSODeviceManagement.objects.order_by("device_id").values_list("device_id", flat=True))
+    ordered = _fleet_rotation(device_ids)
     audited_devices = repaired = deferred = unknown = failed = 0
-    for index, device_id in enumerate(device_ids):
+    for index, device_id in enumerate(ordered):
         if _budget_expired(deadline):
-            deferred += (len(device_ids) - index) * len(scopes)
+            deferred += (len(ordered) - index) * len(scopes)
             break
+        # Stamped for being TRIED, not for succeeding, and before the attempt: a device that
+        # raises on every tick would otherwise hold the head and starve everything behind it.
+        _FLEET_ROTATION["after_device_id"] = device_id
         try:
             result = audit_renderer_scopes(
                 device_id,
@@ -387,6 +443,8 @@ def audit_renderer_fleet() -> RendererFleetAuditResult:
                 trigger="cadence",
                 deadline=deadline,
             )
+        except DeploymentQuiesced:
+            raise  # a fleet-wide pause is one paused pass, not N failed devices
         except Exception:  # noqa: BLE001 (the next cadence retries this device)
             failed += 1
             logger.exception("renderer cadence audit failed device=%s", device_id)

@@ -10,8 +10,35 @@ from django.db.utils import OperationalError
 from django.test import TransactionTestCase
 from django.test.utils import CaptureQueriesContext, override_settings
 
-from ._outbox_case import make_managed, mirror_update, own_route, own_vlan
+from ._outbox_case import in_thread, make_managed, mirror_update, own_route, own_vlan
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
+
+
+def own_redistribution(management, dest_protocol, source_protocol):
+    """One owned redistribution overlay, whose delivery scope is its ``dest_protocol``."""
+    from netbox_nso_plugin.models import NSORedistributionState
+    from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
+    state = NSORedistributionState(
+        management=management,
+        dest_protocol=dest_protocol,
+        dest_ref="65100::ipv4-unicast",
+        source_protocol=source_protocol,
+        source_ref="",
+        status="accepted",
+    )
+    plan = RendererMutationPlan.build(
+        saves=(
+            planned_save(
+                state,
+                force_insert=True,
+                natural_key=("management", "dest_protocol", "dest_ref", "source_protocol", "source_ref"),
+            ),
+        )
+    )
+    with renderer_writes(plan) as writer:
+        writer.save(state, force_insert=True)
+    return state
 
 
 class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
@@ -207,6 +234,77 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
         self.assertEqual(after.payload["statuses"], ["accepted"])
         self.assertEqual(revision.verified_fingerprint, delivery.canonical_fingerprint(after.payload))
 
+    def test_static_route_repair_demotes_a_deploying_row_the_push_filter_omits(self):
+        """Apply deploys every accepted row; the repair must be able to demote every one.
+
+        ``promote_current_intent`` moves accepted/apply_failed rows to ``deploying`` with no
+        next-hop condition, so a repair that only considers the rows the renderer pushes
+        strands an interface-next-hop row in ``deploying`` forever.
+        """
+        import time
+
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOStaticRouteState
+        from netbox_nso_plugin.renderer_audit import _repair_with_retries
+
+        route = own_route(self.management, "198.18.164.0/24", None, device=self.device)
+        state = NSOStaticRouteState.objects.get(management=self.management, static_route=route)
+        mirror_update(state, status="deploying", apply_attempt_id=uuid4())
+        NSOIntentRevision.objects.filter(device=self.device, scope="static_route").update(verified_revision=None)
+
+        # The repair itself, not the whole audit: `reconcile_scope_ownership` retracts this
+        # route's manifest before the repair can run (reported separately, not this pin).
+        repaired = _repair_with_retries(
+            self.device.pk,
+            ("static_route",),
+            self.management,
+            time.monotonic() + 120,
+        )
+
+        state.refresh_from_db()
+        self.assertEqual(repaired, ("static_route",))
+        self.assertEqual((state.status, state.apply_attempt_id), ("accepted", None))
+
+    def test_a_repair_demotes_only_the_redistribution_rows_of_the_repaired_scope(self):
+        """One spec covers bgp/isis/ospf; the row's ``dest_protocol`` is its scope."""
+        from netbox_nso_plugin.models import NSOIntentRevision
+        from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
+
+        bgp = own_redistribution(self.management, "bgp", "connected")
+        isis = own_redistribution(self.management, "isis", "connected")
+        mirror_update(bgp, status="deploying")
+        mirror_update(isis, status="deploying")
+        NSOIntentRevision.objects.filter(device=self.device, scope="bgp").update(verified_revision=None)
+
+        result = audit_renderer_scopes(
+            self.device.pk,
+            ["bgp"],
+            trigger="test",
+            pre_capture=True,
+        )
+
+        bgp.refresh_from_db()
+        isis.refresh_from_db()
+        self.assertEqual(result.repaired, ("bgp",))
+        self.assertEqual(bgp.status, "accepted")
+        self.assertEqual(isis.status, "deploying")
+
+    def test_leaving_a_key_unknown_takes_the_revision_lock_at_its_declared_level(self):
+        from netbox_nso_plugin import apply_state
+        from netbox_nso_plugin.renderer_audit import _leave_unknown
+
+        own_vlan(self.management, 1638, "renderer-audit-unknown-order")
+        real_enter_level = apply_state._enter_level
+        entered = []
+
+        def record(level, key):
+            entered.append((level, key))
+            return real_enter_level(level, key)
+
+        with patch("netbox_nso_plugin.apply_state._enter_level", side_effect=record):
+            _leave_unknown(self.device.pk, ("vlan",))
+
+        self.assertEqual(entered, [(7, (self.device.pk, "vlan"))])
+
     def test_matching_scope_uses_only_the_optimistic_read_committed_pass(self):
         from netbox_nso_plugin.models import NSOIntentOutboxEntry
         from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
@@ -315,26 +413,6 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
             }
         }
     )
-    def test_cadence_defers_scopes_above_the_batch_cap(self):
-        from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
-
-        result = audit_renderer_scopes(
-            self.device.pk,
-            ["vlan", "interface"],
-            trigger="cadence",
-        )
-
-        self.assertEqual(result.audited, ("vlan",))
-        self.assertEqual(result.deferred, ("interface",))
-
-    @override_settings(
-        PLUGINS_CONFIG={
-            "netbox_nso_plugin": {
-                "renderer_audit_scope_batch_cap": 1,
-                "renderer_audit_tick_budget_seconds": 240,
-            }
-        }
-    )
     def test_pre_capture_fails_before_a_partial_batch(self):
         from netbox_nso_plugin.renderer_audit import RendererAuditBudgetExceeded, audit_renderer_scopes
 
@@ -354,19 +432,58 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
     @override_settings(
         PLUGINS_CONFIG={
             "netbox_nso_plugin": {
+                "renderer_audit_scope_batch_cap": 1,
+                "renderer_audit_tick_budget_seconds": 240,
+            }
+        }
+    )
+    def test_cadence_rotates_over_the_scopes_the_previous_tick_deferred(self):
+        from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
+
+        first = audit_renderer_scopes(self.device.pk, ["vlan", "interface"], trigger="cadence")
+        second = audit_renderer_scopes(self.device.pk, ["vlan", "interface"], trigger="cadence")
+
+        self.assertEqual((first.audited, first.deferred), (("vlan",), ("interface",)))
+        self.assertEqual((second.audited, second.deferred), (("interface",), ("vlan",)))
+
+    @override_settings(PLUGINS_CONFIG={"netbox_nso_plugin": {}})
+    def test_the_default_batch_cap_admits_a_registry_that_grows_by_one_key(self):
+        """The default is derived from the registry, so a new delivery key cannot exceed it."""
+        import dataclasses
+
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.renderer_audit import _bounded_scopes
+
+        registry = delivery.delivery_keys()
+        grown = {**registry, "fake_scope": dataclasses.replace(registry["vlan"], key="fake_scope")}
+
+        with patch("netbox_nso_plugin.delivery.delivery_keys", return_value=grown):
+            selected, deferred = _bounded_scopes(tuple(grown), pre_capture=True)
+
+        self.assertEqual(selected, tuple(grown))
+        self.assertEqual(deferred, ())
+
+    @override_settings(
+        PLUGINS_CONFIG={
+            "netbox_nso_plugin": {
                 "renderer_audit_scope_batch_cap": 18,
                 "renderer_audit_tick_budget_seconds": 0.5,
             }
         }
     )
     def test_cadence_defers_a_candidate_when_the_repair_budget_expires(self):
+        import itertools
+
         from netbox_nso_plugin.models import NSOIntentRevision
         from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
 
         own_vlan(self.management, 1636, "renderer-audit-budget")
         NSOIntentRevision.objects.filter(device=self.device, scope="vlan").update(verified_revision=None)
+        # A real clock, 0.4s per reading against the configured 0.5s budget: the optimistic
+        # pass still fits, the repair that follows it does not.
+        clock = itertools.count(0.0, 0.4)
 
-        with patch("netbox_nso_plugin.renderer_audit._budget_expired", side_effect=(False, True)):
+        with patch("netbox_nso_plugin.renderer_audit.time.monotonic", side_effect=lambda: next(clock)):
             result = audit_renderer_scopes(
                 self.device.pk,
                 ["vlan"],
@@ -375,6 +492,61 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
 
         self.assertEqual(result.repaired, ())
         self.assertEqual(result.deferred, ("vlan",))
+
+    def test_a_real_concurrent_update_serializes_the_repair_out_and_retries_it(self):
+        """A genuine 40001, not a fabricated one: a foreign committed write races the locks.
+
+        The competing write lands between the repeatable-read snapshot and the row locks,
+        which is exactly where PostgreSQL answers ``SELECT ... FOR UPDATE`` with "could not
+        serialize access". Only the first attempt races, so the retry has to recover.
+        """
+        import time
+
+        from django.utils import timezone
+
+        from netbox_nso_plugin import apply_state
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOVLANState
+        from netbox_nso_plugin.renderer_audit import _repair_with_retries
+
+        state = own_vlan(self.management, 1639, "renderer-audit-serialization")
+        NSOIntentRevision.objects.filter(device=self.device, scope="vlan").update(verified_revision=None)
+        real_lock_shared = apply_state.lock_shared_dependencies
+        collisions = []
+
+        def collide(keys):
+            if not collisions:
+                collisions.append(True)
+                in_thread(lambda: NSOVLANState.objects.filter(pk=state.pk).update(last_sync_at=timezone.now()))
+            return real_lock_shared(keys)
+
+        with patch("netbox_nso_plugin.apply_state.lock_shared_dependencies", side_effect=collide):
+            repaired = _repair_with_retries(
+                self.device.pk,
+                ("vlan",),
+                self.management,
+                time.monotonic() + 120,
+            )
+
+        self.assertEqual(collisions, [True])
+        self.assertEqual(repaired, ("vlan",))
+
+    def test_a_serialization_failure_is_recognised_through_either_driver_attribute(self):
+        from netbox_nso_plugin.renderer_audit import _serialization_failure
+
+        class Psycopg2Failure(Exception):
+            pgcode = "40001"
+
+        class Psycopg3Failure(Exception):
+            sqlstate = "40001"
+
+        class OtherFailure(Exception):
+            sqlstate = "23505"
+
+        for cause, expected in ((Psycopg2Failure(), True), (Psycopg3Failure(), True), (OtherFailure(), False)):
+            with self.subTest(cause=type(cause).__name__):
+                failure = OperationalError("driver failure")
+                failure.__cause__ = cause
+                self.assertIs(_serialization_failure(failure), expected)
 
     def test_serialization_exhaustion_leaves_the_key_unknown(self):
         from netbox_nso_plugin.models import NSOIntentRevision
