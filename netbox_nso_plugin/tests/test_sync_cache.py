@@ -71,6 +71,22 @@ def _adapter_row(mgmt, **overrides):
     return row
 
 
+def _stamp_verified_baselines(mgmt):
+    """Give *mgmt* a verified delivery baseline on every scope, as a settled audit leaves it."""
+    from netbox_nso_plugin import delivery
+    from netbox_nso_plugin.models import NSOIntentRevision
+
+    for scope in delivery.delivery_keys():
+        NSOIntentRevision.objects.create(
+            device=mgmt.device,
+            scope=scope,
+            revision=4,
+            verified_revision=4,
+            verified_fingerprint=f"verified-{scope}",
+            verified_at=timezone.now(),
+        )
+
+
 def _scope_404_for(*dead_ids):
     """Return a ``set_scope`` stand-in that 404s the given ids and succeeds otherwise.
 
@@ -659,20 +675,11 @@ class TestReconcileDeviceLinks(_SyncCacheTestBase):
 
     def test_remap_invalidates_every_delivery_baseline(self):
         """A new mapping identity creates audit work instead of only changing the pointer."""
-        from netbox_nso_plugin import delivery
         from netbox_nso_plugin.models import NSOIntentRevision
         from netbox_nso_plugin.sync_cache import reconcile_device_links
 
         mgmt = self._mgmt("cache-remap-baseline", 196)
-        for scope in delivery.delivery_keys():
-            NSOIntentRevision.objects.create(
-                device=mgmt.device,
-                scope=scope,
-                revision=4,
-                verified_revision=4,
-                verified_fingerprint=f"verified-{scope}",
-                verified_at=timezone.now(),
-            )
+        _stamp_verified_baselines(mgmt)
         moved = _adapter_row(mgmt, id=809)
         with (
             patch("netbox_nso_plugin.adapter_client.list_devices", return_value=[moved]),
@@ -687,6 +694,44 @@ class TestReconcileDeviceLinks(_SyncCacheTestBase):
                 device=mgmt.device,
                 verified_revision__isnull=False,
             ).exists()
+        )
+
+    def test_ambiguous_identity_keeps_its_verified_baselines_across_sweeps(self):
+        """A mapping only an operator can repair must not blank 18 baselines every sweep.
+
+        Two adapter rows claim this device's logical identity, so the sweep can prove nothing
+        and writes nothing — it flags the row and moves on. Invalidating on the way in made
+        that no-op branch throw away every verified fingerprint on the device, every five
+        minutes, forcing a full 18-scope repair for as long as the ambiguity lasts.
+        """
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision
+        from netbox_nso_plugin.sync_cache import reconcile_device_links
+
+        mgmt = self._mgmt("cache-ambiguous", 196)
+        _stamp_verified_baselines(mgmt)
+        twins = [_adapter_row(mgmt, id=810), _adapter_row(mgmt, id=811)]
+
+        for _sweep in range(2):
+            with (
+                patch("netbox_nso_plugin.adapter_client.list_devices", return_value=twins),
+                patch("netbox_nso_plugin.adapter_client.onboard_device") as onboard,
+                patch("netbox_nso_plugin.adapter_client.set_scope", return_value={}) as set_scope,
+                patch("netbox_nso_plugin.adapter_client.sync_notify", return_value=None),
+                self.captureOnCommitCallbacks(execute=True),
+            ):
+                broken, attempted = reconcile_device_links(NSODeviceManagement.objects.all())
+
+            self.assertEqual((broken, attempted), (1, 1))
+            onboard.assert_not_called()
+            set_scope.assert_not_called()
+
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.adapter_device_id, 196)  # nothing was remapped
+        self.assertEqual(mgmt.adapter_link_error, "Adapter identity is ambiguous; repair requires operator action.")
+        self.assertEqual(
+            NSOIntentRevision.objects.filter(device=mgmt.device, verified_revision=4).count(),
+            len(delivery.delivery_keys()),
         )
 
     def test_identity_change_routes_through_the_fenced_rekey(self):

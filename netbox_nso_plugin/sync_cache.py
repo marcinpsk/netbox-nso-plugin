@@ -346,7 +346,6 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
                 if not _mirror_management(current, adapter_link_attempted_at=now):
                     continue
                 attempted += 1
-                invalidate_delivery_baselines(current.device_id)
                 if state is _REMAPPED:
                     logger.warning(
                         "Adapter device for %s moved from id %s to %s — adopting",
@@ -356,8 +355,11 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
                     )
                     if not _mirror_management(current, adapter_device_id=adapter_device["id"]):
                         continue
+                    invalidate_delivery_baselines(current.device_id)
                 elif state is _IDENTITY_CHANGED:
                     if adapter_device is None:
+                        # Nothing is provable and nothing is written, so nothing may be invalidated:
+                        # blanking here cost the device its whole verified baseline on every sweep.
                         _flag_link_error(current, "Adapter identity is ambiguous; repair requires operator action.")
                         continue
                     if adapter_device.get("netbox_device_id") == current.device_id:
@@ -372,7 +374,10 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
                             current.adapter_device_id,
                         )
                         _mirror_management(current, adapter_device_id=None)
+                    invalidate_delivery_baselines(current.device_id)
                 elif state is _UNMAPPED:
+                    # The pointer is already null and this branch does not change it. The repair
+                    # that cleared it already invalidated, and a new row never delivered.
                     logger.warning("Management row %s has no adapter mapping. Re-linking it.", current.pk)
                 elif state is _DELETED:
                     logger.warning(
@@ -380,6 +385,9 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
                         current.adapter_device_id,
                         current.nso_device_name,
                     )
+                    # The row that held every verified baseline is gone. The re-link creates a
+                    # fresh adapter device that holds none of it.
+                    invalidate_delivery_baselines(current.device_id)
                 save_management(current)
         except _LinkReconcileNoOp:
             continue
