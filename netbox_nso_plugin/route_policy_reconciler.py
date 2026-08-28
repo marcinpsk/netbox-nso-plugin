@@ -720,6 +720,12 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
         return None
 
     def plan_prefix_entries(self, root, entries):
+        values = {
+            entry.get("prefix").strip()
+            for entry in entries
+            if entry.get("prefix") and entry.get("prefix").strip() not in self.prefixes
+        }
+        self.prefixes.update({str(row.prefix): row for row in self.CustomPrefix.objects.filter(prefix__in=values)})
         content_type = self.ContentType.objects.get_for_model(self.CustomPrefix)
         sequence = 0
         for entry in entries:
@@ -754,6 +760,14 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
             )
 
     def plan_community_entries(self, root, entries):
+        values = {
+            entry.get("community").strip()
+            for entry in entries
+            if entry.get("community") and entry.get("community").strip() not in self.communities
+        }
+        self.communities.update(
+            {str(row.community): row for row in self.Community.objects.filter(community__in=values)}
+        )
         members = []
         for entry in entries:
             value = (entry.get("community") or "").strip()
@@ -836,6 +850,17 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
     def plan_set_communities(self, row, structured):
         unresolved = []
         literal_groups = {}
+        literal_values = {
+            action.name
+            for action in structured.set_communities
+            if _looks_like_community_literal(action.name) and action.name not in self.communities
+        }
+        self.communities.update(
+            {
+                str(community.community): community
+                for community in self.Community.objects.filter(community__in=literal_values)
+            }
+        )
         for action in structured.set_communities:
             community_list = self.name_maps["community_list"].get(action.name)
             if community_list is not None:
