@@ -48,6 +48,85 @@ class TestOwnershipManifestSchema(SimpleTestCase):
         assert fields["acknowledged_lineage"].get_default() == []
 
 
+_MANIFEST_TABLE = "netbox_nso_plugin_nsoownershipmanifest"
+
+
+class _PeerManifestInsert:
+    """Land a peer audit's identical manifest row right after this audit read the identity.
+
+    The identity read and the write are separate statements, so a second audit can land the
+    row in the window between them. Reproduce that against the real unique index.
+    """
+
+    def __init__(self, identity):
+        self.identity = identity
+        self.fired = False
+
+    def __call__(self, execute, sql, params, many, context):
+        result = execute(sql, params, many, context)
+        if not self.fired and sql.lstrip().upper().startswith("SELECT") and _MANIFEST_TABLE in sql:
+            self.fired = True
+            from netbox_nso_plugin.models import NSOOwnershipManifest
+
+            NSOOwnershipManifest.objects.create(
+                **self.identity,
+                native_id=0,
+                ownership_state="owned",
+                deletion_authority=False,
+            )
+        return result
+
+
+class TestOwnershipManifestConcurrency(TestCase):
+    def test_a_peer_insert_does_not_abort_the_recording_transaction(self):
+        from django.db import connection
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin.models import NSOOwnershipManifest, NSOVLANState
+        from netbox_nso_plugin.ownership_planner import maintain_manifest, manifest_binding
+
+        from ._outbox_case import make_managed
+
+        device, management = make_managed("ownership-conflict", 16274)
+        group = VLANGroup.objects.create(name="Ownership conflict", slug=f"nso-{device.pk}")
+        vlan = VLAN.objects.create(group=group, vid=1730, name="ownership-conflict")
+        state = NSOVLANState.objects.create(
+            management=management,
+            vlan=vlan,
+            device_name=vlan.name,
+            status="accepted",
+        )
+        (
+            _rule,
+            scope,
+            device_id,
+            native_model_label,
+            _native_id,
+            native_key,
+            state_model_label,
+            state_key,
+        ) = manifest_binding(state)
+        identity = {
+            "device_id": device_id,
+            "scope": scope,
+            "native_model_label": native_model_label,
+            "native_key": native_key,
+            "state_model_label": state_model_label,
+            "state_key": state_key,
+        }
+        peer = _PeerManifestInsert(identity)
+
+        with connection.execute_wrapper(peer):
+            maintain_manifest(state)
+
+        manifest = NSOOwnershipManifest.objects.get(**identity)
+        self.assertTrue(peer.fired)
+        self.assertEqual(NSOOwnershipManifest.objects.filter(**identity).count(), 1)
+        self.assertEqual(manifest.native_id, vlan.pk)
+        self.assertEqual(manifest.ownership_state, "owned")
+        self.assertTrue(manifest.deletion_authority)
+
+
 class TestOwnershipManifestDurability(TestCase):
     def test_device_deletion_retires_and_keeps_manifest_evidence(self):
         from unittest.mock import patch
