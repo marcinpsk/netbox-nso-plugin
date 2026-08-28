@@ -1409,18 +1409,25 @@ def _database_fragment(instance, spec):
     return ABSENT if current is None else canonical_fragment(current, spec)
 
 
-def _effective_after_fragment(instance, spec, update_fields):
-    """Serialize only values this save will persist, not unrelated stale attributes."""
-    if instance.pk is None or instance._state.adding or update_fields is None:
-        return canonical_fragment(instance, spec)
-    current = type(instance).objects.filter(pk=instance.pk).first()
-    if current is None:
-        return canonical_fragment(instance, spec)
-    effective = copy.copy(current)
+def _effective_after(instance, before, update_fields):
+    """Apply the fields saved by this write to the stored instance shape."""
+    if before is None or update_fields is None:
+        return instance
+    effective = copy.copy(before)
     for field_name in update_fields:
         field = instance._meta.get_field(field_name)
         setattr(effective, field.attname, getattr(instance, field.attname))
-    return canonical_fragment(effective, spec)
+        if field.is_relation and field.is_cached(instance):
+            field.set_cached_value(effective, field.get_cached_value(instance))
+    return effective
+
+
+def _effective_after_fragment(instance, spec, update_fields):
+    """Serialize only values this save will persist, not unrelated stale attributes."""
+    current = (
+        None if instance.pk is None or instance._state.adding else type(instance).objects.filter(pk=instance.pk).first()
+    )
+    return canonical_fragment(_effective_after(instance, current, update_fields), spec)
 
 
 def _management_keys(device_ids, scopes):

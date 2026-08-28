@@ -22,6 +22,7 @@ from .intent_state import (
     MutationFootprint,
     SourceRow,
     _authorize_dml,
+    _effective_after,
     _intent_transaction,
     _normal,
     canonical_fragment,
@@ -264,18 +265,6 @@ def _stored_instance(instance):
     if instance.pk is None or instance._state.adding:
         return None
     return type(instance)._default_manager.filter(pk=instance.pk).first()
-
-
-def _effective_after(instance, before, update_fields):
-    if before is None or update_fields is None:
-        return instance
-    effective = copy.copy(before)
-    for name in update_fields:
-        field = instance._meta.get_field(name)
-        setattr(effective, field.attname, getattr(instance, field.attname))
-        if field.is_relation and field.is_cached(instance):
-            field.set_cached_value(effective, field.get_cached_value(instance))
-    return effective
 
 
 def replay_creation_references(instance, references) -> None:

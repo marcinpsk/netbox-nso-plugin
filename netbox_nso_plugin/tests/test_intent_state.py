@@ -451,6 +451,23 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         schedule.assert_not_called()
         self.assertIsNone(_ACTIVE_PERMIT.get())
 
+    def test_writerless_save_preserves_a_cached_foreign_key_created_later(self):
+        from ipam.models import VLAN
+
+        planned_vlan = VLAN(
+            pk=self.state.vlan_id + 1_000_000,
+            vid=1624,
+            name="intent-planned-vlan",
+        )
+        self.state.vlan = planned_vlan
+
+        with without_commit_drain(), transaction.atomic():
+            self.state.save(update_fields=["vlan"])
+            VLAN.objects.bulk_create([planned_vlan])
+
+        self.state.refresh_from_db()
+        self.assertEqual(self.state.vlan, planned_vlan)
+
     def test_content_permit_rejects_a_write_outside_its_footprint(self):
         other_device, other_management = make_managed("intent-other", 1624, index=2)
         other = own_vlan(other_management, 1624, "intent-other")
