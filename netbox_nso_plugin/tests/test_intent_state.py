@@ -11,7 +11,7 @@ from uuid import uuid4
 import sqlparse
 from django.db import connection, transaction
 from django.db.models import F
-from django.test import SimpleTestCase, TransactionTestCase
+from django.test import SimpleTestCase, TestCase, TransactionTestCase
 
 from netbox_nso_plugin import delivery, outbox
 from netbox_nso_plugin.intent_state import (
@@ -752,6 +752,47 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
 
         self.assertEqual(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").count(), 1)
 
+    def test_acquiring_intent_locks_outside_a_transaction_is_refused(self):
+        from netbox_nso_plugin.intent_state import _acquire
+
+        with self.assertRaisesRegex(IntentMutationProtocolError, r"intent_transaction requires transaction\.atomic"):
+            _acquire(MutationFootprint.for_keys({(self.device.pk, "vlan")}))
+
+    def test_intent_transaction_opens_the_atomic_block_its_locks_need(self):
+        from netbox_nso_plugin.intent_state import intent_transaction
+
+        self.assertFalse(transaction.get_connection().in_atomic_block)
+        with without_commit_drain(), intent_transaction(MutationFootprint.for_keys({(self.device.pk, "vlan")})):
+            self.assertTrue(transaction.get_connection().in_atomic_block)
+
+    def test_offline_mutation_outside_a_transaction_is_refused(self):
+        from netbox_nso_plugin.intent_state import offline_mutation
+
+        with self.assertRaisesRegex(IntentMutationProtocolError, r"offline mutation requires transaction\.atomic"):
+            with offline_mutation():
+                pass
+
+    def test_a_deploying_row_that_vanished_unaccounted_fails_the_repend(self):
+        from netbox_nso_plugin.intent_state import _repend_locked_rows, intent_transaction
+
+        vanished = SourceRow(self.state._meta.label_lower, self.state.pk + 1_000_000)
+
+        with without_commit_drain(), intent_transaction(MutationFootprint.for_keys({(self.device.pk, "vlan")})):
+            with self.assertRaisesRegex(IntentMutationProtocolError, "vanished"):
+                _repend_locked_rows((vanished,))
+
+    def test_a_planned_delete_accounts_for_the_deploying_row_it_consumes(self):
+        from uuid import uuid4
+
+        from ._outbox_case import delete_vlan_state, mirror_update
+
+        mirror_update(self.state, status="deploying", apply_attempt_id=uuid4())
+
+        with without_commit_drain():
+            delete_vlan_state(self.state)
+
+        self.assertFalse(type(self.state).objects.filter(pk=self.state.pk).exists())
+
     def test_registry_declares_all_renderer_overlay_tables(self):
         declared = set(renderer_input_specs())
         required = {
@@ -1090,3 +1131,66 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         for label, fields in expected.items():
             with self.subTest(label=label):
                 self.assertEqual(specs[label].content_fields, fields)
+
+class TestRepairBoundaryIsolation(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    """The repair boundary the audit consumes really runs at REPEATABLE READ."""
+
+    reset_sequences = True
+
+    def setUp(self):
+        super().setUp()
+        self.device, self.management = make_managed("intent-isolation", 1625)
+        own_vlan(self.management, 1625, "intent-isolation")
+
+    @staticmethod
+    def _isolation_level():
+        from django.db import connection
+
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW transaction_isolation")
+            return cursor.fetchone()[0]
+
+    def test_a_repeatable_read_mirror_transaction_really_is_repeatable_read(self):
+        from netbox_nso_plugin.intent_state import audit_scope_footprint
+
+        footprint = audit_scope_footprint(self.device.pk, ("vlan",))
+
+        with mirror_transaction(footprint, repeatable_read=True):
+            inside = self._isolation_level()
+
+        self.assertEqual(inside, "repeatable read")
+
+    def test_an_ordinary_mirror_transaction_keeps_the_session_default(self):
+        from netbox_nso_plugin.intent_state import audit_scope_footprint
+
+        footprint = audit_scope_footprint(self.device.pk, ("vlan",))
+
+        with mirror_transaction(footprint):
+            inside = self._isolation_level()
+
+        self.assertEqual(inside, "read committed")
+
+
+class TestRepeatableReadDegradesOnlyUnderATestCaseAtomic(TestCase):
+    """The one place the repair boundary does not get its isolation, pinned and bounded.
+
+    PostgreSQL accepts SET TRANSACTION ISOLATION LEVEL only before a transaction's first
+    statement, and a Django TestCase has already run its fixtures inside the block this
+    would set. The skip is keyed on ``_from_testcase``, which only ``TestCase._enter_atomics``
+    sets, so no production transaction can reach it. Sibling class above pins the real thing.
+    """
+
+    def test_the_marker_this_skip_reads_is_present_only_under_a_testcase(self):
+        from django.db import connections
+
+        self.assertTrue(any(getattr(block, "_from_testcase", False) for block in connections["default"].atomic_blocks))
+
+    def test_a_repeatable_read_request_stays_read_committed_inside_a_testcase(self):
+        from django.db import connection
+
+        with mirror_transaction(MutationFootprint(), repeatable_read=True):
+            with connection.cursor() as cursor:
+                cursor.execute("SHOW transaction_isolation")
+                inside = cursor.fetchone()[0]
+
+        self.assertEqual(inside, "read committed")

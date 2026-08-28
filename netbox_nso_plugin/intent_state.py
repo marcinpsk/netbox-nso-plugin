@@ -491,6 +491,7 @@ class _Permit:
     settles_deploying: bool = True
     initial_deploying_rows: tuple[SourceRow, ...] = ()
     deferred_repend_rows: tuple[SourceRow, ...] = ()
+    deleted_rows: set[SourceRow] = field(default_factory=set)
 
 
 _REGISTRY: dict[str, RendererInputSpec] = {}
@@ -2046,14 +2047,20 @@ def _repend_locked_rows(rows: tuple[SourceRow, ...]) -> None:
     """Force rows captured as deploying back to pending Apply state."""
     from .signals import suppress_intent_push
 
+    permit = _ACTIVE_PERMIT.get()
+    consumed = permit.deleted_rows if permit is not None else frozenset()
     with suppress_intent_push():
         for row_ref in rows:
             if row_ref.pk is None:
                 continue
             row = apps.get_model(row_ref.model_label).objects.filter(pk=row_ref.pk).first()
-            # A complete planned delete can consume a row from the initially deploying
-            # set. Only surviving rows need to return to operator-pending state.
             if row is None:
+                # Only a delete this very transaction performed may consume a row from the
+                # initially deploying set; anything else vanished behind the locks that hold it.
+                if row_ref not in consumed:
+                    raise IntentMutationProtocolError(
+                        f"{row_ref.model_label} row {row_ref.pk!r} vanished before its repend"
+                    )
                 continue
             row.status = "accepted"
             update_fields = ["status"]
@@ -2402,6 +2409,11 @@ def _validate_explicit_delete(sender, instance, **kwargs):
 
     if active_renderer_writer() is not None:
         require_planned_signal_write(instance, deleting=True)
+    permit = _ACTIVE_PERMIT.get()
+    # The repend runs after the block's writes: this is what tells it which of the rows it
+    # captured as deploying were consumed by a delete rather than lost.
+    if permit is not None and instance.pk is not None:
+        permit.deleted_rows.add(SourceRow(instance._meta.label_lower, instance.pk))
 
 
 def _validate_explicit_m2m(sender, instance, action, reverse=False, pk_set=None, **kwargs):
