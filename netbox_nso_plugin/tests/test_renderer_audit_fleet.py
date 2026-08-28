@@ -158,6 +158,47 @@ class TestRendererFleetAudit(_FleetCase):
             resume()
 
 
+class TestRendererFleetTombstoneSweep(_FleetCase):
+    def _tombstone(self, state):
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+
+        return NSOProvisionTombstone.objects.create(
+            netbox_device_id=self.device_ids[0],
+            nso_instance="cl-fleet-inst",
+            nso_device_name="nso-cl-fleet-orphan",
+            canonical_request={},
+            state=state,
+        )
+
+    def test_the_cadence_pass_advances_the_provision_tombstones(self):
+        from netbox_nso_plugin.renderer_audit import audit_renderer_fleet
+
+        tombstone = self._tombstone("offboarded")
+
+        with patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes", side_effect=self._canned()):
+            audit_renderer_fleet()
+
+        tombstone.refresh_from_db()
+        self.assertEqual(tombstone.state, "closed")
+
+    def test_a_failing_sweep_does_not_fail_the_renderer_audit(self):
+        from netbox_nso_plugin.renderer_audit import audit_renderer_fleet
+
+        reached = []
+        audit = self._canned(audited=("vlan",), record=reached)
+        with (
+            patch(
+                "netbox_nso_plugin.provision_lifecycle.sweep_provision_tombstones",
+                side_effect=RuntimeError("the sweep is broken"),
+            ),
+            patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes", side_effect=audit),
+        ):
+            result = audit_renderer_fleet()
+
+        self.assertEqual(reached, self.device_ids)
+        self.assertEqual((result.devices, result.failed), (3, 0))
+
+
 class TestAuditRendererScopesJob(_FleetCase):
     def test_the_job_returns_the_fleet_result_it_ran(self):
         from netbox_nso_plugin.jobs import AuditRendererScopesJob
