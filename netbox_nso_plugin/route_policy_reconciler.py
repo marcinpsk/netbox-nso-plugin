@@ -82,6 +82,12 @@ class _Operations:
 
     def display_m2m_add(self, instance, field_name, related):
         """Record an unregistered display-only M2M projection for replay."""
+        from .intent_state import IntentMutationProtocolError, renderer_input_specs
+
+        field = instance._meta.get_field(field_name)
+        through_label = field.remote_field.through._meta.label_lower
+        if through_label in renderer_input_specs():
+            raise IntentMutationProtocolError(f"display-only M2M {through_label} is a registered renderer input")
         related = tuple(related)
         if related:
             self.operations.append(("display_m2m_add", instance, None, False, (), field_name, related))
@@ -829,6 +835,7 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
 
     def plan_set_communities(self, row, structured):
         unresolved = []
+        literal_groups = {}
         for action in structured.set_communities:
             community_list = self.name_maps["community_list"].get(action.name)
             if community_list is not None:
@@ -846,18 +853,20 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
             if not _looks_like_community_literal(action.name):
                 unresolved.append({"operation": action.operation, "name": action.name})
                 continue
-            set_row = self.RouteMapEntrySetCommunity(route_map_entry=row, operation=action.operation)
-            self.operations.save(
-                set_row,
-                force_insert=True,
-                natural_key=("route_map_entry", "operation", "community_list"),
-            )
             community = self.communities.get(action.name)
             if community is None:
                 community = self.Community(community=action.name)
                 self.communities[action.name] = community
                 self.operations.save(community, force_insert=True, natural_key=("community",))
-            self.operations.m2m_add(set_row, "communities", (community,))
+            literal_groups.setdefault(action.operation, {})[action.name] = community
+        for operation, communities in literal_groups.items():
+            set_row = self.RouteMapEntrySetCommunity(route_map_entry=row, operation=operation)
+            self.operations.save(
+                set_row,
+                force_insert=True,
+                natural_key=("route_map_entry", "operation", "community_list"),
+            )
+            self.operations.m2m_add(set_row, "communities", tuple(communities.values()))
         return unresolved
 
 
