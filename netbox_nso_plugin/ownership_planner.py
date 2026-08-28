@@ -152,7 +152,8 @@ _CONVERTED_SCOPE_RULES = {
             "synchronously. Greenfield acceptance uses exact acquisition planning and outbox delivery instead of "
             "accepting and pushing directly. Routers, scopes, address families, peer templates, ASNs, and peer IPs "
             "are graph dependencies. BGP reconciliation no longer suppresses missing netbox-routing or IPAM imports; "
-            "missing graph dependencies fail fast."
+            "missing graph dependencies fail fast. BGP foreign-key merge identities use natural graph identities. "
+            "Legacy PK-shaped peer and template merge bases are reset before reconciliation."
         ),
     ),
     "interface": ScopeOwnershipRule(
