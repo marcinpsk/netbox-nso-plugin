@@ -15,9 +15,17 @@ class _FleetCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
 
     def setUp(self):
         super().setUp()
-        set_scope = patch("netbox_nso_plugin.adapter_client.set_scope", return_value={})
-        set_scope.start()
-        self.addCleanup(set_scope.stop)
+        adapter_patches = (
+            patch("netbox_nso_plugin.adapter_client.get_device", return_value={"failover": None}),
+            patch(
+                "netbox_nso_plugin.adapter_client.get_scope",
+                return_value={"attributes": [], "auto_apply": False, "sync_before_apply": True},
+            ),
+            patch("netbox_nso_plugin.adapter_client.set_scope", return_value={}),
+        )
+        for adapter_patch in adapter_patches:
+            adapter_patch.start()
+            self.addCleanup(adapter_patch.stop)
         self.fleet = [make_managed("fleet", 16280 + index, index=index) for index in range(3)]
         self.device_ids = [device.pk for device, _management in self.fleet]
 
