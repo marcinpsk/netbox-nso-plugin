@@ -187,6 +187,25 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
 
         self.assertEqual(raised.exception.code, "invalid_response")
 
+    def test_switchport_reconciler_accepts_the_unconfigured_mode_sentinel(self):
+        from netbox_nso_plugin.vlan_reconciler import reconcile_switchport
+
+        rows = reconcile_switchport(
+            self.device,
+            {
+                "interfaces": [
+                    {
+                        "interface_name": self.interface.name,
+                        "mode": "",
+                        "tagged_vlans": [],
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].mode, "")
+
     def test_vlan_reconcile_preflights_native_and_overlay_creations(self):
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan
         from netbox_nso_plugin.vlan_reconciler import vlan_reconcile_plan
