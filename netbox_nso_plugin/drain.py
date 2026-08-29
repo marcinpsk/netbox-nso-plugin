@@ -467,14 +467,9 @@ def _takeover(state, mgmt, now) -> Claim | None:
         _abandon_locked(state)
         return None
     if state.claim_revision is None:
-        logger.warning(
-            "abandoning legacy push_seq %s for %s/%s because it has no durable intent revision",
-            state.push_seq,
-            state.device_id,
-            state.scope,
+        raise ProtocolViolation(
+            f"push_seq {state.push_seq} for {state.device_id}/{state.scope} has no durable intent revision"
         )
-        _abandon_locked(state)
-        return None
     state.claimed_at = now
     state.save()
     logger.info("taking over push_seq %s for %s/%s", state.push_seq, state.device_id, state.scope)
@@ -1843,13 +1838,9 @@ def _sent_wire_digest(state, flags: ClaimFlags | None = None) -> str:
 def _restored_claim_validation(state, receipt, flags) -> str | None:
     """Return a restore outcome when persisted claim evidence cannot settle."""
     if state.claim_revision is None:
-        logger.warning(
-            "%s/%s holds legacy push_seq %s without a durable intent revision; replaying",
-            state.device_id,
-            state.scope,
-            state.push_seq,
+        raise ProtocolViolation(
+            f"push_seq {state.push_seq} for {state.device_id}/{state.scope} has no durable intent revision"
         )
-        return RESTORE_REPLAY
     if receipt.get("request_digest") != _sent_wire_digest(state, flags):
         logger.error(
             "%s/%s holds push_seq %s at a digest the receipt does not name",

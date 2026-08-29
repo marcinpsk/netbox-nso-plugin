@@ -274,7 +274,7 @@ class TestCrashedAttemptsReplayAtTheirOwnSequence(_ClaimCase):
         assert self.adapter.replays == 0
         assert entries(self.device, "vlan") == []
 
-    def test_a_legacy_claim_without_a_revision_is_abandoned_and_reformed(self):
+    def test_a_claim_without_a_revision_is_rejected_as_corrupt(self):
         from netbox_nso_plugin import drain
         from netbox_nso_plugin.models import NSOIntentOutboxState
 
@@ -285,10 +285,10 @@ class TestCrashedAttemptsReplayAtTheirOwnSequence(_ClaimCase):
             claimed_at=None,
         )
 
-        assert self.drain() == drain.SUCCEEDED
+        with self.assertRaisesRegex(drain.ProtocolViolation, "durable intent revision"):
+            drain.claim(self.device.pk, "vlan")
 
-        self.assertGreater(self.adapter.sequences[-1], claimed.push_seq)
-        self.assertEqual(entries(self.device, "vlan"), [])
+        self.assertEqual(state_of(self.device, "vlan").push_seq, claimed.push_seq)
 
     def test_a_crash_after_the_send_replays_into_the_receipt_and_clears_the_authority(self):
         from netbox_nso_plugin import drain

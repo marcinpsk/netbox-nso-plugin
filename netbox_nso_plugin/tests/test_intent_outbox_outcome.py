@@ -973,7 +973,7 @@ class TestARestoredClaimSettlesAgainstTheReceiptsOwnDigest(_OutcomeCase):
         assert state.push_seq is None, "the operation is resolved, so the key can allocate again"
         assert entries(self.device, "vlan") == []
 
-    def test_a_legacy_claim_without_a_revision_replays_instead_of_settling(self):
+    def test_a_claim_without_a_revision_is_rejected_as_corrupt(self):
         from netbox_nso_plugin import drain
         from netbox_nso_plugin.models import NSOIntentOutboxState
 
@@ -982,10 +982,8 @@ class TestARestoredClaimSettlesAgainstTheReceiptsOwnDigest(_OutcomeCase):
         receipt = self._receipt()
         NSOIntentOutboxState.objects.filter(device=self.device, scope="vlan").update(claim_revision=None)
 
-        self.assertEqual(
-            drain.resolve_restored_claim(self.device.pk, "vlan", receipt),
-            drain.RESTORE_REPLAY,
-        )
+        with self.assertRaisesRegex(drain.ProtocolViolation, "durable intent revision"):
+            drain.resolve_restored_claim(self.device.pk, "vlan", receipt)
         self.assertEqual(state_of(self.device, "vlan").push_seq, claimed.push_seq)
 
     def test_a_receipt_naming_another_body_still_fails_closed(self):
