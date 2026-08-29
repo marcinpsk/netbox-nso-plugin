@@ -187,6 +187,44 @@ class TestProvisionTombstoneSweep(TestCase):
 
         self.assertEqual(caught.exception.code, "invalid_response")
 
+    def test_falsey_invalid_adapter_inventory_is_an_adapter_error(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
+
+        _device, _instance, _management, tombstone = self._attempt(
+            "provision-falsey-inventory",
+            with_management=False,
+        )
+        tombstone.adapter_device_id = None
+        tombstone.save(update_fields=["adapter_device_id"])
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value={}),
+            self.assertRaises(AdapterError) as caught,
+        ):
+            sweep_provision_tombstones(tombstone.provision_attempt_id)
+
+        self.assertEqual(caught.exception.code, "invalid_response")
+
+    def test_invalid_adapter_inventory_entry_is_an_adapter_error(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
+
+        _device, _instance, _management, tombstone = self._attempt(
+            "provision-invalid-inventory-entry",
+            with_management=False,
+        )
+        tombstone.adapter_device_id = None
+        tombstone.save(update_fields=["adapter_device_id"])
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value=[None]),
+            self.assertRaises(AdapterError) as caught,
+        ):
+            sweep_provision_tombstones(tombstone.provision_attempt_id)
+
+        self.assertEqual(caught.exception.code, "invalid_response")
+
     def test_open_attempt_is_polled_by_attempt_identity_and_completed(self):
         from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
 
