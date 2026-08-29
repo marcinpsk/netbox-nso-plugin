@@ -199,7 +199,7 @@ class TestAdvanceStaleOnboardingSweep(TestCase):
         from netbox_nso_plugin.deployment import quiesce, resume
         from netbox_nso_plugin.jobs import AdvanceStaleOnboardingJob
 
-        mgmt = self._provisioning("sweep-quiesced", "J-QUIESCED")
+        mgmt, _attempt = self._provisioning("sweep-quiesced", "J-QUIESCED")
         quiesce()
         try:
             with (
