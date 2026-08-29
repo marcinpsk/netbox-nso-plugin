@@ -4874,9 +4874,10 @@ def _save_owned_interface_mtu_edit(obj, old_values, *, _retry_on_stale=True):
     if not sm.is_owned(candidate.status):
         candidate.accepted_at = planned_at
     candidate.status = sm.on_operator_edit(candidate.status)
-    state_fields = {
+    edited_fields = {
         field_name for field_name, old_value in old_values.items() if getattr(candidate, field_name) != old_value
     }
+    state_fields = set(edited_fields)
     state_fields.add("status")
     if candidate.accepted_at is not None:
         state_fields.add("accepted_at")
@@ -4887,8 +4888,8 @@ def _save_owned_interface_mtu_edit(obj, old_values, *, _retry_on_stale=True):
         if not _retry_on_stale:
             raise
         current = type(obj).objects.select_related("interface").get(pk=obj.pk)
-        current_old_values = {field_name: getattr(current, field_name) for field_name in old_values}
-        for field_name in old_values:
+        current_old_values = {field_name: getattr(current, field_name) for field_name in edited_fields}
+        for field_name in edited_fields:
             setattr(current, field_name, getattr(obj, field_name))
         _save_owned_interface_mtu_edit(current, current_old_values, _retry_on_stale=False)
 

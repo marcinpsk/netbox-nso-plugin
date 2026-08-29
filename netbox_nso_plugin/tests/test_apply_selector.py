@@ -842,7 +842,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         stale.refresh_from_db()
         self.assertEqual(stale.status, "accepted")
 
-    def test_same_row_intent_writers_serialize_before_comparing(self):
+    def test_stale_mtu_retry_preserves_a_concurrent_edit_to_an_untouched_field(self):
         import threading
 
         from django.db import connections
@@ -858,10 +858,12 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 management=self.mgmt,
                 interface=interface,
                 l2_mtu=1500,
+                ip_mtu=1500,
                 status="deploying",
                 apply_attempt_id=uuid4(),
             )
         stale = NSOInterfaceMtuState.objects.get(pk=state.pk)
+        stale.l2_mtu = 1600
         first_locked = threading.Event()
         release_first = threading.Event()
         comparison_finished = threading.Event()
@@ -876,7 +878,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 current = NSOInterfaceMtuState.objects.get(pk=state.pk)
                 with intent_transaction(footprint_for_instance(current)):
                     NSOInterfaceMtuState.objects.select_for_update().filter(pk=state.pk).update(
-                        l2_mtu=1600,
+                        ip_mtu=9000,
                         status="accepted",
                     )
                     comparison_finished.clear()
@@ -893,7 +895,11 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 if not first_locked.wait(10):
                     raise AssertionError("the first writer did not lock the row")
                 with without_commit_drain():
-                    _save_owned_overlay_edit(stale, "interface_mtu", {"l2_mtu": 1500})
+                    _save_owned_overlay_edit(
+                        stale,
+                        "interface_mtu",
+                        {"l2_mtu": 1500, "ip_mtu": 1500, "mpls_mtu": None},
+                    )
             except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
                 errors.append(exc)
             finally:
@@ -918,6 +924,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         if errors:
             raise errors[0]
         state.refresh_from_db()
+        self.assertEqual((state.l2_mtu, state.ip_mtu), (1600, 9000))
         self.assertEqual(state.status, "accepted")
 
     def test_accept_derives_status_from_the_locked_current_row(self):
