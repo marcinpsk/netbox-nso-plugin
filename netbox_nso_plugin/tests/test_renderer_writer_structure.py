@@ -311,6 +311,26 @@ class TestRendererWriterStructure(SimpleTestCase):
 
         self.assertEqual(found, set())
 
+    def test_static_route_signals_do_not_keep_the_retired_delta_path(self):
+        path = Path(__file__).resolve().parents[1] / "signals.py"
+        tree = ast.parse(path.read_text(), filename=str(path))
+        functions = {node.name for node in ast.walk(tree) if isinstance(node, _FUNCTION_SCOPES)}
+        retired = {
+            "_on_routing_static_route_pre_save",
+            "_remove_static_route_for_device",
+            "_static_route_content",
+            "_transition_static_route_content",
+        }
+        local_copy_imports = [
+            node.lineno
+            for function in (node for node in ast.walk(tree) if isinstance(node, _FUNCTION_SCOPES))
+            for node in ast.walk(function)
+            if isinstance(node, ast.Import) and any(alias.name == "copy" for alias in node.names)
+        ]
+
+        self.assertEqual(sorted(functions & retired), [])
+        self.assertEqual(local_copy_imports, [])
+
 
 #: The seams that acquire the locks a caller-owned plan is then consumed under. Entering one
 #: re-pends the scope's deploying rows (``intent_state._repend_locked_rows``).
