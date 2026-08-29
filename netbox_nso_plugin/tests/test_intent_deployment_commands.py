@@ -63,7 +63,7 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
             except BaseException as exc:
                 errors.append(exc)
             finally:
-                close_old_connections()
+                connection.close()
 
         def request_quiesce():
             close_old_connections()
@@ -72,7 +72,7 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
             except BaseException as exc:
                 errors.append(exc)
             finally:
-                close_old_connections()
+                connection.close()
 
         holder = threading.Thread(target=hold_shared_lock)
         waiter = threading.Thread(target=request_quiesce)
@@ -80,7 +80,7 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         waiter_finished = False
         try:
             self.assertTrue(holder_ready.wait(5), "the shared lock was not acquired")
-            with patch.object(deployment, "_EXCLUSIVE_LOCK_TIMEOUT_MS", 50, create=True):
+            with patch.object(deployment, "_EXCLUSIVE_LOCK_TIMEOUT_MS", 50):
                 waiter.start()
                 waiter.join(timeout=1)
                 waiter_finished = not waiter.is_alive()
@@ -115,7 +115,7 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
             except BaseException as exc:
                 errors.append(exc)
             finally:
-                close_old_connections()
+                connection.close()
 
         def request_exclusive_lock():
             close_old_connections()
@@ -128,7 +128,7 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
             except BaseException as exc:
                 errors.append(exc)
             finally:
-                close_old_connections()
+                connection.close()
 
         holder = threading.Thread(target=hold_shared_lock)
         waiter = threading.Thread(target=request_exclusive_lock)
@@ -160,7 +160,7 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
             except deployment.DeploymentQuiesced:
                 outcomes["operation"] = "refused"
             finally:
-                close_old_connections()
+                connection.close()
 
         def attempt_mutation():
             close_old_connections()
@@ -171,7 +171,7 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
             except deployment.DeploymentQuiesced:
                 outcomes["mutation"] = "refused"
             finally:
-                close_old_connections()
+                connection.close()
 
         late = [threading.Thread(target=attempt_operation), threading.Thread(target=attempt_mutation)]
         for worker in late:
