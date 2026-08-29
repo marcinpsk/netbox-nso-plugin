@@ -131,8 +131,8 @@ def _control_footprint(device_id):
     )
 
 
-def reconcile_management_control(device_id: int) -> bool:
-    """Update divergent adapter control fields while their owners stay locked."""
+def _update_management_control(device_id: int, *, compare_adapter: bool) -> bool:
+    """Write adapter control fields while their owners stay locked."""
     from . import adapter_client
     from .intent_state import mirror_transaction
     from .models import NSODeviceManagement
@@ -161,20 +161,21 @@ def reconcile_management_control(device_id: int) -> bool:
             primary_ip,
             oob_ip,
         )
-        device_state = adapter_client.get_device(management.adapter_device_id)
-        scope_state = adapter_client.get_scope(management.adapter_device_id)
-        failover_state = device_state["failover"]
-        adapter_primary_ip = None if failover_state is None else failover_state["primary_ip"]
-        adapter_oob_ip = None if failover_state is None else failover_state["oob_ip"]
-        current = (
-            tuple(sorted(scope_state["attributes"])),
-            scope_state["auto_apply"],
-            scope_state["sync_before_apply"],
-            adapter_primary_ip,
-            adapter_oob_ip,
-        )
-        if current == desired:
-            return False
+        if compare_adapter:
+            device_state = adapter_client.get_device(management.adapter_device_id)
+            scope_state = adapter_client.get_scope(management.adapter_device_id)
+            failover_state = device_state["failover"]
+            adapter_primary_ip = None if failover_state is None else failover_state["primary_ip"]
+            adapter_oob_ip = None if failover_state is None else failover_state["oob_ip"]
+            current = (
+                tuple(sorted(scope_state["attributes"])),
+                scope_state["auto_apply"],
+                scope_state["sync_before_apply"],
+                adapter_primary_ip,
+                adapter_oob_ip,
+            )
+            if current == desired:
+                return False
         adapter_client.set_scope(
             management.adapter_device_id,
             management.managed_attributes,
@@ -184,3 +185,13 @@ def reconcile_management_control(device_id: int) -> bool:
             oob_ip=oob_ip,
         )
         return True
+
+
+def reconcile_management_control(device_id: int) -> bool:
+    """Update divergent adapter control fields while their owners stay locked."""
+    return _update_management_control(device_id, compare_adapter=True)
+
+
+def push_management_control(device_id: int) -> bool:
+    """Push a control change while its authoritative owners stay locked."""
+    return _update_management_control(device_id, compare_adapter=False)

@@ -872,10 +872,10 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
             if not _sync_source_change(instance, client):
                 return
 
-        from .management_lifecycle import reconcile_management_control
+        from .management_lifecycle import push_management_control
 
         try:
-            reconcile_management_control(instance.device_id)
+            push_management_control(instance.device_id)
         except AdapterError as exc:
             # The stored id points at an adapter device row that no longer exists (a provision
             # that rolled back, a manual delete, a restored DB). Without this the branch above
@@ -890,7 +890,7 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
                 instance.device_id,
             )
             _onboard_into_adapter(instance, client)
-            reconcile_management_control(instance.device_id)
+            push_management_control(instance.device_id)
 
         notify_result = client.sync_notify(instance.adapter_device_id)
         if notify_result and notify_result.get("job_id"):
