@@ -724,6 +724,29 @@ class TestSymmetricOwnershipExecutor(TestCase):
         self.assertEqual(state.status, "accepted")
         self.assertEqual(manifest.native_id, address.pk)
 
+    def test_an_unknown_vrf_cannot_bind_to_a_global_address(self):
+        from dcim.models import Interface
+        from django.contrib.contenttypes.models import ContentType
+        from ipam.models import IPAddress
+
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+        from netbox_nso_plugin.ownership_planner import manifest_binding
+
+        interface = Interface.objects.create(device=self.device, name="Ethernet5.1", type="virtual")
+        address = IPAddress.objects.create(
+            address="198.18.172.6/24",
+            assigned_object_type=ContentType.objects.get_for_model(Interface),
+            assigned_object_id=interface.pk,
+        )
+        state = NSOInterfaceIPState(
+            interface=interface,
+            address=str(address.address),
+            vrf="missing-vrf",
+            status="accepted",
+        )
+
+        self.assertIsNone(manifest_binding(state))
+
     def test_native_routing_graph_creates_every_owned_overlay(self):
         from dcim.models import Device, Interface
         from django.contrib.contenttypes.models import ContentType
