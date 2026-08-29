@@ -18,58 +18,23 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def _validated_interface_items(payload) -> list:
-    """Validate one adapter MTU document before planning any changes."""
-    from django.db import connection
-
-    from .adapter_client import AdapterError
-    from .models import NSOInterfaceMtuState
-
+def _validated_interface_items(payload: dict) -> tuple[dict, ...]:
+    """Validate one adapter MTU document before planning stale-row changes."""
     if not isinstance(payload, dict):
-        raise AdapterError("interface MTU payload must be an object", code="invalid_response")
-    items = payload.get("interfaces")
+        raise ValueError("interface MTU payload must be an object")
+    items = payload.get("interfaces", [])
     if not isinstance(items, list):
-        raise AdapterError("interface MTU interfaces must be a list", code="invalid_response")
-    model_fields = {
-        "mtu": "l2_mtu",
-        "ip_mtu": "ip_mtu",
-        "mpls_mtu": "mpls_mtu",
-    }
-    value_ranges = {
-        payload_field: connection.ops.integer_field_range(
-            NSOInterfaceMtuState._meta.get_field(model_field).get_internal_type()
-        )
-        for payload_field, model_field in model_fields.items()
-    }
-    bound_port_max_length = NSOInterfaceMtuState._meta.get_field("bound_port").max_length
+        raise ValueError("interface MTU interfaces must be a list")
+    seen = set()
     for item in items:
         if not isinstance(item, dict):
-            raise AdapterError("interface MTU payload entry must be an object", code="invalid_response")
+            raise ValueError("interface MTU payload entry must be an object")
         name = item.get("interface_name")
-        if not isinstance(name, str) or not name:
-            raise AdapterError(
-                "interface MTU payload entry interface_name must be a non-empty string",
-                code="invalid_response",
-            )
-        for field_name, (minimum, maximum) in value_ranges.items():
-            value = item.get(field_name)
-            if value is not None and (type(value) is not int or value < minimum or value > maximum):
-                raise AdapterError(
-                    f"interface MTU payload entry {field_name} must be an integer from {minimum} through {maximum} or null",
-                    code="invalid_response",
-                )
-        bound_port = item.get("bound_port")
-        if bound_port is not None and not isinstance(bound_port, str):
-            raise AdapterError(
-                "interface MTU payload entry bound_port must be a string or null",
-                code="invalid_response",
-            )
-        if isinstance(bound_port, str) and len(bound_port) > bound_port_max_length:
-            raise AdapterError(
-                "interface MTU payload entry bound_port is too long",
-                code="invalid_response",
-            )
-    return items
+        if name and name in seen:
+            raise ValueError(f"duplicate interface_name in interface MTU payload: {name}")
+        if name:
+            seen.add(name)
+    return tuple(items)
 
 
 def interface_mtu_reconcile_plan(device, payload: dict):
@@ -99,10 +64,10 @@ def _interface_mtu_reconcile_operations(device, payload, planned_at):
     from dcim.models import Interface
 
     from . import status_machine as sm
+    from .adapter_client import AdapterError
     from .models import NSODeviceManagement, NSOInterfaceMtuState
     from .renderer_writer import planned_delete, planned_save
 
-    items = _validated_interface_items(payload)
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:
         return [], [], [], []
@@ -111,20 +76,30 @@ def _interface_mtu_reconcile_operations(device, payload, planned_at):
         row.interface_id: row
         for row in NSOInterfaceMtuState.objects.filter(management=management).select_related("interface").order_by("pk")
     }
+    bound_port_max_length = NSOInterfaceMtuState._meta.get_field("bound_port").max_length
     saves = []
     deletes = []
     operations = []
     rows = []
+    items = _validated_interface_items(payload)
     matched_names = set()
 
     for item in items:
         name = item.get("interface_name")
-        if name in matched_names:
-            continue
         interface = interfaces.get(name)
         if not name or interface is None:
             continue
         bound_port = item.get("bound_port")
+        if bound_port is not None and not isinstance(bound_port, str):
+            raise AdapterError(
+                "interface MTU payload entry bound_port must be a string or null",
+                code="invalid_response",
+            )
+        if isinstance(bound_port, str) and len(bound_port) > bound_port_max_length:
+            raise AdapterError(
+                "interface MTU payload entry bound_port is too long",
+                code="invalid_response",
+            )
         matched_names.add(name)
         current = states.get(interface.pk)
         candidate = (
@@ -173,6 +148,7 @@ def reconcile_interface_mtu(device, payload: dict) -> list:
     from .renderer_writer import active_renderer_writer, renderer_writes_replanning_once
     from .signals import suppress_intent_push
 
+    _validated_interface_items(payload)
     active = active_renderer_writer()
     executions = {}
     if active is not None:
