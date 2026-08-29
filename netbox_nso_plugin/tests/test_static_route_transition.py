@@ -20,6 +20,7 @@ from django.urls import reverse
 
 from netbox_nso_plugin import adapter_client as _adapter_client
 
+from ._outbox_case import trust_scope
 from ._static_route_case import PUT, _fixtures, _make_device, _make_mgmt, _own, _route
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 from .strict_writer import assert_each_operation_consumed_once, strict_writer_harness
@@ -55,19 +56,7 @@ class TestStaticRouteContentTransition(IntentPushDeliveryMixin, TestCase):
 
     def _trust_the_current_baseline(self):
         """Certify what the scope renders right now, as a settled push leaves it."""
-        from django.utils import timezone
-
-        from netbox_nso_plugin import delivery
-        from netbox_nso_plugin.models import NSOIntentRevision
-
-        revision, _created = NSOIntentRevision.objects.get_or_create(device=self.device, scope="static_route")
-        revision.verified_revision = revision.revision
-        revision.verified_fingerprint = delivery.canonical_fingerprint(
-            delivery.render("static_route", self.device.pk, self.mgmt.adapter_device_id).payload
-        )
-        revision.verified_at = timezone.now()
-        revision.save(update_fields=["verified_revision", "verified_fingerprint", "verified_at", "updated_at"])
-        return revision
+        return trust_scope(self.device, self.mgmt, "static_route")
 
     def test_a_foreign_edit_demotes_a_deploying_row_during_audit(self):
         """An audit prevents an old result from settling foreign-edited intent."""
