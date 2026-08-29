@@ -147,6 +147,28 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
                     reconcile(self.device, {})
                 self.assertEqual(raised.exception.code, "invalid_response")
 
+    def test_switchport_reconciler_rejects_falsey_non_list_tagged_vlans(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.vlan_reconciler import reconcile_switchport
+
+        for tagged_vlans in ("", {}):
+            with self.subTest(tagged_vlans=tagged_vlans):
+                with self.assertRaisesRegex(AdapterError, "tagged_vlans must be a list"):
+                    reconcile_switchport(
+                        self.device,
+                        {
+                            "interfaces": [
+                                {
+                                    "interface_name": self.interface.name,
+                                    "mode": "trunk",
+                                    "tagged_vlans": tagged_vlans,
+                                }
+                            ]
+                        },
+                    )
+
+                self.assertFalse(NSOSwitchportState.objects.filter(interface=self.interface).exists())
+
     def test_switchport_reconciler_rejects_non_list_tagged_vlans(self):
         from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.vlan_reconciler import reconcile_switchport

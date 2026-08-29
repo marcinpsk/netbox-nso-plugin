@@ -145,6 +145,22 @@ class TestInterfaceMtuReconciler(TestCase):
 
                 self.assertTrue(NSOInterfaceMtuState.objects.filter(pk=state.pk).exists())
 
+    def test_malformed_mtu_values_are_rejected_before_planning(self):
+        from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
+
+        invalid_entries = (
+            {"interface_name": self.po1.name, "mtu": 1500.9},
+            {"interface_name": self.po1.name, "ip_mtu": True},
+            {"interface_name": self.po1.name, "mpls_mtu": -1},
+            {"interface_name": self.po1.name, "bound_port": 0},
+        )
+        for entry in invalid_entries:
+            with self.subTest(entry=entry):
+                with self.assertRaises(ValueError):
+                    reconcile_interface_mtu(self.device, {"interfaces": [entry]})
+
+                self.assertFalse(NSOInterfaceMtuState.objects.filter(interface=self.po1).exists())
+
     def test_interface_absent_in_netbox_is_skipped(self):
         from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
 
