@@ -400,8 +400,8 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
 def advance_provisioning(mgmt) -> dict:
     """Delegate one UI poll to the fenced provision-attempt sweep and report its row.
 
-    Returns ``{"status", "error"}`` — the onboard state ("ready"/"provisioning"/
-    "provision_failed", or "deleted" when the row is gone) — plus ``poll_error`` when the poll
+    Returns ``{"status", "error"}``, the onboard state ("ready"/"provisioning"/
+    "provision_failed", or "deleted" when the row is gone), plus ``poll_error`` when the poll
     itself failed, so the dashboard can tell a transient adapter outage from "still running".
     """
     if mgmt.onboard_status != "provisioning":

@@ -503,7 +503,7 @@ class TestAdvanceProvisioning(TestCase):
         self.assertEqual(mgmt.onboard_status, "provisioning")
 
     def test_a_deleted_management_row_does_not_raise_out_of_the_poll(self):
-        """The JSON poll view has no try around this call — a concurrent delete must not 500."""
+        """A concurrent delete must not escape from the JSON poll view."""
         from netbox_nso_plugin.models import NSODeviceManagement
         from netbox_nso_plugin.onboarding import advance_provisioning
 

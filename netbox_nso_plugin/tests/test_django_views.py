@@ -432,7 +432,7 @@ class TestOnboardStatusView(ViewTestBase):
         mgmt = self._provisioning_mgmt("prov-untracked")
         NSOProvisionTombstone.objects.filter(netbox_device_id=mgmt.device_id).delete()
 
-        resp = self._post_status(mgmt)  # no attempt patch — the poll is never reached
+        resp = self._post_status(mgmt)  # No attempt patch means that the poll is never reached.
 
         self.assertEqual(resp.json()["status"], "provision_failed")
         mgmt.refresh_from_db()
