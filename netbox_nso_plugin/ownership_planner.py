@@ -68,6 +68,11 @@ class ScopeOwnershipRule:
     native_key_fields_by_model: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
 
+_DIRECT_OVERLAY_EDIT_DELTA = (
+    "Stale direct overlay edits no longer demote imported rows to changed. Exact writers reload rows before planning."
+)
+
+
 _CONVERTED_SCOPE_RULES = {
     "lacp": ScopeOwnershipRule(
         scope="lacp",
@@ -97,7 +102,10 @@ _CONVERTED_SCOPE_RULES = {
         overlay_native_fields=(("netbox_nso_plugin.nsovlanstate", "vlan"),),
         foreign_overlay_delete="reown",
         deletion_authority=True,
-        intentional_semantic_delta=("Acquire from persisted VLAN attachment state. Canceling edits need not acquire."),
+        intentional_semantic_delta=(
+            f"Acquire from persisted VLAN attachment state. Canceling edits need not acquire. "
+            f"{_DIRECT_OVERLAY_EDIT_DELTA}"
+        ),
     ),
     "svi": ScopeOwnershipRule(
         scope="svi",
@@ -108,7 +116,9 @@ _CONVERTED_SCOPE_RULES = {
         overlay_native_fields=(("netbox_nso_plugin.nsosvistate", "interface"),),
         foreign_overlay_delete="reown",
         deletion_authority=True,
-        intentional_semantic_delta=("Acquire from persisted SVI interface state instead of save-event provenance."),
+        intentional_semantic_delta=(
+            f"Acquire from persisted SVI interface state instead of save-event provenance. {_DIRECT_OVERLAY_EDIT_DELTA}"
+        ),
     ),
     "switchport": ScopeOwnershipRule(
         scope="switchport",
@@ -131,7 +141,8 @@ _CONVERTED_SCOPE_RULES = {
         foreign_overlay_delete="reown",
         deletion_authority=True,
         intentional_semantic_delta=(
-            "Acquire from persisted per-interface MTU state. A save event is not ownership evidence."
+            "Acquire from persisted per-interface MTU state. A save event is not ownership evidence. "
+            f"{_DIRECT_OVERLAY_EDIT_DELTA}"
         ),
     ),
     "subinterface": ScopeOwnershipRule(
@@ -144,7 +155,8 @@ _CONVERTED_SCOPE_RULES = {
         foreign_overlay_delete="reown",
         deletion_authority=True,
         intentional_semantic_delta=(
-            "Acquire from persisted parent and dot1q state. Native save events are not ownership evidence."
+            "Acquire from persisted parent and dot1q state. Native save events are not ownership evidence. "
+            f"{_DIRECT_OVERLAY_EDIT_DELTA}"
         ),
     ),
     "bfd": ScopeOwnershipRule(
@@ -159,7 +171,8 @@ _CONVERTED_SCOPE_RULES = {
         intentional_semantic_delta=(
             "Acquire from persisted per-interface BFD state. Save events are not ownership evidence. "
             "The BFD timers live only on the overlay, so a foreign overlay delete retires the identity "
-            "instead of re-owning it from a native row that carries no BFD content."
+            "instead of re-owning it from a native row that carries no BFD content. "
+            f"{_DIRECT_OVERLAY_EDIT_DELTA}"
         ),
     ),
     "bgp": ScopeOwnershipRule(
@@ -220,7 +233,8 @@ _CONVERTED_SCOPE_RULES = {
         deletion_authority=True,
         intentional_semantic_delta=(
             "Acquire from a persisted SAP overlay because the rendered SAP values live on that row. "
-            "VPN and termination mirrors do not establish ownership, and save events are not ownership evidence."
+            "VPN and termination mirrors do not establish ownership, and save events are not ownership evidence. "
+            f"{_DIRECT_OVERLAY_EDIT_DELTA}"
         ),
     ),
     "logging": ScopeOwnershipRule(
@@ -241,7 +255,9 @@ _CONVERTED_SCOPE_RULES = {
         ),
         foreign_overlay_delete="reown",
         deletion_authority=True,
-        intentional_semantic_delta=("Acquire from persisted logging rows. Save events are not ownership evidence."),
+        intentional_semantic_delta=(
+            f"Acquire from persisted logging rows. Save events are not ownership evidence. {_DIRECT_OVERLAY_EDIT_DELTA}"
+        ),
     ),
     "snmp": ScopeOwnershipRule(
         scope="snmp",
@@ -280,7 +296,8 @@ _CONVERTED_SCOPE_RULES = {
         deletion_authority=True,
         intentional_semantic_delta=(
             "Acquire from a persisted route assignment and overlay. Native route and assignment events are not "
-            "ownership evidence. Deletion authority carries only the adapter-acknowledged route triple."
+            "ownership evidence. Deletion authority carries only the adapter-acknowledged route triple. "
+            f"{_DIRECT_OVERLAY_EDIT_DELTA}"
         ),
         acknowledged_lineage_field="last_acked_triple",
     ),
@@ -338,7 +355,8 @@ _CONVERTED_SCOPE_RULES = {
             "overlays and push reduced snapshots synchronously. Acceptance and contributor cascades use exact "
             "acquisition planning and outbox delivery instead of owning and pushing directly. Entries and references "
             "are graph dependencies. The per-device content hash lives only on the overlay, so a foreign overlay "
-            "delete retires the identity instead of re-owning it from the shared policy root."
+            "delete retires the identity instead of re-owning it from the shared policy root. "
+            f"{_DIRECT_OVERLAY_EDIT_DELTA}"
         ),
     ),
     "isis": ScopeOwnershipRule(
