@@ -311,11 +311,12 @@ class TestRendererWriterStructure(SimpleTestCase):
 
         self.assertEqual(found, set())
 
-    def test_static_route_signals_do_not_keep_the_retired_delta_path(self):
+    def test_signals_do_not_keep_retired_mutation_paths(self):
         path = Path(__file__).resolve().parents[1] / "signals.py"
         tree = ast.parse(path.read_text(), filename=str(path))
         functions = {node.name for node in ast.walk(tree) if isinstance(node, _FUNCTION_SCOPES)}
         retired = {
+            "_create_greenfield_subif_state",
             "_on_routing_static_route_pre_save",
             "_remove_static_route_for_device",
             "_static_route_content",
