@@ -555,9 +555,7 @@ class TestRoutePolicyForeignEditDoesNotOwnOrPush(_RPBase):
 
 
 class TestOwnershipCascade(_RPBase):
-    """Owning a route-map cascades ownership to its referenced prefix-lists / community-lists /
-    as-paths — otherwise the route-map's ``match`` references dangle on the device (the gap that
-    left an ``ip as-path access-list`` missing after a route-map apply)."""
+    """Explicit acquisition cascades, while foreign native edits remain neutral."""
 
     def _route_map_with_refs(self, name="RM-CASCADE"):
         from netbox_routing.models import ASPath, CommunityList, RouteMap, RouteMapEntry
