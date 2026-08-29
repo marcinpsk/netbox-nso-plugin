@@ -15,6 +15,7 @@ import threading
 import time
 import weakref
 from contextlib import contextmanager
+from dataclasses import dataclass
 
 import requests
 from django.conf import settings
@@ -618,6 +619,32 @@ def put_failover_config(payload):
     return _request("PUT", "/api/v1/config/failover", json=payload)
 
 
+@dataclass(frozen=True)
+class AdapterControlState:
+    """The five authoritative control fields shared by adapter reads and writes."""
+
+    managed_attributes: tuple[str, ...]
+    auto_apply: bool
+    sync_before_apply: bool
+    primary_ip: str | None
+    oob_ip: str | None
+
+    def __post_init__(self):
+        object.__setattr__(self, "managed_attributes", tuple(sorted(self.managed_attributes)))
+
+    @classmethod
+    def from_adapter(cls, device_state: dict, scope_state: dict):
+        """Build canonical control state from the adapter's two read responses."""
+        failover_state = device_state["failover"]
+        return cls(
+            managed_attributes=tuple(scope_state["attributes"]),
+            auto_apply=scope_state["auto_apply"],
+            sync_before_apply=scope_state["sync_before_apply"],
+            primary_ip=None if failover_state is None else failover_state["primary_ip"],
+            oob_ip=None if failover_state is None else failover_state["oob_ip"],
+        )
+
+
 def set_scope(
     adapter_device_id, attributes, auto_apply=False, sync_before_apply=True, *, primary_ip=_UNSET, oob_ip=_UNSET
 ):
@@ -642,6 +669,23 @@ def set_scope(
 def get_scope(adapter_device_id):
     """GET /api/v1/devices/{id}/scope."""
     return _request("GET", f"/api/v1/devices/{adapter_device_id}/scope")
+
+
+def get_control_state(adapter_device_id) -> AdapterControlState:
+    """Read and combine the adapter's authoritative device control state."""
+    return AdapterControlState.from_adapter(get_device(adapter_device_id), get_scope(adapter_device_id))
+
+
+def set_control_state(adapter_device_id, state: AdapterControlState):
+    """Write one canonical adapter control state."""
+    return set_scope(
+        adapter_device_id,
+        list(state.managed_attributes),
+        auto_apply=state.auto_apply,
+        sync_before_apply=state.sync_before_apply,
+        primary_ip=state.primary_ip,
+        oob_ip=state.oob_ip,
+    )
 
 
 def patch_device(adapter_device_id, nso_instance=None, nso_device_name=None):

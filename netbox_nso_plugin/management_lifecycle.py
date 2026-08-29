@@ -154,36 +154,16 @@ def _update_management_control(device_id: int, *, compare_adapter: bool) -> bool
         if management is None or management.adapter_device_id is None:
             return False
         primary_ip, oob_ip = device_mgmt_addresses(management.device)
-        desired = (
-            tuple(sorted(management.managed_attributes)),
-            management.auto_apply,
-            management.sync_before_apply,
-            primary_ip,
-            oob_ip,
-        )
-        if compare_adapter:
-            device_state = adapter_client.get_device(management.adapter_device_id)
-            scope_state = adapter_client.get_scope(management.adapter_device_id)
-            failover_state = device_state["failover"]
-            adapter_primary_ip = None if failover_state is None else failover_state["primary_ip"]
-            adapter_oob_ip = None if failover_state is None else failover_state["oob_ip"]
-            current = (
-                tuple(sorted(scope_state["attributes"])),
-                scope_state["auto_apply"],
-                scope_state["sync_before_apply"],
-                adapter_primary_ip,
-                adapter_oob_ip,
-            )
-            if current == desired:
-                return False
-        adapter_client.set_scope(
-            management.adapter_device_id,
-            management.managed_attributes,
+        desired = adapter_client.AdapterControlState(
+            managed_attributes=tuple(management.managed_attributes),
             auto_apply=management.auto_apply,
             sync_before_apply=management.sync_before_apply,
             primary_ip=primary_ip,
             oob_ip=oob_ip,
         )
+        if compare_adapter and adapter_client.get_control_state(management.adapter_device_id) == desired:
+            return False
+        adapter_client.set_control_state(management.adapter_device_id, desired)
         return True
 
 
