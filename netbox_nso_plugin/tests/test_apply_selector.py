@@ -240,8 +240,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         """Rename one interface through its exact native renderer plan."""
         import copy
 
-        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
         from netbox_nso_plugin.renderer_writer import (
+            IntentPlanStaleError,
             RendererMutationPlan,
             planned_save,
             renderer_mirror_writes,
@@ -258,9 +258,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 with mutation as writer:
                     writer.save(candidate, update_fields=("name",))
                 return
-            except IntentMutationProtocolError as exc:
-                stale = " row " in str(exc) and str(exc).endswith(" changed after planning")
-                if attempt or not stale:
+            except IntentPlanStaleError:
+                if attempt:
                     raise
                 current = type(interface).objects.get(pk=interface.pk)
 
