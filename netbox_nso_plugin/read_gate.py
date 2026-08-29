@@ -177,6 +177,7 @@ class DeviceReadLease:
         self._hb_thread: threading.Thread | None = None
 
     def acquire(self) -> bool:
+        """Attempt to acquire the read lease; returns True if successful."""
         return bool(self.conn.set(self.key, self.token, nx=True, ex=self.ttl_s))
 
     def _extend(self) -> bool:

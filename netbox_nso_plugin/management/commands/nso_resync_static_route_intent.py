@@ -8,6 +8,8 @@ from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet
 
 
 class Command(BaseCommand):
+    """Django management command to re-push static-route intent for adapter backfill."""
+
     help = (
         "Re-push every NSO-managed device's static-route intent store-only, so the adapter "
         "backfills route_id on its stored rows and its replacement fence can open. Owned "

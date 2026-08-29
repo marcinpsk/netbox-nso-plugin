@@ -116,6 +116,8 @@ def _claim_modes(state, flags):
 
 
 class Command(BaseCommand):
+    """Django management command to reconcile plugin database state after a restore."""
+
     help = "Resolve a plugin-only database restore against the adapter's durable intent receipts."
 
     def handle(self, *args, **options):

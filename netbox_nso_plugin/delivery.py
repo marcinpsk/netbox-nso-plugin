@@ -56,6 +56,7 @@ class DeliveryKey:
     push_name: str
 
     def push(self, device_id, adapter_device_id):
+        """Push intent for this scope to the adapter by calling the registered signal handler."""
         from . import signals
 
         return getattr(signals, self.push_name)(device_id, adapter_device_id)

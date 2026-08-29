@@ -62,6 +62,8 @@ def secret_fingerprint(value: str) -> str:
 
 @dataclass(frozen=True)
 class VaultRef:
+    """Parsed Vault reference containing mount, path, and optional key."""
+
     mount: str
     path: str
     key: str | None
