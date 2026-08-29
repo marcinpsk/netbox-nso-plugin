@@ -153,6 +153,18 @@ def _update_management_control(device_id: int, *, compare_adapter: bool) -> bool
         )
         if management is None or management.adapter_device_id is None:
             return False
+        locked_address_ids = {row.pk for row in footprint.source_rows if row.model_label == "ipam.ipaddress"}
+        current_address_ids = {
+            address_id
+            for address_id in (
+                management.device.primary_ip4_id,
+                management.device.primary_ip6_id,
+                management.device.oob_ip_id,
+            )
+            if address_id is not None
+        }
+        if not current_address_ids.issubset(locked_address_ids):
+            return False
         primary_ip, oob_ip = device_mgmt_addresses(management.device)
         desired = adapter_client.AdapterControlState(
             managed_attributes=tuple(management.managed_attributes),

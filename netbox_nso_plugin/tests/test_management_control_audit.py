@@ -243,6 +243,35 @@ class TestManagementControlAudit(_CascadeFlushMixin, IntentPushResetMixin, Trans
         for outcome in probes:
             self.assertIsInstance(outcome, OperationalError)
 
+    def test_an_address_move_after_discovery_defers_the_control_post(self):
+        from netbox_nso_plugin import management_lifecycle
+
+        old_interface = Interface.objects.create(device=self.device, name="Loopback1628", type="virtual")
+        new_interface = Interface.objects.create(device=self.device, name="Loopback1629", type="virtual")
+        old_address = IPAddress.objects.create(address="198.18.175.3/32", assigned_object=old_interface)
+        new_address = IPAddress.objects.create(address="198.18.175.4/32", assigned_object=new_interface)
+        self.device.primary_ip4 = old_address
+        self.device.save(update_fields=["primary_ip4"])
+        discover = management_lifecycle._control_footprint
+
+        def move_after_discovery(device_id):
+            footprint = discover(device_id)
+            Device.objects.filter(pk=device_id).update(primary_ip4=new_address)
+            return footprint
+
+        with (
+            patch("netbox_nso_plugin.management_lifecycle._control_footprint", side_effect=move_after_discovery),
+            patch("netbox_nso_plugin.adapter_client.get_device", return_value={"failover": None}),
+            patch(
+                "netbox_nso_plugin.adapter_client.get_scope",
+                return_value={"attributes": [], "auto_apply": False, "sync_before_apply": True},
+            ),
+            patch("netbox_nso_plugin.adapter_client.set_scope") as set_scope,
+        ):
+            self.assertFalse(management_lifecycle.reconcile_management_control(self.device.pk))
+
+        set_scope.assert_not_called()
+
     def test_cadence_runs_control_reconciliation_before_renderer_comparison(self):
         from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
 
