@@ -185,8 +185,7 @@ class RendererMutationPlan:
     lock_footprint: MutationFootprint
     content_keys: tuple[tuple[int, str], ...]
     planned_at: Any
-    validate_after_acquire: Callable[[], None] | None = dataclass_field(default=None, compare=False, repr=False)
-    settles_deploying: bool = True
+    execution: Any = dataclass_field(default=None, compare=False, repr=False)
 
     @property
     def changes_content(self) -> bool:
@@ -202,8 +201,8 @@ class RendererMutationPlan:
         m2m_writes=(),
         read_dependencies=(),
         planned_at=None,
-        validate_after_acquire=None,
-        settles_deploying=True,
+        additional_footprints=(),
+        execution=None,
     ) -> RendererMutationPlan:
         """Freeze proposed writes and derive every lock and revision dependency."""
         planned_at = planned_at or timezone.now()
@@ -265,6 +264,7 @@ class RendererMutationPlan:
 
         content_keys.update(_prospective_visibility_keys(effective_saves))
 
+        footprints.extend(additional_footprints)
         lock_footprint = MutationFootprint.merge(*footprints) if footprints else MutationFootprint()
         return cls(
             write_set=tuple(writes),
@@ -272,8 +272,7 @@ class RendererMutationPlan:
             lock_footprint=lock_footprint,
             content_keys=tuple(sorted(content_keys)),
             planned_at=planned_at,
-            validate_after_acquire=validate_after_acquire,
-            settles_deploying=settles_deploying,
+            execution=execution,
         )
 
 
@@ -945,11 +944,12 @@ class RendererWriter:
         )
 
     def _creation_matches(self, write, instance):
-        spec = renderer_input_specs().get(write.model_label)
-        if spec is None:
-            return bool(write.natural_key) and self._fields_match(write.natural_key, instance)
-        content_attnames = {spec.model._meta.get_field(field_name).attname for field_name in spec.content_fields}
-        expected = tuple((attname, value) for attname, value in write.values if attname in content_attnames)
+        from django.db.models import Field
+
+        fields = {field.attname: field for field in instance._meta.concrete_fields}
+        expected = tuple(
+            (attname, value) for attname, value in write.values if type(fields[attname]).pre_save is Field.pre_save
+        )
         return self._fields_match(expected, instance)
 
     def consume_existing_creation(self, instance) -> bool:
@@ -1045,8 +1045,12 @@ class RendererWriter:
                 except IntegrityError:
                     write = self.plan.write_set[index]
                     existing = self._resolve_creation(write) if write.natural_key else None
-                    if existing is None or not self._creation_matches(write, existing):
+                    if existing is None:
                         raise
+                    if not self._creation_matches(write, existing):
+                        raise IntentPlanStaleError(
+                            f"{write.model_label} creation {write.natural_key!r} changed after planning"
+                        ) from None
                     instance.pk = existing.pk
                     instance._state.adding = False
                     instance._state.db = existing._state.db

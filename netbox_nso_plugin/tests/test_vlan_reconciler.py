@@ -14,6 +14,7 @@ from ipam.models import VLAN, VLANGroup
 from netbox_nso_plugin.models import (
     NSODeviceManagement,
     NSOInstance,
+    NSOSwitchportState,
     NSOVLANState,
 )
 from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
@@ -100,7 +101,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
 
         self.assertFalse(VLANGroup.objects.filter(slug=f"nso-{self.device.pk}").exists())
 
-    def test_vlan_reconciler_skips_entries_without_a_usable_vlan_id(self):
+    def test_vlan_reconciler_rejects_entries_without_a_usable_vlan_id(self):
         from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
 
         payload = {
@@ -112,10 +113,18 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
                 {"vlan_id": 1624, "name": "VALID"},
             ]
         }
-        with self.assertLogs("netbox_nso_plugin.vlan_reconciler", level="WARNING"):
-            rows = reconcile_vlan_database(self.device, payload)
+        with self.assertRaisesRegex(ValueError, "VLAN payload entry"):
+            reconcile_vlan_database(self.device, payload)
 
-        self.assertEqual([row.vlan.vid for row in rows], [1624])
+        self.assertFalse(NSOVLANState.objects.filter(management=self.management).exists())
+
+    def test_switchport_reconciler_rejects_a_non_list_document(self):
+        from netbox_nso_plugin.vlan_reconciler import reconcile_switchport
+
+        with self.assertRaisesRegex(ValueError, "interfaces must be a list"):
+            reconcile_switchport(self.device, {"interfaces": {"interface_name": self.interface.name}})
+
+        self.assertFalse(NSOSwitchportState.objects.filter(interface=self.interface).exists())
 
     def test_vlan_reconcile_preflights_native_and_overlay_creations(self):
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan
@@ -147,13 +156,28 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         waiting_plan = vlan_reconcile_plan(self.device, payload)
         winner_plan = vlan_reconcile_plan(self.device, payload)
         with renderer_mirror_writes(winner_plan) as writer:
-            _reconcile_vlan_database(self.device, payload, writer, winner_plan.planned_at)
+            _reconcile_vlan_database(self.device, payload, writer, winner_plan)
 
         with renderer_mirror_writes(waiting_plan) as writer:
-            rows = _reconcile_vlan_database(self.device, payload, writer, waiting_plan.planned_at)
+            rows = _reconcile_vlan_database(self.device, payload, writer, waiting_plan)
 
         self.assertEqual([row.vlan.vid for row in rows], [1645])
         self.assertEqual(NSOVLANState.objects.filter(management=self.management, vlan__vid=1645).count(), 1)
+
+    def test_vlan_reconcile_replays_the_frozen_group_creation_after_a_race(self):
+        from netbox_nso_plugin.renderer_writer import renderer_mirror_writes, renderer_writes
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database, vlan_reconcile_plan
+
+        payload = {"vlans": [{"vlan_id": 1627, "name": "PREFLIGHT"}]}
+        plan = vlan_reconcile_plan(self.device, payload)
+        group = VLANGroup.objects.create(name=f"NSO {self.device.name}", slug=f"nso-{self.device.pk}")
+
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+        with mutation:
+            rows = reconcile_vlan_database(self.device, payload)
+
+        self.assertEqual([row.vlan.vid for row in rows], [1627])
+        self.assertEqual(VLANGroup.objects.get(slug=group.slug).pk, group.pk)
 
     def test_direct_vlan_reconcile_does_not_advance_intent_revision(self):
         from netbox_nso_plugin.models import NSOIntentRevision
@@ -240,10 +264,10 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         waiting = prepare_switchport_reconcile(self.device, payload)
         winner = prepare_switchport_reconcile(self.device, payload)
         with renderer_mirror_writes(winner.plan) as writer:
-            _reconcile_switchport(self.device, payload, writer, winner.plan.planned_at, winner.interface_pks)
+            _reconcile_switchport(self.device, payload, writer, winner.plan)
 
         with renderer_mirror_writes(waiting.plan) as writer:
-            rows = _reconcile_switchport(self.device, payload, writer, waiting.plan.planned_at, waiting.interface_pks)
+            rows = _reconcile_switchport(self.device, payload, writer, waiting.plan)
 
         self.assertEqual([row.interface_id for row in rows], [self.interface.pk])
 

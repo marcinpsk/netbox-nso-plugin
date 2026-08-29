@@ -26,6 +26,47 @@ from .strict_writer import strict_writer_harness
 
 
 class TestRendererSetUpdate(IntentPushResetMixin, TestCase):
+    def test_raced_unregistered_creation_is_consumed_from_its_full_plan(self):
+        from ipam.models import VLANGroup
+
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes
+
+        group = VLANGroup(name="Writer raced group", slug="writer-raced-group")
+        plan = RendererMutationPlan.build(saves=(planned_save(group, force_insert=True, natural_key=("slug",)),))
+        raced = VLANGroup.objects.create(name=group.name, slug=group.slug)
+
+        with renderer_mirror_writes(plan) as writer:
+            self.assertTrue(writer.consume_existing_creation(raced))
+
+        self.assertIsNotNone(raced.pk)
+
+    def test_raced_overlay_creation_with_different_lifecycle_is_rejected(self):
+        from netbox_nso_plugin.renderer_writer import (
+            IntentPlanStaleError,
+            RendererMutationPlan,
+            planned_save,
+            renderer_writes,
+        )
+
+        device, management = make_managed("writer-raced-overlay", 16275)
+        from ipam.models import VLANGroup
+
+        group = VLANGroup.objects.create(name="Writer raced overlay", slug="writer-raced-overlay")
+        vlan = VLAN.objects.create(group=group, vid=1627, name="Writer raced overlay")
+        planned = NSOVLANState(management=management, vlan=vlan, device_name=vlan.name, status="accepted")
+        plan = RendererMutationPlan.build(
+            saves=(planned_save(planned, force_insert=True, natural_key=("management", "vlan")),)
+        )
+        mirror_update(
+            NSOVLANState.objects.create(management=management, vlan=vlan, device_name=vlan.name),
+            status="imported",
+        )
+
+        with self.assertRaises(IntentPlanStaleError), renderer_writes(plan) as writer:
+            writer.save(planned, force_insert=True)
+
+        self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=device.pk, scope="vlan").exists())
+
     def test_forward_creation_reference_is_rejected_during_planning(self):
         from ipam.models import VLANGroup
 

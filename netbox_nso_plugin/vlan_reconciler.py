@@ -30,6 +30,14 @@ class VLANRescopeConflict(Exception):
     """The VLAN membership changed while a rescope request waited for admission."""
 
 
+@dataclass(frozen=True)
+class _ReconcileExecution:
+    """The instances and result rows captured by one frozen renderer plan."""
+
+    operations: tuple
+    rows: tuple
+
+
 def _rescope_plan_ready(plan):
     """Return a completed rescope plan before it enters the lock protocol."""
     return plan
@@ -39,31 +47,82 @@ def _rescope_plan_ready(plan):
 _NSO_TO_NETBOX_MODE = {"access": "access", "trunk": "tagged", "trunk-all": "tagged-all"}
 
 
-def _validated_switchport_items(payload) -> list[dict]:
-    """Return complete switchport entries or reject the invalid adapter document."""
-    from .adapter_client import AdapterError
+def _validated_vlan_id(value, field_name):
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be an integer VLAN ID")
+    try:
+        vlan_id = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be an integer VLAN ID") from exc
+    if not 1 <= vlan_id <= 4094:
+        raise ValueError(f"{field_name} must be between 1 and 4094")
+    return vlan_id
 
-    items = payload.get("interfaces") if isinstance(payload, dict) else None
+
+def _validated_vlan_items(payload: dict) -> tuple[dict, ...]:
+    """Validate and normalize a complete adapter VLAN document."""
+    if not isinstance(payload, dict):
+        raise ValueError("VLAN payload must be an object")
+    items = payload.get("vlans", [])
     if not isinstance(items, list):
-        raise AdapterError("Adapter returned malformed switchport interfaces.", code="invalid_response")
+        raise ValueError("VLAN payload vlans must be a list")
+    normalized = []
+    seen = set()
     for item in items:
-        valid_tagged = isinstance(item, dict) and isinstance(item.get("tagged_vlans"), list)
-        if valid_tagged:
-            valid_tagged = all(isinstance(vid, int) and not isinstance(vid, bool) for vid in item["tagged_vlans"])
-        valid_untagged = isinstance(item, dict) and (
-            item.get("untagged_vlan") is None
-            or (isinstance(item.get("untagged_vlan"), int) and not isinstance(item.get("untagged_vlan"), bool))
-        )
-        if not (
-            isinstance(item, dict)
-            and isinstance(item.get("interface_name"), str)
-            and item["interface_name"]
-            and item.get("mode") in _NSO_TO_NETBOX_MODE
-            and valid_untagged
-            and valid_tagged
-        ):
-            raise AdapterError("Adapter returned a malformed switchport entry.", code="invalid_response")
-    return items
+        if not isinstance(item, dict):
+            raise ValueError("VLAN payload entry must be an object")
+        try:
+            vlan_id = _validated_vlan_id(item.get("vlan_id"), "VLAN payload entry vlan_id")
+        except ValueError as exc:
+            raise ValueError(f"VLAN payload entry is invalid: {exc}") from exc
+        if vlan_id in seen:
+            raise ValueError(f"VLAN payload contains duplicate vlan_id {vlan_id}")
+        name = item.get("name")
+        if name is not None and not isinstance(name, str):
+            raise ValueError("VLAN payload entry name must be a string or null")
+        seen.add(vlan_id)
+        normalized.append({**item, "vlan_id": vlan_id})
+    return tuple(normalized)
+
+
+def _validated_switchport_items(payload: dict) -> tuple[dict, ...]:
+    """Validate and normalize a complete adapter switchport document."""
+    if not isinstance(payload, dict):
+        raise ValueError("switchport payload must be an object")
+    items = payload.get("interfaces", [])
+    if not isinstance(items, list):
+        raise ValueError("switchport payload interfaces must be a list")
+    normalized = []
+    seen = set()
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("switchport payload entry must be an object")
+        name = item.get("interface_name")
+        if not isinstance(name, str) or not name:
+            raise ValueError("switchport payload entry interface_name must be a non-empty string")
+        if name in seen:
+            raise ValueError(f"switchport payload contains duplicate interface_name {name}")
+        tagged = item.get("tagged_vlans") or []
+        if not isinstance(tagged, list):
+            raise ValueError("switchport payload entry tagged_vlans must be a list")
+        tagged = [_validated_vlan_id(value, "tagged_vlans entry") for value in tagged]
+        if len(tagged) != len(set(tagged)):
+            raise ValueError(f"switchport payload entry {name} contains duplicate tagged VLANs")
+        untagged = item.get("untagged_vlan")
+        if untagged is not None:
+            untagged = _validated_vlan_id(untagged, "untagged_vlan")
+        mode = item.get("mode")
+        if mode is not None and not isinstance(mode, str):
+            raise ValueError("switchport payload entry mode must be a string or null")
+        seen.add(name)
+        normalized.append({**item, "untagged_vlan": untagged, "tagged_vlans": tagged})
+    return tuple(normalized)
+
+
+def _device_vlan_group_lock(device):
+    from .intent_state import MutationFootprint
+
+    return MutationFootprint.for_keys((), shared_keys=(("vlan-group", f"nso-{device.pk}"),))
 
 
 def _device_vlan_group(device, *, create=True):
@@ -154,8 +213,13 @@ def vlan_reconcile_plan(device, payload: dict):
     from .renderer_writer import RendererMutationPlan
 
     planned_at = timezone.now()
-    saves, _operations, _reported_rows = _vlan_reconcile_operations(device, payload, planned_at)
-    return RendererMutationPlan.build(saves=saves, planned_at=planned_at)
+    saves, operations, reported_rows = _vlan_reconcile_operations(device, payload, planned_at)
+    return RendererMutationPlan.build(
+        saves=saves,
+        planned_at=planned_at,
+        additional_footprints=(_device_vlan_group_lock(device),),
+        execution=_ReconcileExecution(tuple(operations), tuple(reported_rows)),
+    )
 
 
 def _vlan_reconcile_operations(device, payload, planned_at):
@@ -191,17 +255,8 @@ def _vlan_reconcile_operations(device, payload, planned_at):
         operations.append((group, None, True))
         return group
 
-    for item in payload.get("vlans", []) or []:
-        if not isinstance(item, dict):
-            logger.warning("VLAN reconcile for %s dropped a malformed entry: %r", device, item)
-            continue
-        try:
-            vid = int(item["vlan_id"])
-        except (KeyError, TypeError, ValueError):
-            logger.warning("VLAN reconcile for %s dropped an entry without a usable vlan_id: %r", device, item)
-            continue
-        if vid in seen_vids:
-            continue
+    for item in _validated_vlan_items(payload):
+        vid = item["vlan_id"]
         seen_vids.add(vid)
         name = item.get("name") or ""
         current = states_by_vid.get(vid)
@@ -347,7 +402,7 @@ def switchport_reconcile_plan(device, payload: dict, interface_pks: dict | None 
     if interface_pks is None:
         interface_pks = _switchport_interface_pks(device, payload)
     planned_at = timezone.now()
-    saves, deletes, m2m_writes, _operations, _rows = _switchport_reconcile_operations(
+    saves, deletes, m2m_writes, operations, rows = _switchport_reconcile_operations(
         device,
         payload,
         planned_at,
@@ -358,6 +413,8 @@ def switchport_reconcile_plan(device, payload: dict, interface_pks: dict | None 
         deletes=deletes,
         m2m_writes=m2m_writes,
         planned_at=planned_at,
+        additional_footprints=(_device_vlan_group_lock(device),),
+        execution=_ReconcileExecution(tuple(operations), tuple(rows)),
     )
 
 
@@ -828,32 +885,54 @@ def reconcile_vlan_database(device, payload: dict) -> list:
     from .signals import suppress_intent_push
 
     active = active_renderer_writer()
-    if active is not None:
-        with contextlib.nullcontext(active) as writer, suppress_intent_push():
-            return _reconcile_vlan_database(device, payload, writer, active.plan.planned_at)
-
-    def plan_fn():
-        return vlan_reconcile_plan(device, payload)
-
-    with renderer_writes_replanning_once(plan_fn) as (writer, plan), suppress_intent_push():
-        return _reconcile_vlan_database(device, payload, writer, plan.planned_at)
+    plan = active.plan if active is not None else vlan_reconcile_plan(device, payload)
+    mutation = contextlib.nullcontext(active)
+    if active is None:
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+    with mutation as writer, suppress_intent_push():
+        return _reconcile_vlan_database(device, payload, writer, plan)
 
 
-def _reconcile_vlan_database(device, payload: dict, writer, planned_at) -> list:
-    """Execute the VLAN operations after their exact write set is frozen."""
-    _saves, operations, reported_rows = _vlan_reconcile_operations(device, payload, planned_at)
-    raced_rows = set()
-    for row in reported_rows:
-        if row.vlan.group_id is not None:
-            writer.consume_existing_creation(row.vlan.group)
-        writer.consume_existing_creation(row.vlan)
-        if writer.consume_existing_creation(row):
-            raced_rows.add(id(row))
-    for instance, update_fields, force_insert in operations:
-        if id(instance) in raced_rows:
+def _sync_cached_foreign_keys(instance):
+    """Refresh FK IDs whose related rows were created earlier in this plan."""
+    for field in instance._meta.concrete_fields:
+        if not field.many_to_one or not field.is_cached(instance):
             continue
-        writer.save(instance, update_fields=update_fields, force_insert=force_insert)
-    return reported_rows
+        related = field.get_cached_value(instance)
+        if related is not None and related.pk is not None:
+            setattr(instance, field.attname, related.pk)
+
+
+def _save_reconcile_instance(writer, instance, update_fields, force_insert):
+    """Save one frozen step, adopting an identical raced device VLAN group."""
+    from .renderer_writer import IntentPlanStaleError
+
+    if force_insert and instance._meta.label_lower == "ipam.vlangroup":
+        matches = list(type(instance).objects.filter(slug=instance.slug).order_by("pk")[:2])
+        if len(matches) > 1:
+            raise IntentPlanStaleError(f"multiple VLAN groups use planned slug {instance.slug!r}")
+        if matches:
+            existing = matches[0]
+            if not writer.consume_existing_creation(existing):
+                raise IntentPlanStaleError(f"VLAN group creation {instance.slug!r} changed after planning")
+            instance.pk = existing.pk
+            instance._state.adding = False
+            instance._state.db = existing._state.db
+            return
+    _sync_cached_foreign_keys(instance)
+    writer.save(instance, update_fields=update_fields, force_insert=force_insert)
+
+
+def _reconcile_vlan_database(device, payload: dict, writer, plan) -> list:
+    """Execute the VLAN operations after their exact write set is frozen."""
+    _validated_vlan_items(payload)
+    execution = plan.execution
+    if not isinstance(execution, _ReconcileExecution):
+        raise ValueError("VLAN reconciliation requires its frozen execution steps")
+    operations = execution.operations
+    for instance, update_fields, force_insert in operations:
+        _save_reconcile_instance(writer, instance, update_fields, force_insert)
+    return list(execution.rows)
 
 
 def save_vlan_content(vlan, *, update_fields):
@@ -966,7 +1045,7 @@ def reconcile_switchport(device, payload: dict, attempt: SwitchportReconcileAtte
     active = active_renderer_writer()
     if active is not None:
         with contextlib.nullcontext(active) as writer, suppress_intent_push():
-            return _reconcile_switchport(device, payload, writer, active.plan.planned_at, attempt.interface_pks)
+            return _reconcile_switchport(device, payload, writer, active.plan)
 
     served = False
 
@@ -980,56 +1059,29 @@ def reconcile_switchport(device, payload: dict, attempt: SwitchportReconcileAtte
         return switchport_reconcile_plan(device, payload, attempt.interface_pks)
 
     with renderer_writes_replanning_once(plan_fn) as (writer, plan), suppress_intent_push():
-        return _reconcile_switchport(device, payload, writer, plan.planned_at, attempt.interface_pks)
+        return _reconcile_switchport(device, payload, writer, plan)
 
 
-def _reconcile_switchport(device, payload: dict, writer, planned_at, interface_pks: dict) -> list:
+def _reconcile_switchport(device, payload: dict, writer, plan) -> list:
     """Execute the switchport operations after their write set is frozen.
 
-    The frozen *interface_pks* are reloaded under the acquired lock, so no row outside the
-    declared footprint is written and no pre-lock copy is compared or saved.
+    The plan froze the interface pks resolved before acquisition and reloaded exactly those
+    rows under the lock, so no row outside the declared footprint is written and no pre-lock
+    copy is compared or saved.
     """
-    _saves, _deletes, _m2m_writes, operations, rows = _switchport_reconcile_operations(
-        device,
-        payload,
-        planned_at,
-        interface_pks,
-    )
-    raced_rows = set()
-    consumed_m2m = set()
-    for row in rows:
-        interface = row.interface
-        state_tagged = () if row.pk is None else _ordered_tagged_vlans(row)
-        writer.consume_applied_save(interface)
-        if writer.consume_applied_m2m_set(interface, "tagged_vlans"):
-            consumed_m2m.add((id(interface), "tagged_vlans"))
-        related_vlans = {
-            vlan.pk: vlan
-            for vlan in (
-                interface.untagged_vlan,
-                row.untagged_vlan,
-                *_ordered_tagged_vlans(interface),
-                *state_tagged,
-            )
-            if vlan is not None and vlan.pk is not None
-        }
-        for vlan in related_vlans.values():
-            if vlan.group_id is not None:
-                writer.consume_existing_creation(vlan.group)
-            writer.consume_existing_creation(vlan)
-        if writer.consume_existing_creation(row) or writer.consume_applied_save(row):
-            raced_rows.add(id(row))
-        if row.pk is not None and writer.consume_applied_m2m_set(row, "tagged_vlans"):
-            consumed_m2m.add((id(row), "tagged_vlans"))
+    _validated_switchport_items(payload)
+    execution = plan.execution
+    if not isinstance(execution, _ReconcileExecution):
+        raise ValueError("switchport reconciliation requires its frozen execution steps")
+    operations = execution.operations
     for operation, instance, update_fields, force_insert, field_name, related in operations:
         if operation == "save":
-            if id(instance) in raced_rows:
-                continue
-            writer.save(instance, update_fields=update_fields, force_insert=force_insert)
+            _save_reconcile_instance(writer, instance, update_fields, force_insert)
         elif operation == "delete":
             writer.delete(instance)
         else:
-            if (id(instance), field_name) in consumed_m2m:
-                continue
+            _sync_cached_foreign_keys(instance)
+            for related_instance in related:
+                _sync_cached_foreign_keys(related_instance)
             writer.m2m_set(instance, field_name, related)
-    return rows
+    return list(execution.rows)
