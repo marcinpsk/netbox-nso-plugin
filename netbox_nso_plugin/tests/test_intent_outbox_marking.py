@@ -319,6 +319,7 @@ class TestRevisionLockSerializesClaimFormation(_MarkCase):
             return rendered
 
         with (
+            # Keep the render hook bound to claim formation, not the fronting audit.
             patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes"),
             patch("netbox_nso_plugin.delivery.render", side_effect=render_then_commit),
         ):
