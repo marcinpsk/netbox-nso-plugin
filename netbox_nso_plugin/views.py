@@ -5613,6 +5613,30 @@ class NSOLACPBundleStateAcceptView(NSOActionPermissionMixin, View):
         return redirect(_device_nso_tab_url(state.management.device_id))
 
 
+def _switchport_accept_plan(state):
+    """Freeze the native, overlay, and tagged-VLAN writes for one switchport accept."""
+    import copy
+
+    from .renderer_writer import RendererMutationPlan, planned_m2m_set, planned_save
+
+    tagged = tuple(state.tagged_vlans.order_by("pk"))
+    interface = copy.copy(state.interface)
+    interface.mode = state.mode or ""
+    interface.untagged_vlan = state.untagged_vlan
+    candidate = copy.copy(state)
+    candidate.status = _status_after_accept(state.status)
+    candidate.accepted_at = timezone.now()
+    plan = RendererMutationPlan.build(
+        saves=(
+            planned_save(interface, update_fields=("mode", "untagged_vlan")),
+            planned_save(candidate, update_fields=("status", "accepted_at")),
+        ),
+        m2m_writes=(planned_m2m_set(interface, "tagged_vlans", tagged),),
+        planned_at=candidate.accepted_at,
+    )
+    return plan, interface, candidate, tagged
+
+
 class NSOSwitchportStateAcceptView(NSOActionPermissionMixin, View):
     """Accept one L2 switchport: native-write the observed mode/VLANs + mark owned.
 
@@ -5623,37 +5647,15 @@ class NSOSwitchportStateAcceptView(NSOActionPermissionMixin, View):
     """
 
     def post(self, request, pk):  # noqa: D102
-        import copy
-
         from .intent_state import IntentMutationProtocolError
         from .models import NSOSwitchportState
-        from .renderer_writer import (
-            RendererMutationPlan,
-            planned_m2m_set,
-            planned_save,
-            renderer_mirror_writes,
-            renderer_writes,
-        )
+        from .renderer_writer import renderer_mirror_writes, renderer_writes
 
         for _attempt in range(2):
             state = get_object_or_404(NSOSwitchportState, pk=pk)
             if state.management.device_id != state.interface.device_id:
                 continue
-            tagged = tuple(state.tagged_vlans.order_by("pk"))
-            interface = copy.copy(state.interface)
-            interface.mode = state.mode or ""
-            interface.untagged_vlan = state.untagged_vlan
-            candidate = copy.copy(state)
-            candidate.status = _status_after_accept(state.status)
-            candidate.accepted_at = timezone.now()
-            plan = RendererMutationPlan.build(
-                saves=(
-                    planned_save(interface, update_fields=("mode", "untagged_vlan")),
-                    planned_save(candidate, update_fields=("status", "accepted_at")),
-                ),
-                m2m_writes=(planned_m2m_set(interface, "tagged_vlans", tagged),),
-                planned_at=candidate.accepted_at,
-            )
+            plan, interface, candidate, tagged = _switchport_accept_plan(state)
             mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
             try:
                 with mutation as writer:
