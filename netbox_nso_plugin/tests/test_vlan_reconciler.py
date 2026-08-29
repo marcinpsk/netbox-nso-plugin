@@ -233,7 +233,6 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
                 with self.assertRaisesRegex(AdapterError, "integer VLAN ID"):
                     reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": vlan_id}]})
                 self.assertFalse(NSOVLANState.objects.filter(management=self.management).exists())
-
     def test_vlan_reconcile_preflights_native_and_overlay_creations(self):
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan
         from netbox_nso_plugin.vlan_reconciler import vlan_reconcile_plan
