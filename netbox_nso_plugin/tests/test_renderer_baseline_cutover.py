@@ -29,6 +29,7 @@ class TestRendererBaselineCutover(_CascadeFlushMixin, IntentPushResetMixin, Tran
         super().tearDown()
 
     def test_unknown_baseline_is_repaired_and_verified_before_resume(self):
+        from netbox_nso_plugin.deployment import is_quiesced
         from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentRevision
 
         state = own_vlan(self.management, 1674, "renderer-cutover")
@@ -49,6 +50,7 @@ class TestRendererBaselineCutover(_CascadeFlushMixin, IntentPushResetMixin, Tran
         assert_each_operation_consumed_once(records)
         state.refresh_from_db()
         revision.refresh_from_db()
+        self.assertFalse(is_quiesced())
         self.assertEqual(state.status, "accepted")
         self.assertIsNone(state.apply_attempt_id)
         self.assertEqual(revision.verified_revision, revision.revision)
@@ -67,6 +69,19 @@ class TestRendererBaselineCutover(_CascadeFlushMixin, IntentPushResetMixin, Tran
             with self.assertRaisesMessage(Exception, "racing"):
                 call_command("nso_renderer_baseline_cutover", stdout=io.StringIO())
 
+        self.assertTrue(is_quiesced())
+
+    def test_setup_failure_reports_that_the_gate_remains_active(self):
+        from django.core.management.base import CommandError
+
+        from netbox_nso_plugin.deployment import is_quiesced
+
+        stderr = io.StringIO()
+        with patch("netbox_nso_plugin.delivery.delivery_keys", side_effect=RuntimeError("registry unavailable")):
+            with self.assertRaisesRegex(CommandError, "registry unavailable"):
+                call_command("nso_renderer_baseline_cutover", stderr=stderr)
+
+        self.assertIn("intent work remains quiesced", stderr.getvalue())
         self.assertTrue(is_quiesced())
 
     def test_a_baseline_that_never_stops_repairing_fails_and_stays_quiesced(self):
