@@ -87,7 +87,15 @@ def _record(mgmt, scope="static_route"):
 
 
 class TestIntentPushRejectionRecord(IntentPushResetMixin, TestCase):
-    """P6.1, P6.3, P6.4, P6.5 — what gets persisted, and what deliberately does not."""
+    """P6.1, P6.3, P6.4, P6.5: what gets persisted, and what deliberately does not."""
+
+    def test_management_mirror_allowlist_names_only_model_fields(self):
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.signals import _MANAGEMENT_MIRROR_FIELDS
+
+        model_fields = {field.name for field in NSODeviceManagement._meta.concrete_fields}
+
+        self.assertLessEqual(_MANAGEMENT_MIRROR_FIELDS, model_fields)
 
     @classmethod
     def setUpTestData(cls):

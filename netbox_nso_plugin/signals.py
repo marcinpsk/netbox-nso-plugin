@@ -629,7 +629,6 @@ _MANAGEMENT_MIRROR_FIELDS = frozenset(
         "onboarded_at",
         "onboard_steps",
         "onboard_job_id",
-        "last_reconciled",
         "last_sync_at",
         "last_sync_status",
         "degraded_surfaces",
