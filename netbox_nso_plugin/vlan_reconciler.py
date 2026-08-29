@@ -133,7 +133,7 @@ def vlan_reconcile_plan(device, payload: dict):
 
 def _vlan_reconcile_operations(device, payload, planned_at):
     """Build the deterministic VLAN writes shared by preflight and apply."""
-    from ipam.models import VLAN
+    from ipam.models import VLAN, VLANGroup
 
     from . import status_machine as sm
     from .models import NSODeviceManagement, NSOVLANState
@@ -142,16 +142,27 @@ def _vlan_reconcile_operations(device, payload, planned_at):
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:
         return [], [], []
-    group = _device_vlan_group(device)
+    group = _device_vlan_group(device, create=False)
     states = list(NSOVLANState.objects.filter(management=management).select_related("vlan").order_by("pk"))
     states_by_vid = {}
     for state in states:
         states_by_vid.setdefault(state.vlan.vid, state)
-    group_vlans = {vlan.vid: vlan for vlan in VLAN.objects.filter(group=group).order_by("pk")}
+    group_vlans = (
+        {vlan.vid: vlan for vlan in VLAN.objects.filter(group=group).order_by("pk")} if group is not None else {}
+    )
     saves = []
     operations = []
     reported_rows = []
     seen_vids = set()
+
+    def ensure_group():
+        nonlocal group
+        if group is not None:
+            return group
+        group = VLANGroup(name=f"NSO {device.name}", slug=f"nso-{device.pk}")
+        saves.append(planned_save(group, force_insert=True, natural_key=("slug",)))
+        operations.append((group, None, True))
+        return group
 
     for item in payload.get("vlans", []) or []:
         if not isinstance(item, dict):
@@ -167,7 +178,7 @@ def _vlan_reconcile_operations(device, payload, planned_at):
         current = states_by_vid.get(vid)
         vlan = current.vlan if current is not None else group_vlans.get(vid)
         if vlan is None:
-            vlan = VLAN(group=group, vid=vid, name=name or placeholder_vlan_name(vid))
+            vlan = VLAN(group=ensure_group(), vid=vid, name=name or placeholder_vlan_name(vid))
             proposal = planned_save(
                 vlan,
                 force_insert=True,
@@ -326,7 +337,7 @@ def _switchport_reconcile_operations(device, payload, planned_at, interface_pks)
     here, so the apply-time build (under the lock) compares and writes committed values.
     """
     from dcim.models import Interface
-    from ipam.models import VLAN
+    from ipam.models import VLAN, VLANGroup
 
     from . import merge_util
     from . import status_machine as sm
@@ -337,7 +348,7 @@ def _switchport_reconcile_operations(device, payload, planned_at, interface_pks)
     if management is None:
         return [], [], [], [], []
     items = _switchport_items(payload)
-    group = _device_vlan_group(device)
+    group = _device_vlan_group(device, create=False)
     interfaces = {
         row.pk: row
         for row in Interface.objects.filter(pk__in=set(interface_pks.values())).select_related("untagged_vlan")
@@ -353,7 +364,8 @@ def _switchport_reconcile_operations(device, payload, planned_at, interface_pks)
         row.vlan.vid: row.vlan
         for row in NSOVLANState.objects.filter(management=management).select_related("vlan").order_by("pk")
     }
-    group_vlans = {row.vid: row for row in VLAN.objects.filter(group=group).order_by("pk")}
+    group_vlans = {row.vid: row for row in VLAN.objects.filter(group=group).order_by("pk")} if group is not None else {}
+    group_saves = []
     vlan_saves = []
     native_saves = []
     state_saves = []
@@ -364,14 +376,24 @@ def _switchport_reconcile_operations(device, payload, planned_at, interface_pks)
     state_operations = []
     m2m_operations = []
     delete_operations = []
+    group_operations = []
     rows = []
     seen = set()
+
+    def ensure_group():
+        nonlocal group
+        if group is not None:
+            return group
+        group = VLANGroup(name=f"NSO {device.name}", slug=f"nso-{device.pk}")
+        group_saves.append(planned_save(group, force_insert=True, natural_key=("slug",)))
+        group_operations.append(("save", group, None, True, None, ()))
+        return group
 
     def resolve_vlan(vid, *, create):
         vlan = synced_vlans.get(vid) or group_vlans.get(vid)
         if vlan is not None or not create:
             return vlan
-        vlan = VLAN(group=group, vid=vid, name=placeholder_vlan_name(vid))
+        vlan = VLAN(group=ensure_group(), vid=vid, name=placeholder_vlan_name(vid))
         group_vlans[vid] = vlan
         vlan_saves.append(planned_save(vlan, force_insert=True, natural_key=("group", "vid")))
         vlan_operations.append(("save", vlan, None, True, None, ()))
@@ -486,8 +508,15 @@ def _switchport_reconcile_operations(device, payload, planned_at, interface_pks)
         state_saves.append(planned_save(candidate, update_fields=fields))
         state_operations.append(("save", candidate, fields, False, None, ()))
 
-    saves = (*vlan_saves, *native_saves, *state_saves)
-    operations = (*vlan_operations, *native_operations, *state_operations, *m2m_operations, *delete_operations)
+    saves = (*group_saves, *vlan_saves, *native_saves, *state_saves)
+    operations = (
+        *group_operations,
+        *vlan_operations,
+        *native_operations,
+        *state_operations,
+        *m2m_operations,
+        *delete_operations,
+    )
     return saves, deletes, m2m_writes, operations, rows
 
 
