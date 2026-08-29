@@ -55,6 +55,25 @@ class TestInterfaceMtuReconciler(TestCase):
             [("save", "netbox_nso_plugin.nsointerfacemtustate")],
         )
 
+    def test_reconcile_replays_the_frozen_operations(self):
+        from netbox_nso_plugin.interface_mtu_reconciler import (
+            interface_mtu_reconcile_plan,
+            reconcile_interface_mtu,
+        )
+        from netbox_nso_plugin.renderer_writer import renderer_mirror_writes, renderer_writes
+
+        payload = {"interfaces": [{"interface_name": self.po1.name, "mtu": 9000}]}
+        plan = interface_mtu_reconcile_plan(self.device, payload)
+        payload["interfaces"][0] = {"interface_name": self.lag99.name, "mtu": 1500}
+
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+        with mutation:
+            rows = reconcile_interface_mtu(self.device, payload)
+
+        self.assertEqual([row.interface_id for row in rows], [self.po1.pk])
+        self.assertTrue(NSOInterfaceMtuState.objects.filter(interface=self.po1, l2_mtu=9000).exists())
+        self.assertFalse(NSOInterfaceMtuState.objects.filter(interface=self.lag99).exists())
+
     def test_mirrors_l2_and_ip_mtu(self):
         from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
 
