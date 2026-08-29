@@ -14,11 +14,17 @@ PLUGIN = Path(__file__).resolve().parent.parent
 
 def _functions(path):
     tree = ast.parse(path.read_text(encoding="utf-8"))
-    return {node.name: node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)}
+    functions = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            functions.setdefault(node.name, []).append(node)
+    return functions
 
 
-def _calls(function):
-    return [ast.unparse(node.func) for node in ast.walk(function) if isinstance(node, ast.Call)]
+def _calls(functions):
+    return [
+        ast.unparse(node.func) for function in functions for node in ast.walk(function) if isinstance(node, ast.Call)
+    ]
 
 
 def _reachable_calls(functions, entry):
@@ -32,10 +38,10 @@ def _reachable_calls(functions, entry):
     pending = [entry]
     calls = []
     while pending:
-        function = functions.get(pending.pop())
-        if function is None:
+        candidates = functions.get(pending.pop())
+        if candidates is None:
             continue
-        for call in _calls(function):
+        for call in _calls(candidates):
             calls.append(call)
             if call in functions and call not in seen:
                 seen.add(call)
@@ -56,7 +62,33 @@ def _render_names(path):
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module and node.module.split(".")[-1] == "delivery":
             names |= {alias.asname or alias.name for alias in node.names if alias.name == "render"}
+        if isinstance(node, ast.ImportFrom) and node.module is None:
+            names |= {f"{alias.asname}.render" for alias in node.names if alias.name == "delivery" and alias.asname}
+        if isinstance(node, ast.Import):
+            names |= {
+                f"{alias.asname or alias.name}.render"
+                for alias in node.names
+                if alias.name.split(".")[-1] == "delivery"
+            }
     return names
+
+
+class TestStructureScanHelpers(SimpleTestCase):
+    def test_same_named_functions_all_remain_reachable(self):
+        from types import SimpleNamespace
+
+        source = "def entry():\n    target()\nclass Other:\n    def entry(self):\n        sibling()\n"
+        functions = _functions(SimpleNamespace(read_text=lambda **_kwargs: source))
+
+        self.assertEqual(set(_reachable_calls(functions, "entry")), {"target", "sibling"})
+
+    def test_delivery_module_aliases_are_detected(self):
+        from types import SimpleNamespace
+
+        source = "from . import delivery as dlv\ndef capture():\n    dlv.render()\n"
+        path = SimpleNamespace(name="capture.py", read_text=lambda **_kwargs: source)
+
+        self.assertIn("dlv.render", _render_names(path))
 
 
 class TestRendererCaptureSitesAreAuditFronted(SimpleTestCase):
