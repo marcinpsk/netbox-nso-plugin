@@ -2683,7 +2683,7 @@ def _audit_capture(mgmt, scopes, trigger, remaining_budget) -> None:
     """
     import time
 
-    from .renderer_audit import RendererAuditBudgetExceeded, audit_renderer_scopes
+    from .renderer_audit import RendererAuditBudgetExceeded, RendererAuditRepairFailed, audit_renderer_scopes
 
     try:
         audit_renderer_scopes(
@@ -2695,6 +2695,8 @@ def _audit_capture(mgmt, scopes, trigger, remaining_budget) -> None:
         )
     except RendererAuditBudgetExceeded as exc:
         raise ApplyDeadlineExpired from exc
+    except RendererAuditRepairFailed as exc:
+        raise ApplyRefused from exc
 
 
 def _push_direct_snapshots(mgmt, registry, remaining_budget) -> None:
