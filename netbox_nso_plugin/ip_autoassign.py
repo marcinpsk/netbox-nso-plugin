@@ -352,7 +352,8 @@ def rollback_auto_assigned(state) -> None:
                 renderer_writes(clear_plan) if clear_plan.changes_content else renderer_mirror_writes(clear_plan)
             )
             with clear_mutation as writer:
-                writer.set_update(type(state), clear_plan.write_set[0], peer_state=None)
+                clear_write = next(write for write in clear_plan.write_set if write.operation == "set_update")
+                writer.set_update(type(state), clear_write, peer_state=None)
             states = list(type(state).objects.filter(pk__in=[candidate.pk for candidate in states]).order_by("pk"))
 
         plan = RendererMutationPlan.build(
