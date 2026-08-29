@@ -459,6 +459,10 @@ def _restore_static_route_generations(before: list[dict]) -> int:
             with suppress_intent_push(), renderer_writes(plan) as writer:
                 writer.save(candidate, update_fields=fields)
         except IntentPlanStaleError:
+            logger.warning(
+                "Static-route overlay %s kept its armed generation because its restore plan went stale",
+                pk,
+            )
             continue
         restored += 1
     return restored
