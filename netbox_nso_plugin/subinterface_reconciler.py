@@ -168,6 +168,8 @@ def reconcile_subinterface(device, payload: dict) -> list:
 def _reconcile_subinterface(device, payload: dict, writer, planned_at) -> list:
     """Apply a subinterface mirror after its complete footprint is locked."""
     _saves, _deletes, operations, rows = _subinterface_reconcile_operations(device, payload, planned_at)
+    for row in rows:
+        writer.consume_existing_creation(row.interface)
     for operation, instance, update_fields, force_insert in operations:
         if operation == "delete":
             writer.delete(instance)

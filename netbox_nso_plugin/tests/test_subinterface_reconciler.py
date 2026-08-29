@@ -93,6 +93,45 @@ class TestSubinterfaceReconciler(TestCase):
         # A dot1q tag must NOT create a device VLAN object.
         self.assertEqual(VLAN.objects.count(), 0)
 
+    def test_a_concurrently_created_subinterface_is_reused(self):
+        from django.db import connection
+
+        from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
+
+        inserted = None
+
+        def insert_after_interface_read(execute, sql, params, many, context):
+            nonlocal inserted
+            result = execute(sql, params, many, context)
+            if inserted is None and sql.lstrip().upper().startswith("SELECT") and Interface._meta.db_table in sql:
+                inserted = Interface.objects.create(
+                    device=self.device,
+                    name="GigabitEthernet0/1.101",
+                    type="virtual",
+                    parent=self.parent,
+                )
+            return result
+
+        with connection.execute_wrapper(insert_after_interface_read):
+            rows = reconcile_subinterface(
+                self.device,
+                {
+                    "interfaces": [
+                        {
+                            "interface_name": "GigabitEthernet0/1.101",
+                            "parent_interface": self.parent.name,
+                            "dot1q_vlan": 101,
+                        }
+                    ]
+                },
+            )
+
+        self.assertEqual(rows[0].interface_id, inserted.pk)
+        self.assertEqual(
+            Interface.objects.filter(device=self.device, name="GigabitEthernet0/1.101").count(),
+            1,
+        )
+
     def test_direct_reconcile_does_not_advance_intent_revision(self):
         from netbox_nso_plugin.models import NSOIntentRevision
         from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
