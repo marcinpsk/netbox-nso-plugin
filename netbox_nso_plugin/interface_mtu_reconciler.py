@@ -43,6 +43,13 @@ def _validated_interface_items(payload: dict) -> tuple[dict, ...]:
             raise ValueError("interface MTU payload entry interface_name must be a non-empty string")
         if name in seen:
             raise ValueError(f"duplicate interface_name in interface MTU payload: {name}")
+        for field_name in ("mtu", "ip_mtu", "mpls_mtu"):
+            value = item.get(field_name)
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError(f"interface MTU payload entry {field_name} must be a non-negative integer or null")
+        bound_port = item.get("bound_port")
+        if bound_port is not None and not isinstance(bound_port, str):
+            raise ValueError("interface MTU payload entry bound_port must be a string or null")
         seen.add(name)
     return tuple(items)
 
