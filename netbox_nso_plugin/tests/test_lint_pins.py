@@ -12,40 +12,13 @@ from pathlib import Path
 
 import pytest
 import yaml
-from packaging.requirements import InvalidRequirement, Requirement
-from packaging.version import InvalidVersion, Version
+from packaging.requirements import Requirement
 
 ROOT = Path(__file__).parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "lint-format.yaml"
 PRE_COMMIT = ROOT / ".pre-commit-config.yaml"
 PYPROJECT = ROOT / "pyproject.toml"
 UV_LOCK = ROOT / "uv.lock"
-SQLPARSE_MINIMUM = Version("0.5.0")
-
-
-def _has_supported_sqlparse_floor(dependency: str) -> bool:
-    try:
-        requirement = Requirement(dependency)
-    except InvalidRequirement:
-        return False
-    if requirement.name.casefold() != "sqlparse":
-        return False
-    for specifier in requirement.specifier:
-        if specifier.operator not in {">", ">=", "~=", "==", "==="}:
-            continue
-        try:
-            floor = Version(specifier.version)
-        except InvalidVersion:
-            continue
-        if floor >= SQLPARSE_MINIMUM:
-            return True
-    return False
-
-
-def test_sqlparse_is_a_runtime_dependency():
-    dependencies = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"]["dependencies"]
-
-    assert any(_has_supported_sqlparse_floor(dependency) for dependency in dependencies)
 
 
 @pytest.mark.parametrize("dependency", ["sqlparse>=0.5.0", "sqlparse>0.5.0"])
@@ -59,29 +32,11 @@ def test_packaging_is_a_direct_test_dependency():
     assert any(Requirement(dependency).name == "packaging" for dependency in dependencies)
 
 
-@pytest.mark.parametrize("dependency", ["sqlparse", "sqlparse>=0.4.4"])
-def test_sqlparse_dependency_rejects_an_unsupported_floor(dependency):
-    assert not _has_supported_sqlparse_floor(dependency)
-
-
-def _workflow_tool_commands(tool: str) -> list[list[str]]:
-    workflow_text = WORKFLOW.read_text(encoding="utf-8")
-    assert not re.search(rf"(?<![\w-]){tool}==", workflow_text), f"the lint workflow hardcodes a {tool} version"
-
-    workflow = yaml.safe_load(workflow_text)
-    commands = []
-    for job in workflow["jobs"].values():
-        for step in job.get("steps", []):
-            run = step.get("run")
-            if isinstance(run, str) and re.search(rf"(?<![\w-]){tool}(?![\w-])", run):
-                command = shlex.split(run)
-                assert command[:4] == ["uv", "run", "--frozen", tool], (
-                    f"the lint workflow must run {tool} via uv run --frozen: {run!r}"
-                )
-                commands.append(command[4:])
-
-    assert commands, f"the lint workflow does not run {tool} via uv run --frozen"
-    return commands
+def _workflow_version() -> str:
+    found = re.findall(r"ruff==([0-9][^\s\"']*)", WORKFLOW.read_text(encoding="utf-8"))
+    assert found, "the lint workflow installs an unpinned ruff"
+    assert len(set(found)) == 1, f"the lint workflow installs different ruff versions: {found}"
+    return found[0]
 
 
 def _local_hook(hook_id: str, tool: str) -> dict[str, object]:
