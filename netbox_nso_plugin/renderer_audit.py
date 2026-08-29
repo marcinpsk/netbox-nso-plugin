@@ -398,6 +398,11 @@ def audit_renderer_scopes(
             raise RendererAuditRepairFailed("pre-capture audit could not establish a trusted baseline")
         return RendererAuditResult(selected, (), deferred, candidates)
     if repaired:
+        if not pre_capture:
+            from .signals import _schedule_intent_drain
+
+            for scope in repaired:
+                _schedule_intent_drain((device_id, scope))
         logger.warning(
             "renderer audit repaired device=%s scopes=%s trigger=%s",
             device_id,
