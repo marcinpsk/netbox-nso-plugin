@@ -19,6 +19,43 @@ from django.urls import reverse
 
 
 class TestReconcileRoutePolicy(TestCase):
+    def test_prefix_unit_owner_lookup_is_batched(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from django.utils import timezone
+
+        from netbox_nso_plugin.route_policy_reconciler import _RoutePolicyGraphPlanner
+
+        self._make_mgmt(self.device)
+        payload = {
+            "prefix_lists": [
+                {"name": f"BATCH-{index}", "entries": [{"prefix": f"198.18.{index}.0/24"}]} for index in range(3)
+            ]
+        }
+        planner = _RoutePolicyGraphPlanner(self.device, payload, timezone.now())
+
+        with CaptureQueriesContext(connection) as captured:
+            planner._seed_prefix_units()
+
+        self.assertEqual(len(captured), 1)
+
+    def test_direct_reconcile_builds_the_route_policy_graph_once(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import route_policy_reconciler
+
+        self._make_mgmt(self.device)
+        payload = self._pl_payload("ONE-PLAN", "198.18.4.0/24")
+
+        with patch.object(
+            route_policy_reconciler,
+            "_route_policy_reconcile_operations",
+            wraps=route_policy_reconciler._route_policy_reconcile_operations,
+        ) as build_operations:
+            route_policy_reconciler.reconcile_route_policy(self.device, payload)
+
+        self.assertEqual(build_operations.call_count, 1)
+
     @classmethod
     def setUpTestData(cls):
         mfg = Manufacturer.objects.create(name="RpMfg", slug="rpmfg")
@@ -2753,6 +2790,27 @@ class TestRouteMapStructuredMaterialisation(TestCase):
                 ],
             }
         )
+        self.assertEqual(self._entry().call_policy.name, "SUB-POLICY")
+
+    def test_call_policy_can_reference_a_later_greenfield_route_map(self):
+        self._reconcile(
+            {
+                "route_maps": [
+                    {
+                        "name": "RM",
+                        "entries": [
+                            {
+                                "sequence": 10,
+                                "action": "permit",
+                                "match": '{"_junos_from_policy": ["SUB-POLICY"]}',
+                            }
+                        ],
+                    },
+                    {"name": "SUB-POLICY", "entries": []},
+                ]
+            }
+        )
+
         self.assertEqual(self._entry().call_policy.name, "SUB-POLICY")
 
     def test_timos_default_action_projected_to_route_map(self):

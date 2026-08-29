@@ -93,8 +93,8 @@ class _Operations:
             self.operations.append(("display_m2m_add", instance, None, False, (), field_name, related))
 
 
-def route_policy_reconcile_plan(device, payload):
-    """Freeze every root, entry, registered M2M, through-row, and overlay write."""
+def _route_policy_reconcile_plan_and_operations(device, payload):
+    """Build one exact route-policy plan and its replay operations."""
     from django.utils import timezone
 
     from .renderer_writer import RendererMutationPlan
@@ -103,13 +103,20 @@ def route_policy_reconcile_plan(device, payload):
     try:
         operations = _route_policy_reconcile_operations(device, payload, planned_at)
     except ImportError:
-        return RendererMutationPlan.build(planned_at=planned_at)
-    return RendererMutationPlan.build(
+        return RendererMutationPlan.build(planned_at=planned_at), _Operations()
+    plan = RendererMutationPlan.build(
         saves=operations.saves,
         deletes=operations.deletes,
         m2m_writes=operations.m2m_writes,
         planned_at=planned_at,
     )
+    return plan, operations
+
+
+def route_policy_reconcile_plan(device, payload):
+    """Freeze every root, entry, registered M2M, through-row, and overlay write."""
+    plan, _operations = _route_policy_reconcile_plan_and_operations(device, payload)
+    return plan
 
 
 def _resolve_prefix_list_units(name: str) -> tuple:
@@ -267,33 +274,65 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
         self.seen = set()
         self.modified_state_pks = set()
         self.prospective_owner_hashes = {}
+        self.preplanned_root_keys = set()
 
     def build(self):
         if self.management is None:
             return self.operations
         self._seed_prefix_units()
-        for family in ("prefix_list", "community_list", "as_path", "route_map"):
+        for family in ("prefix_list", "community_list", "as_path"):
             rows = sorted(
                 self.payload.get(self.FAMILY_PAYLOAD_KEYS[family]) or [],
                 key=lambda row: (row.get("name") or "").casefold(),
             )
             for captured in rows:
                 self.plan_object(family, captured)
+        route_maps = sorted(
+            self.payload.get(self.FAMILY_PAYLOAD_KEYS["route_map"]) or [],
+            key=lambda row: (row.get("name") or "").casefold(),
+        )
+        for captured in route_maps:
+            name = captured.get("name") or ""
+            key = ("route_map", name.casefold())
+            if not name or self._group_mode("route_map", name) == "local" or key[1] in self.roots["route_map"]:
+                continue
+            root = self.models["route_map"](
+                name=name,
+                default_action=self._route_map_default_action(captured.get("entries") or []),
+            )
+            self.roots["route_map"][key[1]] = root
+            self.name_maps["route_map"][name] = root
+            self.operations.save(root, force_insert=True, natural_key=("name",))
+            self.preplanned_root_keys.add(key)
+        for captured in route_maps:
+            self.plan_object("route_map", captured)
         self.plan_stale_states()
         self.plan_resettle_conflicts()
         return self.operations
 
     def _seed_prefix_units(self):
+        from django.db.models.functions import Lower
+
         cache = {}
-        for captured in self.payload.get("prefix_lists") or []:
+        captured_rows = self.payload.get("prefix_lists") or []
+        names = {(captured.get("name") or "").casefold() for captured in captured_rows}
+        names.discard("")
+        owners = {}
+        for owner in (
+            self.NSORoutePolicyState.objects.filter(
+                family="prefix_list",
+                is_materialized=True,
+            )
+            .annotate(name_key=Lower("object_name"))
+            .filter(name_key__in=names)
+            .order_by("pk")
+        ):
+            owners.setdefault(owner.object_name.casefold(), owner)
+        for captured in captured_rows:
             name = captured.get("name") or ""
             if not name:
                 continue
-            owner = self.NSORoutePolicyState.objects.filter(
-                family="prefix_list",
-                object_name__iexact=name,
-                is_materialized=True,
-            ).first()
+            owner = owners.get(name.casefold())
             if owner is not None and owner.management_id != self.management.pk:
                 entries = (owner.captured or {}).get("entries") or []
             else:
@@ -437,7 +476,7 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
             self.plan_local_state(family, name, captured)
             return
         root = self.roots[family].get(name.casefold())
-        created_root = root is None
+        created_root = root is None or key in self.preplanned_root_keys
         if root is None:
             kwargs = {"name": name}
             if family == "community_list":
@@ -481,7 +520,8 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
                 self.roots[family][name.casefold()] = root
                 self.name_maps[family][name] = root
                 changed_fields.append("default_action")
-        self._plan_root_save(family, root, created_root, changed_fields)
+        if key not in self.preplanned_root_keys:
+            self._plan_root_save(family, root, created_root, changed_fields)
         if fill:
             if family == "prefix_list":
                 self.plan_prefix_entries(root, captured.get("entries") or [])
@@ -1365,12 +1405,17 @@ def reconcile_route_policy(device, payload: dict) -> list:
     if management is None:
         return []
     active = active_renderer_writer()
-    plan = active.plan if active is not None else route_policy_reconcile_plan(device, payload)
+    operations = None
+    if active is not None:
+        plan = active.plan
+    else:
+        plan, operations = _route_policy_reconcile_plan_and_operations(device, payload)
     mutation = nullcontext(active)
     if active is None:
         mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
     with mutation as writer, suppress_intent_push():
-        operations = _route_policy_reconcile_operations(device, payload, plan.planned_at)
+        if operations is None:
+            operations = _route_policy_reconcile_operations(device, payload, plan.planned_at)
         _replay_operations(writer, operations)
     return list(NSORoutePolicyState.objects.filter(management=management).order_by("family", "object_name"))
 
