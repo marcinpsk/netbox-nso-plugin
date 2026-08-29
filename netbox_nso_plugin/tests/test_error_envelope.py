@@ -26,6 +26,7 @@ from netbox_nso_plugin.adapter_client import AdapterError
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOPlatformNedMapping
 
 from ._adapter_http import make_response
+from ._outbox_case import mirror_update
 from .test_django_views import ViewTestBase
 
 # Shaped like something that must never be echoed to a client: a requests transport error
@@ -149,7 +150,7 @@ class TestAdapterErrorEnvelopeInResponses(_UnreachableAdapterMixin, ViewTestBase
     def setUpTestData(cls):
         super().setUpTestData()
         # A queryset write, so the post_save adapter push does not fire during fixture setup.
-        NSODeviceManagement.objects.filter(pk=cls.mgmt.pk).update(adapter_device_id=4242)
+        mirror_update(cls.mgmt, adapter_device_id=4242)
         cls.mgmt.refresh_from_db()
 
     def _url(self, name, **kwargs):
@@ -196,9 +197,7 @@ class TestAdapterErrorEnvelopeInResponses(_UnreachableAdapterMixin, ViewTestBase
 
     def test_onboard_status_poll_reports_a_fixed_public_error(self):
         """A transient adapter outage while polling keeps the row provisioning, with no leak."""
-        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(
-            onboard_status="provisioning", onboard_job_id="job-42"
-        )
+        mirror_update(self.mgmt, onboard_status="provisioning", onboard_job_id="job-42")
 
         with self.assertLogs(_ADAPTER_LOG, level="WARNING"):
             resp = self.client.post(self._url("onboard_status", pk=self.mgmt.pk), **_AJAX)
@@ -391,7 +390,7 @@ class TestMalformedAdapterPayloadIsRefused(_UnreachableAdapterMixin, ViewTestBas
     @classmethod
     def setUpTestData(cls):
         super().setUpTestData()
-        NSODeviceManagement.objects.filter(pk=cls.mgmt.pk).update(adapter_device_id=4242)
+        mirror_update(cls.mgmt, adapter_device_id=4242)
         cls.mgmt.refresh_from_db()
 
     def setUp(self):
@@ -426,9 +425,7 @@ class TestMalformedAdapterPayloadIsRefused(_UnreachableAdapterMixin, ViewTestBas
         """
         from netbox_nso_plugin.onboarding import advance_provisioning
 
-        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(
-            onboard_status="provisioning", onboard_job_id="job-42"
-        )
+        mirror_update(self.mgmt, onboard_status="provisioning", onboard_job_id="job-42")
         self.mgmt.refresh_from_db()
 
         result = advance_provisioning(self.mgmt)

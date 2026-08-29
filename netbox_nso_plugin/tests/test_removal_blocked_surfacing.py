@@ -151,8 +151,17 @@ class BlockedRemovalTestBase(TestCase):
         super().setUp()
         self.client.force_login(self.superuser)
 
-    def _get_jobs(self, jobs, *, generations=None, generation_ids=(), since_seq=None):
+    def _get_jobs(self, jobs, *, generations=None, generation_ids=(), since_seq=None, apply_state=None):
         """Hit device_nso_jobs with the adapter's job list canned at the transport."""
+        apply_state = apply_state or {
+            "device_id": 10,
+            "head": None,
+            "blocked": False,
+            "write_work_pending": False,
+            "held_jobs": [],
+            "pending_generations": 0,
+            "last_apply_job": None,
+        }
         generation_request_params = []
         with (
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_ADAPTER_CFG),
@@ -161,6 +170,8 @@ class BlockedRemovalTestBase(TestCase):
             session = make_session()
 
             def request(_method, url, **kwargs):
+                if url.endswith("/apply-state"):
+                    return make_response(200, json_data=apply_state)
                 if url.endswith("/generations"):
                     params = kwargs.get("params") or {}
                     generation_request_params.append(params)
@@ -200,6 +211,32 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
         )
         self.assertIn("would delete lo0", entry["preview"])
         self.assertEqual(entry["blocked_at"], "2026-07-10T06:00:00Z")
+
+    def test_blocked_apply_head_is_included_in_the_poll_payload(self):
+        apply_state = {
+            "device_id": 10,
+            "head": {
+                "generation_id": 73,
+                "seq": 11,
+                "status": "failed",
+                "job_id": 901,
+                "mode": "networked",
+                "settlement_cohort": 17,
+                "sections": ["vlan"],
+                "source_push_seq": {"vlan": 44},
+                "created_at": "2026-08-25T12:00:00Z",
+                "updated_at": "2026-08-25T12:01:00Z",
+            },
+            "blocked": True,
+            "write_work_pending": False,
+            "held_jobs": [902],
+            "pending_generations": 2,
+            "last_apply_job": None,
+        }
+
+        data = self._get_jobs([], apply_state=apply_state)
+
+        self.assertEqual(data["apply_state"], apply_state)
 
     def test_requested_apply_generations_are_wired_on_the_first_poll(self):
         generations = _device_generations()
