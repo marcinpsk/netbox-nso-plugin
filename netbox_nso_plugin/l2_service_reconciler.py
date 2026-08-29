@@ -13,10 +13,57 @@ from __future__ import annotations
 
 import logging
 
+from .intent_state import mirror_reconciler, reconcile_transaction
+
 logger = logging.getLogger(__name__)
 
 # SR OS service-type → NetBox vpn.L2VPNTypeChoices code.
 _L2VPN_TYPE = {"epipe": "vpws", "vpls": "vpls"}
+
+
+def l2_service_reconcile_plan(device, payload: dict):
+    """Declare one L2 SAP refresh and its predicted renderer-fragment delta."""
+    import copy
+
+    from . import status_machine as sm
+    from .intent_state import MutationFootprint, ReconcileMutationPlan, SourceRow, canonical_fragment
+    from .models import NSODeviceManagement, NSOL2SapState
+
+    management = NSODeviceManagement.objects.filter(device=device).first()
+    if management is None:
+        return ReconcileMutationPlan(MutationFootprint())
+    states = tuple(NSOL2SapState.objects.filter(management=management).order_by("pk"))
+    reported = {
+        (service.get("service_name"), sap.get("sap_id")): (service, sap)
+        for service in payload.get("services", []) or []
+        if isinstance(service, dict) and service.get("service_name")
+        for sap in service.get("saps", []) or []
+        if isinstance(sap, dict) and sap.get("sap_id")
+    }
+    changes_content = False
+    for state in states:
+        candidate = copy.copy(state)
+        observed = reported.get((state.service_name, state.sap_id))
+        if observed is None:
+            candidate.status = sm.on_reconcile(state.status, present=False)
+        else:
+            service, sap = observed
+            if not sm.is_owned(state.status):
+                candidate.service_type = service.get("service_type", "")
+            candidate.port = sap.get("port", "")
+            candidate.outer_tag = sap.get("outer_tag")
+            candidate.inner_tag = sap.get("inner_tag")
+        if canonical_fragment(state) != canonical_fragment(candidate):
+            changes_content = True
+            break
+    footprint = MutationFootprint.for_keys(
+        {(device.pk, "l2_sap")},
+        overlay_rows=(
+            SourceRow("netbox_nso_plugin.nsol2sapstate", None),
+            *(SourceRow(state._meta.label_lower, state.pk) for state in states),
+        ),
+    )
+    return ReconcileMutationPlan(footprint, changes_content=changes_content)
 
 
 def _upsert_l2vpn(L2VPN, device, service_name: str, service_type: str, service_id):
@@ -104,12 +151,19 @@ def _retire_stale_l2_saps(NSOL2SapState, mgmt, seen: set, now) -> None:
             state.save(update_fields=["status", "last_sync_at"])
 
 
+@mirror_reconciler
 def reconcile_l2_services(device, payload: dict) -> list:
     """Reconcile the adapter L2-service payload into L2VPN/termination + NSOL2SapState.
 
     Returns all current NSOL2SapState rows for the device. No-op (``[]``) when the device
     has no NSO management or the ``vpn`` app is unavailable.
     """
+    with reconcile_transaction(l2_service_reconcile_plan(device, payload)):
+        return _reconcile_l2_services(device, payload)
+
+
+def _reconcile_l2_services(device, payload: dict) -> list:
+    """Apply an L2 SAP mirror after its complete footprint is locked."""
     from dcim.models import Interface
     from django.contrib.contenttypes.models import ContentType
     from django.utils import timezone

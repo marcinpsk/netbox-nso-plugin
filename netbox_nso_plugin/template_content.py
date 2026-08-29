@@ -10,9 +10,23 @@ from django.utils import timezone
 from netbox.plugins import PluginTemplateExtension
 
 from . import status_machine as sm
+from .intent_state import mirror_reconciler, mirror_refresh
 from .snmp_versions import canonical_snmp_version
 
 logger = logging.getLogger(__name__)
+
+
+def _cas_mirror_update(queryset, **values):
+    """Lock and update one matching mirror row without bypassing model guards."""
+    row = queryset.select_for_update(of=("self",)).first()
+    if row is None:
+        return None
+    for field_name, value in values.items():
+        setattr(row, field_name, value)
+    with mirror_refresh(row, values):
+        row.save(update_fields=set(values))
+    return row
+
 
 # Status → Bootstrap badge colour
 _STATUS_BADGE = {
@@ -76,6 +90,7 @@ def _resolve_interface_attr_status(state, *, created, attr_name, iface, nso_valu
     return adapter_status, False
 
 
+@mirror_reconciler
 def _upsert_interface_states(device, interfaces: list) -> dict:
     """Sync NSOInterfaceState rows from adapter interface data.
 
@@ -403,6 +418,7 @@ def _activate_auto_assigned_ip(state, existing_ip, address, iface, IPAddress, lo
             logger.warning("nso_ip.activate_peer_failed peer_addr=%s: %s", peer_state.address, repr(_exc))
 
 
+@mirror_reconciler
 def _reconcile_interface_ips(device, payload: dict) -> list:
     """Reconcile IP addresses from the adapter payload into NetBox IPAM.
 
@@ -547,12 +563,17 @@ def _reconcile_snmp_system_info(mgmt, sys_data: dict, now):
         # device read; settle accepted → in_sync only when the device matches.
         matches = state.location == dev_location and state.contact == dev_contact
         # CAS: settle only if the row still holds the values `matches` saw — a concurrent edit wins wholesale
-        NSOSnmpSystemInfoState.objects.filter(
-            pk=state.pk, status=state.status, location=state.location, contact=state.contact
-        ).update(status=sm.on_reconcile(state.status, matches=matches), last_sync_at=now)
-        try:
-            state.refresh_from_db()
-        except NSOSnmpSystemInfoState.DoesNotExist:
+        state = _cas_mirror_update(
+            NSOSnmpSystemInfoState.objects.filter(
+                pk=state.pk,
+                status=state.status,
+                location=state.location,
+                contact=state.contact,
+            ),
+            status=sm.on_reconcile(state.status, matches=matches),
+            last_sync_at=now,
+        )
+        if state is None:
             return None
     else:
         state.last_sync_at = now
@@ -563,6 +584,7 @@ def _reconcile_snmp_system_info(mgmt, sys_data: dict, now):
     return state
 
 
+@mirror_reconciler
 def _reconcile_snmp_config(device, payload: dict) -> dict:
     """Full-replace import of SNMP config from adapter into plugin SNMP state models.
 
@@ -615,14 +637,15 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
                 matches = state.vault_secret_hash == h and state.access == dev_access and state.acl == dev_acl
             # CAS: settle only if the row still holds the identity + values `matches` saw —
             # a concurrent edit (a rekey included) wins wholesale
-            NSOSnmpCommunityState.objects.filter(
-                pk=state.pk,
-                community_hash=h,
-                status=state.status,
-                access=state.access,
-                acl=state.acl,
-                vault_secret_hash=state.vault_secret_hash,
-            ).update(
+            _cas_mirror_update(
+                NSOSnmpCommunityState.objects.filter(
+                    pk=state.pk,
+                    community_hash=h,
+                    status=state.status,
+                    access=state.access,
+                    acl=state.acl,
+                    vault_secret_hash=state.vault_secret_hash,
+                ),
                 status=sm.on_reconcile(state.status, matches=matches),
                 last_sync_at=now,
                 has_secret=dev_has_secret,
@@ -685,9 +708,16 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
             )
             # CAS: settle only if the row still holds the identity + values `matches` saw —
             # a concurrent edit (a rename included) wins wholesale
-            NSOSnmpHostState.objects.filter(
-                pk=state.pk, address=address, status=state.status, **{f: getattr(state, f) for f in dev}
-            ).update(status=sm.on_reconcile(state.status, matches=matches), last_sync_at=now)
+            _cas_mirror_update(
+                NSOSnmpHostState.objects.filter(
+                    pk=state.pk,
+                    address=address,
+                    status=state.status,
+                    **{f: getattr(state, f) for f in dev},
+                ),
+                status=sm.on_reconcile(state.status, matches=matches),
+                last_sync_at=now,
+            )
         else:
             state.last_sync_at = now
             for f, v in dev.items():
@@ -754,12 +784,16 @@ def _reconcile_logging_levels(mgmt, levels_data: dict, now):
         # read; settle accepted → in_sync only when the device matches exactly.
         matches = all(getattr(state, f) == v for f, v in dev.items())
         # CAS: settle only if the row still holds the values `matches` saw — a concurrent edit wins wholesale
-        NSOLoggingLevelState.objects.filter(
-            pk=state.pk, status=state.status, **{f: getattr(state, f) for f in dev}
-        ).update(status=sm.on_reconcile(state.status, matches=matches), last_sync_at=now)
-        try:
-            state.refresh_from_db()
-        except NSOLoggingLevelState.DoesNotExist:
+        state = _cas_mirror_update(
+            NSOLoggingLevelState.objects.filter(
+                pk=state.pk,
+                status=state.status,
+                **{f: getattr(state, f) for f in dev},
+            ),
+            status=sm.on_reconcile(state.status, matches=matches),
+            last_sync_at=now,
+        )
+        if state is None:
             return None
     else:
         state.last_sync_at = now
@@ -768,6 +802,43 @@ def _reconcile_logging_levels(mgmt, levels_data: dict, now):
         state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
         state.save()
     return state
+
+
+def logging_reconcile_plan(device, payload):
+    """Declare all logging overlay rows the full-replace read can mutate."""
+    from .intent_state import MutationFootprint, ReconcileMutationPlan, SourceRow
+    from .models import NSODeviceManagement, NSOLoggingHostState, NSOLoggingLevelState
+
+    try:
+        management = device.nso_management
+    except NSODeviceManagement.DoesNotExist:
+        return ReconcileMutationPlan(MutationFootprint())
+    host_rows = tuple(NSOLoggingHostState.objects.filter(management=management).order_by("pk"))
+    level_rows = tuple(NSOLoggingLevelState.objects.filter(management=management).order_by("pk"))
+    addresses = {host.get("address") for host in (payload.get("hosts") or []) if host.get("address")}
+    changes_content = any(
+        sm.is_owned(row.status)
+        and row.address not in addresses
+        and not sm.is_owned(sm.on_reconcile(row.status, present=False))
+        for row in host_rows
+    )
+    if not (payload.get("local_levels") or {}):
+        changes_content = changes_content or any(
+            sm.is_owned(row.status) and not sm.is_owned(sm.on_reconcile(row.status, present=False))
+            for row in level_rows
+        )
+    return ReconcileMutationPlan(
+        MutationFootprint.for_keys(
+            {(device.pk, "logging")},
+            overlay_rows=(
+                SourceRow(NSOLoggingHostState._meta.label_lower, None),
+                *(SourceRow(row._meta.label_lower, row.pk) for row in host_rows),
+                SourceRow(NSOLoggingLevelState._meta.label_lower, None),
+                *(SourceRow(row._meta.label_lower, row.pk) for row in level_rows),
+            ),
+        ),
+        changes_content=changes_content,
+    )
 
 
 _TIMOS_LOGGING_SEVERITY = {
@@ -839,6 +910,7 @@ def _canonical_logging_intent_field(ned_id: str, field: str, value):
     return _canonical_logging_field(ned_id, field, value)
 
 
+@mirror_reconciler
 def _reconcile_logging_config(device, payload: dict) -> dict:
     """Full-replace import of logging config into the NSOLogging* overlays.
 
@@ -894,9 +966,16 @@ def _reconcile_logging_config(device, payload: dict) -> dict:
             )
             # CAS: settle only if the row still holds the identity + values `matches` saw —
             # a concurrent edit (a rename included) wins wholesale
-            NSOLoggingHostState.objects.filter(
-                pk=state.pk, address=addr, status=state.status, **{f: getattr(state, f) for f in dev}
-            ).update(status=sm.on_reconcile(state.status, matches=matches), last_sync_at=now)
+            _cas_mirror_update(
+                NSOLoggingHostState.objects.filter(
+                    pk=state.pk,
+                    address=addr,
+                    status=state.status,
+                    **{f: getattr(state, f) for f in dev},
+                ),
+                status=sm.on_reconcile(state.status, matches=matches),
+                last_sync_at=now,
+            )
         else:
             state.last_sync_at = now
             for f, v in dev.items():
@@ -1015,8 +1094,11 @@ def _write_static_route_status(state, observed: str, new_status: str) -> None:
 
     if new_status == observed:
         return
-    matched = NSOStaticRouteState.objects.filter(pk=state.pk, status=observed).update(status=new_status)
-    if matched:
+    matched = _cas_mirror_update(
+        NSOStaticRouteState.objects.filter(pk=state.pk, status=observed),
+        status=new_status,
+    )
+    if matched is not None:
         state.status = new_status
         return
     logger.debug(
@@ -1026,7 +1108,64 @@ def _write_static_route_status(state, observed: str, new_status: str) -> None:
     )
 
 
+def _static_route_reconcile_footprint(device, payload):
+    """Discover every existing and future renderer row before a route mirror pass."""
+    from netbox_routing.models import StaticRoute
+
+    from .intent_state import MutationFootprint, SourceRow
+    from .models import NSODeviceManagement, NSOStaticRouteState
+
+    mgmt = NSODeviceManagement.objects.filter(device=device).first()
+    if mgmt is None:
+        return MutationFootprint()
+    route_ids = set(NSOStaticRouteState.objects.filter(management=mgmt).values_list("static_route_id", flat=True))
+    vrf_ids = set()
+    try:
+        from ipam.models import VRF
+    except ImportError:
+        VRF = None
+    for entry in payload.get("routes") or []:
+        prefix = entry.get("prefix") or ""
+        next_hop = entry.get("next_hop") or None
+        interface_next_hop = entry.get("interface_next_hop") or None
+        if not prefix or (not next_hop and not interface_next_hop):
+            continue
+        vrf_name = entry.get("vrf") or ""
+        vrf = None if not vrf_name or VRF is None else VRF.objects.filter(name=vrf_name).first()
+        if vrf is not None:
+            vrf_ids.add(vrf.pk)
+        if vrf_name and vrf is None:
+            continue
+        lookup = {"vrf": vrf, "prefix": prefix, "next_hop": next_hop}
+        if next_hop is None:
+            lookup["interface_next_hop"] = interface_next_hop
+        route_ids.update(StaticRoute.objects.filter(**lookup).values_list("pk", flat=True))
+    overlay_ids = NSOStaticRouteState.objects.filter(management=mgmt).values_list("pk", flat=True)
+    return MutationFootprint.for_keys(
+        {(device.pk, "static_route")},
+        source_rows=(
+            SourceRow("ipam.vrf", None),
+            *(SourceRow("ipam.vrf", pk) for pk in vrf_ids),
+            SourceRow("netbox_routing.staticroute", None),
+            SourceRow("netbox_routing.staticroute_devices", None),
+            *(SourceRow("netbox_routing.staticroute", pk) for pk in route_ids),
+        ),
+        overlay_rows=(
+            SourceRow("netbox_nso_plugin.nsostaticroutestate", None),
+            *(SourceRow("netbox_nso_plugin.nsostaticroutestate", pk) for pk in overlay_ids),
+        ),
+    )
+
+
+@mirror_reconciler
 def _reconcile_static_routes(device, payload: dict) -> list:
+    from .intent_state import mirror_transaction
+
+    with mirror_transaction(_static_route_reconcile_footprint(device, payload)):
+        return _reconcile_static_routes_locked(device, payload)
+
+
+def _reconcile_static_routes_locked(device, payload: dict) -> list:
     """Reconcile static routes from the adapter payload into NetBox routing.
 
     For each route reported by NSO:
@@ -1837,6 +1976,7 @@ def _link_routing_isis_interface(device, iface, af, state, instances: dict, bfd_
     return ri, False, base
 
 
+@mirror_reconciler
 def _reconcile_isis_interfaces(device, interfaces: list) -> list:
     """Reconcile IS-IS interface data from the adapter into NSOISISInterfaceState rows.
 
@@ -2195,6 +2335,7 @@ def _sync_routing_isis_instance(device, tag, state, entry, base):
     return inst, False, base  # operator edited → changed (edit preserved)
 
 
+@mirror_reconciler
 def _reconcile_isis_process(device, process_list: list) -> list:
     """Reconcile IS-IS process data from the adapter into NSOISISInstanceState rows.
 
@@ -2491,6 +2632,7 @@ def _fill_ospf_interface(entry, iface, inst_by_pid, OSPFArea, OSPFInterface, bas
     return False, True, base  # conflict
 
 
+@mirror_reconciler
 def _reconcile_ospf(device, payload: dict) -> dict:
     """Reconcile OSPF data from the adapter into NSOOSPFInstanceState and NSOOSPFInterfaceState rows.
 

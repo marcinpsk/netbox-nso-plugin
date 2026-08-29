@@ -47,6 +47,21 @@ class TestSviReconciler(TestCase):
         self.assertTrue(NSOSVIState.objects.filter(management=self.management, interface=iface).exists())
         self.assertEqual(rows[0].status, "imported")
 
+    def test_direct_reconcile_does_not_advance_intent_revision(self):
+        from netbox_nso_plugin.models import NSOIntentRevision
+        from netbox_nso_plugin.svi_reconciler import reconcile_svi
+
+        revision, _ = NSOIntentRevision.objects.get_or_create(device=self.device, scope="svi")
+        before = revision.revision
+
+        reconcile_svi(
+            self.device,
+            {"interfaces": [{"interface_name": "Vlan1623", "vlan_id": 1623, "type": "svi"}]},
+        )
+
+        revision.refresh_from_db()
+        self.assertEqual(revision.revision, before)
+
     def test_vlan_linked_when_present(self):
         from ipam.models import VLAN
 
@@ -96,6 +111,8 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         )
 
     def _state(self, name="Vlan100", vid=100, status="imported"):
+        from uuid import uuid4
+
         from dcim.models import Interface
         from ipam.models import VLAN
 
@@ -105,7 +122,13 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         iface = Interface.objects.create(device=self.device, name=name, type="virtual")
         vlan = VLAN.objects.create(group=_device_vlan_group(self.device), vid=vid, name=f"V{vid}")
         return NSOSVIState.objects.create(
-            management=self.management, interface=iface, vlan=vlan, svi_type="svi", vrf="MGMT", status=status
+            management=self.management,
+            interface=iface,
+            vlan=vlan,
+            svi_type="svi",
+            vrf="MGMT",
+            status=status,
+            apply_attempt_id=uuid4() if status == "deploying" else None,
         )
 
     def test_reconcile_preserves_owned_status(self):
@@ -161,8 +184,8 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         """An owned SVI overlay must NOT be hard-deleted when the device stops reporting it.
 
         NSOSVIState is in ``_APPLY_DEPLOYING_SCOPES``; a bulk delete of stale rows destroys
-        the in-flight Apply marker + ownership. Intent-pending rows (deploying) are kept; a
-        confirmed row (in_sync) that vanishes surfaces as drift (``changed``), never data-loss.
+        ownership. A confirmed row that vanishes surfaces as ``changed``. That content
+        change advances the scope revision and re-pends another deploying row.
         """
         from netbox_nso_plugin.models import NSOSVIState
         from netbox_nso_plugin.svi_reconciler import reconcile_svi
@@ -172,7 +195,9 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         reconcile_svi(self.device, {"interfaces": []})  # device stops reporting all SVIs
         assert NSOSVIState.objects.filter(pk=deploying.pk).exists(), "deploying (apply-in-flight) overlay deleted"
         assert NSOSVIState.objects.filter(pk=confirmed.pk).exists(), "in_sync overlay deleted"
-        assert NSOSVIState.objects.get(pk=deploying.pk).status == "deploying"
+        deploying.refresh_from_db()
+        assert deploying.status == "accepted"
+        assert deploying.apply_attempt_id is None
         assert NSOSVIState.objects.get(pk=confirmed.pk).status == "changed"
 
     def test_push_builds_owned_snapshot(self):

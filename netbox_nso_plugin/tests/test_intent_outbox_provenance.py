@@ -69,13 +69,11 @@ def _own_route(mgmt, prefix, next_hop, *, device=None):
     """A route assigned to the device and owned by it, exactly as the accept path leaves it."""
     from netbox_routing.models import StaticRoute
 
-    from netbox_nso_plugin.signals import _accept_static_route_for_device, suppress_intent_push
+    from ._static_route_case import _assign_and_accept
 
     with without_commit_drain(), transaction.atomic():
         route = StaticRoute.objects.create(prefix=prefix, next_hop=next_hop, metric=1)
-        with suppress_intent_push():
-            route.devices.add(device or mgmt.device)
-        _accept_static_route_for_device(route, device or mgmt.device)
+        _assign_and_accept(route, device or mgmt.device)
     return route
 
 
@@ -107,6 +105,9 @@ class TestOutboxSuppression(IntentPushResetMixin, TestCase):
             return NSOVLANState.objects.create(management=self.mgmt, vlan=vlan, status="accepted")
 
     def test_a_save_under_suppression_writes_no_entry(self):
+        from django.utils import timezone
+
+        from netbox_nso_plugin.intent_state import mirror_refresh
         from netbox_nso_plugin.signals import suppress_intent_push
 
         state = self._accepted_vlan_state()
@@ -115,7 +116,9 @@ class TestOutboxSuppression(IntentPushResetMixin, TestCase):
         NSOIntentOutboxEntry.objects.all().delete()
 
         with patch(PUT_VLAN), suppress_intent_push(), self.captureOnCommitCallbacks(execute=True):
-            state.save()
+            state.last_sync_at = timezone.now()
+            with mirror_refresh(state, {"last_sync_at"}):
+                state.save(update_fields=["last_sync_at"])
 
         assert _entries(self.device, "vlan") == []
 
@@ -168,8 +171,6 @@ class TestOutboxRollback(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         durable record must not, and the fresh edit's own work must still be pending."""
         from netbox_routing.models import StaticRoute
 
-        from netbox_nso_plugin.signals import _accept_static_route_for_device
-
         route = StaticRoute.objects.create(prefix="203.0.113.0/24", next_hop="203.0.113.1", metric=1)
         with without_commit_drain():
             try:
@@ -183,7 +184,6 @@ class TestOutboxRollback(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
 
         with without_commit_drain(), transaction.atomic():
             route.devices.add(self.device)
-            _accept_static_route_for_device(route, self.device)
 
         pending = [e for e in _entries(self.device, "static_route") if e.consumed_by_push_seq is None]
         assert pending, "the fresh edit must leave the drain a durable record of its work"
@@ -319,22 +319,24 @@ class TestOutboxMarkingModes(_CascadeFlushMixin, IntentPushResetMixin, Transacti
 
 
 class TestOutboxEnqueueSharedLockCompatibility(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
-    """O1.18 — the shared deployment lock keeps opposite key orders compatible."""
+    """O1.18 — the shared deployment lock keeps disjoint footprints compatible."""
 
     def test_opposite_key_orders_both_commit(self):
         from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentOutboxState
 
-        device = _make_device("lk")
-        _make_mgmt(device, "lk", 7404)
-        device_id = device.pk
+        devices = (_make_device("lk", 1), _make_device("lk", 2))
+        for index, device in enumerate(devices):
+            _make_mgmt(device, f"lk-{index}", 7404 + index)
         barrier = threading.Barrier(2, timeout=30)
         errors: list[BaseException] = []
 
-        def _append(scopes):
+        def _append(device_id, scopes):
+            from netbox_nso_plugin.intent_state import MutationFootprint, intent_transaction
             from netbox_nso_plugin.signals import _schedule_intent_push
 
             try:
-                with transaction.atomic():
+                footprint = MutationFootprint.for_keys({(device_id, scope) for scope in scopes})
+                with intent_transaction(footprint):
                     _schedule_intent_push((device_id, scopes[0]))
                     barrier.wait()
                     _schedule_intent_push((device_id, scopes[1]))
@@ -344,8 +346,8 @@ class TestOutboxEnqueueSharedLockCompatibility(_CascadeFlushMixin, IntentPushRes
                 connection.close()
 
         threads = [
-            threading.Thread(target=_append, args=(("vlan", "interface"),)),
-            threading.Thread(target=_append, args=(("interface", "vlan"),)),
+            threading.Thread(target=_append, args=(devices[0].pk, ("vlan", "interface"))),
+            threading.Thread(target=_append, args=(devices[1].pk, ("interface", "vlan"))),
         ]
         with without_commit_drain():
             for thread in threads:
@@ -358,10 +360,10 @@ class TestOutboxEnqueueSharedLockCompatibility(_CascadeFlushMixin, IntentPushRes
         for thread in threads:
             assert not thread.is_alive(), "worker did not finish - deadlock"
         assert errors == []
-        assert NSOIntentOutboxEntry.objects.filter(device_id=device_id).count() == 4
+        assert NSOIntentOutboxEntry.objects.filter(device__in=devices).count() == 4
         # The state row is the drain's mutual-exclusion point; an enqueue that touched it
         # would make two operator transactions serialize on one row for no reason.
-        assert not NSOIntentOutboxState.objects.filter(device_id=device_id).exists()
+        assert not NSOIntentOutboxState.objects.filter(device__in=devices).exists()
 
 
 class TestOutboxTeardown(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
@@ -415,12 +417,14 @@ class TestOutboxTeardown(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
     def test_device_delete_suppresses_a_cascaded_svi_overlay_append(self):
         from dcim.models import Interface
 
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOSVIState
         from netbox_nso_plugin.signals import suppress_intent_push
 
         interface = Interface.objects.create(device=self.device, name="Vlan444", type="virtual")
-        with suppress_intent_push():
-            NSOSVIState.objects.create(management=self.mgmt, interface=interface, status="accepted")
+        state = NSOSVIState(management=self.mgmt, interface=interface, status="accepted")
+        with suppress_intent_push(), intent_transaction(footprint_for_instance(state)):
+            state.save()
         NSOIntentOutboxEntry.objects.all().delete()
         device_id = self.device.pk
 
@@ -433,6 +437,7 @@ class TestOutboxTeardown(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         from django.db.models.signals import pre_delete
 
         from netbox_nso_plugin import outbox
+        from netbox_nso_plugin.intent_state import content_mutation
         from netbox_nso_plugin.models import NSODeviceManagement, NSOIntentOutboxEntry
 
         class AbortTeardown(Exception):
@@ -450,7 +455,8 @@ class TestOutboxTeardown(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
                     self.mgmt.delete()
             except AbortTeardown:
                 pass
-            outbox.enqueue(self.device.pk, "vlan")
+            with content_mutation({(self.device.pk, "vlan")}):
+                outbox.enqueue(self.device.pk, "vlan")
 
         assert NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").exists()
 
@@ -459,6 +465,7 @@ class TestOutboxTeardown(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         from django.db.models.signals import pre_delete
 
         from netbox_nso_plugin import outbox
+        from netbox_nso_plugin.intent_state import content_mutation
         from netbox_nso_plugin.models import NSODeviceManagement
 
         class AbortTeardown(Exception):
@@ -477,7 +484,8 @@ class TestOutboxTeardown(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
             except AbortTeardown:
                 pass
             assert self.device.pk in outbox._teardown_marks(), "the aborted deletion never marked the device"
-            outbox.enqueue(self.device.pk, "vlan")
+            with content_mutation({(self.device.pk, "vlan")}):
+                outbox.enqueue(self.device.pk, "vlan")
 
             assert self.device.pk not in outbox._teardown_marks(), (
                 "the mark of a scope that is gone stays for the life of the worker thread"

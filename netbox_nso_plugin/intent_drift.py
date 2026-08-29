@@ -330,33 +330,44 @@ def _backfill_static_route_generations(mgmt) -> list[dict]:
     """
     from . import signals
     from .intent_generation import UNALLOCATED
+    from .intent_state import MutationFootprint, footprint_for_instance, intent_transaction
     from .models import NSOStaticRouteState
     from .status_machine import DEPLOYING
 
-    rows = list(
-        NSOStaticRouteState.objects.select_for_update(of=("self",))
-        .filter(signals.PUSHED_STATIC_ROUTE_FILTER, management=mgmt, intent_generation=UNALLOCATED)
-        .order_by("management_id", "pk")
+    candidates = list(
+        NSOStaticRouteState.objects.filter(
+            signals.PUSHED_STATIC_ROUTE_FILTER,
+            management=mgmt,
+            intent_generation=UNALLOCATED,
+        ).order_by("management_id", "pk")
     )
-    if not rows:
+    if not candidates:
         return []
-    armed_fields = signals._STATIC_ROUTE_ARMED_FIELDS
-    before = [
-        {"pk": row.pk, "status": row.status, **{field: getattr(row, field) for field in armed_fields}} for row in rows
-    ]
-    demote = [row.pk for row in rows if row.status == DEPLOYING]
-    with signals.suppress_intent_push():
-        for row in rows:
-            signals._arm_static_route_generation(row)
-            row.save(update_fields=list(signals._STATIC_ROUTE_ARMED_FIELDS))
-    for snapshot, row in zip(before, rows, strict=True):
-        # The restore only changes a row that remains in its post-arm state.
-        snapshot["armed_generation"] = row.intent_generation
-        snapshot["armed_status"] = "accepted" if snapshot["status"] == DEPLOYING else row.status
-    if demote:
-        # .update(): a status save would re-fire the row's intent push, and this is
-        # bookkeeping about intent that has not moved.
-        NSOStaticRouteState.objects.filter(pk__in=demote).update(status="accepted")
+    footprint = MutationFootprint.merge(*(footprint_for_instance(row) for row in candidates))
+    with intent_transaction(footprint):
+        rows = list(
+            NSOStaticRouteState.objects.filter(
+                pk__in=[row.pk for row in candidates],
+                intent_generation=UNALLOCATED,
+            ).order_by("management_id", "pk")
+        )
+        armed_fields = signals._STATIC_ROUTE_ARMED_FIELDS
+        before = [
+            {"pk": row.pk, "status": row.status, **{field: getattr(row, field) for field in armed_fields}}
+            for row in rows
+        ]
+        with signals.suppress_intent_push():
+            for row in rows:
+                signals._arm_static_route_generation(row)
+                update_fields = list(armed_fields)
+                if row.status == DEPLOYING:
+                    row.status = "accepted"
+                    update_fields.append("status")
+                row.save(update_fields=update_fields)
+        for snapshot, row in zip(before, rows, strict=True):
+            # Restore only while both lifecycle coordinates remain as this pass left them.
+            snapshot["armed_generation"] = row.intent_generation
+            snapshot["armed_status"] = row.status
     logger.info("Armed %s static-route overlay(s) of device %s from the generation sentinel", len(rows), mgmt.device_id)
     return before
 
@@ -398,8 +409,9 @@ def _restore_static_route_generations(before: list[dict]) -> int:
     status. An operator can re-accept, promote, or settle a row while the push is on the
     wire. A row that moved is left alone, and is not counted as rolled back.
     """
+    from .intent_state import footprint_for_instance, intent_transaction
     from .models import NSOStaticRouteState
-    from .status_machine import DEPLOYING
+    from .signals import suppress_intent_push
 
     restored = 0
     for snapshot in before:
@@ -407,14 +419,22 @@ def _restore_static_route_generations(before: list[dict]) -> int:
         pk = fields.pop("pk")
         armed_generation = fields.pop("armed_generation")
         armed_status = fields.pop("armed_status")
-        original_status = fields.pop("status")
-        if original_status == DEPLOYING:
-            fields["status"] = original_status
-        restored += NSOStaticRouteState.objects.filter(
+        state = NSOStaticRouteState.objects.filter(
             pk=pk,
             intent_generation=armed_generation,
             status=armed_status,
-        ).update(**fields)
+        ).first()
+        if state is None:
+            continue
+        with intent_transaction(footprint_for_instance(state)):
+            state.refresh_from_db()
+            if state.intent_generation != armed_generation or state.status != armed_status:
+                continue
+            for field_name, value in fields.items():
+                setattr(state, field_name, value)
+            with suppress_intent_push():
+                state.save(update_fields=fields)
+            restored += 1
     return restored
 
 

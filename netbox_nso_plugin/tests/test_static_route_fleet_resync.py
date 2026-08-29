@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextlib
 from io import StringIO
 from unittest.mock import patch
+from uuid import uuid4
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.core.management import CommandError, call_command
@@ -70,16 +71,17 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         from netbox_routing.models import StaticRoute
 
         from netbox_nso_plugin.models import NSOStaticRouteState
-        from netbox_nso_plugin.signals import suppress_intent_push
+
+        from ._static_route_case import _assign_without_push
 
         with _quiet_fixture(), transaction.atomic():
             sr = StaticRoute.objects.create(prefix=prefix, next_hop=next_hop, metric=1)
-            with suppress_intent_push():
-                sr.devices.add(mgmt.device)
+            _assign_without_push(sr, mgmt.device)
             return NSOStaticRouteState.objects.create(
                 management=mgmt,
                 static_route=sr,
                 status=status,
+                apply_attempt_id=uuid4() if status == "deploying" else None,
                 nso_prefix=prefix,
                 nso_next_hop=next_hop,
                 accepted_at=timezone.now(),
@@ -409,7 +411,8 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet
         from netbox_nso_plugin.intent_generation import UNALLOCATED
         from netbox_nso_plugin.models import NSOStaticRouteState
-        from netbox_nso_plugin.signals import suppress_intent_push
+
+        from ._static_route_case import _assign_without_push
 
         _, mgmt = self._managed_device("ifacenh", 8105)
         carried = self._own_route(mgmt, "10.77.0.0/16", "10.0.0.78")
@@ -417,8 +420,7 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
             iface_route = StaticRoute.objects.create(
                 prefix="10.78.0.0/16", next_hop=None, interface_next_hop="Ethernet1/1", metric=1
             )
-            with suppress_intent_push():
-                iface_route.devices.add(mgmt.device)
+            _assign_without_push(iface_route, mgmt.device)
             skipped = NSOStaticRouteState.objects.create(
                 management=mgmt,
                 static_route=iface_route,
@@ -532,6 +534,7 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
 
         def _edit_then_refuse(adapter_device_id, routes):
             """Re-accept the row on the sender's own connection, then answer unacknowledged."""
+            from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
             from netbox_nso_plugin.signals import (
                 _STATIC_ROUTE_ARMED_FIELDS,
                 _arm_static_route_generation,
@@ -539,7 +542,7 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
             )
 
             live = NSOStaticRouteState.objects.get(pk=row.pk)
-            with suppress_intent_push():
+            with suppress_intent_push(), intent_transaction(footprint_for_instance(live)):
                 _arm_static_route_generation(live)
                 live.save(update_fields=list(_STATIC_ROUTE_ARMED_FIELDS))
             edited["generation"] = live.intent_generation
@@ -565,13 +568,24 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         armed_generations: dict[int, int] = {}
 
         def _change_statuses_then_refuse(adapter_device_id, routes):
+            from netbox_nso_plugin.intent_state import mirror_refresh
+            from netbox_nso_plugin.signals import suppress_intent_push
+
             armed_generations.update(
                 NSOStaticRouteState.objects.filter(pk__in=(deploying.pk, in_sync.pk)).values_list(
                     "pk", "intent_generation"
                 )
             )
-            NSOStaticRouteState.objects.filter(pk=deploying.pk).update(status="deploying")
-            NSOStaticRouteState.objects.filter(pk=in_sync.pk).update(status="in_sync")
+            for row, status in ((deploying, "deploying"), (in_sync, "in_sync")):
+                current = NSOStaticRouteState.objects.get(pk=row.pk)
+                fields = {"status"}
+                if status == "deploying":
+                    fields.add("apply_attempt_id")
+                with transaction.atomic(), suppress_intent_push(), mirror_refresh(current, fields) as locked:
+                    locked.status = status
+                    if status == "deploying":
+                        locked.apply_attempt_id = uuid4()
+                    locked.save(update_fields=fields)
 
         with patch(
             "netbox_nso_plugin.adapter_client.put_static_route_intent",
@@ -599,10 +613,16 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         armed_generation: dict[str, int] = {}
 
         def _move_one_then_refuse(adapter_device_id, routes):
+            from netbox_nso_plugin.intent_state import mirror_refresh
+            from netbox_nso_plugin.signals import suppress_intent_push
+
             armed_generation["moved"] = NSOStaticRouteState.objects.values_list("intent_generation", flat=True).get(
                 pk=moved.pk
             )
-            NSOStaticRouteState.objects.filter(pk=moved.pk).update(status="in_sync")
+            current = NSOStaticRouteState.objects.get(pk=moved.pk)
+            with transaction.atomic(), suppress_intent_push(), mirror_refresh(current, {"status"}) as locked:
+                locked.status = "in_sync"
+                locked.save(update_fields=["status"])
 
         with patch(
             "netbox_nso_plugin.adapter_client.put_static_route_intent",

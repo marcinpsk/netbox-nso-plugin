@@ -7,9 +7,18 @@ from unittest.mock import patch
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Platform, Site
 from django.test import TestCase
 
+from ._static_route_case import _assign_without_push
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin
 
 PUT = "netbox_nso_plugin.adapter_client.put_static_route_intent"
+
+
+def _invoke_static_route_state_save(state):
+    from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+    from netbox_nso_plugin.signals import _on_static_route_state_save
+
+    with intent_transaction(footprint_for_instance(state)):
+        _on_static_route_state_save(sender=type(state), instance=state)
 
 
 class TestPushStaticRouteIntentForDevice(IntentPushResetMixin, TestCase):
@@ -43,7 +52,6 @@ class TestPushStaticRouteIntentForDevice(IntentPushResetMixin, TestCase):
         from netbox_routing.models import StaticRoute
 
         from netbox_nso_plugin.models import NSOStaticRouteState
-        from netbox_nso_plugin.signals import suppress_intent_push
 
         sr, _ = StaticRoute.objects.get_or_create(
             prefix=prefix,
@@ -53,8 +61,7 @@ class TestPushStaticRouteIntentForDevice(IntentPushResetMixin, TestCase):
         )
         # Brownfield setup mirrors reconcile (under suppress) so the greenfield
         # assign-signal doesn't auto-own the route before we set the desired status.
-        with suppress_intent_push():
-            sr.devices.add(self.device)
+        _assign_without_push(sr, self.device)
         return NSOStaticRouteState.objects.create(
             management=mgmt,
             static_route=sr,
@@ -241,16 +248,13 @@ class TestOnStaticRouteStateSave(IntentPushDeliveryMixin, TestCase):
     def _make_route(self, prefix="10.20.0.0/16", next_hop="10.0.0.1"):
         from netbox_routing.models import StaticRoute
 
-        from netbox_nso_plugin.signals import suppress_intent_push
-
         sr, _ = StaticRoute.objects.get_or_create(
             prefix=prefix,
             next_hop=next_hop,
             vrf=None,
             defaults={"metric": 1},
         )
-        with suppress_intent_push():
-            sr.devices.add(self.device)
+        _assign_without_push(sr, self.device)
         return sr
 
     def test_save_triggers_intent_push(self):
@@ -268,10 +272,8 @@ class TestOnStaticRouteStateSave(IntentPushDeliveryMixin, TestCase):
                 nso_prefix="10.20.0.0/16",
                 nso_next_hop="10.0.0.1",
             )
-            from netbox_nso_plugin.signals import _on_static_route_state_save
-
             with self.captureOnCommitCallbacks(execute=True):
-                _on_static_route_state_save(sender=NSOStaticRouteState, instance=state)
+                _invoke_static_route_state_save(state)
             mock_push.assert_called_once()
             args = mock_push.call_args[0]
             assert args[0] == 99  # adapter_device_id
@@ -298,10 +300,8 @@ class TestOnStaticRouteStateSave(IntentPushDeliveryMixin, TestCase):
         state = NSOStaticRouteState(management=mgmt, static_route=sr, status="accepted")
 
         with patch(PUT) as mock_push:
-            from netbox_nso_plugin.signals import _on_static_route_state_save
-
             with self.captureOnCommitCallbacks(execute=True):
-                _on_static_route_state_save(sender=NSOStaticRouteState, instance=state)
+                _invoke_static_route_state_save(state)
             mock_push.assert_not_called()
 
 
@@ -427,7 +427,6 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
         from netbox_routing.models import StaticRoute
 
         from netbox_nso_plugin.models import NSOStaticRouteState
-        from netbox_nso_plugin.signals import suppress_intent_push
 
         sr = StaticRoute.objects.create(
             prefix=prefix,
@@ -435,8 +434,7 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
             metric=1,
             interface_next_hop="GigabitEthernet0/0" if next_hop_is_none else "",
         )
-        with suppress_intent_push():
-            sr.devices.add(self.device)
+        _assign_without_push(sr, self.device)
         return NSOStaticRouteState.objects.create(
             management=mgmt,
             static_route=sr,
@@ -534,7 +532,6 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
         content the operator has already replaced."""
         from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.intent_generation import allocate_intent_generation
-        from netbox_nso_plugin.models import NSOStaticRouteState
 
         mgmt = self._mgmt()
         pushed = allocate_intent_generation()
@@ -543,7 +540,9 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
 
         def _bump_then_answer(*args, **kwargs):
             # The concurrent edit lands while the request is in flight.
-            NSOStaticRouteState.objects.filter(pk=state.pk).update(intent_generation=newer)
+            from ._outbox_case import content_bulk_update
+
+            content_bulk_update(state, intent_generation=newer)
             return {
                 "device_id": 4242,
                 "count": 1,
@@ -585,7 +584,6 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.intent_generation import allocate_intent_generation
         from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOStaticRouteState
-        from netbox_nso_plugin.signals import suppress_intent_push
 
         mgmt = self._mgmt()
         generation = allocate_intent_generation()
@@ -596,8 +594,7 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
         other_mgmt = NSODeviceManagement.objects.create(
             device=other, nso_instance=inst, nso_device_name="nso-sr-gen-2", adapter_device_id=4243
         )
-        with suppress_intent_push():
-            state.static_route.devices.add(other)
+        _assign_without_push(state.static_route, other)
         other_state, _ = NSOStaticRouteState.objects.update_or_create(
             management=other_mgmt,
             static_route=state.static_route,

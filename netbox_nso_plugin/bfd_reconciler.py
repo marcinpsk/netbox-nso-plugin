@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import logging
 
+from .intent_state import mirror_reconciler
+
 logger = logging.getLogger(__name__)
 
 
@@ -100,6 +102,7 @@ def _prune_stale_bfd(device, mgmt, seen_iface_ids: set, seen_state_iface_ids: se
         sm.finalise_stale_overlay(stale, vestigial=vestigial, now=now)
 
 
+@mirror_reconciler
 def reconcile_bfd(device, interfaces: list) -> list:
     """Create/update BFDInterface rows for *device* from the adapter BFD payload.
 

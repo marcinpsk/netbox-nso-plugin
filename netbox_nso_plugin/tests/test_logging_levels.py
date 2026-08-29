@@ -22,7 +22,7 @@ from django.urls import reverse
 from django.utils import timezone
 
 from ._adapter_http import make_session
-from ._outbox_case import without_commit_drain
+from ._outbox_case import mirror_update, without_commit_drain
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin, isolate_other_scopes
 
 User = get_user_model()
@@ -340,15 +340,13 @@ class TestLoggingLevelsViews(LevelsTestBase):
         self.assertEqual(row.status, "imported")
 
     def test_unaccept_deploying_row_is_refused(self):
-        from netbox_nso_plugin.models import NSOLoggingLevelState
-
         attempt_id = uuid4()
         row = self._row(
             console_severity="CRITICAL",
             status="accepted",
             accepted_at=timezone.now(),
         )
-        NSOLoggingLevelState.objects.filter(pk=row.pk).update(status="deploying", apply_attempt_id=attempt_id)
+        mirror_update(row, status="deploying", apply_attempt_id=attempt_id)
         self._unaccept(row)
         row.refresh_from_db()
         self.assertEqual(row.status, "deploying", "an in-flight Apply must settle before ownership is released")
@@ -551,16 +549,14 @@ class TestLoggingLevelsApplyPush(_CascadeFlushMixin, IntentPushResetMixin, Trans
             )
 
     def test_prepare_apply_force_pushes_logging_and_marks_deploying(self):
-        from netbox_nso_plugin import drain, outbox
+        from netbox_nso_plugin import drain
         from netbox_nso_plugin.views import _prepare_apply
 
         # The acknowledged baseline an accept-time push leaves behind, which the Apply overrides.
         with patch("netbox_nso_plugin.adapter_client.put_logging_intent", return_value={}):
             drain.drain_key(self.device.pk, "logging")
         with patch("netbox_nso_plugin.adapter_client.put_logging_intent", return_value={}) as unforced:
-            with transaction.atomic():
-                outbox.enqueue(self.device.pk, "logging")
-            drain.drain_key(self.device.pk, "logging")
+            drain.push_now(self.device.pk, "logging")
         unforced.assert_not_called()
 
         with isolate_other_scopes("logging") as stack:

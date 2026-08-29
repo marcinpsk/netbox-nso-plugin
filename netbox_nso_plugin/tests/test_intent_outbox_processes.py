@@ -213,7 +213,11 @@ class TestOneClaimerAcrossTwoProcesses(_CascadeFlushMixin, IntentPushResetMixin,
         detach = own_route(mgmt, "198.18.2.16/28", "198.18.2.17")
         NSOIntentOutboxEntry.objects.all().delete()
         with without_commit_drain(), transaction.atomic():
-            NSOStaticRouteState.objects.filter(management=mgmt, static_route=detach).update(status="imported")
+            from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+
+            detach_state = NSOStaticRouteState.objects.get(management=mgmt, static_route=detach)
+            with intent_transaction(footprint_for_instance(detach_state)):
+                NSOStaticRouteState.objects.filter(pk=detach_state.pk).update(status="imported")
             retract.devices.remove(device)
         AdapterConnection.objects.create(url=self._adapter_url(), enabled=True, verify_tls=False, timeout_seconds=30)
 

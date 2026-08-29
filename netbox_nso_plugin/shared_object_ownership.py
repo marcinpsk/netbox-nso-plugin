@@ -45,6 +45,7 @@ class SharedObjectSpec:
     fill: Callable[[object, dict], None]
     hash_captured: Callable[[dict], str]
     label: str = ""
+    renderer_models: tuple[str, ...] = ()
     # Reverse of fill: the CURRENT NetBox object content in device-capture shape, for the
     # device-caught-up settle (#93). None = the family cannot compare (settle skipped).
     extract: Callable[[object], dict] | None = None
@@ -60,6 +61,11 @@ def register(family: str, spec: SharedObjectSpec) -> None:
 
 def get_spec(family: str) -> SharedObjectSpec | None:
     return _REGISTRY.get(family)
+
+
+def registered_specs() -> dict[str, SharedObjectSpec]:
+    """Return the dynamic shared-family declarations keyed by family."""
+    return _REGISTRY
 
 
 def hash_captured(family: str, captured: dict) -> str:
@@ -151,9 +157,9 @@ def mark_materialized(state) -> None:
     Called when a device first fills an empty shared object.  Clears the flag on any
     sibling so the 'exactly one owner' invariant holds even across races.
     """
-    from django.db import transaction
+    from .intent_state import intent_transaction, route_policy_footprint
 
-    with transaction.atomic():
+    with intent_transaction(route_policy_footprint({(state.family, state.object_name)})):
         # Lock the whole group so two devices first-filling the same shared object serialize:
         # without this both could pass the "no materialized sibling" check and both flag
         # themselves owner, leaving two materialized owners (this runs on every reconcile of
@@ -227,9 +233,8 @@ def rematerialize(state) -> None:
     separate, explicit operator Accept.  Runs under ``suppress_intent_push`` so the
     NetBox-object saves don't fire the operator-edit push handlers.
     """
-    from django.db import transaction
-
     from . import status_machine as sm
+    from .intent_state import intent_transaction, route_policy_footprint
     from .signals import suppress_intent_push
 
     spec = get_spec(state.family)
@@ -243,7 +248,7 @@ def rematerialize(state) -> None:
         raise ValueError("no captured content to materialize for this device")
 
     new_hash = spec.hash_captured(captured)
-    with transaction.atomic():
+    with intent_transaction(route_policy_footprint({(state.family, state.object_name)})):
         with suppress_intent_push():
             spec.fill(target, captured)
         for row in group_rows(state):

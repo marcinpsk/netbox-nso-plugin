@@ -43,8 +43,9 @@ def vlan_member(vid):
 def _append_in_its_own_transaction(device_id):
     """One writer's contribution, committed the way an operator transaction commits it."""
     from netbox_nso_plugin import outbox
+    from netbox_nso_plugin.intent_state import content_mutation
 
-    with transaction.atomic():
+    with content_mutation({(device_id, "vlan")}):
         outbox.enqueue(device_id, "vlan", transitions=[])
 
 
@@ -85,9 +86,9 @@ class _MarkCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
 
     def unown(self, state):
         """An unmarked shrink: the operator hands the object back, the device keeps it."""
-        with without_commit_drain(), transaction.atomic():
-            state.status = "imported"
-            state.save()
+        from ._outbox_case import content_update
+
+        content_update(state, status="imported")
 
     def delete_overlay(self, state):
         """A marked shrink: the object is destroyed in NetBox, so the device may lose it."""
@@ -205,13 +206,13 @@ class TestAnAllMarkedFoldRetracts(_MarkCase):
         assert state_of(self.device, "vlan").degraded_deletions == [], "nothing was downgraded"
 
 
-class TestALateEntryNeverAbandonsTheClaim(_MarkCase):
-    """O1.14(a), O1.14(d): there is no pre-send invalidation, so the claim sends first time."""
+class TestRevisionLockSerializesClaimFormation(_MarkCase):
+    """A23: renderer writers cannot cross a claim's fold-and-render snapshot."""
 
     tag = "late"
     adapter_device_id = 7705
 
-    def test_a_lower_id_entry_committing_before_the_send_does_not_abandon(self):
+    def test_a_writer_started_before_the_claim_commits_before_render(self):
         from netbox_nso_plugin import drain, outbox
 
         route = own_route(self.mgmt, "198.51.100.80/28", "198.51.100.6")
@@ -223,8 +224,10 @@ class TestALateEntryNeverAbandonsTheClaim(_MarkCase):
 
         def late_writer():
             """Allocates its entry first and commits it last, so its id is the lower one."""
+            from netbox_nso_plugin.intent_state import content_mutation
+
             try:
-                with transaction.atomic():
+                with content_mutation({(self.device.pk, "static_route")}):
                     outbox.enqueue(self.device.pk, "static_route", transitions=[])
                     started.set()
                     assert release.wait(timeout=30)
@@ -237,15 +240,16 @@ class TestALateEntryNeverAbandonsTheClaim(_MarkCase):
         self.addCleanup(release.set)
         assert started.wait(timeout=30), errors
 
+        release.set()
+        worker.join(timeout=30)
+        assert not worker.is_alive(), "the writer did not finish"
+        assert errors == []
+
         with without_commit_drain(), transaction.atomic():
             self.mgmt.static_route_states.get(static_route=route).save()
         with as_per_object("static_route"):
             claimed = drain.claim(self.device.pk, "static_route")
             assert claimed is not None
-            release.set()
-            worker.join(timeout=30)
-            assert not worker.is_alive(), "the writer did not finish"
-            assert errors == []
 
             config, session = self.adapter.patches()
             with config, session:
@@ -256,25 +260,46 @@ class TestALateEntryNeverAbandonsTheClaim(_MarkCase):
 
         assert len(self.sent()) == 1
         assert state_of(self.device, "static_route").attempts == 0
-        assert len(entries(self.device, "static_route", unconsumed=True)) == 1
+        assert entries(self.device, "static_route", unconsumed=True) == []
 
-    def test_a_sustained_writer_never_stops_the_claim_from_sending(self):
+    def test_a_writer_started_during_render_waits_for_claim_formation(self):
         from netbox_nso_plugin import delivery, drain
 
         states = self.own(851, 852)
         self.unown(states[852])
         real_render = delivery.render
+        started = threading.Event()
+        committed = threading.Event()
+        errors: list[BaseException] = []
+        workers = []
+
+        def append_after_claim():
+            started.set()
+            try:
+                _append_in_its_own_transaction(self.device.pk)
+                committed.set()
+            except BaseException as exc:  # noqa: BLE001 (the parent reports the failure)
+                errors.append(exc)
 
         def render_then_commit(*args, **kwargs):
-            """A writer that commits one more entry before every attempt's render."""
+            """Start a writer while the claim still holds the scope revision lock."""
             rendered = real_render(*args, **kwargs)
-            in_thread(lambda: _append_in_its_own_transaction(self.device.pk))
+            worker = threading.Thread(target=lambda: in_thread(append_after_claim))
+            worker.start()
+            workers.append(worker)
+            assert started.wait(timeout=30)
+            assert not committed.wait(timeout=1), "the writer crossed the claim's revision lock"
             return rendered
 
         with patch("netbox_nso_plugin.delivery.render", side_effect=render_then_commit):
             outcome = self.drain(chain=0)
+        for worker in workers:
+            worker.join(timeout=30)
+            assert not worker.is_alive(), "the fenced writer did not finish after claim formation"
 
         assert outcome == drain.SUCCEEDED
+        assert errors == []
+        assert committed.is_set()
         assert len(self.sent()) == 1, "the claim sent on its first attempt"
         assert state_of(self.device, "vlan").attempts == 0
         assert entries(self.device, "vlan", unconsumed=True), "the writer's later entry simply waits"
@@ -288,7 +313,8 @@ class TestACommittedRevocationAbandonsAndReformsOnce(_MarkCase):
 
     def test_a_revocation_committed_before_the_scan_is_folded_by_the_re_form(self):
         from netbox_nso_plugin import drain
-        from netbox_nso_plugin.signals import _accept_static_route_for_device
+
+        from ._static_route_case import _accept_with_permit
 
         route = own_route(self.mgmt, "198.51.100.96/28", "198.51.100.7")
         with without_commit_drain():
@@ -299,8 +325,7 @@ class TestACommittedRevocationAbandonsAndReformsOnce(_MarkCase):
         scanned: list[bool] = []
 
         def reown_in_its_own_transaction():
-            with transaction.atomic():
-                _accept_static_route_for_device(route, self.device)
+            _accept_with_permit(route, self.device)
 
         def scan_after_a_committed_re_own(claim):
             """The re-ownership commits while the claim is formed, before this scan runs."""

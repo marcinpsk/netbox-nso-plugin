@@ -7,6 +7,7 @@ from unittest.mock import patch
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Platform, Site
 from django.test import TestCase
 
+from ._outbox_case import content_bulk_update
 from .mixins import IntentPushResetMixin
 
 
@@ -186,7 +187,7 @@ class TestReconcileLoggingConfig(IntentPushResetMixin, TestCase):
             if fired or instance.pk != row.pk:
                 return
             fired.append(True)
-            NSOLoggingHostState.objects.filter(pk=instance.pk).update(severity="error")
+            content_bulk_update(instance, severity="error")
 
         post_init.connect(_concurrent_editor, sender=NSOLoggingHostState, weak=False)
         self.addCleanup(post_init.disconnect, _concurrent_editor, sender=NSOLoggingHostState)
@@ -227,7 +228,7 @@ class TestReconcileLoggingConfig(IntentPushResetMixin, TestCase):
             if fired or instance.pk != row.pk:
                 return
             fired.append(True)
-            NSOLoggingHostState.objects.filter(pk=instance.pk).update(address="198.18.0.98")
+            content_bulk_update(instance, address="198.18.0.98")
 
         post_init.connect(_concurrent_renamer, sender=NSOLoggingHostState, weak=False)
         self.addCleanup(post_init.disconnect, _concurrent_renamer, sender=NSOLoggingHostState)

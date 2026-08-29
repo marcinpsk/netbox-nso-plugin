@@ -20,6 +20,7 @@ from unittest.mock import patch
 
 from django.test import TestCase
 
+from ._outbox_case import mirror_update
 from ._settlement_case import _make_device
 
 # ── CodeQL py/stack-trace-exposure — the refusal wording is rebuilt, never serialized ────
@@ -149,14 +150,11 @@ class TestApplyRefusalSealing(TestCase):
         from django.urls import reverse
 
         from netbox_nso_plugin import drain
-        from netbox_nso_plugin.models import NSODeviceManagement
         from netbox_nso_plugin.views import _snmp_refusal_message
 
         mgmt = self._mgmt("seal-snmp", 97)
         supplied = "Traceback: private adapter path and response body"
-        NSODeviceManagement.objects.filter(pk=mgmt.pk).update(
-            intent_push_errors={"snmp": {"code": "nso_error", "message": supplied}}
-        )
+        mirror_update(mgmt, intent_push_errors={"snmp": {"code": "nso_error", "message": supplied}})
         for name, answer in (("push_now", {"count": 0}), ("drain_key", drain.REFUSED)):
             patcher = patch(f"netbox_nso_plugin.drain.{name}", side_effect=lambda *a, answer=answer, **kw: answer)
             patcher.start()

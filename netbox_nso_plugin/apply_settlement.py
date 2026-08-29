@@ -284,9 +284,13 @@ def _settlement_decisions(rows_by_scope, validated, unknown_ids, *, static_route
 
 def settle_apply_attempts(management, deployment_evidence, *, static_route_feed_drained: bool) -> None:
     """Apply one validated evidence snapshot through UUID-fenced compare-and-set writes."""
+    from django.db import transaction
+
     from .adapter_client import DEPLOYMENT_EVIDENCE_FIELDS
     from .apply_state import deploying_models
+    from .intent_state import mirror_refresh
     from .models import NSOApplyAttempt
+    from .signals import suppress_intent_push
 
     if not isinstance(deployment_evidence, dict) or set(deployment_evidence) != DEPLOYMENT_EVIDENCE_FIELDS:
         raise EvidenceInvariantError("deployment evidence has an invalid top-level shape")
@@ -314,11 +318,22 @@ def settle_apply_attempts(management, deployment_evidence, *, static_route_feed_
         }
         if clear_attempt:
             fields["apply_attempt_id"] = None
-        model.objects.filter(
-            pk=row.pk,
-            status="deploying",
-            apply_attempt_id=row.apply_attempt_id,
-        ).update(**fields)
+        with transaction.atomic():
+            current = (
+                model.objects.select_for_update(of=("self",))
+                .filter(
+                    pk=row.pk,
+                    status="deploying",
+                    apply_attempt_id=row.apply_attempt_id,
+                )
+                .first()
+            )
+            if current is None:
+                continue
+            for field_name, value in fields.items():
+                setattr(current, field_name, value)
+            with suppress_intent_push(), mirror_refresh(current, fields):
+                current.save(update_fields=fields)
 
     for attempt_id, evidence in validated.items():
         local = local_attempts[attempt_id]
@@ -332,8 +347,9 @@ def settle_apply_attempts(management, deployment_evidence, *, static_route_feed_
 def deploying_attempt_ids(management) -> tuple[UUID, ...]:
     """Return the distinct durable attempts still referenced by deploying rows."""
     from .apply_state import deploying_models
+    from .models import NSOApplyAttempt
 
-    attempt_ids = {
+    referenced_ids = {
         attempt_id
         for model in deploying_models().values()
         for attempt_id in model.objects.filter(
@@ -342,6 +358,10 @@ def deploying_attempt_ids(management) -> tuple[UUID, ...]:
             apply_attempt_id__isnull=False,
         ).values_list("apply_attempt_id", flat=True)
     }
+    attempt_ids = NSOApplyAttempt.objects.filter(
+        management=management,
+        pk__in=referenced_ids,
+    ).values_list("pk", flat=True)
     return tuple(sorted(attempt_ids, key=str))
 
 

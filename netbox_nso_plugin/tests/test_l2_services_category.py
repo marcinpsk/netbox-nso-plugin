@@ -14,6 +14,8 @@ from django.utils import timezone
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOL2SapState
 
+from ._outbox_case import mirror_update
+
 User = get_user_model()
 
 _PAYLOAD = {
@@ -148,7 +150,7 @@ class TestL2ServicesCategoryViewAndAccept(TestCase):
             reconcile_category(self.device, self.mgmt, "l2_services")
         # Force a drift status so Accept is meaningful.
         st = NSOL2SapState.objects.get(management=self.mgmt, service_name="701")
-        NSOL2SapState.objects.filter(pk=st.pk).update(status="changed")
+        mirror_update(st, status="changed")
         url = reverse("plugins:netbox_nso_plugin:l2_accept_sap", kwargs={"pk": st.pk})
         resp = self.client.post(url)
         assert resp.status_code == 302

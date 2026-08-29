@@ -68,13 +68,15 @@ class TestVlanDeletePropagation(_VlanGreenfieldBase):
     def test_delete_vlan_pushes_reduced_intent_to_all_attached(self):
         from ipam.models import VLAN
 
+        from netbox_nso_plugin.intent_state import intent_transaction, vlan_footprint
         from netbox_nso_plugin.models import NSOVLANState
         from netbox_nso_plugin.signals import suppress_intent_push
 
         m3 = self._mgmt(self.sw3, 196)
         m4 = self._mgmt(self.sw4, 197)
         vlan = self._shared_vlan()
-        with suppress_intent_push():
+        footprint = vlan_footprint(vlan.pk, ("vlan",), extra_device_ids=(self.sw3.pk, self.sw4.pk))
+        with suppress_intent_push(), intent_transaction(footprint):
             NSOVLANState.objects.create(management=m3, vlan=vlan, status="in_sync")
             NSOVLANState.objects.create(management=m4, vlan=vlan, status="in_sync")
 

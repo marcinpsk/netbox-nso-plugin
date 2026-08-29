@@ -133,10 +133,10 @@ def apply_description_for_role(interface, role, other_end=None, push=True, *, mg
     defers pushes to after an atomic commit). Returns ``{interface, changed,
     description, skipped, error}``.
     """
-    from django.db import transaction
     from django.utils import timezone
 
     from .derived_intent import render_template
+    from .intent_state import MutationFootprint, SourceRow, intent_transaction
     from .ip_autoassign import _resolve_managed_mgmt
     from .models import NSOInterfaceState
     from .signals import _schedule_intent_push, suppress_intent_push
@@ -156,7 +156,12 @@ def apply_description_for_role(interface, role, other_end=None, push=True, *, mg
     new_value = render_template(role.description_template, self_iface=interface, peer_iface=other_end)
     changed = interface.description != new_value
 
-    with transaction.atomic():
+    footprint = MutationFootprint.for_keys(
+        {(mgmt.device_id, "interface")},
+        source_rows=(SourceRow("dcim.interface", interface.pk),),
+        overlay_rows=(SourceRow(NSOInterfaceState._meta.label_lower, None),),
+    )
+    with intent_transaction(footprint):
         with suppress_intent_push():
             if changed:
                 interface.description = new_value
@@ -189,9 +194,9 @@ def enable_igp_for_role(interface, role, push=True, *, mgmt=None) -> dict:
     ``{interface, igp, enabled, skipped, error}``. One end only; the orchestrator
     runs it on both.
     """
-    from django.db import transaction
     from django.utils import timezone
 
+    from .intent_state import MutationFootprint, SourceRow, intent_transaction
     from .ip_autoassign import _resolve_managed_mgmt
     from .models import NSOISISInterfaceState, NSOOSPFInterfaceState
     from .signals import _schedule_intent_push, suppress_intent_push
@@ -209,10 +214,18 @@ def enable_igp_for_role(interface, role, push=True, *, mgmt=None) -> dict:
             return result
 
     now = timezone.now()
-    # One transaction, so the ownership and the outbox entry it schedules commit together.
-    # The orchestrator's own atomic block nests here as a savepoint.
-    with transaction.atomic():
-        if role.igp == "isis":
+    if role.igp == "isis":
+        scope = "isis"
+        state_model = NSOISISInterfaceState
+    else:
+        scope = "ospf"
+        state_model = NSOOSPFInterfaceState
+    footprint = MutationFootprint.for_keys(
+        {(mgmt.device_id, scope)},
+        overlay_rows=(SourceRow(state_model._meta.label_lower, None),),
+    )
+    with intent_transaction(footprint):
+        if scope == "isis":
             with suppress_intent_push():
                 NSOISISInterfaceState.objects.update_or_create(
                     management=mgmt,
@@ -227,7 +240,6 @@ def enable_igp_for_role(interface, role, push=True, *, mgmt=None) -> dict:
                         "accepted_at": now,
                     },
                 )
-            scope = "isis"
         else:  # ospf
             with suppress_intent_push():
                 NSOOSPFInterfaceState.objects.update_or_create(
@@ -243,8 +255,6 @@ def enable_igp_for_role(interface, role, push=True, *, mgmt=None) -> dict:
                         "accepted_at": now,
                     },
                 )
-            scope = "ospf"
-
         if push:
             # Appended, never pushed around the outbox: an in-protocol send is a claimed,
             # sequenced operation, and the drain runs on this transaction's commit.
@@ -303,6 +313,28 @@ def _enqueue_provisioned(role, device_ids) -> None:
             outbox.enqueue(device_id, scope)
 
 
+def _provision_link_footprint(role, pairs, device_ids):
+    """Return the complete renderer footprint for one link-role provision."""
+    from .intent_state import MutationFootprint, SourceRow
+
+    source_rows = [SourceRow("dcim.interface", end.pk) for end, _peer in pairs]
+    overlay_rows = []
+    if role.assign_ipv4 or role.assign_ipv6:
+        source_rows.append(SourceRow("ipam.ipaddress", None))
+        overlay_rows.append(SourceRow("netbox_nso_plugin.nsointerfaceipstate", None))
+    if role.description_template:
+        overlay_rows.append(SourceRow("netbox_nso_plugin.nsointerfacestate", None))
+    if role.igp == "isis":
+        overlay_rows.append(SourceRow("netbox_nso_plugin.nsoisisinterfacestate", None))
+    elif role.igp == "ospf":
+        overlay_rows.append(SourceRow("netbox_nso_plugin.nsoospfinterfacestate", None))
+    return MutationFootprint.for_keys(
+        {(device_id, scope) for device_id in device_ids for scope in _provisioned_scopes(role)},
+        source_rows=source_rows,
+        overlay_rows=overlay_rows,
+    )
+
+
 def provision_link_role(interface) -> dict:
     """Provision a whole link/interface from its resolved ``NSOLinkRole``.
 
@@ -320,6 +352,7 @@ def provision_link_role(interface) -> dict:
     """
     from django.db import transaction
 
+    from .intent_state import intent_transaction
     from .ip_autoassign import assign_ips_for_role
     from .signals import suppress_intent_push
 
@@ -377,7 +410,7 @@ def provision_link_role(interface) -> dict:
             summary["errors"].append({"kind": kind, "reason": res["error"], "interface": res.get("interface")})
 
     try:
-        with transaction.atomic():
+        with intent_transaction(_provision_link_footprint(role, pairs, device_ids)):
             with suppress_intent_push():
                 ip_res = assign_ips_for_role(
                     interface,

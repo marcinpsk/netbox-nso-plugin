@@ -51,12 +51,11 @@ def _make_mgmt(device, tag: str, adapter_device_id: int | None):
 def _route(prefix, next_hop, *, devices=()):
     from netbox_routing.models import StaticRoute
 
-    from netbox_nso_plugin.signals import suppress_intent_push
+    from ._static_route_case import _assign_without_push
 
     sr = StaticRoute.objects.create(prefix=prefix, next_hop=next_hop, metric=1)
     if devices:
-        with suppress_intent_push():
-            sr.devices.add(*devices)
+        _assign_without_push(sr, *devices)
     return sr
 
 

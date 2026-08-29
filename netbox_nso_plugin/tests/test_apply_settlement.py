@@ -8,10 +8,9 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from django.test import TestCase
-from ipam.models import VLAN
 
 from ._adapter_http import make_response
-from ._outbox_case import make_managed, without_commit_drain
+from ._outbox_case import make_managed, mirror_update, own_vlan
 
 _CLIENT_CONFIG = {
     "url": "http://adapter.local",
@@ -88,15 +87,8 @@ class TestAttemptSettlement(TestCase):
         self.device, self.management = make_managed("attempt-settlement", self.adapter_device_id)
 
     def _vlan_row(self, vid, attempt_id):
-        from netbox_nso_plugin.models import NSOVLANState
-        from netbox_nso_plugin.signals import suppress_intent_push
-
-        with without_commit_drain(), suppress_intent_push():
-            vlan = VLAN.objects.create(vid=vid, name=f"attempt-vlan-{vid}")
-            row = NSOVLANState.objects.create(management=self.management, vlan=vlan, status="accepted")
-        NSOVLANState.objects.filter(pk=row.pk).update(status="deploying", apply_attempt_id=attempt_id)
-        row.refresh_from_db()
-        return row
+        row = own_vlan(self.management, vid, f"attempt-{vid}")
+        return mirror_update(row, status="deploying", apply_attempt_id=attempt_id)
 
     def _local_attempt(self, attempt_id, generation_id, selected, *, answered=True):
         from netbox_nso_plugin.models import NSOApplyAttempt

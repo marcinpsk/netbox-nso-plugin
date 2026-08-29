@@ -662,6 +662,7 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         from netbox_nso_plugin import drain, outbox
         from netbox_nso_plugin.deployment import DeploymentQuiesced
         from netbox_nso_plugin.intent_drift import resync_intent
+        from netbox_nso_plugin.intent_state import content_mutation
         from netbox_nso_plugin.middleware import IntentDeploymentMiddleware
         from netbox_nso_plugin.onboarding import advance_provisioning, onboard_candidate
         from netbox_nso_plugin.reconcile import reconcile_device
@@ -716,7 +717,7 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         assert drain.gate_blockers() == []
         assert "Deployment verification passed" in stdout.getvalue()
 
-        with without_commit_drain(), transaction.atomic():
+        with without_commit_drain(), content_mutation({(self.device.pk, "static_route")}):
             outbox.enqueue(self.device.pk, "static_route")
         assert entries(self.device, "static_route", unconsumed=True), "normal operation did not resume"
 

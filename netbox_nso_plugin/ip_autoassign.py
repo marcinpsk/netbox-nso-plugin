@@ -275,76 +275,60 @@ def carve_p2p_child(pool, family: str, override_mask: int | None = None):
 # ── Rollback ──────────────────────────────────────────────────────────────────
 
 
-def rollback_auto_assigned(state, _cascade: bool = True) -> None:
+def rollback_auto_assigned(state) -> None:
     """Unassign and delete an auto-assigned IP address from *state*.
 
     Clears the IPAddress assignment from the interface, deletes the IPAddress
     object, then deletes the ``NSOInterfaceIPState`` row.  Used on
     ``apply_failed`` or explicit operator de-allocation.
 
-    For P2P states (``state.peer_state`` is set), when called as the primary
-    end (``_cascade=True``), also rolls back the peer state and deletes the
-    shared carved child prefix (``source_pool``).
-
-    Swallows exceptions so callers can call this in a cleanup path.
+    For P2P states, one immutable footprint covers both ends and the shared
+    carved child prefix. A failure rolls the complete cleanup back.
     """
+    from dcim.models import Interface
+    from django.contrib.contenttypes.models import ContentType
     from ipam.models import IPAddress
+
+    from .intent_state import (
+        MutationFootprint,
+        deletion_footprint_for_instance,
+        intent_transaction,
+    )
 
     if not state.auto_assigned:
         return
 
-    # Capture P2P references before any deletions (objects may be nulled).
-    # Only follow peer_state on the primary (cascading) call: in the cascaded
-    # (peer) call the sibling has already been deleted, and peer_state is
-    # SET_NULL, so re-reading the FK here would raise DoesNotExist against the
-    # stale in-memory id.
-    peer_state = state.peer_state if _cascade else None
+    states = [state]
+    if state.peer_state_id is not None:
+        states.append(type(state).objects.get(pk=state.peer_state_id))
     source_pool = state.source_pool
-
-    try:
+    interface_type = ContentType.objects.get_for_model(Interface)
+    ip_addresses = []
+    for candidate in states:
         vrf_obj = None
-        if state.vrf:
-            try:
-                from ipam.models import VRF
+        if candidate.vrf:
+            from ipam.models import VRF
 
-                vrf_obj = VRF.objects.get(name=state.vrf)
-            except Exception:
-                pass
-        # Scope by BOTH the content type and the id: assigned_object_id is a bare
-        # GenericForeignKey pk shared across content types, so filtering on the id
-        # alone could match (and delete) an IPAddress at the same address+VRF that
-        # is assigned to a non-Interface object whose pk collides with ours.
-        from dcim.models import Interface as _Interface
-        from django.contrib.contenttypes.models import ContentType
-
-        ip_obj = IPAddress.objects.filter(
-            address=state.address,
+            vrf_obj = VRF.objects.filter(name=candidate.vrf).first()
+        ip_address = IPAddress.objects.filter(
+            address=candidate.address,
             vrf=vrf_obj,
-            assigned_object_type=ContentType.objects.get_for_model(_Interface),
-            assigned_object_id=state.interface_id,
+            assigned_object_type=interface_type,
+            assigned_object_id=candidate.interface_id,
         ).first()
-        if ip_obj is not None:
-            ip_obj.delete()
-    except Exception as exc:
-        logger.warning("ip_autoassign.rollback: failed to delete IPAddress for %s: %s", state, exc)
-    try:
-        state.delete()
-    except Exception as exc:
-        logger.warning("ip_autoassign.rollback: failed to delete NSOInterfaceIPState %s: %s", state, exc)
+        if ip_address is not None:
+            ip_addresses.append(ip_address)
 
-    if _cascade and peer_state is not None:
-        rollback_auto_assigned(peer_state, _cascade=False)
-        # Delete the carved child prefix (shared by both ends) only once.
+    footprint = MutationFootprint.merge(
+        *(deletion_footprint_for_instance(candidate) for candidate in (*states, *ip_addresses))
+    )
+    with intent_transaction(footprint):
+        for ip_address in ip_addresses:
+            ip_address.delete()
+        for candidate in states:
+            candidate.delete()
         if source_pool is not None:
-            try:
-                source_pool.refresh_from_db()
-                source_pool.delete()
-            except Exception as exc:
-                logger.warning(
-                    "ip_autoassign.rollback: failed to delete carved child prefix %s: %s",
-                    source_pool,
-                    exc,
-                )
+            source_pool.delete()
 
 
 # ── P2P allocation helper ─────────────────────────────────────────────────────
@@ -372,6 +356,17 @@ def _suppress_ip_intent_push():
     return _ctx()
 
 
+def _ip_allocation_footprint(*managements):
+    """Declare every new renderer row before reserving an address."""
+    from .intent_state import MutationFootprint, SourceRow
+
+    return MutationFootprint.for_keys(
+        {(management.device_id, "ip") for management in managements},
+        source_rows=(SourceRow("ipam.ipaddress", None),),
+        overlay_rows=(SourceRow("netbox_nso_plugin.nsointerfaceipstate", None),),
+    )
+
+
 def _assign_one_p2p_family(
     interface,
     peer_iface,
@@ -395,11 +390,11 @@ def _assign_one_p2p_family(
     link-role path resolves the role's configured pool — both reuse this one
     carve/reserve/rollback flow.
     """
-    from django.db import transaction
     from django.db.models import Q
     from django.utils import timezone
     from ipam.models import IPAddress, Prefix
 
+    from .intent_state import intent_transaction
     from .models import NSOInterfaceIPState
     from .signals import _schedule_intent_push
 
@@ -415,7 +410,7 @@ def _assign_one_p2p_family(
     # standalone M13 path has no outer atomic to save it). The lock also closes the TOCTOU
     # window where two callers carve the same block.
     try:
-        with transaction.atomic():
+        with intent_transaction(_ip_allocation_footprint(mgmt, peer_mgmt)):
             pool = pool_finder(family, site)
             if pool is None:
                 result["errors"].append(
@@ -568,6 +563,7 @@ def _reserve_single(interface, mgmt, family: str, pool, result, push=True) -> No
     from django.utils import timezone
     from ipam.models import IPAddress
 
+    from .intent_state import intent_transaction
     from .models import NSOInterfaceIPState
     from .signals import _schedule_intent_push
 
@@ -585,7 +581,7 @@ def _reserve_single(interface, mgmt, family: str, pool, result, push=True) -> No
     # One transaction, so the reservation, the overlay and the outbox entry they schedule
     # commit together. The link-role orchestrator's own atomic block nests as a savepoint.
     try:
-        with transaction.atomic():
+        with intent_transaction(_ip_allocation_footprint(mgmt)):
             failed_step = "IPAddress"
             try:
                 with transaction.atomic():

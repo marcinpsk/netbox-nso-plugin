@@ -235,8 +235,9 @@ class TestTheTestCaseDeliveryDouble(_CascadeFlushMixin, IntentPushResetMixin, Tr
 
     def test_a_delivery_failure_is_logged_and_does_not_escape(self):
         from netbox_nso_plugin import delivery, outbox, signals
+        from netbox_nso_plugin.intent_state import content_mutation
 
-        with transaction.atomic():
+        with content_mutation({(self.device.pk, "vlan")}):
             outbox.enqueue(self.device.pk, "vlan")
         signals._pending_intent_keys().add((self.device.pk, "vlan"))
         with (
@@ -251,8 +252,9 @@ class TestTheTestCaseDeliveryDouble(_CascadeFlushMixin, IntentPushResetMixin, Tr
 
     def test_an_adapter_error_is_logged_and_leaves_the_row_unconsumed(self):
         from netbox_nso_plugin import delivery, outbox, signals
+        from netbox_nso_plugin.intent_state import content_mutation
 
-        with transaction.atomic():
+        with content_mutation({(self.device.pk, "vlan")}):
             outbox.enqueue(self.device.pk, "vlan")
         signals._pending_intent_keys().add((self.device.pk, "vlan"))
         with (
@@ -267,6 +269,7 @@ class TestTheTestCaseDeliveryDouble(_CascadeFlushMixin, IntentPushResetMixin, Tr
 
     def test_a_success_retires_rows_before_the_next_delivery(self):
         from netbox_nso_plugin import delivery, outbox, signals
+        from netbox_nso_plugin.intent_state import content_mutation
         from netbox_nso_plugin.models import NSOIntentOutboxState
 
         marks = []
@@ -274,7 +277,7 @@ class TestTheTestCaseDeliveryDouble(_CascadeFlushMixin, IntentPushResetMixin, Tr
         NSOIntentOutboxState.objects.create(device=self.device, scope="vlan")
         assert NSOIntentOutboxState.objects.filter(device=self.device, scope="vlan").exists()
         for delete_origin in (False, True):
-            with transaction.atomic():
+            with content_mutation({key}):
                 outbox.enqueue(*key, delete_origin=delete_origin)
             signals._pending_intent_keys().add(key)
             with patch.object(delivery, "send", side_effect=lambda *args, mark, **kwargs: marks.append(mark)):

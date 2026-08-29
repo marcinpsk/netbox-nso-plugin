@@ -326,15 +326,28 @@ class NSOSnmpCommunityStateForm(NetBoxModelForm):
             self.instance.vault_secret_version = self._secret_result["version"]
             self.instance.status = "accepted"
             self.instance.accepted_at = timezone.now()
-        obj = super().save(*args, **kwargs)
-        if self._secret_result and self._old_hash and self._old_hash != obj.community_hash:
-            # Trap hosts reference the community by hash-as-label; re-point them
-            # so the push doesn't reference the rotated-away hash (which the
-            # reconciler now rejects instead of configuring it as a community).
-            NSOSnmpHostState.objects.filter(management=obj.management, community_hash=self._old_hash).update(
-                community_hash=obj.community_hash
+            from .intent_state import MutationFootprint, footprint_for_instance, intent_transaction
+
+            hosts = list(
+                NSOSnmpHostState.objects.filter(
+                    management=self.instance.management,
+                    community_hash=self._old_hash,
+                ).order_by("pk")
             )
-        return obj
+            footprint = MutationFootprint.merge(
+                footprint_for_instance(self.instance),
+                *(footprint_for_instance(host) for host in hosts),
+            )
+            with intent_transaction(footprint):
+                obj = super().save(*args, **kwargs)
+                if self._old_hash and self._old_hash != obj.community_hash:
+                    # Trap hosts reference the community by hash-as-label; re-point them
+                    # so the push does not reference the rotated-away hash.
+                    NSOSnmpHostState.objects.filter(pk__in=[host.pk for host in hosts]).update(
+                        community_hash=obj.community_hash
+                    )
+                return obj
+        return super().save(*args, **kwargs)
 
 
 class NSOSnmpV3UserStateForm(NetBoxModelForm):
@@ -423,6 +436,10 @@ class NSOSnmpV3UserStateForm(NetBoxModelForm):
                 self.instance.vault_has_priv = True
             self.instance.status = "accepted"
             self.instance.accepted_at = timezone.now()
+            from .intent_state import footprint_for_instance, intent_transaction
+
+            with intent_transaction(footprint_for_instance(self.instance)):
+                return super().save(*args, **kwargs)
         return super().save(*args, **kwargs)
 
 

@@ -13,31 +13,66 @@ from __future__ import annotations
 
 import logging
 
+from .intent_state import mirror_reconciler, reconcile_transaction
+
 logger = logging.getLogger(__name__)
 
 
-def lock_svi_reconcile_dependencies(device, payload: dict) -> None:
-    """Lock native VLANs before the device lock and SVI overlay writes."""
-    from .models import NSOSVIState
-    from .vlan_reconciler import _lock_reconcile_vlan_dependencies
+def svi_reconcile_plan(device, payload: dict):
+    """Declare one SVI refresh and whether it changes rendered membership."""
+    from dcim.models import Interface
+    from ipam.models import VLAN
 
-    def collect_overlay_vlan_ids(management, _vids):
-        return NSOSVIState.objects.filter(management=management, vlan__isnull=False).values_list(
-            "vlan_id",
-            flat=True,
-        )
+    from .apply_state import vlan_ids_for_dependency_lock
+    from .intent_state import MutationFootprint, ReconcileMutationPlan, SourceRow
+    from .models import NSODeviceManagement, NSOSVIState
 
-    _lock_reconcile_vlan_dependencies(
-        device,
-        payload,
-        payload_key="interfaces",
-        vid_fields=("vlan_id",),
-        collect_overlay_vlan_ids=collect_overlay_vlan_ids,
+    management = NSODeviceManagement.objects.filter(device=device).first()
+    if management is None:
+        return ReconcileMutationPlan(MutationFootprint())
+    raw_items = payload.get("interfaces", []) if isinstance(payload, dict) else []
+    items = raw_items if isinstance(raw_items, list) else []
+    vids = vlan_ids_for_dependency_lock(items)
+
+    interfaces = tuple(Interface.objects.filter(device=device).order_by("pk"))
+    states = tuple(NSOSVIState.objects.filter(management=management).order_by("pk"))
+    vlan_ids = {state.vlan_id for state in states if state.vlan_id is not None}
+    vlan_ids.update(VLAN.objects.filter(group__slug=f"nso-{device.pk}", vid__in=vids).values_list("pk", flat=True))
+    reported = {item.get("interface_name") for item in items if isinstance(item, dict) and item.get("interface_name")}
+    changes_content = any(state.status == "in_sync" and state.interface.name not in reported for state in states)
+    return ReconcileMutationPlan(
+        MutationFootprint.for_keys(
+            {(device.pk, "svi")},
+            shared_keys=(("vlan", str(vlan_id)) for vlan_id in vlan_ids),
+            source_rows=(
+                SourceRow("dcim.device", device.pk),
+                SourceRow("dcim.interface", None),
+                *(SourceRow("dcim.interface", interface.pk) for interface in interfaces),
+                *(SourceRow("ipam.vlan", vlan_id) for vlan_id in vlan_ids),
+            ),
+            overlay_rows=(
+                SourceRow("netbox_nso_plugin.nsosvistate", None),
+                *(SourceRow(state._meta.label_lower, state.pk) for state in states),
+            ),
+        ),
+        changes_content=changes_content,
     )
 
 
+def svi_reconcile_footprint(device, payload: dict):
+    """Return the immutable footprint for callers that only need lock discovery."""
+    return svi_reconcile_plan(device, payload).footprint
+
+
+@mirror_reconciler
 def reconcile_svi(device, payload: dict) -> list:
     """Create/update virtual SVI/IRB interfaces + NSOSVIState from the adapter payload."""
+    with reconcile_transaction(svi_reconcile_plan(device, payload)):
+        return _reconcile_svi(device, payload)
+
+
+def _reconcile_svi(device, payload: dict) -> list:
+    """Apply an SVI mirror after its complete footprint is locked."""
     from dcim.models import Interface
     from django.utils import timezone
     from ipam.models import VLAN
@@ -58,7 +93,10 @@ def reconcile_svi(device, payload: dict) -> list:
         name = item.get("interface_name")
         if not name:
             continue
-        iface, _ = Interface.objects.get_or_create(device=device, name=name, defaults={"type": "virtual"})
+        iface = Interface.objects.filter(device=device, name=name).first()
+        if iface is None:
+            iface = Interface(device=device, name=name, type="virtual")
+            iface.save(force_insert=True)
         vid = item.get("vlan_id")
         vlan = VLAN.objects.filter(group=group, vid=vid).first() if vid else None
         device_type = item.get("type") or "svi"

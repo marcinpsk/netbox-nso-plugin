@@ -307,10 +307,19 @@ def _unconsumed(device_id, scope):
 
 
 def _intent_revision(device_id, scope) -> int:
-    """Return the scope revision visible to the claim's repeatable-read snapshot."""
+    """Lock and return the revision that brackets this claim's rendered snapshot.
+
+    A renderer mutation that committed after the repeatable-read snapshot began updated
+    this row. PostgreSQL then raises a serialization failure at ``FOR UPDATE`` and the
+    outer claim retry starts with a fresh snapshot. A mutation that starts after this lock
+    waits until the claim has folded and rendered.
+    """
     from .models import NSOIntentRevision
 
-    revision, _created = NSOIntentRevision.objects.get_or_create(device_id=device_id, scope=scope)
+    NSOIntentRevision.objects.get_or_create(device_id=device_id, scope=scope)
+    revision = (
+        NSOIntentRevision.objects.select_for_update(of=("self",)).order_by().get(device_id=device_id, scope=scope)
+    )
     return int(revision.revision)
 
 

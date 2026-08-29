@@ -575,7 +575,6 @@ class TestCarveP2PChild(TestCase):
         self.assertTrue(host_a.endswith("/31"))
         self.assertTrue(host_b.endswith("/31"))
         self.assertNotEqual(host_a, host_b)
-        child.delete()
 
     def test_carve_v6_returns_127_prefix(self):
         from netbox_nso_plugin.ip_autoassign import carve_p2p_child
@@ -584,7 +583,6 @@ class TestCarveP2PChild(TestCase):
         self.assertIsNotNone(result)
         child, host_a, host_b = result
         self.assertTrue(host_a.endswith("/127"))
-        child.delete()
 
     def test_carve_exhausted_pool_returns_none(self):
         from netbox_nso_plugin.ip_autoassign import carve_p2p_child
@@ -594,7 +592,6 @@ class TestCarveP2PChild(TestCase):
         tiny_pool = Prefix.objects.create(prefix="10.250.0.0/32", role=tiny_role)
         result = carve_p2p_child(tiny_pool, "ipv4")
         self.assertIsNone(result)
-        tiny_pool.delete()
 
 
 class TestAutoAssignIPP2P(TestCase):

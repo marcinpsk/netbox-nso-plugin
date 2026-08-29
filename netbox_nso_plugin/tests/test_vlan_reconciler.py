@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from uuid import uuid4
+
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
 from django.db import transaction
 from django.test import TestCase, TransactionTestCase
@@ -51,6 +53,42 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
             NSOVLANState.objects.filter(management=self.management, vlan__group=group, vlan__vid=10).exists()
         )
 
+    def test_direct_vlan_reconcile_does_not_advance_intent_revision(self):
+        from netbox_nso_plugin.models import NSOIntentRevision
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+
+        revision, _ = NSOIntentRevision.objects.get_or_create(device=self.device, scope="vlan")
+        before = revision.revision
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 1623, "name": "TEST"}]})
+
+        revision.refresh_from_db()
+        self.assertEqual(revision.revision, before)
+
+    def test_direct_switchport_reconcile_does_not_advance_intent_revision(self):
+        from netbox_nso_plugin.models import NSOIntentRevision
+        from netbox_nso_plugin.vlan_reconciler import reconcile_switchport, reconcile_vlan_database
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 1623, "name": "TEST"}]})
+        revision, _ = NSOIntentRevision.objects.get_or_create(device=self.device, scope="switchport")
+        before = revision.revision
+
+        reconcile_switchport(
+            self.device,
+            {
+                "interfaces": [
+                    {
+                        "interface_name": self.interface.name,
+                        "mode": "trunk",
+                        "tagged_vlans": [1623],
+                    }
+                ]
+            },
+        )
+
+        revision.refresh_from_db()
+        self.assertEqual(revision.revision, before)
+
     def test_two_nameless_vlans_get_unique_placeholder_names(self):
         """Live arcos shape (vlans 5/6, no names): NetBox's (group, name) unique
         constraint rejects a SECOND name='' VLAN in the per-device group, which
@@ -83,9 +121,10 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         rows = reconcile_vlan_database(
             self.device, {"vlans": [{"vlan_id": 5, "name": ""}, {"vlan_id": 7, "name": "V7"}]}
         )
+        from ._outbox_case import content_update
+
         for row in rows:  # the operator accepts both, renaming neither
-            row.status = "accepted"
-            row.save()
+            content_update(row, status="accepted")
 
         with patch("netbox_nso_plugin.adapter_client.put_vlan_intent") as mock_put:
             deliver("vlan", self.device.pk, 42)
@@ -106,8 +145,12 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         (row,) = reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 5, "name": ""}]})
         row.vlan.name = "STORAGE"
         row.vlan.save()
-        row.status = "accepted"
-        row.save()
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+
+        row.refresh_from_db()
+        with intent_transaction(footprint_for_instance(row)):
+            row.status = "accepted"
+            row.save(update_fields=["status"])
 
         with patch("netbox_nso_plugin.adapter_client.put_vlan_intent") as mock_put:
             deliver("vlan", self.device.pk, 42)
@@ -230,7 +273,9 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
 
         reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 32, "name": "MGMT"}]})
         state = NSOVLANState.objects.get(management=self.management, vlan__vid=32)
-        NSOVLANState.objects.filter(pk=state.pk).update(status="deploying")
+        from ._outbox_case import content_update
+
+        content_update(state, status="deploying", apply_attempt_id=uuid4())
 
         state.vlan.description = "Operator note"
         state.vlan.save(update_fields=["description"])
@@ -277,8 +322,10 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         site = VLANGroup.objects.create(name="Site Wide", slug="site-wide")
         shared = VLAN.objects.create(group=site, vid=41, name="SHARED_MGMT")
 
-        NSODeviceManagement.objects.filter(pk=self.management.pk).update(adapter_device_id=41)
-        NSOVLANState.objects.filter(pk=state.pk).update(status="in_sync")
+        from ._outbox_case import content_update, mirror_update
+
+        mirror_update(self.management, adapter_device_id=41)
+        content_update(state, status="in_sync")
         state.refresh_from_db()
         with patch("netbox_nso_plugin.signals._schedule_intent_push") as schedule:
             action, surviving = rescope_vlan(state, site)
@@ -300,7 +347,9 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database, rescope_vlan
 
         (source_state,) = reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 41, "name": ""}]})
-        NSOVLANState.objects.filter(pk=source_state.pk).update(status="in_sync")
+        from ._outbox_case import content_update
+
+        content_update(source_state, status="in_sync")
         source_state.refresh_from_db()
         target_group = VLANGroup.objects.create(name="Rendered Name Target", slug="rendered-name-target")
         target_vlan = VLAN.objects.create(group=target_group, vid=41, name=source_state.vlan.name)
@@ -310,7 +359,9 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
             device_name=target_vlan.name,
             status="in_sync",
         )
-        NSODeviceManagement.objects.filter(pk=self.management.pk).update(adapter_device_id=41)
+        from ._outbox_case import mirror_update
+
+        mirror_update(self.management, adapter_device_id=41)
 
         with patch("netbox_nso_plugin.signals._schedule_intent_push") as schedule:
             action, surviving = rescope_vlan(source_state, target_group)
@@ -334,8 +385,9 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
 
         reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 42, "name": "MGMT"}]})
         source_state = NSOVLANState.objects.get(management=self.management, vlan__vid=42)
-        source_state.status = "deploying"
-        source_state.save(update_fields=["status"])
+        from ._outbox_case import content_update
+
+        content_update(source_state, status="deploying", apply_attempt_id=uuid4())
         target_group = VLANGroup.objects.create(name="Same Name Target", slug="same-name-target")
         target_vlan = VLAN.objects.create(group=target_group, vid=42, name="MGMT")
         surviving_state = NSOVLANState.objects.create(
@@ -356,7 +408,8 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
     def test_rescope_rejects_a_source_vlan_identity_change_while_waiting(self):
         from unittest.mock import patch
 
-        from netbox_nso_plugin import apply_state
+        from netbox_nso_plugin import intent_state
+        from netbox_nso_plugin.signals import suppress_intent_push
         from netbox_nso_plugin.vlan_reconciler import (
             VLANRescopeConflict,
             reconcile_vlan_database,
@@ -367,19 +420,21 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         source_state = NSOVLANState.objects.get(management=self.management, vlan__vid=43)
         target_group = VLANGroup.objects.create(name="Identity Target", slug="identity-target")
         VLAN.objects.create(group=target_group, vid=43, name="MGMT")
-        original_lock = apply_state.lock_vlan_intent_transaction
+        original_footprint = intent_state.vlan_footprint
         changed = False
 
-        def change_source_before_native_lock(vlan_id):
+        def change_source_before_native_lock(vlan_id, scopes, **kwargs):
             nonlocal changed
+            footprint = original_footprint(vlan_id, scopes, **kwargs)
             if not changed and vlan_id == source_state.vlan_id:
                 changed = True
-                VLAN.objects.filter(pk=vlan_id).update(vid=1043)
-            original_lock(vlan_id)
+                with suppress_intent_push(), intent_state.intent_transaction(footprint):
+                    VLAN.objects.filter(pk=vlan_id).update(vid=1043)
+            return footprint
 
         with (
             patch(
-                "netbox_nso_plugin.apply_state.lock_vlan_intent_transaction",
+                "netbox_nso_plugin.intent_state.vlan_footprint",
                 side_effect=change_source_before_native_lock,
             ),
             self.assertRaises(VLANRescopeConflict),
@@ -649,7 +704,12 @@ class TestVlanApplyPush(_CascadeFlushMixin, IntentPushResetMixin, TransactionTes
 
         with patch("netbox_nso_plugin.adapter_client.put_vlan_intent", return_value={}):
             drain.drain_key(self.device.pk, "vlan")  # the acknowledged baseline, carrying "OLD"
-        VLAN.objects.filter(pk=self.state.vlan_id).update(name="LIVE_RENAMED")
+        from ._outbox_case import content_update
+
+        content_update(self.state.vlan, name="LIVE_RENAMED")
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry
+
+        NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").delete()
 
         # The premise: the rename owes the key nothing, so an ordinary drain sends nothing.
         with patch("netbox_nso_plugin.adapter_client.put_vlan_intent", return_value={}) as unforced:
@@ -670,17 +730,19 @@ class TestVlanApplyPush(_CascadeFlushMixin, IntentPushResetMixin, TransactionTes
         vlan = self.state.vlan
         vlan.name = "UNTRANSACTIONAL"
 
-        with self.assertRaisesRegex(RuntimeError, "VLAN intent edit must be saved inside a transaction"):
+        with self.assertRaisesRegex(RuntimeError, "intent_transaction requires transaction.atomic"):
             vlan.save(update_fields=["name"])
 
         vlan.refresh_from_db()
         self.assertEqual(vlan.name, "OLD")
 
-    def test_unmanaged_vlan_rename_does_not_require_an_outbox_transaction(self):
-        vlan = VLAN.objects.create(group=_device_vlan_group(self.device), vid=2214, name="UNMANAGED")
+    def test_unmanaged_vlan_rename_uses_the_shared_dependency_transaction(self):
+        with transaction.atomic():
+            vlan = VLAN.objects.create(group=_device_vlan_group(self.device), vid=2214, name="UNMANAGED")
 
         vlan.name = "RENAMED"
-        vlan.save(update_fields=["name"])
+        with transaction.atomic():
+            vlan.save(update_fields=["name"])
 
         vlan.refresh_from_db()
         self.assertEqual(vlan.name, "RENAMED")

@@ -9,6 +9,7 @@ from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Platform, 
 from django.test import TestCase
 
 from ._adapter_http import make_session
+from ._outbox_case import content_bulk_update
 from .mixins import IntentPushResetMixin
 
 _BASE_CFG = {
@@ -210,9 +211,8 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
         mgmt = self._create_mgmt()
         _reconcile_snmp_config(self.device, _SAMPLE_PAYLOAD)
 
-        NSOSnmpCommunityState.objects.filter(management=mgmt, community_hash="abcd1234abcd1234").update(
-            status="accepted"
-        )
+        state = NSOSnmpCommunityState.objects.get(management=mgmt, community_hash="abcd1234abcd1234")
+        content_bulk_update(state, status="accepted")
 
         _reconcile_snmp_config(self.device, _SAMPLE_PAYLOAD)
 
@@ -356,7 +356,7 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
             if fired or instance.pk != row.pk:
                 return
             fired.append(True)
-            NSOSnmpHostState.objects.filter(pk=instance.pk).update(notify_type="inform")
+            content_bulk_update(instance, notify_type="inform")
 
         post_init.connect(_concurrent_editor, sender=NSOSnmpHostState, weak=False)
         self.addCleanup(post_init.disconnect, _concurrent_editor, sender=NSOSnmpHostState)
@@ -408,7 +408,7 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
             if fired or instance.pk != row.pk:
                 return
             fired.append(True)
-            NSOSnmpHostState.objects.filter(pk=instance.pk).update(address="198.18.0.99")
+            content_bulk_update(instance, address="198.18.0.99")
 
         post_init.connect(_concurrent_renamer, sender=NSOSnmpHostState, weak=False)
         self.addCleanup(post_init.disconnect, _concurrent_renamer, sender=NSOSnmpHostState)
@@ -592,14 +592,20 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
         mgmt = self._create_mgmt()
         _reconcile_snmp_config(self.device, _SAMPLE_PAYLOAD)
 
-        NSOSnmpCommunityState.objects.filter(management=mgmt, community_hash="ef012345ef012345").update(
+        community = NSOSnmpCommunityState.objects.get(management=mgmt, community_hash="ef012345ef012345")
+        content_bulk_update(
+            community,
             status="accepted",
             vault_ref="network/netbox/snmp/community/ef012345ef012345#community",
         )
-        NSOSnmpV3UserState.objects.filter(management=mgmt, username="nms-user").update(
-            status="deploying", vault_ref="network/netbox/snmp/v3/nms-user"
+        user = NSOSnmpV3UserState.objects.get(management=mgmt, username="nms-user")
+        content_bulk_update(
+            user,
+            status="deploying",
+            vault_ref="network/netbox/snmp/v3/nms-user",
         )
-        NSOSnmpHostState.objects.filter(management=mgmt, address="10.0.0.100").update(status="in_sync")
+        host = NSOSnmpHostState.objects.get(management=mgmt, address="10.0.0.100")
+        content_bulk_update(host, status="in_sync")
 
         empty = dict(_SAMPLE_PAYLOAD)
         empty["communities"], empty["v3_users"], empty["hosts"] = [], [], []
@@ -632,13 +638,11 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
         _reconcile_snmp_config(self.device, _SAMPLE_PAYLOAD)
 
         # confirmed: fingerprint equals the device hash → settles
-        NSOSnmpCommunityState.objects.filter(management=mgmt, community_hash="abcd1234abcd1234").update(
-            status="accepted", vault_secret_hash="abcd1234abcd1234"
-        )
+        confirmed = NSOSnmpCommunityState.objects.get(management=mgmt, community_hash="abcd1234abcd1234")
+        content_bulk_update(confirmed, status="accepted", vault_secret_hash="abcd1234abcd1234")
         # unconfirmed: no fingerprint recorded → preserved
-        NSOSnmpCommunityState.objects.filter(management=mgmt, community_hash="ef012345ef012345").update(
-            status="accepted", vault_secret_hash=""
-        )
+        unconfirmed = NSOSnmpCommunityState.objects.get(management=mgmt, community_hash="ef012345ef012345")
+        content_bulk_update(unconfirmed, status="accepted", vault_secret_hash="")
 
         _reconcile_snmp_config(self.device, _SAMPLE_PAYLOAD)
 
@@ -652,8 +656,10 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
 
         mgmt = self._create_mgmt()
         _reconcile_snmp_config(self.device, _SAMPLE_PAYLOAD)
-        NSOSnmpCommunityState.objects.filter(management=mgmt, community_hash="abcd1234abcd1234").update(
-            vault_ref="network/netbox/snmp/community/abcd1234abcd1234#community"
+        state = NSOSnmpCommunityState.objects.get(management=mgmt, community_hash="abcd1234abcd1234")
+        content_bulk_update(
+            state,
+            vault_ref="network/netbox/snmp/community/abcd1234abcd1234#community",
         )
 
         _reconcile_snmp_config(self.device, _SAMPLE_PAYLOAD)

@@ -10,6 +10,8 @@ NSORedistributionState overlay row to it.
 
 import logging
 
+from .intent_state import mirror_reconciler
+
 logger = logging.getLogger(__name__)
 
 
@@ -176,6 +178,7 @@ def _create_or_link_redistribution(state, device, entry: dict) -> tuple[bool | N
         return None, False
 
 
+@mirror_reconciler
 def reconcile_redistribution(device, payload: dict) -> list:
     """Reconcile redistribution data from the adapter into NSORedistributionState rows.
 
@@ -263,6 +266,9 @@ def reconcile_redistribution(device, payload: dict) -> list:
             rd = stale.redistribution
             stale.delete()
             if rd is not None and not rd.nso_redistribution_states.exists():
-                rd.delete()
+                from .intent_state import footprint_for_instance, intent_transaction
+
+                with intent_transaction(footprint_for_instance(rd)):
+                    rd.delete()
 
     return list(NSORedistributionState.objects.filter(management=mgmt))

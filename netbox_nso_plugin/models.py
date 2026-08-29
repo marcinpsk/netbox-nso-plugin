@@ -331,20 +331,38 @@ class NSOInstance(NetBoxModel):
         """
         from django.db import transaction
 
+        from .intent_state import MutationFootprint, SourceRow, intent_transaction
+
         with transaction.atomic():
-            # Lock the other default rows so concurrent saves serialize on the default check:
-            # without this, two concurrent non-default creates both see "no default", both force
-            # themselves default, then each clears the other → zero defaults (get_default()→None).
-            # (Re-query fresh in each spot: on a create self.pk is None until super().save(), so a
-            # single captured queryset would exclude the wrong row and clear its own flag.)
-            other_defaults = NSOInstance.objects.select_for_update().filter(is_default=True).exclude(pk=self.pk)
-            # If no other default exists (e.g. this is the first instance), force this one to be
-            # the default so onboarding always has something to pre-select.
-            if not other_defaults.exists():
-                self.is_default = True
-            super().save(*args, **kwargs)
-            if self.is_default:
-                NSOInstance.objects.filter(is_default=True).exclude(pk=self.pk).update(is_default=False)
+            default_ids = tuple(
+                NSOInstance.objects.filter(is_default=True).exclude(pk=self.pk).values_list("pk", flat=True)
+            )
+            footprint = MutationFootprint.for_keys(
+                (),
+                shared_keys=(("nso-instance-default", "singleton"),),
+                source_rows=(
+                    SourceRow(self._meta.label_lower, self.pk),
+                    *(SourceRow(self._meta.label_lower, pk) for pk in default_ids),
+                ),
+            )
+            with intent_transaction(footprint):
+                current_default_ids = tuple(
+                    NSOInstance.objects.filter(is_default=True).exclude(pk=self.pk).values_list("pk", flat=True)
+                )
+                if current_default_ids != default_ids:
+                    from .intent_state import IntentMutationProtocolError
+
+                    raise IntentMutationProtocolError("the NSO instance default set changed during acquisition")
+                # The shared key serializes the default check. The source rows lock the
+                # existing default instances before the write.
+                other_defaults = NSOInstance.objects.filter(is_default=True).exclude(pk=self.pk)
+                # If no other default exists (e.g. this is the first instance), force this one to be
+                # the default so onboarding always has something to pre-select.
+                if not other_defaults.exists():
+                    self.is_default = True
+                super().save(*args, **kwargs)
+                if self.is_default:
+                    NSOInstance.objects.filter(is_default=True).exclude(pk=self.pk).update(is_default=False)
 
 
 class NSOPlatformNedMapping(NetBoxModel):
@@ -464,8 +482,8 @@ class NSODeviceManagement(NetBoxModel):
     auto_apply = models.BooleanField(
         default=False,
         help_text=(
-            "When True, every accept of a value on this device enqueues an apply job "
-            "on the adapter. Disabled by default so brownfield devices are brought into "
+            "When True, every accepted value on this device starts Apply automatically. "
+            "Disabled by default so brownfield devices are brought into "
             "management one cautious push at a time."
         ),
     )
@@ -655,7 +673,8 @@ class NSODeviceManagement(NetBoxModel):
         them deliberately, holding this same row lock.
         """
         if kwargs.get("update_fields") is not None or not self.pk:
-            return super().save(*args, **kwargs)
+            with transaction.atomic():
+                return super().save(*args, **kwargs)
         protected = self._STALE_SAVE_PROTECTED_FIELDS
         with transaction.atomic():
             current = type(self).objects.select_for_update().filter(pk=self.pk).values(*protected).first()

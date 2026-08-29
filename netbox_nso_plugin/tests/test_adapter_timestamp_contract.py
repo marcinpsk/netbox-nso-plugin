@@ -24,6 +24,8 @@ from django.test import TestCase
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOInterfaceState
 
+from ._outbox_case import mirror_update
+
 #: The two shapes the adapter is allowed to emit, and the instant each denotes.
 _WHOLE = ("2026-06-01T10:00:00Z", datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC))
 _FRACTIONAL = ("2026-06-01T10:00:00.123456Z", datetime(2026, 6, 1, 10, 0, 0, 123456, tzinfo=UTC))
@@ -169,7 +171,7 @@ class TestSyncCacheTimestamp(_AwareUTCMixin, TestCase):
         for wire, expected in _SHAPES:
             with self.subTest(wire=wire):
                 self.mgmt.last_sync_at = None
-                NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(last_sync_at=None)
+                mirror_update(self.mgmt, last_sync_at=None)
                 changed = refresh_sync_cache(self.mgmt, self._adapter_row(wire))
                 self.assertIn("last_sync_at", changed)
                 # In memory first: this is the parser's OWN tzinfo, before the DB round-trip
@@ -212,7 +214,7 @@ class TestSyncCacheTimestamp(_AwareUTCMixin, TestCase):
 
         previous = datetime(2026, 5, 31, 9, 0, tzinfo=UTC)
         self.mgmt.last_sync_at = previous
-        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(last_sync_at=previous)
+        mirror_update(self.mgmt, last_sync_at=previous)
         for value in (1717236000, {"at": "2026-06-01T10:00:00Z"}, ["2026-06-01T10:00:00Z"]):
             with self.subTest(value=value):
                 with self.assertLogs("netbox_nso_plugin.sync_cache", level="WARNING"):

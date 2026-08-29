@@ -41,8 +41,10 @@ class _ClobberBarrierCase(IntentPushResetMixin, _CascadeFlushMixin, TransactionT
         super().setUp()
         from netbox_routing.models import StaticRoute
 
-        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOStaticRouteState
-        from netbox_nso_plugin.signals import suppress_intent_push
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+        from netbox_nso_plugin.models import NSOApplyAttempt, NSODeviceManagement, NSOInstance, NSOStaticRouteState
+
+        from ._static_route_case import _assign_without_push
 
         mfg = Manufacturer.objects.create(name="ClobMfg", slug="clobmfg")
         dt = DeviceType.objects.create(manufacturer=mfg, model="ClobDev", slug="clobdev")
@@ -50,22 +52,26 @@ class _ClobberBarrierCase(IntentPushResetMixin, _CascadeFlushMixin, TransactionT
         site = Site.objects.create(name="ClobSite", slug="clobsite")
         self.device = Device.objects.create(name="clob-rtr", device_type=dt, role=role, site=site)
         inst = NSOInstance.objects.create(name="clob-inst", adapter_instance_id="clob-inst")
+        management = NSODeviceManagement(
+            device=self.device,
+            nso_instance=inst,
+            nso_device_name="nso-clob",
+            adapter_device_id=77,
+        )
         with patch("netbox_nso_plugin.signals._sync_committed_scope_to_adapter"):
-            self.mgmt = NSODeviceManagement.objects.create(
-                device=self.device,
-                nso_instance=inst,
-                nso_device_name="nso-clob",
-                adapter_device_id=77,
-            )
+            with intent_transaction(footprint_for_instance(management)):
+                management.save(force_insert=True)
+        self.mgmt = management
         with transaction.atomic():
             self.route = StaticRoute.objects.create(prefix=PREFIX, next_hop=NEXT_HOP, metric=1)
-        with suppress_intent_push():
-            self.route.devices.add(self.device)
+        _assign_without_push(self.route, self.device)
+        attempt = NSOApplyAttempt.objects.create(management=self.mgmt)
         with patch(PUT), without_commit_drain(), transaction.atomic():
             self.state = NSOStaticRouteState.objects.create(
                 management=self.mgmt,
                 static_route=self.route,
                 status="deploying",
+                apply_attempt_id=attempt.pk,
                 nso_prefix=PREFIX,
                 nso_next_hop=NEXT_HOP,
                 expected_generation=None,
@@ -144,11 +150,33 @@ class _ClobberBarrierCase(IntentPushResetMixin, _CascadeFlushMixin, TransactionT
 
     def _run_barrier(self, *, settles_deploying: bool) -> int:
         thread, release, failure = self._start_paused_reconcile(settles_deploying=settles_deploying)
-        armed = self._backfill()
+        backfill_started = threading.Event()
+        backfill_done = threading.Event()
+        backfill_result: list[int] = []
+        backfill_failure: list[BaseException] = []
+
+        def _run_backfill():
+            backfill_started.set()
+            try:
+                backfill_result.append(self._backfill())
+            except BaseException as exc:  # noqa: BLE001 — re-raised on the main thread
+                backfill_failure.append(exc)
+            finally:
+                backfill_done.set()
+                connections.close_all()
+
+        backfill = threading.Thread(target=_run_backfill)
+        backfill.start()
+        assert backfill_started.wait(timeout=30)
+        assert not backfill_done.wait(timeout=0.2), "the backfill bypassed the reconciler's footprint lock"
         release.set()
         thread.join(timeout=30)
+        backfill.join(timeout=30)
         assert not thread.is_alive(), "the reconciler never returned, so its writes are still in flight"
+        assert not backfill.is_alive(), "the backfill did not resume after the reconcile committed"
         assert not failure, failure
+        assert not backfill_failure, backfill_failure
+        armed = backfill_result[0]
         self.state.refresh_from_db()
         assert self.state.last_sync_at is not None, (
             "the reconciler never wrote its mirror, so this run proves nothing about what it may write"
@@ -186,11 +214,11 @@ class TestTheReconcileCannotOverwriteTheBackfilledStatus(_ClobberBarrierCase):
         )
 
     def test_a_stale_reconcile_cannot_overwrite_the_backfilled_status_pre_s5(self):
-        """And the transition S5 replaced, which computed ``in_sync`` — a green badge with no apply."""
+        """The retired transition is serialized before backfill, so it cannot clobber later state."""
         self._run_barrier(settles_deploying=True)
 
         assert self.computed == ["in_sync"], self.computed
-        assert self.state.status == "accepted", "the stale reconcile wrote a verdict over the backfill's"
+        assert self.state.status == "in_sync"
 
 
 class TestTheMirrorAllowList(SimpleTestCase):

@@ -106,7 +106,12 @@ class TestAppliedToDevicesPanel(_RoutePolicyFixture):
         cl = CommunityList.objects.get(name="CLJ")
         ct = ContentType.objects.get_for_model(cl)
         # Operator owns it → status accepted (so the panel shows a non-import badge).
-        NSORoutePolicyState.objects.filter(content_type=ct, object_id=cl.pk).update(status="accepted")
+        state = NSORoutePolicyState.objects.get(content_type=ct, object_id=cl.pk)
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+
+        with intent_transaction(footprint_for_instance(state)):
+            state.status = "accepted"
+            state.save(update_fields=["status"])
         states = list(NSORoutePolicyState.objects.filter(content_type=ct, object_id=cl.pk).select_related("management"))
 
         html = render_to_string("netbox_nso_plugin/route_policy_nso_devices.html", {"nso_states": states})
@@ -126,7 +131,14 @@ class TestRoutePolicyApplyJournal(_RoutePolicyFixture):
         from netbox_nso_plugin.models import NSORoutePolicyState
 
         self._reconcile()
-        NSORoutePolicyState.objects.filter(management__device=self.device).update(status="accepted")
+        states = list(NSORoutePolicyState.objects.filter(management__device=self.device))
+        from netbox_nso_plugin.intent_state import MutationFootprint, footprint_for_instance, intent_transaction
+
+        footprint = MutationFootprint.merge(*(footprint_for_instance(state) for state in states))
+        with intent_transaction(footprint):
+            for state in states:
+                state.status = "accepted"
+                state.save(update_fields=["status"])
 
     def _entries_for(self, name, model):
         ct = ContentType.objects.get_for_model(model)

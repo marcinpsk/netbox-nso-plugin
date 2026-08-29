@@ -26,6 +26,7 @@ class TestIsisIntentPush(IntentPushResetMixin, TestCase):
     def _push_and_capture(self, **state_kwargs):
         from netbox_nso_plugin import adapter_client
         from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.intent_state import SourceRow, content_mutation
         from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOISISInstanceState
         from netbox_nso_plugin.signals import suppress_intent_push
 
@@ -35,7 +36,13 @@ class TestIsisIntentPush(IntentPushResetMixin, TestCase):
             defaults={"nso_instance": inst, "nso_device_name": "ii-dev", "adapter_device_id": self.device.pk},
         )[0]
         # Create within suppression so the save() itself doesn't push.
-        with suppress_intent_push():
+        with (
+            content_mutation(
+                {(self.device.pk, "isis")},
+                overlay_rows=(SourceRow(NSOISISInstanceState._meta.label_lower, None),),
+            ),
+            suppress_intent_push(),
+        ):
             NSOISISInstanceState.objects.update_or_create(
                 management=mgmt,
                 process_tag="",

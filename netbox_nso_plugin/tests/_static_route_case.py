@@ -23,21 +23,23 @@ def _make_device(tag: str, index: int = 1):
     dt, _ = DeviceType.objects.get_or_create(manufacturer=mfg, model=f"Sr{tag}Dev", slug=f"sr{tag}dev")
     role, _ = DeviceRole.objects.get_or_create(name=f"Sr{tag}Role", slug=f"sr{tag}role")
     site, _ = Site.objects.get_or_create(name=f"Sr{tag}Site", slug=f"sr{tag}site")
-    return Device.objects.create(name=f"sr-{tag}-rtr-{index}", device_type=dt, role=role, site=site)
+    with transaction.atomic():
+        return Device.objects.create(name=f"sr-{tag}-rtr-{index}", device_type=dt, role=role, site=site)
 
 
 def _make_mgmt(device, tag: str, adapter_device_id: int):
     from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
 
-    inst, _ = NSOInstance.objects.get_or_create(
-        name=f"sr-{tag}-inst", defaults={"adapter_instance_id": f"sr-{tag}-inst"}
-    )
-    return NSODeviceManagement.objects.create(
-        device=device,
-        nso_instance=inst,
-        nso_device_name=f"nso-sr-{tag}-{device.pk}",
-        adapter_device_id=adapter_device_id,
-    )
+    with transaction.atomic():
+        inst, _ = NSOInstance.objects.get_or_create(
+            name=f"sr-{tag}-inst", defaults={"adapter_instance_id": f"sr-{tag}-inst"}
+        )
+        return NSODeviceManagement.objects.create(
+            device=device,
+            nso_instance=inst,
+            nso_device_name=f"nso-sr-{tag}-{device.pk}",
+            adapter_device_id=adapter_device_id,
+        )
 
 
 @contextlib.contextmanager
@@ -66,21 +68,83 @@ def _route(prefix, next_hop, *, vrf=None, metric=1, devices=()):
     """Create a route already assigned to *devices*, without owning it (brownfield shape)."""
     from netbox_routing.models import StaticRoute
 
+    with transaction.atomic():
+        sr = StaticRoute.objects.create(prefix=prefix, next_hop=next_hop, vrf=vrf, metric=metric)
+    if devices:
+        _assign_without_push(sr, *devices)
+    return sr
+
+
+def _assign_without_push(route, *devices):
+    """Assign a brownfield route through its exact suppressed content footprint."""
+    from netbox_nso_plugin.intent_state import MutationFootprint, SourceRow, intent_transaction
+    from netbox_nso_plugin.models import NSODeviceManagement
     from netbox_nso_plugin.signals import suppress_intent_push
 
-    sr = StaticRoute.objects.create(prefix=prefix, next_hop=next_hop, vrf=vrf, metric=metric)
-    if devices:
+    device_ids = {device.pk for device in devices}
+    managed_ids = set(NSODeviceManagement.objects.filter(device_id__in=device_ids).values_list("device_id", flat=True))
+    footprint = MutationFootprint.for_keys(
+        {(device_id, "static_route") for device_id in managed_ids},
+        source_rows=(
+            SourceRow("netbox_routing.staticroute", route.pk),
+            SourceRow("netbox_routing.staticroute_devices", None),
+        ),
+        overlay_rows=(SourceRow("netbox_nso_plugin.nsostaticroutestate", None),),
+    )
+    with suppress_intent_push(), intent_transaction(footprint):
+        route.devices.add(*devices)
+
+
+def _unassign_without_push(route, *devices):
+    """Remove a route assignment through its exact suppressed content footprint."""
+    from netbox_nso_plugin.intent_state import _static_route_devices_footprint, intent_transaction
+    from netbox_nso_plugin.signals import suppress_intent_push
+
+    footprint = _static_route_devices_footprint(
+        route,
+        "pre_remove",
+        {device.pk for device in devices},
+        False,
+    )
+    with suppress_intent_push(), intent_transaction(footprint):
+        route.devices.remove(*devices)
+
+
+def _assign_and_accept(route, *devices):
+    """Assign and own routes once under the same exact content permit."""
+    from netbox_nso_plugin.intent_state import _static_route_devices_footprint, intent_transaction
+    from netbox_nso_plugin.signals import _accept_static_route_for_device, suppress_intent_push
+
+    footprint = _static_route_devices_footprint(
+        route,
+        "pre_add",
+        {device.pk for device in devices},
+        False,
+    )
+    with intent_transaction(footprint):
         with suppress_intent_push():
-            sr.devices.add(*devices)
-    return sr
+            route.devices.add(*devices)
+        for device in devices:
+            _accept_static_route_for_device(route, device)
+
+
+def _accept_with_permit(route, device):
+    """Own one route overlay through its exact content permit."""
+    from netbox_nso_plugin.intent_state import _static_route_devices_footprint, intent_transaction
+    from netbox_nso_plugin.signals import _accept_static_route_for_device
+
+    footprint = _static_route_devices_footprint(route, "pre_add", {device.pk}, False)
+    with intent_transaction(footprint):
+        _accept_static_route_for_device(route, device)
 
 
 def _own(sr, mgmt, *, status="in_sync", mirror_vrf=None):
     """Create the overlay the reconciler would have, already carrying a generation."""
     from netbox_nso_plugin.intent_generation import allocate_intent_generation
-    from netbox_nso_plugin.models import NSOStaticRouteState
+    from netbox_nso_plugin.models import NSOApplyAttempt, NSOStaticRouteState
 
     with transaction.atomic():
+        attempt_id = NSOApplyAttempt.objects.create(management=mgmt).pk if status == "deploying" else None
         return NSOStaticRouteState.objects.create(
             management=mgmt,
             static_route=sr,
@@ -89,6 +153,7 @@ def _own(sr, mgmt, *, status="in_sync", mirror_vrf=None):
             nso_prefix=str(sr.prefix or ""),
             nso_next_hop=str(sr.next_hop or ""),
             accepted_at=timezone.now(),
+            apply_attempt_id=attempt_id,
             intent_generation=allocate_intent_generation(),
             generation_started_at=timezone.now(),
         )

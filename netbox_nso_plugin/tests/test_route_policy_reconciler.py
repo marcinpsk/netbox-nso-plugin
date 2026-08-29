@@ -85,6 +85,8 @@ class TestReconcileRoutePolicy(TestCase):
     def test_deploying_row_settles_in_sync_when_present(self):
         """A route-policy row marked 'deploying' at Apply settles to in_sync once the
         device re-reports the object — the accepted→deploying→in_sync apply lifecycle."""
+        from uuid import uuid4
+
         self._make_mgmt(self.device)
         from netbox_nso_plugin.models import NSORoutePolicyState
         from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
@@ -94,7 +96,8 @@ class TestReconcileRoutePolicy(TestCase):
             management__device=self.device, family="community_list", object_name="CL-LOCAL"
         )
         st.status = "deploying"  # Apply marked it deploying
-        st.save(update_fields=["status"])
+        st.apply_attempt_id = uuid4()
+        st.save(update_fields=["status", "apply_attempt_id"])
 
         reconcile_route_policy(self.device, self._payload())  # object still present → settle
         st.refresh_from_db()
@@ -1299,7 +1302,8 @@ class TestSharedObjectOwnership(TestCase):
         sib = NSORoutePolicyState.objects.get(management__device=self.d1, object_name="PL-RS")
         other = NSORoutePolicyState.objects.get(management__device=self.d2, object_name="PL-RS")
         old = timezone.now() - timezone.timedelta(days=1)
-        NSORoutePolicyState.objects.filter(pk=sib.pk).update(last_sync_at=old)  # backdate to prove the bump
+        sib.last_sync_at = old
+        sib.save(update_fields=["last_sync_at"])  # backdate to prove the bump
 
         ownership.rematerialize(other)  # re-point to d2 → resettles the d1 sibling
 

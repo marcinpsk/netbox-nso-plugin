@@ -17,6 +17,8 @@ import ipaddress
 import json
 import logging
 
+from .intent_state import mirror_reconciler
+
 logger = logging.getLogger(__name__)
 
 
@@ -626,6 +628,7 @@ def _reconcile_scope(
         seen_template_names.add((mgmt.pk, pg_name))
 
 
+@mirror_reconciler
 def _reconcile_bgp_config(device, payload: dict) -> list:
     """Reconcile BGP config from adapter payload into NetBox netbox-routing BGP models.
 

@@ -60,6 +60,17 @@ class IntentPushResetMixin:
 
         reset_intent_push_state()
 
+    def tearDown(self):
+        from netbox_nso_plugin.intent_state import _ACTIVE_PERMIT, _IMPLICIT_PERMITS
+
+        permit = _ACTIVE_PERMIT.get()
+        try:
+            self.assertIsNone(permit, f"implicit renderer permit leaked after the test: {permit!r}")
+        finally:
+            _ACTIVE_PERMIT.set(None)
+            _IMPLICIT_PERMITS.set({})
+            super().tearDown()
+
 
 def _deliver_scheduled_keys():
     """Deliver what the transaction scheduled, when a ``TestCase`` makes the drain impossible.
@@ -138,6 +149,8 @@ class IntentPushDeliveryMixin(IntentPushResetMixin):
         real_drain = signals._drain_intent_pushes
 
         def deliver_or_drain():
+            if connection.needs_rollback:
+                return None
             if connection.in_atomic_block:
                 return _deliver_scheduled_keys()
             return real_drain()

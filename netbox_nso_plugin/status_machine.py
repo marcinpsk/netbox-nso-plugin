@@ -473,9 +473,16 @@ def finalise_stale_overlay(stale, *, vestigial: bool, now=None) -> None:
     new_status = on_reconcile(stale.status, present=False)
     if new_status == stale.status:
         return
+    loses_ownership = is_owned(stale.status) and not is_owned(new_status)
     stale.status = new_status
     fields = ["status"]
     if now is not None:
         stale.last_sync_at = now
         fields.append("last_sync_at")
-    stale.save(update_fields=fields)
+    if loses_ownership and hasattr(stale, "_meta"):
+        from .intent_state import footprint_for_instance, intent_transaction
+
+        with intent_transaction(footprint_for_instance(stale)):
+            stale.save(update_fields=fields)
+    else:
+        stale.save(update_fields=fields)

@@ -122,26 +122,29 @@ class TestCoalescedRoutePolicyClaimPreservesSuccessHook(_ClaimCase):
         from netbox_routing.models import Community, CommunityList, CommunityListEntry
 
         from netbox_nso_plugin import drain
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSORoutePolicyState
         from netbox_nso_plugin.signals import suppress_intent_push
 
         name = "claim-community"
         unsupported = "color:0:12."
-        community_list = CommunityList.objects.create(name=name)
-        CommunityListEntry.objects.create(
-            community_list=community_list,
-            action="permit",
-            community=Community.objects.create(community=unsupported),
-        )
-        with suppress_intent_push():
-            state = NSORoutePolicyState.objects.create(
-                management=self.mgmt,
-                family="community_list",
-                object_name=name,
-                content_type=ContentType.objects.get_for_model(CommunityList),
-                object_id=community_list.pk,
-                status="accepted",
+        with transaction.atomic():
+            community_list = CommunityList.objects.create(name=name)
+            CommunityListEntry.objects.create(
+                community_list=community_list,
+                action="permit",
+                community=Community.objects.create(community=unsupported),
             )
+        state = NSORoutePolicyState(
+            management=self.mgmt,
+            family="community_list",
+            object_name=name,
+            content_type=ContentType.objects.get_for_model(CommunityList),
+            object_id=community_list.pk,
+            status="accepted",
+        )
+        with suppress_intent_push(), intent_transaction(footprint_for_instance(state)):
+            state.save()
 
         enqueue(self.device, "route_policy")
         enqueue(self.device, "route_policy")

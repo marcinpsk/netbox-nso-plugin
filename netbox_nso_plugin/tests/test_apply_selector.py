@@ -14,7 +14,14 @@ from django.urls import reverse
 from requests.exceptions import ConnectionError
 
 from ._adapter_http import make_response
-from ._outbox_case import ReceiptAdapter, make_managed, own_vlan, without_commit_drain
+from ._outbox_case import (
+    ReceiptAdapter,
+    content_update,
+    make_managed,
+    mirror_update,
+    own_vlan,
+    without_commit_drain,
+)
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 _ADAPTER_STREAMS = {
@@ -223,6 +230,10 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.device, self.mgmt = make_managed("apply-selector", 1558)
         self.vlan_state = own_vlan(self.mgmt, 1558, "apply-selector")
 
+    def _create_interface(self, **values):
+        with without_commit_drain(), transaction.atomic():
+            return Interface.objects.create(**values)
+
     def _post(self, adapter):
         config, session = adapter.patches()
         url = reverse(
@@ -282,7 +293,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertEqual(attempt.response, _promoted(attempt.selected))
 
     def test_promoted_retry_moves_apply_failed_intent_back_to_deploying(self):
-        type(self.vlan_state).objects.filter(pk=self.vlan_state.pk).update(
+        mirror_update(
+            type(self.vlan_state).objects.get(pk=self.vlan_state.pk),
             status="apply_failed",
             last_apply_at=None,
         )
@@ -317,7 +329,10 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertEqual(self.vlan_state.apply_attempt_id, attempt.pk)
 
     def test_no_op_retry_restores_apply_failed_intent(self):
-        type(self.vlan_state).objects.filter(pk=self.vlan_state.pk).update(status="apply_failed")
+        mirror_update(
+            type(self.vlan_state).objects.get(pk=self.vlan_state.pk),
+            status="apply_failed",
+        )
         adapter = _ApplyContractAdapter(lambda selected: (202, _no_op(selected)))
 
         response = self._post(adapter)
@@ -367,7 +382,10 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
 
         for malformed in (missing_successor_job, successor_claims_the_head_job, mismatched_response_job):
             with self.subTest(malformed=malformed.__name__):
-                type(self.vlan_state).objects.filter(pk=self.vlan_state.pk).update(status="accepted")
+                mirror_update(
+                    type(self.vlan_state).objects.get(pk=self.vlan_state.pk),
+                    status="accepted",
+                )
                 response = self._post(_ApplyContractAdapter(lambda selected: (202, malformed(selected))))
 
                 self.assertEqual(response.status_code, 502)
@@ -386,7 +404,10 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         )
         for result in malformed:
             with self.subTest(result=result):
-                type(self.vlan_state).objects.filter(pk=self.vlan_state.pk).update(status="accepted")
+                mirror_update(
+                    type(self.vlan_state).objects.get(pk=self.vlan_state.pk),
+                    status="accepted",
+                )
                 response = self._post(_ApplyContractAdapter(lambda _selected, result=result: (202, result)))
 
                 self.assertEqual(response.status_code, 502)
@@ -488,7 +509,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from netbox_nso_plugin.models import NSOISISInterfaceState
 
         with without_commit_drain(), transaction.atomic():
-            interface = Interface.objects.create(device=self.device, name="Ethernet1", type="1000base-t")
+            interface = self._create_interface(device=self.device, name="Ethernet1", type="1000base-t")
             NSOISISInterfaceState.objects.create(
                 management=self.mgmt,
                 interface=interface,
@@ -626,7 +647,10 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         with config, session:
             prepared, _selected = _prepare_apply(self.mgmt)
         newer_attempt_id = uuid4()
-        NSOVLANState.objects.filter(pk=self.vlan_state.pk).update(apply_attempt_id=newer_attempt_id)
+        mirror_update(
+            NSOVLANState.objects.get(pk=self.vlan_state.pk),
+            apply_attempt_id=newer_attempt_id,
+        )
 
         _rollback_prepare_apply(prepared)
 
@@ -652,12 +676,11 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertEqual(self.vlan_state.status, "accepted")
 
     def test_an_overlay_edit_repends_its_deploying_scope(self):
-        from dcim.models import Interface
 
         from netbox_nso_plugin.models import NSOInterfaceMtuState
         from netbox_nso_plugin.views import _save_owned_overlay_edit
 
-        interface = Interface.objects.create(device=self.device, name="Ethernet9", type="1000base-t")
+        interface = self._create_interface(device=self.device, name="Ethernet9", type="1000base-t")
         with without_commit_drain(), transaction.atomic():
             state = NSOInterfaceMtuState.objects.create(
                 management=self.mgmt,
@@ -669,18 +692,17 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
 
         state.l2_mtu = 1600
         with without_commit_drain():
-            _save_owned_overlay_edit(state, "interface_mtu")
+            _save_owned_overlay_edit(state, "interface_mtu", {"l2_mtu": 1500})
 
         state.refresh_from_db()
         self.assertEqual(state.status, "accepted")
 
     def test_a_stale_overlay_instance_cannot_restore_deploying(self):
-        from dcim.models import Interface
 
         from netbox_nso_plugin.models import NSOInterfaceMtuState
         from netbox_nso_plugin.views import _save_owned_overlay_edit
 
-        interface = Interface.objects.create(device=self.device, name="Ethernet9.1", type="1000base-t")
+        interface = self._create_interface(device=self.device, name="Ethernet9.1", type="1000base-t")
         with without_commit_drain(), transaction.atomic():
             state = NSOInterfaceMtuState.objects.create(
                 management=self.mgmt,
@@ -694,22 +716,22 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         current = NSOInterfaceMtuState.objects.get(pk=state.pk)
         current.l2_mtu = 1600
         with without_commit_drain():
-            _save_owned_overlay_edit(current, "interface_mtu")
+            _save_owned_overlay_edit(current, "interface_mtu", {"l2_mtu": 1500})
 
         stale.l2_mtu = 1700
         with without_commit_drain():
-            _save_owned_overlay_edit(stale, "interface_mtu")
+            _save_owned_overlay_edit(stale, "interface_mtu", {"l2_mtu": 1500})
 
         stale.refresh_from_db()
         self.assertEqual(stale.status, "accepted")
 
     def test_a_same_value_stale_overlay_edit_cannot_restore_deploying(self):
-        from dcim.models import Interface
 
         from netbox_nso_plugin.models import NSOInterfaceMtuState
         from netbox_nso_plugin.views import _save_owned_overlay_edit
 
-        interface = Interface.objects.create(device=self.device, name="Ethernet9.11", type="1000base-t")
+        with transaction.atomic():
+            interface = self._create_interface(device=self.device, name="Ethernet9.11", type="1000base-t")
         with without_commit_drain(), transaction.atomic():
             state = NSOInterfaceMtuState.objects.create(
                 management=self.mgmt,
@@ -723,21 +745,20 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         stale = NSOInterfaceMtuState.objects.get(pk=state.pk)
         first.l2_mtu = 1600
         with without_commit_drain():
-            _save_owned_overlay_edit(first, "interface_mtu")
+            _save_owned_overlay_edit(first, "interface_mtu", {"l2_mtu": 1500})
 
         stale.l2_mtu = 1600
         with without_commit_drain():
-            _save_owned_overlay_edit(stale, "interface_mtu")
+            _save_owned_overlay_edit(stale, "interface_mtu", {"l2_mtu": 1500})
 
         stale.refresh_from_db()
         self.assertEqual(stale.status, "accepted")
 
     def test_a_stale_full_save_cannot_restore_deploying_without_an_intent_change(self):
-        from dcim.models import Interface
 
         from netbox_nso_plugin.models import NSOInterfaceMtuState
 
-        interface = Interface.objects.create(device=self.device, name="Ethernet9.15", type="1000base-t")
+        interface = self._create_interface(device=self.device, name="Ethernet9.15", type="1000base-t")
         with without_commit_drain(), transaction.atomic():
             stale = NSOInterfaceMtuState.objects.create(
                 management=self.mgmt,
@@ -746,7 +767,10 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 status="deploying",
                 apply_attempt_id=uuid4(),
             )
-        NSOInterfaceMtuState.objects.filter(pk=stale.pk).update(status="accepted")
+        mirror_update(
+            NSOInterfaceMtuState.objects.get(pk=stale.pk),
+            status="accepted",
+        )
 
         with without_commit_drain(), transaction.atomic():
             stale.save()
@@ -755,11 +779,10 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertEqual(stale.status, "accepted")
 
     def test_a_stale_accepted_full_save_cannot_repend_unchanged_deploying_intent(self):
-        from dcim.models import Interface
 
         from netbox_nso_plugin.models import NSOInterfaceMtuState
 
-        interface = Interface.objects.create(device=self.device, name="Ethernet9.155", type="1000base-t")
+        interface = self._create_interface(device=self.device, name="Ethernet9.155", type="1000base-t")
         with without_commit_drain(), transaction.atomic():
             stale = NSOInterfaceMtuState.objects.create(
                 management=self.mgmt,
@@ -767,7 +790,11 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 l2_mtu=1500,
                 status="accepted",
             )
-        NSOInterfaceMtuState.objects.filter(pk=stale.pk).update(status="deploying", apply_attempt_id=uuid4())
+        mirror_update(
+            NSOInterfaceMtuState.objects.get(pk=stale.pk),
+            status="deploying",
+            apply_attempt_id=uuid4(),
+        )
 
         with without_commit_drain(), transaction.atomic():
             stale.save()
@@ -776,11 +803,10 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertEqual(stale.status, "deploying")
 
     def test_a_wire_field_update_repends_an_in_sync_row_when_status_is_not_in_update_fields(self):
-        from dcim.models import Interface
 
         from netbox_nso_plugin.models import NSOInterfaceMtuState
 
-        interface = Interface.objects.create(device=self.device, name="Ethernet9.16", type="1000base-t")
+        interface = self._create_interface(device=self.device, name="Ethernet9.16", type="1000base-t")
         with without_commit_drain(), transaction.atomic():
             state = NSOInterfaceMtuState.objects.create(
                 management=self.mgmt,
@@ -797,13 +823,12 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertEqual(state.status, "accepted")
 
     def test_a_stale_transient_owned_status_cannot_reclaim_an_unaccepted_row(self):
-        from dcim.models import Interface
 
         from netbox_nso_plugin.models import NSOInterfaceMtuState
 
         for index, stale_status in enumerate(("deploying", "in_sync", "apply_failed")):
             with self.subTest(status=stale_status):
-                interface = Interface.objects.create(
+                interface = self._create_interface(
                     device=self.device,
                     name=f"Ethernet9.2{index}",
                     type="1000base-t",
@@ -814,8 +839,12 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                         interface=interface,
                         l2_mtu=1500,
                         status=stale_status,
+                        apply_attempt_id=uuid4() if stale_status == "deploying" else None,
                     )
-                NSOInterfaceMtuState.objects.filter(pk=stale.pk).update(status="imported")
+                content_update(
+                    NSOInterfaceMtuState.objects.get(pk=stale.pk),
+                    status="imported",
+                )
 
                 stale.l2_mtu = 1600
                 with without_commit_drain(), transaction.atomic():
@@ -825,11 +854,10 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 self.assertEqual(stale.status, "changed")
 
     def test_a_stale_wire_only_update_persists_changed_after_unaccept(self):
-        from dcim.models import Interface
 
         from netbox_nso_plugin.models import NSOInterfaceMtuState
 
-        interface = Interface.objects.create(device=self.device, name="Ethernet9.29", type="1000base-t")
+        interface = self._create_interface(device=self.device, name="Ethernet9.29", type="1000base-t")
         with without_commit_drain(), transaction.atomic():
             stale = NSOInterfaceMtuState.objects.create(
                 management=self.mgmt,
@@ -837,7 +865,10 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 l2_mtu=1500,
                 status="in_sync",
             )
-        NSOInterfaceMtuState.objects.filter(pk=stale.pk).update(status="imported")
+        content_update(
+            NSOInterfaceMtuState.objects.get(pk=stale.pk),
+            status="imported",
+        )
 
         stale.l2_mtu = 1600
         with without_commit_drain(), transaction.atomic():
@@ -847,13 +878,12 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertEqual(stale.status, "changed")
 
     def test_a_stale_transient_owned_status_cannot_undo_unaccept_when_intent_is_unchanged(self):
-        from dcim.models import Interface
 
         from netbox_nso_plugin.models import NSOInterfaceMtuState
 
         for index, stale_status in enumerate(("deploying", "in_sync", "apply_failed")):
             with self.subTest(status=stale_status):
-                interface = Interface.objects.create(
+                interface = self._create_interface(
                     device=self.device,
                     name=f"Ethernet9.3{index}",
                     type="1000base-t",
@@ -864,8 +894,12 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                         interface=interface,
                         l2_mtu=1500,
                         status=stale_status,
+                        apply_attempt_id=uuid4() if stale_status == "deploying" else None,
                     )
-                NSOInterfaceMtuState.objects.filter(pk=stale.pk).update(status="imported")
+                content_update(
+                    NSOInterfaceMtuState.objects.get(pk=stale.pk),
+                    status="imported",
+                )
 
                 with without_commit_drain(), transaction.atomic():
                     stale.save()
@@ -879,8 +913,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from netbox_nso_plugin.models import NSOInterfaceMtuState
         from netbox_nso_plugin.signals import suppress_intent_push
 
-        interface = Interface.objects.create(device=self.device, name="Ethernet9.35", type="1000base-t")
-        with suppress_intent_push():
+        interface = self._create_interface(device=self.device, name="Ethernet9.35", type="1000base-t")
+        with without_commit_drain(), transaction.atomic():
             state = NSOInterfaceMtuState.objects.create(
                 management=self.mgmt,
                 interface=interface,
@@ -904,14 +938,14 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
     def test_same_row_intent_writers_serialize_before_comparing(self):
         import threading
 
-        from dcim.models import Interface
         from django.db import connections
         from django.db.models.signals import pre_save
 
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSOInterfaceMtuState
         from netbox_nso_plugin.views import _save_owned_overlay_edit
 
-        interface = Interface.objects.create(device=self.device, name="Ethernet9.2", type="1000base-t")
+        interface = self._create_interface(device=self.device, name="Ethernet9.2", type="1000base-t")
         with without_commit_drain(), transaction.atomic():
             state = NSOInterfaceMtuState.objects.create(
                 management=self.mgmt,
@@ -932,11 +966,13 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
 
         def hold_first():
             try:
-                with transaction.atomic():
+                current = NSOInterfaceMtuState.objects.get(pk=state.pk)
+                with intent_transaction(footprint_for_instance(current)):
                     NSOInterfaceMtuState.objects.select_for_update().filter(pk=state.pk).update(
                         l2_mtu=1600,
                         status="accepted",
                     )
+                    comparison_finished.clear()
                     first_locked.set()
                     if not release_first.wait(10):
                         raise AssertionError("the competing save did not inspect the locked row")
@@ -950,7 +986,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 if not first_locked.wait(10):
                     raise AssertionError("the first writer did not lock the row")
                 with without_commit_drain():
-                    _save_owned_overlay_edit(stale, "interface_mtu")
+                    _save_owned_overlay_edit(stale, "interface_mtu", {"l2_mtu": 1500})
             except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
                 errors.append(exc)
             finally:
@@ -984,20 +1020,22 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from django.contrib.messages.storage.fallback import FallbackStorage
         from django.db import connections
 
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction, mirror_transaction
         from netbox_nso_plugin.models import NSOBFDInterfaceState
         from netbox_nso_plugin.signals import suppress_intent_push
         from netbox_nso_plugin.views import NSOBFDInterfaceStateAcceptView
 
-        interface = Interface.objects.create(device=self.device, name="Ethernet9.4", type="1000base-t")
-        with suppress_intent_push():
-            state = NSOBFDInterfaceState.objects.create(
-                management=self.mgmt,
-                interface=interface,
-                min_tx=300,
-                min_rx=300,
-                multiplier=3,
-                status="imported",
-            )
+        interface = self._create_interface(device=self.device, name="Ethernet9.4", type="1000base-t")
+        state = NSOBFDInterfaceState(
+            management=self.mgmt,
+            interface=interface,
+            min_tx=300,
+            min_rx=300,
+            multiplier=3,
+            status="imported",
+        )
+        with suppress_intent_push(), mirror_transaction(footprint_for_instance(state)):
+            state.save(force_insert=True)
 
         row_updated = threading.Event()
         accept_waited = threading.Event()
@@ -1009,9 +1047,11 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         def promote_row():
             try:
                 with transaction.atomic():
-                    NSOBFDInterfaceState.objects.filter(pk=state.pk).update(
-                        status="deploying", apply_attempt_id=uuid4()
-                    )
+                    current = NSOBFDInterfaceState.objects.get(pk=state.pk)
+                    with intent_transaction(footprint_for_instance(current)):
+                        current.status = "deploying"
+                        current.apply_attempt_id = uuid4()
+                        current.save(update_fields=["status", "apply_attempt_id"])
                     row_updated.set()
                     deadline = time.monotonic() + 5
                     while time.monotonic() < deadline:
@@ -1057,10 +1097,11 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from django.db import connections
         from django.db.models.signals import pre_save
 
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSOInterfaceMtuState
         from netbox_nso_plugin.views import _save_owned_overlay_edit
 
-        interface = Interface.objects.create(device=self.device, name="Ethernet9.39", type="1000base-t")
+        interface = self._create_interface(device=self.device, name="Ethernet9.39", type="1000base-t")
         with without_commit_drain(), transaction.atomic():
             state = NSOInterfaceMtuState.objects.create(
                 management=self.mgmt,
@@ -1079,15 +1120,15 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
 
         def edit_overlay():
             try:
-                with transaction.atomic():
-                    Interface.objects.select_for_update().get(pk=interface.pk)
+                current_interface = Interface.objects.get(pk=interface.pk)
+                with intent_transaction(footprint_for_instance(current_interface)):
                     native_locked.set()
                     if not allow_writer.wait(10):
                         raise AssertionError("the rename did not inspect the native lock")
                     current = NSOInterfaceMtuState.objects.get(pk=state.pk)
                     current.l2_mtu = 1600
                     with without_commit_drain():
-                        _save_owned_overlay_edit(current, "interface_mtu")
+                        _save_owned_overlay_edit(current, "interface_mtu", {"l2_mtu": 1500})
             except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
                 errors.append(exc)
             finally:
@@ -1137,11 +1178,10 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from netbox_routing.models import BGPPeer, BGPRouter, BGPScope
 
         from netbox_nso_plugin.models import NSOBGPPeerState, NSOInterfaceIPState
-        from netbox_nso_plugin.signals import suppress_intent_push
 
-        with suppress_intent_push():
-            interface = Interface.objects.create(device=self.device, name="Ethernet9.395", type="lag")
-            child = Interface.objects.create(
+        with without_commit_drain(), transaction.atomic():
+            interface = self._create_interface(device=self.device, name="Ethernet9.395", type="lag")
+            child = self._create_interface(
                 device=self.device,
                 name="LAG395:395",
                 type="virtual",
@@ -1165,13 +1205,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 update_source=interface,
                 enabled=True,
             )
-            unlinked_bgp_state = NSOBGPPeerState.objects.create(
-                management=self.mgmt,
-                asn_str="65042",
-                peer_address_str="198.18.95.2",
-                remote_as_str="65043",
-                status="accepted",
-            )
+        unlinked_bgp_state = NSOBGPPeerState.objects.get(bgp_peer=peer)
+        content_update(unlinked_bgp_state, bgp_peer=None)
         rename_prepared = threading.Event()
         release_rename = threading.Event()
         ip_dependency_created = threading.Event()
@@ -1199,7 +1234,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             try:
                 if not rename_prepared.wait(10):
                     raise AssertionError("the rename did not reach its dependency fence")
-                with suppress_intent_push(), transaction.atomic():
+                with without_commit_drain(), transaction.atomic():
                     NSOInterfaceIPState.objects.create(
                         interface_id=child.pk,
                         address="198.18.95.1/31",
@@ -1215,7 +1250,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             try:
                 if not rename_prepared.wait(10):
                     raise AssertionError("the rename did not reach its dependency fence")
-                with suppress_intent_push(), transaction.atomic():
+                with without_commit_drain(), transaction.atomic():
                     current = NSOBGPPeerState.objects.get(pk=unlinked_bgp_state.pk)
                     current.bgp_peer_id = peer.pk
                     current.save(update_fields=["bgp_peer"])
@@ -1259,12 +1294,15 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from django.test import Client
         from ipam.models import VLAN
 
+        from netbox_nso_plugin.intent_state import footprint_for_instance, mirror_transaction
         from netbox_nso_plugin.models import NSOVLANState
         from netbox_nso_plugin.signals import suppress_intent_push
 
-        vlan = VLAN.objects.create(vid=3558, name="before-rename")
-        with suppress_intent_push():
-            NSOVLANState.objects.create(management=self.mgmt, vlan=vlan, device_name=vlan.name, status="imported")
+        with transaction.atomic():
+            vlan = VLAN.objects.create(vid=3558, name="before-rename")
+        state = NSOVLANState(management=self.mgmt, vlan=vlan, device_name=vlan.name, status="imported")
+        with suppress_intent_push(), mirror_transaction(footprint_for_instance(state)):
+            state.save(force_insert=True)
         other_device, other_mgmt = make_managed("apply-selector-vlan-attach", 2558)
         attach_client = Client()
         attach_client.force_login(self.user)
@@ -1349,35 +1387,40 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from ipam.models import VLAN
 
         from netbox_nso_plugin import apply_state
+        from netbox_nso_plugin.intent_state import (
+            IntentMutationProtocolError,
+            footprint_for_instance,
+            mirror_transaction,
+        )
         from netbox_nso_plugin.models import NSOVLANState
         from netbox_nso_plugin.signals import suppress_intent_push
 
-        vlan = VLAN.objects.create(vid=3557, name="attach-before-rename")
-        with suppress_intent_push():
-            NSOVLANState.objects.create(management=self.mgmt, vlan=vlan, device_name=vlan.name, status="imported")
+        with transaction.atomic():
+            vlan = VLAN.objects.create(vid=3557, name="attach-before-rename")
+        state = NSOVLANState(management=self.mgmt, vlan=vlan, device_name=vlan.name, status="imported")
+        with suppress_intent_push(), mirror_transaction(footprint_for_instance(state)):
+            state.save(force_insert=True)
         other_device, other_mgmt = make_managed("apply-selector-attach-order", 2557)
         attach_client = Client()
         attach_client.force_login(self.user)
-        attach_between_locks = threading.Event()
+        attach_holds_vlan = threading.Event()
         release_attach = threading.Event()
-        rename_holds_vlan_intent = threading.Event()
+        rename_acquired_vlan = threading.Event()
         errors = []
-        original_device_membership_lock = apply_state.lock_device_vlan_membership_transaction
-        original_vlan_intent_lock = apply_state.lock_vlan_intent_transaction
+        original_shared_lock = apply_state.lock_shared_dependencies
         attacher = None
         renamer = None
 
-        def hold_attach_after_device_membership(device_id):
-            original_device_membership_lock(device_id)
-            if threading.current_thread() is attacher and device_id == other_device.pk:
-                attach_between_locks.set()
+        def observe_shared_lock(keys):
+            original_shared_lock(keys)
+            if ("vlan", str(vlan.pk)) not in keys:
+                return
+            if threading.current_thread() is attacher:
+                attach_holds_vlan.set()
                 if not release_attach.wait(10):
-                    raise AssertionError("the VLAN rename did not reach its intent lock")
-
-        def note_rename_vlan_intent(vlan_id):
-            original_vlan_intent_lock(vlan_id)
-            if threading.current_thread() is renamer and vlan_id == vlan.pk:
-                rename_holds_vlan_intent.set()
+                    raise AssertionError("the VLAN attachment was not released")
+            elif threading.current_thread() is renamer:
+                rename_acquired_vlan.set()
 
         def attach_vlan():
             try:
@@ -1395,8 +1438,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
 
         def rename_vlan():
             try:
-                if not attach_between_locks.wait(10):
-                    raise AssertionError("the attachment did not pause between its locks")
+                if not attach_holds_vlan.wait(10):
+                    raise AssertionError("the attachment did not acquire the shared VLAN lock")
                 with without_commit_drain(), transaction.atomic():
                     current = VLAN.objects.get(pk=vlan.pk)
                     current.name = "rename-after-attach-started"
@@ -1407,261 +1450,138 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 connections.close_all()
 
         with (
-            patch(
-                "netbox_nso_plugin.apply_state.lock_device_vlan_membership_transaction",
-                side_effect=hold_attach_after_device_membership,
-            ),
-            patch(
-                "netbox_nso_plugin.apply_state.lock_vlan_intent_transaction",
-                side_effect=note_rename_vlan_intent,
-            ),
+            patch("netbox_nso_plugin.apply_state.lock_shared_dependencies", side_effect=observe_shared_lock),
         ):
             attacher = threading.Thread(target=attach_vlan)
             renamer = threading.Thread(target=rename_vlan)
             attacher.start()
-            self.assertTrue(attach_between_locks.wait(10), "the attachment did not pause between its locks")
+            self.assertTrue(attach_holds_vlan.wait(10), "the attachment did not acquire the shared VLAN lock")
             renamer.start()
             try:
-                self.assertTrue(rename_holds_vlan_intent.wait(10), "the rename did not acquire VLAN intent")
+                self.assertFalse(rename_acquired_vlan.wait(0.2), "the rename bypassed the attachment's VLAN lock")
             finally:
                 release_attach.set()
                 attacher.join(10)
                 renamer.join(10)
+            self.assertTrue(rename_acquired_vlan.is_set(), "the rename never acquired the released VLAN lock")
 
         self.assertFalse(attacher.is_alive())
         self.assertFalse(renamer.is_alive())
-        if errors:
-            raise errors[0]
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], IntentMutationProtocolError)
+        self.assertIn("changed its renderer targets", str(errors[0]))
         self.assertTrue(NSOVLANState.objects.filter(management=other_mgmt, vlan=vlan).exists())
         vlan.refresh_from_db()
-        self.assertEqual(vlan.name, "rename-after-attach-started")
+        self.assertEqual(vlan.name, "attach-before-rename")
 
     def test_native_vlan_prelocks_leave_malformed_payloads_to_scope_isolation(self):
+        from netbox_nso_plugin.intent_state import MutationFootprint
         from netbox_nso_plugin.models import NSOVLANState
-        from netbox_nso_plugin.svi_reconciler import lock_svi_reconcile_dependencies
+        from netbox_nso_plugin.svi_reconciler import svi_reconcile_footprint
         from netbox_nso_plugin.vlan_reconciler import (
-            lock_switchport_reconcile_dependencies,
-            lock_vlan_reconcile_dependencies,
+            switchport_reconcile_footprint,
+            vlan_reconcile_footprint,
         )
 
         state_before = list(NSOVLANState.objects.filter(management=self.mgmt).values_list("pk", "vlan_id", "status"))
         with transaction.atomic():
             results = [
-                lock_vlan_reconcile_dependencies(
+                vlan_reconcile_footprint(
                     self.device,
                     {"vlans": [{"vlan_id": "not-an-integer"}, None]},
                 ),
-                lock_svi_reconcile_dependencies(
+                svi_reconcile_footprint(
                     self.device,
                     {"interfaces": [{"vlan_id": "not-an-integer"}, None]},
                 ),
-                lock_switchport_reconcile_dependencies(
+                switchport_reconcile_footprint(
                     self.device,
                     {"interfaces": [{"untagged_vlan": "bad", "tagged_vlans": 5}, None]},
                 ),
-                lock_vlan_reconcile_dependencies(self.device, {"vlans": 5}),
-                lock_svi_reconcile_dependencies(self.device, {"interfaces": 5}),
-                lock_switchport_reconcile_dependencies(self.device, {"interfaces": 5}),
+                vlan_reconcile_footprint(self.device, {"vlans": 5}),
+                svi_reconcile_footprint(self.device, {"interfaces": 5}),
+                switchport_reconcile_footprint(self.device, {"interfaces": 5}),
             ]
 
-        self.assertEqual(results, [None] * 6)
+        self.assertTrue(all(isinstance(result, MutationFootprint) for result in results))
         self.assertEqual(
             list(NSOVLANState.objects.filter(management=self.mgmt).values_list("pk", "vlan_id", "status")),
             state_before,
         )
 
     def test_unknown_native_vlan_dependency_family_is_rejected(self):
-        from netbox_nso_plugin.reconcile import _lock_native_vlan_dependencies
+        from netbox_nso_plugin.reconcile import _native_vlan_footprint
 
-        with transaction.atomic(), self.assertRaisesRegex(ValueError, "unknown native VLAN dependency family"):
-            _lock_native_vlan_dependencies(self.device, {}, "unknown")
+        with self.assertRaisesRegex(ValueError, "unknown native VLAN dependency family"):
+            _native_vlan_footprint(self.device, {}, "unknown")
 
     def test_all_native_vlan_dependency_prelocks_defer_discovery_to_one_lock_sequence(self):
-        from unittest.mock import patch
 
-        from dcim.models import Interface
-
-        from netbox_nso_plugin import apply_state
+        from netbox_nso_plugin.intent_state import MutationFootprint, footprint_for_instance, mirror_transaction
         from netbox_nso_plugin.models import NSOSVIState, NSOSwitchportState
         from netbox_nso_plugin.signals import suppress_intent_push
-        from netbox_nso_plugin.svi_reconciler import lock_svi_reconcile_dependencies
+        from netbox_nso_plugin.svi_reconciler import svi_reconcile_footprint
         from netbox_nso_plugin.vlan_reconciler import (
-            lock_switchport_reconcile_dependencies,
-            lock_vlan_reconcile_dependencies,
+            switchport_reconcile_footprint,
+            vlan_reconcile_footprint,
         )
 
-        self.assertTrue(
-            hasattr(apply_state, "lock_native_vlan_dependency_rows"),
-            "the three dependency prelocks do not share one lock-sequence helper",
+        interface = self._create_interface(device=self.device, name="Vlan3558", type="virtual")
+        svi_state = NSOSVIState(
+            management=self.mgmt,
+            interface=interface,
+            vlan=self.vlan_state.vlan,
+            status="imported",
         )
-        interface = Interface.objects.create(device=self.device, name="Vlan3558", type="virtual")
-        with suppress_intent_push(), transaction.atomic():
-            NSOSVIState.objects.create(
-                management=self.mgmt,
-                interface=interface,
-                vlan=self.vlan_state.vlan,
-                status="imported",
-            )
-            NSOSwitchportState.objects.create(
-                management=self.mgmt,
-                interface=interface,
-                mode="access",
-                untagged_vlan=self.vlan_state.vlan,
-                status="imported",
-            )
+        switchport_state = NSOSwitchportState(
+            management=self.mgmt,
+            interface=interface,
+            mode="access",
+            untagged_vlan=self.vlan_state.vlan,
+            status="imported",
+        )
+        footprint = MutationFootprint.merge(
+            footprint_for_instance(svi_state),
+            footprint_for_instance(switchport_state),
+        )
+        with suppress_intent_push(), mirror_transaction(footprint):
+            svi_state.save(force_insert=True)
+            switchport_state.save(force_insert=True)
 
-        with patch.object(apply_state, "lock_native_vlan_dependency_rows") as lock_rows:
-            lock_vlan_reconcile_dependencies(
-                self.device,
-                {"vlans": [{"vlan_id": self.vlan_state.vlan.vid}]},
-            )
-            lock_svi_reconcile_dependencies(
-                self.device,
-                {"interfaces": [{"vlan_id": self.vlan_state.vlan.vid}]},
-            )
-            lock_switchport_reconcile_dependencies(
+        footprints = [
+            vlan_reconcile_footprint(self.device, {"vlans": [{"vlan_id": self.vlan_state.vlan.vid}]}),
+            svi_reconcile_footprint(self.device, {"interfaces": [{"vlan_id": self.vlan_state.vlan.vid}]}),
+            switchport_reconcile_footprint(
                 self.device,
                 {"interfaces": [{"untagged_vlan": self.vlan_state.vlan.vid, "tagged_vlans": []}]},
+            ),
+        ]
+
+        for footprint in footprints:
+            self.assertIn(("vlan", str(self.vlan_state.vlan_id)), footprint.shared_keys)
+            self.assertIn(
+                ("ipam.vlan", self.vlan_state.vlan_id), {(row.model_label, row.pk) for row in footprint.source_rows}
             )
 
-        self.assertEqual(len(lock_rows.call_args_list), 3)
-        for helper_call in lock_rows.call_args_list:
-            device_id, collect_vlan_ids = helper_call.args
-            self.assertEqual(device_id, self.device.pk)
-            self.assertTrue(callable(collect_vlan_ids))
-            self.assertEqual(collect_vlan_ids(), {self.vlan_state.vlan_id})
-
-    def test_all_native_vlan_dependency_prelocks_lock_default_group_payload_vlans(self):
-        import threading
-
-        from django.db import connections
-        from ipam.models import VLAN
-
-        from netbox_nso_plugin import vlan_reconciler
-        from netbox_nso_plugin.svi_reconciler import lock_svi_reconcile_dependencies
-
-        group = vlan_reconciler._device_vlan_group(self.device)
-        vlan = VLAN.objects.create(group=group, vid=3557, name="V3557")
-        payloads = (
-            (vlan_reconciler.lock_vlan_reconcile_dependencies, {"vlans": [{"vlan_id": vlan.vid}]}),
-            (lock_svi_reconcile_dependencies, {"interfaces": [{"vlan_id": vlan.vid}]}),
-            (
-                vlan_reconciler.lock_switchport_reconcile_dependencies,
-                {"interfaces": [{"untagged_vlan": vlan.vid, "tagged_vlans": []}]},
-            ),
-        )
-
-        for locker, payload in payloads:
-            with self.subTest(locker=locker.__name__):
-                locked = threading.Event()
-                release = threading.Event()
-                errors = []
-
-                def hold_dependency_lock():
-                    try:
-                        with transaction.atomic():
-                            locker(self.device, payload)
-                            locked.set()
-                            if not release.wait(10):
-                                raise AssertionError("the dependency lock was not released")
-                    except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
-                        errors.append(exc)
-                    finally:
-                        connections.close_all()
-
-                holder = threading.Thread(target=hold_dependency_lock)
-                holder.start()
-                try:
-                    self.assertTrue(locked.wait(10), "the dependency prelock did not acquire its rows")
-                    with self.assertRaises(DatabaseError), transaction.atomic():
-                        VLAN.objects.select_for_update(nowait=True).get(pk=vlan.pk)
-                finally:
-                    release.set()
-                    holder.join(10)
-
-                self.assertFalse(holder.is_alive())
-                if errors:
-                    raise errors[0]
-
-    def test_shared_native_vlan_dependency_lock_discovers_ids_after_membership_fence(self):
-        from unittest.mock import patch
-
-        from netbox_nso_plugin import apply_state
-
-        lower_vlan_id = self.vlan_state.vlan_id
-        higher_vlan_id = lower_vlan_id + 10_000
-        events = []
-
-        def collect_vlan_ids():
-            events.append("discover")
-            return {higher_vlan_id, lower_vlan_id}
-
-        with (
-            patch.object(
-                apply_state,
-                "lock_device_vlan_membership_transaction",
-                side_effect=lambda device_id: events.append(("membership", device_id)),
-            ),
-            patch.object(
-                apply_state,
-                "lock_vlan_intent_transaction",
-                side_effect=lambda vlan_id: events.append(("intent", vlan_id)),
-            ),
-            transaction.atomic(),
-        ):
-            apply_state.lock_native_vlan_dependency_rows(self.device.pk, collect_vlan_ids)
-
-        self.assertEqual(
-            events,
-            [
-                ("membership", self.device.pk),
-                "discover",
-                ("intent", lower_vlan_id),
-                ("intent", higher_vlan_id),
-            ],
-        )
-
-    def test_advisory_lock_helpers_use_distinct_transaction_namespaces(self):
-        from netbox_nso_plugin.apply_state import (
-            lock_device_intent_transaction,
-            lock_device_vlan_membership_transaction,
-            lock_vlan_intent_transaction,
-            lock_vlan_membership_transaction,
-            lock_vlan_rescope_transaction,
-        )
+    def test_advisory_lock_helpers_use_the_two_declared_transaction_namespaces(self):
+        from netbox_nso_plugin.apply_state import lock_device_intent_transaction, lock_shared_dependencies
 
         lock_id = 1611
-        namespaces = [
-            1_503_003_007,
-            1_503_003_008,
-            1_503_003_009,
-            1_503_003_010,
-            1_503_003_011,
-        ]
-        helpers = [
-            lock_device_intent_transaction,
-            lock_vlan_intent_transaction,
-            lock_device_vlan_membership_transaction,
-            lock_vlan_membership_transaction,
-            lock_vlan_rescope_transaction,
-        ]
+        namespaces = [1_503_003_007, 1_503_003_008]
 
         with transaction.atomic():
-            for helper in helpers:
-                helper(lock_id)
+            lock_device_intent_transaction(lock_id)
+            lock_shared_dependencies({("vlan", str(lock_id))})
             with connection.cursor() as cursor:
                 cursor.execute(
-                    "SELECT classid::bigint, objid::bigint, objsubid, mode, granted "
+                    "SELECT DISTINCT classid::bigint "
                     "FROM pg_locks WHERE pid = pg_backend_pid() AND locktype = 'advisory' "
-                    "AND classid = ANY(%s) AND objid = %s ORDER BY classid",
-                    [namespaces, lock_id],
+                    "AND classid = ANY(%s) ORDER BY classid",
+                    [namespaces],
                 )
-                held_locks = cursor.fetchall()
+                held_namespaces = {row[0] for row in cursor.fetchall()}
 
-        self.assertEqual(
-            held_locks,
-            [(namespace, lock_id, 2, "ExclusiveLock", True) for namespace in namespaces],
-        )
+        self.assertEqual(held_namespaces, set(namespaces))
         with connection.cursor() as cursor:
             cursor.execute(
                 "SELECT count(*) FROM pg_locks WHERE pid = pg_backend_pid() AND locktype = 'advisory' "
@@ -1675,7 +1595,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
 
         from netbox_nso_plugin.deployment import quiesce, resume
 
-        vlan = VLAN.objects.create(vid=3556, name="outside-nso-intent")
+        with transaction.atomic():
+            vlan = VLAN.objects.create(vid=3556, name="outside-nso-intent")
 
         quiesce()
         try:
@@ -1696,10 +1617,12 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from django.test import Client
         from ipam.models import VLAN
 
+        from netbox_nso_plugin.intent_state import intent_transaction
         from netbox_nso_plugin.models import NSOVLANState
-        from netbox_nso_plugin.vlan_reconciler import lock_switchport_reconcile_dependencies
+        from netbox_nso_plugin.vlan_reconciler import switchport_reconcile_footprint
 
-        vlan = VLAN.objects.create(vid=3559, name="membership-fence")
+        with transaction.atomic():
+            vlan = VLAN.objects.create(vid=3559, name="membership-fence")
         attach_client = Client()
         attach_client.force_login(self.user)
         discovery_complete = threading.Event()
@@ -1713,11 +1636,11 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
 
         def hold_dependency_snapshot():
             try:
-                with transaction.atomic():
-                    lock_switchport_reconcile_dependencies(
-                        self.device,
-                        {"interfaces": [{"untagged_vlan": vlan.vid, "tagged_vlans": []}]},
-                    )
+                footprint = switchport_reconcile_footprint(
+                    self.device,
+                    {"interfaces": [{"untagged_vlan": vlan.vid, "tagged_vlans": []}]},
+                )
+                with intent_transaction(footprint):
                     discovery_complete.set()
                     if not release_discovery.wait(10):
                         raise AssertionError("the attachment did not inspect the membership fence")
@@ -1768,24 +1691,25 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
     def test_switchport_dependency_discovery_fences_a_vlan_rescope_merge(self):
         import threading
 
-        from dcim.models import Interface
         from django.db import connections
         from django.db.models.signals import pre_save
         from ipam.models import VLAN, VLANGroup
 
+        from netbox_nso_plugin.intent_state import intent_transaction
         from netbox_nso_plugin.models import NSOSVIState
         from netbox_nso_plugin.vlan_reconciler import (
-            lock_switchport_reconcile_dependencies,
             rescope_vlan,
+            switchport_reconcile_footprint,
         )
 
         target_group = VLANGroup.objects.create(name="Membership fence target", slug="membership-fence-target")
-        target_vlan = VLAN.objects.create(
-            group=target_group,
-            vid=self.vlan_state.vlan.vid,
-            name="shared-target",
-        )
-        svi_interface = Interface.objects.create(device=self.device, name="Vlan3559", type="virtual")
+        with transaction.atomic():
+            target_vlan = VLAN.objects.create(
+                group=target_group,
+                vid=self.vlan_state.vlan.vid,
+                name="shared-target",
+            )
+        svi_interface = self._create_interface(device=self.device, name="Vlan3559", type="virtual")
         with without_commit_drain(), transaction.atomic():
             svi_state = NSOSVIState.objects.create(
                 management=self.mgmt,
@@ -1805,11 +1729,11 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
 
         def hold_dependency_snapshot():
             try:
-                with transaction.atomic():
-                    lock_switchport_reconcile_dependencies(
-                        self.device,
-                        {"interfaces": [{"untagged_vlan": self.vlan_state.vlan.vid, "tagged_vlans": []}]},
-                    )
+                footprint = switchport_reconcile_footprint(
+                    self.device,
+                    {"interfaces": [{"untagged_vlan": self.vlan_state.vlan.vid, "tagged_vlans": []}]},
+                )
+                with intent_transaction(footprint):
                     discovery_complete.set()
                     if not release_discovery.wait(30):
                         raise AssertionError("rescope did not inspect the membership fence")
@@ -1861,7 +1785,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertEqual(self.vlan_state.vlan_id, target_vlan.pk)
         self.assertEqual(svi_state.vlan_id, target_vlan.pk)
 
-    def test_vlan_rescope_move_reports_a_concurrent_target_creation_as_a_conflict(self):
+    def test_vlan_rescope_target_slot_serializes_a_concurrent_vlan_creation(self):
         import threading
         from unittest.mock import patch
 
@@ -1869,22 +1793,21 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from ipam.models import VLAN, VLANGroup
 
         from netbox_nso_plugin import apply_state
-        from netbox_nso_plugin.vlan_reconciler import VLANRescopeConflict, rescope_vlan
+        from netbox_nso_plugin.vlan_reconciler import rescope_vlan
 
         target_group = VLANGroup.objects.create(name="Concurrent target", slug="concurrent-target")
-        source_vlan_id = self.vlan_state.vlan_id
         source_vid = self.vlan_state.vlan.vid
         rescope_admitted = threading.Event()
         release_rescope = threading.Event()
         target_created = threading.Event()
-        rescope_conflicted = threading.Event()
+        rescope_moved = threading.Event()
         rescope_errors = []
         creator_errors = []
-        original_lock = apply_state.lock_vlan_membership_transaction
+        original_lock = apply_state.lock_shared_dependencies
 
-        def hold_after_target_lookup(vlan_id):
-            original_lock(vlan_id)
-            if vlan_id == source_vlan_id:
+        def hold_target_slot(keys):
+            original_lock(keys)
+            if threading.current_thread() is rescoping and ("vlan-slot", f"{target_group.pk}:{source_vid}") in keys:
                 rescope_admitted.set()
                 if not release_rescope.wait(10):
                     raise AssertionError("the concurrent VLAN creator did not inspect the target-group fence")
@@ -1892,8 +1815,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         def move_vlan():
             try:
                 rescope_vlan(type(self.vlan_state).objects.get(pk=self.vlan_state.pk), target_group)
-            except VLANRescopeConflict:
-                rescope_conflicted.set()
+                rescope_moved.set()
             except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
                 rescope_errors.append(exc)
             finally:
@@ -1903,7 +1825,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             try:
                 if not rescope_admitted.wait(10):
                     raise AssertionError("the rescope did not reach its target lookup fence")
-                VLAN.objects.create(group=target_group, vid=source_vid, name="concurrent")
+                with transaction.atomic():
+                    VLAN.objects.create(group=target_group, vid=source_vid, name="concurrent")
                 target_created.set()
             except IntegrityError as exc:
                 creator_errors.append(exc)
@@ -1913,8 +1836,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 connections.close_all()
 
         with patch(
-            "netbox_nso_plugin.apply_state.lock_vlan_membership_transaction",
-            side_effect=hold_after_target_lookup,
+            "netbox_nso_plugin.apply_state.lock_shared_dependencies",
+            side_effect=hold_target_slot,
         ):
             rescoping = threading.Thread(target=move_vlan)
             creator = threading.Thread(target=create_target_vlan)
@@ -1928,17 +1851,16 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 rescoping.join(10)
                 creator.join(10)
 
-        self.assertTrue(created_before_rescope, "the concurrent target VLAN did not commit")
+        self.assertFalse(created_before_rescope, "the concurrent target VLAN bypassed the target-slot lock")
         if rescope_errors:
             raise rescope_errors[0]
-        if creator_errors:
-            raise creator_errors[0]
-        self.assertTrue(rescope_conflicted.is_set(), "the rescope did not report a controlled conflict")
+        self.assertEqual(len(creator_errors), 1)
+        self.assertIsInstance(creator_errors[0], IntegrityError)
+        self.assertTrue(rescope_moved.is_set(), "the rescope did not complete before the competing insert")
         self.assertFalse(rescoping.is_alive())
         self.assertFalse(creator.is_alive())
         self.vlan_state.refresh_from_db()
-        self.assertEqual(self.vlan_state.vlan_id, source_vlan_id)
-        self.assertNotEqual(self.vlan_state.vlan.group_id, target_group.pk)
+        self.assertEqual(self.vlan_state.vlan.group_id, target_group.pk)
         self.assertEqual(VLAN.objects.filter(group=target_group, vid=source_vid).count(), 1)
 
     def test_vlan_rescope_merge_preserves_a_concurrent_accept(self):
@@ -1957,8 +1879,12 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
 
         source_vlan = self.vlan_state.vlan
         target_group = VLANGroup.objects.create(name="Accept target", slug="accept-target")
-        target_vlan = VLAN.objects.create(group=target_group, vid=source_vlan.vid, name=source_vlan.name)
-        NSOVLANState.objects.filter(pk=self.vlan_state.pk).update(status="imported")
+        with transaction.atomic():
+            target_vlan = VLAN.objects.create(group=target_group, vid=source_vlan.vid, name=source_vlan.name)
+        content_update(
+            NSOVLANState.objects.get(pk=self.vlan_state.pk),
+            status="imported",
+        )
         with without_commit_drain(), transaction.atomic():
             target_state = NSOVLANState.objects.create(
                 management=self.mgmt,
@@ -2028,104 +1954,10 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertTrue(is_owned(target_state.status))
         self.assertFalse(NSOVLANState.objects.filter(pk=self.vlan_state.pk).exists())
 
-    def test_switchport_accept_retries_when_the_interface_vanishes_before_locking(self):
-        from unittest.mock import patch
-
-        from dcim.models import Interface
-
-        from netbox_nso_plugin import apply_state
-        from netbox_nso_plugin.models import NSOSwitchportState
-        from netbox_nso_plugin.signals import suppress_intent_push
-        from netbox_nso_plugin.views import _lock_switchport_accept_state, _SwitchportAcceptRetry
-
-        interface = Interface.objects.create(device=self.device, name="Ethernet9.379", type="1000base-t")
-        with without_commit_drain(), transaction.atomic():
-            state = NSOSwitchportState.objects.create(
-                management=self.mgmt,
-                interface=interface,
-                mode="access",
-                untagged_vlan=self.vlan_state.vlan,
-                status="changed",
-            )
-        original_lock = apply_state.lock_device_intent_transaction
-
-        def lock_then_delete(device_id):
-            original_lock(device_id)
-            Interface.objects.filter(pk=interface.pk).delete()
-
-        with (
-            suppress_intent_push(),
-            transaction.atomic(),
-            patch(
-                "netbox_nso_plugin.apply_state.lock_device_intent_transaction",
-                side_effect=lock_then_delete,
-            ),
-            self.assertRaises(_SwitchportAcceptRetry),
-        ):
-            _lock_switchport_accept_state(state)
-
-    def test_switchport_accept_retries_when_the_interface_moves_after_dependency_locking(self):
-        from unittest.mock import patch
-
-        from dcim.models import Interface
-
-        from netbox_nso_plugin import apply_state
-        from netbox_nso_plugin.models import NSOSwitchportState
-        from netbox_nso_plugin.signals import suppress_intent_push
-        from netbox_nso_plugin.views import _lock_switchport_accept_state, _SwitchportAcceptRetry
-
-        other_device, _other_management = make_managed("switchport-accept-moved", 9378)
-        interface = Interface.objects.create(device=self.device, name="Ethernet9.380", type="1000base-t")
-        with without_commit_drain(), transaction.atomic():
-            state = NSOSwitchportState.objects.create(
-                management=self.mgmt,
-                interface=interface,
-                mode="access",
-                status="imported",
-            )
-        original_lock = apply_state.lock_device_intent_transaction
-
-        def lock_then_move(device_id):
-            original_lock(device_id)
-            Interface.objects.filter(pk=interface.pk).update(device=other_device)
-
-        with (
-            suppress_intent_push(),
-            transaction.atomic(),
-            patch(
-                "netbox_nso_plugin.apply_state.lock_device_intent_transaction",
-                side_effect=lock_then_move,
-            ),
-            self.assertRaises(_SwitchportAcceptRetry),
-        ):
-            _lock_switchport_accept_state(state)
-
-    def test_switchport_accept_retries_when_the_overlay_belongs_to_the_old_device(self):
-        from dcim.models import Interface
-
-        from netbox_nso_plugin.models import NSOSwitchportState
-        from netbox_nso_plugin.signals import suppress_intent_push
-        from netbox_nso_plugin.views import _lock_switchport_accept_state, _SwitchportAcceptRetry
-
-        other_device, _other_management = make_managed("switchport-accept-rescoped", 9379)
-        interface = Interface.objects.create(device=self.device, name="Ethernet9.381", type="1000base-t")
-        with without_commit_drain(), transaction.atomic():
-            state = NSOSwitchportState.objects.create(
-                management=self.mgmt,
-                interface=interface,
-                mode="access",
-                status="imported",
-            )
-        Interface.objects.filter(pk=interface.pk).update(device=other_device)
-
-        with suppress_intent_push(), transaction.atomic(), self.assertRaises(_SwitchportAcceptRetry):
-            _lock_switchport_accept_state(state)
-
     def test_switchport_accept_reloads_vlan_references_after_a_concurrent_rescope(self):
         import threading
         from unittest.mock import patch
 
-        from dcim.models import Interface
         from django.db import connections, transaction
         from django.test import Client
         from ipam.models import VLAN, VLANGroup
@@ -2136,7 +1968,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from netbox_nso_plugin.vlan_reconciler import rescope_vlan
 
         source_vlan = self.vlan_state.vlan
-        interface = Interface.objects.create(device=self.device, name="Ethernet9.38", type="1000base-t")
+        interface = self._create_interface(device=self.device, name="Ethernet9.38", type="1000base-t")
         with without_commit_drain(), transaction.atomic():
             switchport_state = NSOSwitchportState.objects.create(
                 management=self.mgmt,
@@ -2146,13 +1978,14 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 status="changed",
             )
         target_group = VLANGroup.objects.create(name="Switchport target", slug="switchport-target")
-        target_vlan = VLAN.objects.create(group=target_group, vid=source_vlan.vid, name=source_vlan.name)
+        with transaction.atomic():
+            target_vlan = VLAN.objects.create(group=target_group, vid=source_vlan.vid, name=source_vlan.name)
         rescope_holds_device = threading.Event()
         release_rescope = threading.Event()
         accept_waiting = threading.Event()
         errors = []
         original_device_lock = apply_state.lock_device_intent_transaction
-        original_membership_lock = apply_state.lock_device_vlan_membership_transaction
+        original_shared_lock = apply_state.lock_shared_dependencies
         rescoping = None
         accepting = None
 
@@ -2163,10 +1996,10 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 if not release_rescope.wait(10):
                     raise AssertionError("switchport Accept did not inspect the device-intent fence")
 
-        def note_accept_waiting(device_id):
-            if threading.current_thread() is accepting and device_id == self.device.pk:
+        def note_accept_waiting(keys):
+            if threading.current_thread() is accepting:
                 accept_waiting.set()
-            return original_membership_lock(device_id)
+            return original_shared_lock(keys)
 
         def merge_vlan():
             try:
@@ -2198,7 +2031,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 side_effect=hold_rescope_device_lock,
             ),
             patch(
-                "netbox_nso_plugin.apply_state.lock_device_vlan_membership_transaction",
+                "netbox_nso_plugin.apply_state.lock_shared_dependencies",
                 side_effect=note_accept_waiting,
             ),
         ):
@@ -2229,7 +2062,6 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         import threading
         from unittest.mock import patch
 
-        from dcim.models import Interface
         from django.db import connections, transaction
         from django.test import Client
         from ipam.models import VLAN, VLANGroup
@@ -2240,7 +2072,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from netbox_nso_plugin.vlan_reconciler import rescope_vlan
 
         source_vlan = self.vlan_state.vlan
-        interface = Interface.objects.create(device=self.device, name="Ethernet9.39", type="1000base-t")
+        interface = self._create_interface(device=self.device, name="Ethernet9.39", type="1000base-t")
         with without_commit_drain(), transaction.atomic():
             switchport_state = NSOSwitchportState.objects.create(
                 management=self.mgmt,
@@ -2250,13 +2082,14 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 status="changed",
             )
         target_group = VLANGroup.objects.create(name="Lock-order target", slug="lock-order-target")
-        VLAN.objects.create(group=target_group, vid=source_vlan.vid, name=source_vlan.name)
+        with transaction.atomic():
+            VLAN.objects.create(group=target_group, vid=source_vlan.vid, name=source_vlan.name)
         accept_holds_device = threading.Event()
         release_accept = threading.Event()
         rescope_holds_vlan = threading.Event()
         errors = []
         original_device_lock = apply_state.lock_device_intent_transaction
-        original_vlan_lock = apply_state.lock_vlan_intent_transaction
+        original_shared_lock = apply_state.lock_shared_dependencies
         rescoping = None
         accepting = None
 
@@ -2267,9 +2100,9 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 if not release_accept.wait(10):
                     raise AssertionError("rescope did not inspect the VLAN-before-device lock order")
 
-        def note_rescope_vlan_lock(vlan_id):
-            original_vlan_lock(vlan_id)
-            if threading.current_thread() is rescoping and vlan_id == source_vlan.pk:
+        def note_rescope_vlan_lock(keys):
+            original_shared_lock(keys)
+            if threading.current_thread() is rescoping and ("vlan", str(source_vlan.pk)) in keys:
                 rescope_holds_vlan.set()
 
         def accept_switchport():
@@ -2302,7 +2135,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 side_effect=hold_accept_device_lock,
             ),
             patch(
-                "netbox_nso_plugin.apply_state.lock_vlan_intent_transaction",
+                "netbox_nso_plugin.apply_state.lock_shared_dependencies",
                 side_effect=note_rescope_vlan_lock,
             ),
         ):
@@ -2330,13 +2163,12 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
     def test_vlan_vid_change_does_not_push_an_unowned_switchport_in_auto_apply_mode(self):
         from unittest.mock import patch
 
-        from dcim.models import Interface
-
         from netbox_nso_plugin.models import NSOSwitchportState
 
-        type(self.mgmt).objects.filter(pk=self.mgmt.pk).update(auto_apply=True)
-        self.mgmt.refresh_from_db()
-        interface = Interface.objects.create(device=self.device, name="Ethernet9.37", type="1000base-t")
+        self.mgmt.auto_apply = True
+        with without_commit_drain(), transaction.atomic():
+            self.mgmt.save(update_fields=["auto_apply"])
+        interface = self._create_interface(device=self.device, name="Ethernet9.37", type="1000base-t")
         with without_commit_drain(), transaction.atomic():
             state = NSOSwitchportState.objects.create(
                 management=self.mgmt,
@@ -2358,60 +2190,26 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             [call.args for call in schedule.call_args_list],
         )
 
-    def test_vlan_name_change_does_not_repend_switchport_intent(self):
-        from unittest.mock import patch
-
-        from dcim.models import Interface
-
-        from netbox_nso_plugin.models import NSOSwitchportState
-
-        with without_commit_drain(), transaction.atomic():
-            states = [
-                NSOSwitchportState.objects.create(
-                    management=self.mgmt,
-                    interface=Interface.objects.create(
-                        device=self.device,
-                        name=f"Ethernet9.{index}",
-                        type="1000base-t",
-                    ),
-                    mode="access",
-                    untagged_vlan=self.vlan_state.vlan,
-                    status=status,
-                )
-                for index, status in ((371, "deploying"), (372, "in_sync"))
-            ]
-
-        with patch("netbox_nso_plugin.signals._schedule_intent_push") as schedule, transaction.atomic():
-            vlan = self.vlan_state.vlan
-            vlan.name = "renamed-only"
-            vlan.save()
-
-        self.assertEqual(
-            [type(state).objects.get(pk=state.pk).status for state in states],
-            ["deploying", "in_sync"],
-        )
-        self.assertNotIn(
-            ((self.device.pk, "switchport"),),
-            [call.args for call in schedule.call_args_list],
-        )
-
     def test_vlan_vid_change_does_not_schedule_unowned_vlan_or_svi_intent(self):
         from unittest.mock import patch
 
-        from dcim.models import Interface
-
+        from netbox_nso_plugin.intent_state import footprint_for_instance, mirror_transaction
         from netbox_nso_plugin.models import NSOSVIState
         from netbox_nso_plugin.signals import suppress_intent_push
 
-        type(self.vlan_state).objects.filter(pk=self.vlan_state.pk).update(status="imported")
-        interface = Interface.objects.create(device=self.device, name="Vlan2213-unowned", type="virtual")
-        with suppress_intent_push(), transaction.atomic():
-            svi_state = NSOSVIState.objects.create(
-                management=self.mgmt,
-                interface=interface,
-                vlan=self.vlan_state.vlan,
-                status="imported",
-            )
+        content_update(
+            type(self.vlan_state).objects.get(pk=self.vlan_state.pk),
+            status="imported",
+        )
+        interface = self._create_interface(device=self.device, name="Vlan2213-unowned", type="virtual")
+        svi_state = NSOSVIState(
+            management=self.mgmt,
+            interface=interface,
+            vlan=self.vlan_state.vlan,
+            status="imported",
+        )
+        with suppress_intent_push(), mirror_transaction(footprint_for_instance(svi_state)):
+            svi_state.save(force_insert=True)
 
         with patch("netbox_nso_plugin.signals._schedule_intent_push") as schedule, transaction.atomic():
             vlan = self.vlan_state.vlan
@@ -2425,13 +2223,12 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertTrue({"vlan", "svi"}.isdisjoint(scheduled))
 
     def test_a_vlan_id_change_repends_every_scope_that_renders_the_vid(self):
-        from dcim.models import Interface
 
         from netbox_nso_plugin.models import NSOSVIState, NSOSwitchportState
         from netbox_nso_plugin.views import _prepare_apply
 
-        interface = Interface.objects.create(device=self.device, name="Vlan2213", type="virtual")
-        switchport_interface = Interface.objects.create(
+        interface = self._create_interface(device=self.device, name="Vlan2213", type="virtual")
+        switchport_interface = self._create_interface(
             device=self.device,
             name="Ethernet9.38",
             type="1000base-t",
@@ -2477,7 +2274,6 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         )
 
     def test_an_interface_rename_repends_every_deploying_scope_that_renders_its_name(self):
-        from dcim.models import Interface
         from django.contrib.contenttypes.models import ContentType
         from ipam.models import ASN, RIR, IPAddress
         from netbox_routing.models import BGPPeer, BGPRouter, BGPScope
@@ -2495,12 +2291,11 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             NSOSVIState,
             NSOSwitchportState,
         )
-        from netbox_nso_plugin.signals import suppress_intent_push
         from netbox_nso_plugin.views import _prepare_apply
 
-        with suppress_intent_push():
-            shared = Interface.objects.create(device=self.device, name="Ethernet9.40", type="1000base-t")
-            child = Interface.objects.create(
+        with without_commit_drain(), transaction.atomic():
+            shared = self._create_interface(device=self.device, name="Ethernet9.40", type="1000base-t")
+            child = self._create_interface(
                 device=self.device,
                 name="Ethernet9-40-100",
                 type="virtual",
@@ -2524,6 +2319,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 update_source=shared,
                 enabled=True,
             )
+        bgp_state = NSOBGPPeerState.objects.get(bgp_peer=peer)
+        mirror_update(bgp_state, status="in_sync")
         with without_commit_drain(), transaction.atomic():
             states = [
                 NSOSVIState.objects.create(
@@ -2587,14 +2384,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                     interface=shared,
                     status="in_sync",
                 ),
-                NSOBGPPeerState.objects.create(
-                    management=self.mgmt,
-                    asn_str="65040",
-                    peer_address_str="198.18.40.2",
-                    bgp_peer=peer,
-                    remote_as_str="65041",
-                    status="in_sync",
-                ),
+                bgp_state,
             ]
 
         adapter = _ApplyContractAdapter(lambda selected: (202, _promoted(selected)))
@@ -2616,13 +2406,11 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         )
 
     def test_overlay_intent_edit_requires_an_atomic_transaction_before_row_locking(self):
-        from dcim.models import Interface
 
         from netbox_nso_plugin.models import NSOInterfaceMtuState
-        from netbox_nso_plugin.signals import suppress_intent_push
 
-        interface = Interface.objects.create(device=self.device, name="Ethernet9.415", type="1000base-t")
-        with suppress_intent_push(), transaction.atomic():
+        interface = self._create_interface(device=self.device, name="Ethernet9.415", type="1000base-t")
+        with without_commit_drain(), transaction.atomic():
             state = NSOInterfaceMtuState.objects.create(
                 management=self.mgmt,
                 interface=interface,
@@ -2631,24 +2419,28 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             )
 
         state.l2_mtu = 1600
-        with self.assertRaisesRegex(RuntimeError, "intent field edit must be saved inside a transaction"):
+        with self.assertRaisesRegex(RuntimeError, "intent_transaction requires transaction.atomic"):
             state.save(update_fields=["l2_mtu"])
 
         state.refresh_from_db()
         self.assertEqual(state.l2_mtu, 1500)
 
-    def test_interface_intent_lock_refuses_a_move_after_the_device_lock(self):
+    def test_interface_footprint_refuses_a_move_after_the_device_lock(self):
         from unittest.mock import patch
 
         from dcim.models import Interface
 
         from netbox_nso_plugin import apply_state
+        from netbox_nso_plugin.intent_state import (
+            IntentMutationProtocolError,
+            footprint_for_instance,
+            intent_transaction,
+        )
         from netbox_nso_plugin.models import NSOInterfaceMtuState
-        from netbox_nso_plugin.signals import suppress_intent_push
 
         other_device, _other_mgmt = make_managed("apply-selector-interface-move", 2559)
-        interface = Interface.objects.create(device=self.device, name="Ethernet9.416", type="1000base-t")
-        with suppress_intent_push(), transaction.atomic():
+        interface = self._create_interface(device=self.device, name="Ethernet9.416", type="1000base-t")
+        with without_commit_drain(), transaction.atomic():
             NSOInterfaceMtuState.objects.create(
                 management=self.mgmt,
                 interface=interface,
@@ -2661,24 +2453,21 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             original_lock(device_id)
             Interface.objects.filter(pk=interface.pk).update(device=other_device)
 
-        with self.assertRaisesRegex(RuntimeError, "interface changed devices while acquiring intent locks"):
+        with self.assertRaisesRegex(IntentMutationProtocolError, "changed its renderer targets"):
             with (
-                transaction.atomic(),
                 patch("netbox_nso_plugin.apply_state.lock_device_intent_transaction", side_effect=lock_then_move),
             ):
-                apply_state.lock_interface_intent_rows(interface.pk)
+                with intent_transaction(footprint_for_instance(interface)):
+                    pass
 
     def test_interface_rename_does_not_direct_apply_lacp_or_switchport_in_manual_mode(self):
         from unittest.mock import patch
 
-        from dcim.models import Interface
-
         from netbox_nso_plugin.models import NSOLACPBundleState, NSOSwitchportState
-        from netbox_nso_plugin.signals import suppress_intent_push
 
         self.assertFalse(self.mgmt.auto_apply)
-        with suppress_intent_push():
-            interface = Interface.objects.create(device=self.device, name="Ethernet9.42", type="lag")
+        with without_commit_drain(), transaction.atomic():
+            interface = self._create_interface(device=self.device, name="Ethernet9.42", type="lag")
             lacp = NSOLACPBundleState.objects.create(
                 management=self.mgmt,
                 interface=interface,
@@ -2711,11 +2500,15 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from netbox_nso_plugin.vlan_reconciler import placeholder_vlan_name
 
         old_vid = self.vlan_state.vlan.vid
-        NSOVLANState.objects.filter(pk=self.vlan_state.pk).update(
-            device_name="", status="deploying", apply_attempt_id=uuid4()
+        content_update(
+            type(self.vlan_state.vlan).objects.get(pk=self.vlan_state.vlan_id),
+            name=placeholder_vlan_name(old_vid),
         )
-        type(self.vlan_state.vlan).objects.filter(pk=self.vlan_state.vlan_id).update(
-            name=placeholder_vlan_name(old_vid)
+        content_update(
+            NSOVLANState.objects.get(pk=self.vlan_state.pk),
+            device_name="",
+            status="deploying",
+            apply_attempt_id=uuid4(),
         )
 
         with without_commit_drain(), transaction.atomic():
@@ -2791,14 +2584,13 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
     def test_editing_one_deploying_row_does_not_lock_an_unrelated_row(self):
         import threading
 
-        from dcim.models import Interface
         from django.db import connections
 
         from netbox_nso_plugin.models import NSOInterfaceMtuState
         from netbox_nso_plugin.views import _save_owned_overlay_edit
 
-        first_interface = Interface.objects.create(device=self.device, name="Ethernet10", type="1000base-t")
-        second_interface = Interface.objects.create(device=self.device, name="Ethernet11", type="1000base-t")
+        first_interface = self._create_interface(device=self.device, name="Ethernet10", type="1000base-t")
+        second_interface = self._create_interface(device=self.device, name="Ethernet11", type="1000base-t")
         with without_commit_drain(), transaction.atomic():
             first = NSOInterfaceMtuState.objects.create(
                 management=self.mgmt, interface=first_interface, l2_mtu=1500, status="accepted"
@@ -2806,11 +2598,9 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             second = NSOInterfaceMtuState.objects.create(
                 management=self.mgmt, interface=second_interface, l2_mtu=1500, status="accepted"
             )
-        NSOInterfaceMtuState.objects.filter(pk__in=(first.pk, second.pk)).update(
-            status="deploying", apply_attempt_id=uuid4()
-        )
-        first.status = "deploying"
-        second.status = "deploying"
+        attempt_id = uuid4()
+        mirror_update(first, status="deploying", apply_attempt_id=attempt_id)
+        mirror_update(second, status="deploying", apply_attempt_id=attempt_id)
 
         first_locked = threading.Event()
         second_committed = threading.Event()
@@ -2836,7 +2626,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 with without_commit_drain():
                     current = NSOInterfaceMtuState.objects.get(pk=second.pk)
                     current.l2_mtu = 1600
-                    _save_owned_overlay_edit(current, "interface_mtu")
+                    _save_owned_overlay_edit(current, "interface_mtu", {"l2_mtu": 1500})
                 second_committed.set()
             except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
                 errors.append(exc)

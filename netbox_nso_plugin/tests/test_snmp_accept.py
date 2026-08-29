@@ -77,6 +77,7 @@ class TestSnmpAcceptView(_SnmpBase):
     def test_accept_with_vault_ref_pushes_intent(self):
         """Accepting a community that has a Vault ref stores it in the SNMP intent
         mirror (deferred); the device Apply later commits it."""
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSOSnmpCommunityState
         from netbox_nso_plugin.signals import _on_snmp_state_save, reset_intent_push_state
 
@@ -87,7 +88,8 @@ class TestSnmpAcceptView(_SnmpBase):
         reset_intent_push_state()
         with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
             with self.captureOnCommitCallbacks(execute=True):
-                _on_snmp_state_save(sender=NSOSnmpCommunityState, instance=c)
+                with intent_transaction(footprint_for_instance(c)):
+                    _on_snmp_state_save(sender=NSOSnmpCommunityState, instance=c)
             mock_put.assert_called_once()
             # communities arg carries the vault_ref-bearing row
             communities = mock_put.call_args[0][1]

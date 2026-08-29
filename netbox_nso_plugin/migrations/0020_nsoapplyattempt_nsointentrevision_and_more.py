@@ -23,13 +23,16 @@ PROMOTED_MODEL_NAMES = (
 
 def normalize_deploying_rows(apps, _schema_editor):
     """Return rows with no durable Apply identity to operator-pending state."""
-    for model_name in PROMOTED_MODEL_NAMES:
-        model = apps.get_model("netbox_nso_plugin", model_name)
-        model.objects.filter(status="deploying").update(
-            status="accepted",
-            apply_attempt_id=None,
-            last_apply_error="",
-        )
+    from netbox_nso_plugin.intent_state import offline_mutation
+
+    with offline_mutation():
+        for model_name in PROMOTED_MODEL_NAMES:
+            model = apps.get_model("netbox_nso_plugin", model_name)
+            model.objects.filter(status="deploying").update(
+                status="accepted",
+                apply_attempt_id=None,
+                last_apply_error="",
+            )
 
 
 class Migration(migrations.Migration):

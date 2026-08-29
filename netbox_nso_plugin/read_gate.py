@@ -661,7 +661,7 @@ def _maybe_clear_source_marker(m) -> bool:
     if NSOFamilyReadState.objects.filter(management=m, observed_outcome="").exists():
         return False
     m.reset_pending_source_epoch = None
-    type(m).objects.filter(pk=m.pk).update(reset_pending_source_epoch=None)
+    m.save(update_fields=["reset_pending_source_epoch"])
     return True
 
 
@@ -687,10 +687,12 @@ def _adopt_source_epoch(m, row, source_epoch) -> str | None:
     if m.adapter_source_epoch != source_epoch or not m.source_epoch_aware:
         m.adapter_source_epoch = source_epoch
         m.source_epoch_aware = True
-        type(m).objects.filter(pk=m.pk).update(
-            adapter_source_epoch=source_epoch,
-            source_epoch_aware=True,
-            reset_pending_source_epoch=m.reset_pending_source_epoch,
+        m.save(
+            update_fields=[
+                "adapter_source_epoch",
+                "source_epoch_aware",
+                "reset_pending_source_epoch",
+            ]
         )
     return None
 
@@ -848,14 +850,13 @@ class _SupersededPublication(Exception):
     """Raised out of transaction.atomic() so every stale body write rolls back."""
 
 
-def _exception_sqlstate(exc: BaseException) -> str | None:
-    """Find a psycopg SQLSTATE through Django and scope-error exception wrappers."""
-    current = exc
-    while current is not None:
-        if sqlstate := getattr(current, "sqlstate", None):
-            return sqlstate
-        current = current.__cause__
-    return None
+_INTENT_SCOPES_BY_READ_FAMILY = {
+    "interface_attributes": ("interface",),
+    "interface_ip": ("ip",),
+    "lag_config": ("lacp",),
+    "l2_service": ("l2_sap",),
+    "redistribution": ("bgp", "isis", "ospf"),
+}
 
 
 def _locked_publication_matches(management, row, decision: _Decision, epoch) -> bool:
@@ -891,7 +892,7 @@ def gated_family_run(
     body: Callable[[], Any],
     *,
     epoch,
-    pre_body: Callable[[], None] | None = None,
+    pre_body: Callable[[], Any] | None = None,
 ) -> GateResult:
     """ONE family document → ONE gate decision → at most ONE body run (R3-6).
 
@@ -909,48 +910,41 @@ def gated_family_run(
         return GateResult(SKIPPED_STALE_ATTEMPT)
     from .models import NSODeviceManagement, NSOFamilyReadState
 
-    try:
-        for deadlock_attempt in range(3):
-            try:
-                with transaction.atomic():
-                    from .apply_state import lock_device_intent_transaction
+    scopes = _INTENT_SCOPES_BY_READ_FAMILY.get(family, (family,))
+    plan = pre_body() if pre_body is not None else None
+    if plan is None:
+        from .intent_state import MutationFootprint, ReconcileMutationPlan
 
-                    if pre_body is not None:
-                        pre_body()
-                    lock_device_intent_transaction(mgmt.device_id)
-                    value = body()
-                    current_management = NSODeviceManagement.objects.select_for_update().get(pk=mgmt.pk)
-                    row = NSOFamilyReadState.objects.select_for_update().get(
-                        management=current_management, family=family
-                    )
-                    if not _locked_publication_matches(current_management, row, decision, epoch):
-                        raise _SupersededPublication
-                    row.applied_attempt_id = decision.attempt_id
-                    row.applied_incarnation = decision.incarnation
-                    row.applied_source_epoch = decision.source_epoch
-                    row.applied_payload_revision = decision.payload_revision
-                    row.applied_publication_sequence = decision.sequence
-                    row.save(
-                        update_fields=[
-                            "applied_attempt_id",
-                            "applied_incarnation",
-                            "applied_source_epoch",
-                            "applied_payload_revision",
-                            "applied_publication_sequence",
-                            "last_updated",
-                        ]
-                    )
-                break
-            except Exception as exc:  # noqa: BLE001 — unwrap a scoped PostgreSQL deadlock
-                if _exception_sqlstate(exc) != "40P01" or deadlock_attempt == 2:
-                    raise
-                if not _publication_identity_current(mgmt, family, decision, epoch):
-                    return GateResult(SKIPPED_STALE_ATTEMPT)
-                logger.warning(
-                    "family %s publication deadlocked; retrying body (%d/3)",
-                    family,
-                    deadlock_attempt + 2,
-                )
+        plan = ReconcileMutationPlan(MutationFootprint.for_keys({(mgmt.device_id, scope) for scope in scopes}))
+    else:
+        from .intent_state import MutationFootprint, ReconcileMutationPlan
+
+        if isinstance(plan, MutationFootprint):
+            plan = ReconcileMutationPlan(plan)
+    try:
+        from .intent_state import reconcile_transaction
+
+        with reconcile_transaction(plan):
+            current_management = NSODeviceManagement.objects.select_for_update().get(pk=mgmt.pk)
+            row = NSOFamilyReadState.objects.select_for_update().get(management=current_management, family=family)
+            if not _locked_publication_matches(current_management, row, decision, epoch):
+                raise _SupersededPublication
+            value = body()
+            row.applied_attempt_id = decision.attempt_id
+            row.applied_incarnation = decision.incarnation
+            row.applied_source_epoch = decision.source_epoch
+            row.applied_payload_revision = decision.payload_revision
+            row.applied_publication_sequence = decision.sequence
+            row.save(
+                update_fields=[
+                    "applied_attempt_id",
+                    "applied_incarnation",
+                    "applied_source_epoch",
+                    "applied_payload_revision",
+                    "applied_publication_sequence",
+                    "last_updated",
+                ]
+            )
     except _SupersededPublication:
         return GateResult(SKIPPED_STALE_ATTEMPT)
     except Exception as exc:
@@ -1044,9 +1038,11 @@ def observe_aggregate(mgmt, read_states: dict[str, dict | None], *, epoch) -> bo
         if marker_dirty:
             m.save(update_fields=_MARKER_FIELDS)
         if source_dirty:
-            type(m).objects.filter(pk=m.pk).update(
-                source_epoch_aware=m.source_epoch_aware,
-                reset_pending_source_epoch=m.reset_pending_source_epoch,
+            m.save(
+                update_fields=[
+                    "source_epoch_aware",
+                    "reset_pending_source_epoch",
+                ]
             )
         cleared = _maybe_clear_reset_marker(m) if wrote else False
         source_cleared = _maybe_clear_source_marker(m) if wrote else False

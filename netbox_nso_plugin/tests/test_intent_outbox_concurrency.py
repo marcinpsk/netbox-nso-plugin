@@ -128,56 +128,87 @@ class TestOnlyOneScavengerReplaysAnExpiredClaim(_ConcurrencyCase):
 
 
 class TestTheFoldAndTheRenderShareOneSnapshot(_ConcurrencyCase):
-    """O1.25 (R5-B2): a deletion committing between them must be invisible to both."""
+    """O1.25 (R5-B2): a deletion cannot split the fold from its rendered snapshot."""
 
     tag = "snap"
     adapter_device_id = 7804
 
     def test_a_deletion_committing_before_the_render_leaves_body_and_authority_together(self):
+        from django.db import connections
+
         from netbox_nso_plugin import delivery, drain
 
         route = own_route(self.mgmt, "198.51.100.112/28", "198.51.100.8")
         keeper = own_route(self.mgmt, "198.51.100.128/28", "198.51.100.9")
         real_render = delivery.render
-        removed = threading.Event()
+        render_started = threading.Event()
+        release_render = threading.Event()
+        removal_done = threading.Event()
+        claimed: list = []
+        failures: list[BaseException] = []
 
-        def remove_between_the_fold_and_the_render(*args, **kwargs):
-            """The operator's removal commits after the fold read its entries."""
-            if not removed.is_set():
-                self._remove_in_another_connection(route)
-                removed.set()
+        def pause_between_the_fold_and_the_render(*args, **kwargs):
+            render_started.set()
+            assert release_render.wait(timeout=30), "the barrier never released the render"
             return real_render(*args, **kwargs)
 
-        with patch("netbox_nso_plugin.delivery.render", side_effect=remove_between_the_fold_and_the_render):
-            claimed = drain.claim(self.device.pk, "static_route")
+        def claim():
+            try:
+                claimed.append(drain.claim(self.device.pk, "static_route"))
+            except BaseException as exc:  # noqa: BLE001 (reported on the main thread)
+                failures.append(exc)
+            finally:
+                connections.close_all()
 
-        assert claimed is not None
-        sent_ids = {entry["route_id"] for entry in claimed.payload}
+        def remove():
+            try:
+                with transaction.atomic():
+                    route.devices.remove(self.device)
+            except BaseException as exc:  # noqa: BLE001 (reported on the main thread)
+                failures.append(exc)
+            finally:
+                removal_done.set()
+                connections.close_all()
+
+        with (
+            without_commit_drain(),
+            patch("netbox_nso_plugin.delivery.render", side_effect=pause_between_the_fold_and_the_render),
+        ):
+            claimant = threading.Thread(target=claim)
+            claimant.start()
+            self.addCleanup(claimant.join, 30)
+            assert render_started.wait(timeout=30), "the claim never reached the render"
+
+            remover = threading.Thread(target=remove)
+            remover.start()
+            self.addCleanup(remover.join, 30)
+            assert not removal_done.wait(timeout=0.2), "the deletion bypassed the claim's footprint lock"
+
+            release_render.set()
+            claimant.join(timeout=30)
+            remover.join(timeout=30)
+
+        assert not claimant.is_alive(), "the claim did not finish"
+        assert not remover.is_alive(), "the deletion did not resume after the claim committed"
+        assert failures == []
+
+        [first_claim] = claimed
+        assert first_claim is not None
+        sent_ids = {entry["route_id"] for entry in first_claim.payload}
         assert sent_ids == {route.pk, keeper.pk}, "the body is rendered on the fold's own snapshot"
-        assert claimed.deletions == []
+        assert first_claim.deletions == []
         assert entries(self.device, "static_route", unconsumed=True), "the deletion entry is untouched"
 
         config, session = self.adapter.patches()
         with config, session:
-            answer = drain.send_claim(claimed)
-        assert drain.settle(claimed, answer) == drain.SUCCEEDED
+            answer = drain.send_claim(first_claim)
+        assert drain.settle(first_claim, answer) == drain.SUCCEEDED
 
         later = drain.claim(self.device.pk, "static_route")
         assert {entry["route_id"] for entry in later.payload} == {keeper.pk}
         assert [record["route_id"] for record in later.deletions] == [route.pk], (
             "the next claim ships the omission WITH its authority"
         )
-
-    def _remove_in_another_connection(self, route):
-        """Commit the operator's removal on its own connection, patching only from here."""
-        from ._outbox_case import in_thread, without_commit_drain
-
-        def remove():
-            with transaction.atomic():
-                route.devices.remove(self.device)
-
-        with without_commit_drain():
-            in_thread(remove)
 
 
 class _SerializationCause(Exception):
@@ -283,11 +314,8 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
         return self._transaction(lambda: route.devices.remove(self.device), **barriers)
 
     def _reown(self, route, **barriers):
-        from netbox_nso_plugin.signals import _accept_static_route_for_device
-
         def own():
             route.devices.add(self.device)
-            _accept_static_route_for_device(route, self.device)
 
         return self._transaction(own, **barriers)
 
@@ -379,7 +407,7 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
         found, op_delete, op_revoke = self._transitions_for(route.pk)
         assert [op for _pk, op in found] == [op_revoke, op_delete], f"id order is not commit order: {found}"
 
-    def test_two_different_routes_commute_and_never_wait_on_each_other(self):
+    def test_two_different_routes_share_the_scope_revision_lock(self):
         from netbox_nso_plugin import outbox
 
         leaving = own_route(self.mgmt, "198.51.100.176/28", "198.51.100.12")
@@ -390,20 +418,23 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
         held = threading.Event()
         owned = threading.Event()
         release = threading.Event()
+        observed_wait: list[bool] = []
 
-        def release_once_the_other_finished():
-            assert owned.wait(timeout=30), "the re-ownership waited on the removal's rows"
+        def release_once_the_other_waits():
+            assert held.wait(timeout=30), "the removal never reached its hold point"
+            observed_wait.append(not owned.wait(timeout=0.2))
             release.set()
 
-        watcher = threading.Thread(target=release_once_the_other_finished)
+        watcher = threading.Thread(target=release_once_the_other_waits)
         watcher.start()
-        # The removal holds its transaction open across the whole of the other one: two
-        # routes touch disjoint rows, so the re-ownership commits without waiting for it.
+        # The route rows are disjoint, but both changes bump the same device and scope
+        # revision. The revision row serializes the two renderer mutations.
         self._run(
             self._remove(leaving, after=held, hold=release),
             self._reown(returning, before=held, committed=owned),
         )
         watcher.join(timeout=30)
+        assert observed_wait == [True], "the re-ownership bypassed the scope revision lock"
 
         folded = outbox.fold_transitions(
             [record for row in entries(self.device, "static_route") for record in row.transitions]

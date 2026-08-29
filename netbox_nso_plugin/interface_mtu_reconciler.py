@@ -13,9 +13,12 @@ from __future__ import annotations
 
 import logging
 
+from .intent_state import mirror_reconciler
+
 logger = logging.getLogger(__name__)
 
 
+@mirror_reconciler
 def reconcile_interface_mtu(device, payload: dict) -> list:
     """Create/update NSOInterfaceMtuState rows from the payload."""
     from dcim.models import Interface

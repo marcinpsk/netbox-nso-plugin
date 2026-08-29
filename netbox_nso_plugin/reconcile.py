@@ -207,23 +207,20 @@ def _gated(
     return result
 
 
-def _lock_native_vlan_dependencies(device, payload, family: str) -> None:
-    """Take shared native-object fences before one device publication lock."""
+def _native_vlan_footprint(device, payload, family: str):
+    """Resolve the complete native VLAN footprint before taking its first lock."""
     if family == "vlan":
-        from .vlan_reconciler import lock_vlan_reconcile_dependencies
+        from .vlan_reconciler import vlan_reconcile_plan
 
-        lock_vlan_reconcile_dependencies(device, payload)
-        return
+        return vlan_reconcile_plan(device, payload)
     if family == "switchport":
-        from .vlan_reconciler import lock_switchport_reconcile_dependencies
+        from .vlan_reconciler import switchport_reconcile_plan
 
-        lock_switchport_reconcile_dependencies(device, payload)
-        return
+        return switchport_reconcile_plan(device, payload)
     if family == "svi":
-        from .svi_reconciler import lock_svi_reconcile_dependencies
+        from .svi_reconciler import svi_reconcile_plan
 
-        lock_svi_reconcile_dependencies(device, payload)
-        return
+        return svi_reconcile_plan(device, payload)
     raise ValueError(f"unknown native VLAN dependency family: {family}")
 
 
@@ -301,7 +298,7 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
     from .bfd_reconciler import reconcile_bfd
     from .bgp_reconciler import _reconcile_bgp_config
     from .redistribution_reconciler import reconcile_redistribution
-    from .route_policy_reconciler import reconcile_route_policy
+    from .route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_footprint
     from .template_content import (
         _reconcile_isis_interfaces,
         _reconcile_isis_process,
@@ -362,6 +359,7 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
                 ctx, "route_policy_states", mgmt, ("NSORoutePolicyState",), reconcile_route_policy, device, rp_doc
             ),
             epoch=dev_id,
+            pre_body=lambda: route_policy_reconcile_footprint(device, rp_doc),
         )
     if mgmt.manage_ospf:
         ospf_doc = client.get_ospf(dev_id)
@@ -531,11 +529,11 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                 svi_doc,
                 lambda: _safe_reconcile(ctx, "svi_states", mgmt, ("NSOSVIState",), reconcile_svi, device, svi_doc),
                 epoch=dev_id,
-                pre_body=lambda: _lock_native_vlan_dependencies(device, svi_doc, "svi"),
+                pre_body=lambda: _native_vlan_footprint(device, svi_doc, "svi"),
             )
             # materialise dot1q subinterfaces (virtual interface + Interface.parent
             # link) BEFORE the IP reconcile, for the same ordering reason as SVIs.
-            from .subinterface_reconciler import reconcile_subinterface
+            from .subinterface_reconciler import reconcile_subinterface, subinterface_reconcile_plan
 
             sub_doc = client.get_subinterface(dev_id)
             _gated(
@@ -547,6 +545,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                     ctx, "subinterface_states", mgmt, ("NSOSubinterfaceState",), reconcile_subinterface, device, sub_doc
                 ),
                 epoch=dev_id,
+                pre_body=lambda: subinterface_reconcile_plan(device, sub_doc),
             )
             # Phase 2b: per-interface MTU read mirror (read-only display).
             from .interface_mtu_reconciler import reconcile_interface_mtu
@@ -615,7 +614,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                     ctx, "vlan_states", mgmt, ("NSOVLANState",), reconcile_vlan_database, device, vlan_doc
                 ),
                 epoch=dev_id,
-                pre_body=lambda: _lock_native_vlan_dependencies(device, vlan_doc, "vlan"),
+                pre_body=lambda: _native_vlan_footprint(device, vlan_doc, "vlan"),
             )
             sw_doc = client.get_switchport(dev_id)
             _gated(
@@ -627,7 +626,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                     ctx, "switchport_states", mgmt, ("NSOSwitchportState",), reconcile_switchport, device, sw_doc
                 ),
                 epoch=dev_id,
-                pre_body=lambda: _lock_native_vlan_dependencies(device, sw_doc, "switchport"),
+                pre_body=lambda: _native_vlan_footprint(device, sw_doc, "switchport"),
             )
         if mgmt.manage_snmp:
             snmp_doc = client.get_snmp_config(dev_id)
@@ -669,7 +668,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
             # Nokia L2 SAP overlays. Kept in the full reconcile (not just
             # on-expand) so the periodic sync-complete refresh keeps them current —
             # the tab reads these persisted rows without reconciling on expand.
-            from .l2_service_reconciler import reconcile_l2_services
+            from .l2_service_reconciler import l2_service_reconcile_plan, reconcile_l2_services
 
             l2_doc = client.get_l2_services(dev_id)
             _gated(
@@ -681,6 +680,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                     ctx, "l2_sap_states", mgmt, ("NSOL2SapState",), reconcile_l2_services, device, l2_doc
                 ),
                 epoch=dev_id,
+                pre_body=lambda: l2_service_reconcile_plan(device, l2_doc),
             )
         _reconcile_routing(device, mgmt, client, ctx)
     return ctx
@@ -698,7 +698,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
     from . import adapter_client as client
     from .bgp_reconciler import _reconcile_bgp_config
     from .redistribution_reconciler import reconcile_redistribution
-    from .route_policy_reconciler import reconcile_route_policy
+    from .route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_footprint
     from .signals import suppress_intent_push
     from .template_content import (
         _reconcile_interface_ips,
@@ -744,7 +744,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
             # overlays (enabled/description, IPs, MTU, switchport) so the
             # consolidated row-per-interface table reflects the latest device read.
             from .interface_mtu_reconciler import reconcile_interface_mtu
-            from .subinterface_reconciler import reconcile_subinterface
+            from .subinterface_reconciler import reconcile_subinterface, subinterface_reconcile_plan
             from .svi_reconciler import reconcile_svi
             from .vlan_reconciler import reconcile_switchport, reconcile_vlan_database
 
@@ -772,7 +772,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_svi(device, svi_doc),
                 epoch=dev_id,
                 ctx_key="svi_states",
-                pre_body=lambda: _lock_native_vlan_dependencies(device, svi_doc, "svi"),
+                pre_body=lambda: _native_vlan_footprint(device, svi_doc, "svi"),
             )
             sub_doc = client.get_subinterface(dev_id)
             _gated(
@@ -783,6 +783,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_subinterface(device, sub_doc),
                 epoch=dev_id,
                 ctx_key="subinterface_states",
+                pre_body=lambda: subinterface_reconcile_plan(device, sub_doc),
             )
             ip_doc = client.get_interface_ips(dev_id)
             _gated(
@@ -813,7 +814,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 vlan_doc,
                 lambda: reconcile_vlan_database(device, vlan_doc),
                 epoch=dev_id,
-                pre_body=lambda: _lock_native_vlan_dependencies(device, vlan_doc, "vlan"),
+                pre_body=lambda: _native_vlan_footprint(device, vlan_doc, "vlan"),
             )
             sw_doc = client.get_switchport(dev_id)
             _gated(
@@ -824,10 +825,10 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_switchport(device, sw_doc),
                 epoch=dev_id,
                 ctx_key="switchport_states",
-                pre_body=lambda: _lock_native_vlan_dependencies(device, sw_doc, "switchport"),
+                pre_body=lambda: _native_vlan_footprint(device, sw_doc, "switchport"),
             )
         elif key == "interfaces":
-            from .subinterface_reconciler import reconcile_subinterface
+            from .subinterface_reconciler import reconcile_subinterface, subinterface_reconcile_plan
             from .svi_reconciler import reconcile_svi
 
             interfaces_doc = client.get_interfaces_doc(dev_id)
@@ -854,7 +855,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_svi(device, svi_doc),
                 epoch=dev_id,
                 ctx_key="svi_states",
-                pre_body=lambda: _lock_native_vlan_dependencies(device, svi_doc, "svi"),
+                pre_body=lambda: _native_vlan_footprint(device, svi_doc, "svi"),
             )
             sub_doc = client.get_subinterface(dev_id)
             _gated(
@@ -865,6 +866,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_subinterface(device, sub_doc),
                 epoch=dev_id,
                 ctx_key="subinterface_states",
+                pre_body=lambda: subinterface_reconcile_plan(device, sub_doc),
             )
             ip_doc = client.get_interface_ips(dev_id)
             _gated(
@@ -877,7 +879,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 ctx_key="interface_ips",
             )
         elif key == "interface_ips":
-            from .subinterface_reconciler import reconcile_subinterface
+            from .subinterface_reconciler import reconcile_subinterface, subinterface_reconcile_plan
             from .svi_reconciler import reconcile_svi
 
             svi_doc = client.get_svi(dev_id)  # SVIs exist before IPs
@@ -889,7 +891,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_svi(device, svi_doc),
                 epoch=dev_id,
                 ctx_key="svi_states",
-                pre_body=lambda: _lock_native_vlan_dependencies(device, svi_doc, "svi"),
+                pre_body=lambda: _native_vlan_footprint(device, svi_doc, "svi"),
             )
             sub_doc = client.get_subinterface(dev_id)
             _gated(
@@ -900,6 +902,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_subinterface(device, sub_doc),
                 epoch=dev_id,
                 ctx_key="subinterface_states",
+                pre_body=lambda: subinterface_reconcile_plan(device, sub_doc),
             )
             ip_doc = client.get_interface_ips(dev_id)
             _gated(
@@ -936,7 +939,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_vlan_database(device, vlan_doc),
                 epoch=dev_id,
                 ctx_key="vlan_states",
-                pre_body=lambda: _lock_native_vlan_dependencies(device, vlan_doc, "vlan"),
+                pre_body=lambda: _native_vlan_footprint(device, vlan_doc, "vlan"),
             )
         elif key == "switchport":
             from .vlan_reconciler import reconcile_switchport, reconcile_vlan_database
@@ -950,7 +953,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 vlan_doc,
                 lambda: reconcile_vlan_database(device, vlan_doc),
                 epoch=dev_id,
-                pre_body=lambda: _lock_native_vlan_dependencies(device, vlan_doc, "vlan"),
+                pre_body=lambda: _native_vlan_footprint(device, vlan_doc, "vlan"),
             )
             sw_doc = client.get_switchport(dev_id)
             _gated(
@@ -961,7 +964,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_switchport(device, sw_doc),
                 epoch=dev_id,
                 ctx_key="switchport_states",
-                pre_body=lambda: _lock_native_vlan_dependencies(device, sw_doc, "switchport"),
+                pre_body=lambda: _native_vlan_footprint(device, sw_doc, "switchport"),
             )
         elif key == "svi":
             from .svi_reconciler import reconcile_svi
@@ -975,10 +978,10 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_svi(device, svi_doc),
                 epoch=dev_id,
                 ctx_key="svi_states",
-                pre_body=lambda: _lock_native_vlan_dependencies(device, svi_doc, "svi"),
+                pre_body=lambda: _native_vlan_footprint(device, svi_doc, "svi"),
             )
         elif key == "subinterface":
-            from .subinterface_reconciler import reconcile_subinterface
+            from .subinterface_reconciler import reconcile_subinterface, subinterface_reconcile_plan
 
             sub_doc = client.get_subinterface(dev_id)
             _gated(
@@ -989,6 +992,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_subinterface(device, sub_doc),
                 epoch=dev_id,
                 ctx_key="subinterface_states",
+                pre_body=lambda: subinterface_reconcile_plan(device, sub_doc),
             )
         elif key == "interface_mtu":
             from .interface_mtu_reconciler import reconcile_interface_mtu
@@ -1015,6 +1019,8 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 ctx_key="snmp_data",
             )
         elif key == "logging":
+            from .template_content import logging_reconcile_plan
+
             log_doc = client.get_logging_config(dev_id)
             _gated(
                 ctx,
@@ -1024,6 +1030,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: _reconcile_logging_config(device, log_doc),
                 epoch=dev_id,
                 ctx_key="logging_data",
+                pre_body=lambda: logging_reconcile_plan(device, log_doc),
             )
         elif key == "static":
             static_doc = client.get_static_routes(dev_id)
@@ -1099,6 +1106,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_route_policy(device, rp_doc),
                 epoch=dev_id,
                 ctx_key="route_policy_states",
+                pre_body=lambda: route_policy_reconcile_footprint(device, rp_doc),
             )
         elif key == "redistribution":
             redist_doc = client.get_redistribution(dev_id)
@@ -1114,7 +1122,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
         elif key == "l2_services":
             # reconcile into native vpn.L2VPN + L2VPNTermination + NSOL2SapState
             # (value-aware drift/accept). The dot1q tag stays per-SAP interface-local encap.
-            from .l2_service_reconciler import reconcile_l2_services
+            from .l2_service_reconciler import l2_service_reconcile_plan, reconcile_l2_services
 
             l2_doc = client.get_l2_services(dev_id)
             _gated(
@@ -1125,6 +1133,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_l2_services(device, l2_doc),
                 epoch=dev_id,
                 ctx_key="l2_sap_states",
+                pre_body=lambda: l2_service_reconcile_plan(device, l2_doc),
             )
     return ctx
 

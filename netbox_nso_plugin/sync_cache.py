@@ -16,6 +16,7 @@ push this row's scope, failover addresses and auto-apply flag onto it.
 import logging
 from datetime import UTC, datetime
 
+from django.db import transaction
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
@@ -38,6 +39,22 @@ _MOVED = "moved"  # our device is there under a different id — adopt it
 _MISSING = "missing"  # our device is not in the adapter at all — re-link it
 
 _BROKEN_LINK_MESSAGE = "This device's adapter mapping is broken; the next sync-cache sweep will repair it."
+
+
+def _mirror_management(mgmt, **values) -> None:
+    """Persist lifecycle-only adapter observations with one locked instance save."""
+    from .intent_state import mirror_refresh
+    from .signals import suppress_intent_push
+
+    fields = frozenset(values)
+    with transaction.atomic():
+        current = NSODeviceManagement.objects.select_for_update(of=("self",)).get(pk=mgmt.pk)
+        for field_name, value in values.items():
+            setattr(current, field_name, value)
+        with suppress_intent_push(), mirror_refresh(current, fields):
+            current.save(update_fields=fields)
+    for field_name, value in values.items():
+        setattr(mgmt, field_name, value)
 
 
 def parse_adapter_timestamp(value, field="timestamp"):
@@ -99,7 +116,7 @@ def refresh_sync_cache(mgmt, adapter_device):
     # the failure would retire a banner whose scope never landed. It is cleared by the successful
     # push (signals.sync_scope_to_adapter) or the banner's own "Retry adapter link" action.
     if update_fields:
-        NSODeviceManagement.objects.filter(pk=mgmt.pk).update(**{f: getattr(mgmt, f) for f in update_fields})
+        _mirror_management(mgmt, **{field_name: getattr(mgmt, field_name) for field_name in update_fields})
     return update_fields
 
 
@@ -195,8 +212,7 @@ def refresh_sync_caches(rows, snapshot=None) -> tuple[int, int]:
 def _flag_link_error(mgmt, message) -> None:
     """Record an operator-visible link error without firing the post_save adapter push."""
     if mgmt.adapter_link_error != message:
-        mgmt.adapter_link_error = message
-        NSODeviceManagement.objects.filter(pk=mgmt.pk).update(adapter_link_error=message)
+        _mirror_management(mgmt, adapter_link_error=message)
 
 
 def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
@@ -259,8 +275,7 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
         # permanently broken row to the back of the queue. Through .update(), which does not
         # re-fire the row's push handler.
         attempted += 1
-        mgmt.adapter_link_attempted_at = now
-        NSODeviceManagement.objects.filter(pk=mgmt.pk).update(adapter_link_attempted_at=now)
+        _mirror_management(mgmt, adapter_link_attempted_at=now)
         try:
             if state is _MOVED:
                 logger.warning(
@@ -269,17 +284,18 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
                     mgmt.adapter_device_id,
                     adapter_device["id"],
                 )
-                mgmt.adapter_device_id = adapter_device["id"]
-                NSODeviceManagement.objects.filter(pk=mgmt.pk).update(adapter_device_id=adapter_device["id"])
+                _mirror_management(mgmt, adapter_device_id=adapter_device["id"])
             elif state is _REUSED:
                 logger.warning(
                     "Adapter device id %s no longer belongs to %s — dropping the stale pointer",
                     mgmt.adapter_device_id,
                     mgmt.nso_device_name,
                 )
-                mgmt.adapter_device_id = None
-                NSODeviceManagement.objects.filter(pk=mgmt.pk).update(adapter_device_id=None)
-            mgmt.save()  # re-fires sync_scope_to_adapter → onboard / not-found recovery → scope
+                _mirror_management(mgmt, adapter_device_id=None)
+            from .intent_state import footprint_for_instance, intent_transaction
+
+            with intent_transaction(footprint_for_instance(mgmt)):
+                mgmt.save()  # re-fires sync_scope_to_adapter → onboard / not-found recovery → scope
         except Exception:  # noqa: BLE001 — one bad row must not abort the sweep
             logger.exception("Link reconcile failed for management row %s", mgmt.pk)
             continue

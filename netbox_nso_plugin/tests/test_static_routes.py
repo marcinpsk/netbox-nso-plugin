@@ -227,10 +227,9 @@ class TestReconcileStaticRoutes(TestCase):
             next_hop="198.18.0.2",
             metric=1,
         )
-        from netbox_nso_plugin.signals import suppress_intent_push
+        from ._static_route_case import _assign_without_push
 
-        with suppress_intent_push():
-            route.devices.add(self.device)
+        _assign_without_push(route, self.device)
         entry = self._route_entry(str(route.prefix), str(route.next_hop))
         entry.pop("metric")
 
@@ -247,11 +246,10 @@ class TestReconcileStaticRoutes(TestCase):
         """A StaticRoute already in NetBox and already linked to self.device."""
         from netbox_routing.models import StaticRoute
 
-        from netbox_nso_plugin.signals import suppress_intent_push
-
         route = StaticRoute.objects.create(prefix=prefix, next_hop=next_hop, metric=1, tag=tag)
-        with suppress_intent_push():
-            route.devices.add(self.device)
+        from ._static_route_case import _assign_without_push
+
+        _assign_without_push(route, self.device)
         return route
 
     def test_new_route_carries_the_payload_tag(self):
@@ -344,6 +342,7 @@ class TestReconcileStaticRoutes(TestCase):
         the OLD route came back on a sync. Only a generation-correlated apply result may
         settle this family now.
         """
+        from netbox_nso_plugin.models import NSOApplyAttempt
         from netbox_nso_plugin.template_content import _reconcile_static_routes
 
         mgmt = self._make_mgmt(self.device, nso_device_name="sr-tag-owned")
@@ -357,7 +356,12 @@ class TestReconcileStaticRoutes(TestCase):
         ):
             with self.subTest(status=owned):
                 route = self._tagged_route(f"198.18.6{i}.0/24", f"198.18.1.{i + 1}", tag=None)
-                state = route.nso_states.create(management=mgmt, status=owned)
+                attempt = NSOApplyAttempt.objects.create(management=mgmt) if owned == "deploying" else None
+                state = route.nso_states.create(
+                    management=mgmt,
+                    status=owned,
+                    apply_attempt_id=attempt.pk if attempt else None,
+                )
                 entry = self._route_entry(str(route.prefix), str(route.next_hop))
 
                 entry_tag = dict(entry, tag=42)
@@ -470,7 +474,7 @@ class TestReconcileStaticRoutes(TestCase):
         sr = StaticRoute.objects.get(prefix="10.77.0.0/16")
         state = NSOStaticRouteState.objects.get(management__device=self.device, static_route=sr)
         state.status = "in_sync"  # operator owns it
-        state.save()
+        state.save(update_fields=["status"])
 
         with self._auto_create_ctx(True):
             _reconcile_static_routes(self.device, self._route_payload())  # route gone
@@ -545,7 +549,7 @@ class TestReconcileStaticRoutes(TestCase):
         # Simulate operator accepting
         state = NSOStaticRouteState.objects.get(management__device=self.device)
         state.status = "accepted"
-        state.save()
+        state.save(update_fields=["status"])
 
         with self._auto_create_ctx(True):
             result = _reconcile_static_routes(self.device, payload)

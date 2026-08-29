@@ -321,7 +321,7 @@ def current_txid() -> int:
 
     outer = connection.atomic_blocks[0] if connection.atomic_blocks else None
     hooks = connection.run_on_commit
-    cached = getattr(connection, "_nso_intent_txid", None)
+    cached = getattr(connection, "_nso_outbox_txid", None)
     # Django 6.1 rollback paths replace this private hook list. Its identity rejects
     # transaction IDs cached by a transaction or savepoint that rolled back.
     if outer is not None and cached is not None and cached[0] is outer and cached[1] is hooks:
@@ -331,12 +331,12 @@ def current_txid() -> int:
         cursor.execute("SELECT txid_current()")
         txid = int(cursor.fetchone()[0])
     if outer is not None:
-        connection._nso_intent_txid = (outer, hooks, txid)
+        connection._nso_outbox_txid = (outer, hooks, txid)
 
         def clear_cache():
-            cached = getattr(connection, "_nso_intent_txid", None)
+            cached = getattr(connection, "_nso_outbox_txid", None)
             if cached is not None and cached[0] is outer and cached[1] is hooks:
-                del connection._nso_intent_txid
+                del connection._nso_outbox_txid
 
         transaction.on_commit(clear_cache)
     return txid
@@ -357,19 +357,6 @@ def _refuse_outside_a_transaction() -> None:
         raise RuntimeError("an intent outbox entry must be appended inside the writer's own transaction")
 
 
-def _repend_scope(device_id: int, scope: str) -> None:
-    """Invalidate every in-flight Apply row rendered by one delivery scope."""
-    from .apply_state import deploying_models
-
-    model = deploying_models().get(scope)
-    if model is None:
-        return
-    model.objects.filter(management__device_id=device_id, status="deploying").update(
-        status="accepted",
-        apply_attempt_id=None,
-    )
-
-
 def bump_intent_revision(device_id: int, scope: str) -> int:
     """Advance one delivery scope's durable content revision."""
     from django.db import connection
@@ -385,9 +372,7 @@ def bump_intent_revision(device_id: int, scope: str) -> int:
             "RETURNING revision",
             [device_id, scope],
         )
-        revision = int(cursor.fetchone()[0])
-    _repend_scope(device_id, scope)
-    return revision
+        return int(cursor.fetchone()[0])
 
 
 def enqueue(device_id, scope: str, *, transitions=(), delete_origin: bool = False) -> None:
@@ -415,7 +400,14 @@ def enqueue(device_id, scope: str, *, transitions=(), delete_origin: bool = Fals
     txid = current_txid()
     if _device_is_tearing_down(device_id, txid):
         return
-    bump_intent_revision(device_id, scope)
+    from .intent_state import revision_was_acquired
+
+    if not revision_was_acquired(device_id, scope):
+        from .intent_state import IntentMutationProtocolError
+
+        raise IntentMutationProtocolError(
+            f"intent outbox key {(device_id, scope)!r} was not acquired before the source write"
+        )
     NSOIntentOutboxEntry.objects.create(
         device_id=device_id,
         scope=scope,

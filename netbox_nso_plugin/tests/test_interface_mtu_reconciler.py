@@ -110,8 +110,14 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
         cls.po1 = Interface.objects.create(device=cls.device, name="Port-channel1", type="lag")
 
     def _state(self, l2_mtu=9216, status="accepted"):
+        from uuid import uuid4
+
         return NSOInterfaceMtuState.objects.create(
-            management=self.management, interface=self.po1, l2_mtu=l2_mtu, status=status
+            management=self.management,
+            interface=self.po1,
+            l2_mtu=l2_mtu,
+            status=status,
+            apply_attempt_id=uuid4() if status == "deploying" else None,
         )
 
     def test_owned_values_not_clobbered_by_device_read(self):

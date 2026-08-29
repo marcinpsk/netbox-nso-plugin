@@ -5,6 +5,7 @@
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Platform, Site
 from django.test import TestCase
 
+from ._outbox_case import content_update
 from .mixins import IntentPushResetMixin
 
 
@@ -247,12 +248,14 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
         native.enabled = True
         native.save(update_fields=["bfd_profile", "micro_bfd", "enabled"])
         state = NSOBFDInterfaceState.objects.get(management=self.management, interface=self.iface)
-        state.min_tx = 100
-        state.min_rx = 100
-        state.multiplier = 5
-        state.micro_bfd = True
-        state.status = "accepted"
-        state.save()
+        state = content_update(
+            state,
+            min_tx=100,
+            min_rx=100,
+            multiplier=5,
+            micro_bfd=True,
+            status="accepted",
+        )
 
         reconcile_bfd(
             self.device,
@@ -283,11 +286,19 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
         rows (deploying) are kept; a confirmed row (in_sync) that vanishes surfaces as drift
         (``changed``), never data-loss.
         """
+        from uuid import uuid4
+
         from netbox_nso_plugin.bfd_reconciler import reconcile_bfd
         from netbox_nso_plugin.models import NSOBFDInterfaceState
 
         deploying = NSOBFDInterfaceState.objects.create(
-            management=self.management, interface=self.iface, min_tx=300, min_rx=300, multiplier=3, status="deploying"
+            management=self.management,
+            interface=self.iface,
+            min_tx=300,
+            min_rx=300,
+            multiplier=3,
+            status="deploying",
+            apply_attempt_id=uuid4(),
         )
         ge = Interface.objects.create(device=self.device, name="Gi7/7", type="1000base-t")
         confirmed = NSOBFDInterfaceState.objects.create(

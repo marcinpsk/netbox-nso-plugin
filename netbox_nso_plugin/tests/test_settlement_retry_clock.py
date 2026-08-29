@@ -243,17 +243,14 @@ class TestTheRepairCapRotates(_SettlementCase):
         assert tail_mgmt.adapter_link_attempted_at is not None, "convergence is slower than ceil(B / C) ticks"
 
 
-class TestTheClockAlsoEscalates(_CarrierCase):
-    """Codex S5 P1 — a clock that only consumes is half a clock.
+class TestTheClockDoesNotJudgeAnOrphanAttempt(_CarrierCase):
+    """An exact feed result cannot replace missing Apply-attempt evidence.
 
-    With the callback channel dead, the tick is the only thing left running. It walks the
-    feed, bounds an unresolvable result and advances past it on the fifth attempt — and then
-    every later page is empty. If the timeout backstop rides only the carrier, that row is
-    ``deploying`` for good: the same shared-failure-domain trap the tick exists to break,
-    one level down.
+    The tick still bounds and advances past an unresolvable legacy feed row. It must not
+    turn that unrelated result into a verdict for a UUID that has no local attempt row.
     """
 
-    def test_the_tick_escalates_a_row_whose_result_never_resolved(self):
+    def test_the_tick_leaves_an_orphan_attempt_non_actionable(self):
         from netbox_nso_plugin.settlement import SETTLE_STALL_MAX_ATTEMPTS
 
         device = _make_device("noresolve")
@@ -283,9 +280,7 @@ class TestTheClockAlsoEscalates(_CarrierCase):
 
         state.refresh_from_db()
         assert self._cursor(mgmt).settle_cursor_seq == 1, "the stall bound never released the cursor"
-        assert state.status == "apply_failed", (
-            "the row is stranded deploying forever: the independent clock consumed but never escalated"
-        )
+        assert state.status == "deploying", "an exact Apply-attempt identity was invented from unrelated evidence"
 
     def test_the_tick_does_not_escalate_while_an_apply_is_in_flight(self):
         """The clock the carrier had, which the tick must not be missing.

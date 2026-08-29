@@ -16,11 +16,58 @@ from __future__ import annotations
 
 import logging
 
+from .intent_state import mirror_reconciler, reconcile_transaction
+
 logger = logging.getLogger(__name__)
 
 
+def subinterface_reconcile_plan(device, payload: dict):
+    """Declare one subinterface refresh and whether it changes rendered membership."""
+    from dcim.models import Interface
+
+    from .intent_state import MutationFootprint, ReconcileMutationPlan, SourceRow
+    from .models import NSODeviceManagement, NSOSubinterfaceState
+
+    management = NSODeviceManagement.objects.filter(device=device).first()
+    if management is None:
+        return ReconcileMutationPlan(MutationFootprint())
+    raw_items = payload.get("interfaces", []) if isinstance(payload, dict) else []
+    items = raw_items if isinstance(raw_items, list) else []
+    interfaces = tuple(Interface.objects.filter(device=device).order_by("pk"))
+    states = tuple(NSOSubinterfaceState.objects.filter(management=management).order_by("pk"))
+    reported = {item.get("interface_name") for item in items if isinstance(item, dict) and item.get("interface_name")}
+    changes_content = any(state.status == "in_sync" and state.interface.name not in reported for state in states)
+    return ReconcileMutationPlan(
+        MutationFootprint.for_keys(
+            {(device.pk, "subinterface")},
+            source_rows=(
+                SourceRow("dcim.device", device.pk),
+                SourceRow("dcim.interface", None),
+                *(SourceRow("dcim.interface", interface.pk) for interface in interfaces),
+            ),
+            overlay_rows=(
+                SourceRow("netbox_nso_plugin.nsosubinterfacestate", None),
+                *(SourceRow(state._meta.label_lower, state.pk) for state in states),
+            ),
+        ),
+        changes_content=changes_content,
+    )
+
+
+def subinterface_reconcile_footprint(device, payload: dict):
+    """Return the immutable footprint for callers that only need lock discovery."""
+    return subinterface_reconcile_plan(device, payload).footprint
+
+
+@mirror_reconciler
 def reconcile_subinterface(device, payload: dict) -> list:
     """Create/update virtual subinterfaces + NSOSubinterfaceState from the payload."""
+    with reconcile_transaction(subinterface_reconcile_plan(device, payload)):
+        return _reconcile_subinterface(device, payload)
+
+
+def _reconcile_subinterface(device, payload: dict) -> list:
+    """Apply a subinterface mirror after its complete footprint is locked."""
     from dcim.models import Interface
     from django.utils import timezone
 
@@ -45,7 +92,8 @@ def reconcile_subinterface(device, payload: dict) -> list:
             continue
         iface = iface_map.get(name)
         if iface is None:
-            iface = Interface.objects.create(device=device, name=name, type="virtual")
+            iface = Interface(device=device, name=name, type="virtual")
+            iface.save(force_insert=True)
             iface_map[name] = iface
 
         # Resolve the physical parent from the map; never create it (device sync owns it).

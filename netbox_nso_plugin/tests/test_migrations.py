@@ -176,6 +176,7 @@ class TestApplyIdentityMigration(_CascadeFlushMixin, TransactionTestCase):
         executor.migrate(executor.loader.graph.leaf_nodes(APP))
 
     def test_unattributed_deploying_rows_return_to_operator_pending(self):
+        from netbox_nso_plugin.intent_state import offline_mutation
         from netbox_nso_plugin.models import NSOLoggingLevelState
 
         from ._outbox_case import make_managed, without_commit_drain
@@ -190,11 +191,12 @@ class TestApplyIdentityMigration(_CascadeFlushMixin, TransactionTestCase):
             )
         self.addCleanup(self._migrate_to_leaves)
         self._migrate(DEPLOYMENT_CONTROL)
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "UPDATE netbox_nso_plugin_nsologginglevelstate SET status = %s WHERE id = %s",
-                ["deploying", row.pk],
-            )
+        with transaction.atomic(), offline_mutation():
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE netbox_nso_plugin_nsologginglevelstate SET status = %s WHERE id = %s",
+                    ["deploying", row.pk],
+                )
 
         self._migrate(APPLY_IDENTITY)
 

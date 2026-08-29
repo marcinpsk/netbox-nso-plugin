@@ -10,6 +10,7 @@ from ipam.models import VLAN
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOSubinterfaceState
 
+from ._outbox_case import content_update
 from .mixins import IntentPushResetMixin
 
 
@@ -65,6 +66,33 @@ class TestSubinterfaceReconciler(TestCase):
         self.assertEqual(rows[0].status, "imported")
         # A dot1q tag must NOT create a device VLAN object.
         self.assertEqual(VLAN.objects.count(), 0)
+
+    def test_direct_reconcile_does_not_advance_intent_revision(self):
+        from netbox_nso_plugin.models import NSOIntentRevision
+        from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
+
+        revision, _ = NSOIntentRevision.objects.get_or_create(
+            device=self.device,
+            scope="subinterface",
+        )
+        before = revision.revision
+
+        reconcile_subinterface(
+            self.device,
+            {
+                "interfaces": [
+                    {
+                        "interface_name": "GigabitEthernet0/1.1623",
+                        "parent_interface": "GigabitEthernet0/1",
+                        "dot1q_vlan": 1623,
+                        "type": "subinterface",
+                    }
+                ]
+            },
+        )
+
+        revision.refresh_from_db()
+        self.assertEqual(revision.revision, before)
 
     def test_missing_parent_creates_subif_without_parent_flagged_changed(self):
         from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
@@ -171,6 +199,8 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
         cls.parent = Interface.objects.create(device=cls.device, name="ge-0/0/0", type="1000base-t")
 
     def _state(self, name="ge-0/0/0.100", dot1q=100, status="imported"):
+        from uuid import uuid4
+
         iface = Interface.objects.create(device=self.device, name=name, type="virtual", parent=self.parent)
         # Creating a NEW parent+dot1q interface on a managed device (adapter_device_id set)
         # fires the greenfield post_save signal (_create_greenfield_subif_state), which
@@ -185,11 +215,11 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
                 "dot1q_vlan": dot1q,
                 "vrf": "MTI",
                 "status": status,
+                "apply_attempt_id": uuid4() if status == "deploying" else None,
             },
         )
         if state.status != status:
-            NSOSubinterfaceState.objects.filter(pk=state.pk).update(status=status)
-            state.status = status
+            state = content_update(state, status=status)
         return state
 
     def test_reconcile_preserves_owned_status(self):
@@ -216,7 +246,7 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
 
         state = self._state(name="ge-0/0/0.100", dot1q=100, status="accepted")
-        NSOSubinterfaceState.objects.filter(pk=state.pk).update(dot1q_vlan=200, vrf="CUSTOMER")
+        state = content_update(state, dot1q_vlan=200, vrf="CUSTOMER")
         old_device = {
             "interfaces": [
                 {
@@ -255,8 +285,9 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
         """An owned subinterface overlay must NOT be hard-deleted when the device stops reporting it.
 
         NSOSubinterfaceState is in ``_APPLY_DEPLOYING_SCOPES``; a bulk delete of stale rows
-        destroys the in-flight Apply marker + ownership. Intent-pending rows (deploying) are
-        kept; a confirmed row (in_sync) that vanishes surfaces as drift (``changed``).
+        destroys ownership. A confirmed row that vanishes surfaces as ``changed``. That
+        rendered-membership change advances the scope revision, so another deploying row is
+        re-pended to ``accepted`` and loses its superseded attempt identity.
         """
         from netbox_nso_plugin.models import NSOSubinterfaceState
         from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
@@ -268,7 +299,9 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
             "deploying (apply-in-flight) overlay deleted"
         )
         assert NSOSubinterfaceState.objects.filter(pk=confirmed.pk).exists(), "in_sync overlay deleted"
-        assert NSOSubinterfaceState.objects.get(pk=deploying.pk).status == "deploying"
+        deploying.refresh_from_db()
+        assert deploying.status == "accepted"
+        assert deploying.apply_attempt_id is None
         assert NSOSubinterfaceState.objects.get(pk=confirmed.pk).status == "changed"
 
     def test_push_builds_owned_snapshot(self):

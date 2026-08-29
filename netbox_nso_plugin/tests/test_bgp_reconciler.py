@@ -9,6 +9,7 @@ from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.test import TestCase
 
 from ._adapter_http import make_session
+from ._outbox_case import content_update
 from .mixins import IntentPushResetMixin
 
 _BASE_CFG = {
@@ -873,7 +874,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.models import NSOBGPPeerState
 
         _reconcile_bgp_config(self.device, self._payload(self._router_payload(peers=[self._peer_entry()])))
-        NSOBGPPeerState.objects.filter(management=mgmt).update(status="accepted")
+        content_update(NSOBGPPeerState.objects.get(management=mgmt), status="accepted")
 
         result = _reconcile_bgp_config(
             self.device,

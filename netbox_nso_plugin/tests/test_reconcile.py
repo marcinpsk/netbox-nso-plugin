@@ -151,19 +151,23 @@ class TestSyncCompleteEndpoint(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
     def test_adapter_device_id_resolves_to_device_and_enqueues(self):
+        from netbox_nso_plugin.delivery import delivery_keys
+        from netbox_nso_plugin.intent_state import content_mutation
+
         device = _make_device("rec-map")
         inst = NSOInstance.objects.create(name="rec-nso", adapter_instance_id="rec-nso")
-        NSODeviceManagement.objects.bulk_create(
-            [
-                NSODeviceManagement(
-                    device=device,
-                    nso_instance=inst,
-                    nso_device_name="rec-map",
-                    adapter_device_id=4242,
-                    custom_field_data={},
-                )
-            ]
-        )
+        with content_mutation({(device.pk, scope) for scope in delivery_keys()}):
+            NSODeviceManagement.objects.bulk_create(
+                [
+                    NSODeviceManagement(
+                        device=device,
+                        nso_instance=inst,
+                        nso_device_name="rec-map",
+                        adapter_device_id=4242,
+                        custom_field_data={},
+                    )
+                ]
+            )
         with patch("netbox_nso_plugin.reconcile.enqueue_device_reconcile") as m:
             response = self.client.post(self._url(), {"adapter_device_id": 4242}, format="json", **self.header)
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)

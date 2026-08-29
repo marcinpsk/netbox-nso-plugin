@@ -66,10 +66,10 @@ class _OutcomeCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase
             route.devices.remove(self.device)
 
     def reown(self, route):
-        from netbox_nso_plugin.signals import _accept_static_route_for_device
+        from ._static_route_case import _accept_with_permit
 
         with without_commit_drain(), transaction.atomic():
-            _accept_static_route_for_device(route, self.device)
+            _accept_with_permit(route, self.device)
 
 
 class TestTheSingleHomeInvariantHoldsAcrossAReplay(_OutcomeCase):
@@ -341,6 +341,7 @@ class TestStampingFollowsTheAcknowledgedBody(_OutcomeCase):
 
     def test_a_late_acknowledgement_stamps_even_though_the_overlay_advanced(self):
         from netbox_nso_plugin import drain
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSOStaticRouteState
 
         self._touch()
@@ -348,7 +349,9 @@ class TestStampingFollowsTheAcknowledgedBody(_OutcomeCase):
         # The generation moves on while the answer is in flight. Reusing the expectation
         # hook's CAS here would skip the stamp, and the acknowledged intermediate triple is
         # exactly the one the lineage exists to remember.
-        NSOStaticRouteState.objects.filter(management=self.mgmt).update(intent_generation=999_999)
+        state = NSOStaticRouteState.objects.get(management=self.mgmt)
+        with intent_transaction(footprint_for_instance(state)):
+            NSOStaticRouteState.objects.filter(pk=state.pk).update(intent_generation=999_999)
 
         assert drain.settle(claimed, {"count": 1}) == drain.SUCCEEDED
         assert last_acked(self.mgmt, self.route) == self.mirror

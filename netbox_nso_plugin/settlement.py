@@ -253,19 +253,25 @@ def _clear_stall(row) -> None:
 def _persist(row, cursor: int, device_id: int, incarnation: str) -> None:
     """Write the cursor, the epoch and the stall triple in the consuming transaction.
 
-    Through ``.update()``: a ``save()`` re-fires the management row's push handlers, and
-    the cursor advance is bookkeeping, not an intent change.
+    The cursor advance is bookkeeping, not an intent change.
     """
-    from .models import NSODeviceManagement
+    from django.db import transaction
 
-    NSODeviceManagement.objects.filter(pk=row.pk).update(
-        settle_cursor_seq=cursor,
-        settle_cursor_incarnation=incarnation,
-        settle_cursor_device_id=device_id,
-        settle_stall_seq=row.settle_stall_seq,
-        settle_stall_attempts=row.settle_stall_attempts,
-        settle_stall_first_seen_at=row.settle_stall_first_seen_at,
-    )
+    from .intent_state import mirror_refresh
+    from .signals import suppress_intent_push
+
+    values = {
+        "settle_cursor_seq": cursor,
+        "settle_cursor_incarnation": incarnation,
+        "settle_cursor_device_id": device_id,
+        "settle_stall_seq": row.settle_stall_seq,
+        "settle_stall_attempts": row.settle_stall_attempts,
+        "settle_stall_first_seen_at": row.settle_stall_first_seen_at,
+    }
+    with transaction.atomic(), suppress_intent_push(), mirror_refresh(row, values) as locked:
+        for field_name, value in values.items():
+            setattr(locked, field_name, value)
+        locked.save(update_fields=values)
 
 
 class _Readback:
@@ -430,16 +436,25 @@ def _write_verdict(state, **fields) -> bool:
     Returns whether the row still matched. Zero rows means a newer writer won, and the next
     pass recomputes from a fresh read.
     """
-    from .models import NSOStaticRouteState
+    from django.db import transaction
 
-    matched = NSOStaticRouteState.objects.filter(
-        pk=state.pk,
-        status=state.status,
-        apply_attempt_id=state.apply_attempt_id,
-        intent_generation=state.intent_generation,
-        expected_generation=state.expected_generation,
-        expected_fingerprint=state.expected_fingerprint,
-    ).update(**fields)
+    from .intent_state import mirror_refresh
+    from .signals import suppress_intent_push
+
+    expected = {
+        "status": state.status,
+        "apply_attempt_id": state.apply_attempt_id,
+        "intent_generation": state.intent_generation,
+        "expected_generation": state.expected_generation,
+        "expected_fingerprint": state.expected_fingerprint,
+    }
+    matched = False
+    with transaction.atomic(), suppress_intent_push(), mirror_refresh(state, fields) as locked:
+        if all(getattr(locked, field_name) == value for field_name, value in expected.items()):
+            for field_name, value in fields.items():
+                setattr(locked, field_name, value)
+            locked.save(update_fields=fields)
+            matched = True
     if not matched:
         logger.debug(
             "settlement verdict for overlay %s skipped: the row moved under the read (generation %s)",

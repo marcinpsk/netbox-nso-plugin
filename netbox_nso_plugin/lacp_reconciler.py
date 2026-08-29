@@ -20,9 +20,12 @@ from __future__ import annotations
 
 import logging
 
+from .intent_state import mirror_reconciler
+
 logger = logging.getLogger(__name__)
 
 
+@mirror_reconciler
 def reconcile_lag_config(device, payload: dict) -> list:
     """Upsert NSOLACPBundleState + NSOLACPMemberState from the adapter lag-config payload.
 
