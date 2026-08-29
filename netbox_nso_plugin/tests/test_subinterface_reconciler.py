@@ -93,6 +93,44 @@ class TestSubinterfaceReconciler(TestCase):
         # A dot1q tag must NOT create a device VLAN object.
         self.assertEqual(VLAN.objects.count(), 0)
 
+    def test_unowned_existing_subinterface_tracks_a_new_parent(self):
+        from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
+
+        new_parent = Interface.objects.create(
+            device=self.device,
+            name="GigabitEthernet0/2",
+            type="1000base-t",
+        )
+        interface = Interface.objects.create(
+            device=self.device,
+            name="GigabitEthernet0/1.200",
+            type="virtual",
+            parent=self.parent,
+        )
+        NSOSubinterfaceState.objects.create(
+            management=self.management,
+            interface=interface,
+            parent_interface=self.parent,
+            dot1q_vlan=200,
+            status="imported",
+        )
+
+        reconcile_subinterface(
+            self.device,
+            {
+                "interfaces": [
+                    {
+                        "interface_name": interface.name,
+                        "parent_interface": new_parent.name,
+                        "dot1q_vlan": 200,
+                    }
+                ]
+            },
+        )
+
+        interface.refresh_from_db()
+        self.assertEqual(interface.parent_id, new_parent.pk)
+
     def test_a_concurrently_created_subinterface_is_reused(self):
         from django.db import connection
 
