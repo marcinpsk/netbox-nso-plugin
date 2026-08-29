@@ -88,6 +88,22 @@ class TestInterfaceMtuReconciler(TestCase):
         self.assertEqual(lag.ip_mtu, 9170)
         self.assertEqual(lag.bound_port, "lag-99")
 
+    def test_duplicate_interface_entries_use_the_first_observation(self):
+        from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
+
+        rows = reconcile_interface_mtu(
+            self.device,
+            {
+                "interfaces": [
+                    {"interface_name": self.po1.name, "mtu": 1500},
+                    {"interface_name": self.po1.name, "mtu": 9000},
+                ]
+            },
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(NSOInterfaceMtuState.objects.get(interface=self.po1).l2_mtu, 1500)
+
     def test_interface_absent_in_netbox_is_skipped(self):
         from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
 

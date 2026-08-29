@@ -42,6 +42,8 @@ def interface_mtu_reconcile_plan(device, payload: dict):
 
     for item in payload.get("interfaces", []):
         name = item.get("interface_name")
+        if name in matched_names:
+            continue
         interface = interfaces.get(name)
         if not name or interface is None:
             continue
@@ -116,7 +118,7 @@ def _reconcile_interface_mtu(device, payload: dict, writer, planned_at) -> list:
     matched_names: set[str] = set()
     for item in payload.get("interfaces", []):
         name = item.get("interface_name")
-        if not name:
+        if not name or name in matched_names:
             continue
         iface = iface_map.get(name)
         if iface is None:
