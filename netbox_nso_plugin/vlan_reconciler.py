@@ -154,7 +154,14 @@ def _vlan_reconcile_operations(device, payload, planned_at):
     seen_vids = set()
 
     for item in payload.get("vlans", []) or []:
-        vid = int(item["vlan_id"])
+        if not isinstance(item, dict):
+            logger.warning("VLAN reconcile for %s dropped a malformed entry: %r", device, item)
+            continue
+        try:
+            vid = int(item["vlan_id"])
+        except (KeyError, TypeError, ValueError):
+            logger.warning("VLAN reconcile for %s dropped an entry without a usable vlan_id: %r", device, item)
+            continue
         seen_vids.add(vid)
         name = item.get("name") or ""
         current = states_by_vid.get(vid)
@@ -644,6 +651,7 @@ def rescope_vlan(state, target_group, *, _retry_on_stale=True):
     from .models import NSOVLANState
     from .ownership_planner import retire_manifest_identity
     from .renderer_writer import (
+        IntentPlanStaleError,
         RendererMutationPlan,
         planned_delete,
         planned_save,
@@ -681,7 +689,7 @@ def rescope_vlan(state, target_group, *, _retry_on_stale=True):
                 with renderer_mirror_writes(plan) as writer, suppress_intent_push():
                     current_identity = VLAN.objects.filter(pk=old_vlan.pk).values_list("vid", "group_id").first()
                     if current_identity != source_identity:
-                        raise IntentMutationProtocolError("the source VLAN identity changed after planning")
+                        raise IntentPlanStaleError("the source VLAN identity changed after planning")
                     writer.save(candidate, update_fields=("group",))
                     for overlay in overlay_candidates:
                         writer.save(overlay, update_fields=("status",))
@@ -707,7 +715,7 @@ def rescope_vlan(state, target_group, *, _retry_on_stale=True):
                     or current_target != target_identity
                     or current_state_vlan != old_vlan.pk
                 ):
-                    raise IntentMutationProtocolError("the VLAN membership changed after planning")
+                    raise IntentPlanStaleError("the VLAN membership changed after planning")
                 with suppress_intent_push():
                     for candidate, fields in saves:
                         writer.save(candidate, update_fields=fields)
@@ -733,7 +741,7 @@ def rescope_vlan(state, target_group, *, _retry_on_stale=True):
         except IntegrityError as exc:
             raise VLANRescopeConflict("the VLAN membership changed while the rescope request waited") from exc
         except IntentMutationProtocolError as exc:
-            retryable = " row " in str(exc) and str(exc).endswith(" changed after planning")
+            retryable = isinstance(exc, IntentPlanStaleError)
             if not _retry_on_stale or not retryable:
                 raise VLANRescopeConflict("the VLAN membership changed while the rescope request waited") from exc
             transaction.set_rollback(True)

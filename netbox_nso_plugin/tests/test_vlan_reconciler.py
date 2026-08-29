@@ -88,6 +88,23 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
 
         self.assertFalse(VLANGroup.objects.filter(slug=f"nso-{self.device.pk}").exists())
 
+    def test_vlan_reconciler_skips_entries_without_a_usable_vlan_id(self):
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+
+        payload = {
+            "vlans": [
+                None,
+                {},
+                {"vlan_id": None},
+                {"vlan_id": "not-an-integer"},
+                {"vlan_id": 1624, "name": "VALID"},
+            ]
+        }
+        with self.assertLogs("netbox_nso_plugin.vlan_reconciler", level="WARNING"):
+            rows = reconcile_vlan_database(self.device, payload)
+
+        self.assertEqual([row.vlan.vid for row in rows], [1624])
+
     def test_vlan_reconcile_preflights_native_and_overlay_creations(self):
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan
         from netbox_nso_plugin.vlan_reconciler import vlan_reconcile_plan
@@ -687,13 +704,12 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         self.assertEqual(surviving_state.status, "accepted")
         self.assertFalse(NSOVLANState.objects.filter(pk=source_state.pk).exists())
 
-    def test_rescope_rejects_a_source_vlan_identity_change_while_waiting(self):
+    def test_rescope_retries_a_merge_after_source_identity_changes_while_waiting(self):
         from unittest.mock import patch
 
         from netbox_nso_plugin import intent_state
         from netbox_nso_plugin.signals import suppress_intent_push
         from netbox_nso_plugin.vlan_reconciler import (
-            VLANRescopeConflict,
             reconcile_vlan_database,
             rescope_vlan,
         )
@@ -701,7 +717,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 43, "name": "MGMT"}]})
         source_state = NSOVLANState.objects.get(management=self.management, vlan__vid=43)
         target_group = VLANGroup.objects.create(name="Identity Target", slug="identity-target")
-        VLAN.objects.create(group=target_group, vid=43, name="MGMT")
+        target_vlan = VLAN.objects.create(group=target_group, vid=43, name="MGMT")
         changed = False
 
         def change_source_before_native_lock(plan):
@@ -713,14 +729,45 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
                     VLAN.objects.filter(pk=source_state.vlan_id).update(vid=1043)
             return plan
 
-        with (
-            patch(
-                "netbox_nso_plugin.vlan_reconciler._rescope_plan_ready",
-                side_effect=change_source_before_native_lock,
-            ),
-            self.assertRaises(VLANRescopeConflict),
+        with patch(
+            "netbox_nso_plugin.vlan_reconciler._rescope_plan_ready",
+            side_effect=change_source_before_native_lock,
         ):
-            rescope_vlan(source_state, target_group)
+            action, vlan = rescope_vlan(source_state, target_group)
+
+        self.assertTrue(changed)
+        self.assertEqual((action, vlan.pk), ("merged", target_vlan.pk))
+
+    def test_rescope_retries_a_source_identity_change_after_planning(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import intent_state
+        from netbox_nso_plugin.signals import suppress_intent_push
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database, rescope_vlan
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 44, "name": "MGMT"}]})
+        source_state = NSOVLANState.objects.get(management=self.management, vlan__vid=44)
+        target_group = VLANGroup.objects.create(name="Retry Target", slug="retry-target")
+        changed = False
+
+        def change_source_before_native_lock(plan):
+            nonlocal changed
+            if not changed:
+                changed = True
+                footprint = intent_state.footprint_for_instance(source_state.vlan)
+                with suppress_intent_push(), intent_state.intent_transaction(footprint):
+                    VLAN.objects.filter(pk=source_state.vlan_id).update(vid=1044)
+            return plan
+
+        with patch(
+            "netbox_nso_plugin.vlan_reconciler._rescope_plan_ready",
+            side_effect=change_source_before_native_lock,
+        ):
+            action, vlan = rescope_vlan(source_state, target_group)
+
+        self.assertTrue(changed)
+        self.assertEqual(action, "moved")
+        self.assertEqual(vlan.group_id, target_group.pk)
 
     def test_rescope_rejects_a_device_that_attaches_before_transaction_acquisition(self):
         from unittest.mock import patch
