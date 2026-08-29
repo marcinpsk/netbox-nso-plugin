@@ -123,14 +123,16 @@ class TestRendererAuditScopeBudget(SimpleTestCase):
         """A cap under the registry size fails every pre-capture gate closed.
 
         Operator Apply, drain, deliver and the baseline cutover all audit the complete key
-        set, so the effective cap has to admit it. The plugin's own ``default_settings``
-        pins the number, which is why this reads the live setting rather than the module
-        default the setting shadows.
+        set, so the effective cap has to admit it.
         """
         from django.conf import settings
 
         from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.renderer_audit import _default_scope_batch_cap
 
-        configured = settings.PLUGINS_CONFIG["netbox_nso_plugin"]["renderer_audit_scope_batch_cap"]
+        configured = settings.PLUGINS_CONFIG["netbox_nso_plugin"].get(
+            "renderer_audit_scope_batch_cap",
+            _default_scope_batch_cap(),
+        )
 
         self.assertGreaterEqual(configured, len(delivery.delivery_keys()))
