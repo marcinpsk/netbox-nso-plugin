@@ -467,7 +467,14 @@ def _takeover(state, mgmt, now) -> Claim | None:
         _abandon_locked(state)
         return None
     if state.claim_revision is None:
-        raise ProtocolViolation(f"push_seq {state.push_seq} has no durable intent revision")
+        logger.warning(
+            "abandoning legacy push_seq %s for %s/%s because it has no durable intent revision",
+            state.push_seq,
+            state.device_id,
+            state.scope,
+        )
+        _abandon_locked(state)
+        return None
     state.claimed_at = now
     state.save()
     logger.info("taking over push_seq %s for %s/%s", state.push_seq, state.device_id, state.scope)
@@ -1833,6 +1840,27 @@ def _sent_wire_digest(state, flags: ClaimFlags | None = None) -> str:
     )
 
 
+def _restored_claim_validation(state, receipt, flags) -> str | None:
+    """Return a restore outcome when persisted claim evidence cannot settle."""
+    if state.claim_revision is None:
+        logger.warning(
+            "%s/%s holds legacy push_seq %s without a durable intent revision; replaying",
+            state.device_id,
+            state.scope,
+            state.push_seq,
+        )
+        return RESTORE_REPLAY
+    if receipt.get("request_digest") != _sent_wire_digest(state, flags):
+        logger.error(
+            "%s/%s holds push_seq %s at a digest the receipt does not name",
+            state.device_id,
+            state.scope,
+            state.push_seq,
+        )
+        return RESTORE_FAILED_CLOSED
+    return None
+
+
 def resolve_restored_claim(device_id, scope, receipt) -> str:
     """Resolve one restored claim against the adapter's receipt for its key (§4.6).
 
@@ -1897,14 +1925,9 @@ def resolve_restored_claim(device_id, scope, receipt) -> str:
                 _clear_claim(state)
                 state.save()
                 return RESTORE_REBASED
-            if receipt.get("request_digest") != _sent_wire_digest(state, flags):
-                logger.error(
-                    "%s/%s holds push_seq %s at a digest the receipt does not name",
-                    device_id,
-                    scope,
-                    state.push_seq,
-                )
-                return RESTORE_FAILED_CLOSED
+            validation = _restored_claim_validation(state, receipt, flags)
+            if validation is not None:
+                return validation
             break
 
     # Rebuilt from the row alone: nothing is sent, so the claim needs no adapter id.
