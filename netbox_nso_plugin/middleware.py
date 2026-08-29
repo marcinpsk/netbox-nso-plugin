@@ -4,6 +4,7 @@
 
 import logging
 
+from django.db import transaction
 from django.http import HttpResponse, JsonResponse
 
 from .deployment import DeploymentQuiesced, operation
@@ -24,10 +25,11 @@ class IntentDeploymentMiddleware:
         if request.method in _SAFE_METHODS:
             return self.get_response(request)
         try:
-            if request.path_info.startswith(_PLUGIN_PATH_PREFIXES):
-                with operation("HTTP mutations"):
-                    return self.get_response(request)
-            return self.get_response(request)
+            with transaction.atomic():
+                if request.path_info.startswith(_PLUGIN_PATH_PREFIXES):
+                    with operation("HTTP mutations"):
+                        return self.get_response(request)
+                return self.get_response(request)
         except DeploymentQuiesced:
             logger.info("Refused a mutation during intent deployment: %r", request.path_info)
             # The gate answers before the view, so this IS the Apply response the tab's

@@ -287,6 +287,7 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
     def test_quiescence_returns_503_and_rolls_back_a_core_intent_mutation(self):
         from django.http import HttpResponse
         from django.test import RequestFactory
+        from extras.models import Tag
 
         from netbox_nso_plugin.deployment import quiesce, resume
         from netbox_nso_plugin.middleware import IntentDeploymentMiddleware
@@ -296,6 +297,7 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         NSOIntentOutboxEntry.objects.all().delete()
 
         def remove_route(_request):
+            Tag.objects.create(name="request rollback witness", slug="request-rollback-witness")
             with transaction.atomic():
                 route.devices.remove(self.device)
             return HttpResponse("mutated")
@@ -312,6 +314,9 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         assert route.devices.filter(pk=self.device.pk).exists(), "the refused request committed the route removal"
         assert NSOStaticRouteState.objects.filter(management=self.mgmt, static_route=route).exists()
         assert not NSOIntentOutboxEntry.objects.exists(), "the refused request left partial outbox work"
+        assert not Tag.objects.filter(slug="request-rollback-witness").exists(), (
+            "the refused request left an earlier autocommitted write"
+        )
 
     def test_each_dirty_key_shape_refuses_the_gate(self):
         from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentOutboxState
