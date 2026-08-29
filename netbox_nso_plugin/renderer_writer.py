@@ -450,7 +450,10 @@ def _plan_m2m_add(proposed: RendererM2MAdd, creation_refs):
     if {row.pk for row in persisted} != set(persisted_pks):
         raise IntentMutationProtocolError("an M2M add plan contains a missing related row")
     owner_footprint = footprint_for_instance(instance, owner_spec)
-    related_footprints = tuple(footprint_for_instance(row) for row in proposed.related)
+    try:
+        related_footprints = tuple(footprint_for_instance(row) for row in proposed.related)
+    except KeyError as exc:
+        raise IntentMutationProtocolError(f"unregistered M2M related model {exc.args[0]}") from exc
     row_kind = "source_rows" if through._meta.label_lower in SOURCE_MODEL_RANKS else "overlay_rows"
     through_footprint = MutationFootprint.for_keys(
         (),
@@ -508,7 +511,7 @@ def _plan_m2m_set(proposed: RendererM2MSet, creation_refs):
         footprint,
         *(footprint_for_instance(row) for row in previous_related),
     )
-    if before_pks == related_identities:
+    if set(before_pks) == set(related_identities):
         keys = set()
     return write, footprint, keys
 

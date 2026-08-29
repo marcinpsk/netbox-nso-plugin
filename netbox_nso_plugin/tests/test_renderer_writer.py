@@ -172,6 +172,49 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         assert revision.verified_revision == revision.revision
         assert revision.verified_fingerprint == expected
 
+    def test_m2m_plan_refuses_an_unregistered_related_model(self):
+        from extras.models import Tag
+
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_m2m_add
+
+        device, management = make_managed("writer-unregistered-m2m", 16288)
+        interface = Interface.objects.create(device=device, name="Ethernet1/8", type="1000base-t")
+        state = NSOSwitchportState.objects.create(
+            management=management,
+            interface=interface,
+            mode="tagged",
+            status="imported",
+        )
+        tag = Tag.objects.create(name="unregistered renderer relation", slug="unregistered-renderer-relation")
+
+        with self.assertRaisesRegex(IntentMutationProtocolError, "unregistered.*related"):
+            RendererMutationPlan.build(m2m_writes=(planned_m2m_add(state, "tags", (tag,)),))
+
+    def test_an_unchanged_m2m_set_is_content_neutral_across_digit_widths(self):
+        from netbox_nso_plugin.intent_state import MutationFootprint, SourceRow, mirror_transaction
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_m2m_set, renderer_writes
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        device, management = make_managed("writer-m2m-order", 16289)
+        interface = Interface.objects.create(device=device, name="Ethernet1/10", type="1000base-t")
+        state = NSOSwitchportState.objects.create(
+            management=management,
+            interface=interface,
+            mode="tagged",
+            status="accepted",
+        )
+        footprint = MutationFootprint.for_keys((), source_rows=(SourceRow(VLAN._meta.label_lower, None),))
+        with mirror_transaction(footprint), suppress_intent_push():
+            lower = VLAN.objects.create(pk=2_000_000, vid=1641, name="writer-m2m-lower")
+            higher = VLAN.objects.create(pk=10_000_000, vid=1642, name="writer-m2m-higher")
+        seed = RendererMutationPlan.build(m2m_writes=(planned_m2m_set(state, "tagged_vlans", (lower, higher)),))
+        with renderer_writes(seed) as writer:
+            writer.m2m_set(state, "tagged_vlans", (lower, higher))
+
+        plan = RendererMutationPlan.build(m2m_writes=(planned_m2m_set(state, "tagged_vlans", (lower, higher)),))
+
+        self.assertFalse(plan.changes_content)
+
     def test_content_save_bumps_repends_enqueues_and_finalizes_fingerprint(self):
         from netbox_nso_plugin import delivery
         from netbox_nso_plugin.renderer_writer import (
@@ -319,6 +362,30 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         assert type(management).objects.filter(pk=management.pk).exists()
         assert NSOStaticRouteState.objects.filter(pk=state.pk).exists()
         assert type(device).objects.filter(pk=device.pk).exists()
+
+    def test_delete_plan_records_collector_set_null_updates(self):
+        from netbox_nso_plugin.models import NSOSVIState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete
+
+        device, management = make_managed("writer-set-null", 16290)
+        interface = Interface.objects.create(device=device, name="Vlan1643", type="virtual")
+        vlan = VLAN.objects.create(vid=1643, name="writer-set-null")
+        state = NSOSVIState.objects.create(
+            management=management,
+            interface=interface,
+            vlan=vlan,
+            status="imported",
+        )
+
+        plan = RendererMutationPlan.build(deletes=(planned_delete(vlan),))
+
+        self.assertIn(
+            ("set_update", state._meta.label_lower, state.pk, ("vlan",), (("vlan_id", None),)),
+            tuple(
+                (write.operation, write.model_label, write.pk, write.update_fields, write.values)
+                for write in plan.write_set
+            ),
+        )
 
     def test_rollback_removes_content_bookkeeping_and_fingerprint_together(self):
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
