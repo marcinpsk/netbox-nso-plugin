@@ -20,10 +20,11 @@ class Command(BaseCommand):
         from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
 
         created_gate = quiesce()
-        scopes = tuple(delivery.delivery_keys())
         repaired = 0
-        devices = tuple(NSODeviceManagement.objects.order_by("device_id").values_list("device_id", flat=True))
+        devices = ()
         try:
+            scopes = tuple(delivery.delivery_keys())
+            devices = tuple(NSODeviceManagement.objects.order_by("device_id").values_list("device_id", flat=True))
             with gate_bypass():
                 for device_id in devices:
                     for _pass in range(_STABILITY_PASSES):
