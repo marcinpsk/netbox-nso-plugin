@@ -2137,7 +2137,7 @@ class TestDeleteOriginMarking(_SignalDBBase):
             pre_delete.disconnect(capture_origin, sender=NSOSVIState)
 
         self.assertEqual(origins, [self.device])
-        self.assertEqual(calls, [])
+        self._assert_teardown_touched_only_the_offboard(calls)
 
 
 class TestSourceRekeyLocksOnlyItsManagementRow(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):

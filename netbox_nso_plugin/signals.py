@@ -954,7 +954,9 @@ def offboard_device_from_adapter(sender, instance, **kwargs):
     """
     from .renderer_writer import active_renderer_writer
 
-    if active_renderer_writer() is None:
+    origin = kwargs.get("origin")
+    cascaded_from_device = getattr(getattr(origin, "_meta", None), "label_lower", None) == "dcim.device"
+    if active_renderer_writer() is None and not cascaded_from_device:
         return
     _queue_adapter_offboard(instance)
 
