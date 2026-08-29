@@ -150,7 +150,10 @@ class TestReconcileRedistribution(TestCase):
         reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
         redist = Redistribution.objects.get(source_protocol="static")
         redist.metric = 99  # operator edit; device still reports 10
-        redist.save()
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+
+        with intent_transaction(footprint_for_instance(redist)):
+            redist.save()
 
         states = reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
         self.assertEqual(states[0].status, "changed")  # edit surfaced as drift
@@ -400,7 +403,10 @@ class TestReconcileRedistribution(TestCase):
         reconcile_redistribution(self.device, {"entries": [self._entry()]})
         state = NSORedistributionState.objects.get()
         state.redistribution.metric_type = "internal"
-        state.redistribution.save(update_fields=["metric_type"])
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+
+        with intent_transaction(footprint_for_instance(state.redistribution)):
+            state.redistribution.save(update_fields=["metric_type"])
         state.metric_type = "internal"
         state.status = "accepted"
         state.save(update_fields=["metric_type", "status"])
@@ -438,7 +444,10 @@ class TestReconcileRedistribution(TestCase):
         reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
         redist = Redistribution.objects.get(source_protocol="static")
         redist.metric = 99  # operator edit
-        redist.save()
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+
+        with intent_transaction(footprint_for_instance(redist)):
+            redist.save()
         states = reconcile_redistribution(self.device, {"entries": [self._entry(metric=20)]})  # device also moved
         self.assertEqual(states[0].status, "conflict")
         redist.refresh_from_db()

@@ -1,0 +1,478 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
+"""The renderer-input registry and mutation-permit contract."""
+
+from __future__ import annotations
+
+from unittest.mock import patch
+from uuid import uuid4
+
+from django.db import transaction
+from django.db.models import F
+from django.test import TransactionTestCase
+
+from netbox_nso_plugin import delivery, outbox
+from netbox_nso_plugin.intent_state import (
+    OVERLAY_MODEL_RANKS,
+    SOURCE_MODEL_RANKS,
+    IntentMutationProtocolError,
+    MutationFootprint,
+    SourceRow,
+    canonical_fragment,
+    content_mutation,
+    deletion_footprint_for_instance,
+    intent_transaction,
+    mirror_refresh,
+    renderer_input_specs,
+    renderer_query_trace,
+)
+from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentRevision, NSOVLANState
+from netbox_nso_plugin.signals import suppress_intent_push
+
+from ._outbox_case import make_managed, own_vlan, without_commit_drain
+from .mixins import IntentPushResetMixin, _CascadeFlushMixin
+
+
+class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    """Exercise permits through real ORM writes and durable revision rows."""
+
+    reset_sequences = True
+
+    def setUp(self):
+        super().setUp()
+        self.device, self.management = make_managed("intent-permit", 1623)
+        self.state = own_vlan(self.management, 1623, "intent-permit")
+
+    def test_registered_bulk_dml_requires_a_content_permit(self):
+        with self.assertRaises(IntentMutationProtocolError):
+            NSOVLANState.objects.filter(pk=self.state.pk).update(vlan_id=self.state.vlan_id + 100000)
+
+    def test_registered_bulk_dml_allows_a_non_content_counter_update(self):
+        type(self.device).objects.filter(pk=self.device.pk).update(interface_count=F("interface_count") + 1)
+
+        self.device.refresh_from_db()
+        self.assertEqual(self.device.interface_count, 1)
+
+    def test_registered_bulk_dml_allows_a_non_rendered_interface_update(self):
+        from dcim.models import Interface
+
+        interface = Interface.objects.create(device=self.device, name="Ethernet1623", type="1000base-t")
+        Interface.objects.filter(pk=interface.pk).update(label="inventory-only")
+
+        interface.refresh_from_db()
+        self.assertEqual(interface.label, "inventory-only")
+
+    def test_device_delete_footprint_includes_assigned_native_addresses(self):
+        from dcim.models import Device, Interface
+        from ipam.models import IPAddress
+
+        device = Device.objects.create(
+            name="intent-delete-peer",
+            device_type=self.device.device_type,
+            role=self.device.role,
+            site=self.device.site,
+        )
+        interface = Interface.objects.create(device=device, name="Ethernet1624", type="1000base-t")
+        with transaction.atomic():
+            address = IPAddress.objects.create(address="198.18.16.0/31", assigned_object=interface)
+
+        footprint = deletion_footprint_for_instance(device)
+
+        self.assertIn(SourceRow(address._meta.label_lower, address.pk), footprint.source_rows)
+        from netbox_nso_plugin.intent_state import _ACTIVE_PERMIT
+
+        self.assertIsNone(_ACTIVE_PERMIT.get())
+
+        device.delete()
+        self.assertFalse(IPAddress.objects.filter(pk=address.pk).exists())
+
+    def test_failed_static_route_m2m_behavior_closes_its_implicit_permit(self):
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.intent_state import _ACTIVE_PERMIT
+
+        route = StaticRoute.objects.create(prefix="198.18.16.0/28", next_hop="198.18.16.1", metric=1)
+        with self.assertRaises(RuntimeError):
+            with (
+                transaction.atomic(),
+                patch(
+                    "netbox_nso_plugin.signals._schedule_intent_push",
+                    side_effect=RuntimeError("behavior failed"),
+                ),
+            ):
+                route.devices.add(self.device)
+
+        self.assertIsNone(_ACTIVE_PERMIT.get())
+
+    def test_failed_post_save_behavior_closes_its_implicit_permit(self):
+        from netbox_nso_plugin.intent_state import _ACTIVE_PERMIT
+
+        self.state.device_name = "intent-permit-router"
+        with self.assertRaises(RuntimeError):
+            with (
+                transaction.atomic(),
+                patch(
+                    "netbox_nso_plugin.signals._schedule_intent_push",
+                    side_effect=RuntimeError("behavior failed"),
+                ),
+            ):
+                self.state.save(update_fields=["device_name"])
+
+        self.assertIsNone(_ACTIVE_PERMIT.get())
+
+    def test_content_permit_rejects_a_write_outside_its_footprint(self):
+        other_device, other_management = make_managed("intent-other", 1624, index=2)
+        other = own_vlan(other_management, 1624, "intent-other")
+        footprint = MutationFootprint.for_keys(
+            {(self.device.pk, "vlan")},
+            source_rows=(SourceRow(self.state._meta.label_lower, self.state.pk),),
+        )
+
+        with self.assertRaises(IntentMutationProtocolError), transaction.atomic():
+            with intent_transaction(footprint):
+                other.device_name = "outside-footprint"
+                other.save(update_fields=["device_name"])
+
+        other.refresh_from_db()
+        self.assertEqual(other.device_name, "")
+        self.assertNotEqual(other_device.pk, self.device.pk)
+
+    def test_content_mutation_bumps_before_write_and_repends_deploying_rows(self):
+        attempt_id = uuid4()
+        self.state.status = "deploying"
+        self.state.apply_attempt_id = attempt_id
+        with transaction.atomic(), suppress_intent_push(), mirror_refresh(self.state, {"status", "apply_attempt_id"}):
+            self.state.save(update_fields=["status", "apply_attempt_id"])
+        before = NSOIntentRevision.objects.get(device=self.device, scope="vlan").revision
+
+        with (
+            without_commit_drain(),
+            content_mutation(
+                {
+                    (self.device.pk, "vlan"),
+                    (self.device.pk, "svi"),
+                    (self.device.pk, "switchport"),
+                },
+                source_rows=(SourceRow("ipam.vlan", self.state.vlan_id),),
+                overlay_rows=(SourceRow(self.state._meta.label_lower, self.state.pk),),
+            ),
+        ):
+            self.state.vlan.name = "intent-permit-renamed"
+            self.state.vlan.save(update_fields=["name"])
+
+        self.state.refresh_from_db()
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="vlan")
+        self.assertEqual(revision.revision, before + 1)
+        self.assertEqual(self.state.status, "accepted")
+        self.assertIsNone(self.state.apply_attempt_id)
+
+    def test_savepoint_rollback_does_not_authorize_a_later_enqueue(self):
+        key = (self.device.pk, "vlan")
+        NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").delete()
+        with without_commit_drain(), transaction.atomic():
+            try:
+                with transaction.atomic(), content_mutation({key}):
+                    outbox.enqueue(*key)
+                    raise RuntimeError("roll back the savepoint")
+            except RuntimeError:
+                pass
+
+            with self.assertRaises(IntentMutationProtocolError):
+                outbox.enqueue(*key)
+            with content_mutation({key}):
+                outbox.enqueue(*key)
+
+        self.assertEqual(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").count(), 1)
+
+    def test_registry_declares_all_renderer_overlay_tables(self):
+        declared = set(renderer_input_specs())
+        required = {
+            "netbox_nso_plugin.nsobgppeerstate",
+            "netbox_nso_plugin.nsoredistributionstate",
+            "netbox_nso_plugin.nsoroutepolicystate",
+            "netbox_nso_plugin.nsostaticroutestate",
+            "netbox_nso_plugin.nsosvistate",
+            "netbox_nso_plugin.nsovlanstate",
+        }
+        self.assertTrue(required <= declared, required - declared)
+
+    def test_registry_has_frozen_ranks_and_trace_fixtures(self):
+        declared = set(renderer_input_specs())
+        classified = set(SOURCE_MODEL_RANKS) | set(OVERLAY_MODEL_RANKS) | {"netbox_nso_plugin.nsodevicemanagement"}
+        self.assertEqual(declared - classified, set())
+        self.assertEqual(
+            classified - declared,
+            {
+                "dcim.interface_tagged_vlans",
+                "ipam.vlangroup",
+                "netbox_nso_plugin.nsoinstance",
+                "netbox_nso_plugin.nsoroutepolicyobjectclass",
+                "netbox_routing.staticroute_devices",
+            },
+        )
+        self.assertTrue(all(spec.required_trace_fixtures for spec in renderer_input_specs().values()))
+
+    def test_registry_entries_carry_executable_resolvers_and_fragments(self):
+        for label, spec in renderer_input_specs().items():
+            with self.subTest(label=label):
+                self.assertTrue(callable(spec.resolver))
+                self.assertTrue(callable(spec.fragment))
+
+    def test_vlan_fragment_is_the_exact_renderer_item(self):
+        rendered = delivery.render("vlan", self.device.pk, self.management.adapter_device_id)
+
+        self.assertEqual(canonical_fragment(self.state), self._normal_fragment(rendered.payload[0]))
+
+    @staticmethod
+    def _normal_fragment(value):
+        if isinstance(value, dict):
+            return tuple(
+                sorted((str(key), TestIntentMutationProtocol._normal_fragment(item)) for key, item in value.items())
+            )
+        if isinstance(value, (list, tuple)):
+            return tuple(TestIntentMutationProtocol._normal_fragment(item) for item in value)
+        return value
+
+    def test_nested_direct_apply_fragments_are_exact_renderer_items(self):
+        from netbox_nso_plugin.models import NSOLACPBundleState, NSOSwitchportState
+
+        self._install_complete_renderer_trace_fixture()
+        for scope, model in (
+            ("lacp", NSOLACPBundleState),
+            ("switchport", NSOSwitchportState),
+        ):
+            row = model.objects.get(management=self.management)
+            rendered = delivery.render(scope, self.device.pk, self.management.adapter_device_id)
+            with self.subTest(scope=scope):
+                self.assertEqual(canonical_fragment(row), self._normal_fragment(rendered.payload[0]))
+
+    def _install_complete_renderer_trace_fixture(self):
+        """Create every conditional renderer branch named by the registry."""
+        from dcim.models import Device, Interface, Platform
+        from django.contrib.contenttypes.models import ContentType
+        from ipam.models import ASN, RIR, IPAddress
+        from netbox_routing.models import (
+            ASPath,
+            ASPathEntry,
+            BGPAddressFamily,
+            BGPPeer,
+            BGPPeerAddressFamily,
+            BGPPeerTemplate,
+            BGPRouter,
+            BGPScope,
+            Community,
+            CommunityList,
+            CommunityListEntry,
+            CustomPrefix,
+            ISISInstance,
+            ISISLevel,
+            PrefixList,
+            PrefixListEntry,
+            RouteMap,
+            RouteMapEntry,
+            RouteMapEntrySetCommunity,
+        )
+
+        from netbox_nso_plugin.models import (
+            NSOISISInstanceState,
+            NSOLACPBundleState,
+            NSOLACPMemberState,
+            NSOPlatformNedMapping,
+            NSORoutePolicyState,
+            NSOSwitchportState,
+        )
+
+        with without_commit_drain(), transaction.atomic():
+            platform = Platform.objects.create(name="Trace Platform", slug="trace-platform")
+            self.device.platform = platform
+            self.device.save(update_fields=["platform"])
+            NSOPlatformNedMapping.objects.create(platform=platform, ned_id="test-ned")
+
+            lag = Interface.objects.create(device=self.device, name="Bundle-Ether1", type="lag")
+            member = Interface.objects.create(device=self.device, name="Ethernet1", type="1000base-t")
+            NSOLACPBundleState.objects.create(
+                management=self.management,
+                interface=lag,
+                lag_id=1,
+                status="accepted",
+            )
+            NSOLACPMemberState.objects.create(
+                management=self.management,
+                interface=member,
+                lag_bundle=lag,
+                mode="active",
+                status="accepted",
+            )
+            switchport = NSOSwitchportState.objects.create(
+                management=self.management,
+                interface=member,
+                mode="tagged",
+                status="accepted",
+            )
+            switchport.tagged_vlans.add(self.state.vlan)
+
+            isis_instance = ISISInstance.objects.create(
+                device=self.device,
+                process_tag="TRACE",
+                net="49.0001.0000.0000.0001.00",
+            )
+            ISISLevel.objects.create(instance=isis_instance, level=2, wide_metrics_only=True)
+            NSOISISInstanceState.objects.create(
+                management=self.management,
+                process_tag="TRACE",
+                net=isis_instance.net,
+                isis_instance=isis_instance,
+                status="accepted",
+            )
+
+            rir = RIR.objects.create(name="Trace RIR", slug="trace-rir", is_private=True)
+            local_as = ASN.objects.create(asn=64512, rir=rir)
+            remote_as = ASN.objects.create(asn=64513, rir=rir)
+            router = BGPRouter.objects.create(
+                assigned_object_type=ContentType.objects.get_for_model(Device),
+                assigned_object_id=self.device.pk,
+                asn=local_as,
+                name="64512",
+            )
+            scope = BGPScope.objects.create(router=router)
+            address_family = BGPAddressFamily.objects.create(scope=scope, address_family="ipv4-unicast")
+            peer_group = BGPPeerTemplate.objects.create(name="TRACE-PEERS", remote_as=remote_as)
+            peer = BGPPeer.objects.create(
+                scope=scope,
+                peer=IPAddress.objects.create(address="198.18.0.2/32"),
+                source=IPAddress.objects.create(address="198.18.0.1/32"),
+                remote_as=remote_as,
+                local_as=local_as,
+                peer_group=peer_group,
+                enabled=True,
+            )
+            BGPPeerAddressFamily.objects.create(
+                assigned_object_type=ContentType.objects.get_for_model(BGPPeer),
+                assigned_object_id=peer.pk,
+                address_family=address_family,
+                enabled=True,
+            )
+
+            prefix_list = PrefixList.objects.create(name="TRACE-PREFIXES")
+            custom_prefix = CustomPrefix.objects.create(prefix="198.18.0.0/24")
+            PrefixListEntry.objects.create(
+                prefix_list=prefix_list,
+                assigned_prefix_type=ContentType.objects.get_for_model(CustomPrefix),
+                assigned_prefix_id=custom_prefix.pk,
+                sequence=10,
+                action="permit",
+            )
+            community_list = CommunityList.objects.create(name="TRACE-COMMUNITIES")
+            community = Community.objects.create(community="64512:1623")
+            CommunityListEntry.objects.create(
+                community_list=community_list,
+                action="permit",
+                community=community,
+            )
+            as_path = ASPath.objects.create(name="TRACE-AS-PATH")
+            ASPathEntry.objects.create(aspath=as_path, sequence=10, action="permit", pattern="^64512$")
+            route_map = RouteMap.objects.create(name="TRACE-ROUTE-MAP")
+            route_map_entry = RouteMapEntry.objects.create(route_map=route_map, sequence=10, action="permit")
+            route_map_entry.match_prefix_list.add(prefix_list)
+            route_map_entry.match_community_list.add(community_list)
+            route_map_entry.match_aspath.add(as_path)
+            set_community = RouteMapEntrySetCommunity.objects.create(
+                route_map_entry=route_map_entry,
+                operation="add",
+                community_list=community_list,
+            )
+            set_community.communities.add(community)
+            inline_community = RouteMapEntrySetCommunity.objects.create(
+                route_map_entry=route_map_entry,
+                operation="set",
+            )
+            inline_community.communities.add(community)
+            for family, obj in (
+                ("prefix_list", prefix_list),
+                ("community_list", community_list),
+                ("as_path", as_path),
+                ("route_map", route_map),
+            ):
+                NSORoutePolicyState.objects.create(
+                    management=self.management,
+                    family=family,
+                    object_name=obj.name,
+                    content_type=ContentType.objects.get_for_model(type(obj)),
+                    object_id=obj.pk,
+                    status="accepted",
+                )
+
+    def test_render_trace_matches_the_declared_registry_in_both_directions(self):
+        self._install_complete_renderer_trace_fixture()
+        observed_by_fixture = {}
+        for scope in delivery.delivery_keys():
+            with renderer_query_trace() as observed:
+                delivery.render(scope, self.device.pk, self.management.adapter_device_id)
+            observed_by_fixture[scope] = observed
+
+        declared = set(renderer_input_specs())
+        observed = set().union(*observed_by_fixture.values())
+        self.assertEqual(observed - declared, set(), f"undeclared renderer sources: {sorted(observed - declared)}")
+        for label, spec in renderer_input_specs().items():
+            with self.subTest(label=label):
+                exercised = {
+                    fixture
+                    for fixture in spec.required_trace_fixtures
+                    if label in observed_by_fixture.get(fixture, set())
+                }
+                self.assertTrue(exercised, f"{label} was not read by {spec.required_trace_fixtures!r}")
+
+    def test_route_policy_registry_matches_every_table_read_by_the_renderer(self):
+        declared = set(renderer_input_specs())
+        required = {
+            "netbox_routing.customprefix",
+            "netbox_routing.community",
+            "netbox_routing.routemapentrysetcommunity",
+            "netbox_routing.routemapentrysetcommunity_communities",
+        }
+
+        self.assertTrue(required <= declared, required - declared)
+        self.assertNotIn("netbox_routing.routemapentry_match_community", declared)
+
+    def test_route_policy_registry_classifies_only_wire_contributing_fields_as_content(self):
+        specs = renderer_input_specs()
+        expected = {
+            "netbox_routing.customprefix": {"prefix"},
+            "netbox_routing.prefixlist": {"name"},
+            "netbox_routing.prefixlistentry": {
+                "prefix_list",
+                "assigned_prefix_type",
+                "assigned_prefix_id",
+                "sequence",
+                "action",
+                "ge",
+                "le",
+            },
+            "netbox_routing.community": {"community"},
+            "netbox_routing.communitylist": {"name", "invert_match"},
+            "netbox_routing.communitylistentry": {"community_list", "action", "community"},
+            "netbox_routing.aspath": {"name"},
+            "netbox_routing.aspathentry": {"aspath", "sequence", "action", "pattern"},
+            "netbox_routing.routemap": {"name"},
+            "netbox_routing.routemapentry": {
+                "route_map",
+                "action",
+                "sequence",
+                "flow_control",
+                "match_afi",
+                "call_policy",
+                "match",
+                "set",
+                "vendor_ext",
+                "apply_policy",
+            },
+            "netbox_routing.routemapentrysetcommunity": {
+                "route_map_entry",
+                "operation",
+                "community_list",
+            },
+        }
+
+        for label, fields in expected.items():
+            with self.subTest(label=label):
+                self.assertEqual(specs[label].content_fields, fields)
