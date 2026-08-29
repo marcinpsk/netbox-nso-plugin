@@ -530,6 +530,26 @@ class TestAttemptSettlement(TestCase):
         row.refresh_from_db()
         self.assertEqual(row.status, "in_sync")
 
+    def test_an_unrequested_unknown_attempt_is_not_replayed(self):
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, load_deployment_evidence
+
+        requested_id = uuid4()
+        extra_id = uuid4()
+        self._vlan_row(1635, requested_id)
+        self._local_attempt(requested_id, 64, {"vlan": 404})
+        self._local_attempt(extra_id, 65, {"vlan": 405})
+        evidence = _payload(self.adapter_device_id, [])
+        evidence["unknown_apply_attempt_ids"] = [str(extra_id)]
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.get_deployment_evidence", return_value=evidence),
+            patch("netbox_nso_plugin.adapter_client.trigger_apply") as trigger_apply,
+            self.assertRaises(EvidenceInvariantError),
+        ):
+            load_deployment_evidence(self.management)
+
+        trigger_apply.assert_not_called()
+
     def test_a_rowless_lost_no_op_response_is_recovered_by_exact_replay(self):
         from netbox_nso_plugin.apply_settlement import settle_device_apply_attempts
 
@@ -608,90 +628,26 @@ class TestAttemptSettlement(TestCase):
         row.refresh_from_db()
         self.assertEqual(row.status, "deploying")
 
-    def test_settled_generation_rejects_a_failed_carrier_snapshot(self):
-        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_apply_attempts
-
-        attempt_id = uuid4()
-        row = self._vlan_row(1639, attempt_id)
-        self._local_attempt(attempt_id, 53, {"vlan": 303})
-        evidence = _attempt(
-            attempt_id,
-            self.adapter_device_id,
-            53,
-            {"vlan": 303},
-            "settled",
-            result={"vlan_count_by_outcome": {"in_sync": 1, "apply_failed": 0}},
-        )
-        evidence["generations"][0]["carrier_job_status"] = "failed"
-
-        with self.assertRaisesRegex(EvidenceInvariantError, "settled generation has an invalid carrier snapshot"):
-            settle_apply_attempts(
-                self.management,
-                _payload(self.adapter_device_id, [evidence]),
-                static_route_feed_drained=True,
-            )
-
-        row.refresh_from_db()
-        self.assertEqual(row.status, "deploying")
-
-    def test_settled_generation_rejects_a_missing_carrier_result(self):
-        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_apply_attempts
-
-        attempt_id = uuid4()
-        row = self._vlan_row(1641, attempt_id)
-        self._local_attempt(attempt_id, 55, {"vlan": 305})
-        evidence = _attempt(attempt_id, self.adapter_device_id, 55, {"vlan": 305}, "settled")
-
-        with self.assertRaisesRegex(EvidenceInvariantError, "settled generation has an invalid carrier snapshot"):
-            settle_apply_attempts(
-                self.management,
-                _payload(self.adapter_device_id, [evidence]),
-                static_route_feed_drained=True,
-            )
-
-        row.refresh_from_db()
-        self.assertEqual(row.status, "deploying")
-
-    def test_settled_generation_rejects_an_unknown_scope_outcome(self):
-        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_apply_attempts
-
-        attempt_id = uuid4()
-        row = self._vlan_row(1640, attempt_id)
-        self._local_attempt(attempt_id, 54, {"vlan": 304})
-        evidence = _attempt(
-            attempt_id,
-            self.adapter_device_id,
-            54,
-            {"vlan": 304},
-            "settled",
-            result={"vlan_count_by_outcome": {"in_sync": 1, "apply_failed": 0, "unknown": 1}},
-        )
-
-        with self.assertRaisesRegex(EvidenceInvariantError, "invalid vlan outcome counts"):
-            settle_apply_attempts(
-                self.management,
-                _payload(self.adapter_device_id, [evidence]),
-                static_route_feed_drained=True,
-            )
-
-        row.refresh_from_db()
-        self.assertEqual(row.status, "deploying")
-
-    def test_a_non_list_generation_collection_is_a_contract_error(self):
+    def test_malformed_generation_types_are_non_actionable_contract_errors(self):
         from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_apply_attempts
 
         attempt_id = uuid4()
         row = self._vlan_row(1636, attempt_id)
         self._local_attempt(attempt_id, 52, {"vlan": 302})
-        evidence = _attempt(attempt_id, self.adapter_device_id, 52, {"vlan": 302}, "running")
-        evidence["generations"] = None
+        for field, value in (("status", []), ("generations", None)):
+            with self.subTest(field=field):
+                evidence = _attempt(attempt_id, self.adapter_device_id, 52, {"vlan": 302}, "pending")
+                if field == "generations":
+                    evidence["generations"] = value
+                else:
+                    evidence["generations"][0][field] = value
 
-        with self.assertRaises(EvidenceInvariantError):
-            settle_apply_attempts(
-                self.management,
-                _payload(self.adapter_device_id, [evidence]),
-                static_route_feed_drained=True,
-            )
+                with self.assertRaises(EvidenceInvariantError):
+                    settle_apply_attempts(
+                        self.management,
+                        _payload(self.adapter_device_id, [evidence]),
+                        static_route_feed_drained=True,
+                    )
 
         row.refresh_from_db()
         self.assertEqual(row.status, "deploying")

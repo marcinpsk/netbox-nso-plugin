@@ -70,6 +70,8 @@ def _validate_generation(raw) -> dict:
         raise EvidenceInvariantError("deployment evidence generation has an invalid shape")
     if not _positive_int(raw["generation_id"]) or not _positive_int(raw["seq"]):
         raise EvidenceInvariantError("deployment evidence generation has an invalid identity")
+    if type(raw["status"]) is not str:
+        raise EvidenceInvariantError("deployment evidence generation has an invalid status")
     _generation_disposition(raw["status"])
     if (
         not isinstance(raw["sections"], list)
@@ -474,6 +476,8 @@ def load_deployment_evidence(management, *, attempt_ids=None):
             "Adapter returned an invalid unknown attempt UUID.",
             code="invalid_response",
         ) from exc
+    if unknown - set(attempt_ids):
+        raise EvidenceInvariantError("deployment evidence names an unrequested unknown Apply attempt")
     replayed = False
     for attempt in NSOApplyAttempt.objects.filter(
         pk__in=unknown,
