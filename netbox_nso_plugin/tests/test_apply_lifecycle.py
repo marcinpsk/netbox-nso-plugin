@@ -9,7 +9,7 @@ from uuid import uuid4
 from django.db import IntegrityError, models, transaction
 from django.test import SimpleTestCase, TestCase
 
-from ._outbox_case import make_managed, mirror_update, without_commit_drain
+from ._outbox_case import make_managed, mirror_update, trust_scope, without_commit_drain
 
 PROMOTED_MODEL_NAMES = (
     "NSOVLANState",
@@ -153,10 +153,7 @@ class TestIntentRevisionWrites(TestCase):
         self.assertIsNone(row.apply_attempt_id)
 
     def test_a_foreign_logging_host_edit_repends_on_the_next_audit(self):
-        from django.utils import timezone
-
-        from netbox_nso_plugin import delivery
-        from netbox_nso_plugin.models import NSOIntentRevision, NSOLoggingHostState, NSOLoggingLevelState
+        from netbox_nso_plugin.models import NSOLoggingHostState, NSOLoggingLevelState
         from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
 
         with without_commit_drain(), transaction.atomic():
@@ -171,15 +168,7 @@ class TestIntentRevisionWrites(TestCase):
                 status="accepted",
             )
         mirror_update(level, status="deploying", apply_attempt_id=uuid4())
-        revision, _created = NSOIntentRevision.objects.get_or_create(device=self.device, scope="logging")
-        mirror_update(
-            revision,
-            verified_revision=revision.revision,
-            verified_fingerprint=delivery.canonical_fingerprint(
-                delivery.render("logging", self.device.pk, self.management.adapter_device_id).payload
-            ),
-            verified_at=timezone.now(),
-        )
+        trust_scope(self.device, self.management, "logging")
 
         with without_commit_drain(), transaction.atomic():
             host.port = 5514
