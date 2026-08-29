@@ -26,6 +26,29 @@ from .strict_writer import strict_writer_harness
 
 
 class TestRendererSetUpdate(IntentPushResetMixin, TestCase):
+    def test_forward_creation_reference_is_rejected_during_planning(self):
+        from ipam.models import VLANGroup
+
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save
+
+        device, management = make_managed("writer-forward-ref", 16279)
+        group = VLANGroup(name="Writer forward ref", slug=f"writer-forward-ref-{device.pk}")
+        vlan = VLAN(group=group, vid=1627, name="Writer forward ref")
+        state = NSOVLANState(management=management, vlan=vlan)
+
+        with self.assertRaisesRegex(IntentMutationProtocolError, "planned later"):
+            RendererMutationPlan.build(
+                saves=(
+                    planned_save(
+                        state,
+                        force_insert=True,
+                        natural_key=("management", "vlan"),
+                    ),
+                    planned_save(vlan, force_insert=True, natural_key=("group", "vid")),
+                    planned_save(group, force_insert=True, natural_key=("slug",)),
+                )
+            )
+
     def test_opt_in_harness_records_the_real_consumed_write_set(self):
         from netbox_nso_plugin.renderer_writer import (
             RendererMutationPlan,
