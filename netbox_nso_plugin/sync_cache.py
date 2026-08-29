@@ -255,9 +255,9 @@ def _broken_links(mapped, by_id, by_identity) -> list[tuple]:
         # A row mid-provision has no adapter device yet by design and its push is gated.
         # A row mid-rekey is NOT broken either: NetBox already carries the new NSO name while
         # the adapter still carries the old one, so it classifies as identity_changed. Dropping
-        # its pointer here would strand it for good — _snapshot only considers rows that HAVE
-        # an id, and re-onboarding the new identity collides with the old row still holding this
-        # netbox_device_id. _sync_source_change owns that transition, dead mapping included.
+        # its pointer would let the generic repair re-onboard the new identity while the old
+        # adapter row still holds this netbox_device_id. _sync_source_change owns that fenced
+        # transition, including a dead mapping.
         if mgmt.onboard_status or mgmt.source_rekey_pending:
             continue
         state, adapter_device = _classify(mgmt, by_id, by_identity)
