@@ -420,6 +420,25 @@ class TestSymmetricOwnershipExecutor(TestCase):
         # per extra owned overlay is constant. A per-row re-scan makes it grow.
         self.assertEqual(four - three, three - two)
 
+    def test_native_create_planning_batches_manifest_and_overlay_reads(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin.ownership_planner import _native_create_actions
+
+        def measure(rows):
+            device, _management = make_managed(f"owncreate{rows}", 16300 + rows, index=rows)
+            group = VLANGroup.objects.create(name=f"Ownership create {rows}", slug=f"nso-{device.pk}")
+            for index in range(rows):
+                VLAN.objects.create(group=group, vid=1760 + index, name=f"ownership-create-{rows}-{index}")
+            with CaptureQueriesContext(connection) as captured:
+                planned = _native_create_actions(device.pk, frozenset({"vlan"}))
+            self.assertEqual(len(planned), rows)
+            return len(captured.captured_queries)
+
+        self.assertEqual(measure(2), measure(4))
+
     def test_cleared_ownership_detaches_without_deletion_authority(self):
         from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOOwnershipManifest, NSOVLANState
         from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
@@ -723,6 +742,34 @@ class TestSymmetricOwnershipExecutor(TestCase):
         manifest = NSOOwnershipManifest.objects.get(device_id=self.device.pk, scope="ip")
         self.assertEqual(state.status, "accepted")
         self.assertEqual(manifest.native_id, address.pk)
+
+    def test_deleted_native_ip_demotes_its_surviving_owned_overlay(self):
+        from dcim.models import Interface
+        from django.contrib.contenttypes.models import ContentType
+        from ipam.models import IPAddress
+
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOInterfaceIPState, NSOOwnershipManifest
+        from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
+
+        interface = Interface.objects.create(device=self.device, name="Ethernet5.2", type="1000base-t")
+        address = IPAddress.objects.create(
+            address="198.18.172.7/24",
+            assigned_object_type=ContentType.objects.get_for_model(Interface),
+            assigned_object_id=interface.pk,
+        )
+        reconcile_scope_ownership(self.device.pk, ["ip"])
+        state = NSOInterfaceIPState.objects.get(interface=interface, address=str(address.address), vrf="")
+        manifest = NSOOwnershipManifest.objects.get(device_id=self.device.pk, scope="ip")
+
+        IPAddress.objects.filter(pk=address.pk).delete()
+        reconcile_scope_ownership(self.device.pk, ["ip"])
+
+        state.refresh_from_db()
+        manifest.refresh_from_db()
+        self.assertEqual(state.status, "imported")
+        self.assertEqual(manifest.ownership_state, "retired")
+        self.assertEqual(delivery.render("ip", self.device.pk, self.management.adapter_device_id).payload, [])
 
     def test_an_unknown_vrf_cannot_bind_to_a_global_address(self):
         from dcim.models import Interface
