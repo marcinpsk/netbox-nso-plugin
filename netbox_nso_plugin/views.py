@@ -4836,60 +4836,61 @@ def _save_owned_overlay_only_edit(obj, old_values):
         writer.save(candidate, update_fields=update_fields)
 
 
-def _write_owned_interface_mtu(candidate, update_fields):
+def _write_owned_interface_mtu(candidate, update_fields, *, planned_at):
     """Write one MTU ownership claim and its native interface value."""
     import copy
 
     from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
     saves = []
-    interface_candidate = None
+    operations = []
     if candidate.l2_mtu is not None:
         clamped = min(int(candidate.l2_mtu), NSOInterfaceMtuStateAcceptView._NETBOX_MTU_MAX)
         if candidate.interface.mtu != clamped:
-            interface_candidate = copy.copy(candidate.interface)
-            interface_candidate.mtu = clamped
-            saves.append(planned_save(interface_candidate, update_fields=("mtu",)))
+            interface = copy.copy(candidate.interface)
+            interface.mtu = clamped
+            fields = ("mtu",)
+            saves.append(planned_save(interface, update_fields=fields))
+            operations.append((interface, fields))
     saves.append(planned_save(candidate, update_fields=update_fields))
+    operations.append((candidate, update_fields))
 
-    plan = RendererMutationPlan.build(saves=saves, planned_at=candidate.accepted_at)
+    plan = RendererMutationPlan.build(saves=saves, planned_at=planned_at)
     mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
     with mutation as writer:
-        if interface_candidate is not None:
-            writer.save(interface_candidate, update_fields=("mtu",))
-        writer.save(candidate, update_fields=update_fields)
+        for instance, fields in operations:
+            writer.save(instance, update_fields=fields)
 
 
-def _save_owned_interface_mtu_edit(obj, old_values):
-    """Claim an inline MTU edit and write its native value through one plan."""
+def _save_owned_interface_mtu_edit(obj, old_values, *, _retry_on_stale=True):
+    """Claim one MTU edit and save its native interface through one exact plan."""
     import copy
 
     from . import status_machine as sm
     from .renderer_writer import IntentPlanStaleError
 
-    edited_values = {
-        field_name: getattr(obj, field_name)
-        for field_name, old_value in old_values.items()
-        if hasattr(obj, field_name) and getattr(obj, field_name) != old_value
+    planned_at = timezone.now()
+    candidate = copy.copy(obj)
+    if not sm.is_owned(candidate.status):
+        candidate.accepted_at = planned_at
+    candidate.status = sm.on_operator_edit(candidate.status)
+    state_fields = {
+        field_name for field_name, old_value in old_values.items() if getattr(candidate, field_name) != old_value
     }
-    current = obj
-    for attempt in range(2):
-        candidate = copy.copy(current)
-        for field_name, value in edited_values.items():
-            setattr(candidate, field_name, value)
-        if not sm.is_owned(candidate.status):
-            candidate.accepted_at = timezone.now()
-        candidate.status = sm.on_operator_edit(candidate.status)
-        update_fields = {*edited_values, "status"}
-        if candidate.accepted_at is not None:
-            update_fields.add("accepted_at")
-        try:
-            _write_owned_interface_mtu(candidate, update_fields)
-            return
-        except IntentPlanStaleError:
-            if attempt:
-                raise
-            current = type(obj).objects.get(pk=obj.pk)
+    state_fields.add("status")
+    if candidate.accepted_at is not None:
+        state_fields.add("accepted_at")
+
+    try:
+        _write_owned_interface_mtu(candidate, state_fields, planned_at=planned_at)
+    except IntentPlanStaleError:
+        if not _retry_on_stale:
+            raise
+        current = type(obj).objects.select_related("interface").get(pk=obj.pk)
+        current_old_values = {field_name: getattr(current, field_name) for field_name in old_values}
+        for field_name in old_values:
+            setattr(current, field_name, getattr(obj, field_name))
+        _save_owned_interface_mtu_edit(current, current_old_values, _retry_on_stale=False)
 
 
 def _save_owned_overlay_edit(obj, key, old_values):
@@ -4926,24 +4927,7 @@ def _save_owned_overlay_edit(obj, key, old_values):
     if key == "interface_mtu":
         _save_owned_interface_mtu_edit(obj, old_values)
         return
-
-    from . import status_machine as sm
-    from .intent_state import intent_transaction
-
-    with intent_transaction(_owned_overlay_edit_footprint(obj, key)):
-        if not sm.is_owned(obj.status):
-            obj.accepted_at = timezone.now()
-        obj.status = sm.on_operator_edit(obj.status)
-        update_fields = {
-            field_name
-            for field_name, old_value in old_values.items()
-            if hasattr(obj, field_name) and getattr(obj, field_name) != old_value
-        }
-        update_fields.add("status")
-        _clear_apply_attempt(obj, update_fields)
-        if obj.accepted_at is not None:
-            update_fields.add("accepted_at")
-        obj.save(update_fields=update_fields)
+    raise ValueError(f"unsupported owned overlay edit family: {key}")
 
 
 def _route_map_name_errors(state, old_name):
@@ -7409,7 +7393,7 @@ class NSOInterfaceMtuStateAcceptView(OverlayStateAcceptMixin):
         candidate = copy.copy(state)
         candidate.status = _status_after_accept(state.status)
         candidate.accepted_at = timezone.now()
-        _write_owned_interface_mtu(candidate, ("status", "accepted_at"))
+        _write_owned_interface_mtu(candidate, ("status", "accepted_at"), planned_at=candidate.accepted_at)
         messages.success(request, f"Accepted {candidate}.")
         return redirect(_device_nso_tab_url(candidate.management.device_id))
 

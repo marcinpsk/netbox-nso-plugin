@@ -18,6 +18,25 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _validated_interface_items(payload: dict) -> tuple[dict, ...]:
+    """Validate one adapter MTU document before planning stale-row changes."""
+    if not isinstance(payload, dict):
+        raise ValueError("interface MTU payload must be an object")
+    items = payload.get("interfaces", [])
+    if not isinstance(items, list):
+        raise ValueError("interface MTU interfaces must be a list")
+    seen = set()
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("interface MTU payload entry must be an object")
+        name = item.get("interface_name")
+        if name and name in seen:
+            raise ValueError(f"duplicate interface_name in interface MTU payload: {name}")
+        if name:
+            seen.add(name)
+    return tuple(items)
+
+
 def interface_mtu_reconcile_plan(device, payload: dict):
     """Freeze every MTU overlay save/delete before the first lock or write."""
     from django.utils import timezone
@@ -60,12 +79,11 @@ def _interface_mtu_reconcile_operations(device, payload, planned_at):
     deletes = []
     operations = []
     rows = []
+    items = _validated_interface_items(payload)
     matched_names = set()
 
-    for item in payload.get("interfaces", []):
+    for item in items:
         name = item.get("interface_name")
-        if name in matched_names:
-            continue
         interface = interfaces.get(name)
         if not name or interface is None:
             continue
@@ -115,6 +133,7 @@ def reconcile_interface_mtu(device, payload: dict) -> list:
     from .renderer_writer import active_renderer_writer, renderer_mirror_writes, renderer_writes
     from .signals import suppress_intent_push
 
+    _validated_interface_items(payload)
     active = active_renderer_writer()
     if active is None:
         from django.utils import timezone

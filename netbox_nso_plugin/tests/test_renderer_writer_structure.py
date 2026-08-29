@@ -332,6 +332,18 @@ class TestRendererWriterStructure(SimpleTestCase):
         self.assertEqual(sorted(functions & retired), [])
         self.assertEqual(local_copy_imports, [])
 
+    def test_mtu_inline_edits_delegate_to_an_exact_plan(self):
+        path = Path(__file__).resolve().parents[1] / "views.py"
+        tree = ast.parse(path.read_text(), filename=str(path))
+        target = next(
+            node for node in tree.body if isinstance(node, _FUNCTION_SCOPES) and node.name == "_save_owned_overlay_edit"
+        )
+        calls = {_dotted(node.func) for node in ast.walk(target) if isinstance(node, ast.Call)}
+
+        self.assertIn("_save_owned_interface_mtu_edit", calls)
+        self.assertNotIn("obj.save", calls)
+        self.assertNotIn("iface.save", calls)
+
 
 #: The seams that acquire the locks a caller-owned plan is then consumed under. Entering one
 #: re-pends the scope's deploying rows (``intent_state._repend_locked_rows``).
