@@ -72,3 +72,23 @@ class TestGenerationBarrierViews(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertEqual(response.status_code, 302)
         messages = [str(message) for message in get_messages(response.wsgi_request)]
         self.assertEqual(messages, ["Generation 73 moved. The current blocked head is generation 74."])
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=CFG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_running_action_conflict_names_the_existing_job(self, mock_session, _config):
+        mock_session.return_value = make_session(
+            status_code=409,
+            json_data={
+                "error": {
+                    "code": "conflict",
+                    "message": "An action is already running",
+                    "detail": {"job_id": 902},
+                }
+            },
+        )
+
+        response = self.client.post(self._url("retry"), {"generation_id": 73})
+
+        self.assertEqual(response.status_code, 302)
+        messages = [str(message) for message in get_messages(response.wsgi_request)]
+        self.assertEqual(messages, ["An action is already running. Job ID: 902."])

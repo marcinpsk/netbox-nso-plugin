@@ -24,6 +24,7 @@ keywords = [
 ]
 dependencies = [
     "requests>=2.34.2",
+    "sqlparse>=0.5.0",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",

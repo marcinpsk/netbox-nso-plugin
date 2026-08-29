@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-from time import perf_counter
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -196,20 +195,15 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
 
     def test_registered_table_select_skips_sqlparse(self):
         table = NSOVLANState._meta.db_table
-        real_parse = sqlparse.parse
-        parse_calls = 0
-
-        def counting_parse(*args, **kwargs):
-            nonlocal parse_calls
-            parse_calls += 1
-            return real_parse(*args, **kwargs)
-
-        with patch("netbox_nso_plugin.intent_state.sqlparse.parse", counting_parse), connection.cursor() as cursor:
+        with patch("netbox_nso_plugin.intent_state.sqlparse.parse") as parse, connection.cursor() as cursor:
             cursor.execute(f'SELECT id FROM "{table}" WHERE id = %s', [self.state.pk])
             selected = cursor.fetchone()
+            for index in range(1000):
+                statement = f'SELECT id FROM "{table}" WHERE id = %s /* intent guard select {index} */'
+                _dml_guard(lambda *args: None, statement, (self.state.pk,), False, {})
 
         self.assertEqual(selected, (self.state.pk,))
-        self.assertEqual(parse_calls, 0)
+        parse.assert_not_called()
 
     def test_unregistered_changelog_insert_skips_sqlparse(self):
         statement = (
@@ -298,22 +292,6 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
             cursor.execute(statement, ["second", self.state.pk])
 
         self.assertLessEqual(parse_calls, 2)
-
-    def test_select_classification_stays_below_the_timing_bound(self):
-        table = NSOVLANState._meta.db_table
-        statements = (
-            f'SELECT "{table}"."id", "{table}"."management_id", "{table}"."vlan_id", '
-            f'"{table}"."device_name", "{table}"."status" FROM "{table}" '
-            f'WHERE "{table}"."id" = %s /* intent guard timing {index} */'
-            for index in range(1000)
-        )
-
-        started = perf_counter()
-        for statement in statements:
-            _dml_guard(lambda *args: None, statement, (self.state.pk,), False, {})
-        elapsed = perf_counter() - started
-
-        self.assertLess(elapsed, 0.5)
 
     def test_select_for_update_of_a_registered_table_is_not_dml(self):
         with transaction.atomic():

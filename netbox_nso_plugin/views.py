@@ -3358,8 +3358,11 @@ class _NSOGenerationActionView(NSOActionPermissionMixin, View):
             result = getattr(client, self.client_method)(mgmt.adapter_device_id, generation_id)
         except AdapterError as exc:
             detail = exc.detail if isinstance(exc.detail, dict) else {}
+            running_job_id = detail.get("job_id")
             head_generation_id = detail.get("head_generation_id")
-            if exc.status_code == 409 and type(head_generation_id) is int:
+            if exc.status_code == 409 and type(running_job_id) is int and running_job_id > 0:
+                messages.warning(request, f"An action is already running. Job ID: {running_job_id}.")
+            elif exc.status_code == 409 and type(head_generation_id) is int:
                 messages.warning(
                     request,
                     f"Generation {generation_id} moved. The current blocked head is generation {head_generation_id}.",

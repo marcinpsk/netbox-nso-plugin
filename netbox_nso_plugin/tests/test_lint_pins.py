@@ -22,6 +22,12 @@ PYPROJECT = ROOT / "pyproject.toml"
 UV_LOCK = ROOT / "uv.lock"
 
 
+def test_sqlparse_is_a_runtime_dependency():
+    dependencies = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"]["dependencies"]
+
+    assert any(re.match(r"sqlparse(?:\W|$)", dependency, re.IGNORECASE) for dependency in dependencies)
+
+
 def _workflow_version() -> str:
     found = re.findall(r"ruff==([0-9][^\s\"']*)", WORKFLOW.read_text(encoding="utf-8"))
     assert found, "the lint workflow installs an unpinned ruff"
