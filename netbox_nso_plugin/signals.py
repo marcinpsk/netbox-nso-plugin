@@ -320,14 +320,19 @@ def _schedule_intent_push(key, transitions=()) -> None:
     writer's transaction (O1.2), so by the time there is anything to drain there is a
     commit to wait for.
     """
-    from django.db import transaction
-
     from . import outbox
     from .intent_state import mirror_refresh_is_active
 
     if _is_intent_push_suppressed() or _is_render_request() or mirror_refresh_is_active():
         return  # a reconcile or render write mirrors the adapter; it is not operator intent
     outbox.enqueue(key[0], key[1], transitions=transitions, delete_origin=_DELETE_DISPATCH.get())
+    _schedule_intent_drain(key)
+
+
+def _schedule_intent_drain(key) -> None:
+    """Arrange an on-commit drain for an outbox contribution already appended to *key*."""
+    from django.db import transaction
+
     _pending_intent_keys().add(tuple(key))
     transaction.on_commit(_drain_intent_pushes)
 

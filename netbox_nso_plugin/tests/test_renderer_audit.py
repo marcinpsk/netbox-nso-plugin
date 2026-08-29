@@ -11,7 +11,7 @@ from django.test import TransactionTestCase
 from django.test.utils import CaptureQueriesContext, override_settings
 
 from ._adapter_http import patch_matching_control_state
-from ._outbox_case import in_thread, make_managed, mirror_update, own_route, own_vlan
+from ._outbox_case import ReceiptAdapter, in_thread, make_managed, mirror_update, own_route, own_vlan
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -100,6 +100,33 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
         self.assertEqual(
             contributions,
             [{"kind": "repair", "mark_and": False, "mark_any": False, "transitions": []}],
+        )
+
+    def test_a_repair_schedules_its_contribution_for_immediate_drain(self):
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentRevision
+        from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
+
+        own_vlan(self.management, 1641, "renderer-audit-drain")
+        NSOIntentRevision.objects.filter(device=self.device, scope="vlan").update(verified_revision=None)
+        NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").delete()
+        adapter = ReceiptAdapter()
+        config, session = adapter.patches()
+
+        with config, session:
+            result = audit_renderer_scopes(
+                self.device.pk,
+                ["vlan"],
+                trigger="cadence",
+            )
+
+        self.assertEqual(result.repaired, ("vlan",))
+        self.assertEqual(len(adapter.requests), 1)
+        self.assertFalse(
+            NSOIntentOutboxEntry.objects.filter(
+                device=self.device,
+                scope="vlan",
+                consumed_by_push_seq__isnull=True,
+            ).exists()
         )
 
     def test_signal_less_owned_creation_is_acquired_before_drift_repair(self):
