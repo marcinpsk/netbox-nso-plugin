@@ -254,17 +254,6 @@ def _settlement_decisions(rows_by_scope, validated, unknown_ids, *, static_route
             if disposition == "not_promoted":
                 decisions.append((scope, row, "accepted", "", True))
                 continue
-            if disposition == "settled" and _scope_failed(generation, scope):
-                decisions.append(
-                    (
-                        scope,
-                        row,
-                        "apply_failed",
-                        _failure_message(disposition, row.apply_attempt_id, generation, scope),
-                        False,
-                    )
-                )
-                continue
             if disposition == "settled":
                 if scope == "static_route" and not static_route_feed_drained:
                     continue
@@ -401,7 +390,8 @@ def load_deployment_evidence(management):
         try:
             result = client.trigger_apply(management.adapter_device_id, attempt.pk, attempt.selected)
         except client.AdapterError as exc:
-            _record_replay_answer(attempt, error=exc)
+            if not (exc.status_code == 409 and exc.code == "conflict"):
+                _record_replay_answer(attempt, error=exc)
         else:
             _record_replay_answer(attempt, result=result)
         replayed = True

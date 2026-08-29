@@ -8,6 +8,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from django.test import TestCase
+from django.utils import timezone
 
 from ._adapter_http import make_response
 from ._outbox_case import make_managed, mirror_update, own_vlan
@@ -148,6 +149,36 @@ class TestAttemptSettlement(TestCase):
         self.assertEqual(row.status, "deploying")
         self.assertEqual(row.apply_attempt_id, current_id)
 
+    def test_an_aggregate_scope_failure_does_not_fail_unidentified_rows(self):
+        from netbox_nso_plugin.apply_settlement import settle_apply_attempts
+
+        attempt_id = uuid4()
+        first = self._vlan_row(1633, attempt_id)
+        second = self._vlan_row(1634, attempt_id)
+        mirror_update(first, status="deploying", apply_attempt_id=attempt_id)
+        self._local_attempt(attempt_id, 73, {"vlan": 503})
+        result = {"vlan_count_by_outcome": {"apply_failed": 1, "in_sync": 1}}
+        evidence = _attempt(
+            attempt_id,
+            self.adapter_device_id,
+            73,
+            {"vlan": 503},
+            "settled",
+            result=result,
+        )
+        evidence["generations"][0]["updated_at"] = timezone.now().isoformat()
+
+        settle_apply_attempts(
+            self.management,
+            _payload(self.adapter_device_id, [evidence]),
+            static_route_feed_drained=True,
+        )
+
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertEqual(first.status, "deploying")
+        self.assertEqual(second.status, "deploying")
+
     def test_unknown_evidence_replays_the_identical_request_and_normalizes_the_local_attempt(self):
         from netbox_nso_plugin.apply_settlement import load_deployment_evidence
 
@@ -189,6 +220,105 @@ class TestAttemptSettlement(TestCase):
         local.refresh_from_db()
         self.assertEqual(local.http_status, 202)
         self.assertEqual(local.response, known["response"])
+
+    def test_a_replay_job_conflict_leaves_the_attempt_unanswered(self):
+        from netbox_nso_plugin.apply_settlement import load_deployment_evidence
+
+        attempt_id = uuid4()
+        local = self._local_attempt(attempt_id, 63, {"vlan": 403}, answered=False)
+        unknown = _payload(self.adapter_device_id, [])
+        unknown["unknown_apply_attempt_ids"] = [str(attempt_id)]
+        requests = []
+
+        class ConflictSession:
+            def request(_self, method, url, **kwargs):
+                requests.append((method, url))
+                if url.endswith("/deployment-evidence"):
+                    return make_response(200, unknown)
+                return make_response(
+                    409,
+                    {
+                        "error": {
+                            "code": "conflict",
+                            "message": "A job is already queued or running for this device",
+                            "detail": {"job_id": 900},
+                        }
+                    },
+                )
+
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_CLIENT_CONFIG),
+            patch("netbox_nso_plugin.adapter_client._get_session", return_value=ConflictSession()),
+        ):
+            load_deployment_evidence(self.management)
+
+        self.assertEqual(
+            [url.rsplit("/", 1)[-1] for _method, url in requests],
+            ["deployment-evidence", "apply", "deployment-evidence"],
+        )
+        local.refresh_from_db()
+        self.assertIsNone(local.http_status)
+        self.assertIsNone(local.response)
+
+    def test_a_rowless_lost_no_op_response_is_recovered_by_exact_replay(self):
+        from netbox_nso_plugin.apply_settlement import settle_device_apply_attempts
+
+        attempt_id = uuid4()
+        selected = {"ip": 402}
+        local = self._local_attempt(attempt_id, 62, selected, answered=False)
+        no_op = {
+            "device_id": self.adapter_device_id,
+            "outcome": "no_op",
+            "job_id": None,
+            "selected": selected,
+            "skipped": {"ip": "already_applied"},
+            "skipped_detail": None,
+            "generations": [],
+        }
+        known = {
+            "apply_attempt_id": str(attempt_id),
+            "admission_state": "admitted",
+            "http_status": 200,
+            "response": no_op,
+            "generations": [],
+        }
+        requests = []
+        admitted = False
+
+        class ReplaySession:
+            def request(_self, method, url, **kwargs):
+                nonlocal admitted
+                body = kwargs["json"]
+                requests.append((method, url, body))
+                if url.endswith("/deployment-evidence"):
+                    payload = _payload(self.adapter_device_id, [known] if admitted else [])
+                    payload["unknown_apply_attempt_ids"] = [] if admitted else [str(attempt_id)]
+                    return make_response(200, payload)
+                self.assertTrue(url.endswith("/actions/apply"))
+                self.assertEqual(
+                    body,
+                    {"apply_attempt_id": str(attempt_id), "selected": selected},
+                )
+                admitted = True
+                return make_response(200, no_op)
+
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_CLIENT_CONFIG),
+            patch("netbox_nso_plugin.adapter_client._get_session", return_value=ReplaySession()),
+        ):
+            evidence = settle_device_apply_attempts(
+                self.management,
+                static_route_feed_drained=True,
+            )
+
+        self.assertIsNotNone(evidence)
+        self.assertEqual(
+            [url.rsplit("/", 1)[-1] for _method, url, _body in requests],
+            ["deployment-evidence", "apply", "deployment-evidence"],
+        )
+        local.refresh_from_db()
+        self.assertEqual(local.http_status, 200)
+        self.assertEqual(local.response, no_op)
 
     def test_unknown_generation_status_is_a_non_actionable_contract_error(self):
         from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_apply_attempts
