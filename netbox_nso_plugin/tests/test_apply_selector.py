@@ -2748,7 +2748,11 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
     def test_a_vlan_id_change_keeps_the_old_placeholder_when_the_new_name_is_taken(self):
         from ipam.models import VLAN
 
-        from netbox_nso_plugin.vlan_reconciler import _device_vlan_group, placeholder_vlan_name
+        from netbox_nso_plugin.vlan_reconciler import (
+            _device_vlan_group,
+            placeholder_vlan_name,
+            save_vlan_content,
+        )
 
         old_vid = self.vlan_state.vlan.vid
         new_vid = old_vid + 1
@@ -2766,7 +2770,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         with without_commit_drain(), transaction.atomic():
             vlan = VLAN.objects.get(pk=self.vlan_state.vlan_id)
             vlan.vid = new_vid
-            vlan.save(update_fields=["vid"])
+            save_vlan_content(vlan, update_fields=("vid",))
 
         vlan.refresh_from_db()
         self.assertEqual((vlan.vid, vlan.name), (new_vid, old_placeholder))

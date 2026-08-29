@@ -789,8 +789,20 @@ def save_vlan_content(vlan, *, update_fields):
         and stored.name == placeholder_vlan_name(stored.vid)
         and all(not state.device_name for state in rows["vlan"])
     ):
-        candidate.name = placeholder_vlan_name(candidate.vid)
-        changed_fields.add("name")
+        derived_name = placeholder_vlan_name(candidate.vid)
+        name_taken = (
+            stored.group_id is not None
+            and type(stored).objects.filter(group_id=stored.group_id, name=derived_name).exclude(pk=stored.pk).exists()
+        ) or (
+            stored.qinq_svlan_id is not None
+            and type(stored)
+            .objects.filter(qinq_svlan_id=stored.qinq_svlan_id, name=derived_name)
+            .exclude(pk=stored.pk)
+            .exists()
+        )
+        if not name_taken:
+            candidate.name = derived_name
+            changed_fields.add("name")
     state_candidates = []
     vid_changed = "vid" in changed_fields
     for scope, states in rows.items():
