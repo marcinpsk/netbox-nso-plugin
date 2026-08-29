@@ -2021,7 +2021,6 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
     def test_switchport_accept_rejects_an_overlay_owned_by_the_interfaces_old_device(self):
         from netbox_nso_plugin.intent_state import offline_mutation
         from netbox_nso_plugin.models import NSOSwitchportState
-        from netbox_nso_plugin.views import _reload_switchport_accept_state, _SwitchportAcceptRetry
 
         other_device, _other_management = make_managed("switchport-accept-rescoped", 9379)
         interface = self._create_interface(device=self.device, name="Ethernet9.381", type="1000base-t")
@@ -2030,13 +2029,23 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 management=self.mgmt,
                 interface=interface,
                 mode="access",
+                untagged_vlan=self.vlan_state.vlan,
                 status="imported",
             )
         with transaction.atomic(), offline_mutation():
             Interface.objects.filter(pk=interface.pk).update(device=other_device)
 
-        with self.assertRaises(_SwitchportAcceptRetry):
-            _reload_switchport_accept_state(state, set())
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:switchport_accept", args=[state.pk]),
+        )
+
+        self.assertEqual(response.status_code, 302)
+        state.refresh_from_db()
+        interface.refresh_from_db()
+        self.assertEqual(interface.device_id, other_device.pk)
+        self.assertEqual(interface.mode, "")
+        self.assertIsNone(interface.untagged_vlan_id)
+        self.assertEqual(state.status, "imported")
 
     def test_switchport_accept_retries_a_device_move_during_footprint_acquisition(self):
         import threading
@@ -2091,6 +2100,40 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         interface.refresh_from_db()
         self.assertEqual(interface.device_id, other_device.pk)
         self.assertEqual(state.status, "imported")
+
+    def test_switchport_accept_retries_when_the_interface_vanishes_before_locking(self):
+        from dcim.models import Interface
+
+        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
+        from netbox_nso_plugin.models import NSOSwitchportState
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_delete,
+            renderer_mirror_writes,
+            renderer_writes,
+        )
+        from netbox_nso_plugin.views import _switchport_accept_plan
+
+        interface = Interface.objects.create(device=self.device, name="Ethernet9.379", type="1000base-t")
+        with without_commit_drain(), transaction.atomic():
+            state = NSOSwitchportState.objects.create(
+                management=self.mgmt,
+                interface=interface,
+                mode="access",
+                untagged_vlan=self.vlan_state.vlan,
+                status="changed",
+            )
+        plan, candidate_interface, candidate_state, tagged = _switchport_accept_plan(state)
+        delete_plan = RendererMutationPlan.build(deletes=(planned_delete(interface),))
+        delete_mutation = renderer_writes if delete_plan.changes_content else renderer_mirror_writes
+        with without_commit_drain(), delete_mutation(delete_plan) as writer:
+            writer.delete(interface)
+
+        with self.assertRaisesRegex(IntentMutationProtocolError, r"dcim\.interface row .* disappeared"):
+            with renderer_writes(plan) as writer:
+                writer.save(candidate_interface, update_fields=("mode", "untagged_vlan"))
+                writer.save(candidate_state, update_fields=("status", "accepted_at"))
+                writer.m2m_set(candidate_interface, "tagged_vlans", tagged)
 
     def test_switchport_accept_reloads_vlan_references_after_a_concurrent_rescope(self):
         import threading
