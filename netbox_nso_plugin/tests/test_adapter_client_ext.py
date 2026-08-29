@@ -704,6 +704,29 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_get_scope(self, mock_s, _cfg):
+        from netbox_nso_plugin.adapter_client import get_scope
+
+        session = self._make_session(
+            200,
+            {
+                "device_id": 5,
+                "attributes": ["description"],
+                "auto_apply": True,
+                "sync_before_apply": False,
+            },
+        )
+        mock_s.return_value = session
+
+        result = get_scope(5)
+
+        self.assertEqual(result["attributes"], ["description"])
+        args, _ = session.request.call_args
+        self.assertEqual(args[0], "GET")
+        self.assertTrue(args[1].endswith("/api/v1/devices/5/scope"))
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_get_interfaces(self, mock_s, _cfg):
         from netbox_nso_plugin.adapter_client import get_interfaces
 

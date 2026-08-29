@@ -639,6 +639,11 @@ def set_scope(
     return _request("PUT", f"/api/v1/devices/{adapter_device_id}/scope", json=payload)
 
 
+def get_scope(adapter_device_id):
+    """GET /api/v1/devices/{id}/scope."""
+    return _request("GET", f"/api/v1/devices/{adapter_device_id}/scope")
+
+
 def patch_device(adapter_device_id, nso_instance=None, nso_device_name=None):
     """PATCH /api/v1/devices/{id} — re-key device mapping."""
     payload = {}
