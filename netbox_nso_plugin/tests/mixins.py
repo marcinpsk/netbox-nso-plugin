@@ -114,6 +114,7 @@ def _deliver_scheduled_keys():
             logger.exception("test delivery failed for %s/%s", device_id, scope)
             continue
         NSOIntentOutboxEntry.objects.filter(id__in=entry_ids).update(consumed_by_push_seq=_TEST_DELIVERY_PUSH_SEQ)
+        NSOIntentOutboxState.objects.filter(device_id=device_id, scope=scope).delete()
 
 
 class IntentPushDeliveryMixin(IntentPushResetMixin):

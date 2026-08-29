@@ -252,6 +252,8 @@ class TestTheTestCaseDeliveryDouble(_CascadeFlushMixin, IntentPushResetMixin, Tr
 
         marks = []
         key = (self.device.pk, "vlan")
+        NSOIntentOutboxState.objects.create(device=self.device, scope="vlan")
+        assert NSOIntentOutboxState.objects.filter(device=self.device, scope="vlan").exists()
         for delete_origin in (False, True):
             with transaction.atomic():
                 outbox.enqueue(*key, delete_origin=delete_origin)
