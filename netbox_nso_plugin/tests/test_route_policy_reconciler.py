@@ -1080,6 +1080,24 @@ class TestReconcileRoutePolicy(TestCase):
             NSORoutePolicyState.objects.filter(family="prefix_list", object_name="LGI", is_materialized=True).exists()
         )
 
+    def test_master_reclassification_reuses_the_existing_root(self):
+        from netbox_routing.models import PrefixList, PrefixListEntry
+
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, set_classification
+
+        self._make_mgmt(self.device)
+        reconcile_route_policy(self.device, self._pl_payload("REUSE-ROOT", "198.18.2.0/24"))
+        root = PrefixList.objects.get(name="REUSE-ROOT")
+        set_classification("prefix_list", "REUSE-ROOT", "local")
+        reconcile_route_policy(self.device, self._pl_payload("REUSE-ROOT", "198.18.3.0/24"))
+
+        set_classification("prefix_list", "REUSE-ROOT", "master")
+
+        self.assertEqual(PrefixList.objects.filter(name="REUSE-ROOT").count(), 1)
+        self.assertEqual(PrefixList.objects.get(name="REUSE-ROOT").pk, root.pk)
+        self.assertEqual(PrefixListEntry.objects.filter(prefix_list=root).count(), 1)
+        self.assertEqual(str(PrefixListEntry.objects.get(prefix_list=root).assigned_prefix), "198.18.3.0/24")
+
     def test_classification_preflight_freezes_master_graph_without_writes(self):
         """LOCAL-to-MASTER classification plans the class, graph, and every overlay first."""
         from netbox_routing.models import CustomPrefix, PrefixList, PrefixListEntry
