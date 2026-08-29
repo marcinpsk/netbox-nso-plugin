@@ -604,12 +604,6 @@ def maintain_manifest(instance) -> None:
         "state_model_label": state_model_label,
         "state_key": state_key,
     }
-    base_identity = {
-        "device_id": device_id,
-        "scope": scope,
-        "native_model_label": native_model_label,
-        "native_key": native_key,
-    }
     if sm.is_owned(instance.status):
         from django.db import IntegrityError, transaction
 
@@ -661,18 +655,6 @@ def maintain_manifest(instance) -> None:
         )
         if previous is not None:
             if adopt_manifest(previous.pk, native_key=native_key):
-                return
-        legacy = NSOOwnershipManifest.objects.filter(
-            **base_identity,
-            state_model_label="",
-            state_key={},
-        ).exclude(ownership_state="retired").first()
-        if legacy is not None:
-            if adopt_manifest(
-                legacy.pk,
-                state_model_label=state_model_label,
-                state_key=state_key,
-            ):
                 return
         # The identity read above and this write are two statements, so a peer audit can land
         # the same row in between. get_or_create absorbs that conflict in its own savepoint
@@ -845,8 +827,8 @@ def _demote_overlay(instance, device_id, scope) -> bool:
     from .renderer_writer import consume_renderer_plan
     from .status_machine import is_owned
 
-    # Planned twice on purpose: this pre-pass only derives the lock footprint. The CONSUMED
-    # plan is rebuilt below, after intent_transaction re-pends the deploying rows (#1637).
+    # Planned twice on purpose: this pre-pass only derives the lock footprint. The consumed
+    # plan is rebuilt below after the transaction re-pends the deploying rows.
     *_, footprint_plan = _demotion_plan(instance)
     footprint = MutationFootprint.merge(
         reconcile_family_footprint(device_id, [scope]),
@@ -876,15 +858,7 @@ def _rule_for_manifest(manifest):
 def _native_for_manifest(manifest, rule):
     """Resolve a surviving native row without relying on a cascading relation."""
     model = apps.get_model(manifest.native_model_label)
-    if manifest.native_id is not None:
-        native = model.objects.filter(pk=manifest.native_id).first()
-    else:
-        key_fields = dict(rule.native_key_fields_by_model).get(
-            manifest.native_model_label,
-            rule.native_key_fields,
-        )
-        filters = {name: manifest.native_key.get(name) for name in key_fields}
-        native = model.objects.filter(**filters).first() if filters else None
+    native = model.objects.filter(pk=manifest.native_id).first()
     if native is None:
         return None
     key_fields = dict(rule.native_key_fields_by_model).get(
@@ -903,11 +877,6 @@ def _json_value(value):
     if isinstance(value, (list, tuple)):
         return [_json_value(item) for item in value]
     return str(value)
-
-
-def _manifest_identity_is_complete(manifest) -> bool:
-    """Return whether one manifest can still name its native row and its overlay."""
-    return manifest.native_id is not None and bool(manifest.state_model_label)
 
 
 def _state_filters(manifest, rule, native, management):
@@ -1164,7 +1133,7 @@ def _reown_manifest(manifest, rule, native, *, revoke=True):
         writer.save(candidate, force_insert=True)
         if m2m_writes:
             writer.m2m_set(candidate, "tagged_vlans", tuple(native.tagged_vlans.all()))
-        if revoke and manifest.scope == "static_route" and manifest.native_id is not None:
+        if revoke and manifest.scope == "static_route":
             from . import outbox
 
             carried = manifest.acknowledged_lineage[-1] if manifest.acknowledged_lineage else None
@@ -1664,8 +1633,8 @@ def _retract_manifest(manifest, overlay=None) -> bool:
     # still reads it: without this the contribution authorises a deletion the re-rendered
     # document never asks for. Demoted, not deleted, so operator content survives.
     if overlay is not None:
-        # Planned twice on purpose: this pre-pass only derives the lock footprint. The CONSUMED
-        # plan is rebuilt below, after intent_transaction re-pends the deploying rows (#1637).
+        # Planned twice on purpose: this pre-pass only derives the lock footprint. The consumed
+        # plan is rebuilt below after the transaction re-pends the deploying rows.
         *_, footprint_plan = _demotion_plan(overlay)
         footprint = MutationFootprint.merge(footprint, footprint_plan.lock_footprint)
     with intent_transaction(footprint) as permit:
@@ -1683,8 +1652,6 @@ def _retract_manifest(manifest, overlay=None) -> bool:
         transitions = ()
         delete_origin = True
         if manifest.scope == "static_route":
-            if manifest.native_id is None:
-                raise RuntimeError("a static-route manifest cannot retract without its native id")
             acknowledged = manifest.acknowledged_lineage[-1] if manifest.acknowledged_lineage else None
             transitions = (
                 outbox.delete_transition(
@@ -1742,12 +1709,6 @@ def _manifest_lifecycle_actions(device_id, requested, *, qualifying=None):
         ownership_state="owned",
     ).order_by("pk")
     for manifest in manifests:
-        # 0026/0027 added the native id and state-model columns with no backfill. A row that
-        # carries neither cannot name what it owns, so it is no longer usable evidence: retire
-        # it and let this same audit rebuild the identity from the surviving state.
-        if not _manifest_identity_is_complete(manifest):
-            planned.append((manifest, None, None, None, OwnershipAction.RETIRE))
-            continue
         rule = _rule_for_manifest(manifest)
         if rule is None:
             continue
@@ -1756,7 +1717,7 @@ def _manifest_lifecycle_actions(device_id, requested, *, qualifying=None):
         if native is not None:
             model, filters = _state_filters(manifest, rule, native, management)
             overlay = model.objects.filter(**filters).first()
-        elif manifest.state_model_label:
+        else:
             model, filters = _state_filters_without_native(manifest, rule, management)
             overlay = model.objects.filter(**filters).first()
         native_qualifies = native is not None and (

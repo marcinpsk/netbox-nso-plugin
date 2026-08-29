@@ -185,7 +185,7 @@ def _age_out_unknown_attempt(tombstone) -> bool:
     if age < _UNKNOWN_ATTEMPT_MAX_AGE:
         return False
     logger.warning(
-        "Provision attempt %s is unknown to the adapter after %s — recording it as failed",
+        "Provision attempt %s is unknown to the adapter after %s. Recording it as failed.",
         tombstone.provision_attempt_id,
         age,
     )
@@ -248,7 +248,7 @@ def _complete_terminal_attempt(tombstone) -> bool:
             return _close_tombstone(provision_attempt_id, expected_state="terminal")
 
         # An orphan matches no management row, so the adapter calls below hold the tombstone
-        # fence alone — no device, management, or instance row is locked across them.
+        # fence alone. No device, management, or instance row is locked across them.
         adapter_device_id = tombstone.adapter_device_id
         ambiguous = False
         if adapter_device_id is None:
@@ -295,14 +295,15 @@ def _recover_adapter_device_id(tombstone):
     """Resolve an orphan by logical identity. No match means it is already absent."""
     from . import adapter_client
 
-    inventory = adapter_client.list_devices() or []
+    inventory = adapter_client.list_devices()
     if not isinstance(inventory, list):
         raise _invalid_adapter_response("Adapter device inventory must be a list.")
+    if not all(isinstance(row, dict) for row in inventory):
+        raise _invalid_adapter_response("Adapter device inventory entries must be objects.")
     matches = [
         row
         for row in inventory
-        if isinstance(row, dict)
-        and row.get("nso_instance") == tombstone.nso_instance
+        if row.get("nso_instance") == tombstone.nso_instance
         and row.get("nso_device_name") == tombstone.nso_device_name
         and row.get("netbox_device_id") in (None, tombstone.netbox_device_id)
     ]

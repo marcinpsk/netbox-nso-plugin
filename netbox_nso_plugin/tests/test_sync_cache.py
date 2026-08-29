@@ -743,7 +743,7 @@ class TestReconcileDeviceLinks(_SyncCacheTestBase):
         """A mapping only an operator can repair must not blank 18 baselines every sweep.
 
         Two adapter rows claim this device's logical identity, so the sweep can prove nothing
-        and writes nothing — it flags the row and moves on. Invalidating on the way in made
+        and writes nothing. It flags the row and moves on. Invalidating on the way in made
         that no-op branch throw away every verified fingerprint on the device, every five
         minutes, forcing a full 18-scope repair for as long as the ambiguity lasts.
         """

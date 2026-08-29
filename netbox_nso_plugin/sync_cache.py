@@ -301,12 +301,12 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
     Repairs, all of which re-save the row so the real link path (onboard → scope → sync-notify)
     runs and records its own outcome on the row:
 
-    * *remapped* — our device is present under another id → adopt that id, no onboard needed.
-    * *identity_changed* — our id resolves to a different owner. The NetBox device still ours →
-      arm the source-rekey fence; someone else's → drop the pointer FIRST, so the re-save can
+    * *remapped*: our device is present under another id. Adopt that id, no onboard is needed.
+    * *identity_changed*: our id resolves to a different owner. If the NetBox device is still
+      ours, arm the source-rekey fence. If it belongs to someone else, drop the pointer first, so the re-save can
       never push this device's scope onto theirs. Several adapter rows claiming our identity is
       ambiguous: flag it for the operator and write nothing.
-    * *unmapped* / *deleted* — no live mapping → re-save; the not-found scope push re-onboards it.
+    * *unmapped* / *deleted*: no live mapping. Re-save the row. The not-found scope push re-onboards it.
 
     Returns ``(broken, attempted)``. Attempts are capped at :data:`MAX_RELINKS_PER_RUN`; rows
     over the cap keep an ``adapter_link_error`` so nothing is silently deferred, and the
@@ -356,7 +356,7 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
                 attempted += 1
                 if state is _REMAPPED:
                     logger.warning(
-                        "Adapter device for %s now resolves to id %s (previous mapping: %s) — adopting",
+                        "Adapter device for %s now resolves to id %s (previous mapping: %s). Adopting it.",
                         current.nso_device_name,
                         adapter_device["id"],
                         "none" if current.adapter_device_id is None else current.adapter_device_id,

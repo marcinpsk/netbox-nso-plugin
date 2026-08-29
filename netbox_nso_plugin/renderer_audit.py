@@ -440,7 +440,7 @@ def audit_renderer_fleet() -> RendererFleetAuditResult:
     )
     deadline = _monotonic() + budget
     scopes = tuple(delivery.delivery_keys())
-    # RF3-3's backstop belongs on this five-minute cadence rather than on the hourly job:
+    # The provision backstop belongs on this five-minute cadence rather than on the hourly job:
     # an orphan offboard or a stranded onboard would otherwise wait an hour. It runs before
     # the device loop, which can spend the whole budget, and its failure is not this pass's.
     try:

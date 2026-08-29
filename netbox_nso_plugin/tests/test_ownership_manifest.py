@@ -38,6 +38,14 @@ class TestOwnershipManifestSchema(SimpleTestCase):
             "state_key",
         ) in constraints
 
+    def test_native_and_overlay_identity_fields_are_required(self):
+        from netbox_nso_plugin.models import NSOOwnershipManifest
+
+        fields = {field.name: field for field in NSOOwnershipManifest._meta.fields}
+
+        assert fields["native_id"].null is False
+        assert fields["state_model_label"].blank is False
+
     def test_manifest_carries_ownership_and_deletion_evidence(self):
         from netbox_nso_plugin.models import NSOOwnershipManifest
 
@@ -167,53 +175,6 @@ class TestOwnershipManifestConcurrency(TestCase):
         manifest = NSOOwnershipManifest.objects.get(**identity)
         self.assertTrue(peer.fired)
         self.assertEqual(previous.ownership_state, "retired")
-        self.assertEqual(manifest.native_id, vlan.pk)
-        self.assertTrue(manifest.deletion_authority)
-
-    def test_a_peer_insert_does_not_abort_legacy_manifest_adoption(self):
-        from django.db import connection
-        from ipam.models import VLAN, VLANGroup
-
-        from netbox_nso_plugin.models import NSOOwnershipManifest, NSOVLANState
-        from netbox_nso_plugin.ownership_planner import maintain_manifest, manifest_binding
-
-        from ._outbox_case import make_managed
-
-        device, management = make_managed("ownership-legacy-conflict", 16276)
-        group = VLANGroup.objects.create(name="Ownership legacy conflict", slug=f"nso-{device.pk}")
-        vlan = VLAN.objects.create(group=group, vid=1732, name="ownership-legacy-conflict")
-        state = NSOVLANState.objects.create(
-            management=management,
-            vlan=vlan,
-            device_name=vlan.name,
-            status="accepted",
-        )
-        binding = manifest_binding(state)
-        identity = {
-            "device_id": binding[2],
-            "scope": binding[1],
-            "native_model_label": binding[3],
-            "native_key": binding[5],
-            "state_model_label": binding[6],
-            "state_key": binding[7],
-        }
-        legacy = NSOOwnershipManifest.objects.create(
-            device_id=identity["device_id"],
-            scope=identity["scope"],
-            native_model_label=identity["native_model_label"],
-            native_key=identity["native_key"],
-            native_id=vlan.pk,
-            state_model_label="",
-            state_key={},
-        )
-        peer = _PeerManifestInsert(identity)
-
-        with connection.execute_wrapper(peer):
-            maintain_manifest(state)
-
-        manifest = NSOOwnershipManifest.objects.get(**identity)
-        self.assertTrue(peer.fired)
-        self.assertTrue(NSOOwnershipManifest.objects.filter(pk=legacy.pk).exists())
         self.assertEqual(manifest.native_id, vlan.pk)
         self.assertTrue(manifest.deletion_authority)
 

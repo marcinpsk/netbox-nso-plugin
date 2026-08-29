@@ -455,75 +455,6 @@ class TestSymmetricOwnershipExecutor(TestCase):
         self.assertFalse(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").exists())
         self.assertIn(("vlan", manifest.pk), completed)
 
-    def test_legacy_manifest_signature_is_upgraded_before_lifecycle_execution(self):
-        from netbox_nso_plugin.models import NSOOwnershipManifest
-        from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
-
-        state = own_vlan(self.management, 1714, "ownership-signature-upgrade")
-        manifest = NSOOwnershipManifest.objects.get(device_id=self.device.pk, scope="vlan")
-        NSOOwnershipManifest.objects.filter(pk=manifest.pk).update(
-            native_id=None,
-            state_model_label="",
-            state_key={},
-        )
-
-        reconcile_scope_ownership(self.device.pk, ["vlan"])
-
-        manifest.refresh_from_db()
-        self.assertEqual(manifest.native_id, state.vlan_id)
-        self.assertEqual(manifest.state_model_label, "netbox_nso_plugin.nsovlanstate")
-        self.assertEqual(NSOOwnershipManifest.objects.filter(device_id=self.device.pk, scope="vlan").count(), 1)
-
-    def test_legacy_manifest_without_a_native_id_is_retired_not_raised(self):
-        from netbox_routing.models import StaticRoute
-
-        from netbox_nso_plugin.models import NSOOwnershipManifest
-        from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
-
-        route = own_route(
-            self.management,
-            "198.18.174.0/24",
-            "198.18.0.174",
-            device=self.device,
-        )
-        manifest = NSOOwnershipManifest.objects.get(device_id=self.device.pk, scope="static_route")
-        StaticRoute.objects.filter(pk=route.pk).delete()
-        # The shape migrations 0026/0027 left behind: no native id and no state model.
-        NSOOwnershipManifest.objects.filter(pk=manifest.pk).update(
-            native_id=None,
-            state_model_label="",
-            state_key={},
-        )
-
-        completed = reconcile_scope_ownership(self.device.pk, ["static_route"])
-
-        manifest.refresh_from_db()
-        self.assertEqual(manifest.ownership_state, "retired")
-        self.assertIn(("static_route", manifest.pk), completed)
-
-    def test_legacy_manifest_never_authorises_a_device_deletion(self):
-        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOOwnershipManifest, NSOVLANState
-        from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
-
-        state = own_vlan(self.management, 1717, "ownership-legacy-delete")
-        manifest = NSOOwnershipManifest.objects.get(device_id=self.device.pk, scope="vlan")
-        vlan_id = state.vlan_id
-        NSOVLANState.objects.filter(pk=state.pk).delete()
-        NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").delete()
-        NSOOwnershipManifest.objects.filter(pk=manifest.pk).update(
-            native_id=None,
-            state_model_label="",
-            state_key={},
-        )
-
-        reconcile_scope_ownership(self.device.pk, ["vlan"])
-
-        # A blank identity names nothing the device should delete, so it must not mark one.
-        self.assertFalse(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan", mark_any=True).exists())
-        manifest.refresh_from_db()
-        self.assertEqual((manifest.native_id, manifest.ownership_state), (vlan_id, "owned"))
-        self.assertEqual(manifest.state_model_label, "netbox_nso_plugin.nsovlanstate")
-
     def test_static_route_delete_uses_manifest_id_and_lineage_authority(self):
         from netbox_routing.models import StaticRoute
 
@@ -951,7 +882,7 @@ class TestSymmetricOwnershipExecutor(TestCase):
         self.assertEqual(NSOOwnershipManifest.objects.filter(device_id=self.device.pk).count(), 5)
 
     def test_a_retract_demotes_the_row_its_own_transaction_repended(self):
-        """#1637: a plan frozen before ``intent_transaction`` loses to the transaction's repend.
+        """A plan frozen before ``intent_transaction`` loses to the transaction's repend.
 
         A route whose next hop is an interface never qualifies for ownership, so an owned
         manifest for it retracts on every pass. ``intent_transaction`` re-pends every
@@ -986,7 +917,7 @@ class TestSymmetricOwnershipExecutor(TestCase):
         self.assertEqual((state.status, state.accepted_at), ("imported", None))
 
     def test_a_manifest_less_demotion_survives_its_own_transaction_repend(self):
-        """The same #1637 shape on the record loop's retract, which has no manifest to read."""
+        """The record loop rebuilds the retract plan after its transaction re-pends rows."""
         from dcim.models import Interface
 
         from netbox_nso_plugin.models import NSOInterfaceMtuState, NSOOwnershipManifest

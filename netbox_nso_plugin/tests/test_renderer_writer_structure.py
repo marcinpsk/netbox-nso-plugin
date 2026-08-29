@@ -502,7 +502,7 @@ def _consumers(tree):
 def _stale_plan_source(source, module) -> list:
     """Every ``consume_renderer_plan`` whose plan was frozen before its own locks.
 
-    #1637: entering the transaction re-pends the scope's deploying rows, and
+    Entering the transaction re-pends the scope's deploying rows, and
     ``RendererWriter._find_save`` compares the FULL pre-image, so a plan frozen before the
     ``with`` loses to the very transaction that consumes it. A pre-transaction pass that only
     derives the lock footprint stays legal and is not reported: the rule reads the name the
