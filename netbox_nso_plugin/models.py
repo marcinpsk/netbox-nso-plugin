@@ -334,7 +334,7 @@ class NSOInstance(NetBoxModel):
         from .intent_state import MutationFootprint, SourceRow, intent_transaction
 
         with transaction.atomic():
-            default_ids = tuple(
+            default_ids = frozenset(
                 NSOInstance.objects.filter(is_default=True).exclude(pk=self.pk).values_list("pk", flat=True)
             )
             footprint = MutationFootprint.for_keys(
@@ -346,7 +346,7 @@ class NSOInstance(NetBoxModel):
                 ),
             )
             with intent_transaction(footprint):
-                current_default_ids = tuple(
+                current_default_ids = frozenset(
                     NSOInstance.objects.filter(is_default=True).exclude(pk=self.pk).values_list("pk", flat=True)
                 )
                 if current_default_ids != default_ids:

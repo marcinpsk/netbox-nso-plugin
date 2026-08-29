@@ -133,6 +133,37 @@ class TestNSOInstanceDefault(TestCase):
         only.refresh_from_db()
         self.assertTrue(only.is_default)
 
+    def test_default_revalidation_ignores_database_row_order(self):
+        from django.db import connection
+
+        from netbox_nso_plugin.models import NSOInstance
+
+        first = self._make("first")
+        second = self._make("second")
+        third = self._make("third")
+        NSOInstance.objects.filter(pk__in=(first.pk, second.pk)).update(is_default=True)
+        calls = 0
+
+        def alternate_order(execute, sql, params, many, context):
+            nonlocal calls
+            if (
+                calls < 2
+                and sql.lstrip().startswith(f'SELECT "{NSOInstance._meta.db_table}"."id" AS "pk"')
+                and '"is_default"' in sql
+            ):
+                calls += 1
+                direction = "ASC" if calls == 1 else "DESC"
+                sql = sql.replace(
+                    f'ORDER BY "{NSOInstance._meta.db_table}"."name" ASC',
+                    f'ORDER BY "{NSOInstance._meta.db_table}"."id" {direction}',
+                )
+            return execute(sql, params, many, context)
+
+        with connection.execute_wrapper(alternate_order):
+            third.save()
+
+        self.assertEqual(calls, 2)
+
 
 class TestNSODeviceManagementModelMethods(TestCase):
     """Tests for NSODeviceManagement model methods using real DB fixtures."""
