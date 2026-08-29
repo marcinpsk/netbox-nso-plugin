@@ -810,6 +810,26 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         assert results[0]["armed"] == 1
         assert results[0]["armed_rolled_back"] == 1
 
+    def test_a_stale_restore_plan_logs_the_row_left_armed(self):
+        from netbox_nso_plugin.intent_drift import (
+            _backfill_static_route_generations,
+            _restore_static_route_generations,
+        )
+        from netbox_nso_plugin.renderer_writer import IntentPlanStaleError
+
+        _, mgmt = self._managed_device("stale-restore-log", 8112)
+        state = self._own_route(mgmt, "198.18.84.0/24", "198.18.0.84")
+        before = _backfill_static_route_generations(mgmt)
+
+        with (
+            patch("netbox_nso_plugin.renderer_writer.renderer_writes", side_effect=IntentPlanStaleError),
+            self.assertLogs("netbox_nso_plugin.intent_drift", level="WARNING") as logged,
+        ):
+            restored = _restore_static_route_generations(before)
+
+        self.assertEqual(restored, 0)
+        self.assertTrue(any(str(state.pk) in message and "stale" in message for message in logged.output))
+
     def test_an_unacknowledged_push_restores_the_demoted_deploying_identity(self):
         """The demotion clears ``apply_attempt_id``, so the rollback has to put it back.
 
