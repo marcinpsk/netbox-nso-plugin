@@ -10,6 +10,7 @@ from django.db.utils import OperationalError
 from django.test import TransactionTestCase
 from django.test.utils import CaptureQueriesContext, override_settings
 
+from ._adapter_http import patch_matching_control_state
 from ._outbox_case import in_thread, make_managed, mirror_update, own_route, own_vlan
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
@@ -44,17 +45,7 @@ def own_redistribution(management, dest_protocol, source_protocol):
 class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     def setUp(self):
         super().setUp()
-        adapter_patches = (
-            patch("netbox_nso_plugin.adapter_client.get_device", return_value={"failover": None}),
-            patch(
-                "netbox_nso_plugin.adapter_client.get_scope",
-                return_value={"attributes": [], "auto_apply": False, "sync_before_apply": True},
-            ),
-            patch("netbox_nso_plugin.adapter_client.set_scope", return_value={}),
-        )
-        for adapter_patch in adapter_patches:
-            adapter_patch.start()
-            self.addCleanup(adapter_patch.stop)
+        patch_matching_control_state(self)
         self.device, self.management = make_managed("renderer-audit", 16270)
 
     def test_unknown_baseline_repairs_once_and_demotes_stale_lifecycle(self):

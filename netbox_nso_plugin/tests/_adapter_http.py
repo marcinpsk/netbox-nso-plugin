@@ -18,7 +18,7 @@ body makes ``.json()`` raise a real ``JSONDecodeError``, exactly as in prod.
 """
 
 import json as _json
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import requests
 
@@ -63,3 +63,18 @@ def make_session(status_code=200, json_data=None, content=None, response=None):
         response = make_response(status_code, json_data, content)
     session.request.return_value = response
     return session
+
+
+def patch_matching_control_state(test_case):
+    """Patch the adapter boundary with an empty control state that matches default management."""
+    patchers = (
+        patch("netbox_nso_plugin.adapter_client.get_device", return_value={"failover": None}),
+        patch(
+            "netbox_nso_plugin.adapter_client.get_scope",
+            return_value={"attributes": [], "auto_apply": False, "sync_before_apply": True},
+        ),
+        patch("netbox_nso_plugin.adapter_client.set_scope", return_value={}),
+    )
+    for patcher in patchers:
+        patcher.start()
+        test_case.addCleanup(patcher.stop)
