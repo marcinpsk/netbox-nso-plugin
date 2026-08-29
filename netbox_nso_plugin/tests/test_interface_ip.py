@@ -676,15 +676,15 @@ class TestInterfaceIPInlineEdit(IntentPushResetMixin, TestCase):
     def test_edit_refuses_a_native_address_reassigned_before_acquisition(self):
         from netbox_nso_plugin import views
 
-        original_footprint = views._ip_edit_footprint
+        original_plan = views._ip_edit_plan_and_operations
 
-        def reassign_after_discovery(updates):
-            footprint = original_footprint(updates)
+        def reassign_after_discovery(updates, planned_at):
+            planned = original_plan(updates, planned_at)
             self.local_ip.assigned_object = self.peer
             self.local_ip.save()
-            return footprint
+            return planned
 
-        with patch.object(views, "_ip_edit_footprint", new=reassign_after_discovery):
+        with patch.object(views, "_ip_edit_plan_and_operations", new=reassign_after_discovery):
             response = self.client.post(self._url(), {"address": "198.18.20.2/31"})
 
         self.assertEqual(response.status_code, 400, response.content)
@@ -694,6 +694,28 @@ class TestInterfaceIPInlineEdit(IntentPushResetMixin, TestCase):
         self.assertEqual(self.local_ip.assigned_object, self.peer)
         self.assertEqual(str(self.local_ip.address), "198.18.20.0/31")
         self.assertEqual(self.local_state.address, "198.18.20.0/31")
+
+    def test_edit_schedules_the_ip_snapshot_after_write_suppression(self):
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.signals import _is_intent_push_suppressed
+
+        management = NSODeviceManagement.objects.get(device=self.device_a)
+        management.adapter_device_id = 1627
+        management.save(update_fields=["adapter_device_id"])
+
+        suppression_states = []
+        with patch(
+            "netbox_nso_plugin.signals._schedule_intent_push",
+            side_effect=lambda _key: suppression_states.append(_is_intent_push_suppressed()),
+        ):
+            response = self.client.post(
+                self._url(),
+                {"address": "198.18.20.2/31"},
+                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(suppression_states, [False])
 
     def test_unchanged_prefilled_peer_is_not_modified(self):
         """The real two-field popover always submits the displayed peer value.

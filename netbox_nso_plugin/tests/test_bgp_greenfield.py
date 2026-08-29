@@ -423,6 +423,18 @@ class TestBgpPeerAddView(BgpGreenfieldBase):
         routing_perm.users.add(user)
         self.client.force_login(User.objects.get(pk=user.pk))  # drop the cached permission set
 
+        self.assertEqual(self.client.get(url).status_code, 403, "peer permission alone must not mint its graph")
+
+        from netbox_routing.models import BGPAddressFamily, BGPPeerAddressFamily
+
+        routing_perm.object_types.add(
+            *(
+                ObjectType.objects.get_for_model(model)
+                for model in (BGPRouter, BGPScope, BGPAddressFamily, BGPPeerAddressFamily)
+            )
+        )
+        self.client.force_login(User.objects.get(pk=user.pk))
+
         self.assertEqual(self.client.get(url).status_code, 200, "both permissions together must open it")
 
 
