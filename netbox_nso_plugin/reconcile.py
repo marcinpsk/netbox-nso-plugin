@@ -1600,13 +1600,20 @@ def enqueue_provision_tombstone_sweep(provision_attempt_id):
         import django_rq
     except ImportError:  # pragma: no cover - RQ ships with NetBox
         logger.warning("django_rq unavailable; sweeping provision attempt %s inline", provision_attempt_id)
-        run_provision_tombstone_sweep(provision_attempt_id)
+        try:
+            run_provision_tombstone_sweep(provision_attempt_id)
+        except Exception:  # noqa: BLE001 - the cadence sweep is the retry clock
+            logger.exception("Inline provision tombstone sweep failed for attempt %s", provision_attempt_id)
         return None
 
-    queue = django_rq.get_queue(_RECONCILE_QUEUE)
-    return queue.enqueue(
-        run_provision_tombstone_sweep,
-        provision_attempt_id,
-        result_ttl=300,
-        job_timeout=300,
-    )
+    try:
+        queue = django_rq.get_queue(_RECONCILE_QUEUE)
+        return queue.enqueue(
+            run_provision_tombstone_sweep,
+            provision_attempt_id,
+            result_ttl=300,
+            job_timeout=300,
+        )
+    except Exception:  # noqa: BLE001 - the cadence sweep is the retry clock
+        logger.exception("Could not enqueue provision tombstone sweep for attempt %s", provision_attempt_id)
+        return None

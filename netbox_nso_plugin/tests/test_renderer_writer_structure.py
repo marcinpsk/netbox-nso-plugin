@@ -401,6 +401,68 @@ def _plan_names(nodes, builders) -> set:
     return bound
 
 
+def _direct_bindings(node):
+    """Bindings made by one statement, excluding its nested statement bodies."""
+    if isinstance(node, ast.Assign):
+        yield node.targets, node.value
+    elif isinstance(node, ast.AnnAssign) and node.value is not None:
+        yield [node.target], node.value
+    elif isinstance(node, (ast.For, ast.AsyncFor)):
+        yield [node.target], node.iter
+    elif isinstance(node, (ast.With, ast.AsyncWith)):
+        for item in node.items:
+            if item.optional_vars is not None:
+                yield [item.optional_vars], item.context_expr
+
+
+def _direct_plan_names(nodes, builders) -> set:
+    """Plan names bound directly by these statements, aliases included."""
+    bound: set[str] = set()
+    for _ in range(_BUILDER_PASSES):
+        for node in nodes:
+            for targets, value in _direct_bindings(node):
+                if not _builds_a_plan(value, builders) and _root_name(value) not in bound:
+                    continue
+                for target in targets:
+                    elements = target.elts if isinstance(target, (ast.Tuple, ast.List)) else [target]
+                    bound.update(element.id for element in elements if isinstance(element, ast.Name))
+    return bound
+
+
+def _statement_bodies(statement):
+    """Yield nested statement lists owned by one compound statement."""
+    for name in ("body", "orelse", "finalbody"):
+        body = getattr(statement, name, None)
+        if body:
+            yield body
+    for handler in getattr(statement, "handlers", ()):
+        if handler.body:
+            yield handler.body
+    for case in getattr(statement, "cases", ()):
+        if case.body:
+            yield case.body
+
+
+def _contains_node(statement, target) -> bool:
+    return any(node is target for node in ast.walk(statement))
+
+
+def _statements_before(body, target):
+    """Return direct bindings that dominate target along its enclosing statement path."""
+    preceding = []
+    for index, statement in enumerate(body):
+        if not _contains_node(statement, target):
+            continue
+        preceding.extend(body[:index])
+        preceding.append(statement)
+        for nested in _statement_bodies(statement):
+            if any(_contains_node(child, target) for child in nested):
+                preceding.extend(_statements_before(nested, target))
+                break
+        return preceding
+    return preceding
+
+
 def _plan_builders(tree) -> set:
     """``RendererMutationPlan.build`` plus every module-local helper that returns its result."""
     builders = {_PLAN_BUILDER}
@@ -437,7 +499,7 @@ def _consumers(tree):
     ]
 
 
-def _stale_plan_sites(path, module) -> list:
+def _stale_plan_source(source, module) -> list:
     """Every ``consume_renderer_plan`` whose plan was frozen before its own locks.
 
     #1637: entering the transaction re-pends the scope's deploying rows, and
@@ -450,21 +512,25 @@ def _stale_plan_sites(path, module) -> list:
     ``repend_after=True``, so the repend lands after the body and cannot invalidate a plan
     built before the call. Only a CALLER-owned lock context has that hazard.
     """
-    tree = ast.parse(path.read_text(), filename=str(path))
+    tree = ast.parse(source, filename=module)
     builders = _plan_builders(tree)
     pending = _consumers(tree)
     offenders = []
     for statement in _lock_contexts(tree):
         inside = {node for item in statement.body for node in ast.walk(item)}
-        bound = _plan_names(statement.body, builders)
         for call in [node for node in pending if node in inside]:
             pending.remove(call)
             plan = call.args[0]
+            bound = _direct_plan_names(_statements_before(statement.body, call), builders)
             if not _builds_a_plan(plan, builders) and _root_name(plan) not in bound:
                 offenders.append((module, ast.unparse(plan), call.lineno))
     # A consumer that no lock context encloses at all has no locks to be planned under.
     offenders.extend((module, ast.unparse(call.args[0]), call.lineno) for call in pending)
     return offenders
+
+
+def _stale_plan_sites(path, module) -> list:
+    return _stale_plan_source(path.read_text(), module)
 
 
 class TestPlansAreBuiltUnderTheLocksThatConsumeThem(SimpleTestCase):
@@ -474,6 +540,21 @@ class TestPlansAreBuiltUnderTheLocksThatConsumeThem(SimpleTestCase):
             offenders.extend(_stale_plan_sites(path, relative))
 
         self.assertEqual(sorted(offenders), [])
+
+    def test_a_later_rebuild_does_not_authorize_an_earlier_stale_plan(self):
+        source = """
+def repair():
+    plan = RendererMutationPlan.build()
+    with intent_transaction(footprint):
+        with consume_renderer_plan(plan, permit):
+            repair_row()
+        plan = RendererMutationPlan.build()
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 5)],
+        )
 
     def test_the_guard_still_reaches_the_call_sites_it_polices(self):
         """A rule that resolves nothing passes for free, so pin what it actually reads."""

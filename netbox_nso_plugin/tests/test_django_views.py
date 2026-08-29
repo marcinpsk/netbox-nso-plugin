@@ -379,14 +379,40 @@ class TestOnboardStatusView(ViewTestBase):
         self.assertEqual(resp.json()["status"], "provision_failed")
         self.assertEqual(resp.json()["error"], "earlier failure")
 
-    @patch("netbox_nso_plugin.adapter_client.get_provision_attempt", side_effect=AdapterError("receipt pending"))
-    def test_missing_job_receipt_stays_retryable(self, _attempt):
-        """An attempt with no admitted job receipt remains open for recovery."""
+    @patch(
+        "netbox_nso_plugin.adapter_client.get_provision_attempt",
+        return_value={"status": "running", "job_id": "99"},
+    )
+    def test_missing_job_receipt_adopts_the_admitted_job_and_stays_open(self, _attempt):
+        """An attempt with no admitted job receipt records the adapter's job id."""
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+
         mgmt = self._provisioning_mgmt("prov-nojob", job_id="")
         resp = self._post_status(mgmt)
         self.assertEqual(resp.json()["status"], "provisioning")
         mgmt.refresh_from_db()
         self.assertEqual(mgmt.onboard_status, "provisioning")
+        tombstone = NSOProvisionTombstone.objects.get(netbox_device_id=mgmt.device_id)
+        self.assertEqual(tombstone.adapter_job_id, "99")
+        self.assertEqual(tombstone.state, "open")
+
+    @patch(
+        "netbox_nso_plugin.adapter_client.get_provision_attempt",
+        return_value={"status": "running", "job_id": "99"},
+    )
+    def test_conflicting_job_receipt_stays_retryable(self, _attempt):
+        """A conflicting adapter receipt is a retryable invalid response, not a server error."""
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+
+        mgmt = self._provisioning_mgmt("prov-job-conflict", job_id="71")
+        resp = self._post_status(mgmt)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["status"], "provisioning")
+        self.assertIn("poll_error", resp.json())
+        tombstone = NSOProvisionTombstone.objects.get(netbox_device_id=mgmt.device_id)
+        self.assertEqual(tombstone.adapter_job_id, "71")
+        self.assertEqual(tombstone.state, "open")
 
     @patch("netbox_nso_plugin.adapter_client.get_provision_attempt", side_effect=AdapterError("adapter down"))
     def test_transient_adapter_error_keeps_provisioning(self, _attempt):

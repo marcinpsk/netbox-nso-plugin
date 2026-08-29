@@ -3,6 +3,7 @@
 """Tests for the off-request reconcile job and the sync-complete callback endpoint."""
 
 import os
+import sys
 from contextlib import contextmanager
 from unittest.mock import ANY, patch
 from uuid import uuid4
@@ -18,6 +19,34 @@ from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
 
 from ._outbox_case import without_commit_drain
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin, isolate_other_scopes
+
+
+class TestProvisionTombstoneEnqueue(TestCase):
+    def test_inline_sweep_failure_is_left_for_the_cadence_retry(self):
+        from netbox_nso_plugin.reconcile import enqueue_provision_tombstone_sweep
+
+        attempt_id = uuid4()
+        with (
+            patch.dict(sys.modules, {"django_rq": None}),
+            patch(
+                "netbox_nso_plugin.reconcile.run_provision_tombstone_sweep",
+                side_effect=RuntimeError("sweep unavailable"),
+            ),
+        ):
+            result = enqueue_provision_tombstone_sweep(attempt_id)
+
+        self.assertIsNone(result)
+
+    def test_queue_failure_is_left_for_the_cadence_retry(self):
+        from netbox_nso_plugin.reconcile import enqueue_provision_tombstone_sweep
+
+        attempt_id = uuid4()
+        with patch("django_rq.get_queue") as get_queue:
+            get_queue.return_value.enqueue.side_effect = RuntimeError("queue unavailable")
+
+            result = enqueue_provision_tombstone_sweep(attempt_id)
+
+        self.assertIsNone(result)
 
 
 def _make_device(name="rec-dev"):
@@ -332,6 +361,27 @@ class TestProvisionCompleteEndpoint(APITestCase):
         tombstone.refresh_from_db()
         self.assertEqual(tombstone.state, "open")
         self.assertIsNone(tombstone.terminal_evidence)
+        enqueue.assert_not_called()
+
+    def test_conflicting_job_receipt_returns_400(self):
+        tombstone = self._tombstone("79")
+
+        with patch("netbox_nso_plugin.reconcile.enqueue_provision_tombstone_sweep") as enqueue:
+            response = self.client.post(
+                self._url(),
+                {
+                    "provision_attempt_id": str(tombstone.provision_attempt_id),
+                    "status": "failed",
+                    "job_id": 80,
+                    "error": {"code": "provision_failed"},
+                },
+                format="json",
+                **self.header,
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        tombstone.refresh_from_db()
+        self.assertEqual(tombstone.state, "open")
         enqueue.assert_not_called()
 
     def test_unknown_attempt_is_acked_without_enqueue(self):

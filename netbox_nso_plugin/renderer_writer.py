@@ -546,13 +546,19 @@ def _materialize_field_update_rows(rows):
     return type(materialized[0]), materialized
 
 
-def _collector_writes(instance):
+def _append_deleted_overlay(deleted_overlays, row):
+    if row._meta.label_lower in OVERLAY_MODEL_RANKS:
+        deleted_overlays.append(row)
+
+
+def _collector_closure(instance):
     from django.db.models.deletion import Collector
 
     collector = Collector(using=instance._state.db or "default", origin=instance)
     collector.collect([instance])
     root_identity = (instance._meta.label_lower, instance.pk)
     writes = []
+    deleted_overlays = []
     footprints = []
     changed_keys = set()
     specs = renderer_input_specs()
@@ -570,6 +576,7 @@ def _collector_writes(instance):
 
     for model, rows in collector.data.items():
         for row in sorted(rows, key=lambda instance: instance.pk):
+            _append_deleted_overlay(deleted_overlays, row)
             writes.append(
                 RendererWrite(
                     operation="delete",
@@ -582,6 +589,7 @@ def _collector_writes(instance):
             record_change(row, None)
     for queryset in collector.fast_deletes:
         for row in queryset.order_by("pk"):
+            _append_deleted_overlay(deleted_overlays, row)
             writes.append(
                 RendererWrite(
                     operation="delete",
@@ -614,7 +622,12 @@ def _collector_writes(instance):
                     field.delete_cached_value(after)
                 record_change(row, after)
     footprint = MutationFootprint.merge(*footprints) if footprints else MutationFootprint()
-    return tuple(writes), footprint, changed_keys
+    return tuple(writes), tuple(deleted_overlays), footprint, changed_keys
+
+
+def _collector_writes(instance):
+    writes, _deleted_overlays, footprint, changed_keys = _collector_closure(instance)
+    return writes, footprint, changed_keys
 
 
 def _plan_delete(proposed: RendererDelete):
@@ -1127,7 +1140,7 @@ class RendererWriter:
         current = type(instance)._default_manager.filter(pk=instance.pk).first()
         if current is None or not self._fields_match(root_write.before_values, current):
             raise IntentPlanStaleError(f"{root_write.model_label} row {root_write.pk!r} changed after planning")
-        closure, _footprint, _changed_keys = _collector_writes(current)
+        closure, deleted_overlays, _footprint, _changed_keys = _collector_closure(current)
         matched = []
         available = [candidate for candidate in range(len(self.plan.write_set)) if candidate not in self._consumed]
         for expected in closure:
@@ -1141,9 +1154,12 @@ class RendererWriter:
             available.remove(candidate)
         if len(matched) != len(closure) or index not in matched:
             raise IntentMutationProtocolError("the planned Collector cascade changed before delete")
+        for overlay in deleted_overlays:
+            _retire_overlay_manifest(overlay)
         with self._operation(index):
             result = instance.delete()
-        _retire_overlay_manifest(current)
+        if current._meta.label_lower not in OVERLAY_MODEL_RANKS:
+            _retire_overlay_manifest(current)
         self._consumed.update(matched)
         return result
 

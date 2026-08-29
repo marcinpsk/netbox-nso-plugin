@@ -21,6 +21,12 @@ _FLEET_SWEEP_LIMIT = 100
 _UNKNOWN_ATTEMPT_MAX_AGE = timedelta(hours=6)
 
 
+def _invalid_adapter_response(message):
+    from .adapter_client import AdapterError
+
+    return AdapterError(message, code="invalid_response")
+
+
 def validate_provision_evidence(evidence, *, terminal_required=False) -> dict:
     """Validate the shared adapter and callback provision-evidence contract."""
     if not isinstance(evidence, dict):
@@ -60,7 +66,7 @@ def _record_open_job_id(tombstone, evidence) -> None:
     if not adapter_job_id:
         return
     if tombstone.adapter_job_id not in ("", adapter_job_id):
-        raise ValueError("provision receipt job_id does not match the admitted job")
+        raise _invalid_adapter_response("Provision receipt job_id does not match the admitted job.")
     NSOProvisionTombstone.objects.filter(
         provision_attempt_id=tombstone.provision_attempt_id,
         state="open",
@@ -83,7 +89,7 @@ def mark_provision_terminal(provision_attempt_id, evidence: dict) -> bool:
         state="open",
     )
     if adapter_job_id and open_attempt.exclude(adapter_job_id__in=("", adapter_job_id)).exists():
-        raise ValueError("provision evidence job_id does not match the admitted job")
+        raise _invalid_adapter_response("Provision evidence job_id does not match the admitted job.")
     updates = {
         "state": "terminal",
         "terminal_status": terminal_status,
@@ -291,7 +297,7 @@ def _recover_adapter_device_id(tombstone):
 
     inventory = adapter_client.list_devices() or []
     if not isinstance(inventory, list):
-        raise ValueError("adapter device inventory must be a list")
+        raise _invalid_adapter_response("Adapter device inventory must be a list.")
     matches = [
         row
         for row in inventory
@@ -306,7 +312,7 @@ def _recover_adapter_device_id(tombstone):
         return None, False
     adapter_device_id = matches[0].get("id")
     if type(adapter_device_id) is not int or adapter_device_id <= 0:
-        raise ValueError("adapter device inventory has an invalid id")
+        raise _invalid_adapter_response("Adapter device inventory has an invalid id.")
     return adapter_device_id, False
 
 

@@ -611,6 +611,8 @@ def maintain_manifest(instance) -> None:
         "native_key": native_key,
     }
     if sm.is_owned(instance.status):
+        from django.db import IntegrityError, transaction
+
         lineage = (
             getattr(instance, rule.acknowledged_lineage_field, None)
             if rule.acknowledged_lineage_field is not None
@@ -623,6 +625,16 @@ def maintain_manifest(instance) -> None:
         }
         if lineage is not None:
             defaults["acknowledged_lineage"] = [copy.deepcopy(lineage)]
+
+        def adopt_manifest(pk, **changes):
+            """Update one reusable row without letting a peer insert abort this transaction."""
+            try:
+                with transaction.atomic():
+                    NSOOwnershipManifest.objects.filter(pk=pk).update(**changes, **defaults)
+            except IntegrityError:
+                return False
+            return True
+
         incarnation = {
             "device_id": device_id,
             "scope": scope,
@@ -648,23 +660,20 @@ def maintain_manifest(instance) -> None:
             .first()
         )
         if previous is not None:
-            NSOOwnershipManifest.objects.filter(pk=previous.pk).update(
-                native_key=native_key,
-                **defaults,
-            )
-            return
+            if adopt_manifest(previous.pk, native_key=native_key):
+                return
         legacy = NSOOwnershipManifest.objects.filter(
             **base_identity,
             state_model_label="",
             state_key={},
         ).exclude(ownership_state="retired").first()
         if legacy is not None:
-            NSOOwnershipManifest.objects.filter(pk=legacy.pk).update(
+            if adopt_manifest(
+                legacy.pk,
                 state_model_label=state_model_label,
                 state_key=state_key,
-                **defaults,
-            )
-            return
+            ):
+                return
         # The identity read above and this write are two statements, so a peer audit can land
         # the same row in between. get_or_create absorbs that conflict in its own savepoint
         # instead of aborting the enclosing mirror transaction.
@@ -804,9 +813,9 @@ def _device_overlays(device_id, requested):
             yield instance
 
 
-def _manifest_record_actions(device_id, requested):
+def _manifest_record_actions(device_id, requested, *, qualifying=None):
     """Return the owned overlays whose durable manifest evidence needs work."""
-    qualifying = _qualifying_overlay_signatures(device_id, requested)
+    qualifying = _qualifying_overlay_signatures(device_id, requested) if qualifying is None else qualifying
     manifest_states = _manifest_states(device_id, requested)
     planned = []
     for instance in _device_overlays(device_id, requested):
@@ -927,6 +936,40 @@ def _state_filters(manifest, rule, native, management):
         )
     else:
         filters[native_field] = native
+    return model, filters
+
+
+def _state_filters_without_native(manifest, rule, management):
+    """Resolve a durable overlay identity after its native row disappeared."""
+    model = apps.get_model(manifest.state_model_label)
+    native_field = dict(rule.overlay_native_fields)[model._meta.label_lower]
+    fields = {field.name for field in model._meta.concrete_fields}
+    filters = dict(manifest.state_key)
+    if "management" in fields:
+        filters["management"] = management
+    if native_field == "__self__":
+        filters["pk"] = manifest.native_id
+    elif native_field == "__ip_address__":
+        from ipam.models import VRF
+
+        vrf_id = manifest.native_key.get("vrf_id")
+        vrf = VRF.objects.filter(pk=vrf_id).values_list("name", flat=True).first() if vrf_id else ""
+        filters.update(
+            interface_id=manifest.native_key.get("assigned_object_id"),
+            address=manifest.native_key.get("address"),
+            vrf=vrf or "",
+        )
+    elif native_field == "__ospf_interface__":
+        filters["interface_id"] = manifest.native_key.get("interface_id")
+    elif native_field == "assigned_object":
+        from django.contrib.contenttypes.models import ContentType
+
+        filters.update(
+            content_type=ContentType.objects.get_for_model(apps.get_model(manifest.native_model_label)),
+            object_id=manifest.native_id,
+        )
+    else:
+        filters[f"{native_field}_id"] = manifest.native_id
     return model, filters
 
 
@@ -1460,13 +1503,14 @@ def _native_bindings(management, requested):
     return tuple(bindings)
 
 
-def _qualifying_overlay_signatures(device_id, requested):
+def _qualifying_overlay_signatures(device_id, requested, *, management=None, bindings=None):
     """Return the exact native bindings that qualify for ownership."""
     from .models import NSODeviceManagement
 
-    management = NSODeviceManagement.objects.filter(device_id=device_id).first()
+    management = management or NSODeviceManagement.objects.filter(device_id=device_id).first()
     if management is None:
         return frozenset()
+    bindings = _native_bindings(management, requested) if bindings is None else bindings
     return frozenset(
         (
             scope,
@@ -1475,45 +1519,117 @@ def _qualifying_overlay_signatures(device_id, requested):
             state_model_label,
             json.dumps(state_key, sort_keys=True),
         )
-        for scope, native, state_model_label, state_key in _native_bindings(management, requested)
+        for scope, native, state_model_label, state_key in bindings
     )
 
 
-def _native_create_actions(device_id, requested):
+def _manifest_lookup_key(identity):
+    """Return one hashable manifest identity."""
+    return (
+        identity["device_id"],
+        identity["scope"],
+        identity["native_model_label"],
+        json.dumps(identity["native_key"], sort_keys=True),
+        identity["state_model_label"],
+        json.dumps(identity["state_key"], sort_keys=True),
+    )
+
+
+def _normalized_overlay_filter(model, filters):
+    """Return database field names and values for one exact overlay filter."""
+    normalized = []
+    for name, value in sorted(filters.items()):
+        field = model._meta.get_field(name)
+        if field.is_relation and hasattr(value, "pk"):
+            value = value.pk
+        normalized.append((field.attname, value))
+    return tuple(normalized)
+
+
+def _present_overlay_identities(device_id, management, prepared):
+    """Read every candidate state model once and return identities that exist."""
+    from django.db.models import Q
+
+    grouped = {}
+    for identity_key, model, filters in prepared:
+        group = grouped.setdefault(model, {"filters": Q(), "expected": {}})
+        group["filters"] |= Q(**filters)
+        normalized = _normalized_overlay_filter(model, filters)
+        fields = tuple(name for name, _value in normalized)
+        values = tuple(value for _name, value in normalized)
+        group["expected"].setdefault(fields, {}).setdefault(values, set()).add(identity_key)
+
+    present = set()
+    for model, group in grouped.items():
+        field_names = {field.name for field in model._meta.concrete_fields}
+        queryset = model.objects.all()
+        if "management" in field_names:
+            queryset = queryset.filter(management=management)
+        elif "interface" in field_names:
+            queryset = queryset.filter(interface__device_id=device_id)
+        else:
+            queryset = queryset.filter(group["filters"])
+        selected = sorted({name for fields in group["expected"] for name in fields})
+        for row in queryset.values(*selected):
+            for fields, expected in group["expected"].items():
+                present.update(expected.get(tuple(row[name] for name in fields), ()))
+    return present
+
+
+def _native_create_actions(device_id, requested, *, management=None, bindings=None):
     """Return native-only objects whose reviewed rule can construct an overlay."""
     from .models import NSODeviceManagement, NSOOwnershipManifest
 
-    management = NSODeviceManagement.objects.filter(device_id=device_id).first()
+    management = management or NSODeviceManagement.objects.filter(device_id=device_id).first()
     if management is None:
         return ()
-    planned = []
-    for scope, native, state_model_label, state_key in _native_bindings(management, requested):
+    bindings = _native_bindings(management, requested) if bindings is None else bindings
+    manifests = {
+        _manifest_lookup_key(
+            {
+                "device_id": manifest.device_id,
+                "scope": manifest.scope,
+                "native_model_label": manifest.native_model_label,
+                "native_key": manifest.native_key,
+                "state_model_label": manifest.state_model_label,
+                "state_key": manifest.state_key,
+            }
+        ): manifest.ownership_state
+        for manifest in NSOOwnershipManifest.objects.filter(device_id=device_id, scope__in=requested)
+    }
+    candidates = []
+    overlay_filters = []
+    for scope, native, state_model_label, state_key in bindings:
         rule_key = "redistribution" if native._meta.label_lower == "netbox_routing.redistribution" else scope
         rule = converted_scope_rules()[rule_key]
-        native_key = _native_identity(rule, native)
         identity = {
             "device_id": device_id,
             "scope": scope,
             "native_model_label": native._meta.label_lower,
-            "native_key": native_key,
+            "native_key": _native_identity(rule, native),
             "state_model_label": state_model_label,
             "state_key": state_key,
         }
-        manifest = NSOOwnershipManifest.objects.filter(**identity).first()
+        identity_key = _manifest_lookup_key(identity)
         signature = SimpleNamespace(
             **identity,
             native_id=native.pk,
             acknowledged_lineage=[],
         )
         model, filters = _state_filters(signature, rule, native, management)
-        overlay_present = model.objects.filter(**filters).exists()
+        candidates.append((identity_key, signature, rule, native))
+        overlay_filters.append((identity_key, model, filters))
+    present_overlays = _present_overlay_identities(device_id, management, overlay_filters)
+
+    planned = []
+    for identity_key, signature, rule, native in candidates:
         action = plan_ownership(
             rule,
             OwnershipSignature(
                 native_present=True,
                 native_qualifies=True,
-                overlay_present=overlay_present,
-                manifest_state=manifest.ownership_state if manifest is not None else None,
+                overlay_present=identity_key in present_overlays,
+                manifest_state=manifests.get(identity_key),
             ),
         )
         if action is OwnershipAction.CREATE:
@@ -1611,7 +1727,7 @@ def _retire_manifest(manifest) -> bool:
     )
 
 
-def _manifest_lifecycle_actions(device_id, requested):
+def _manifest_lifecycle_actions(device_id, requested, *, qualifying=None):
     from .models import NSODeviceManagement, NSOOwnershipManifest
     from .status_machine import is_owned
 
@@ -1619,7 +1735,7 @@ def _manifest_lifecycle_actions(device_id, requested):
     if management is None:
         return ()
     planned = []
-    qualifying = _qualifying_overlay_signatures(device_id, requested)
+    qualifying = _qualifying_overlay_signatures(device_id, requested) if qualifying is None else qualifying
     manifests = NSOOwnershipManifest.objects.filter(
         device_id=device_id,
         scope__in=requested,
@@ -1639,6 +1755,9 @@ def _manifest_lifecycle_actions(device_id, requested):
         overlay = None
         if native is not None:
             model, filters = _state_filters(manifest, rule, native, management)
+            overlay = model.objects.filter(**filters).first()
+        elif manifest.state_model_label:
+            model, filters = _state_filters_without_native(manifest, rule, management)
             overlay = model.objects.filter(**filters).first()
         native_qualifies = native is not None and (
             rule.acquisition_strategy == "existing_overlay"
@@ -1665,12 +1784,12 @@ def _manifest_lifecycle_actions(device_id, requested):
     return tuple(planned)
 
 
-def _execute_overlay_records(device_id, requested):
+def _execute_overlay_records(device_id, requested, *, qualifying=None):
     """Record the missing manifests, and demote the owned overlays that have none to record."""
     from .intent_state import mirror_transaction, reconcile_family_footprint
 
     completed = []
-    planned = _manifest_record_actions(device_id, requested)
+    planned = _manifest_record_actions(device_id, requested, qualifying=qualifying)
     if not planned:
         return completed
     records = tuple(entry for entry in planned if entry[0] is OwnershipAction.RECORD_MANIFEST)
@@ -1697,9 +1816,13 @@ def _execute_overlay_records(device_id, requested):
     return completed
 
 
-def _execute_manifest_lifecycle(device_id, requested):
+def _execute_manifest_lifecycle(device_id, requested, *, qualifying=None):
     completed = []
-    for manifest, rule, native, overlay, action in _manifest_lifecycle_actions(device_id, requested):
+    for manifest, rule, native, overlay, action in _manifest_lifecycle_actions(
+        device_id,
+        requested,
+        qualifying=qualifying,
+    ):
         if action is OwnershipAction.REOWN and native is not None:
             replacement = _reown_manifest(manifest, rule, native)
             if replacement is not None:
@@ -1716,9 +1839,14 @@ def _execute_manifest_lifecycle(device_id, requested):
     return completed
 
 
-def _execute_native_creates(device_id, requested):
+def _execute_native_creates(device_id, requested, *, management=None, bindings=None):
     completed = []
-    for signature, rule, native in _native_create_actions(device_id, requested):
+    for signature, rule, native in _native_create_actions(
+        device_id,
+        requested,
+        management=management,
+        bindings=bindings,
+    ):
         created = _reown_manifest(signature, rule, native, revoke=False)
         if created is not None:
             completed.append((signature.scope, created.pk))
@@ -1730,7 +1858,26 @@ def reconcile_scope_ownership(device_id: int, scopes) -> tuple[tuple[str, object
     requested = frozenset(str(scope) for scope in scopes)
     if not requested:
         return ()
-    completed = _execute_overlay_records(device_id, requested)
-    completed.extend(_execute_manifest_lifecycle(device_id, requested))
-    completed.extend(_execute_native_creates(device_id, requested))
+    from .models import NSODeviceManagement
+
+    management = NSODeviceManagement.objects.filter(device_id=device_id).first()
+    if management is None:
+        return ()
+    bindings = _native_bindings(management, requested)
+    qualifying = _qualifying_overlay_signatures(
+        device_id,
+        requested,
+        management=management,
+        bindings=bindings,
+    )
+    completed = _execute_overlay_records(device_id, requested, qualifying=qualifying)
+    completed.extend(_execute_manifest_lifecycle(device_id, requested, qualifying=qualifying))
+    completed.extend(
+        _execute_native_creates(
+            device_id,
+            requested,
+            management=management,
+            bindings=bindings,
+        )
+    )
     return tuple(completed)

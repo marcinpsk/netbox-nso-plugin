@@ -5,6 +5,7 @@
 import threading
 from datetime import timedelta
 from unittest.mock import patch
+from uuid import uuid4
 
 from django.db import DatabaseError, close_old_connections, connection, transaction
 from django.test import TestCase, TransactionTestCase
@@ -64,13 +65,15 @@ class TestProvisionTombstoneSweep(TestCase):
                 onboard_status="provisioning",
                 onboard_job_id="71",
             )
+        provision_attempt_id = uuid4()
         evidence = {
-            "provision_attempt_id": "6f4db857-f08f-4597-8500-2c1c30c941d7",
+            "provision_attempt_id": str(provision_attempt_id),
             "status": "succeeded",
             "job_id": 71,
             "result": {"ok": True, "steps": [{"name": "create", "ok": True}]},
         }
         tombstone = NSOProvisionTombstone.objects.create(
+            provision_attempt_id=provision_attempt_id,
             netbox_device_id=device.pk,
             nso_instance=instance.adapter_instance_id,
             nso_device_name=f"{tag}-device",
@@ -165,6 +168,25 @@ class TestProvisionTombstoneSweep(TestCase):
         inventory.assert_called_once()
         offboard.assert_not_called()
 
+    def test_invalid_adapter_inventory_is_an_adapter_error(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
+
+        _device, _instance, _management, tombstone = self._attempt(
+            "provision-invalid-inventory",
+            with_management=False,
+        )
+        tombstone.adapter_device_id = None
+        tombstone.save(update_fields=["adapter_device_id"])
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value={"unexpected": "object"}),
+            self.assertRaises(AdapterError) as caught,
+        ):
+            sweep_provision_tombstones(tombstone.provision_attempt_id)
+
+        self.assertEqual(caught.exception.code, "invalid_response")
+
     def test_open_attempt_is_polled_by_attempt_identity_and_completed(self):
         from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
 
@@ -219,6 +241,29 @@ class TestProvisionTombstoneSweep(TestCase):
         self.assertEqual((checked, closed), (1, 0))
         self.assertEqual(tombstone.state, "open")
         self.assertEqual(tombstone.adapter_job_id, "73")
+
+    def test_terminal_evidence_with_a_conflicting_job_id_is_an_adapter_error(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.provision_lifecycle import mark_provision_terminal
+
+        _device, _instance, _management, tombstone = self._attempt(
+            "provision-terminal-job-conflict",
+            with_management=False,
+            state="open",
+        )
+        evidence = {
+            "provision_attempt_id": str(tombstone.provision_attempt_id),
+            "status": "failed",
+            "job_id": 72,
+            "error": {"code": "provision_failed"},
+        }
+
+        with self.assertRaises(AdapterError) as caught:
+            mark_provision_terminal(tombstone.provision_attempt_id, evidence)
+
+        self.assertEqual(caught.exception.code, "invalid_response")
+        tombstone.refresh_from_db()
+        self.assertEqual(tombstone.state, "open")
 
     def test_failed_attempt_marks_surviving_management_failed(self):
         from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones

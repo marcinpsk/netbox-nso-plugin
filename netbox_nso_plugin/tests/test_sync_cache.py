@@ -560,6 +560,49 @@ class TestReconcileDeviceLinks(_SyncCacheTestBase):
         mgmt.refresh_from_db()
         self.assertEqual(mgmt.adapter_device_id, 704)
 
+    def test_unmapped_row_adopts_its_one_matching_adapter_device(self):
+        from netbox_nso_plugin.models import NSOIntentRevision
+        from netbox_nso_plugin.sync_cache import reconcile_device_links
+
+        mgmt = self._mgmt("cache-unmapped-adopt", None)
+        _stamp_verified_baselines(mgmt)
+        present = _adapter_row(mgmt, id=812)
+        with (
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value=[present]),
+            patch("netbox_nso_plugin.adapter_client.onboard_device") as onboard,
+            patch("netbox_nso_plugin.adapter_client.set_scope", return_value={}) as set_scope,
+            patch("netbox_nso_plugin.adapter_client.sync_notify", return_value=None),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            broken, attempted = reconcile_device_links(NSODeviceManagement.objects.all())
+
+        self.assertEqual((broken, attempted), (1, 1))
+        onboard.assert_not_called()
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.adapter_device_id, 812)
+        self.assertEqual(set_scope.call_args[0][0], 812)
+        self.assertFalse(NSOIntentRevision.objects.filter(device=mgmt.device, verified_revision__isnull=False).exists())
+
+    def test_unmapped_row_with_multiple_matching_devices_is_ambiguous(self):
+        from netbox_nso_plugin.sync_cache import reconcile_device_links
+
+        mgmt = self._mgmt("cache-unmapped-ambiguous", None)
+        twins = [_adapter_row(mgmt, id=813), _adapter_row(mgmt, id=814)]
+        with (
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value=twins),
+            patch("netbox_nso_plugin.adapter_client.onboard_device") as onboard,
+            patch("netbox_nso_plugin.adapter_client.set_scope") as set_scope,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            broken, attempted = reconcile_device_links(NSODeviceManagement.objects.all())
+
+        self.assertEqual((broken, attempted), (1, 1))
+        onboard.assert_not_called()
+        set_scope.assert_not_called()
+        mgmt.refresh_from_db()
+        self.assertIsNone(mgmt.adapter_device_id)
+        self.assertEqual(mgmt.adapter_link_error, "Adapter identity is ambiguous; repair requires operator action.")
+
     def test_relink_pushes_scope_against_the_fresh_id(self):
         """The dead id is tried, then the whole link is redone against the new device row.
 

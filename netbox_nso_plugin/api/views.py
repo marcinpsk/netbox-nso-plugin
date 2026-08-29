@@ -328,6 +328,7 @@ class ProvisionCompleteView(APIView):
         """CAS-mark terminal evidence and delegate every completion action to the sweep."""
         from uuid import UUID
 
+        from ..adapter_client import AdapterError
         from ..provision_lifecycle import mark_provision_terminal
         from ..reconcile import enqueue_provision_tombstone_sweep
 
@@ -337,7 +338,7 @@ class ProvisionCompleteView(APIView):
         try:
             attempt_id = UUID(str(raw_attempt_id))
             known = mark_provision_terminal(attempt_id, dict(request.data))
-        except (TypeError, ValueError):
+        except (AdapterError, TypeError, ValueError):
             return Response({"detail": "invalid provision completion evidence"}, status=status.HTTP_400_BAD_REQUEST)
         if not known:
             return Response({"queued": False}, status=status.HTTP_202_ACCEPTED)
