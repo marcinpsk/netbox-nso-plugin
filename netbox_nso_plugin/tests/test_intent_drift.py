@@ -126,7 +126,8 @@ class TestIntentDrift(IntentPushResetMixin, TestCase):
         self.assertNotIn("interface", {d["key"] for d in drift})
         # Flip to an unowned status (with a STALE accepted_at) → owned count drops to 0 →
         # the adapter's 1 row is now orphaned → flagged.
-        content_bulk_update(state, status="changed", accepted_at=timezone.now())
+        state = content_bulk_update(state, status="changed", accepted_at=timezone.now())
+        self.assertEqual(state.status, "changed")
         drift = intent_drift.compute_intent_drift(self.device, self.mgmt)
         self.assertIn("interface", {d["key"] for d in drift})
 
