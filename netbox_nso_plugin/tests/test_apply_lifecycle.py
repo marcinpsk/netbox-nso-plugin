@@ -67,9 +67,10 @@ class TestApplyAttemptSchema(SimpleTestCase):
                     ("management", "status", "apply_attempt_id"),
                     {tuple(index.fields) for index in model._meta.indexes},
                 )
-                self.assertIn(
-                    "(OR: (NOT (AND: ('status', 'deploying'))), ('apply_attempt_id__isnull', False))",
-                    {str(constraint.condition) for constraint in model._meta.constraints},
+                expected = ~models.Q(status="deploying") | models.Q(apply_attempt_id__isnull=False)
+                self.assertTrue(
+                    any(constraint.condition == expected for constraint in model._meta.constraints),
+                    f"{model_name} must require an attempt UUID while deploying",
                 )
 
 
