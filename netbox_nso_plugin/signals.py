@@ -1901,35 +1901,6 @@ def _on_vlan_pre_save(sender, instance, **kwargs):
         return
     _device_ids, rows = vlan_intent_targets(instance.pk, scopes)
     changed_fields = {field for field in candidate_fields if getattr(current_vlan, field) != getattr(instance, field)}
-    if "vid" in changed_fields and "name" not in changed_fields and rows.get("vlan"):
-        from .vlan_reconciler import placeholder_vlan_name
-
-        display_placeholder = current_vlan.name == placeholder_vlan_name(current_vlan.vid) and all(
-            not state.device_name for state in rows["vlan"]
-        )
-        derived_name = placeholder_vlan_name(instance.vid)
-        name_taken = (
-            current_vlan.group_id is not None
-            and sender.objects.filter(
-                group_id=current_vlan.group_id,
-                name=derived_name,
-            )
-            .exclude(pk=instance.pk)
-            .exists()
-        ) or (
-            current_vlan.qinq_svlan_id is not None
-            and sender.objects.filter(
-                qinq_svlan_id=current_vlan.qinq_svlan_id,
-                name=derived_name,
-            )
-            .exclude(pk=instance.pk)
-            .exists()
-        )
-        if display_placeholder and not name_taken:
-            instance.name = derived_name
-            if update_fields is not None and "name" not in update_fields:
-                instance._intent_vlan_update_name = True
-            changed_fields.add("name")
     instance._intent_vlan_changed_fields = frozenset(changed_fields)
     instance._intent_vlan_rows = rows
 
