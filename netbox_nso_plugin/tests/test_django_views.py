@@ -7253,6 +7253,18 @@ class TestApplyRefusesAStaleSnmpStore(_CascadeFlushMixin, IntentPushResetMixin, 
 
         assert len(applied) == 1
 
+    def test_a_failed_renderer_repair_refuses_apply(self):
+        from netbox_nso_plugin.renderer_audit import RendererAuditRepairFailed
+
+        with patch(
+            "netbox_nso_plugin.renderer_audit.audit_renderer_scopes",
+            side_effect=RendererAuditRepairFailed("baseline changed"),
+        ):
+            applied, messages_shown = self._apply()
+
+        self.assertEqual(applied, [])
+        self.assertTrue(any("precondition was unmet" in message for message in messages_shown))
+
 
 class TestDeviceNSOTabDegradedDeletions(ViewTestBase):
     """codex O1 r4 F3 (§4.3(c)): the durable degradation record needs an operator surface.
