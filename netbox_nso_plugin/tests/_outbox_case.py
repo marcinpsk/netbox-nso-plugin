@@ -84,6 +84,23 @@ def reset_renderer_audit_rotation(test_case):
     test_case.addCleanup(reset)
 
 
+def trust_scope(device, management, scope):
+    """Certify the current render as one scope's verified baseline."""
+    from django.utils import timezone
+
+    from netbox_nso_plugin import delivery
+    from netbox_nso_plugin.models import NSOIntentRevision
+
+    revision, _created = NSOIntentRevision.objects.get_or_create(device=device, scope=scope)
+    revision.verified_revision = revision.revision
+    revision.verified_fingerprint = delivery.canonical_fingerprint(
+        delivery.render(scope, device.pk, management.adapter_device_id).payload
+    )
+    revision.verified_at = timezone.now()
+    revision.save(update_fields=["verified_revision", "verified_fingerprint", "verified_at", "updated_at"])
+    return revision
+
+
 def content_update(instance, **values):
     """Persist a fixture change through the production exact writer."""
     from netbox_nso_plugin.renderer_writer import (
