@@ -53,6 +53,41 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
             NSOVLANState.objects.filter(management=self.management, vlan__group=group, vlan__vid=10).exists()
         )
 
+    def test_vlan_footprint_does_not_create_the_device_group(self):
+        from netbox_nso_plugin.vlan_reconciler import vlan_reconcile_footprint
+
+        footprint = vlan_reconcile_footprint(self.device, {"vlans": [{"vlan_id": 1627}]})
+
+        self.assertFalse(VLANGroup.objects.filter(slug=f"nso-{self.device.pk}").exists())
+        self.assertFalse(any(namespace == "vlan-slot" for namespace, _key in footprint.shared_keys))
+
+    def test_switchport_footprint_does_not_create_the_device_group(self):
+        from netbox_nso_plugin.vlan_reconciler import switchport_reconcile_footprint
+
+        footprint = switchport_reconcile_footprint(
+            self.device,
+            {
+                "interfaces": [
+                    {
+                        "interface_name": self.interface.name,
+                        "mode": "access",
+                        "untagged_vlan": 1627,
+                        "tagged_vlans": [],
+                    }
+                ]
+            },
+        )
+
+        self.assertFalse(VLANGroup.objects.filter(slug=f"nso-{self.device.pk}").exists())
+        self.assertFalse(any(namespace == "vlan-slot" for namespace, _key in footprint.shared_keys))
+
+    def test_native_vlan_preflight_is_read_only(self):
+        from netbox_nso_plugin.reconcile import _native_vlan_footprint
+
+        _native_vlan_footprint(self.device, {"vlans": [{"vlan_id": 1627}]}, "vlan")
+
+        self.assertFalse(VLANGroup.objects.filter(slug=f"nso-{self.device.pk}").exists())
+
     def test_direct_vlan_reconcile_does_not_advance_intent_revision(self):
         from netbox_nso_plugin.models import NSOIntentRevision
         from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database

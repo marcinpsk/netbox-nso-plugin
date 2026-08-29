@@ -112,16 +112,17 @@ def vlan_reconcile_footprint(device, payload: dict):
         return MutationFootprint()
     items = payload.get("vlans", []) or [] if isinstance(payload, dict) else []
     vids = vlan_ids_for_dependency_lock(items)
-    group = _device_vlan_group(device)
+    group = _device_vlan_group(device, create=False)
 
     states = list(NSOVLANState.objects.filter(management=management))
     vlan_ids = {state.vlan_id for state in states}
     vlan_ids.update(VLAN.objects.filter(group__slug=f"nso-{device.pk}", vid__in=vids).values_list("pk", flat=True))
+    slot_keys = () if group is None else (("vlan-slot", f"{group.pk}:{vid}") for vid in vids)
     return MutationFootprint.for_keys(
         {(device.pk, "vlan")},
         shared_keys=(
             *(("vlan", str(vlan_id)) for vlan_id in vlan_ids),
-            *(("vlan-slot", f"{group.pk}:{vid}") for vid in vids),
+            *slot_keys,
         ),
         source_rows=(
             *(SourceRow("ipam.vlan", vlan_id) for vlan_id in vlan_ids),
@@ -191,7 +192,7 @@ def switchport_reconcile_footprint(device, payload: dict):
         if isinstance(item, dict) and isinstance(item.get("interface_name"), str)
     }
     interfaces = list(Interface.objects.filter(device=device, name__in=interface_names))
-    group = _device_vlan_group(device)
+    group = _device_vlan_group(device, create=False)
 
     states = list(NSOSwitchportState.objects.filter(management=management).prefetch_related("tagged_vlans"))
     vlan_ids = {state.untagged_vlan_id for state in states if state.untagged_vlan_id is not None}
@@ -200,11 +201,12 @@ def switchport_reconcile_footprint(device, payload: dict):
         NSOVLANState.objects.filter(management=management, vlan__vid__in=vids).values_list("vlan_id", flat=True)
     )
     vlan_ids.update(VLAN.objects.filter(group__slug=f"nso-{device.pk}", vid__in=vids).values_list("pk", flat=True))
+    slot_keys = () if group is None else (("vlan-slot", f"{group.pk}:{vid}") for vid in vids)
     return MutationFootprint.for_keys(
         {(device.pk, "switchport")},
         shared_keys=(
             *(("vlan", str(vlan_id)) for vlan_id in vlan_ids),
-            *(("vlan-slot", f"{group.pk}:{vid}") for vid in vids),
+            *slot_keys,
         ),
         source_rows=(
             *(SourceRow("ipam.vlan", vlan_id) for vlan_id in vlan_ids),
