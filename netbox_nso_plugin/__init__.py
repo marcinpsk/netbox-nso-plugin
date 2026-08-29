@@ -19,10 +19,8 @@ class NSOPluginConfig(PluginConfig):
     default_settings = {
         "adapter_url": "",
         "adapter_token": "",
-        # A sparse managed device renders all 18 scopes in about 3.5 seconds in the
-        # real NetBox test database. Keep one device in one audit batch. Leave one
-        # minute of the five-minute cadence for the other maintenance passes.
-        "renderer_audit_scope_batch_cap": 18,
+        # Keep one device in one audit batch. The cap defaults to the delivery registry
+        # size, so a new delivery key cannot fail the pre-capture gates closed.
         "renderer_audit_tick_budget_seconds": 240,
         # A 'deploying' row that outlives a SUCCEEDED apply by this long without the
         # device ever showing its value escalates to apply_failed (silent drop, #26).
