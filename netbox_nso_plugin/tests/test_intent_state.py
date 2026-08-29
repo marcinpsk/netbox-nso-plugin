@@ -1170,14 +1170,27 @@ class TestRepairBoundaryIsolation(_CascadeFlushMixin, IntentPushResetMixin, Tran
 
         self.assertEqual(inside, "read committed")
 
+    def test_a_nested_repeatable_read_request_keeps_the_outer_isolation(self):
+        from django.db import transaction
 
-class TestRepeatableReadDegradesOnlyUnderATestCaseAtomic(TestCase):
-    """The one place the repair boundary does not get its isolation, pinned and bounded.
+        from netbox_nso_plugin.intent_state import audit_scope_footprint
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        footprint = audit_scope_footprint(self.device.pk, ("vlan",))
+        with transaction.atomic():
+            NSODeviceManagement.objects.filter(pk=self.management.pk).exists()
+            with mirror_transaction(footprint, repeatable_read=True):
+                inside = self._isolation_level()
+
+        self.assertEqual(inside, "read committed")
+
+
+class TestRepeatableReadDegradesUnderATestCaseAtomic(TestCase):
+    """A caller-owned transaction keeps the isolation level it already established.
 
     PostgreSQL accepts SET TRANSACTION ISOLATION LEVEL only before a transaction's first
-    statement, and a Django TestCase has already run its fixtures inside the block this
-    would set. The skip is keyed on ``_from_testcase``, which only ``TestCase._enter_atomics``
-    sets, so no production transaction can reach it. Sibling class above pins the real thing.
+    statement. A Django TestCase has already run its fixtures inside that block. The sibling
+    class pins both the standalone repeatable-read boundary and the production nested case.
     """
 
     def test_the_marker_this_skip_reads_is_present_only_under_a_testcase(self):

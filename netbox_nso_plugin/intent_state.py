@@ -2234,16 +2234,13 @@ def mirror_transaction(
         return
     from .apply_state import lock_order_scope
 
+    connection = connections["default"]
+    outer_atomic = connection.in_atomic_block
     with transaction.atomic(), lock_order_scope():
-        # Django TestCase opens one outer transaction before fixture setup and marks its
-        # Atomic block. PostgreSQL cannot change that transaction's isolation after the
-        # fixture queries. Dedicated TransactionTestCase coverage exercises the real
-        # REPEATABLE READ repair boundary; production has no marked TestCase block.
-        django_test_wrapper = any(
-            getattr(block, "_from_testcase", False) for block in connections["default"].atomic_blocks
-        )
-        if repeatable_read and not django_test_wrapper:
-            with connections["default"].cursor() as cursor:
+        # PostgreSQL accepts an isolation change only at the start of the outer transaction.
+        # A caller-owned transaction keeps its established isolation level.
+        if repeatable_read and not outer_atomic:
+            with connection.cursor() as cursor:
                 cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         permit = _Permit(
             footprint=footprint,
