@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from django.test import TransactionTestCase
 
+from ._adapter_http import patch_matching_control_state
 from ._outbox_case import make_managed, own_vlan
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
@@ -15,17 +16,7 @@ class _FleetCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
 
     def setUp(self):
         super().setUp()
-        adapter_patches = (
-            patch("netbox_nso_plugin.adapter_client.get_device", return_value={"failover": None}),
-            patch(
-                "netbox_nso_plugin.adapter_client.get_scope",
-                return_value={"attributes": [], "auto_apply": False, "sync_before_apply": True},
-            ),
-            patch("netbox_nso_plugin.adapter_client.set_scope", return_value={}),
-        )
-        for adapter_patch in adapter_patches:
-            adapter_patch.start()
-            self.addCleanup(adapter_patch.stop)
+        patch_matching_control_state(self)
         self.fleet = [make_managed("fleet", 16280 + index, index=index) for index in range(3)]
         self.device_ids = [device.pk for device, _management in self.fleet]
 
