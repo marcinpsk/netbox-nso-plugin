@@ -72,6 +72,18 @@ def mirror_update(instance, **values):
     return update_mirror_fields(instance, **values)
 
 
+def reset_renderer_audit_rotation(test_case):
+    """Reset process-local audit cursors before and after one test case."""
+    from netbox_nso_plugin import renderer_audit
+
+    def reset():
+        renderer_audit._FLEET_ROTATION["after_device_id"] = 0
+        renderer_audit._SCOPE_ROTATION.clear()
+
+    reset()
+    test_case.addCleanup(reset)
+
+
 def content_update(instance, **values):
     """Persist a fixture change through the production exact writer."""
     from netbox_nso_plugin.renderer_writer import (

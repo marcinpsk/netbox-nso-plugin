@@ -11,7 +11,15 @@ from django.test import TransactionTestCase
 from django.test.utils import CaptureQueriesContext, override_settings
 
 from ._adapter_http import patch_matching_control_state
-from ._outbox_case import ReceiptAdapter, in_thread, make_managed, mirror_update, own_route, own_vlan
+from ._outbox_case import (
+    ReceiptAdapter,
+    in_thread,
+    make_managed,
+    mirror_update,
+    own_route,
+    own_vlan,
+    reset_renderer_audit_rotation,
+)
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -45,6 +53,7 @@ def own_redistribution(management, dest_protocol, source_protocol):
 class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     def setUp(self):
         super().setUp()
+        reset_renderer_audit_rotation(self)
         patch_matching_control_state(self)
         self.device, self.management = make_managed("renderer-audit", 16270)
 

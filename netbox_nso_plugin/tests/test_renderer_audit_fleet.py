@@ -7,7 +7,7 @@ from unittest.mock import patch
 from django.test import TransactionTestCase
 
 from ._adapter_http import patch_matching_control_state
-from ._outbox_case import make_managed, own_vlan
+from ._outbox_case import make_managed, own_vlan, reset_renderer_audit_rotation
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -16,6 +16,7 @@ class _FleetCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
 
     def setUp(self):
         super().setUp()
+        reset_renderer_audit_rotation(self)
         patch_matching_control_state(self)
         self.fleet = [make_managed("fleet", 16280 + index, index=index) for index in range(3)]
         self.device_ids = [device.pk for device, _management in self.fleet]
@@ -25,7 +26,7 @@ class _FleetCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
         """Stand in for one device audit, recording the order the pass reached devices."""
         from netbox_nso_plugin.renderer_audit import RendererAuditResult
 
-        def audit(device_id, scopes, trigger, deadline=None, pre_capture=False):
+        def audit(device_id, scopes, trigger, *, deadline=None, pre_capture=False):
             if record is not None:
                 record.append(device_id)
             return RendererAuditResult(audited, repaired, deferred, unknown)
@@ -87,7 +88,7 @@ class TestRendererFleetAudit(_FleetCase):
 
         reached = []
 
-        def audit(device_id, scopes, trigger, deadline=None, pre_capture=False):
+        def audit(device_id, scopes, trigger, *, deadline=None, pre_capture=False):
             reached.append(device_id)
             if device_id == self.device_ids[1]:
                 raise RuntimeError("this device alone is broken")
@@ -118,7 +119,7 @@ class TestRendererFleetAudit(_FleetCase):
 
         reached = []
 
-        def audit(device_id, scopes, trigger, deadline=None, pre_capture=False):
+        def audit(device_id, scopes, trigger, *, deadline=None, pre_capture=False):
             reached.append(device_id)
             raise RuntimeError("this device is broken on every tick")
 
