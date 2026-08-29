@@ -225,26 +225,64 @@ def switchport_reconcile_footprint(device, payload: dict):
 
 def switchport_reconcile_plan(device, payload: dict):
     """Classify a switchport refresh from its predicted rendered membership."""
-    from .intent_state import ReconcileMutationPlan
-    from .models import NSODeviceManagement, NSOSwitchportState
+    from ipam.models import VLAN
+
+    from .intent_state import ReconcileMutationPlan, _normal, canonical_fragment
+    from .models import NSODeviceManagement, NSOSwitchportState, NSOVLANState
+    from .status_machine import is_owned
 
     footprint = switchport_reconcile_footprint(device, payload)
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:
         return ReconcileMutationPlan(footprint)
     reported = {
-        item.get("interface_name")
+        item.get("interface_name"): item
         for item in payload.get("interfaces", []) or []
         if isinstance(item, dict) and item.get("interface_name")
     }
-    changes_content = (
-        NSOSwitchportState.objects.filter(
-            management=management,
-            status="in_sync",
-        )
-        .exclude(interface__name__in=reported)
-        .exists()
+    states = tuple(
+        NSOSwitchportState.objects.filter(management=management)
+        .select_related("interface", "untagged_vlan")
+        .prefetch_related("tagged_vlans")
     )
+    changes_content = any(state.status == "in_sync" and state.interface.name not in reported for state in states)
+    group = _device_vlan_group(device, create=False)
+    synced_vlans = {
+        state.vlan.vid: state.vlan
+        for state in NSOVLANState.objects.filter(management=management).select_related("vlan").order_by("pk")
+    }
+    group_vlans = (
+        {vlan.vid: vlan for vlan in VLAN.objects.filter(group=group).order_by("pk")} if group is not None else {}
+    )
+    for state in states:
+        item = reported.get(state.interface.name)
+        if item is None or not is_owned(state.status):
+            continue
+        nso_untagged = item.get("untagged_vlan")
+        if nso_untagged == 1:
+            nso_untagged = None
+        untagged = (
+            (synced_vlans.get(nso_untagged) or group_vlans.get(nso_untagged)) if nso_untagged is not None else None
+        )
+        tagged = tuple(
+            vlan
+            for vlan in (
+                synced_vlans.get(vid) or group_vlans.get(vid) for vid in sorted(item.get("tagged_vlans") or [])
+            )
+            if vlan is not None
+        )
+        after = _normal(
+            {
+                "interface_name": state.interface.name,
+                "mode": item.get("mode") if item.get("mode") in _NSO_TO_NETBOX_MODE else "",
+                "untagged_vlan": untagged.vid if untagged is not None else None,
+                "tagged_vlans": sorted(vlan.vid for vlan in tagged),
+            }
+        )
+        before = canonical_fragment(state)
+        if before != after:
+            changes_content = True
+            break
     return ReconcileMutationPlan(footprint, changes_content=changes_content)
 
 

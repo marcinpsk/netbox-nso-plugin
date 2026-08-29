@@ -18,7 +18,7 @@ from netbox_nso_plugin.models import (
 )
 from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
 
-from ._outbox_case import without_commit_drain
+from ._outbox_case import mirror_update, without_commit_drain
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin, isolate_other_scopes
 
 
@@ -88,6 +88,50 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
 
         revision.refresh_from_db()
         self.assertEqual(revision.revision, before)
+
+    def test_switchport_plan_detects_a_reported_owned_fragment_change(self):
+        from netbox_nso_plugin.models import NSOSwitchportState
+        from netbox_nso_plugin.vlan_reconciler import (
+            reconcile_switchport,
+            reconcile_vlan_database,
+            switchport_reconcile_plan,
+        )
+
+        reconcile_vlan_database(
+            self.device,
+            {"vlans": [{"vlan_id": 10, "name": "TEN"}, {"vlan_id": 20, "name": "TWENTY"}]},
+        )
+        reconcile_switchport(
+            self.device,
+            {
+                "interfaces": [
+                    {
+                        "interface_name": self.interface.name,
+                        "mode": "access",
+                        "untagged_vlan": 10,
+                        "tagged_vlans": [],
+                    }
+                ]
+            },
+        )
+        state = NSOSwitchportState.objects.get(management=self.management, interface=self.interface)
+        mirror_update(state, status="in_sync")
+
+        plan = switchport_reconcile_plan(
+            self.device,
+            {
+                "interfaces": [
+                    {
+                        "interface_name": self.interface.name,
+                        "mode": "trunk",
+                        "untagged_vlan": None,
+                        "tagged_vlans": [20],
+                    }
+                ]
+            },
+        )
+
+        self.assertTrue(plan.changes_content)
 
     def test_two_nameless_vlans_get_unique_placeholder_names(self):
         """Live arcos shape (vlans 5/6, no names): NetBox's (group, name) unique

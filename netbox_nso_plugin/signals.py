@@ -142,14 +142,14 @@ def _skip_on_render(handler):
                 return None
             return handler(*args, **kwargs)
         except BaseException:
-            from .intent_state import _end_implicit, _end_m2m_implicit
+            from .intent_state import _abort_m2m_implicit, _end_implicit
 
             sender = kwargs.get("sender", args[0] if len(args) > 0 else None)
             instance = kwargs.get("instance", args[1] if len(args) > 1 else None)
             action = kwargs.get("action", args[2] if len(args) > 2 else None)
             details = {key: value for key, value in kwargs.items() if key not in {"sender", "instance", "action"}}
             if action is not None:
-                _end_m2m_implicit(sender, instance, action, **details)
+                _abort_m2m_implicit(sender, instance)
             else:
                 _end_implicit(sender, instance, **details)
             raise

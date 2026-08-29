@@ -18,9 +18,38 @@ from django.test import RequestFactory, TestCase
 from django.utils import timezone
 
 from ._outbox_case import content_bulk_update, mirror_update
-from .mixins import IntentPushDeliveryMixin
+from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin
 
 _MOD = "netbox_nso_plugin.adapter_client"
+
+
+class TestM2MPermitCleanup(IntentPushResetMixin, TestCase):
+    def test_a_failing_pre_action_handler_closes_its_implicit_permit(self):
+        from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.intent_state import _ACTIVE_PERMIT, _IMPLICIT_PERMITS, _begin_m2m_implicit
+        from netbox_nso_plugin.signals import _skip_on_render
+
+        manufacturer = Manufacturer.objects.create(name="M2M permit", slug="m2m-permit")
+        device_type = DeviceType.objects.create(manufacturer=manufacturer, model="M2M permit", slug="m2m-permit")
+        role = DeviceRole.objects.create(name="M2M permit", slug="m2m-permit")
+        site = Site.objects.create(name="M2M permit", slug="m2m-permit")
+        device = Device.objects.create(name="m2m-permit", device_type=device_type, role=role, site=site)
+        route = StaticRoute.objects.create(prefix="198.18.27.0/24", next_hop="198.18.0.27")
+        sender = StaticRoute.devices.through
+        details = {"pk_set": {device.pk}, "reverse": False, "model": Device}
+        _begin_m2m_implicit(sender, route, "pre_add", **details)
+
+        @_skip_on_render
+        def fail_pre_add(sender, instance, action, **kwargs):
+            raise RuntimeError("pre-add failure")
+
+        with self.assertRaisesRegex(RuntimeError, "pre-add failure"):
+            fail_pre_add(sender, route, "pre_add", **details)
+
+        self.assertIsNone(_ACTIVE_PERMIT.get())
+        self.assertEqual(_IMPLICIT_PERMITS.get(), {})
 
 
 def _bulk_create_management_without_signals(rows):

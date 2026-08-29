@@ -606,7 +606,7 @@ def _switchport_fragment(instance):
 
     if instance.status not in ("accepted", "deploying", "in_sync"):
         return ABSENT
-    tagged = instance.tagged_vlans.values_list("vid", flat=True) if instance.pk else ()
+    tagged = (vlan.vid for vlan in instance.tagged_vlans.all()) if instance.pk else ()
     return _normal(switchport_intent_item(instance, tagged))
 
 
@@ -2257,15 +2257,24 @@ def _begin_m2m_implicit(sender, instance, action, **kwargs):
     _IMPLICIT_PERMITS.set(permits)
 
 
-def _end_m2m_implicit(sender, instance, action, **kwargs):
-    if not action.startswith("post_"):
-        return
+def _close_m2m_implicit(sender, instance):
+    """Close the implicit permit for one M2M mutation."""
     token_key = (id(instance), sender._meta.label_lower)
     permits = dict(_IMPLICIT_PERMITS.get())
     token = permits.pop(token_key, None)
     _IMPLICIT_PERMITS.set(permits)
     if token is not None:
         _ACTIVE_PERMIT.reset(token)
+
+
+def _abort_m2m_implicit(sender, instance):
+    """Close an M2M permit when a pre-action behavior handler fails."""
+    _close_m2m_implicit(sender, instance)
+
+
+def _end_m2m_implicit(sender, instance, action, **kwargs):
+    if action.startswith("post_"):
+        _close_m2m_implicit(sender, instance)
 
 
 def _dml_guard(execute, sql, params, many, context):
