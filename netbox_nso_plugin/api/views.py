@@ -109,8 +109,6 @@ class NSOInterfaceStateViewSet(NetBoxModelViewSet):
         from ..renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
         candidate = copy.copy(serializer.instance)
-        if "status" in serializer.validated_data:
-            candidate._nso_explicit_status_update = True
         deferred_tag_fields = set()
         for field_name, value in serializer.validated_data.items():
             try:

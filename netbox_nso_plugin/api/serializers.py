@@ -142,17 +142,6 @@ class NSOInterfaceStateSerializer(NetBoxModelSerializer):
 
     intent_value = serializers.SerializerMethodField()
 
-    def update(self, instance, validated_data):
-        """Mark an API status field as an explicit operator transition."""
-        explicit_status = "status" in validated_data
-        if explicit_status:
-            instance._nso_explicit_status_update = True
-        try:
-            return super().update(instance, validated_data)
-        finally:
-            if explicit_status:
-                del instance._nso_explicit_status_update
-
     def get_intent_value(self, obj) -> str | None:
         """Return the current dcim.Interface field value for this attribute."""
         iface = obj.interface
