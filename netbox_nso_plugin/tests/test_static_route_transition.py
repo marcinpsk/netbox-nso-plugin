@@ -273,6 +273,26 @@ class TestStaticRouteReAcceptBumps(IntentPushResetMixin, TestCase):
         self.assertGreater(state.intent_generation, 0)
         self.assertIsNotNone(state.generation_started_at)
 
+    def test_bulk_accept_stamps_the_first_accepted_at(self):
+        with _fixtures():
+            route = _route("198.18.31.0/24", "198.18.0.1", devices=[self.device])
+            state = _own(route, self.mgmt, status="imported")
+            state.accepted_at = None
+            state.save(update_fields=["accepted_at"])
+
+        with patch(PUT), self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(
+                reverse(
+                    "plugins:netbox_nso_plugin:routing_bulk_accept_static_routes",
+                    kwargs={"device_pk": self.device.pk},
+                )
+            )
+
+        self.assertEqual(response.status_code, 302)
+        state.refresh_from_db()
+        self.assertEqual(state.status, "in_sync")
+        self.assertIsNotNone(state.accepted_at)
+
 
 class TestStaticRouteBulkAcceptOutsideATransaction(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     """Bulk accept runs in a real request, which NetBox does not wrap in a transaction."""
