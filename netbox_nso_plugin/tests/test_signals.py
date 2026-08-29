@@ -2366,7 +2366,7 @@ class TestDeleteOriginMarking(_SignalDBBase):
             pre_delete.disconnect(capture_origin, sender=NSOSVIState)
 
         self.assertEqual(origins, [self.device])
-        self.assertEqual(calls, [])
+        self._assert_teardown_touched_only_the_offboard(calls)
 
     def test_deleting_a_device_with_isis_flex_algos_pushes_no_intent(self):
         """The flex-algo cascade handler appends from its own nested atomic block.
