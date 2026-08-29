@@ -94,6 +94,30 @@ class TestIntentRevisionWrites(TestCase):
     def setUp(self):
         self.device, self.management = make_managed("intent-revision", 1624)
 
+    def test_revision_upsert_uses_the_models_table_name(self):
+        from unittest.mock import patch
+
+        from django.db import connection
+
+        from netbox_nso_plugin.models import NSOIntentRevision
+        from netbox_nso_plugin.outbox import bump_intent_revision
+
+        real_table = NSOIntentRevision._meta.db_table
+        renamed_table = "test_nso_intent_revision"
+
+        def restore_real_table(execute, sql, params, many, context):
+            if sql.lstrip().upper().startswith("INSERT"):
+                self.assertIn(connection.ops.quote_name(renamed_table), sql)
+                sql = sql.replace(connection.ops.quote_name(renamed_table), connection.ops.quote_name(real_table))
+            return execute(sql, params, many, context)
+
+        with (
+            patch.object(NSOIntentRevision._meta, "db_table", renamed_table),
+            connection.execute_wrapper(restore_real_table),
+            transaction.atomic(),
+        ):
+            self.assertEqual(bump_intent_revision(self.device.pk, "vlan"), 1)
+
     def test_enqueue_bumps_the_scope_revision_and_repends_deploying_rows(self):
         from netbox_nso_plugin import outbox
         from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
