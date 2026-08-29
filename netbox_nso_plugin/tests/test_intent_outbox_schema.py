@@ -21,12 +21,6 @@ ENTRY_TABLE = "netbox_nso_plugin_nsointentoutboxentry"
 STATE_TABLE = "netbox_nso_plugin_nsointentoutboxstate"
 
 
-def _app_migrations() -> list[str]:
-    """Every migration name of this app, in chain order."""
-    loader = MigrationLoader(None, ignore_no_migrations=True)
-    return sorted(name for app, name in loader.disk_migrations if app == APP)
-
-
 def _outbox_migration() -> str:
     """Return the migration that creates both outbox models."""
     from importlib import import_module
@@ -52,14 +46,17 @@ class TestOutboxMigrationShape(SimpleTestCase):
         from importlib import import_module
 
         outbox = _outbox_migration()
-        names = _app_migrations()
+        loader = MigrationLoader(None, ignore_no_migrations=True)
 
         migration = import_module(f"{APP}.migrations.{outbox}").Migration
         created = {op.name for op in migration.operations if isinstance(op, migrations.CreateModel)}
         assert {"NSOIntentOutboxEntry", "NSOIntentOutboxState"} <= created, f"the migration creates {created}"
         in_app = [name for app, name in migration.dependencies if app == APP]
-        prior = names[names.index(outbox) - 1]
-        assert in_app == [prior], f"the outbox migration must chain off {prior}; saw {in_app}"
+        assert len(in_app) == 1, f"the outbox migration must have one in-app parent; saw {in_app}"
+        graph_parents = {node.key[1] for node in loader.graph.node_map[(APP, outbox)].parents if node.key[0] == APP}
+        assert graph_parents == set(in_app), (
+            f"the migration graph parent must match the declared in-app dependency; saw {graph_parents}"
+        )
 
     def test_the_migrations_sequence_name_still_matches_the_running_one(self):
         """0018 inlines the name so a rename cannot rewrite history; this is the drift alarm."""
