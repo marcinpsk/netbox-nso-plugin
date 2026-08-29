@@ -6439,7 +6439,7 @@ def _warn_route_policy_cascade(request, route_map_name, device_name, cascade):
         messages.warning(
             request,
             f"Route-map {route_map_name} references {len(cascade.cross_device)} shared object(s) whose "
-            f"NetBox version came from another device. Applying here pushes that version onto "
+            f"NetBox version was sourced from another device. Applying here pushes that version onto "
             f"{device_name}: {refs}.",
         )
 
