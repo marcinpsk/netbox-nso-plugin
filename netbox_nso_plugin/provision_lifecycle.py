@@ -10,6 +10,9 @@ from datetime import timedelta
 from django.db import transaction
 from django.utils import timezone
 
+from .deployment import DeploymentQuiesced
+from .deployment import guarded as _deployment_guarded
+
 logger = logging.getLogger(__name__)
 
 # One fleet tick polls at most this many attempts, oldest first, so nothing starves.
@@ -102,6 +105,7 @@ def mark_provision_terminal(provision_attempt_id, evidence: dict) -> bool:
     ).exists()
 
 
+@_deployment_guarded("provisioning")
 def sweep_provision_tombstones(provision_attempt_id=None):
     """Advance matching provision tombstones through the fenced completion states."""
     from .models import NSOProvisionTombstone
@@ -120,6 +124,8 @@ def sweep_provision_tombstones(provision_attempt_id=None):
         checked += 1
         try:
             closed += int(_sweep_one(tombstone_id))
+        except DeploymentQuiesced:
+            raise
         except Exception:  # noqa: BLE001 - one attempt must not stop the fleet sweep
             logger.exception("Provision tombstone sweep failed for attempt %s", tombstone_id)
     return checked, closed
