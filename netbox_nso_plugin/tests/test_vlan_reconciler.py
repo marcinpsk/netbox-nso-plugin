@@ -386,6 +386,50 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         ):
             rescope_vlan(source_state, target_group)
 
+    def test_rescope_rejects_a_device_that_attaches_before_membership_locking(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import apply_state
+        from netbox_nso_plugin.vlan_reconciler import (
+            VLANRescopeConflict,
+            reconcile_vlan_database,
+            rescope_vlan,
+        )
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 44, "name": "MGMT"}]})
+        source_state = NSOVLANState.objects.get(management=self.management, vlan__vid=44)
+        target_group = VLANGroup.objects.create(name="Membership Target", slug="membership-target")
+        VLAN.objects.create(group=target_group, vid=44, name="MGMT")
+        late_device = _make_device("late-membership")
+        late_management = NSODeviceManagement.objects.create(
+            device=late_device,
+            nso_instance=self.instance,
+            nso_device_name="late-membership",
+        )
+        original_lock = apply_state.lock_vlan_membership_transaction
+        attached = False
+
+        def attach_before_membership_lock(vlan_id):
+            nonlocal attached
+            if not attached and vlan_id == source_state.vlan_id:
+                attached = True
+                NSOVLANState.objects.create(
+                    management=late_management,
+                    vlan=source_state.vlan,
+                    device_name="MGMT",
+                    status="imported",
+                )
+            original_lock(vlan_id)
+
+        with (
+            patch(
+                "netbox_nso_plugin.apply_state.lock_vlan_membership_transaction",
+                side_effect=attach_before_membership_lock,
+            ),
+            self.assertRaises(VLANRescopeConflict),
+        ):
+            rescope_vlan(source_state, target_group)
+
     def test_switchport_seeded_when_pristine(self):
         """A pristine NetBox interface is SEEDED from the device (read mirror) → imported, no drift.
 

@@ -193,6 +193,12 @@ def _rescope_managed_device_ids(old_vlan) -> set[int]:
     return device_ids
 
 
+def _validate_rescope_managed_device_ids(old_vlan, locked_device_ids) -> None:
+    """Reject a managed VLAN attachment that arrived before membership locking."""
+    if not _rescope_managed_device_ids(old_vlan).issubset(locked_device_ids):
+        raise VLANRescopeConflict("a managed device attached to the VLAN while the rescope request waited")
+
+
 def _merge_vlan_references(old_vlan, existing) -> set[tuple[int, str]]:
     """Repoint every VLAN consumer and return owned devices whose wire name changed."""
     from dcim.models import Interface
@@ -324,6 +330,7 @@ def rescope_vlan(state, target_group):
             lock_device_vlan_membership_transaction(device_id)
         for vlan_id in vlan_ids:
             lock_vlan_membership_transaction(vlan_id)
+        _validate_rescope_managed_device_ids(old_vlan, managed_device_ids)
         current_vlan_id = NSOVLANState.objects.filter(pk=state.pk).values_list("vlan_id", flat=True).first()
         if current_vlan_id != old_vlan.pk:
             raise VLANRescopeConflict("the VLAN attachment changed while the rescope request waited")
