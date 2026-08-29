@@ -2,6 +2,8 @@
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Pure ownership lifecycle rules for the first converted scopes."""
 
+from pathlib import Path
+
 from django.test import SimpleTestCase, TestCase
 
 
@@ -279,6 +281,39 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
         assert "missing graph dependencies fail fast" in rules["bgp"].intentional_semantic_delta
         assert "foreign-key merge identities use natural graph identities" in rules["bgp"].intentional_semantic_delta
         assert "Legacy PK-shaped peer and template merge bases are reset" in rules["bgp"].intentional_semantic_delta
+
+    def test_direct_overlay_edit_demotion_delta_names_every_affected_scope(self):
+        from netbox_nso_plugin.ownership_planner import converted_scope_rules
+
+        clause = (
+            "Stale direct overlay edits no longer demote imported rows to changed. "
+            "Exact writers reload rows before planning."
+        )
+
+        assert {
+            scope for scope, rule in converted_scope_rules().items() if clause in rule.intentional_semantic_delta
+        } == {
+            "bfd",
+            "interface_mtu",
+            "l2_sap",
+            "logging",
+            "route_policy",
+            "static_route",
+            "subinterface",
+            "svi",
+            "vlan",
+        }
+
+    def test_dead_explicit_status_marker_is_absent_from_production(self):
+        package_root = Path(__file__).resolve().parents[1]
+
+        occurrences = [
+            path.relative_to(package_root)
+            for path in package_root.rglob("*.py")
+            if path.relative_to(package_root).parts[0] != "tests" and "_nso_explicit_status_update" in path.read_text()
+        ]
+
+        assert occurrences == []
 
     def test_reown_is_declared_only_where_the_native_row_carries_the_content(self):
         """A re-owned overlay is rebuilt from its native anchor, so one must be able to."""
