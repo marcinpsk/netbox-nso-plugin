@@ -62,6 +62,27 @@ class _SnmpBase(IntentPushDeliveryMixin, TestCase):
 
 
 class TestSnmpAcceptView(_SnmpBase):
+    def test_exhausted_stale_accept_retry_returns_an_operator_error(self):
+        from django.contrib.messages import get_messages
+
+        from netbox_nso_plugin.renderer_writer import IntentPlanStaleError
+
+        mgmt = self._make_mgmt()
+        community = self._community(mgmt, status="imported")
+        self.client.force_login(_superuser())
+
+        with patch(
+            "netbox_nso_plugin.renderer_writer.RendererWriter.save",
+            side_effect=IntentPlanStaleError("changed after planning"),
+        ):
+            response = self.client.post(f"/plugins/nso/snmp/community-state/{community.pk}/accept/")
+
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(
+            "Routing state changed. Refresh the page and try again.",
+            [str(message) for message in get_messages(response.wsgi_request)],
+        )
+
     def test_accept_differing_marks_accepted(self):
         """Accepting a differing (conflict) row creates intent → 'accepted' (pending apply)."""
         from netbox_nso_plugin import delivery

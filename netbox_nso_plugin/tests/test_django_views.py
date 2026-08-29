@@ -1911,6 +1911,24 @@ class TestNSOInterfaceStateDeleteView(ViewTestBase):
         self.assertFalse(NSOInterfaceState.objects.filter(pk=self.iface_state.pk).exists())
         mock_put.assert_not_called()
 
+    def test_confirmed_bulk_delete_reports_an_invalid_primary_key(self):
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:nsointerfacestate_bulk_delete"),
+            {"pk": ["not-a-primary-key"], "_confirm": "Confirm", "confirm": "on"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(NSOInterfaceState.objects.filter(pk=self.iface_state.pk).exists())
+
+    def test_delete_rejects_a_protocol_relative_return_url(self):
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:nsointerfacestate_delete", args=[self.iface_state.pk]),
+            {"confirm": "true", "return_url": "//attacker.invalid/redirect"},
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertFalse(response.url.startswith("//attacker.invalid"))
+
 
 class TestNSOInterfaceEditFieldView(ViewTestBase):
     """Tests for NSOInterfaceEditFieldView (inline edit of description/enabled from the tab)."""

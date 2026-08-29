@@ -673,6 +673,28 @@ class TestInterfaceIPInlineEdit(IntentPushResetMixin, TestCase):
             delivery.canonical_fingerprint(delivery.render("ip", self.device_a.pk, None).payload),
         )
 
+    def test_edit_schedules_the_ip_snapshot_after_write_suppression(self):
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.signals import _is_intent_push_suppressed
+
+        management = NSODeviceManagement.objects.get(device=self.device_a)
+        management.adapter_device_id = 1627
+        management.save(update_fields=["adapter_device_id"])
+
+        suppression_states = []
+        with patch(
+            "netbox_nso_plugin.signals._schedule_intent_push",
+            side_effect=lambda _key: suppression_states.append(_is_intent_push_suppressed()),
+        ):
+            response = self.client.post(
+                self._url(),
+                {"address": "198.18.20.2/31"},
+                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(suppression_states, [False])
+
     def test_unchanged_prefilled_peer_is_not_modified(self):
         """The real two-field popover always submits the displayed peer value.
 

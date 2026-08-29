@@ -3861,15 +3861,26 @@ class NSOInterfaceStateBulkDeleteView(generic.BulkDeleteView):
         from utilities.jobs import is_background_request, process_request_as_job
 
         model = self.queryset.model
+        form = BulkDeleteForm(model, request.POST)
+        if not form.is_valid():
+            table = self.table(self.queryset.none(), orderable=False)
+            return render(
+                request,
+                self.template_name,
+                {
+                    "model": model,
+                    "form": form,
+                    "table": table,
+                    "return_url": self.get_return_url(request),
+                    **self.get_extra_context(request),
+                },
+            )
         if request.POST.get("_all"):
             queryset = model.objects.all()
             if self.filterset is not None:
                 queryset = self.filterset(request.GET, queryset, request=request).qs
         else:
-            queryset = self.queryset.filter(pk__in=[int(pk) for pk in request.POST.getlist("pk")])
-        form = BulkDeleteForm(model, request.POST)
-        if not form.is_valid():
-            return super().post(request, **kwargs)
+            queryset = self.queryset.filter(pk__in=form.cleaned_data["pk"])
         if form.cleaned_data["background_job"]:
             job_name = _("Bulk delete {count} {object_type}").format(
                 count=len(form.cleaned_data["pk"]),
@@ -3968,7 +3979,13 @@ class NSOInterfaceStateDeleteView(generic.ObjectDeleteView):
 
         messages.success(request, f"Deleted {self.queryset.model._meta.verbose_name} {label}")
         return_url = form.cleaned_data.get("return_url")
-        if return_url and return_url.startswith("/"):
+        from django.utils.http import url_has_allowed_host_and_scheme
+
+        if return_url and url_has_allowed_host_and_scheme(
+            return_url,
+            allowed_hosts={request.get_host()},
+            require_https=request.is_secure(),
+        ):
             return redirect(return_url)
         return redirect(self.get_return_url(request, obj))
 
@@ -4934,6 +4951,7 @@ def _route_map_name_edit_operations(state, old_name, planned_at):
     """Build one prospective route-map rename and its dependent targets."""
     import copy
 
+    from . import signals
     from . import status_machine as sm
     from .models import NSORoutePolicyObjectClass, NSORoutePolicyState
     from .renderer_writer import RendererMutationPlan, planned_save
@@ -4941,7 +4959,7 @@ def _route_map_name_edit_operations(state, old_name, planned_at):
     assigned = state.assigned_object
     route_map = type(assigned).objects.get(pk=assigned.pk)
     new_name = state.object_name
-    bgp_states, redistribution_states, _dependent_groups = _route_map_rename_dependents(route_map, old_name)
+    bgp_states, redistribution_states, dependent_groups = _route_map_rename_dependents(route_map, old_name)
     attached = list(
         NSORoutePolicyState.objects.filter(
             content_type_id=state.content_type_id,
@@ -4983,8 +5001,19 @@ def _route_map_name_edit_operations(state, old_name, planned_at):
         saves=(planned_save(candidate, update_fields=fields) for candidate, fields in operations),
         planned_at=planned_at,
     )
+    dependent_route_policy_targets = set()
+    for family, name in dependent_groups:
+        dependent_route_policy_targets.update(
+            NSORoutePolicyState.objects.filter(
+                family=family,
+                object_name__iexact=name,
+                status__in=signals._OWNED_PUSH_STATUSES,
+                management__adapter_device_id__isnull=False,
+            ).values_list("management__device_id", flat=True)
+        )
     targets = (
-        {
+        dependent_route_policy_targets
+        | {
             attached_state.management.device_id
             for attached_state in attached
             if attached_state.management.adapter_device_id is not None
@@ -6252,18 +6281,18 @@ class NSOInterfaceIPStateEditView(NSOActionPermissionMixin, View):
         try:
             plan, native_operations, state_operations = _ip_edit_plan_and_operations(updates, timezone.now())
             mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-            with mutation as writer, suppress_intent_push():
-                for native, created in native_operations:
-                    writer.save(native, force_insert=created)
-                for candidate, update_fields in state_operations:
-                    writer.save(candidate, update_fields=update_fields)
+            with mutation as writer:
+                with suppress_intent_push():
+                    for native, created in native_operations:
+                        writer.save(native, force_insert=created)
+                    for candidate, update_fields in state_operations:
+                        writer.save(candidate, update_fields=update_fields)
                 device_ids = {update["state"].interface.device_id for update in updates}
                 for mgmt in NSODeviceManagement.objects.filter(
                     device_id__in=device_ids,
                     adapter_device_id__isnull=False,
                 ):
-                    device_id = mgmt.device_id
-                    _schedule_intent_push((device_id, "ip"))
+                    _schedule_intent_push((mgmt.device_id, "ip"))
         except (ValidationError, IntegrityError) as exc:
             messages_list = getattr(exc, "messages", None) or ["The address conflicts with an existing object."]
             return JsonResponse(
@@ -6392,6 +6421,29 @@ class NSOBGPPeerTemplateStateAcceptView(NSOActionPermissionMixin, View):
         return redirect(_device_nso_tab_url(state.management.device_id))
 
 
+def _warn_route_policy_cascade(request, route_map_name, device_name, cascade):
+    """Report referenced policy objects that acquisition could not own silently."""
+    if cascade is None:
+        return
+    if cascade.drifted:
+        refs = ", ".join(f"{family.replace('_', ' ')} {name}" for family, name in cascade.drifted)
+        messages.warning(
+            request,
+            f"Route-map {route_map_name} references {len(cascade.drifted)} object(s) that differ on "
+            f"{device_name}; left as-is (not overwritten). Resolve their drift before they ship: {refs}.",
+        )
+    if cascade.cross_device:
+        refs = ", ".join(
+            f"{family.replace('_', ' ')} {name} (from {source})" for family, name, source in cascade.cross_device
+        )
+        messages.warning(
+            request,
+            f"Route-map {route_map_name} references {len(cascade.cross_device)} shared object(s) whose "
+            f"NetBox version came from another device. Applying here pushes that version onto "
+            f"{device_name}: {refs}.",
+        )
+
+
 class NSORoutePolicyStateAcceptView(RoutingStateAcceptMixin):
     """Per-row accept for a route-policy object.
 
@@ -6416,7 +6468,7 @@ class NSORoutePolicyStateAcceptView(RoutingStateAcceptMixin):
         route_maps = (
             (candidate.assigned_object,) if candidate.family == "route_map" and candidate.assigned_object else ()
         )
-        plan, operations, _cascade = _route_policy_acquisition_plan(
+        plan, operations, cascade = _route_policy_acquisition_plan(
             candidate.management,
             primary_operations=((candidate, fields, False),),
             route_maps=route_maps,
@@ -6425,6 +6477,12 @@ class NSORoutePolicyStateAcceptView(RoutingStateAcceptMixin):
         with mutation as writer:
             for operation, update_fields, created in operations:
                 writer.save(operation, update_fields=update_fields, force_insert=created)
+        _warn_route_policy_cascade(
+            request,
+            candidate.object_name,
+            candidate.management.device.name,
+            cascade,
+        )
         messages.success(request, f"Accepted routing state {candidate.pk}.")
         return redirect(_device_nso_tab_url(state.management.device_id))
 
@@ -7394,27 +7452,7 @@ class NSORoutePolicyAttachView(NSOActionPermissionMixin, View):
         with mutation as writer:
             for operation, update_fields, force_insert in operations:
                 writer.save(operation, update_fields=update_fields, force_insert=force_insert)
-        if cascade is not None:
-            if cascade.drifted:
-                # A referenced object the device already has but that diverges from NetBox was
-                # NOT overwritten — tell the operator so they can resolve it explicitly.
-                refs = ", ".join(f"{fam.replace('_', ' ')} {nm}" for fam, nm in cascade.drifted)
-                messages.warning(
-                    request,
-                    f"Route-map {obj.name} references {len(cascade.drifted)} object(s) that differ on "
-                    f"{mgmt.device.name} — left as-is (not overwritten); resolve their drift before "
-                    f"they ship: {refs}.",
-                )
-            if cascade.cross_device:
-                # A greenfield reference whose NetBox content came from another device — owning
-                # the route-map here pushes that device's version. Make the provenance explicit.
-                refs = ", ".join(f"{fam.replace('_', ' ')} {nm} (from {src})" for fam, nm, src in cascade.cross_device)
-                messages.warning(
-                    request,
-                    f"Route-map {obj.name} references {len(cascade.cross_device)} shared object(s) whose "
-                    f"NetBox version was sourced from another device — applying here pushes that version "
-                    f"onto {mgmt.device.name}: {refs}.",
-                )
+        _warn_route_policy_cascade(request, obj.name, mgmt.device.name, cascade)
         if override:
             # Operator overrode a known-negative verdict — be explicit about what won't land.
             messages.warning(
@@ -7462,6 +7500,10 @@ class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
     required_permission = (
         "netbox_nso_plugin.change_nsodevicemanagement",
         "netbox_routing.add_bgppeer",
+        "netbox_routing.add_bgprouter",
+        "netbox_routing.add_bgpscope",
+        "netbox_routing.add_bgpaddressfamily",
+        "netbox_routing.add_bgppeeraddressfamily",
     )
 
     @staticmethod

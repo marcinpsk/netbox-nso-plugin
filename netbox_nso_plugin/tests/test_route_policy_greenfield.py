@@ -639,6 +639,102 @@ class TestOwnershipCascade(_RPBase):
         # the greenfield references are still owned (only the drifted one is skipped)
         assert NSORoutePolicyState.objects.get(management=mgmt, family="as_path", object_name="50").status == "accepted"
 
+    def test_per_row_accept_warns_about_a_drifted_reference(self):
+        from django.contrib.auth import get_user_model
+        from django.contrib.contenttypes.models import ContentType
+        from django.contrib.messages import get_messages
+        from django.urls import reverse
+        from netbox_routing.models import PrefixList, RouteMap
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+
+        mgmt = self._mgmt()
+        route_map, _as_path, _community_list, prefix_list = self._route_map_with_refs("RM-ACCEPT-WARN")
+        route_map_state = _save_without_push(
+            NSORoutePolicyState(
+                management=mgmt,
+                family="route_map",
+                object_name=route_map.name,
+                content_type=ContentType.objects.get_for_model(RouteMap),
+                object_id=route_map.pk,
+                status="changed",
+            )
+        )
+        _save_without_push(
+            NSORoutePolicyState(
+                management=mgmt,
+                family="prefix_list",
+                object_name=prefix_list.name,
+                content_type=ContentType.objects.get_for_model(PrefixList),
+                object_id=prefix_list.pk,
+                status="conflict",
+            )
+        )
+        user = get_user_model().objects.create_superuser("rp-accept-warn", "warn@example.test", "pw")
+        self.client.force_login(user)
+
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:routing_accept_route_policy", args=[route_map_state.pk])
+        )
+
+        self.assertEqual(response.status_code, 302)
+        messages = [str(message) for message in get_messages(response.wsgi_request)]
+        self.assertTrue(any("differ" in message and prefix_list.name in message for message in messages))
+
+    def test_route_map_rename_pushes_dependent_route_map_devices(self):
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import RouteMap, RouteMapEntry
+
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSORoutePolicyState
+        from netbox_nso_plugin.views import _save_route_map_name_edit
+
+        target_mgmt = self._mgmt()
+        target = RouteMap.objects.create(name="RM-RENAME-TARGET")
+        target_state = _save_without_push(
+            NSORoutePolicyState(
+                management=target_mgmt,
+                family="route_map",
+                object_name=target.name,
+                content_type=ContentType.objects.get_for_model(RouteMap),
+                object_id=target.pk,
+                status="in_sync",
+            )
+        )
+        caller = RouteMap.objects.create(name="RM-RENAME-CALLER")
+        _save_without_push(RouteMapEntry(route_map=caller, sequence=10, action="permit", call_policy=target))
+        other_device = Device.objects.create(
+            name="rp-rename-dependent",
+            device_type=self.device.device_type,
+            role=self.device.role,
+            site=self.device.site,
+        )
+        instance, _ = NSOInstance.objects.get_or_create(
+            name="rp-inst",
+            defaults={"adapter_instance_id": "rp-inst"},
+        )
+        dependent_mgmt = NSODeviceManagement.objects.create(
+            device=other_device,
+            nso_instance=instance,
+            nso_device_name="rp-rename-dependent",
+            adapter_device_id=1628,
+        )
+        _save_without_push(
+            NSORoutePolicyState(
+                management=dependent_mgmt,
+                family="route_map",
+                object_name=caller.name,
+                content_type=ContentType.objects.get_for_model(RouteMap),
+                object_id=caller.pk,
+                status="in_sync",
+            )
+        )
+        target_state.object_name = "RM-RENAMED-TARGET"
+
+        with patch("netbox_nso_plugin.signals._schedule_intent_push") as schedule:
+            _save_route_map_name_edit(target_state, "RM-RENAME-TARGET")
+
+        self.assertIn(((other_device.pk, "route_policy"),), [call.args for call in schedule.call_args_list])
+
     def test_cascade_owns_set_community_list_reference(self):
         """A community-list referenced by a route-map's SET action (`set comm-list delete <CL>`)
         is a dependency too — the cascade owns it, else the device rejects the undefined list
