@@ -386,9 +386,15 @@ def _creation_refs(save_states):
             continue
         if not proposed.natural_key_fields:
             continue
-        for _attname, related in proposed.reference_fields:
-            if related.pk is None and id(related) in planned_creations and id(related) not in references:
-                raise IntentMutationProtocolError(f"{instance._meta.label_lower} references a row planned after it")
+        related_instances = [related for _attname, related in proposed.reference_fields]
+        for field_name in proposed.natural_key_fields:
+            field = instance._meta.get_field(field_name)
+            if field.is_relation and field.many_to_one and field.is_cached(instance):
+                related_instances.append(field.get_cached_value(instance))
+        if any(id(related) in planned_creations and id(related) not in references for related in related_instances):
+            raise IntentMutationProtocolError(
+                f"{instance._meta.label_lower} creation references a row planned after it (a creation planned later)"
+            )
         references[id(instance)] = RendererCreationRef(
             model_label=instance._meta.label_lower,
             natural_key=_natural_key(
