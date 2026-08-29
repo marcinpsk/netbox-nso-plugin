@@ -125,6 +125,26 @@ class TestInterfaceMtuReconciler(TestCase):
 
         self.assertFalse(NSOInterfaceMtuState.objects.filter(interface=self.po1).exists())
 
+    def test_missing_interface_name_is_rejected_before_stale_rows_are_changed(self):
+        from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
+
+        state = NSOInterfaceMtuState.objects.create(
+            management=self.management,
+            interface=self.po1,
+            l2_mtu=1500,
+            status="imported",
+        )
+
+        for invalid_name in (None, ""):
+            with self.subTest(interface_name=invalid_name):
+                with self.assertRaisesRegex(ValueError, "interface_name must be a non-empty string"):
+                    reconcile_interface_mtu(
+                        self.device,
+                        {"interfaces": [{"interface_name": invalid_name, "mtu": 9000}]},
+                    )
+
+                self.assertTrue(NSOInterfaceMtuState.objects.filter(pk=state.pk).exists())
+
     def test_interface_absent_in_netbox_is_skipped(self):
         from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
 

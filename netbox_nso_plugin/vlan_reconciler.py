@@ -51,12 +51,9 @@ _NSO_TO_NETBOX_MODE = {"access": "access", "trunk": "tagged", "trunk-all": "tagg
 
 
 def _validated_vlan_id(value, field_name):
-    if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
+    if type(value) is not int:
         raise AdapterError(f"{field_name} must be an integer VLAN ID", code="invalid_response")
-    try:
-        vlan_id = int(value)
-    except (TypeError, ValueError) as exc:
-        raise AdapterError(f"{field_name} must be an integer VLAN ID", code="invalid_response") from exc
+    vlan_id = value
     if not 1 <= vlan_id <= 4094:
         raise AdapterError(f"{field_name} must be between 1 and 4094", code="invalid_response")
     return vlan_id

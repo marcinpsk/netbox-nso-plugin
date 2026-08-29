@@ -14,8 +14,17 @@ from __future__ import annotations
 import contextlib
 import copy
 import logging
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _ReconcileExecution:
+    """The operations and result rows captured by one frozen MTU plan."""
+
+    operations: tuple
+    rows: tuple
 
 
 def _validated_interface_items(payload: dict) -> tuple[dict, ...]:
@@ -30,10 +39,11 @@ def _validated_interface_items(payload: dict) -> tuple[dict, ...]:
         if not isinstance(item, dict):
             raise ValueError("interface MTU payload entry must be an object")
         name = item.get("interface_name")
-        if name and name in seen:
+        if not isinstance(name, str) or not name:
+            raise ValueError("interface MTU payload entry interface_name must be a non-empty string")
+        if name in seen:
             raise ValueError(f"duplicate interface_name in interface MTU payload: {name}")
-        if name:
-            seen.add(name)
+        seen.add(name)
     return tuple(items)
 
 
@@ -41,32 +51,27 @@ def interface_mtu_reconcile_plan(device, payload: dict):
     """Freeze every MTU overlay save/delete before the first lock or write."""
     from django.utils import timezone
 
-    plan, _operations, _rows = _interface_mtu_plan_and_operations(device, payload, timezone.now())
-    return plan
-
-
-def _interface_mtu_plan_and_operations(device, payload, planned_at):
-    """Build one exact MTU plan and its matching operation sequence."""
     from .renderer_writer import RendererMutationPlan
 
+    planned_at = timezone.now()
     saves, deletes, operations, rows = _interface_mtu_reconcile_operations(device, payload, planned_at)
-    plan = RendererMutationPlan.build(
+    return RendererMutationPlan.build(
         saves=saves,
         deletes=deletes,
         planned_at=planned_at,
-        settles_deploying=False,
+        execution=_ReconcileExecution(tuple(operations), tuple(rows)),
     )
-    return plan, operations, rows
 
 
 def _interface_mtu_reconcile_operations(device, payload, planned_at):
-    """Build deterministic MTU writes for preflight and direct apply."""
+    """Build the deterministic MTU writes shared by preflight and apply."""
     from dcim.models import Interface
 
     from . import status_machine as sm
     from .models import NSODeviceManagement, NSOInterfaceMtuState
     from .renderer_writer import planned_delete, planned_save
 
+    items = _validated_interface_items(payload)
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:
         return [], [], [], []
@@ -79,13 +84,12 @@ def _interface_mtu_reconcile_operations(device, payload, planned_at):
     deletes = []
     operations = []
     rows = []
-    items = _validated_interface_items(payload)
     matched_names = set()
 
     for item in items:
         name = item.get("interface_name")
         interface = interfaces.get(name)
-        if not name or interface is None:
+        if interface is None:
             continue
         matched_names.add(name)
         current = states.get(interface.pk)
@@ -135,50 +139,23 @@ def reconcile_interface_mtu(device, payload: dict) -> list:
 
     _validated_interface_items(payload)
     active = active_renderer_writer()
-    if active is None:
-        from django.utils import timezone
-
-        plan, operations, rows = _interface_mtu_plan_and_operations(device, payload, timezone.now())
-    else:
-        plan = active.plan
-        operations, rows = _frozen_interface_mtu_operations(plan)
+    plan = active.plan if active is not None else interface_mtu_reconcile_plan(device, payload)
     mutation = contextlib.nullcontext(active)
     if active is None:
         mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
     with mutation as writer, suppress_intent_push():
-        _execute_interface_mtu_operations(writer, operations)
-    return rows
+        return _reconcile_interface_mtu(payload, writer, plan)
 
 
-def _frozen_interface_mtu_operations(plan):
-    """Materialize only MTU operations from the active immutable write set."""
-    from .models import NSOInterfaceMtuState
-
-    operations = []
-    rows = []
-    model_label = NSOInterfaceMtuState._meta.label_lower
-    for write in plan.write_set:
-        if write.model_label != model_label or write.cascade:
-            continue
-        current = NSOInterfaceMtuState.objects.filter(pk=write.pk).first() if write.pk is not None else None
-        instance = copy.copy(current) if current is not None else NSOInterfaceMtuState(pk=write.pk)
-        for field_name, value in write.values:
-            if NSOInterfaceMtuState._meta.get_field(field_name).get_internal_type() == "JSONField":
-                continue
-            setattr(instance, field_name, value)
-        if write.operation == "save":
-            operations.append(("save", instance, write.update_fields, write.force_insert))
-            if write.update_fields is None:
-                rows.append(instance)
-        elif write.operation == "delete":
-            operations.append(("delete", instance, None, False))
-    return operations, rows
-
-
-def _execute_interface_mtu_operations(writer, operations):
-    """Replay the operations paired with one frozen MTU plan."""
-    for operation, instance, update_fields, force_insert in operations:
-        if operation == "delete":
-            writer.delete(instance)
-        else:
+def _reconcile_interface_mtu(payload: dict, writer, plan) -> list:
+    """Apply the MTU payload after its exact write set is frozen."""
+    _validated_interface_items(payload)
+    execution = plan.execution
+    if not isinstance(execution, _ReconcileExecution):
+        raise ValueError("interface MTU reconciliation requires its frozen execution steps")
+    for operation, instance, update_fields, force_insert in execution.operations:
+        if operation == "save":
             writer.save(instance, update_fields=update_fields, force_insert=force_insert)
+        else:
+            writer.delete(instance)
+    return list(execution.rows)
