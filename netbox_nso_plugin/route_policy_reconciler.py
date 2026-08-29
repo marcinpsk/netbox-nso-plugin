@@ -1221,6 +1221,10 @@ def _classification_operations(family, object_name, mode, planned_at):  # noqa: 
     owner = max(rows, key=lambda row: len((row.captured or {}).get("entries") or []))
     root = planner.roots[family].get(object_name.casefold())
     if root is None:
+        root = planner.models[family].objects.filter(name__iexact=object_name).first()
+        if root is not None:
+            planner.roots[family][object_name.casefold()] = root
+    if root is None:
         kwargs = {"name": object_name}
         if family == "prefix_list" and owner.captured.get("family") in (4, 6):
             kwargs["family"] = owner.captured["family"]
