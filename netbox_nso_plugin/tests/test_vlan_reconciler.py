@@ -118,6 +118,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         self.assertEqual(
             [(write.operation, write.model_label) for write in plan.write_set],
             [
+                ("save", "ipam.vlangroup"),
                 ("save", "ipam.vlan"),
                 ("save", "netbox_nso_plugin.nsovlanstate"),
             ],
@@ -181,6 +182,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         self.assertEqual(
             [(write.operation, write.model_label) for write in plan.write_set],
             [
+                ("save", "ipam.vlangroup"),
                 ("save", "ipam.vlan"),
                 ("save", "dcim.interface"),
                 ("save", "netbox_nso_plugin.nsoswitchportstate"),
