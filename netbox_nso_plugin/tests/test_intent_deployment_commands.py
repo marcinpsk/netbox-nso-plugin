@@ -284,6 +284,26 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         assert "\n" not in message
         assert repr(request.path_info) in message
 
+    def test_plugin_request_does_not_wrap_network_delivery_in_a_database_transaction(self):
+        from django.db import connection
+        from django.http import HttpResponse
+        from django.test import RequestFactory
+
+        from netbox_nso_plugin.middleware import IntentDeploymentMiddleware
+
+        in_atomic_block = []
+
+        def inspect_transaction(_request):
+            in_atomic_block.append(connection.in_atomic_block)
+            return HttpResponse("ok")
+
+        response = IntentDeploymentMiddleware(inspect_transaction)(
+            RequestFactory().post("/plugins/nso/device-management/1/actions/apply/")
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(in_atomic_block, [False])
+
     def test_quiescence_returns_503_and_rolls_back_a_core_intent_mutation(self):
         from django.http import HttpResponse
         from django.test import RequestFactory
