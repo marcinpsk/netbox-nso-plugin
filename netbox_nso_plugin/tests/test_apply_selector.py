@@ -1652,6 +1652,57 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 ("ipam.vlan", self.vlan_state.vlan_id), {(row.model_label, row.pk) for row in footprint.source_rows}
             )
 
+    def test_native_vlan_plans_lock_a_payload_vlan_without_an_overlay(self):
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin.svi_reconciler import svi_reconcile_plan
+        from netbox_nso_plugin.vlan_reconciler import (
+            _device_vlan_group,
+            switchport_reconcile_plan,
+            vlan_reconcile_plan,
+        )
+
+        vid = 3559
+        vlan = VLAN.objects.create(
+            group=_device_vlan_group(self.device),
+            vid=vid,
+            name="payload-only",
+        )
+        interface = self._create_interface(device=self.device, name="Ethernet3559", type="1000base-t")
+        self.assertFalse(NSOVLANState.objects.filter(management=self.mgmt, vlan=vlan).exists())
+
+        plans = [
+            vlan_reconcile_plan(
+                self.device,
+                {"vlans": [{"vlan_id": vid, "name": vlan.name}]},
+            ),
+            svi_reconcile_plan(
+                self.device,
+                {"interfaces": [{"interface_name": f"Vlan{vid}", "vlan_id": vid, "type": "svi"}]},
+            ),
+            switchport_reconcile_plan(
+                self.device,
+                {
+                    "interfaces": [
+                        {
+                            "interface_name": interface.name,
+                            "mode": "access",
+                            "untagged_vlan": vid,
+                            "tagged_vlans": [],
+                        }
+                    ]
+                },
+            ),
+        ]
+
+        for plan in plans:
+            self.assertIn(("vlan", str(vlan.pk)), plan.lock_footprint.shared_keys)
+            self.assertIn(
+                ("ipam.vlan", vlan.pk),
+                {(row.model_label, row.pk) for row in plan.lock_footprint.source_rows},
+            )
+
     def test_advisory_lock_helpers_use_the_two_declared_transaction_namespaces(self):
         from netbox_nso_plugin.apply_state import lock_device_intent_transaction, lock_shared_dependencies
 
