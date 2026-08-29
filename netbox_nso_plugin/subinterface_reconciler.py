@@ -66,6 +66,7 @@ def _subinterface_reconcile_operations(device, payload, planned_at):
             continue
         reported.add(name)
         current_interface = interfaces.get(name)
+        stored_parent_id = current_interface.parent_id if current_interface is not None else None
         interface = current_interface or Interface(device=device, name=name, type="virtual")
         if current_interface is None:
             interface._site = device.site
@@ -102,7 +103,7 @@ def _subinterface_reconcile_operations(device, payload, planned_at):
         if current_interface is None:
             saves.append(planned_save(interface, force_insert=True, natural_key=("device", "name")))
             operations.append(("save", interface, None, True))
-        elif not owned and current_interface.parent_id != interface.parent_id:
+        elif not owned and stored_parent_id != interface.parent_id:
             saves.append(planned_save(interface, update_fields=("parent",)))
             operations.append(("save", interface, ("parent",), False))
         created = current is None
