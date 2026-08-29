@@ -49,6 +49,95 @@ class TestManagementControlAudit(_CascadeFlushMixin, IntentPushResetMixin, Trans
         super().setUp()
         self.device, self.management = make_managed("control-audit", 16275)
 
+    def test_matching_adapter_control_state_skips_the_scope_post(self):
+        from netbox_nso_plugin.management_lifecycle import reconcile_management_control
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        primary_interface = Interface.objects.create(device=self.device, name="Loopback16271", type="virtual")
+        oob_interface = Interface.objects.create(device=self.device, name="Management16271", type="1000base-t")
+        primary = IPAddress.objects.create(address="198.18.175.11/32", assigned_object=primary_interface)
+        oob = IPAddress.objects.create(address="198.18.175.12/32", assigned_object=oob_interface)
+        self.device.primary_ip4 = primary
+        self.device.oob_ip = oob
+        self.device.save(update_fields=["primary_ip4", "oob_ip"])
+        NSODeviceManagement.objects.filter(pk=self.management.pk).update(
+            manage_description=True,
+            auto_apply=True,
+            sync_before_apply=False,
+        )
+
+        with (
+            patch(
+                "netbox_nso_plugin.adapter_client.get_device",
+                return_value={
+                    "failover": {
+                        "primary_ip": "198.18.175.11",
+                        "oob_ip": "198.18.175.12",
+                    }
+                },
+            ),
+            patch(
+                "netbox_nso_plugin.adapter_client.get_scope",
+                return_value={
+                    "attributes": ["description"],
+                    "auto_apply": True,
+                    "sync_before_apply": False,
+                },
+            ),
+            patch("netbox_nso_plugin.adapter_client.set_scope") as set_scope,
+        ):
+            self.assertFalse(reconcile_management_control(self.device.pk))
+
+        set_scope.assert_not_called()
+
+    def test_each_adapter_control_divergence_posts_all_authoritative_fields(self):
+        from netbox_nso_plugin.management_lifecycle import reconcile_management_control
+
+        cases = (
+            ("attributes", {"attributes": ["description"]}, None),
+            ("auto_apply", {"auto_apply": True}, None),
+            ("sync_before_apply", {"sync_before_apply": False}, None),
+            (
+                "primary_ip",
+                {},
+                {"primary_ip": "198.18.175.21", "oob_ip": None},
+            ),
+            (
+                "oob_ip",
+                {},
+                {"primary_ip": None, "oob_ip": "198.18.175.22"},
+            ),
+        )
+        for field_name, scope_override, failover in cases:
+            with self.subTest(field_name=field_name):
+                scope = {
+                    "attributes": [],
+                    "auto_apply": False,
+                    "sync_before_apply": True,
+                    **scope_override,
+                }
+                with (
+                    patch(
+                        "netbox_nso_plugin.adapter_client.get_device",
+                        return_value={"failover": failover},
+                    ),
+                    patch(
+                        "netbox_nso_plugin.adapter_client.get_scope",
+                        return_value=scope,
+                    ),
+                    patch("netbox_nso_plugin.adapter_client.set_scope") as set_scope,
+                ):
+                    self.assertTrue(reconcile_management_control(self.device.pk))
+
+                set_scope.assert_called_once_with(
+                    self.management.adapter_device_id,
+                    [],
+                    auto_apply=False,
+                    sync_before_apply=True,
+                    primary_ip=None,
+                    oob_ip=None,
+                )
+
     def test_reloads_all_five_authoritative_fields_inside_the_lock_window(self):
         from netbox_nso_plugin.management_lifecycle import reconcile_management_control
         from netbox_nso_plugin.models import NSODeviceManagement
@@ -79,7 +168,14 @@ class TestManagementControlAudit(_CascadeFlushMixin, IntentPushResetMixin, Trans
             )
             return {}
 
-        with patch("netbox_nso_plugin.adapter_client.set_scope", side_effect=assert_lock_window) as set_scope:
+        with (
+            patch("netbox_nso_plugin.adapter_client.get_device", return_value={"failover": None}),
+            patch(
+                "netbox_nso_plugin.adapter_client.get_scope",
+                return_value={"attributes": [], "auto_apply": False, "sync_before_apply": True},
+            ),
+            patch("netbox_nso_plugin.adapter_client.set_scope", side_effect=assert_lock_window) as set_scope,
+        ):
             self.assertTrue(reconcile_management_control(self.device.pk))
 
         set_scope.assert_called_once()
@@ -101,7 +197,14 @@ class TestManagementControlAudit(_CascadeFlushMixin, IntentPushResetMixin, Trans
             probes.append(_probe_lock(NSOIntentRevision.objects.filter(pk=revision.pk)))
             return {}
 
-        with patch("netbox_nso_plugin.adapter_client.set_scope", side_effect=probe_family_lock):
+        with (
+            patch("netbox_nso_plugin.adapter_client.get_device", return_value={"failover": None}),
+            patch(
+                "netbox_nso_plugin.adapter_client.get_scope",
+                return_value={"attributes": ["description"], "auto_apply": False, "sync_before_apply": True},
+            ),
+            patch("netbox_nso_plugin.adapter_client.set_scope", side_effect=probe_family_lock),
+        ):
             self.assertTrue(reconcile_management_control(self.device.pk))
 
         self.assertEqual(probes, [None])
@@ -126,7 +229,14 @@ class TestManagementControlAudit(_CascadeFlushMixin, IntentPushResetMixin, Trans
             probes.append(_probe_lock(IPAddress.objects.filter(pk=primary.pk)))
             return {}
 
-        with patch("netbox_nso_plugin.adapter_client.set_scope", side_effect=probe_source_locks):
+        with (
+            patch("netbox_nso_plugin.adapter_client.get_device", return_value={"failover": None}),
+            patch(
+                "netbox_nso_plugin.adapter_client.get_scope",
+                return_value={"attributes": ["description"], "auto_apply": False, "sync_before_apply": True},
+            ),
+            patch("netbox_nso_plugin.adapter_client.set_scope", side_effect=probe_source_locks),
+        ):
             self.assertTrue(reconcile_management_control(self.device.pk))
 
         self.assertEqual(len(probes), 2)
