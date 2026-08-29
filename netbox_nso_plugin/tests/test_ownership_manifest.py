@@ -176,6 +176,23 @@ class TestOwnershipManifestDurability(TestCase):
 
         self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=device.pk, ownership_state="owned").exists())
 
+    def test_bulk_device_deletion_offboards_the_adapter_device(self):
+        from unittest.mock import patch
+
+        from dcim.models import Device
+
+        from ._outbox_case import make_managed
+
+        device, management = make_managed("ownership-bulk-offboard", 16273)
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.delete_device") as delete_device,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            Device.objects.filter(pk=device.pk).delete()
+
+        delete_device.assert_called_once_with(management.adapter_device_id)
+
 
 class TestOwnershipManifestMaintenance(TestCase):
     def setUp(self):
