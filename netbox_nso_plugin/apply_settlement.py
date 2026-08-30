@@ -4,10 +4,13 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from uuid import UUID
 
 from django.utils import timezone
+
+logger = logging.getLogger(__name__)
 
 GENERATION_STATUSES = frozenset({"pending", "running", "settled", "failed", "outcome_unknown", "abandoned"})
 _ATTEMPT_FIELDS = frozenset({"apply_attempt_id", "admission_state", "http_status", "response", "generations"})
@@ -115,7 +118,10 @@ def _validate_attempt(raw, local) -> dict:
         skipped = response.get("skipped")
         if response.get("outcome") not in {"promoted", "no_op"} or not isinstance(skipped, dict):
             raise EvidenceInvariantError("deployment evidence has an invalid admitted response")
-    generations = [_validate_generation(generation) for generation in raw["generations"]]
+    raw_generations = raw["generations"]
+    if not isinstance(raw_generations, list):
+        raise EvidenceInvariantError("deployment evidence generations are not a list")
+    generations = [_validate_generation(generation) for generation in raw_generations]
     if len({generation["generation_id"] for generation in generations}) != len(generations):
         raise EvidenceInvariantError("deployment evidence repeats a generation identity")
     if _response_generation_ids(response) != {generation["generation_id"] for generation in generations}:
@@ -390,7 +396,14 @@ def load_deployment_evidence(management):
         try:
             result = client.trigger_apply(management.adapter_device_id, attempt.pk, attempt.selected)
         except client.AdapterError as exc:
-            if not (exc.status_code == 409 and exc.code == "conflict"):
+            if exc.status_code == 409 and exc.code == "conflict":
+                job_id = exc.detail.get("job_id") if isinstance(exc.detail, dict) else None
+                logger.info(
+                    "Apply replay for attempt %s is waiting for adapter job %s",
+                    attempt.pk,
+                    job_id,
+                )
+            else:
                 _record_replay_answer(attempt, error=exc)
         else:
             _record_replay_answer(attempt, result=result)
