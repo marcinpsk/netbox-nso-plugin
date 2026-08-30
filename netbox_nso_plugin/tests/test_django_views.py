@@ -4071,7 +4071,7 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(row.address, "198.51.100.2", "the colliding edit must not be persisted")
 
     def test_edit_mtu_takes_ownership_and_adopts_native_l2(self):
-        from netbox_nso_plugin.models import NSOInterfaceMtuState
+        from netbox_nso_plugin.models import NSOInterfaceMtuState, NSOOwnershipManifest
 
         row = NSOInterfaceMtuState.objects.create(
             management=self.mgmt, interface=self.interface, l2_mtu=9214, status="imported"
@@ -4084,6 +4084,15 @@ class TestOverlayFieldEditView(ViewTestBase):
         # Same side effect as the Accept view: the native NetBox interface MTU follows.
         self.interface.refresh_from_db()
         self.assertEqual(self.interface.mtu, 9000)
+        self.assertTrue(
+            NSOOwnershipManifest.objects.filter(
+                device=self.device,
+                scope="interface_mtu",
+                native_model_label="dcim.interface",
+                native_key={"device_id": self.device.pk, "name": self.interface.name},
+                ownership_state="owned",
+            ).exists()
+        )
 
     def test_edit_mtu_keeps_owned_status(self):
         from netbox_nso_plugin.models import NSOInterfaceMtuState

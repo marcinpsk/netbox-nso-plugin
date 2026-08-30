@@ -4815,6 +4815,51 @@ def _save_owned_overlay_only_edit(obj, old_values):
         writer.save(candidate, update_fields=update_fields)
 
 
+def _write_owned_interface_mtu(candidate, update_fields):
+    """Write one MTU ownership claim and its native interface value."""
+    import copy
+
+    from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
+
+    saves = []
+    interface_candidate = None
+    if candidate.l2_mtu is not None:
+        clamped = min(int(candidate.l2_mtu), NSOInterfaceMtuStateAcceptView._NETBOX_MTU_MAX)
+        if candidate.interface.mtu != clamped:
+            interface_candidate = copy.copy(candidate.interface)
+            interface_candidate.mtu = clamped
+            saves.append(planned_save(interface_candidate, update_fields=("mtu",)))
+    saves.append(planned_save(candidate, update_fields=update_fields))
+
+    plan = RendererMutationPlan.build(saves=saves, planned_at=candidate.accepted_at)
+    mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+    with mutation as writer:
+        if interface_candidate is not None:
+            writer.save(interface_candidate, update_fields=("mtu",))
+        writer.save(candidate, update_fields=update_fields)
+
+
+def _save_owned_interface_mtu_edit(obj, old_values):
+    """Claim an inline MTU edit and write its native value through one plan."""
+    import copy
+
+    from . import status_machine as sm
+
+    candidate = copy.copy(obj)
+    if not sm.is_owned(candidate.status):
+        candidate.accepted_at = timezone.now()
+    candidate.status = sm.on_operator_edit(candidate.status)
+    update_fields = {
+        field_name
+        for field_name, old_value in old_values.items()
+        if hasattr(candidate, field_name) and getattr(candidate, field_name) != old_value
+    }
+    update_fields.add("status")
+    if candidate.accepted_at is not None:
+        update_fields.add("accepted_at")
+    _write_owned_interface_mtu(candidate, update_fields)
+
+
 def _save_owned_overlay_edit(obj, key, old_values):
     """Claim an edited overlay and update its matching native NetBox object atomically."""
     if key in {
@@ -4846,6 +4891,9 @@ def _save_owned_overlay_edit(obj, key, old_values):
     if key == "bgp_peer":
         _save_owned_bgp_edit(obj, old_values)
         return
+    if key == "interface_mtu":
+        _save_owned_interface_mtu_edit(obj, old_values)
+        return
 
     from . import status_machine as sm
     from .intent_state import intent_transaction
@@ -4854,12 +4902,6 @@ def _save_owned_overlay_edit(obj, key, old_values):
         if not sm.is_owned(obj.status):
             obj.accepted_at = timezone.now()
         obj.status = sm.on_operator_edit(obj.status)
-        if key == "interface_mtu" and obj.l2_mtu is not None:
-            iface = obj.interface
-            clamped = min(int(obj.l2_mtu), NSOInterfaceMtuStateAcceptView._NETBOX_MTU_MAX)
-            if iface.mtu != clamped:
-                iface.mtu = clamped
-                iface.save(update_fields=["mtu"])
         update_fields = {
             field_name
             for field_name, old_value in old_values.items()
@@ -7255,28 +7297,11 @@ class NSOInterfaceMtuStateAcceptView(OverlayStateAcceptMixin):
     def post(self, request, pk):  # noqa: D102
         import copy
 
-        from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
-
         state = get_object_or_404(self.model_class, pk=pk)
         candidate = copy.copy(state)
         candidate.status = _status_after_accept(state.status)
         candidate.accepted_at = timezone.now()
-        saves = []
-        interface_candidate = None
-        if candidate.l2_mtu is not None:
-            clamped = min(int(candidate.l2_mtu), self._NETBOX_MTU_MAX)
-            if candidate.interface.mtu != clamped:
-                interface_candidate = copy.copy(candidate.interface)
-                interface_candidate.mtu = clamped
-                saves.append(planned_save(interface_candidate, update_fields=("mtu",)))
-        saves.append(planned_save(candidate, update_fields=("status", "accepted_at")))
-
-        plan = RendererMutationPlan.build(saves=saves, planned_at=candidate.accepted_at)
-        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-        with mutation as writer:
-            if interface_candidate is not None:
-                writer.save(interface_candidate, update_fields=("mtu",))
-            writer.save(candidate, update_fields=("status", "accepted_at"))
+        _write_owned_interface_mtu(candidate, ("status", "accepted_at"))
         messages.success(request, f"Accepted {candidate}.")
         return redirect(_device_nso_tab_url(candidate.management.device_id))
 
