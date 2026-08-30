@@ -299,9 +299,12 @@ def rollback_auto_assigned(state) -> None:
         return
 
     states = [state]
-    if state.peer_state_id is not None:
-        states.append(type(state).objects.get(pk=state.peer_state_id))
     source_pool = state.source_pool
+    is_p2p = state.allocation_kind == state.ALLOCATION_KIND_P2P
+    if is_p2p:
+        peer = type(state).objects.filter(pk=state.peer_state_id).first()
+        if peer is not None:
+            states.append(peer)
     interface_type = ContentType.objects.get_for_model(Interface)
     ip_addresses = []
     for candidate in states:
@@ -327,7 +330,7 @@ def rollback_auto_assigned(state) -> None:
             ip_address.delete()
         for candidate in states:
             candidate.delete()
-        if source_pool is not None:
+        if is_p2p and source_pool is not None:
             source_pool.delete()
 
 
@@ -460,6 +463,7 @@ def _assign_one_p2p_family(
                     "family": family,
                     "status": "accepted",
                     "auto_assigned": True,
+                    "allocation_kind": NSOInterfaceIPState.ALLOCATION_KIND_P2P,
                     "source_pool": child_prefix,
                     "accepted_at": now,
                 },
@@ -472,6 +476,7 @@ def _assign_one_p2p_family(
                     "family": family,
                     "status": "accepted",
                     "auto_assigned": True,
+                    "allocation_kind": NSOInterfaceIPState.ALLOCATION_KIND_P2P,
                     "source_pool": child_prefix,
                     "accepted_at": now,
                 },
@@ -600,6 +605,7 @@ def _reserve_single(interface, mgmt, family: str, pool, result, push=True) -> No
                             "family": family,
                             "status": "accepted",
                             "auto_assigned": True,
+                            "allocation_kind": NSOInterfaceIPState.ALLOCATION_KIND_SINGLE,
                             "source_pool": pool,
                             "accepted_at": timezone.now(),
                         },

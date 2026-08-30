@@ -76,6 +76,19 @@ class Migration(migrations.Migration):
             field=models.BigIntegerField(blank=True, null=True),
         ),
         migrations.AddField(
+            model_name="nsointerfaceipstate",
+            name="allocation_kind",
+            field=models.CharField(
+                choices=[
+                    ("manual", "Manual"),
+                    ("single", "Auto-assigned single address"),
+                    ("p2p", "Auto-assigned P2P pair"),
+                ],
+                default="manual",
+                max_length=16,
+            ),
+        ),
+        migrations.AddField(
             model_name="nsobfdinterfacestate",
             name="apply_attempt_id",
             field=models.UUIDField(blank=True, null=True),

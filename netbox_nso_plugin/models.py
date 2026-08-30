@@ -883,6 +883,14 @@ class NSOInterfaceIPState(_NSODeviceTabURLMixin, NetBoxModel):
         ("error", "Error"),
         ("conflict", "Conflict"),  # address already assigned elsewhere in NetBox
     ]
+    ALLOCATION_KIND_MANUAL = "manual"
+    ALLOCATION_KIND_SINGLE = "single"
+    ALLOCATION_KIND_P2P = "p2p"
+    ALLOCATION_KIND_CHOICES = [
+        (ALLOCATION_KIND_MANUAL, "Manual"),
+        (ALLOCATION_KIND_SINGLE, "Auto-assigned single address"),
+        (ALLOCATION_KIND_P2P, "Auto-assigned P2P pair"),
+    ]
 
     interface = models.ForeignKey(
         to="dcim.Interface",
@@ -930,6 +938,12 @@ class NSOInterfaceIPState(_NSODeviceTabURLMixin, NetBoxModel):
     auto_assigned = models.BooleanField(
         default=False,
         help_text="True when this address was minted by the IP auto-assignment engine.",
+    )
+    allocation_kind = models.CharField(
+        max_length=16,
+        choices=ALLOCATION_KIND_CHOICES,
+        default=ALLOCATION_KIND_MANUAL,
+        help_text="The allocation shape that owns cleanup of the source pool.",
     )
     source_pool = models.ForeignKey(
         to="ipam.Prefix",

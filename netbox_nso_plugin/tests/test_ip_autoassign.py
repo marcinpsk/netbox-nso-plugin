@@ -186,6 +186,7 @@ class TestAutoAssignIP(TestCase):
         state = NSOInterfaceIPState.objects.get(interface=iface, address=entry["address"])
         self.assertEqual(state.status, "accepted")
         self.assertTrue(state.auto_assigned)
+        self.assertEqual(state.allocation_kind, NSOInterfaceIPState.ALLOCATION_KIND_SINGLE)
         self.assertEqual(state.source_pool_id, self.pool_lo4.pk)
 
         mgmt.delete()
@@ -358,6 +359,31 @@ class TestRollbackAutoAssigned(TestCase):
 
         self.assertFalse(IPAddress.objects.filter(address="10.200.0.1/32").exists())
         self.assertFalse(NSOInterfaceIPState.objects.filter(pk=state.pk).exists())
+
+    def test_single_address_rollback_preserves_the_shared_source_pool(self):
+        from netbox_nso_plugin.ip_autoassign import rollback_auto_assigned
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        pool = Prefix.objects.create(prefix="198.18.200.0/24", status="active")
+        iface = Interface.objects.create(device=self.device, name="Loopback202", type="virtual")
+        ip = IPAddress.objects.create(address="198.18.200.1/32", status="reserved")
+        ip.assigned_object = iface
+        ip.save()
+        state = NSOInterfaceIPState.objects.create(
+            interface=iface,
+            address="198.18.200.1/32",
+            family="ipv4",
+            status="accepted",
+            auto_assigned=True,
+            allocation_kind=NSOInterfaceIPState.ALLOCATION_KIND_SINGLE,
+            source_pool=pool,
+        )
+
+        rollback_auto_assigned(state)
+
+        self.assertFalse(IPAddress.objects.filter(pk=ip.pk).exists())
+        self.assertFalse(NSOInterfaceIPState.objects.filter(pk=state.pk).exists())
+        self.assertTrue(Prefix.objects.filter(pk=pool.pk).exists())
 
     def test_rollback_noop_for_non_auto_assigned(self):
         from netbox_nso_plugin.ip_autoassign import rollback_auto_assigned
@@ -652,6 +678,8 @@ class TestAutoAssignIPP2P(TestCase):
         self.assertEqual(state_b.peer_state_id, state_a.pk)
         self.assertTrue(state_a.auto_assigned)
         self.assertTrue(state_b.auto_assigned)
+        self.assertEqual(state_a.allocation_kind, NSOInterfaceIPState.ALLOCATION_KIND_P2P)
+        self.assertEqual(state_b.allocation_kind, NSOInterfaceIPState.ALLOCATION_KIND_P2P)
 
         mgmt_a.delete()
         mgmt_b.delete()
@@ -842,6 +870,7 @@ class TestRollbackP2PCascade(TestCase):
             family="ipv4",
             status="accepted",
             auto_assigned=True,
+            allocation_kind=NSOInterfaceIPState.ALLOCATION_KIND_P2P,
             source_pool=child,
         )
         state_b = NSOInterfaceIPState.objects.create(
@@ -850,6 +879,7 @@ class TestRollbackP2PCascade(TestCase):
             family="ipv4",
             status="accepted",
             auto_assigned=True,
+            allocation_kind=NSOInterfaceIPState.ALLOCATION_KIND_P2P,
             source_pool=child,
         )
         state_a.peer_state = state_b
@@ -864,6 +894,46 @@ class TestRollbackP2PCascade(TestCase):
         self.assertFalse(NSOInterfaceIPState.objects.filter(pk=state_a.pk).exists())
         self.assertFalse(NSOInterfaceIPState.objects.filter(pk=state_b.pk).exists())
         self.assertFalse(Prefix.objects.filter(prefix="10.88.0.0/31").exists())
+
+    def test_rollback_deletes_the_p2p_child_after_the_peer_row_disappears(self):
+        from netbox_nso_plugin.ip_autoassign import rollback_auto_assigned
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        child = Prefix.objects.create(prefix="198.18.202.0/31", status="reserved")
+        iface_a = Interface.objects.create(device=self.device_a, name="Gi21/0/0", type="1000base-t")
+        iface_b = Interface.objects.create(device=self.device_b, name="Gi21/0/0", type="1000base-t")
+        ip_a = IPAddress.objects.create(address="198.18.202.0/31", status="reserved")
+        ip_a.assigned_object = iface_a
+        ip_a.save()
+        state_a = NSOInterfaceIPState.objects.create(
+            interface=iface_a,
+            address="198.18.202.0/31",
+            family="ipv4",
+            status="accepted",
+            auto_assigned=True,
+            allocation_kind=NSOInterfaceIPState.ALLOCATION_KIND_P2P,
+            source_pool=child,
+        )
+        state_b = NSOInterfaceIPState.objects.create(
+            interface=iface_b,
+            address="198.18.202.1/31",
+            family="ipv4",
+            status="accepted",
+            auto_assigned=True,
+            allocation_kind=NSOInterfaceIPState.ALLOCATION_KIND_P2P,
+            source_pool=child,
+        )
+        state_a.peer_state = state_b
+        state_a.save(update_fields=["peer_state"])
+        state_b.delete()
+        state_a.refresh_from_db()
+        self.assertIsNone(state_a.peer_state_id)
+
+        rollback_auto_assigned(state_a)
+
+        self.assertFalse(IPAddress.objects.filter(pk=ip_a.pk).exists())
+        self.assertFalse(NSOInterfaceIPState.objects.filter(pk=state_a.pk).exists())
+        self.assertFalse(Prefix.objects.filter(pk=child.pk).exists())
 
 
 class TestReconcileP2PBothInSync(TestCase):

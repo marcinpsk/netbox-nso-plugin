@@ -337,6 +337,7 @@ _GLOBAL_LIFECYCLE_FIELDS = frozenset(
         "last_apply_at",
         "last_apply_error",
         "apply_attempt_id",
+        "allocation_kind",
         "generation_started_at",
         "last_result_advisory",
         "device_present",
