@@ -8,7 +8,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from django.db import DatabaseError, close_old_connections, connection, transaction
-from django.test import TestCase, TransactionTestCase
+from django.test import SimpleTestCase, TestCase, TransactionTestCase
 from django.utils import timezone
 
 from ._outbox_case import make_device
@@ -48,6 +48,23 @@ def _device_is_editable(device_pk) -> bool:
 def _row_is_lockable(model, **filters) -> bool:
     """Report whether a second connection can take the row lock right now."""
     return _in_second_connection(lambda: list(model.objects.select_for_update().filter(**filters)))
+
+
+class TestProvisionEvidenceValidation(SimpleTestCase):
+    def test_terminal_evidence_rejects_an_unknown_status(self):
+        from netbox_nso_plugin.provision_lifecycle import validate_provision_evidence
+
+        with self.assertRaises(ValueError):
+            validate_provision_evidence({"status": "suceeded"}, terminal_required=True)
+
+    def test_success_evidence_requires_a_boolean_result(self):
+        from netbox_nso_plugin.provision_lifecycle import validate_provision_evidence
+
+        with self.assertRaises(ValueError):
+            validate_provision_evidence(
+                {"status": "succeeded", "result": {"ok": "false"}},
+                terminal_required=True,
+            )
 
 
 class TestProvisionTombstoneSweep(TestCase):
