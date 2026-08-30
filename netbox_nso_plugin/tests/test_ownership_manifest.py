@@ -11,7 +11,7 @@ class TestOwnershipManifestSchema(SimpleTestCase):
 
         fields = {field.name: field for field in NSOOwnershipManifest._meta.fields}
 
-        assert fields["device"].is_relation
+        assert not fields["device_id"].is_relation
         assert not fields["native_model_label"].is_relation
         assert not fields["native_key"].is_relation
         assert "overlay" not in fields
@@ -25,7 +25,7 @@ class TestOwnershipManifestSchema(SimpleTestCase):
             if getattr(constraint, "fields", None)
         }
 
-        assert ("device", "scope", "native_model_label", "native_key") in constraints
+        assert ("device_id", "scope", "native_model_label", "native_key") in constraints
 
     def test_manifest_carries_ownership_and_deletion_evidence(self):
         from netbox_nso_plugin.models import NSOOwnershipManifest
@@ -38,22 +38,19 @@ class TestOwnershipManifestSchema(SimpleTestCase):
 
 
 class TestOwnershipManifestDurability(TestCase):
-    def test_device_deletion_cannot_remove_manifest_evidence(self):
-        from django.db.models.deletion import ProtectedError
-
+    def test_device_deletion_keeps_manifest_evidence(self):
         from netbox_nso_plugin.models import NSOOwnershipManifest
 
         from ._outbox_case import make_managed
 
         device, _management = make_managed("manifest-durability", 1627)
         manifest = NSOOwnershipManifest.objects.create(
-            device=device,
+            device_id=device.pk,
             scope="interface",
             native_model_label="dcim.interface",
             native_key={"device_id": device.pk, "name": "Ethernet1"},
         )
 
-        with self.assertRaises(ProtectedError):
-            device.delete()
+        device.delete()
 
         self.assertTrue(NSOOwnershipManifest.objects.filter(pk=manifest.pk).exists())

@@ -2893,11 +2893,7 @@ class NSOLinkRoleAssignment(NetBoxModel):
 class NSOOwnershipManifest(models.Model):
     """Durable ownership evidence for one native object in one delivery scope."""
 
-    device = models.ForeignKey(
-        to="dcim.Device",
-        on_delete=models.PROTECT,
-        related_name="nso_ownership_manifest_entries",
-    )
+    device_id = models.PositiveBigIntegerField(db_column="device_id", db_index=True)
     scope = models.CharField(max_length=32)
     native_model_label = models.CharField(max_length=200)
     native_key = models.JSONField()
@@ -2908,11 +2904,11 @@ class NSOOwnershipManifest(models.Model):
     class Meta:
         constraints = [
             models.UniqueConstraint(
-                fields=["device", "scope", "native_model_label", "native_key"],
+                fields=["device_id", "scope", "native_model_label", "native_key"],
                 name="nso_owner_manifest_identity",
             )
         ]
-        ordering = ["device", "scope", "native_model_label", "id"]
+        ordering = ["device_id", "scope", "native_model_label", "id"]
         verbose_name = "NSO Ownership Manifest Entry"
         verbose_name_plural = "NSO Ownership Manifest Entries"
 
