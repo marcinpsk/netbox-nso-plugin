@@ -163,6 +163,17 @@ class TestNothingToCorrelate(_SettlementCase):
 class TestPerRouteVerdicts(_SettlementCase):
     """P5.2-P5.5, P5.7 and P5.10 — one result row decides one overlay, on its own evidence."""
 
+    def test_a_deleted_overlay_is_a_lost_verdict_compare_and_set(self):
+        from netbox_nso_plugin.settlement import _write_verdict
+
+        device = _make_device("deleted-verdict")
+        mgmt = _make_mgmt(device, "deleted-verdict", 49)
+        route = _route("198.18.0.0/24", "198.18.0.1", devices=[device])
+        state = _own(route, mgmt, generation=75)
+        type(state).objects.filter(pk=state.pk).delete()
+
+        self.assertFalse(_write_verdict(state, status="in_sync"))
+
     def test_an_auto_applied_row_settles_without_passing_through_deploying(self):
         """P5.2: an auto-applied route is never marked deploying, and still has a real result."""
         from netbox_nso_plugin.settlement import consume_static_route_settlements

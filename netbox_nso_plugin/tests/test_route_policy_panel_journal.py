@@ -10,6 +10,10 @@ writes (no mocks of our own code).
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import patch
+from uuid import uuid4
+
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.contrib.contenttypes.models import ContentType
 from django.template.loader import render_to_string
@@ -54,17 +58,19 @@ class _RoutePolicyFixture(TestCase):
             defaults={"nso_instance": inst, "nso_device_name": "rpj-dev", "adapter_device_id": 777},
         )[0]
 
-    def _reconcile(self):
-        """Create real netbox_routing objects + GFK-linked state rows via the reconciler."""
-        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
-
-        payload = {
+    def _payload(self):
+        return {
             "prefix_lists": [{"name": "PLJ", "entries": [{"seq": 5, "action": "permit"}]}],
             "community_lists": [{"name": "CLJ", "entries": [{"community": "65000:1"}]}],
             "as_paths": [{"name": "APJ", "entries": [{"regex": "^65000_"}]}],
             "route_maps": [{"name": "RMJ", "entries": [{"seq": 10, "action": "permit"}]}],
         }
-        reconcile_route_policy(self.device, payload)
+
+    def _reconcile(self):
+        """Create real netbox_routing objects + GFK-linked state rows via the reconciler."""
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        reconcile_route_policy(self.device, self._payload())
 
 
 class TestAppliedToDevicesPanel(_RoutePolicyFixture):
@@ -171,6 +177,77 @@ class TestRoutePolicyApplyJournal(_RoutePolicyFixture):
         self.assertEqual(mgmt.last_journaled_apply_job, "8527")
         # last_apply_at stamped on the rows for the panel's "Last apply" column.
         self.assertTrue(all(r.last_apply_at for r in NSORoutePolicyState.objects.filter(management=mgmt)))
+
+    def test_reconcile_preserves_the_final_route_policy_attempt_for_journaling(self):
+        from netbox_nso_plugin.models import NSOApplyAttempt, NSORoutePolicyState
+        from netbox_nso_plugin.reconcile import _LeaseOutcome, reconcile_device, run_device_reconcile
+
+        from ._outbox_case import content_update, mirror_update
+        from .test_apply_settlement import _attempt, _payload, _response
+
+        mgmt = content_update(self._make_mgmt(), manage_routing=True, manage_route_policy=True)
+        route_policy_payload = {
+            "prefix_lists": [
+                {
+                    "name": "PL-STABLE",
+                    "family": 4,
+                    "entries": [{"action": "permit", "prefix": "198.18.0.0/15"}],
+                }
+            ],
+            "community_lists": [],
+            "as_paths": [],
+            "route_maps": [],
+        }
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+
+        reconcile_route_policy(self.device, route_policy_payload)
+        row = NSORoutePolicyState.objects.get(management=mgmt, family="prefix_list", object_name="PL-STABLE")
+        with intent_transaction(footprint_for_instance(row)):
+            row.status = "accepted"
+            row.save(update_fields=["status"])
+        attempt_id = uuid4()
+        mirror_update(row, status="deploying", apply_attempt_id=attempt_id)
+        row.refresh_from_db()
+        self.assertEqual(row.status, "deploying")
+        self.assertFalse(route_policy_reconcile_plan(self.device, route_policy_payload).changes_content)
+        selected = {"route_policy": 41}
+        response = _response(mgmt.adapter_device_id, 81, selected)
+        NSOApplyAttempt.objects.create(
+            id=attempt_id,
+            management=mgmt,
+            adapter_device_id=mgmt.adapter_device_id,
+            selected=selected,
+            scope_revisions={"route_policy": 1},
+            http_status=202,
+            response=response,
+        )
+        carrier_result = {"route_policy_count_by_outcome": {"in_sync": 1, "apply_failed": 0}}
+        evidence = _payload(
+            mgmt.adapter_device_id,
+            [_attempt(attempt_id, mgmt.adapter_device_id, 81, selected, "settled", result=carrier_result)],
+        )
+
+        with (
+            patch("netbox_nso_plugin.reconcile._acquire_reconcile_lease", return_value=_LeaseOutcome()),
+            patch("netbox_nso_plugin.adapter_client.get_deployment_evidence", return_value=evidence) as fetch_evidence,
+            patch("netbox_nso_plugin.adapter_client.get_route_policy", return_value=route_policy_payload),
+            patch(
+                "netbox_nso_plugin.settlement.settle_static_routes",
+                return_value=SimpleNamespace(drained=True),
+            ),
+        ):
+            ctx = reconcile_device(self.device, mgmt)
+            row.refresh_from_db()
+            self.assertEqual(row.status, "in_sync")
+            with patch("netbox_nso_plugin.reconcile.reconcile_device", return_value=ctx):
+                run_device_reconcile(self.device.pk)
+
+        row.refresh_from_db()
+        mgmt.refresh_from_db()
+        self.assertEqual(row.status, "in_sync")
+        self.assertEqual(mgmt.last_journaled_apply_job, "981")
+        fetch_evidence.assert_called_once_with(mgmt.adapter_device_id, (attempt_id,))
 
     def test_idempotent_same_job_does_not_duplicate(self):
         from netbox_routing.models import CommunityList

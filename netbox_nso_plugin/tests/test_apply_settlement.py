@@ -368,3 +368,15 @@ class TestAttemptSettlement(TestCase):
         row.refresh_from_db()
         self.assertEqual(row.status, "apply_failed")
         self.assertIn("was abandoned", row.last_apply_error)
+
+    def test_a_deleted_overlay_is_an_absent_mirror_fragment(self):
+        from django.db import transaction
+
+        row = self._vlan_row(1637, uuid4())
+        type(row).objects.filter(pk=row.pk).delete()
+
+        from netbox_nso_plugin.intent_state import mirror_refresh
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        with transaction.atomic(), suppress_intent_push(), mirror_refresh(row, {"status"}) as locked:
+            self.assertIsNone(locked)

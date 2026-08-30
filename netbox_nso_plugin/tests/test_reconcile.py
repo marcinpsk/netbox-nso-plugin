@@ -69,6 +69,36 @@ def _forced_scopes(push, device_id):
 class TestRunDeviceReconcile(APITestCase):
     """run_device_reconcile is the rqworker entrypoint (off-request)."""
 
+    def test_route_policy_evidence_programming_error_stops_reconcile(self):
+        from types import SimpleNamespace
+
+        from netbox_nso_plugin.reconcile import _reconcile_routing
+
+        device = SimpleNamespace(pk=17)
+        mgmt = SimpleNamespace(
+            adapter_device_id=23,
+            manage_routing=True,
+            manage_static=False,
+            manage_isis=False,
+            manage_route_policy=True,
+            manage_ospf=False,
+            manage_bgp=False,
+            manage_redistribution=False,
+        )
+
+        def continued_after_error(_device_id):
+            raise AssertionError("route-policy reconcile continued after an internal evidence error")
+
+        client = SimpleNamespace(get_route_policy=continued_after_error)
+        with (
+            patch(
+                "netbox_nso_plugin.apply_settlement.load_deployment_evidence",
+                side_effect=RuntimeError("evidence parser failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "evidence parser failed"),
+        ):
+            _reconcile_routing(device, mgmt, client, {})
+
     def test_missing_device_is_skipped(self):
         from netbox_nso_plugin.reconcile import run_device_reconcile
 

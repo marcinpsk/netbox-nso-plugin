@@ -351,11 +351,12 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
 
         _gated(ctx, mgmt, "isis", isis_payload, _isis_body, epoch=dev_id)
     if mgmt.manage_route_policy:
+        from .adapter_client import AdapterError
         from .apply_settlement import load_deployment_evidence
 
         try:
             evidence = load_deployment_evidence(mgmt)
-        except Exception as exc:  # noqa: BLE001 — settlement remains best-effort
+        except AdapterError as exc:
             logger.warning(
                 "nso reconcile: pre-route-policy evidence failed for device %s: %s",
                 device.pk,

@@ -450,7 +450,7 @@ def _write_verdict(state, **fields) -> bool:
     }
     matched = False
     with transaction.atomic(), suppress_intent_push(), mirror_refresh(state, fields) as locked:
-        if all(getattr(locked, field_name) == value for field_name, value in expected.items()):
+        if locked is not None and all(getattr(locked, field_name) == value for field_name, value in expected.items()):
             for field_name, value in fields.items():
                 setattr(locked, field_name, value)
             locked.save(update_fields=fields)

@@ -1804,7 +1804,8 @@ def mirror_refresh(instance, update_fields):
     token = _ACTIVE_PERMIT.set(permit)
     try:
         yield locked
-        if canonical_fragment(locked, spec) != before:
+        after = ABSENT if locked is None else canonical_fragment(locked, spec)
+        if after != before:
             raise IntentMutationProtocolError("mirror_refresh changed a canonical renderer fragment")
     finally:
         _ACTIVE_PERMIT.reset(token)
