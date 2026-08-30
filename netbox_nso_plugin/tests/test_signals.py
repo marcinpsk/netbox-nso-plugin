@@ -2022,6 +2022,22 @@ class TestDeleteOriginMarking(_SignalDBBase):
         self._assert_teardown_touched_only_the_offboard(self._recorded_calls(mgmt.delete))
 
     def test_deleting_a_device_pushes_no_intent(self):
+        from django.db.models.signals import pre_delete
+
+        from netbox_nso_plugin.models import NSOSVIState
+
         mgmt = self._mgmt()
         self._owned_svi(mgmt)
-        self._assert_teardown_touched_only_the_offboard(self._recorded_calls(self.device.delete))
+        origins = []
+
+        def capture_origin(sender, origin, **kwargs):
+            origins.append(origin)
+
+        pre_delete.connect(capture_origin, sender=NSOSVIState, weak=False)
+        try:
+            calls = self._recorded_calls(self.device.delete)
+        finally:
+            pre_delete.disconnect(capture_origin, sender=NSOSVIState)
+
+        self.assertEqual(origins, [self.device])
+        self._assert_teardown_touched_only_the_offboard(calls)

@@ -44,11 +44,16 @@ class NSOPluginConfig(PluginConfig):
         # hash_captured() return "" and every device version falsely read as "matches". Importing
         # it here guarantees the specs exist in every process (web + worker).
         from .derived_intent import _register_description_from_cable
-        from .intent_state import connect_renderer_input_end_handlers, register_builtin_renderer_inputs
+        from .intent_state import (
+            connect_renderer_input_end_handlers,
+            ensure_delete_signal_origin,
+            register_builtin_renderer_inputs,
+        )
         from .signals import _connect_g_activated
 
         # The field is always available; enabled templates are read live from NetBox.
         _register_description_from_cable()
+        ensure_delete_signal_origin()
         # Register the begin hooks before behavior signals. Register the matching end hooks
         # afterwards so one implicit permit encloses the complete save or delete sequence.
         register_builtin_renderer_inputs(connect_ends=False)

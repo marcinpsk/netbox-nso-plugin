@@ -2365,6 +2365,28 @@ def _finish_migrations(**kwargs):
     _MIGRATIONS_ACTIVE.set(False)
 
 
+def ensure_delete_signal_origin() -> None:
+    """Make a model deletion identify its root to every cascade signal."""
+    from netbox.models.deletion import CustomCollector
+
+    collect = CustomCollector.collect
+    if getattr(collect, "_nso_preserves_delete_origin", False):
+        return
+
+    @functools.wraps(collect)
+    def collect_with_origin(self, objs, *args, **kwargs):
+        source = kwargs.get("source", args[0] if args else None)
+        if self.origin is None and source is None:
+            roots = tuple(objs)
+            if len(roots) == 1:
+                self.origin = roots[0]
+            objs = roots
+        return collect(self, objs, *args, **kwargs)
+
+    collect_with_origin._nso_preserves_delete_origin = True
+    CustomCollector.collect = collect_with_origin
+
+
 def register_renderer_input(spec: RendererInputSpec, *, connect_ends: bool = True) -> None:
     """Register one concrete or auto-created-through renderer input."""
     label = spec.model_label.lower()
