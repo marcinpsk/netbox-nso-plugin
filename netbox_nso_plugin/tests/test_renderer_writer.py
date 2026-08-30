@@ -204,7 +204,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         with renderer_writes(plan) as writer:
             writer.save(candidate, update_fields=("status",))
 
-        manifest = NSOOwnershipManifest.objects.get(device=device, scope="static_route")
+        manifest = NSOOwnershipManifest.objects.get(device_id=device.pk, scope="static_route")
         assert manifest.acknowledged_lineage == [acknowledged]
 
     def test_one_plan_can_create_unregistered_native_rows_and_registered_overlay(self):
