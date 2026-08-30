@@ -574,6 +574,49 @@ class TestJobBoundaryValidation(unittest.TestCase):
 class TestAdapterClientRemainingFunctions(unittest.TestCase):
     """Smoke tests for API functions not covered in test_models.py."""
 
+    def test_control_state_normalizes_valid_adapter_payloads(self):
+        from netbox_nso_plugin.adapter_client import AdapterControlState
+
+        state = AdapterControlState.from_adapter(
+            {"failover": {"primary_ip": "198.18.0.1", "oob_ip": None}},
+            {"attributes": ["enabled", "description"], "auto_apply": False, "sync_before_apply": True},
+        )
+
+        self.assertEqual(
+            state,
+            AdapterControlState(
+                managed_attributes=("description", "enabled"),
+                auto_apply=False,
+                sync_before_apply=True,
+                primary_ip="198.18.0.1",
+                oob_ip=None,
+            ),
+        )
+
+    def test_control_state_rejects_malformed_adapter_payloads(self):
+        from netbox_nso_plugin.adapter_client import AdapterControlState, AdapterError
+
+        valid_device = {"failover": None}
+        valid_scope = {"attributes": [], "auto_apply": False, "sync_before_apply": True}
+        malformed = (
+            (None, valid_scope),
+            (valid_device, None),
+            ({}, valid_scope),
+            ({"failover": []}, valid_scope),
+            ({"failover": {}}, valid_scope),
+            ({"failover": {"primary_ip": 1, "oob_ip": None}}, valid_scope),
+            (valid_device, {**valid_scope, "attributes": "description"}),
+            (valid_device, {**valid_scope, "auto_apply": 1}),
+            (valid_device, {**valid_scope, "sync_before_apply": None}),
+        )
+
+        for device_state, scope_state in malformed:
+            with self.subTest(device_state=device_state, scope_state=scope_state):
+                with self.assertRaises(AdapterError) as raised:
+                    AdapterControlState.from_adapter(device_state, scope_state)
+
+                self.assertEqual(raised.exception.code, "invalid_response")
+
     def _make_session(self, status=200, json_data=None, content=None):
         return make_session(status_code=status, json_data=json_data, content=content)
 
