@@ -492,7 +492,7 @@ class TestRoutePolicyDeletePropagation(_RPBase):
         assert pushed == []
 
 
-class TestRoutePolicyEditOwnsAndPushes(_RPBase):
+class TestRoutePolicyForeignEditDoesNotOwnOrPush(_RPBase):
     """Foreign native entry edits do not establish route-policy ownership."""
 
     def _community_list_with_overlay(self, status="in_sync"):

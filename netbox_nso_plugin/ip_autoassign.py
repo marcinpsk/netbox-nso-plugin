@@ -705,10 +705,11 @@ def _reserve_single(interface, mgmt, family: str, pool, result, push=True) -> No
                     ),
                     planned_at=planned_at,
                 )
-                with renderer_writes(plan) as writer, suppress_intent_push():
-                    writer.save(ip_obj, force_insert=True)
-                    failed_step = "create NSOInterfaceIPState"
-                    writer.save(state, update_fields=state_fields, force_insert=current is None)
+                with renderer_writes(plan) as writer:
+                    with suppress_intent_push():
+                        writer.save(ip_obj, force_insert=True)
+                        failed_step = "create NSOInterfaceIPState"
+                        writer.save(state, update_fields=state_fields, force_insert=current is None)
                     failed_step = "schedule the IP intent push"
                     if push:
                         _schedule_intent_push((mgmt.device_id, "ip"))

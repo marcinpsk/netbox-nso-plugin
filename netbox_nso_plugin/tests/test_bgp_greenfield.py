@@ -299,7 +299,10 @@ class TestBgpPeerGreenfieldDelete(BgpGreenfieldBase):
             status="in_sync",
         )
 
-        with patch("netbox_nso_plugin.adapter_client.put_bgp_intent") as mock_put:
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_bgp_intent") as mock_put,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
             peer.delete()
 
         state.refresh_from_db()

@@ -502,7 +502,10 @@ class TestInterfaceIPReassignment(IntentPushResetMixin, TestCase):
             status="accepted",
         )
 
-        with patch("netbox_nso_plugin.adapter_client.put_ip_intent") as mock_put:
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_ip_intent") as mock_put,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
             ip.assigned_object = self.if_b
             ip.save()
 

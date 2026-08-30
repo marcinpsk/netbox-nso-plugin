@@ -72,6 +72,7 @@ class TestInterfaceMtuReconciler(TestCase):
 
         self.assertEqual([row.interface_id for row in rows], [self.po1.pk])
         self.assertTrue(NSOInterfaceMtuState.objects.filter(interface=self.po1, l2_mtu=9000).exists())
+        self.assertEqual(NSOInterfaceMtuState.objects.get(interface=self.po1).custom_field_data, {})
         self.assertFalse(NSOInterfaceMtuState.objects.filter(interface=self.lag99).exists())
 
     def test_mirrors_l2_and_ip_mtu(self):
