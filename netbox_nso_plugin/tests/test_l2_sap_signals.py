@@ -147,7 +147,6 @@ class TestOnL2SapStateSave(IntentPushDeliveryMixin, TestCase):
     def test_save_triggers_intent_push(self):
         """Saving NSOL2SapState triggers put_l2_sap_intent."""
         from netbox_nso_plugin.models import NSOL2SapState
-        from netbox_nso_plugin.signals import _on_l2_sap_state_save
 
         mgmt = self._make_mgmt()
 
@@ -161,7 +160,7 @@ class TestOnL2SapStateSave(IntentPushDeliveryMixin, TestCase):
                 status="accepted",
             )
             with self.captureOnCommitCallbacks(execute=True):
-                _on_l2_sap_state_save(sender=NSOL2SapState, instance=state)
+                state.save()
             mock_push.assert_called_once()
             assert mock_push.call_args[0][0] == 99
 
