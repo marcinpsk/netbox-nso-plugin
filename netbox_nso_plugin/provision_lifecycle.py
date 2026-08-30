@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 _FLEET_SWEEP_LIMIT = 100
 # Past this age an attempt the adapter has no record of can no longer be in flight.
 _UNKNOWN_ATTEMPT_MAX_AGE = timedelta(hours=6)
+_PROVISION_STATUSES = frozenset({"queued", "running", "succeeded", "failed"})
+_TERMINAL_PROVISION_STATUSES = frozenset({"succeeded", "failed"})
 
 
 def _invalid_adapter_response(message):
@@ -34,14 +36,18 @@ def validate_provision_evidence(evidence, *, terminal_required=False) -> dict:
     status = evidence.get("status")
     if not isinstance(status, str) or not status:
         raise ValueError("provision evidence status must be a non-empty string")
+    if status not in _PROVISION_STATUSES:
+        raise ValueError("provision evidence status is not supported")
     for member in ("result", "error"):
         value = evidence.get(member)
         if value is not None and not isinstance(value, dict):
             raise ValueError(f"provision evidence {member} must be an object or null")
     if status == "succeeded" and not isinstance(evidence.get("result"), dict):
         raise ValueError("successful provision evidence must include a result object")
+    if status == "succeeded" and type(evidence["result"].get("ok")) is not bool:
+        raise ValueError("successful provision evidence result.ok must be a boolean")
     _evidence_job_id(evidence)
-    if terminal_required and status in {"queued", "running"}:
+    if terminal_required and status not in _TERMINAL_PROVISION_STATUSES:
         raise ValueError("provision completion evidence must be terminal")
     return dict(evidence)
 
