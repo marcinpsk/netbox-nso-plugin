@@ -455,6 +455,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
         _reconcile_logging_config,
         _reconcile_snmp_config,
         _upsert_interface_states,
+        logging_reconcile_plan,
     )
 
     ctx = _empty_context()
@@ -663,6 +664,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                     log_doc,
                 ),
                 epoch=dev_id,
+                pre_body=lambda: logging_reconcile_plan(device, log_doc),
             )
         if getattr(mgmt, "manage_l2", False):
             # Nokia L2 SAP overlays. Kept in the full reconcile (not just

@@ -96,6 +96,17 @@ class TestReconcileLoggingLevels(LevelsTestBase):
         self.assertEqual(row.status, "imported")
         self.assertIsNotNone(row.last_sync_at)
 
+    def test_full_device_reconcile_uses_the_logging_mutation_plan(self):
+        from netbox_nso_plugin.reconcile import reconcile_device
+
+        payload = self._payload(local_levels=_LEVELS_PAYLOAD)
+        with patch("netbox_nso_plugin.adapter_client.get_logging_config", return_value=payload):
+            result = reconcile_device(self.device, self.mgmt)
+
+        row = result["logging_data"]["local_levels"]
+        self.assertEqual(row.console_severity, "CRITICAL")
+        self.assertEqual(row.status, "imported")
+
     def test_partial_payload_leaves_other_destinations_blank(self):
         res = self._reconcile(self._payload(local_levels={"console_severity": "ERROR"}))
         row = res["local_levels"]
