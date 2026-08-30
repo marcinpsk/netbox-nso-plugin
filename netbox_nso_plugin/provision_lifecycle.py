@@ -42,10 +42,14 @@ def validate_provision_evidence(evidence, *, terminal_required=False) -> dict:
         value = evidence.get(member)
         if value is not None and not isinstance(value, dict):
             raise ValueError(f"provision evidence {member} must be an object or null")
-    if status == "succeeded" and not isinstance(evidence.get("result"), dict):
+    result = evidence.get("result")
+    if status == "succeeded" and not isinstance(result, dict):
         raise ValueError("successful provision evidence must include a result object")
-    if status == "succeeded" and type(evidence["result"].get("ok")) is not bool:
+    if status == "succeeded" and type(result.get("ok")) is not bool:
         raise ValueError("successful provision evidence result.ok must be a boolean")
+    adapter_device_id = result.get("device_id") if isinstance(result, dict) else None
+    if adapter_device_id is not None and (type(adapter_device_id) is not int or adapter_device_id <= 0):
+        raise ValueError("provision evidence result.device_id must be a positive integer")
     _evidence_job_id(evidence)
     if terminal_required and status not in _TERMINAL_PROVISION_STATUSES:
         raise ValueError("provision completion evidence must be terminal")
