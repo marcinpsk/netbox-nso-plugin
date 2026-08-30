@@ -331,7 +331,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         assert NSOVLANState.objects.filter(management=management, vlan=vlan).exists()
 
     def test_one_plan_can_create_a_referenced_support_row(self):
-        from ipam.models import VLANGroup
+        from tenancy.models import Tenant
 
         from netbox_nso_plugin.renderer_writer import (
             RendererMutationPlan,
@@ -339,20 +339,20 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
             renderer_mirror_writes,
         )
 
-        group = VLANGroup(name="Writer support group", slug="writer-support-group")
-        vlan = VLAN(group=group, vid=1638, name="writer-support-vlan")
+        tenant = Tenant(name="Writer support tenant", slug="writer-support-tenant")
+        vlan = VLAN(tenant=tenant, vid=1638, name="writer-support-vlan")
         plan = RendererMutationPlan.build(
             saves=(
-                planned_save(group, force_insert=True, natural_key=("slug",)),
+                planned_save(tenant, force_insert=True, natural_key=("slug",)),
                 planned_save(vlan, force_insert=True, natural_key=("group", "vid")),
             )
         )
 
         with renderer_mirror_writes(plan) as writer:
-            writer.save(group, force_insert=True)
+            writer.save(tenant, force_insert=True)
             writer.save(vlan, force_insert=True)
 
-        assert vlan.group_id == group.pk
+        assert vlan.tenant_id == tenant.pk
 
     def test_referenced_support_creation_adopts_a_natural_key_race_winner(self):
         from ipam.models import VLANGroup
@@ -381,14 +381,14 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         self.assertEqual(vlan.group_id, winner.pk)
 
     def test_plan_refuses_an_unreferenced_support_row(self):
-        from ipam.models import VLANGroup
+        from tenancy.models import Tenant
 
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save
 
-        group = VLANGroup(name="Writer unreferenced group", slug="writer-unreferenced-group")
+        tenant = Tenant(name="Writer unreferenced tenant", slug="writer-unreferenced-tenant")
 
         with self.assertRaisesRegex(IntentMutationProtocolError, "not a registered renderer input"):
-            RendererMutationPlan.build(saves=(planned_save(group, force_insert=True, natural_key=("slug",)),))
+            RendererMutationPlan.build(saves=(planned_save(tenant, force_insert=True, natural_key=("slug",)),))
 
     def test_one_plan_can_create_an_owner_related_row_and_m2m_edge(self):
         from netbox_nso_plugin.renderer_writer import (
