@@ -196,7 +196,8 @@ class TestOnLacpStateSave(_LacpBase):
         bundle = NSOLACPBundleState(management=mgmt, interface=lag, lag_id=1, status="accepted")
 
         with patch("netbox_nso_plugin.adapter_client.apply_lag_config") as mock_apply:
-            bundle.save()
+            with self.captureOnCommitCallbacks(execute=True):
+                bundle.save()
             mock_apply.assert_not_called()
 
 
