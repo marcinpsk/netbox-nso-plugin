@@ -664,7 +664,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         )
         self.assertTrue(
             NSOOwnershipManifest.objects.filter(
-                device=self.device,
+                device_id=self.device.pk,
                 scope="vlan",
                 native_model_label="ipam.vlan",
                 native_key={"group_id": shared.group_id, "vid": shared.vid},
@@ -1036,7 +1036,7 @@ class TestVlanWritePath(IntentPushResetMixin, TestCase):
             delivery.render("vlan", self.device.pk, self.management.adapter_device_id).payload
         )
         assert NSOOwnershipManifest.objects.filter(
-            device=self.device,
+            device_id=self.device.pk,
             scope="vlan",
             native_model_label="ipam.vlan",
             native_key={"group_id": state.vlan.group_id, "vid": state.vlan.vid},
