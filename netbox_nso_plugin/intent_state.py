@@ -8,6 +8,7 @@ import contextlib
 import contextvars
 import copy
 import functools
+import inspect
 import logging
 import operator
 import re
@@ -3148,6 +3149,17 @@ def ensure_delete_signal_origin() -> None:
     from netbox.models.deletion import CustomCollector
 
     collect = CustomCollector.collect
+    parameters = tuple(inspect.signature(collect).parameters.values())
+    positional = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    if len(parameters) < 3 or parameters[2].name != "source" or parameters[2].kind not in positional:
+        raise RuntimeError("NetBox CustomCollector.collect no longer has the expected positional source parameter")
+    origin = object()
+    try:
+        collector = CustomCollector(using="default", origin=origin)
+    except TypeError as exc:
+        raise RuntimeError("NetBox CustomCollector no longer accepts origin") from exc
+    if getattr(collector, "origin", None) is not origin:
+        raise RuntimeError("NetBox CustomCollector.origin is no longer initialized by its constructor")
     if getattr(collect, "_nso_preserves_delete_origin", False):
         return
 
