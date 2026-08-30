@@ -2552,26 +2552,28 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
     def test_a_vlan_id_change_keeps_the_old_placeholder_when_a_qinq_sibling_has_the_new_name(self):
         from ipam.models import VLAN
 
-        from netbox_nso_plugin.models import NSOVLANState
         from netbox_nso_plugin.vlan_reconciler import placeholder_vlan_name
 
         old_vid = self.vlan_state.vlan.vid
         new_vid = old_vid + 1
         old_placeholder = placeholder_vlan_name(old_vid)
-        service_vlan = VLAN.objects.create(vid=old_vid + 200, name="SERVICE", qinq_role="svlan")
-        NSOVLANState.objects.filter(pk=self.vlan_state.pk).update(device_name="")
-        VLAN.objects.filter(pk=self.vlan_state.vlan_id).update(
+        with without_commit_drain(), transaction.atomic():
+            service_vlan = VLAN.objects.create(vid=old_vid + 200, name="SERVICE", qinq_role="svlan")
+        content_update(self.vlan_state, device_name="")
+        content_update(
+            self.vlan_state.vlan,
             group=None,
             qinq_role="cvlan",
             qinq_svlan=service_vlan,
             name=old_placeholder,
         )
-        VLAN.objects.create(
-            vid=old_vid + 100,
-            name=placeholder_vlan_name(new_vid),
-            qinq_role="cvlan",
-            qinq_svlan=service_vlan,
-        )
+        with without_commit_drain(), transaction.atomic():
+            VLAN.objects.create(
+                vid=old_vid + 100,
+                name=placeholder_vlan_name(new_vid),
+                qinq_role="cvlan",
+                qinq_svlan=service_vlan,
+            )
 
         with without_commit_drain(), transaction.atomic():
             vlan = VLAN.objects.get(pk=self.vlan_state.vlan_id)
