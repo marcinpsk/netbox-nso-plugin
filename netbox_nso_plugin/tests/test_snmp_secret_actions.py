@@ -413,7 +413,7 @@ class TestDeletePropagation(_SecretBase):
 
 
 class TestV3PushDerivation(_SecretBase):
-    def test_push_derives_auth_priv_refs_from_protocols_and_skips_v3_hosts(self):
+    def test_push_derives_auth_priv_refs_and_includes_v3_hosts(self):
         from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.models import NSOSnmpHostState, NSOSnmpV3UserState
         from netbox_nso_plugin.signals import reset_intent_push_state
@@ -429,7 +429,12 @@ class TestV3PushDerivation(_SecretBase):
             priv_protocol="",  # no priv protocol → priv ref must be withheld
         )
         NSOSnmpHostState.objects.create(
-            management=mgmt, address="10.0.0.5", version="v3", notify_type="trap", status="accepted"
+            management=mgmt,
+            address="10.0.0.5",
+            version="v3",
+            notify_type="trap",
+            username="monitor",
+            status="accepted",
         )
         NSOSnmpHostState.objects.create(
             management=mgmt,
@@ -459,10 +464,9 @@ class TestV3PushDerivation(_SecretBase):
                 }
             ],
         )
-        # CR-P16: a v3 host with NO user name is still refused — both NSO writers key the receiver
-        # on that field, so pushing it would key the host on an empty user. (A v3 host WITH a user
-        # name now pushes; see test_a_v3_host_WITH_a_user_name_is_pushed below.)
-        self.assertEqual(len(hosts), 1)
-        self.assertEqual(hosts[0]["address"], "10.0.0.6")
-        self.assertEqual(hosts[0]["port"], 1162)
-        self.assertEqual(hosts[0]["community_or_user"], "oldhash1234567890")
+        self.assertEqual(len(hosts), 2)
+        self.assertEqual(hosts[0]["address"], "10.0.0.5")
+        self.assertEqual(hosts[0]["community_or_user"], "monitor")
+        self.assertEqual(hosts[1]["address"], "10.0.0.6")
+        self.assertEqual(hosts[1]["port"], 1162)
+        self.assertEqual(hosts[1]["community_or_user"], "oldhash1234567890")
