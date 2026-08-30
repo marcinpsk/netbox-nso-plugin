@@ -6493,11 +6493,18 @@ class NSOInterfaceMtuStateAcceptView(OverlayStateAcceptMixin):
 
     def post(self, request, pk):  # noqa: D102
         state = get_object_or_404(self.model_class, pk=pk)
-        state.status = _status_after_accept(state.status)
-        state.accepted_at = timezone.now()
+        from .intent_state import MutationFootprint, footprint_for_instance, intent_transaction
+
+        footprint = MutationFootprint.merge(
+            footprint_for_instance(state),
+            footprint_for_instance(state.interface),
+        )
         # One transaction, so the native adoption, the row and the outbox entry it
         # schedules commit together.
-        with transaction.atomic():
+        with intent_transaction(footprint):
+            state = get_object_or_404(self.model_class, pk=state.pk)
+            state.status = _status_after_accept(state.status)
+            state.accepted_at = timezone.now()
             if state.l2_mtu is not None:
                 iface = state.interface
                 clamped = min(int(state.l2_mtu), self._NETBOX_MTU_MAX)

@@ -167,8 +167,22 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
         from unittest.mock import patch
 
         from django.contrib.auth import get_user_model
+        from django.db.models.signals import pre_save
+
+        from netbox_nso_plugin.intent_state import revision_was_acquired
+        from netbox_nso_plugin.models import NSOIntentRevision
 
         state = self._state(l2_mtu=9216, status="imported")
+        revision, _created = NSOIntentRevision.objects.get_or_create(device=self.device, scope="interface_mtu")
+        revision_before = revision.revision
+        interface_scope_acquired = []
+
+        def _record_footprint(sender, instance, **kwargs):
+            if instance.pk == state.pk:
+                interface_scope_acquired.append(revision_was_acquired(self.device.pk, "interface"))
+
+        pre_save.connect(_record_footprint, sender=type(state), weak=False)
+        self.addCleanup(pre_save.disconnect, _record_footprint, sender=type(state))
         User = get_user_model()
         admin = User.objects.create_superuser(username="mtu-admin", password="pw", email="m@x.y")  # noqa: S106
         self.client.force_login(admin)
@@ -181,6 +195,10 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
         self.assertEqual(state.status, "in_sync")
         self.assertIsNotNone(state.accepted_at)
         self.assertEqual(self.po1.mtu, 9216)  # native L2 mtu written onto dcim.Interface
+        revision.refresh_from_db()
+        self.assertEqual(revision.revision, revision_before + 1)
+        self.assertTrue(interface_scope_acquired)
+        self.assertTrue(all(interface_scope_acquired))
 
     def test_accept_differing_value_marks_accepted_pending_apply(self):
         from unittest.mock import patch
