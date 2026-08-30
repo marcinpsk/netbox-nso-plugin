@@ -66,6 +66,16 @@ class TestProvisionEvidenceValidation(SimpleTestCase):
                 terminal_required=True,
             )
 
+    def test_terminal_evidence_rejects_an_invalid_adapter_device_id(self):
+        from netbox_nso_plugin.provision_lifecycle import validate_provision_evidence
+
+        for device_id in (True, 0, -1, "701"):
+            with self.subTest(device_id=device_id), self.assertRaises(ValueError):
+                validate_provision_evidence(
+                    {"status": "succeeded", "result": {"ok": True, "device_id": device_id}},
+                    terminal_required=True,
+                )
+
 
 class TestProvisionTombstoneSweep(TestCase):
     def _attempt(self, tag, *, with_management, state="terminal"):
