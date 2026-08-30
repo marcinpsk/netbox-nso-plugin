@@ -406,7 +406,7 @@ class TestLoggingLevelsViews(LevelsTestBase):
         )
         self.assertTrue(
             NSOOwnershipManifest.objects.filter(
-                device=self.device,
+                device_id=self.device.pk,
                 scope="logging",
                 native_model_label="netbox_nso_plugin.nsologginglevelstate",
                 native_key={"management_id": self.mgmt.pk, "pk": row.pk},

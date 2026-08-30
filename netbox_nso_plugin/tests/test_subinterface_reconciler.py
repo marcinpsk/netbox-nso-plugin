@@ -644,7 +644,7 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
             delivery.render("subinterface", self.device.pk, self.management.adapter_device_id).payload
         )
         assert NSOOwnershipManifest.objects.filter(
-            device=self.device,
+            device_id=self.device.pk,
             scope="subinterface",
             native_model_label="dcim.interface",
             native_key={"device_id": state.interface.device_id, "name": state.interface.name},

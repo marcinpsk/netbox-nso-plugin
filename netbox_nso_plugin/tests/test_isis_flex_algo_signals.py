@@ -145,7 +145,7 @@ class TestFlexAlgoOwnershipSignals(_FlexAlgoBase):
 
         mock_put.assert_called_once()
         assert NSOOwnershipManifest.objects.filter(
-            device=self.device,
+            device_id=self.device.pk,
             scope="isis_flex_algo",
             native_model_label="netbox_routing.isisflexalgo",
             native_key={"instance_id": native.instance_id, "algo_id": 130},
