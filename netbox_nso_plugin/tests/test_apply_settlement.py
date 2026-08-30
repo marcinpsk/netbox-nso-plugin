@@ -110,9 +110,10 @@ class TestAttemptSettlement(TestCase):
         from netbox_nso_plugin.apply_settlement import settle_apply_attempts
 
         first_id, second_id = uuid4(), uuid4()
-        first = self._vlan_row(1626, first_id)
-        second = self._vlan_row(1627, second_id)
-        mirror_update(first, status="deploying", apply_attempt_id=first_id)
+        first = own_vlan(self.management, 1626, "attempt-1626")
+        second = own_vlan(self.management, 1627, "attempt-1627")
+        first = mirror_update(first, status="deploying", apply_attempt_id=first_id)
+        second = mirror_update(second, status="deploying", apply_attempt_id=second_id)
         self._local_attempt(first_id, 31, {"vlan": 101})
         self._local_attempt(second_id, 32, {"vlan": 102})
         first_evidence = _attempt(first_id, self.adapter_device_id, 31, {"vlan": 101}, "failed")
@@ -203,8 +204,10 @@ class TestAttemptSettlement(TestCase):
         from netbox_nso_plugin.apply_settlement import settle_apply_attempts
 
         attempt_id, unidentified_attempt_id = uuid4(), uuid4()
-        first = self._vlan_row(1633, attempt_id)
-        second = self._vlan_row(1634, unidentified_attempt_id)
+        first = own_vlan(self.management, 1633, "attempt-1633")
+        second = own_vlan(self.management, 1634, "attempt-1634")
+        first = mirror_update(first, status="deploying", apply_attempt_id=attempt_id)
+        second = mirror_update(second, status="deploying", apply_attempt_id=unidentified_attempt_id)
         self._local_attempt(attempt_id, 73, {"vlan": 503})
         result = {"vlan_count_by_outcome": {"apply_failed": 1, "in_sync": 1}}
         evidence = _attempt(
@@ -233,8 +236,14 @@ class TestAttemptSettlement(TestCase):
         from netbox_nso_plugin.reconcile import _stuck_deploying_grace
 
         attempt_id, unidentified_attempt_id = uuid4(), uuid4()
-        identified = self._vlan_row(1637, attempt_id)
-        unidentified = self._vlan_row(1638, unidentified_attempt_id)
+        identified = own_vlan(self.management, 1637, "attempt-1637")
+        unidentified = own_vlan(self.management, 1638, "attempt-1638")
+        identified = mirror_update(identified, status="deploying", apply_attempt_id=attempt_id)
+        unidentified = mirror_update(
+            unidentified,
+            status="deploying",
+            apply_attempt_id=unidentified_attempt_id,
+        )
         self._local_attempt(attempt_id, 74, {"vlan": 504})
         result = {"vlan_count_by_outcome": {"in_sync": 0, "apply_failed": 1}}
         evidence = _attempt(
