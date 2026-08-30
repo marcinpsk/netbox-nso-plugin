@@ -1775,6 +1775,14 @@ def _on_vlan_pre_save(sender, instance, **kwargs):
             )
             .exclude(pk=instance.pk)
             .exists()
+        ) or (
+            locked_vlan.qinq_svlan_id is not None
+            and sender.objects.filter(
+                qinq_svlan_id=locked_vlan.qinq_svlan_id,
+                name=derived_name,
+            )
+            .exclude(pk=instance.pk)
+            .exists()
         )
         if display_placeholder and not name_taken:
             instance.name = derived_name
@@ -3779,30 +3787,32 @@ def _own_route_map_contributors(mgmt, route_map) -> CascadeResult:
 def _accept_route_policy_object(obj) -> None:
     """Re-own + push every OWNED overlay attached to a saved route-policy object."""
     from django.contrib.contenttypes.models import ContentType
+    from django.db import transaction
 
     from .models import NSORoutePolicyState
 
     is_route_map = hasattr(obj, "route_map_entries")
     ct = ContentType.objects.get_for_model(type(obj))
-    states = NSORoutePolicyState.objects.filter(content_type=ct, object_id=obj.pk).select_related("management")
-    for state in states:
-        mgmt = state.management
-        if mgmt.adapter_device_id is None:
-            continue
-        # Only re-own an already-owned overlay (incl. in_sync). A brownfield/un-owned
-        # (imported/unknown) overlay must surface the edit via reconcile, not be force-owned.
-        if state.status not in _OWNED_PUSH_STATUSES:
-            continue
-        if state.status != "accepted":
-            state.status = "accepted"
-        state.last_sync_at = timezone.now()
-        from .apply_state import mark_explicit_accept
+    with transaction.atomic():
+        states = NSORoutePolicyState.objects.filter(content_type=ct, object_id=obj.pk).select_related("management")
+        for state in states:
+            mgmt = state.management
+            if mgmt.adapter_device_id is None:
+                continue
+            # Only re-own an already-owned overlay (incl. in_sync). A brownfield/un-owned
+            # (imported/unknown) overlay must surface the edit via reconcile, not be force-owned.
+            if state.status not in _OWNED_PUSH_STATUSES:
+                continue
+            if state.status != "accepted":
+                state.status = "accepted"
+            state.last_sync_at = timezone.now()
+            from .apply_state import mark_explicit_accept
 
-        mark_explicit_accept(state)
-        state.save()  # → _on_route_policy_state_save schedules the intent push
-        if is_route_map:
-            # Owning a route-map owns its contributors (else dangling device references).
-            _own_route_map_contributors(mgmt, obj)
+            mark_explicit_accept(state)
+            state.save()  # → _on_route_policy_state_save schedules the intent push
+            if is_route_map:
+                # Owning a route-map owns its contributors (else dangling device references).
+                _own_route_map_contributors(mgmt, obj)
 
 
 @_skip_on_render

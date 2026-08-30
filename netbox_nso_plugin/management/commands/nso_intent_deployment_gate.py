@@ -42,7 +42,12 @@ def _receipt_for(document, *, adapter_device_id: int, section: str):
 
 def _verification_receipt(claim, receipt):
     """Validate and normalize the adapter receipt for the landed restore resolver."""
-    wire = delivery.wire_body(claim.rendered, claim.payload, deletions=[])
+    wire = delivery.wire_body(
+        claim.rendered,
+        claim.payload,
+        deletions=[],
+        marking_mode=claim.marking_mode,
+    )
     expected = {
         "push_seq": claim.push_seq,
         "request_digest": drain.wire_digest(wire),

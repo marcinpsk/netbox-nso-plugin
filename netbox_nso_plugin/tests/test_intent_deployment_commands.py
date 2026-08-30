@@ -97,7 +97,7 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         self.assertIsInstance(errors[0], deployment.DeploymentTransitionTimeout)
         self.assertIn("timed out", str(errors[0]).lower())
 
-    def test_a_pending_exclusive_transition_refuses_new_shared_work(self):
+    def test_a_pending_exclusive_transition_refuses_new_shared_work(self):  # noqa: C901
         from netbox_nso_plugin import deployment
 
         holder_ready = threading.Event()
@@ -133,24 +133,9 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         holder = threading.Thread(target=hold_shared_lock)
         waiter = threading.Thread(target=request_exclusive_lock)
         holder.start()
-        self.assertTrue(holder_ready.wait(5), "the shared lock was not acquired")
-        waiter.start()
-        self.assertTrue(waiter_ready.wait(5), "the exclusive waiter did not start")
-
-        deadline = time.monotonic() + 5
         queued = False
-        while time.monotonic() < deadline:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = %s AND locktype = 'advisory' AND NOT granted)",
-                    [waiter_pid[0]],
-                )
-                queued = cursor.fetchone()[0]
-            if queued:
-                break
-            time.sleep(0.01)
-
         outcomes = {}
+        late = []
 
         def attempt_operation():
             close_old_connections()
@@ -173,20 +158,38 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
             finally:
                 connection.close()
 
-        late = [threading.Thread(target=attempt_operation), threading.Thread(target=attempt_mutation)]
-        for worker in late:
-            worker.start()
-        for worker in late:
-            worker.join(timeout=1)
-        finished_before_release = [not worker.is_alive() for worker in late]
+        try:
+            self.assertTrue(holder_ready.wait(5), "the shared lock was not acquired")
+            waiter.start()
+            self.assertTrue(waiter_ready.wait(5), "the exclusive waiter did not start")
 
-        release_holder.set()
-        holder.join(timeout=10)
-        waiter.join(timeout=10)
-        for worker in late:
-            worker.join(timeout=10)
-        if deployment.is_quiesced():
-            deployment.resume()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = %s AND locktype = 'advisory' AND NOT granted)",
+                        [waiter_pid[0]],
+                    )
+                    queued = cursor.fetchone()[0]
+                if queued:
+                    break
+                time.sleep(0.01)
+
+            late = [threading.Thread(target=attempt_operation), threading.Thread(target=attempt_mutation)]
+            for worker in late:
+                worker.start()
+            for worker in late:
+                worker.join(timeout=1)
+            finished_before_release = [not worker.is_alive() for worker in late]
+        finally:
+            release_holder.set()
+            holder.join(timeout=10)
+            if waiter.ident is not None:
+                waiter.join(timeout=10)
+            for worker in late:
+                worker.join(timeout=10)
+            if deployment.is_quiesced():
+                deployment.resume()
 
         self.assertTrue(queued, "the exclusive transition never queued behind the shared lock")
         self.assertEqual(finished_before_release, [True, True], "new shared work blocked behind the transition")
@@ -219,6 +222,38 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
             with self.subTest(field=field):
                 with self.assertRaises(CommandError):
                     _verification_receipt(claim, {**valid, field: malformed})
+
+    def test_verification_receipt_uses_the_claim_marking_mode(self):
+        from netbox_nso_plugin import delivery, drain
+        from netbox_nso_plugin.management.commands.nso_intent_deployment_gate import _verification_receipt
+
+        own_route(self.mgmt, "198.18.40.0/24", "198.18.0.1")
+        claim = drain.claim(self.device.pk, "static_route", force=True)
+        expected_wire = delivery.wire_body(
+            claim.rendered,
+            claim.payload,
+            deletions=[],
+            marking_mode=claim.marking_mode,
+        )
+        receipt = {
+            "push_seq": claim.push_seq,
+            "request_digest": drain.wire_digest(expected_wire),
+            "store_only": False,
+            "delete_origin": False,
+            "backfill_only": False,
+            "status_code": 200,
+        }
+        observed_modes = []
+        original_wire_body = delivery.wire_body
+
+        def record_marking_mode(*args, **kwargs):
+            observed_modes.append(kwargs.get("marking_mode"))
+            return original_wire_body(*args, **kwargs)
+
+        with patch.object(delivery, "wire_body", side_effect=record_marking_mode):
+            _verification_receipt(claim, receipt)
+
+        self.assertEqual(observed_modes, [claim.marking_mode])
 
     def test_pending_transition_probe_is_scoped_to_the_current_database(self):
         from netbox_nso_plugin import deployment

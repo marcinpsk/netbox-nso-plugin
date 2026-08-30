@@ -429,7 +429,7 @@ class TestCategoryViewSkipFallback(TestCase):
             "plugins:netbox_nso_plugin:device_nso_category",
             kwargs={"pk": self.device.pk, "key": "l2_services"},
         )
-        quiesce()
+        activated = quiesce()
         try:
             with patch(
                 "netbox_nso_plugin.adapter_client.get_l2_services",
@@ -437,7 +437,8 @@ class TestCategoryViewSkipFallback(TestCase):
             ) as live_read:
                 resp = self.client.get(url, {"refresh": "1"})
         finally:
-            resume()
+            if activated:
+                resume()
         self.assertEqual(resp.status_code, 200)
         live_read.assert_not_called()  # the window blocks the live read, it never 500s
         html = resp.content.decode()
