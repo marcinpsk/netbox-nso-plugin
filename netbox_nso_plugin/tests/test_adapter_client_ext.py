@@ -871,6 +871,49 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_device_generations_refuses_an_unbounded_history(self, mock_s, _cfg):
+        from netbox_nso_plugin.adapter_client import (
+            _GENERATION_PAGE_LIMIT,
+            _GENERATION_PAGE_MAX,
+            AdapterError,
+            list_device_generations,
+        )
+
+        self.assertLessEqual(_GENERATION_PAGE_MAX, 20)
+
+        page_number = 0
+
+        def full_page(*_args, **_kwargs):
+            nonlocal page_number
+            page_number += 1
+            if page_number > _GENERATION_PAGE_MAX:
+                raise AssertionError("the generations reader requested an unbounded page")
+            first_seq = (page_number - 1) * _GENERATION_PAGE_LIMIT + 1
+            return make_response(
+                200,
+                [
+                    {
+                        "generation_id": seq,
+                        "seq": seq,
+                        "status": "pending",
+                        "settlement_cohort": None,
+                    }
+                    for seq in range(first_seq, first_seq + _GENERATION_PAGE_LIMIT)
+                ],
+            )
+
+        session = make_session()
+        session.request.side_effect = full_page
+        mock_s.return_value = session
+
+        with self.assertRaisesRegex(AdapterError, "more generation pages") as raised:
+            list_device_generations(5)
+
+        self.assertEqual(raised.exception.code, "invalid_response")
+        self.assertEqual(session.request.call_count, _GENERATION_PAGE_MAX)
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_put_intent(self, mock_s, _cfg):
         from netbox_nso_plugin.adapter_client import put_intent
 

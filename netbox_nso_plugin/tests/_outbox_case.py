@@ -352,7 +352,9 @@ class ReceiptAdapter:
         if params.get("backfill_only") == "true":
             return
         deleted_routes = body.get("deleted_routes") if isinstance(body, dict) else None
-        if deleted_routes is not None:
+        if params.get("delete_origin") == "true" and not deleted_routes:
+            on_device -= dropped  # authorized retraction: the object leaves the device
+        elif deleted_routes is not None:
             marked = {("route_id", int(record["route_id"])) for record in deleted_routes}
             for member in sorted(dropped):
                 marking = "delete_origin" if member in marked else "detach"
@@ -361,8 +363,6 @@ class ReceiptAdapter:
                     on_device.discard(member)
                 elif member in on_device:
                     detached.add(member)
-        elif params.get("delete_origin") == "true":
-            on_device -= dropped  # authorized retraction: the object leaves the device
         else:
             detached |= dropped & on_device  # an unmarked shrink un-owns, it never removes
         on_device |= members

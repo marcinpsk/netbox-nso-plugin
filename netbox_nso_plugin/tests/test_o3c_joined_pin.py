@@ -559,6 +559,9 @@ class TestO3CJoinedCrossRepositoryPin(_CascadeFlushMixin, IntentPushResetMixin, 
                     cleanup()
                 except Exception as cleanup_error:  # noqa: BLE001 - preserve the primary setup failure
                     cleanup_failures.append(f"{label} failed with {type(cleanup_error).__name__}")
+                if label == "Django class cleanups":
+                    for exception_type, _exception, _traceback in cls.tearDown_exceptions:
+                        cleanup_failures.append(f"{label} failed with {exception_type.__name__}")
             for failure in cleanup_failures:
                 start_error.add_note(failure)
             raise
@@ -791,6 +794,12 @@ class TestO3CEnvironmentFailFast(SimpleTestCase):
             def test_probe(self):
                 pass
 
+        def fail_class_cleanup():
+            events.append("class-cleanup")
+            raise LookupError("class cleanup failed")
+
+        FailingJoinedCase.addClassCleanup(fail_class_cleanup)
+
         original_prefix = settings.EMAIL_SUBJECT_PREFIX
         with (
             patch(f"{__name__}._ADAPTER_ROOT", Path.cwd()),
@@ -799,9 +808,12 @@ class TestO3CEnvironmentFailFast(SimpleTestCase):
         ):
             FailingJoinedCase.setUpClass()
 
-        assert events == ["start", "stop"]
+        assert events == ["start", "stop", "class-cleanup"]
         assert settings.EMAIL_SUBJECT_PREFIX == original_prefix
-        assert raised.exception.__notes__ == ["O3C environment cleanup failed with RuntimeError"]
+        assert raised.exception.__notes__ == [
+            "O3C environment cleanup failed with RuntimeError",
+            "Django class cleanups failed with LookupError",
+        ]
 
     def test_adapter_port_is_selected_only_when_starting_the_process(self):
         with patch(f"{__name__}._adapter_database_name", return_value="test_o3c_port_selection"):

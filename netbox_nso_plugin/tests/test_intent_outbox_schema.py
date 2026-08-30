@@ -2,9 +2,9 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """#1503 Appendix O (O1) — the outbox schema, pin O1.1.
 
-The migration chains off the current end, lands both tables with an unconstrained entry
-table, a state row unique on ``(device, scope)``, a partial index on the unconsumed
-predicate and a ``NO CYCLE`` sequence, and unapplies one step.
+The migration declares one in-app parent, lands both tables with an unconstrained entry table,
+a state row unique on ``(device, scope)``, a partial index on the unconsumed predicate and a
+``NO CYCLE`` sequence, and unapplies one step.
 """
 
 from __future__ import annotations
@@ -41,8 +41,8 @@ def _outbox_migration() -> str:
 class TestOutboxMigrationShape(SimpleTestCase):
     """O1.1 — the properties readable off the migration files alone."""
 
-    def test_the_outbox_migration_chains_off_the_current_end(self):
-        """The outbox migration chained off the graph end that existed when it landed."""
+    def test_the_outbox_migration_declares_its_single_in_app_parent(self):
+        """The graph parent matches the migration's one declared in-app dependency."""
         from importlib import import_module
 
         outbox = _outbox_migration()

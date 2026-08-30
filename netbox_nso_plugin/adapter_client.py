@@ -123,6 +123,8 @@ _CONNECT_TIMEOUT = 5  # seconds
 # consumer and the adapter cannot drift on the spelling.
 STORE_INCARNATION_HEADER = "X-Store-Incarnation"
 _GENERATION_PAGE_LIMIT = 500
+# One UI poll can hold at most 10,000 generation rows.
+_GENERATION_PAGE_MAX = 20
 
 # Process-wide pooled session, reused across calls so connections to the (internal)
 # adapter are kept alive instead of a fresh TCP+TLS handshake per request. Keyed by the
@@ -1029,13 +1031,13 @@ def list_jobs(adapter_device_id):
 
 
 def list_device_generations(adapter_device_id, *, since_seq=None):
-    """GET every ascending generation page for one device after ``since_seq``."""
+    """GET a bounded set of ascending generation pages after ``since_seq``."""
     if since_seq is not None and (type(since_seq) is not int or since_seq < 0):
         raise ValueError("since_seq must be a non-negative integer")
     generations = []
     generation_ids = set()
     last_seq = since_seq
-    while True:
+    for _ in range(_GENERATION_PAGE_MAX):
         params = {"limit": _GENERATION_PAGE_LIMIT}
         if last_seq is not None:
             params["since_seq"] = last_seq
@@ -1067,6 +1069,7 @@ def list_device_generations(adapter_device_id, *, since_seq=None):
         generations.extend(page)
         if len(page) < _GENERATION_PAGE_LIMIT:
             return generations
+    raise AdapterError("Adapter returned more generation pages than one read may fetch.", code="invalid_response")
 
 
 def get_settlement_feed(adapter_device_id, *, after_settle_seq, limit):

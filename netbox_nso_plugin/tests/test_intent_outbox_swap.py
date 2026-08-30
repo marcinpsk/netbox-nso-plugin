@@ -196,6 +196,21 @@ class TestTheReceiptAdapterInjectionSeam(SimpleTestCase):
         with self.assertRaises(AdapterError):
             adapter._handle("PUT", "http://adapter/devices/1/vlan")
 
+    def test_an_empty_static_route_deletion_list_does_not_mask_the_query_flag(self):
+        adapter = ReceiptAdapter()
+        member = ("route_id", 17)
+        adapter.on_device[1] = {member}
+        adapter._owned[1] = {member}
+
+        adapter._apply_to_device(
+            "http://adapter/devices/1/static-route-intent",
+            {"routes": [], "deleted_routes": []},
+            {"delete_origin": "true"},
+        )
+
+        assert adapter.on_device[1] == set()
+        assert adapter.detached[1] == set()
+
 
 class TestTheTestCaseDeliveryDouble(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     """The TestCase delivery double follows the production drain's empty-key behavior."""
