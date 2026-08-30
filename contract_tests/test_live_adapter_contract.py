@@ -117,6 +117,12 @@ def _entry(route_id, generation, **overrides):
     return entry
 
 
+def _put_static_routes(client, push_seq, device_id, routes):
+    """Send one production-shaped static-route push with its durable sequence."""
+    with client.push_seq(push_seq):
+        return client.put_static_route_intent(device_id, routes)
+
+
 def test_live_adapter_read_and_auth_contract():
     """Exercise the real plugin HTTP client, adapter auth, ORM reads, and response schemas."""
     with _live_client() as client:
@@ -198,14 +204,14 @@ def test_a_timos_metric_edit_creates_no_pending_clear():
     with _live_client() as client, _devices(client, 4) as ids:
         edited, cleared, control_five, control_three = ids
 
-        client.put_static_route_intent(edited, [_entry(41, 101, metric=3)])
-        client.put_static_route_intent(edited, [_entry(41, 102, metric=5)])  # the 3 → 5 edit
+        _put_static_routes(client, 1, edited, [_entry(41, 101, metric=3)])
+        _put_static_routes(client, 2, edited, [_entry(41, 102, metric=5)])  # the 3 → 5 edit
 
-        client.put_static_route_intent(cleared, [_entry(41, 201, metric=3)])
-        client.put_static_route_intent(cleared, [_entry(41, 202, metric=None)])  # the old wire
+        _put_static_routes(client, 3, cleared, [_entry(41, 201, metric=3)])
+        _put_static_routes(client, 4, cleared, [_entry(41, 202, metric=None)])  # the old wire
 
-        client.put_static_route_intent(control_five, [_entry(41, 301, metric=5)])
-        client.put_static_route_intent(control_three, [_entry(41, 401, metric=3)])
+        _put_static_routes(client, 5, control_five, [_entry(41, 301, metric=5)])
+        _put_static_routes(client, 6, control_three, [_entry(41, 401, metric=3)])
 
         def fingerprint(device_id):
             routes = client.get_static_route_intent(device_id)["routes"]
@@ -235,8 +241,8 @@ def test_an_identity_edit_is_a_replacement_not_a_delete_plus_insert():
     OQ-R3-4 left to the R5 live gate.
     """
     with _live_client() as client, _devices(client, 1) as (device_id,):
-        client.put_static_route_intent(device_id, [_entry(41, 101, prefix="10.9.0.0/16")])
-        client.put_static_route_intent(device_id, [_entry(41, 102, prefix="10.9.0.0/24")])  # A → B
+        _put_static_routes(client, 7, device_id, [_entry(41, 101, prefix="10.9.0.0/16")])
+        _put_static_routes(client, 8, device_id, [_entry(41, 102, prefix="10.9.0.0/24")])  # A → B
 
         routes = client.get_static_route_intent(device_id)["routes"]
         assert [row["route_id"] for row in routes] == [41], f"the edit did not land on one row: {routes}"
