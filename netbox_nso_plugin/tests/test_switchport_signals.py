@@ -125,7 +125,7 @@ class TestSwitchportAcceptView(_SwBase):
             delivery.render("switchport", self.device.pk, mgmt.adapter_device_id).payload
         )
         assert NSOOwnershipManifest.objects.filter(
-            device=self.device,
+            device_id=self.device.pk,
             scope="switchport",
             native_model_label="dcim.interface",
             native_key={"device_id": self.iface.device_id, "name": self.iface.name},

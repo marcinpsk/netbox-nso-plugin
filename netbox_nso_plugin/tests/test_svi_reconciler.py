@@ -349,7 +349,7 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
             delivery.render("svi", self.device.pk, self.management.adapter_device_id).payload
         )
         assert NSOOwnershipManifest.objects.filter(
-            device=self.device,
+            device_id=self.device.pk,
             scope="svi",
             native_model_label="dcim.interface",
             native_key={"device_id": state.interface.device_id, "name": state.interface.name},

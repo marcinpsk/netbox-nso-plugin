@@ -289,7 +289,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         assert revision.verified_fingerprint == expected
         assert NSOIntentOutboxEntry.objects.filter(device=device, scope="vlan").count() == 1
         assert NSOOwnershipManifest.objects.filter(
-            device=device,
+            device_id=device.pk,
             scope="vlan",
             native_model_label="ipam.vlan",
             native_key={"group_id": target.vlan.group_id, "vid": target.vlan.vid},

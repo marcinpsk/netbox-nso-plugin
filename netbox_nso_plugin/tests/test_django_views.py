@@ -4853,7 +4853,7 @@ class TestOverlayFieldEditView(ViewTestBase):
             )
             self.assertTrue(
                 NSOOwnershipManifest.objects.filter(
-                    device=state.management.device,
+                    device_id=state.management.device_id,
                     scope="vlan",
                     native_model_label="ipam.vlan",
                     native_key={"group_id": vlan.group_id, "vid": vlan.vid},
@@ -4937,7 +4937,7 @@ class TestOverlayFieldEditView(ViewTestBase):
         )
         self.assertTrue(
             NSOOwnershipManifest.objects.filter(
-                device=self.device,
+                device_id=self.device.pk,
                 scope="svi",
                 native_model_label="dcim.interface",
                 native_key={"device_id": interface.device_id, "name": interface.name},
