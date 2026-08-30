@@ -805,8 +805,8 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         from unittest.mock import patch
 
         from netbox_nso_plugin import intent_state
-        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
         from netbox_nso_plugin.vlan_reconciler import (
+            VLANRescopeConflict,
             reconcile_vlan_database,
             rescope_vlan,
         )
@@ -821,13 +821,11 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
             nso_instance=self.instance,
             nso_device_name="late-membership",
         )
-        original_footprint = intent_state.vlan_footprint
         attached = False
 
-        def attach_before_transaction(vlan_id, scopes, **kwargs):
+        def attach_before_transaction(plan):
             nonlocal attached
-            footprint = original_footprint(vlan_id, scopes, **kwargs)
-            if not attached and vlan_id == source_state.vlan_id:
+            if not attached:
                 attached = True
                 late_state = NSOVLANState(
                     management=late_management,
@@ -837,14 +835,14 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
                 )
                 with intent_state.intent_transaction(intent_state.footprint_for_instance(late_state)):
                     late_state.save()
-            return footprint
+            return plan
 
         with (
             patch(
-                "netbox_nso_plugin.intent_state.vlan_footprint",
+                "netbox_nso_plugin.vlan_reconciler._rescope_plan_ready",
                 side_effect=attach_before_transaction,
             ),
-            self.assertRaisesRegex(IntentMutationProtocolError, "changed its renderer targets"),
+            self.assertRaisesRegex(VLANRescopeConflict, "membership changed"),
         ):
             rescope_vlan(source_state, target_group)
 
