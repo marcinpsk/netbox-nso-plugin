@@ -2895,7 +2895,7 @@ class NSOOwnershipManifest(models.Model):
 
     device = models.ForeignKey(
         to="dcim.Device",
-        on_delete=models.CASCADE,
+        on_delete=models.PROTECT,
         related_name="nso_ownership_manifest_entries",
     )
     scope = models.CharField(max_length=32)

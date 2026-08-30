@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """#1627: durable ownership manifest schema."""
 
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, TestCase
 
 
 class TestOwnershipManifestSchema(SimpleTestCase):
@@ -35,3 +35,25 @@ class TestOwnershipManifestSchema(SimpleTestCase):
         assert fields["ownership_state"].get_default() == "owned"
         assert fields["deletion_authority"].get_default() is False
         assert fields["acknowledged_lineage"].get_default() == []
+
+
+class TestOwnershipManifestDurability(TestCase):
+    def test_device_deletion_cannot_remove_manifest_evidence(self):
+        from django.db.models.deletion import ProtectedError
+
+        from netbox_nso_plugin.models import NSOOwnershipManifest
+
+        from ._outbox_case import make_managed
+
+        device, _management = make_managed("manifest-durability", 1627)
+        manifest = NSOOwnershipManifest.objects.create(
+            device=device,
+            scope="interface",
+            native_model_label="dcim.interface",
+            native_key={"device_id": device.pk, "name": "Ethernet1"},
+        )
+
+        with self.assertRaises(ProtectedError):
+            device.delete()
+
+        self.assertTrue(NSOOwnershipManifest.objects.filter(pk=manifest.pk).exists())
