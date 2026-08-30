@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 
-import django.db.models.deletion
 from django.db import migrations, models
 
 
@@ -27,21 +26,17 @@ class Migration(migrations.Migration):
                 ("deletion_authority", models.BooleanField(default=False)),
                 ("acknowledged_lineage", models.JSONField(blank=True, default=list)),
                 (
-                    "device",
-                    models.ForeignKey(
-                        on_delete=django.db.models.deletion.PROTECT,
-                        related_name="nso_ownership_manifest_entries",
-                        to="dcim.device",
-                    ),
+                    "device_id",
+                    models.PositiveBigIntegerField(db_column="device_id", db_index=True),
                 ),
             ],
             options={
                 "verbose_name": "NSO Ownership Manifest Entry",
                 "verbose_name_plural": "NSO Ownership Manifest Entries",
-                "ordering": ["device", "scope", "native_model_label", "id"],
+                "ordering": ["device_id", "scope", "native_model_label", "id"],
                 "constraints": [
                     models.UniqueConstraint(
-                        fields=("device", "scope", "native_model_label", "native_key"),
+                        fields=("device_id", "scope", "native_model_label", "native_key"),
                         name="nso_owner_manifest_identity",
                     )
                 ],
