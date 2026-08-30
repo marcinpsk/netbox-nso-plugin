@@ -2043,7 +2043,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         state.refresh_from_db()
         interface.refresh_from_db()
         self.assertEqual(interface.device_id, other_device.pk)
-        self.assertEqual(interface.mode, "")
+        self.assertIsNone(interface.mode)
         self.assertIsNone(interface.untagged_vlan_id)
         self.assertEqual(state.status, "imported")
 
