@@ -281,7 +281,11 @@ def _device_is_managed(device_id) -> bool:
 @receiver(pre_delete, sender="dcim.Device")
 def _mark_device_teardown(sender, instance, **kwargs):
     from . import outbox
+    from .models import NSOOwnershipManifest
 
+    NSOOwnershipManifest.objects.filter(device_id=instance.pk, ownership_state="owned").update(
+        ownership_state="retired"
+    )
     outbox.mark_device_teardown(instance.pk, outbox.current_txid())
 
 
@@ -1871,16 +1875,14 @@ def _on_vlan_state_save(sender, instance, **kwargs):
 
 @_skip_on_render
 def _on_vlan_pre_save(sender, instance, **kwargs):
-    """Record the exact VLAN or SVI fields changed by a sanctioned writer save."""
-    from .renderer_writer import active_renderer_writer
-
+    """Record the exact VLAN or SVI fields changed by this save."""
     update_fields = kwargs.get("update_fields")
     candidate_fields = {"name", "vid"}
     if update_fields is not None:
         candidate_fields.intersection_update(update_fields)
     instance._intent_vlan_changed_fields = frozenset()
     instance._intent_vlan_rows = {}
-    if active_renderer_writer() is None or instance._state.adding or not candidate_fields:
+    if instance._state.adding or not candidate_fields:
         return
 
     from .apply_state import vlan_intent_targets
@@ -1909,6 +1911,7 @@ def _on_vlan_change(sender, instance, **kwargs):
         return
     from . import delivery
     from . import status_machine as sm
+    from .intent_state import revision_was_acquired
 
     rows = getattr(instance, "_intent_vlan_rows", {})
     vid_changed = "vid" in changed_fields
@@ -1924,7 +1927,10 @@ def _on_vlan_change(sender, instance, **kwargs):
                 was_owned
                 and state.management.adapter_device_id is not None
                 and may_deliver
-                and _converted_writer_owns_content(state.management.device_id, scope)
+                and (
+                    _converted_writer_owns_content(state.management.device_id, scope)
+                    or revision_was_acquired(state.management.device_id, scope)
+                )
             ):
                 targets.add((state.management.device_id, scope))
     for key in sorted(targets):

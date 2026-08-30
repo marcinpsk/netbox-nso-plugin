@@ -291,15 +291,23 @@ class TestSyncScopeToAdapter(_SignalDBBase):
                 )
             self.assertEqual(callbacks, [], field_name)
 
-    def test_foreign_management_save_does_not_schedule_adapter_work(self):
-        """A direct foreign save is behavior-neutral without writer context."""
+    def test_direct_management_save_schedules_adapter_work_through_writer(self):
+        """A direct save cannot bypass the management writer and adapter sync."""
         mgmt = self._make_mgmt(adapter_device_id=7)
         mgmt.manage_enabled = True
 
         with self.captureOnCommitCallbacks(execute=False) as callbacks:
             mgmt.save(update_fields=["manage_enabled"])
 
-        self.assertEqual(callbacks, [])
+        self.assertEqual(len(callbacks), 1)
+
+    def test_management_mirror_ignores_a_row_deleted_before_the_callback(self):
+        from netbox_nso_plugin.signals import _update_management_mirror
+
+        mgmt = self._make_mgmt(adapter_device_id=7)
+        type(mgmt).objects.filter(pk=mgmt.pk).delete()
+
+        _update_management_mirror(mgmt, adapter_link_error="adapter unavailable")
 
     def test_created_onboards_device_and_sets_scope(self):
         mgmt = self._make_mgmt(adapter_device_id=None)

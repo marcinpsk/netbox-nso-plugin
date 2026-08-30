@@ -674,15 +674,16 @@ class NSODeviceManagement(NetBoxModel):
         A save that NAMES its fields is untouched: every writer of these columns names
         them deliberately, holding this same row lock.
         """
-        from .management_lifecycle import management_crud_is_active, save_management
+        from .intent_state import mirror_refresh_is_active
+        from .management_lifecycle import save_management
         from .renderer_writer import active_renderer_writer
 
-        if management_crud_is_active() and active_renderer_writer() is None:
+        if active_renderer_writer() is None and not mirror_refresh_is_active():
             if args or kwargs.keys() - {"force_insert", "update_fields", "using"}:
-                raise TypeError("the management CRUD writer accepts only force_insert, update_fields, and using")
+                raise TypeError("the management writer accepts only force_insert, update_fields, and using")
             using = kwargs.get("using")
             if using not in (None, "default"):
-                raise ValueError("the management CRUD writer supports only the default database")
+                raise ValueError("the management writer supports only the default database")
             return save_management(
                 self,
                 update_fields=kwargs.get("update_fields"),

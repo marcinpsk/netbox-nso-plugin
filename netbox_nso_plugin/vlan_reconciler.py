@@ -337,6 +337,7 @@ def _switchport_reconcile_operations(device, payload, planned_at, interface_pks)
     here, so the apply-time build (under the lock) compares and writes committed values.
     """
     from dcim.models import Interface
+    from django.db.models import Prefetch
     from ipam.models import VLAN, VLANGroup
 
     from . import merge_util
@@ -349,15 +350,23 @@ def _switchport_reconcile_operations(device, payload, planned_at, interface_pks)
         return [], [], [], [], []
     items = _switchport_items(payload)
     group = _device_vlan_group(device, create=False)
+    tagged_vlans = Prefetch(
+        "tagged_vlans",
+        queryset=VLAN.objects.order_by("pk"),
+        to_attr="_intent_tagged_vlans",
+    )
     interfaces = {
         row.pk: row
-        for row in Interface.objects.filter(pk__in=set(interface_pks.values())).select_related("untagged_vlan")
+        for row in Interface.objects.filter(pk__in=set(interface_pks.values()))
+        .select_related("untagged_vlan")
+        .prefetch_related(tagged_vlans)
+        .order_by("pk")
     }
     states = {
         row.interface_id: row
         for row in NSOSwitchportState.objects.filter(management=management)
         .select_related("interface", "untagged_vlan")
-        .prefetch_related("tagged_vlans")
+        .prefetch_related(tagged_vlans)
         .order_by("pk")
     }
     synced_vlans = {
@@ -468,7 +477,7 @@ def _switchport_reconcile_operations(device, payload, planned_at, interface_pks)
             fields = ("mode", "untagged_vlan")
             native_saves.append(planned_save(native_candidate, update_fields=fields))
             native_operations.append(("save", native_candidate, fields, False, None, ()))
-            current_tagged = tuple(interface.tagged_vlans.order_by("pk"))
+            current_tagged = _ordered_tagged_vlans(interface)
             if {row.pk for row in current_tagged} != {row.pk for row in native_tagged if row.pk is not None} or any(
                 row.pk is None for row in native_tagged
             ):
@@ -486,7 +495,7 @@ def _switchport_reconcile_operations(device, payload, planned_at, interface_pks)
             )
         )
         state_operations.append(("save", state, update_fields, created, None, ()))
-        current_state_tagged = tuple(current.tagged_vlans.order_by("pk")) if current is not None else ()
+        current_state_tagged = _ordered_tagged_vlans(current) if current is not None else ()
         if {row.pk for row in current_state_tagged} != {row.pk for row in state_tagged}:
             m2m_writes.append(planned_m2m_set(state, "tagged_vlans", state_tagged))
             m2m_operations.append(("m2m_set", state, None, False, "tagged_vlans", state_tagged))
@@ -580,7 +589,9 @@ def _vlan_repoint_plan(old_vlan, target_vlan):  # noqa: C901
             save_operations.append((candidate, fields))
         if interface.tagged_vlans.filter(pk=old_vlan.pk).exists():
             tagged = tuple(
-                target_vlan if row.pk == old_vlan.pk else row for row in interface.tagged_vlans.order_by("pk")
+                dict.fromkeys(
+                    target_vlan if row.pk == old_vlan.pk else row for row in interface.tagged_vlans.order_by("pk")
+                )
             )
             m2m_writes.append(planned_m2m_set(interface, "tagged_vlans", tagged))
             m2m_operations.append((interface, "tagged_vlans", tagged))
@@ -602,7 +613,9 @@ def _vlan_repoint_plan(old_vlan, target_vlan):  # noqa: C901
             save_operations.append((candidate, fields))
         if switchport.tagged_vlans.filter(pk=old_vlan.pk).exists():
             tagged = tuple(
-                target_vlan if row.pk == old_vlan.pk else row for row in switchport.tagged_vlans.order_by("pk")
+                dict.fromkeys(
+                    target_vlan if row.pk == old_vlan.pk else row for row in switchport.tagged_vlans.order_by("pk")
+                )
             )
             m2m_writes.append(planned_m2m_set(switchport, "tagged_vlans", tagged))
             m2m_operations.append((switchport, "tagged_vlans", tagged))
@@ -880,16 +893,24 @@ def _switchport_content(mode: str, untagged, tagged: list) -> dict:
     return {"mode": mode or "", "untagged": untagged, "tagged": sorted(tagged or [])}
 
 
+def _ordered_tagged_vlans(instance) -> tuple:
+    """Return tagged VLANs in stable order, using the planning prefetch when present."""
+    prefetched = getattr(instance, "_intent_tagged_vlans", None)
+    if prefetched is not None:
+        return tuple(prefetched)
+    return tuple(instance.tagged_vlans.order_by("pk"))
+
+
 def _switchport_object_content(interface) -> dict:
     """Return the live NetBox interface's L2 content."""
     nb_untagged = interface.untagged_vlan.vid if interface.untagged_vlan else None
-    nb_tagged = sorted(interface.tagged_vlans.values_list("vid", flat=True))
+    nb_tagged = sorted(vlan.vid for vlan in _ordered_tagged_vlans(interface))
     return _switchport_content(interface.mode or "", nb_untagged, nb_tagged)
 
 
 def _switchport_is_pristine(interface) -> bool:
     """Return True if the NetBox interface carries NO operator L2 config (never materialised)."""
-    return not (interface.mode or "") and interface.untagged_vlan_id is None and not interface.tagged_vlans.exists()
+    return not (interface.mode or "") and interface.untagged_vlan_id is None and not _ordered_tagged_vlans(interface)
 
 
 def reconcile_switchport(device, payload: dict, attempt: SwitchportReconcileAttempt | None = None) -> list:
