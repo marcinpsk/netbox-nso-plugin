@@ -96,6 +96,40 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         assert state.vlan_id == vlan.pk
         assert NSOVLANState.objects.filter(management=management, vlan=vlan).exists()
 
+    def test_one_plan_can_create_a_referenced_support_row(self):
+        from ipam.models import VLANGroup
+
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_save,
+            renderer_mirror_writes,
+        )
+
+        group = VLANGroup(name="Writer support group", slug="writer-support-group")
+        vlan = VLAN(group=group, vid=1638, name="writer-support-vlan")
+        plan = RendererMutationPlan.build(
+            saves=(
+                planned_save(group, force_insert=True, natural_key=("slug",)),
+                planned_save(vlan, force_insert=True, natural_key=("group", "vid")),
+            )
+        )
+
+        with renderer_mirror_writes(plan) as writer:
+            writer.save(group, force_insert=True)
+            writer.save(vlan, force_insert=True)
+
+        assert vlan.group_id == group.pk
+
+    def test_plan_refuses_an_unreferenced_support_row(self):
+        from ipam.models import VLANGroup
+
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save
+
+        group = VLANGroup(name="Writer unreferenced group", slug="writer-unreferenced-group")
+
+        with self.assertRaisesRegex(IntentMutationProtocolError, "not a registered renderer input"):
+            RendererMutationPlan.build(saves=(planned_save(group, force_insert=True, natural_key=("slug",)),))
+
     def test_one_plan_can_create_an_owner_related_row_and_m2m_edge(self):
         from netbox_nso_plugin.renderer_writer import (
             RendererMutationPlan,
@@ -386,6 +420,23 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
                 for write in plan.write_set
             ),
         )
+
+    def test_delete_plan_counts_an_owned_cascade_as_content(self):
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete
+
+        device, management = make_managed("writer-owned-cascade", 16291)
+        interface = Interface.objects.create(device=device, name="Ethernet1/11", type="1000base-t")
+        NSOSwitchportState.objects.create(
+            management=management,
+            interface=interface,
+            mode="access",
+            status="accepted",
+        )
+
+        plan = RendererMutationPlan.build(deletes=(planned_delete(interface),))
+
+        self.assertTrue(plan.changes_content)
+        self.assertIn((device.pk, "switchport"), plan.content_keys)
 
     def test_rollback_removes_content_bookkeeping_and_fingerprint_together(self):
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes

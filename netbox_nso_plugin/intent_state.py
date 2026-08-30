@@ -2617,6 +2617,11 @@ def _begin_implicit(
 
 def _begin_delete_implicit(sender, instance, origin=None, **kwargs):
     """Keep a cascade permit alive until the registered root's post-delete."""
+    from .renderer_writer import active_renderer_writer
+
+    if active_renderer_writer() is not None:
+        _begin_implicit(sender, instance, deleting=True, origin=origin, **kwargs)
+        return
     origin_label = getattr(getattr(origin, "_meta", None), "label_lower", None)
     if origin_label in _REGISTRY:
         target = origin

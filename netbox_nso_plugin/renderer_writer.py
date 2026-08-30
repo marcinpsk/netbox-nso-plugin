@@ -166,12 +166,13 @@ class RendererMutationPlan:
         planned_at = planned_at or timezone.now()
         saves = tuple(saves)
         creation_refs = _creation_refs(saves)
+        support_refs = _referenced_support_refs(saves, creation_refs)
         writes: list[RendererWrite] = []
         footprints: list[MutationFootprint] = []
         content_keys: set[tuple[int, str]] = set()
 
         for proposed in saves:
-            write, footprint, changed_keys = _plan_save(proposed, creation_refs)
+            write, footprint, changed_keys = _plan_save(proposed, creation_refs, support_refs)
             writes.append(write)
             footprints.append(footprint)
             content_keys.update(changed_keys)
@@ -267,6 +268,19 @@ def _creation_refs(saves):
     return references
 
 
+def _referenced_support_refs(saves, creation_refs):
+    references = set()
+    specs = renderer_input_specs()
+    for proposed in saves:
+        if proposed.instance._meta.label_lower not in specs:
+            continue
+        before = _stored_instance(proposed.instance)
+        after = _effective_after(proposed.instance, before, proposed.update_fields)
+        values = _field_values(after, proposed.update_fields, creation_refs)
+        references.update(value for _attname, value in values if isinstance(value, RendererCreationRef))
+    return frozenset(references)
+
+
 def _dependencies(before, after, spec):
     resolver = spec.dependency_resolver
     if resolver is None:
@@ -286,13 +300,27 @@ def _changed_keys(before, after, spec, dependency_changed):
     return keys
 
 
-def _plan_save(proposed: RendererSave, creation_refs):
+def _plan_save(proposed: RendererSave, creation_refs, support_refs):
     instance = proposed.instance
     label = instance._meta.label_lower
     spec = renderer_input_specs().get(label)
-    if spec is None:
-        raise IntentMutationProtocolError(f"{label} is not a registered renderer input")
     before = _stored_instance(instance)
+    if spec is None:
+        reference = creation_refs.get(id(instance))
+        if before is not None or not proposed.force_insert or reference not in support_refs:
+            raise IntentMutationProtocolError(f"{label} is not a registered renderer input")
+        return (
+            RendererWrite(
+                operation="save",
+                model_label=label,
+                natural_key=reference.natural_key,
+                update_fields=proposed.update_fields,
+                values=_field_values(instance, proposed.update_fields, creation_refs),
+                force_insert=True,
+            ),
+            MutationFootprint(),
+            set(),
+        )
     after = _effective_after(instance, before, proposed.update_fields)
     if before is None and not proposed.natural_key_fields:
         raise IntentMutationProtocolError(f"a {label} creation requires a stable natural key")
@@ -322,6 +350,21 @@ def _collector_writes(instance):
     collector.collect([instance])
     root_identity = (instance._meta.label_lower, instance.pk)
     writes = []
+    footprints = []
+    changed_keys = set()
+    specs = renderer_input_specs()
+
+    def record_change(before, after):
+        spec = specs.get(before._meta.label_lower)
+        if spec is None:
+            return
+        dependency_footprint, dependency_changed = _dependencies(before, after, spec)
+        footprints.append(footprint_for_instance(before, spec))
+        if after is not None:
+            footprints.append(footprint_for_instance(after, spec))
+        footprints.append(dependency_footprint)
+        changed_keys.update(_changed_keys(before, after, spec, dependency_changed))
+
     for model, rows in collector.data.items():
         for row in rows:
             writes.append(
@@ -333,40 +376,47 @@ def _collector_writes(instance):
                     cascade=(model._meta.label_lower, row.pk) != root_identity,
                 )
             )
+            record_change(row, None)
     for queryset in collector.fast_deletes:
-        writes.extend(
-            RendererWrite(
-                operation="delete",
-                model_label=queryset.model._meta.label_lower,
-                pk=row.pk,
-                before_values=_field_values(row, None),
-                cascade=True,
+        for row in queryset.order_by("pk"):
+            writes.append(
+                RendererWrite(
+                    operation="delete",
+                    model_label=queryset.model._meta.label_lower,
+                    pk=row.pk,
+                    before_values=_field_values(row, None),
+                    cascade=True,
+                )
             )
-            for row in queryset.order_by("pk")
-        )
+            record_change(row, None)
     for (field, value), querysets in collector.field_updates.items():
         for rows in querysets:
             if hasattr(rows, "values_list"):
                 model = rows.model
-                pks = rows.order_by("pk").values_list("pk", flat=True)
+                materialized = tuple(rows.order_by("pk"))
             else:
                 materialized = tuple(rows)
                 if not materialized:
                     continue
                 model = type(materialized[0])
-                pks = (row.pk for row in materialized)
-            writes.extend(
-                RendererWrite(
-                    operation="set_update",
-                    model_label=model._meta.label_lower,
-                    pk=pk,
-                    update_fields=(field.name,),
-                    values=((field.attname, _normal(value)),),
-                    cascade=True,
+            for row in materialized:
+                writes.append(
+                    RendererWrite(
+                        operation="set_update",
+                        model_label=model._meta.label_lower,
+                        pk=row.pk,
+                        update_fields=(field.name,),
+                        values=((field.attname, _normal(value)),),
+                        cascade=True,
+                    )
                 )
-                for pk in pks
-            )
-    return tuple(writes)
+                after = copy.copy(row)
+                setattr(after, field.attname, _normal(value))
+                if field.is_relation and field.is_cached(after):
+                    field.delete_cached_value(after)
+                record_change(row, after)
+    footprint = MutationFootprint.merge(*footprints) if footprints else MutationFootprint()
+    return tuple(writes), footprint, changed_keys
 
 
 def _plan_delete(proposed: RendererDelete):
@@ -378,12 +428,12 @@ def _plan_delete(proposed: RendererDelete):
     before = _stored_instance(instance)
     if before is None:
         raise IntentMutationProtocolError(f"cannot plan deletion of missing {label} row {instance.pk!r}")
-    dependency_footprint, dependency_changed = _dependencies(before, None, spec)
+    writes, collector_footprint, changed_keys = _collector_writes(before)
     footprint = MutationFootprint.merge(
         deletion_footprint_for_instance(before),
-        dependency_footprint,
+        collector_footprint,
     )
-    return _collector_writes(before), footprint, _changed_keys(before, None, spec, dependency_changed)
+    return writes, footprint, changed_keys
 
 
 def _plan_set_update(proposed: RendererSetUpdate):
@@ -650,7 +700,7 @@ class RendererWriter:
         current = type(instance)._default_manager.filter(pk=instance.pk).first()
         if current is None or not self._fields_match(root_write.before_values, current):
             raise IntentPlanStaleError(f"{root_write.model_label} row {root_write.pk!r} changed after planning")
-        closure = _collector_writes(current)
+        closure, _footprint, _changed_keys = _collector_writes(current)
         matched = []
         available = [candidate for candidate in range(len(self.plan.write_set)) if candidate not in self._consumed]
         for expected in closure:
