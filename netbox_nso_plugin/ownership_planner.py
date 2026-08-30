@@ -510,10 +510,12 @@ def maintain_manifest(instance) -> None:
         }
         if lineage is not None:
             defaults["acknowledged_lineage"] = [copy.deepcopy(lineage)]
-        NSOOwnershipManifest.objects.update_or_create(
+        manifest, created = NSOOwnershipManifest.objects.get_or_create(
             **identity,
             defaults=defaults,
         )
+        if not created:
+            NSOOwnershipManifest.objects.filter(pk=manifest.pk).exclude(ownership_state="retired").update(**defaults)
     else:
         NSOOwnershipManifest.objects.filter(**identity, ownership_state="owned").update(ownership_state="detached")
 
@@ -588,11 +590,11 @@ def reconcile_scope_ownership(device_id: int, scopes) -> tuple[tuple[str, object
     footprint = reconcile_family_footprint(device_id, requested)
     completed = []
     with mirror_transaction(footprint):
+        current = set(_manifest_record_actions(device_id, requested))
         for scope, model_label, pk in planned:
             instance = apps.get_model(model_label).objects.filter(pk=pk).first()
             if instance is None:
                 continue
-            current = _manifest_record_actions(device_id, frozenset({scope}))
             if (scope, model_label, pk) not in current:
                 continue
             maintain_manifest(instance)

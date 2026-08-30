@@ -40,6 +40,11 @@ _SCOPE_ROTATION: dict[int | None, int] = {}
 _FLEET_ROTATION = {"after_device_id": 0}
 
 
+def _monotonic() -> float:
+    """Return the audit clock without exposing the shared module to test patches."""
+    return time.monotonic()
+
+
 class RendererAuditBudgetExceeded(RuntimeError):
     """A pre-capture audit could not verify its complete requested scope set."""
 
@@ -159,7 +164,7 @@ def _trusted(revision) -> bool:
 
 
 def _budget_expired(deadline: float) -> bool:
-    return time.monotonic() >= deadline
+    return _monotonic() >= deadline
 
 
 def _default_scope_batch_cap() -> int:
@@ -346,7 +351,7 @@ def audit_renderer_scopes(
             _DEFAULT_TICK_BUDGET_SECONDS,
             float,
         )
-        deadline = time.monotonic() + budget
+        deadline = _monotonic() + budget
     management = NSODeviceManagement.objects.filter(device_id=device_id).first()
     if management is None:
         return RendererAuditResult(selected, (), deferred)
@@ -429,7 +434,7 @@ def audit_renderer_fleet() -> RendererFleetAuditResult:
         _DEFAULT_TICK_BUDGET_SECONDS,
         float,
     )
-    deadline = time.monotonic() + budget
+    deadline = _monotonic() + budget
     scopes = tuple(delivery.delivery_keys())
     device_ids = tuple(NSODeviceManagement.objects.order_by("device_id").values_list("device_id", flat=True))
     ordered = _fleet_rotation(device_ids)
