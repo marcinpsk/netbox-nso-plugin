@@ -11,7 +11,7 @@ from uuid import uuid4
 import sqlparse
 from django.db import connection, transaction
 from django.db.models import F
-from django.test import TransactionTestCase
+from django.test import SimpleTestCase, TransactionTestCase
 
 from netbox_nso_plugin import delivery, outbox
 from netbox_nso_plugin.intent_state import (
@@ -35,6 +35,40 @@ from netbox_nso_plugin.signals import suppress_intent_push
 
 from ._outbox_case import make_managed, own_vlan, wait_until_postgres_blocks, without_commit_drain
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
+
+
+class TestDeleteCollectorContract(SimpleTestCase):
+    def test_install_rejects_collector_without_positional_source(self):
+        from netbox_nso_plugin.intent_state import ensure_delete_signal_origin
+
+        class IncompatibleCollector:
+            def __init__(self, using, origin=None):
+                self.origin = origin
+
+            def collect(self, objs, nullable=False):
+                pass
+
+        with (
+            patch("netbox.models.deletion.CustomCollector", IncompatibleCollector),
+            self.assertRaisesRegex(RuntimeError, "CustomCollector.collect"),
+        ):
+            ensure_delete_signal_origin()
+
+    def test_install_rejects_collector_without_origin_state(self):
+        from netbox_nso_plugin.intent_state import ensure_delete_signal_origin
+
+        class IncompatibleCollector:
+            def __init__(self, using, origin=None):
+                pass
+
+            def collect(self, objs, source=None):
+                pass
+
+        with (
+            patch("netbox.models.deletion.CustomCollector", IncompatibleCollector),
+            self.assertRaisesRegex(RuntimeError, "CustomCollector.origin"),
+        ):
+            ensure_delete_signal_origin()
 
 
 class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
