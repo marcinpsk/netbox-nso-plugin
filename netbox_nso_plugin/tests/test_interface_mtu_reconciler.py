@@ -398,6 +398,40 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
         self.assertEqual(state.status, "accepted")  # differing value → pending apply
         self.assertIsNotNone(state.accepted_at)
 
+    def test_accept_retries_when_mtu_changes_before_planning(self):
+        from unittest.mock import patch
+
+        from django.contrib.auth import get_user_model
+
+        from netbox_nso_plugin.models import NSOInterfaceMtuState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+
+        state = self._state(l2_mtu=1500, status="changed")
+        User = get_user_model()
+        admin = User.objects.create_superuser(username="mtu-race", password="pw", email="r@x.y")  # noqa: S106
+        self.client.force_login(admin)
+        original_build = RendererMutationPlan.build
+        changed = False
+
+        def build_after_concurrent_edit(**kwargs):
+            nonlocal changed
+            if not changed:
+                NSOInterfaceMtuState.objects.filter(pk=state.pk).update(l2_mtu=9000)
+                changed = True
+            return original_build(**kwargs)
+
+        with (
+            patch.object(RendererMutationPlan, "build", side_effect=build_after_concurrent_edit),
+            patch("netbox_nso_plugin.adapter_client.put_interface_mtu_intent"),
+        ):
+            response = self.client.post(f"/plugins/nso/interface-mtu/state/{state.pk}/accept/")
+
+        self.assertEqual(response.status_code, 302)
+        state.refresh_from_db()
+        self.po1.refresh_from_db()
+        self.assertEqual(state.l2_mtu, 9000)
+        self.assertEqual(self.po1.mtu, 9000)
+
     def test_edit_form_flags_unowned_changed(self):
         from netbox_nso_plugin.forms import NSOInterfaceMtuStateForm
 

@@ -4836,26 +4836,53 @@ def _save_owned_overlay_only_edit(obj, old_values):
         writer.save(candidate, update_fields=update_fields)
 
 
-def _write_owned_interface_mtu(candidate, update_fields, *, planned_at):
+def _write_owned_interface_mtu(
+    candidate,
+    update_fields,
+    *,
+    planned_at,
+    expected_state_values,
+    expected_interface_mtu,
+):
     """Write one MTU ownership claim and its native interface value."""
     import copy
 
-    from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
+    from .renderer_writer import (
+        IntentPlanStaleError,
+        RendererMutationPlan,
+        planned_save,
+        renderer_mirror_writes,
+        renderer_writes,
+    )
 
     saves = []
     operations = []
+    state_fields = set(update_fields) | set(expected_state_values)
     if candidate.l2_mtu is not None:
         clamped = min(int(candidate.l2_mtu), NSOInterfaceMtuStateAcceptView._NETBOX_MTU_MAX)
-        if candidate.interface.mtu != clamped:
-            interface = copy.copy(candidate.interface)
-            interface.mtu = clamped
-            fields = ("mtu",)
-            saves.append(planned_save(interface, update_fields=fields))
-            operations.append((interface, fields))
-    saves.append(planned_save(candidate, update_fields=update_fields))
-    operations.append((candidate, update_fields))
+        interface = copy.copy(candidate.interface)
+        interface.mtu = clamped
+        fields = ("mtu",)
+        saves.append(planned_save(interface, update_fields=fields))
+        operations.append((interface, fields))
+    saves.append(planned_save(candidate, update_fields=state_fields))
+    operations.append((candidate, state_fields))
 
     plan = RendererMutationPlan.build(saves=saves, planned_at=planned_at)
+    expected_before = {
+        (candidate._meta.label_lower, candidate.pk): expected_state_values,
+    }
+    if candidate.l2_mtu is not None:
+        expected_before[(candidate.interface._meta.label_lower, candidate.interface.pk)] = {
+            "mtu": expected_interface_mtu
+        }
+    for write in plan.write_set:
+        expected = expected_before.get((write.model_label, write.pk))
+        if expected is None:
+            continue
+        before_values = dict(write.before_values)
+        if any(before_values.get(field) != value for field, value in expected.items()):
+            raise IntentPlanStaleError(f"{write.model_label} row {write.pk!r} changed before planning")
     mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
     with mutation as writer:
         for instance, fields in operations:
@@ -4881,9 +4908,19 @@ def _save_owned_interface_mtu_edit(obj, old_values, *, _retry_on_stale=True):
     state_fields.add("status")
     if candidate.accepted_at is not None:
         state_fields.add("accepted_at")
+    expected_state_values = {
+        field_name: old_values.get(field_name, getattr(obj, field_name)) for field_name in state_fields
+    }
+    expected_state_values["l2_mtu"] = old_values.get("l2_mtu", obj.l2_mtu)
 
     try:
-        _write_owned_interface_mtu(candidate, state_fields, planned_at=planned_at)
+        _write_owned_interface_mtu(
+            candidate,
+            state_fields,
+            planned_at=planned_at,
+            expected_state_values=expected_state_values,
+            expected_interface_mtu=obj.interface.mtu,
+        )
     except IntentPlanStaleError:
         if not _retry_on_stale:
             raise
@@ -7387,14 +7424,39 @@ class NSOInterfaceMtuStateAcceptView(OverlayStateAcceptMixin):
     # NetBox dcim.Interface.mtu max (and the read-side clamp ceiling).
     _NETBOX_MTU_MAX = 65536
 
-    def post(self, request, pk):  # noqa: D102
+    @staticmethod
+    def _accept(state, *, retry_on_stale=True):
         import copy
 
-        state = get_object_or_404(self.model_class, pk=pk)
+        from .renderer_writer import IntentPlanStaleError
+
         candidate = copy.copy(state)
         candidate.status = _status_after_accept(state.status)
         candidate.accepted_at = timezone.now()
-        _write_owned_interface_mtu(candidate, ("status", "accepted_at"), planned_at=candidate.accepted_at)
+        fields = ("status", "accepted_at")
+        expected_state_values = {
+            "status": state.status,
+            "accepted_at": state.accepted_at,
+            "l2_mtu": state.l2_mtu,
+        }
+        try:
+            _write_owned_interface_mtu(
+                candidate,
+                fields,
+                planned_at=candidate.accepted_at,
+                expected_state_values=expected_state_values,
+                expected_interface_mtu=state.interface.mtu,
+            )
+        except IntentPlanStaleError:
+            if not retry_on_stale:
+                raise
+            current = type(state).objects.select_related("interface", "management").get(pk=state.pk)
+            return NSOInterfaceMtuStateAcceptView._accept(current, retry_on_stale=False)
+        return candidate
+
+    def post(self, request, pk):  # noqa: D102
+        state = get_object_or_404(self.model_class.objects.select_related("interface", "management"), pk=pk)
+        candidate = self._accept(state)
         messages.success(request, f"Accepted {candidate}.")
         return redirect(_device_nso_tab_url(candidate.management.device_id))
 
