@@ -16,6 +16,8 @@ import copy
 import logging
 from dataclasses import dataclass
 
+from .adapter_client import AdapterError
+
 logger = logging.getLogger(__name__)
 
 
@@ -30,26 +32,38 @@ class _ReconcileExecution:
 def _validated_interface_items(payload: dict) -> tuple[dict, ...]:
     """Validate one adapter MTU document before planning stale-row changes."""
     if not isinstance(payload, dict):
-        raise ValueError("interface MTU payload must be an object")
+        raise AdapterError("interface MTU payload must be an object", code="invalid_response")
     items = payload.get("interfaces", [])
     if not isinstance(items, list):
-        raise ValueError("interface MTU interfaces must be a list")
+        raise AdapterError("interface MTU interfaces must be a list", code="invalid_response")
     seen = set()
     for item in items:
         if not isinstance(item, dict):
-            raise ValueError("interface MTU payload entry must be an object")
+            raise AdapterError("interface MTU payload entry must be an object", code="invalid_response")
         name = item.get("interface_name")
         if not isinstance(name, str) or not name:
-            raise ValueError("interface MTU payload entry interface_name must be a non-empty string")
+            raise AdapterError(
+                "interface MTU payload entry interface_name must be a non-empty string",
+                code="invalid_response",
+            )
         if name in seen:
-            raise ValueError(f"duplicate interface_name in interface MTU payload: {name}")
+            raise AdapterError(
+                f"duplicate interface_name in interface MTU payload: {name}",
+                code="invalid_response",
+            )
         for field_name in ("mtu", "ip_mtu", "mpls_mtu"):
             value = item.get(field_name)
             if value is not None and (type(value) is not int or value < 0):
-                raise ValueError(f"interface MTU payload entry {field_name} must be a non-negative integer or null")
+                raise AdapterError(
+                    f"interface MTU payload entry {field_name} must be a non-negative integer or null",
+                    code="invalid_response",
+                )
         bound_port = item.get("bound_port")
         if bound_port is not None and not isinstance(bound_port, str):
-            raise ValueError("interface MTU payload entry bound_port must be a string or null")
+            raise AdapterError(
+                "interface MTU payload entry bound_port must be a string or null",
+                code="invalid_response",
+            )
         seen.add(name)
     return tuple(items)
 
