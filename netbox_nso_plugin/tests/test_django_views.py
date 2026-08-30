@@ -5057,7 +5057,7 @@ class TestOverlayFieldEditView(ViewTestBase):
     def test_edit_vlan_name_reports_a_qinq_collision_created_after_validation(self):
         from ipam.models import VLAN, VLANGroup
 
-        from netbox_nso_plugin import intent_state
+        from netbox_nso_plugin import views
         from netbox_nso_plugin.models import NSOVLANState
 
         first_group = VLANGroup.objects.create(name="First Q-in-Q Group", slug="first-qinq-group")
@@ -5076,10 +5076,10 @@ class TestOverlayFieldEditView(ViewTestBase):
             device_name="KEEP-NAME",
             status="imported",
         )
-        original_footprint = intent_state.vlan_footprint
+        original_rows = views._vlan_name_edit_rows
 
-        def resolve_then_collide(vlan_id, scopes, **kwargs):
-            result = original_footprint(vlan_id, scopes, **kwargs)
+        def load_then_collide(vlan_model, vlan_id):
+            result = original_rows(vlan_model, vlan_id)
             VLAN.objects.create(
                 group=second_group,
                 vid=122,
@@ -5089,7 +5089,7 @@ class TestOverlayFieldEditView(ViewTestBase):
             )
             return result
 
-        with patch("netbox_nso_plugin.intent_state.vlan_footprint", side_effect=resolve_then_collide):
+        with patch("netbox_nso_plugin.views._vlan_name_edit_rows", side_effect=load_then_collide):
             response = self.client.post(self._url("vlan_name", state.pk), {"name": "TAKEN-NAME"})
 
         self.assertEqual(response.status_code, 400)
@@ -5102,7 +5102,7 @@ class TestOverlayFieldEditView(ViewTestBase):
     def test_edit_vlan_name_reports_a_collision_created_after_validation(self):
         from ipam.models import VLAN, VLANGroup
 
-        from netbox_nso_plugin import intent_state
+        from netbox_nso_plugin import views
         from netbox_nso_plugin.models import NSOVLANState
 
         group = VLANGroup.objects.create(name="Raced Inline VLANs", slug="raced-inline-vlans")
@@ -5113,14 +5113,14 @@ class TestOverlayFieldEditView(ViewTestBase):
             device_name="KEEP-NAME",
             status="imported",
         )
-        original_footprint = intent_state.vlan_footprint
+        original_rows = views._vlan_name_edit_rows
 
-        def resolve_then_collide(vlan_id, scopes, **kwargs):
-            result = original_footprint(vlan_id, scopes, **kwargs)
+        def load_then_collide(vlan_model, vlan_id):
+            result = original_rows(vlan_model, vlan_id)
             VLAN.objects.create(group=group, vid=125, name="RACED-NAME")
             return result
 
-        with patch("netbox_nso_plugin.intent_state.vlan_footprint", side_effect=resolve_then_collide):
+        with patch("netbox_nso_plugin.views._vlan_name_edit_rows", side_effect=load_then_collide):
             response = self.client.post(self._url("vlan_name", state.pk), {"name": "RACED-NAME"})
 
         self.assertEqual(response.status_code, 400, response.content)
