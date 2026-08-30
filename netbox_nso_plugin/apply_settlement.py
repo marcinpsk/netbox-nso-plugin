@@ -5,12 +5,14 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import UUID
 
 from django.utils import timezone
 
 logger = logging.getLogger(__name__)
+
+LOST_RESPONSE_REPLAY_WINDOW = timedelta(days=1)
 
 GENERATION_DISPOSITIONS = {
     "pending": "waiting",
@@ -426,6 +428,7 @@ def deployment_evidence_attempt_ids(management) -> tuple[UUID, ...]:
             management=management,
             adapter_device_id=management.adapter_device_id,
             response__isnull=True,
+            created_at__gte=timezone.now() - LOST_RESPONSE_REPLAY_WINDOW,
         ).values_list("pk", flat=True)
     )
     return tuple(sorted(attempt_ids, key=str))
@@ -490,7 +493,8 @@ def load_deployment_evidence(management, *, attempt_ids=None):
             if exc.status_code == 409 and exc.code == "conflict":
                 job_id = exc.detail.get("job_id") if isinstance(exc.detail, dict) else None
                 logger.info(
-                    "Apply replay for attempt %s is waiting for adapter job %s",
+                    "Apply replay for adapter device %s attempt %s is waiting for adapter job %s",
+                    management.adapter_device_id,
                     attempt.pk,
                     job_id,
                 )

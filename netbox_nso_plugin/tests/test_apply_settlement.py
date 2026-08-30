@@ -442,6 +442,21 @@ class TestAttemptSettlement(TestCase):
         self.assertIsNone(local.http_status)
         self.assertIsNone(local.response)
         self.assertTrue(any("job 900" in message for message in logs.output))
+        self.assertTrue(any("device 1626" in message for message in logs.output))
+
+    def test_rowless_lost_responses_expire_from_evidence_replay(self):
+        from netbox_nso_plugin.apply_settlement import deployment_evidence_attempt_ids
+        from netbox_nso_plugin.models import NSOApplyAttempt
+
+        expired_id, recent_id = uuid4(), uuid4()
+        expired = self._local_attempt(expired_id, 66, {"vlan": 406}, answered=False)
+        self._local_attempt(recent_id, 67, {"vlan": 407}, answered=False)
+        NSOApplyAttempt.objects.filter(pk=expired.pk).update(created_at=timezone.now() - timedelta(days=2))
+
+        attempt_ids = deployment_evidence_attempt_ids(self.management)
+
+        self.assertNotIn(expired_id, attempt_ids)
+        self.assertIn(recent_id, attempt_ids)
 
     def test_an_ambiguous_replay_failure_leaves_the_attempt_answerable(self):
         """A 503 replay may still have enqueued the Apply, so it may not become the stored answer.
