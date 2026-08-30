@@ -2299,7 +2299,7 @@ def _transition_static_route_content(static_route, previous=None) -> list:
     return rows
 
 
-def _static_route_delete_transition(row, static_route):
+def _static_route_delete_transition(row, static_route_id):
     """Record what is leaving, from the overlay that still mirrors it.
 
     The lineage leads with the triple the adapter last ACKNOWLEDGED, because a content edit
@@ -2309,7 +2309,7 @@ def _static_route_delete_transition(row, static_route):
     from . import outbox
 
     return outbox.delete_transition(
-        static_route.pk,
+        static_route_id,
         last_acked=row.last_acked_triple,
         current=outbox.triple_of(row.nso_vrf, row.nso_prefix, row.nso_next_hop),
     )

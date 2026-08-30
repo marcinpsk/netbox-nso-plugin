@@ -1664,11 +1664,12 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         )
 
         vid = 3559
-        vlan = VLAN.objects.create(
-            group=_device_vlan_group(self.device),
-            vid=vid,
-            name="payload-only",
-        )
+        with without_commit_drain(), transaction.atomic():
+            vlan = VLAN.objects.create(
+                group=_device_vlan_group(self.device),
+                vid=vid,
+                name="payload-only",
+            )
         interface = self._create_interface(device=self.device, name="Ethernet3559", type="1000base-t")
         self.assertFalse(NSOVLANState.objects.filter(management=self.mgmt, vlan=vlan).exists())
 

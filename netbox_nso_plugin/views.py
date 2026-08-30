@@ -4844,20 +4844,31 @@ def _save_owned_interface_mtu_edit(obj, old_values):
     import copy
 
     from . import status_machine as sm
+    from .renderer_writer import IntentPlanStaleError
 
-    candidate = copy.copy(obj)
-    if not sm.is_owned(candidate.status):
-        candidate.accepted_at = timezone.now()
-    candidate.status = sm.on_operator_edit(candidate.status)
-    update_fields = {
-        field_name
+    edited_values = {
+        field_name: getattr(obj, field_name)
         for field_name, old_value in old_values.items()
-        if hasattr(candidate, field_name) and getattr(candidate, field_name) != old_value
+        if hasattr(obj, field_name) and getattr(obj, field_name) != old_value
     }
-    update_fields.add("status")
-    if candidate.accepted_at is not None:
-        update_fields.add("accepted_at")
-    _write_owned_interface_mtu(candidate, update_fields)
+    current = obj
+    for attempt in range(2):
+        candidate = copy.copy(current)
+        for field_name, value in edited_values.items():
+            setattr(candidate, field_name, value)
+        if not sm.is_owned(candidate.status):
+            candidate.accepted_at = timezone.now()
+        candidate.status = sm.on_operator_edit(candidate.status)
+        update_fields = {*edited_values, "status"}
+        if candidate.accepted_at is not None:
+            update_fields.add("accepted_at")
+        try:
+            _write_owned_interface_mtu(candidate, update_fields)
+            return
+        except IntentPlanStaleError:
+            if attempt:
+                raise
+            current = type(obj).objects.get(pk=obj.pk)
 
 
 def _save_owned_overlay_edit(obj, key, old_values):
