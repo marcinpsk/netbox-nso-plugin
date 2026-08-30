@@ -176,6 +176,11 @@ class TestTheApplyProbeNamesTheLockedDevice(_CarrierCase):
         state = _own(sr, mgmt, generation=120)
         _stale_clock(state)
         # Device 60 is idle; the repaired device 61 has an apply in flight.
+        self.adapter.store.add_device(
+            nso_instance="se-probe-repaired-inst",
+            nso_device_name="nso-se-probe-repaired",
+            device_id=61,
+        )
         self.adapter.store.queued_job(61)
 
         with _repair_before_the_lock(mgmt.pk, 61):

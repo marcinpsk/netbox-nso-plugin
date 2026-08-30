@@ -729,7 +729,7 @@
         });
         var data = await r.json();
         if (data.status === 'error') { setStatus('Error: ' + data.message, 'danger', false); setButtons(false); }
-        else if (data.status === 'no_op') { setStatus(data.message, 'info', false); setButtons(false); }
+        else if (data.status === 'no_op') { setStatus(data.message || 'Nothing to do.', 'info', false); setButtons(false); }
         else if (data.status === 'conflict') {
           // Poll the incumbent under its own name and use the server's admission wording.
           var conflictMessage = data.message || 'The adapter reported a job conflict.';

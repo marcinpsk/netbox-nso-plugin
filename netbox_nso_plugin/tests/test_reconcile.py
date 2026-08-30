@@ -756,6 +756,11 @@ class TestStepFourRereadsAfterTheSettlement(_SettlementCase):
         self._aged(
             self.adapter.store.terminal_job(70, extra={"vlan_count_by_outcome": {"in_sync": 1, "apply_failed": 0}})
         )
+        self.adapter.store.add_device(
+            nso_instance="se-repair-active-inst",
+            nso_device_name="nso-se-repair-active",
+            device_id=71,
+        )
         self.adapter.store.queued_job(71)
 
         self._reconcile(mgmt, _commit_link_repair(mgmt.pk, 71))

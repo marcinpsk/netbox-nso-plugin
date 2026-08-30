@@ -2184,6 +2184,24 @@ def _on_static_route_state_save(sender, instance, **kwargs):
     _schedule_intent_push((device_id, "static_route"))
 
 
+@_skip_on_render
+def _on_static_route_state_delete(sender, instance, **kwargs):
+    """Push a reduced static-route snapshot with this row's deletion authority."""
+    from .models import NSODeviceManagement
+
+    if instance.status not in _OWNED_PUSH_STATUSES:
+        return
+    try:
+        mgmt = instance.management
+    except NSODeviceManagement.DoesNotExist:
+        return
+    if mgmt.adapter_device_id is None:
+        return
+
+    transition = _static_route_delete_transition(instance, instance.static_route_id)
+    _schedule_intent_push((mgmt.device_id, "static_route"), transitions=[transition])
+
+
 # ── Greenfield static routes (operator-created in NetBox, not yet on the device) ──
 #
 # The reconcile path only ever creates an NSOStaticRouteState overlay for a route the
@@ -2379,7 +2397,7 @@ def _accept_static_route_for_device(static_route, device) -> None:
         _schedule_intent_push((device_id, "static_route"), transitions=[outbox.revoke_transition(static_route.pk)])
 
 
-def _static_route_delete_transition(row, static_route):
+def _static_route_delete_transition(row, static_route_id):
     """Record what is leaving, from the overlay that still mirrors it.
 
     The lineage leads with the triple the adapter last ACKNOWLEDGED, because a content edit
@@ -2389,7 +2407,7 @@ def _static_route_delete_transition(row, static_route):
     from . import outbox
 
     return outbox.delete_transition(
-        static_route.pk,
+        static_route_id,
         last_acked=row.last_acked_triple,
         current=outbox.triple_of(row.nso_vrf, row.nso_prefix, row.nso_next_hop),
     )
@@ -2406,11 +2424,7 @@ def _remove_static_route_for_device(static_route, device) -> None:
     if mgmt.adapter_device_id is None:
         return
     rows = NSOStaticRouteState.objects.filter(management=mgmt, static_route=static_route)
-    # Captured here because this is the last moment the mirror is alive: the next statement
-    # deletes it, and a removed route's content cannot be re-rendered from anything else.
-    transitions = [_static_route_delete_transition(row, static_route) for row in rows]
     rows.delete()
-    _schedule_intent_push((mgmt.device_id, "static_route"), transitions=transitions)
 
 
 def _on_routing_static_route_pre_save(sender, instance, **kwargs):
@@ -4469,7 +4483,7 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_static_route_state_post_save",
     )
     post_delete.connect(
-        _as_delete_origin(_on_static_route_state_save),
+        _as_delete_origin(_on_static_route_state_delete),
         sender=NSOStaticRouteState,
         dispatch_uid="nso_plugin_static_route_state_post_delete",
         weak=False,

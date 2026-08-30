@@ -192,6 +192,19 @@ describe("the device tab's Apply generation-chain poller", () => {
     expect(() => pinned(withoutDigest, DEVICE_GENERATION_FIELDS, "device generation")).toThrow(/digest/);
   });
 
+  it("shows a stable message when a no-op response omits one", async () => {
+    const fetched = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ status: "no_op" }),
+    }));
+    vi.stubGlobal("fetch", fetched);
+    const form = mountTab();
+
+    form.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+    await vi.waitFor(() => expect(message()).toBe("Nothing to do."));
+    expect(fetched).toHaveBeenCalledOnce();
+  });
+
   it("refreshes the categories when the chain settles without its successor's job details", async () => {
     const refreshed = await runApply(RACED);
 

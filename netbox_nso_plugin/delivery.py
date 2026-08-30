@@ -295,6 +295,8 @@ def send(
         raise ValueError("a backfill-only request carries no authority, so it cannot mark a deletion")
     entry = delivery_keys()[rendered.key[1]]
     marking_mode = _resolved_marking_mode(entry, marking_mode)
+    if mark and marking_mode == MARKING_PER_OBJECT and not deletions:
+        raise ValueError("a marked per-object request requires deletion records")
     if deadline is not None:
         rendered = dataclasses.replace(rendered, do_push=_under_deadline(rendered.do_push, deadline))
     with contextlib.ExitStack() as stack:

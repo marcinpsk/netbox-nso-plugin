@@ -4457,7 +4457,7 @@ def _save_lacp_edit(obj, key):
 
 def _save_vlan_name_edit(obj):
     """Rename one shared VLAN and take ownership on every attached managed device."""
-    from django.db import transaction
+    from django.db import IntegrityError, transaction
 
     from . import status_machine as sm
     from .apply_state import lock_vlan_intent_rows, mark_explicit_accept
@@ -4471,8 +4471,14 @@ def _save_vlan_name_edit(obj):
             return {"name": ["This VLAN no longer exists. Refresh the page before editing it."]}
         vlan.name = desired_name
         states = rows["vlan"]
-        with suppress_intent_push():
-            vlan.save(update_fields=["name"])
+        try:
+            with transaction.atomic(), suppress_intent_push():
+                vlan.save(update_fields=["name"])
+        except IntegrityError:
+            collision = type(vlan).objects.filter(group_id=vlan.group_id, name=desired_name).exclude(pk=vlan.pk)
+            if collision.exists():
+                return {"name": ["A VLAN with this name already exists in this group."]}
+            raise
 
         now = timezone.now()
         for state in states:

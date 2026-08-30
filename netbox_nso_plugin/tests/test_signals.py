@@ -1385,6 +1385,74 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             )
         self._delete_pushes(row, "put_static_route_intent")
 
+    def test_static_route_overlay_delete_records_per_object_authority(self):
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOStaticRouteState
+
+        mgmt = self._mgmt()
+        route = StaticRoute.objects.create(prefix="198.18.98.0/24", next_hop="198.18.0.1", metric=1)
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_static_route_intent"),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            row = NSOStaticRouteState.objects.create(
+                management=mgmt,
+                static_route=route,
+                nso_prefix="198.18.98.0/24",
+                status="accepted",
+            )
+
+        with self.captureOnCommitCallbacks(execute=False):
+            row.delete()
+
+        entry = NSOIntentOutboxEntry.objects.get(
+            device=self.device,
+            scope="static_route",
+            consumed_by_push_seq__isnull=True,
+        )
+        self.assertTrue(entry.mark_and)
+        self.assertEqual(
+            entry.transitions,
+            [
+                {
+                    "op": "delete",
+                    "route_id": route.pk,
+                    "triples": [{"vrf": "", "prefix": "198.18.98.0/24", "next_hop": ""}],
+                    "unverified": True,
+                }
+            ],
+        )
+
+    def test_unowned_static_route_overlay_delete_records_no_authority(self):
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOStaticRouteState
+
+        mgmt = self._mgmt()
+        route = StaticRoute.objects.create(prefix="198.18.97.0/24", next_hop="198.18.0.1", metric=1)
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_static_route_intent"),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            row = NSOStaticRouteState.objects.create(
+                management=mgmt,
+                static_route=route,
+                nso_prefix="198.18.97.0/24",
+                status="imported",
+            )
+
+        with self.captureOnCommitCallbacks(execute=False):
+            row.delete()
+
+        self.assertFalse(
+            NSOIntentOutboxEntry.objects.filter(
+                device=self.device,
+                scope="static_route",
+                consumed_by_push_seq__isnull=True,
+            ).exists()
+        )
+
     def test_l2_sap_delete_pushes_reduced_snapshot(self):
         from netbox_nso_plugin.models import NSOL2SapState
 

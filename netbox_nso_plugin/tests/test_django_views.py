@@ -4933,6 +4933,37 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(vlan.name, "KEEP-NAME")
         self.assertEqual(state.status, "imported")
 
+    def test_edit_vlan_name_reports_a_collision_created_after_validation(self):
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin import apply_state
+        from netbox_nso_plugin.models import NSOVLANState
+
+        group = VLANGroup.objects.create(name="Raced Inline VLANs", slug="raced-inline-vlans")
+        vlan = VLAN.objects.create(group=group, vid=124, name="KEEP-NAME")
+        state = NSOVLANState.objects.create(
+            management=self.mgmt,
+            vlan=vlan,
+            device_name="KEEP-NAME",
+            status="imported",
+        )
+        original_lock = apply_state.lock_vlan_intent_rows
+
+        def lock_then_collide(vlan_id, scopes):
+            result = original_lock(vlan_id, scopes)
+            VLAN.objects.create(group=group, vid=125, name="RACED-NAME")
+            return result
+
+        with patch("netbox_nso_plugin.apply_state.lock_vlan_intent_rows", side_effect=lock_then_collide):
+            response = self.client.post(self._url("vlan_name", state.pk), {"name": "RACED-NAME"})
+
+        self.assertEqual(response.status_code, 400, response.content)
+        self.assertIn("name", response.json()["errors"])
+        vlan.refresh_from_db()
+        state.refresh_from_db()
+        self.assertEqual(vlan.name, "KEEP-NAME")
+        self.assertEqual(state.status, "imported")
+
     def test_edit_route_map_name_updates_shared_object_overlays_and_dependent_intent(self):
         from django.contrib.contenttypes.models import ContentType
         from netbox_routing.models import OSPFInstance, Redistribution, RouteMap

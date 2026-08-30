@@ -104,6 +104,8 @@ class TestTheTickDrainsTheTail(_DrainCase):
         drain_all.assert_not_called()
 
     def test_an_adapter_outage_reports_compaction_and_settlement_durations_separately(self):
+        from itertools import chain, repeat
+
         from netbox_nso_plugin import jobs
 
         with (
@@ -114,7 +116,7 @@ class TestTheTickDrainsTheTail(_DrainCase):
             patch.object(jobs, "time") as clock,
             patch.object(jobs.logger, "info") as log,
         ):
-            clock.monotonic.side_effect = [10.0, 20.0, 21.0]
+            clock.monotonic.side_effect = chain((10.0, 20.0), repeat(21.0))
             jobs.RefreshDeviceSyncCacheJob.run(None)
 
         # Rendered, not indexed: a value added to that one `logger.info` shifts every index,

@@ -193,6 +193,22 @@ class TestDeliverySuccessHooks(IntentPushResetMixin, TestCase):
 
         assert sent == []
 
+    def test_a_marked_per_object_send_requires_deletion_records(self):
+        from netbox_nso_plugin import delivery
+
+        device, _mgmt = _fixture("empty-per-object-mark", 7308)
+        sent = []
+        rendered = delivery.Rendered(
+            key=(device.pk, "static_route"),
+            payload=[],
+            do_push=lambda body: sent.append(body),
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires deletion records"):
+            delivery.send(rendered, rendered.payload, mark=True)
+
+        assert sent == []
+
     def test_receipt_adapter_device_failure_uses_the_client_transport_exception(self):
         from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.delivery import deliver

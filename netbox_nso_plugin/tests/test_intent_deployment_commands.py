@@ -389,8 +389,28 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
             ),
             "row carrying push_seq": (
                 {},
-                77,
+                {"consumed_by_push_seq": 77},
                 "a row carrying a push_seq",
+            ),
+            "unconsumed entry": (
+                {},
+                {"consumed_by_push_seq": None},
+                "an unconsumed entry",
+            ),
+            "unacknowledged operation": (
+                {"push_seq": 91},
+                None,
+                "an unacknowledged operation",
+            ),
+            "queued deletions": (
+                {"queued_deletions": [{"route_id": 9, "triples": [], "unverified": True}]},
+                None,
+                "queued deletions",
+            ),
+            "revoked ids": (
+                {"revoked_ids": [11]},
+                None,
+                "revoked ids",
             ),
             "fence withheld": (
                 {"fence_withheld_since": timezone.now()},
@@ -398,17 +418,17 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
                 "the fence is withheld",
             ),
         }
-        for label, (state_fields, row_seq, expected) in cases.items():
+        for label, (state_fields, entry_fields, expected) in cases.items():
             with self.subTest(case=label):
                 NSOIntentOutboxEntry.objects.all().delete()
                 NSOIntentOutboxState.objects.all().delete()
                 NSOIntentOutboxState.objects.create(device=self.device, scope="static_route", **state_fields)
-                if row_seq is not None:
+                if entry_fields is not None:
                     NSOIntentOutboxEntry.objects.create(
                         device=self.device,
                         scope="static_route",
                         batch_id=1,
-                        consumed_by_push_seq=row_seq,
+                        **entry_fields,
                     )
 
                 with patch("netbox_nso_plugin.management.commands.nso_intent_deployment_gate._sleep"):
