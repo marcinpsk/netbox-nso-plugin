@@ -93,6 +93,31 @@ class TestSubinterfaceReconciler(TestCase):
         # A dot1q tag must NOT create a device VLAN object.
         self.assertEqual(VLAN.objects.count(), 0)
 
+    def test_duplicate_interface_entries_use_the_first_observation(self):
+        from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
+
+        rows = reconcile_subinterface(
+            self.device,
+            {
+                "interfaces": [
+                    {
+                        "interface_name": "GigabitEthernet0/1.101",
+                        "parent_interface": self.parent.name,
+                        "dot1q_vlan": 101,
+                    },
+                    {
+                        "interface_name": "GigabitEthernet0/1.101",
+                        "parent_interface": self.parent.name,
+                        "dot1q_vlan": 202,
+                    },
+                ]
+            },
+        )
+
+        self.assertEqual(len(rows), 1)
+        state = NSOSubinterfaceState.objects.get(interface__name="GigabitEthernet0/1.101")
+        self.assertEqual(state.dot1q_vlan, 101)
+
     def test_unowned_existing_subinterface_tracks_a_new_parent(self):
         from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
 
@@ -348,25 +373,15 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
         from uuid import uuid4
 
         iface = Interface.objects.create(device=self.device, name=name, type="virtual", parent=self.parent)
-        # Creating a NEW parent+dot1q interface on a managed device (adapter_device_id set)
-        # fires the greenfield post_save signal (_create_greenfield_subif_state), which
-        # ALREADY creates an owned NSOSubinterfaceState. Cooperate with it via
-        # update_or_create rather than a second create that would violate the unique
-        # (management, interface) constraint.
-        state, _ = NSOSubinterfaceState.objects.update_or_create(
+        return NSOSubinterfaceState.objects.create(
             management=self.management,
             interface=iface,
-            defaults={
-                "parent_interface": self.parent,
-                "dot1q_vlan": dot1q,
-                "vrf": "MTI",
-                "status": status,
-                "apply_attempt_id": uuid4() if status == "deploying" else None,
-            },
+            parent_interface=self.parent,
+            dot1q_vlan=dot1q,
+            vrf="MTI",
+            status=status,
+            apply_attempt_id=uuid4() if status == "deploying" else None,
         )
-        if state.status != status:
-            state = content_update(state, status=status)
-        return state
 
     def test_reconcile_preserves_owned_status(self):
         from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface

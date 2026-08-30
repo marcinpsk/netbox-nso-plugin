@@ -62,7 +62,7 @@ def _subinterface_reconcile_operations(device, payload, planned_at):
         if not isinstance(item, dict):
             continue
         name = item.get("interface_name")
-        if not name:
+        if not name or name in reported:
             continue
         reported.add(name)
         current_interface = interfaces.get(name)

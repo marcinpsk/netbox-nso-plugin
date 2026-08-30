@@ -441,6 +441,20 @@ class TestAutoAssignIP(TestCase):
         ]
         assert not IPAddress.objects.filter(assigned_object_id=iface.pk).exists()
 
+    def test_reserve_single_enqueues_the_requested_push(self):
+        from netbox_nso_plugin.ip_autoassign import _reserve_single
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry
+
+        pool = Prefix.objects.get(pk=self.pool_lo4.pk)
+        mgmt = self._make_mgmt()
+        iface = Interface.objects.create(device=self.device, name="Loopback153", type="virtual")
+        result = {"allocated": [], "errors": [], "skipped": []}
+
+        _reserve_single(iface, mgmt, "ipv4", pool, result, push=True)
+
+        self.assertTrue(result["allocated"], result)
+        self.assertTrue(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="ip").exists())
+
     def test_fill_empty_skips_interface_with_managed_ip(self):
         from netbox_nso_plugin.models import NSOInterfaceIPState
 
