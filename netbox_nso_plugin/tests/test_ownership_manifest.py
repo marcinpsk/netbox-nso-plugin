@@ -38,7 +38,7 @@ class TestOwnershipManifestSchema(SimpleTestCase):
 
 
 class TestOwnershipManifestDurability(TestCase):
-    def test_device_deletion_keeps_manifest_evidence(self):
+    def test_device_deletion_retires_and_keeps_manifest_evidence(self):
         from netbox_nso_plugin.models import NSOOwnershipManifest
 
         from ._outbox_case import make_managed
@@ -53,4 +53,5 @@ class TestOwnershipManifestDurability(TestCase):
 
         device.delete()
 
-        self.assertTrue(NSOOwnershipManifest.objects.filter(pk=manifest.pk).exists())
+        manifest.refresh_from_db()
+        self.assertEqual(manifest.ownership_state, "retired")
