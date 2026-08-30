@@ -42,9 +42,9 @@ class Command(BaseCommand):
                             f"Renderer baseline for device {device_id} did not stabilize after "
                             f"{_STABILITY_PASSES} complete audits"
                         )
-        except Exception as exc:
+        except BaseException as exc:
             self.stderr.write(self.style.ERROR("Renderer baseline cutover failed; intent work remains quiesced"))
-            if isinstance(exc, CommandError):
+            if not isinstance(exc, Exception) or isinstance(exc, CommandError):
                 raise
             raise CommandError(f"Renderer baseline cutover failed: {exc}") from exc
 
