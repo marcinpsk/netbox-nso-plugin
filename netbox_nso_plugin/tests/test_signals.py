@@ -1734,6 +1734,12 @@ class TestDeleteOriginMarking(_SignalDBBase):
 
         return suppress_intent_push()
 
+    @staticmethod
+    def _body_deletes_route(body, route_id):
+        return isinstance(body, dict) and any(
+            isinstance(record, dict) and record.get("route_id") == route_id for record in body.get("deleted_routes", [])
+        )
+
     def _owned_svi(self, mgmt):
         from ipam.models import VLAN
 
@@ -1794,7 +1800,7 @@ class TestDeleteOriginMarking(_SignalDBBase):
         )
         bodies = [body for _method, _url, _params, body in requests]
         self.assertTrue(
-            any(route_id in [record["route_id"] for record in body["deleted_routes"]] for body in bodies),
+            any(self._body_deletes_route(body, route_id) for body in bodies),
             f"the deleted route must carry per-object authority; saw bodies {bodies}",
         )
 
@@ -1838,7 +1844,7 @@ class TestDeleteOriginMarking(_SignalDBBase):
         )
         bodies = [body for _method, _url, _params, body in requests]
         self.assertTrue(
-            any(route.pk in [record["route_id"] for record in body["deleted_routes"]] for body in bodies),
+            any(self._body_deletes_route(body, route.pk) for body in bodies),
             f"the unassigned route must carry per-object authority; saw bodies {bodies}",
         )
 

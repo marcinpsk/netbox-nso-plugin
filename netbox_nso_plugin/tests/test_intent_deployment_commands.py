@@ -202,7 +202,12 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
 
         own_route(self.mgmt, "198.18.39.0/24", "198.18.0.1")
         claim = drain.claim(self.device.pk, "static_route", force=True)
-        wire = delivery.wire_body(claim.rendered, claim.payload, deletions=[])
+        wire = delivery.wire_body(
+            claim.rendered,
+            claim.payload,
+            deletions=[],
+            marking_mode=claim.marking_mode,
+        )
         valid = {
             "push_seq": claim.push_seq,
             "request_digest": drain.wire_digest(wire),

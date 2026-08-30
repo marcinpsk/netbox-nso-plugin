@@ -87,6 +87,8 @@ class TestRoutePolicyNativeSaveTransactions(_CascadeFlushMixin, TransactionTestC
         from django.contrib.contenttypes.models import ContentType
         from netbox_routing.models import CustomPrefix, PrefixListEntry
 
+        from netbox_nso_plugin.signals import suppress_intent_push
+
         prefix_list, state = self._owned_prefix_list()
         custom_prefix = CustomPrefix.objects.create(prefix="198.18.64.0/24")
         entry = PrefixListEntry.objects.create(
@@ -96,6 +98,8 @@ class TestRoutePolicyNativeSaveTransactions(_CascadeFlushMixin, TransactionTestC
             sequence=10,
             action="permit",
         )
+        with suppress_intent_push():
+            type(state).objects.filter(pk=state.pk).update(status="in_sync")
 
         with without_commit_drain():
             entry.action = "deny"
