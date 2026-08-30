@@ -8,8 +8,6 @@ from netbox_nso_plugin.drain import acknowledge_degraded_deletions
 
 
 class Command(BaseCommand):
-    """Django management command to acknowledge and clear degraded deletion records."""
-
     help = (
         "Acknowledge the recorded deletions that degraded to a detach, and clear them. This "
         "is the ONLY thing that clears them: no push outcome ever does, because a success "

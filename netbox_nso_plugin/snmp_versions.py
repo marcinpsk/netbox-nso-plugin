@@ -19,6 +19,5 @@ _VERSION_CANON = {
 
 
 def canonical_snmp_version(value) -> str:
-    """Normalize SNMP version string to canonical form (1, 2c, or 3)."""
     token = str(value or "2c").strip().lower()
     return _VERSION_CANON.get(token, token)

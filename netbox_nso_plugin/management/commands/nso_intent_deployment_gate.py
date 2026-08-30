@@ -74,8 +74,6 @@ def _verification_receipt(claim, receipt):
 
 
 class Command(BaseCommand):
-    """Django management command to control the intent deployment gate for safe upgrades."""
-
     help = "Quiesce intent work before deployment, then verify the deployed protocol and resume it."
 
     def add_arguments(self, parser):

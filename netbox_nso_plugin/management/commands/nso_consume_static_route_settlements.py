@@ -14,8 +14,6 @@ from netbox_nso_plugin.settlement import consume_static_route_settlements
 
 
 class Command(BaseCommand):
-    """Django management command to consume static-route settlement feed from the adapter."""
-
     help = (
         "Consume the nso-adapter's static-route settlement feed for every linked managed "
         "device, advancing each device's durable cursor."

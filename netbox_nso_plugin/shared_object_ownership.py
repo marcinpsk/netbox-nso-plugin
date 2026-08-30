@@ -60,7 +60,6 @@ def register(family: str, spec: SharedObjectSpec) -> None:
 
 
 def get_spec(family: str) -> SharedObjectSpec | None:
-    """Return the materialization spec for a family, or None if not registered."""
     return _REGISTRY.get(family)
 
 
