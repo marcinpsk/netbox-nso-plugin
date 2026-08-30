@@ -1502,8 +1502,6 @@ def _push_snmp_intent_for_device(device_id, adapter_device_id):
     blocked = _snmp_push_blockers(owned_communities, snmp_vault_ref_push_blocker)
     communities = []
     for row in owned_communities:
-        if not row.vault_ref:
-            continue
         communities.append(snmp_community_intent_item(row))
 
     owned_v3 = list(
