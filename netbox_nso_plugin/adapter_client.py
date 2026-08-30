@@ -635,13 +635,36 @@ class AdapterControlState:
     @classmethod
     def from_adapter(cls, device_state: dict, scope_state: dict):
         """Build canonical control state from the adapter's two read responses."""
+        if not isinstance(device_state, dict) or not isinstance(scope_state, dict):
+            raise AdapterError("Adapter returned malformed control state.", code="invalid_response")
+        if "failover" not in device_state:
+            raise AdapterError("Adapter returned malformed device control state.", code="invalid_response")
         failover_state = device_state["failover"]
+        if failover_state is not None and not isinstance(failover_state, dict):
+            raise AdapterError("Adapter returned malformed failover state.", code="invalid_response")
+        if failover_state is not None and not {"primary_ip", "oob_ip"} <= failover_state.keys():
+            raise AdapterError("Adapter returned incomplete failover state.", code="invalid_response")
+
+        attributes = scope_state.get("attributes")
+        auto_apply = scope_state.get("auto_apply")
+        sync_before_apply = scope_state.get("sync_before_apply")
+        if not isinstance(attributes, list) or any(not isinstance(attribute, str) for attribute in attributes):
+            raise AdapterError("Adapter returned malformed managed attributes.", code="invalid_response")
+        if not isinstance(auto_apply, bool) or not isinstance(sync_before_apply, bool):
+            raise AdapterError("Adapter returned malformed scope settings.", code="invalid_response")
+
+        primary_ip = None if failover_state is None else failover_state["primary_ip"]
+        oob_ip = None if failover_state is None else failover_state["oob_ip"]
+        if primary_ip is not None and not isinstance(primary_ip, str):
+            raise AdapterError("Adapter returned malformed primary IP state.", code="invalid_response")
+        if oob_ip is not None and not isinstance(oob_ip, str):
+            raise AdapterError("Adapter returned malformed out-of-band IP state.", code="invalid_response")
         return cls(
-            managed_attributes=tuple(scope_state["attributes"]),
-            auto_apply=scope_state["auto_apply"],
-            sync_before_apply=scope_state["sync_before_apply"],
-            primary_ip=None if failover_state is None else failover_state["primary_ip"],
-            oob_ip=None if failover_state is None else failover_state["oob_ip"],
+            managed_attributes=tuple(attributes),
+            auto_apply=auto_apply,
+            sync_before_apply=sync_before_apply,
+            primary_ip=primary_ip,
+            oob_ip=oob_ip,
         )
 
 

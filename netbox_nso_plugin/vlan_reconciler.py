@@ -23,6 +23,8 @@ import copy
 import logging
 from dataclasses import dataclass
 
+from .adapter_client import AdapterError
+
 logger = logging.getLogger(__name__)
 
 
@@ -48,38 +50,38 @@ _NSO_TO_NETBOX_MODE = {"access": "access", "trunk": "tagged", "trunk-all": "tagg
 
 
 def _validated_vlan_id(value, field_name):
-    if isinstance(value, bool):
-        raise ValueError(f"{field_name} must be an integer VLAN ID")
+    if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
+        raise AdapterError(f"{field_name} must be an integer VLAN ID", code="invalid_response")
     try:
         vlan_id = int(value)
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"{field_name} must be an integer VLAN ID") from exc
+        raise AdapterError(f"{field_name} must be an integer VLAN ID", code="invalid_response") from exc
     if not 1 <= vlan_id <= 4094:
-        raise ValueError(f"{field_name} must be between 1 and 4094")
+        raise AdapterError(f"{field_name} must be between 1 and 4094", code="invalid_response")
     return vlan_id
 
 
 def _validated_vlan_items(payload: dict) -> tuple[dict, ...]:
     """Validate and normalize a complete adapter VLAN document."""
     if not isinstance(payload, dict):
-        raise ValueError("VLAN payload must be an object")
+        raise AdapterError("VLAN payload must be an object", code="invalid_response")
     items = payload.get("vlans", [])
     if not isinstance(items, list):
-        raise ValueError("VLAN payload vlans must be a list")
+        raise AdapterError("VLAN payload vlans must be a list", code="invalid_response")
     normalized = []
     seen = set()
     for item in items:
         if not isinstance(item, dict):
-            raise ValueError("VLAN payload entry must be an object")
+            raise AdapterError("VLAN payload entry must be an object", code="invalid_response")
         try:
             vlan_id = _validated_vlan_id(item.get("vlan_id"), "VLAN payload entry vlan_id")
-        except ValueError as exc:
-            raise ValueError(f"VLAN payload entry is invalid: {exc}") from exc
+        except AdapterError as exc:
+            raise AdapterError(f"VLAN payload entry is invalid: {exc}", code="invalid_response") from exc
         if vlan_id in seen:
-            raise ValueError(f"VLAN payload contains duplicate vlan_id {vlan_id}")
+            raise AdapterError(f"VLAN payload contains duplicate vlan_id {vlan_id}", code="invalid_response")
         name = item.get("name")
         if name is not None and not isinstance(name, str):
-            raise ValueError("VLAN payload entry name must be a string or null")
+            raise AdapterError("VLAN payload entry name must be a string or null", code="invalid_response")
         seen.add(vlan_id)
         normalized.append({**item, "vlan_id": vlan_id})
     return tuple(normalized)
@@ -88,32 +90,41 @@ def _validated_vlan_items(payload: dict) -> tuple[dict, ...]:
 def _validated_switchport_items(payload: dict) -> tuple[dict, ...]:
     """Validate and normalize a complete adapter switchport document."""
     if not isinstance(payload, dict):
-        raise ValueError("switchport payload must be an object")
+        raise AdapterError("switchport payload must be an object", code="invalid_response")
     items = payload.get("interfaces", [])
     if not isinstance(items, list):
-        raise ValueError("switchport payload interfaces must be a list")
+        raise AdapterError("switchport payload interfaces must be a list", code="invalid_response")
     normalized = []
     seen = set()
     for item in items:
         if not isinstance(item, dict):
-            raise ValueError("switchport payload entry must be an object")
+            raise AdapterError("switchport payload entry must be an object", code="invalid_response")
         name = item.get("interface_name")
         if not isinstance(name, str) or not name:
-            raise ValueError("switchport payload entry interface_name must be a non-empty string")
+            raise AdapterError(
+                "switchport payload entry interface_name must be a non-empty string",
+                code="invalid_response",
+            )
         if name in seen:
-            raise ValueError(f"switchport payload contains duplicate interface_name {name}")
+            raise AdapterError(
+                f"switchport payload contains duplicate interface_name {name}",
+                code="invalid_response",
+            )
         tagged = item.get("tagged_vlans") or []
         if not isinstance(tagged, list):
-            raise ValueError("switchport payload entry tagged_vlans must be a list")
+            raise AdapterError("switchport payload entry tagged_vlans must be a list", code="invalid_response")
         tagged = [_validated_vlan_id(value, "tagged_vlans entry") for value in tagged]
         if len(tagged) != len(set(tagged)):
-            raise ValueError(f"switchport payload entry {name} contains duplicate tagged VLANs")
+            raise AdapterError(
+                f"switchport payload entry {name} contains duplicate tagged VLANs",
+                code="invalid_response",
+            )
         untagged = item.get("untagged_vlan")
         if untagged is not None:
             untagged = _validated_vlan_id(untagged, "untagged_vlan")
         mode = item.get("mode")
         if mode is not None and not isinstance(mode, str):
-            raise ValueError("switchport payload entry mode must be a string or null")
+            raise AdapterError("switchport payload entry mode must be a string or null", code="invalid_response")
         seen.add(name)
         normalized.append({**item, "untagged_vlan": untagged, "tagged_vlans": tagged})
     return tuple(normalized)

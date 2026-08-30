@@ -102,6 +102,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         self.assertFalse(VLANGroup.objects.filter(slug=f"nso-{self.device.pk}").exists())
 
     def test_vlan_reconciler_rejects_entries_without_a_usable_vlan_id(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
 
         payload = {
@@ -113,18 +114,28 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
                 {"vlan_id": 1624, "name": "VALID"},
             ]
         }
-        with self.assertRaisesRegex(ValueError, "VLAN payload entry"):
+        with self.assertRaisesRegex(AdapterError, "VLAN payload entry"):
             reconcile_vlan_database(self.device, payload)
 
         self.assertFalse(NSOVLANState.objects.filter(management=self.management).exists())
 
     def test_switchport_reconciler_rejects_a_non_list_document(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.vlan_reconciler import reconcile_switchport
 
-        with self.assertRaisesRegex(ValueError, "interfaces must be a list"):
+        with self.assertRaisesRegex(AdapterError, "interfaces must be a list"):
             reconcile_switchport(self.device, {"interfaces": {"interface_name": self.interface.name}})
 
         self.assertFalse(NSOSwitchportState.objects.filter(interface=self.interface).exists())
+
+    def test_vlan_reconciler_rejects_a_fractional_vlan_id(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+
+        with self.assertRaisesRegex(AdapterError, "integer VLAN ID"):
+            reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 3.7}]})
+
+        self.assertFalse(NSOVLANState.objects.filter(management=self.management).exists())
 
     def test_vlan_reconcile_preflights_native_and_overlay_creations(self):
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan
