@@ -105,6 +105,12 @@ class TestIntentRevisionWrites(TestCase):
 
         real_table = NSOIntentRevision._meta.db_table
         renamed_table = "test_nso_intent_revision"
+        before = (
+            NSOIntentRevision.objects.filter(device=self.device, scope="vlan")
+            .values_list("revision", flat=True)
+            .first()
+            or 0
+        )
 
         def restore_real_table(execute, sql, params, many, context):
             if sql.lstrip().upper().startswith("INSERT"):
@@ -117,7 +123,7 @@ class TestIntentRevisionWrites(TestCase):
             connection.execute_wrapper(restore_real_table),
             transaction.atomic(),
         ):
-            self.assertEqual(bump_intent_revision(self.device.pk, "vlan"), 1)
+            self.assertEqual(bump_intent_revision(self.device.pk, "vlan"), before + 1)
 
     def test_enqueue_bumps_the_scope_revision_and_repends_deploying_rows(self):
         from netbox_nso_plugin import outbox
