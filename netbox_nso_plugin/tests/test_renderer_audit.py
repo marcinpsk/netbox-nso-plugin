@@ -175,7 +175,7 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
         self.assertEqual(revision.revision, before_revision + 1)
         self.assertTrue(
             NSOOwnershipManifest.objects.filter(
-                device=self.device,
+                device_id=self.device.pk,
                 scope="vlan",
                 native_model_label="ipam.vlan",
                 native_key={"group_id": None, "vid": 1630},
