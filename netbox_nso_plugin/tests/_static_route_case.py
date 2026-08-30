@@ -263,7 +263,7 @@ def _delete_owned_route(route):
     transitions = tuple(
         (
             state.management.device_id,
-            signals._static_route_delete_transition(state, current),
+            signals._static_route_delete_transition(state, current.pk),
         )
         for state in NSOStaticRouteState.objects.filter(static_route=current)
         .select_related("management")
@@ -337,7 +337,7 @@ def _unassign_and_retire(route, device):
     else:
         mutation = renderer_writes(plan)
     with mutation as writer:
-        transition = None if state is None else signals._static_route_delete_transition(state, current)
+        transition = None if state is None else signals._static_route_delete_transition(state, current.pk)
         with signals.suppress_intent_push():
             if state is not None:
                 writer.delete(state)

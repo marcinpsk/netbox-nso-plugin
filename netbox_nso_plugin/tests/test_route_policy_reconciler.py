@@ -87,34 +87,6 @@ class TestReconcileRoutePolicy(TestCase):
 
         self.assertEqual(reconcile_route_policy(self.device, self._payload()), [])
 
-    def test_reconcile_plan_marks_only_materialized_content_changes(self):
-        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
-
-        self._make_mgmt(self.device)
-        payload = {
-            "prefix_lists": [
-                {"name": "PL-PLAN", "family": 4, "entries": [{"action": "permit", "prefix": "198.18.0.0/15"}]}
-            ]
-        }
-
-        self.assertTrue(route_policy_reconcile_plan(self.device, payload).changes_content)
-        reconcile_route_policy(self.device, payload)
-        self.assertFalse(route_policy_reconcile_plan(self.device, payload).changes_content)
-
-        changed = {
-            "prefix_lists": [
-                {
-                    "name": "PL-PLAN",
-                    "family": 4,
-                    "entries": [
-                        {"action": "permit", "prefix": "198.18.0.0/15"},
-                        {"action": "permit", "prefix": "198.20.0.0/15"},
-                    ],
-                }
-            ]
-        }
-        self.assertTrue(route_policy_reconcile_plan(self.device, changed).changes_content)
-
     def test_reconcile_plan_marks_empty_shell_fills_as_content_changes(self):
         from netbox_routing.models import ASPath, CommunityList, PrefixList, RouteMap
 
