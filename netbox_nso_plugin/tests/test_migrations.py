@@ -31,6 +31,22 @@ PRE_OWNERSHIP_EXECUTION = BGP_MERGE_BASE_RESET
 
 
 class TestMigrationGraph(SimpleTestCase):
+    def test_interface_ip_allocation_kind_is_added_once(self):
+        from django.db import migrations
+
+        loader = MigrationLoader(None, ignore_no_migrations=True)
+        additions = [
+            name
+            for (app, name), migration in loader.disk_migrations.items()
+            if app == APP
+            for operation in migration.operations
+            if isinstance(operation, migrations.AddField)
+            and operation.model_name == "nsointerfaceipstate"
+            and operation.name == "allocation_kind"
+        ]
+
+        self.assertEqual(additions, [APPLY_IDENTITY])
+
     def test_the_push_sequence_reverse_is_a_noop(self):
         from django.db import migrations
 
