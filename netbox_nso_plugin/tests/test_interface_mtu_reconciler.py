@@ -110,9 +110,10 @@ class TestInterfaceMtuReconciler(TestCase):
         self.assertEqual(lag.bound_port, "lag-99")
 
     def test_conflicting_duplicate_interface_entries_are_rejected(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
 
-        with self.assertRaisesRegex(ValueError, "duplicate interface_name"):
+        with self.assertRaisesRegex(AdapterError, "duplicate interface_name") as raised:
             reconcile_interface_mtu(
                 self.device,
                 {
@@ -123,9 +124,11 @@ class TestInterfaceMtuReconciler(TestCase):
                 },
             )
 
+        self.assertEqual(raised.exception.code, "invalid_response")
         self.assertFalse(NSOInterfaceMtuState.objects.filter(interface=self.po1).exists())
 
     def test_missing_interface_name_is_rejected_before_stale_rows_are_changed(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
 
         state = NSOInterfaceMtuState.objects.create(
@@ -137,15 +140,17 @@ class TestInterfaceMtuReconciler(TestCase):
 
         for invalid_name in (None, ""):
             with self.subTest(interface_name=invalid_name):
-                with self.assertRaisesRegex(ValueError, "interface_name must be a non-empty string"):
+                with self.assertRaisesRegex(AdapterError, "interface_name must be a non-empty string") as raised:
                     reconcile_interface_mtu(
                         self.device,
                         {"interfaces": [{"interface_name": invalid_name, "mtu": 9000}]},
                     )
 
+                self.assertEqual(raised.exception.code, "invalid_response")
                 self.assertTrue(NSOInterfaceMtuState.objects.filter(pk=state.pk).exists())
 
     def test_malformed_mtu_values_are_rejected_before_planning(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
 
         invalid_entries = (
@@ -156,9 +161,10 @@ class TestInterfaceMtuReconciler(TestCase):
         )
         for entry in invalid_entries:
             with self.subTest(entry=entry):
-                with self.assertRaises(ValueError):
+                with self.assertRaises(AdapterError) as raised:
                     reconcile_interface_mtu(self.device, {"interfaces": [entry]})
 
+                self.assertEqual(raised.exception.code, "invalid_response")
                 self.assertFalse(NSOInterfaceMtuState.objects.filter(interface=self.po1).exists())
 
     def test_interface_absent_in_netbox_is_skipped(self):

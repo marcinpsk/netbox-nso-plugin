@@ -193,21 +193,23 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.vlan_reconciler import reconcile_switchport
 
-        payload = {
-            "interfaces": [
-                {
-                    "interface_name": self.interface.name,
-                    "mode": "hybrid",
-                    "untagged_vlan": None,
-                    "tagged_vlans": [],
+        for mode in ("hybrid", [], {}):
+            with self.subTest(mode=mode):
+                payload = {
+                    "interfaces": [
+                        {
+                            "interface_name": self.interface.name,
+                            "mode": mode,
+                            "untagged_vlan": None,
+                            "tagged_vlans": [],
+                        }
+                    ]
                 }
-            ]
-        }
 
-        with self.assertRaises(AdapterError) as raised:
-            reconcile_switchport(self.device, payload)
+                with self.assertRaises(AdapterError) as raised:
+                    reconcile_switchport(self.device, payload)
 
-        self.assertEqual(raised.exception.code, "invalid_response")
+                self.assertEqual(raised.exception.code, "invalid_response")
 
     def test_switchport_reconciler_accepts_the_unconfigured_mode_sentinel(self):
         from netbox_nso_plugin.vlan_reconciler import reconcile_switchport
