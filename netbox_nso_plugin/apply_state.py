@@ -10,6 +10,14 @@ class IntentChangedDuringPreparation(Exception):
     """The current NetBox intent no longer matches a stored Apply receipt."""
 
 
+class InterfaceIntentLockStale(RuntimeError):
+    """The interface moved after its device-scoped dependency locks were chosen."""
+
+
+class DeferredIntentFieldStale(RuntimeError):
+    """A field loaded without its baseline changed before the row was locked."""
+
+
 APPLY_DEPLOYING_MODEL_NAMES = {
     "vlan": "NSOVLANState",
     "svi": "NSOSVIState",
@@ -135,7 +143,8 @@ def mark_explicit_accept(instance) -> None:
 
 def remember_loaded_status(instance) -> None:
     """Record the status represented by this in-memory instance."""
-    instance._nso_loaded_status = instance.status
+    if "status" in instance.__dict__:
+        instance._nso_loaded_status = instance.__dict__["status"]
 
 
 def deploying_models() -> dict:
@@ -158,7 +167,10 @@ def capture_intent_field_change(instance, scope, *, update_fields=None) -> None:
     field_names = APPLY_INTENT_FIELD_NAMES[scope]
     if update_fields is not None:
         field_names = field_names.intersection(update_fields)
-    if not field_names:
+    status_needs_baseline = not hasattr(instance, "_nso_loaded_status") and (
+        update_fields is None or "status" in update_fields
+    )
+    if not field_names and not status_needs_baseline:
         return
     if not connection.in_atomic_block:
         raise RuntimeError("an intent field edit must be saved inside a transaction")
@@ -171,7 +183,14 @@ def capture_intent_field_change(instance, scope, *, update_fields=None) -> None:
 
         intent_changed = any(current[field.attname] != getattr(instance, field.attname) for field in fields)
         current_status = current["status"]
-        loaded_status = getattr(instance, "_nso_loaded_status", current_status)
+        loaded_status = getattr(instance, "_nso_loaded_status", None)
+        if loaded_status is None:
+            deferred_status = instance.__dict__.get("status", current_status)
+            if not explicit_accept and deferred_status != current_status:
+                raise DeferredIntentFieldStale("deferred intent status changed before save")
+            loaded_status = current_status
+            if "status" not in instance.__dict__:
+                instance.status = current_status
         stale_status = loaded_status != current_status
         status_edited = instance.status != loaded_status
         if intent_changed:
@@ -313,7 +332,7 @@ def lock_interface_intent_rows(interface_id) -> tuple[object | None, object | No
     if interface is None:
         return None, None, empty
     if interface.device_id != current["device_id"]:
-        raise RuntimeError("interface changed devices while acquiring intent locks")
+        raise InterfaceIntentLockStale("interface changed devices while acquiring intent locks")
     list(Interface.objects.select_for_update(of=("self",)).filter(parent_id=interface_id).order_by("pk"))
     management = (
         NSODeviceManagement.objects.select_for_update(of=("self",))

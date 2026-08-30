@@ -13,7 +13,7 @@ from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.test import TestCase, TransactionTestCase
 
 from ._outbox_case import make_managed, without_commit_drain
-from .mixins import IntentPushDeliveryMixin, _CascadeFlushMixin
+from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 
 class _RPBase(IntentPushDeliveryMixin, TestCase):
@@ -49,8 +49,9 @@ class _RPBase(IntentPushDeliveryMixin, TestCase):
         return pl
 
 
-class TestRoutePolicyNativeSaveTransactions(_CascadeFlushMixin, TransactionTestCase):
+class TestRoutePolicyNativeSaveTransactions(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     def setUp(self):
+        super().setUp()
         self.device, self.management = make_managed("route-policy-save", 16230)
 
     def _owned_prefix_list(self):

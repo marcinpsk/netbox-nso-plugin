@@ -1067,14 +1067,21 @@ def _stash_interface_old_values(sender, instance, **kwargs):
     ):
         return
 
-    from .apply_state import lock_interface_intent_rows
+    from .apply_state import DeferredIntentFieldStale, lock_interface_intent_rows
 
     locked, management, rows = lock_interface_intent_rows(instance.pk)
     if locked is None or management is None or not any(rows.values()):
         return
     current = {field: getattr(locked, field) for field in fields}
     instance._nso_old_values = current
-    loaded_name = getattr(instance, "_nso_loaded_interface_name", current["name"])
+    loaded_name = getattr(instance, "_nso_loaded_interface_name", None)
+    if loaded_name is None:
+        deferred_name = instance.__dict__.get("name", current["name"])
+        if deferred_name != current["name"]:
+            raise DeferredIntentFieldStale("deferred interface name changed before save")
+        loaded_name = current["name"]
+        if "name" not in instance.__dict__:
+            instance.name = current["name"]
     if loaded_name != current["name"] and instance.name == loaded_name:
         instance.name = current["name"]
         return
@@ -1122,7 +1129,8 @@ def _repend_intent_on_interface_rename(sender, instance, created, **kwargs):
 
 def _remember_interface_name(sender, instance, **kwargs):
     """Record the native name represented by this interface instance."""
-    instance._nso_loaded_interface_name = instance.name
+    if "name" in instance.__dict__:
+        instance._nso_loaded_interface_name = instance.__dict__["name"]
 
 
 @_skip_on_render

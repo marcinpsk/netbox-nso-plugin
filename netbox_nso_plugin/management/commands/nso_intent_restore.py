@@ -57,7 +57,10 @@ def _key_receipt(document, *, adapter_device_id, section):
     matches = [
         row
         for row in document["receipts"]
-        if isinstance(row, dict) and row.get("device_id") == adapter_device_id and row.get("section") == section
+        if isinstance(row, dict)
+        and type(row.get("device_id")) is int
+        and row.get("device_id") == adapter_device_id
+        and row.get("section") == section
     ]
     if len(matches) > 1:
         raise CommandError(f"Adapter returned duplicate receipts for {adapter_device_id}/{section}")

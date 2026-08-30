@@ -88,6 +88,25 @@ class TestTheCoalescerSymbolsAreGone(SimpleTestCase):
             with self.subTest(symbol=name):
                 assert not hasattr(signals, name)
 
+    def test_no_module_still_reads_them(self):
+        import ast
+
+        gone = {"_pending_pushes", "_last_pushed_hashes"}
+        read = set()
+        for path in _production_modules():
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                if isinstance(node, ast.Name):
+                    named_here = node.id
+                elif isinstance(node, ast.Attribute):
+                    named_here = node.attr
+                elif isinstance(node, ast.alias):
+                    named_here = node.name
+                else:
+                    continue
+                if named_here in gone:
+                    read.add(f"{path.name}:{node.lineno}")
+        assert read == set(), read
+
 
 class TestFixtureCommitDrainSuppression(SimpleTestCase):
     def test_overlapping_thread_contexts_restore_the_production_callback(self):
@@ -151,25 +170,6 @@ class TestFixtureCommitDrainSuppression(SimpleTestCase):
             first.join(5)
             second.join(5)
             signals._drain_intent_pushes = original
-
-    def test_no_module_still_reads_them(self):
-        import ast
-
-        gone = {"_pending_pushes", "_last_pushed_hashes"}
-        read = set()
-        for path in _production_modules():
-            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-                if isinstance(node, ast.Name):
-                    named_here = node.id
-                elif isinstance(node, ast.Attribute):
-                    named_here = node.attr
-                elif isinstance(node, ast.alias):
-                    named_here = node.name
-                else:
-                    continue
-                if named_here in gone:
-                    read.add(f"{path.name}:{node.lineno}")
-        assert read == set(), read
 
 
 class TestTheReceiptAdapterInjectionSeam(SimpleTestCase):

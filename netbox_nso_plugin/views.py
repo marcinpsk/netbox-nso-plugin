@@ -5262,6 +5262,7 @@ def _lock_switchport_accept_state(state):
     from ipam.models import VLAN
 
     from .apply_state import (
+        InterfaceIntentLockStale,
         lock_device_vlan_membership_transaction,
         lock_interface_intent_rows,
         lock_vlan_intent_transaction,
@@ -5280,11 +5281,16 @@ def _lock_switchport_accept_state(state):
     if locked_vlan_ids != vlan_ids:
         raise _SwitchportAcceptRetry
 
-    interface, _management, rows = lock_interface_intent_rows(state.interface_id)
+    try:
+        interface, _management, rows = lock_interface_intent_rows(state.interface_id)
+    except InterfaceIntentLockStale as exc:
+        raise _SwitchportAcceptRetry from exc
     locked_state = next((candidate for candidate in rows["switchport"] if candidate.pk == state.pk), None)
     if (
         interface is None
+        or _management is None
         or locked_state is None
+        or locked_state.management_id != _management.pk
         or locked_state.interface_id != interface.pk
         or _switchport_vlan_ids(locked_state) != vlan_ids
     ):

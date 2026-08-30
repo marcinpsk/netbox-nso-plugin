@@ -829,6 +829,11 @@ class TestStepFourRereadsAfterTheSettlement(_SettlementCase):
         this case, which is the common one.
         """
         mgmt, row = self._setup("rec-apply-starts", 75)
+        self.adapter.store.add_device(
+            nso_instance="se-apply-starts-inst",
+            nso_device_name="nso-se-apply-starts",
+            device_id=75,
+        )
         # A stale succeeded apply: an escalation verdict, until 75's next apply starts.
         self._aged(
             self.adapter.store.terminal_job(75, extra={"vlan_count_by_outcome": {"in_sync": 1, "apply_failed": 0}})

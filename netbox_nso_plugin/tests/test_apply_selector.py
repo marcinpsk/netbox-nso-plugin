@@ -1970,6 +1970,63 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         ):
             _lock_switchport_accept_state(state)
 
+    def test_switchport_accept_retries_when_the_interface_moves_after_dependency_locking(self):
+        from unittest.mock import patch
+
+        from dcim.models import Interface
+
+        from netbox_nso_plugin import apply_state
+        from netbox_nso_plugin.models import NSOSwitchportState
+        from netbox_nso_plugin.signals import suppress_intent_push
+        from netbox_nso_plugin.views import _lock_switchport_accept_state, _SwitchportAcceptRetry
+
+        other_device, _other_management = make_managed("switchport-accept-moved", 9378)
+        interface = Interface.objects.create(device=self.device, name="Ethernet9.380", type="1000base-t")
+        with without_commit_drain(), transaction.atomic():
+            state = NSOSwitchportState.objects.create(
+                management=self.mgmt,
+                interface=interface,
+                mode="access",
+                status="imported",
+            )
+        original_lock = apply_state.lock_device_intent_transaction
+
+        def lock_then_move(device_id):
+            original_lock(device_id)
+            Interface.objects.filter(pk=interface.pk).update(device=other_device)
+
+        with (
+            suppress_intent_push(),
+            transaction.atomic(),
+            patch(
+                "netbox_nso_plugin.apply_state.lock_device_intent_transaction",
+                side_effect=lock_then_move,
+            ),
+            self.assertRaises(_SwitchportAcceptRetry),
+        ):
+            _lock_switchport_accept_state(state)
+
+    def test_switchport_accept_retries_when_the_overlay_belongs_to_the_old_device(self):
+        from dcim.models import Interface
+
+        from netbox_nso_plugin.models import NSOSwitchportState
+        from netbox_nso_plugin.signals import suppress_intent_push
+        from netbox_nso_plugin.views import _lock_switchport_accept_state, _SwitchportAcceptRetry
+
+        other_device, _other_management = make_managed("switchport-accept-rescoped", 9379)
+        interface = Interface.objects.create(device=self.device, name="Ethernet9.381", type="1000base-t")
+        with without_commit_drain(), transaction.atomic():
+            state = NSOSwitchportState.objects.create(
+                management=self.mgmt,
+                interface=interface,
+                mode="access",
+                status="imported",
+            )
+        Interface.objects.filter(pk=interface.pk).update(device=other_device)
+
+        with suppress_intent_push(), transaction.atomic(), self.assertRaises(_SwitchportAcceptRetry):
+            _lock_switchport_accept_state(state)
+
     def test_switchport_accept_reloads_vlan_references_after_a_concurrent_rescope(self):
         import threading
         from unittest.mock import patch

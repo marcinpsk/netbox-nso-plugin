@@ -33,7 +33,10 @@ def _receipt_for(document, *, adapter_device_id: int, section: str):
     matches = [
         row
         for row in receipts
-        if isinstance(row, dict) and row.get("device_id") == adapter_device_id and row.get("section") == section
+        if isinstance(row, dict)
+        and type(row.get("device_id")) is int
+        and row.get("device_id") == adapter_device_id
+        and row.get("section") == section
     ]
     if len(matches) != 1:
         raise CommandError(f"Missing receipt for adapter device {adapter_device_id}/{section}")

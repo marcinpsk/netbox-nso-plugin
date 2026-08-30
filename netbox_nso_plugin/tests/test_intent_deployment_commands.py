@@ -12,7 +12,7 @@ from unittest.mock import patch
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.db import close_old_connections, connection, transaction
-from django.test import TransactionTestCase
+from django.test import SimpleTestCase, TransactionTestCase
 from django.utils import timezone
 
 from ._outbox_case import (
@@ -26,6 +26,23 @@ from ._outbox_case import (
     without_commit_drain,
 )
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
+
+
+class TestReceiptSelectors(SimpleTestCase):
+    def test_deployment_gate_rejects_a_boolean_device_id(self):
+        from netbox_nso_plugin.management.commands.nso_intent_deployment_gate import _receipt_for
+
+        document = {"receipts": [{"device_id": True, "section": "vlan"}]}
+
+        with self.assertRaisesRegex(CommandError, "Missing receipt"):
+            _receipt_for(document, adapter_device_id=1, section="vlan")
+
+    def test_restore_ignores_a_boolean_device_id(self):
+        from netbox_nso_plugin.management.commands.nso_intent_restore import _key_receipt
+
+        document = {"receipts": [{"device_id": True, "section": "vlan"}]}
+
+        self.assertIsNone(_key_receipt(document, adapter_device_id=1, section="vlan"))
 
 
 class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
