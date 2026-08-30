@@ -25,6 +25,7 @@ from netbox_nso_plugin.intent_state import (
     deletion_footprint_for_instance,
     intent_transaction,
     mirror_refresh,
+    mirror_transaction,
     renderer_input_specs,
     renderer_query_trace,
 )
@@ -448,6 +449,22 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertEqual(revision.revision, before + 1)
         self.assertEqual(self.state.status, "accepted")
         self.assertIsNone(self.state.apply_attempt_id)
+
+    def test_detected_reconcile_can_delete_a_captured_deploying_row(self):
+        attempt_id = uuid4()
+        self.state.status = "deploying"
+        self.state.apply_attempt_id = attempt_id
+        with transaction.atomic(), suppress_intent_push(), mirror_refresh(self.state, {"status", "apply_attempt_id"}):
+            self.state.save(update_fields=["status", "apply_attempt_id"])
+        footprint = MutationFootprint.for_keys(
+            {(self.device.pk, "vlan")},
+            overlay_rows=(SourceRow(self.state._meta.label_lower, self.state.pk),),
+        )
+
+        with without_commit_drain(), mirror_transaction(footprint, detect_content_changes=True):
+            self.state.delete()
+
+        self.assertFalse(type(self.state).objects.filter(pk=self.state.pk).exists())
 
     def test_savepoint_rollback_does_not_authorize_a_later_enqueue(self):
         key = (self.device.pk, "vlan")

@@ -1802,7 +1802,9 @@ def _repend_locked_rows(rows: tuple[SourceRow, ...]) -> None:
         for row_ref in rows:
             if row_ref.pk is None:
                 continue
-            row = apps.get_model(row_ref.model_label).objects.get(pk=row_ref.pk)
+            row = apps.get_model(row_ref.model_label).objects.filter(pk=row_ref.pk).first()
+            if row is None:
+                continue
             row.status = "accepted"
             update_fields = ["status"]
             if hasattr(row, "apply_attempt_id"):
