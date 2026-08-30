@@ -30,6 +30,10 @@ from .intent_state import (
 )
 
 
+class IntentPlanStaleError(IntentMutationProtocolError):
+    """A renderer input row changed after its exact plan was frozen."""
+
+
 @dataclass(frozen=True)
 class RendererWrite:
     """One exact operation in a frozen renderer write set."""
@@ -597,9 +601,7 @@ class RendererWriter:
                 if write.pk is not None:
                     current = type(instance)._default_manager.filter(pk=write.pk).first()
                     if current is None or not self._fields_match(write.before_values, current):
-                        raise IntentMutationProtocolError(
-                            f"{write.model_label} row {write.pk!r} changed after planning"
-                        )
+                        raise IntentPlanStaleError(f"{write.model_label} row {write.pk!r} changed after planning")
                 return index
         raise IntentMutationProtocolError(
             f"save of {instance._meta.label_lower} row {instance.pk!r} is outside the frozen write set"
@@ -644,7 +646,7 @@ class RendererWriter:
         root_write = self.plan.write_set[index]
         current = type(instance)._default_manager.filter(pk=instance.pk).first()
         if current is None or not self._fields_match(root_write.before_values, current):
-            raise IntentMutationProtocolError(f"{root_write.model_label} row {root_write.pk!r} changed after planning")
+            raise IntentPlanStaleError(f"{root_write.model_label} row {root_write.pk!r} changed after planning")
         closure = _collector_writes(current)
         matched = []
         available = [candidate for candidate in range(len(self.plan.write_set)) if candidate not in self._consumed]
@@ -742,7 +744,7 @@ class RendererWriter:
         before_pks = dict(write.values)["before_pks"]
         current_pks = tuple(sorted(getattr(instance, field_name).values_list("pk", flat=True)))
         if current_pks != before_pks:
-            raise IntentMutationProtocolError("the M2M edge set changed after planning")
+            raise IntentPlanStaleError("the M2M edge set changed after planning")
         with self._operation(index):
             getattr(instance, field_name).set(related)
         _maintain_manifest(instance)
@@ -771,7 +773,7 @@ class RendererWriter:
         _authorize_dml(self.permit, model._meta.db_table)
         updated = model._default_manager.filter(pk__in=operation.selected_pks).update(**values)
         if updated != len(operation.selected_pks):
-            raise IntentMutationProtocolError("the frozen set-based update lost a selected row")
+            raise IntentPlanStaleError("the frozen set-based update lost a selected row")
         self._consumed.add(index)
         return updated
 

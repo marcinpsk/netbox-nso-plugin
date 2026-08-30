@@ -415,11 +415,7 @@ def _switchport_reconcile_operations(device, payload, planned_at, interface_pks)
             else NSOSwitchportState(management=management, interface=interface, status="unknown")
         )
         state.mode = nso_mode
-        state.untagged_vlan = resolve_vlan(nso_untagged, create=False) if nso_untagged is not None else None
         state.last_sync_at = planned_at
-        state_tagged = tuple(
-            vlan for vlan in (resolve_vlan(vid, create=False) for vid in nso_tagged) if vlan is not None
-        )
         dev_hash = merge_util.content_hash(_switchport_content(nso_mode, nso_untagged, nso_tagged))
         obj_hash = merge_util.content_hash(_switchport_object_content(interface))
         native_candidate = None
@@ -462,6 +458,11 @@ def _switchport_reconcile_operations(device, payload, planned_at, interface_pks)
             elif action == "conflict":
                 matches, conflict = False, True
             state.status = sm.on_reconcile(state.status, matches=matches, conflict=conflict)
+
+        state.untagged_vlan = resolve_vlan(nso_untagged, create=False) if nso_untagged is not None else None
+        state_tagged = tuple(
+            vlan for vlan in (resolve_vlan(vid, create=False) for vid in nso_tagged) if vlan is not None
+        )
 
         if native_candidate is not None:
             fields = ("mode", "untagged_vlan")

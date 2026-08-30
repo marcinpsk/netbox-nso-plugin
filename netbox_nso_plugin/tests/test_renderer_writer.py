@@ -54,6 +54,12 @@ class TestRendererSetUpdate(IntentPushResetMixin, TestCase):
 
 
 class TestRendererContentWriter(IntentPushResetMixin, TestCase):
+    def test_stale_plan_error_is_a_renderer_protocol_error(self):
+        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
+        from netbox_nso_plugin.renderer_writer import IntentPlanStaleError
+
+        self.assertTrue(issubclass(IntentPlanStaleError, IntentMutationProtocolError))
+
     def test_one_plan_can_create_a_native_row_and_its_overlay(self):
         from ipam.models import VLANGroup
 

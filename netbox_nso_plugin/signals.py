@@ -1435,18 +1435,6 @@ def snmp_host_push_blocker(row) -> str:
     return ""
 
 
-def _pushable_snmp_rows(rows, blocker):
-    """Return the pushable rows without mutating the blocked rows."""
-    pushable = []
-    for row in rows:
-        reason = blocker(row)
-        if reason:
-            logger.warning("SNMP intent: %s excluded from the snapshot — %s", row, reason)
-        else:
-            pushable.append(row)
-    return pushable
-
-
 def _snmp_push_blockers(rows, blocker):
     """Return the reasons that prevent a complete SNMP snapshot."""
     blocked = []
@@ -1515,19 +1503,18 @@ def _push_snmp_intent_for_device(device_id, adapter_device_id):
     blocked = _snmp_push_blockers(owned_communities, snmp_vault_ref_push_blocker)
     communities = []
     for row in owned_communities:
-        if not row.vault_ref:
-            continue
         communities.append(snmp_community_intent_item(row))
 
-    v3_users = []
     owned_v3 = list(
         NSOSnmpV3UserState.objects.filter(
             management__device_id=device_id,
             status__in=_OWNED_PUSH_STATUSES,
         )
     )
+    blocked.extend(_snmp_push_blockers(owned_v3, snmp_v3_user_push_blocker))
     blocked.extend(_snmp_push_blockers(owned_v3, snmp_vault_ref_push_blocker))
-    for row in _pushable_snmp_rows(owned_v3, snmp_v3_user_push_blocker):
+    v3_users = []
+    for row in owned_v3:
         # vault_ref is a PATH ref ("mount/path"); the auth/priv fields live at
         # "#auth"/"#priv" by convention. A leg without its protocol is not
         # derivable on-device, so its ref is withheld (the reconciler would
@@ -1544,7 +1531,8 @@ def _push_snmp_intent_for_device(device_id, adapter_device_id):
             status__in=_OWNED_PUSH_STATUSES,
         )
     )
-    for row in _pushable_snmp_rows(owned_hosts, snmp_host_push_blocker):
+    blocked.extend(_snmp_push_blockers(owned_hosts, snmp_host_push_blocker))
+    for row in owned_hosts:
         hosts.append(snmp_host_intent_item(row, ned_id))
 
     system_info = None

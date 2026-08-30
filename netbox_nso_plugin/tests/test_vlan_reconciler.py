@@ -189,6 +189,36 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
             ],
         )
 
+    def test_switchport_overlay_plan_references_vlans_created_for_the_native_mirror(self):
+        from netbox_nso_plugin.renderer_writer import RendererCreationRef
+        from netbox_nso_plugin.vlan_reconciler import _device_vlan_group, switchport_reconcile_plan
+
+        _device_vlan_group(self.device)
+
+        plan = switchport_reconcile_plan(
+            self.device,
+            {
+                "interfaces": [
+                    {
+                        "interface_name": self.interface.name,
+                        "mode": "trunk",
+                        "untagged_vlan": 1625,
+                        "tagged_vlans": [1626],
+                    }
+                ]
+            },
+        )
+
+        overlay = next(write for write in plan.write_set if write.model_label == "netbox_nso_plugin.nsoswitchportstate")
+        self.assertIsInstance(dict(overlay.values)["untagged_vlan_id"], RendererCreationRef)
+        overlay_m2m = next(
+            write
+            for write in plan.write_set
+            if write.operation == "m2m_set" and write.model_label == "netbox_nso_plugin.nsoswitchportstate"
+        )
+        self.assertEqual(len(overlay_m2m.selected_pks), 1)
+        self.assertIsInstance(overlay_m2m.selected_pks[0], RendererCreationRef)
+
     def test_switchport_plan_detects_a_reported_owned_fragment_change(self):
         from netbox_nso_plugin.models import NSOSwitchportState
         from netbox_nso_plugin.vlan_reconciler import (
