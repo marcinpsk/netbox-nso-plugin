@@ -537,7 +537,7 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
         # pass still fits, the repair that follows it does not.
         clock = itertools.count(0.0, 0.4)
 
-        with patch("netbox_nso_plugin.renderer_audit.time.monotonic", side_effect=lambda: next(clock)):
+        with patch("netbox_nso_plugin.renderer_audit._monotonic", side_effect=lambda: next(clock)):
             result = audit_renderer_scopes(
                 self.device.pk,
                 ["vlan"],
