@@ -485,12 +485,12 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         ):
             rescope_vlan(source_state, target_group)
 
-    def test_rescope_rejects_a_device_that_attaches_before_membership_locking(self):
+    def test_rescope_rejects_a_device_that_attaches_before_transaction_acquisition(self):
         from unittest.mock import patch
 
-        from netbox_nso_plugin import apply_state
+        from netbox_nso_plugin import intent_state
+        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
         from netbox_nso_plugin.vlan_reconciler import (
-            VLANRescopeConflict,
             reconcile_vlan_database,
             rescope_vlan,
         )
@@ -505,27 +505,30 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
             nso_instance=self.instance,
             nso_device_name="late-membership",
         )
-        original_lock = apply_state.lock_vlan_membership_transaction
+        original_footprint = intent_state.vlan_footprint
         attached = False
 
-        def attach_before_membership_lock(vlan_id):
+        def attach_before_transaction(vlan_id, scopes, **kwargs):
             nonlocal attached
+            footprint = original_footprint(vlan_id, scopes, **kwargs)
             if not attached and vlan_id == source_state.vlan_id:
                 attached = True
-                NSOVLANState.objects.create(
+                late_state = NSOVLANState(
                     management=late_management,
                     vlan=source_state.vlan,
                     device_name="MGMT",
                     status="imported",
                 )
-            original_lock(vlan_id)
+                with intent_state.intent_transaction(intent_state.footprint_for_instance(late_state)):
+                    late_state.save()
+            return footprint
 
         with (
             patch(
-                "netbox_nso_plugin.apply_state.lock_vlan_membership_transaction",
-                side_effect=attach_before_membership_lock,
+                "netbox_nso_plugin.intent_state.vlan_footprint",
+                side_effect=attach_before_transaction,
             ),
-            self.assertRaises(VLANRescopeConflict),
+            self.assertRaisesRegex(IntentMutationProtocolError, "changed its renderer targets"),
         ):
             rescope_vlan(source_state, target_group)
 
