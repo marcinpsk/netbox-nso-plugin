@@ -15,6 +15,8 @@ from netbox_nso_plugin.models import (
     NSOLACPMemberState,
 )
 
+from ._outbox_case import content_update
+
 
 def _payload(bundles):
     return {"device_id": 1, "bundles": bundles}
@@ -138,6 +140,35 @@ class TestReconcileLagConfig(TestCase):
         reconcile_lag_config(self.device, _payload([]))
         state.refresh_from_db()
         assert state.status == "accepted"
+
+    def test_stale_finalization_reloads_ownership_before_transition(self):
+        from netbox_nso_plugin import status_machine as sm
+
+        reconcile_lag_config(self.device, _payload([self._bundle(min_links=2)]))
+        stale = NSOLACPBundleState.objects.get(interface=self.lag)
+        content_update(NSOLACPBundleState.objects.get(pk=stale.pk), status="accepted")
+
+        sm.finalise_stale_overlay(stale, vestigial=False)
+
+        stale.refresh_from_db()
+        self.assertEqual(stale.status, "accepted")
+
+    def test_stale_finalization_retries_when_ownership_changes_rendered_content(self):
+        from netbox_nso_plugin import status_machine as sm
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        reconcile_lag_config(self.device, _payload([self._bundle(min_links=2)]))
+        stale = NSOLACPBundleState.objects.get(interface=self.lag)
+        content_update(NSOLACPBundleState.objects.get(pk=stale.pk), status="in_sync")
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="lacp")
+        before = revision.revision
+
+        sm.finalise_stale_overlay(stale, vestigial=False)
+
+        stale.refresh_from_db()
+        revision.refresh_from_db()
+        self.assertEqual(stale.status, "changed")
+        self.assertEqual(revision.revision, before + 1)
 
     def test_stale_member_unbundled_pruned(self):
         # A dropped member whose interface is no longer assigned to any LAG is vestigial.

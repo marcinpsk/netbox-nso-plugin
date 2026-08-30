@@ -1076,6 +1076,18 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_deployment_evidence_rejects_an_empty_response(self, mock_s, _cfg):
+        from netbox_nso_plugin.adapter_client import AdapterError, get_deployment_evidence
+
+        mock_s.return_value = self._make_session(200, content=b"")
+
+        with self.assertRaises(AdapterError) as raised:
+            get_deployment_evidence(5, ["8a2c9231-7ad8-4b17-a4b8-f5b4df745dd8"])
+
+        self.assertEqual(raised.exception.code, "invalid_response")
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_sync_notify_non_conflict_error_propagates(self, mock_s, _cfg):
         """sync_notify re-raises AdapterError when code != conflict."""
         from netbox_nso_plugin.adapter_client import AdapterError, sync_notify

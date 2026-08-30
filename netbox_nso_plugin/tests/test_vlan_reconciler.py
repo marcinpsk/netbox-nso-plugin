@@ -759,9 +759,8 @@ class TestVlanApplyPush(_CascadeFlushMixin, IntentPushResetMixin, TransactionTes
     """The Apply's forced VLAN push, which needs a committed transaction to take.
 
     ``drain.push_now`` refuses to run nested in a caller's block (#1503 Appendix O), so this
-    runs outside a test transaction, against the real claim. Renaming the ipam.VLAN fires no
-    plugin signal, so the row stays 'in_sync' and its acknowledged baseline still names the
-    old body: only the forced claim ships the LIVE NetBox name.
+    runs outside a test transaction, against the real claim. The test first consumes the
+    rename's ordinary claim, then proves Apply still forces the current live body.
     """
 
     def setUp(self):
@@ -789,11 +788,12 @@ class TestVlanApplyPush(_CascadeFlushMixin, IntentPushResetMixin, TransactionTes
         from ._outbox_case import content_update
 
         content_update(self.state.vlan, name="LIVE_RENAMED")
-        from netbox_nso_plugin.models import NSOIntentOutboxEntry
 
-        NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").delete()
+        with patch("netbox_nso_plugin.adapter_client.put_vlan_intent", return_value={}) as rename_push:
+            drain.drain_key(self.device.pk, "vlan")
+        rename_push.assert_called_once()
 
-        # The premise: the rename owes the key nothing, so an ordinary drain sends nothing.
+        # The rename claim is acknowledged, so another ordinary drain sends nothing.
         with patch("netbox_nso_plugin.adapter_client.put_vlan_intent", return_value={}) as unforced:
             drain.drain_key(self.device.pk, "vlan")
         unforced.assert_not_called()

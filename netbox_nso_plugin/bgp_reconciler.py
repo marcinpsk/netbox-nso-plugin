@@ -22,6 +22,195 @@ from .intent_state import mirror_reconciler
 logger = logging.getLogger(__name__)
 
 
+def bgp_reconcile_plan(device, payload: dict):
+    """Declare the BGP graph and predict changes to owned peer fragments."""
+    import copy
+
+    from django.contrib.contenttypes.models import ContentType
+    from ipam.models import ASN, IPAddress
+    from netbox_routing.models import (
+        BGPAddressFamily,
+        BGPPeer,
+        BGPPeerAddressFamily,
+        BGPPeerTemplate,
+        BGPRouter,
+        BGPScope,
+    )
+
+    from . import status_machine as sm
+    from .intent_state import MutationFootprint, ReconcileMutationPlan, SourceRow, canonical_fragment
+    from .models import NSOBGPPeerState, NSODeviceManagement
+
+    management = NSODeviceManagement.objects.filter(device=device).first()
+    if management is None:
+        return ReconcileMutationPlan(MutationFootprint())
+    states = tuple(NSOBGPPeerState.objects.filter(management=management).select_related("bgp_peer").order_by("pk"))
+    reported = {
+        (str(router.get("asn") or ""), scope.get("vrf") or "", peer.get("peer_address") or ""): peer
+        for router in payload.get("routers", []) or []
+        if isinstance(router, dict)
+        for scope in router.get("scopes", []) or []
+        if isinstance(scope, dict)
+        for peer in scope.get("peers", []) or []
+        if isinstance(peer, dict) and peer.get("peer_address")
+    }
+    changes_content = False
+    for state in states:
+        candidate = copy.copy(state)
+        peer = reported.get((state.asn_str, state.vrf_name, state.peer_address_str))
+        if peer is None:
+            candidate.status = sm.on_reconcile(state.status, present=False)
+        else:
+            candidate.remote_as_str = str(peer.get("remote_as") or "")
+            candidate.enabled = peer.get("enabled")
+        if canonical_fragment(state) != canonical_fragment(candidate):
+            changes_content = True
+            break
+        if peer is not None and _peer_plan_changes_native_content(device, state, peer):
+            changes_content = True
+            break
+
+    device_type = ContentType.objects.get_for_model(type(device))
+    routers = tuple(
+        BGPRouter.objects.filter(assigned_object_type=device_type, assigned_object_id=device.pk)
+        .select_related("asn")
+        .order_by("pk")
+    )
+    scopes = tuple(BGPScope.objects.filter(router__in=routers).order_by("pk"))
+    peers = tuple(BGPPeer.objects.filter(scope__in=scopes).order_by("pk"))
+    template_remote_as = {
+        peer.get("peer_group"): peer.get("remote_as")
+        for router in payload.get("routers", []) or []
+        if isinstance(router, dict)
+        for scope in router.get("scopes", []) or []
+        if isinstance(scope, dict)
+        for peer in scope.get("peers", []) or []
+        if isinstance(peer, dict) and peer.get("peer_group")
+    }
+    template_remote_as.update(
+        {
+            group.get("name"): group.get("remote_as")
+            for router in payload.get("routers", []) or []
+            if isinstance(router, dict)
+            for scope in router.get("scopes", []) or []
+            if isinstance(scope, dict)
+            for group in scope.get("peer_groups", []) or []
+            if isinstance(group, dict) and group.get("name")
+        }
+    )
+    from django.db.models import Q
+
+    templates = tuple(
+        BGPPeerTemplate.objects.filter(
+            Q(pk__in={peer.peer_group_id for peer in peers if peer.peer_group_id is not None})
+            | Q(name__in=template_remote_as)
+        ).order_by("pk")
+    )
+    if not changes_content:
+        changes_content = _bgp_shared_graph_changes_content(
+            routers,
+            templates,
+            template_remote_as,
+            payload,
+        )
+    address_families = tuple(BGPAddressFamily.objects.filter(scope__in=scopes).order_by("pk"))
+    owner_ids = {peer.pk for peer in peers} | {template.pk for template in templates}
+    peer_address_families = tuple(BGPPeerAddressFamily.objects.filter(assigned_object_id__in=owner_ids).order_by("pk"))
+    asn_values = {
+        int(value)
+        for router in payload.get("routers", []) or []
+        if isinstance(router, dict)
+        for value in (
+            [router.get("asn")]
+            + [
+                peer.get(field)
+                for scope in router.get("scopes", []) or []
+                if isinstance(scope, dict)
+                for peer in scope.get("peers", []) or []
+                if isinstance(peer, dict)
+                for field in ("remote_as", "local_as")
+            ]
+            + [
+                group.get("remote_as")
+                for scope in router.get("scopes", []) or []
+                if isinstance(scope, dict)
+                for group in scope.get("peer_groups", []) or []
+                if isinstance(group, dict)
+            ]
+        )
+        if value not in (None, "") and str(value).isdigit()
+    }
+    asns = tuple(ASN.objects.filter(asn__in=asn_values).order_by("pk"))
+    addresses = tuple(
+        IPAddress.objects.filter(
+            pk__in={value for peer in peers for value in (peer.peer_id, peer.source_id) if value is not None}
+        ).order_by("pk")
+    )
+    source_models = {
+        "ipam.asn": asns,
+        "ipam.ipaddress": addresses,
+        "netbox_routing.bgprouter": routers,
+        "netbox_routing.bgpscope": scopes,
+        "netbox_routing.bgppeer": peers,
+        "netbox_routing.bgppeertemplate": templates,
+        "netbox_routing.bgpaddressfamily": address_families,
+        "netbox_routing.bgppeeraddressfamily": peer_address_families,
+    }
+    return ReconcileMutationPlan(
+        MutationFootprint.for_keys(
+            {(device.pk, "bgp")},
+            source_rows=(
+                *(SourceRow(label, None) for label in source_models),
+                *(SourceRow(label, row.pk) for label, rows in source_models.items() for row in rows),
+            ),
+            overlay_rows=(
+                SourceRow("netbox_nso_plugin.nsobgppeerstate", None),
+                *(SourceRow(state._meta.label_lower, state.pk) for state in states),
+            ),
+        ),
+        changes_content=changes_content,
+    )
+
+
+def _bgp_shared_graph_changes_content(routers, templates, template_remote_as, payload) -> bool:
+    """Predict router-id and shared-template changes visible to owned peers."""
+    import copy
+
+    from ipam.models import ASN
+
+    from .intent_state import ABSENT, canonical_fragment
+
+    reported_routers = {
+        str(item.get("asn") or ""): item
+        for item in payload.get("routers", []) or []
+        if isinstance(item, dict) and item.get("asn") not in (None, "")
+    }
+    for router in routers:
+        reported_router_id = reported_routers.get(str(router.asn.asn), {}).get("router_id")
+        if reported_router_id and not router.router_id:
+            candidate = copy.copy(router)
+            candidate.router_id = reported_router_id
+            if canonical_fragment(router) != canonical_fragment(candidate):
+                return True
+    for template in templates:
+        remote_as = template_remote_as.get(template.name)
+        if remote_as in (None, ""):
+            continue
+        try:
+            remote_asn = ASN.objects.filter(asn=int(remote_as)).first()
+        except (TypeError, ValueError):
+            continue
+        if remote_asn is None:
+            if canonical_fragment(template) != ABSENT:
+                return True
+            continue
+        candidate = copy.copy(template)
+        candidate.remote_as = remote_asn
+        if canonical_fragment(template) != canonical_fragment(candidate):
+            return True
+    return False
+
+
 def _pk(obj):
     """FK target → pk (None-safe), for canonical content hashing."""
     return obj.pk if obj is not None else None
@@ -234,6 +423,63 @@ def _peer_desired(peer_data, remote_asn_obj, local_asn_obj, peer_group_obj, sour
         "password": peer_data.get("password"),
         "bfd_enabled": peer_data.get("bfd_enabled"),
     }
+
+
+def _peer_plan_changes_native_content(device, state, peer_entry: dict) -> bool:
+    """Predict the existing-peer auto-mirror branch without creating dependencies."""
+    from dcim.models import Interface
+    from ipam.models import ASN, IPAddress
+    from netbox_routing.models import BGPPeerTemplate
+
+    from . import status_machine as sm
+
+    bgp_peer = state.bgp_peer
+    if not sm.is_owned(state.status) or bgp_peer is None or not state.device_base_hash:
+        return False
+    if _content_hash(_peer_object_content(bgp_peer)) != state.device_base_hash:
+        return False
+
+    unresolved = False
+
+    def existing_asn(value):
+        nonlocal unresolved
+        if value in (None, ""):
+            return None
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return None
+        result = ASN.objects.filter(asn=number).first()
+        unresolved = unresolved or result is None
+        return result
+
+    remote_asn = existing_asn(peer_entry.get("remote_as"))
+    local_asn = existing_asn(peer_entry.get("local_as"))
+    peer_group_name = peer_entry.get("peer_group") or ""
+    peer_group = BGPPeerTemplate.objects.filter(name=peer_group_name).first() if peer_group_name else None
+    unresolved = unresolved or bool(peer_group_name and peer_group is None)
+    source = peer_entry.get("source") or ""
+    source_ip = update_source = None
+    if source:
+        try:
+            ipaddress.ip_address(source)
+        except ValueError:
+            update_source = Interface.objects.filter(device=device, name=source).first()
+        else:
+            source_ip = IPAddress.objects.filter(address__net_host=source).first()
+            unresolved = unresolved or source_ip is None
+    desired = _peer_desired(
+        peer_entry,
+        remote_asn,
+        local_asn,
+        peer_group,
+        source_ip,
+        update_source,
+    )
+    if unresolved:
+        return True
+    desired_hash = _content_hash(_peer_device_content(desired, peer_entry.get("address_families") or []))
+    return desired_hash != state.device_base_hash
 
 
 def _af_device_content(af_list: list) -> list:

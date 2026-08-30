@@ -287,6 +287,7 @@ class TestRevisionLockSerializesClaimFormation(_MarkCase):
             worker = threading.Thread(target=lambda: in_thread(append_after_claim))
             worker.start()
             workers.append(worker)
+            self.addCleanup(worker.join, 30)
             assert started.wait(timeout=30)
             assert not committed.wait(timeout=1), "the writer crossed the claim's revision lock"
             return rendered

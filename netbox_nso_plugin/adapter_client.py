@@ -1483,11 +1483,14 @@ DEPLOYMENT_EVIDENCE_FIELDS = frozenset(
 
 def get_deployment_evidence(adapter_device_id, apply_attempt_ids):
     """Return barrier and durable evidence for the named Apply attempts."""
-    return _request(
+    evidence = _request(
         "POST",
         f"/api/v1/devices/{adapter_device_id}/deployment-evidence",
         json={"apply_attempt_ids": [str(attempt_id) for attempt_id in apply_attempt_ids]},
     )
+    if not isinstance(evidence, dict):
+        raise AdapterError("Adapter returned no deployment evidence body.", code="invalid_response")
+    return evidence
 
 
 def list_nso_devices(nso_instance_id: str) -> list[dict]:

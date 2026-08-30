@@ -1954,6 +1954,80 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertTrue(is_owned(target_state.status))
         self.assertFalse(NSOVLANState.objects.filter(pk=self.vlan_state.pk).exists())
 
+    def test_switchport_accept_rejects_an_overlay_owned_by_the_interfaces_old_device(self):
+        from netbox_nso_plugin.intent_state import offline_mutation
+        from netbox_nso_plugin.models import NSOSwitchportState
+        from netbox_nso_plugin.views import _reload_switchport_accept_state, _SwitchportAcceptRetry
+
+        other_device, _other_management = make_managed("switchport-accept-rescoped", 9379)
+        interface = self._create_interface(device=self.device, name="Ethernet9.381", type="1000base-t")
+        with without_commit_drain(), transaction.atomic():
+            state = NSOSwitchportState.objects.create(
+                management=self.mgmt,
+                interface=interface,
+                mode="access",
+                status="imported",
+            )
+        with transaction.atomic(), offline_mutation():
+            Interface.objects.filter(pk=interface.pk).update(device=other_device)
+
+        with self.assertRaises(_SwitchportAcceptRetry):
+            _reload_switchport_accept_state(state, set())
+
+    def test_switchport_accept_retries_a_device_move_during_footprint_acquisition(self):
+        import threading
+        from unittest.mock import patch
+
+        from django.db import connections
+
+        from netbox_nso_plugin import apply_state
+        from netbox_nso_plugin.intent_state import offline_mutation
+        from netbox_nso_plugin.models import NSOSwitchportState
+
+        other_device, _other_management = make_managed("switchport-accept-moved", 9380)
+        interface = self._create_interface(device=self.device, name="Ethernet9.382", type="1000base-t")
+        with without_commit_drain(), transaction.atomic():
+            state = NSOSwitchportState.objects.create(
+                management=self.mgmt,
+                interface=interface,
+                mode="access",
+                status="imported",
+            )
+        original_lock = apply_state.lock_device_intent_transaction
+        moved = []
+
+        def lock_then_move(device_id):
+            original_lock(device_id)
+            if moved or device_id != self.device.pk:
+                return
+
+            def move_interface():
+                try:
+                    with transaction.atomic(), offline_mutation():
+                        Interface.objects.filter(pk=interface.pk).update(device=other_device)
+                finally:
+                    connections.close_all()
+
+            mover = threading.Thread(target=move_interface)
+            mover.start()
+            mover.join(10)
+            self.assertFalse(mover.is_alive())
+            moved.append(True)
+
+        with patch(
+            "netbox_nso_plugin.apply_state.lock_device_intent_transaction",
+            side_effect=lock_then_move,
+        ):
+            response = self.client.post(
+                reverse("plugins:netbox_nso_plugin:switchport_accept", args=[state.pk]),
+            )
+
+        self.assertEqual(response.status_code, 302)
+        state.refresh_from_db()
+        interface.refresh_from_db()
+        self.assertEqual(interface.device_id, other_device.pk)
+        self.assertEqual(state.status, "imported")
+
     def test_switchport_accept_reloads_vlan_references_after_a_concurrent_rescope(self):
         import threading
         from unittest.mock import patch
@@ -2526,20 +2600,20 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
     def test_a_vlan_id_change_keeps_the_old_placeholder_when_the_new_name_is_taken(self):
         from ipam.models import VLAN
 
-        from netbox_nso_plugin.models import NSOVLANState
         from netbox_nso_plugin.vlan_reconciler import _device_vlan_group, placeholder_vlan_name
 
         old_vid = self.vlan_state.vlan.vid
         new_vid = old_vid + 1
         old_placeholder = placeholder_vlan_name(old_vid)
         group = _device_vlan_group(self.device)
-        NSOVLANState.objects.filter(pk=self.vlan_state.pk).update(device_name="")
-        VLAN.objects.filter(pk=self.vlan_state.vlan_id).update(group=group, name=old_placeholder)
-        VLAN.objects.create(
-            group=group,
-            vid=old_vid + 100,
-            name=placeholder_vlan_name(new_vid),
-        )
+        content_update(self.vlan_state, device_name="")
+        content_update(self.vlan_state.vlan, group=group, name=old_placeholder)
+        with without_commit_drain(), transaction.atomic():
+            VLAN.objects.create(
+                group=group,
+                vid=old_vid + 100,
+                name=placeholder_vlan_name(new_vid),
+            )
 
         with without_commit_drain(), transaction.atomic():
             vlan = VLAN.objects.get(pk=self.vlan_state.vlan_id)

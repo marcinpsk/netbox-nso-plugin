@@ -5435,10 +5435,11 @@ def _reload_switchport_accept_state(state, vlan_ids):
     from .models import NSOSwitchportState
 
     interface = Interface.objects.filter(pk=state.interface_id).first()
-    locked_state = NSOSwitchportState.objects.filter(pk=state.pk).first()
+    locked_state = NSOSwitchportState.objects.select_related("management").filter(pk=state.pk).first()
     if (
         interface is None
         or locked_state is None
+        or locked_state.management.device_id != interface.device_id
         or locked_state.interface_id != interface.pk
         or _switchport_vlan_ids(locked_state) != vlan_ids
     ):
@@ -5461,21 +5462,21 @@ class NSOSwitchportStateAcceptView(NSOActionPermissionMixin, View):
         for _attempt in range(2):
             state = get_object_or_404(NSOSwitchportState, pk=pk)
             vlan_ids = _switchport_vlan_ids(state)
-            from .intent_state import intent_transaction
+            from .intent_state import RendererTargetsChanged, intent_transaction
 
-            with intent_transaction(_switchport_accept_footprint(state)):
-                try:
+            try:
+                with intent_transaction(_switchport_accept_footprint(state)):
                     state, iface = _reload_switchport_accept_state(state, vlan_ids)
-                except _SwitchportAcceptRetry:
-                    continue
-                # native-write-on-accept: make the NetBox interface match what NSO observed.
-                iface.mode = state.mode or ""
-                iface.untagged_vlan = state.untagged_vlan
-                iface.save()
-                iface.tagged_vlans.set(state.tagged_vlans.all())
-                state.status = _status_after_accept(state.status)
-                state.accepted_at = timezone.now()
-                state.save(update_fields=["status", "accepted_at"])
+                    # native-write-on-accept: make the NetBox interface match what NSO observed.
+                    iface.mode = state.mode or ""
+                    iface.untagged_vlan = state.untagged_vlan
+                    iface.save()
+                    iface.tagged_vlans.set(state.tagged_vlans.all())
+                    state.status = _status_after_accept(state.status)
+                    state.accepted_at = timezone.now()
+                    state.save(update_fields=["status", "accepted_at"])
+            except (RendererTargetsChanged, _SwitchportAcceptRetry):
+                continue
             break
         else:
             messages.error(request, "The switchport changed. Refresh the page and try again.")

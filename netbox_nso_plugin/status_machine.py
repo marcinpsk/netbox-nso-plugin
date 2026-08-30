@@ -451,6 +451,10 @@ def on_reconcile_error(current: str) -> str:
     return advance(current, RECONCILE_ERROR, to=ERROR)
 
 
+class _StaleOverlayStatusChanged(RuntimeError):
+    """The status used to choose a stale-row permit changed before its row lock."""
+
+
 def finalise_stale_overlay(stale, *, vestigial: bool, now=None) -> None:
     """Shared tail for every reconciler's stale loop: prune vestigial rows, else mark ``changed``.
 
@@ -467,22 +471,43 @@ def finalise_stale_overlay(stale, *, vestigial: bool, now=None) -> None:
 
     ``now`` (optional) bumps ``last_sync_at`` alongside ``status`` when the row is kept.
     """
-    if not is_owned(stale.status) and vestigial:
-        stale.delete()
-        return
-    new_status = on_reconcile(stale.status, present=False)
-    if new_status == stale.status:
-        return
-    loses_ownership = is_owned(stale.status) and not is_owned(new_status)
-    stale.status = new_status
-    fields = ["status"]
-    if now is not None:
-        stale.last_sync_at = now
-        fields.append("last_sync_at")
-    if loses_ownership and hasattr(stale, "_meta"):
-        from .intent_state import footprint_for_instance, intent_transaction
 
-        with intent_transaction(footprint_for_instance(stale)):
-            stale.save(update_fields=fields)
-    else:
+    def finalise_locked():
+        if not is_owned(stale.status) and vestigial:
+            stale.delete()
+            return
+        new_status = on_reconcile(stale.status, present=False)
+        if new_status == stale.status:
+            return
+        stale.status = new_status
+        fields = ["status"]
+        if now is not None:
+            stale.last_sync_at = now
+            fields.append("last_sync_at")
         stale.save(update_fields=fields)
+
+    if hasattr(stale, "_meta"):
+        from .intent_state import (
+            IntentMutationProtocolError,
+            ReconcileMutationPlan,
+            footprint_for_instance,
+            reconcile_transaction,
+        )
+
+        for _attempt in range(2):
+            expected_status = stale.status
+            plan = ReconcileMutationPlan(
+                footprint_for_instance(stale),
+                changes_content=expected_status == IN_SYNC,
+            )
+            try:
+                with reconcile_transaction(plan):
+                    stale.refresh_from_db()
+                    if stale.status != expected_status:
+                        raise _StaleOverlayStatusChanged
+                    finalise_locked()
+                return
+            except _StaleOverlayStatusChanged:
+                stale.refresh_from_db()
+        raise IntentMutationProtocolError("a stale overlay changed status during finalization")
+    finalise_locked()

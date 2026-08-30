@@ -14,7 +14,7 @@ import threading
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
-from django.db import connection, transaction
+from django.db import connection, connections, transaction
 from django.test import TestCase, TransactionTestCase
 from django.urls import reverse
 
@@ -370,8 +370,20 @@ class TestStaticRouteBulkAcceptOutsideATransaction(_CascadeFlushMixin, IntentPus
         observed = []
 
         def _observe_committed_push(_adapter_device_id, _routes):
-            row = NSOStaticRouteState.objects.get(pk=state.pk)
-            observed.append((row.status, row.intent_generation))
+            alias = "static_route_observer"
+            connections[alias] = connection.copy(alias=alias)
+            observer = connections[alias]
+            try:
+                table = observer.ops.quote_name(NSOStaticRouteState._meta.db_table)
+                with observer.cursor() as cursor:
+                    cursor.execute(  # noqa: S608 - the quoted table name comes from model metadata
+                        f"SELECT status, intent_generation FROM {table} WHERE id = %s",
+                        [state.pk],
+                    )
+                    observed.append(cursor.fetchone())
+            finally:
+                observer.close()
+                del connections[alias]
             return {}
 
         with patch(PUT, side_effect=_observe_committed_push):

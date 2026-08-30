@@ -370,6 +370,10 @@ class IntentMutationProtocolError(RuntimeError):
     """A renderer input write did not hold its complete mutation footprint."""
 
 
+class RendererTargetsChanged(IntentMutationProtocolError):
+    """A source row changed the devices that render it during acquisition."""
+
+
 @dataclass(frozen=True, order=True)
 class SourceRow:
     """One source row that must be locked before revision rows."""
@@ -1626,7 +1630,7 @@ def _revalidate_sources(footprint: MutationFootprint) -> None:
         instance = apps.get_model(row.model_label).objects.filter(pk=row.pk).first()
         resolved_devices = {device_id for device_id, _scope in spec.resolver(instance, spec)}
         if instance is not None and not resolved_devices <= expected_devices:
-            raise IntentMutationProtocolError(
+            raise RendererTargetsChanged(
                 f"{row.model_label} row {row.pk!r} changed its renderer targets during acquisition"
             )
 

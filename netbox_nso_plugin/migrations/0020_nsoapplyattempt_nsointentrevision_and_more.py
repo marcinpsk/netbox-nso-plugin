@@ -21,6 +21,17 @@ PROMOTED_MODEL_NAMES = (
 )
 
 
+def backfill_allocation_kinds(apps, _schema_editor):
+    """Classify addresses created by the pre-allocation-kind auto-assigner."""
+    from netbox_nso_plugin.intent_state import offline_mutation
+
+    state = apps.get_model("netbox_nso_plugin", "NSOInterfaceIPState")
+    with offline_mutation():
+        auto_assigned = state.objects.filter(auto_assigned=True)
+        auto_assigned.filter(peer_state__isnull=True).update(allocation_kind="single")
+        auto_assigned.filter(peer_state__isnull=False).update(allocation_kind="p2p")
+
+
 def normalize_deploying_rows(apps, _schema_editor):
     """Return rows with no durable Apply identity to operator-pending state."""
     from netbox_nso_plugin.intent_state import offline_mutation
@@ -133,6 +144,7 @@ class Migration(migrations.Migration):
             name="apply_attempt_id",
             field=models.UUIDField(blank=True, null=True),
         ),
+        migrations.RunPython(backfill_allocation_kinds, migrations.RunPython.noop),
         migrations.RunPython(normalize_deploying_rows, migrations.RunPython.noop),
         migrations.AddIndex(
             model_name="nsobfdinterfacestate",

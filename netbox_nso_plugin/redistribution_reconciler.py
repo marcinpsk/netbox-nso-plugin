@@ -14,6 +14,68 @@ from .intent_state import mirror_reconciler
 
 logger = logging.getLogger(__name__)
 
+_DESTINATION_PROTOCOLS = ("bgp", "isis", "ospf")
+
+
+def redistribution_reconcile_plan(device, payload: dict):
+    """Declare every native and overlay row one redistribution refresh can write."""
+    import copy
+
+    from . import status_machine as sm
+    from .intent_state import MutationFootprint, ReconcileMutationPlan, SourceRow, canonical_fragment
+    from .models import NSODeviceManagement, NSORedistributionState
+
+    management = NSODeviceManagement.objects.filter(device=device).first()
+    if management is None:
+        return ReconcileMutationPlan(MutationFootprint())
+    states = tuple(
+        NSORedistributionState.objects.filter(management=management).select_related("redistribution").order_by("pk")
+    )
+    reported = {
+        (
+            entry.get("dest_protocol") or "",
+            entry.get("dest_ref") or "",
+            entry.get("source_protocol") or "",
+            entry.get("source_ref") or "",
+        ): entry
+        for entry in payload.get("entries", []) or []
+        if isinstance(entry, dict) and entry.get("dest_protocol") and entry.get("source_protocol")
+    }
+    protocols = {
+        protocol
+        for protocol in (
+            *(state.dest_protocol for state in states),
+            *(key[0] for key in reported),
+        )
+        if protocol in _DESTINATION_PROTOCOLS
+    }
+    changes_content = False
+    for state in states:
+        key = (state.dest_protocol, state.dest_ref, state.source_protocol, state.source_ref)
+        if key not in reported:
+            candidate = copy.copy(state)
+            candidate.status = sm.on_reconcile(state.status, present=False)
+            if canonical_fragment(state) != canonical_fragment(candidate):
+                changes_content = True
+                break
+        elif sm.is_owned(state.status) and state.redistribution_id is None:
+            if _resolve_redist_destination(device, state.dest_protocol, state.dest_ref) is not None:
+                changes_content = True
+                break
+    redistributions = {state.redistribution_id for state in states if state.redistribution_id is not None}
+    footprint = MutationFootprint.for_keys(
+        {(device.pk, protocol) for protocol in protocols},
+        source_rows=(
+            SourceRow("netbox_routing.redistribution", None),
+            *(SourceRow("netbox_routing.redistribution", pk) for pk in redistributions),
+        ),
+        overlay_rows=(
+            SourceRow("netbox_nso_plugin.nsoredistributionstate", None),
+            *(SourceRow(state._meta.label_lower, state.pk) for state in states),
+        ),
+    )
+    return ReconcileMutationPlan(footprint, changes_content=changes_content)
+
 
 def _resolve_redist_destination(device, dest_protocol: str, dest_ref: str):
     """Resolve the netbox_routing destination object for a redistribution entry.
@@ -266,9 +328,6 @@ def reconcile_redistribution(device, payload: dict) -> list:
             rd = stale.redistribution
             stale.delete()
             if rd is not None and not rd.nso_redistribution_states.exists():
-                from .intent_state import footprint_for_instance, intent_transaction
-
-                with intent_transaction(footprint_for_instance(rd)):
-                    rd.delete()
+                rd.delete()
 
     return list(NSORedistributionState.objects.filter(management=mgmt))

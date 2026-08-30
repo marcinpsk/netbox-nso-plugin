@@ -2506,6 +2506,7 @@ class TestDeviceNSOTabView(ViewTestBase):
             mocks[name] = m
         mocks["get_device"].return_value = {"id": 15, "last_sync_at": None, "last_sync_status": ""}
         mocks["get_isis_interfaces"].return_value = {"interfaces": [], "processes": []}
+        mocks["get_bgp_config"].return_value = {"routers": []}
         # Patch the reconcilers/upsert too: this test verifies the view's *gating*
         # decision (which adapter getter runs for a given scope), not reconciler
         # internals, so stub them out to keep the test isolated and DB-free.

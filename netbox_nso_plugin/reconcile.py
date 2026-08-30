@@ -298,8 +298,8 @@ _PRE_ROUTE_POLICY_EVIDENCE = "_pre_route_policy_deployment_evidence"
 def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
     """Reconcile each opted-in routing protocol into *ctx* (gated by kill-switches)."""
     from .bfd_reconciler import reconcile_bfd
-    from .bgp_reconciler import _reconcile_bgp_config
-    from .redistribution_reconciler import reconcile_redistribution
+    from .bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
+    from .redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
     from .route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
     from .template_content import (
         _reconcile_isis_interfaces,
@@ -406,6 +406,7 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
                 ctx, "bgp_peers", mgmt, ("NSOBGPPeerState",), _reconcile_bgp_config, device, bgp_doc
             ),
             epoch=dev_id,
+            pre_body=lambda: bgp_reconcile_plan(device, bgp_doc),
         )
     # BFD is interface-level + protocol-agnostic; reconcile it whenever any of the
     # protocols that ride it (BGP/IS-IS/OSPF) are managed.
@@ -452,6 +453,7 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
                 redist_doc,
             ),
             epoch=dev_id,
+            pre_body=lambda: redistribution_reconcile_plan(device, redist_doc),
         )
 
 
@@ -599,7 +601,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                 epoch=dev_id,
             )
             # LACP/LAG bundle + member overlay states (interface-level).
-            from .lacp_reconciler import reconcile_lag_config
+            from .lacp_reconciler import lag_config_reconcile_plan, reconcile_lag_config
 
             lag_doc = client.get_lag_config(dev_id)
             _gated(
@@ -617,6 +619,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                     lag_doc,
                 ),
                 epoch=dev_id,
+                pre_body=lambda: lag_config_reconcile_plan(device, lag_doc),
             )
             # VLAN database + L2 switchport (VLAN DB first — switchport links to it).
             from .vlan_reconciler import reconcile_switchport, reconcile_vlan_database
@@ -714,8 +717,8 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
     adapter failure — the caller renders a per-category error.
     """
     from . import adapter_client as client
-    from .bgp_reconciler import _reconcile_bgp_config
-    from .redistribution_reconciler import reconcile_redistribution
+    from .bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
+    from .redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
     from .route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
     from .signals import suppress_intent_push
     from .template_content import (
@@ -933,7 +936,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 ctx_key="interface_ips",
             )
         elif key == "lacp":
-            from .lacp_reconciler import reconcile_lag_config
+            from .lacp_reconciler import lag_config_reconcile_plan, reconcile_lag_config
 
             lag_doc = client.get_lag_config(dev_id)
             _gated(
@@ -944,6 +947,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_lag_config(device, lag_doc),
                 epoch=dev_id,
                 ctx_key="lacp_bundle_states",
+                pre_body=lambda: lag_config_reconcile_plan(device, lag_doc),
             )
         elif key == "vlan":
             from .vlan_reconciler import reconcile_vlan_database
@@ -1093,6 +1097,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: _reconcile_bgp_config(device, bgp_doc),
                 epoch=dev_id,
                 ctx_key="bgp_peers",
+                pre_body=lambda: bgp_reconcile_plan(device, bgp_doc),
             )
             ctx["bgp_peer_templates"] = list(
                 NSOBGPPeerTemplateState.objects.filter(management=mgmt).select_related("template")
@@ -1136,6 +1141,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_redistribution(device, redist_doc),
                 epoch=dev_id,
                 ctx_key="redistribution_states",
+                pre_body=lambda: redistribution_reconcile_plan(device, redist_doc),
             )
         elif key == "l2_services":
             # reconcile into native vpn.L2VPN + L2VPNTermination + NSOL2SapState

@@ -160,13 +160,6 @@ def _attempt_disposition(attempt: dict, stream: str):
     return disposition, representative
 
 
-def _scope_failed(generation, scope: str) -> bool:
-    result = generation.get("carrier_job_result")
-    counts = result.get(f"{scope}_count_by_outcome") if isinstance(result, dict) else None
-    count = counts.get("apply_failed") if isinstance(counts, dict) else None
-    return type(count) is int and count > 0
-
-
 def _carrier_error(generation, scope: str) -> str:
     error = generation.get("carrier_job_error")
     detail = error.get("detail") if isinstance(error, dict) else None
@@ -196,8 +189,6 @@ def _failure_message(disposition, attempt_id, generation, scope):
     carrier = _carrier_error(generation, scope)
     if carrier:
         return carrier
-    if _scope_failed(generation, scope):
-        return f"Apply attempt {attempt_id} reported a failure for this scope."
     return (
         f"Generation {generation_id} settled, but later device reads did not show this value. "
         "Check device and NED support, then run Apply again."

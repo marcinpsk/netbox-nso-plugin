@@ -209,6 +209,99 @@ class TestIsisCompoundGate(TestCase):
         self.assertEqual(ctx["_gate"]["isis"], "skipped_unavailable")
 
 
+class TestRealReconcilerGateFootprints(TestCase):
+    """Run registered overlay writers through their production read gates."""
+
+    def setUp(self):
+        self.device, self.mgmt = _make(
+            f"gf{uuid.uuid4().hex[:6]}",
+            manage_interfaces=True,
+            manage_routing=True,
+            manage_bgp=True,
+        )
+
+    def test_lacp_gate_covers_bundle_and_member_rows(self):
+        from netbox_nso_plugin.reconcile import reconcile_category
+
+        Interface.objects.create(device=self.device, name="Port-channel1", type="lag")
+        Interface.objects.create(device=self.device, name="Ethernet1", type="1000base-t")
+        payload = {
+            "bundles": [
+                {
+                    "name": "Port-channel1",
+                    "lag_id": 1,
+                    "members": [{"interface_name": "Ethernet1", "mode": "active"}],
+                }
+            ],
+            "read_state": _rs(),
+        }
+
+        with patch("netbox_nso_plugin.adapter_client.get_lag_config", return_value=payload):
+            ctx = reconcile_category(self.device, self.mgmt, "lacp")
+
+        self.assertEqual(ctx["_gate"]["lag_config"], "ran")
+
+    def test_bgp_gate_covers_the_materialized_graph_and_overlay(self):
+        from netbox_nso_plugin.reconcile import reconcile_category
+
+        payload = self._bgp_payload()
+
+        with patch("netbox_nso_plugin.adapter_client.get_bgp_config", return_value=payload):
+            ctx = reconcile_category(self.device, self.mgmt, "bgp")
+
+        self.assertEqual(ctx["_gate"]["bgp"], "ran")
+
+    def test_bgp_gate_predicts_an_owned_native_peer_change(self):
+        from netbox_nso_plugin.models import NSOBGPPeerState, NSOIntentRevision
+        from netbox_nso_plugin.reconcile import reconcile_category
+
+        from ._outbox_case import content_update
+
+        with patch("netbox_nso_plugin.adapter_client.get_bgp_config", return_value=self._bgp_payload()):
+            reconcile_category(self.device, self.mgmt, "bgp")
+        state = NSOBGPPeerState.objects.get(management=self.mgmt)
+        content_update(state, status="accepted")
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="bgp")
+        before = revision.revision
+
+        with patch(
+            "netbox_nso_plugin.adapter_client.get_bgp_config",
+            return_value=self._bgp_payload(ttl=2, attempt_id=2),
+        ):
+            reconcile_category(self.device, self.mgmt, "bgp")
+
+        state.refresh_from_db()
+        revision.refresh_from_db()
+        self.assertEqual(state.bgp_peer.ttl, 2)
+        self.assertEqual(revision.revision, before + 1)
+
+    @staticmethod
+    def _bgp_payload(*, ttl=None, attempt_id=1):
+        peer = {
+            "peer_address": "198.18.0.1",
+            "remote_as": "64513",
+            "enabled": True,
+            "address_families": [{"af": "ipv4-unicast", "enabled": True}],
+        }
+        if ttl is not None:
+            peer["ttl"] = ttl
+        return {
+            "routers": [
+                {
+                    "asn": "64512",
+                    "scopes": [
+                        {
+                            "vrf": "",
+                            "address_families": ["ipv4-unicast"],
+                            "peers": [peer],
+                        }
+                    ],
+                }
+            ],
+            "read_state": _rs(attempt_id=attempt_id),
+        }
+
+
 #: every family fetcher reconcile_device consumes, with a minimal doc shape.
 _DEVICE_FETCHERS = {
     "get_interfaces_doc": {"device_id": 0, "interfaces": []},

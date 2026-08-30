@@ -97,10 +97,13 @@ class TestReconcileLoggingLevels(LevelsTestBase):
         self.assertIsNotNone(row.last_sync_at)
 
     def test_full_device_reconcile_uses_the_logging_mutation_plan(self):
-        from netbox_nso_plugin.reconcile import reconcile_device
+        from netbox_nso_plugin.reconcile import _LeaseOutcome, reconcile_device
 
         payload = self._payload(local_levels=_LEVELS_PAYLOAD)
-        with patch("netbox_nso_plugin.adapter_client.get_logging_config", return_value=payload):
+        with (
+            patch("netbox_nso_plugin.reconcile._acquire_reconcile_lease", return_value=_LeaseOutcome()),
+            patch("netbox_nso_plugin.adapter_client.get_logging_config", return_value=payload),
+        ):
             result = reconcile_device(self.device, self.mgmt)
 
         row = result["logging_data"]["local_levels"]

@@ -9,6 +9,8 @@ destination scope resolved + route-map linked. Uses an IS-IS destination
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Platform, Site
 from django.test import TestCase
 
@@ -76,6 +78,25 @@ class TestReconcileRedistribution(TestCase):
         self.assertEqual(r.route_map_id, rm.pk)
         self.assertEqual(r.metric, 10)
         self.assertEqual(r.metric_type, "external")
+
+    def test_category_reconcile_declares_its_native_and_overlay_writes(self):
+        management = self._make_mgmt()
+        from netbox_routing.models import ISISInstance, Redistribution
+
+        ISISInstance.objects.create(device=self.device, process_tag="")
+        from netbox_nso_plugin.models import NSORedistributionState
+        from netbox_nso_plugin.reconcile import _LeaseOutcome, reconcile_category
+
+        payload = {"entries": [self._entry(metric=10)]}
+        with (
+            patch("netbox_nso_plugin.reconcile._acquire_reconcile_lease", return_value=_LeaseOutcome()),
+            patch("netbox_nso_plugin.adapter_client.get_redistribution", return_value=payload),
+        ):
+            result = reconcile_category(self.device, management, "redistribution")
+
+        self.assertEqual(result["redistribution_states"][0].status, "imported")
+        self.assertEqual(NSORedistributionState.objects.filter(management=management).count(), 1)
+        self.assertEqual(Redistribution.objects.filter(source_protocol="static").count(), 1)
 
     def test_missing_destination_stays_imported(self):
         """No matching ISISInstance → no Redistribution created, status=imported."""

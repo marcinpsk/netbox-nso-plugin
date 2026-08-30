@@ -77,19 +77,14 @@ def _route(prefix, next_hop, *, vrf=None, metric=1, devices=()):
 
 def _assign_without_push(route, *devices):
     """Assign a brownfield route through its exact suppressed content footprint."""
-    from netbox_nso_plugin.intent_state import MutationFootprint, SourceRow, intent_transaction
-    from netbox_nso_plugin.models import NSODeviceManagement
+    from netbox_nso_plugin.intent_state import _static_route_devices_footprint, intent_transaction
     from netbox_nso_plugin.signals import suppress_intent_push
 
-    device_ids = {device.pk for device in devices}
-    managed_ids = set(NSODeviceManagement.objects.filter(device_id__in=device_ids).values_list("device_id", flat=True))
-    footprint = MutationFootprint.for_keys(
-        {(device_id, "static_route") for device_id in managed_ids},
-        source_rows=(
-            SourceRow("netbox_routing.staticroute", route.pk),
-            SourceRow("netbox_routing.staticroute_devices", None),
-        ),
-        overlay_rows=(SourceRow("netbox_nso_plugin.nsostaticroutestate", None),),
+    footprint = _static_route_devices_footprint(
+        route,
+        "pre_add",
+        {device.pk for device in devices},
+        False,
     )
     with suppress_intent_push(), intent_transaction(footprint):
         route.devices.add(*devices)

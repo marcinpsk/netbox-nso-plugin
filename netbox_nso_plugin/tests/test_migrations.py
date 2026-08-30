@@ -204,3 +204,49 @@ class TestApplyIdentityMigration(_CascadeFlushMixin, TransactionTestCase):
         self.assertEqual(row.status, "accepted")
         self.assertIsNone(row.apply_attempt_id)
         self.assertEqual(row.last_apply_error, "")
+
+    def test_auto_assigned_rows_keep_their_cleanup_shape(self):
+        from dcim.models import Interface
+        from ipam.models import Prefix
+
+        from netbox_nso_plugin.intent_state import offline_mutation
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        from ._outbox_case import make_managed
+
+        device, _management = make_managed("allocation-kind-migration", 1627)
+        interface = Interface.objects.create(device=device, name="Ethernet1", type="1000base-t")
+        pool = Prefix.objects.create(prefix="198.18.96.0/24")
+        with transaction.atomic(), offline_mutation():
+            single = NSOInterfaceIPState.objects.create(
+                interface=interface,
+                address="198.18.96.1/32",
+                auto_assigned=True,
+                source_pool=pool,
+            )
+            peer = NSOInterfaceIPState.objects.create(
+                interface=interface,
+                address="198.18.96.2/31",
+                auto_assigned=True,
+                source_pool=pool,
+            )
+            point_to_point = NSOInterfaceIPState.objects.create(
+                interface=interface,
+                address="198.18.96.3/31",
+                auto_assigned=True,
+                source_pool=pool,
+                peer_state=peer,
+            )
+            peer.peer_state = point_to_point
+            peer.save(update_fields=["peer_state"])
+        self.addCleanup(self._migrate_to_leaves)
+
+        self._migrate(PRE_APPLY_IDENTITY)
+        self._migrate(APPLY_IDENTITY)
+
+        single.refresh_from_db()
+        peer.refresh_from_db()
+        point_to_point.refresh_from_db()
+        self.assertEqual(single.allocation_kind, NSOInterfaceIPState.ALLOCATION_KIND_SINGLE)
+        self.assertEqual(peer.allocation_kind, NSOInterfaceIPState.ALLOCATION_KIND_P2P)
+        self.assertEqual(point_to_point.allocation_kind, NSOInterfaceIPState.ALLOCATION_KIND_P2P)

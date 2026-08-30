@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -177,6 +178,39 @@ class TestAttemptSettlement(TestCase):
         second.refresh_from_db()
         self.assertEqual(first.status, "deploying")
         self.assertEqual(second.status, "deploying")
+
+    def test_an_aged_settled_row_uses_missing_readback_not_the_scope_counter(self):
+        from netbox_nso_plugin.apply_settlement import settle_apply_attempts
+        from netbox_nso_plugin.reconcile import _stuck_deploying_grace
+
+        attempt_id, unidentified_attempt_id = uuid4(), uuid4()
+        identified = self._vlan_row(1637, attempt_id)
+        unidentified = self._vlan_row(1638, unidentified_attempt_id)
+        self._local_attempt(attempt_id, 74, {"vlan": 504})
+        result = {"vlan_count_by_outcome": {"apply_failed": 1}}
+        evidence = _attempt(
+            attempt_id,
+            self.adapter_device_id,
+            74,
+            {"vlan": 504},
+            "settled",
+            result=result,
+        )
+        evidence["generations"][0]["updated_at"] = (
+            timezone.now() - _stuck_deploying_grace() - timedelta(seconds=1)
+        ).isoformat()
+
+        settle_apply_attempts(
+            self.management,
+            _payload(self.adapter_device_id, [evidence]),
+            static_route_feed_drained=True,
+        )
+
+        identified.refresh_from_db()
+        unidentified.refresh_from_db()
+        self.assertEqual(identified.status, "apply_failed")
+        self.assertIn("later device reads did not show this value", identified.last_apply_error)
+        self.assertEqual(unidentified.status, "deploying")
 
     def test_generation_timestamps_accept_whole_and_fractional_seconds(self):
         from netbox_nso_plugin.apply_settlement import _parse_time
