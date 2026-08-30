@@ -4,8 +4,8 @@
 
 Every timestamp in every adapter API response matches ``^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?Z$``
 — strict UTC, trailing ``Z``, optional fractional seconds. Four plugin sites turn those strings
-back into datetimes, and each one silently degrades rather than failing loudly when the parse
-misses: the job clock (``reconcile._parse_adapter_ts``) stops the stuck-deploying escalation,
+back into datetimes, and each one validates or degrades according to its consumer. The Apply
+settlement clock (``apply_settlement._parse_time``) stops the stuck-deploying escalation,
 the interface tab (``template_content``) blanks ``last_apply_at``, the read gate
 (``read_gate._parse_dt``) nulls ``incarnation_born`` — which is never-null on the wire and is
 what orders incarnation adoption, so a null fails the gate closed — and the sync mirror

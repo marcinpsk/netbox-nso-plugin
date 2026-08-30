@@ -95,6 +95,7 @@ class TestIntentPushRejectionRecord(IntentPushResetMixin, TestCase):
 
         model_fields = {field.name for field in NSODeviceManagement._meta.concrete_fields}
 
+        self.assertTrue(_MANAGEMENT_MIRROR_FIELDS)
         self.assertLessEqual(_MANAGEMENT_MIRROR_FIELDS, model_fields)
 
     @classmethod

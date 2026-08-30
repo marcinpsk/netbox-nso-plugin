@@ -910,18 +910,18 @@ def gated_family_run(
         return GateResult(SKIPPED_STALE_ATTEMPT)
     from .models import NSODeviceManagement, NSOFamilyReadState
 
-    scopes = _INTENT_SCOPES_BY_READ_FAMILY.get(family, (family,))
-    plan = pre_body() if pre_body is not None else None
-    if plan is None:
-        from .intent_state import MutationFootprint, ReconcileMutationPlan
-
-        plan = ReconcileMutationPlan(MutationFootprint.for_keys({(mgmt.device_id, scope) for scope in scopes}))
-    else:
-        from .intent_state import MutationFootprint, ReconcileMutationPlan
-
-        if isinstance(plan, MutationFootprint):
-            plan = ReconcileMutationPlan(plan)
     try:
+        scopes = _INTENT_SCOPES_BY_READ_FAMILY.get(family, (family,))
+        plan = pre_body() if pre_body is not None else None
+        if plan is None:
+            from .intent_state import MutationFootprint, ReconcileMutationPlan
+
+            plan = ReconcileMutationPlan(MutationFootprint.for_keys({(mgmt.device_id, scope) for scope in scopes}))
+        else:
+            from .intent_state import MutationFootprint, ReconcileMutationPlan
+
+            if isinstance(plan, MutationFootprint):
+                plan = ReconcileMutationPlan(plan)
         from .intent_state import reconcile_transaction
 
         with reconcile_transaction(plan):

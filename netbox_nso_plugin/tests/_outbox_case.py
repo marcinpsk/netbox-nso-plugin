@@ -103,6 +103,7 @@ def content_bulk_update(instance, **values):
         type(instance).objects.filter(pk=instance.pk).update(**values)
     for field_name, value in values.items():
         setattr(instance, field_name, value)
+    return type(instance).objects.get(pk=instance.pk)
 
 
 def own_vlan(mgmt, vid: int, tag: str):

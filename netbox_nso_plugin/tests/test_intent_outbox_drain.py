@@ -525,6 +525,7 @@ class TestOutOfOrderCommitVisibility(_DrainCase):
         claimant = threading.Thread(target=claim)
         claimant.start()
         self.addCleanup(claimant.join, 30)
+        self.addCleanup(release.set)
         assert not claim_done.wait(timeout=0.2), "the claim bypassed the open revision mutation"
 
         release.set()

@@ -182,6 +182,7 @@ class TestTheFoldAndTheRenderShareOneSnapshot(_ConcurrencyCase):
             remover = threading.Thread(target=remove)
             remover.start()
             self.addCleanup(remover.join, 30)
+            self.addCleanup(release_render.set)
             assert not removal_done.wait(timeout=0.2), "the deletion bypassed the claim's footprint lock"
 
             release_render.set()

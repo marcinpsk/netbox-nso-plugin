@@ -1105,6 +1105,79 @@ def route_policy_reconcile_footprint(device, payload: dict):
     return route_policy_footprint(groups, device_ids=(device.pk,))
 
 
+def _route_policy_group_changes_content(management, family: str, name: str, captured: dict) -> bool:
+    """Predict whether one MASTER group will write materialized policy content."""
+    from netbox_routing.models import ASPathEntry, CommunityListEntry, PrefixListEntry, RouteMapEntry
+
+    from .models import NSORoutePolicyState
+
+    if _group_mode(family, name) == "local":
+        return False
+    model = _family_model(family)
+    obj = model.objects.filter(name__iexact=name).first()
+    if obj is None:
+        return True
+
+    entries_hash = ownership.hash_captured(family, captured)
+    state = NSORoutePolicyState.objects.filter(
+        management=management,
+        family=family,
+        object_name__iexact=name,
+    ).first()
+    if state is None:
+        canonical = ownership.canonical_hash(NSORoutePolicyState, family, name)
+        can_fill = canonical is None or canonical == entries_hash
+    else:
+        diverged = _row_diverged(state, entries_hash, family, name)
+        if diverged and _owner_can_refresh(state):
+            return True
+        can_fill = not diverged
+    if not can_fill:
+        return False
+
+    if family == "prefix_list":
+        family_changed = captured.get("family") in (4, 6) and obj.family != captured["family"]
+        return (
+            family_changed or bool(_entries(captured)) and not PrefixListEntry.objects.filter(prefix_list=obj).exists()
+        )
+    if family == "community_list":
+        invert_changed = obj.invert_match != bool(captured.get("invert_match", False))
+        return (
+            invert_changed
+            or bool(_entries(captured))
+            and not CommunityListEntry.objects.filter(community_list=obj).exists()
+        )
+    if family == "as_path":
+        return bool(_entries(captured)) and not ASPathEntry.objects.filter(aspath=obj).exists()
+    if family == "route_map":
+        return bool(_entries(captured)) and not RouteMapEntry.objects.filter(route_map=obj).exists()
+    return False
+
+
+def route_policy_reconcile_plan(device, payload: dict):
+    """Declare the route-policy footprint and any materialized-content write."""
+    from .intent_state import ReconcileMutationPlan
+    from .models import NSODeviceManagement
+
+    footprint = route_policy_reconcile_footprint(device, payload)
+    management = NSODeviceManagement.objects.filter(device=device).first()
+    if management is None:
+        return ReconcileMutationPlan(footprint)
+    family_payload_keys = {
+        "prefix_list": "prefix_lists",
+        "community_list": "community_lists",
+        "as_path": "as_paths",
+        "route_map": "route_maps",
+    }
+    changes_content = any(
+        _route_policy_group_changes_content(management, family, row["name"], row)
+        for family, key in family_payload_keys.items()
+        for row in payload.get(key) or []
+        if isinstance(row, dict) and row.get("name")
+    )
+    return ReconcileMutationPlan(footprint, changes_content=changes_content)
+
+
 def _reconcile_route_policy(device, payload: dict) -> list:
     from django.contrib.contenttypes.models import ContentType
     from django.utils import timezone

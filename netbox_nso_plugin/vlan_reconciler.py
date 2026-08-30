@@ -66,6 +66,11 @@ def is_placeholder_vlan_name(row) -> bool:
     return not row.device_name and row.vlan is not None and row.vlan.name == placeholder_vlan_name(row.vlan.vid)
 
 
+def vlan_name_matches(row) -> bool:
+    """Return whether the NetBox name matches this row's device observation."""
+    return row.vlan.name == row.device_name if row.device_name else is_placeholder_vlan_name(row)
+
+
 def rendered_vlan_name(row) -> str:
     """Return the VLAN name emitted by the owned-intent snapshot."""
     return "" if is_placeholder_vlan_name(row) else (row.vlan.name or "")
@@ -531,11 +536,9 @@ def _reconcile_vlan_database(device, payload: dict) -> list:
         state, _ = NSOVLANState.objects.get_or_create(management=management, vlan=vlan)
         state.last_sync_at = now
         state.device_name = name  # mirror the device value for drift display
-        # Value overlay: the editable value is the VLAN name. A device with no name
-        # has nothing to drift against, so treat that as a match. The unified machine
-        # then settles owned→in_sync (or re-pends to accepted) and rests unowned at
-        # imported (or changed on a real rename divergence).
-        matches = (not name) or vlan.name == name
+        # Value overlay: the editable value is the VLAN name. A nameless device VLAN
+        # matches only its untouched placeholder. An operator rename remains pending.
+        matches = vlan_name_matches(state)
         state.status = sm.on_reconcile(state.status, matches=matches)
         state.save()
         rows.append(state)

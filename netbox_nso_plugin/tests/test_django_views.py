@@ -4719,6 +4719,7 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual((bundle.status, edited_state.status, sibling_state.status), ("accepted",) * 3)
 
     def test_edit_shared_vlan_name_updates_native_object_and_owns_every_attached_device(self):
+        from django.utils import timezone
         from ipam.models import VLAN, VLANGroup
 
         from netbox_nso_plugin.models import NSOVLANState
@@ -4729,7 +4730,9 @@ class TestOverlayFieldEditView(ViewTestBase):
             management=self.mgmt,
             vlan=vlan,
             device_name="OLD-NAME",
-            status="imported",
+            status="deploying",
+            accepted_at=timezone.now(),
+            apply_attempt_id=uuid4(),
         )
         other_device = Device.objects.create(
             name="view-router-vlan-02",
@@ -4757,6 +4760,7 @@ class TestOverlayFieldEditView(ViewTestBase):
         second.refresh_from_db()
         self.assertEqual(vlan.name, "CUSTOMER-A")
         self.assertEqual((first.status, second.status), ("accepted", "accepted"))
+        self.assertIsNone(first.apply_attempt_id)
         self.assertIsNotNone(first.accepted_at)
         self.assertIsNotNone(second.accepted_at)
 
@@ -4793,6 +4797,7 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertFalse(VLAN.objects.filter(name="UNSAVED-NAME").exists())
 
     def test_edit_svi_vrf_takes_ownership_without_changing_structural_identity(self):
+        from django.utils import timezone
         from ipam.models import VLAN, VLANGroup
 
         from netbox_nso_plugin.models import NSOSVIState
@@ -4806,7 +4811,9 @@ class TestOverlayFieldEditView(ViewTestBase):
             vlan=vlan,
             svi_type="svi",
             vrf="OLD-VRF",
-            status="imported",
+            status="deploying",
+            accepted_at=timezone.now(),
+            apply_attempt_id=uuid4(),
         )
 
         response = self.client.post(self._url("svi", state.pk), {"vrf": "CUSTOMER"})
@@ -4815,6 +4822,7 @@ class TestOverlayFieldEditView(ViewTestBase):
         state.refresh_from_db()
         self.assertEqual(state.vrf, "CUSTOMER")
         self.assertEqual(state.status, "accepted")
+        self.assertIsNone(state.apply_attempt_id)
         self.assertIsNotNone(state.accepted_at)
         self.assertEqual(state.interface_id, interface.pk)
         self.assertEqual(state.vlan_id, vlan.pk)
@@ -4977,7 +4985,7 @@ class TestOverlayFieldEditView(ViewTestBase):
     def test_edit_vlan_name_reports_a_collision_created_after_validation(self):
         from ipam.models import VLAN, VLANGroup
 
-        from netbox_nso_plugin import apply_state
+        from netbox_nso_plugin import intent_state
         from netbox_nso_plugin.models import NSOVLANState
 
         group = VLANGroup.objects.create(name="Raced Inline VLANs", slug="raced-inline-vlans")
@@ -4988,14 +4996,14 @@ class TestOverlayFieldEditView(ViewTestBase):
             device_name="KEEP-NAME",
             status="imported",
         )
-        original_lock = apply_state.lock_vlan_intent_rows
+        original_footprint = intent_state.vlan_footprint
 
-        def lock_then_collide(vlan_id, scopes):
-            result = original_lock(vlan_id, scopes)
+        def resolve_then_collide(vlan_id, scopes, **kwargs):
+            result = original_footprint(vlan_id, scopes, **kwargs)
             VLAN.objects.create(group=group, vid=125, name="RACED-NAME")
             return result
 
-        with patch("netbox_nso_plugin.apply_state.lock_vlan_intent_rows", side_effect=lock_then_collide):
+        with patch("netbox_nso_plugin.intent_state.vlan_footprint", side_effect=resolve_then_collide):
             response = self.client.post(self._url("vlan_name", state.pk), {"name": "RACED-NAME"})
 
         self.assertEqual(response.status_code, 400, response.content)
@@ -6348,3 +6356,22 @@ class TestReviewRegressionPins(ViewTestBase):
             NSORedistributionBulkAcceptView()._push(self.mgmt)
 
         schedule.assert_called_once_with((self.device.pk, "bgp"))
+
+    def test_routing_bulk_accept_stamps_first_ownership_time(self):
+        from netbox_nso_plugin.models import NSORedistributionState
+
+        row = NSORedistributionState.objects.create(
+            management=self.mgmt,
+            dest_protocol="bgp",
+            source_protocol="static",
+            status="changed",
+        )
+
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:routing_bulk_accept_redistribution", args=[self.device.pk])
+        )
+
+        self.assertEqual(response.status_code, 302)
+        row.refresh_from_db()
+        self.assertEqual(row.status, "accepted")
+        self.assertIsNotNone(row.accepted_at)

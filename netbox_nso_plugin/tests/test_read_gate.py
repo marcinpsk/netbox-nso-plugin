@@ -327,6 +327,22 @@ class TestGateTransitions(TestCase):
         self.assertIsNone(row.applied_attempt_id)
         self.assertNotEqual(row.publication_sequence, row.applied_publication_sequence)
 
+    def test_plan_failure_carries_the_publication_guard(self):
+        from netbox_nso_plugin.read_gate import gated_family_run
+
+        boom = RuntimeError("plan failed")
+        with self.assertRaises(RuntimeError) as raised:
+            gated_family_run(
+                self.mgmt,
+                "bfd",
+                _rs(attempt_id=8),
+                _Recorder(),
+                epoch=self.epoch,
+                pre_body=lambda: (_ for _ in ()).throw(boom),
+            )
+
+        self.assertEqual(raised.exception._nso_publication_guard[0], "bfd")
+
     def test_late_synthesized_null_loses(self):
         self._run(_rs(attempt_id=5))
         from netbox_nso_plugin.read_gate import SKIPPED_STALE_ATTEMPT

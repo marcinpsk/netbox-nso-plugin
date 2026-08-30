@@ -4319,6 +4319,18 @@ def _owned_overlay_edit_footprint(obj, key):
     return MutationFootprint.merge(*footprints)
 
 
+def _clear_apply_attempt(obj, update_fields) -> None:
+    """Clear a stale deployment fence when this overlay supports one."""
+    from django.core.exceptions import FieldDoesNotExist
+
+    try:
+        obj._meta.get_field("apply_attempt_id")
+    except FieldDoesNotExist:
+        return
+    obj.apply_attempt_id = None
+    update_fields.add("apply_attempt_id")
+
+
 def _save_owned_overlay_edit(obj, key, old_values):
     """Claim an edited overlay and update its matching native NetBox object atomically."""
     from . import status_machine as sm
@@ -4359,6 +4371,7 @@ def _save_owned_overlay_edit(obj, key, old_values):
             if hasattr(obj, field_name) and getattr(obj, field_name) != old_value
         }
         update_fields.add("status")
+        _clear_apply_attempt(obj, update_fields)
         if obj.accepted_at is not None:
             update_fields.add("accepted_at")
         obj.save(update_fields=update_fields)
@@ -4597,7 +4610,7 @@ def _save_vlan_name_edit(obj):
     from .intent_state import intent_transaction, vlan_footprint
     from .models import NSOVLANState
     from .signals import suppress_intent_push
-    from .vlan_reconciler import is_placeholder_vlan_name
+    from .vlan_reconciler import vlan_name_matches
 
     desired_name = obj.vlan.name
     footprint = vlan_footprint(obj.vlan_id, ("vlan",))
@@ -4624,14 +4637,17 @@ def _save_vlan_name_edit(obj):
         now = timezone.now()
         for state in states:
             state.vlan = vlan
+            was_deploying = state.status == "deploying"
             if not sm.is_owned(state.status):
                 state.accepted_at = now
-            matches = state.device_name == vlan.name if state.device_name else is_placeholder_vlan_name(state)
+            matches = vlan_name_matches(state)
             state.status = (
                 sm.on_operator_edit(state.status)
                 if state.status == "deploying"
                 else ("in_sync" if matches else "accepted")
             )
+            if was_deploying:
+                state.apply_attempt_id = None
             state.save()
     return None
 
@@ -6118,10 +6134,15 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
             current = list(self.model_class.objects.filter(pk__in=[row.pk for row in candidates]).order_by("pk"))
             drift_pks = [row.pk for row in current if row.status in {"changed", "conflict"}]
             accepted = [row for row in current if row.status in {"imported", "changed", "conflict"}]
+            now = timezone.now()
             with suppress_intent_push():
                 for row in accepted:
                     row.status = "in_sync" if row.status == "imported" else "accepted"
-                    row.save(update_fields=["status"])
+                    update_fields = ["status"]
+                    if row.accepted_at is None:
+                        row.accepted_at = now
+                        update_fields.append("accepted_at")
+                    row.save(update_fields=update_fields)
             count = len(accepted)
             if count and mgmt.adapter_device_id is not None:
                 self._after_accept(mgmt, drift_pks)

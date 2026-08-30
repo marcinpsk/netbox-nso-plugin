@@ -35,7 +35,7 @@ def svi_reconcile_plan(device, payload: dict):
     vids = vlan_ids_for_dependency_lock(items)
 
     interfaces = tuple(Interface.objects.filter(device=device).order_by("pk"))
-    states = tuple(NSOSVIState.objects.filter(management=management).order_by("pk"))
+    states = tuple(NSOSVIState.objects.filter(management=management).select_related("interface").order_by("pk"))
     vlan_ids = {state.vlan_id for state in states if state.vlan_id is not None}
     vlan_ids.update(VLAN.objects.filter(group__slug=f"nso-{device.pk}", vid__in=vids).values_list("pk", flat=True))
     reported = {item.get("interface_name") for item in items if isinstance(item, dict) and item.get("interface_name")}

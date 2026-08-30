@@ -292,13 +292,15 @@ _CATEGORY_RECONCILE_FAMILIES: dict[str, tuple[str, ...]] = {
     "l2_services": ("l2_service",),
 }
 
+_PRE_ROUTE_POLICY_EVIDENCE = "_pre_route_policy_deployment_evidence"
+
 
 def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
     """Reconcile each opted-in routing protocol into *ctx* (gated by kill-switches)."""
     from .bfd_reconciler import reconcile_bfd
     from .bgp_reconciler import _reconcile_bgp_config
     from .redistribution_reconciler import reconcile_redistribution
-    from .route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_footprint
+    from .route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
     from .template_content import (
         _reconcile_isis_interfaces,
         _reconcile_isis_process,
@@ -349,6 +351,19 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
 
         _gated(ctx, mgmt, "isis", isis_payload, _isis_body, epoch=dev_id)
     if mgmt.manage_route_policy:
+        from .apply_settlement import load_deployment_evidence
+
+        try:
+            evidence = load_deployment_evidence(mgmt)
+        except Exception as exc:  # noqa: BLE001 — settlement remains best-effort
+            logger.warning(
+                "nso reconcile: pre-route-policy evidence failed for device %s: %s",
+                device.pk,
+                exc,
+            )
+        else:
+            if evidence is not None:
+                ctx[_PRE_ROUTE_POLICY_EVIDENCE] = evidence
         rp_doc = client.get_route_policy(dev_id)
         _gated(
             ctx,
@@ -359,7 +374,7 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
                 ctx, "route_policy_states", mgmt, ("NSORoutePolicyState",), reconcile_route_policy, device, rp_doc
             ),
             epoch=dev_id,
-            pre_body=lambda: route_policy_reconcile_footprint(device, rp_doc),
+            pre_body=lambda: route_policy_reconcile_plan(device, rp_doc),
         )
     if mgmt.manage_ospf:
         ospf_doc = client.get_ospf(dev_id)
@@ -700,7 +715,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
     from . import adapter_client as client
     from .bgp_reconciler import _reconcile_bgp_config
     from .redistribution_reconciler import reconcile_redistribution
-    from .route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_footprint
+    from .route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
     from .signals import suppress_intent_push
     from .template_content import (
         _reconcile_interface_ips,
@@ -1108,7 +1123,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_route_policy(device, rp_doc),
                 epoch=dev_id,
                 ctx_key="route_policy_states",
-                pre_body=lambda: route_policy_reconcile_footprint(device, rp_doc),
+                pre_body=lambda: route_policy_reconcile_plan(device, rp_doc),
             )
         elif key == "redistribution":
             redist_doc = client.get_redistribution(dev_id)
@@ -1363,12 +1378,24 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
                 # first status flip's push-on-save signal refuses (no writer transaction) and
                 # takes the rest of Step 4 with it.
                 with suppress_intent_push():
-                    from .apply_settlement import latest_route_policy_carrier, settle_device_apply_attempts
-
-                    evidence = settle_device_apply_attempts(
-                        mgmt,
-                        static_route_feed_drained=static_route_feed_drained,
+                    from .apply_settlement import (
+                        latest_route_policy_carrier,
+                        settle_apply_attempts,
+                        settle_device_apply_attempts,
                     )
+
+                    evidence = ctx.get(_PRE_ROUTE_POLICY_EVIDENCE)
+                    if isinstance(evidence, dict) and evidence.get("device_id") == mgmt.adapter_device_id:
+                        settle_apply_attempts(
+                            mgmt,
+                            evidence,
+                            static_route_feed_drained=static_route_feed_drained,
+                        )
+                    else:
+                        evidence = settle_device_apply_attempts(
+                            mgmt,
+                            static_route_feed_drained=static_route_feed_drained,
+                        )
                     _journal_route_policy_apply(mgmt, latest_route_policy_carrier(evidence))
     except Exception as exc:  # noqa: BLE001 — settling is best-effort, never crash the worker
         logger.warning("nso reconcile: apply-failure settle skipped for device %s: %s", device_id, exc)

@@ -838,11 +838,17 @@ def _update_management_mirror(instance, **values):
 
     fields = set(values)
     with transaction.atomic():
-        current = type(instance).objects.get(pk=instance.pk)
+        current = type(instance).objects.filter(pk=instance.pk).first()
+        if current is None:
+            return
         for field_name, value in values.items():
             setattr(current, field_name, value)
-        with suppress_intent_push(), mirror_refresh(current, fields):
-            current.save(update_fields=fields)
+        with suppress_intent_push(), mirror_refresh(current, fields) as locked:
+            if locked is None:
+                return
+            for field_name, value in values.items():
+                setattr(locked, field_name, value)
+            locked.save(update_fields=fields)
     for field_name, value in values.items():
         setattr(instance, field_name, value)
 
@@ -1171,6 +1177,8 @@ def _repend_intent_on_interface_rename(sender, instance, created, **kwargs):
     from .models import NSODeviceManagement
 
     targets = getattr(instance, "_intent_rename_targets", set())
+    if not targets:
+        return
     with suppress_intent_push():
         for state in interface_name_intent_rows(instance.pk):
             if not sm.is_owned(state.status):
@@ -1444,6 +1452,8 @@ def _drop_unpushable_snmp_rows(rows, blocker):
                 if row.status == "error":
                     continue
                 with mirror_refresh(row, {"status"}) as locked:
+                    if locked is None:
+                        continue
                     locked.status = "error"
                     locked.save(update_fields=["status"])
     return pushable
@@ -3535,6 +3545,8 @@ def _store_unsupported_members(owned_rows, resp) -> None:
             members = unsupported.get(row.object_name, []) if row.family == "community_list" else []
             if list(row.unsupported_members or []) != list(members):
                 with mirror_refresh(row, {"unsupported_members"}) as locked:
+                    if locked is None:
+                        continue
                     locked.unsupported_members = members
                     locked.save(update_fields=["unsupported_members"])
 

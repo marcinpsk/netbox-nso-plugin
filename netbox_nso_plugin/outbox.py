@@ -361,14 +361,17 @@ def bump_intent_revision(device_id: int, scope: str) -> int:
     """Advance one delivery scope's durable content revision."""
     from django.db import connection
 
+    from .models import NSOIntentRevision
+
     if not connection.in_atomic_block:
         raise RuntimeError("an intent revision must be bumped inside the writer's own transaction")
+    table = connection.ops.quote_name(NSOIntentRevision._meta.db_table)
     with connection.cursor() as cursor:
         cursor.execute(
-            "INSERT INTO netbox_nso_plugin_nsointentrevision "
+            f"INSERT INTO {table} "
             "(device_id, scope, revision, updated_at) VALUES (%s, %s, 1, NOW()) "
             "ON CONFLICT (device_id, scope) DO UPDATE SET "
-            "revision = netbox_nso_plugin_nsointentrevision.revision + 1, updated_at = NOW() "
+            f"revision = {table}.revision + 1, updated_at = NOW() "
             "RETURNING revision",
             [device_id, scope],
         )

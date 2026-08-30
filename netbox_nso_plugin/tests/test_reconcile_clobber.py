@@ -167,6 +167,8 @@ class _ClobberBarrierCase(IntentPushResetMixin, _CascadeFlushMixin, TransactionT
 
         backfill = threading.Thread(target=_run_backfill)
         backfill.start()
+        self.addCleanup(backfill.join, 30)
+        self.addCleanup(release.set)
         assert backfill_started.wait(timeout=30)
         assert not backfill_done.wait(timeout=0.2), "the backfill bypassed the reconciler's footprint lock"
         release.set()

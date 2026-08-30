@@ -327,8 +327,11 @@ def settle_apply_attempts(management, deployment_evidence, *, static_route_feed_
                 continue
             for field_name, value in fields.items():
                 setattr(current, field_name, value)
-            with suppress_intent_push(), mirror_refresh(current, fields):
-                current.save(update_fields=fields)
+            with suppress_intent_push(), mirror_refresh(current, fields) as locked:
+                if locked is not None:
+                    for field_name, value in fields.items():
+                        setattr(locked, field_name, value)
+                    locked.save(update_fields=fields)
 
     for attempt_id, evidence in validated.items():
         local = local_attempts[attempt_id]
@@ -428,8 +431,20 @@ def settle_device_apply_attempts(management, *, static_route_feed_drained: bool)
 def latest_route_policy_carrier(deployment_evidence):
     """Return the newest exact carrier snapshot that reports route-policy outcomes."""
     candidates = []
-    for attempt in (deployment_evidence or {}).get("attempts", []):
-        for generation in attempt.get("generations", []):
+    if not isinstance(deployment_evidence, dict):
+        return None
+    attempts = deployment_evidence.get("attempts", [])
+    if not isinstance(attempts, list):
+        return None
+    for attempt in attempts:
+        if not isinstance(attempt, dict):
+            continue
+        generations = attempt.get("generations", [])
+        if not isinstance(generations, list):
+            continue
+        for generation in generations:
+            if not isinstance(generation, dict) or not _positive_int(generation.get("seq")):
+                continue
             result = generation.get("carrier_job_result")
             if not isinstance(result, dict) or not isinstance(result.get("route_policy_count_by_outcome"), dict):
                 continue

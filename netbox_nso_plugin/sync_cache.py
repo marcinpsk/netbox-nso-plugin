@@ -48,11 +48,17 @@ def _mirror_management(mgmt, **values) -> None:
 
     fields = frozenset(values)
     with transaction.atomic():
-        current = NSODeviceManagement.objects.select_for_update(of=("self",)).get(pk=mgmt.pk)
+        current = NSODeviceManagement.objects.select_for_update(of=("self",)).filter(pk=mgmt.pk).first()
+        if current is None:
+            return
         for field_name, value in values.items():
             setattr(current, field_name, value)
-        with suppress_intent_push(), mirror_refresh(current, fields):
-            current.save(update_fields=fields)
+        with suppress_intent_push(), mirror_refresh(current, fields) as locked:
+            if locked is None:
+                return
+            for field_name, value in values.items():
+                setattr(locked, field_name, value)
+            locked.save(update_fields=fields)
     for field_name, value in values.items():
         setattr(mgmt, field_name, value)
 

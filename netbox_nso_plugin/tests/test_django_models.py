@@ -153,10 +153,12 @@ class TestNSOInstanceDefault(TestCase):
             ):
                 calls += 1
                 direction = "ASC" if calls == 1 else "DESC"
-                sql = sql.replace(
+                reordered = sql.replace(
                     f'ORDER BY "{NSOInstance._meta.db_table}"."name" ASC',
                     f'ORDER BY "{NSOInstance._meta.db_table}"."id" {direction}',
                 )
+                self.assertNotEqual(reordered, sql)
+                sql = reordered
             return execute(sql, params, many, context)
 
         with connection.execute_wrapper(alternate_order):

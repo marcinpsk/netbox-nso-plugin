@@ -152,10 +152,9 @@ class TestAttemptSettlement(TestCase):
     def test_an_aggregate_scope_failure_does_not_fail_unidentified_rows(self):
         from netbox_nso_plugin.apply_settlement import settle_apply_attempts
 
-        attempt_id = uuid4()
+        attempt_id, unidentified_attempt_id = uuid4(), uuid4()
         first = self._vlan_row(1633, attempt_id)
-        second = self._vlan_row(1634, attempt_id)
-        mirror_update(first, status="deploying", apply_attempt_id=attempt_id)
+        second = self._vlan_row(1634, unidentified_attempt_id)
         self._local_attempt(attempt_id, 73, {"vlan": 503})
         result = {"vlan_count_by_outcome": {"apply_failed": 1, "in_sync": 1}}
         evidence = _attempt(
@@ -178,6 +177,40 @@ class TestAttemptSettlement(TestCase):
         second.refresh_from_db()
         self.assertEqual(first.status, "deploying")
         self.assertEqual(second.status, "deploying")
+
+    def test_generation_timestamps_accept_whole_and_fractional_seconds(self):
+        from netbox_nso_plugin.apply_settlement import _parse_time
+
+        for value in ("2026-08-01T10:01:00Z", "2026-08-01T10:01:00.123456Z"):
+            with self.subTest(value=value):
+                self.assertEqual(_parse_time(value).utcoffset().total_seconds(), 0)
+
+    def test_latest_route_policy_carrier_ignores_malformed_attempt_shapes(self):
+        from netbox_nso_plugin.apply_settlement import latest_route_policy_carrier
+
+        result = {"route_policy_count_by_outcome": {"in_sync": 1}}
+        evidence = {
+            "attempts": [
+                None,
+                {"generations": None},
+                {"generations": [None, {"seq": True, "carrier_job_id": 91, "carrier_job_result": result}]},
+                {
+                    "generations": [
+                        {
+                            "seq": 7,
+                            "carrier_job_id": 92,
+                            "carrier_job_status": "succeeded",
+                            "carrier_job_result": result,
+                            "carrier_job_error": None,
+                            "updated_at": "2026-08-01T10:01:00Z",
+                        }
+                    ]
+                },
+            ]
+        }
+
+        self.assertEqual(latest_route_policy_carrier(evidence)["id"], 92)
+        self.assertIsNone(latest_route_policy_carrier({"attempts": {"invalid": "shape"}}))
 
     def test_unknown_evidence_replays_the_identical_request_and_normalizes_the_local_attempt(self):
         from netbox_nso_plugin.apply_settlement import load_deployment_evidence

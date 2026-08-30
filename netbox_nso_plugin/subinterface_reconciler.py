@@ -34,7 +34,9 @@ def subinterface_reconcile_plan(device, payload: dict):
     raw_items = payload.get("interfaces", []) if isinstance(payload, dict) else []
     items = raw_items if isinstance(raw_items, list) else []
     interfaces = tuple(Interface.objects.filter(device=device).order_by("pk"))
-    states = tuple(NSOSubinterfaceState.objects.filter(management=management).order_by("pk"))
+    states = tuple(
+        NSOSubinterfaceState.objects.filter(management=management).select_related("interface").order_by("pk")
+    )
     reported = {item.get("interface_name") for item in items if isinstance(item, dict) and item.get("interface_name")}
     changes_content = any(state.status == "in_sync" and state.interface.name not in reported for state in states)
     return ReconcileMutationPlan(
