@@ -100,7 +100,7 @@ class TestOwnershipManifestMaintenance(TestCase):
         from ._outbox_case import own_vlan
 
         state = own_vlan(self.management, 1701, "manifest-retired")
-        manifest = NSOOwnershipManifest.objects.get(device=self.device, scope="vlan")
+        manifest = NSOOwnershipManifest.objects.get(device_id=self.device.pk, scope="vlan")
         manifest.ownership_state = "retired"
         manifest.deletion_authority = False
         manifest.save(update_fields=("ownership_state", "deletion_authority"))
@@ -127,7 +127,7 @@ class TestOwnershipManifestMaintenance(TestCase):
                 own_vlan(management, 1710 + count * 10 + index, f"manifest-scale-{count}-{index}")
                 for index in range(count)
             ]
-            NSOOwnershipManifest.objects.filter(device=device, scope="vlan").delete()
+            NSOOwnershipManifest.objects.filter(device_id=device.pk, scope="vlan").delete()
 
             with CaptureQueriesContext(connection) as queries:
                 completed = ownership_planner.reconcile_scope_ownership(device.pk, {"vlan"})
