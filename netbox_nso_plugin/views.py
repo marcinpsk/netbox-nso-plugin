@@ -4475,9 +4475,14 @@ def _save_vlan_name_edit(obj):
             with transaction.atomic(), suppress_intent_push():
                 vlan.save(update_fields=["name"])
         except IntegrityError:
-            collision = type(vlan).objects.filter(group_id=vlan.group_id, name=desired_name).exclude(pk=vlan.pk)
+            from django.db.models import Q
+
+            collision_scope = Q(group_id=vlan.group_id)
+            if vlan.qinq_svlan_id is not None:
+                collision_scope |= Q(qinq_svlan_id=vlan.qinq_svlan_id)
+            collision = type(vlan).objects.filter(collision_scope, name=desired_name).exclude(pk=vlan.pk)
             if collision.exists():
-                return {"name": ["A VLAN with this name already exists in this group."]}
+                return {"name": ["A VLAN with this name already exists in this VLAN scope."]}
             raise
 
         now = timezone.now()

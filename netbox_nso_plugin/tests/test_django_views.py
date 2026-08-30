@@ -4933,6 +4933,51 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(vlan.name, "KEEP-NAME")
         self.assertEqual(state.status, "imported")
 
+    def test_edit_vlan_name_reports_a_qinq_collision_created_after_validation(self):
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin import apply_state
+        from netbox_nso_plugin.models import NSOVLANState
+
+        first_group = VLANGroup.objects.create(name="First Q-in-Q Group", slug="first-qinq-group")
+        second_group = VLANGroup.objects.create(name="Second Q-in-Q Group", slug="second-qinq-group")
+        service_vlan = VLAN.objects.create(vid=3000, name="SERVICE", qinq_role="svlan")
+        vlan = VLAN.objects.create(
+            group=first_group,
+            vid=121,
+            name="KEEP-NAME",
+            qinq_role="cvlan",
+            qinq_svlan=service_vlan,
+        )
+        state = NSOVLANState.objects.create(
+            management=self.mgmt,
+            vlan=vlan,
+            device_name="KEEP-NAME",
+            status="imported",
+        )
+        original_lock = apply_state.lock_vlan_intent_rows
+
+        def lock_then_collide(vlan_id, scopes):
+            result = original_lock(vlan_id, scopes)
+            VLAN.objects.create(
+                group=second_group,
+                vid=122,
+                name="TAKEN-NAME",
+                qinq_role="cvlan",
+                qinq_svlan=service_vlan,
+            )
+            return result
+
+        with patch("netbox_nso_plugin.apply_state.lock_vlan_intent_rows", side_effect=lock_then_collide):
+            response = self.client.post(self._url("vlan_name", state.pk), {"name": "TAKEN-NAME"})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("name", response.json()["errors"])
+        vlan.refresh_from_db()
+        state.refresh_from_db()
+        self.assertEqual(vlan.name, "KEEP-NAME")
+        self.assertEqual(state.status, "imported")
+
     def test_edit_vlan_name_reports_a_collision_created_after_validation(self):
         from ipam.models import VLAN, VLANGroup
 
