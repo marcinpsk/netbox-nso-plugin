@@ -1217,6 +1217,31 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
             == "retired"
         )
 
+    def test_cascade_retires_manifest_after_a_foreign_native_key_rename(self):
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.models import NSOOwnershipManifest
+        from netbox_nso_plugin.ownership_planner import maintain_manifest
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
+
+        _device, management = make_managed("writer-renamed-cascade", 16288)
+        route = StaticRoute.objects.create(prefix="198.18.88.0/24", next_hop="198.18.0.88", metric=1)
+        state = NSOStaticRouteState.objects.create(
+            management=management,
+            static_route=route,
+            status="accepted",
+        )
+        maintain_manifest(state)
+        manifest = NSOOwnershipManifest.objects.get(state_model_label=state._meta.label_lower)
+        StaticRoute.objects.filter(pk=route.pk).update(prefix="198.18.89.0/24")
+        plan = RendererMutationPlan.build(deletes=(planned_delete(management),))
+
+        with renderer_writes(plan) as writer:
+            writer.delete(management)
+
+        manifest.refresh_from_db()
+        self.assertEqual(manifest.ownership_state, "retired")
+
     def test_delete_authorizes_registered_collector_child_tables(self):
         from netbox_routing.models import Community, CommunityList, CommunityListEntry
 

@@ -673,12 +673,12 @@ def retire_overlay_manifest(instance) -> None:
     binding = manifest_binding(instance)
     if binding is None:
         return
-    _rule, scope, device_id, native_model_label, _native_id, native_key, state_model_label, state_key = binding
+    _rule, scope, device_id, native_model_label, native_id, _native_key, state_model_label, state_key = binding
     NSOOwnershipManifest.objects.filter(
         device_id=device_id,
         scope=scope,
         native_model_label=native_model_label,
-        native_key=native_key,
+        native_id=native_id,
         state_model_label=state_model_label,
         state_key=state_key,
         ownership_state="owned",
