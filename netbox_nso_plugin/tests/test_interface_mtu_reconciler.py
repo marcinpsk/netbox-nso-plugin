@@ -333,7 +333,7 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
         )
         self.assertTrue(
             NSOOwnershipManifest.objects.filter(
-                device=self.device,
+                device_id=self.device.pk,
                 scope="interface_mtu",
                 native_model_label="dcim.interface",
                 native_key={"device_id": self.po1.device_id, "name": self.po1.name},

@@ -103,7 +103,7 @@ class TestSnmpAcceptView(_SnmpBase):
             delivery.render("snmp", self.device.pk, mgmt.adapter_device_id).payload
         )
         assert NSOOwnershipManifest.objects.filter(
-            device=self.device,
+            device_id=self.device.pk,
             scope="snmp",
             native_model_label="netbox_nso_plugin.nsosnmpcommunitystate",
             native_key={"management_id": mgmt.pk, "pk": c.pk},

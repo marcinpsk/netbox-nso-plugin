@@ -479,7 +479,7 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
             delivery.render("bfd", self.device.pk, self.management.adapter_device_id).payload
         )
         assert NSOOwnershipManifest.objects.filter(
-            device=self.device,
+            device_id=self.device.pk,
             scope="bfd",
             native_model_label="dcim.interface",
             native_key={"device_id": self.iface.device_id, "name": self.iface.name},

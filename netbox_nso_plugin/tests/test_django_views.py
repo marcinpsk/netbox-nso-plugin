@@ -4408,7 +4408,7 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(self.interface.mtu, 9000)
         self.assertTrue(
             NSOOwnershipManifest.objects.filter(
-                device=self.device,
+                device_id=self.device.pk,
                 scope="interface_mtu",
                 native_model_label="dcim.interface",
                 native_key={"device_id": self.device.pk, "name": self.interface.name},
@@ -4552,7 +4552,7 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual((native.network_type, native.cost, native.passive), ("point-to-point", 25, True))
         self.assertTrue(
             NSOOwnershipManifest.objects.filter(
-                device=self.device,
+                device_id=self.device.pk,
                 scope="ospf",
                 native_model_label="netbox_routing.ospfinterface",
                 native_key={"interface_id": self.interface.pk},
@@ -4636,7 +4636,7 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(row.status, "accepted")
         self.assertTrue(
             NSOOwnershipManifest.objects.filter(
-                device=self.device,
+                device_id=self.device.pk,
                 scope="ospf",
                 native_model_label="netbox_routing.ospfinstance",
                 native_key={"device_id": self.device.pk, "process_id": "9"},
@@ -4704,7 +4704,7 @@ class TestOverlayFieldEditView(ViewTestBase):
         )
         self.assertTrue(
             NSOOwnershipManifest.objects.filter(
-                device=self.device,
+                device_id=self.device.pk,
                 scope="isis",
                 native_model_label="netbox_routing.isisinterface",
                 native_key={"interface_id": self.interface.pk, "address_family": "ipv4"},
@@ -4780,7 +4780,7 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(row.status, "accepted")
         self.assertTrue(
             NSOOwnershipManifest.objects.filter(
-                device=self.device,
+                device_id=self.device.pk,
                 scope="isis",
                 native_model_label="netbox_routing.isisinstance",
                 native_key={"device_id": self.device.pk, "process_tag": "CORE"},
