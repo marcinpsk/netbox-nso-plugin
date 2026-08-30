@@ -661,7 +661,7 @@ def maintain_manifest(instance) -> None:
         # instead of aborting the enclosing mirror transaction.
         recorded, created = NSOOwnershipManifest.objects.get_or_create(**identity, defaults=defaults)
         if not created:
-            NSOOwnershipManifest.objects.filter(pk=recorded.pk).update(**defaults)
+            NSOOwnershipManifest.objects.filter(pk=recorded.pk).exclude(ownership_state="retired").update(**defaults)
     else:
         NSOOwnershipManifest.objects.filter(**identity, ownership_state="owned").update(ownership_state="detached")
 
