@@ -84,6 +84,17 @@ class TestRendererBaselineCutover(_CascadeFlushMixin, IntentPushResetMixin, Tran
         self.assertIn("intent work remains quiesced", stderr.getvalue())
         self.assertTrue(is_quiesced())
 
+    def test_interrupt_reports_that_the_gate_remains_active(self):
+        from netbox_nso_plugin.deployment import is_quiesced
+
+        stderr = io.StringIO()
+        with patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                call_command("nso_renderer_baseline_cutover", stderr=stderr)
+
+        self.assertIn("intent work remains quiesced", stderr.getvalue())
+        self.assertTrue(is_quiesced())
+
     def test_a_baseline_that_never_stops_repairing_fails_and_stays_quiesced(self):
         """A device whose every audit still repairs has no trusted baseline to hand over."""
         from django.core.management.base import CommandError
