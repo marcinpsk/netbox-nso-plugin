@@ -272,29 +272,16 @@ class TestRoutePolicyApplyJournal(_RoutePolicyFixture):
             http_status=202,
             response=_response(mgmt.adapter_device_id, 82, waiting_selected),
         )
-        failed_selected = {"svi": 44}
-        NSOApplyAttempt.objects.create(
-            id=failed_attempt_id,
+        lost_response_attempt_id = uuid4()
+        lost_response_selected = {"ip": 43}
+        lost_response_attempt = NSOApplyAttempt.objects.create(
+            id=lost_response_attempt_id,
             management=mgmt,
             adapter_device_id=mgmt.adapter_device_id,
-            selected=failed_selected,
-            scope_revisions={"svi": 1},
-            http_status=202,
-            response=_response(mgmt.adapter_device_id, 83, failed_selected),
+            selected=lost_response_selected,
+            scope_revisions={"ip": 1},
         )
-        carrier_result = {
-            "route_policy_count_by_outcome": {"in_sync": 2, "apply_failed": 0},
-            "svi_count_by_outcome": {"in_sync": 2, "apply_failed": 0},
-        }
-        successful_evidence = _attempt(
-            attempt_id,
-            mgmt.adapter_device_id,
-            81,
-            selected,
-            "settled",
-            result=carrier_result,
-        )
-        successful_evidence["generations"][0]["updated_at"] = timezone.now().isoformat()
+        carrier_result = {"route_policy_count_by_outcome": {"in_sync": 1, "apply_failed": 0}}
         evidence_by_id = {
             attempt_id: successful_evidence,
             waiting_attempt_id: _attempt(
@@ -310,6 +297,13 @@ class TestRoutePolicyApplyJournal(_RoutePolicyFixture):
                 83,
                 failed_selected,
                 "failed",
+            ),
+            lost_response_attempt_id: _attempt(
+                lost_response_attempt_id,
+                mgmt.adapter_device_id,
+                83,
+                lost_response_selected,
+                "settled",
             ),
         }
         lease_held = False
@@ -349,25 +343,16 @@ class TestRoutePolicyApplyJournal(_RoutePolicyFixture):
             run_device_reconcile(self.device.pk)
 
         row.refresh_from_db()
-        successful_svi.refresh_from_db()
-        waiting_svi.refresh_from_db()
-        failed_svi.refresh_from_db()
+        vlan_row.refresh_from_db()
+        lost_response_attempt.refresh_from_db()
         mgmt.refresh_from_db()
         self.assertEqual(row.status, "in_sync")
-        self.assertEqual(successful_svi.status, "in_sync")
-        self.assertEqual(waiting_svi.status, "deploying")
-        self.assertEqual(waiting_svi.apply_attempt_id, waiting_attempt_id)
-        self.assertEqual(failed_svi.status, "apply_failed")
+        self.assertEqual(vlan_row.status, "apply_failed")
+        self.assertEqual(lost_response_attempt.http_status, 202)
         self.assertEqual(mgmt.last_journaled_apply_job, "981")
-        self.assertEqual(
-            fetch_evidence.call_args_list,
-            [
-                call(
-                    mgmt.adapter_device_id,
-                    tuple(sorted((attempt_id, waiting_attempt_id, failed_attempt_id), key=str)),
-                ),
-                call(mgmt.adapter_device_id, (waiting_attempt_id,)),
-            ],
+        fetch_evidence.assert_called_once_with(
+            mgmt.adapter_device_id,
+            tuple(sorted((attempt_id, unrelated_attempt_id, lost_response_attempt_id), key=str)),
         )
 
     def test_idempotent_same_job_does_not_duplicate(self):
