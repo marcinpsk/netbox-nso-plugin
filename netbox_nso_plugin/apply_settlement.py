@@ -195,13 +195,14 @@ def _failure_message(disposition, attempt_id, generation, scope):
     )
 
 
-def _load_attempts(management, deployment_evidence, rows_by_scope):
+def _load_attempts(management, deployment_evidence, rows_by_scope, required_attempt_ids=()):
     from .models import NSOApplyAttempt
 
     raw_attempts = deployment_evidence["attempts"]
     if not isinstance(raw_attempts, list) or not isinstance(deployment_evidence["unknown_apply_attempt_ids"], list):
         raise EvidenceInvariantError("deployment evidence attempt collections are invalid")
     attempt_ids = {row.apply_attempt_id for rows in rows_by_scope.values() for row in rows}
+    attempt_ids.update(required_attempt_ids)
     local_attempts = NSOApplyAttempt.objects.in_bulk(attempt_ids)
     validated = {}
     for raw in raw_attempts:
@@ -268,7 +269,13 @@ def _settlement_decisions(rows_by_scope, validated, unknown_ids, *, static_route
     return decisions
 
 
-def settle_apply_attempts(management, deployment_evidence, *, static_route_feed_drained: bool) -> None:
+def settle_apply_attempts(
+    management,
+    deployment_evidence,
+    *,
+    static_route_feed_drained: bool,
+    required_attempt_ids=(),
+) -> None:
     """Apply one validated evidence snapshot through UUID-fenced compare-and-set writes."""
     from django.db import transaction
 
@@ -286,7 +293,12 @@ def settle_apply_attempts(management, deployment_evidence, *, static_route_feed_
         scope: list(model.objects.filter(management=management, status="deploying"))
         for scope, model in deploying_models().items()
     }
-    local_attempts, validated, unknown_ids = _load_attempts(management, deployment_evidence, rows_by_scope)
+    local_attempts, validated, unknown_ids = _load_attempts(
+        management,
+        deployment_evidence,
+        rows_by_scope,
+        required_attempt_ids,
+    )
     decisions = _settlement_decisions(
         rows_by_scope,
         validated,
@@ -354,6 +366,22 @@ def deploying_attempt_ids(management) -> tuple[UUID, ...]:
     return tuple(sorted(attempt_ids, key=str))
 
 
+def route_policy_deploying_attempt_ids(management) -> tuple[UUID, ...]:
+    """Return attempts referenced by route-policy rows in the locked reconcile footprint."""
+    from .models import NSOApplyAttempt, NSORoutePolicyState
+
+    referenced_ids = NSORoutePolicyState.objects.filter(
+        management=management,
+        status="deploying",
+        apply_attempt_id__isnull=False,
+    ).values_list("apply_attempt_id", flat=True)
+    attempt_ids = NSOApplyAttempt.objects.filter(
+        management=management,
+        pk__in=referenced_ids,
+    ).values_list("pk", flat=True)
+    return tuple(sorted(attempt_ids, key=str))
+
+
 def _record_replay_answer(attempt, result=None, error=None) -> None:
     from .models import NSOApplyAttempt
 
@@ -371,16 +399,29 @@ def _record_replay_answer(attempt, result=None, error=None) -> None:
     )
 
 
-def load_deployment_evidence(management):
+def load_deployment_evidence(management, *, attempt_ids=None):
     """Fetch attempt evidence and recover unknown UUIDs by replaying their exact request."""
     from . import adapter_client as client
     from .models import NSOApplyAttempt
 
-    attempt_ids = deploying_attempt_ids(management)
+    if attempt_ids is None:
+        attempt_ids = deploying_attempt_ids(management)
     if not attempt_ids:
         return None
     evidence = client.get_deployment_evidence(management.adapter_device_id, attempt_ids)
-    unknown = {UUID(str(value)) for value in evidence.get("unknown_apply_attempt_ids", [])}
+    raw_unknown = evidence.get("unknown_apply_attempt_ids", [])
+    if not isinstance(raw_unknown, list):
+        raise client.AdapterError(
+            "Adapter returned an invalid unknown attempt collection.",
+            code="invalid_response",
+        )
+    try:
+        unknown = {UUID(str(value)) for value in raw_unknown}
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise client.AdapterError(
+            "Adapter returned an invalid unknown attempt UUID.",
+            code="invalid_response",
+        ) from exc
     replayed = False
     for attempt in NSOApplyAttempt.objects.filter(
         pk__in=unknown,
@@ -419,9 +460,10 @@ def settle_device_apply_attempts(management, *, static_route_feed_drained: bool)
     return evidence
 
 
-def latest_route_policy_carrier(deployment_evidence):
+def latest_route_policy_carrier(deployment_evidence, *, attempt_ids=None):
     """Return the newest exact carrier snapshot that reports route-policy outcomes."""
     candidates = []
+    allowed_attempt_ids = None if attempt_ids is None else set(attempt_ids)
     if not isinstance(deployment_evidence, dict):
         return None
     attempts = deployment_evidence.get("attempts", [])
@@ -429,6 +471,12 @@ def latest_route_policy_carrier(deployment_evidence):
         return None
     for attempt in attempts:
         if not isinstance(attempt, dict):
+            continue
+        try:
+            attempt_id = UUID(str(attempt.get("apply_attempt_id")))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if allowed_attempt_ids is not None and attempt_id not in allowed_attempt_ids:
             continue
         generations = attempt.get("generations", [])
         if not isinstance(generations, list):
@@ -447,6 +495,7 @@ def latest_route_policy_carrier(deployment_evidence):
                     generation.get("seq", 0),
                     {
                         "id": job_id,
+                        "apply_attempt_id": str(attempt_id),
                         "status": generation.get("carrier_job_status"),
                         "result": result,
                         "error": generation.get("carrier_job_error"),

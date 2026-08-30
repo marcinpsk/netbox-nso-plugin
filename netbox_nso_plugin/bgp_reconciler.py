@@ -114,8 +114,14 @@ def bgp_reconcile_plan(device, payload: dict):
             payload,
         )
     address_families = tuple(BGPAddressFamily.objects.filter(scope__in=scopes).order_by("pk"))
-    owner_ids = {peer.pk for peer in peers} | {template.pk for template in templates}
-    peer_address_families = tuple(BGPPeerAddressFamily.objects.filter(assigned_object_id__in=owner_ids).order_by("pk"))
+    peer_type = ContentType.objects.get_for_model(BGPPeer)
+    template_type = ContentType.objects.get_for_model(BGPPeerTemplate)
+    peer_address_families = tuple(
+        BGPPeerAddressFamily.objects.filter(
+            Q(assigned_object_type=peer_type, assigned_object_id__in={peer.pk for peer in peers})
+            | Q(assigned_object_type=template_type, assigned_object_id__in={template.pk for template in templates})
+        ).order_by("pk")
+    )
     asn_values = {
         int(value)
         for router in payload.get("routers", []) or []

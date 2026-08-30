@@ -69,7 +69,7 @@ def _forced_scopes(push, device_id):
 class TestRunDeviceReconcile(APITestCase):
     """run_device_reconcile is the rqworker entrypoint (off-request)."""
 
-    def test_route_policy_evidence_programming_error_stops_reconcile(self):
+    def test_route_policy_reconcile_does_not_prefetch_deployment_evidence(self):
         from types import SimpleNamespace
 
         from netbox_nso_plugin.reconcile import _reconcile_routing
@@ -86,18 +86,47 @@ class TestRunDeviceReconcile(APITestCase):
             manage_redistribution=False,
         )
 
-        def continued_after_error(_device_id):
-            raise AssertionError("route-policy reconcile continued after an internal evidence error")
-
-        client = SimpleNamespace(get_route_policy=continued_after_error)
+        client = SimpleNamespace(get_route_policy=lambda _device_id: {})
         with (
+            patch("netbox_nso_plugin.apply_settlement.load_deployment_evidence") as load_evidence,
+            patch("netbox_nso_plugin.reconcile._gated"),
+        ):
+            _reconcile_routing(device, mgmt, client, {})
+
+        load_evidence.assert_not_called()
+
+    def test_route_policy_evidence_programming_error_stops_reconcile(self):
+        from uuid import uuid4
+
+        from netbox_nso_plugin import reconcile
+
+        device = _make_device("rec-evidence-error")
+        instance = NSOInstance.objects.create(
+            name="rec-evidence-error",
+            adapter_instance_id="rec-evidence-error",
+        )
+        NSODeviceManagement.objects.create(
+            device=device,
+            nso_instance=instance,
+            nso_device_name="rec-evidence-error",
+            adapter_device_id=23,
+            manage_route_policy=True,
+        )
+
+        attempt_id = uuid4()
+        reconcile_context = {
+            reconcile._ROUTE_POLICY_ATTEMPT_IDS: (attempt_id,),
+            reconcile._ROUTE_POLICY_ADAPTER_DEVICE_ID: 23,
+        }
+        with (
+            patch.object(reconcile, "reconcile_device", return_value=reconcile_context),
             patch(
                 "netbox_nso_plugin.apply_settlement.load_deployment_evidence",
                 side_effect=RuntimeError("evidence parser failed"),
             ),
             self.assertRaisesRegex(RuntimeError, "evidence parser failed"),
         ):
-            _reconcile_routing(device, mgmt, client, {})
+            reconcile.run_device_reconcile(device.pk)
 
     def test_missing_device_is_skipped(self):
         from netbox_nso_plugin.reconcile import run_device_reconcile

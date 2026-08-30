@@ -40,8 +40,8 @@ def lag_config_reconcile_plan(device, payload: dict):
         return ReconcileMutationPlan(MutationFootprint())
     interfaces = tuple(Interface.objects.filter(device=device).order_by("pk"))
     interface_by_name = {interface.name: interface for interface in interfaces}
-    bundles = tuple(NSOLACPBundleState.objects.filter(management=management).order_by("pk"))
-    members = tuple(NSOLACPMemberState.objects.filter(management=management).order_by("pk"))
+    bundles = tuple(NSOLACPBundleState.objects.filter(management=management).select_related("interface").order_by("pk"))
+    members = tuple(NSOLACPMemberState.objects.filter(management=management).select_related("interface").order_by("pk"))
     reported_bundles = {
         item.get("name"): item
         for item in payload.get("bundles", []) or []

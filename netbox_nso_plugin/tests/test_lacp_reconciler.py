@@ -94,6 +94,26 @@ class TestReconcileLagConfig(TestCase):
         reconcile_lag_config(self.device, data)
         assert NSOLACPBundleState.objects.filter(interface=self.lag).count() == 1
 
+    def test_plan_query_count_does_not_grow_with_overlay_rows(self):
+        from netbox_nso_plugin.lacp_reconciler import lag_config_reconcile_plan
+
+        data = _payload(
+            [
+                self._bundle(
+                    members=[
+                        {"interface_name": "GigabitEthernet0/1", "mode": "active"},
+                        {"interface_name": "GigabitEthernet0/2", "mode": "active"},
+                    ]
+                )
+            ]
+        )
+        reconcile_lag_config(self.device, data)
+
+        with self.assertNumQueries(4):
+            plan = lag_config_reconcile_plan(self.device, data)
+
+        self.assertFalse(plan.changes_content)
+
     def test_missing_interface_skipped(self):
         reconcile_lag_config(self.device, _payload([{"name": "Port-channel99", "lag_id": 99, "members": []}]))
         assert NSOLACPBundleState.objects.count() == 0

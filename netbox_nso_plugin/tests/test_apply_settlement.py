@@ -223,12 +223,14 @@ class TestAttemptSettlement(TestCase):
         from netbox_nso_plugin.apply_settlement import latest_route_policy_carrier
 
         result = {"route_policy_count_by_outcome": {"in_sync": 1}}
+        attempt_id = uuid4()
         evidence = {
             "attempts": [
                 None,
                 {"generations": None},
                 {"generations": [None, {"seq": True, "carrier_job_id": 91, "carrier_job_result": result}]},
                 {
+                    "apply_attempt_id": str(attempt_id),
                     "generations": [
                         {
                             "seq": 7,
@@ -238,7 +240,7 @@ class TestAttemptSettlement(TestCase):
                             "carrier_job_error": None,
                             "updated_at": "2026-08-01T10:01:00Z",
                         }
-                    ]
+                    ],
                 },
             ]
         }
@@ -287,6 +289,46 @@ class TestAttemptSettlement(TestCase):
         local.refresh_from_db()
         self.assertEqual(local.http_status, 202)
         self.assertEqual(local.response, known["response"])
+
+    def test_malformed_unknown_attempt_id_is_an_adapter_error(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.apply_settlement import load_deployment_evidence
+
+        attempt_id = uuid4()
+        self._vlan_row(1631, attempt_id)
+        self._local_attempt(attempt_id, 62, {"vlan": 402}, answered=False)
+        malformed = _payload(self.adapter_device_id, [])
+        malformed["unknown_apply_attempt_ids"] = [{"attempt_id": str(attempt_id)}]
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.get_deployment_evidence", return_value=malformed),
+            self.assertRaisesRegex(AdapterError, "invalid unknown attempt UUID") as raised,
+        ):
+            load_deployment_evidence(self.management)
+
+        self.assertEqual(raised.exception.code, "invalid_response")
+
+    def test_required_attempt_is_validated_after_its_deploying_row_reconciles(self):
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_apply_attempts
+
+        attempt_id = uuid4()
+        self._local_attempt(attempt_id, 63, {"route_policy": 403})
+        changed = _attempt(
+            attempt_id,
+            self.adapter_device_id,
+            63,
+            {"route_policy": 404},
+            "settled",
+            result={"route_policy_count_by_outcome": {"in_sync": 1}},
+        )
+
+        with self.assertRaisesRegex(EvidenceInvariantError, "changed the Apply selection"):
+            settle_apply_attempts(
+                self.management,
+                _payload(self.adapter_device_id, [changed]),
+                static_route_feed_drained=True,
+                required_attempt_ids=(attempt_id,),
+            )
 
     def test_a_replay_job_conflict_leaves_the_attempt_unanswered(self):
         from netbox_nso_plugin.apply_settlement import load_deployment_evidence

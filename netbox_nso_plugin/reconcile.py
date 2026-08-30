@@ -292,7 +292,8 @@ _CATEGORY_RECONCILE_FAMILIES: dict[str, tuple[str, ...]] = {
     "l2_services": ("l2_service",),
 }
 
-_PRE_ROUTE_POLICY_EVIDENCE = "_pre_route_policy_deployment_evidence"
+_ROUTE_POLICY_ATTEMPT_IDS = "_route_policy_attempt_ids"
+_ROUTE_POLICY_ADAPTER_DEVICE_ID = "_route_policy_adapter_device_id"
 
 
 def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
@@ -351,29 +352,29 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
 
         _gated(ctx, mgmt, "isis", isis_payload, _isis_body, epoch=dev_id)
     if mgmt.manage_route_policy:
-        from .adapter_client import AdapterError
-        from .apply_settlement import load_deployment_evidence
+        from .apply_settlement import route_policy_deploying_attempt_ids
 
-        try:
-            evidence = load_deployment_evidence(mgmt)
-        except AdapterError as exc:
-            logger.warning(
-                "nso reconcile: pre-route-policy evidence failed for device %s: %s",
-                device.pk,
-                exc,
-            )
-        else:
-            if evidence is not None:
-                ctx[_PRE_ROUTE_POLICY_EVIDENCE] = evidence
         rp_doc = client.get_route_policy(dev_id)
+
+        def _route_policy_body():
+            ctx[_ROUTE_POLICY_ATTEMPT_IDS] = route_policy_deploying_attempt_ids(mgmt)
+            ctx[_ROUTE_POLICY_ADAPTER_DEVICE_ID] = mgmt.adapter_device_id
+            return _safe_reconcile(
+                ctx,
+                "route_policy_states",
+                mgmt,
+                ("NSORoutePolicyState",),
+                reconcile_route_policy,
+                device,
+                rp_doc,
+            )
+
         _gated(
             ctx,
             mgmt,
             "route_policy",
             rp_doc,
-            lambda: _safe_reconcile(
-                ctx, "route_policy_states", mgmt, ("NSORoutePolicyState",), reconcile_route_policy, device, rp_doc
-            ),
+            _route_policy_body,
             epoch=dev_id,
             pre_body=lambda: route_policy_reconcile_plan(device, rp_doc),
         )
@@ -1241,6 +1242,46 @@ def _journal_route_policy_apply(mgmt, job: dict | None) -> None:
     """
     if not job:
         return
+    from . import status_machine as sm
+    from .intent_state import MutationFootprint, SourceRow, mirror_transaction
+    from .models import NSORoutePolicyState
+
+    rows = list(
+        NSORoutePolicyState.objects.filter(
+            management=mgmt,
+            content_type__isnull=False,
+            object_id__isnull=False,
+            status__in=sm.OWNED_STATES,
+        )
+    )
+    footprint = MutationFootprint.for_keys(
+        {(mgmt.device_id, "route_policy")},
+        overlay_rows=tuple(SourceRow(row._meta.label_lower, row.pk) for row in rows),
+    )
+    with mirror_transaction(footprint):
+        _journal_route_policy_apply_locked(type(mgmt).objects.get(pk=mgmt.pk), job)
+
+
+def _journal_route_policy_apply_locked(mgmt, job: dict) -> None:
+    """Journal one carrier while its device revision and owned policy rows are locked."""
+    apply_attempt_id = job.get("apply_attempt_id")
+    if apply_attempt_id is not None:
+        from django.core.exceptions import ValidationError
+
+        from .models import NSOApplyAttempt, NSOIntentRevision
+
+        try:
+            attempt = NSOApplyAttempt.objects.filter(pk=apply_attempt_id, management=mgmt).first()
+        except (TypeError, ValueError, ValidationError):
+            return
+        expected_revision = None if attempt is None else attempt.scope_revisions.get("route_policy")
+        current_revision = (
+            NSOIntentRevision.objects.filter(device_id=mgmt.device_id, scope="route_policy")
+            .values_list("revision", flat=True)
+            .first()
+        )
+        if type(expected_revision) is not int or current_revision != expected_revision:
+            return
     job_id = str(job.get("id") or "")
     if not job_id or job_id == (mgmt.last_journaled_apply_job or ""):
         return
@@ -1249,7 +1290,7 @@ def _journal_route_policy_apply(mgmt, job: dict | None) -> None:
     failed = _count_of(counts, "apply_failed")
     # Mark the job seen FIRST so a failure mid-write can't double-post next reconcile.
     mgmt.last_journaled_apply_job = job_id
-    mgmt.save(update_fields=["last_journaled_apply_job"])
+    type(mgmt).objects.filter(pk=mgmt.pk).update(last_journaled_apply_job=job_id)
     if applied == 0 and failed == 0:
         return  # this apply committed no route-policy scope → nothing to journal
 
@@ -1326,7 +1367,7 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
     from dcim.models import Device
 
     from .adapter_client import AdapterError
-    from .deployment import DeploymentQuiesced
+    from .deployment import DeploymentQuiesced, operation
     from .models import NSODeviceManagement
     from .settlement import settle_static_routes
     from .signals import suppress_intent_push
@@ -1354,6 +1395,39 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
         return {"device_id": device_id, "deferred": True, "attempts": ctx["_deferred"]}
     if ctx.get("_lock_unavailable"):
         return {"device_id": device_id, "skipped": "lock_unavailable"}
+
+    route_policy_attempt_ids = ctx.pop(_ROUTE_POLICY_ATTEMPT_IDS, ())
+    route_policy_adapter_device_id = ctx.pop(_ROUTE_POLICY_ADAPTER_DEVICE_ID, None)
+    route_policy_evidence = None
+    if route_policy_adapter_device_id is not None and route_policy_attempt_ids:
+        from .apply_settlement import deploying_attempt_ids, load_deployment_evidence
+
+        evidence_management = NSODeviceManagement.objects.filter(
+            device=device,
+            adapter_device_id=route_policy_adapter_device_id,
+        ).first()
+        if evidence_management is not None:
+            requested_attempt_ids = tuple(
+                sorted(
+                    set(route_policy_attempt_ids) | set(deploying_attempt_ids(evidence_management)),
+                    key=str,
+                )
+            )
+            try:
+                with operation("reconcile"):
+                    route_policy_evidence = load_deployment_evidence(
+                        evidence_management,
+                        attempt_ids=requested_attempt_ids,
+                    )
+            except AdapterError as exc:
+                logger.warning(
+                    "nso reconcile: route-policy evidence failed for device %s: %s",
+                    device.pk,
+                    exc,
+                )
+            except DeploymentQuiesced as exc:
+                logger.warning("nso reconcile deferred for device %s: %s", device_id, exc)
+                return {"device_id": device_id, "error": str(exc)}
 
     # Step 4: after the post-sync reconcile, walk this device's settlement feed (the
     # production carrier for #1502's consumer), settle any rows left 'deploying' whose
@@ -1391,19 +1465,30 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
                         settle_device_apply_attempts,
                     )
 
-                    evidence = ctx.get(_PRE_ROUTE_POLICY_EVIDENCE)
-                    if isinstance(evidence, dict) and evidence.get("device_id") == mgmt.adapter_device_id:
-                        settle_apply_attempts(
-                            mgmt,
+                    with operation("reconcile"):
+                        if (
+                            isinstance(route_policy_evidence, dict)
+                            and route_policy_evidence.get("device_id") == mgmt.adapter_device_id
+                        ):
+                            evidence = route_policy_evidence
+                            settle_apply_attempts(
+                                mgmt,
+                                evidence,
+                                static_route_feed_drained=static_route_feed_drained,
+                                required_attempt_ids=route_policy_attempt_ids,
+                            )
+                        else:
+                            evidence = settle_device_apply_attempts(
+                                mgmt,
+                                static_route_feed_drained=static_route_feed_drained,
+                            )
+                    _journal_route_policy_apply(
+                        mgmt,
+                        latest_route_policy_carrier(
                             evidence,
-                            static_route_feed_drained=static_route_feed_drained,
-                        )
-                    else:
-                        evidence = settle_device_apply_attempts(
-                            mgmt,
-                            static_route_feed_drained=static_route_feed_drained,
-                        )
-                    _journal_route_policy_apply(mgmt, latest_route_policy_carrier(evidence))
+                            attempt_ids=route_policy_attempt_ids or None,
+                        ),
+                    )
     except Exception as exc:  # noqa: BLE001 — settling is best-effort, never crash the worker
         logger.warning("nso reconcile: apply-failure settle skipped for device %s: %s", device_id, exc)
 

@@ -5088,7 +5088,7 @@ class TestOverlayFieldEditView(ViewTestBase):
         ospf_payload = put_ospf.call_args.args[1]
         self.assertEqual(ospf_payload["instances"][0]["redistribution"][0]["route_map"], "RM-INLINE-NEW")
 
-    def test_edit_route_map_name_repends_a_deploying_row(self):
+    def test_edit_route_map_name_repends_every_deploying_attachment(self):
         from django.contrib.contenttypes.models import ContentType
         from netbox_routing.models import RouteMap
 
@@ -5107,13 +5107,28 @@ class TestOverlayFieldEditView(ViewTestBase):
             status="deploying",
             apply_attempt_id=uuid4(),
         )
+        _other_device, other_management = make_managed("route-map-rename", 322)
+        attached = NSORoutePolicyState.objects.create(
+            management=other_management,
+            family="route_map",
+            object_name=route_map.name,
+            content_type=row.content_type,
+            object_id=route_map.pk,
+            status="deploying",
+            apply_attempt_id=uuid4(),
+        )
 
         row.object_name = "RM-IN-FLIGHT-NEW"
         with suppress_intent_push():
             _save_route_map_name_edit(row, route_map.name)
 
         row.refresh_from_db()
+        attached.refresh_from_db()
         self.assertEqual(row.status, "accepted")
+        self.assertIsNone(row.apply_attempt_id)
+        self.assertEqual(attached.object_name, "RM-IN-FLIGHT-NEW")
+        self.assertEqual(attached.status, "accepted")
+        self.assertIsNone(attached.apply_attempt_id)
         row.status = sm.on_apply_result(row.status, ok=True)
         row.save(update_fields=["status"])
         row.refresh_from_db()

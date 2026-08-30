@@ -912,6 +912,46 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         peer.refresh_from_db()
         self.assertFalse(peer.enabled)  # (b) edit preserved, not reverted to device
 
+    def test_plan_detects_an_owned_peer_after_a_netbox_edit(self):
+        mgmt = self._make_mgmt()
+
+        from netbox_routing.models import BGPPeer
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
+        from netbox_nso_plugin.models import NSOBGPPeerState
+
+        payload = self._payload(self._router_payload(peers=[self._peer_entry()]))
+        _reconcile_bgp_config(self.device, payload)
+        content_update(NSOBGPPeerState.objects.get(management=mgmt), status="in_sync")
+        content_update(BGPPeer.objects.get(), enabled=False)
+
+        self.assertTrue(bgp_reconcile_plan(self.device, payload).changes_content)
+
+    def test_plan_ignores_address_family_rows_owned_by_another_content_type(self):
+        self._make_mgmt()
+
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import BGPPeer, BGPPeerAddressFamily
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
+        from netbox_nso_plugin.intent_state import SourceRow
+
+        payload = self._payload(self._router_payload(peers=[self._peer_entry()]))
+        _reconcile_bgp_config(self.device, payload)
+        peer = BGPPeer.objects.get()
+        peer_address_family = BGPPeerAddressFamily.objects.get()
+        colliding = BGPPeerAddressFamily.objects.create(
+            assigned_object_type=ContentType.objects.get_for_model(Device),
+            assigned_object_id=peer.pk,
+            address_family=peer_address_family.address_family,
+            enabled=True,
+        )
+
+        source_rows = set(bgp_reconcile_plan(self.device, payload).footprint.source_rows)
+
+        self.assertIn(SourceRow(peer_address_family._meta.label_lower, peer_address_family.pk), source_rows)
+        self.assertNotIn(SourceRow(colliding._meta.label_lower, colliding.pk), source_rows)
+
     def test_device_change_auto_mirrors_when_netbox_untouched(self):
         """3-way: device-side change with NetBox untouched → object auto-updated, in sync.
 
