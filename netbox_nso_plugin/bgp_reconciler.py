@@ -195,22 +195,10 @@ def _af_device_content(
     return sorted(afs, key=lambda a: a["af"])
 
 
-def _af_object_content(owner_obj) -> list:
-    """Canonical per-AF policy content read back from a BGPPeer / BGPPeerTemplate object."""
-    from django.contrib.contenttypes.models import ContentType
-    from netbox_routing.models import BGPPeerAddressFamily
-
-    ct = ContentType.objects.get_for_model(owner_obj.__class__)
+def _af_rows_content(rows) -> list:
+    """Build canonical policy content from preloaded address-family rows."""
     afs = []
-    for paf in BGPPeerAddressFamily.objects.filter(
-        assigned_object_type=ct, assigned_object_id=owner_obj.pk
-    ).select_related(
-        "address_family",
-        "routemap_in",
-        "routemap_out",
-        "prefixlist_in",
-        "prefixlist_out",
-    ):
+    for paf in rows:
         afs.append(
             {
                 "af": paf.address_family.address_family,
@@ -222,6 +210,22 @@ def _af_object_content(owner_obj) -> list:
             }
         )
     return sorted(afs, key=lambda a: a["af"])
+
+
+def _af_object_content(owner_obj) -> list:
+    """Canonical per-AF policy content read back from a BGPPeer / BGPPeerTemplate object."""
+    from django.contrib.contenttypes.models import ContentType
+    from netbox_routing.models import BGPPeerAddressFamily
+
+    ct = ContentType.objects.get_for_model(owner_obj.__class__)
+    rows = BGPPeerAddressFamily.objects.filter(assigned_object_type=ct, assigned_object_id=owner_obj.pk).select_related(
+        "address_family",
+        "routemap_in",
+        "routemap_out",
+        "prefixlist_in",
+        "prefixlist_out",
+    )
+    return _af_rows_content(rows)
 
 
 def _drop_unset_update_source(content: dict) -> None:
@@ -257,14 +261,14 @@ def _peer_device_content(
     return content
 
 
-def _peer_object_content(bgp_peer) -> dict:
+def _peer_object_content(bgp_peer, address_families=None) -> dict:
     """Build canonical content read back from the netbox-routing BGPPeer object + its AFs."""
     content = {
         f: (_bgp_fk_identity(getattr(bgp_peer, f)) if f in _PEER_FK_FIELDS else getattr(bgp_peer, f))
         for f in _PEER_FIELDS
     }
     _drop_unset_update_source(content)
-    content["afs"] = _af_object_content(bgp_peer)
+    content["afs"] = _af_object_content(bgp_peer) if address_families is None else _af_rows_content(address_families)
     return content
 
 
@@ -286,9 +290,10 @@ def _template_device_content(
     }
 
 
-def _template_object_content(template_obj) -> dict:
+def _template_object_content(template_obj, address_families=None) -> dict:
     """Canonical content read back from a netbox-routing BGPPeerTemplate object + its AFs."""
-    return {"remote_as": _bgp_fk_identity(template_obj.remote_as), "afs": _af_object_content(template_obj)}
+    afs = _af_object_content(template_obj) if address_families is None else _af_rows_content(address_families)
+    return {"remote_as": _bgp_fk_identity(template_obj.remote_as), "afs": afs}
 
 
 def _resolve_routemap(name):
@@ -319,8 +324,9 @@ class _BGPGraphPlanner:  # noqa: PLR0904
     """Build the deterministic writes for one BGP payload."""
 
     def __init__(self, device, payload, planned_at):  # noqa: PLR0915
-        from dcim.models import Device
+        from dcim.models import Device, Interface
         from django.contrib.contenttypes.models import ContentType
+        from django.db.models import Q
         from ipam.models import ASN, RIR, VRF, IPAddress
         from netbox_routing.models import (
             BGPAddressFamily,
@@ -395,11 +401,42 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             )
             if name
         }
+        peer_addresses = {
+            peer.get("peer_address")
+            for router in routers
+            for scope in router.get("scopes") or []
+            for peer in scope.get("peers") or []
+            if peer.get("peer_address")
+        }
+        source_values = {
+            peer.get("source")
+            for router in routers
+            for scope in router.get("scopes") or []
+            for peer in scope.get("peers") or []
+            if peer.get("source")
+        }
+        ip_hosts = set()
+        source_interfaces = set()
+        for value in peer_addresses | source_values:
+            try:
+                address = ipaddress.ip_address(value)
+            except ValueError:
+                if value in source_values:
+                    source_interfaces.add(value)
+            else:
+                if getattr(address, "scope_id", None) is None:
+                    ip_hosts.add(str(address))
+        ip_filter = Q(pk__in=[])
+        for host in ip_hosts:
+            ip_filter |= Q(address__net_host=host)
         self.asns = {
             row.asn: row for row in ASN.objects.filter(asn__in=asn_values).select_related("rir").order_by("pk")
         }
         self.rir = RIR.objects.filter(name="NSO Auto-Discovered").first()
-        self.ips = {}
+        self.ips = {str(row.address.ip): row for row in IPAddress.objects.filter(ip_filter).order_by("pk")}
+        self.source_interfaces = {
+            row.name: row for row in Interface.objects.filter(device=device, name__in=source_interfaces).order_by("pk")
+        }
         self.vrfs = {row.name: row for row in VRF.objects.filter(name__in=vrf_names).order_by("pk")}
         self.routers = {
             int(row.asn.asn): row
@@ -429,7 +466,16 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         self.peers = {}
         for row in (
             BGPPeer.objects.filter(scope__in=self.scopes.values(), name__isnull=True)
-            .select_related("scope__router__asn", "scope__vrf", "peer")
+            .select_related(
+                "scope__router__asn",
+                "scope__vrf",
+                "peer",
+                "remote_as",
+                "local_as",
+                "peer_group",
+                "source",
+                "update_source",
+            )
             .order_by("pk")
         ):
             scope_key = (row.scope.router_id, row.scope.vrf_id)
@@ -440,6 +486,22 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             .select_related("remote_as")
             .order_by("pk")
         }
+        address_family_filter = Q(
+            assigned_object_type=self.peer_content_type,
+            assigned_object_id__in={row.pk for row in self.peers.values()},
+        ) | Q(
+            assigned_object_type=self.template_content_type,
+            assigned_object_id__in={row.pk for row in self.templates.values()},
+        )
+        self.peer_address_families = {}
+        for row in BGPPeerAddressFamily.objects.filter(address_family_filter).select_related(
+            "address_family",
+            "routemap_in",
+            "routemap_out",
+            "prefixlist_in",
+            "prefixlist_out",
+        ):
+            self.peer_address_families.setdefault((row.assigned_object_type_id, row.assigned_object_id), []).append(row)
         self.template_saved = set()
         self.peer_states = (
             {
@@ -465,7 +527,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         self.seen_templates = set()
         policy_entries = tuple(
             address_family
-            for router in payload.get("routers", []) or []
+            for router in self.payload.get("routers", []) or []
             if isinstance(router, dict)
             for scope in router.get("scopes", []) or []
             if isinstance(scope, dict)
@@ -575,9 +637,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         try:
             netaddr.IPAddress(value)
         except (netaddr.AddrFormatError, ValueError):
-            from dcim.models import Interface
-
-            return None, Interface.objects.filter(device=self.device, name=value).first()
+            return None, self.source_interfaces.get(value)
         return self.peer_ip(value), None
 
     def router(self, asn, router_id):
@@ -675,12 +735,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         existing = (
             {
                 row.address_family.address_family: row
-                for row in self.BGPPeerAddressFamily.objects.filter(
-                    assigned_object_type=content_type,
-                    assigned_object_id=owner.pk,
-                )
-                .select_related("address_family")
-                .order_by("pk")
+                for row in self.peer_address_families.get((content_type.pk, owner.pk), ())
             }
             if owner.pk is not None
             else {}
@@ -771,7 +826,12 @@ class _BGPGraphPlanner:  # noqa: PLR0904
                 prefix_lists_by_name=self.prefix_lists_by_name,
             )
         )
-        object_hash = device_hash if created_peer else _content_hash(_peer_object_content(current_peer))
+        peer_address_families = (
+            () if created_peer else self.peer_address_families.get((self.peer_content_type.pk, current_peer.pk), ())
+        )
+        object_hash = (
+            device_hash if created_peer else _content_hash(_peer_object_content(current_peer, peer_address_families))
+        )
         base = state.device_base_hash
         matches = True
         conflict = False
@@ -836,7 +896,8 @@ class _BGPGraphPlanner:  # noqa: PLR0904
                 prefix_lists_by_name=self.prefix_lists_by_name,
             )
         )
-        object_hash = _content_hash(_template_object_content(template))
+        template_address_families = self.peer_address_families.get((self.template_content_type.pk, template.pk), ())
+        object_hash = _content_hash(_template_object_content(template, template_address_families))
         base = state.device_base_hash
         matches = True
         conflict = False

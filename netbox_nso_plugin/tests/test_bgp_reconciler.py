@@ -1277,6 +1277,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         ]
         self.assertEqual(len(four_policy_queries), len(one_policy_queries))
         self.assertEqual(len(one_policy_queries), 2)
+        self.assertLessEqual(len(four_queries), len(one_queries))
 
     def test_plan_revalidates_a_missing_route_map_after_lock_acquisition(self):
         from netbox_routing.models import RouteMap
