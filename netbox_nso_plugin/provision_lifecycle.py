@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import timedelta
 
 from django.db import transaction
@@ -122,7 +123,7 @@ def mark_provision_terminal(provision_attempt_id, evidence: dict) -> bool:
 
 
 @_deployment_guarded("provisioning")
-def sweep_provision_tombstones(provision_attempt_id=None):
+def sweep_provision_tombstones(provision_attempt_id=None, *, deadline: float | None = None):
     """Advance matching provision tombstones through the fenced completion states."""
     from .models import NSOProvisionTombstone
 
@@ -141,6 +142,8 @@ def sweep_provision_tombstones(provision_attempt_id=None):
     checked = 0
     closed = 0
     for tombstone_id in tombstones.values_list("provision_attempt_id", flat=True)[:_FLEET_SWEEP_LIMIT]:
+        if deadline is not None and time.monotonic() >= deadline:
+            break
         checked += 1
         try:
             closed += int(_sweep_one(tombstone_id))

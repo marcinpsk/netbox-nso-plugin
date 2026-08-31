@@ -469,6 +469,28 @@ class TestProvisionSweepBudget(TestCase):
         self.assertEqual((checked, closed), (_FLEET_SWEEP_LIMIT, 0))
         self.assertEqual(polled, [row.provision_attempt_id for row in rows[:_FLEET_SWEEP_LIMIT]])
 
+    def test_a_fleet_sweep_stops_before_starting_work_past_its_deadline(self):
+        from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
+
+        rows = [
+            self._open_tombstone("deadline", netbox_device_id=index + 1, age=timedelta(seconds=100 - index))
+            for index in range(2)
+        ]
+        polled = []
+
+        def poll(attempt_id):
+            polled.append(attempt_id)
+            return {"status": "running"}
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.get_provision_attempt", side_effect=poll),
+            patch("time.monotonic", side_effect=(0.0, 1.0)),
+        ):
+            checked, closed = sweep_provision_tombstones(deadline=1.0)
+
+        self.assertEqual((checked, closed), (1, 0))
+        self.assertEqual(polled, [rows[0].provision_attempt_id])
+
     def test_a_later_attempt_reaches_the_next_budgeted_page(self):
         from netbox_nso_plugin.provision_lifecycle import _FLEET_SWEEP_LIMIT, sweep_provision_tombstones
 

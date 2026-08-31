@@ -181,6 +181,18 @@ class TestRendererFleetTombstoneSweep(_FleetCase):
         tombstone.refresh_from_db()
         self.assertEqual(tombstone.state, "closed")
 
+    def test_the_cadence_gives_the_tombstone_sweep_its_shared_deadline(self):
+        from netbox_nso_plugin.renderer_audit import audit_renderer_fleet
+
+        with (
+            patch("netbox_nso_plugin.renderer_audit._monotonic", return_value=10.0),
+            patch("netbox_nso_plugin.provision_lifecycle.sweep_provision_tombstones") as sweep,
+            patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes", side_effect=self._canned()),
+        ):
+            audit_renderer_fleet()
+
+        sweep.assert_called_once_with(deadline=250.0)
+
     def test_a_failing_sweep_does_not_fail_the_renderer_audit(self):
         from netbox_nso_plugin.renderer_audit import audit_renderer_fleet
 
