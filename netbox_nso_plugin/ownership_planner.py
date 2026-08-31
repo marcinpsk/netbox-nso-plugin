@@ -410,13 +410,15 @@ _CONVERTED_SCOPE_RULES = {
             ("netbox_nso_plugin.nsoospfinstancestate", "ospf_instance"),
             ("netbox_nso_plugin.nsoospfinterfacestate", "__ospf_interface__"),
         ),
-        foreign_overlay_delete="reown",
+        foreign_overlay_delete="retire",
         deletion_authority=True,
         intentional_semantic_delta=(
             "Acquire from a persisted native process or interface and its overlay. Native and overlay save events "
             "are not ownership evidence and no longer create or refresh owned overlays. Native process and interface "
             "deletes no longer delete overlays and push retirement synchronously. Reconciliation and ownership "
-            "audits handle these changes. A shared OSPF area is a dependency, not a device-owned object."
+            "audits handle these changes. A shared OSPF area is a dependency, not a device-owned object. Process "
+            "areas, admin state, and interface settings live only on the overlays, so a foreign overlay delete "
+            "retires the identity instead of reconstructing incomplete intent from the native graph."
         ),
     ),
 }
@@ -1055,9 +1057,15 @@ def _seed_isis_interface(candidate, native, _manifest):
 
 
 def _seed_ospf_instance(candidate, native, _manifest):
+    from netbox_routing.models import OSPFInterface
+
     candidate.router_id = str(native.router_id or "")
     candidate.vrf = native.vrf.name if native.vrf_id else ""
-    candidate.areas = []
+    areas = OSPFInterface.objects.filter(instance=native).values_list(
+        "area__area_id",
+        "area__area_type",
+    )
+    candidate.areas = [{"area-id": str(area_id), "area-type": area_type} for area_id, area_type in sorted(set(areas))]
     candidate.enabled = True
 
 
@@ -1207,11 +1215,16 @@ def _lacp_bindings(management):
 
 
 def _vlan_bindings(management):
+    from django.db.models import Q
     from ipam.models import VLAN
 
     return tuple(
         _native_binding("vlan", row, "netbox_nso_plugin.nsovlanstate")
-        for row in VLAN.objects.filter(group__slug=f"nso-{management.device_id}").order_by("pk")
+        for row in VLAN.objects.filter(
+            Q(group__slug=f"nso-{management.device_id}") | Q(nso_vlan_states__management_id=management.pk)
+        )
+        .distinct()
+        .order_by("pk")
     )
 
 

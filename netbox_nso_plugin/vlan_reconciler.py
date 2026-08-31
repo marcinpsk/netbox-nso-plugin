@@ -78,8 +78,8 @@ def _validated_vlan_items(payload: dict) -> tuple[dict, ...]:
         if vlan_id in seen:
             continue
         name = item.get("name")
-        if name is not None and not isinstance(name, str):
-            raise AdapterError("VLAN payload entry name must be a string or null", code="invalid_response")
+        if "name" not in item or not isinstance(name, str):
+            raise AdapterError("VLAN payload entry name must be a string", code="invalid_response")
         seen.add(vlan_id)
         normalized.append({**item, "vlan_id": vlan_id})
     return tuple(normalized)
@@ -117,6 +117,8 @@ def _validated_switchport_items(payload: dict) -> tuple[dict, ...]:
                 f"switchport payload entry {name} contains duplicate tagged VLANs",
                 code="invalid_response",
             )
+        if "untagged_vlan" not in item:
+            raise AdapterError("switchport payload entry untagged_vlan is required", code="invalid_response")
         untagged = item.get("untagged_vlan")
         if untagged is not None:
             untagged = _validated_vlan_id(untagged, "untagged_vlan")

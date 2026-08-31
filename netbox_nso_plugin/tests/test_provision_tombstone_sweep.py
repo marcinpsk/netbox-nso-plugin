@@ -469,6 +469,25 @@ class TestProvisionSweepBudget(TestCase):
         self.assertEqual((checked, closed), (_FLEET_SWEEP_LIMIT, 0))
         self.assertEqual(polled, [row.provision_attempt_id for row in rows[:_FLEET_SWEEP_LIMIT]])
 
+    def test_a_later_attempt_reaches_the_next_budgeted_page(self):
+        from netbox_nso_plugin.provision_lifecycle import _FLEET_SWEEP_LIMIT, sweep_provision_tombstones
+
+        rows = [
+            self._open_tombstone("rotation", netbox_device_id=index + 1, age=timedelta(seconds=10_000 - index))
+            for index in range(_FLEET_SWEEP_LIMIT + 1)
+        ]
+        polled = []
+
+        def poll(attempt_id):
+            polled.append(attempt_id)
+            return {"status": "running"}
+
+        with patch("netbox_nso_plugin.adapter_client.get_provision_attempt", side_effect=poll):
+            sweep_provision_tombstones()
+            sweep_provision_tombstones()
+
+        self.assertIn(rows[-1].provision_attempt_id, polled[_FLEET_SWEEP_LIMIT:])
+
     def test_an_attempt_the_adapter_has_no_record_of_ages_out_to_failed(self):
         from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.provision_lifecycle import _UNKNOWN_ATTEMPT_MAX_AGE, sweep_provision_tombstones

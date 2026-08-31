@@ -641,6 +641,7 @@ class TestRealBodyGateSweep(TestCase):
                             "mtu": 9100,
                             "ip_mtu": 9000,
                             "mpls_mtu": 9088,
+                            "bound_port": "",
                         }
                     ]
                 elif fetcher == "get_l2_services":
@@ -717,9 +718,10 @@ class TestDefaultPlanContentMutation(TestCase):
             "interfaces": [
                 {
                     "interface_name": deploying_interface.name,
-                    "min_tx": 300,
-                    "min_rx": 300,
-                    "multiplier": 3,
+                    "mtu": 9100,
+                    "ip_mtu": 9000,
+                    "mpls_mtu": 9088,
+                    "bound_port": "",
                 }
             ],
             "read_state": _rs(),
