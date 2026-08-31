@@ -25,6 +25,11 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _member_bearing_lag_ids(interfaces):
+    """Return every LAG referenced by the device's loaded interfaces."""
+    return {row.lag_id for row in interfaces if row.lag_id is not None}
+
+
 def lacp_reconcile_plan(device, payload: dict):
     """Freeze every LACP overlay save/delete before the first lock or write."""
     from dcim.models import Interface
@@ -38,7 +43,7 @@ def lacp_reconcile_plan(device, payload: dict):
     if management is None:
         return RendererMutationPlan.build()
     interfaces = {row.name: row for row in Interface.objects.filter(device=device)}
-    member_bearing_lag_ids = {row.lag_id for row in interfaces.values() if row.lag_id is not None}
+    member_bearing_lag_ids = _member_bearing_lag_ids(interfaces.values())
     bundle_states = {
         row.interface_id: row for row in NSOLACPBundleState.objects.filter(management=management).order_by("pk")
     }
@@ -83,6 +88,8 @@ def lacp_reconcile_plan(device, payload: dict):
         for member_data in bundle_data.get("members", []) or []:
             member_interface = interfaces.get(member_data.get("interface_name") or "")
             if member_interface is None:
+                continue
+            if member_interface.pk in seen_members:
                 continue
             current_member = member_states.get(member_interface.pk)
             member = (
@@ -214,6 +221,8 @@ def _reconcile_lag_config(device, payload: dict, writer, planned_at) -> list:
             if member_iface is None:
                 dropped.append(iface_name)
                 continue
+            if member_iface.pk in seen_members:
+                continue
 
             m_state = NSOLACPMemberState.objects.filter(management=mgmt, interface=member_iface).first()
             member_created = m_state is None
@@ -230,7 +239,14 @@ def _reconcile_lag_config(device, payload: dict, writer, planned_at) -> list:
     # Rows the payload no longer reports → prune vestigial husks, else drift (clobber-safe;
     # native interfaces untouched). A stale bundle is vestigial when its LAG interface has
     # no members left; a stale member when its interface is no longer assigned to any LAG.
-    _finalise_stale_lacp(mgmt, seen_bundles, seen_members, writer, now)
+    _finalise_stale_lacp(
+        mgmt,
+        seen_bundles,
+        seen_members,
+        _member_bearing_lag_ids(iface_map.values()),
+        writer,
+        now,
+    )
 
     if dropped:
         logger.warning(
@@ -243,10 +259,8 @@ def _reconcile_lag_config(device, payload: dict, writer, planned_at) -> list:
     return list(NSOLACPBundleState.objects.filter(management=mgmt).select_related("interface"))
 
 
-def _finalise_stale_lacp(management, seen_bundles, seen_members, writer, now) -> None:
+def _finalise_stale_lacp(management, seen_bundles, seen_members, member_bearing_lag_ids, writer, now) -> None:
     """Apply the planned stale-row outcomes for one LACP snapshot."""
-    from dcim.models import Interface
-
     from . import status_machine as sm
     from .models import NSOLACPBundleState, NSOLACPMemberState
 
@@ -254,7 +268,7 @@ def _finalise_stale_lacp(management, seen_bundles, seen_members, writer, now) ->
         (
             NSOLACPBundleState.objects.filter(management=management),
             seen_bundles,
-            lambda row: not Interface.objects.filter(lag_id=row.interface_id).exists(),
+            lambda row: row.interface_id not in member_bearing_lag_ids,
         ),
         (
             NSOLACPMemberState.objects.filter(management=management).select_related("interface"),

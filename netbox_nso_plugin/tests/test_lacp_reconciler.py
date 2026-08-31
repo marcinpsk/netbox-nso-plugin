@@ -90,6 +90,14 @@ class TestReconcileLagConfig(TestCase):
         m2 = NSOLACPMemberState.objects.get(interface=self.m2)
         assert m2.port_priority is None
 
+    def test_repeated_member_entry_is_applied_once(self):
+        member = {"interface_name": self.m1.name, "mode": "active", "port_priority": 128}
+
+        reconcile_lag_config(self.device, _payload([self._bundle(members=[member, member | {"mode": "passive"}])]))
+
+        self.assertEqual(NSOLACPMemberState.objects.filter(management=self.mgmt, interface=self.m1).count(), 1)
+        self.assertEqual(NSOLACPMemberState.objects.get(management=self.mgmt, interface=self.m1).mode, "active")
+
     def test_owned_member_move_bumps_the_lacp_document(self):
         """A lag_bundle change affects the nested LACP document, not only the member row."""
         from netbox_nso_plugin.models import NSOIntentRevision
@@ -179,6 +187,33 @@ class TestReconcileLagConfig(TestCase):
 
         with CaptureQueriesContext(connection) as queries:
             lacp_reconcile_plan(self.device, _payload([]))
+
+        lag_probes = [
+            query["sql"]
+            for query in queries
+            if 'FROM "dcim_interface"' in query["sql"] and '"lag_id" =' in query["sql"]
+        ]
+        self.assertEqual(lag_probes, [])
+
+    def test_stale_bundle_apply_does_not_probe_each_interface(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        second = Interface.objects.create(device=self.device, name="Port-channel2", type="lag")
+        third = Interface.objects.create(device=self.device, name="Port-channel3", type="lag")
+        reconcile_lag_config(
+            self.device,
+            _payload(
+                [
+                    self._bundle(),
+                    self._bundle(name=second.name, lag_id=2),
+                    self._bundle(name=third.name, lag_id=3),
+                ]
+            ),
+        )
+
+        with CaptureQueriesContext(connection) as queries:
+            reconcile_lag_config(self.device, _payload([]))
 
         lag_probes = [
             query["sql"]

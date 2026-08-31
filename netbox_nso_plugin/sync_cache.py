@@ -79,9 +79,8 @@ def parse_adapter_timestamp(value, field="timestamp"):
 def refresh_sync_cache(mgmt, adapter_device):
     """Update one row's cached last_sync_* from an adapter device dict.
 
-    Writes only changed fields via a targeted ``.update()`` (no full save / no signals),
-    so it is cheap enough to call per-row on a list view. Returns the list of fields
-    actually changed (empty if already current).
+    Writes only changed fields through the lifecycle writer's exact mutation plan.
+    Returns the list of fields actually changed (empty if already current).
     """
     # Fail closed on identity: callers that fetch a single device by the stored id (the device
     # NSO tab) would otherwise copy a reused id's owner status onto this row — the same wrong

@@ -42,13 +42,13 @@ def _svi_reconcile_operations(device, payload, planned_at):
         return [], [], [], []
     raw_items = payload.get("interfaces", []) if isinstance(payload, dict) else []
     items = raw_items if isinstance(raw_items, list) else []
-    group = _device_vlan_group(device)
+    group = _device_vlan_group(device, create=False)
     interfaces = {row.name: row for row in Interface.objects.filter(device=device).order_by("pk")}
     states = {
         row.interface.name: row
         for row in NSOSVIState.objects.filter(management=management).select_related("interface", "vlan").order_by("pk")
     }
-    vlans = {row.vid: row for row in VLAN.objects.filter(group=group).order_by("pk")}
+    vlans = {row.vid: row for row in VLAN.objects.filter(group=group).order_by("pk")} if group is not None else {}
     saves = []
     deletes = []
     operations = []

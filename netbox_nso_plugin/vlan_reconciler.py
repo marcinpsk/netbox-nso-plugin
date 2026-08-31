@@ -173,12 +173,15 @@ def _vlan_reconcile_operations(device, payload, planned_at):
         except (KeyError, TypeError, ValueError):
             logger.warning("VLAN reconcile for %s dropped an entry without a usable vlan_id: %r", device, item)
             continue
+        if vid in seen_vids:
+            continue
         seen_vids.add(vid)
         name = item.get("name") or ""
         current = states_by_vid.get(vid)
         vlan = current.vlan if current is not None else group_vlans.get(vid)
         if vlan is None:
             vlan = VLAN(group=ensure_group(), vid=vid, name=name or placeholder_vlan_name(vid))
+            group_vlans[vid] = vlan
             proposal = planned_save(
                 vlan,
                 force_insert=True,
