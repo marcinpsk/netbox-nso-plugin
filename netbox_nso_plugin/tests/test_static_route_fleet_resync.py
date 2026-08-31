@@ -447,6 +447,39 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         assert skipped.generation_started_at is None
         assert results[0]["armed"] == 1
 
+    def test_a_route_that_becomes_unpushable_before_arming_stays_unallocated(self):
+        """Recheck push eligibility after the content footprint is acquired."""
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin import intent_state
+        from netbox_nso_plugin.intent_drift import _backfill_static_route_generations
+        from netbox_nso_plugin.intent_generation import UNALLOCATED
+
+        _, mgmt = self._managed_device("arming-race", 8106)
+        row = self._own_route(mgmt, "198.18.32.0/24", "198.18.32.1")
+        real_intent_transaction = intent_state.intent_transaction
+
+        @contextlib.contextmanager
+        def make_route_unpushable(footprint):
+            from netbox_nso_plugin.signals import suppress_intent_push
+
+            route = StaticRoute.objects.get(pk=row.static_route_id)
+            route_footprint = intent_state.footprint_for_instance(route)
+            with without_commit_drain(), suppress_intent_push(), real_intent_transaction(route_footprint):
+                route.next_hop = None
+                route.interface_next_hop = "Ethernet1/1"
+                route.save(update_fields=["next_hop", "interface_next_hop"])
+            with real_intent_transaction(footprint):
+                yield
+
+        with patch("netbox_nso_plugin.intent_state.intent_transaction", side_effect=make_route_unpushable):
+            armed = _backfill_static_route_generations(mgmt)
+
+        row.refresh_from_db()
+        self.assertEqual(armed, [])
+        self.assertEqual(row.intent_generation, UNALLOCATED)
+        self.assertIsNone(row.generation_started_at)
+
     def test_a_rejected_push_keeps_its_reason_on_the_device(self):
         """Codex S6 P2 — the rollback undoes the arming, and must not undo the diagnosis.
 

@@ -321,8 +321,10 @@ def _backfill_static_route_generations(mgmt) -> list[dict]:
     broader "owned" one: a route with an interface-only next hop is owned but has no place
     in the snapshot, so arming it would mint a generation the adapter never receives — and
     a later run would find no sentinel row to retry, leaving an Apply free to promote a row
-    nothing can settle. Only ``self`` is locked, so the join the filter adds cannot take
-    ``static_route`` locks against the content transition's own order.
+    nothing can settle. The footprint acquired by :func:`intent_transaction` locks the
+    selected overlays and their renderer dependencies. The authoritative query repeats
+    the pusher predicate after those locks are held, so a route that became unpushable is
+    not armed.
 
     Rows are locked in the same order the content transition takes them (``management_id``,
     then pk), and the pushes the arming saves would fire are suppressed: the caller's own
@@ -347,6 +349,7 @@ def _backfill_static_route_generations(mgmt) -> list[dict]:
     with intent_transaction(footprint):
         rows = list(
             NSOStaticRouteState.objects.filter(
+                signals.PUSHED_STATIC_ROUTE_FILTER,
                 pk__in=[row.pk for row in candidates],
                 intent_generation=UNALLOCATED,
             ).order_by("management_id", "pk")

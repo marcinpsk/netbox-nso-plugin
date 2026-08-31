@@ -64,8 +64,13 @@ class IntentPushResetMixin:
         from netbox_nso_plugin.intent_state import _ACTIVE_PERMIT, _IMPLICIT_PERMITS
 
         permit = _ACTIVE_PERMIT.get()
+        implicit_permits = _IMPLICIT_PERMITS.get()
         try:
             self.assertIsNone(permit, f"implicit renderer permit leaked after the test: {permit!r}")
+            self.assertFalse(
+                implicit_permits,
+                f"implicit renderer permit entries leaked after the test: {implicit_permits!r}",
+            )
         finally:
             _ACTIVE_PERMIT.set(None)
             _IMPLICIT_PERMITS.set({})

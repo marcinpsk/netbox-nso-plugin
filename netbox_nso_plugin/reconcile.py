@@ -298,7 +298,7 @@ _ROUTE_POLICY_ADAPTER_DEVICE_ID = "_route_policy_adapter_device_id"
 
 def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
     """Reconcile each opted-in routing protocol into *ctx* (gated by kill-switches)."""
-    from .bfd_reconciler import reconcile_bfd
+    from .bfd_reconciler import bfd_reconcile_plan, reconcile_bfd
     from .bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
     from .redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
     from .route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
@@ -428,6 +428,7 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
                 bfd_doc.get("interfaces", []),
             ),
             epoch=dev_id,
+            pre_body=lambda: bfd_reconcile_plan(device, bfd_doc.get("interfaces", [])),
         )
         from .models import NSOBFDInterfaceState
 
@@ -1104,7 +1105,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 NSOBGPPeerTemplateState.objects.filter(management=mgmt).select_related("template")
             )
         elif key == "bfd":
-            from .bfd_reconciler import reconcile_bfd
+            from .bfd_reconciler import bfd_reconcile_plan, reconcile_bfd
             from .models import NSOBFDInterfaceState
 
             bfd_doc = client.get_bfd(dev_id)
@@ -1116,6 +1117,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_bfd(device, bfd_doc.get("interfaces", [])),
                 epoch=dev_id,
                 ctx_key="bfd_interfaces",
+                pre_body=lambda: bfd_reconcile_plan(device, bfd_doc.get("interfaces", [])),
             )
             ctx["bfd_states"] = list(
                 NSOBFDInterfaceState.objects.filter(management__device=device).select_related("interface")

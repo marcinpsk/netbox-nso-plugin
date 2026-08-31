@@ -28,18 +28,22 @@ def bgp_reconcile_plan(device, payload: dict):
 
     from django.contrib.contenttypes.models import ContentType
     from ipam.models import ASN, IPAddress
-    from netbox_routing.models import (
-        BGPAddressFamily,
-        BGPPeer,
-        BGPPeerAddressFamily,
-        BGPPeerTemplate,
-        BGPRouter,
-        BGPScope,
-    )
 
     from . import status_machine as sm
     from .intent_state import MutationFootprint, ReconcileMutationPlan, SourceRow, canonical_fragment
     from .models import NSOBGPPeerState, NSODeviceManagement
+
+    try:
+        from netbox_routing.models import (
+            BGPAddressFamily,
+            BGPPeer,
+            BGPPeerAddressFamily,
+            BGPPeerTemplate,
+            BGPRouter,
+            BGPScope,
+        )
+    except ImportError:
+        return ReconcileMutationPlan(MutationFootprint())
 
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:

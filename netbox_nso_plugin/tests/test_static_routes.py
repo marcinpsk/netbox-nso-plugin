@@ -346,6 +346,7 @@ class TestReconcileStaticRoutes(TestCase):
         from netbox_nso_plugin.template_content import _reconcile_static_routes
 
         mgmt = self._make_mgmt(self.device, nso_device_name="sr-tag-owned")
+        baseline_entries = []
         for i, (owned, expected) in enumerate(
             (
                 ("accepted", "accepted"),
@@ -365,18 +366,19 @@ class TestReconcileStaticRoutes(TestCase):
                 entry = self._route_entry(str(route.prefix), str(route.next_hop))
 
                 entry_tag = dict(entry, tag=42)
-                _reconcile_static_routes(self.device, self._route_payload(entry_tag))
+                _reconcile_static_routes(self.device, self._route_payload(*baseline_entries, entry_tag))
                 state.refresh_from_db()
                 tag_result = state.status
 
                 # the same row driven by a METRIC mismatch instead — must land identically
                 state.status = owned
                 state.save(update_fields=["status"])
-                _reconcile_static_routes(self.device, self._route_payload(dict(entry, metric=99)))
+                _reconcile_static_routes(self.device, self._route_payload(*baseline_entries, dict(entry, metric=99)))
                 state.refresh_from_db()
 
                 self.assertEqual(tag_result, expected)
                 self.assertEqual(tag_result, state.status)
+                baseline_entries.append(entry)
 
     def test_idempotent_second_reconcile_same_result(self):
         """Second reconcile with same payload → same state rows, no duplicates."""
@@ -460,11 +462,11 @@ class TestReconcileStaticRoutes(TestCase):
 
     def test_stale_owned_route_kept_as_changed(self):
         """An owned (greenfield/accepted) route the device stops reporting → overlay kept as
-        'changed' and the device↔route association preserved (operator intent not discarded)."""
+        'changed', the revision advances, and the device↔route association stays."""
         from netbox_routing.models import StaticRoute
 
         self._make_mgmt(self.device, nso_device_name="sr-owned-stale")
-        from netbox_nso_plugin.models import NSOStaticRouteState
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOStaticRouteState
         from netbox_nso_plugin.template_content import _reconcile_static_routes
 
         payload_with = self._route_payload(self._route_entry("10.77.0.0/16", "10.0.0.3"))
@@ -475,13 +477,50 @@ class TestReconcileStaticRoutes(TestCase):
         state = NSOStaticRouteState.objects.get(management__device=self.device, static_route=sr)
         state.status = "in_sync"  # operator owns it
         state.save(update_fields=["status"])
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="static_route")
+        before = revision.revision
 
         with self._auto_create_ctx(True):
             _reconcile_static_routes(self.device, self._route_payload())  # route gone
 
         state.refresh_from_db()
+        revision.refresh_from_db()
         self.assertEqual(state.status, "changed")
+        self.assertEqual(revision.revision, before + 1)
         self.assertTrue(sr.devices.filter(pk=self.device.pk).exists())  # association kept
+
+    def test_stale_owned_interface_route_does_not_advance_revision(self):
+        """Removing an already excluded interface route changes lifecycle only."""
+        from netbox_routing.models import StaticRoute
+
+        self._make_mgmt(self.device, nso_device_name="sr-owned-interface-stale")
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOStaticRouteState
+        from netbox_nso_plugin.template_content import _reconcile_static_routes
+
+        entry = {
+            "vrf": "",
+            "prefix": "198.18.76.0/24",
+            "next_hop": None,
+            "interface_next_hop": "Ethernet1/1",
+        }
+        with self._auto_create_ctx(True):
+            _reconcile_static_routes(self.device, self._route_payload(entry))
+
+        route = StaticRoute.objects.get(prefix="198.18.76.0/24")
+        state = NSOStaticRouteState.objects.get(management__device=self.device, static_route=route)
+        state.status = "in_sync"
+        state.save(update_fields=["status"])
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="static_route")
+        before = revision.revision
+
+        with self._auto_create_ctx(True):
+            _reconcile_static_routes(self.device, self._route_payload())
+
+        state.refresh_from_db()
+        revision.refresh_from_db()
+        self.assertEqual(state.status, "changed")
+        self.assertEqual(revision.revision, before)
+        self.assertTrue(route.devices.filter(pk=self.device.pk).exists())
 
     def test_stale_removal_leaves_static_route_object(self):
         """Removing device from M2M never deletes the StaticRoute object."""

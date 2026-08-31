@@ -14,6 +14,7 @@ redis-down fail-closed dispositions, the interfaces fetch moving to the S4
 
 from __future__ import annotations
 
+import sys
 import uuid
 from unittest.mock import patch
 
@@ -251,6 +252,32 @@ class TestRealReconcilerGateFootprints(TestCase):
 
         self.assertEqual(ctx["_gate"]["bgp"], "ran")
 
+    def test_bfd_gate_covers_native_and_overlay_creations(self):
+        from netbox_nso_plugin.models import NSOBFDInterfaceState
+        from netbox_nso_plugin.reconcile import reconcile_category
+
+        interface = Interface.objects.create(device=self.device, name="Port-channel1", type="lag")
+        payload = {
+            "interfaces": [
+                {
+                    "interface_name": interface.name,
+                    "micro_bfd": True,
+                    "enabled": True,
+                    "min_tx": 300,
+                    "min_rx": 300,
+                    "multiplier": 3,
+                }
+            ],
+            "read_state": _rs(),
+        }
+
+        with patch("netbox_nso_plugin.adapter_client.get_bfd", return_value=payload):
+            ctx = reconcile_category(self.device, self.mgmt, "bfd")
+
+        self.assertEqual(ctx["_gate"]["bfd"], "ran")
+        state = NSOBFDInterfaceState.objects.get(management=self.mgmt, interface=interface)
+        self.assertEqual(state.status, "imported")
+
     def test_bgp_gate_predicts_an_owned_native_peer_change(self):
         from netbox_nso_plugin.models import NSOBGPPeerState, NSOIntentRevision
         from netbox_nso_plugin.reconcile import reconcile_category
@@ -300,6 +327,29 @@ class TestRealReconcilerGateFootprints(TestCase):
             ],
             "read_state": _rs(attempt_id=attempt_id),
         }
+
+
+class TestOptionalRoutingDependencyPlans(TestCase):
+    """Preflight keeps the reconcilers' optional dependency boundary."""
+
+    def test_missing_netbox_routing_returns_empty_plans(self):
+        from netbox_nso_plugin.bgp_reconciler import bgp_reconcile_plan
+        from netbox_nso_plugin.intent_state import MutationFootprint, ReconcileMutationPlan
+        from netbox_nso_plugin.route_policy_reconciler import route_policy_reconcile_plan
+        from netbox_nso_plugin.template_content import _static_route_reconcile_plan
+
+        device, _management = _make("missing-routing")
+        empty_plan = ReconcileMutationPlan(MutationFootprint())
+        planners = (
+            (bgp_reconcile_plan, {}),
+            (route_policy_reconcile_plan, {"prefix_lists": [{"name": "PL", "entries": []}]}),
+            (_static_route_reconcile_plan, {"routes": []}),
+        )
+
+        with patch.dict(sys.modules, {"netbox_routing.models": None}):
+            for planner, payload in planners:
+                with self.subTest(planner=planner.__name__):
+                    self.assertEqual(planner(device, payload), empty_plan)
 
 
 #: every family fetcher reconcile_device consumes, with a minimal doc shape.

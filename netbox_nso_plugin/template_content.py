@@ -1157,11 +1157,49 @@ def _static_route_reconcile_footprint(device, payload):
     )
 
 
+def _static_route_reconcile_plan(device, payload):
+    """Declare one static-route refresh and any rendered membership change."""
+    try:
+        from netbox_routing.models import StaticRoute
+    except ImportError:
+        StaticRoute = None
+    try:
+        from ipam.models import VRF
+    except ImportError:
+        VRF = None
+
+    from . import signals
+    from .intent_state import MutationFootprint, ReconcileMutationPlan
+    from .models import NSODeviceManagement, NSOStaticRouteState
+
+    if StaticRoute is None:
+        return ReconcileMutationPlan(MutationFootprint())
+    footprint = _static_route_reconcile_footprint(device, payload)
+    management = NSODeviceManagement.objects.filter(device=device).first()
+    if management is None:
+        return ReconcileMutationPlan(footprint)
+    reported_route_ids = set()
+    for entry in payload.get("routes") or []:
+        route, _created = _resolve_static_route(entry, StaticRoute, VRF, False, False, device, logger)
+        if route is not None:
+            reported_route_ids.add(route.pk)
+    changes_content = (
+        NSOStaticRouteState.objects.filter(
+            signals.PUSHED_STATIC_ROUTE_FILTER,
+            management=management,
+            status="in_sync",
+        )
+        .exclude(static_route_id__in=reported_route_ids)
+        .exists()
+    )
+    return ReconcileMutationPlan(footprint, changes_content=changes_content)
+
+
 @mirror_reconciler
 def _reconcile_static_routes(device, payload: dict) -> list:
-    from .intent_state import mirror_transaction
+    from .intent_state import reconcile_transaction
 
-    with mirror_transaction(_static_route_reconcile_footprint(device, payload)):
+    with reconcile_transaction(_static_route_reconcile_plan(device, payload)):
         return _reconcile_static_routes_locked(device, payload)
 
 

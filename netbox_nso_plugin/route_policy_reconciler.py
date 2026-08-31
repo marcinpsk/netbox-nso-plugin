@@ -1156,7 +1156,7 @@ def _route_policy_group_changes_content(management, family: str, name: str, capt
 
 def route_policy_reconcile_plan(device, payload: dict):
     """Declare the route-policy footprint and any materialized-content write."""
-    from .intent_state import ReconcileMutationPlan
+    from .intent_state import MutationFootprint, ReconcileMutationPlan
     from .models import NSODeviceManagement
 
     footprint = route_policy_reconcile_footprint(device, payload)
@@ -1169,12 +1169,15 @@ def route_policy_reconcile_plan(device, payload: dict):
         "as_path": "as_paths",
         "route_map": "route_maps",
     }
-    changes_content = any(
-        _route_policy_group_changes_content(management, family, row["name"], row)
-        for family, key in family_payload_keys.items()
-        for row in payload.get(key) or []
-        if isinstance(row, dict) and row.get("name")
-    )
+    try:
+        changes_content = any(
+            _route_policy_group_changes_content(management, family, row["name"], row)
+            for family, key in family_payload_keys.items()
+            for row in payload.get(key) or []
+            if isinstance(row, dict) and row.get("name")
+        )
+    except ImportError:
+        return ReconcileMutationPlan(MutationFootprint())
     return ReconcileMutationPlan(footprint, changes_content=changes_content)
 
 

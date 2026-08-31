@@ -17,6 +17,69 @@ from .intent_state import mirror_reconciler
 logger = logging.getLogger(__name__)
 
 
+def bfd_reconcile_plan(device, interfaces: list):
+    """Declare BFD overlay writes and predict changes to owned intent."""
+    import copy
+
+    from dcim.models import Interface
+
+    from . import status_machine as sm
+    from .intent_state import MutationFootprint, ReconcileMutationPlan, SourceRow, canonical_fragment
+    from .models import NSOBFDInterfaceState, NSODeviceManagement
+
+    management = NSODeviceManagement.objects.filter(device=device).first()
+    if management is None:
+        return ReconcileMutationPlan(MutationFootprint())
+    interface_rows = tuple(Interface.objects.filter(device=device).order_by("pk"))
+    interface_by_name = {interface.name: interface for interface in interface_rows}
+    states = tuple(
+        NSOBFDInterfaceState.objects.filter(management=management).select_related("interface").order_by("pk")
+    )
+    reported = {}
+    for entry in interfaces or []:
+        if not isinstance(entry, dict):
+            continue
+        interface = interface_by_name.get(entry.get("interface_name") or "")
+        if interface is None:
+            interface = interface_by_name.get(entry.get("bound_port") or "")
+        if interface is not None:
+            reported[interface.pk] = entry
+
+    changes_content = False
+    for state in states:
+        candidate = copy.copy(state)
+        entry = reported.get(state.interface_id)
+        if entry is None:
+            candidate.status = sm.on_reconcile(state.status, present=False)
+        elif sm.is_owned(state.status):
+            matches = all(entry.get(field) == getattr(state, field) for field in ("min_tx", "min_rx", "multiplier"))
+            matches = matches and bool(entry.get("micro_bfd", False)) == state.micro_bfd
+            candidate.status = sm.on_reconcile(state.status, matches=matches)
+        else:
+            for field in ("min_tx", "min_rx", "multiplier"):
+                setattr(candidate, field, entry.get(field))
+            candidate.micro_bfd = bool(entry.get("micro_bfd", False))
+            candidate.status = sm.on_reconcile(state.status, matches=None)
+        if canonical_fragment(state) != canonical_fragment(candidate):
+            changes_content = True
+            break
+
+    return ReconcileMutationPlan(
+        MutationFootprint.for_keys(
+            {(device.pk, "bfd")},
+            source_rows=(
+                SourceRow("dcim.device", device.pk),
+                *(SourceRow("dcim.interface", interface.pk) for interface in interface_rows),
+            ),
+            overlay_rows=(
+                SourceRow("netbox_nso_plugin.nsobfdinterfacestate", None),
+                *(SourceRow(state._meta.label_lower, state.pk) for state in states),
+            ),
+        ),
+        changes_content=changes_content,
+    )
+
+
 def _get_or_create_bfd_profile(entry: dict, BFDProfile, cache: dict):
     """Return a shared BFDProfile for this entry's timer-set, or None.
 
