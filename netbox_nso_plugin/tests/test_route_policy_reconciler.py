@@ -2144,7 +2144,7 @@ class TestSharedObjectOwnership(TestCase):
 
         root = PrefixList.objects.create(name="PL-FIRST-CAPTURE")
         old_prefix = CustomPrefix.objects.create(prefix="198.18.40.0/24")
-        PrefixListEntry.objects.create(
+        old_entry = PrefixListEntry.objects.create(
             prefix_list=root,
             assigned_prefix_type=ContentType.objects.get_for_model(CustomPrefix),
             assigned_prefix_id=old_prefix.pk,
@@ -2154,7 +2154,15 @@ class TestSharedObjectOwnership(TestCase):
         management = self._mgmt(self.d1)
         payload = self._pl(root.name, [])
 
-        self.assertTrue(route_policy_reconcile_plan(self.d1, payload).changes_content)
+        plan = route_policy_reconcile_plan(self.d1, payload)
+        planned_deletes = [
+            write
+            for write in plan.write_set
+            if write.operation == "delete"
+            and write.model_label == "netbox_routing.prefixlistentry"
+            and write.pk == old_entry.pk
+        ]
+        self.assertEqual(len(planned_deletes), 1)
 
         with (
             patch("netbox_nso_plugin.reconcile._acquire_reconcile_lease", return_value=_LeaseOutcome()),

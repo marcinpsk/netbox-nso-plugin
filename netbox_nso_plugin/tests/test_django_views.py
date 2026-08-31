@@ -5349,7 +5349,6 @@ class TestOverlayFieldEditView(ViewTestBase):
         from netbox_routing.models import RouteMap
 
         from netbox_nso_plugin import status_machine as sm
-        from netbox_nso_plugin.intent_state import MutationFootprint, footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSORoutePolicyState
         from netbox_nso_plugin.signals import suppress_intent_push
         from netbox_nso_plugin.views import _save_route_map_name_edit
@@ -5372,13 +5371,10 @@ class TestOverlayFieldEditView(ViewTestBase):
             object_id=route_map.pk,
             status="imported",
         )
-        footprint = MutationFootprint.merge(footprint_for_instance(row), footprint_for_instance(attached))
-        with without_commit_drain(), intent_transaction(footprint):
-            for promoted in (row, attached):
-                type(promoted).objects.filter(pk=promoted.pk).update(
-                    status="deploying",
-                    apply_attempt_id=uuid4(),
-                )
+        content_bulk_update(row, status="accepted")
+        content_bulk_update(attached, status="accepted")
+        mirror_update(row, status="deploying", apply_attempt_id=uuid4())
+        mirror_update(attached, status="deploying", apply_attempt_id=uuid4())
         row.refresh_from_db()
         attached.refresh_from_db()
         self.assertEqual(row.status, "deploying")
