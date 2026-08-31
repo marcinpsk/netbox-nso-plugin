@@ -2175,7 +2175,12 @@ def _acquire(
     return _still_deploying_rows(deploying_rows)
 
 
-def _upgrade_detected_reconcile(permit: _Permit, requested: MutationFootprint) -> None:
+def _upgrade_detected_reconcile(
+    permit: _Permit,
+    requested: MutationFootprint,
+    *,
+    bump_keys=None,
+) -> None:
     """Upgrade a locked read transaction when its body proves a content delta."""
     if not permit.detect_reconcile_content:
         raise IntentMutationProtocolError("read-side content mutation requires a predicted reconcile plan")
@@ -2184,9 +2189,13 @@ def _upgrade_detected_reconcile(permit: _Permit, requested: MutationFootprint) -
     if missing_rows:
         details = sorted((row.model_label, repr(row.pk)) for row in missing_rows)
         raise IntentMutationProtocolError(f"detected reconcile content rows were not prelocked: {details!r}")
+    revision_keys = tuple(permit.footprint.revision_keys if bump_keys is None else bump_keys)
+    if not set(revision_keys) <= set(permit.footprint.revision_keys):
+        raise IntentMutationProtocolError("detected reconcile content keys were not prelocked")
+
     from .outbox import bump_intent_revision
 
-    for device_id, scope in permit.footprint.revision_keys:
+    for device_id, scope in revision_keys:
         bump_intent_revision(device_id, scope)
     permit.deferred_repend_rows = permit.initial_deploying_rows
     permit.dml_kind = "content"

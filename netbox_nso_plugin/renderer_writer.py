@@ -25,6 +25,7 @@ from .intent_state import (
     _effective_after,
     _intent_transaction,
     _normal,
+    _upgrade_detected_reconcile,
     canonical_fragment,
     deletion_footprint_for_instance,
     footprint_for_instance,
@@ -1374,6 +1375,12 @@ def renderer_writes(plan: RendererMutationPlan):
         repend_after=True,
         settles_deploying=plan.settles_deploying,
     ) as permit:
+        if permit.dml_kind == "reconcile":
+            _upgrade_detected_reconcile(
+                permit,
+                plan.lock_footprint,
+                bump_keys=plan.content_keys,
+            )
         writer = RendererWriter(plan, content=True, permit=permit)
         token = _ACTIVE_WRITER.set(writer)
         try:
