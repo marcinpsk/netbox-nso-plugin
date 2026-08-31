@@ -38,6 +38,7 @@ def lacp_reconcile_plan(device, payload: dict):
     if management is None:
         return RendererMutationPlan.build()
     interfaces = {row.name: row for row in Interface.objects.filter(device=device)}
+    member_bearing_lag_ids = {row.lag_id for row in interfaces.values() if row.lag_id is not None}
     bundle_states = {
         row.interface_id: row for row in NSOLACPBundleState.objects.filter(management=management).order_by("pk")
     }
@@ -106,7 +107,7 @@ def lacp_reconcile_plan(device, payload: dict):
     for stale in bundle_states.values():
         if stale.interface_id in seen_bundles:
             continue
-        vestigial = not Interface.objects.filter(lag_id=stale.interface_id).exists()
+        vestigial = stale.interface_id not in member_bearing_lag_ids
         if not sm.is_owned(stale.status) and vestigial:
             deletes.append(planned_delete(stale))
             continue
