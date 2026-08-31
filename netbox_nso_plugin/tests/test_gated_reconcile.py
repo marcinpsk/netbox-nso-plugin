@@ -409,13 +409,15 @@ class TestOptionalRoutingDependencyPlans(TestCase):
     """Preflight keeps the reconcilers' optional dependency boundary."""
 
     def test_missing_netbox_routing_returns_empty_plans(self):
+        from netbox_nso_plugin.bfd_reconciler import bfd_reconcile_plan
         from netbox_nso_plugin.bgp_reconciler import bgp_reconcile_plan
-        from netbox_nso_plugin.intent_state import MutationFootprint, ReconcileMutationPlan
+        from netbox_nso_plugin.intent_state import MutationFootprint
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
         from netbox_nso_plugin.route_policy_reconciler import route_policy_reconcile_plan
-        from netbox_nso_plugin.template_content import _static_route_reconcile_plan
+        from netbox_nso_plugin.template_content import static_route_reconcile_plan
 
         device, _management = _make("missing-routing")
-        empty_plan = ReconcileMutationPlan(MutationFootprint())
+        Interface.objects.create(device=device, name="Ethernet1", type="1000base-t")
         bgp_payload = {
             "routers": [
                 {
@@ -430,22 +432,37 @@ class TestOptionalRoutingDependencyPlans(TestCase):
             ]
         }
         planners = (
+            (
+                bfd_reconcile_plan,
+                [
+                    {
+                        "interface_name": "Ethernet1",
+                        "min_tx": 300,
+                        "min_rx": 300,
+                        "multiplier": 3,
+                    }
+                ],
+            ),
             (bgp_reconcile_plan, bgp_payload),
             (route_policy_reconcile_plan, {"prefix_lists": [{"name": "PL", "entries": []}]}),
             (
-                _static_route_reconcile_plan,
+                static_route_reconcile_plan,
                 {"routes": [{"prefix": "198.18.0.0/15", "next_hop": "198.18.0.1", "metric": 1}]},
             ),
         )
 
         for planner, payload in planners:
             with self.subTest(control=planner.__name__):
-                self.assertNotEqual(planner(device, payload), empty_plan)
+                self.assertTrue(planner(device, payload).write_set)
 
         with patch.dict(sys.modules, {"netbox_routing.models": None}):
             for planner, payload in planners:
                 with self.subTest(planner=planner.__name__):
-                    self.assertEqual(planner(device, payload), empty_plan)
+                    plan = planner(device, payload)
+                    self.assertIsInstance(plan, RendererMutationPlan)
+                    self.assertEqual(plan.write_set, ())
+                    self.assertEqual(plan.lock_footprint, MutationFootprint())
+                    self.assertFalse(plan.changes_content)
 
 
 #: every family fetcher reconcile_device consumes, with a minimal doc shape.
