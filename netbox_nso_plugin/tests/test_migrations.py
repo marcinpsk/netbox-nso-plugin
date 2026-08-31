@@ -241,7 +241,7 @@ class TestApplyIdentityMigration(_CascadeFlushMixin, TransactionTestCase):
             peer.save(update_fields=["peer_state"])
         self.addCleanup(self._migrate_to_leaves)
 
-        self._migrate(PRE_APPLY_IDENTITY)
+        self._migrate(DEPLOYMENT_CONTROL)
         self._migrate(APPLY_IDENTITY)
 
         single.refresh_from_db()
