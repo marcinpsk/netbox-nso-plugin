@@ -1089,8 +1089,8 @@ def _write_static_route_status(state, observed: str, new_status: str) -> None:
     owns it. A stale instance therefore has to lose on the value instead: zero rows matched
     means the row moved under the unlocked read, so this pass writes no status at all and
     the next one recomputes from a fresh read. Same shape as
-    ``signals._record_static_route_expectations``'s CAS. The write uses ``save()``, and the
-    surrounding ``mirror_reconciler`` suppresses the row's intent push.
+    ``signals._record_static_route_expectations``'s CAS. ``mirror_reconciler`` suppresses
+    the intent push fired by the instance save inside :func:`_cas_mirror_update`.
     """
     from .models import NSOStaticRouteState
 

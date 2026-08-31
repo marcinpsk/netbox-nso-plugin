@@ -747,14 +747,23 @@ def _upsert_state(mgmt, family, name, obj, ct, captured, now):
     return state, should_fill
 
 
-def _needs_fill(EntryModel, created: bool, should_fill: bool, **filt) -> bool:
+def _needs_fill(
+    EntryModel,
+    created: bool,
+    should_fill: bool,
+    *,
+    has_materialized_owner: bool,
+    **filt,
+) -> bool:
     """Decide whether to (re)fill a parent's entries.
 
-    True when the parent is brand new or an empty shell — but never when the overlay
-    flagged a conflict (should_fill is False then).
+    True for the group's first materialized capture, a new parent, or an empty shell.
+    A conflicting overlay never fills the parent.
     """
     if not should_fill:
         return False
+    if not has_materialized_owner:
+        return True
     if created:
         return True
     return not EntryModel.objects.filter(**filt).exists()
@@ -992,12 +1001,19 @@ def _reconcile_prefix_lists(mgmt, device, pl_list, PrefixList, ContentType, now,
         pl_obj, created = _get_or_create_named(PrefixList, name)
         name_map[name] = pl_obj
         state, should_fill = _upsert_state(mgmt, "prefix_list", name, pl_obj, ct, pl_data, now)
+        has_materialized_owner = ownership.materialized_row(type(state), "prefix_list", name) is not None
         # family is device-sourced and entry-independent (not in the hash), so refresh it on any
         # non-conflicting read — _needs_fill skips an already-populated list, leaving a stale v4
         # on a v6 list. (A conflicting read leaves should_fill False → an owned/diverged row is
         # untouched; the owner-content-changed path sets it via _fill_prefix_list.) Mirrors the
         # community_list invert_match refresh below.
-        needs_fill = _needs_fill(PrefixListEntry, created, should_fill, prefix_list=pl_obj)
+        needs_fill = _needs_fill(
+            PrefixListEntry,
+            created,
+            should_fill,
+            has_materialized_owner=has_materialized_owner,
+            prefix_list=pl_obj,
+        )
         family_changed = should_fill and pl_data.get("family") in (4, 6) and pl_obj.family != pl_data["family"]
         if needs_fill or family_changed:
             with _group_content_mutation("prefix_list", name):
@@ -1027,9 +1043,16 @@ def _reconcile_community_lists(mgmt, device, cl_list, CommunityList, ContentType
         # Hash is invert_match-aware via the registered spec (_cl_hash); a non-inverted
         # list keeps the plain-entries hash so it doesn't false-drift, an invert flip drifts.
         state, should_fill = _upsert_state(mgmt, "community_list", name, cl_obj, ct, cl_data, now)
+        has_materialized_owner = ownership.materialized_row(type(state), "community_list", name) is not None
         # invert_match is device-sourced config — refresh it on any non-conflicting read
         # (a conflicting read leaves should_fill False, so an owned/diverged row is untouched).
-        needs_fill = _needs_fill(CommunityListEntry, created, should_fill, community_list=cl_obj)
+        needs_fill = _needs_fill(
+            CommunityListEntry,
+            created,
+            should_fill,
+            has_materialized_owner=has_materialized_owner,
+            community_list=cl_obj,
+        )
         invert_changed = should_fill and cl_obj.invert_match != invert_match
         if needs_fill or invert_changed:
             with _group_content_mutation("community_list", name):
@@ -1058,7 +1081,14 @@ def _reconcile_as_paths(mgmt, device, ap_list, ASPath, ContentType, now, seen_ke
         ap_obj, created = _get_or_create_named(ASPath, name)
         name_map[name] = ap_obj
         state, should_fill = _upsert_state(mgmt, "as_path", name, ap_obj, ct, ap_data, now)
-        if _needs_fill(ASPathEntry, created, should_fill, aspath=ap_obj):
+        has_materialized_owner = ownership.materialized_row(type(state), "as_path", name) is not None
+        if _needs_fill(
+            ASPathEntry,
+            created,
+            should_fill,
+            has_materialized_owner=has_materialized_owner,
+            aspath=ap_obj,
+        ):
             with _group_content_mutation("as_path", name):
                 _fill_as_path_entries(ap_obj, entries)
                 ownership.mark_materialized(state)
@@ -1080,7 +1110,14 @@ def _reconcile_route_maps(mgmt, device, rm_list, RouteMap, ContentType, now, see
         entries = rm_data.get("entries", []) or []
         rm_obj, created = _get_or_create_named(RouteMap, name)
         state, should_fill = _upsert_state(mgmt, "route_map", name, rm_obj, ct, rm_data, now)
-        if _needs_fill(RouteMapEntry, created, should_fill, route_map=rm_obj):
+        has_materialized_owner = ownership.materialized_row(type(state), "route_map", name) is not None
+        if _needs_fill(
+            RouteMapEntry,
+            created,
+            should_fill,
+            has_materialized_owner=has_materialized_owner,
+            route_map=rm_obj,
+        ):
             with _group_content_mutation("route_map", name):
                 _fill_route_map_entries(rm_obj, entries, pl_map, cl_map, ap_map)
                 ownership.mark_materialized(state)
@@ -1129,6 +1166,7 @@ def _route_policy_group_changes_content(management, family: str, name: str, capt
     """Predict whether one MASTER group will write materialized policy content."""
     from netbox_routing.models import ASPathEntry, CommunityListEntry, PrefixListEntry, RouteMapEntry
 
+    from . import status_machine as sm
     from .models import NSORoutePolicyState
 
     if _group_mode(family, name) == "local":
@@ -1151,9 +1189,11 @@ def _route_policy_group_changes_content(management, family: str, name: str, capt
         diverged = _row_diverged(state, entries_hash, family, name)
         if diverged and _owner_can_refresh(state):
             return True
-        can_fill = not diverged
+        can_fill = sm.is_owned(state.status) or not diverged
     if not can_fill:
         return False
+    if ownership.materialized_row(NSORoutePolicyState, family, name) is None:
+        return True
 
     if family == "prefix_list":
         family_changed = captured.get("family") in (4, 6) and obj.family != captured["family"]
