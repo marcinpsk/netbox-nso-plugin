@@ -349,13 +349,16 @@ def _backfill_static_route_generations(mgmt) -> list[dict]:
                 signals.PUSHED_STATIC_ROUTE_FILTER,
                 management=mgmt,
                 intent_generation=UNALLOCATED,
-            ).order_by("management_id", "pk")
+            )
+            .select_related("static_route")
+            .order_by("management_id", "pk")
         )
         if not candidates:
             return []
         armed_fields = signals._STATIC_ROUTE_ARMED_FIELDS
         before = []
         operations = []
+        route_checks = []
         for row in candidates:
             # apply_attempt_id rides with status: nso_static_deploy_attempt refuses
             # `deploying` with a NULL attempt, so a rollback that put the status back
@@ -377,11 +380,17 @@ def _backfill_static_route_generations(mgmt) -> list[dict]:
             snapshot["armed_status"] = candidate.status
             before.append(snapshot)
             operations.append((candidate, tuple(update_fields)))
+            route_checks.append(copy.copy(row.static_route))
         plan = RendererMutationPlan.build(
-            saves=tuple(planned_save(candidate, update_fields=fields) for candidate, fields in operations)
+            saves=(
+                *(planned_save(route, update_fields=()) for route in route_checks),
+                *(planned_save(candidate, update_fields=fields) for candidate, fields in operations),
+            )
         )
         try:
             with signals.suppress_intent_push(), renderer_writes(plan) as writer:
+                for route in route_checks:
+                    writer.save(route, update_fields=())
                 for candidate, fields in operations:
                     writer.save(candidate, update_fields=fields)
         except IntentPlanStaleError:
