@@ -77,13 +77,15 @@ def _stamp_verified_baselines(mgmt):
     from netbox_nso_plugin.models import NSOIntentRevision
 
     for scope in delivery.delivery_keys():
-        NSOIntentRevision.objects.create(
+        NSOIntentRevision.objects.update_or_create(
             device=mgmt.device,
             scope=scope,
-            revision=4,
-            verified_revision=4,
-            verified_fingerprint=f"verified-{scope}",
-            verified_at=timezone.now(),
+            defaults={
+                "revision": 4,
+                "verified_revision": 4,
+                "verified_fingerprint": f"verified-{scope}",
+                "verified_at": timezone.now(),
+            },
         )
 
 

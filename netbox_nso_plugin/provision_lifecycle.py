@@ -15,7 +15,7 @@ from .deployment import guarded as _deployment_guarded
 
 logger = logging.getLogger(__name__)
 
-# One fleet tick polls at most this many attempts, oldest first, so nothing starves.
+# One fleet tick polls at most this many attempts. Attempted rows rotate to the back.
 _FLEET_SWEEP_LIMIT = 100
 # Past this age an attempt the adapter has no record of can no longer be in flight.
 _UNKNOWN_ATTEMPT_MAX_AGE = timedelta(hours=6)
@@ -126,7 +126,11 @@ def sweep_provision_tombstones(provision_attempt_id=None):
     """Advance matching provision tombstones through the fenced completion states."""
     from .models import NSOProvisionTombstone
 
-    tombstones = NSOProvisionTombstone.objects.exclude(state="closed").order_by("created_at", "provision_attempt_id")
+    tombstones = NSOProvisionTombstone.objects.exclude(state="closed").order_by(
+        "updated_at",
+        "created_at",
+        "provision_attempt_id",
+    )
     if provision_attempt_id is not None:
         # One named attempt: its caller (UI poll, callback job) can act on the failure.
         attempts = list(
@@ -144,6 +148,10 @@ def sweep_provision_tombstones(provision_attempt_id=None):
             raise
         except Exception:  # noqa: BLE001 - one attempt must not stop the fleet sweep
             logger.exception("Provision tombstone sweep failed for attempt %s", tombstone_id)
+        finally:
+            NSOProvisionTombstone.objects.filter(
+                provision_attempt_id=tombstone_id,
+            ).exclude(state="closed").update(updated_at=timezone.now())
     return checked, closed
 
 
