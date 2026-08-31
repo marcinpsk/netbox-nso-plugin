@@ -59,11 +59,8 @@ _REVIEWED_MUTATION_SITES = frozenset(
         ("link_role.py", "enable_igp_for_role", "NSOISISInterfaceState.objects.update_or_create"),
         ("link_role.py", "enable_igp_for_role", "NSOOSPFInterfaceState.objects.update_or_create"),
         ("onboarding.py", "onboard_candidate", "NSOPlatformNedMapping.objects.get_or_create"),
-        ("read_gate.py", "_gate_and_record", "m.save"),
-        ("read_gate.py", "observe_aggregate", "m.save"),
         ("signals.py", "_create_greenfield_subif_state", "NSOSubinterfaceState.objects.create"),
         ("signals.py", "_record_static_route_expectations", "row.save"),
-        ("signals.py", "_remove_static_route_for_device", "rows.delete"),
         ("template_content.py", "_reconcile_lag_topology", "stale.save"),
     }
 )

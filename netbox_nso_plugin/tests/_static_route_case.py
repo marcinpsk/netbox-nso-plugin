@@ -257,8 +257,6 @@ def _touch_owned_route(route):
 
 def _delete_owned_route(route):
     """Delete one native route and its exact Collector closure."""
-    from netbox_nso_plugin import signals
-    from netbox_nso_plugin.models import NSOStaticRouteState
     from netbox_nso_plugin.renderer_writer import (
         RendererMutationPlan,
         planned_delete,
@@ -267,26 +265,10 @@ def _delete_owned_route(route):
     )
 
     current = type(route).objects.get(pk=route.pk)
-    transitions = tuple(
-        (
-            state.management.device_id,
-            signals._static_route_delete_transition(state, current),
-        )
-        for state in NSOStaticRouteState.objects.filter(static_route=current)
-        .select_related("management")
-        .order_by("management__device_id", "pk")
-    )
     plan = RendererMutationPlan.build(deletes=(planned_delete(current),))
     mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
     with mutation as writer:
-        with signals.suppress_intent_push():
-            writer.delete(current)
-        with signals._delete_origin_dispatch():
-            for device_id, transition in transitions:
-                signals._schedule_intent_push(
-                    (device_id, "static_route"),
-                    transitions=(transition,),
-                )
+        writer.delete(current)
 
 
 def _accept_with_permit(route, device):
@@ -320,7 +302,6 @@ def _accept_with_permit(route, device):
 
 def _unassign_and_retire(route, device):
     """Remove one owned route membership through one exact retirement plan."""
-    from netbox_nso_plugin import signals
     from netbox_nso_plugin.models import NSOStaticRouteState
     from netbox_nso_plugin.renderer_writer import (
         RendererMutationPlan,
@@ -344,17 +325,9 @@ def _unassign_and_retire(route, device):
     else:
         mutation = renderer_writes(plan)
     with mutation as writer:
-        transition = None if state is None else signals._static_route_delete_transition(state, current)
-        with signals.suppress_intent_push():
-            if state is not None:
-                writer.delete(state)
-            writer.m2m_set(current, "devices", remaining)
-        if transition is not None:
-            with signals._delete_origin_dispatch():
-                signals._schedule_intent_push(
-                    (state.management.device_id, "static_route"),
-                    transitions=(transition,),
-                )
+        if state is not None:
+            writer.delete(state)
+        writer.m2m_set(current, "devices", remaining)
 
 
 def _own(sr, mgmt, *, status="in_sync", mirror_vrf=None):
@@ -376,4 +349,3 @@ def _own(sr, mgmt, *, status="in_sync", mirror_vrf=None):
             intent_generation=allocate_intent_generation(),
             generation_started_at=timezone.now(),
         )
-
