@@ -444,7 +444,7 @@ def audit_renderer_fleet() -> RendererFleetAuditResult:
     # an orphan offboard or a stranded onboard would otherwise wait an hour. It runs before
     # the device loop, which can spend the whole budget, and its failure is not this pass's.
     try:
-        sweep_provision_tombstones()
+        sweep_provision_tombstones(deadline=deadline)
     except DeploymentQuiesced:
         raise
     except Exception:  # noqa: BLE001 (the next cadence retries the sweep)

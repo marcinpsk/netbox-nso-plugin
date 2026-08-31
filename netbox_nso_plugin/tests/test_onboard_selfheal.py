@@ -187,6 +187,24 @@ class TestAdvanceStaleOnboardingSweep(TestCase):
                 self.assertEqual(mgmt.onboard_status, "provision_failed")
                 self.assertTrue(mgmt.onboard_error)
 
+    def test_untracked_failure_does_not_overwrite_concurrent_completion(self):
+        from netbox_nso_plugin.management_lifecycle import save_management
+        from netbox_nso_plugin.onboarding import advance_provisioning
+
+        stale, tombstone = self._provisioning("sweep-concurrent-completion", "J-COMPLETE")
+        tombstone.delete()
+        current = NSODeviceManagement.objects.get(pk=stale.pk)
+        current.onboard_status = ""
+        current.onboard_error = ""
+        save_management(current, update_fields=["onboard_status", "onboard_error"])
+
+        result = advance_provisioning(stale)
+
+        self.assertEqual(result, {"status": "ready", "error": ""})
+        current.refresh_from_db()
+        self.assertEqual(current.onboard_status, "")
+        self.assertEqual(current.onboard_error, "")
+
     def test_system_job_run_delegates_to_sweep(self):
         """The JobRunner.run wrapper calls the sweep (thin shell around the domain function)."""
         from netbox_nso_plugin.jobs import AdvanceStaleOnboardingJob
@@ -205,7 +223,7 @@ class TestAdvanceStaleOnboardingSweep(TestCase):
             with (
                 self.assertNoLogs("netbox_nso_plugin.onboarding", level="ERROR"),
                 self.assertLogs("netbox_nso_plugin.jobs", level="INFO") as logged,
-                patch("netbox_nso_plugin.adapter_client.get_job") as get_job,
+                patch("netbox_nso_plugin.adapter_client.get_provision_attempt") as get_provision_attempt,
             ):
                 result = AdvanceStaleOnboardingJob.run(None)
         finally:
@@ -214,7 +232,7 @@ class TestAdvanceStaleOnboardingSweep(TestCase):
         self.assertIsNone(result)
         self.assertEqual(len(logged.output), 1)
         self.assertIn("paused for an intent deployment", logged.output[0])
-        get_job.assert_not_called()
+        get_provision_attempt.assert_not_called()
         mgmt.refresh_from_db()
         self.assertEqual(mgmt.onboard_status, "provisioning")
 

@@ -329,7 +329,7 @@ class ProvisionCompleteView(APIView):
         from uuid import UUID
 
         from ..adapter_client import AdapterError
-        from ..provision_lifecycle import mark_provision_terminal
+        from ..provision_lifecycle import mark_provision_terminal, validate_provision_evidence
         from ..reconcile import enqueue_provision_tombstone_sweep
 
         raw_attempt_id = request.data.get("provision_attempt_id")
@@ -337,8 +337,12 @@ class ProvisionCompleteView(APIView):
             return Response({"detail": "provision_attempt_id is required"}, status=status.HTTP_400_BAD_REQUEST)
         try:
             attempt_id = UUID(str(raw_attempt_id))
-            known = mark_provision_terminal(attempt_id, dict(request.data))
-        except (AdapterError, TypeError, ValueError):
+            evidence = validate_provision_evidence(dict(request.data), terminal_required=True)
+        except (TypeError, ValueError):
+            return Response({"detail": "invalid provision completion evidence"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            known = mark_provision_terminal(attempt_id, evidence)
+        except AdapterError:
             return Response({"detail": "invalid provision completion evidence"}, status=status.HTTP_400_BAD_REQUEST)
         if not known:
             return Response({"queued": False}, status=status.HTTP_202_ACCEPTED)

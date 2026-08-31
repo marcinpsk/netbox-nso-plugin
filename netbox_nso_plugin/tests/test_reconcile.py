@@ -317,6 +317,18 @@ class TestProvisionCompleteEndpoint(APITestCase):
         response = self.client.post(self._url(), {}, format="json", **self.header)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
+    def test_unexpected_terminal_write_error_is_not_reported_as_invalid_evidence(self):
+        payload = {"provision_attempt_id": str(uuid4()), "status": "failed"}
+
+        with (
+            patch(
+                "netbox_nso_plugin.provision_lifecycle.mark_provision_terminal",
+                side_effect=ValueError("unexpected terminal write failure"),
+            ),
+            self.assertRaisesRegex(ValueError, "unexpected terminal write failure"),
+        ):
+            self.client.post(self._url(), payload, format="json", **self.header)
+
     def test_known_attempt_only_marks_terminal_and_enqueues_the_sweep(self):
         """The callback records evidence but never advances or offboards a device."""
         tombstone = self._tombstone("77")
