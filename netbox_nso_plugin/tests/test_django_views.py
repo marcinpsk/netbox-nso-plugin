@@ -5122,8 +5122,7 @@ class TestOverlayFieldEditView(ViewTestBase):
             object_name=route_map.name,
             content_type=ContentType.objects.get_for_model(RouteMap),
             object_id=route_map.pk,
-            status="deploying",
-            apply_attempt_id=uuid4(),
+            status="imported",
         )
         _other_device, other_management = make_managed("route-map-rename", 322)
         attached = NSORoutePolicyState.objects.create(
@@ -5132,9 +5131,14 @@ class TestOverlayFieldEditView(ViewTestBase):
             object_name=route_map.name,
             content_type=row.content_type,
             object_id=route_map.pk,
-            status="deploying",
-            apply_attempt_id=uuid4(),
+            status="imported",
         )
+        content_bulk_update(row, status="deploying", apply_attempt_id=uuid4())
+        content_bulk_update(attached, status="deploying", apply_attempt_id=uuid4())
+        row.refresh_from_db()
+        attached.refresh_from_db()
+        self.assertEqual(row.status, "deploying")
+        self.assertEqual(attached.status, "deploying")
 
         row.object_name = "RM-IN-FLIGHT-NEW"
         with suppress_intent_push():

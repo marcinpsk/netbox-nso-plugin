@@ -481,7 +481,7 @@ class TestReconcileRedistribution(TestCase):
 
         ISISInstance.objects.create(device=self.device, process_tag="")
         from netbox_nso_plugin.models import NSORedistributionState
-        from netbox_nso_plugin.reconcile import reconcile_category
+        from netbox_nso_plugin.reconcile import _LeaseOutcome, reconcile_category
         from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
 
         reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
@@ -493,6 +493,7 @@ class TestReconcileRedistribution(TestCase):
             return execute(sql, params, many, context)
 
         with (
+            patch("netbox_nso_plugin.reconcile._acquire_reconcile_lease", return_value=_LeaseOutcome()),
             patch("netbox_nso_plugin.adapter_client.get_redistribution", return_value={"entries": []}),
             connection.execute_wrapper(observe_sql),
         ):

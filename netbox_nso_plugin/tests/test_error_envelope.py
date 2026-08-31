@@ -151,7 +151,7 @@ class TestAdapterErrorEnvelopeInResponses(_UnreachableAdapterMixin, ViewTestBase
     @classmethod
     def setUpTestData(cls):
         super().setUpTestData()
-        # A queryset write, so the post_save adapter push does not fire during fixture setup.
+        # A suppressed mirror write, so the post_save adapter push does not fire during fixture setup.
         mirror_update(cls.mgmt, adapter_device_id=4242)
         cls.mgmt.refresh_from_db()
 

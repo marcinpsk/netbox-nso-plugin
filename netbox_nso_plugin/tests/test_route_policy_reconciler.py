@@ -11,6 +11,7 @@ ASPathAccessList->ASPath rename slipped through unnoticed).
 from __future__ import annotations
 
 import json
+from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.test import TestCase
@@ -1772,6 +1773,87 @@ class TestSharedObjectOwnership(TestCase):
         st = NSORoutePolicyState.objects.get(management__device=self.d1, object_name="PL-OWN")
         self.assertTrue(st.is_materialized)
         self.assertEqual(st.status, "imported")
+
+    def test_first_prefix_list_capture_replaces_a_populated_unowned_root(self):
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import CustomPrefix, PrefixList, PrefixListEntry
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.reconcile import _LeaseOutcome, reconcile_category
+        from netbox_nso_plugin.route_policy_reconciler import route_policy_reconcile_plan
+
+        root = PrefixList.objects.create(name="PL-FIRST-CAPTURE")
+        old_prefix = CustomPrefix.objects.create(prefix="198.18.40.0/24")
+        PrefixListEntry.objects.create(
+            prefix_list=root,
+            assigned_prefix_type=ContentType.objects.get_for_model(CustomPrefix),
+            assigned_prefix_id=old_prefix.pk,
+            sequence=10,
+            action="permit",
+        )
+        management = self._mgmt(self.d1)
+        payload = self._pl(root.name, [])
+
+        self.assertTrue(route_policy_reconcile_plan(self.d1, payload).changes_content)
+
+        with (
+            patch("netbox_nso_plugin.reconcile._acquire_reconcile_lease", return_value=_LeaseOutcome()),
+            patch("netbox_nso_plugin.adapter_client.get_route_policy", return_value=payload),
+        ):
+            result = reconcile_category(self.d1, management, "route_policy")
+
+        state = NSORoutePolicyState.objects.get(management__device=self.d1, object_name=root.name)
+        self.assertEqual(result["_gate"]["route_policy"], "legacy")
+        self.assertTrue(state.is_materialized)
+        self.assertFalse(PrefixListEntry.objects.filter(prefix_list=root).exists())
+
+    def test_first_community_list_capture_replaces_a_populated_unowned_root(self):
+        from netbox_routing.models import Community, CommunityList, CommunityListEntry
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        root = CommunityList.objects.create(name="CL-FIRST-CAPTURE")
+        old_community = Community.objects.create(community="64512:1")
+        CommunityListEntry.objects.create(community_list=root, community=old_community, action="permit")
+        self._mgmt(self.d1)
+        payload = {"community_lists": [{"name": root.name, "entries": []}]}
+
+        reconcile_route_policy(self.d1, payload)
+
+        state = NSORoutePolicyState.objects.get(management__device=self.d1, object_name=root.name)
+        self.assertTrue(state.is_materialized)
+        self.assertFalse(CommunityListEntry.objects.filter(community_list=root).exists())
+
+    def test_owned_prefix_list_capture_replaces_content_when_the_group_has_no_owner(self):
+        from netbox_routing.models import PrefixListEntry
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.reconcile import _LeaseOutcome, reconcile_category
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+
+        from ._outbox_case import content_update
+
+        management = self._mgmt(self.d1)
+        initial = self._pl("PL-OWNED-FIRST-CAPTURE", ["198.18.64.0/24"])
+        reconcile_route_policy(self.d1, initial)
+        state = NSORoutePolicyState.objects.get(management=management, object_name="PL-OWNED-FIRST-CAPTURE")
+        content_update(state, status="accepted", is_materialized=False)
+        payload = self._pl(state.object_name, [])
+
+        self.assertTrue(route_policy_reconcile_plan(self.d1, payload).changes_content)
+
+        with (
+            patch("netbox_nso_plugin.reconcile._acquire_reconcile_lease", return_value=_LeaseOutcome()),
+            patch("netbox_nso_plugin.adapter_client.get_route_policy", return_value=payload),
+        ):
+            result = reconcile_category(self.d1, management, "route_policy")
+
+        state.refresh_from_db()
+        self.assertEqual(result["_gate"]["route_policy"], "legacy")
+        self.assertEqual(state.status, "accepted")
+        self.assertTrue(state.is_materialized)
+        self.assertFalse(PrefixListEntry.objects.filter(prefix_list_id=state.object_id).exists())
 
     def test_resettle_sibling_bumps_last_sync_at(self):
         """Re-pointing a shared object resettles the old owner's sibling row and recomputes its
