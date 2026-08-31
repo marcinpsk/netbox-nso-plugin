@@ -103,11 +103,8 @@ class TestSviReconciler(TestCase):
     def test_a_concurrently_created_interface_is_reused(self):
         from django.db import connection
 
-        from netbox_nso_plugin.intent_state import reconcile_transaction
-        from netbox_nso_plugin.svi_reconciler import _reconcile_svi, svi_reconcile_plan
+        from netbox_nso_plugin.svi_reconciler import reconcile_svi
 
-        payload = {"interfaces": [{"interface_name": "Vlan201", "vlan_id": 201, "type": "svi"}]}
-        plan = svi_reconcile_plan(self.device, payload)
         inserted = None
 
         def insert_after_interface_read(execute, sql, params, many, context):
@@ -117,12 +114,56 @@ class TestSviReconciler(TestCase):
                 inserted = Interface.objects.create(device=self.device, name="Vlan201", type="virtual")
             return result
 
-        with reconcile_transaction(plan), connection.execute_wrapper(insert_after_interface_read):
-            rows = _reconcile_svi(self.device, payload)
+        with connection.execute_wrapper(insert_after_interface_read):
+            rows = reconcile_svi(
+                self.device,
+                {"interfaces": [{"interface_name": "Vlan201", "vlan_id": 201, "type": "svi"}]},
+            )
 
         self.assertIsNotNone(inserted, "the wrapper never reached the interface read seam")
         self.assertEqual(rows[0].interface_id, inserted.pk)
         self.assertEqual(Interface.objects.filter(device=self.device, name="Vlan201").count(), 1)
+
+    def test_a_concurrently_completed_svi_creation_is_reused(self):
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_save,
+            renderer_mirror_writes,
+        )
+        from netbox_nso_plugin.svi_reconciler import _reconcile_svi, svi_reconcile_plan
+
+        payload = {"interfaces": [{"interface_name": "Vlan202", "vlan_id": 202, "type": "svi"}]}
+        plan = svi_reconcile_plan(self.device, payload)
+        interface = Interface(device=self.device, name="Vlan202", type="virtual")
+        interface._site = self.device.site
+        interface._location = self.device.location
+        interface._rack = self.device.rack
+        state = NSOSVIState(
+            management=self.management,
+            interface=interface,
+            svi_type="svi",
+            status="imported",
+            last_sync_at=plan.planned_at,
+        )
+        winner = RendererMutationPlan.build(
+            saves=(
+                planned_save(interface, force_insert=True, natural_key=("device", "name")),
+                planned_save(
+                    state,
+                    force_insert=True,
+                    natural_key=("management", "interface"),
+                ),
+            )
+        )
+        with renderer_mirror_writes(winner) as writer:
+            writer.save(interface, force_insert=True)
+            writer.save(state, force_insert=True)
+
+        with renderer_mirror_writes(plan) as writer:
+            rows = _reconcile_svi(self.device, payload, writer, plan.planned_at)
+
+        self.assertEqual(rows[0].pk, state.pk)
+        self.assertEqual(NSOSVIState.objects.filter(management=self.management, interface=interface).count(), 1)
 
     def test_irb_type_preserved(self):
         from netbox_nso_plugin.svi_reconciler import reconcile_svi

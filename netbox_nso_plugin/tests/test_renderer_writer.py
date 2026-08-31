@@ -60,6 +60,31 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
 
         self.assertTrue(issubclass(IntentPlanStaleError, IntentMutationProtocolError))
 
+    def test_planned_creation_adopts_a_natural_key_race_winner(self):
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_save,
+            renderer_mirror_writes,
+            renderer_writes,
+        )
+
+        device, _management = make_managed("writer-create-race", 16288)
+        planned = Interface(device=device, name="Loopback1627", type="virtual")
+        planned._site = device.site
+        planned._location = device.location
+        planned._rack = device.rack
+        plan = RendererMutationPlan.build(
+            saves=(planned_save(planned, force_insert=True, natural_key=("device", "name")),)
+        )
+        existing = Interface.objects.create(device=device, name="Loopback1627", type="virtual")
+        mutation = renderer_writes if plan.changes_content else renderer_mirror_writes
+
+        with mutation(plan) as writer:
+            writer.save(planned, force_insert=True)
+
+        self.assertEqual(planned.pk, existing.pk)
+        self.assertEqual(Interface.objects.filter(device=device, name="Loopback1627").count(), 1)
+
     def test_one_plan_can_create_a_native_row_and_its_overlay(self):
         from ipam.models import VLANGroup
 

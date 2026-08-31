@@ -146,9 +146,16 @@ def reconcile_svi(device, payload: dict) -> list:
 def _reconcile_svi(device, payload: dict, writer, planned_at) -> list:
     """Execute the SVI operations after their exact write set is frozen."""
     _saves, _deletes, operations, rows = _svi_reconcile_operations(device, payload, planned_at)
+    raced_states = set()
+    for row in rows:
+        writer.consume_existing_creation(row.interface)
+        if writer.consume_existing_creation(row):
+            raced_states.add(id(row))
     for operation, instance, update_fields, force_insert in operations:
         if operation == "delete":
             writer.delete(instance)
+        elif id(instance) in raced_states:
+            continue
         else:
             writer.save(instance, update_fields=update_fields, force_insert=force_insert)
     return rows
