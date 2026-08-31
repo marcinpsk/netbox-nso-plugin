@@ -82,6 +82,29 @@ class TestSviReconciler(TestCase):
         reconcile_svi(self.device, {"interfaces": [{"interface_name": "Vlan200", "vlan_id": 200, "type": "svi"}]})
         self.assertEqual(Interface.objects.filter(device=self.device, name="Vlan200").count(), 1)
 
+    def test_a_concurrently_created_interface_is_reused(self):
+        from django.db import connection
+
+        from netbox_nso_plugin.intent_state import reconcile_transaction
+        from netbox_nso_plugin.svi_reconciler import _reconcile_svi, svi_reconcile_plan
+
+        payload = {"interfaces": [{"interface_name": "Vlan201", "vlan_id": 201, "type": "svi"}]}
+        plan = svi_reconcile_plan(self.device, payload)
+        inserted = None
+
+        def insert_after_interface_read(execute, sql, params, many, context):
+            nonlocal inserted
+            result = execute(sql, params, many, context)
+            if inserted is None and sql.lstrip().upper().startswith("SELECT") and Interface._meta.db_table in sql:
+                inserted = Interface.objects.create(device=self.device, name="Vlan201", type="virtual")
+            return result
+
+        with reconcile_transaction(plan), connection.execute_wrapper(insert_after_interface_read):
+            rows = _reconcile_svi(self.device, payload)
+
+        self.assertEqual(rows[0].interface_id, inserted.pk)
+        self.assertEqual(Interface.objects.filter(device=self.device, name="Vlan201").count(), 1)
+
     def test_irb_type_preserved(self):
         from netbox_nso_plugin.svi_reconciler import reconcile_svi
 

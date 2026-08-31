@@ -74,6 +74,7 @@ def reconcile_svi(device, payload: dict) -> list:
 def _reconcile_svi(device, payload: dict) -> list:
     """Apply an SVI mirror after its complete footprint is locked."""
     from dcim.models import Interface
+    from django.db import IntegrityError, transaction
     from django.utils import timezone
     from ipam.models import VLAN
 
@@ -96,7 +97,13 @@ def _reconcile_svi(device, payload: dict) -> list:
         iface = Interface.objects.filter(device=device, name=name).first()
         if iface is None:
             iface = Interface(device=device, name=name, type="virtual")
-            iface.save(force_insert=True)
+            try:
+                with transaction.atomic():
+                    iface.save(force_insert=True)
+            except IntegrityError:
+                iface = Interface.objects.filter(device=device, name=name).first()
+                if iface is None:
+                    raise
         vid = item.get("vlan_id")
         vlan = VLAN.objects.filter(group=group, vid=vid).first() if vid else None
         device_type = item.get("type") or "svi"

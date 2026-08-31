@@ -71,6 +71,7 @@ def reconcile_subinterface(device, payload: dict) -> list:
 def _reconcile_subinterface(device, payload: dict) -> list:
     """Apply a subinterface mirror after its complete footprint is locked."""
     from dcim.models import Interface
+    from django.db import IntegrityError, transaction
     from django.utils import timezone
 
     from . import status_machine as sm
@@ -95,7 +96,13 @@ def _reconcile_subinterface(device, payload: dict) -> list:
         iface = iface_map.get(name)
         if iface is None:
             iface = Interface(device=device, name=name, type="virtual")
-            iface.save(force_insert=True)
+            try:
+                with transaction.atomic():
+                    iface.save(force_insert=True)
+            except IntegrityError:
+                iface = Interface.objects.filter(device=device, name=name).first()
+                if iface is None:
+                    raise
             iface_map[name] = iface
 
         # Resolve the physical parent from the map; never create it (device sync owns it).

@@ -155,6 +155,48 @@ class TestSubinterfaceReconciler(TestCase):
         )
         self.assertEqual(Interface.objects.filter(device=self.device, name="GigabitEthernet0/1.200").count(), 1)
 
+    def test_a_concurrently_created_subinterface_is_reused(self):
+        from django.db import connection
+
+        from netbox_nso_plugin.intent_state import reconcile_transaction
+        from netbox_nso_plugin.subinterface_reconciler import (
+            _reconcile_subinterface,
+            subinterface_reconcile_plan,
+        )
+
+        payload = {
+            "interfaces": [
+                {
+                    "interface_name": "GigabitEthernet0/1.201",
+                    "parent_interface": self.parent.name,
+                    "dot1q_vlan": 201,
+                }
+            ]
+        }
+        plan = subinterface_reconcile_plan(self.device, payload)
+        inserted = None
+
+        def insert_after_interface_read(execute, sql, params, many, context):
+            nonlocal inserted
+            result = execute(sql, params, many, context)
+            if inserted is None and sql.lstrip().upper().startswith("SELECT") and Interface._meta.db_table in sql:
+                inserted = Interface.objects.create(
+                    device=self.device,
+                    name="GigabitEthernet0/1.201",
+                    type="virtual",
+                    parent=self.parent,
+                )
+            return result
+
+        with reconcile_transaction(plan), connection.execute_wrapper(insert_after_interface_read):
+            rows = _reconcile_subinterface(self.device, payload)
+
+        self.assertEqual(rows[0].interface_id, inserted.pk)
+        self.assertEqual(
+            Interface.objects.filter(device=self.device, name="GigabitEthernet0/1.201").count(),
+            1,
+        )
+
     def test_stale_state_pruned(self):
         from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
 
