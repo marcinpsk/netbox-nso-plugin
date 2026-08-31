@@ -33,13 +33,19 @@ def _validated_interface_items(payload: dict) -> tuple[dict, ...]:
     """Validate one adapter MTU document before planning stale-row changes."""
     if not isinstance(payload, dict):
         raise AdapterError("interface MTU payload must be an object", code="invalid_response")
-    items = payload.get("interfaces", [])
+    items = payload.get("interfaces")
     if not isinstance(items, list):
         raise AdapterError("interface MTU interfaces must be a list", code="invalid_response")
     seen = set()
     for item in items:
         if not isinstance(item, dict):
             raise AdapterError("interface MTU payload entry must be an object", code="invalid_response")
+        for field_name in ("interface_name", "mtu", "ip_mtu", "mpls_mtu", "bound_port"):
+            if field_name not in item:
+                raise AdapterError(
+                    f"interface MTU payload entry {field_name} is required",
+                    code="invalid_response",
+                )
         name = item.get("interface_name")
         if not isinstance(name, str) or not name:
             raise AdapterError(
