@@ -462,37 +462,37 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         assert results[0]["armed"] == 1
 
     def test_a_route_that_becomes_unpushable_before_arming_stays_unallocated(self):
-        """Recheck push eligibility after the content footprint is acquired."""
+        """Retry eligibility when an exact arming plan becomes stale."""
+        import copy
+
         from netbox_routing.models import StaticRoute
 
-        from netbox_nso_plugin import intent_state
         from netbox_nso_plugin.intent_drift import _backfill_static_route_generations
         from netbox_nso_plugin.intent_generation import UNALLOCATED
-        from netbox_nso_plugin.models import NSOIntentRevision
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
         _, mgmt = self._managed_device("arming-race", 8106)
         row = self._own_route(mgmt, "198.18.32.0/24", "198.18.32.1")
-        revision, _ = NSOIntentRevision.objects.get_or_create(device=mgmt.device, scope="static_route")
-        initial_revision = revision.revision
-        revision_before_arming: list[int] = []
-        real_intent_transaction = intent_state.intent_transaction
+        real_renderer_writes = renderer_writes
+        raced = False
 
         @contextlib.contextmanager
-        def make_route_unpushable(footprint):
-            from netbox_nso_plugin.signals import suppress_intent_push
+        def make_route_unpushable(plan):
+            nonlocal raced
+            if not raced:
+                raced = True
+                route = StaticRoute.objects.get(pk=row.static_route_id)
+                candidate = copy.copy(route)
+                candidate.next_hop = None
+                candidate.interface_next_hop = "Ethernet1/1"
+                fields = ("next_hop", "interface_next_hop")
+                route_plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=fields),))
+                with without_commit_drain(), real_renderer_writes(route_plan) as writer:
+                    writer.save(candidate, update_fields=fields)
+            with real_renderer_writes(plan) as writer:
+                yield writer
 
-            route = StaticRoute.objects.get(pk=row.static_route_id)
-            route_footprint = intent_state.footprint_for_instance(route)
-            with without_commit_drain(), suppress_intent_push(), real_intent_transaction(route_footprint):
-                route.next_hop = None
-                route.interface_next_hop = "Ethernet1/1"
-                route.save(update_fields=["next_hop", "interface_next_hop"])
-            revision.refresh_from_db()
-            revision_before_arming.append(revision.revision)
-            with real_intent_transaction(footprint):
-                yield
-
-        with patch("netbox_nso_plugin.intent_state.intent_transaction", side_effect=make_route_unpushable):
+        with patch("netbox_nso_plugin.renderer_writer.renderer_writes", new=make_route_unpushable):
             armed = _backfill_static_route_generations(mgmt)
 
         row.refresh_from_db()
