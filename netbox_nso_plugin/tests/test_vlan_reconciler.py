@@ -563,7 +563,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
 
         reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 33, "name": "MGMT"}]})
         state = NSOVLANState.objects.get(management=self.management, vlan__vid=33)
-        from ._outbox_case import content_update
+        from ._outbox_case import content_update, mirror_update
 
         mirror_update(self.management, adapter_device_id=33)
         content_update(state, status="in_sync")
