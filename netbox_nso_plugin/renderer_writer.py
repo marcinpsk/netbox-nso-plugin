@@ -475,7 +475,12 @@ def _creation_identity(instance, creation_refs):
 
 def _related_identities(related, creation_refs):
     identities = {_creation_identity(row, creation_refs) for row in related}
-    return tuple(sorted(identities, key=repr))
+    return tuple(
+        sorted(
+            identities,
+            key=lambda identity: (1, repr(identity)) if isinstance(identity, RendererCreationRef) else (0, identity),
+        )
+    )
 
 
 def _plan_m2m_add(proposed: RendererM2MAdd, creation_refs):

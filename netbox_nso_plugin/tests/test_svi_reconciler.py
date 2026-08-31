@@ -65,6 +65,18 @@ class TestSviReconciler(TestCase):
             ],
         )
 
+    def test_reconcile_plan_does_not_create_the_device_vlan_group(self):
+        from ipam.models import VLANGroup
+
+        from netbox_nso_plugin.svi_reconciler import svi_reconcile_plan
+
+        svi_reconcile_plan(
+            self.device,
+            {"interfaces": [{"interface_name": "Vlan1628", "vlan_id": 1628, "type": "svi"}]},
+        )
+
+        self.assertFalse(VLANGroup.objects.filter(slug=f"nso-{self.device.pk}").exists())
+
     def test_direct_reconcile_does_not_advance_intent_revision(self):
         from netbox_nso_plugin.models import NSOIntentRevision
         from netbox_nso_plugin.svi_reconciler import reconcile_svi

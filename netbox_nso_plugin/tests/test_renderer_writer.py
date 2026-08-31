@@ -273,6 +273,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         plan = RendererMutationPlan.build(m2m_writes=(planned_m2m_set(state, "tagged_vlans", (lower, higher)),))
 
         self.assertFalse(plan.changes_content)
+        self.assertEqual(plan.write_set[0].selected_pks, (lower.pk, higher.pk))
 
     def test_content_save_bumps_repends_enqueues_and_finalizes_fingerprint(self):
         from netbox_nso_plugin import delivery

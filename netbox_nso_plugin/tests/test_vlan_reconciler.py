@@ -53,6 +53,18 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
             NSOVLANState.objects.filter(management=self.management, vlan__group=group, vlan__vid=10).exists()
         )
 
+    def test_vlan_reconciler_uses_the_first_repeated_vlan_entry(self):
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+
+        rows = reconcile_vlan_database(
+            self.device,
+            {"vlans": [{"vlan_id": 1627, "name": "FIRST"}, {"vlan_id": 1627, "name": "SECOND"}]},
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].device_name, "FIRST")
+        self.assertEqual(VLAN.objects.filter(group__slug=f"nso-{self.device.pk}", vid=1627).count(), 1)
+
     def test_vlan_footprint_does_not_create_the_device_group(self):
         from netbox_nso_plugin.vlan_reconciler import vlan_reconcile_footprint
 
