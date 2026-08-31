@@ -1473,6 +1473,7 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
             with self.subTest(label=label):
                 self.assertEqual(specs[label].content_fields, fields)
 
+
 class TestRepairBoundaryIsolation(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     """The repair boundary the audit consumes really runs at REPEATABLE READ."""
 
