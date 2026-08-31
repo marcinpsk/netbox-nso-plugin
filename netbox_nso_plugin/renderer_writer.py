@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from django.apps import apps
+from django.db import IntegrityError, transaction
 from django.utils import timezone
 
 from .intent_state import (
@@ -660,6 +661,55 @@ class RendererWriter:
             f"save of {instance._meta.label_lower} row {instance.pk!r} is outside the frozen write set"
         )
 
+    def _resolve_reference(self, reference):
+        model = apps.get_model(reference.model_label)
+        filters = {}
+        for attname, expected in reference.natural_key:
+            if isinstance(expected, RendererCreationRef):
+                related = self._resolve_reference(expected)
+                if related is None:
+                    return None
+                expected = related.pk
+            filters[attname] = expected
+        return model._default_manager.filter(**filters).first()
+
+    def _resolve_creation(self, write):
+        return self._resolve_reference(
+            RendererCreationRef(model_label=write.model_label, natural_key=write.natural_key)
+        )
+
+    def _creation_matches(self, write, instance):
+        spec = renderer_input_specs().get(write.model_label)
+        if spec is None:
+            return False
+        content_attnames = {spec.model._meta.get_field(field_name).attname for field_name in spec.content_fields}
+        expected = tuple((attname, value) for attname, value in write.values if attname in content_attnames)
+        return self._fields_match(expected, instance)
+
+    def consume_existing_creation(self, instance) -> bool:
+        """Consume a planned insert that a concurrent writer materialized first."""
+        if instance.pk is None:
+            return False
+        index = next(
+            (
+                candidate
+                for candidate, write in enumerate(self.plan.write_set)
+                if candidate not in self._consumed
+                and write.operation == "save"
+                and write.force_insert
+                and write.model_label == instance._meta.label_lower
+                and self._identity_matches(write, instance)
+            ),
+            None,
+        )
+        if index is None:
+            return False
+        write = self.plan.write_set[index]
+        if not self._creation_matches(write, instance):
+            raise IntentPlanStaleError(f"{write.model_label} creation {write.natural_key!r} changed after planning")
+        self._consumed.add(index)
+        return True
+
     @contextlib.contextmanager
     def _operation(self, index):
         previous = self._active_operation
@@ -673,7 +723,20 @@ class RendererWriter:
         """Execute one exact planned save."""
         index = self._find_save(instance, update_fields, force_insert)
         with self._operation(index):
-            instance.save(update_fields=update_fields, force_insert=force_insert)
+            if not force_insert:
+                instance.save(update_fields=update_fields)
+            else:
+                try:
+                    with transaction.atomic():
+                        instance.save(force_insert=True)
+                except IntegrityError:
+                    write = self.plan.write_set[index]
+                    existing = self._resolve_creation(write) if write.natural_key else None
+                    if existing is None or not self._creation_matches(write, existing):
+                        raise
+                    instance.pk = existing.pk
+                    instance._state.adding = False
+                    instance._state.db = existing._state.db
         _maintain_manifest(instance)
         self._consumed.add(index)
         return instance
