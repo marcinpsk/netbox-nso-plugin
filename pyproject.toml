@@ -82,6 +82,7 @@ parse_squash_commits = false
 [dependency-groups]
 dev = [
     "build",
+    "packaging",
     "reuse",
     "ruff==0.15.4",
     "pre-commit",

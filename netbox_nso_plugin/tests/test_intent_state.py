@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -511,6 +512,16 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
             },
         )
         self.assertTrue(all(spec.required_trace_fixtures for spec in renderer_input_specs().values()))
+
+    def test_reconcile_footprint_rejects_a_registered_model_without_a_lock_rank(self):
+        from netbox_nso_plugin import intent_state
+
+        unranked = SimpleNamespace(scopes=("vlan",), model=NSOIntentRevision)
+        with (
+            patch.dict(intent_state._REGISTRY, {NSOIntentRevision._meta.label_lower: unranked}),
+            self.assertRaisesRegex(IntentMutationProtocolError, "nsointentrevision.*lock rank"),
+        ):
+            intent_state.reconcile_family_footprint(self.device.pk, ("vlan",))
 
     def test_registry_entries_carry_executable_resolvers_and_fragments(self):
         for label, spec in renderer_input_specs().items():

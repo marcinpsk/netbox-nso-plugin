@@ -591,6 +591,8 @@ def reconcile_family_footprint(device_id: int, scopes) -> MutationFootprint:
             )
         elif label in SOURCE_MODEL_RANKS:
             source_labels.add(label)
+        elif label in _REGISTRY and label != "netbox_nso_plugin.nsodevicemanagement":
+            raise IntentMutationProtocolError(f"renderer-input model {label} has no declared lock rank")
 
     for spec in _REGISTRY.values():
         if requested.isdisjoint(spec.scopes):
