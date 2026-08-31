@@ -65,6 +65,17 @@ class TestReceiptSelectors(SimpleTestCase):
         self.assertIn("owning operation", message)
         self.assertNotIn("nso_intent_deployment_gate --abort", message)
 
+    def test_restore_adapter_failure_preserves_gate_recovery_guidance(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.management.commands.nso_intent_restore import _gate_failure_guidance
+
+        with self.assertRaises(CommandError) as raised:
+            with _gate_failure_guidance(created=True):
+                raise AdapterError("adapter receipt lookup failed", code="nso_unreachable")
+
+        self.assertIn("adapter receipt lookup failed", str(raised.exception))
+        self.assertIn("nso_intent_restore", str(raised.exception))
+
 
 class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     """O3.16: every dirty-key shape blocks, while the complete healthy sequence passes."""

@@ -19,7 +19,7 @@ def _gate_failure_guidance(*, created):
     """Name the manual recovery for a restore that deliberately fails closed."""
     try:
         yield
-    except CommandError as exc:
+    except (CommandError, adapter_client.AdapterError) as exc:
         if created:
             recovery = (
                 "Fix the cause, rerun nso_intent_restore, then run nso_intent_deployment_gate --abort "
