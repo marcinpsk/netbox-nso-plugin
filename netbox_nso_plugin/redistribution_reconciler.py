@@ -20,6 +20,9 @@ _DESTINATION_PROTOCOLS = ("bgp", "isis", "ospf")
 def redistribution_reconcile_plan(device, payload: dict):
     """Declare every native and overlay row one redistribution refresh can write."""
     import copy
+    from collections import Counter
+
+    from django.db.models import Count
 
     from . import status_machine as sm
     from .intent_state import MutationFootprint, ReconcileMutationPlan, SourceRow, canonical_fragment
@@ -49,6 +52,20 @@ def redistribution_reconcile_plan(device, payload: dict):
         )
         if protocol in _DESTINATION_PROTOCOLS
     }
+    redistribution_ids = {state.redistribution_id for state in states if state.redistribution_id is not None}
+    reference_counts = dict(
+        NSORedistributionState.objects.filter(redistribution_id__in=redistribution_ids)
+        .values("redistribution_id")
+        .annotate(count=Count("pk"))
+        .values_list("redistribution_id", "count")
+    )
+    stale_unowned_counts = Counter(
+        state.redistribution_id
+        for state in states
+        if state.redistribution_id is not None
+        and not sm.is_owned(state.status)
+        and (state.dest_protocol, state.dest_ref, state.source_protocol, state.source_ref) not in reported
+    )
     changes_content = False
     for state in states:
         key = (state.dest_protocol, state.dest_ref, state.source_protocol, state.source_ref)
@@ -58,16 +75,20 @@ def redistribution_reconcile_plan(device, payload: dict):
             if canonical_fragment(state) != canonical_fragment(candidate):
                 changes_content = True
                 break
+            if state.redistribution_id is not None and stale_unowned_counts[
+                state.redistribution_id
+            ] == reference_counts.get(state.redistribution_id, 0):
+                changes_content = True
+                break
         elif sm.is_owned(state.status) and state.redistribution_id is None:
             if _resolve_redist_destination(device, state.dest_protocol, state.dest_ref) is not None:
                 changes_content = True
                 break
-    redistributions = {state.redistribution_id for state in states if state.redistribution_id is not None}
     footprint = MutationFootprint.for_keys(
         {(device.pk, protocol) for protocol in protocols},
         source_rows=(
             SourceRow("netbox_routing.redistribution", None),
-            *(SourceRow("netbox_routing.redistribution", pk) for pk in redistributions),
+            *(SourceRow("netbox_routing.redistribution", pk) for pk in redistribution_ids),
         ),
         overlay_rows=(
             SourceRow("netbox_nso_plugin.nsoredistributionstate", None),

@@ -417,25 +417,34 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
             returning.devices.remove(self.device)
         self.clear_entries()
         held = threading.Event()
-        owned = threading.Event()
         release = threading.Event()
-        observed_wait: list[bool] = []
+        observed_wait: list[float] = []
 
-        def release_once_the_other_waits():
+        def release_after_contention_window():
             assert held.wait(timeout=30), "the removal never reached its hold point"
-            observed_wait.append(not owned.wait(timeout=0.2))
+            time.sleep(2.0)
             release.set()
 
-        watcher = threading.Thread(target=release_once_the_other_waits)
+        reown = self._reown(returning, before=held)
+
+        def measured_reown():
+            started = time.monotonic()
+            reown()
+            observed_wait.append(time.monotonic() - started)
+
+        watcher = threading.Thread(target=release_after_contention_window, daemon=True)
         watcher.start()
+        self.addCleanup(release.set)
         # The route rows are disjoint, but both changes bump the same device and scope
         # revision. The revision row serializes the two renderer mutations.
         self._run(
             self._remove(leaving, after=held, hold=release),
-            self._reown(returning, before=held, committed=owned),
+            measured_reown,
         )
         watcher.join(timeout=30)
-        assert observed_wait == [True], "the re-ownership bypassed the scope revision lock"
+        assert observed_wait and observed_wait[0] > 1.0, (
+            f"the re-ownership bypassed the scope revision lock: {observed_wait}"
+        )
 
         folded = outbox.fold_transitions(
             [record for row in entries(self.device, "static_route") for record in row.transitions]

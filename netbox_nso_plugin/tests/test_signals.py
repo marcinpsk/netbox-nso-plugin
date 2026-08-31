@@ -976,12 +976,12 @@ try:
             address = IPAddress(
                 address="10.2.0.1/24", assigned_object_type=self._ct(), assigned_object_id=self.iface.pk
             )
-            from netbox_nso_plugin.intent_state import footprint_for_instance, mirror_transaction
+            from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
 
             with (
                 self.captureOnCommitCallbacks(execute=True),
                 suppress_intent_push(),
-                mirror_transaction(footprint_for_instance(address)),
+                intent_transaction(footprint_for_instance(address)),
             ):
                 address.save()
 

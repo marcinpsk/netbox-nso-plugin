@@ -16,11 +16,8 @@ push this row's scope, failover addresses and auto-apply flag onto it.
 import logging
 from datetime import UTC, datetime
 
-from django.db import transaction
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
-
-from .models import NSODeviceManagement
 
 logger = logging.getLogger(__name__)
 
@@ -43,24 +40,9 @@ _BROKEN_LINK_MESSAGE = "This device's adapter mapping is broken; the next sync-c
 
 def _mirror_management(mgmt, **values) -> None:
     """Persist lifecycle-only adapter observations with one locked instance save."""
-    from .intent_state import mirror_refresh
-    from .signals import suppress_intent_push
+    from .intent_state import update_mirror_fields
 
-    fields = frozenset(values)
-    with transaction.atomic():
-        current = NSODeviceManagement.objects.select_for_update(of=("self",)).filter(pk=mgmt.pk).first()
-        if current is None:
-            return
-        for field_name, value in values.items():
-            setattr(current, field_name, value)
-        with suppress_intent_push(), mirror_refresh(current, fields) as locked:
-            if locked is None:
-                return
-            for field_name, value in values.items():
-                setattr(locked, field_name, value)
-            locked.save(update_fields=fields)
-    for field_name, value in values.items():
-        setattr(mgmt, field_name, value)
+    update_mirror_fields(mgmt, **values)
 
 
 def parse_adapter_timestamp(value, field="timestamp"):

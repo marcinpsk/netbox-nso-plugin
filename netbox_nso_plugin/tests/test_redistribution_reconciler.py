@@ -294,6 +294,25 @@ class TestReconcileRedistribution(TestCase):
         self.assertEqual(NSORedistributionState.objects.count(), 0)  # overlay gone
         self.assertEqual(Redistribution.objects.count(), 0)  # object gone
 
+    def test_category_reconcile_deletes_the_last_unowned_native_row(self):
+        management = self._make_mgmt()
+        from netbox_routing.models import ISISInstance, Redistribution
+
+        ISISInstance.objects.create(device=self.device, process_tag="")
+        from netbox_nso_plugin.models import NSORedistributionState
+        from netbox_nso_plugin.reconcile import _LeaseOutcome, reconcile_category
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+
+        reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
+        with (
+            patch("netbox_nso_plugin.reconcile._acquire_reconcile_lease", return_value=_LeaseOutcome()),
+            patch("netbox_nso_plugin.adapter_client.get_redistribution", return_value={"entries": []}),
+        ):
+            reconcile_category(self.device, management, "redistribution")
+
+        self.assertFalse(NSORedistributionState.objects.exists())
+        self.assertFalse(Redistribution.objects.exists())
+
     def test_owned_removed_redistribution_kept_as_drift(self):
         """An ACCEPTED redistribution the device removes is KEPT and flagged: status=changed,
         device_present=False — operator intent is never auto-deleted."""

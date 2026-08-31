@@ -1815,6 +1815,33 @@ def mirror_refresh(instance, update_fields):
         _ACTIVE_PERMIT.reset(token)
 
 
+@contextlib.contextmanager
+def locked_mirror_refresh(instance, update_fields):
+    """Yield the locked save target without shadowing an active exact mutation permit."""
+    _discard_rolled_back_implicit_permit()
+    if _ACTIVE_PERMIT.get() is not None:
+        yield instance
+        return
+    with mirror_refresh(instance, update_fields) as locked:
+        yield locked
+
+
+def update_mirror_fields(instance, **values):
+    """Lock and save lifecycle fields through the instance yielded by ``mirror_refresh``."""
+    from .signals import suppress_intent_push
+
+    fields = frozenset(values)
+    with transaction.atomic(), suppress_intent_push(), mirror_refresh(instance, fields) as locked:
+        if locked is None:
+            return None
+        for field_name, value in values.items():
+            setattr(locked, field_name, value)
+        locked.save(update_fields=fields)
+    for field_name, value in values.items():
+        setattr(instance, field_name, value)
+    return locked
+
+
 def mirror_reconciler(function):
     """Run one read-side reconciler inside the sanctioned mutation boundary."""
 

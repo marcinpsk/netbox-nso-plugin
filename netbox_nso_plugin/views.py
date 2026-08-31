@@ -4891,8 +4891,11 @@ class NSOBulkAcceptView(NSOActionPermissionMixin, View):
                 if row.status not in {"imported", "changed"}:
                     continue
                 row.status = "in_sync" if row.status == "imported" else "accepted"
-                row.accepted_at = now
-                row.save(update_fields={"status", "accepted_at"})
+                update_fields = {"status"}
+                if row.accepted_at is None:
+                    row.accepted_at = now
+                    update_fields.add("accepted_at")
+                row.save(update_fields=update_fields)
                 updated += 1
 
         if updated:

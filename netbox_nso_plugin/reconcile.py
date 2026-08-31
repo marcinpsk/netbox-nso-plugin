@@ -569,7 +569,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                 pre_body=lambda: subinterface_reconcile_plan(device, sub_doc),
             )
             # Phase 2b: per-interface MTU read mirror (read-only display).
-            from .interface_mtu_reconciler import reconcile_interface_mtu
+            from .interface_mtu_reconciler import interface_mtu_reconcile_plan, reconcile_interface_mtu
 
             mtu_doc = client.get_interface_mtu(dev_id)
             _gated(
@@ -587,6 +587,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                     mtu_doc,
                 ),
                 epoch=dev_id,
+                pre_body=lambda: interface_mtu_reconcile_plan(device, mtu_doc),
             )
             # Import interface IP addresses onto their (now first-class, logical-named)
             # NetBox interfaces. Runs AFTER the adapter sync created the interfaces;
@@ -766,7 +767,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
             # Merged "Interfaces" card: refresh all four per-interface scalar
             # overlays (enabled/description, IPs, MTU, switchport) so the
             # consolidated row-per-interface table reflects the latest device read.
-            from .interface_mtu_reconciler import reconcile_interface_mtu
+            from .interface_mtu_reconciler import interface_mtu_reconcile_plan, reconcile_interface_mtu
             from .subinterface_reconciler import reconcile_subinterface, subinterface_reconcile_plan
             from .svi_reconciler import reconcile_svi
             from .vlan_reconciler import reconcile_switchport, reconcile_vlan_database
@@ -827,6 +828,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_interface_mtu(device, mtu_doc),
                 epoch=dev_id,
                 ctx_key="interface_mtu_states",
+                pre_body=lambda: interface_mtu_reconcile_plan(device, mtu_doc),
             )
             # VLAN DB first so switchport vid lookups resolve in the per-device group.
             vlan_doc = client.get_vlan_database(dev_id)
@@ -1019,7 +1021,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 pre_body=lambda: subinterface_reconcile_plan(device, sub_doc),
             )
         elif key == "interface_mtu":
-            from .interface_mtu_reconciler import reconcile_interface_mtu
+            from .interface_mtu_reconciler import interface_mtu_reconcile_plan, reconcile_interface_mtu
 
             mtu_doc = client.get_interface_mtu(dev_id)
             _gated(
@@ -1030,6 +1032,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_interface_mtu(device, mtu_doc),
                 epoch=dev_id,
                 ctx_key="interface_mtu_states",
+                pre_body=lambda: interface_mtu_reconcile_plan(device, mtu_doc),
             )
         elif key == "snmp":
             snmp_doc = client.get_snmp_config(dev_id)

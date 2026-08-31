@@ -244,16 +244,20 @@ def promote_current_intent(
             section = registry[scope].section
             for previous_status in (sm.ACCEPTED, sm.APPLY_FAILED):
                 selected_rows = [row for row in rows if row.status == previous_status]
-                pks = [row.pk for row in selected_rows]
-                if not pks:
+                if not selected_rows:
                     continue
+                pks = []
                 for row in selected_rows:
-                    row.status = sm.advance(previous_status, sm.APPLY)
-                    row.apply_attempt_id = attempt.pk
-                    row.last_apply_at = now
-                    row.last_apply_error = ""
                     fields = {"status", "apply_attempt_id", "last_apply_at", "last_apply_error"}
-                    with suppress_intent_push(), mirror_refresh(row, fields):
-                        row.save(update_fields=fields)
-                moved.append((section, model, pks, previous_status))
+                    with suppress_intent_push(), mirror_refresh(row, fields) as locked:
+                        if locked is None:
+                            continue
+                        locked.status = sm.advance(previous_status, sm.APPLY)
+                        locked.apply_attempt_id = attempt.pk
+                        locked.last_apply_at = now
+                        locked.last_apply_error = ""
+                        locked.save(update_fields=fields)
+                        pks.append(locked.pk)
+                if pks:
+                    moved.append((section, model, pks, previous_status))
     return attempt, moved

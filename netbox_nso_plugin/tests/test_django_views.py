@@ -8,7 +8,7 @@ Adapter calls are mocked so no live adapter is needed.
 
 import json
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -2333,6 +2333,19 @@ class TestNSOBulkAcceptView(ViewTestBase):
         url = reverse("plugins:netbox_nso_plugin:device_bulk_accept", args=[self.device.pk])
         response = self.client.post(url)
         self.assertEqual(response.status_code, 302)
+
+    @patch("netbox_nso_plugin.signals._schedule_intent_push")
+    def test_post_bulk_accept_keeps_the_first_ownership_time(self, _mock_schedule):
+        from django.utils import timezone
+
+        original = timezone.now() - timedelta(days=12)
+        content_bulk_update(self.iface_state, status="changed", accepted_at=original)
+
+        response = self.client.post(reverse("plugins:netbox_nso_plugin:device_bulk_accept", args=[self.device.pk]))
+
+        self.assertEqual(response.status_code, 302)
+        self.iface_state.refresh_from_db()
+        self.assertEqual(self.iface_state.accepted_at, original)
 
 
 # ── Device NSO Tab ────────────────────────────────────────────────────────────────

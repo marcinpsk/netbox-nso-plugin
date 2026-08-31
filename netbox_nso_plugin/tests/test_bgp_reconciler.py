@@ -928,6 +928,31 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
 
         self.assertTrue(bgp_reconcile_plan(self.device, payload).changes_content)
 
+    def test_plan_batches_owned_peer_dependency_lookups(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
+        from netbox_nso_plugin.models import NSOBGPPeerState
+
+        mgmt = self._make_mgmt()
+        peers = [self._peer_entry(f"10.0.2.{index}", remote_as=str(65200 + index)) for index in range(1, 5)]
+        payload = self._payload(self._router_payload(peers=peers))
+        _reconcile_bgp_config(self.device, payload)
+        states = list(NSOBGPPeerState.objects.filter(management=mgmt).order_by("peer_address_str"))
+        content_update(states[0], status="in_sync")
+
+        one_peer = self._payload(self._router_payload(peers=peers[:1]))
+        bgp_reconcile_plan(self.device, one_peer)
+        with CaptureQueriesContext(connection) as one_queries:
+            bgp_reconcile_plan(self.device, one_peer)
+        for state in states[1:]:
+            content_update(state, status="in_sync")
+        with CaptureQueriesContext(connection) as four_queries:
+            bgp_reconcile_plan(self.device, payload)
+
+        self.assertEqual(len(four_queries), len(one_queries))
+
     def test_plan_ignores_address_family_rows_owned_by_another_content_type(self):
         self._make_mgmt()
 

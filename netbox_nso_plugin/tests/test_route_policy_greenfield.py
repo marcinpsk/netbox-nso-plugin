@@ -13,7 +13,7 @@ from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.db import transaction
 from django.test import TestCase, TransactionTestCase
 
-from ._outbox_case import make_managed, mirror_update, without_commit_drain
+from ._outbox_case import content_update, make_managed, without_commit_drain
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -72,15 +72,17 @@ class TestRoutePolicyNativeSaveTransactions(_CascadeFlushMixin, IntentPushResetM
 
         with without_commit_drain(), transaction.atomic():
             prefix_list = PrefixList.objects.create(name="TESTNSO-PL-SAVE")
-            state = NSORoutePolicyState.objects.create(
-                management=self.management,
-                family="prefix_list",
-                object_name=prefix_list.name,
-                content_type=ContentType.objects.get_for_model(PrefixList),
-                object_id=prefix_list.pk,
-                status="imported",
+            state = _save_without_push(
+                NSORoutePolicyState(
+                    management=self.management,
+                    family="prefix_list",
+                    object_name=prefix_list.name,
+                    content_type=ContentType.objects.get_for_model(PrefixList),
+                    object_id=prefix_list.pk,
+                    status="imported",
+                )
             )
-        mirror_update(state, status="in_sync")
+        content_update(state, status="in_sync")
         return prefix_list, state
 
     def test_an_owned_policy_object_save_reaccepts_the_overlay_in_a_renderer_transaction(self):
@@ -107,7 +109,7 @@ class TestRoutePolicyNativeSaveTransactions(_CascadeFlushMixin, IntentPushResetM
                 sequence=10,
                 action="permit",
             )
-        mirror_update(state, status="in_sync")
+        content_update(state, status="in_sync")
 
         with without_commit_drain(), transaction.atomic():
             entry.action = "deny"

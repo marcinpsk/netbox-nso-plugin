@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
 from django.test import TestCase
 from django.utils import timezone
@@ -97,6 +99,22 @@ class TestInterfaceMtuReconciler(TestCase):
         reconcile_interface_mtu(self.device, {"interfaces": [{"interface_name": "Port-channel1", "mtu": 9216}]})
         reconcile_interface_mtu(self.device, {"interfaces": [{"interface_name": "Port-channel1", "mtu": 1500}]})
         self.assertEqual(NSOInterfaceMtuState.objects.get(interface=self.po1).l2_mtu, 1500)
+
+    def test_category_reconcile_declares_interface_mtu_rows(self):
+        from netbox_nso_plugin.reconcile import _LeaseOutcome, reconcile_category
+
+        from ._outbox_case import mirror_update
+
+        payload = {"interfaces": [{"interface_name": "Port-channel1", "mtu": 9216}]}
+        mirror_update(self.management, adapter_device_id=76)
+        self.addCleanup(mirror_update, self.management, adapter_device_id=None)
+        with (
+            patch("netbox_nso_plugin.reconcile._acquire_reconcile_lease", return_value=_LeaseOutcome()),
+            patch("netbox_nso_plugin.adapter_client.get_interface_mtu", return_value=payload),
+        ):
+            result = reconcile_category(self.device, self.management, "interface_mtu")
+
+        self.assertEqual(result["interface_mtu_states"][0].l2_mtu, 9216)
 
 
 class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):

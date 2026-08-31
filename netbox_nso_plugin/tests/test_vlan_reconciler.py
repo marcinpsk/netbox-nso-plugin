@@ -18,7 +18,7 @@ from netbox_nso_plugin.models import (
 )
 from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
 
-from ._outbox_case import mirror_update, without_commit_drain
+from ._outbox_case import without_commit_drain
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin, isolate_other_scopes
 
 
@@ -132,6 +132,8 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
             switchport_reconcile_plan,
         )
 
+        from ._outbox_case import content_update
+
         reconcile_vlan_database(
             self.device,
             {"vlans": [{"vlan_id": 10, "name": "TEN"}, {"vlan_id": 20, "name": "TWENTY"}]},
@@ -150,7 +152,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
             },
         )
         state = NSOSwitchportState.objects.get(management=self.management, interface=self.interface)
-        mirror_update(state, status="in_sync")
+        content_update(state, status="in_sync")
 
         plan = switchport_reconcile_plan(
             self.device,

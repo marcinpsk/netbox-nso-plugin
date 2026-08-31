@@ -832,25 +832,9 @@ def sync_scope_to_adapter(sender, instance, created, update_fields=None, **kwarg
 
 def _update_management_mirror(instance, **values):
     """Persist management lifecycle fields through a per-instance mirror permit."""
-    from django.db import transaction
+    from .intent_state import update_mirror_fields
 
-    from .intent_state import mirror_refresh
-
-    fields = set(values)
-    with transaction.atomic():
-        current = type(instance).objects.filter(pk=instance.pk).first()
-        if current is None:
-            return
-        for field_name, value in values.items():
-            setattr(current, field_name, value)
-        with suppress_intent_push(), mirror_refresh(current, fields) as locked:
-            if locked is None:
-                return
-            for field_name, value in values.items():
-                setattr(locked, field_name, value)
-            locked.save(update_fields=fields)
-    for field_name, value in values.items():
-        setattr(instance, field_name, value)
+    update_mirror_fields(instance, **values)
 
 
 def _sync_committed_scope_to_adapter(sender, instance_pk, created):
@@ -2309,11 +2293,13 @@ def _record_static_route_expectations(device_id, generations: dict, echoes) -> N
                 intent_generation=generation,
             )
             for row in rows:
-                row.expected_generation = generation
-                row.expected_fingerprint = fingerprint
                 fields = {"expected_generation", "expected_fingerprint"}
-                with mirror_refresh(row, fields):
-                    row.save(update_fields=fields)
+                with mirror_refresh(row, fields) as locked:
+                    if locked is None:
+                        continue
+                    locked.expected_generation = generation
+                    locked.expected_fingerprint = fingerprint
+                    locked.save(update_fields=fields)
 
 
 @_skip_on_render

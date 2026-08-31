@@ -65,19 +65,9 @@ def make_managed(tag: str, adapter_device_id: int, index: int = 1):
 
 def mirror_update(instance, **values):
     """Persist lifecycle-only fixture fields through the production mirror permit."""
-    from netbox_nso_plugin.intent_state import mirror_refresh
-    from netbox_nso_plugin.signals import suppress_intent_push
+    from netbox_nso_plugin.intent_state import update_mirror_fields
 
-    fields = set(values)
-    with transaction.atomic():
-        current = type(instance).objects.get(pk=instance.pk)
-        for field_name, value in values.items():
-            setattr(current, field_name, value)
-        with suppress_intent_push(), mirror_refresh(current, fields):
-            current.save(update_fields=fields)
-    for field_name, value in values.items():
-        setattr(instance, field_name, value)
-    return current
+    return update_mirror_fields(instance, **values)
 
 
 def content_update(instance, **values):

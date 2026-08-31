@@ -10,7 +10,7 @@ from django.utils import timezone
 from netbox.plugins import PluginTemplateExtension
 
 from . import status_machine as sm
-from .intent_state import mirror_reconciler, mirror_refresh
+from .intent_state import locked_mirror_refresh, mirror_reconciler
 from .snmp_versions import canonical_snmp_version
 
 logger = logging.getLogger(__name__)
@@ -21,11 +21,13 @@ def _cas_mirror_update(queryset, **values):
     row = queryset.select_for_update(of=("self",)).first()
     if row is None:
         return None
-    for field_name, value in values.items():
-        setattr(row, field_name, value)
-    with mirror_refresh(row, values):
-        row.save(update_fields=set(values))
-    return row
+    with locked_mirror_refresh(row, values) as locked:
+        if locked is None:
+            return None
+        for field_name, value in values.items():
+            setattr(locked, field_name, value)
+        locked.save(update_fields=set(values))
+    return locked
 
 
 # Status → Bootstrap badge colour

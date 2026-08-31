@@ -357,6 +357,7 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
                 return
             fired.append(True)
             content_bulk_update(instance, notify_type="inform")
+            instance.notify_type = "trap"
 
         post_init.connect(_concurrent_editor, sender=NSOSnmpHostState, weak=False)
         self.addCleanup(post_init.disconnect, _concurrent_editor, sender=NSOSnmpHostState)
@@ -409,6 +410,7 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
                 return
             fired.append(True)
             content_bulk_update(instance, address="198.18.0.99")
+            instance.address = "198.18.0.35"
 
         post_init.connect(_concurrent_renamer, sender=NSOSnmpHostState, weak=False)
         self.addCleanup(post_init.disconnect, _concurrent_renamer, sender=NSOSnmpHostState)

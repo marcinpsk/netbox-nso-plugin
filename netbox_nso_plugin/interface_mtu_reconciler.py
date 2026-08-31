@@ -18,6 +18,68 @@ from .intent_state import mirror_reconciler
 logger = logging.getLogger(__name__)
 
 
+def interface_mtu_reconcile_plan(device, payload: dict):
+    """Declare MTU overlay rows and predict changes to owned intent."""
+    import copy
+
+    from dcim.models import Interface
+
+    from . import status_machine as sm
+    from .intent_state import MutationFootprint, ReconcileMutationPlan, SourceRow, canonical_fragment
+    from .models import NSODeviceManagement, NSOInterfaceMtuState
+
+    management = NSODeviceManagement.objects.filter(device=device).first()
+    if management is None:
+        return ReconcileMutationPlan(MutationFootprint())
+    interfaces = tuple(Interface.objects.filter(device=device).order_by("pk"))
+    interface_by_name = {interface.name: interface for interface in interfaces}
+    states = tuple(
+        NSOInterfaceMtuState.objects.filter(management=management).select_related("interface").order_by("pk")
+    )
+    reported = {
+        interface.pk: item
+        for item in payload.get("interfaces", []) or []
+        if isinstance(item, dict)
+        if (interface := interface_by_name.get(item.get("interface_name") or "")) is not None
+    }
+    changes_content = False
+    for state in states:
+        candidate = copy.copy(state)
+        item = reported.get(state.interface_id)
+        if item is None:
+            candidate.status = sm.on_reconcile(state.status, present=False)
+        elif sm.is_owned(state.status):
+            matches = all(
+                item.get(source) == getattr(state, target)
+                for source, target in (("mtu", "l2_mtu"), ("ip_mtu", "ip_mtu"), ("mpls_mtu", "mpls_mtu"))
+            )
+            candidate.status = sm.on_reconcile(state.status, matches=matches)
+        else:
+            candidate.l2_mtu = item.get("mtu")
+            candidate.ip_mtu = item.get("ip_mtu")
+            candidate.mpls_mtu = item.get("mpls_mtu")
+            candidate.bound_port = item.get("bound_port") or ""
+            candidate.status = sm.on_reconcile(state.status, matches=None)
+        if canonical_fragment(state) != canonical_fragment(candidate):
+            changes_content = True
+            break
+
+    return ReconcileMutationPlan(
+        MutationFootprint.for_keys(
+            {(device.pk, "interface_mtu")},
+            source_rows=(
+                SourceRow("dcim.device", device.pk),
+                *(SourceRow("dcim.interface", interface.pk) for interface in interfaces),
+            ),
+            overlay_rows=(
+                SourceRow("netbox_nso_plugin.nsointerfacemtustate", None),
+                *(SourceRow(state._meta.label_lower, state.pk) for state in states),
+            ),
+        ),
+        changes_content=changes_content,
+    )
+
+
 @mirror_reconciler
 def reconcile_interface_mtu(device, payload: dict) -> list:
     """Create/update NSOInterfaceMtuState rows from the payload."""
