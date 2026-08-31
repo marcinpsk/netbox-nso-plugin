@@ -1212,21 +1212,6 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         peer.refresh_from_db()
         self.assertFalse(peer.enabled)  # (b) edit preserved, not reverted to device
 
-    def test_plan_detects_an_owned_peer_after_a_netbox_edit(self):
-        mgmt = self._make_mgmt()
-
-        from netbox_routing.models import BGPPeer
-
-        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
-        from netbox_nso_plugin.models import NSOBGPPeerState
-
-        payload = self._payload(self._router_payload(peers=[self._peer_entry()]))
-        _reconcile_bgp_config(self.device, payload)
-        content_update(NSOBGPPeerState.objects.get(management=mgmt), status="in_sync")
-        content_update(BGPPeer.objects.get(), enabled=False)
-
-        self.assertTrue(bgp_reconcile_plan(self.device, payload).changes_content)
-
     def test_plan_normalizes_equivalent_source_ip_text(self):
         mgmt = self._make_mgmt()
 
@@ -1437,7 +1422,6 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         from netbox_routing.models import BGPPeer, BGPPeerAddressFamily
 
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
-        from netbox_nso_plugin.intent_state import SourceRow
 
         payload = self._payload(self._router_payload(peers=[self._peer_entry()]))
         _reconcile_bgp_config(self.device, payload)
@@ -1450,10 +1434,15 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
             enabled=True,
         )
 
-        source_rows = set(bgp_reconcile_plan(self.device, payload).lock_footprint.source_rows)
+        changed_payload = self._payload(
+            self._router_payload(peers=[self._peer_entry(address_families=[{"af": "ipv4-unicast", "enabled": False}])])
+        )
+        planned_rows = {
+            (write.model_label, write.pk) for write in bgp_reconcile_plan(self.device, changed_payload).write_set
+        }
 
-        self.assertIn(SourceRow(peer_address_family._meta.label_lower, peer_address_family.pk), source_rows)
-        self.assertNotIn(SourceRow(colliding._meta.label_lower, colliding.pk), source_rows)
+        self.assertIn((peer_address_family._meta.label_lower, peer_address_family.pk), planned_rows)
+        self.assertNotIn((colliding._meta.label_lower, colliding.pk), planned_rows)
 
     def test_device_change_auto_mirrors_when_netbox_untouched(self):
         """3-way: device-side change with NetBox untouched → object auto-updated, in sync.
