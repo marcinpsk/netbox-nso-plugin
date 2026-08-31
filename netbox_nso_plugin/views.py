@@ -3688,12 +3688,16 @@ class NSODeviceJobsView(LoginRequiredMixin, View):
             return JsonResponse({"error": "since_seq must be non-negative"}, status=400)
         try:
             jobs = client.list_jobs(mgmt.adapter_device_id)
-            apply_state = client.get_device_apply_state(mgmt.adapter_device_id)
             generations = (
                 client.list_device_generations(mgmt.adapter_device_id, since_seq=since_seq) if generation_ids else []
             )
         except AdapterError as exc:
             return JsonResponse({"error": public_error_message(exc)}, status=502)
+        try:
+            apply_state = client.get_device_apply_state(mgmt.adapter_device_id)
+        except AdapterError:
+            logger.warning("Apply-state poll failed for device %s", pk, exc_info=True)
+            apply_state = None
         generations = [row for row in generations if row.get("generation_id") in generation_ids]
         serialized_jobs = jobs
         if generation_ids:

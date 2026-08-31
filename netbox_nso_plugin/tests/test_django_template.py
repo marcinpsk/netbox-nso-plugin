@@ -49,6 +49,14 @@ class TestTemplateCommentSyntax(SimpleTestCase):
         )
 
 
+class TestMirrorUpdateDocumentation(SimpleTestCase):
+    def test_cas_mirror_update_names_both_mutation_guards(self):
+        from netbox_nso_plugin.template_content import _cas_mirror_update
+
+        self.assertIn("mirror_refresh", _cas_mirror_update.__doc__)
+        self.assertIn("mirror_reconciler", _cas_mirror_update.__doc__)
+
+
 class TestBadgeContrast(SimpleTestCase):
     """Guard against low-contrast (grey-on-grey) badges.
 

@@ -50,6 +50,12 @@ def test_sqlparse_is_a_runtime_dependency():
     assert any(_has_supported_sqlparse_floor(dependency) for dependency in dependencies)
 
 
+def test_packaging_is_a_direct_test_dependency():
+    dependencies = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["dependency-groups"]["dev"]
+
+    assert any(Requirement(dependency).name == "packaging" for dependency in dependencies)
+
+
 @pytest.mark.parametrize("dependency", ["sqlparse", "sqlparse>=0.4.4"])
 def test_sqlparse_dependency_rejects_an_unsupported_floor(dependency):
     assert not _has_supported_sqlparse_floor(dependency)

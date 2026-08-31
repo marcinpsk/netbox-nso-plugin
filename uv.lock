@@ -528,6 +528,7 @@ dependencies = [
 dev = [
     { name = "build" },
     { name = "django" },
+    { name = "packaging" },
     { name = "pre-commit" },
     { name = "pytest" },
     { name = "pytest-cov" },
@@ -553,6 +554,7 @@ requires-dist = [
 dev = [
     { name = "build" },
     { name = "django", specifier = ">=6.1,<7.0" },
+    { name = "packaging" },
     { name = "pre-commit" },
     { name = "pytest" },
     { name = "pytest-cov", specifier = ">=7.1.0" },

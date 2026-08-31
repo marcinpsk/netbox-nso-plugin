@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 def _cas_mirror_update(queryset, **values):
-    """Lock and update one matching mirror row without bypassing model guards."""
+    """Use ``mirror_refresh`` to authorize a save inside a push-suppressing ``mirror_reconciler``."""
     row = queryset.select_for_update(of=("self",)).first()
     if row is None:
         return None

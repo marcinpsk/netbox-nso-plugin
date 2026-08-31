@@ -151,7 +151,16 @@ class BlockedRemovalTestBase(TestCase):
         super().setUp()
         self.client.force_login(self.superuser)
 
-    def _get_jobs(self, jobs, *, generations=None, generation_ids=(), since_seq=None, apply_state=None):
+    def _get_jobs(
+        self,
+        jobs,
+        *,
+        generations=None,
+        generation_ids=(),
+        since_seq=None,
+        apply_state=None,
+        apply_state_status=200,
+    ):
         """Hit device_nso_jobs with the adapter's job list canned at the transport."""
         apply_state = apply_state or {
             "device_id": 10,
@@ -171,7 +180,7 @@ class BlockedRemovalTestBase(TestCase):
 
             def request(_method, url, **kwargs):
                 if url.endswith("/apply-state"):
-                    return make_response(200, json_data=apply_state)
+                    return make_response(apply_state_status, json_data=apply_state)
                 if url.endswith("/generations"):
                     params = kwargs.get("params") or {}
                     generation_request_params.append(params)
@@ -237,6 +246,21 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
         data = self._get_jobs([], apply_state=apply_state)
 
         self.assertEqual(data["apply_state"], apply_state)
+
+    def test_apply_state_failure_preserves_the_job_strip(self):
+        running = _removal_job(49, "logging", "running")
+        blocked = _blocked_job()
+        residue = _residue_job()
+        jobs = [running, blocked, residue]
+
+        data = self._get_jobs(jobs, apply_state_status=503)
+
+        self.assertIsNone(data["apply_state"])
+        self.assertEqual(data["jobs"], jobs)
+        self.assertEqual(data["running"], running)
+        self.assertEqual(data["last"], blocked)
+        self.assertEqual(data["blocked_removals"][0]["job_id"], blocked["id"])
+        self.assertEqual(data["residue_removals"][0]["job_id"], residue["id"])
 
     def test_requested_apply_generations_are_wired_on_the_first_poll(self):
         generations = _device_generations()
