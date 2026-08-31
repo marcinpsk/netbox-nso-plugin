@@ -83,7 +83,7 @@ def _require_converted_writer(handler):
     return _wrapped
 
 
-def _schedule_exact_writer_scope(target_scope) -> None:
+def _schedule_exact_writer_scope(target_scope, *, device_ids=None) -> None:
     """Schedule keys for one scope only from its active exact content writer."""
     from .renderer_writer import active_renderer_writer
 
@@ -91,7 +91,11 @@ def _schedule_exact_writer_scope(target_scope) -> None:
     if writer is None:
         return
     for device_id, scope in writer.plan.content_keys:
-        if scope == target_scope and _converted_writer_owns_content(device_id, scope):
+        if (
+            scope == target_scope
+            and (device_ids is None or device_id in device_ids)
+            and _converted_writer_owns_content(device_id, scope)
+        ):
             _schedule_intent_push((device_id, scope))
 
 
@@ -1846,14 +1850,16 @@ def _on_vlan_state_save(sender, instance, **kwargs):
 
 @_skip_on_render
 def _on_vlan_pre_save(sender, instance, **kwargs):
-    """Record the exact VLAN or SVI fields changed by this save."""
+    """Record the exact VLAN or SVI fields changed by a sanctioned writer save."""
+    from .renderer_writer import active_renderer_writer
+
     update_fields = kwargs.get("update_fields")
     candidate_fields = {"name", "vid"}
     if update_fields is not None:
         candidate_fields.intersection_update(update_fields)
     instance._intent_vlan_changed_fields = frozenset()
     instance._intent_vlan_rows = {}
-    if instance._state.adding or not candidate_fields:
+    if active_renderer_writer() is None or instance._state.adding or not candidate_fields:
         return
 
     from .apply_state import vlan_intent_targets
@@ -1882,7 +1888,6 @@ def _on_vlan_change(sender, instance, **kwargs):
         return
     from . import delivery
     from . import status_machine as sm
-    from .intent_state import revision_was_acquired
 
     rows = getattr(instance, "_intent_vlan_rows", {})
     vid_changed = "vid" in changed_fields
@@ -1898,10 +1903,7 @@ def _on_vlan_change(sender, instance, **kwargs):
                 was_owned
                 and state.management.adapter_device_id is not None
                 and may_deliver
-                and (
-                    _converted_writer_owns_content(state.management.device_id, scope)
-                    or revision_was_acquired(state.management.device_id, scope)
-                )
+                and _converted_writer_owns_content(state.management.device_id, scope)
             ):
                 targets.add((state.management.device_id, scope))
     for key in sorted(targets):
@@ -2132,8 +2134,9 @@ def _on_static_route_state_save(sender, instance, **kwargs):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_static_route_state_delete(sender, instance, **kwargs):
-    """Push a reduced static-route snapshot with this row's deletion authority."""
+    """Schedule an exact-writer deletion with its per-object authority."""
     from .models import NSODeviceManagement
 
     if instance.status not in _OWNED_PUSH_STATUSES:
@@ -2142,11 +2145,10 @@ def _on_static_route_state_delete(sender, instance, **kwargs):
         mgmt = instance.management
     except NSODeviceManagement.DoesNotExist:
         return
-    if mgmt.adapter_device_id is None:
+    if mgmt.adapter_device_id is None or not _converted_writer_owns_content(mgmt.device_id, "static_route"):
         return
-
     transition = _static_route_delete_transition(instance, instance.static_route_id)
-    _schedule_intent_push((mgmt.device_id, "static_route"), transitions=[transition])
+    _schedule_intent_push((mgmt.device_id, "static_route"), transitions=(transition,))
 
 
 # ── Greenfield static routes (operator-created in NetBox, not yet on the device) ──
@@ -2282,20 +2284,6 @@ def _static_route_delete_transition(row, static_route_id):
     )
 
 
-def _remove_static_route_for_device(static_route, device) -> None:
-    """Drop the overlay for (device, route) and push the removal (full-replace)."""
-    from .models import NSODeviceManagement, NSOStaticRouteState
-
-    try:
-        mgmt = NSODeviceManagement.objects.get(device=device)
-    except NSODeviceManagement.DoesNotExist:
-        return
-    if mgmt.adapter_device_id is None:
-        return
-    rows = NSOStaticRouteState.objects.filter(management=mgmt, static_route=static_route)
-    rows.delete()
-
-
 @_skip_on_render
 def _on_routing_static_route_save(sender, instance, created=False, **kwargs):
     """Schedule only the static-route keys declared by the active exact writer."""
@@ -2305,9 +2293,18 @@ def _on_routing_static_route_save(sender, instance, created=False, **kwargs):
 @_skip_on_render
 def _on_routing_static_route_devices_changed(sender, instance, action, pk_set, reverse, **kwargs):
     """Schedule only exact-writer assignment changes, without acquiring in the signal."""
-    if not action.startswith("post_"):
+    if reverse or action not in {"post_add", "post_remove"}:
         return
-    _schedule_exact_writer_scope("static_route")
+    changed_device_ids = set(pk_set or ())
+
+    def schedule_content_keys():
+        _schedule_exact_writer_scope("static_route", device_ids=changed_device_ids)
+
+    if action == "post_remove":
+        with _delete_origin_dispatch():
+            schedule_content_keys()
+    else:
+        schedule_content_keys()
 
 
 @_skip_on_render
@@ -4204,8 +4201,8 @@ def _connect_g_activated():  # pragma: no cover
             sender=StaticRoute,
             dispatch_uid="nso_plugin_routing_static_route_post_save",
         )
-        # NOT _as_delete_origin: m2m_changed also carries post_add — the handler opens the
-        # deletion mark itself, around its post_remove / post_clear branches only.
+        # NOT _as_delete_origin: m2m_changed also carries post_add. The handler opens the
+        # deletion mark itself around post_remove only.
         m2m_changed.connect(
             _on_routing_static_route_devices_changed,
             sender=StaticRoute.devices.through,

@@ -26,35 +26,6 @@ from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlush
 _MOD = "netbox_nso_plugin.adapter_client"
 
 
-class TestM2MPermitCleanup(IntentPushResetMixin, TestCase):
-    def test_a_failing_pre_action_handler_closes_its_implicit_permit(self):
-        from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
-        from netbox_routing.models import StaticRoute
-
-        from netbox_nso_plugin.intent_state import _ACTIVE_PERMIT, _IMPLICIT_PERMITS, _begin_m2m_implicit
-        from netbox_nso_plugin.signals import _skip_on_render
-
-        manufacturer = Manufacturer.objects.create(name="M2M permit", slug="m2m-permit")
-        device_type = DeviceType.objects.create(manufacturer=manufacturer, model="M2M permit", slug="m2m-permit")
-        role = DeviceRole.objects.create(name="M2M permit", slug="m2m-permit")
-        site = Site.objects.create(name="M2M permit", slug="m2m-permit")
-        device = Device.objects.create(name="m2m-permit", device_type=device_type, role=role, site=site)
-        route = StaticRoute.objects.create(prefix="198.18.27.0/24", next_hop="198.18.0.27")
-        sender = StaticRoute.devices.through
-        details = {"pk_set": {device.pk}, "reverse": False, "model": Device}
-        _begin_m2m_implicit(sender, route, "pre_add", **details)
-
-        @_skip_on_render
-        def fail_pre_add(sender, instance, action, **kwargs):
-            raise RuntimeError("pre-add failure")
-
-        with self.assertRaisesRegex(RuntimeError, "pre-add failure"):
-            fail_pre_add(sender, route, "pre_add", **details)
-
-        self.assertIsNone(_ACTIVE_PERMIT.get())
-        self.assertEqual(_IMPLICIT_PERMITS.get(), {})
-
-
 def _bulk_create_management_without_signals(rows):
     from netbox_nso_plugin.intent_state import MutationFootprint, footprint_for_instance, intent_transaction
 
@@ -1728,22 +1699,20 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
         from netbox_routing.models import StaticRoute
 
         from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOStaticRouteState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
 
         mgmt = self._mgmt()
         route = StaticRoute.objects.create(prefix="198.18.98.0/24", next_hop="198.18.0.1", metric=1)
-        with (
-            patch("netbox_nso_plugin.adapter_client.put_static_route_intent"),
-            self.captureOnCommitCallbacks(execute=True),
-        ):
-            row = NSOStaticRouteState.objects.create(
-                management=mgmt,
-                static_route=route,
-                nso_prefix="198.18.98.0/24",
-                status="accepted",
-            )
+        row = NSOStaticRouteState.objects.create(
+            management=mgmt,
+            static_route=route,
+            nso_prefix="198.18.98.0/24",
+            status="accepted",
+        )
+        plan = RendererMutationPlan.build(deletes=(planned_delete(row),))
 
-        with self.captureOnCommitCallbacks(execute=False):
-            row.delete()
+        with self.captureOnCommitCallbacks(execute=False), renderer_writes(plan) as writer:
+            writer.delete(row)
 
         entry = NSOIntentOutboxEntry.objects.get(
             device=self.device,
@@ -1761,35 +1730,6 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
                     "unverified": True,
                 }
             ],
-        )
-
-    def test_unowned_static_route_overlay_delete_records_no_authority(self):
-        from netbox_routing.models import StaticRoute
-
-        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOStaticRouteState
-
-        mgmt = self._mgmt()
-        route = StaticRoute.objects.create(prefix="198.18.97.0/24", next_hop="198.18.0.1", metric=1)
-        with (
-            patch("netbox_nso_plugin.adapter_client.put_static_route_intent"),
-            self.captureOnCommitCallbacks(execute=True),
-        ):
-            row = NSOStaticRouteState.objects.create(
-                management=mgmt,
-                static_route=route,
-                nso_prefix="198.18.97.0/24",
-                status="imported",
-            )
-
-        with self.captureOnCommitCallbacks(execute=False):
-            row.delete()
-
-        self.assertFalse(
-            NSOIntentOutboxEntry.objects.filter(
-                device=self.device,
-                scope="static_route",
-                consumed_by_push_seq__isnull=True,
-            ).exists()
         )
 
     def test_foreign_l2_sap_delete_does_not_push(self):

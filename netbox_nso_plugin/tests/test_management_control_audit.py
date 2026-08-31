@@ -190,7 +190,11 @@ class TestManagementControlAudit(_CascadeFlushMixin, IntentPushResetMixin, Trans
         from netbox_nso_plugin.management_lifecycle import reconcile_management_control
         from netbox_nso_plugin.models import NSOIntentRevision
 
-        revision = NSOIntentRevision.objects.create(device=self.device, scope="vlan", revision=1)
+        revision, _created = NSOIntentRevision.objects.get_or_create(
+            device=self.device,
+            scope="vlan",
+            defaults={"revision": 1},
+        )
         probes = []
 
         def probe_family_lock(*args, **kwargs):

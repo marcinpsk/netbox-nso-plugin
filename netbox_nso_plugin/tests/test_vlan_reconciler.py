@@ -128,6 +128,56 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
 
         self.assertFalse(NSOSwitchportState.objects.filter(interface=self.interface).exists())
 
+    def test_l2_reconcilers_reject_documents_without_the_required_collection(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.vlan_reconciler import reconcile_switchport, reconcile_vlan_database
+
+        for reconcile in (reconcile_vlan_database, reconcile_switchport):
+            with self.subTest(reconcile=reconcile.__name__):
+                with self.assertRaises(AdapterError) as raised:
+                    reconcile(self.device, {})
+                self.assertEqual(raised.exception.code, "invalid_response")
+
+    def test_switchport_reconciler_rejects_non_list_tagged_vlans(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.vlan_reconciler import reconcile_switchport
+
+        payload = {
+            "interfaces": [
+                {
+                    "interface_name": self.interface.name,
+                    "mode": "access",
+                    "untagged_vlan": None,
+                    "tagged_vlans": None,
+                }
+            ]
+        }
+
+        with self.assertRaises(AdapterError) as raised:
+            reconcile_switchport(self.device, payload)
+
+        self.assertEqual(raised.exception.code, "invalid_response")
+
+    def test_switchport_reconciler_rejects_unknown_modes(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.vlan_reconciler import reconcile_switchport
+
+        payload = {
+            "interfaces": [
+                {
+                    "interface_name": self.interface.name,
+                    "mode": "hybrid",
+                    "untagged_vlan": None,
+                    "tagged_vlans": [],
+                }
+            ]
+        }
+
+        with self.assertRaises(AdapterError) as raised:
+            reconcile_switchport(self.device, payload)
+
+        self.assertEqual(raised.exception.code, "invalid_response")
+
     def test_vlan_reconciler_rejects_a_fractional_vlan_id(self):
         from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
@@ -729,24 +779,6 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
 
         state.refresh_from_db()
         self.assertEqual(state.status, "changed")
-
-    def test_direct_vlan_rename_schedules_the_owned_snapshot(self):
-        from unittest.mock import patch
-
-        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
-
-        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 33, "name": "MGMT"}]})
-        state = NSOVLANState.objects.get(management=self.management, vlan__vid=33)
-        from ._outbox_case import content_update, mirror_update
-
-        mirror_update(self.management, adapter_device_id=33)
-        content_update(state, status="in_sync")
-        state.vlan.name = "RENAMED"
-
-        with patch("netbox_nso_plugin.signals._schedule_intent_push") as schedule:
-            state.vlan.save(update_fields=["name"])
-
-        schedule.assert_called_once_with((self.device.pk, "vlan"))
 
     def test_vlan_rename_back_clears_drift(self):
         """Renaming back to the device value clears the overlay drift immediately."""

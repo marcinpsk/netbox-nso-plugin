@@ -322,6 +322,22 @@ class TestOutboxMarkingModes(_CascadeFlushMixin, IntentPushResetMixin, Transacti
 
         assert any(p.get("delete_origin") == "true" for p in params), f"saw {params}"
 
+    def test_removing_one_device_does_not_mark_an_unchanged_device(self):
+        """A membership removal schedules only the device that lost the route."""
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry
+
+        other_device = _make_device("mk", 2)
+        _make_mgmt(other_device, "mk-other", 7404)
+        route = _own_route(self.mgmt, "203.0.113.144/28", "203.0.113.6")
+        with without_commit_drain(), transaction.atomic():
+            _assign_and_accept(route, other_device)
+        NSOIntentOutboxEntry.objects.all().delete()
+
+        params = self._recorded_params(lambda: _unassign_and_retire(route, self.device))
+
+        assert len(params) == 1, f"only the removed device must receive a request; saw {params}"
+        assert _entries(other_device, "static_route") == [], "the unchanged device must receive no outbox contribution"
+
 
 class TestOutboxEnqueueSharedLockCompatibility(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     """O1.18 — the shared deployment lock keeps disjoint footprints compatible."""
