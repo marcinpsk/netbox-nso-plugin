@@ -2345,7 +2345,6 @@ def mirror_refresh(instance, update_fields):
 @contextlib.contextmanager
 def locked_mirror_refresh(instance, update_fields):
     """Yield the locked save target without shadowing an active exact mutation permit."""
-    _discard_rolled_back_implicit_permit()
     if _ACTIVE_PERMIT.get() is not None:
         yield instance
         return
