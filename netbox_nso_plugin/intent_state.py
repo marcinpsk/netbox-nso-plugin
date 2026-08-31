@@ -8,6 +8,7 @@ import contextlib
 import contextvars
 import copy
 import functools
+import inspect
 import logging
 import operator
 from collections.abc import Callable
@@ -374,6 +375,10 @@ _GLOBAL_LIFECYCLE_FIELDS = frozenset(
 
 class IntentMutationProtocolError(RuntimeError):
     """A renderer input write did not hold its complete mutation footprint."""
+
+
+class RendererTargetsChanged(IntentMutationProtocolError):
+    """A source row changed the devices that render it during acquisition."""
 
 
 @dataclass(frozen=True, order=True)
@@ -1986,7 +1991,7 @@ def _revalidate_sources(footprint: MutationFootprint) -> None:
             raise RendererTargetsChanged(f"{row.model_label} row {row.pk!r} disappeared during acquisition")
         resolved_devices = {device_id for device_id, _scope in spec.resolver(instance, spec)}
         if not resolved_devices <= expected_devices:
-            raise IntentMutationProtocolError(
+            raise RendererTargetsChanged(
                 f"{row.model_label} row {row.pk!r} changed its renderer targets during acquisition"
             )
 
@@ -2330,7 +2335,8 @@ def mirror_refresh(instance, update_fields):
     token = _ACTIVE_PERMIT.set(permit)
     try:
         yield locked
-        if canonical_fragment(locked, spec) != before:
+        after = ABSENT if locked is None else canonical_fragment(locked, spec)
+        if after != before:
             raise IntentMutationProtocolError("mirror_refresh changed a canonical renderer fragment")
     finally:
         _ACTIVE_PERMIT.reset(token)
@@ -2435,6 +2441,17 @@ def ensure_delete_signal_origin() -> None:
     from netbox.models.deletion import CustomCollector
 
     collect = CustomCollector.collect
+    parameters = tuple(inspect.signature(collect).parameters.values())
+    positional = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    if len(parameters) < 3 or parameters[2].name != "source" or parameters[2].kind not in positional:
+        raise RuntimeError("NetBox CustomCollector.collect no longer has the expected positional source parameter")
+    origin = object()
+    try:
+        collector = CustomCollector(using="default", origin=origin)
+    except TypeError as exc:
+        raise RuntimeError("NetBox CustomCollector no longer accepts origin") from exc
+    if getattr(collector, "origin", None) is not origin:
+        raise RuntimeError("NetBox CustomCollector.origin is no longer initialized by its constructor")
     if getattr(collect, "_nso_preserves_delete_origin", False):
         return
 
