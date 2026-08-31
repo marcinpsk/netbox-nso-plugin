@@ -167,7 +167,6 @@ class TestOnL2SapStateSave(IntentPushDeliveryMixin, TestCase):
     def test_no_push_when_no_adapter_device_id(self):
         """No push when management.adapter_device_id is None."""
         from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOL2SapState
-        from netbox_nso_plugin.signals import _on_l2_sap_state_save
 
         inst, _ = NSOInstance.objects.get_or_create(
             name="l2-noid-inst",
@@ -186,5 +185,6 @@ class TestOnL2SapStateSave(IntentPushDeliveryMixin, TestCase):
         state = NSOL2SapState(management=mgmt, service_name="TL", service_type="epipe", sap_id="x:1", status="accepted")
 
         with patch("netbox_nso_plugin.adapter_client.put_l2_sap_intent") as mock_push:
-            _on_l2_sap_state_save(sender=NSOL2SapState, instance=state)
+            with self.captureOnCommitCallbacks(execute=True):
+                state.save()
             mock_push.assert_not_called()

@@ -196,6 +196,10 @@ class TestTheReceiptAdapterInjectionSeam(SimpleTestCase):
         with self.assertRaises(AdapterError):
             adapter._handle("PUT", "http://adapter/devices/1/vlan")
 
+
+class TestTheReceiptAdapterDeviceProjection(SimpleTestCase):
+    """How a receipt changes the adapter's model of the device."""
+
     def test_an_empty_static_route_deletion_list_does_not_mask_the_query_flag(self):
         adapter = ReceiptAdapter()
         member = ("route_id", 17)
