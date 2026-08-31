@@ -249,7 +249,7 @@ class TestInterfaceMtuReconciler(TestCase):
 
         from ._outbox_case import mirror_update
 
-        payload = {"interfaces": [{"interface_name": "Port-channel1", "mtu": 9216}]}
+        payload = {"interfaces": [_mtu_entry("Port-channel1", mtu=9216)]}
         mirror_update(self.management, adapter_device_id=76)
         self.addCleanup(mirror_update, self.management, adapter_device_id=None)
         with (
